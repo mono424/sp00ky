@@ -388,7 +388,7 @@ pub struct ClientTypeConfig {
 
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Sp00kyConfig {
-    /// Cloud project slug (used by `sp00ky cloud` commands)
+    /// Cloud project slug (used by the cloud commands: deploy, status, env, ...)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

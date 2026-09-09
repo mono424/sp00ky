@@ -461,7 +461,14 @@ impl SchemaParser {
         )
         .unwrap();
 
-        let max_size_re = Regex::new(r"file::head\(\$file\)\.size\s*<=?\s*(\d+)").unwrap();
+        // The upload limit is a `COMMENT 'sp00ky:maxSize=<bytes>'` annotation, not a
+        // permission predicate: the engine evaluates a bucket's PERMISSIONS clause
+        // before the upload exists, so `file::head($file).size` there is the size of
+        // whatever already sits at that key. Buckets scaffolded before that was
+        // understood still carry the old predicate, so it is read as a fallback.
+        let max_size_re = Regex::new(r"sp00ky:maxSize=(\d+)").unwrap();
+        let legacy_max_size_re =
+            Regex::new(r"file::head\(\$file\)\.size\s*<=?\s*(\d+)").unwrap();
         let ext_re = Regex::new(r"string::ends_with\(file::key\(\$file\),\s*'\.(\w+)'\)").unwrap();
         let auth_re = Regex::new(r"string::starts_with\(file::key\(\$file\),.*\$auth").unwrap();
         let backend_re = Regex::new(r#"(?i)BACKEND\s+"([^"]*)""#).unwrap();
@@ -472,6 +479,7 @@ impl SchemaParser {
 
             let max_size = max_size_re
                 .captures(body)
+                .or_else(|| legacy_max_size_re.captures(body))
                 .and_then(|c| c[1].parse::<u64>().ok());
 
             let allowed_extensions: Vec<String> = ext_re
@@ -1035,6 +1043,36 @@ DEFINE FIELD secret_token ON TABLE user TYPE string;
         assert!(!secret.opaque, "@nosync is not @opaque on the client side");
         // Both are excluded server-side, which is what the marker keys on.
         assert!(blob.excluded_from_sync() && secret.excluded_from_sync());
+    }
+
+    #[test]
+    fn bucket_max_size_comes_from_the_annotation_with_a_legacy_fallback() {
+        let mut p = SchemaParser::new();
+        p.extract_buckets(
+            "\
+DEFINE BUCKET IF NOT EXISTS avatars BACKEND \"memory\"
+  PERMISSIONS WHERE
+    $action NOT IN ['put']
+    OR (
+      string::ends_with(file::key($file), '.png')
+    )
+  COMMENT 'sp00ky:maxSize=5242880';
+DEFINE BUCKET IF NOT EXISTS legacy BACKEND \"memory\"
+  PERMISSIONS WHERE
+    $action NOT IN ['put']
+    OR (
+      file::head($file).size <= 1024
+      AND string::ends_with(file::key($file), '.pdf')
+    );
+DEFINE BUCKET IF NOT EXISTS bare BACKEND \"memory\";
+",
+        );
+        let avatars = p.buckets.get("avatars").expect("avatars bucket");
+        assert_eq!(avatars.max_size, Some(5_242_880));
+        assert_eq!(avatars.allowed_extensions, vec!["png".to_string()]);
+        // Buckets scaffolded before the annotation existed still report a limit.
+        assert_eq!(p.buckets.get("legacy").expect("legacy").max_size, Some(1024));
+        assert_eq!(p.buckets.get("bare").expect("bare").max_size, None);
     }
 
     #[test]

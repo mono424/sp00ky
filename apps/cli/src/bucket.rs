@@ -213,26 +213,50 @@ fn check_duplicate_bucket(name: &str, buckets_dir: &Path, config_path: &Path) ->
 
 // ── SURQL generation ─────────────────────────────────────────────────────────
 
+/// The bucket's `.surql`, as scaffolded by `spky bucket create`.
+///
+/// The PERMISSIONS clause gates `put` on the file EXTENSION only. It cannot gate
+/// on size: SurrealDB evaluates the clause before the upload exists, binding
+/// only `$action`, `$file` and `$target`, so the only size available to it is
+/// `file::head($file).size`, the size of whatever is ALREADY at that key. On
+/// SurrealDB 3.0.5 per-file actions were not enforced at all and the mistake was
+/// invisible; on 3.1.x the clause runs, and a `size <=` predicate then does the
+/// opposite of what it reads like: a first upload to a fresh key passes at any
+/// size (`file::head` is NONE), and re-uploading over a file that is already
+/// over the limit is DENIED however small the new content is.
+///
+/// The limit therefore lives in a `COMMENT` annotation, which `parser.rs` reads
+/// into the generated client schema so `useFileUpload` enforces it before the
+/// bytes ever leave the browser. A server-side size cap needs a bucket-level
+/// engine feature that does not exist yet; do not put one back in here.
 fn generate_surql(name: &str, backend: &str, max_size: u64, extensions: &[String]) -> String {
     let ext_conditions: Vec<String> = extensions
         .iter()
-        .map(|ext| format!("        string::ends_with(file::key($file), '.{}')", ext))
+        .map(|ext| format!("      string::ends_with(file::key($file), '.{}')", ext))
         .collect();
 
-    let ext_block = ext_conditions.join("\n        OR ");
+    let ext_block = ext_conditions.join("\n      OR ");
 
     format!(
-        r#"DEFINE BUCKET IF NOT EXISTS {} BACKEND "{}"
+        r#"-- Uploads are limited to {} by the CLIENT (the `sp00ky:maxSize` comment
+-- below is read by codegen into the bucket's client config). The engine cannot
+-- check an upload's size in a PERMISSIONS clause (it evaluates the clause
+-- before the file exists), so do not add a `file::head($file).size` predicate:
+-- it reads the size of the file already at that key, which lets any first
+-- upload through and blocks legitimate overwrites.
+DEFINE BUCKET IF NOT EXISTS {} BACKEND "{}"
   PERMISSIONS WHERE
     $action NOT IN ['put']
     OR (
-      file::head($file).size <= {}
-      AND (
 {}
-      )
-    );
+    )
+  COMMENT 'sp00ky:maxSize={}';
 "#,
-        name, backend, max_size, ext_block
+        format_size(max_size),
+        name,
+        backend,
+        ext_block,
+        max_size
     )
 }
 
@@ -794,9 +818,15 @@ mod tests {
             &["jpg".to_string(), "png".to_string()],
         );
         assert!(result.contains("DEFINE BUCKET IF NOT EXISTS avatars BACKEND \"memory\""));
-        assert!(result.contains("file::head($file).size <= 5242880"));
         assert!(result.contains("string::ends_with(file::key($file), '.jpg')"));
         assert!(result.contains("string::ends_with(file::key($file), '.png')"));
+        // The limit is an annotation the client enforces, never a permission
+        // predicate: `file::head($file)` in a PERMISSIONS clause reads the file
+        // ALREADY at the key, so it waves through every first upload and blocks
+        // overwrites of anything over the limit.
+        assert!(result.contains("COMMENT 'sp00ky:maxSize=5242880'"));
+        let statement = result.split("DEFINE BUCKET").nth(1).unwrap();
+        assert!(!statement.contains("file::head("));
     }
 
     #[test]
@@ -804,8 +834,8 @@ mod tests {
         let result = generate_surql("docs", "memory", 1024, &["pdf".to_string()]);
         assert!(result.contains("string::ends_with(file::key($file), '.pdf')"));
         // With a single extension, there should be no OR between extension checks
-        let ext_section = result.split("AND (").nth(1).unwrap_or("");
-        assert!(!ext_section.contains("\n        OR "));
+        let ext_section = result.split("$action NOT IN ['put']").nth(1).unwrap_or("");
+        assert!(!ext_section.contains("\n      OR "));
     }
 
     #[test]

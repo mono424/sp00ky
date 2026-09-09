@@ -1,6 +1,6 @@
 {
   "name": "ssp",
-  "version": "0.0.1-alpha.1",
+  "version": "0.0.1-alpha.2",
   "private": true,
   "scripts": {
     "build": "docker buildx build --target ssp -t mono424/spooky-ssp:dev -f ../../Dockerfile ../..",

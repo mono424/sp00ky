@@ -1,6 +1,6 @@
 [package]
 name = "ssp-node"
-version = "0.0.1-alpha.1"
+version = "0.0.1-alpha.2"
 edition = "2021"
 description = "Portable SSP node core: platform ports (traits) + shared types for the VM (tokio/axum) and Cloudflare (workers-rs) shells"
 

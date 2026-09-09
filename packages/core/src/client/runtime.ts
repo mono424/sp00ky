@@ -49,12 +49,14 @@ export class Runtime {
   private readonly scheduledMaterialize = new Set<QueryHash>();
   private readonly timerKeys = new Set<string>();
   private lastActivity = { fetching: 0, pending: 0 };
+  private lastHealth: ClientState['sync']['health'];
   private disposed = false;
 
   constructor(opts: RuntimeOptions) {
     this.env = opts.env;
     this.logger = opts.logger;
     this.stateValue = opts.initialState ?? emptyState({ tabId: opts.tabId });
+    this.lastHealth = this.stateValue.sync.health;
     const timers = opts.adapters.timers;
     this.adapters = {
       ...opts.adapters,
@@ -160,6 +162,15 @@ export class Runtime {
     if (activity.fetching !== this.lastActivity.fetching || activity.pending !== this.lastActivity.pending) {
       this.lastActivity = activity;
       this.notify({ type: 'activity:changed', ...activity });
+    }
+    // Health is notified from here, not from the saga that folds a sync round:
+    // `connection` moves through `setConnection` on a transport event with no
+    // round attached, and a subscriber that only heard the round would show a
+    // stale socket state forever. `setHealth` keeps the identity stable while
+    // the values are unchanged, so this fires exactly on real transitions.
+    if (next.sync.health !== this.lastHealth) {
+      this.lastHealth = next.sync.health;
+      this.notify({ type: 'health:changed', health: next.sync.health });
     }
   }
 

@@ -16,7 +16,10 @@ schema.gen.ts (typed schema + SURQL_SCHEMA constant)
 Sp00kyClient<S>  ── facade: every method = one saga run, selector or subscription
        │
        ├── Runtime (client/runtime.ts): one immutable ClientState, lanes, timers,
-       │     subscriptions, dirty -> materialize scheduling
+       │     subscriptions, dirty -> materialize scheduling. `query:status`,
+       │     `activity:changed` and `health:changed` are all notified from here,
+       │     off state transitions - never emitted by a saga, so a change made
+       │     outside a sync round (a socket drop, say) still reaches subscribers
        ├── Sagas (query/ mutation/ sync/ boot/): pure generators yielding effects
        └── Interpreter (kernel/interpreter.ts) -> adapters (services/):
              local store · remote socket · SSP wasm circuit · tabs broker · blobs

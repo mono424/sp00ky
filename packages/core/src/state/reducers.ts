@@ -447,9 +447,23 @@ export const setConnection =
   (s) =>
     s.sync.health.connection === connection ? s : { ...s, sync: { ...s.sync, health: { ...s.sync.health, connection } } };
 
+/**
+ * Shallow value equality over {@link SyncHealth}. `nextHealth` rebuilds the
+ * snapshot on every sync round, so identity alone would report a change each
+ * time; the runtime uses identity to decide whether to notify subscribers, and
+ * this is what keeps that identity stable while nothing actually moved.
+ */
+export const sameHealth = (a: SyncHealth, b: SyncHealth): boolean =>
+  a.status === b.status &&
+  a.consecutiveFailures === b.consecutiveFailures &&
+  a.everConnected === b.everConnected &&
+  a.connection === b.connection &&
+  a.kind === b.kind &&
+  a.error === b.error;
+
 export const setHealth =
   (health: SyncHealth): Reducer =>
-  (s) => ({ ...s, sync: { ...s.sync, health } });
+  (s) => (sameHealth(s.sync.health, health) ? s : { ...s, sync: { ...s.sync, health } });
 
 export const patchSync =
   (patch: Partial<Omit<ClientState['sync'], 'health'>>): Reducer =>

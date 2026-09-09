@@ -13,10 +13,16 @@ export interface UseSyncActivityOptions {
   downloadDelayMs?: number;
   /**
    * `isUploading()` turns on once MORE than this many mutations are waiting in
-   * the outbox. Default 1: a single write acknowledged within a round trip is
-   * not worth an animation; a backlog is.
+   * the outbox. Default 0: any unacknowledged write is upsync worth showing.
    */
   uploadThreshold?: number;
+  /**
+   * How long the outbox must stay above `uploadThreshold` before
+   * `isUploading()` turns on. The mirror of `downloadDelayMs`: a write the
+   * server acknowledges within a round trip never lights the indicator, a
+   * write that is actually waiting does. Default 150 ms.
+   */
+  uploadDelayMs?: number;
 }
 
 export interface UseSyncActivity {
@@ -26,7 +32,10 @@ export interface UseSyncActivity {
   pendingMutations: Accessor<number>;
   /** Fetching for longer than `downloadDelayMs`. Drives a "downloading" mark. */
   isDownloading: Accessor<boolean>;
-  /** More than `uploadThreshold` writes queued. Drives an "uploading" mark. */
+  /**
+   * More than `uploadThreshold` writes have been queued for longer than
+   * `uploadDelayMs`. Drives an "uploading" mark.
+   */
   isUploading: Accessor<boolean>;
 }
 
@@ -34,10 +43,10 @@ export interface UseSyncActivity {
  * The two directions of sync traffic, for an indicator in the app chrome.
  *
  * `fetchingQueries` is one subscription on the engine's aggregate fetch count,
- * not one per query; `pendingMutations` is the outbox depth. `isDownloading`
- * is the fetch count debounced ON by `downloadDelayMs` (and off at once), so a
- * local-first page that answers from cache and confirms with the server in a
- * few milliseconds never flickers. Must be used within a `<Sp00kyProvider>`, or
+ * not one per query; `pendingMutations` is the outbox depth. Both
+ * `isDownloading` and `isUploading` are debounced ON by their delay (and off at
+ * once), so a local-first page that answers from cache and confirms with the
+ * server in a few milliseconds never flickers. Must be used within a `<Sp00kyProvider>`, or
  * pass the `SyncedDb` explicitly.
  */
 export function useSyncActivity<S extends SchemaStructure = any>(
@@ -51,7 +60,8 @@ export function useSyncActivity<S extends SchemaStructure = any>(
   const options = (explicitDb ? maybeOptions : (dbOrOptions as UseSyncActivityOptions)) ?? {};
   const db = explicitDb ?? useDb<S>();
   const downloadDelayMs = options.downloadDelayMs ?? 200;
-  const uploadThreshold = options.uploadThreshold ?? 1;
+  const uploadThreshold = options.uploadThreshold ?? 0;
+  const uploadDelayMs = options.uploadDelayMs ?? 150;
 
   const fetchingQueries = fromSubscription<number>(
     (cb) => db.subscribeToFetchActivity(cb),
@@ -62,38 +72,41 @@ export function useSyncActivity<S extends SchemaStructure = any>(
     db.pendingMutationCount
   );
 
-  // ON after the delay, OFF immediately. Written from a timer, hence ownedWrite.
-  const [isDownloading, setIsDownloading] = createSignal(false, { ownedWrite: true });
+  const isDownloading = delayedOn(() => fetchingQueries() > 0, downloadDelayMs);
+  const isUploading = delayedOn(() => pendingMutations() > uploadThreshold, uploadDelayMs);
+
+  return { fetchingQueries, pendingMutations, isDownloading, isUploading };
+}
+
+/**
+ * `busy` held for `delayMs`, dropped the instant it clears. Both directions of
+ * traffic use it, so a burst too short to see never flickers the indicator and
+ * neither one can latch on after the work is done.
+ */
+function delayedOn(busy: Accessor<boolean>, delayMs: number): Accessor<boolean> {
+  // Written from a timer, hence ownedWrite.
+  const [on, setOn] = createSignal(false, { ownedWrite: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
-  createEffect(
-    () => fetchingQueries() > 0,
-    (busy) => {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
-      if (!busy) {
-        setIsDownloading(false);
-        return;
-      }
-      if (downloadDelayMs <= 0) {
-        setIsDownloading(true);
-        return;
-      }
-      timer = setTimeout(() => {
-        timer = undefined;
-        setIsDownloading(true);
-      }, downloadDelayMs);
+  createEffect(busy, (isBusy) => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
     }
-  );
+    if (!isBusy) {
+      setOn(false);
+      return;
+    }
+    if (delayMs <= 0) {
+      setOn(true);
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      setOn(true);
+    }, delayMs);
+  });
   onCleanup(() => {
     if (timer !== undefined) clearTimeout(timer);
   });
-
-  return {
-    fetchingQueries,
-    pendingMutations,
-    isDownloading,
-    isUploading: () => pendingMutations() > uploadThreshold,
-  };
+  return on;
 }

@@ -85,19 +85,49 @@ describe('useSyncActivity', () => {
     });
   });
 
-  it('isUploading needs more than the threshold of queued writes', async () => {
+  it('turns isUploading on after the delay for any queued write, and off at once', async () => {
     const m = mockDb(0, 1);
     await createRoot(async (dispose) => {
-      const a = useSyncActivity(m.db);
+      const a = useSyncActivity(m.db, { uploadDelayMs: 150 });
       await settle();
       expect(a.pendingMutations()).toBe(1);
       expect(a.isUploading()).toBe(false);
-      m.setPending(2);
-      await settle();
+      await vi.advanceTimersByTimeAsync(200);
+      flush();
       expect(a.isUploading()).toBe(true);
       m.setPending(0);
       await settle();
       expect(a.isUploading()).toBe(false);
+      dispose();
+    });
+  });
+
+  it('a write acknowledged inside the delay never shows', async () => {
+    const m = mockDb(0, 0);
+    await createRoot(async (dispose) => {
+      const a = useSyncActivity(m.db, { uploadDelayMs: 150 });
+      await settle();
+      m.setPending(1);
+      await settle();
+      await vi.advanceTimersByTimeAsync(80);
+      m.setPending(0);
+      await settle();
+      await vi.advanceTimersByTimeAsync(300);
+      flush();
+      expect(a.isUploading()).toBe(false);
+      dispose();
+    });
+  });
+
+  it('uploadThreshold holds the mark back until a backlog builds', async () => {
+    const m = mockDb(0, 1);
+    await createRoot(async (dispose) => {
+      const a = useSyncActivity(m.db, { uploadThreshold: 1, uploadDelayMs: 0 });
+      await settle();
+      expect(a.isUploading()).toBe(false);
+      m.setPending(2);
+      await settle();
+      expect(a.isUploading()).toBe(true);
       dispose();
     });
   });

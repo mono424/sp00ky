@@ -111,6 +111,20 @@ describe('Runtime state hooks', () => {
     rt.subscribeAuthority('zz', () => missing.push('x'), { immediate: true });
     expect(missing).toEqual([]);
   });
+  it('notifies health on a transport change, and only on a real move', () => {
+    const { rt } = make();
+    const seen: string[] = [];
+    rt.on('health:changed', (e) => seen.push(e.type === 'health:changed' ? e.health.connection : '?'));
+    rt.update(R.setConnection('connected'));
+    rt.update(R.setConnection('connected'));
+    rt.update(R.setConnection('reconnecting'));
+    expect(seen).toEqual(['connected', 'reconnecting']);
+    // A health snapshot rebuilt with the same values must not re-notify.
+    rt.update(R.setHealth({ ...rt.state.sync.health }));
+    expect(seen).toHaveLength(2);
+    rt.update(R.setHealth({ ...rt.state.sync.health, status: 'degraded' }));
+    expect(seen).toHaveLength(3);
+  });
   it('activity, listeners, records subscription bookkeeping, waitFor and dispose', async () => {
     const { a, rt } = make({}, buildState([buildEntry({ def: { hash: 'q' } })]));
     const events: string[] = [];

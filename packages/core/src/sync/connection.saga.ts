@@ -50,7 +50,6 @@ export function* syncOutcome(env: SagaEnv, ok: boolean, error?: unknown): Saga<v
   yield fx.state.update(
     R.compose(R.setHealth(next.health), R.patchSync({ consecutiveFailures: next.consecutiveFailures, hasSyncedOnce: next.hasSyncedOnce }))
   );
-  if (next.changed) yield fx.emit({ type: 'health:changed', health: next.health });
   if (next.degradedNow) {
     yield fx.state.update(R.patchSync({ selfHealAttempts: 0 }));
     yield fx.timer.set('heal', selfHealDelayMs(0), { type: 'SelfHealTick' });

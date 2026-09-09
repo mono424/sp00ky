@@ -1,21 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import { nextHealth, selfHealDelayMs } from './policy';
 import { initialHealth } from '../state/client-state';
+import { sameHealth } from '../state/reducers';
 
 const start = { health: initialHealth('connected'), consecutiveFailures: 0, hasSyncedOnce: false };
 
 describe('nextHealth', () => {
   it('disabled reporting never changes anything', () => {
     const out = nextHealth(start, false, new Error('x'), 0);
-    expect(out).toMatchObject({ ...start, changed: false, degradedNow: false, recoveredNow: false });
+    expect(out).toMatchObject({ ...start, degradedNow: false, recoveredNow: false });
   });
   it('first success latches everConnected and hasSyncedOnce', () => {
     const out = nextHealth(start, true, undefined, 3);
     expect(out.health.everConnected).toBe(true);
     expect(out.hasSyncedOnce).toBe(true);
-    expect(out.changed).toBe(true);
+    // A second success moves nothing, so the runtime must not re-notify.
     const again = nextHealth(out, true, undefined, 3);
-    expect(again.changed).toBe(false);
+    expect(sameHealth(again.health, out.health)).toBe(true);
   });
   it('failures accumulate, degrade at the threshold once, recover on success', () => {
     let s = nextHealth(start, false, new Error('socket closed'), 3);
@@ -30,7 +31,6 @@ describe('nextHealth', () => {
     expect(s.health.consecutiveFailures).toBe(3);
     s = nextHealth(s, false, new Error('timeout'), 3);
     expect(s.degradedNow).toBe(false);
-    expect(s.changed).toBe(false);
     expect(s.consecutiveFailures).toBe(4);
     const r = nextHealth(s, true, undefined, 3);
     expect(r.health.status).toBe('healthy');
@@ -42,7 +42,7 @@ describe('nextHealth', () => {
     const s = nextHealth(start, false, new Error('x'), 3);
     const r = nextHealth(s, true, undefined, 3);
     expect(r.recoveredNow).toBe(false);
-    expect(r.changed).toBe(true);
+    expect(r.consecutiveFailures).toBe(0);
   });
 });
 

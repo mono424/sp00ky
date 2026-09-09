@@ -452,8 +452,6 @@ export interface HealthInput {
 }
 
 export interface HealthOutput extends HealthInput {
-  /** The health changed in a way subscribers must hear about. */
-  changed: boolean;
   /** Crossed into degraded on this outcome: start self-heal. */
   degradedNow: boolean;
   /** Left degraded on this outcome: stop self-heal. */
@@ -466,13 +464,12 @@ export interface HealthOutput extends HealthInput {
  * back. `degradeAfter <= 0` disables reporting.
  */
 export function nextHealth(input: HealthInput, ok: boolean, error: unknown, degradeAfter: number): HealthOutput {
-  const base = { ...input, changed: false, degradedNow: false, recoveredNow: false };
+  const base = { ...input, degradedNow: false, recoveredNow: false };
   if (degradeAfter <= 0) return base;
   if (ok) {
     const everConnected = true;
     if (input.consecutiveFailures === 0) {
-      const changed = !input.health.everConnected;
-      return { ...base, hasSyncedOnce: true, health: { ...input.health, everConnected }, changed };
+      return { ...base, hasSyncedOnce: true, health: { ...input.health, everConnected } };
     }
     const recovered = input.health.status === 'degraded';
     return {
@@ -480,7 +477,6 @@ export function nextHealth(input: HealthInput, ok: boolean, error: unknown, degr
       hasSyncedOnce: true,
       consecutiveFailures: 0,
       health: { ...input.health, status: 'healthy', kind: undefined, error: undefined, everConnected },
-      changed: true,
       recoveredNow: recovered,
     };
   }
@@ -492,7 +488,6 @@ export function nextHealth(input: HealthInput, ok: boolean, error: unknown, degr
       ...base,
       consecutiveFailures,
       health: { ...input.health, status: 'degraded', consecutiveFailures, kind, error: message },
-      changed: true,
       degradedNow: true,
     };
   }

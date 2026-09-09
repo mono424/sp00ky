@@ -44,15 +44,17 @@ describe('syncOutcome', () => {
     expect(state.sync.health.status).toBe('healthy');
     const third = await runPure(syncOutcome(env, false, new Error('socket')), { state });
     expect(third.state.sync.health.status).toBe('degraded');
-    expect(third.emitted).toEqual([{ type: 'health:changed', health: third.state.sync.health }]);
+    // The saga emits nothing: the runtime notifies `health:changed` off the
+    // health object's identity, which `setHealth` only replaces on a real move.
+    expect(third.emitted).toEqual([]);
     expect(third.timers.get('heal')).toEqual({ ms: 2000, event: { type: 'SelfHealTick' } });
     expect(third.state.sync.selfHealAttempts).toBe(0);
     const back = await runPure(syncOutcome(env, true), { state: third.state });
     expect(back.state.sync.health.status).toBe('healthy');
-    expect(back.emitted).toHaveLength(1);
+    expect(back.state.sync.health).not.toBe(third.state.sync.health);
     expect(back.log.some((e) => e.kind === 'timer.clear' && (e as any).key === 'heal')).toBe(true);
     const quiet = await runPure(syncOutcome(env, true), { state: back.state });
-    expect(quiet.emitted).toEqual([]);
+    expect(quiet.state.sync.health).toBe(back.state.sync.health);
   });
 });
 

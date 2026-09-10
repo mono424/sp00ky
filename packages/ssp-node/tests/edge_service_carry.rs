@@ -1,6 +1,6 @@
 //! The edge-update service carries what a flush could not write into the next
-//! window, ahead of newer deltas, and gives up only after a bounded number of
-//! rounds.
+//! window, ahead of newer deltas, and once the carry budget is out it PARKS
+//! the delta and retries it on a slower cadence rather than dropping it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,13 +92,26 @@ async fn leftovers_lead_the_next_batch() {
 }
 
 #[tokio::test]
-async fn a_permanently_failing_delta_is_dropped_after_the_carry_budget() {
+async fn a_permanently_failing_delta_stops_riding_every_window_but_is_never_dropped() {
     let feed: Vec<Vec<ViewDelta>> = (0..(MAX_EDGE_CARRY as usize + 3)).map(|i| vec![delta(&format!("good:{i}"))]).collect();
     let mut feed_with_bad = vec![vec![delta("bad:x")]];
     feed_with_bad.extend(feed);
     let batches = run(usize::MAX, feed_with_bad).await;
     let carried = batches.iter().filter(|b| b.iter().any(|q| q == "bad:x")).count();
-    // The first flush plus MAX_EDGE_CARRY carries, then it is gone.
-    assert_eq!(carried, 1 + MAX_EDGE_CARRY as usize);
-    assert!(!batches.last().unwrap().iter().any(|q| q == "bad:x"));
+    // The first flush plus MAX_EDGE_CARRY carries, and after that it rides
+    // only the parked cadence — so it appears again, but not in every window.
+    assert!(
+        carried > MAX_EDGE_CARRY as usize,
+        "a delta that cannot be written is parked and retried, not dropped: {batches:?}"
+    );
+    assert!(
+        carried < batches.len(),
+        "a parked delta does not ride every window: {batches:?}"
+    );
+    let healthy = batches.iter().filter(|b| b.iter().any(|q| q.starts_with("good"))).count();
+    assert_eq!(
+        healthy,
+        MAX_EDGE_CARRY as usize + 3,
+        "every healthy delta still flushed: {batches:?}"
+    );
 }

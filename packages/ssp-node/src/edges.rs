@@ -585,7 +585,11 @@ pub async fn write_deltas_resilient(
 /// "not there" answers true: a query error is no evidence either way, and the
 /// caller then keeps carrying the delta.
 async fn view_is_gone(db: &dyn Db, query_id: &str) -> bool {
-    let key = query_id.strip_prefix("_00_query:").unwrap_or(query_id);
+    // The same key derivation the publish itself binds (`incantation_key`).
+    // A prefix strip is not it: a view id spelled any other way resolved to a
+    // record that cannot exist, so a delta whose transaction merely failed was
+    // declared orphaned and dropped.
+    let key = incantation_key(query_id);
     match db
         .query(
             "SELECT VALUE id FROM ONLY type::record('_00_query', $key)",

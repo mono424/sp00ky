@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 
 use ssp_protocol::{list_ref_table_for, sanitize_user_id, RefMode, ANON_AUTH_ID};
 
+use crate::db_retry::query_retrying;
 use crate::ports::Db;
 
 /// Per-user tables this process has already defined, keyed by sanitized uid.
@@ -114,7 +115,7 @@ pub async fn ensure_anon_table(db: &dyn Db) -> Result<()> {
         tbl = tbl,
         fields = list_ref_fields(tbl),
     );
-    db.query(&ddl, &[])
+    query_retrying(db, &ddl, &[])
         .await
         .context("Failed to ensure anonymous list_ref table")?;
     ENSURED_ANON_TABLE.store(true, Ordering::Release);
@@ -170,7 +171,14 @@ pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Re
         uid = uid,
         fields = list_ref_fields(&tbl),
     );
-    db.query(&ddl, &[])
+    // Retried: this DDL is issued from `/view/register`, and a registration
+    // burst has every client defining its own table against the same catalog
+    // at once. `db_retry`'s own doc names `_00_list_ref_*` as a hot row for
+    // exactly this reason — it was just never wired up here, so a lost
+    // optimistic-concurrency race 500'd the registration outright and the
+    // client's view never came up. Seen on whitepawn: twelve of these inside
+    // one second during a re-registration storm.
+    query_retrying(db, &ddl, &[])
         .await
         .with_context(|| format!("Failed to ensure per-user list_ref table for {}", auth_id))?;
     mark_user_table_ensured(&uid);
@@ -360,6 +368,49 @@ mod ensure_once_tests {
             ddl_count(&db, "DEFINE TABLE OVERWRITE _00_list_ref_user_ensureonce_a1b2c3"),
             2,
             "re-defined after a drop"
+        );
+    }
+
+    /// A registration burst has every client defining its own per-user table
+    /// against the same catalog at once, so this DDL loses
+    /// optimistic-concurrency races. Without a retry the loser 500s
+    /// `/view/register` and that client's view never comes up.
+    #[tokio::test]
+    async fn a_write_conflict_on_the_define_is_retried() {
+        struct ConflictThenOk {
+            attempts: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Db for ConflictThenOk {
+            async fn query(
+                &self,
+                _surql: &str,
+                _binds: &[(&str, serde_json::Value)],
+            ) -> Result<Vec<serde_json::Value>, DbError> {
+                let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if n == 0 {
+                    return Err(DbError::Query(
+                        "Transaction conflict: Resource busy: . This transaction can be retried"
+                            .into(),
+                    ));
+                }
+                Ok(vec![])
+            }
+            async fn version(&self) -> Result<String, DbError> {
+                Ok("test".into())
+            }
+        }
+
+        let db = ConflictThenOk {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+        ensure_user_tables(&db, RefMode::Dedicated, "user:retried_after_conflict_q1")
+            .await
+            .expect("a write conflict must be retried, not surfaced as a 500");
+        assert_eq!(
+            db.attempts.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "the DDL should have run twice: the conflict, then the retry"
         );
     }
 

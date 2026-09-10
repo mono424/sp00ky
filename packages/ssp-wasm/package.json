@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/ssp-wasm",
-  "version": "0.0.1-canary.240",
+  "version": "0.0.1-canary.241",
   "main": "pkg/ssp_wasm.js",
   "types": "pkg/ssp_wasm.d.ts",
   "files": [

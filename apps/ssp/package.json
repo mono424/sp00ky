@@ -1,6 +1,6 @@
 {
   "name": "ssp",
-  "version": "0.0.1-canary.240",
+  "version": "0.0.1-canary.241",
   "private": true,
   "scripts": {
     "build": "docker buildx build --target ssp -t mono424/spooky-ssp:dev -f ../../Dockerfile ../..",

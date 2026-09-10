@@ -1,6 +1,6 @@
 [package]
 name = "ssp"
-version = "0.0.1-canary.240"
+version = "0.0.1-canary.241"
 edition = "2021"
 
 [lib]

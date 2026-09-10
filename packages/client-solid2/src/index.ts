@@ -310,6 +310,32 @@ export class SyncedDb<S extends SchemaStructure> {
     if (!this.sp00ky) throw new Error('SyncedDb not initialized');
     return await this.sp00ky.useRemote(fn);
   }
+
+  /**
+   * Run one SurrealQL statement against the REMOTE database, results shaped
+   * like the SDK's own `.query()` (one entry per statement).
+   *
+   * Prefer this over `useRemote(s => s.query(...))` for a plain read: the bare
+   * SDK client the callback receives bypasses the client's connect gate, so a
+   * statement issued while the socket is being rebuilt fails with "Specify a
+   * namespace to use" instead of waiting for the session to be applied. It is
+   * also bounded by the remote service's concurrency limit and query timeout.
+   *
+   * Vars go through `unproxy` for the same reason writes do: a value read out
+   * of a Solid 2 store is a Proxy, and one bound as a query parameter reaches
+   * the CBOR encoder (and, under shared tabs, `postMessage`) as something it
+   * cannot serialize.
+   */
+  public async remoteQuery<T extends unknown[] = unknown[]>(
+    sql: string,
+    vars?: Record<string, unknown>
+  ): Promise<T> {
+    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
+    return await this.sp00ky.remoteQuery<T>(
+      sql,
+      vars ? (unproxy(vars) as Record<string, unknown>) : undefined
+    );
+  }
   /**
    * Access the remote database service directly
    */

@@ -45,7 +45,7 @@ pub use runtime::Runtime;
 pub use status::{error_codes, SspError, SspStatus};
 pub use ports::{
     ArtifactError, ArtifactMeta, ArtifactStore, CancelHandle, CancelWatch, CircuitStore,
-    CircuitStoreError, Db, DbError, HttpClient, HttpError, MaybeSendSync, NoopCircuitStore,
+    CircuitStoreError, Db, DbConnection, DbError, HttpClient, HttpError, MaybeSendSync, NoopCircuitStore,
     NoopTelemetry, OutboundRequest, OutboundResponse, ResumePoint, Scheduler, Spawner, Telemetry,
     TimerKind,
 };

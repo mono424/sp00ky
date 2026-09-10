@@ -14,6 +14,27 @@ pub enum DbError {
     Query(String),
 }
 
+/// What the adapter has most recently observed about its connection.
+///
+/// `/health` is answered from memory and never touches the database. Without
+/// this an SSP whose DB handle is wedged keeps answering `ready` in
+/// milliseconds while every DB-touching route (`/ingest`, `/view/register`,
+/// `/job/recover`) hangs — which is how a stalled SurrealDB reads as "the SSP
+/// went down" from the scheduler's side, with the two disagreeing and neither
+/// able to say why.
+///
+/// Adapters that do not track it (in-memory doubles, tests) get `Unknown` from
+/// the default trait method and report nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbConnection {
+    /// Not tracked by this adapter.
+    Unknown,
+    /// A query has completed since the last failure.
+    Ok,
+    /// This many queries in a row exceeded the adapter's call timeout.
+    Stalled { consecutive_timeouts: u32 },
+}
+
 /// Database access port.
 ///
 /// Deliberately OUR abstraction rather than the `surrealdb` SDK: the SDK's
@@ -35,4 +56,11 @@ pub trait Db: MaybeSendSync {
 
     /// Server version string (surfaced via `/info`).
     async fn version(&self) -> Result<String, DbError>;
+
+    /// Connection liveness as the adapter last observed it. Never performs
+    /// I/O — `/health` calls this on every probe and must stay allocation-free
+    /// and instant.
+    fn connection(&self) -> DbConnection {
+        DbConnection::Unknown
+    }
 }

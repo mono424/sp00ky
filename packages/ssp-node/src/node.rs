@@ -506,10 +506,33 @@ impl SspNode {
         let ssp_ready = status == SspStatus::Ready;
         let status_str = Self::status_str(status);
 
+        // `status` deliberately still reflects only bootstrap state. The
+        // scheduler's bootstrap handshake compares it to the literal "ready"
+        // and the cloud autoheal destroys a container whose probe fails, so a
+        // wedged database must NOT flip this field or 503 the endpoint —
+        // otherwise a slow SurrealDB gets "healed" by having its SSP deleted.
+        // It is reported alongside instead, where an operator and the admin
+        // dashboard can see it. `Lagging` on the scheduler side remains the
+        // signal that actually takes an SSP out of rotation.
+        let db_stall = match self.platform.db.connection() {
+            crate::ports::DbConnection::Stalled {
+                consecutive_timeouts,
+            } => Some(consecutive_timeouts),
+            _ => None,
+        };
+
         let Some(backend_health) = &self.backend_health else {
-            // Cluster mode (or no monitor): historical shape, untouched.
+            // Cluster mode (or no monitor): historical shape, plus `db` only
+            // when there is something wrong to report.
             let http_status = if ssp_ready { 200 } else { 503 };
-            return ApiResponse::json(http_status, json!({ "status": status_str }));
+            let mut body = json!({ "status": status_str });
+            if let Some(consecutive_timeouts) = db_stall {
+                body["db"] = json!({
+                    "status": "stalled",
+                    "consecutive_timeouts": consecutive_timeouts,
+                });
+            }
+            return ApiResponse::json(http_status, body);
         };
 
         let c = backend_health.counts().await;
@@ -526,19 +549,23 @@ impl SspNode {
             (200, "degraded")
         };
 
-        ApiResponse::json(
-            http_status,
-            json!({
-                "status": aggregate,
-                "ssp": { "status": status_str },
-                "backends": {
-                    "healthy": c.healthy,
-                    "unhealthy": c.unhealthy,
-                    "unreachable": c.unreachable,
-                    "total": c.total,
-                }
-            }),
-        )
+        let mut body = json!({
+            "status": aggregate,
+            "ssp": { "status": status_str },
+            "backends": {
+                "healthy": c.healthy,
+                "unhealthy": c.unhealthy,
+                "unreachable": c.unreachable,
+                "total": c.total,
+            }
+        });
+        if let Some(consecutive_timeouts) = db_stall {
+            body["db"] = json!({
+                "status": "stalled",
+                "consecutive_timeouts": consecutive_timeouts,
+            });
+        }
+        ApiResponse::json(http_status, body)
     }
 
     /// Update backend health check configs at runtime (standalone only — in

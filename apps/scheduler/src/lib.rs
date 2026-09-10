@@ -290,6 +290,10 @@ pub struct Scheduler {
     /// Serializes replica re-clones (admin, breakers, drift) so two of them
     /// can never reset + re-ingest the shared replica concurrently.
     pub reclone_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialised SSP fan-out shared by every `ingest_state()` (see
+    /// `ingest::Fanout`). One consumer per scheduler, or delivery order and
+    /// the `Lagging` bookkeeping would race.
+    fanout: Arc<crate::ingest::Fanout>,
 }
 
 impl Scheduler {
@@ -330,6 +334,7 @@ impl Scheduler {
             drift: Arc::new(RwLock::new(crate::drift::DriftState::default())),
             drift_config: crate::drift::DriftConfig::from_env(),
             reclone_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fanout: crate::ingest::Fanout::start(),
         })
     }
 
@@ -348,6 +353,7 @@ impl Scheduler {
             job_tables: Arc::new(crate::schedule_engine::job_tables_from_env()),
             observer_permits: Arc::clone(&self.observer_permits),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
+            fanout: Arc::clone(&self.fanout),
         }
     }
 

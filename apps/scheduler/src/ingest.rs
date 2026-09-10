@@ -47,6 +47,106 @@ pub struct IngestState {
     /// (`Replica::snapshot_seq_cell`). Health/metrics probes read this so
     /// they never queue behind a drain holding the replica write lock.
     pub snapshot_seq: Arc<AtomicU64>,
+    /// Serialised SSP fan-out. `/ingest` hands the event over here once it is
+    /// durable instead of delivering it inline; see [`Fanout`].
+    pub fanout: Arc<Fanout>,
+}
+
+/// The SSP fan-out, moved off the `/ingest` request path.
+///
+/// # Why
+///
+/// The `_00_<table>_*` DB events `http::post` to `/ingest` **inside the user's
+/// transaction**. While the fan-out ran inline, that transaction stayed open
+/// until every ready SSP had acknowledged the event — so an SSP that was slow
+/// (typically because it was waiting on the very same SurrealDB) made every
+/// user write slow, which made SurrealDB slower still. A write → scheduler →
+/// SSP → SurrealDB → write cycle, with the scheduler's 30s POST timeout as the
+/// only bound. That is what produced `heartbeat failed stage="db_write_timeout"
+/// detail=probe write exceeded 25s` and SurrealDB's "transaction was dropped
+/// without being committed or cancelled".
+///
+/// The event is already durable before the fan-out (WAL append with flush,
+/// then the in-memory buffer), and a scheduler crash replays from the WAL, so
+/// answering the DB event at that point loses nothing.
+///
+/// # Why a queue and not a bare `tokio::spawn`
+///
+/// Delivery order and the `Lagging` bookkeeping are one interleaved sequence:
+/// a failed delivery must mark the SSP lagging, the event must then be
+/// buffered, and only then may redelivery start — otherwise redelivery finds
+/// an empty queue, flips the SSP back to `Ready`, and drops exactly the event
+/// that failed. Spawning per event would let two events race through that
+/// sequence. One consumer keeps it strictly ordered, which is in fact stronger
+/// than the old inline path, where concurrent requests could already interleave
+/// across the broadcast await.
+///
+/// A stall does not grow the queue without bound in practice: the first failed
+/// delivery parks the SSP in `Lagging`, and every later event then skips the
+/// network entirely and goes straight to the buffer.
+pub struct Fanout {
+    tx: tokio::sync::mpsc::UnboundedSender<FanoutJob>,
+    /// Events handed to the queue. Paired with `completed` so callers can wait
+    /// for the queue to catch up; see [`Fanout::idle`].
+    submitted: AtomicU64,
+    completed: tokio::sync::watch::Receiver<u64>,
+}
+
+struct FanoutJob {
+    /// Carrying the state per job (rather than handing it to the worker once)
+    /// keeps `Fanout` constructible before the state that references it. The
+    /// resulting `Arc` cycle is deliberate: the queue is meant to live exactly
+    /// as long as the process.
+    state: IngestState,
+    request: IngestRequest,
+    operation: RecordOp,
+    seq: u64,
+}
+
+impl Fanout {
+    /// Start the consumer. One per scheduler.
+    pub fn start() -> Arc<Self> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FanoutJob>();
+        let (done_tx, completed) = tokio::sync::watch::channel(0u64);
+        tokio::spawn(async move {
+            let mut n = 0u64;
+            while let Some(job) = rx.recv().await {
+                fan_out_event(job.state, job.request, job.operation, job.seq).await;
+                n += 1;
+                let _ = done_tx.send(n);
+            }
+        });
+        Arc::new(Self {
+            tx,
+            submitted: AtomicU64::new(0),
+            completed,
+        })
+    }
+
+    fn submit(&self, job: FanoutJob) {
+        self.submitted.fetch_add(1, Ordering::SeqCst);
+        // The only way this fails is a dropped consumer, i.e. the runtime is
+        // going away. The event is in the WAL either way.
+        if self.tx.send(job).is_err() {
+            error!("Ingest fan-out queue is closed; event stays for WAL replay");
+        }
+    }
+
+    /// Wait until every event submitted so far has been fanned out.
+    ///
+    /// Delivery is no longer finished when `/ingest` answers, so anything that
+    /// needs to observe its effect — tests asserting on SSP state after a
+    /// post, a drain that wants the queue quiet — has to wait for it here
+    /// rather than assume it already happened.
+    pub async fn idle(&self) {
+        let target = self.submitted.load(Ordering::SeqCst);
+        let mut completed = self.completed.clone();
+        while *completed.borrow_and_update() < target {
+            if completed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// Snapshot of how far behind the replica is vs. the ingest stream.
@@ -230,6 +330,27 @@ async fn handle_ingest(
         }
     }
 
+    // Durable now (WAL flushed, buffered). Hand the SSP fan-out to the queue
+    // and answer, so the user's transaction is not held open for it.
+    state.fanout.submit(FanoutJob {
+        state: state.clone(),
+        request,
+        operation,
+        seq,
+    });
+
+    info!(seq, "Ingest accepted");
+    Ok(StatusCode::OK)
+}
+
+/// Deliver one ingested event to the SSPs. Runs on the [`Fanout`] consumer,
+/// never on the `/ingest` request path.
+async fn fan_out_event(
+    state: IngestState,
+    request: IngestRequest,
+    operation: RecordOp,
+    seq: u64,
+) {
     // Select one SSP for job execution (round-robin)
     let job_assignee = {
         let mut pool = state.ssp_pool.write().await;
@@ -319,8 +440,7 @@ async fn handle_ingest(
         tokio::spawn(redeliver_to_lagging_ssp(state.clone(), ssp_id));
     }
 
-    info!(seq, "Ingest processed successfully");
-    Ok(StatusCode::OK)
+    info!(seq, "Ingest fanned out to SSPs");
 }
 
 /// The table an event's record id names when it is NOT `table`.

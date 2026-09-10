@@ -41,6 +41,10 @@ struct TestHarness {
     job_tracker: Arc<JobTracker>,
     config: Arc<SchedulerConfig>,
     snapshot_seq_cell: Arc<AtomicU64>,
+    /// One per harness: `/ingest` hands delivery to this queue instead of
+    /// doing it inline, so a test that asserts on SSP state after a post must
+    /// `h.fanout.idle().await` first.
+    fanout: Arc<ingest::Fanout>,
     _replica_dir: TempDir,
     _wal_dir: TempDir,
 }
@@ -117,6 +121,7 @@ impl TestHarness {
             config: Arc::new(config),
             _replica_dir: replica_dir,
             _wal_dir: wal_dir,
+            fanout: ingest::Fanout::start(),
         }
     }
 
@@ -134,6 +139,7 @@ impl TestHarness {
             job_tables: Arc::new(vec![]),
             observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
+            fanout: Arc::clone(&self.fanout),
         };
         ingest::create_ingest_router(state)
     }
@@ -209,6 +215,7 @@ impl TestHarness {
                     job_tables: Arc::new(vec![]),
                     observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                     snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
+            fanout: Arc::clone(&self.fanout),
                 },
             });
         let (backup_tx, _backup_rx) = maintenance::backup::create_backup_channel();
@@ -272,6 +279,7 @@ impl TestHarness {
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
+            fanout: Arc::clone(&self.fanout),
             },
             replica: Arc::clone(&self.replica),
             surrealdb_version: Arc::new(RwLock::new("unknown".to_string())),
@@ -568,6 +576,7 @@ mod ingest_tests {
         let (status, _) =
             post_json(app.clone(), "/ingest", &ingest_payload("game", "CREATE", "game:1")).await;
         assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
         {
             let pool = h.ssp_pool.read().await;
             assert!(pool.is_lagging("ssp-flaky"), "missed delivery parks the SSP");
@@ -579,6 +588,7 @@ mod ingest_tests {
         let (status, _) =
             post_json(app.clone(), "/ingest", &ingest_payload("game", "CREATE", "game:2")).await;
         assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
 
         // The redelivery task retries with backoff (500ms first) and drains
         // the queue once the SSP answers again.
@@ -607,6 +617,7 @@ mod ingest_tests {
         let (status, _) =
             post_json(app, "/ingest", &ingest_payload("game", "CREATE", "game:3")).await;
         assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
         assert_eq!(ssp.received_count().await, 3);
         assert!(h.ssp_pool.read().await.is_ready("ssp-flaky"));
     }
@@ -630,6 +641,7 @@ mod ingest_tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
         assert_eq!(h.event_buffer.read().await.len(), 0, "not buffered");
         assert_eq!(ssp.received_count().await, 0, "not broadcast");
 
@@ -639,6 +651,7 @@ mod ingest_tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _) = post_json(app, "/ingest", &ingest_payload("_00_app_release", "CREATE", "web")).await;
         assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
         assert_eq!(h.event_buffer.read().await.len(), 2);
         assert_eq!(ssp.received_count().await, 2);
     }
@@ -777,6 +790,7 @@ mod ingest_tests {
         let app = h.ingest_router();
         let (status, _) = post_json(app, "/ingest", &ingest_payload("user", "CREATE", "u1")).await;
         assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
 
         // Check that the message was buffered for the bootstrapping SSP
         let pool = h.ssp_pool.read().await;
@@ -1448,6 +1462,7 @@ mod bootstrap_protocol_tests {
 
         // seq_counter should be 4
         assert_eq!(h.seq_counter.load(Ordering::SeqCst), 4);
+        h.fanout.idle().await;
 
         // The new event should be buffered for the bootstrapping SSP
         let pool = h.ssp_pool.read().await;
@@ -1494,6 +1509,7 @@ mod bootstrap_protocol_tests {
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
+                fanout: Arc::clone(&h.fanout),
             };
             let app = ingest::create_ingest_router(ingest_state);
 
@@ -2059,6 +2075,7 @@ mod bootstrap_protocol_tests {
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
+                fanout: Arc::clone(&h.fanout),
             },
         };
         let seq = host.pre_backup().await.unwrap();
@@ -2567,6 +2584,7 @@ mod drift_tests {
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
+                fanout: Arc::clone(&h.fanout),
             },
             replica: Arc::clone(&h.replica),
             surrealdb_version: Arc::new(RwLock::new("unknown".to_string())),

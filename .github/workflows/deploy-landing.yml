@@ -10,6 +10,13 @@ on:
 permissions:
   contents: write
 
+# The action force-pushes to `gh-pages`; two runs doing that at once lose the
+# race ("cannot lock ref 'refs/heads/gh-pages'"), which is exactly what two
+# pushes to main a minute apart produced on 2026-09-10. Queue them instead.
+concurrency:
+  group: deploy-landing
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest

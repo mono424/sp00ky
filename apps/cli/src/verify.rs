@@ -34,9 +34,17 @@ pub fn run(fix: bool) -> Result<()> {
     let config = backend::load_config(Path::new(DEFAULT_CONFIG_PATH));
     let surreal = config.resolved_surrealdb();
 
+    // Name the endpoints. Every column comes from localhost — this command
+    // reads the LOCAL dev stack, and run inside a cloud-linked project it
+    // otherwise looks like a verdict on the deployment: the counts are a
+    // different database's, and its "mismatches" send you chasing drift that
+    // does not exist.
     println!(
-        "{} Comparing record counts and hashes across SurrealDB, scheduler, and SSP...\n",
-        PREFIX
+        "{} Comparing record counts and hashes across the LOCAL dev stack \
+         (SurrealDB localhost:{}, scheduler localhost:{}, SSP localhost:{}).\n\
+         {} This says nothing about a cloud deployment — for that, read the \
+         scheduler's own drift verdict on the admin dashboard.\n",
+        PREFIX, SURREAL_PORT, SCHEDULER_PORT, SSP_PORT, PREFIX
     );
 
     let main = fetch_main_stats(

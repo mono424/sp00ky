@@ -20,10 +20,14 @@
 //! `snapshot_update_interval_secs` under `drain_lock` and never while an SSP
 //! is bootstrapping. Between drains a busy table's replica count legitimately
 //! trails upstream by everything still buffered. So the periodic check is a
-//! step of that same tick, run right after a drain that left the buffer
-//! empty, and the only mismatch acted on at first sight is the one that
-//! cannot be drain lag: a table with ZERO replica rows that upstream has rows
-//! for. Every other mismatch has to repeat across consecutive checks.
+//! step of that same tick, run right after a drain, over the tables that have
+//! NOTHING still buffered — the caller passes the busy ones and they sit this
+//! pass out, keeping whatever streak they had. Skipping the whole check
+//! instead (the original rule) meant a tenant whose scheduler writes job rows
+//! several times a second never checked at all after startup. The only
+//! mismatch acted on at first sight is the one that cannot be drain lag: a
+//! table with ZERO replica rows that upstream has rows for. Every other
+//! mismatch has to repeat across consecutive checks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -219,12 +223,16 @@ impl DriftReport {
 pub async fn check_once(
     upstream: &dyn UpstreamCounts,
     replica: &Arc<RwLock<Replica>>,
+    skip: &BTreeSet<String>,
 ) -> Result<DriftReport> {
     let upstream_counts = upstream.upstream_counts().await?;
     let mut tables = BTreeMap::new();
     {
         let rep = replica.read().await;
         for (table, upstream_count) in upstream_counts {
+            if skip.contains(&table) {
+                continue;
+            }
             let replica_count = rep.count_table(&table).await.unwrap_or(0) as u64;
             tables.insert(
                 table,
@@ -314,7 +322,12 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig, n
         }
     }
     state.verify_after_reclone = false;
-    state.streaks.retain(|t, _| report.tables.get(t).map_or(false, |c| c.mismatched()));
+    // A table missing from the report was not compared this pass (its events
+    // are still buffered), so its streak stands: only a table that WAS
+    // compared and came back clean loses it.
+    state
+        .streaks
+        .retain(|t, _| report.tables.get(t).map_or(true, |c| c.mismatched()));
     state.last_report = Some(report.clone());
 
     if mismatched.is_empty() {
@@ -384,7 +397,11 @@ pub trait Recloner: Send + Sync {
 /// Called by the snapshot updater AFTER a drain that emptied the buffer, with
 /// `drain_lock` released (the re-clone takes the replica write lock itself and
 /// can run for minutes). Also called once at startup.
-pub async fn run_check(hook: &DriftHook, replica: &Arc<RwLock<Replica>>) -> Action {
+pub async fn run_check(
+    hook: &DriftHook,
+    replica: &Arc<RwLock<Replica>>,
+    skip: &BTreeSet<String>,
+) -> Action {
     if !hook.cfg.enabled {
         return Action::Clean;
     }
@@ -396,7 +413,7 @@ pub async fn run_check(hook: &DriftHook, replica: &Arc<RwLock<Replica>>) -> Acti
     // updater parked in an upstream `count()` that never answered).
     let report = match tokio::time::timeout(
         hook.cfg.check_timeout,
-        check_once(&*hook.upstream, replica),
+        check_once(&*hook.upstream, replica, skip),
     )
     .await
     {
@@ -538,7 +555,7 @@ mod tests {
             reclone: Arc::new(NeverReclones),
         };
 
-        assert_eq!(run_check(&hook, &replica).await, Action::Clean);
+        assert_eq!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Clean);
         assert!(
             stalled.load(Ordering::SeqCst),
             "the handle behind an abandoned check is dropped for the next one"
@@ -575,6 +592,53 @@ mod tests {
         assert_eq!(decide(&report(&[("game", Some(101), 101)]), &mut st, &cfg(), Instant::now()), Action::Clean);
         assert!(st.streaks.is_empty());
         assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Report { tables: vec!["game".into()] });
+        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Reclone { tables: vec!["game".into()] });
+    }
+
+    #[tokio::test]
+    async fn a_table_with_events_still_buffered_sits_the_pass_out() {
+        // The whole point of the per-table gate: on a tenant whose scheduler
+        // writes job rows several times a second, `job` is always busy and
+        // would otherwise take every other table's check down with it.
+        struct Fixed;
+        #[async_trait]
+        impl UpstreamCounts for Fixed {
+            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+                Ok([("game".to_string(), Some(0u64)), ("job".to_string(), Some(9u64))]
+                    .into_iter()
+                    .collect())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let replica = Arc::new(RwLock::new(
+            Replica::new(tmp.path().join("replica")).await.unwrap(),
+        ));
+        let busy: BTreeSet<String> = ["job".to_string()].into_iter().collect();
+
+        let report = check_once(&Fixed, &replica, &busy).await.unwrap();
+        assert!(report.tables.contains_key("game"), "an idle table is still compared");
+        assert!(
+            !report.tables.contains_key("job"),
+            "a table with buffered events is not judged on counts that cannot agree yet"
+        );
+    }
+
+    #[test]
+    fn a_skipped_table_keeps_the_streak_it_had() {
+        // Absent from the report means "not compared", not "clean": dropping
+        // the streak there would let a table that is busy every other pass
+        // never reach `confirm_ticks`.
+        let mut st = DriftState::default();
+        let r = report(&[("game", Some(101), 100)]);
+        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Report { tables: vec!["game".into()] });
+        assert_eq!(st.streaks["game"], 1);
+
+        // `game` is busy this pass, so it is not in the report at all.
+        let a = decide(&report(&[("user", Some(3), 3)]), &mut st, &cfg(), Instant::now());
+        assert_eq!(a, Action::Clean);
+        assert_eq!(st.streaks["game"], 1, "the streak survives a pass that skipped the table");
+
+        // Back in the report and still off: this is the second sighting.
         assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Reclone { tables: vec!["game".into()] });
     }
 

@@ -56,9 +56,9 @@ use crate::wal::EventWal;
 /// out advanced the content while their cached hash stayed behind — exactly
 /// the stale-cache drift that makes an SSP's bootstrap integrity check fail,
 /// forever and unrecoverably.
-fn touched_tables(events: &[BufferedEvent]) -> BTreeSet<String> {
+fn touched_tables<'a>(events: impl IntoIterator<Item = &'a BufferedEvent>) -> BTreeSet<String> {
     events
-        .iter()
+        .into_iter()
         .filter(|e| !ssp_protocol::table_excluded_from_sync(&e.update.table))
         .map(|e| e.update.table.clone())
         .collect()
@@ -103,7 +103,7 @@ pub fn recover_wal_backlog(
         );
     }
     if !event_buffer.is_empty() {
-        let tables = touched_tables(event_buffer.make_contiguous());
+        let tables = touched_tables(event_buffer.iter());
         if replica.interrupted_apply() {
             warn!(
                 tables = ?tables,
@@ -689,7 +689,8 @@ impl Scheduler {
         // is buffered yet, so counts are comparable, and no SSP can register
         // until `Ready`, so a re-clone here costs nobody a bootstrap.
         let drift_started = std::time::Instant::now();
-        match crate::drift::run_check(&drift_hook, &self.replica).await {
+        // Startup pass: nothing has been ingested yet, so no table is busy.
+        match crate::drift::run_check(&drift_hook, &self.replica, &BTreeSet::new()).await {
             crate::drift::Action::Clean => info!(
                 elapsed_ms = drift_started.elapsed().as_millis() as u64,
                 "Startup drift check passed"
@@ -1055,22 +1056,31 @@ pub async fn snapshot_updater_tick(
         }
     }
 
-    // Step 6: replica-vs-upstream drift check, only on a tick whose drain
-    // left nothing buffered (otherwise the replica legitimately trails
-    // upstream by exactly what is still buffered and the counts say nothing).
+    // Step 6: replica-vs-upstream drift check, skipping the tables that still
+    // have events buffered — those legitimately trail upstream by exactly what
+    // has not been applied yet, so their counts say nothing.
+    //
+    // This used to skip the WHOLE check whenever anything at all was still
+    // buffered. On a tenant whose scheduler writes its own job rows several
+    // times a second the buffer is never empty, so the check only ever ran at
+    // startup: whitepawn carried real drift in `player_name`, `contact`,
+    // `game` and `user` (opened by an ingest POST lost while the scheduler
+    // container was being recreated) that nothing would ever confirm, let
+    // alone re-clone. Busy tables are the ones that cannot be judged; every
+    // other table can.
+    //
     // The lock is released first: a re-clone takes the replica write lock for
     // minutes and must not hold up registrations behind `drain_lock` with it.
     let Some(hook) = drift else { return };
     if !hook.cfg.enabled {
         return;
     }
-    let drained = event_buffer.read().await.is_empty();
+    let busy = touched_tables(event_buffer.read().await.iter());
     drop(_guard);
-    if !drained {
-        debug!("Skipping drift check: events still buffered after the drain");
-        return;
+    if !busy.is_empty() {
+        debug!(tables = busy.len(), "Drift check: skipping tables with buffered events");
     }
-    crate::drift::run_check(hook, replica).await;
+    crate::drift::run_check(hook, replica, &busy).await;
 }
 
 #[cfg(test)]

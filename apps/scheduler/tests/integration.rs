@@ -2,7 +2,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -2521,7 +2521,7 @@ mod drift_tests {
         // Upstream has contacts; the replica has never seen the table.
         let (hook, recloner) = hook(&h, &[("contact", 5386)], DriftConfig::default());
 
-        let action = drift::run_check(&hook, &h.replica).await;
+        let action = drift::run_check(&hook, &h.replica, &BTreeSet::new()).await;
         assert!(matches!(action, Action::Reclone { ref tables } if tables == &["contact".to_string()]), "{action:?}");
         assert_eq!(recloner.calls.load(Ordering::SeqCst), 1);
         assert!(h.ssp_pool.write().await.take_resync_flag("ssp-a"), "SSP flagged for re-bootstrap");
@@ -2540,7 +2540,7 @@ mod drift_tests {
         let cfg = DriftConfig { auto_reclone: false, ..DriftConfig::default() };
         let (hook, recloner) = hook(&h, &[("contact", 5)], cfg);
 
-        let action = drift::run_check(&hook, &h.replica).await;
+        let action = drift::run_check(&hook, &h.replica, &BTreeSet::new()).await;
         assert!(matches!(action, Action::Report { .. }), "{action:?}");
         assert_eq!(recloner.calls.load(Ordering::SeqCst), 0);
 
@@ -2593,7 +2593,7 @@ mod drift_tests {
         let h = TestHarness::new().await;
         // Nothing upstream, nothing in the replica: agreement.
         let (hook, recloner) = hook(&h, &[("contact", 0)], DriftConfig::default());
-        assert_eq!(drift::run_check(&hook, &h.replica).await, Action::Clean);
+        assert_eq!(drift::run_check(&hook, &h.replica, &BTreeSet::new()).await, Action::Clean);
         assert_eq!(recloner.calls.load(Ordering::SeqCst), 0);
         let st = hook.state.read().await;
         assert!(drift::state_json(&st, &hook.cfg)["mismatched"].as_array().unwrap().is_empty());

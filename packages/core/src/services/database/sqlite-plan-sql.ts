@@ -99,6 +99,15 @@ export function reviveRow(json: string): Row {
  * than as text. `COALESCE` covers a row sharing none of the requested keys,
  * where the subquery yields NULL and `reviveRow` would throw.
  *
+ * The one value `je.value` does NOT carry back is a TOP-LEVEL boolean. SQLite
+ * has no boolean type, so `json_each` hands `true`/`false` out as the integers
+ * 1/0 and `json_group_object` writes integers back. A projected row therefore
+ * read `published: 1` where the same row read whole read `published: true`,
+ * and every `=== true` in an app turned false the moment a screen painted from
+ * the local cache. (A boolean NESTED in an object or array survives: those come
+ * back as whole JSON documents, untouched.) `je.type` still knows what it was,
+ * so the two boolean types are rebuilt as JSON literals on the way out.
+ *
  * Deliberately unaliased, so the emitted statement keeps the exact shape the
  * callers already produce (`FROM "t" WHERE id IN (…)`).
  *
@@ -109,8 +118,14 @@ export function projectedDataSql(fields: string[], bind: unknown[]): string {
   const keys = ['id', ...fields];
   for (const k of keys) bind.push(k);
   const placeholders = keys.map(() => '?').join(', ');
+  // `json('true')` / `json('false')` return JSON-subtyped values, so
+  // `json_group_object` embeds them as the literals `true` / `false` rather
+  // than as quoted text.
+  const value =
+    `CASE je.type WHEN 'true' THEN json('true') ` +
+    `WHEN 'false' THEN json('false') ELSE je.value END`;
   return (
-    `COALESCE((SELECT json_group_object(je.key, je.value) ` +
+    `COALESCE((SELECT json_group_object(je.key, ${value}) ` +
     `FROM json_each(data) je WHERE je.key IN (${placeholders})), '{}') AS data`
   );
 }

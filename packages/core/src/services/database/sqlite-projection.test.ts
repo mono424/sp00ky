@@ -12,7 +12,9 @@ import type { Row } from './cache-engine';
  * over it, which is what both engine paths did before. The traps it has to
  * clear are an ABSENT key (must stay absent, not become an explicit null — the
  * difference `json_object`/`json_extract` would have introduced), a STORED
- * null, nested objects/arrays, and the `{__u8}` tag that carries binary.
+ * null, nested objects/arrays, the `{__u8}` tag that carries binary, and a
+ * TOP-LEVEL boolean (SQLite has no boolean type, so an unguarded projection
+ * hands `true` back as the integer 1).
  */
 
 function makeDb(rows: Row[]) {
@@ -49,9 +51,10 @@ const FIXTURE: Row[] = [
   { id: 'game:2', white: null, pgn: 'heavy', sort_index: -3 }, // STORED null
   { id: 'game:3', pgn: 'heavy', sort_index: -4 }, // 'white' ABSENT
   { id: 'game:4', white: 'w', pgn: 'heavy', sort_index: -1, meta: { a: 1, b: [2, 3] } },
+  { id: 'game:5', white: 'w', pgn: 'heavy', sort_index: 0, rated: true, draw: false },
 ];
-const IDS = ['game:1', 'game:2', 'game:3', 'game:4'];
-const FIELDS = ['white', 'sort_index', 'meta'];
+const IDS = ['game:1', 'game:2', 'game:3', 'game:4', 'game:5'];
+const FIELDS = ['white', 'sort_index', 'meta', 'rated', 'draw'];
 
 describe('projectedDataSql against real SQLite', () => {
   it('is byte-identical to parse-then-project', () => {
@@ -89,6 +92,25 @@ describe('projectedDataSql against real SQLite', () => {
   it('always includes id, even when it is not in the field list', () => {
     const db = makeDb(FIXTURE);
     for (const row of projectedRows(db, IDS, ['sort_index'])) expect(row.id).toBeTruthy();
+  });
+
+  it('round-trips a top-level boolean as a boolean, not as 1/0', () => {
+    // The bug this guards: `json_each` yields SQLite integers for JSON booleans,
+    // so a projected row read `rated: 1` and every `row.rated === true` in a
+    // consuming app went false as soon as the screen painted from the cache.
+    // WhitePawn's /explore detail page read exactly that as "this collection was
+    // unpublished or deleted by its author".
+    const db = makeDb(FIXTURE);
+    const row = projectedRows(db, IDS, FIELDS).find((r) => r.id === 'game:5')!;
+    expect(row.rated).toBe(true);
+    expect(row.draw).toBe(false);
+  });
+
+  it('leaves a boolean nested in an object or array alone', () => {
+    const db = makeDb([{ id: 'game:7', flags: { on: true, off: false }, list: [true, false] }]);
+    const [row] = projectedRows(db, ['game:7'], ['flags', 'list']);
+    expect(row!.flags).toEqual({ on: true, off: false });
+    expect(row!.list).toEqual([true, false]);
   });
 
   it('yields an empty object, not NULL, for a row sharing none of the keys', () => {

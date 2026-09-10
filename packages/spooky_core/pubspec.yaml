@@ -1,6 +1,6 @@
 name: spooky_core
 description: Pure-Dart core for Spooky local-first sync (framework-agnostic).
-version: 0.0.1-canary.239
+version: 0.0.1-canary.240
 publish_to: none
 
 environment:

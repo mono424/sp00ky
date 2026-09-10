@@ -64,6 +64,18 @@ pub fn list_ref_table(mode: RefMode, auth_id: &str) -> String {
     list_ref_table_for(mode, auth_id)
 }
 
+/// Whether a query failed only because the table it names was never defined.
+///
+/// The per-user `_00_list_ref_user_<id>` table is created the first time that
+/// user registers a view. Deleting a record owned by someone who never did
+/// therefore targets a table that does not exist — vacuously nothing to
+/// clean, but SurrealDB answers with an error and the orphan-proof delete
+/// logged it as one, several times a minute, forever.
+pub fn is_missing_table_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("does not exist") && m.contains("table")
+}
+
 /// Field DDL shared by the anon and per-user `_00_list_ref_*` tables.
 fn list_ref_fields(tbl: &str) -> String {
     format!(
@@ -270,6 +282,24 @@ fn first_i64(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
+#[cfg(test)]
+mod missing_table_tests {
+    use super::is_missing_table_error;
+
+    #[test]
+    fn recognises_surrealdb_s_missing_table_wording() {
+        // Verbatim from whitepawn's SSP log.
+        assert!(is_missing_table_error(
+            "query: The table '_00_list_ref_user_b2go6j6xwozr621ve5dm' does not exist"
+        ));
+    }
+
+    #[test]
+    fn leaves_every_other_failure_an_error() {
+        assert!(!is_missing_table_error("Transaction conflict: Resource busy"));
+        assert!(!is_missing_table_error("The field 'x' does not exist"));
+    }
+}
 #[cfg(test)]
 mod ensure_once_tests {
     use super::*;

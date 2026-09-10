@@ -1576,7 +1576,14 @@ impl SspNode {
                     let id_log = payload.id.clone();
                     self.platform.spawner.spawn(Box::pin(async move {
                         if let Err(e) = db_c.query(&stmt, &[]).await {
-                            error!(target: "ssp::ingest", id = %id_log, error = %e, "list_ref delete cleanup failed");
+                            let msg = e.to_string();
+                            if crate::tables::is_missing_table_error(&msg) {
+                                // The owner never registered a view, so they
+                                // have no per-user table and no edges to drop.
+                                debug!(target: "ssp::ingest", id = %id_log, "list_ref cleanup skipped: the owner has no per-user table");
+                            } else {
+                                error!(target: "ssp::ingest", id = %id_log, error = %msg, "list_ref delete cleanup failed");
+                            }
                         }
                     }));
                 }

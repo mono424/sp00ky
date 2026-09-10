@@ -1506,20 +1506,31 @@ impl SspNode {
             Operation::Delete => Change::delete(&payload.table, &payload.id),
         };
         let step_start = web_time::Instant::now();
-        let (deltas, rv_made_up, rv_made_up_total) = {
+        let (deltas, rv_made_up, rv_made_up_total, rv_missing_total) = {
             let mut circuit = self.processor.write().await;
             let before = circuit.synthesized_row_versions();
             let deltas = circuit.step(ChangeSet { changes: vec![change] });
             let total = circuit.synthesized_row_versions();
-            (deltas, total - before, total)
+            (
+                deltas,
+                total - before,
+                total,
+                circuit.synthesized_row_versions_missing(),
+            )
         };
         let materialization_time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
         self.platform.telemetry.counter("ingest", 1);
         if rv_made_up > 0 {
-            // Each of these is a row the DB-side version stamp failed on
-            // (`_00_version` lookup came back NONE or did not advance). Say so
-            // once, then every thousandth time, so a broken `_00_version`
-            // index shows in the log without flooding it.
+            // Each of these is a row whose `_00_rv` could not be trusted:
+            // either the DB-side stamp produced nothing, or it produced a
+            // version that did not advance. Say so once, then every thousandth
+            // time, so the condition shows in the log without flooding it.
+            //
+            // The two causes are reported apart because only the first
+            // implicates `_00_version`. Pooling them made the message name the
+            // index unconditionally, which cost real time chasing a healthy
+            // index on whitepawn while the actual count of missing stamps was
+            // zero.
             self.platform.telemetry.counter("ingest_rv_synthesized", rv_made_up);
             if rv_made_up_total == rv_made_up || rv_made_up_total % 1000 < rv_made_up {
                 warn!(
@@ -1527,7 +1538,13 @@ impl SspNode {
                     table = %payload.table,
                     id = %payload.id,
                     total = rv_made_up_total,
-                    "ingest carried no advancing _00_rv; version synthesized (is the _00_version index intact?)"
+                    missing_stamp = rv_missing_total,
+                    hint = if rv_missing_total > 0 {
+                        "some bodies carried no _00_rv at all — check the _00_version index"
+                    } else {
+                        "every body carried an _00_rv that did not advance — the stamp works, the versions repeat"
+                    },
+                    "ingest carried no advancing _00_rv; version synthesized"
                 );
             }
         }

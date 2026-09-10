@@ -148,6 +148,12 @@ pub struct Circuit {
     /// Versions the floor had to make up. Non-zero means the DB-side stamp
     /// (`_00_version`) is not keeping up; the shell surfaces it as telemetry.
     synthesized_row_versions: u64,
+    /// Of those, the ones whose incoming body carried NO `_00_rv` at all
+    /// (as opposed to one that simply did not advance). Only the first kind
+    /// implicates the DB-side stamp — and therefore the `_00_version` index —
+    /// so the two are counted apart rather than pooled into one number that
+    /// can only be reported as a guess.
+    synthesized_row_versions_missing: u64,
     /// Per-table raw `PERMISSIONS FOR select WHERE <expr>` text, loaded from
     /// SurrealDB at boot. The registration pipeline routes each scan's
     /// permission through the same converter that handles user queries and
@@ -373,6 +379,7 @@ impl Circuit {
             monotonic_row_versions: false,
             rv_floor: 0,
             synthesized_row_versions: 0,
+            synthesized_row_versions_missing: 0,
             permissions: HashMap::new(),
             link_targets: HashMap::new(),
             opaque_fields: HashMap::new(),
@@ -1463,6 +1470,7 @@ impl Circuit {
             monotonic_row_versions: false,
             rv_floor: 0,
             synthesized_row_versions: 0,
+            synthesized_row_versions_missing: 0,
             permissions: HashMap::new(),
             // Re-seeded from INFO FOR DB / INFO FOR TABLE after restore, same as
             // `permissions` (none of the three is part of the serialized snapshot).
@@ -1581,6 +1589,14 @@ impl Circuit {
         self.synthesized_row_versions
     }
 
+    /// Subset of [`Self::synthesized_row_versions`] where the ingested body
+    /// carried no `_00_rv` at all, i.e. the DB-side stamp produced nothing.
+    /// A non-zero count here is what points at `_00_version`; a zero one says
+    /// the stamp is working and the versions merely failed to advance.
+    pub fn synthesized_row_versions_missing(&self) -> u64 {
+        self.synthesized_row_versions_missing
+    }
+
     /// Stamp `data` with a version subscribers will act on.
     ///
     /// `_00_rv` is the one thing a subscribed client compares against its local
@@ -1629,6 +1645,9 @@ impl Circuit {
         let next = self.rv_floor.max(stored.unwrap_or(0)) + 1;
         self.rv_floor = next;
         self.synthesized_row_versions += 1;
+        if incoming.is_none() {
+            self.synthesized_row_versions_missing += 1;
+        }
         if let Sp00kyValue::Object(map) = &mut data {
             map.insert("_00_rv".to_string(), Sp00kyValue::Int(next));
         }
@@ -4068,6 +4087,39 @@ mod row_version_floor_tests {
         step(&mut circuit, Change::update("thread", "a", json!({ "title": "five", "_00_rv": 20 })));
         assert_eq!(rv(&circuit, "thread:a"), Some(20));
         assert_eq!(circuit.synthesized_row_versions(), 3);
+        // Exactly one of those three arrived with no `_00_rv` at all; the
+        // other two carried one that failed to advance. Only the first kind
+        // says anything about the DB-side stamp.
+        assert_eq!(circuit.synthesized_row_versions_missing(), 1);
+    }
+
+    /// The two causes of a synthesized version must stay countable apart.
+    ///
+    /// A missing stamp implicates `_00_version` (and its unique index); a
+    /// present-but-repeating one does not. Reporting a single pooled number
+    /// made the ingest warning name the index unconditionally, which is how a
+    /// healthy index ends up being investigated.
+    #[test]
+    fn a_repeating_version_is_not_counted_as_a_missing_stamp() {
+        let mut circuit = Circuit::new();
+        circuit.set_monotonic_row_versions(true);
+        step(&mut circuit, Change::create("thread", "a", json!({ "title": "one", "_00_rv": 5 })));
+
+        step(&mut circuit, Change::update("thread", "a", json!({ "title": "two", "_00_rv": 5 })));
+        assert_eq!(circuit.synthesized_row_versions(), 1);
+        assert_eq!(
+            circuit.synthesized_row_versions_missing(),
+            0,
+            "the stamp produced a version, it just repeated"
+        );
+
+        step(&mut circuit, Change::update("thread", "a", json!({ "title": "three" })));
+        assert_eq!(circuit.synthesized_row_versions(), 2);
+        assert_eq!(
+            circuit.synthesized_row_versions_missing(),
+            1,
+            "this one carried no _00_rv at all"
+        );
     }
 
     #[test]

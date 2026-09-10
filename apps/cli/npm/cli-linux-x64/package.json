@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/cli-linux-x64",
-  "version": "0.0.1-canary.241",
+  "version": "0.0.1-canary.242",
   "description": "Linux x64 binary for @spooky-sync/cli",
   "license": "MIT",
   "os": [

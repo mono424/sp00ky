@@ -35,6 +35,7 @@ export const codeInfraEnv = `deployment:
   env:
     ssp:
       SPKY_SSP_MERGE_VIEWS: "true"
+      SPKY_SSP_DB_TIMEOUT_SECS: "15"
     scheduler:
       SPKY_SOME_FLAG: "1"`;
 
@@ -147,6 +148,14 @@ routing while health checks still pass).
 Values take effect when containers are next created, so run `spky deploy` or
 `spky restart` after changing them. Omitting the key entirely keeps the previous
 setting; an explicit empty map clears it.
+
+`SPKY_SSP_DB_TIMEOUT_SECS` is the knob most worth knowing here: it bounds how
+long a single SSP database call may take before it fails and the connection is
+rebuilt (default 15s, `0` disables). It exists because the SurrealDB HTTP
+engine has no request timeout of its own and every SSP database call shares one
+connection, so an unbounded stall parks every route that touches the database.
+See [environment variables](/docs/dev/env) and
+[`GET /health`](/docs/reference/ssp-api#get-health).
 
 ## Log Level
 

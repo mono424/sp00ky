@@ -278,6 +278,28 @@ Health check endpoint (no authentication required).
 
 Possible status values: `"bootstrapping"`, `"ready"`, `"failed"`.
 
+`status` reports bootstrap state only. It deliberately does **not** move when
+the database goes slow: the scheduler's bootstrap handshake compares it to the
+literal `"ready"`, and the cloud autoheal recreates a container whose probe
+fails, so a stalled SurrealDB must not make the SSP look dead.
+
+When the SSP's database calls are timing out (see `SPKY_SSP_DB_TIMEOUT_SECS`),
+an extra `db` object is included. It is informational — the HTTP status and
+`status` are unaffected — and the field is absent while the connection is
+healthy:
+
+```json
+{
+  "status": "ready",
+  "db": { "status": "stalled", "consecutive_timeouts": 3 }
+}
+```
+
+`consecutive_timeouts` resets on the first call that succeeds. A non-zero
+count means every database-touching route (`/ingest`, `/view/register`,
+`/job/recover`) is failing fast rather than hanging, and the scheduler will be
+parking this SSP as `Lagging` until the database recovers.
+
 **Example:**
 
 ```bash

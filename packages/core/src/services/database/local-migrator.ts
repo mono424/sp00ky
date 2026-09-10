@@ -44,9 +44,9 @@ export class LocalMigrator {
 
     const systemSchema = `
       DEFINE TABLE IF NOT EXISTS _00_stream_processor_state SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
-      DEFINE TABLE IF NOT EXISTS _00_query SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
-      DEFINE TABLE IF NOT EXISTS _00_preload SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
+      DEFINE TABLE IF NOT EXISTS _00_view SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
       DEFINE TABLE IF NOT EXISTS _00_window SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
+      DEFINE TABLE IF NOT EXISTS _00_failed_mutations SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
       DEFINE TABLE IF NOT EXISTS _00_schema SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
       DEFINE TABLE IF NOT EXISTS _00_pending_mutations SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
       DEFINE TABLE IF NOT EXISTS _00_blob SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;

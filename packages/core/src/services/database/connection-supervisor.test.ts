@@ -229,6 +229,35 @@ describe('ConnectionSupervisor', () => {
     sup.dispose();
   });
 
+  it('un-sticks the forced offline state when the SDK slept through the outage', async () => {
+    const listeners = new Map<string, Array<() => void>>();
+    vi.stubGlobal('window', {
+      addEventListener: (e: string, cb: () => void) => {
+        listeners.set(e, [...(listeners.get(e) ?? []), cb]);
+      },
+      removeEventListener: () => {},
+    });
+    const { remote, emit } = makeRemote();
+    const sup = makeSupervisor(remote);
+    emit('connected');
+    sup.start();
+
+    // The browser reports offline, but the SDK's own socket never notices: its
+    // status stays `connected` throughout, so it emits no transition at all.
+    listeners.get('offline')?.forEach((cb) => cb());
+    expect(sup.connection).toBe('disconnected');
+
+    // Back online. Nothing but the probe can correct the forced state here -
+    // there is no SDK event coming - and traffic flowing under a permanent
+    // "offline" indicator is exactly the bug.
+    listeners.get('online')?.forEach((cb) => cb());
+    await vi.advanceTimersByTimeAsync(10);
+    expect(remote.query).toHaveBeenCalled();
+    expect(sup.connection).toBe('connected');
+
+    sup.dispose();
+  });
+
   it('probes immediately when a hidden tab becomes visible', async () => {
     const listeners = new Map<string, Array<() => void>>();
     vi.stubGlobal('document', {

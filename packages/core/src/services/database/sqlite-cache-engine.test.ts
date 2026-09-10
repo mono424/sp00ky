@@ -91,7 +91,8 @@ describe('SqliteCacheEngine system-table seeding', () => {
 
     await engine.connect('user:fresh');
     const open = msgs.find((m) => m.type === 'open');
-    expect(open?.payload?.systemTables).toContain('_00_query');
+    expect(open?.payload?.systemTables).toContain('_00_view');
+    expect(open?.payload?.systemTables).toContain('_00_failed_mutations');
     expect(open?.payload?.systemTables).toContain('_00_pending_mutations');
   });
 });
@@ -271,7 +272,7 @@ describe('SqliteCacheEngine role modes', () => {
     return port;
   }
 
-  it('adoptOwner opens under the worker lock and wipes stale _00_query rows', async () => {
+  it('adoptOwner opens under the worker lock without wiping anything', async () => {
     const { engine, log } = makeSharedEngine();
     const health = await engine.adoptOwner('anon', {
       workerLockName: 'sp00ky-tabs:fp:anon:worker:1',
@@ -281,7 +282,7 @@ describe('SqliteCacheEngine role modes', () => {
     expect(health.status).toBe('persistent');
     expect(engine.storageHealth.role).toBe('leader');
     expect(log[0]).toBe('open');
-    expect(log).toContain('run'); // the DELETE _00_query wipe
+    expect(log).not.toContain('run'); // no local _00_query table any more, nothing to wipe
     expect(engine.currentBucketId).toBe('anon');
   });
 

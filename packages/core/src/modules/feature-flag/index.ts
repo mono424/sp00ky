@@ -1,6 +1,4 @@
 import type { SchemaStructure } from '@spooky-sync/query-builder';
-import type { DataModule } from '../data/index';
-import type { Sp00kySync } from '../sync/index';
 import type { AuthService } from '../auth/index';
 import type { Logger } from '../../services/logger/index';
 import type { QueryTimeToLive } from '../../types';
@@ -107,10 +105,20 @@ export class FeatureFlagHandle {
   }
 }
 
+/** The slice of the query engine this module drives: register a live query
+ *  locally, ask for its remote registration, subscribe to its rows. */
+export interface LiveQueryPort {
+  query(table: string, surql: string, params: Record<string, unknown>, ttl: QueryTimeToLive): Promise<string>;
+  subscribe(hash: string, cb: (records: Record<string, any>[]) => void, options?: { immediate?: boolean }): () => void;
+}
+export interface RemoteRegisterPort {
+  enqueueDownEvent(event: { type: 'register'; payload: { hash: string } }): void;
+}
+
 export interface FeatureFlagModuleDeps<S extends SchemaStructure> {
-  dataModule: DataModule<S>;
-  sync: Sp00kySync<S>;
-  auth: AuthService<S>;
+  dataModule: LiveQueryPort;
+  sync: RemoteRegisterPort;
+  auth: Pick<AuthService<S>, 'subscribe'>;
   logger: Logger;
 }
 

@@ -247,12 +247,16 @@ export type LeaderToFollowerMessage =
       error: string;
     }
   /** The leader's drain pushed a mutation and deleted its outbox row from the
-   *  SHARED store. Every follower starts its settled-write grace so a row it
-   *  was rendering as a pending write does not blink out before its
+   *  SHARED store. Every follower keeps the row in its overlay until its
    *  `_00_list_ref` membership arrives. */
   | {
       type: 'mutation-settled';
       mutationId: string;
       recordId: string;
       eventType: 'create' | 'update' | 'delete';
-    };
+    }
+  /** The leader's LIVE saw edges of these queries change; followers re-read
+   *  membership for the ones they hold. */
+  | { type: 'membership-dirty'; hashes: string[] }
+  /** The failed-writes tray changed size on the shared store. */
+  | { type: 'failed-mutations-changed'; count: number };

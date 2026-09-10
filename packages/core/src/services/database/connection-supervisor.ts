@@ -286,6 +286,13 @@ export class ConnectionSupervisor {
         `Heartbeat timed out after ${this.config.heartbeatTimeoutMs}ms`
       );
       this.heartbeatFailures = 0;
+      // A round trip is the strongest evidence there is that the socket works,
+      // so it also RECONCILES the reported state. The `offline` handler forces
+      // `disconnected` without the SDK's agreement; if the SDK never noticed
+      // the outage it emits no transition when the network returns, and that
+      // forced state would otherwise stick for the life of the page - traffic
+      // flowing while every indicator says offline.
+      this.setState('connected');
       this.startHeartbeat();
     } catch (err) {
       this.heartbeatFailures++;

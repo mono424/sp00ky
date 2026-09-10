@@ -124,16 +124,18 @@ network round trip completes.
 
 ## Preloading
 
-`db.preload()` warms a query's cache without rendering it. Run it on a route you're about to
+`db.preload()` registers a query without rendering it. Run it on a route you're about to
 navigate to and the next screen paints instantly.
 
 <CodeBlock code={preloadCode} lang="typescript" />
 
-| `refresh` | Behaviour when a cached copy already exists |
+| State | Behaviour |
 | --- | --- |
-| `onUse` (default) | Don't refetch now; refresh when something actually subscribes. |
-| `background` | Refetch immediately in the background. |
-| `stale` | Refetch in the background only if the cached copy is older than `staleTime` (default 1h). |
+| Resolved before on this device | Resolves at once; the rows are already in the local store. |
+| Never resolved | Resolves once the server's membership and every record are local. Pass `signal` to abort the wait. |
+
+A preloaded query stays registered (and live) until a ttl after nothing has mounted it; a view
+that mounts the same query simply attaches to it.
 
 ## Telling clients a new version shipped
 
@@ -238,10 +240,11 @@ onCleanup(db.subscribeToPendingMutations(setPending));
 </Show>`;
 
 export const preloadCode = `// warm the thread list before the user navigates to it
-await db.preload(
-  db.query('thread').orderBy('created_at', 'desc').limit(20).build(),
-  { refresh: 'stale', staleTime: '5m' }
-);`;
+await db.preload(db.query('thread').orderBy('created_at', 'desc').limit(20).build());
+
+// abortable when the route changes before the data lands
+const ctrl = new AbortController();
+void db.preload(db.query('thread').build(), { signal: ctrl.signal });`;
 
 export const releaseCode = `import { useAppRelease } from '@spooky-sync/client-solid';
 import { Show, createEffect } from 'solid-js';

@@ -36,7 +36,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   - `db.update(table, id, payload, options?)` — `options.debounced` coalesces updates.
   - `db.delete(table, idOrSelector)`.
   - `db.query(table)` — returns a `QueryBuilder`. Chain `.related()`, `.orderBy()`, `.limit()`, etc., end with `.build()`.
-  - `db.preload(query, options?)` — cache-aware, awaitable prewarm. Cold (nothing cached in the bucket) fetches + persists and the promise awaits it (blocks); warm returns instantly. `options.refresh` (`'onUse'` default / `'background'` / `'stale'`) + `options.staleTime` control warm-refresh. One-shot snapshot, no live view — freshens on use.
+  - `db.preload(query, options?)` — registers the query without subscribing. Resolved before on this device: returns instantly. Never resolved: awaits the server's membership and every record. `options.signal` aborts a cold wait; `refresh`/`staleTime` are ignored. Evicted a ttl after registration unless a view mounts the same query.
   - `db.run(backend, route, payload)` — call a backend RPC route.
   - `db.bucket(name)` — get a `BucketHandle` for file storage.
   - `db.remoteQuery(sql, vars?)` — one-shot remote read through the client's queued, connect-gated path (skips cache).
@@ -44,7 +44,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   - `db.authenticate(token)`, `db.signOut()`, `db.auth`.
   - `db.pendingMutationCount`, `db.subscribeToPendingMutations(cb)`.
 - **`useQuery(() => db.query(...).build())`** — reactive query. Returns `{ data, status, error, ... }` accessors. The factory function is tracked, so passing reactive params (signals) re-runs the query.
-- **`createPreload(() => db.query(...).build(), options?)`** — reactive, fire-and-forget prewarm (same overloads/`enabled` as `useQuery`, plus `refresh`/`staleTime`). Warms a query the user is likely to open next (e.g. a list row's detail) into the local cache. For blocking first-load, use the `Sp00kyProvider` `preload` prop instead.
+- **`createPreload(() => db.query(...).build(), options?)`** — reactive, fire-and-forget prewarm (same overloads/`enabled` as `useQuery`, plus `signal`). Registers a query the user is likely to open next (e.g. a list row's detail). For blocking first-load, use the `Sp00kyProvider` `preload` prop instead.
 - **`useCrdtField(table, () => recordId, field, () => valueAccessor)`** — wires a CRDT text field to a Loro doc. Pair with `db.update(table, id, { [field]: newValue }, { debounced: true })` so rapid keystrokes don't flood the queue. *All four arguments take accessor functions where reactive — that's deliberate, for SolidJS tracking.*
 - **`useFileUpload()`** / **`useDownloadFile()`** — bucket helpers; the upload result includes the storage path you write into a record column. `useDownloadFile` reads through the durable OPFS blob cache (options `{ cache, persist, pin, revalidate }`), so images survive a reload and paint offline; `refetch()` bypasses every layer.
 

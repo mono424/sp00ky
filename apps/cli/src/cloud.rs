@@ -231,7 +231,7 @@ fn clear_credentials() -> Result<()> {
 
 pub(crate) fn require_credentials() -> Result<Credentials> {
     load_credentials()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `sp00ky cloud login` first."))
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `spky login` first."))
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +302,10 @@ impl CloudClient {
             let error_msg = json["error"].as_str().unwrap_or(&body);
             match error_code {
                 "project_not_active" => {
-                    "Project billing is not set up. Run `sp00ky cloud billing` or `sp00ky cloud deploy` to get started.".to_string()
+                    "Project billing is not set up. Run `spky billing` or `spky deploy` to get started.".to_string()
                 }
                 "plan_limit" => {
-                    format!("{}. Run `sp00ky cloud billing` to manage your plan.", error_msg)
+                    format!("{}. Run `spky billing` to manage your plan.", error_msg)
                 }
                 "slug_taken" => {
                     "A project with this slug already exists — choose a different slug.".to_string()
@@ -331,7 +331,7 @@ impl CloudClient {
             Ok(resp) => Ok(resp),
             Err(ureq::Error::Status(401, _)) if !self.is_api_key => {
                 self.try_refresh().map_err(|_| {
-                    anyhow::anyhow!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                    anyhow::anyhow!("Session expired. Run `spky login` to re-authenticate.")
                 })?;
                 match ureq::get(&url)
                     .set("Authorization", &self.auth_header())
@@ -341,7 +341,7 @@ impl CloudClient {
                 {
                     Ok(resp) => Ok(resp),
                     Err(ureq::Error::Status(401, _)) => {
-                        bail!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                        bail!("Session expired. Run `spky login` to re-authenticate.")
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         bail!("{}", Self::format_api_error(code, resp))
@@ -371,7 +371,7 @@ impl CloudClient {
             Ok(resp) => Ok(resp),
             Err(ureq::Error::Status(401, _)) if !self.is_api_key => {
                 self.try_refresh().map_err(|_| {
-                    anyhow::anyhow!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                    anyhow::anyhow!("Session expired. Run `spky login` to re-authenticate.")
                 })?;
                 match ureq::post(&url)
                     .set("Authorization", &self.auth_header())
@@ -381,7 +381,7 @@ impl CloudClient {
                 {
                     Ok(resp) => Ok(resp),
                     Err(ureq::Error::Status(401, _)) => {
-                        bail!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                        bail!("Session expired. Run `spky login` to re-authenticate.")
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         bail!("{}", Self::format_api_error(code, resp))
@@ -410,7 +410,7 @@ impl CloudClient {
             Ok(resp) => Ok(resp),
             Err(ureq::Error::Status(401, _)) if !self.is_api_key => {
                 self.try_refresh().map_err(|_| {
-                    anyhow::anyhow!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                    anyhow::anyhow!("Session expired. Run `spky login` to re-authenticate.")
                 })?;
                 match ureq::delete(&url)
                     .set("Authorization", &self.auth_header())
@@ -419,7 +419,7 @@ impl CloudClient {
                 {
                     Ok(resp) => Ok(resp),
                     Err(ureq::Error::Status(401, _)) => {
-                        bail!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                        bail!("Session expired. Run `spky login` to re-authenticate.")
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         bail!("{}", Self::format_api_error(code, resp))
@@ -447,7 +447,7 @@ impl CloudClient {
             Ok(resp) => Ok(resp),
             Err(ureq::Error::Status(401, _)) if !self.is_api_key => {
                 self.try_refresh().map_err(|_| {
-                    anyhow::anyhow!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                    anyhow::anyhow!("Session expired. Run `spky login` to re-authenticate.")
                 })?;
                 match ureq::request("PUT", &url)
                     .set("Authorization", &self.auth_header())
@@ -456,7 +456,7 @@ impl CloudClient {
                 {
                     Ok(resp) => Ok(resp),
                     Err(ureq::Error::Status(401, _)) => {
-                        bail!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                        bail!("Session expired. Run `spky login` to re-authenticate.")
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         bail!("{}", Self::format_api_error(code, resp))
@@ -485,7 +485,7 @@ impl CloudClient {
             Ok(resp) => Ok(resp),
             Err(ureq::Error::Status(401, _)) if !self.is_api_key => {
                 self.try_refresh().map_err(|_| {
-                    anyhow::anyhow!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                    anyhow::anyhow!("Session expired. Run `spky login` to re-authenticate.")
                 })?;
                 match ureq::request("PATCH", &url)
                     .set("Authorization", &self.auth_header())
@@ -494,7 +494,7 @@ impl CloudClient {
                 {
                     Ok(resp) => Ok(resp),
                     Err(ureq::Error::Status(401, _)) => {
-                        bail!("Session expired. Run `sp00ky cloud login` to re-authenticate.")
+                        bail!("Session expired. Run `spky login` to re-authenticate.")
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         bail!("{}", Self::format_api_error(code, resp))
@@ -593,7 +593,7 @@ fn ensure_login() -> Result<Credentials> {
     }
 
     if !is_interactive() {
-        bail!("Not logged in. Run `sp00ky cloud login` first.");
+        bail!("Not logged in. Run `spky login` first.");
     }
 
     println!("You're not logged in to Sp00ky Cloud.");
@@ -603,7 +603,7 @@ fn ensure_login() -> Result<Credentials> {
         .context("Failed to read confirmation")?;
 
     if !do_login {
-        bail!("Login required. Run `sp00ky cloud login` to authenticate.");
+        bail!("Login required. Run `spky login` to authenticate.");
     }
 
     login()?;
@@ -633,7 +633,7 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
                 // Slug is configured but project doesn't exist — fall through to create
                 if !is_interactive() {
                     bail!(
-                        "Project '{}' not found. Run `sp00ky cloud create --slug {}` first.",
+                        "Project '{}' not found. Run `spky project create --slug {}` first.",
                         slug,
                         slug
                     );
@@ -649,7 +649,7 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
                 if do_create {
                     return create_project_inline(client, Some(slug));
                 }
-                bail!("Project required. Run `sp00ky cloud create` to create one.");
+                bail!("Project required. Run `spky project create` to create one.");
             }
         }
     }
@@ -674,7 +674,7 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
         if do_create {
             return create_project_inline(client, None);
         }
-        bail!("Project required. Run `sp00ky cloud create` to create one.");
+        bail!("Project required. Run `spky project create` to create one.");
     }
 
     if active_projects.len() == 1 {
@@ -788,7 +788,7 @@ fn ensure_billing_active(
         "pending_payment" => {
             if !is_interactive() {
                 bail!(
-                    "Project '{}' requires billing setup. Run `sp00ky cloud billing` first.",
+                    "Project '{}' requires billing setup. Run `spky billing` first.",
                     slug
                 );
             }
@@ -801,14 +801,14 @@ fn ensure_billing_active(
                 .context("Failed to read confirmation")?;
 
             if !do_billing {
-                bail!("Billing required before deploying. Run `sp00ky cloud billing` when ready.");
+                bail!("Billing required before deploying. Run `spky billing` when ready.");
             }
 
             wait_for_billing(client, slug)
         }
         "suspended" => {
             bail!(
-                "Project '{}' is suspended due to a billing issue. Run `sp00ky cloud billing` to resolve.",
+                "Project '{}' is suspended due to a billing issue. Run `spky billing` to resolve.",
                 slug
             );
         }
@@ -887,7 +887,7 @@ fn wait_for_billing(client: &mut CloudClient, slug: &str) -> Result<()> {
     }
 
     bail!(
-        "Timed out waiting for payment. If you completed checkout, it may take a moment to process.\n  Run `sp00ky cloud deploy` to try again."
+        "Timed out waiting for payment. If you completed checkout, it may take a moment to process.\n  Run `spky deploy` to try again."
     );
 }
 
@@ -925,7 +925,7 @@ fn poll_scale_completion(client: &mut CloudClient, pid: &str, target_ssp: u32) -
     }
 
     println!();
-    println!("  Scaling is still in progress. Run `sp00ky cloud status` to check.");
+    println!("  Scaling is still in progress. Run `spky status` to check.");
     Ok(())
 }
 
@@ -1135,16 +1135,16 @@ pub fn create(slug: Option<String>, plan: String) -> Result<()> {
         if setup_billing {
             wait_for_billing(&mut client, &slug)?;
             println!();
-            println!("  Project is active! Run `sp00ky cloud deploy` to deploy.");
+            println!("  Project is active! Run `spky deploy` to deploy.");
         } else {
             println!();
-            println!("  Next: Run `sp00ky cloud billing` to set up payment,");
-            println!("        then `sp00ky cloud deploy` to deploy.");
+            println!("  Next: Run `spky billing` to set up payment,");
+            println!("        then `spky deploy` to deploy.");
         }
     } else {
         println!();
-        println!("  Next: Run `sp00ky cloud billing` to set up payment,");
-        println!("        then `sp00ky cloud deploy` to deploy.");
+        println!("  Next: Run `spky billing` to set up payment,");
+        println!("        then `spky deploy` to deploy.");
     }
 
     Ok(())
@@ -5161,7 +5161,7 @@ pub fn destroy() -> Result<()> {
         }
     }
 
-    println!("  Destroy is still in progress. Run `sp00ky cloud status` to check.");
+    println!("  Destroy is still in progress. Run `spky status` to check.");
     Ok(())
 }
 
@@ -5221,7 +5221,7 @@ fn resolve_backup_id(client: &mut CloudClient, pid: &str, input: &str) -> Result
     }
 
     bail!(
-        "No backup found matching '{}'. Run `sp00ky cloud backup list` to see available backups.",
+        "No backup found matching '{}'. Run `spky backup list` to see available backups.",
         input
     )
 }
@@ -5367,7 +5367,7 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                     let err = final_error.unwrap_or_else(|| "unknown".to_string());
                     bail!("Restore failed: {}", err);
                 }
-                _ => bail!("Restore did not complete within 5 minutes. Check status with `sp00ky cloud backup list`."),
+                _ => bail!("Restore did not complete within 5 minutes. Check status with `spky backup list`."),
             }
 
             // Re-run migrations against the restored database.
@@ -6075,12 +6075,12 @@ fn vault(action: CloudVaultCommands) -> Result<()> {
             if status == "pending" {
                 println!("  Your reset request is still pending admin approval.");
                 println!(
-                    "  Ask a team admin to run: sp00ky cloud vault approve-reset <your-email>"
+                    "  Ask a team admin to run: spky env reset approve <your-email>"
                 );
                 return Ok(());
             }
             if status != "approved" {
-                bail!("No approved reset request found. Request one first with: sp00ky cloud vault request-reset");
+                bail!("No approved reset request found. Request one first with: spky env reset request");
             }
 
             // Prompt for new passphrase
@@ -6176,7 +6176,7 @@ pub fn keys(action: CloudKeyCommands) -> Result<()> {
             let resp = client.get("/v1/auth/keys")?;
             let data: Vec<serde_json::Value> = resp.into_json()?;
             if data.is_empty() {
-                println!("No API keys found. Create one with `sp00ky cloud keys create`.");
+                println!("No API keys found. Create one with `spky token create`.");
             } else {
                 println!("{:<38} {:<24} {}", "ID", "PREFIX", "CREATED");
                 for key in &data {
@@ -6460,7 +6460,7 @@ fn domain_add(domain: String, app: Option<String>, status: bool) -> Result<()> {
     }
     println!();
     println!(
-        "Status: {} (checking automatically — run `sp00ky cloud domain list` to track)",
+        "Status: {} (checking automatically — run `spky domain list` to track)",
         data["status"].as_str().unwrap_or("pending_dns")
     );
     Ok(())
@@ -6474,7 +6474,7 @@ fn domain_list() -> Result<()> {
     let resp = client.get(&format!("/v1/projects/{}/domains", pid))?;
     let data: Vec<serde_json::Value> = resp.into_json()?;
     if data.is_empty() {
-        println!("No custom domains. Connect one with `sp00ky cloud domain add <domain>`.");
+        println!("No custom domains. Connect one with `spky domain add <domain>`.");
         return Ok(());
     }
 
@@ -6807,7 +6807,7 @@ fn link_setup() -> Result<()> {
         attempts += 1;
 
         if attempts > max_attempts {
-            bail!("Timed out waiting for GitHub App installation. Try again with `sp00ky cloud link setup`.");
+            bail!("Timed out waiting for GitHub App installation. Try again with `spky link connect`.");
         }
 
         let resp = client.get(&format!("/v1/projects/{}/link", pid))?;
@@ -6995,7 +6995,7 @@ fn link_status() -> Result<()> {
         }
         "not_linked" => {
             println!("Project '{}' is not linked to a GitHub repository.", slug);
-            println!("Run `sp00ky cloud link setup` to set up automated deployments.");
+            println!("Run `spky link connect` to set up automated deployments.");
         }
         _ => {
             println!("Link status: {}", status);
@@ -7021,7 +7021,7 @@ fn link_settings(
             let resp = client.get(&format!("/v1/projects/{}/link", pid))?;
             let data: serde_json::Value = resp.into_json()?;
             if data["status"].as_str() != Some("linked") {
-                bail!("Project is not linked. Run `sp00ky cloud link setup` first.");
+                bail!("Project is not linked. Run `spky link connect` first.");
             }
 
             let current_branch = data["branch"].as_str().unwrap_or("main").to_string();
@@ -7139,7 +7139,7 @@ fn link_runs() -> Result<()> {
 
     if runs.is_empty() {
         println!(
-            "No build runs found. Push to the linked branch or run `sp00ky cloud link trigger`."
+            "No build runs found. Push to the linked branch or run `spky link trigger`."
         );
         return Ok(());
     }
@@ -7296,7 +7296,7 @@ fn ensure_vault(client: &mut CloudClient) -> Result<()> {
     }
 
     if !is_interactive() {
-        bail!("Vault not initialized. Run `sp00ky cloud env init` first.");
+        bail!("Vault not initialized. Run `spky env unlock` first.");
     }
 
     println!("Your encryption vault is not set up yet.");
@@ -7651,7 +7651,7 @@ fn env_list() -> Result<()> {
     let data: Vec<serde_json::Value> = resp.into_json()?;
 
     if data.is_empty() {
-        println!("No environment variables set. Use `sp00ky cloud env set` to add one.");
+        println!("No environment variables set. Use `spky env set` to add one.");
         return Ok(());
     }
 
@@ -7746,7 +7746,7 @@ fn env_ci_access(disable: bool, status: bool) -> Result<()> {
             println!("CI/CD vault access is ENABLED — push deploys can read production secrets.");
         } else {
             println!(
-                "CI/CD vault access is DISABLED. Enable it with `sp00ky cloud env ci-access`."
+                "CI/CD vault access is DISABLED. Enable it with `spky env share-ci`."
             );
         }
         return Ok(());

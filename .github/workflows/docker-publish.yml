@@ -14,15 +14,23 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       is_canary: ${{ steps.meta.outputs.is_canary }}
+      channel: ${{ steps.meta.outputs.channel }}
     steps:
       - name: Extract version from tag
         id: meta
         run: |
           TAG="${GITHUB_REF#refs/tags/sp00ky/v}"
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          if echo "$TAG" | grep -q "canary"; then
+          # Same three channels as the npm publish: an alpha moves only its own
+          # tag, never `canary` and never `latest`.
+          if echo "$TAG" | grep -q "alpha"; then
+            echo "channel=alpha" >> "$GITHUB_OUTPUT"
+            echo "is_canary=false" >> "$GITHUB_OUTPUT"
+          elif echo "$TAG" | grep -q "canary"; then
+            echo "channel=canary" >> "$GITHUB_OUTPUT"
             echo "is_canary=true" >> "$GITHUB_OUTPUT"
           else
+            echo "channel=latest" >> "$GITHUB_OUTPUT"
             echo "is_canary=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -125,11 +133,7 @@ jobs:
         id: tags
         run: |
           TAGS="${{ matrix.image }}:${{ needs.prepare.outputs.version }}"
-          if [ "${{ needs.prepare.outputs.is_canary }}" = "true" ]; then
-            TAGS="$TAGS,${{ matrix.image }}:canary"
-          else
-            TAGS="$TAGS,${{ matrix.image }}:latest"
-          fi
+          TAGS="$TAGS,${{ matrix.image }}:${{ needs.prepare.outputs.channel }}"
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push

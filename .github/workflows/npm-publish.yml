@@ -22,7 +22,12 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/sp00ky/v}"
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          if echo "$TAG" | grep -q "canary"; then
+          # An alpha is its own channel: it must never move `canary`, and above
+          # all never `latest`, which is what every default install resolves to.
+          if echo "$TAG" | grep -q "alpha"; then
+            echo "is_canary=false" >> "$GITHUB_OUTPUT"
+            echo "npm_tag=alpha" >> "$GITHUB_OUTPUT"
+          elif echo "$TAG" | grep -q "canary"; then
             echo "is_canary=true" >> "$GITHUB_OUTPUT"
             echo "npm_tag=canary" >> "$GITHUB_OUTPUT"
           else

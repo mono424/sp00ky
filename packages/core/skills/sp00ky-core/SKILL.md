@@ -82,6 +82,15 @@ unsubscribe();
 
 Queries have a time-to-live. Supported values: `'1m'`, `'5m'`, `'10m'` (default), `'15m'`, `'20m'`, `'25m'`, `'30m'`, `'1h'`–`'12h'`, `'1d'`.
 
+### Preloading
+
+`db.preload(query, { signal? })` registers a query without subscribing to it. If
+the server answered this query on this device before (a durable `_00_view` row
+exists) it resolves at once and the rows paint from the local store; otherwise
+it resolves once the server's membership and every record are local. Nothing
+to tear down: the entry is evicted a ttl after registration unless a view mounts
+the same query. `refresh` / `staleTime` are accepted but ignored.
+
 ## Mutations
 
 Mutations are optimistic and automatically synced to the remote SurrealDB instance.
@@ -111,6 +120,15 @@ await client.delete('post', 'post:abc123');
 Use `debounced` option for frequent updates (e.g., live typing):
 - `key: 'recordId'` — Debounce by record ID only (latest write wins, no merge)
 - `key: 'recordId_x_fields'` — Debounce by record ID + changed fields (recommended)
+
+### Failed writes
+
+A push the server rejects (permission, validation) is rolled back locally
+(create, update and delete) and moved to the `_00_failed_mutations` tray in the
+same local transaction. Network errors never do this; they retry. Inspect and
+act on the tray with `db.failedMutationCount`, `db.subscribeToFailedMutations(cb)`,
+`db.listFailedMutations()`, `db.retryFailedMutation(id)` (a fresh optimistic
+write) and `db.discardFailedMutation(id)`.
 
 ## Authentication
 

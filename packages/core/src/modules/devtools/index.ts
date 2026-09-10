@@ -13,7 +13,7 @@ export interface DevToolsEvent {
   payload: any;
 }
 
-import type { DataModule } from '../data/index';
+import type { QueryState, QueryTimings } from '../../types';
 import type { AuthService } from '../auth/index';
 import { AuthEventTypes } from '../auth/events/index';
 import {
@@ -36,6 +36,13 @@ const WASM_VERSION =
   typeof __SP00KY_WASM_VERSION__ !== 'undefined' ? __SP00KY_WASM_VERSION__ : 'unknown';
 const SURREAL_VERSION =
   typeof __SP00KY_SURREAL_VERSION__ !== 'undefined' ? __SP00KY_SURREAL_VERSION__ : 'unknown';
+
+/** What DevTools reads about live queries; the runtime derives it from state. */
+export interface DevToolsQuerySource {
+  getActiveQueries(): QueryState[];
+  getQueryById(id: RecordId<string>): QueryState | undefined;
+  phaseTimings(q: QueryState): QueryTimings;
+}
 
 export class DevToolsService implements StreamUpdateReceiver {
   private eventsHistory: DevToolsEvent[] = [];
@@ -102,7 +109,7 @@ export class DevToolsService implements StreamUpdateReceiver {
     private logger: Logger,
     private schema: SchemaStructure,
     private authService: AuthService<SchemaStructure>,
-    private dataManager?: DataModule<SchemaStructure>
+    private dataManager?: DevToolsQuerySource
   ) {
     this.flagsAdmin = new FlagsAdminService({
       remote: this.remoteDatabaseService,
@@ -235,7 +242,7 @@ export class DevToolsService implements StreamUpdateReceiver {
         // Detailed per-phase processing-time breakdown (SSP sub-phases, local/
         // remote record fetch, frontend reconcile, registration). Flows to both
         // the DevTools panel and the MCP (which returns activeQueries verbatim).
-        timings: this.dataManager.phaseTimings(q),
+        timings: this.dataManager!.phaseTimings(q),
       });
     });
     return result;

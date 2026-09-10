@@ -60,9 +60,9 @@ const SYSTEM_TABLES = [
   // In-browser circuit snapshot: one BLOB row (`circuit`) + a JSON meta row.
   // Excluded from DevTools' table listing, since its data column is not JSON.
   '_00_circuit_snapshot',
-  '_00_query',
-  '_00_preload',
+  '_00_view',
   '_00_window',
+  '_00_failed_mutations',
   '_00_schema',
   '_00_pending_mutations',
   // Blob cache manifest. Read before its first write on every boot (reconcile
@@ -605,15 +605,6 @@ export class SqliteCacheEngine implements LocalStore {
           disallowMemoryFallback: !opts.allowMemoryFallback,
         },
       });
-      // Leader wipe-on-pool-open: local `_00_query` rows from earlier sessions
-      // are dead (query hashes are session-salted) and this is the one moment
-      // no other tab is attached, so clearing here replaces the per-switch
-      // DELETE that solo mode does in doSwitchBucket. Followers never wipe.
-      try {
-        await this.rawCall('run', { sql: 'DELETE FROM "_00_query"' });
-      } catch {
-        /* fresh bucket: table just seeded, nothing to wipe */
-      }
       getStats().roleChanges = (getStats().roleChanges ?? 0) + 1;
       this.hadStore = true;
       this.closeRoleGate();

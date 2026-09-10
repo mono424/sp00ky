@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { QueryPlan } from '@spooky-sync/query-builder';
 import { renderBaseSelectSurql, renderRelationFetchSurql } from './plan-render';
-import { buildWindowMaterializationPlan } from '../../modules/data/window-query';
+import { buildWindowMaterializationPlan } from '../../query/window-query';
 
 describe('renderBaseSelectSurql', () => {
   it('renders projection, where, order, limit, offset', () => {

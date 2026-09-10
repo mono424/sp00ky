@@ -122,7 +122,7 @@ describe('DevTools explorer against real SQLite', () => {
     expect(Object.keys(info.tables)).toContain('game_insight');
     // Seeded system tables show up too — the panel's "internal" toggle filters
     // them, the engine must not pre-filter.
-    expect(Object.keys(info.tables)).toContain('_00_query');
+    expect(Object.keys(info.tables)).toContain('_00_view');
     expect(Object.keys(info.tables).some((t) => t.startsWith('sqlite_'))).toBe(false);
   });
 

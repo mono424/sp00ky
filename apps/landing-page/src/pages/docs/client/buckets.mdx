@@ -12,14 +12,12 @@ export const code10 = `DEFINE BUCKET IF NOT EXISTS profile_pictures BACKEND "mem
   PERMISSIONS WHERE
     $action NOT IN ['put']
     OR (
-      file::head($file).size <= 5242880
-      AND (
-        string::ends_with(file::key($file), '.jpg')
-        OR string::ends_with(file::key($file), '.jpeg')
-        OR string::ends_with(file::key($file), '.png')
-        OR string::ends_with(file::key($file), '.gif')
-      )
-    );`;
+      string::ends_with(file::key($file), '.jpg')
+      OR string::ends_with(file::key($file), '.jpeg')
+      OR string::ends_with(file::key($file), '.png')
+      OR string::ends_with(file::key($file), '.gif')
+    )
+  COMMENT 'sp00ky:maxSize=5242880';`;
 
 export const code9 = `# sp00ky.yml, \`mode\` is one of \`singlenode\`, \`cluster\`, or \`surrealism\`.
 mode: cluster
@@ -146,11 +144,29 @@ Buckets are defined in SurrealQL using the `DEFINE BUCKET` statement. Create a `
 
 ### Permission Variables
 
-- **`$action`**: The operation type: `'put'`, `'get'`, or `'delete'`
-- **`file::head($file).size`**: The file size in bytes
-- **`file::key($file)`**: The file path/key
+- **`$action`**: the operation: `'put'`, `'get'`, `'head'`, `'delete'`, `'copy'`, `'rename'`, `'exists'` or `'list'`
+- **`file::key($file)`**: the file path/key being acted on
+- **`$target`**: the destination key, on `'copy'` and `'rename'` only
 
-This example allows unrestricted reads and deletes, but restricts uploads to images under 5MB.
+This example allows unrestricted reads and deletes, and restricts uploads to the
+four image extensions. `list` is denied to record and guest sessions by the
+engine itself, whatever the clause says.
+
+### Size limits are a client-side rule
+
+`COMMENT 'sp00ky:maxSize=<bytes>'` is read by `spky` into the bucket's generated
+config, and `useFileUpload` rejects an oversized file before it leaves the
+browser.
+
+<Note>
+Do not express a size limit as a permission predicate. SurrealDB evaluates a
+bucket's PERMISSIONS clause BEFORE the upload exists, so `file::head($file).size`
+there is the size of whatever is already stored at that key, not the size of what
+is being uploaded. A `file::head($file).size <= N` gate therefore lets every
+first upload through at any size, and denies legitimate overwrites of any file
+that is already over the limit. Older schemas carry that predicate because
+SurrealDB 3.0.x did not enforce per-file bucket actions at all; 3.1.x does.
+</Note>
 
 ## Configuration
 

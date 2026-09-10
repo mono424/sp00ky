@@ -104,6 +104,30 @@ export abstract class AbstractDatabaseService {
    * SDK's pending map.
    */
   async query<T extends unknown[]>(query: string, vars?: Record<string, unknown>): Promise<T> {
+    return this.runStatement<T>(query, vars, () => this.client.query(query, vars) as unknown as Promise<T>);
+  }
+
+  /**
+   * Like {@link query} but never rejects on a statement error: every
+   * statement answers on its own as `{ status: 'OK', result }` or
+   * `{ status: 'ERR', error }`. This is what lets a batched outbox push judge
+   * each mutation separately.
+   */
+  async queryResponses(
+    query: string,
+    vars?: Record<string, unknown>
+  ): Promise<Array<{ status: 'OK'; result: unknown } | { status: 'ERR'; error: string }>> {
+    return this.runStatement(query, vars, async () => {
+      const responses = await this.client.query(query, vars).responses();
+      return responses.map((r) =>
+        r.success
+          ? { status: 'OK' as const, result: r.result }
+          : { status: 'ERR' as const, error: r.error instanceof Error ? r.error.message : String(r.error) }
+      );
+    });
+  }
+
+  private async runStatement<T>(query: string, vars: Record<string, unknown> | undefined, dispatch: () => Promise<T>): Promise<T> {
     await this.acquireQuerySlot();
     try {
       await this.beforeQuery();
@@ -113,20 +137,12 @@ export abstract class AbstractDatabaseService {
           { query, vars, Category: 'sp00ky-client::Database::query' },
           'Executing query'
         );
-        const pending = this.client.query(query, vars);
-        // In SurrealDB 2.0, .query() collects results by default.
-        // We cast to T directly as proper typing depends on the caller knowing the return structure.
         // "timed out" in the message is load-bearing: `classifySyncError`
         // keys off it to classify this as `network` so the sync queues
         // retry rather than rolling the mutation back.
-        const result = (await withTimeout(
-          pending as unknown as Promise<T>,
-          this.queryTimeoutMs,
-          () => this.timeoutError(query)
-        )) as T;
+        const result = await withTimeout(dispatch(), this.queryTimeoutMs, () => this.timeoutError(query));
         const duration = performance.now() - startTime;
 
-        // Emit query event
         this.events.emit(this.eventType, {
           query,
           vars,
@@ -143,7 +159,6 @@ export abstract class AbstractDatabaseService {
       } catch (err) {
         const duration = performance.now() - startTime;
 
-        // Emit query event with error
         this.events.emit(this.eventType, {
           query,
           vars,

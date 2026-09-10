@@ -116,7 +116,7 @@ Track a backend job's progress by querying its outbox row: `createQuery(() => db
 
 ## Status hooks
 
-Same shapes as client-solid, rebuilt on async-iterable-backed memos: `useSyncStatus`, `useStorageStatus`, `usePendingMutations`, `useSyncActivity` (new: `isDownloading()` after 200 ms of fetching, `isUploading()` above one queued write, for a traffic indicator), `useFeatureFlag`, `useAppRelease`, `useCrdtField`, `useFileUpload`, `useDownloadFile`, `createPreload`.
+Same shapes as client-solid, rebuilt on async-iterable-backed memos: `useSyncStatus`, `useStorageStatus`, `usePendingMutations`, `useSyncActivity` (new: `isDownloading()` after 200 ms of fetching, `isUploading()` after 150 ms of a queued write, for a traffic indicator), `useFeatureFlag`, `useAppRelease`, `useCrdtField`, `useFileUpload`, `useDownloadFile`, `createPreload`.
 
 ## Migrating from client-solid
 

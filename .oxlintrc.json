@@ -33,6 +33,8 @@
   },
 
   "rules": {
+    // Generator sagas are the core pattern; a @yields tag per saga is noise.
+    "jsdoc/require-yields": "off",
     // ── Correctness (errors) ─────────────────────────────────────────────
 
     "no-unused-vars": "off",

@@ -19,7 +19,10 @@
     "dev": "tsdown --watch",
     "dev:example": "pnpm dev",
     "build": "tsdown && node scripts/check-broker-bundle.mjs",
-    "test": "vitest"
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "type-check": "tsc --noEmit"
   },
   "repository": {
     "type": "git",
@@ -72,6 +75,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.5.2",
+    "@vitest/coverage-v8": "^3.2.4",
     "tsdown": "^0.12.4",
     "typescript": "^5.6.2",
     "vitest": "^3.2.0"

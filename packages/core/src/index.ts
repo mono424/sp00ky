@@ -22,6 +22,7 @@ export type {
   BlobReadOptions,
   BlobUrlLease,
 } from './services/blobs/index';
+export type { FailedMutationRow as FailedMutation } from './mutation/rows';
 export { semverGt } from './utils/semver';
 export { LocalOpTimeoutError, DEFAULT_LOCAL_OP_TIMEOUT_MS } from './services/database/errors';
 export { fileToUint8Array, textToHtml } from './utils/index';

@@ -9,6 +9,7 @@ import {
   generateId,
   parseDuration,
 } from './index';
+import type { QueryTimeToLive } from '../types';
 
 describe('compareRecordIds', () => {
   it('returns true for equal strings', () => {
@@ -123,7 +124,7 @@ describe('generateId', () => {
 
 describe('parseDuration', () => {
   it('parses seconds', () => {
-    expect(parseDuration('30s')).toBe(30000);
+    expect(parseDuration('30s' as QueryTimeToLive)).toBe(30000);
   });
 
   it('parses minutes', () => {

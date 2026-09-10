@@ -58,8 +58,9 @@ export function createPreload<
 /**
  * Reactive, fire-and-forget prewarm. Resolves the query (calling it if it's a
  * function so it tracks reactive deps), dedupes on the query's stable identity
- * hash, and warms it into the local cache via `db.preload`. No subscription and
- * no cleanup: preload registers nothing that needs tearing down.
+ * hash, and registers it via `db.preload`: a live query nobody subscribes to,
+ * evicted a ttl after it was registered unless a view mounts it first. Nothing
+ * to clean up here.
  *
  * Typical use: inside a list row, preload the detail query the user is likely
  * to open next, so navigation paints from cache instead of the network.
@@ -109,7 +110,7 @@ export function createPreload<
       if (!query) return;
       void db
         .getSp00ky()
-        .preload(query, { refresh: options?.refresh, staleTime: options?.staleTime });
+        .preload(query, { signal: options?.signal });
     }
   );
 }

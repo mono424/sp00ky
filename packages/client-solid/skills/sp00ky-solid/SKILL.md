@@ -143,34 +143,30 @@ later `useQuery` for the same data paints instantly instead of waiting on the ne
 does NOT register a live view — it's a one-shot snapshot; the data freshens on use, when the
 real `useQuery` mounts.
 
-### `db.preload(query, options?)` — awaitable, cache-aware
+### `db.preload(query, options?)` — awaitable, a registered query
 
 ```tsx
-// Cold (first load, nothing cached): fetches + persists, and the promise
-// AWAITS it — so you can block on it.
-// Warm (already cached in this bucket): returns instantly, never blocks.
+// Never resolved on this device: the promise AWAITS the server's membership
+// and every record, so you can block on it.
+// Resolved before: returns instantly, no network.
 await db.preload(db.query('config').build());
 ```
 
 Behavior:
 
-- **Cold** — no local copy in the current bucket → fetch one-shot from the remote, store locally,
-  and the returned promise resolves only after that completes. Awaiting it blocks.
-- **Warm** — a copy already exists → resolves immediately, never touches the network by default.
-  Freshness is tracked with a durable per-bucket marker, so "warm" survives reloads and a bucket
-  switch correctly resets to cold.
+- **Never resolved** — no durable membership for this query in the current bucket → the query is
+  registered and the promise resolves once the server's membership and every record are local.
+- **Resolved before** — a `_00_view` row exists → resolves immediately and the rows paint from the
+  local store. Survives reloads; a bucket switch re-reads the new bucket's rows.
+- The query stays registered and live; a view that mounts the same query attaches to it. Nothing
+  mounts it → it is evicted a ttl after registration.
 
 `options`:
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `refresh` | `'onUse' \| 'background' \| 'stale'` | What to do when warm. `onUse` (default): nothing — data freshens when `useQuery` mounts. `background`: return instantly + one silent refetch. `stale`: refetch only if older than `staleTime`. |
-| `staleTime` | `QueryTimeToLive` | For `refresh: 'stale'`. Max age before a warm copy is refetched (default `'1h'`). |
-
-```tsx
-// Refetch in the background once per session, but only if the cache is > 1 day old:
-await db.preload(db.query('config').build(), { refresh: 'stale', staleTime: '1d' });
-```
+| `signal` | `AbortSignal` | Abort a cold wait (the registration continues in the background). |
+| `refresh` / `staleTime` | — | Deprecated, ignored. |
 
 ### Blocking first-load: `Sp00kyProvider` `preload` prop
 
@@ -190,8 +186,8 @@ warm loads it's instant, so there's no perceptible gate after the first run.
 ### `createPreload(query, options?)` — reactive, fire-and-forget
 
 For prewarming data the user is likely to open next (e.g. the detail view for each row in a
-list). Reactive and non-blocking; mirrors `useQuery`'s overloads and `enabled` option, plus the
-`refresh`/`staleTime` options above.
+list). Reactive and non-blocking; mirrors `useQuery`'s overloads and `enabled` option, plus
+`signal`.
 
 ```tsx
 import { createPreload } from '@spooky-sync/client-solid';

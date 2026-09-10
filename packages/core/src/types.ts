@@ -1,7 +1,6 @@
 import type { RecordId, SchemaStructure, QueryPlan } from '@spooky-sync/query-builder';
 import type { Level, LoggerOptions } from 'pino';
 import type { PushEventOptions } from './events/index';
-import type { UpEvent } from './modules/sync/index';
 import type { LocalEngineChoice } from './services/database/cache-engine';
 
 export type { Level };
@@ -80,9 +79,11 @@ export type QueryTimeToLive =
 export type PreloadRefresh = 'onUse' | 'background' | 'stale';
 
 export interface PreloadOptions {
-  /** How to refresh when the query is already cached locally. Default `onUse`. */
+  /** Abort a cold preload that is still waiting for the server. */
+  signal?: AbortSignal;
+  /** @deprecated Preload is a registered query now; a warm preload never refetches by itself. Ignored. */
   refresh?: PreloadRefresh;
-  /** For `refresh: 'stale'` — max age before a warm copy is refetched. Default `1h`. */
+  /** @deprecated Ignored. */
   staleTime?: QueryTimeToLive;
 }
 
@@ -517,21 +518,21 @@ export interface QueryConfig {
   /**
    * Whether authoritative membership (`remoteArray`) has ever been established
    * for this query — either fetched from `_00_list_ref` this session, or read
-   * back from the durable `_00_window` row on a cold start.
+   * back from the durable `_00_view` row on a cold start.
    *
    * Tri-state matters: "known and empty" must render an empty list, while
    * "never established" has to fall back to a predicate scan of the local store
    * so a query first run on this device still paints offline. A
    * `remoteArray.length === 0` check cannot tell those apart.
    *
-   * On a cold start it is seeded from the durable `_00_window` row when that
+   * On a cold start it is seeded from the durable `_00_view` row when that
    * row is non-empty, or empty but `confirmed` (the server reported zero rows
    * for the query). An unconfirmed empty row is ignored, so a device poisoned
    * by an old client that mirrored unflushed reads still self-heals.
    */
   membershipKnown?: boolean;
   /**
-   * Key of this query's durable `_00_window` membership row: a hash of
+   * Key of this query's durable `_00_view` membership row: a hash of
    * `{surql, params}` WITHOUT the `session::id()` salt that `id` carries, so it
    * survives a reload (which mints a new session id) and a bucket switch.
    * In-memory only.
@@ -710,7 +711,7 @@ export type QueryStatusCallback = (status: QueryStatus) => void;
  * (bucket switch). What the bindings' `isAuthoritative()` mirrors.
  */
 export type QueryAuthorityCallback = (known: boolean) => void;
-export type MutationCallback = (mutations: UpEvent[]) => void;
+export type MutationCallback = (mutations: MutationEvent[]) => void;
 
 export type MutationEventType = 'create' | 'update' | 'delete';
 

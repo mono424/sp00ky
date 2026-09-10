@@ -17,6 +17,41 @@ fn is_excluded_field(field_def: &FieldDefinition) -> bool {
 /// Generate Sp00ky events for data hashing and graph synchronization
 // ... imports ...
 
+/// The `/ingest` call every generated DB event makes, wrapped so it cannot
+/// hang the user's transaction.
+///
+/// SurrealDB runs `DEFINE EVENT` bodies **inside the parent transaction**, and
+/// `http::post` only honours a reqwest timeout when the surrounding query
+/// context carries one (`fnc::util::http`). A bare call therefore has no bound
+/// at all: while the scheduler was slow, a single user write held a SurrealDB
+/// write transaction open indefinitely, which starved the database, which made
+/// the scheduler slower — the write → scheduler → SSP → database → write cycle
+/// behind "the SSP lags and goes down".
+///
+/// `TIMEOUT` is a statement clause, so the call has to be wrapped in a
+/// statement that accepts one — a bare `http::post(...) TIMEOUT 10s` is a parse
+/// error. `SELECT * FROM <call>` is the cheapest wrapper that does; verified on
+/// SurrealDB 3.1.5, including that a genuine connection error still surfaces as
+/// a statement error, so a refused ingest keeps aborting the write as before.
+///
+/// A timeout reads as `"...exceeded the timeout: 10s"`, which the client's
+/// `classifySyncError` already matches as `network` — so a queued write is
+/// retried rather than rolled back and discarded.
+fn ingest_post() -> String {
+    format!(
+        "    SELECT * FROM http::post($sp00ky_endpoint + '/ingest', $payload, {{ \"Authorization\": \"Bearer \" + $sp00ky_secret }}) TIMEOUT {}s;\n",
+        EVENT_HTTP_TIMEOUT_SECS
+    )
+}
+
+/// Bound for the HTTP calls a DB event makes inside the user's transaction
+/// (`/ingest` here, `/view/unregister` in `migrate.rs`). The scheduler
+/// acknowledges as soon as the event is durable (WAL flush + buffer) and no
+/// longer waits for the SSP fan-out, so a healthy ack is milliseconds; this
+/// only has to be clear of a slow flush, not of a slow SSP.
+pub(crate) const EVENT_HTTP_TIMEOUT_SECS: u64 = 10;
+
+
 /// Generate Sp00ky events for data hashing and graph synchronization
 pub fn generate_sp00ky_events(
     tables: &BTreeMap<String, TableSchema>,
@@ -196,7 +231,7 @@ pub fn generate_sp00ky_events(
             events.push_str("        hash: \"\"\n");
             events.push_str("    };\n");
 
-            events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+            events.push_str(&ingest_post());
         } else {
             // Surrealism / WASM Mode
             events.push_str(&format!(
@@ -262,7 +297,7 @@ pub fn generate_sp00ky_events(
             events.push_str("        hash: \"\"\n");
             events.push_str("    };\n");
 
-            events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+            events.push_str(&ingest_post());
         } else {
             events.push_str(&format!("    mod::dbsp::ingest('{}', \"DELETE\", <string>($before.id OR \"\"), $plain_before);\n", table_name));
             events.push_str("    mod::dbsp::save_state(NONE);\n");
@@ -313,7 +348,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        record: $plain_after,\n");
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
-        events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+        events.push_str(&ingest_post());
     } else {
         events.push_str("    mod::dbsp::ingest('_00_user_feature', $event, <string>($after.id OR \"\"), $plain_after);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
@@ -340,7 +375,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        record: $plain_before,\n");
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
-        events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+        events.push_str(&ingest_post());
     } else {
         events.push_str("    mod::dbsp::ingest('_00_user_feature', \"DELETE\", <string>($before.id OR \"\"), $plain_before);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
@@ -383,7 +418,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        record: $plain_after,\n");
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
-        events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+        events.push_str(&ingest_post());
     } else {
         events.push_str("    mod::dbsp::ingest('_00_app_release', $event, <string>($after.id OR \"\"), $plain_after);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
@@ -410,7 +445,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        record: $plain_before,\n");
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
-        events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+        events.push_str(&ingest_post());
     } else {
         events.push_str("    mod::dbsp::ingest('_00_app_release', \"DELETE\", <string>($before.id OR \"\"), $plain_before);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
@@ -443,7 +478,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        record: $plain_after,\n");
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
-        events.push_str("    http::post($sp00ky_endpoint + '/ingest', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });\n");
+        events.push_str(&ingest_post());
     } else {
         events.push_str("    mod::dbsp::ingest('_00_heartbeat', $event, <string>($after.id OR \"\"), $plain_after);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");

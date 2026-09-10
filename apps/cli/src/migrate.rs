@@ -894,9 +894,16 @@ pub fn apply_internal_schema(
     // Replace unregister_view for singlenode/cluster mode — uses $sp00ky_endpoint param
     if *mode == DeployMode::Singlenode || *mode == DeployMode::Cluster {
         let unregister_call = "let $result = mod::dbsp::unregister_view(<string>$before.id);";
-        let unregister_http =
-            "let $payload = { id: <string>$before.id };\n    let $result = http::post($sp00ky_endpoint + '/view/unregister', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });";
-        meta_tables_remote = meta_tables_remote.replace(unregister_call, unregister_http);
+        // Wrapped in a `SELECT ... TIMEOUT` for the same reason as the
+        // per-table `/ingest` events: this runs inside the transaction that
+        // deleted the `_00_query` row (the TTL sweep's, usually), so an
+        // unbounded post lets a stalled SSP hold that transaction open.
+        // `$result` is never read, so the shape change is inert.
+        let unregister_http = format!(
+            "let $payload = {{ id: <string>$before.id }};\n    let $result = (SELECT * FROM http::post($sp00ky_endpoint + '/view/unregister', $payload, {{ \"Authorization\": \"Bearer \" + $sp00ky_secret }}) TIMEOUT {}s);",
+            crate::sp00ky::EVENT_HTTP_TIMEOUT_SECS
+        );
+        meta_tables_remote = meta_tables_remote.replace(unregister_call, &unregister_http);
     }
 
     // Make all DEFINE statements idempotent by injecting OVERWRITE

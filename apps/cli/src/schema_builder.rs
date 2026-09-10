@@ -125,13 +125,28 @@ where
             table
         ));
         // The documented outbox template declares `errors` as `array<object>`
-        // but never defined its ELEMENT, so on a SCHEMAFULL table SurrealDB
-        // rejected the runner's `{ code, reason }` append with "Found field
-        // 'errors[0].code', but no such field exists" — statement-level, so the
-        // write was silently lost and failed jobs recorded no reason. Same fix as
-        // `_00_feature_flag.rules[*]`: declare the element FLEXIBLE.
+        // but once defined its ELEMENT without FLEXIBLE, so on a SCHEMAFULL
+        // table SurrealDB rejects the runner's `{ code, reason }` append with
+        // "Found field 'errors[0].code', but no such field exists" —
+        // statement-level, so the write is silently lost and failed jobs record
+        // no reason. Same fix as `_00_feature_flag.rules[*]`: FLEXIBLE.
+        //
+        // OVERWRITE, uniquely among these fields, because `IF NOT EXISTS` is
+        // the wrong idempotency here: the broken state is not a MISSING
+        // `errors[*]` but a PRESENT one that lacks FLEXIBLE (SurrealDB stores
+        // it as `errors.*`), and `IF NOT EXISTS` skips it, so the heal this
+        // block exists to perform could never happen. Seen on whitepawn, whose
+        // `gameanalysis_job` still carried `DEFINE FIELD errors.* … TYPE object`
+        // with no FLEXIBLE from an older copy of the template, silently
+        // discarding every job failure reason.
+        //
+        // Safe to clobber where the others are not: `errors` is platform-owned
+        // (the template gives it `FOR select, update WHERE false`, so the
+        // runner's append is the only writer) and its element shape is a
+        // platform contract, not a user choice. For an up-to-date project this
+        // rewrites the definition to exactly what it already says.
         out.push_str(&format!(
-            "DEFINE FIELD IF NOT EXISTS errors[*] ON {} TYPE object FLEXIBLE;\n",
+            "DEFINE FIELD OVERWRITE errors[*] ON {} TYPE object FLEXIBLE;\n",
             table
         ));
         // `timeout` is set by `db.run(..., { timeout })` and by a schedule's
@@ -908,14 +923,43 @@ mod outbox_platform_field_tests {
         assert!(sql.contains("ON statistics_job TYPE option<string>"));
         // Clients must never write the claim marker.
         assert!(sql.contains("FOR create, update WHERE false"));
-        // OVERWRITE would clobber a user's own definition — must not appear.
-        assert!(!sql.contains("OVERWRITE"));
+        // OVERWRITE would clobber a user's own definition. `errors[*]` is the
+        // one deliberate exception (platform-owned shape, and the state it
+        // heals is a wrong definition rather than a missing one — see
+        // `overwrites_the_errors_element_so_a_stale_non_flexible_one_is_healed`);
+        // nothing else may use it.
+        let overwrites: Vec<&str> = sql
+            .lines()
+            .filter(|l| l.contains("OVERWRITE"))
+            .filter(|l| !l.contains("errors[*]"))
+            .collect();
+        assert!(overwrites.is_empty(), "unexpected OVERWRITE: {overwrites:?}");
     }
 
     #[test]
     fn empty_input_emits_nothing() {
         assert!(build_outbox_platform_fields([], &DeployMode::Singlenode).is_empty());
         assert!(build_outbox_platform_fields([""], &DeployMode::Singlenode).is_empty());
+    }
+
+    /// `errors[*]` must be OVERWRITE, not `IF NOT EXISTS`.
+    ///
+    /// The state this heals is a PRESENT element definition that lacks
+    /// FLEXIBLE (SurrealDB stores it as `errors.*`), left behind by an older
+    /// copy of the outbox template. `IF NOT EXISTS` sees the field and skips,
+    /// so the runner's `{ code, reason }` append keeps failing and every job
+    /// failure records no reason at all.
+    #[test]
+    fn overwrites_the_errors_element_so_a_stale_non_flexible_one_is_healed() {
+        let sql = build_outbox_platform_fields(["job"], &DeployMode::Singlenode);
+        assert!(
+            sql.contains("DEFINE FIELD OVERWRITE errors[*] ON job TYPE object FLEXIBLE"),
+            "errors[*] must be OVERWRITE or a stale non-FLEXIBLE element survives: {sql}"
+        );
+        assert!(
+            !sql.contains("IF NOT EXISTS errors[*]"),
+            "IF NOT EXISTS cannot heal an existing wrong definition"
+        );
     }
 
     /// `timeout` is injected so a project that never re-applied its own schema can

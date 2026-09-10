@@ -1,6 +1,6 @@
 [package]
 name = "ssp-portable"
-version = "0.0.1-canary.242"
+version = "0.0.1-canary.243"
 edition = "2024"
 
 # Reference NON-VM host for the SSP node: proves the generic runtime seam by

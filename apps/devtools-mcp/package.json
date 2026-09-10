@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/devtools-mcp",
-  "version": "0.0.1-canary.242",
+  "version": "0.0.1-canary.243",
   "description": "MCP server for Sp00ky Sync devtools",
   "license": "MIT",
   "type": "module",

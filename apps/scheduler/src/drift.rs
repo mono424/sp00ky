@@ -52,6 +52,11 @@ pub struct DriftConfig {
     /// `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` (default 3600): minimum spacing
     /// between two automatic re-clones.
     pub reclone_cooldown: Duration,
+    /// `SPKY_DRIFT_CHECK_TIMEOUT_SECS` (default 120): deadline for one whole
+    /// check. The check is the last step of the snapshot updater's tick, and
+    /// that tick is a serial loop — a check that never returns stops the
+    /// replica draining forever. See [`run_check`].
+    pub check_timeout: Duration,
 }
 
 impl Default for DriftConfig {
@@ -61,6 +66,7 @@ impl Default for DriftConfig {
             auto_reclone: true,
             confirm_ticks: 2,
             reclone_cooldown: Duration::from_secs(3600),
+            check_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -79,6 +85,9 @@ impl DriftConfig {
         }
         if let Some(n) = env_u64("SPKY_DRIFT_RECLONE_COOLDOWN_SECS") {
             cfg.reclone_cooldown = Duration::from_secs(n);
+        }
+        if let Some(n) = env_u64("SPKY_DRIFT_CHECK_TIMEOUT_SECS") {
+            cfg.check_timeout = Duration::from_secs(n.max(1));
         }
         cfg
     }
@@ -105,6 +114,10 @@ pub trait UpstreamCounts: Send + Sync {
     /// `@nosync`) with their row counts. A table whose count could not be read
     /// is `None`; a table that no longer exists upstream is absent.
     async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>>;
+
+    /// Called when a check was abandoned on its deadline. The handle behind
+    /// it is then presumed wedged, and the next check must not inherit it.
+    fn note_stalled(&self) {}
 }
 
 /// Upstream counts read through the scheduler's shared SurrealDB handle.
@@ -132,6 +145,14 @@ impl UpstreamCounts for SurrealUpstream {
             out.insert(table, count);
         }
         Ok(out)
+    }
+
+    fn note_stalled(&self) {
+        // The HTTP engine has no request timeout, so a session the server has
+        // forgotten answers nothing at all rather than erroring. Our own
+        // deadline is the only evidence there is, and it is strong: a healthy
+        // handle counts these tables in seconds.
+        self.db.force_reconnect();
     }
 }
 
@@ -367,11 +388,33 @@ pub async fn run_check(hook: &DriftHook, replica: &Arc<RwLock<Replica>>) -> Acti
     if !hook.cfg.enabled {
         return Action::Clean;
     }
-    let report = match check_once(&*hook.upstream, replica).await {
-        Ok(r) => r,
-        Err(e) => {
+    // Time-boxed. This check is the last step of the snapshot updater's tick,
+    // and that tick is a serial loop: a check that never returns takes the
+    // replica drain with it, forever, with nothing in the log to say so — the
+    // whole pipeline goes quiet while `/health` still reports ready (observed
+    // on whitepawn 2026-09-09: no drain for 3h, 11.6k events buffered, the
+    // updater parked in an upstream `count()` that never answered).
+    let report = match tokio::time::timeout(
+        hook.cfg.check_timeout,
+        check_once(&*hook.upstream, replica),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             warn!(error = %e, "Replica drift check failed");
             hook.state.write().await.last_error = Some(e.to_string());
+            return Action::Clean;
+        }
+        Err(_) => {
+            let secs = hook.cfg.check_timeout.as_secs();
+            warn!(
+                timeout_secs = secs,
+                "Replica drift check timed out; abandoning it and reconnecting upstream"
+            );
+            hook.upstream.note_stalled();
+            hook.state.write().await.last_error =
+                Some(format!("drift check timed out after {secs}s"));
             return Action::Clean;
         }
     };
@@ -451,6 +494,57 @@ mod tests {
 
     fn cfg() -> DriftConfig {
         DriftConfig::default()
+    }
+
+    /// The whole reason the check is time-boxed: an upstream query that never
+    /// answers (a SurrealDB session the server has forgotten — the HTTP engine
+    /// has no request timeout) used to park the snapshot updater's tick, and
+    /// with it every later drain, silently.
+    #[tokio::test]
+    async fn a_check_that_never_answers_is_abandoned_on_its_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Hangs(Arc<AtomicBool>);
+        #[async_trait]
+        impl UpstreamCounts for Hangs {
+            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+                std::future::pending().await
+            }
+            fn note_stalled(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct NeverReclones;
+        #[async_trait]
+        impl Recloner for NeverReclones {
+            async fn reclone_and_resync(&self) -> Result<bool> {
+                unreachable!("a timed-out check decides nothing")
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let replica = Arc::new(RwLock::new(
+            Replica::new(tmp.path().join("replica")).await.unwrap(),
+        ));
+        let stalled = Arc::new(AtomicBool::new(false));
+        let hook = DriftHook {
+            cfg: DriftConfig {
+                check_timeout: Duration::from_millis(20),
+                ..DriftConfig::default()
+            },
+            upstream: Arc::new(Hangs(Arc::clone(&stalled))),
+            state: Arc::new(RwLock::new(DriftState::default())),
+            reclone: Arc::new(NeverReclones),
+        };
+
+        assert_eq!(run_check(&hook, &replica).await, Action::Clean);
+        assert!(
+            stalled.load(Ordering::SeqCst),
+            "the handle behind an abandoned check is dropped for the next one"
+        );
+        let err = hook.state.read().await.last_error.clone().unwrap();
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[test]

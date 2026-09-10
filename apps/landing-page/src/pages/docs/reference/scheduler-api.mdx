@@ -649,6 +649,7 @@ job_tables:
 - `SPKY_DRIFT_AUTO_RECLONE` - Re-clone the replica and re-bootstrap every SSP when the check finds the replica missing rows (default: `true`; `false` reports only, via `/health/snapshot`, `/metrics` and `spky verify`)
 - `SPKY_DRIFT_CONFIRM_TICKS` - Consecutive checks a non-zero count mismatch must persist before it is acted on; an empty replica table upstream has rows for is acted on at first sight (default: `2`)
 - `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` - Minimum spacing between automatic re-clones (default: `3600`)
+- `SPKY_DRIFT_CHECK_TIMEOUT_SECS` - Deadline for one drift check. The check is the last step of the snapshot updater's tick, so a check that never answers would stop the replica draining; on the deadline it is abandoned, the upstream connection is replaced and the tick finishes (default: `120`)
 - `SPKY_BACKENDS` - JSON-encoded backend health-check list (`SPKY_SCHEDULER_BACKENDS` accepted as legacy fallback)
 - `SPKY_BOOTSTRAP_PAGE_SIZE` - Rows read per bootstrap page from the replica (default: `500`)
 - `SPKY_CLEAR_VIEWS_ON_START` - Wipe `_00_query` at startup (default: `true`). `false` keeps registered views across a scheduler restart: the replica clones them, SSPs re-register them at bootstrap, clients never notice; the SSP TTL sweep retires expired ones. Single-SSP tenants only until scheduler-owned view assignment lands.

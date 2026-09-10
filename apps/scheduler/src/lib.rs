@@ -818,7 +818,15 @@ impl Scheduler {
 
             loop {
                 interval.tick().await;
-                snapshot_updater_tick(
+                // The loop is serial: a tick that never returns takes every
+                // later drain with it, and the only symptom is silence — no
+                // "Snapshot update complete", `/health` still ready, and
+                // `pending_events` climbing for hours (whitepawn, 2026-09-09,
+                // a tick parked in the drift check's upstream `count()`).
+                // Nothing here can safely abort a tick mid-drain, so say so
+                // instead, loudly and repeatedly, naming the elapsed time.
+                let started = std::time::Instant::now();
+                let tick = snapshot_updater_tick(
                     &status,
                     &event_buffer,
                     &replica,
@@ -827,8 +835,19 @@ impl Scheduler {
                     &drain_lock,
                     stale_bootstrap_max_age,
                     drift.as_deref(),
-                )
-                .await;
+                );
+                tokio::pin!(tick);
+                loop {
+                    tokio::select! {
+                        _ = &mut tick => break,
+                        _ = tokio::time::sleep(
+                            std::time::Duration::from_secs(TICK_OVERDUE_WARN_SECS),
+                        ) => warn!(
+                            elapsed_secs = started.elapsed().as_secs(),
+                            "Snapshot updater tick has not returned; the replica is not draining"
+                        ),
+                    }
+                }
             }
         });
     }
@@ -879,6 +898,9 @@ const DRAIN_SLOW_WARN_SECS: u64 = 60;
 
 /// How often a caller still waiting for `drain_lock` says so.
 const DRAIN_LOCK_WAIT_WARN_SECS: u64 = 30;
+
+/// How often a snapshot updater tick that has not returned says so.
+const TICK_OVERDUE_WARN_SECS: u64 = 60;
 
 /// Take `drain_lock`, and say so in the log while the wait drags on.
 ///

@@ -265,6 +265,7 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | `SPKY_DRIFT_AUTO_RECLONE` | Re-clone the replica and re-bootstrap every SSP when the check finds rows missing (`false` = report only) | `true` |
 | `SPKY_DRIFT_CONFIRM_TICKS` | Consecutive checks a non-zero count mismatch must persist before acting (an empty table upstream has rows for is acted on immediately) | `2` |
 | `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` | Minimum seconds between automatic re-clones | `3600` |
+| `SPKY_DRIFT_CHECK_TIMEOUT_SECS` | Deadline for one drift check; past it the check is abandoned and the upstream connection replaced, so a wedged query cannot stop the replica draining | `120` |
 | `SPKY_BOOTSTRAP_PAGE_SIZE` | Rows read per bootstrap page from the replica | `500` |
 | `SPKY_AUTH_SECRET` | Optional shared secret; when set, callers to `/proxy/*` must send `Authorization: Bearer <secret>`. Also signs admin dashboard sessions, so setting it is what makes them survive a restart. | *(empty)* |
 | `SPKY_BACKENDS` | JSON-encoded backend health-check list (`SPKY_SCHEDULER_BACKENDS` accepted as legacy fallback) | *(unset)* |

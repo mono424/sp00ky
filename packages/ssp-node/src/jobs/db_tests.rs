@@ -1250,3 +1250,201 @@ async fn a_hung_request_is_reclaimed_re_run_and_cannot_report_its_own_outcome() 
         "nor append its error to the successful run's history"
     );
 }
+
+// --- live pickup vs. the creating transaction --------------------------------
+//
+// The outbox mutation event runs INSIDE the transaction that creates the job row,
+// so the `/ingest` that drives live pickup reaches the SSP before that row is
+// committed. These tests hold a real transaction open across the claim to
+// reproduce it: the embedded engine behaves like the server here, answering a
+// concurrent UPDATE with "no such row" instead of blocking on the writer.
+
+/// A `Scheduler` that counts its sleeps, so a test can tell "gave up at once" from
+/// "waited".
+#[derive(Default)]
+struct CountingScheduler(std::sync::atomic::AtomicUsize);
+
+impl CountingScheduler {
+    fn sleeps(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl Scheduler for CountingScheduler {
+    async fn schedule(&self, _kind: TimerKind, _at: u64) {}
+    async fn cancel(&self, _kind: &TimerKind) {}
+    async fn sleep(&self, dur: Duration) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(dur).await;
+    }
+}
+
+/// Create `job:<id_part>` as `pending` in a transaction held open for `hold`, then
+/// commit it (or cancel it, when `commit` is false).
+fn create_job_in_open_transaction(
+    raw: &Arc<Surreal<MemEngine>>,
+    id_part: &str,
+    hold: Duration,
+    commit: bool,
+) -> tokio::task::JoinHandle<()> {
+    let sql = format!(
+        "BEGIN TRANSACTION; \
+         CREATE type::record('job', $id) SET status = 'pending', path = '/run', payload = {{}}, \
+         retries = 0, max_retries = 1, retry_strategy = 'linear', errors = []; \
+         SLEEP {}ms; \
+         {} TRANSACTION;",
+        hold.as_millis(),
+        if commit { "COMMIT" } else { "CANCEL" },
+    );
+    let raw = Arc::clone(raw);
+    let id = id_part.to_string();
+    tokio::spawn(async move {
+        let response = raw.query(sql).bind(("id", id)).await.expect("creating transaction");
+        if commit {
+            response.check().expect("creating transaction committed");
+        }
+    })
+}
+
+/// The bug behind "outbox jobs only run when the recovery sweep finds them": the
+/// claim reached a row whose creating transaction had not committed yet, read
+/// "matched nothing" as "claimed elsewhere", and dropped the job.
+#[tokio::test]
+async fn a_claim_waits_for_the_creating_transaction_to_commit() {
+    let (port, raw) = mem_db().await;
+    let creator = create_job_in_open_transaction(&raw, "t1", Duration::from_millis(400), true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // What the runner used to do: one CAS, while the row is still invisible.
+    let plain = claim_processing(port.as_ref(), "job:t1", "ssp-a", 60).await.expect("claim");
+    assert_eq!(plain, Claim::Lost, "an uncommitted row cannot be claimed directly");
+
+    let scheduler = CountingScheduler::default();
+    let claim = claim_processing_when_visible(
+        port.as_ref(),
+        &scheduler,
+        "job:t1",
+        "ssp-a",
+        60,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("claim");
+    creator.await.expect("creator task");
+
+    assert_eq!(claim, Claim::Fenced(1), "the claim lands once the row commits");
+    assert!(scheduler.sleeps() > 0, "and it got there by waiting, not by luck");
+    assert_eq!(
+        select_string(&raw, "SELECT VALUE status FROM ONLY job:t1").await.as_deref(),
+        Some("processing")
+    );
+    assert_eq!(
+        select_string(&raw, "SELECT VALUE assignee FROM ONLY job:t1").await.as_deref(),
+        Some("ssp-a")
+    );
+}
+
+/// Waiting is only for an absent row. One that exists and is not `pending` belongs
+/// to another attempt (or is finished) and must be given up on immediately.
+#[tokio::test]
+async fn a_claim_never_waits_on_a_row_that_is_not_pending() {
+    let (port, raw) = mem_db().await;
+    insert_job(&raw, "t2", "processing").await;
+    insert_job(&raw, "t3", "success").await;
+
+    let scheduler = CountingScheduler::default();
+    for id in ["job:t2", "job:t3"] {
+        let claim = claim_processing_when_visible(
+            port.as_ref(),
+            &scheduler,
+            id,
+            "ssp-a",
+            60,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("claim");
+        assert_eq!(claim, Claim::Lost, "{id} is not ours to run");
+    }
+    assert_eq!(scheduler.sleeps(), 0, "a real loss must not cost a backoff");
+}
+
+/// A rolled-back creation never produces a row. The claim gives up after its
+/// budget instead of holding the table's slot forever.
+#[tokio::test]
+async fn a_claim_gives_up_on_a_row_that_never_commits() {
+    let (port, raw) = mem_db().await;
+    let creator = create_job_in_open_transaction(&raw, "t4", Duration::from_millis(100), false);
+
+    let scheduler = CountingScheduler::default();
+    let started = std::time::Instant::now();
+    let claim = claim_processing_when_visible(
+        port.as_ref(),
+        &scheduler,
+        "job:t4",
+        "ssp-a",
+        60,
+        Duration::from_millis(300),
+    )
+    .await
+    .expect("claim");
+    creator.await.expect("creator task");
+
+    assert_eq!(claim, Claim::Lost);
+    assert!(scheduler.sleeps() > 0, "it did wait for the row");
+    assert!(started.elapsed() < Duration::from_secs(3), "but only for its budget");
+    assert_eq!(
+        count_rows(&raw, "SELECT VALUE count() FROM job WHERE id = job:t4 GROUP ALL").await,
+        0,
+        "and waiting never creates the row"
+    );
+}
+
+/// End to end, the way live pickup reaches the runner in cluster mode: the ingest
+/// admits the job while its row is still uncommitted. It must run exactly once,
+/// right after the commit, not be dropped for the recovery sweep.
+#[tokio::test]
+async fn a_job_admitted_before_its_row_commits_still_runs_once() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(match_path("/run"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"ok\":true}"))
+        .expect(1)
+        .mount(&backend)
+        .await;
+
+    let DispatchHarness { dispatcher, rx, raw } = DispatchHarness::new(false, backend.uri()).await;
+    let port: Arc<dyn Db> = Arc::new(MemDb(Arc::clone(&raw)));
+    let runner = JobRunner::new(
+        rx,
+        port,
+        Arc::new(TestHttp(reqwest::Client::new())),
+        Arc::new(TestScheduler),
+        Arc::new(TestSpawner),
+        Arc::clone(&dispatcher),
+    );
+    tokio::spawn(runner.run());
+
+    let creator = create_job_in_open_transaction(&raw, "t5", Duration::from_millis(300), true);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // `SspNode::admit_or_backlog`, reached from the job's own CREATE ingest.
+    assert!(dispatcher.try_admit(job_entry("job:t5", backend.uri(), 1)).await);
+    creator.await.expect("creator task");
+
+    let mut status = None;
+    for _ in 0..100 {
+        status = select_string(&raw, "SELECT VALUE status FROM ONLY job:t5").await;
+        if status.as_deref() == Some("success") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status.as_deref(), Some("success"), "the live path ran the job");
+    assert_eq!(
+        select_string(&raw, "SELECT VALUE assignee FROM ONLY job:t5").await.as_deref(),
+        Some("ssp-test"),
+        "owned by the node that ran it, so the cluster sweep leaves it alone"
+    );
+    // `expect(1)` on the mock is verified when `backend` drops.
+}

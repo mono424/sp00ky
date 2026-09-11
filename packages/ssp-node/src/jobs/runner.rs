@@ -44,6 +44,25 @@ pub fn lease_secs(timeout: Duration) -> u64 {
     timeout.as_secs().saturating_add(LEASE_GRACE_SECS).min(MAX_LEASE_SECS)
 }
 
+/// How long a claim keeps waiting for a job row that does not exist yet.
+///
+/// Live pickup is driven by the outbox table's mutation event, and SurrealDB runs
+/// that event INSIDE the transaction that creates the row: the `/ingest` post goes
+/// out before the CREATE commits, and in cluster mode the scheduler acknowledges it
+/// before fanning it out. So a job reached through its own CREATE routinely gets to
+/// the claim while the row is still invisible to this node's connection. The claim
+/// CAS then matches nothing, which is indistinguishable from "claimed elsewhere",
+/// and the job used to be dropped until the recovery sweep found it 30-60 s later.
+///
+/// The creating transaction normally commits within milliseconds of its event, and
+/// the DB-side `/ingest` call itself is bounded at 10 s. A row still absent after
+/// this was most likely rolled back; one that commits even later is left to the
+/// recovery sweep, exactly as before. The slot is held while waiting, so this is
+/// also the most a rolled-back job can cost its table.
+pub const CLAIM_VISIBILITY_BUDGET: Duration = Duration::from_secs(10);
+const CLAIM_VISIBILITY_FIRST_BACKOFF: Duration = Duration::from_millis(10);
+const CLAIM_VISIBILITY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Guard the `type::record($id)` conversion: SurrealDB record ids are
 /// `table:key`. The former implementation used `RecordId::parse_simple`;
 /// this keeps the same reject-garbage-early behavior without the SDK type.
@@ -175,8 +194,21 @@ impl JobRunnerCtx {
         //
         // On a DB failure, release the in-flight mark before bailing (same leak hazard
         // as above): the row is still pending, so the sweep can re-dispatch it cleanly.
+        //
+        // The claim waits for a row that is not visible yet: a job arriving through
+        // its own CREATE event gets here before the creating transaction commits.
+        // See `CLAIM_VISIBILITY_BUDGET`.
         let owner = self.dispatcher.ssp_id().to_string();
-        match claim_processing(self.db.as_ref(), &job.id, &owner, lease_secs(job.timeout)).await {
+        match claim_processing_when_visible(
+            self.db.as_ref(),
+            self.scheduler.as_ref(),
+            &job.id,
+            &owner,
+            lease_secs(job.timeout),
+            CLAIM_VISIBILITY_BUDGET,
+        )
+        .await
+        {
             Ok(claim @ (Claim::Fenced(_) | Claim::Unfenced)) => job.lease_epoch = claim.epoch(),
             Ok(Claim::Lost) => {
                 // Not ours. Nothing to undo — we never wrote to the row, and whoever
@@ -647,6 +679,65 @@ pub async fn claim_processing(
             Ok(if updated_any(&results) { Claim::Unfenced } else { Claim::Lost })
         }
         Err(e) => Err(anyhow::Error::from(e).context("Failed to claim job")),
+    }
+}
+
+/// [`claim_processing`], tolerant of a row whose creating transaction has not
+/// committed yet.
+///
+/// A `Lost` from the CAS conflates two answers: "the row is not pending" and "there
+/// is no row". Only the first means another attempt owns the job or it already
+/// finished. The second is the normal state of a job reached through its own CREATE
+/// event (see [`CLAIM_VISIBILITY_BUDGET`]), so it is retried with a short backoff
+/// until the row appears or `budget` runs out.
+///
+/// Nothing here can double-execute: every retry is the same CAS on `pending`, so a
+/// row that becomes visible already claimed by someone else still comes back `Lost`.
+pub async fn claim_processing_when_visible(
+    db: &dyn Db,
+    scheduler: &dyn Scheduler,
+    job_id: &str,
+    assignee: &str,
+    lease_secs: u64,
+    budget: Duration,
+) -> Result<Claim> {
+    let mut waited = Duration::ZERO;
+    let mut backoff = CLAIM_VISIBILITY_FIRST_BACKOFF;
+    loop {
+        let claim = claim_processing(db, job_id, assignee, lease_secs).await?;
+        if claim != Claim::Lost {
+            if !waited.is_zero() {
+                debug!(
+                    job_id = %job_id,
+                    waited_ms = waited.as_millis() as u64,
+                    "Claimed a job once its creating transaction committed"
+                );
+            }
+            return Ok(claim);
+        }
+
+        // The CAS matched nothing. A row that exists and is not `pending` really is
+        // someone else's, or finished. A row that turned up `pending` between the two
+        // reads is simply claimed again; only an absent one is waited for.
+        if let Some(row) = load_job_record(db, job_id).await? {
+            if row.get("status").and_then(Value::as_str) != Some("pending") {
+                return Ok(Claim::Lost);
+            }
+        }
+
+        if waited >= budget {
+            warn!(
+                job_id = %job_id,
+                waited_ms = waited.as_millis() as u64,
+                "Job row never became claimable (creating transaction rolled back, or \
+                 slower than the claim budget). Leaving it to the recovery sweep."
+            );
+            return Ok(Claim::Lost);
+        }
+        let step = backoff.min(budget.saturating_sub(waited)).max(Duration::from_millis(1));
+        scheduler.sleep(step).await;
+        waited += step;
+        backoff = (backoff * 2).min(CLAIM_VISIBILITY_MAX_BACKOFF);
     }
 }
 

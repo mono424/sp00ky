@@ -421,9 +421,12 @@ export function Views() {
                               v.row_count >= d().large_view_rows;
                             return (
                               <tr>
-                                <td>
+                                <td class="cell-surql">
                                   <A href={`/views/${encodeURIComponent(v.key)}`}>
-                                    <span class="truncate">
+                                    <span
+                                      class="clamp-3"
+                                      title={v.surql ?? v.key}
+                                    >
                                       {v.surql ?? v.key}
                                     </span>
                                   </A>

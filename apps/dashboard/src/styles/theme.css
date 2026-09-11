@@ -1197,6 +1197,37 @@ select:focus {
   white-space: nowrap;
 }
 
+/* A SurrealQL statement is the identity of a row in the queries table, and it
+   is long. On one nowrap line it pushed the table wider than the panel, so
+   every column after it lived behind a horizontal scrollbar. Wrap it instead,
+   cap it at three lines, and elide the rest; the full text is on the cell's
+   title and on the view's own page. */
+td.cell-surql {
+  max-width: 460px;
+  vertical-align: top;
+}
+
+td.cell-surql > a {
+  display: block;
+}
+
+/* Only the statement wraps. Once it stops forcing the table wide, the narrow
+   columns after it have room to stay on one line, and an id that wraps mid-word
+   reads worse than a wide column. */
+td.cell-surql ~ td {
+  white-space: nowrap;
+}
+
+.clamp-3 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .id {
   font-size: 11px;
   color: var(--ink-ghost);

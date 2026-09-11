@@ -211,6 +211,7 @@ pub fn sync(
     // silently stop being written because one schedule entry is malformed.
     sync_retention(client, config, processor)?;
     sync_job_policy(client, config)?;
+    sync_job_indexes(client, processor)?;
 
     let rows = resolve_rows(config, processor, base_dir)?;
     let mut report = SyncReport::default();
@@ -327,6 +328,48 @@ fn sync_job_policy(client: &dyn MigrationDB, config: &Sp00kyConfig) -> Result<()
             .with_context(|| format!("failed to write the job policy for '{table}'"))?;
     }
     Ok(())
+}
+
+/// Define the outbox tables' indexes, for projects whose schema predates them.
+///
+/// The scaffold writes these into the table's own `.surql` (`add_api.rs`), but
+/// that file is generated ONCE, when `spky add api` runs. Every project created
+/// before the indexes existed therefore has a schema that will never grow them
+/// on its own, and those are exactly the projects big enough to need them: the
+/// SSP dispatcher scans `WHERE status = 'pending'` on every job completion, the
+/// retention prune scans `updated_at`, and the admin plane's queue counts scan
+/// both.
+///
+/// `IF NOT EXISTS`, never `OVERWRITE`. `OVERWRITE` would rebuild both indexes on
+/// every deploy, which on a table with a million rows is a deploy that looks
+/// hung. With `IF NOT EXISTS` the build happens once, on the first deploy after
+/// this ships, and costs nothing after that.
+///
+/// Best-effort per table: a project whose outbox table does not exist yet (a
+/// first deploy, where the table is created by the schema batch that runs after
+/// this) must not fail the whole deploy over an index.
+fn sync_job_indexes(client: &dyn MigrationDB, processor: &BackendProcessor) -> Result<()> {
+    let mut tables = crate::schema_builder::outbox_tables(processor);
+    tables.sort();
+    tables.dedup();
+    for table in tables {
+        if let Err(e) = client.execute(&job_index_sql(&table)) {
+            // A warning, not a failure: the indexes are an optimization, and a
+            // deploy that refuses to finish without one is worse than a deploy
+            // that is slower than it could be.
+            eprintln!("  warning: could not define the indexes on '{table}': {e:#}");
+        }
+    }
+    Ok(())
+}
+
+/// The two index definitions for one outbox table. Split out so a test can pin
+/// the shape against the scaffold's, which has to say the same thing.
+fn job_index_sql(table: &str) -> String {
+    format!(
+        "DEFINE INDEX IF NOT EXISTS idx_{table}_dispatch ON TABLE {table} COLUMNS status, created_at; \
+         DEFINE INDEX IF NOT EXISTS idx_{table}_activity ON TABLE {table} COLUMNS updated_at;"
+    )
 }
 
 /// `(outbox table, concurrency)` for every backend that declares a limit.
@@ -505,6 +548,47 @@ mod job_policy_sync_tests {
 
     /// The shipped DDL, so this test is about what actually deploys.
     const SCHEDULE_TABLES: &str = include_str!("schedule_tables.surql");
+
+    /// An `OVERWRITE` here would rebuild both indexes on every single deploy,
+    /// which on a large outbox table is a deploy that reads as hung. The whole
+    /// point of running this on every deploy is that it is free after the first.
+    #[test]
+    fn job_indexes_are_defined_once_not_rebuilt_every_deploy() {
+        let sql = job_index_sql("job");
+        assert!(!sql.contains("OVERWRITE"), "{sql}");
+        assert_eq!(sql.matches("IF NOT EXISTS").count(), 2, "{sql}");
+    }
+
+    /// The two indexes have to be the ones the three scanners actually ask for:
+    /// the dispatcher's drain (`status`, then `created_at`), and the prune and
+    /// the jobs listing (`updated_at`).
+    #[test]
+    fn job_indexes_cover_the_dispatch_and_activity_paths() {
+        let sql = job_index_sql("stats_job");
+        assert!(sql.contains("ON TABLE stats_job COLUMNS status, created_at"), "{sql}");
+        assert!(sql.contains("ON TABLE stats_job COLUMNS updated_at"), "{sql}");
+        // Names are per table, or two outbox tables would collide on one index.
+        assert!(sql.contains("idx_stats_job_dispatch"), "{sql}");
+        assert!(sql.contains("idx_stats_job_activity"), "{sql}");
+    }
+
+    /// Deploy and the `spky add api` scaffold must define the SAME indexes: a
+    /// new project would otherwise get a different shape from a migrated one,
+    /// and only one of the two would be the one the dispatcher is tuned for.
+    #[test]
+    fn deploy_defines_what_the_scaffold_does() {
+        let scaffold = crate::add_api::outbox_template_for_test("job");
+        for statement in job_index_sql("job").split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            assert!(
+                scaffold.contains(statement),
+                "the scaffold is missing `{statement}`"
+            );
+        }
+    }
 
     /// Every field this UPSERT writes must be defined on `_00_job_policy`.
     /// SCHEMAFULL rejects the whole statement otherwise, at deploy time, on a

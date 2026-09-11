@@ -114,6 +114,9 @@ await db.update('email', 'email:abc123', { retracted: true });
 if (email.retracted) return { skipped: true };
 await mailer.send(email);`;
 
+export const jobIndexCode = `DEFINE INDEX IF NOT EXISTS idx_job_dispatch ON TABLE job COLUMNS status, created_at;
+DEFINE INDEX IF NOT EXISTS idx_job_activity ON TABLE job COLUMNS updated_at;`;
+
 export const retentionCode = `# sp00ky.yml
 retention:
   success: 6h        # job rows that succeeded
@@ -278,6 +281,28 @@ The job runner is built into the SSP. There is nothing to install or implement:
 <Warning>
   Never mark an outbox table `-- @nosync`. It looks like a way to stop job rows syncing to clients, but job **dispatch** is driven by the table's create event — `@nosync` silently disables the job runner.
 </Warning>
+
+### Indexes
+
+An outbox table is the busiest table most projects have, and three things scan
+it: the dispatcher's drain, on **every** job completion
+(`WHERE status = 'pending' ORDER BY created_at`); the retention prune, which
+ages terminal rows by `updated_at`; and the admin dashboard's queue counts. So
+`spky deploy` defines two indexes on every outbox table it knows about:
+
+<CodeBlock code={jobIndexCode} lang="surql" />
+
+They are defined with `IF NOT EXISTS`, never `OVERWRITE`, so the build happens
+once and every deploy after that is free. `spky add api` writes the same two
+lines into a new table's `.surql`, so a fresh project has them from the start.
+
+<Note title="The first deploy after upgrading">
+  If your project predates this, the next `spky deploy` builds both indexes,
+  and on a table with a lot of rows that is not instant — the deploy will sit on
+  the schema step longer than usual. It happens once. A deploy that is already
+  close to its timeout can be given more room with
+  <code>SPKY_DB_HTTP_TIMEOUT_SECS</code>.
+</Note>
 
 ## Concurrency
 

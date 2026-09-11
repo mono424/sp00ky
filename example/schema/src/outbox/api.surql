@@ -114,3 +114,19 @@ DEFINE FIELD timeout ON TABLE job TYPE option<int>
 PERMISSIONS
   FOR create, select WHERE true
   FOR update WHERE false;
+
+-- ── Indexes ────────────────────────────────────────────────────────────────
+--
+-- `(status, created_at)` is the shape the dispatcher's drain asks for on EVERY
+-- job completion (`SELECT ... WHERE status = 'pending' ORDER BY created_at`),
+-- and the shape the retention prune and the admin plane's queue counts ask for
+-- too. Without it all three are full scans of a table that, on a busy project,
+-- is the largest one there is.
+--
+-- `updated_at` carries the other two: the prune ages terminal rows by their last
+-- write, and the Jobs page lists by it.
+--
+-- `IF NOT EXISTS`, never `OVERWRITE`: an `OVERWRITE` here would rebuild both
+-- indexes on every single `spky deploy`.
+DEFINE INDEX IF NOT EXISTS idx_job_dispatch ON TABLE job COLUMNS status, created_at;
+DEFINE INDEX IF NOT EXISTS idx_job_activity ON TABLE job COLUMNS updated_at;

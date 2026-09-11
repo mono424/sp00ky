@@ -201,6 +201,22 @@ this as “Reload schema” next to the two restart modes.</p>
 </li>
 </ul>
 <p>Possible status values: <code>&quot;bootstrapping&quot;</code>, <code>&quot;ready&quot;</code>, <code>&quot;failed&quot;</code>.</p>
+<p><code>status</code> reports bootstrap state only. It deliberately does <strong>not</strong> move when
+the database goes slow: the scheduler’s bootstrap handshake compares it to the
+literal <code>&quot;ready&quot;</code>, and the cloud autoheal recreates a container whose probe
+fails, so a stalled SurrealDB must not make the SSP look dead.</p>
+<p>When the SSP’s database calls are timing out (see <code>SPKY_SSP_DB_TIMEOUT_SECS</code>),
+an extra <code>db</code> object is included. It is informational — the HTTP status and
+<code>status</code> are unaffected — and the field is absent while the connection is
+healthy:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ready&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;db&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;stalled&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;consecutive_timeouts&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">3</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><code>consecutive_timeouts</code> resets on the first call that succeeds. A non-zero
+count means every database-touching route (<code>/ingest</code>, <code>/view/register</code>,
+<code>/job/recover</code>) is failing fast rather than hanging, and the scheduler will be
+parking this SSP as <code>Lagging</code> until the database recovers.</p>
 <p><strong>Example:</strong></p>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/health</span></span></code></pre>
 <h3 id="get-version">GET /version</h3>

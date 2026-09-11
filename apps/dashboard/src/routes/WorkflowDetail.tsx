@@ -1,4 +1,4 @@
-import { For, Show, createResource, onCleanup } from 'solid-js';
+import { For, Show, createResource, onCleanup, type JSX } from 'solid-js';
 import { A, useNavigate, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import {
@@ -10,6 +10,7 @@ import {
   Panel,
   Pill,
   Rail,
+  Reason,
 } from '../components/Chrome';
 import { Timeline, type Lane } from '../components/Timeline';
 import {
@@ -20,9 +21,9 @@ import {
   orNull,
   relativeStamp,
 } from '../lib/format';
-import { runTone, stepTone } from '../lib/status';
+import { jobTone, runTone, stepTone } from '../lib/status';
 import { cancelRun, killJob, rerunRun, retryJob, retryRun } from '../lib/runActions';
-import type { StepRun, WorkflowRun, WorkflowRunDetail } from '../api/types';
+import type { JobDetail, StepRun, WorkflowRun, WorkflowRunDetail } from '../api/types';
 
 /**
  * One workflow run.
@@ -315,9 +316,10 @@ export function WorkflowDetail() {
 
                 <Show when={d().run.error}>
                   <Panel title="Run error">
-                    <pre class="json bad">
-                      {JSON.stringify(d().run.error, null, 2)}
-                    </pre>
+                    <Reason
+                      error={d().run.error}
+                      tone={d().run.status === 'killed' ? 'warn' : 'bad'}
+                    />
                   </Panel>
                 </Show>
 
@@ -434,10 +436,46 @@ export function WorkflowDetail() {
   );
 }
 
-/** The expanded body of one timeline lane. */
+/**
+ * The expanded body of one timeline lane.
+ *
+ * Two sources, and they answer different questions. The step row says what the
+ * ENGINE decided — dispatched, skipped, and why. The job row says what the
+ * BACKEND did, one line per attempt, and it is the only place the attempts before
+ * the last one survive: `_00_step_run.error` keeps just the attempt that ended
+ * the job. A step that failed after two timeouts and a 500 looks identical to one
+ * that 500'd immediately until you read the job.
+ *
+ * The job is fetched here rather than with the run so the cost is per opened lane
+ * — a fan-out run has hundreds of steps and nobody opens hundreds of them.
+ */
 function StepDetail(props: { step: StepRun; onChange: () => void }) {
   const s = () => props.step;
   const jobId = () => orNull(s().job_id);
+
+  const [jobResult] = createResource(jobId, (id) =>
+    api.getResult<{ job: JobDetail }>(`/jobs/${encodeURIComponent(id)}`),
+  );
+  const job = () => {
+    const r = jobResult();
+    return r?.ok ? r.value.job : undefined;
+  };
+  // A pruned job is the expected case on an old run, not a malfunction, so the
+  // message is shown where the job would have been rather than as an error.
+  const jobMissing = () => {
+    const r = jobResult();
+    return r && !r.ok ? r.message : undefined;
+  };
+
+  const attempts = () => job()?.errors ?? [];
+  // `retries` counts retries, so the attempt count is one more than it.
+  const attemptLabel = () => {
+    const j = job();
+    if (!j || j.retries === null) return null;
+    return `attempt ${j.retries + 1} of ${(j.max_retries ?? 0) + 1}`;
+  };
+  const dispatches = () => s().dispatch_attempts ?? 0;
+
   return (
     <div class="stack" style={{ gap: '10px', 'padding-top': '10px' }}>
       <KeyValue
@@ -451,6 +489,16 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
             'Job',
             <div class="row" style={{ 'flex-wrap': 'wrap' }}>
               <span>{jobId() ?? '—'}</span>
+              <Show when={job()}>
+                {(j) => (
+                  <>
+                    <Pill tone={jobTone(j().status)}>{j().status}</Pill>
+                    <Show when={attemptLabel()}>
+                      <span class="mini">{attemptLabel()}</span>
+                    </Show>
+                  </>
+                )}
+              </Show>
               {/* Job-level controls act on the SSP running it, not on the
                   workflow: killing fails this step; retrying re-runs the SAME
                   job row, which is the right tool when the step's own job
@@ -476,16 +524,97 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
           ['Queued', formatStamp(s().created_at)],
           ['Started', formatStamp(s().started_at)],
           ['Finished', formatStamp(s().finished_at)],
+          // Only worth a row when it is not the ordinary 0-or-1. Above that, the
+          // step lost a dispatch and was re-sent, which is a different story from
+          // a job that ran and failed.
+          ...(dispatches() > 1
+            ? ([
+                [
+                  'Dispatches',
+                  <span class="tone-warn">
+                    {dispatches()} (re-sent after a lost dispatch)
+                  </span>,
+                ],
+              ] as [string, JSX.Element][])
+            : []),
         ]}
       />
+
       <Show when={s().error}>
         <div>
           <div class="tag" style={{ 'margin-bottom': '6px' }}>
-            Error
+            {s().status === 'skipped' ? 'Why it did not run' : 'Error'}
           </div>
-          <pre class="json bad">{JSON.stringify(s().error, null, 2)}</pre>
+          <Reason
+            error={s().error}
+            tone={s().status === 'skipped' ? 'warn' : 'bad'}
+          />
         </div>
       </Show>
+
+      <Show when={jobId()}>
+        <div>
+          <div class="tag" style={{ 'margin-bottom': '6px' }}>
+            Attempts
+          </div>
+          <Show
+            when={job()}
+            fallback={
+              <Empty>
+                {jobMissing() ?? 'Loading the job…'}
+              </Empty>
+            }
+          >
+            {(j) => (
+              <div class="stack" style={{ gap: '8px' }}>
+                <KeyValue
+                  rows={[
+                    ['Path', j().path],
+                    [
+                      'Retries',
+                      `${j().retries ?? 0} of ${j().max_retries ?? 0} (${j().retry_strategy ?? 'linear'})`,
+                    ],
+                    ...((j().assignee
+                      ? [['SSP', j().assignee!]]
+                      : []) as [string, JSX.Element][]),
+                    ...((j().timeout
+                      ? [['Timeout', formatDuration(j().timeout! * 1000)]]
+                      : []) as [string, JSX.Element][]),
+                    ...((j().delay
+                      ? [['Delay', formatDuration(j().delay!)]]
+                      : []) as [string, JSX.Element][]),
+                    ['Last write', formatStamp(j().updated_at)],
+                  ]}
+                />
+                <Show
+                  when={attempts().length > 0}
+                  fallback={
+                    <Empty>
+                      No failed attempt recorded.
+                      {j().status === 'failed'
+                        ? ' The runner could not append to the job’s `errors` array; its log has the rejection.'
+                        : ''}
+                    </Empty>
+                  }
+                >
+                  {/* Oldest first, so the list reads as the history it is: what
+                      the backend did on attempt 1, then 2, then the one that
+                      exhausted the budget. */}
+                  <For each={attempts()}>
+                    {(err, i) => (
+                      <div class="attempt">
+                        <span class="attempt-n">#{i() + 1}</span>
+                        <Reason error={err} />
+                      </div>
+                    )}
+                  </For>
+                </Show>
+              </div>
+            )}
+          </Show>
+        </div>
+      </Show>
+
       <Show when={s().output}>
         <div>
           <div class="tag" style={{ 'margin-bottom': '6px' }}>

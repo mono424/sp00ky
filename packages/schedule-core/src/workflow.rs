@@ -155,6 +155,7 @@ impl ScheduleEngine {
                 "running",
                 None,
                 None,
+                None,
             )
             .await?;
         if !created {
@@ -502,27 +503,59 @@ impl ScheduleEngine {
         //    lets unrelated branches finish.
         if any_failed {
             let on_failure = self.on_failure(&run);
-            let to_skip: Vec<ids::Ref> = match on_failure {
-                OnFailure::Halt => steps
-                    .iter()
-                    .filter(|s| matches!(s.status, StepStatus::Blocked | StepStatus::Ready))
-                    .map(|s| s.id.clone())
-                    .collect(),
-                OnFailure::ContinueIndependent => {
-                    let doomed = dag.doomed_steps(&statuses);
-                    let doomed_names: Vec<&str> = doomed.iter().map(|s| s.name.as_str()).collect();
+            // Paired with the cause to record on each one. The two policies doom a
+            // step for different reasons and an operator reading the row later
+            // cannot tell them apart from the status alone: `halt` stops work that
+            // was perfectly healthy and merely unlucky in its timing, while
+            // `continue-independent` stops only what genuinely depended on the
+            // failure.
+            let failed: Vec<&str> =
+                steps.iter().filter(|s| s.status == StepStatus::Failed).map(|s| s.step.as_str()).collect();
+            let to_skip: Vec<(ids::Ref, Value)> = match on_failure {
+                OnFailure::Halt => {
+                    let reason = json!({
+                        "code": "run_halted",
+                        "reason": format!(
+                            "the run halted after {} failed, and this step had not started",
+                            list(&failed),
+                        ),
+                        "failed_steps": failed,
+                    });
                     steps
                         .iter()
-                        .filter(|s| doomed_names.contains(&s.step.as_str()))
-                        .map(|s| s.id.clone())
+                        .filter(|s| matches!(s.status, StepStatus::Blocked | StepStatus::Ready))
+                        .map(|s| (s.id.clone(), reason.clone()))
+                        .collect()
+                }
+                OnFailure::ContinueIndependent => {
+                    let doomed = dag.doomed_steps(&statuses);
+                    steps
+                        .iter()
+                        .filter_map(|s| {
+                            let (_, blocker) =
+                                doomed.iter().find(|(d, _)| d.name == s.step)?;
+                            Some((
+                                s.id.clone(),
+                                json!({
+                                    "code": "upstream_failed",
+                                    "reason": format!(
+                                        "depends on {blocker}, which did not succeed",
+                                    ),
+                                    "blocked_by": blocker,
+                                    "failed_steps": failed,
+                                }),
+                            ))
+                        })
                         .collect()
                 }
             };
-            for step_ref in &to_skip {
-                self.db.query(sql::SKIP_STEP, &bind_ref("", step_ref)).await?;
+            for (step_ref, reason) in &to_skip {
+                let mut binds = bind_ref("", step_ref).to_vec();
+                binds.push(("error", reason.clone()));
+                self.db.query(sql::SKIP_STEP, &binds).await?;
             }
             for step in steps.iter_mut() {
-                if to_skip.contains(&step.id) {
+                if to_skip.iter().any(|(id, _)| id == &step.id) {
                     step.status = StepStatus::Skipped;
                 }
             }
@@ -537,8 +570,9 @@ impl ScheduleEngine {
                 if step.status != StepStatus::Dispatched || step.job_id.is_some() {
                     continue;
                 }
-                let skipped =
-                    self.db.query(sql::SKIP_UNDISPATCHED_STEP, &bind_ref("", &step.id)).await?;
+                let mut binds = bind_ref("", &step.id).to_vec();
+                binds.push(("error", never_dispatched()));
+                let skipped = self.db.query(sql::SKIP_UNDISPATCHED_STEP, &binds).await?;
                 if first_row(skipped).is_some() {
                     step.status = StepStatus::Skipped;
                 }
@@ -786,10 +820,20 @@ impl ScheduleEngine {
         error: Value,
     ) -> anyhow::Result<()> {
         let steps = self.load_step_rows(wf_run).await?;
+        // The run's own reason says what happened to the RUN; a step that never
+        // started needs to say that about itself, or a `skipped` step on a reaped
+        // run reads as though it ran and was thrown away.
+        let not_started = json!({
+            "code": "not_started",
+            "reason": format!("the run was {status} before this step started"),
+            "run_error": error.clone(),
+        });
         for step in &steps {
             match step.status {
                 StepStatus::Blocked | StepStatus::Ready => {
-                    self.db.query(sql::SKIP_STEP, &bind_ref("", &step.id)).await?;
+                    let mut binds = bind_ref("", &step.id).to_vec();
+                    binds.push(("error", not_started.clone()));
+                    self.db.query(sql::SKIP_STEP, &binds).await?;
                 }
                 StepStatus::Dispatched => {
                     match step.job_id.as_deref() {
@@ -802,9 +846,9 @@ impl ScheduleEngine {
                         // nothing to kill and it is safe to skip. Without this it
                         // would survive the stop and hold the run non-terminal.
                         None => {
-                            self.db
-                                .query(sql::SKIP_UNDISPATCHED_STEP, &bind_ref("", &step.id))
-                                .await?;
+                            let mut binds = bind_ref("", &step.id).to_vec();
+                            binds.push(("error", never_dispatched()));
+                            self.db.query(sql::SKIP_UNDISPATCHED_STEP, &binds).await?;
                         }
                     }
                 }
@@ -1111,5 +1155,42 @@ impl ScheduleEngine {
             Err(e) if e.is_already_exists() => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// The cause recorded on a step that reached `dispatched` without ever getting a
+/// job row. It is the one skip that is not about the DAG at all — the step's own
+/// dispatch was lost — so saying "an ancestor failed" would point the reader at
+/// the wrong half of the system.
+fn never_dispatched() -> Value {
+    json!({
+        "code": "never_dispatched",
+        "reason": "the step was promoted but its job row was never created, \
+                   and the run stopped before recovery could re-dispatch it",
+    })
+}
+
+/// Step names as a reader would say them: `a`, `a and b`, `a, b and c`.
+///
+/// A recorded reason is read by a person, and `["a", "b"]` in the middle of a
+/// sentence is not a sentence.
+fn list(names: &[&str]) -> String {
+    match names {
+        [] => "a step".to_string(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::list;
+
+    #[test]
+    fn step_lists_read_as_prose() {
+        assert_eq!(list(&[]), "a step");
+        assert_eq!(list(&["extract"]), "extract");
+        assert_eq!(list(&["extract", "load"]), "extract and load");
+        assert_eq!(list(&["a", "b", "c"]), "a, b and c");
     }
 }

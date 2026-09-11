@@ -438,9 +438,12 @@ impl ScheduleEngine {
         match spec.concurrency {
             Concurrency::Allow => {}
             Concurrency::Skip => {
-                if self.active_run_count(&spec.name, key).await? > 0 {
-                    // Recorded rather than dropped: an operator needs to see that
-                    // ticks are being suppressed, not just that nothing ran.
+                if let Some(blocker) = self.blocking_run(&spec.name, key).await? {
+                    // Recorded rather than dropped, and recorded WITH ITS CAUSE: an
+                    // operator needs to see that ticks are being suppressed, and the
+                    // next question is always which run is holding the key. A run
+                    // wedged in `running` suppresses every later fire of its key
+                    // forever, so the id below is the whole diagnosis.
                     self.create_schedule_run(
                         schedule_id,
                         spec,
@@ -449,6 +452,7 @@ impl ScheduleEngine {
                         fire_at,
                         trigger,
                         "skipped",
+                        Some(skip_reason(&blocker)),
                         None,
                         None,
                     )
@@ -484,6 +488,7 @@ impl ScheduleEngine {
                         fire_at,
                         trigger,
                         "running",
+                        None,
                         Some(&job.as_string()),
                         None,
                     )
@@ -533,10 +538,13 @@ impl ScheduleEngine {
         Ok(())
     }
 
-    async fn active_run_count(&self, name: &str, key: &str) -> Result<i64, ScheduleDbError> {
-        let results =
-            self.db.query(sql::COUNT_ACTIVE_RUNS, &[("name", json!(name)), ("key", json!(key))]).await?;
-        Ok(count_value(results))
+    /// The run already in flight for this (schedule, key), if any. `None` = free.
+    async fn blocking_run(&self, name: &str, key: &str) -> Result<Option<Value>, ScheduleDbError> {
+        let results = self
+            .db
+            .query(sql::SELECT_BLOCKING_RUN, &[("name", json!(name)), ("key", json!(key))])
+            .await?;
+        Ok(first_row(results))
     }
 
     /// Kill whatever is in flight for this key and mark those runs `replaced`.
@@ -584,6 +592,9 @@ impl ScheduleEngine {
         fire_at: DateTime<Utc>,
         trigger: Trigger,
         status: &str,
+        // Why, for a run born terminal. Mirrors `finalize_schedule_run`: the status
+        // and the reason for it are one decision, so they travel together.
+        error: Option<Value>,
         job_id: Option<&str>,
         workflow_run: Option<&str>,
     ) -> anyhow::Result<bool> {
@@ -596,6 +607,9 @@ impl ScheduleEngine {
         }));
         content.insert("status".into(), json!(status));
         content.insert("trigger".into(), json!(trigger.as_str()));
+        if let Some(error) = error {
+            content.insert("error".into(), error);
+        }
         // Absent optionals are OMITTED, never nulled: `option<T>` rejects NULL.
         if let Some(job_id) = job_id {
             content.insert("job_id".into(), json!(job_id));
@@ -1426,6 +1440,39 @@ impl ScheduleEngine {
             tracing::warn!(schedule = %id, error = %e, "could not record schedule error");
         }
     }
+}
+
+/// The `error` a suppressed fire carries, built from the run that suppressed it.
+///
+/// Shaped like every other recorded cause in this crate — a machine-readable `code`
+/// plus a sentence — with the blocker's ids alongside so a dashboard can link
+/// straight to whatever is holding the key. `since` is the blocking run's
+/// `created_at`: a fire skipped behind something that started nine hours ago is a
+/// wedge, and one skipped behind something that started nine seconds ago is a
+/// schedule firing faster than its own work.
+fn skip_reason(blocker: &Value) -> Value {
+    let field = |name: &str| blocker.get(name).and_then(Value::as_str).map(str::to_string);
+    let mut reason = Map::new();
+    reason.insert("code".into(), json!("concurrency_skip"));
+    reason.insert(
+        "reason".into(),
+        json!(match field("created_at") {
+            Some(since) => format!("a run for this key has been in flight since {since}"),
+            None => "a run for this key is still in flight".to_string(),
+        }),
+    );
+    for (name, value) in [
+        ("blocked_by", field("id")),
+        ("blocked_by_workflow_run", field("workflow_run")),
+        ("blocked_by_job", field("job_id")),
+        ("since", field("created_at")),
+    ] {
+        // `type::string(NONE)` is the literal "NONE", which would read as a real id.
+        if let Some(value) = value.filter(|v| v != "NONE" && !v.is_empty()) {
+            reason.insert(name.into(), json!(value));
+        }
+    }
+    Value::Object(reason)
 }
 
 /// Bind a record id the only way that is safe: as a (table, key) pair. `prefix`

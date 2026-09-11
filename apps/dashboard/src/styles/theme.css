@@ -836,6 +836,120 @@ pre.json.bad {
 }
 
 /* ================================================================
+   RECORDED CAUSES
+   A `{ code, reason, ... }` object as the engine writes it. Deliberately NOT
+   `pre.json`: these are sentences with a couple of ids attached, and rendering
+   them as a payload made the reader parse JSON to find a sentence that was
+   already there.
+   ================================================================ */
+
+.reason {
+  border: 1px solid var(--rule);
+  border-left-width: 2px;
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.reason.bad {
+  border-color: rgba(224, 107, 102, 0.25);
+  border-left-color: var(--bad);
+  background: rgba(224, 107, 102, 0.05);
+}
+
+.reason.warn {
+  border-color: rgba(217, 164, 65, 0.25);
+  border-left-color: var(--warn);
+  background: rgba(217, 164, 65, 0.05);
+}
+
+.reason-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* The machine-readable half. Small, monospace, and never the thing the eye
+   lands on first — the sentence next to it is. */
+.reason-code {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  color: var(--ink-faint);
+}
+
+.reason-text {
+  color: var(--ink);
+  min-width: 0;
+}
+
+.reason-kv {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr;
+  gap: 2px 12px;
+  margin: 8px 0 0;
+  font-size: 11px;
+}
+
+.reason-kv > dt {
+  color: var(--ink-faint);
+  text-transform: lowercase;
+}
+
+.reason-kv > dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  overflow-wrap: anywhere;
+}
+
+/* One entry of a job's attempt history. The number is a gutter, not a column
+   header, so the reasons stay left-aligned with each other down the list. */
+.attempt {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.attempt > .reason {
+  flex: 1;
+  min-width: 0;
+}
+
+.attempt-n {
+  flex: none;
+  padding-top: 9px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-ghost);
+}
+
+/* The table-cell form: one line, clipped, full text on hover. */
+.reason-line {
+  display: block;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
+}
+
+.reason-line.bad {
+  color: var(--bad);
+}
+
+.reason-line.warn {
+  color: var(--warn);
+}
+
+/* ================================================================
    FORMS
    ================================================================ */
 

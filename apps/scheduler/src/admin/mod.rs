@@ -311,6 +311,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/schedules/:name/pause", post(workflows::schedule_pause))
         .route("/schedules/:name/resume", post(workflows::schedule_resume))
         .route("/schedules/:name/trigger", post(workflows::schedule_trigger))
+        .route("/jobs/:id", get(workflows::job_detail))
         .route("/jobs/:id/kill", post(workflows::job_kill))
         .route("/jobs/:id/retry", post(workflows::job_retry))
         // Agents. Tokens are minted by a person; the MCP endpoint takes any

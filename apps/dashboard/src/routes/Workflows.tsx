@@ -1,7 +1,7 @@
 import { For, Show, createSignal, onCleanup, onMount } from 'solid-js';
 import { A, useNavigate } from '@solidjs/router';
 import { openStream } from '../api/client';
-import { Empty, PageHead, Panel, Pill, StatusDot } from '../components/Chrome';
+import { Empty, PageHead, Panel, Pill, ReasonLine, StatusDot } from '../components/Chrome';
 import { elapsed, relativeStamp } from '../lib/format';
 import { runTone } from '../lib/status';
 import { cancelRun, rerunRun } from '../lib/runActions';
@@ -52,7 +52,10 @@ export function Workflows() {
       (r) =>
         r.workflow_name.toLowerCase().includes(q) ||
         r.status.toLowerCase().includes(q) ||
-        (r.schedule_name ?? '').toLowerCase().includes(q),
+        (r.schedule_name ?? '').toLowerCase().includes(q) ||
+        // The reason is on the row, so it has to be filterable: "timeout" is a
+        // far more useful thing to type here than a workflow name.
+        JSON.stringify(r.error ?? '').toLowerCase().includes(q),
     );
   };
 
@@ -151,6 +154,15 @@ export function Workflows() {
                         <div class="id" style={{ 'margin-top': '2px' }}>
                           {run.id}
                         </div>
+                        {/* The reason, on the row itself. A list of runs where
+                            four say `failed` and nothing else forces four clicks
+                            to find out whether it is four problems or one. */}
+                        <Show when={run.error}>
+                          <ReasonLine
+                            error={run.error}
+                            tone={run.status === 'killed' ? 'warn' : 'bad'}
+                          />
+                        </Show>
                       </td>
                       <td data-label="Status">
                         <Pill tone={runTone(run.status)}>

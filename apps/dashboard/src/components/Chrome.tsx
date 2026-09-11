@@ -158,6 +158,132 @@ export function KeyValue(props: { rows: [string, JSX.Element][] }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Recorded causes                                                       */
+/* ------------------------------------------------------------------ */
+
+/** Keys `Reason` renders itself; everything else falls through to the detail. */
+const REASON_KEYS = ['code', 'reason', 'message', 'error'];
+
+/**
+ * One recorded cause — a `{ code, reason, … }` object as the engine writes it.
+ *
+ * Rendered as a sentence rather than as JSON because that is how it was written:
+ * `schedule-core` puts a stable `code` and a human sentence on every failure,
+ * skip and kill it records, precisely so a reader does not have to interpret a
+ * payload. The remaining keys are the actionable part (which run holds a key,
+ * which step failed), so they are shown as pairs, with the raw object one click
+ * away for the shapes this does not anticipate.
+ *
+ * `tone` defaults to bad. A skip is not a failure, so callers pass 'warn'.
+ */
+export function Reason(props: {
+  error: unknown;
+  tone?: string;
+  /** Render ids as links (the dashboard knows how to route some of them). */
+  link?: (key: string, value: string) => JSX.Element | null;
+}) {
+  const obj = () =>
+    props.error && typeof props.error === 'object' && !Array.isArray(props.error)
+      ? (props.error as Record<string, unknown>)
+      : null;
+
+  // A bare string is a legitimate shape: `_00_schedule.last_error` is one.
+  const text = () => {
+    const o = obj();
+    if (!o) return typeof props.error === 'string' ? props.error : null;
+    for (const key of ['reason', 'message', 'error']) {
+      const v = o[key];
+      if (typeof v === 'string' && v) return v;
+    }
+    return null;
+  };
+
+  const code = () => {
+    const c = obj()?.code;
+    return typeof c === 'string' || typeof c === 'number' ? String(c) : null;
+  };
+
+  const extras = () =>
+    Object.entries(obj() ?? {}).filter(
+      ([k, v]) =>
+        !REASON_KEYS.includes(k) &&
+        v !== null &&
+        v !== undefined &&
+        // A value the sentence already quotes — a timestamp, a step name — is
+        // not worth a second line under it. The writer of the cause decides
+        // what belongs in prose; this only avoids echoing the decision.
+        !(typeof v !== 'object' && (text() ?? '').includes(String(v))),
+    );
+
+  /**
+   * One extra value. A list of step names is the common case and reads as prose,
+   * not as a payload, so only genuinely nested values fall back to JSON.
+   */
+  const show = (key: string, value: unknown): JSX.Element => {
+    if (typeof value === 'string') return props.link?.(key, value) ?? value;
+    if (Array.isArray(value) && value.every((v) => typeof v !== 'object')) {
+      return value.join(', ');
+    }
+    return typeof value === 'object' ? JSON.stringify(value) : String(value);
+  };
+
+  return (
+    <Show when={props.error} fallback={null}>
+      <div class="reason" classList={{ [props.tone ?? 'bad']: true }}>
+        <div class="reason-head">
+          <Show when={code()}>
+            <span class="reason-code">{code()}</span>
+          </Show>
+          <span class="reason-text">{text() ?? 'No reason recorded.'}</span>
+        </div>
+        <Show when={extras().length > 0}>
+          <dl class="reason-kv">
+            <For each={extras()}>
+              {([key, value]) => (
+                <>
+                  <dt>{key.replace(/_/g, ' ')}</dt>
+                  <dd>{show(key, value)}</dd>
+                </>
+              )}
+            </For>
+          </dl>
+        </Show>
+      </div>
+    </Show>
+  );
+}
+
+/**
+ * The one-line form, for a table cell. Same source, same precedence — a row in a
+ * list should not disagree with the page it links to.
+ */
+export function ReasonLine(props: { error: unknown; tone?: string }) {
+  const o = () =>
+    props.error && typeof props.error === 'object'
+      ? (props.error as Record<string, unknown>)
+      : null;
+  const text = () => {
+    const obj = o();
+    if (!obj) return typeof props.error === 'string' ? props.error : null;
+    for (const key of ['reason', 'message', 'error']) {
+      const v = obj[key];
+      if (typeof v === 'string' && v) return v;
+    }
+    const code = obj.code;
+    return typeof code === 'string' ? code : null;
+  };
+  return (
+    <Show when={text()}>
+      {(line) => (
+        <span class="reason-line" classList={{ [props.tone ?? 'bad']: true }} title={line()}>
+          {line()}
+        </span>
+      )}
+    </Show>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Brand                                                                 */
 /* ------------------------------------------------------------------ */
 

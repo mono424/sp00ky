@@ -77,7 +77,7 @@ pub fn first_row(results: Vec<serde_json::Value>) -> Option<serde_json::Value> {
 /// some query plans it yields a bare int, on others a `{ "count": n }` group
 /// object — and merely defining an index that covers the predicate is enough to
 /// flip it. Reading only the int shape is therefore a latent bug: adding
-/// `idx_srun_retention` silently turned `COUNT_ACTIVE_RUNS` into `0`, which
+/// `idx_srun_retention` silently turned the active-run lookup into `0` rows, which
 /// disables `concurrency: skip` and `replace` without any error anywhere.
 ///
 /// So every count goes through here, and accepts either shape.

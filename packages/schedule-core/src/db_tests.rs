@@ -598,6 +598,34 @@ async fn skip_suppresses_only_the_key_that_is_still_running() {
         1,
         "the suppressed tick is recorded so an operator can see it"
     );
+
+    // And recorded with its cause. A `skipped` row on its own cannot be told apart
+    // from a healthy suppression and a run wedged in `running` for hours, which is
+    // the whole reason someone opens this table.
+    let code = h
+        .one_string(
+            "SELECT VALUE error.code FROM ONLY _00_schedule_run \
+             WHERE status = 'skipped' LIMIT 1",
+        )
+        .await;
+    assert_eq!(code.as_deref(), Some("concurrency_skip"));
+    let blocked_by = h
+        .one_string(
+            "SELECT VALUE error.blocked_by FROM ONLY _00_schedule_run \
+             WHERE status = 'skipped' LIMIT 1",
+        )
+        .await;
+    let bobs_run = h
+        .one_string(
+            "SELECT VALUE type::string(id) FROM ONLY _00_schedule_run \
+             WHERE key = 'connection:bob' AND status = 'running' LIMIT 1",
+        )
+        .await;
+    assert!(bobs_run.is_some(), "bob's run is what holds the key");
+    assert_eq!(
+        blocked_by, bobs_run,
+        "blocked_by names the run actually holding bob's key, not just any run"
+    );
 }
 
 #[tokio::test]
@@ -1071,6 +1099,18 @@ async fn continue_independent_only_skips_the_affected_branch() {
     h.engine.tick_pass().await.unwrap();
 
     assert_eq!(h.step_status("transform").await.as_deref(), Some("skipped"), "doomed branch");
+    // A skipped step is the most common row on a failed run and the least
+    // self-explanatory: `skipped` alone cannot say whether this step was doomed by
+    // its own branch or stopped because an unrelated one broke.
+    let run = workflow_run_id(&h).await;
+    let reason = h.step_error(&run, "transform").await.expect("a skipped step says why");
+    assert_eq!(reason["code"], json!("upstream_failed"));
+    assert_eq!(
+        reason["blocked_by"],
+        json!("extract-orders"),
+        "the step names the dependency that doomed it, which is one hop away"
+    );
+    assert_eq!(reason["reason"], json!("depends on extract-orders, which did not succeed"));
     assert_eq!(
         h.step_status("after-independent").await.as_deref(),
         Some("dispatched"),
@@ -1122,6 +1162,13 @@ async fn killing_a_run_skips_what_hasnt_started_and_kills_what_has() {
 
     assert_eq!(h.workflow_status().await.as_deref(), Some("killed"));
     assert_eq!(h.step_status("transform").await.as_deref(), Some("skipped"));
+    // `skipped` here means "never started", not "ran and was discarded", and the two
+    // are indistinguishable from the status. A kill must not leave a step looking as
+    // though its own branch was at fault.
+    let reason = h.step_error(&run_id, "transform").await.expect("a skipped step says why");
+    assert_eq!(reason["code"], json!("not_started"));
+    assert_eq!(reason["reason"], json!("the run was killed before this step started"));
+    assert_eq!(reason["run_error"]["code"], json!("killed"));
     let killed = h.kill.killed.lock().unwrap().clone();
     for job in root_jobs {
         assert!(killed.contains(&job), "in-flight step job {job} should have been killed");
@@ -2360,7 +2407,7 @@ async fn a_successful_workflow_under_failures_only_leaves_nothing_behind() {
 /// If the workflow run were deleted first, the schedule run would never be finalized and
 /// would stay `running` forever: the workflow heal only selects `running` WORKFLOW runs,
 /// and the job heal filters `kind = 'job'`, so nothing would ever reach it. It would then
-/// be counted by `COUNT_ACTIVE_RUNS` forever and permanently wedge `concurrency: skip`.
+/// be seen by `SELECT_BLOCKING_RUN` forever and permanently wedge `concurrency: skip`.
 /// Asserting the active count is 0 is what catches that.
 #[tokio::test]
 async fn discarding_a_workflow_never_strands_its_schedule_run_as_running() {

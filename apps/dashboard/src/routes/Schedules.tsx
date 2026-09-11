@@ -1,5 +1,5 @@
 import { For, Show, createResource, onCleanup } from 'solid-js';
-import { useNavigate, useParams } from '@solidjs/router';
+import { A, useNavigate, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import {
   Cell,
@@ -9,6 +9,8 @@ import {
   Panel,
   Pill,
   Rail,
+  Reason,
+  ReasonLine,
   StatusDot,
 } from '../components/Chrome';
 import {
@@ -224,6 +226,27 @@ export function ScheduleDetail() {
 
   const s = () => data()?.schedule;
 
+  /**
+   * Fires this schedule is currently suppressing, and what is holding them.
+   *
+   * A wall of `skipped` rows is the single most misread state in the scheduler:
+   * it looks like "nothing to do" and it means "something is still running".
+   * With the default `concurrency: skip` one run wedged in `running` suppresses
+   * every later fire of its key for as long as it stays there, so the blocking
+   * run — not the skipped rows — is what needs acting on.
+   */
+  const suppressed = () => {
+    const skips = (data()?.runs ?? []).filter(
+      (r) => r.status === 'skipped' && r.error?.code === 'concurrency_skip',
+    );
+    if (!skips.length) return null;
+    const keys = new Set(skips.map((r) => r.key || '—'));
+    return { skips, latest: skips[0], keys: keys.size };
+  };
+
+  const blockingRun = (r: ScheduleRun): string | null =>
+    orNull((r.error?.blocked_by_workflow_run as string | undefined) ?? null);
+
   return (
     <>
       <PageHead
@@ -291,9 +314,40 @@ export function ScheduleDetail() {
                   />
                 </Rail>
 
+                <Show when={suppressed()}>
+                  {(sup) => (
+                    <Panel
+                      title="Fires are being suppressed"
+                      sub={`${sup().skips.length} of the last ${data()!.runs.length} fires were skipped across ${sup().keys} key${sup().keys === 1 ? '' : 's'}, because a run for that key was still going`}
+                    >
+                      <Reason
+                        error={sup().latest.error}
+                        tone="warn"
+                        link={(key, value) =>
+                          key === 'blocked_by_workflow_run' ? (
+                            <A
+                              href={`/workflows/${encodeURIComponent(value)}`}
+                              style={{ 'text-decoration': 'underline' }}
+                            >
+                              {value}
+                            </A>
+                          ) : null
+                        }
+                      />
+                    </Panel>
+                  )}
+                </Show>
+
+                {/* `_00_schedule.last_error` is a bare string, not an object:
+                    it is why the schedule could not be PLANNED or fanned out at
+                    all (a bad cron, a failing forEach), which happens before any
+                    run exists to carry a structured cause. */}
                 <Show when={d().schedule.last_error}>
-                  <Panel title="Last error">
-                    <pre class="json bad">{d().schedule.last_error}</pre>
+                  <Panel
+                    title="Last error"
+                    sub="From planning or fan-out — this schedule could not fire, so no run row carries it"
+                  >
+                    <Reason error={d().schedule.last_error} />
                   </Panel>
                 </Show>
 
@@ -352,7 +406,7 @@ export function ScheduleDetail() {
                             <th>Fired</th>
                             <th>Status</th>
                             <th>Duration</th>
-                            <th>Trigger</th>
+                            <th>Why</th>
                             <th>Key</th>
                             <th>Run</th>
                           </tr>
@@ -386,12 +440,52 @@ export function ScheduleDetail() {
                                 <td class="dim" data-label="Duration">
                                   {elapsed(r.created_at, r.finished_at)}
                                 </td>
-                                <td class="ghost" data-label="Trigger">{orNull(r.trigger) ?? 'schedule'}</td>
+                                {/* The column that used to hold `trigger`. A fire
+                                    is a cron fire 99% of the time, so the trigger
+                                    said nothing; `skipped` and `failed` rows, which
+                                    is what anyone scrolling this table is looking
+                                    for, said nothing either. The trigger is still on
+                                    the row, as a tag when it is the unusual one. */}
+                                <td data-label="Why" data-empty={!r.error && r.trigger !== 'manual'}>
+                                  <Show
+                                    when={r.error}
+                                    fallback={
+                                      <Show when={orNull(r.trigger) === 'manual'}>
+                                        <span class="mini">triggered by hand</span>
+                                      </Show>
+                                    }
+                                  >
+                                    <ReasonLine
+                                      error={r.error}
+                                      tone={r.status === 'skipped' ? 'warn' : 'bad'}
+                                    />
+                                  </Show>
+                                </td>
                                 <td class="ghost truncate" data-label="Key" data-empty={!r.key}>
                                   {r.key || '—'}
                                 </td>
-                                <td class="ghost" data-label="Run" data-empty={!runRef()}>
-                                  {runRef() ? 'open →' : '—'}
+                                <td
+                                  class="ghost"
+                                  data-label="Run"
+                                  data-empty={!runRef() && !blockingRun(r)}
+                                >
+                                  <Show
+                                    when={runRef()}
+                                    fallback={
+                                      <Show when={blockingRun(r)} fallback={'—'}>
+                                        {(blocking) => (
+                                          <A
+                                            href={`/workflows/${encodeURIComponent(blocking())}`}
+                                            onClick={(e) => e.stopPropagation()}
+                                          >
+                                            blocking run →
+                                          </A>
+                                        )}
+                                      </Show>
+                                    }
+                                  >
+                                    open →
+                                  </Show>
                                 </td>
                               </tr>
                               );

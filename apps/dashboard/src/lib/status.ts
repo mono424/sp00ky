@@ -65,6 +65,27 @@ export function runTone(status: string | undefined): Tone {
 }
 
 /**
+ * Outbox job statuses, asserted by the generated table DDL:
+ * `pending | processing | success | failed` (`apps/cli/src/add_api.rs`).
+ *
+ * `pending` is idle rather than warn on purpose: a job waits in the outbox both
+ * because nothing has picked it up yet AND between its own retries, and neither
+ * is a fault to announce in a colour reserved for one.
+ */
+export function jobTone(status: string | undefined): Tone {
+  switch (status) {
+    case 'success':
+      return 'ok';
+    case 'processing':
+      return 'warn';
+    case 'failed':
+      return 'bad';
+    default:
+      return 'idle';
+  }
+}
+
+/**
  * Step statuses are a closed set, asserted by the schema:
  * `blocked | ready | dispatched | success | failed | skipped`
  * (`apps/cli/src/schedule_tables.surql`). Note there is no `running` — a step

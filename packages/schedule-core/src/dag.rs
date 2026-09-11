@@ -9,7 +9,7 @@
 //! dependency has succeeded, and it is only ever dispatched by whichever
 //! advancement pass wins the `blocked → ready` compare-and-swap.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::spec::{StepDef, WorkflowDef};
 
@@ -168,14 +168,19 @@ impl WorkflowDag {
         })
     }
 
-    /// Steps that can never run because an ancestor failed or was skipped.
+    /// Steps that can never run because an ancestor failed or was skipped, each
+    /// paired with the dependency that dooms it.
+    ///
     /// Used by `on_failure: continue-independent` to skip exactly the affected
-    /// branch instead of the whole remainder of the DAG.
+    /// branch instead of the whole remainder of the DAG. The blocking dependency
+    /// comes back because the pass below is the only place that knows it: by the
+    /// time a skip is written, every doomed step looks alike, and the step that
+    /// actually broke may be several hops up the graph.
     pub fn doomed_steps<'a>(
         &'a self,
         statuses: &'a BTreeMap<String, StepStatus>,
-    ) -> Vec<&'a StepDef> {
-        let mut doomed: BTreeSet<String> = BTreeSet::new();
+    ) -> Vec<(&'a StepDef, &'a str)> {
+        let mut doomed: BTreeMap<&str, &str> = BTreeMap::new();
         // `order` is topological, so a single forward pass propagates doom.
         for name in &self.order {
             let step = &self.steps[name];
@@ -183,18 +188,21 @@ impl WorkflowDag {
             if !matches!(status, Some(StepStatus::Blocked) | Some(StepStatus::Ready)) {
                 continue;
             }
-            let blocked_forever = step.depends_on.iter().any(|dep| {
-                doomed.contains(dep)
+            let blocker = step.depends_on.iter().find(|dep| {
+                doomed.contains_key(dep.as_str())
                     || matches!(
-                        statuses.get(dep).copied(),
+                        statuses.get(*dep).copied(),
                         Some(StepStatus::Failed) | Some(StepStatus::Skipped)
                     )
             });
-            if blocked_forever {
-                doomed.insert(name.clone());
+            if let Some(blocker) = blocker {
+                doomed.insert(step.name.as_str(), blocker.as_str());
             }
         }
-        doomed.iter().filter_map(|name| self.steps.get(name)).collect()
+        doomed
+            .into_iter()
+            .filter_map(|(name, blocker)| self.steps.get(name).map(|step| (step, blocker)))
+            .collect()
     }
 }
 
@@ -341,9 +349,22 @@ mod tests {
         statuses.insert("extract-orders".into(), StepStatus::Failed);
         statuses.insert("extract-users".into(), StepStatus::Dispatched);
 
-        let doomed: Vec<_> = dag.doomed_steps(&statuses).iter().map(|s| s.name.clone()).collect();
+        let doomed: Vec<_> = dag
+            .doomed_steps(&statuses)
+            .iter()
+            .map(|(s, blocker)| (s.name.clone(), blocker.to_string()))
+            .collect();
         // transform depends on the failed step; notify/archive depend on transform.
-        assert_eq!(doomed, vec!["archive", "notify", "transform"]);
+        // Each step names the dependency that dooms IT, not the original failure,
+        // so a reader can walk the chain one hop at a time.
+        assert_eq!(
+            doomed,
+            vec![
+                ("archive".to_string(), "transform".to_string()),
+                ("notify".to_string(), "transform".to_string()),
+                ("transform".to_string(), "extract-orders".to_string()),
+            ]
+        );
     }
 
     #[test]

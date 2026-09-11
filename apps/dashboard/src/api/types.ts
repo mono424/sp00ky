@@ -534,13 +534,25 @@ export type RunStatus =
   | 'replaced'
   | 'killed';
 
+/**
+ * A recorded cause, as every table in `schedule-core` writes one: a stable `code`
+ * for the machine, a sentence for the reader, and whatever ids make the sentence
+ * actionable. Extra keys are normal — the renderer shows them rather than
+ * requiring each one to be declared here.
+ */
+export interface RunError {
+  code?: string;
+  reason?: string;
+  [key: string]: unknown;
+}
+
 export interface WorkflowRun {
   id: string;
   workflow_name: string;
   schedule_name: string | null;
   status: RunStatus;
   kill_requested: boolean;
-  error: unknown;
+  error: RunError | null;
   created_at: string;
   updated_at: string | null;
   finished_at: string | null;
@@ -558,13 +570,40 @@ export interface WorkflowRunDetail extends WorkflowRun {
   target_table: string | null;
 }
 
+/**
+ * One outbox job, from `GET /admin/api/jobs/:id`.
+ *
+ * `errors` is the whole attempt history, which is the part a step row cannot
+ * carry: `_00_step_run.error` holds only the attempt that ended the job.
+ */
+export interface JobDetail {
+  id: string;
+  status: string;
+  path: string;
+  payload: unknown;
+  result: unknown;
+  errors: RunError[] | null;
+  retries: number | null;
+  max_retries: number | null;
+  retry_strategy: string | null;
+  /** SSP instance holding the row, when one has claimed it. */
+  assignee: string | null;
+  /** Per-attempt HTTP ceiling in seconds, when the schedule sets one. */
+  timeout: number | null;
+  /** One-shot delay in ms: the job is due at `created_at + delay`. */
+  delay: number | null;
+  lease_until: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 export interface StepRun {
   step: string;
   depends_on: string[];
   status: string;
   job_id: string | null;
   output: unknown;
-  error: unknown;
+  error: RunError | null;
   /** When the step ROW was made — the run's own start for every step in a DAG. */
   created_at: string | null;
   /**
@@ -616,7 +655,7 @@ export interface ScheduleRun {
   job_id: string | null;
   /** Record id of the workflow run this fire produced, when it produced one. */
   workflow_run: string | null;
-  error: unknown;
+  error: RunError | null;
   fire_at: string | null;
   created_at: string | null;
   finished_at: string | null;

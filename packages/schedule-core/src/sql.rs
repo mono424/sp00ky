@@ -86,17 +86,23 @@ WHERE trigger_requested_at = <datetime>$observed RETURN AFTER";
 // Fan-out concurrency
 // ---------------------------------------------------------------------------
 
-/// How many runs for this (schedule, fan-out key) are still in flight. Backed
-/// by the `(schedule_name, key, status)` index, so this stays cheap at fan-out
-/// widths in the thousands.
-pub const COUNT_ACTIVE_RUNS: &str = "\
-SELECT VALUE count() FROM _00_schedule_run \
-WHERE schedule_name = $name AND key = $key AND status = 'running' GROUP ALL";
-
 /// In-flight runs for a (schedule, key), for `concurrency: replace` to kill.
 pub const SELECT_ACTIVE_RUNS: &str = "\
 SELECT id, job_id, workflow_run FROM _00_schedule_run \
 WHERE schedule_name = $name AND key = $key AND status = 'running'";
+
+/// The in-flight run that `concurrency: skip` is about to suppress a fire for.
+///
+/// This IS the skip decision — a row means "blocked", no row means "fire". It used to
+/// be a `count()` over the same index and the same predicate, which cost the same and
+/// answered strictly less: an operator looking at a `skipped` row wants to know WHICH
+/// run is holding the key and since when, and a count cannot say. No ORDER BY: with
+/// `skip` in force there is at most one `running` run per key by construction, and
+/// SurrealDB 3 rejects ordering by a field the projection has cast away.
+pub const SELECT_BLOCKING_RUN: &str = "\
+SELECT type::string(id) AS id, job_id, type::string(workflow_run) AS workflow_run, \
+type::string(created_at) AS created_at FROM _00_schedule_run \
+WHERE schedule_name = $name AND key = $key AND status = 'running' LIMIT 1";
 
 // ---------------------------------------------------------------------------
 // Spawning
@@ -206,8 +212,8 @@ WHERE status INSIDE ['ready', 'dispatched'] RETURN AFTER";
 /// only `blocked`/`ready`, and a step stranded at `dispatched` with no job is
 /// otherwise unskippable — and therefore immortal.
 pub const SKIP_UNDISPATCHED_STEP: &str = "\
-UPDATE type::record($tb, $key) SET status = 'skipped', finished_at = time::now() \
-WHERE status = 'dispatched' AND job_id = NONE";
+UPDATE type::record($tb, $key) SET status = 'skipped', error = $error, \
+finished_at = time::now() WHERE status = 'dispatched' AND job_id = NONE";
 
 /// Fail a step whose dispatch could not be recovered inside its attempt budget.
 /// Same `job_id = NONE` guard and the same reason: this can only ever match a step
@@ -251,9 +257,14 @@ UPDATE type::record($tb, $key) SET status = 'failed', error = $error, finished_a
 WHERE status = 'ready'";
 
 /// Skip a step that can never run (an ancestor failed, or the run was killed).
+///
+/// `$error` is not decoration: a skipped step is the most common thing on a failed
+/// run and the least self-explanatory, because the step that actually broke may be
+/// several hops up the DAG. Without a recorded cause the only way to answer "why
+/// didn't this run" is to re-derive the graph by eye from the other rows.
 pub const SKIP_STEP: &str = "\
-UPDATE type::record($tb, $key) SET status = 'skipped', finished_at = time::now() \
-WHERE status INSIDE ['blocked', 'ready']";
+UPDATE type::record($tb, $key) SET status = 'skipped', error = $error, \
+finished_at = time::now() WHERE status INSIDE ['blocked', 'ready']";
 
 /// `RETURN AFTER` so the caller gets `schedule_name`, `history_mode` and `created_at`
 /// back without re-reading the row.
@@ -263,7 +274,7 @@ WHERE status INSIDE ['blocked', 'ready']";
 /// gone by then the schedule run is never finalized at all. It would stay `running`
 /// forever — the workflow heal only selects `running` WORKFLOW runs, and
 /// `SELECT_RUNNING_JOB_RUNS` filters `kind = 'job'`, so nothing reaches it — which
-/// makes `COUNT_ACTIVE_RUNS` count it forever and permanently wedges
+/// makes `SELECT_BLOCKING_RUN` see it forever and permanently wedges
 /// `concurrency: skip` for that key. Prune can't collect it either, since `running`
 /// is deliberately absent from `SCHEDULE_RUN_PRUNABLE`.
 ///
@@ -747,8 +758,8 @@ mod tests {
 
     /// `running` is the only non-terminal schedule-run status, and it is the one the
     /// concurrency count and the heal pass select on. If the DDL ever renamed it,
-    /// `COUNT_ACTIVE_RUNS` would quietly count zero and `concurrency: skip` would
-    /// stop suppressing.
+    /// `SELECT_BLOCKING_RUN` would quietly match nothing and `concurrency: skip`
+    /// would stop suppressing.
     #[test]
     fn the_non_terminal_status_the_ddl_defines_is_the_one_the_engine_selects_on() {
         for table in ["_00_schedule_run", "_00_workflow_run"] {
@@ -757,8 +768,8 @@ mod tests {
                 "{table} must allow 'running'"
             );
         }
-        assert!(COUNT_ACTIVE_RUNS.contains("status = 'running'"));
         assert!(SELECT_ACTIVE_RUNS.contains("status = 'running'"));
+        assert!(SELECT_BLOCKING_RUN.contains("status = 'running'"));
         assert!(SELECT_RUNNING_JOB_RUNS.contains("status = 'running'"));
         assert!(SELECT_RUNNING_WORKFLOW_RUNS.contains("status = 'running'"));
     }
@@ -790,7 +801,7 @@ mod tests {
     #[test]
     fn the_indexes_the_statements_depend_on_are_defined() {
         for index in [
-            "idx_srun_active",     // COUNT_ACTIVE_RUNS / SELECT_ACTIVE_RUNS
+            "idx_srun_active",     // SELECT_BLOCKING_RUN / SELECT_ACTIVE_RUNS
             "idx_srun_job",        // FIND_RUN_BY_JOB
             "idx_srun_retention",  // PRUNE_SCHEDULE_RUNS status + ordering
             "idx_srun_fire",       // `spky schedules` fire_at sorts
@@ -911,7 +922,7 @@ mod tests {
     fn record_ids_are_bound_as_table_and_key_pairs() {
         for sql in [
             SELECT_UNPLANNED, PLAN_NEXT_FIRE, RECORD_ERROR, SELECT_DUE, SELECT_TRIGGERED,
-            CLAIM_FIRE, CLAIM_TRIGGER, COUNT_ACTIVE_RUNS, SELECT_ACTIVE_RUNS,
+            CLAIM_FIRE, CLAIM_TRIGGER, SELECT_ACTIVE_RUNS, SELECT_BLOCKING_RUN,
             CREATE_SCHEDULE_RUN, CREATE_TERMINAL_SCHEDULE_RUN, LINK_WORKFLOW_RUN, CREATE_JOB,
             SELECT_JOB,
             FINALIZE_SCHEDULE_RUN, CREATE_WORKFLOW_RUN, CREATE_STEP_RUN, SELECT_WORKFLOW_RUN,

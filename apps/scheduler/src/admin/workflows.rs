@@ -604,6 +604,91 @@ pub async fn schedule_trigger(
     Ok(Json(json!({ "name": name, "triggered_at": at })))
 }
 
+/// One outbox row, by table and key.
+///
+/// `result` is the backend's response body, capped at 64 KiB by the runner: fine for
+/// one job, which is why `spky jobs get` shows it and the listing does not. `errors`
+/// is the reason this endpoint exists at all.
+///
+/// The table is interpolated because a table name cannot be a SurrealQL parameter.
+/// The caller checks it against `_00_retention.job_tables` first — the escaping here
+/// is the second line, not the first.
+fn job_surql(table: &str, key: &str) -> String {
+    format!(
+        "SELECT type::string(id) AS id, status, path, payload, result, errors, \
+         retries, max_retries, retry_strategy, assignee, timeout, delay, \
+         type::string(lease_until) AS lease_until, \
+         type::string(created_at) AS created_at, \
+         type::string(updated_at) AS updated_at \
+         FROM type::record('{}', '{}');",
+        esc(table),
+        esc(key)
+    )
+}
+
+/// `GET /admin/api/jobs/:id`
+///
+/// The outbox row behind a step or a schedule fire. Everything else on this plane
+/// reads the `_00_*` tables, which the engine owns; this one reaches into an
+/// application's own table, so the table name is checked against
+/// `_00_retention.job_tables` — the list deploy writes — before it is interpolated.
+/// Without that check a path segment would choose the table, and every table in the
+/// database is readable by the root handle this plane holds.
+///
+/// Worth its own endpoint because it is where a failure actually says what went
+/// wrong: `_00_step_run.error` carries the LAST attempt, while `errors` here carries
+/// every one of them, which is the difference between "the backend 500s" and "the
+/// backend 500s on retry 3 only, after two timeouts".
+pub async fn job_detail(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db().ok_or_else(db_unavailable)?;
+
+    let Some(job) = ids::Ref::parse(&id) else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("'{id}' is not a record id"),
+        ));
+    };
+
+    // A row, not `SELECT VALUE ... FROM ONLY`: `rows` takes the statement's result
+    // as a list of rows, and the VALUE form hands back the array itself, whose
+    // elements then read as the rows.
+    let allowed = rows(&db, "SELECT job_tables FROM _00_retention LIMIT 1;")
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|row| row.get("job_tables").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+    if !allowed.contains(&job.table.as_str()) {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "'{}' is not an outbox table on this project. Deploy writes the list to \
+                 `_00_retention.job_tables`; a job whose table is missing from it was \
+                 created against a table this deployment no longer knows about.",
+                job.table
+            ),
+        ));
+    }
+
+    let row = rows(&db, &job_surql(&job.table, &job.key)).await?.into_iter().next();
+
+    let Some(row) = row.filter(Value::is_object) else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "No job '{id}'. Terminal jobs are pruned on the project's retention \
+                 window, so a run older than that keeps its step rows and loses its jobs."
+            ),
+        ));
+    };
+
+    Ok(Json(json!({ "job": row })))
+}
+
 /// `POST /admin/api/jobs/:id/kill`
 pub async fn job_kill(
     State(state): State<AdminState>,
@@ -678,6 +763,27 @@ mod tests {
     fn rerun_of_filter_compares_the_string_form() {
         let sql = runs_surql(&RunsQuery { rerun_of: Some("_00_workflow_run:x".into()), ..Default::default() });
         assert!(sql.contains("type::string(rerun_of) = '_00_workflow_run:x'"), "{sql}");
+    }
+
+    #[test]
+    fn the_job_query_carries_the_attempt_history() {
+        let sql = job_surql("job", "sch_game_sync_1788364742716_582ceccbb9aa");
+        // The whole point of the endpoint: a step row keeps only the attempt that
+        // ended the job, so without `errors` this says nothing a step cannot.
+        assert!(sql.contains("errors"), "{sql}");
+        assert!(sql.contains("retries, max_retries"), "{sql}");
+        assert!(
+            sql.contains("type::record('job', 'sch_game_sync_1788364742716_582ceccbb9aa')"),
+            "{sql}"
+        );
+        // Never the single-argument form, which truncates a hyphenated key.
+        assert!(!sql.contains("type::record('job:"), "{sql}");
+    }
+
+    #[test]
+    fn the_job_query_escapes_its_interpolated_names() {
+        let sql = job_surql("job", "o'brien");
+        assert!(sql.contains("'o\\'brien'"), "{sql}");
     }
 
     #[test]

@@ -139,16 +139,29 @@ leave it.
 
 **Workflows** — runs updating in real time, and a run page built around a
 timeline: every step plotted on one shared axis, so where the time went is
-visible at a glance rather than reconstructed from timestamps. Click a step to
-expand its job id, output and error inline. A step still waiting on its
-dependencies is drawn hatched at the origin rather than as a bar, because it
-has not run. The scheduler runs a single shared poller behind the live list, so
-ten open dashboards cost your database exactly what one does, and a closed one
-costs nothing.
+visible at a glance rather than reconstructed from timestamps. Each row in the
+list carries the run's own failure reason, so four `failed` runs do not cost
+four clicks to tell one problem from four. Click a step to expand its job,
+output and error inline. A step still waiting on its dependencies is drawn
+hatched at the origin rather than as a bar, because it has not run. The
+scheduler runs a single shared poller behind the live list, so ten open
+dashboards cost your database exactly what one does, and a closed one costs
+nothing.
+
+An expanded step also loads its **job**, which is where a failure says what
+actually happened: the step row keeps only the attempt that ended the job, while
+the job's `errors` array keeps every attempt. A step that failed after two
+timeouts and a 502 is a different problem from one that 502'd immediately, and
+only the job can tell them apart. The job is fetched per opened step rather than
+with the run, so a fan-out run with hundreds of steps costs nothing extra.
 
 **Schedules** — the definition, the next fire, recent fires, and a
 success/failure tally. The tally comes from `_00_run_rollup` rather than
-counting run rows, so it stays accurate after retention has pruned them.
+counting run rows, so it stays accurate after retention has pruned them. Each
+fire shows **why** it ended as it did, and a schedule whose fires are being
+suppressed says so at the top of the page, naming the run that is holding the
+key — a wall of `skipped` rows looks like "nothing to do" and means "something
+is still running".
 
 **Logs** — a live tail of the scheduler's or any SSP's log output, with level
 and text filters. If a viewer falls behind, the gap is shown explicitly rather
@@ -450,6 +463,7 @@ and port with no path lands on the dashboard.
 | `GET /admin/api/workflows/runs` | Run list. `?name=`, `?schedule=`, `?status=`, `?rerun_of=`, `?limit=` |
 | `GET /admin/api/workflows/runs/:id` | One run with its steps and DAG |
 | `GET /admin/api/workflows/stream` | SSE. Run list, pushed on change |
+| `GET /admin/api/jobs/:id` | One outbox job: status, path, payload, result, every attempt in `errors`, retry budget, assignee and lease. `404` unless the id's table is in `_00_retention.job_tables` |
 | `GET /admin/api/schedules` | Schedule definitions with next/last fire |
 | `GET /admin/api/schedules/:name` | One schedule, its recent fires, and its `_00_run_rollup` tally |
 | `GET /admin/api/operations` | Recent operations, newest first |
@@ -490,6 +504,34 @@ database directly because `_00_workflow_run`, `_00_step_run` and
 `_00_schedule_run` are `PERMISSIONS NONE` — no record-auth token can read them.
 The scheduler holds root and is the cluster's only schedule ticker, which makes
 it the right place to serve them.
+
+### Why a row ended the way it did
+
+Every skip, kill and failure the engine records carries a structured cause on the
+row's `error` field — a stable `code`, a sentence, and whatever ids make the
+sentence actionable — and the dashboard renders that rather than a JSON payload.
+The ones worth knowing by name:
+
+| `code` | On | Means |
+| --- | --- | --- |
+| `concurrency_skip` | `_00_schedule_run` | The fire was suppressed by `concurrency: skip`. `blocked_by` is the run holding the key and `since` is when it started. A run wedged in `running` suppresses that key's fires for as long as it stays there, so the blocking run is what needs acting on — not the skipped rows |
+| `upstream_failed` | `_00_step_run` | The step is below a failure under `on_failure: continue-independent`. `blocked_by` names the dependency one hop up, so the chain can be walked a step at a time |
+| `run_halted` | `_00_step_run` | The step had not started when the run halted under `on_failure: halt`. `failed_steps` names what actually broke, which is elsewhere in the DAG |
+| `not_started` | `_00_step_run` | The run was killed or reaped before this step started. `run_error` carries the run's own reason |
+| `never_dispatched` | `_00_step_run` | The step was promoted but its job row was never created, and the run stopped before recovery re-dispatched it |
+| `lost_dispatch` | `_00_step_run` | The step exhausted its dispatch attempts without ever getting a job |
+| `job_failed` | `_00_step_run`, `_00_schedule_run` | The step's job failed. Normally the job's last `errors` entry verbatim; synthesized, and saying so, when the job recorded none |
+| `job_missing` | `_00_step_run`, `_00_schedule_run` | The job row is gone — deleted, or pruned by retention while the step still pointed at it |
+| `step_failed` | `_00_workflow_run` | A step failed and the run failed with it. The step's own row carries the real reason |
+| `deadline_exceeded` | `_00_workflow_run`, `_00_schedule_run` | The reaper stopped a run that passed its `deadline:` (or the project's `run_deadline_secs`) without finishing, and killed its jobs |
+| `killed` | `_00_workflow_run`, `_00_schedule_run` | An operator cancelled the run |
+| `spawn_failed` | `_00_workflow_run`, `_00_schedule_run` | The fire could not create what it needed — the job row, or the run's steps |
+| `bad_dag` | `_00_workflow_run` | The frozen DAG on the run does not validate. A redeploy cannot fix a run already in flight; its DAG is frozen at spawn |
+| `no_target_table` | `_00_step_run` | The step names no outbox table and its schedule has no `target_table` |
+
+`_00_schedule.last_error` is the exception: it is a bare string, because it is why
+a schedule could not be *planned or fanned out at all* (a bad cron, a failing
+`forEach`) — which happens before any run row exists to carry a cause.
 
 Each step in `GET /admin/api/workflows/runs/:id` carries both `created_at` and
 `started_at`, and the distinction matters: the engine creates every step row when

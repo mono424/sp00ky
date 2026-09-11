@@ -418,14 +418,17 @@ export function ScheduleDetail() {
                               // fire that produced no workflow run must be
                               // filtered here or every row grows a dead link.
                               const runRef = () => orNull(r.workflow_run);
+                              const jobRef = () => orNull(r.job_id);
                               return (
                               <tr
-                                class={runRef() ? 'clickable' : undefined}
+                                class={runRef() || jobRef() ? 'clickable' : undefined}
                                 onClick={() =>
-                                  runRef() &&
-                                  navigate(
-                                    `/workflows/${encodeURIComponent(runRef()!)}`,
-                                  )
+                                  runRef()
+                                    ? navigate(
+                                        `/workflows/${encodeURIComponent(runRef()!)}`,
+                                      )
+                                    : jobRef() &&
+                                      navigate(`/jobs/${encodeURIComponent(jobRef()!)}`)
                                 }
                               >
                                 <td>
@@ -467,18 +470,36 @@ export function ScheduleDetail() {
                                 <td
                                   class="ghost"
                                   data-label="Run"
-                                  data-empty={!runRef() && !blockingRun(r)}
+                                  data-empty={!runRef() && !jobRef() && !blockingRun(r)}
                                 >
                                   <Show
                                     when={runRef()}
                                     fallback={
-                                      <Show when={blockingRun(r)} fallback={'—'}>
-                                        {(blocking) => (
+                                      // A `kind: job` fire has no workflow run;
+                                      // what it produced is an outbox job, and
+                                      // until this link existed the row simply
+                                      // ended here with nothing to open.
+                                      <Show
+                                        when={jobRef()}
+                                        fallback={
+                                          <Show when={blockingRun(r)} fallback={'—'}>
+                                            {(blocking) => (
+                                              <A
+                                                href={`/workflows/${encodeURIComponent(blocking())}`}
+                                                onClick={(e) => e.stopPropagation()}
+                                              >
+                                                blocking run →
+                                              </A>
+                                            )}
+                                          </Show>
+                                        }
+                                      >
+                                        {(job) => (
                                           <A
-                                            href={`/workflows/${encodeURIComponent(blocking())}`}
+                                            href={`/jobs/${encodeURIComponent(job())}`}
                                             onClick={(e) => e.stopPropagation()}
                                           >
-                                            blocking run →
+                                            job →
                                           </A>
                                         )}
                                       </Show>

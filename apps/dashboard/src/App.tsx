@@ -19,6 +19,7 @@ import { Backends, BackendDetailView } from './routes/Backends';
 import { Workflows } from './routes/Workflows';
 import { WorkflowDetail } from './routes/WorkflowDetail';
 import { ScheduleDetail, Schedules } from './routes/Schedules';
+import { JobDetailView, Jobs } from './routes/Jobs';
 import { Backups } from './routes/Backups';
 import { Logs } from './routes/Logs';
 import { ViewDetail, Views } from './routes/Views';
@@ -153,6 +154,8 @@ export function App() {
                 <Route path="/workflows/:id" component={WorkflowDetail} />
                 <Route path="/schedules" component={Schedules} />
                 <Route path="/schedules/:name" component={ScheduleDetail} />
+                <Route path="/jobs" component={Jobs} />
+                <Route path="/jobs/:id" component={JobDetailView} />
                 <Route
                   path="/backups"
                   component={() => <Backups overview={overview()} refresh={poll} />}

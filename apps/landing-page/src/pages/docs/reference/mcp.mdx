@@ -314,7 +314,8 @@ with an operation, and `operations_list` is how the agent watches it finish.
 
 - **Cluster**: `admin_config`, `overview`, `backends_list`, `backend_get`, `logs_recent` (bounded, non-streaming), `operations_list`
 - **Live**: `presence` (live users, sessions and views with recent samples), `views_list` (registered live queries, sortable by slowest), `view_get` (one view in full: SurrealQL, params, subscribers, percentiles, SSP memory, and the other sessions running the same query)
-- **Workflows**: `workflow_runs_list`, `workflow_run_get`, `workflow_run_cancel`, `workflow_run_rerun`, `workflow_run_retry`, `schedules_list`, `schedule_get`, `schedule_pause`, `schedule_resume`, `schedule_trigger`, `job_kill`, `job_retry`
+- **Workflows**: `workflow_runs_list`, `workflow_run_get`, `workflow_run_cancel`, `workflow_run_rerun`, `workflow_run_retry`, `schedules_list`, `schedule_get`, `schedule_pause`, `schedule_resume`, `schedule_trigger`
+- **Jobs**: `jobs_list` (every outbox job with the queue totals; `origin=schedule|workflow|app` separates a schedule's fires from a workflow's steps and from jobs your own code created), `job_get` (one job with every attempt in `errors` and the fire or step it came from), `job_kill`, `job_retry`, **`jobs_clear`**
 - **Restart**: `ssp_restart` (`restart`, `clean` or `reload`), `ssps_restart_all` (rolling by default), **`scheduler_restart`** (`restart`, `reclone` or `rehash`), `cloud_deployment`, **`cloud_restart`** (`upgrade`, `clean`, `surreal`)
 - **Backups**: `backups_list`, `backup_create`, **`backup_restore`**, `backup_restore_status`, **`backup_delete`**, `backups_configure`
 

@@ -23,6 +23,7 @@ import {
 } from '../lib/format';
 import { jobTone, runTone, stepTone } from '../lib/status';
 import { cancelRun, killJob, rerunRun, retryJob, retryRun } from '../lib/runActions';
+import { JobAttempts } from './Jobs';
 import type { JobDetail, StepRun, WorkflowRun, WorkflowRunDetail } from '../api/types';
 
 /**
@@ -467,7 +468,6 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
     return r && !r.ok ? r.message : undefined;
   };
 
-  const attempts = () => job()?.errors ?? [];
   // `retries` counts retries, so the attempt count is one more than it.
   const attemptLabel = () => {
     const j = job();
@@ -488,7 +488,11 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
           [
             'Job',
             <div class="row" style={{ 'flex-wrap': 'wrap' }}>
-              <span>{jobId() ?? '—'}</span>
+              <Show when={jobId()} fallback={<span>—</span>}>
+                {(id) => (
+                  <A href={`/jobs/${encodeURIComponent(id())}`}>{id()}</A>
+                )}
+              </Show>
               <Show when={job()}>
                 {(j) => (
                   <>
@@ -586,29 +590,10 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
                     ['Last write', formatStamp(j().updated_at)],
                   ]}
                 />
-                <Show
-                  when={attempts().length > 0}
-                  fallback={
-                    <Empty>
-                      No failed attempt recorded.
-                      {j().status === 'failed'
-                        ? ' The runner could not append to the job’s `errors` array; its log has the rejection.'
-                        : ''}
-                    </Empty>
-                  }
-                >
-                  {/* Oldest first, so the list reads as the history it is: what
-                      the backend did on attempt 1, then 2, then the one that
-                      exhausted the budget. */}
-                  <For each={attempts()}>
-                    {(err, i) => (
-                      <div class="attempt">
-                        <span class="attempt-n">#{i() + 1}</span>
-                        <Reason error={err} />
-                      </div>
-                    )}
-                  </For>
-                </Show>
+                {/* The Jobs page renders the same history; sharing the
+                    component is what keeps a run's view of an attempt from
+                    disagreeing with the job's own page. */}
+                <JobAttempts job={j()} />
               </div>
             )}
           </Show>

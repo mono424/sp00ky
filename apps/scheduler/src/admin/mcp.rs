@@ -103,6 +103,9 @@ const ALL_MODES: &[&str] = &["restart", "clean"];
 const SCHED_MODES: &[&str] = &["restart", "reclone", "rehash"];
 const RUN_STATUSES: &[&str] = &["running", "success", "failed", "killed"];
 const VIEW_SORTS: &[&str] = &["slowest", "newest", "rows", "updates", "errors", "active"];
+/// The four the outbox table's own ASSERT allows.
+const JOB_STATUSES: &[&str] = &["pending", "processing", "success", "failed"];
+const JOB_ORIGINS: &[&str] = &["schedule", "workflow", "app"];
 
 const fn t(
     name: &'static str,
@@ -187,10 +190,26 @@ pub const TOOLS: &[ToolDef] = &[
         path_params = &[req("name", "string", "Schedule name")]),
     tool!("schedule_trigger", "Fire a schedule once now (refused while paused or config-disabled).", "POST", "/schedules/{name}/trigger",
         path_params = &[req("name", "string", "Schedule name")]),
+    // ---- Jobs ----
+    tool!("jobs_list", "Outbox jobs across every table, newest activity first, with the queue totals. Filter by origin to separate a schedule's fires from a workflow's steps and from jobs the application created itself, which have no other surface. Unfiltered it is served from the scheduler's sampler and costs the database nothing.", "GET", "/jobs",
+        query = &[
+            choice(p("status", "string", "Only jobs in this status"), JOB_STATUSES),
+            p("table", "string", "Outbox table name; defaults to every table in _00_retention.job_tables"),
+            choice(p("origin", "string", "Where the job came from: schedule (a kind: job fire), workflow (a step) or app (the application's own code)"), JOB_ORIGINS),
+            p("q", "string", "Substring of the job's path or its id"),
+            p("limit", "number", "Max rows (default 50, max 500)"),
+        ], read_only = true),
+    tool!("job_get", "One outbox job in full: status, path, payload, result, every attempt in `errors`, retry budget, assignee, lease, and the schedule fire or workflow step it came from.", "GET", "/jobs/{id}",
+        path_params = &[req("id", "string", "Job record id, e.g. job:abc")], read_only = true),
     tool!("job_kill", "Kill one outbox job: cancels it in flight or fails it before it starts.", "POST", "/jobs/{id}/kill",
         path_params = &[req("id", "string", "Job record id, e.g. job:abc")]),
     tool!("job_retry", "Retry a terminal (failed or succeeded) outbox job on one SSP.", "POST", "/jobs/{id}/retry",
         path_params = &[req("id", "string", "Job record id")]),
+    tool!("jobs_clear", "Delete terminal outbox rows in batches. `processing` jobs are never touched at either width, so work in flight is safe. Returns how many went per table and whether more is left.", "POST", "/jobs/clear",
+        body = &[
+            p("table", "string", "One outbox table; defaults to every table"),
+            p("all", "boolean", "Also delete pending jobs, not just success and failed"),
+        ], destructive = true),
     // ---- Restart ----
     tool!("ssp_restart", "Restart one SSP. 'restart' exits and relaunches from its snapshot; 'clean' drops the snapshot first for a cold rebuild; 'reload' rebuilds in place without exiting.", "POST", "/ssps/{id}/restart",
         path_params = &[req("id", "string", "SSP id as listed by overview")],

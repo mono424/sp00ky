@@ -31,7 +31,11 @@ import {
   splitValue,
 } from '../lib/format';
 import { backendTone, schedulerTone, sspTone, type Tone } from '../lib/status';
-import type { Overview as OverviewData, PresenceSample } from '../api/types';
+import type {
+  JobTotals,
+  Overview as OverviewData,
+  PresenceSample,
+} from '../api/types';
 
 /**
  * One presence count: the number, a line of context, and its history filling
@@ -99,6 +103,18 @@ export function Overview(props: {
   // The presence sampler's ring, folded into this same poll — so every readout
   // and chart below costs no request of its own and no database work.
   const presence = () => props.data?.presence;
+  const jobs = () => props.data?.jobs;
+
+  /**
+   * A stalled job outranks a deep queue: a backlog is the system working, a
+   * lease that expired with nobody holding it is the system not working.
+   */
+  const jobsTone = (j: JobTotals): string => {
+    if (!j.ready) return 'idle';
+    if (j.stalled > 0 || j.blind) return 'bad';
+    if (j.counts.failed > 0 || j.counts.pending > 0) return 'warn';
+    return 'ok';
+  };
   const totals = () => presence()?.totals;
   const series = (pick: (s: PresenceSample) => number): Point[] =>
     (presence()?.samples ?? []).map((s) => ({
@@ -462,9 +478,99 @@ export function Overview(props: {
                 )}
               </Show>
 
+              {/* ---- the outbox. Same bargain as presence: the job sampler
+                   holds these, so the tile rides this poll and adds nothing to
+                   the database. Span 12 because the presence row above already
+                   fills its twelve columns, and a lone span-3 tile here would
+                   leave nine of them empty. ---- */}
+              <Show when={jobs()}>
+                {(j) => (
+                  <Tile
+                    i={9}
+                    span={12}
+                    label="Jobs"
+                    sub="The outbox queue, across every table"
+                    to="/jobs"
+                    tone={jobsTone(j())}
+                  >
+                    <Show
+                      when={j().ready}
+                      fallback={
+                        <Empty>
+                          <Show
+                            when={j().enabled === false}
+                            fallback={<>Waiting for the first job sample…</>}
+                          >
+                            The job sampler is switched off on this scheduler (
+                            <span class="mono">SPKY_ADMIN_JOB_INTERVAL_SECS=0</span>).
+                            The Jobs page still lists and filters.
+                          </Show>
+                        </Empty>
+                      }
+                    >
+                      <div class="stat3 stat5">
+                        <div>
+                          <div class="k">Pending</div>
+                          <div class="v" classList={{ 'tone-warn': j().counts.pending > 0 }}>
+                            {formatCount(j().counts.pending)}
+                          </div>
+                        </div>
+                        <div>
+                          <div class="k">In flight</div>
+                          <div class="v">{formatCount(j().in_flight)}</div>
+                        </div>
+                        <div>
+                          <div class="k">Stalled</div>
+                          <div class="v" classList={{ 'tone-bad': j().stalled > 0 }}>
+                            {formatCount(j().stalled)}
+                          </div>
+                        </div>
+                        <div>
+                          <div class="k">Failed</div>
+                          <div class="v" classList={{ 'tone-bad': j().counts.failed > 0 }}>
+                            {formatCount(j().counts.failed)}
+                          </div>
+                        </div>
+                        <div>
+                          <div class="k">Per min</div>
+                          <div class="v">{formatCount(j().throughput_1m)}</div>
+                        </div>
+                      </div>
+                      <div class="tile-foot tile-end">
+                        <Show
+                          when={!j().blind}
+                          fallback={
+                            <span class="tone-bad">
+                              every outbox table refused to answer, so these are not measurements
+                            </span>
+                          }
+                        >
+                          <Show
+                            when={j().stalled === 0}
+                            fallback={
+                              <span class="tone-bad">
+                                a stalled job's lease expired with nobody holding it
+                              </span>
+                            }
+                          >
+                            <Show
+                              when={j().oldest_pending}
+                              fallback={<>nothing queued · failures counted over the last hour</>}
+                            >
+                              oldest pending {relativeStamp(j().oldest_pending)} ·
+                              failures over the last hour
+                            </Show>
+                          </Show>
+                        </Show>
+                      </div>
+                    </Show>
+                  </Tile>
+                )}
+              </Show>
+
               {/* ---- the fleets in detail ---- */}
               <Tile
-                i={9}
+                i={10}
                 span={12}
                 flush
                 label="Sync processors"
@@ -548,7 +654,7 @@ export function Overview(props: {
 
               <Show when={data().backends.length > 0}>
                 <Tile
-                  i={10}
+                  i={11}
                   span={12}
                   flush
                   label="Backends"

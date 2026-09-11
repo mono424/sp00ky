@@ -163,6 +163,46 @@ suppressed says so at the top of the page, naming the run that is holding the
 key — a wall of `skipped` rows looks like "nothing to do" and means "something
 is still running".
 
+**Jobs** — every outbox job in one list, whatever created it. This is the only
+place two whole classes of work are visible at all: a `kind: job` schedule's
+fires, and jobs your own code created, which belong to no schedule and no
+workflow. Each row says where it came from, and links back to the schedule or
+the workflow step when the owning run still exists — a terminal run is pruned on
+its own retention window well before the jobs that outlived it, so "scheduled
+work whose fire has aged out" and "a job nobody can account for" are deliberately
+not drawn the same.
+
+Filter by origin (`schedule`, `workflow`, `app`), by status, by table, or by a
+substring of the path. The filter is pushed into SurrealQL rather than applied to
+the page that was already fetched, so asking for application jobs on a busy table
+returns them instead of reporting none.
+
+The tiles above the list are the queue itself: pending depth with the age of the
+oldest one, in-flight against each table's `_00_job_policy` concurrency ceiling,
+failures over the last hour, and jobs succeeded per minute. **Stalled** is called
+out separately from in-flight and is worth knowing: it is a `processing` row
+whose lease has expired, meaning nobody is working on it and a recovery sweep
+will reclaim it on its own clock. The schema has no status for that state, which
+is exactly why it earns a name here.
+
+Counts cover work in flight plus the last hour of terminal work, never all of
+history. Once retention keeps failures longer than successes, an all-time ratio
+reports a failure rate that climbs as successes age out; a bounded window is the
+only honest denominator, and it is the one `spky jobs` uses too.
+
+<Note title="What the Jobs page costs your database">
+  Every job aggregate is a scan of one of your own tables, so the scheduler takes
+  them <em>once</em>, in a single sampler that every reader serves from — the
+  same bargain the presence sampler strikes. It reads every 15 seconds while
+  nobody has the page open and every 2 seconds while someone does, so ten open
+  dashboards cost what one does and an idle cluster costs almost nothing. Tune
+  both with <code>SPKY_ADMIN_JOB_INTERVAL_SECS</code> and
+  <code>SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS</code>, or set the first to <code>0</code>
+  to switch the sampler off entirely: the list and its filters still work, the
+  totals and the Overview tile then say they are not being measured rather than
+  showing zeros.
+</Note>
+
 **Logs** — a live tail of the scheduler's or any SSP's log output, with level
 and text filters. If a viewer falls behind, the gap is shown explicitly rather
 than hidden.
@@ -403,6 +443,8 @@ already makes rather than a request of their own.
 | `SPKY_ADMIN_SLOW_VIEW_MS` | `250` | Materialization p99 at which a view counts as slow. `?slow_ms=` overrides it per request |
 | `SPKY_ADMIN_LARGE_VIEW_ROWS` | `1000` | Row count from which a view is flagged **large** on the Views tab and the Overview. Every row of an unwindowed live view is republished as an edge on each cold registration, so a few thousand at once can stall the database; `?large=true` filters the list to them |
 | `SPKY_ADMIN_PRESENCE_MAX_ROWS` | `20000` | Ceiling on rows one presence or views query may pull back |
+| `SPKY_ADMIN_JOB_INTERVAL_SECS` | `15` | How often the job sampler reads the outbox tables while nobody has the Jobs page open. `0` switches the sampler off: the Jobs list still works, the totals and the Overview tile report that they are not measured |
+| `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | `2` | The cadence while at least one dashboard holds `/admin/api/jobs/stream` open. Clamped to no slower than the idle interval |
 | `SPKY_CLOUD_API_URL` | unset | Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane |
 | `SPKY_CLOUD_PROJECT` | unset | The project slug, injected alongside it |
 | `SPKY_PROJECT_SLUG` | `default` | Storage prefix for backups on an unlinked scheduler |
@@ -463,7 +505,9 @@ and port with no path lands on the dashboard.
 | `GET /admin/api/workflows/runs` | Run list. `?name=`, `?schedule=`, `?status=`, `?rerun_of=`, `?limit=` |
 | `GET /admin/api/workflows/runs/:id` | One run with its steps and DAG |
 | `GET /admin/api/workflows/stream` | SSE. Run list, pushed on change |
-| `GET /admin/api/jobs/:id` | One outbox job: status, path, payload, result, every attempt in `errors`, retry budget, assignee and lease. `404` unless the id's table is in `_00_retention.job_tables` |
+| `GET /admin/api/jobs` | Outbox jobs across every table, newest activity first, with the queue totals and a per-table breakdown. `?status=`, `?table=`, `?origin=schedule\|workflow\|app`, `?q=`, `?limit=`. Unfiltered it is served from the sampler's memory and costs the database nothing |
+| `GET /admin/api/jobs/stream` | SSE. Event `jobs`, the list and totals pushed on change. Holding it open is what puts the sampler on its live cadence. `501` when the sampler is disabled |
+| `GET /admin/api/jobs/:id` | One outbox job: status, path, payload, result, every attempt in `errors`, retry budget, assignee, lease, and the `origin` block naming the schedule fire or workflow step it came from. `404` unless the id's table is in `_00_retention.job_tables` |
 | `GET /admin/api/schedules` | Schedule definitions with next/last fire |
 | `GET /admin/api/schedules/:name` | One schedule, its recent fires, and its `_00_run_rollup` tally |
 | `GET /admin/api/operations` | Recent operations, newest first |
@@ -487,6 +531,7 @@ and port with no path lands on the dashboard.
 | `POST /admin/api/schedules/:name/trigger` | `{name, triggered_at}`. `409` when paused or config-disabled |
 | `POST /admin/api/jobs/:id/kill` | The cluster kill, relaying the SSPs' answer |
 | `POST /admin/api/jobs/:id/retry` | The cluster retry, relaying the SSP's answer |
+| `POST /admin/api/jobs/clear` | `{table, all}`. Batch-deletes terminal rows, never `processing` ones. `200` `{cleared, total, more}` |
 | `POST /admin/api/tokens` | `{label, scope: "read" \| "full", ttl_days}`. `201` with the token, shown once. `403` for an MCP or read-only session |
 | `DELETE /admin/api/tokens` | `{token}`. Revokes it. `204` |
 | `POST /admin/api/mcp` | The scheduler admin MCP server: JSON-RPC over Streamable HTTP, stateless. `GET` and `DELETE` answer `405` |

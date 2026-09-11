@@ -63,6 +63,19 @@ export function Shell(props: {
     },
     { href: '/workflows', label: 'Workflows' },
     { href: '/schedules', label: 'Schedules' },
+    {
+      href: '/jobs',
+      label: 'Jobs',
+      // Work outstanding, not work done: pending plus in flight is the number
+      // that means "there is something to look at". Absent until the job
+      // sampler has run once, which is not the same as "the queue is empty".
+      count: props.overview?.jobs?.ready
+        ? formatCount(
+            props.overview.jobs.counts.pending +
+              props.overview.jobs.counts.processing,
+          )
+        : undefined,
+    },
     { href: '/backups', label: 'Backups' },
     { href: '/logs', label: 'Logs' },
     { href: '/access', label: 'Access' },

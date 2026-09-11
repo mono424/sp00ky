@@ -49,6 +49,15 @@ pub struct AdminConfig {
     /// with a runaway number of registrations cannot make the sampler the
     /// expensive thing on the box.
     pub presence_max_rows: usize,
+    /// How often the job sampler re-reads the outbox tables while nobody has
+    /// the Jobs page open. Every job aggregate is a scan of a user table, so
+    /// this is the standing cost of the Jobs tile and the sidebar count on an
+    /// idle cluster. Zero switches the sampler off entirely.
+    pub job_interval: std::time::Duration,
+    /// The cadence while at least one dashboard holds `/jobs/stream` open.
+    /// Fast enough to watch a backlog drain, and paid only while someone is
+    /// actually watching it.
+    pub job_live_interval: std::time::Duration,
 }
 
 impl AdminConfig {
@@ -97,6 +106,20 @@ impl AdminConfig {
             .filter(|n| *n > 0)
             .unwrap_or(20_000);
 
+        // Zero is meaningful here, unlike the presence interval: it disables the
+        // sampler for a deployment that would rather pay nothing for job
+        // aggregates until someone opens the page.
+        let job_interval_secs = std::env::var("SPKY_ADMIN_JOB_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(15);
+
+        let job_live_interval_secs = std::env::var("SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2);
+
         Self {
             enabled,
             host: std::env::var("SPKY_ADMIN_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -118,6 +141,13 @@ impl AdminConfig {
             presence_slow_ms,
             presence_large_view_rows,
             presence_max_rows,
+            job_interval: std::time::Duration::from_secs(job_interval_secs),
+            // Never slower than the idle cadence: a "live" tick that ticks less
+            // often than the resting one would make opening the page make it
+            // worse.
+            job_live_interval: std::time::Duration::from_secs(
+                job_live_interval_secs.min(job_interval_secs.max(1)),
+            ),
         }
     }
 

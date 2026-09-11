@@ -25,6 +25,7 @@ pub mod backends;
 pub mod backups;
 pub mod cloud;
 pub mod config;
+pub mod jobs;
 pub mod logs;
 pub mod mcp;
 pub mod ops;
@@ -95,6 +96,9 @@ pub struct AdminState {
     /// Live users / sessions / registered views, sampled on a timer so every
     /// reader serves from memory.
     pub presence: Arc<presence::PresenceTracker>,
+    /// The outbox tables, sampled on a timer for the same reason: every job
+    /// aggregate is a scan of a user table, so it is paid for once.
+    pub jobs: Arc<jobs::JobSampler>,
     /// The Sp00ky Cloud link, when this scheduler was given one.
     pub cloud: Option<CloudLink>,
     /// The backup plane's registries and queues, shared with the ingest port.
@@ -146,6 +150,45 @@ pub type ApiError = (StatusCode, Json<serde_json::Value>);
 
 pub fn api_error(status: StatusCode, message: impl std::fmt::Display) -> ApiError {
     (status, Json(json!({ "error": message.to_string() })))
+}
+
+/// The answer every database-backed reader gives before `Scheduler::start()` has
+/// published its handle. Shared so the whole plane says the same sentence.
+pub fn db_unavailable() -> ApiError {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Scheduler is still starting up and has no database handle yet",
+    )
+}
+
+/// Run one statement and take its rows, noting a failure on the handle so the
+/// reconnect logic sees it.
+pub async fn rows(
+    db: &Arc<ReconnectingDb>,
+    surql: &str,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let handle = db.handle();
+    match handle.query(surql).await.and_then(|mut r| r.take(0)) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            db.note_error(&format!("{e:#}"));
+            warn!(error = %e, surql, "Admin query failed");
+            Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Database query failed: {}", e),
+            ))
+        }
+    }
+}
+
+/// Escape a single-quoted SurrealQL string literal.
+///
+/// The admin listings assemble their queries as text because the surrounding
+/// CLI queries do, and their filters are user-supplied. One escaper for the
+/// whole plane, matching `apps/cli/src/flag.rs::esc`, so no reader can end up
+/// with a weaker one than its neighbour.
+pub fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 /// The signed-in session, extracted by [`require_session`] and attached to the
@@ -311,9 +354,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/schedules/:name/pause", post(workflows::schedule_pause))
         .route("/schedules/:name/resume", post(workflows::schedule_resume))
         .route("/schedules/:name/trigger", post(workflows::schedule_trigger))
-        .route("/jobs/:id", get(workflows::job_detail))
-        .route("/jobs/:id/kill", post(workflows::job_kill))
-        .route("/jobs/:id/retry", post(workflows::job_retry))
+        // Jobs. `/jobs/clear` is registered before `/jobs/:id` so the literal
+        // segment wins the match rather than being read as a job named "clear".
+        .route("/jobs", get(jobs::list_jobs))
+        .route("/jobs/stream", get(jobs::stream_jobs))
+        .route("/jobs/clear", post(jobs::jobs_clear))
+        .route("/jobs/:id", get(jobs::job_detail))
+        .route("/jobs/:id/kill", post(jobs::job_kill))
+        .route("/jobs/:id/retry", post(jobs::job_retry))
         // Agents. Tokens are minted by a person; the MCP endpoint takes any
         // bearer and dispatches tools back through this same router.
         .route("/tokens", post(tokens::mint).delete(tokens::revoke))
@@ -402,6 +450,7 @@ pub fn build(config: AdminConfig, deps: AdminDeps) -> (AdminState, Router) {
         heartbeat_interval_ms: scheduler_config.heartbeat_interval_ms,
         ops: Operations::new(),
         presence: presence::PresenceTracker::new(&config_for_presence),
+        jobs: jobs::JobSampler::new(&config_for_presence),
         cloud: deps.cloud,
         backup: deps.backup,
         resync: deps.resync,
@@ -417,5 +466,20 @@ pub fn build(config: AdminConfig, deps: AdminDeps) -> (AdminState, Router) {
     // it reaches the database through the same late-bound slot every other
     // admin reader uses, and simply does nothing until that slot fills.
     Arc::clone(&state.presence).spawn(state.clone());
+    Arc::clone(&state.jobs).spawn(state.clone());
     (state, router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every listing on this plane interpolates its filters, so the one escaper
+    /// they share is the one thing that keeps a quote in a search box a quote.
+    #[test]
+    fn esc_neutralises_quotes_and_backslashes() {
+        assert_eq!(esc("o'brien"), "o\\'brien");
+        assert_eq!(esc(r"back\slash"), r"back\\slash");
+        assert_eq!(esc("plain"), "plain");
+    }
 }

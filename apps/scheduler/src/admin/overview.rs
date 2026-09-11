@@ -54,6 +54,10 @@ pub async fn overview(State(state): State<AdminState>) -> Json<serde_json::Value
         // so the live-user tile and the sidebar count come free with the poll
         // the app makes anyway, and add nothing to the database.
         "presence": state.presence.overview_block(),
+        // And again for jobs: the sampler holds the outbox counts, so the Jobs
+        // tile and the sidebar count ride the poll the dashboard already makes
+        // rather than scanning a user table per open tab.
+        "jobs": state.jobs.overview_block(),
         "cloud_linked": state.cloud.is_some(),
         "server_time_ms": now_ms(),
     }))

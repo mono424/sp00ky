@@ -191,6 +191,12 @@ export interface Overview {
    * sidebar count and the overview tile are free.
    */
   presence?: PresenceBlock;
+  /**
+   * Outbox queue totals, folded in from the job sampler's memory for the same
+   * reason presence is: every job aggregate is a scan of a user table, so it is
+   * paid for once by the sampler rather than once per open tab.
+   */
+  jobs?: JobTotals;
 }
 
 /* ------------------------------------------------------------------ */
@@ -570,6 +576,144 @@ export interface WorkflowRunDetail extends WorkflowRun {
   target_table: string | null;
 }
 
+/* ------------------------------------------------------------------ */
+/* Jobs: the outbox plane.                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where a job came from, derived by the scheduler from the key
+ * `schedule-core` minted for it.
+ *
+ * `app` is the class with no other surface anywhere in the dashboard: a job the
+ * application created itself, belonging to no schedule and no workflow.
+ */
+export type OriginKind = 'schedule' | 'workflow' | 'app';
+
+/**
+ * The origin block on every job row. `kind` is always present; the rest is the
+ * resolved back-link, which is absent once the owning run has been pruned on
+ * its own retention window.
+ */
+export interface JobOrigin {
+  kind: OriginKind;
+  /** `schedule` only. */
+  schedule?: string | null;
+  schedule_run?: string | null;
+  fire_at?: string | null;
+  key?: string | null;
+  /** `workflow` only. */
+  workflow_run?: string | null;
+  step?: string | null;
+}
+
+export interface JobStatusCounts {
+  pending: number;
+  processing: number;
+  success: number;
+  failed: number;
+  /** A status the table's own ASSERT does not allow. Should always be zero. */
+  other: number;
+}
+
+/** One point of the queue-depth sparkline. */
+export interface JobSample {
+  t: number;
+  pending: number;
+  processing: number;
+  failed: number;
+  throughput_1m: number;
+}
+
+/**
+ * The queue as a whole. Counts cover in-flight work plus the last hour of
+ * terminal work, never all of history: an all-time ratio reports a fail rate
+ * that climbs as successes age out of retention.
+ */
+export interface JobTotals {
+  counts: JobStatusCounts;
+  /** `processing` rows whose lease is still live: work really in flight. */
+  in_flight: number;
+  /**
+   * `processing` rows whose lease has expired. Nobody is working on these; a
+   * recovery sweep may reclaim them. The state the schema has no name for.
+   */
+  stalled: number;
+  throughput_1m: number;
+  oldest_pending: string | null;
+  tables: number;
+  /** Every outbox table refused to answer, so zeros here mean nothing. */
+  blind: boolean;
+  samples: JobSample[];
+  taken_at_ms?: number | null;
+  sample_interval_secs?: number;
+  /** False when the background sampler is switched off entirely. */
+  enabled?: boolean;
+  /**
+   * The sampler has completed a pass. False means "not measured yet", which is
+   * not the same as an empty queue, and the UI must not draw it as one.
+   */
+  ready: boolean;
+}
+
+/** Per-table depth, plus the ceiling the dispatcher admits against. */
+export interface JobTableStat {
+  table: string;
+  counts: JobStatusCounts;
+  in_flight: number;
+  stalled: number;
+  /** `_00_job_policy` concurrency, or the dispatcher default of 1. */
+  concurrency: number;
+  throughput_1m: number;
+  oldest_pending: string | null;
+  error: string | null;
+}
+
+/**
+ * One row of the jobs list. Without `payload` and `result`, which are uncapped
+ * and up to 64 KiB; both are on the detail.
+ */
+export interface JobSummary {
+  id: string;
+  /** The bare record key, which is what carries the origin prefix. */
+  key: string;
+  table: string;
+  status: string;
+  path: string | null;
+  retries: number | null;
+  max_retries: number | null;
+  retry_strategy: string | null;
+  assignee: string | null;
+  timeout: number | null;
+  delay: number | null;
+  lease_until: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  origin: JobOrigin;
+  /** The last recorded attempt. The whole history is on the detail. */
+  last_error: RunError | null;
+  attempts: number;
+}
+
+export interface JobsListResponse {
+  jobs: JobSummary[];
+  returned: number;
+  limit: number;
+  totals: JobTotals;
+  tables: JobTableStat[];
+  sampled_at_ms?: number;
+  /** True when this page came from the sampler rather than a fresh query. */
+  live?: boolean;
+  filtered?: boolean;
+  table_errors?: { table: string; error: string | null }[];
+}
+
+export interface JobsClearResponse {
+  cleared: Record<string, number>;
+  total: number;
+  /** The batch ceiling was hit; running it again picks up where it stopped. */
+  more: boolean;
+}
+
 /**
  * One outbox job, from `GET /admin/api/jobs/:id`.
  *
@@ -595,6 +739,11 @@ export interface JobDetail {
   lease_until: string | null;
   created_at: string | null;
   updated_at: string | null;
+  /** Which outbox table the row lives in. */
+  table?: string;
+  key?: string;
+  /** Where it came from, and the run it belongs to when that still exists. */
+  origin?: JobOrigin;
 }
 
 export interface StepRun {

@@ -2813,6 +2813,10 @@ tr:hover .row-actions,
 .stat4 {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
+/* Five, across a full-width tile (the outbox queue). */
+.stat5 {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
 
 .stat3 > div {
   min-width: 0;

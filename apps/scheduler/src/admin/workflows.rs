@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 
 use maintenance::db::ReconnectingDb;
 
-use super::{api_error, AdminState, ApiError};
+use super::{api_error, db_unavailable, esc, rows, AdminState, ApiError};
 
 /// How often the shared poller re-reads the run tables while anyone is
 /// watching. Matches `spky workflows watch`.
@@ -37,37 +37,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// Cap on `?limit=`, so one request cannot ask the database for everything.
 const MAX_LIMIT: usize = 500;
 const DEFAULT_LIMIT: usize = 50;
-
-fn db_unavailable() -> ApiError {
-    api_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Scheduler is still starting up and has no database handle yet",
-    )
-}
-
-async fn rows(db: &Arc<ReconnectingDb>, surql: &str) -> Result<Vec<Value>, ApiError> {
-    let handle = db.handle();
-    match handle.query(surql).await.and_then(|mut r| r.take(0)) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            db.note_error(&format!("{e:#}"));
-            warn!(error = %e, surql, "Admin workflow query failed");
-            Err(api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Database query failed: {}", e),
-            ))
-        }
-    }
-}
-
-/// Escape a single-quoted SurrealQL string literal.
-///
-/// The run-listing filters are user-supplied (`?name=`, `?status=`), and these
-/// queries are assembled as text because the surrounding CLI queries are. Same
-/// escaping as `apps/cli/src/flag.rs::esc`.
-fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
 
 const RUN_FIELDS: &str = "type::string(id) AS id, workflow_name, schedule_name, status, \
      kill_requested, error, trigger, retry_count, \
@@ -604,131 +573,6 @@ pub async fn schedule_trigger(
     Ok(Json(json!({ "name": name, "triggered_at": at })))
 }
 
-/// One outbox row, by table and key.
-///
-/// `result` is the backend's response body, capped at 64 KiB by the runner: fine for
-/// one job, which is why `spky jobs get` shows it and the listing does not. `errors`
-/// is the reason this endpoint exists at all.
-///
-/// The table is interpolated because a table name cannot be a SurrealQL parameter.
-/// The caller checks it against `_00_retention.job_tables` first — the escaping here
-/// is the second line, not the first.
-fn job_surql(table: &str, key: &str) -> String {
-    format!(
-        "SELECT type::string(id) AS id, status, path, payload, result, errors, \
-         retries, max_retries, retry_strategy, assignee, timeout, delay, \
-         type::string(lease_until) AS lease_until, \
-         type::string(created_at) AS created_at, \
-         type::string(updated_at) AS updated_at \
-         FROM type::record('{}', '{}');",
-        esc(table),
-        esc(key)
-    )
-}
-
-/// `GET /admin/api/jobs/:id`
-///
-/// The outbox row behind a step or a schedule fire. Everything else on this plane
-/// reads the `_00_*` tables, which the engine owns; this one reaches into an
-/// application's own table, so the table name is checked against
-/// `_00_retention.job_tables` — the list deploy writes — before it is interpolated.
-/// Without that check a path segment would choose the table, and every table in the
-/// database is readable by the root handle this plane holds.
-///
-/// Worth its own endpoint because it is where a failure actually says what went
-/// wrong: `_00_step_run.error` carries the LAST attempt, while `errors` here carries
-/// every one of them, which is the difference between "the backend 500s" and "the
-/// backend 500s on retry 3 only, after two timeouts".
-pub async fn job_detail(
-    State(state): State<AdminState>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-
-    let Some(job) = ids::Ref::parse(&id) else {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("'{id}' is not a record id"),
-        ));
-    };
-
-    // A row, not `SELECT VALUE ... FROM ONLY`: `rows` takes the statement's result
-    // as a list of rows, and the VALUE form hands back the array itself, whose
-    // elements then read as the rows.
-    let allowed = rows(&db, "SELECT job_tables FROM _00_retention LIMIT 1;")
-        .await?
-        .into_iter()
-        .next()
-        .and_then(|row| row.get("job_tables").and_then(Value::as_array).cloned())
-        .unwrap_or_default();
-    let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
-    if !allowed.contains(&job.table.as_str()) {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "'{}' is not an outbox table on this project. Deploy writes the list to \
-                 `_00_retention.job_tables`; a job whose table is missing from it was \
-                 created against a table this deployment no longer knows about.",
-                job.table
-            ),
-        ));
-    }
-
-    let row = rows(&db, &job_surql(&job.table, &job.key)).await?.into_iter().next();
-
-    let Some(row) = row.filter(Value::is_object) else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "No job '{id}'. Terminal jobs are pruned on the project's retention \
-                 window, so a run older than that keeps its step rows and loses its jobs."
-            ),
-        ));
-    };
-
-    Ok(Json(json!({ "job": row })))
-}
-
-/// `POST /admin/api/jobs/:id/kill`
-pub async fn job_kill(
-    State(state): State<AdminState>,
-    Extension(CurrentSession(session)): Extension<CurrentSession>,
-    Path(id): Path<String>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    tracing::info!(job = %id, by = %session.subject, "Job kill from the dashboard");
-    let (status, body) =
-        crate::job_scheduler::kill_job(&state.metrics.ssp_pool, &state.transport, &id).await;
-    relay(status, body)
-}
-
-/// `POST /admin/api/jobs/:id/retry`
-pub async fn job_retry(
-    State(state): State<AdminState>,
-    Extension(CurrentSession(session)): Extension<CurrentSession>,
-    Path(id): Path<String>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    tracing::info!(job = %id, by = %session.subject, "Job retry from the dashboard");
-    let (status, body) =
-        crate::job_scheduler::retry_job(&state.metrics.ssp_pool, &state.transport, &id).await;
-    relay(status, body)
-}
-
-/// The job routes speak `{code, message}`; the admin plane speaks `{error}`.
-/// Translate on failure, pass through on success.
-fn relay(status: StatusCode, body: Value) -> Result<(StatusCode, Json<Value>), ApiError> {
-    if status.is_success() {
-        Ok((status, Json(body)))
-    } else {
-        let message = body
-            .get("message")
-            .or_else(|| body.get("error"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Job action failed ({})", status.as_u16()));
-        Err(api_error(status, message))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,34 +607,6 @@ mod tests {
     fn rerun_of_filter_compares_the_string_form() {
         let sql = runs_surql(&RunsQuery { rerun_of: Some("_00_workflow_run:x".into()), ..Default::default() });
         assert!(sql.contains("type::string(rerun_of) = '_00_workflow_run:x'"), "{sql}");
-    }
-
-    #[test]
-    fn the_job_query_carries_the_attempt_history() {
-        let sql = job_surql("job", "sch_game_sync_1788364742716_582ceccbb9aa");
-        // The whole point of the endpoint: a step row keeps only the attempt that
-        // ended the job, so without `errors` this says nothing a step cannot.
-        assert!(sql.contains("errors"), "{sql}");
-        assert!(sql.contains("retries, max_retries"), "{sql}");
-        assert!(
-            sql.contains("type::record('job', 'sch_game_sync_1788364742716_582ceccbb9aa')"),
-            "{sql}"
-        );
-        // Never the single-argument form, which truncates a hyphenated key.
-        assert!(!sql.contains("type::record('job:"), "{sql}");
-    }
-
-    #[test]
-    fn the_job_query_escapes_its_interpolated_names() {
-        let sql = job_surql("job", "o'brien");
-        assert!(sql.contains("'o\\'brien'"), "{sql}");
-    }
-
-    #[test]
-    fn esc_neutralises_quotes_and_backslashes() {
-        assert_eq!(esc("o'brien"), "o\\'brien");
-        assert_eq!(esc(r"back\slash"), r"back\\slash");
-        assert_eq!(esc("plain"), "plain");
     }
 
     #[test]

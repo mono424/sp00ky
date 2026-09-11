@@ -47,7 +47,7 @@ use tracing::{debug, warn};
 
 use maintenance::db::ReconnectingDb;
 
-use super::{api_error, AdminConfig, AdminState, ApiError};
+use super::{api_error, db_unavailable, esc, rows, AdminConfig, AdminState, ApiError};
 
 /// How many samples the chart keeps. At the default 15s tick that is half an
 /// hour of history, which outlives the ~9 minute decay tail it has to explain.
@@ -76,39 +76,11 @@ fn canonical_query_id(id: &str) -> &str {
     id.rsplit(':').next().unwrap_or(id)
 }
 
-/// Escape a single-quoted SurrealQL string literal. Same escaping as
-/// `workflows.rs::esc` and `apps/cli/src/flag.rs::esc`.
-fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn db_unavailable() -> ApiError {
-    api_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Scheduler is still starting up and has no database handle yet",
-    )
-}
-
-async fn rows(db: &Arc<ReconnectingDb>, surql: &str) -> Result<Vec<Value>, ApiError> {
-    let handle = db.handle();
-    match handle.query(surql).await.and_then(|mut r| r.take(0)) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            db.note_error(&format!("{e:#}"));
-            warn!(error = %e, surql, "Admin presence query failed");
-            Err(api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Database query failed: {}", e),
-            ))
-        }
-    }
 }
 
 /* ------------------------------------------------------------------ */

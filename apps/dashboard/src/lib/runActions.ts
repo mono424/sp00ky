@@ -2,6 +2,7 @@ import { api } from '../api/client';
 import { runAction, post } from '../components/Actions';
 import type {
   CancelResponse,
+  JobsClearResponse,
   JobKillResponse,
   JobRetryResponse,
   RerunResponse,
@@ -104,6 +105,42 @@ export function retryJob(jobId: string, after?: () => void) {
     label: 'Retry job',
     request: post(`/jobs/${encodeURIComponent(jobId)}/retry`),
     success: (r) => `${r.status} on ${r.assigned_to}`,
+    after,
+  });
+}
+
+/**
+ * Delete terminal outbox rows, the dashboard's `spky jobs clear`.
+ *
+ * `processing` is spared at either width, which is why the consequences say so:
+ * the fear this dialog has to answer is "will this kill the job running right
+ * now", and the answer is no.
+ */
+export function clearJobs(
+  opts: { table?: string; all?: boolean },
+  after?: () => void,
+) {
+  const scope = opts.table ?? 'every outbox table';
+  return runAction<JobsClearResponse>({
+    label: `Clear jobs in ${scope}`,
+    confirm: {
+      title: `Delete terminal jobs in ${scope}?`,
+      verb: 'Delete',
+      consequences: [
+        opts.all
+          ? 'Every success, failed AND pending job is deleted. Pending jobs are queued work that will now never run.'
+          : 'Every success and failed job is deleted. Pending work is left queued.',
+        'Jobs in processing are never touched, so nothing running right now is interrupted.',
+        'This is a delete, not an archive. The rows are gone.',
+      ],
+      typeToConfirm: opts.all ? 'delete' : undefined,
+    },
+    request: post('/jobs/clear', { table: opts.table, all: !!opts.all }),
+    success: (r) =>
+      r.total === 0
+        ? 'Nothing to clear.'
+        : `Removed ${r.total} job${r.total === 1 ? '' : 's'}` +
+          (r.more ? '. More is left; run it again to continue.' : '.'),
     after,
   });
 }

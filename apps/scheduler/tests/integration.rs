@@ -2649,6 +2649,11 @@ mod admin_plane {
             presence_slow_ms: 250.0,
             presence_large_view_rows: 1000,
             presence_max_rows: 20_000,
+            // Zero disables the job sampler outright, which is what a test of
+            // the plane wants: no background task reaching for a handle these
+            // tests deliberately do not publish.
+            job_interval: std::time::Duration::ZERO,
+            job_live_interval: std::time::Duration::from_secs(2),
         };
         let (_state, router) = admin::build(config, h.admin_deps(None, None));
         router
@@ -2677,6 +2682,11 @@ mod admin_plane {
             presence_slow_ms: 250.0,
             presence_large_view_rows: 1000,
             presence_max_rows: 20_000,
+            // Zero disables the job sampler outright, which is what a test of
+            // the plane wants: no background task reaching for a handle these
+            // tests deliberately do not publish.
+            job_interval: std::time::Duration::ZERO,
+            job_live_interval: std::time::Duration::from_secs(2),
         };
         let (_state, router) = admin::build(config, h.admin_deps(cloud_api_url, auth_secret));
         router

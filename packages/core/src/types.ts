@@ -293,6 +293,26 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    */
   instantHydrate?: boolean;
   /**
+   * Carry the changed row's body on the LIVE notification instead of going
+   * back for it.
+   *
+   * The client holds exactly one live subscription, on its `_00_list_ref`
+   * table, and today it is a doorbell: the notification is reduced to the
+   * query hash and the row is then pulled with `SELECT * FROM $ids`. The edge
+   * is a real graph edge, so `FETCH out` makes SurrealDB resolve the row into
+   * the notification and the body fetch disappears.
+   *
+   * The push stays advisory: the body is landed exactly the way a fetched body
+   * is (store write, circuit ingest, version recorded), so a notification the
+   * server drops costs nothing but the old round trip. Membership is still
+   * read back; only the body fetch is saved.
+   *
+   * Default `false`. The cost is wire bytes: one edit bumps the edge in every
+   * view holding the row, and under `FETCH` each of those notifications
+   * carries its own full copy of the body.
+   */
+  liveInlineBodies?: boolean;
+  /**
    * Enable realtime sync while signed out. When `true`, the client starts its
    * `_00_list_ref` poll (and a LIVE subscription) against the shared
    * `_00_list_ref_anon` table even with no authenticated user, so a logged-out
@@ -468,6 +488,18 @@ export interface StorageHealth {
 }
 
 export type QueryHash = string;
+
+/**
+ * One changed row delivered inline on a LIVE notification, when the
+ * subscription was opened with the body joined on (see
+ * {@link Sp00kyConfig.liveInlineBodies}). `version` is the edge's `version`,
+ * i.e. the same number the membership read would have reported for this row.
+ */
+export interface InlineRow {
+  id: string;
+  version: number;
+  record: Record<string, unknown>;
+}
 
 // Flat array format: [[record-id, version], [record-id, version], ...]
 export type RecordVersionArray = Array<[string, number]>;

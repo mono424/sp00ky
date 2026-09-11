@@ -60,8 +60,14 @@ export function* fetchRows(env: SagaEnv): Saga<void> {
   }
 }
 
-/** Write one chunk's bodies to the store and circuit; record their versions. */
-function* landChunk(
+/**
+ * Write one chunk's bodies to the store and circuit; record their versions.
+ *
+ * Shared with the LIVE path: a body that arrives on a notification is landed
+ * through here so it is indistinguishable from a fetched one, which is what
+ * makes `planFetch` stop asking for it.
+ */
+export function* landChunk(
   env: SagaEnv,
   requested: string[],
   rows: Array<Record<string, unknown>>,

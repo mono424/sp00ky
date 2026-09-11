@@ -63,7 +63,8 @@ export function* tabMessage(env: SagaEnv, raw: unknown): Saga<void> {
       return;
     }
     case 'membership-dirty':
-      if (Array.isArray(msg.hashes)) yield* liveChange(msg.hashes);
+      // No inline rows here: the leader relays its own bodies as an `ingest`.
+      if (Array.isArray(msg.hashes)) yield* liveChange(env, msg.hashes);
       return;
     case 'outbox-changed':
       if (role !== 'leader') return;

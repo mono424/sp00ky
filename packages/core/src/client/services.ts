@@ -1,6 +1,6 @@
 import { RecordId, type Uuid } from 'surrealdb';
 import type { SchemaStructure } from '@spooky-sync/query-builder';
-import type { Sp00kyConfig, PersistenceClient } from '../types';
+import type { InlineRow, Sp00kyConfig, PersistenceClient } from '../types';
 import type { Logger } from '../services/logger/index';
 import { createLogger } from '../services/logger/index';
 import { ConnectionSupervisor, LocalMigrator, RemoteDatabaseService, createLocalEngine } from '../services/database/index';
@@ -216,6 +216,28 @@ export function hashOfEdge(value: unknown): string | null {
   return str.length > 0 ? str : null;
 }
 
+/**
+ * The row an edge notification carries, when the subscription joined it on.
+ *
+ * Without `FETCH out` the edge's `out` is a record id and there is nothing to
+ * land, so this returns null and the caller falls back to fetching the body.
+ * It also returns null for a row the session may not read (the join yields
+ * `out: null`) and for an edge whose target has been deleted.
+ */
+export function rowOfEdge(value: unknown): InlineRow | null {
+  const edge = value as { out?: unknown; version?: unknown } | null;
+  const out = edge?.out;
+  if (!out || typeof out !== 'object' || Array.isArray(out) || out instanceof RecordId) return null;
+  // Must be a real RecordId: the landing path keys off `row.id` being one, and
+  // would otherwise record the version for a body it never wrote.
+  const rid = (out as { id?: unknown }).id;
+  if (!(rid instanceof RecordId)) return null;
+  const id = encodeRecordId(rid);
+  const version = typeof edge?.version === 'number' ? edge.version : null;
+  if (version === null) return null;
+  return { id, version, record: out as Record<string, unknown> };
+}
+
 /** Build the adapters the interpreter drives from the services. */
 export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S>, s: Services<S>, host: ServiceHost, lateModules: () => { init(): void }[]): Adapters {
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -305,12 +327,23 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
     remote: {
       queryResponses: (sql, vars) => s.remote.queryResponses(sql, vars),
       live: async (table, onChange) => {
-        const [uuid] = await s.remote.query<[Uuid]>(`LIVE SELECT * FROM ${table}`);
+        // `FETCH out` resolves the edge's target into the notification, so the
+        // body arrives with the doorbell instead of costing a second round
+        // trip. The clause is only ever added, never relied on: a server that
+        // ignores it, or a row the session cannot read, simply yields no
+        // inline row and the fetch path takes over.
+        const join = config.liveInlineBodies ? ' FETCH out' : '';
+        const [uuid] = await s.remote.query<[Uuid]>(`LIVE SELECT * FROM ${table}${join}`);
         const live = await s.remote.getClient().liveOf(uuid);
         live.subscribe((message) => {
           if (message.action === 'KILLED') return;
           const hash = hashOfEdge(message.value);
-          if (hash) onChange([hash]);
+          if (!hash) return;
+          // Not on DELETE: that edge is a row leaving the view, and for a row
+          // that was actually deleted the join yields nothing anyway. Landing
+          // a body there would only ever write back what is going away.
+          const row = message.action === 'DELETE' ? null : rowOfEdge(message.value);
+          onChange([hash], row ? [row] : undefined);
         });
         return String(uuid);
       },

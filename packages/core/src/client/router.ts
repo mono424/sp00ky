@@ -71,7 +71,7 @@ export function route(env: SagaEnv, event: RuntimeEvent): RouteTarget {
     case 'LiveStart':
       return { saga: liveStart(env), lane: serial('live') };
     case 'LiveChange':
-      return { saga: liveChange(event.hashes), lane: serial('live-change') };
+      return { saga: liveChange(env, event.hashes, event.rows), lane: serial('live-change') };
     case 'TabRole':
       return { saga: setRole(env, event.role), lane: serial('tabs') };
     case 'TabMessage':

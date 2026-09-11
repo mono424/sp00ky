@@ -1,0 +1,768 @@
+<!DOCTYPE html><html lang="en" class="dark"> <head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta property="og:type" content="article"><meta property="og:title" content="Admin dashboard | sp00ky Docs"><meta name="description" content="The operator dashboard the scheduler serves at /admin: sign-in, cluster overview, restart and backup actions, backend health, live logs and workflow runs."><meta property="og:description" content="The operator dashboard the scheduler serves at /admin: sign-in, cluster overview, restart and backup actions, backend health, live logs and workflow runs."><meta property="og:image" content="https://sp00ky.cloud/social-card.png"><meta property="twitter:card" content="summary_large_image"><meta property="twitter:title" content="Admin dashboard | sp00ky Docs"><meta property="twitter:description" content="The operator dashboard the scheduler serves at /admin: sign-in, cluster overview, restart and backup actions, backend health, live logs and workflow runs."><meta property="twitter:image" content="https://sp00ky.cloud/social-card.png"><title>Admin dashboard | sp00ky Docs</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"><link rel="help" type="text/markdown" href="/llm.txt" title="LLM Info"><script type="module" src="/pr-preview/pr-38/_astro/DocsLayout.astro_astro_type_script_index_0_lang.BswKC14f.js"></script><meta name="astro-view-transitions-enabled" content="true"><meta name="astro-view-transitions-fallback" content="animate"><script type="module" src="/pr-preview/pr-38/_astro/ClientRouter.astro_astro_type_script_index_0_lang.zIqIeV6h.js"></script><link rel="stylesheet" href="/pr-preview/pr-38/_astro/CodeBlock.DSbpnYrp.css"><script type="module" src="/pr-preview/pr-38/_astro/page.CFbxjes3.js"></script><style>[data-astro-transition-scope="astro-jo646ijk-1"] { view-transition-name: root; }@layer astro { ::view-transition-old(root) { animation: none; opacity: 0; mix-blend-mode: normal; }::view-transition-new(root) { animation: none; mix-blend-mode: normal; }::view-transition-group(root) { animation: none } }[data-astro-transition-fallback="old"] [data-astro-transition-scope="astro-jo646ijk-1"],
+			[data-astro-transition-fallback="old"][data-astro-transition-scope="astro-jo646ijk-1"] { animation: none; mix-blend-mode: normal; }[data-astro-transition-fallback="new"] [data-astro-transition-scope="astro-jo646ijk-1"],
+			[data-astro-transition-fallback="new"][data-astro-transition-scope="astro-jo646ijk-1"] { animation: none; mix-blend-mode: normal; }</style></head> <body class="bg-background text-text-secondary antialiased selection:bg-brand-500/30" data-astro-transition-scope="astro-jo646ijk-1"> <header class="h-16 bg-background/75 shadow-[0_10px_30px_-18px_rgba(0,0,0,0.9)] backdrop-blur-xl backdrop-saturate-150 sticky top-0 z-50"> <div class="max-w-[1600px] mx-auto h-full flex items-center justify-between px-6"> <div class="flex items-center gap-4"> <button id="mobile-menu-trigger" class="lg:hidden p-2 -ml-2 text-text-muted hover:text-text-primary hover:bg-white/[0.06] rounded-lg transition-colors" aria-label="Toggle menu"> <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path> </svg> </button> <a href="/" class="flex items-center gap-2 hover:opacity-80 transition-opacity"> <img src="/logo.svg" alt="sp00ky Logo" class="h-6"> </a> </div> <div> <style>astro-island,astro-slot,astro-static-slot{display:contents}</style><script>(()=>{var l=(n,t)=>{let i=async()=>{await(await n())()},e=typeof t.value=="object"?t.value:void 0,s={timeout:e==null?void 0:e.timeout};"requestIdleCallback"in window?window.requestIdleCallback(i,s):setTimeout(i,s.timeout||200)};(self.Astro||(self.Astro={})).idle=l;window.dispatchEvent(new Event("astro:idle"));})();</script><script>(()=>{var A=Object.defineProperty;var g=(i,o,a)=>o in i?A(i,o,{enumerable:!0,configurable:!0,writable:!0,value:a}):i[o]=a;var d=(i,o,a)=>g(i,typeof o!="symbol"?o+"":o,a);{let i={0:t=>m(t),1:t=>a(t),2:t=>new RegExp(t),3:t=>new Date(t),4:t=>new Map(a(t)),5:t=>new Set(a(t)),6:t=>BigInt(t),7:t=>new URL(t),8:t=>new Uint8Array(t),9:t=>new Uint16Array(t),10:t=>new Uint32Array(t),11:t=>Number.POSITIVE_INFINITY*t},o=t=>{let[l,e]=t;return l in i?i[l](e):void 0},a=t=>t.map(o),m=t=>typeof t!="object"||t===null?t:Object.fromEntries(Object.entries(t).map(([l,e])=>[l,o(e)]));class y extends HTMLElement{constructor(){super(...arguments);d(this,"Component");d(this,"hydrator");d(this,"hydrate",async()=>{var b;if(!this.hydrator||!this.isConnected)return;let e=(b=this.parentElement)==null?void 0:b.closest("astro-island[ssr]");if(e){e.addEventListener("astro:hydrate",this.hydrate,{once:!0});return}let c=this.querySelectorAll("astro-slot"),n={},h=this.querySelectorAll("template[data-astro-template]");for(let r of h){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("data-astro-template")||"default"]=r.innerHTML,r.remove())}for(let r of c){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("name")||"default"]=r.innerHTML)}let p;try{p=this.hasAttribute("props")?m(JSON.parse(this.getAttribute("props"))):{}}catch(r){let s=this.getAttribute("component-url")||"<unknown>",v=this.getAttribute("component-export");throw v&&(s+=` (export ${v})`),console.error(`[hydrate] Error parsing props for component ${s}`,this.getAttribute("props"),r),r}let u;await this.hydrator(this)(this.Component,p,n,{client:this.getAttribute("client")}),this.removeAttribute("ssr"),this.dispatchEvent(new CustomEvent("astro:hydrate"))});d(this,"unmount",()=>{this.isConnected||this.dispatchEvent(new CustomEvent("astro:unmount"))})}disconnectedCallback(){document.removeEventListener("astro:after-swap",this.unmount),document.addEventListener("astro:after-swap",this.unmount,{once:!0})}connectedCallback(){if(!this.hasAttribute("await-children")||document.readyState==="interactive"||document.readyState==="complete")this.childrenConnectedCallback();else{let e=()=>{document.removeEventListener("DOMContentLoaded",e),c.disconnect(),this.childrenConnectedCallback()},c=new MutationObserver(()=>{var n;((n=this.lastChild)==null?void 0:n.nodeType)===Node.COMMENT_NODE&&this.lastChild.nodeValue==="astro:end"&&(this.lastChild.remove(),e())});c.observe(this,{childList:!0}),document.addEventListener("DOMContentLoaded",e)}}async childrenConnectedCallback(){let e=this.getAttribute("before-hydration-url");e&&await import(e),this.start()}async start(){let e=JSON.parse(this.getAttribute("opts")),c=this.getAttribute("client");if(Astro[c]===void 0){window.addEventListener(`astro:${c}`,()=>this.start(),{once:!0});return}try{await Astro[c](async()=>{let n=this.getAttribute("renderer-url"),[h,{default:p}]=await Promise.all([import(this.getAttribute("component-url")),n?import(n):()=>()=>{}]),u=this.getAttribute("component-export")||"default";if(!u.includes("."))this.Component=h[u];else{this.Component=h;for(let f of u.split("."))this.Component=this.Component[f]}return this.hydrator=p,this.hydrate},e,this)}catch(n){console.error(`[astro-island] Error hydrating ${this.getAttribute("component-url")}`,n)}}attributeChangedCallback(){this.hydrate()}}d(y,"observedAttributes",["props"]),customElements.get("astro-island")||customElements.define("astro-island",y)}})();</script><astro-island uid="Z12LyUL" prefix="r2" component-url="/pr-preview/pr-38/_astro/Search.Bv26sCcI.js" component-export="Search" renderer-url="/pr-preview/pr-38/_astro/client.NQDPFRSz.js" props="{}" ssr client="idle" opts="{&quot;name&quot;:&quot;Search&quot;,&quot;value&quot;:true}" await-children><button class="flex items-center gap-2 px-3 py-1.5 text-sm text-zinc-400 bg-white/[0.04] border border-white/[0.08] shadow-glass-inset hover:bg-white/[0.07] hover:text-zinc-200 rounded-lg transition-colors w-full md:w-64"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-search w-4 h-4" aria-hidden="true"><path d="m21 21-4.34-4.34"></path><circle cx="11" cy="11" r="8"></circle></svg><span class="hidden md:inline">Search...</span><kbd class="hidden md:inline-flex items-center gap-1 px-1.5 py-0.5 text-xs font-mono text-zinc-400 bg-white/[0.06] rounded-md border border-white/10 ml-auto"><span class="text-xs">⌘</span>K</kbd></button><!--astro:end--></astro-island> </div> <div class="flex items-center gap-4 text-sm text-text-muted"> <script>(()=>{var e=async t=>{await(await t())()};(self.Astro||(self.Astro={})).load=e;window.dispatchEvent(new Event("astro:load"));})();</script><astro-island uid="ZcVTy6" prefix="r3" component-url="/pr-preview/pr-38/_astro/GitHubStars.CBnmlTzL.js" component-export="default" renderer-url="/pr-preview/pr-38/_astro/client.NQDPFRSz.js" props="{}" ssr client="load" opts="{&quot;name&quot;:&quot;GitHubStars&quot;,&quot;value&quot;:true}" await-children><a href="https://github.com/mono424/sp00ky" target="_blank" rel="noreferrer" class="group inline-flex items-center gap-2 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 font-mono text-xs font-medium uppercase tracking-wider text-zinc-300 shadow-glass-inset transition-colors hover:bg-white/[0.08] hover:text-white"><span class="flex items-center gap-2"><svg viewBox="0 0 24 24" class="fill-current h-3.5 w-3.5" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-3.795-.735-.54-1.38-1.335-1.755-1.335-1.755-1.095-.75.075-.735.075-.735 1.215.09 1.845 1.245 1.845 1.245 1.05 1.785 2.76 1.275 3.435.975.105-.75.405-1.275.735-1.575-2.415-.27-4.95-1.215-4.95-5.43 0-1.185.42-2.16 1.11-2.94-.105-.27-.48-1.395.105-2.94 0 0 .93-.3 3.045 1.125a10.59 10.59 0 0 1 2.76-.375c.945.0.1875.1275 2.76.375 2.115-1.425 3.045-1.125 3.045-1.125.585 1.545.21 2.67.105 2.94 1.185.78 1.11 1.755 1.11 2.94 0 4.23-2.55 5.145-4.965 5.415.42.375.78 1.11.78 2.235 0 1.605-.015 2.895-.015 3.285 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12Z"></path></svg><span>Github</span><span class="text-white/20">|</span><span class="animate-pulse text-neutral-500">...</span></span></a><!--astro:end--></astro-island> </div> </div> </header> <div class="max-w-[1600px] mx-auto flex w-full min-h-screen"> <aside class="hidden lg:block w-[280px] shrink-0 h-[calc(100vh-64px)] sticky top-16 overflow-y-auto py-8 pl-6 pr-4"> <nav class="space-y-6" data-astro-cid-ssfzsv2f> <details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Start here <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Introduction</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/quickstart" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Quickstart</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/how-it-works" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>How it works</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/install" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Installation</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Schema <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Define your schema</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema/relationships" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Relationships</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema/generated-types" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Generated types</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema/migrations" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Migrations</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Client SDK <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/queries" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Reactive queries</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/pagination" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Pagination</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/mutations" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Mutations</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/auth" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Authentication</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/offline-sync" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Offline &amp; sync health</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/feature-flags" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Feature flags</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/buckets" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>File buckets</span> <svg class="ml-auto w-3.5 h-3.5 text-amber-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-label="Experimental" data-astro-cid-ssfzsv2f> <title>Experimental</title> <path d="M9 3h6" data-astro-cid-ssfzsv2f></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3" data-astro-cid-ssfzsv2f></path> <path d="M7 14h10" data-astro-cid-ssfzsv2f></path> </svg> </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/crdt" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>CRDT fields</span> <svg class="ml-auto w-3.5 h-3.5 text-amber-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-label="Experimental" data-astro-cid-ssfzsv2f> <title>Experimental</title> <path d="M9 3h6" data-astro-cid-ssfzsv2f></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3" data-astro-cid-ssfzsv2f></path> <path d="M7 14h10" data-astro-cid-ssfzsv2f></path> </svg> </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Framework Guides <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/solid" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>SolidJS</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/solid2" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Solid 2 (RC)</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/flutter" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Flutter</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/vanilla" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Vanilla JS / TS</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Backends <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/backend" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>What is a backend</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/backend/add" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Add a backend</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/backend/options" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Backend options</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Background Jobs <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/jobs" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Jobs</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/jobs/schedules" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Schedules</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/jobs/workflows" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Workflows</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Local Development <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>spky dev</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev/servers" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Dev servers &amp; sidecars</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev/env" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Environment variables</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev/doctor" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Doctor &amp; troubleshooting</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Deploy <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/getting-started" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Getting started</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/deploying" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Deploying</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/env-variables" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Environment &amp; vault</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/logs" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Logs &amp; monitoring</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/backups" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Backups</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/ci-cd" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>CI/CD</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/team" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Teams</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/self-hosting" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Self-hosting</span>  </a> </li> </ul> </details><details open name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Operations <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/admin-dashboard" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-white bg-white/[0.06] font-medium border-white/[0.08] shadow-glass-inset" data-astro-cid-ssfzsv2f> <span class="w-1.5 h-1.5 bg-brand-400 rounded-full" data-astro-cid-ssfzsv2f></span> <span data-astro-cid-ssfzsv2f>Admin dashboard</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/mcp" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>MCP server</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Reference <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/cli" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>CLI</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/config" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>sp00ky.yml</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/client-config" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Client config</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/ai-agents" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>AI coding agents</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/architecture" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Architecture</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/performance" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Performance</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/vault" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Vault architecture</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/ssp-api" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>SSP API</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/scheduler-api" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Scheduler API</span>  </a> </li> </ul> </details> </nav> <script type="module">document.querySelectorAll('details[name="docs-sidebar"]').forEach(e=>{e.addEventListener("toggle",()=>{e.open&&document.querySelectorAll('details[name="docs-sidebar"]').forEach(o=>{o!==e&&(o.open=!1)})})});</script> </aside> <main class="flex-1 min-w-0 py-8 px-6 lg:px-12"> <div class="prose prose-invert prose-docs max-w-3xl w-full">  <nav class="flex items-center text-sm text-text-muted mb-6 overflow-x-auto whitespace-nowrap"> <a href="/pr-preview/pr-38/docs" class="hover:text-text-primary transition-colors">Docs</a>  <span class="mx-2 text-zinc-600">/</span> <span class="text-text-primary font-medium">Operations</span>  </nav> <h1 class="text-4xl font-semibold tracking-tight mb-4"> Admin dashboard </h1> <p class="text-lg text-text-muted leading-relaxed mb-8">The operator dashboard the scheduler serves at /admin: sign-in, cluster overview, restart and backup actions, backend health, live logs and workflow runs.</p> <p>Every scheduler serves an operator dashboard. It shows the health of the
+scheduler and its SSPs, the end-to-end sync latency, the status of your
+backends, live logs, and workflow runs as they happen.</p>
+<h2 id="opening-it">Opening it</h2>
+<p>The dashboard is bundled into the official <code>mono424/spooky-scheduler</code> image and
+served on its own port:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="plaintext"><code><span class="line"><span>http://&lt;scheduler-host&gt;:9668/admin</span></span></code></pre>
+<h3 id="why-a-second-port">Why a second port</h3>
+<p>Everything on the ingest port (<code>9667</code>) is unauthenticated by design — including
+<code>POST /proxy/query</code>, which runs arbitrary SurrealQL against the scheduler’s
+replica. That port is meant to be reachable only from inside your deployment’s
+private network.</p>
+<p>The dashboard is the first surface intended for a browser, so it gets a listener
+of its own. Publish <code>9668</code>; keep <code>9667</code> private.</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">docker</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -p</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> 9668:9668</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> mono424/spooky-scheduler</span><span style="color:#6A737D;--shiki-dark:#6A737D">   # dashboard reachable</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># 9667 stays on the internal network</span></span></code></pre>
+<h2 id="signing-in">Signing in</h2>
+<p>Two ways in.</p>
+<h3 id="admin-accounts-the-normal-path">Admin accounts (the normal path)</h3>
+<p>Any account on the <code>_00_admin</code> roster can sign in with its ordinary application
+credentials. Grant access with the CLI:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">spky</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> admin</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> add</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> alice</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">spky</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> admin</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> list</span></span>
+<span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">spky</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> admin</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> remove</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> alice</span></span></code></pre>
+<p>The scheduler signs in to your database through your app’s own record-access
+method, then checks the resulting user against <code>_00_admin</code>. Nothing extra to
+configure, and no second password to manage.</p>
+<p>The access method is discovered from <code>INFO FOR DB</code>. If your schema defines
+several record accesses and you want to pin one, set <code>SPKY_ADMIN_ACCESS</code>. Both
+<code>$username</code> and <code>$email</code> are tried as the identifier parameter, so either
+spelling of a <code>SIGNIN</code> clause works.</p>
+<h3 id="break-glass-password">Break-glass password</h3>
+<p>Set <code>SPKY_ADMIN_PASSWORD</code> to enable a password-only login that needs no
+database:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_ADMIN_PASSWORD</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&#39;…&#39;</span></span></code></pre>
+<p>This exists because the roster path needs a working database, and a database
+that is down is exactly when you most want the dashboard. A session established
+this way is flagged with a persistent banner in the UI.</p>
+<p>Leave the variable unset to disable this path entirely; there is no default
+password.</p>
+<h3 id="session-behaviour">Session behaviour</h3>
+<p>How long a session lives depends on whether the scheduler has a cluster secret:</p>
+<ul>
+<li>With <code>SPKY_AUTH_SECRET</code> set (always the case on Sp00ky Cloud), tokens are
+self-describing and HMAC-signed with a key derived from that secret. They
+verify without any server-side state, so they <strong>survive a scheduler
+restart</strong>, including one you trigger from the dashboard. Signing out adds
+the token to an in-memory revocation set; a restart forgets that set, so a
+revoked token comes back for the remainder of its own expiry. That trade is
+deliberate and is the whole cost of not logging you out when you press
+Restart.</li>
+<li>Without a secret there is nothing to sign with that outlives the process,
+so sessions are random tokens held in memory and a restart means signing in
+again.</li>
+</ul>
+<p><code>GET /admin/api/config</code> reports which mode is active as <code>sessions_persistent</code>.
+<code>GET /admin/api/me</code> reports the session’s <code>mode</code> (<code>roster</code>, <code>breakglass</code>, or
+<code>mcp</code> for a token minted on the <a href="#access">Access</a> page) and its <code>scope</code>.</p>
+<p>Failed logins are rate limited to 10 attempts per address per 5 minutes, and
+every failure returns the same response regardless of cause, so the endpoint
+cannot be used to discover which usernames exist.</p>
+<h2 id="standalone-use">Standalone use</h2>
+<p>The same bundle runs outside a scheduler. Opened from anywhere else, the sign-in
+form grows an <strong>endpoint</strong> field; point it at a scheduler’s admin port and it
+behaves identically.</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">pnpm</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> --filter</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> @spooky-sync/dashboard</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> dev</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># then enter http://your-scheduler:9668 in the endpoint field</span></span></code></pre>
+<p>The dashboard authenticates with a bearer token in <code>localStorage</code>, keyed per
+endpoint, rather than a cookie — a cross-origin cookie would need
+<code>SameSite=None; Secure</code>, which browsers refuse over plain HTTP, and plain HTTP
+at an IP address is exactly how a scheduler is usually reached.</p>
+<h2 id="what-it-shows">What it shows</h2>
+<p><strong>Overview</strong> — a grid of tiles, one per question: the end-to-end sync latency
+with a 30-minute chart as the large tile, then SSPs ready, backends healthy,
+ingest lag and the scheduler’s own details beside it. A tile whose subject is
+degraded is tinted, so the problem is the first thing on the page. The
+latency is the scheduler’s own heartbeat probe: it writes <code>_00_heartbeat:probe</code>
+upstream and times the full round trip through <code>/ingest</code>, the WAL, the
+broadcast and every SSP’s circuit. It measures the real sync path, not a
+synthetic ping.</p>
+<p><strong>SSPs</strong> — per-processor status, live view count, uptime and environment. An SSP
+that is bootstrapping or replaying shows a progress bar: tables loaded and rows
+read when the SSP reports it, and otherwise the phase with its elapsed time
+against the scheduler’s bootstrap budget.</p>
+<p><strong>Backends</strong> — status and response time for everything in <code>SPKY_BACKENDS</code>, with
+a detail page carrying a ~30-minute response-time history and the resolved
+healthcheck URL. Environment values are masked by the scheduler before they
+leave it.</p>
+<p><strong>Workflows</strong> — runs updating in real time, and a run page built around a
+timeline: every step plotted on one shared axis, so where the time went is
+visible at a glance rather than reconstructed from timestamps. Each row in the
+list carries the run’s own failure reason, so four <code>failed</code> runs do not cost
+four clicks to tell one problem from four. Click a step to expand its job,
+output and error inline. A step still waiting on its dependencies is drawn
+hatched at the origin rather than as a bar, because it has not run. The
+scheduler runs a single shared poller behind the live list, so ten open
+dashboards cost your database exactly what one does, and a closed one costs
+nothing.</p>
+<p>An expanded step also loads its <strong>job</strong>, which is where a failure says what
+actually happened: the step row keeps only the attempt that ended the job, while
+the job’s <code>errors</code> array keeps every attempt. A step that failed after two
+timeouts and a 502 is a different problem from one that 502’d immediately, and
+only the job can tell them apart. The job is fetched per opened step rather than
+with the run, so a fan-out run with hundreds of steps costs nothing extra.</p>
+<p><strong>Schedules</strong> — the definition, the next fire, recent fires, and a
+success/failure tally. The tally comes from <code>_00_run_rollup</code> rather than
+counting run rows, so it stays accurate after retention has pruned them. Each
+fire shows <strong>why</strong> it ended as it did, and a schedule whose fires are being
+suppressed says so at the top of the page, naming the run that is holding the
+key — a wall of <code>skipped</code> rows looks like “nothing to do” and means “something
+is still running”.</p>
+<p><strong>Logs</strong> — a live tail of the scheduler’s or any SSP’s log output, with level
+and text filters. If a viewer falls behind, the gap is shown explicitly rather
+than hidden.</p>
+<p>Backends have no log stream: the scheduler reaches them with HTTP health checks
+and has no access to their output.</p>
+<h2 id="actions">Actions</h2>
+<p>Everything the dashboard can <em>do</em>, as opposed to show, goes through the
+scheduler. Every action logs the signed-in subject, and the long-running ones
+answer <code>202</code> with an <strong>operation</strong> the dashboard watches (see below).</p>
+<h3 id="restarting-an-ssp">Restarting an SSP</h3>
+<p>The scheduler never touches a container. Restarting an SSP means flagging it
+in the pool; the SSP’s next heartbeat is answered with <code>409</code> and a JSON
+<code>ResyncDirective</code>, the SSP exits, and its supervisor relaunches it through the
+same register, bootstrap and verify path every SSP takes on boot. A restart
+from the dashboard is indistinguishable from one by Docker.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Mode</th><th>What happens</th></tr></thead><tbody><tr><td><code>restart</code></td><td>Flag, <code>409</code>, exit, relaunch. The SSP restores its circuit snapshot and catches up the delta.</td></tr><tr><td><code>clean</code></td><td>The directive carries <code>clean: true</code>, so before exiting the SSP deletes its <code>snapshot.json</code> and its arena directory. The relaunch is a cold rebuild from the database. Use it when the snapshot itself is suspect.</td></tr><tr><td><code>reload</code></td><td>No exit. The scheduler calls the SSP’s <code>POST /admin/reload</code>, which rebuilds the circuit in-process from the database. Picks up tables and permissions defined after the last bootstrap.</td></tr></tbody></table>
+<p>Nothing happens until the next heartbeat (5 s by default). An operation is
+marked <strong>done</strong> when the SSP has re-registered and reached <code>ready</code>, and
+<strong>failed</strong> if that has not happened within one heartbeat interval plus the
+scheduler’s bootstrap timeout plus 30 s. An SSP older than this release reads
+the directive as free text and restarts anyway, so a <code>clean</code> on it degrades to
+a plain restart; the operation records the SSP’s version so you can tell.</p>
+<p><strong>Restart all</strong> defaults to <strong>rolling</strong>: one SSP is flagged, the scheduler
+waits for it to come back ready, then flags the next, in id order. Queries are
+pinned to an SSP, so taking one down is already an outage for its clients;
+taking all of them down at once is an outage for everyone. All-at-once is
+still offered for the case where you want exactly that. A roll stops at the
+first SSP that does not come back, because continuing would take down the next
+one while this one is still missing. Only one roll runs at a time.</p>
+<h3 id="restarting-the-scheduler">Restarting the scheduler</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Mode</th><th>What happens</th></tr></thead><tbody><tr><td><code>restart</code></td><td>The scheduler answers <code>202</code>, waits for the response to flush, and calls <code>exit(0)</code>. Sp00ky Cloud runs it under Docker’s <code>unless-stopped</code>, which relaunches on any exit code, and the startup integrity check runs again on boot.</td></tr><tr><td><code>reclone</code></td><td>Resets the local replica and re-fetches everything from upstream SurrealDB, then flags every SSP to re-verify. The same thing <code>POST /admin/resync</code> on the ingest port does. Runs as an operation, because it can take minutes.</td></tr><tr><td><code>rehash</code></td><td>Keeps the replica’s rows and recomputes the persisted snapshot hashes from them, then flags every SSP. Repairs hash-metadata drift without a refetch.</td></tr></tbody></table>
+<p>A scheduler run from a checkout has no supervisor and simply stops.
+<code>GET /admin/api/config</code> reports <code>supervised</code> (true when <code>SPKY_ENV=cloud</code>) so
+the dashboard can say so before you press the button rather than after.
+Reclone and rehash are refused with <code>503</code> while the scheduler is cloning or
+restoring, and with <code>409</code> while another reclone is running.</p>
+<h3 id="cloud-only-actions">Cloud-only actions</h3>
+<p>Some things are not the scheduler’s to do: pulling a newer image, wiping its
+own volume (RocksDB holds the files open), bouncing SurrealDB, and the backup
+catalog with its schedule and retention. Those belong to Sp00ky Cloud, which
+owns the containers and the backup rows. When the scheduler is <strong>linked</strong> (see
+<a href="#configuration">Configuration</a>) the dashboard offers them and the scheduler
+forwards the request; when it is not, every such action answers <code>409</code> with
+<code>Not linked to Sp00ky Cloud</code>, and the dashboard shows the option disabled with
+that sentence beside it.</p>
+<p>If Sp00ky Cloud refuses the scheduler’s credentials, the dashboard shows a
+<code>502</code> with <code>code: cloud_auth</code> and the sentence from the control plane. It is
+never relayed as a <code>401</code>: that status means “not signed in” to the dashboard,
+and a cloud refusal has nothing to do with your session.</p>
+<p><code>POST /admin/api/cloud/restart</code> takes <code>{roles, upgrade, clean, surreal}</code> with
+exactly the meaning of <code>spky restart</code>: <code>upgrade</code> force-pulls the latest
+scheduler and SSP images, <code>clean</code> wipes the scheduler’s volume (and always
+includes the scheduler in the role set), <code>surreal</code> also bounces SurrealDB.
+Empty <code>roles</code> means scheduler plus SSPs. A request that recreates this
+scheduler will, by definition, not be reported done by it; the dashboard’s
+reconnect loop observes the outcome instead.</p>
+<h3 id="operations">Operations</h3>
+<p>Every asynchronous action records an operation: kind, target, who asked,
+start and finish times, status (<code>running</code>, <code>done</code>, <code>failed</code>), the server’s
+own closing message, and free-form progress (<code>{done, total, current}</code> for a
+rolling restart, the registry state for a backup).</p>
+<ul>
+<li><code>GET /admin/api/operations</code> lists the most recent ones, newest first.</li>
+<li><code>GET /admin/api/operations/stream</code> is an SSE stream (event <code>operations</code>)
+that sends the whole list on every change.</li>
+<li><code>GET /admin/api/overview</code> embeds the <strong>running</strong> ones, so the poll the
+dashboard already makes shows activity without a second request.</li>
+</ul>
+<p>Operations live in memory, bounded at 50. Finished ones are evicted oldest
+first; a running one is never evicted, however old, because a stuck operation
+is exactly what you still need to see. They are a UI convenience, not an audit
+log: the audit trail is the scheduler’s own log output.</p>
+<h3 id="workflows-schedules-and-jobs">Workflows, schedules and jobs</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Action</th><th>What happens</th></tr></thead><tbody><tr><td>Cancel a run</td><td>Sets <code>kill_requested</code> <strong>and</strong> runs the kill immediately: every dispatched step’s job gets <code>/job/kill</code> broadcast to the ready SSPs. Sub-second, with the flag as the durable fallback the next sweep would act on. <code>409</code> unless the run is <code>running</code>.</td></tr><tr><td>Rerun</td><td>A brand-new ad-hoc run with the same frozen DAG, input and target table, <code>trigger: manual</code>, and <code>rerun_of</code> pointing at the source. It has no owning schedule run, never counts towards <code>concurrency: skip</code>, and rolls up under <code>(ad-hoc)</code>. Any source status is allowed.</td></tr><tr><td>Retry from failed</td><td>Only for a <code>failed</code> or <code>killed</code> run. Resets <code>failed</code> and <code>skipped</code> steps to <code>blocked</code>, keeps successful steps and their outputs, reopens the run (and its owning schedule run, so the outcome is mirrored there) and dispatches the reset steps again under new job ids of the form <code>&lt;table&gt;:wf_&lt;run key&gt;_&lt;step&gt;_r&lt;n&gt;</code>. Old job rows are left as history; a job row is never deleted or re-created under the same id. Refused with <code>409 step &lt;name&gt;&#39;s job is still processing; wait for the kill to settle</code> while a killed step’s job has not gone terminal on its SSP, because resetting it before the kill lands would run the step twice.</td></tr><tr><td>Pause / resume a schedule</td><td>Writes <code>paused</code> on the <code>_00_schedule</code> row, the same field <code>spky schedules pause</code> writes.</td></tr><tr><td>Run a schedule now</td><td>Writes <code>trigger_requested_at</code>. <code>409</code> while the schedule is paused (pause wins over a queued trigger, so the fire would silently never happen) or disabled in its config.</td></tr><tr><td>Kill / retry a step’s job</td><td>The cluster <code>/job/kill</code> (broadcast to every ready SSP) and <code>/job/retry</code> (one SSP is picked). The SSP’s own verdict is relayed: a <code>409</code> for a job that is not terminal, a <code>404</code> for one it does not know.</td></tr></tbody></table>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">Note</strong> <p>Retrying the latest fire of a schedule leaves <code>_00_schedule.last_run_status</code>
+at <code>failed</code> even when the retry succeeds: the engine only lets a failure
+overwrite an equal <code>last_run_at</code>. The run and schedule-run rows are correct;
+only that summary field lags.</p> </div> </div>
+<p>A scheduler upgraded before <code>spky deploy</code> has migrated the schedule tables
+answers <code>409</code> asking you to run it: rerun and retry write fields
+(<code>trigger</code>, <code>rerun_of</code>, <code>retry_count</code> as <code>option&lt;int&gt;</code>, <code>last_retry_at</code> on <code>_00_workflow_run</code>)
+that older schemas do not have.</p>
+<h2 id="access">Access</h2>
+<p>The <strong>Access</strong> page mints long-lived tokens for MCP clients, so an AI agent can
+do everything this dashboard does through the
+<a href="/docs/reference/mcp#scheduler-admin-mcp">scheduler admin MCP</a> at
+<code>/admin/api/mcp</code>. A token has a label, a scope and a lifetime of up to 365
+days, and is shown once; the page prints the <code>claude mcp add</code> command and the
+Cursor and VS Code snippets with everything filled in. Paste a token back to
+revoke it.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Scope</th><th>Meaning</th></tr></thead><tbody><tr><td><code>read</code></td><td>May only make <code>GET</code> requests to the API. Any other method answers <code>403 This token is read-only</code></td></tr><tr><td><code>full</code></td><td>Everything the signed-in operator can do</td></tr></tbody></table>
+<p>The bearer middleware enforces that on every request, so a read token binds an
+agent exactly as it binds a browser. <code>POST /admin/api/mcp</code> is the single
+exception, and it has to be: MCP carries reads over POST as well, so the
+endpoint is exempted from the method check and enforces scope per tool
+instead. A read token’s <code>tools/list</code> lists only read tools, and calling a
+write tool anyway comes back as a tool error rather than a result. The reach
+is the same either way, only the place it is checked differs.</p>
+<p>Roster and break-glass sessions are always <code>full</code>. An MCP token cannot mint
+further tokens; only a person’s own session can. Tokens follow the
+<a href="#session-behaviour">session rules</a>: signed and restart-proof when
+<code>SPKY_AUTH_SECRET</code> is set, in memory otherwise.</p>
+<h2 id="backups">Backups</h2>
+<p>The Backups tab merges two sources rather than choosing between them:</p>
+<ul>
+<li><strong>This scheduler</strong> executes backups and restores. Its registries know the
+live state of anything in flight, including restore stages nothing else can
+see. They are in memory and forget on restart, which the tab says under
+<em>Restore history</em> when it is empty.</li>
+<li><strong>Sp00ky Cloud</strong>, when linked, owns the catalog, the schedule, retention and
+deletion.</li>
+</ul>
+<p>Linked, the catalog is the control plane’s list with each row joined to the
+scheduler’s registry entry by id (the cloud worker uses its own row id as the
+scheduler’s backup id, so the join is exact). Unlinked with S3 configured, the
+catalog is a listing of <code>{slug}/*.surql.gz</code> in the bucket, where the slug is
+<code>SPKY_CLOUD_PROJECT</code> or, failing that, <code>SPKY_PROJECT_SLUG</code> (default
+<code>default</code>). That is enough to create and restore; there is no schedule,
+retention or delete, and the tab says so instead of hiding the panels.</p>
+<p>A restore reports the stages the scheduler actually goes through:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="plaintext"><code><span class="line"><span>queued → running → main_db → replica → done</span></span>
+<span class="line"><span>                                   ↘ failed</span></span></code></pre>
+<p><code>main_db</code> means the main SurrealDB has been wiped and re-imported; <code>replica</code>
+means the scheduler’s own replica followed. A restore that ends <code>failed</code> with
+the main database restored but the replica not is the deliberately stuck
+<code>Restoring</code> state described under <a href="/docs/cloud/backups">Cloud → Backups</a>; the
+tab calls it out with the recovery step.</p>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-amber-500/20 bg-amber-500/[0.07]"> <div class="shrink-0 mt-0.5 text-amber-500"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-amber-200/70"> <strong class="block mb-1 text-sm font-medium text-amber-500">Warning</strong> <p>A restore wipes the database, evicts every SSP (they re-bootstrap against the
+restored state) and requires your migrations to be run again. The dialog asks
+you to type <code>restore</code> before it proceeds.</p> </div> </div>
+<h2 id="who-is-connected-and-what-they-registered">Who is connected, and what they registered</h2>
+<p>Two surfaces, split by the question each answers.</p>
+<p><strong>Overview</strong> carries the rollup, because “is anyone using this?” is a
+landing-page question: a band of four tiles — users, sessions and registered
+views, each with its count and its history, and a view-health tile with the
+shared / slow / errored counts. Each chart keeps its own scale; views outnumber
+users by one to two orders of magnitude, and a shared axis would flatten the
+users line onto the baseline.</p>
+<p><strong>Views</strong> is the tab you open to ask <em>which</em> queries are registered: a
+filterable, sortable table of every live query with its owner, SSP, row count,
+subscribers, materialization percentiles and time to expiry. Clicking one opens
+its SurrealQL and params, every subscribing session with its age, that view’s
+heap inside its SSP, and the other live sessions running the identical query.</p>
+<p>Everything is derived from <code>_00_query</code>, the registry of live queries. One row
+there is one <em>client session x query</em> — the query id is hashed with a
+per-browser-session salt, so two tabs of the same person register two rows.
+That is what makes the rollup possible: distinct <code>auth_id</code> counts people,
+distinct <code>clientId</code> counts open tabs, and the row count is registered views.</p>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">Liveness is TTL-shaped, not instant</strong> <p>A client proves it is still watching by refreshing <code>lastActiveAt</code> on a
+<code>0.9 × ttl</code> timer — about nine minutes at the default
+<code>10m</code>. A row counts as live while <code>lastActiveAt + ttl &gt;
+time::now()</code>, the same rule the TTL sweep uses, so a closed tab <em>decays</em>
+out of these counts over minutes rather than leaving at once. Every row on the
+Views tab carries its own <code>expires</code> so you can see which ones are on
+the way out. There is no finer signal to be had: the client’s WebSocket goes to
+SurrealDB, not to the scheduler, so there is no connection to count.</p> </div> </div>
+<p>One background sampler feeds both surfaces, so ten open dashboards cost the
+database exactly what one does, and the totals ride the overview poll the app
+already makes rather than a request of their own.</p>
+<h2 id="configuration">Configuration</h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead><tbody><tr><td><code>SPKY_ADMIN_ENABLED</code></td><td><code>true</code></td><td>Set to <code>0</code>/<code>false</code>/<code>off</code> to disable the admin listener entirely</td></tr><tr><td><code>SPKY_ADMIN_PORT</code></td><td><code>9668</code></td><td>Admin listener port</td></tr><tr><td><code>SPKY_ADMIN_HOST</code></td><td><code>0.0.0.0</code></td><td>Admin listener bind address</td></tr><tr><td><code>SPKY_ADMIN_DIR</code></td><td><code>/usr/share/spooky/dashboard</code></td><td>Where the built dashboard lives</td></tr><tr><td><code>SPKY_ADMIN_PASSWORD</code></td><td>unset</td><td>Break-glass password. Unset disables password-only login</td></tr><tr><td><code>SPKY_ADMIN_ACCESS</code></td><td>auto</td><td>Pins the record-access method used for sign-in</td></tr><tr><td><code>SPKY_ADMIN_SESSION_TTL_SECS</code></td><td><code>28800</code></td><td>Session lifetime (8 hours)</td></tr><tr><td><code>SPKY_ADMIN_PRESENCE_INTERVAL_SECS</code></td><td><code>15</code></td><td>How often the presence sampler reads <code>_00_query</code>. One sampler serves every open dashboard</td></tr><tr><td><code>SPKY_ADMIN_SLOW_VIEW_MS</code></td><td><code>250</code></td><td>Materialization p99 at which a view counts as slow. <code>?slow_ms=</code> overrides it per request</td></tr><tr><td><code>SPKY_ADMIN_LARGE_VIEW_ROWS</code></td><td><code>1000</code></td><td>Row count from which a view is flagged <strong>large</strong> on the Views tab and the Overview. Every row of an unwindowed live view is republished as an edge on each cold registration, so a few thousand at once can stall the database; <code>?large=true</code> filters the list to them</td></tr><tr><td><code>SPKY_ADMIN_PRESENCE_MAX_ROWS</code></td><td><code>20000</code></td><td>Ceiling on rows one presence or views query may pull back</td></tr><tr><td><code>SPKY_CLOUD_API_URL</code></td><td>unset</td><td>Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane</td></tr><tr><td><code>SPKY_CLOUD_PROJECT</code></td><td>unset</td><td>The project slug, injected alongside it</td></tr><tr><td><code>SPKY_PROJECT_SLUG</code></td><td><code>default</code></td><td>Storage prefix for backups on an unlinked scheduler</td></tr></tbody></table>
+<p>Backup storage is configured separately, and those five variables carry no
+<code>SPKY_</code> prefix: <code>S3_ENDPOINT</code>, <code>S3_ACCESS_KEY</code>, <code>S3_SECRET_KEY</code>, <code>S3_BUCKET</code>
+and <code>S3_REGION</code>. The backup plane switches on as soon as any of the first four
+is present, and each one falls back to a local-MinIO default when it is not, so
+set them deliberately rather than partially. Sp00ky Cloud injects them for you;
+self-hosters set them by hand, and
+<a href="/docs/self-hosting#scheduler">Self-hosting</a> lists them with their defaults.
+Without them the Backups tab still loads and says storage is unconfigured, and
+<code>POST /admin/api/backups</code> answers <code>503</code>.</p>
+<p>The scheduler counts as <strong>linked</strong> when <code>SPKY_CLOUD_API_URL</code>,
+<code>SPKY_CLOUD_PROJECT</code> and <code>SPKY_AUTH_SECRET</code> are all set. The first two are not
+secrets; the credential is the <code>SPKY_AUTH_SECRET</code> the scheduler already holds
+as its cluster identity, which the control plane accepts on a small,
+allow-listed route family for that one project. No new credential is minted
+or stored. <code>GET /admin/api/config</code> reports the result as <code>cloud_linked</code>.</p>
+<h2 id="running-from-a-checkout">Running from a checkout</h2>
+<p>The dashboard is shipped as files rather than embedded in the binary, so
+<code>cargo build -p scheduler</code> needs no Node toolchain. A scheduler with no bundle
+starts normally, logs one warning, and serves a short placeholder page at
+<code>/admin</code>; the API on that port is unaffected.</p>
+<p>To build and serve it locally:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">pnpm</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> --filter</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> @spooky-sync/dashboard</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> build</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_ADMIN_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">apps/dashboard/dist</span><span style="color:#6F42C1;--shiki-dark:#B392F0"> cargo</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> run</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -p</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> scheduler</span></span></code></pre>
+<h2 id="api">API</h2>
+<p>Every endpoint is under <code>/admin/api</code> on the admin port. All require
+<code>Authorization: Bearer &lt;token&gt;</code> except <code>GET /admin/api/config</code>.</p>
+<p>Two routes sit outside that prefix: the built dashboard itself, served from
+<code>/admin</code>, and <code>GET /</code>, which answers a <code>301</code> to <code>/admin/</code> so typing the host
+and port with no path lands on the dashboard.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td><code>GET /admin/api/config</code></td><td>Scheduler id, version, <code>breakglass_available</code>, <code>cloud_linked</code>, <code>supervised</code>, <code>sessions_persistent</code>, <code>project_slug</code>. Unauthenticated</td></tr><tr><td><code>POST /admin/api/session</code></td><td>Sign in. <code>{username, password}</code> or <code>{password}</code> for break-glass</td></tr><tr><td><code>POST /admin/api/logout</code></td><td>Revoke the current token</td></tr><tr><td><code>GET /admin/api/me</code></td><td>Current session’s subject, label, mode and scope</td></tr><tr><td><code>GET /admin/api/overview</code></td><td>Scheduler, SSP and backend entities plus totals, and the presence rollup</td></tr><tr><td><code>GET /admin/api/presence</code></td><td>Live users, sessions and views, the sample ring behind the charts, the heaviest users and the per-SSP split. Served from the sampler’s memory</td></tr><tr><td><code>GET /admin/api/views</code></td><td>Registered live queries. <code>?limit=</code>, <code>?user=</code>, <code>?ssp=</code>, <code>?sort=</code>, <code>?slow_ms=</code>, <code>?q=</code>, <code>?shared=</code>, <code>?include_expired=</code></td></tr><tr><td><code>GET /admin/api/views/:key</code></td><td>One view: SurrealQL, params, subscribers, percentiles, its SSP’s memory attribution, and the other sessions running the identical query</td></tr><tr><td><code>GET /admin/api/backends</code></td><td>Backend list</td></tr><tr><td><code>GET /admin/api/backends/:name</code></td><td>One backend with probe history and masked env</td></tr><tr><td><code>GET /admin/api/logs</code></td><td>SSE. <code>?source=scheduler</code> or <code>ssp:&lt;id&gt;</code>, <code>&amp;tail=</code>, <code>&amp;backfill=</code></td></tr><tr><td><code>GET /admin/api/workflows/runs</code></td><td>Run list. <code>?name=</code>, <code>?schedule=</code>, <code>?status=</code>, <code>?rerun_of=</code>, <code>?limit=</code></td></tr><tr><td><code>GET /admin/api/workflows/runs/:id</code></td><td>One run with its steps and DAG</td></tr><tr><td><code>GET /admin/api/workflows/stream</code></td><td>SSE. Run list, pushed on change</td></tr><tr><td><code>GET /admin/api/jobs/:id</code></td><td>One outbox job: status, path, payload, result, every attempt in <code>errors</code>, retry budget, assignee and lease. <code>404</code> unless the id’s table is in <code>_00_retention.job_tables</code></td></tr><tr><td><code>GET /admin/api/schedules</code></td><td>Schedule definitions with next/last fire</td></tr><tr><td><code>GET /admin/api/schedules/:name</code></td><td>One schedule, its recent fires, and its <code>_00_run_rollup</code> tally</td></tr><tr><td><code>GET /admin/api/operations</code></td><td>Recent operations, newest first</td></tr><tr><td><code>GET /admin/api/operations/stream</code></td><td>SSE. Event <code>operations</code>, the whole list on every change</td></tr><tr><td><code>POST /admin/api/ssps/:id/restart</code></td><td><code>{mode: &quot;restart&quot; | &quot;clean&quot; | &quot;reload&quot;}</code>. <code>202</code> with the operation</td></tr><tr><td><code>POST /admin/api/ssps/restart-all</code></td><td><code>{mode: &quot;restart&quot; | &quot;clean&quot;, rolling: true}</code>. <code>409</code> while a roll is running</td></tr><tr><td><code>POST /admin/api/scheduler/restart</code></td><td><code>{mode: &quot;restart&quot; | &quot;reclone&quot; | &quot;rehash&quot;}</code></td></tr><tr><td><code>POST /admin/api/cloud/restart</code></td><td><code>{roles, upgrade, clean, surreal}</code>, forwarded to Sp00ky Cloud. <code>409</code> when unlinked</td></tr><tr><td><code>GET /admin/api/cloud/deployment</code></td><td>The deployment as Sp00ky Cloud sees it. <code>409</code> when unlinked</td></tr><tr><td><code>GET /admin/api/backups</code></td><td>Catalog, local registry, restores, schedule config, storage status</td></tr><tr><td><code>POST /admin/api/backups</code></td><td><code>{name}</code>. <code>202</code> with the operation and <code>backup_id</code>. <code>503</code> without S3 storage</td></tr><tr><td><code>PUT /admin/api/backups/config</code></td><td><code>{enabled, schedule, retention}</code>. <code>409</code> when unlinked</td></tr><tr><td><code>DELETE /admin/api/backups/:id</code></td><td>Soft-delete in the catalog. <code>409</code> when unlinked</td></tr><tr><td><code>POST /admin/api/backups/:id/restore</code></td><td><code>202</code> with the operation and <code>restore_id</code>. <code>503</code> unless the scheduler is <code>Ready</code></td></tr><tr><td><code>GET /admin/api/backups/:id/restore</code></td><td><code>{cloud, local, stage}</code> for the latest restore of that backup</td></tr><tr><td><code>POST /admin/api/workflows/runs/:id/cancel</code></td><td><code>202</code> <code>{run, status: &quot;killed&quot; | &quot;kill_requested&quot;}</code></td></tr><tr><td><code>POST /admin/api/workflows/runs/:id/rerun</code></td><td><code>201</code> <code>{run, rerun_of}</code></td></tr><tr><td><code>POST /admin/api/workflows/runs/:id/retry</code></td><td><code>200</code> <code>{run, retry_count, reset, kept}</code></td></tr><tr><td><code>POST /admin/api/schedules/:name/pause</code></td><td><code>{name, paused: true}</code></td></tr><tr><td><code>POST /admin/api/schedules/:name/resume</code></td><td><code>{name, paused: false}</code></td></tr><tr><td><code>POST /admin/api/schedules/:name/trigger</code></td><td><code>{name, triggered_at}</code>. <code>409</code> when paused or config-disabled</td></tr><tr><td><code>POST /admin/api/jobs/:id/kill</code></td><td>The cluster kill, relaying the SSPs’ answer</td></tr><tr><td><code>POST /admin/api/jobs/:id/retry</code></td><td>The cluster retry, relaying the SSP’s answer</td></tr><tr><td><code>POST /admin/api/tokens</code></td><td><code>{label, scope: &quot;read&quot; | &quot;full&quot;, ttl_days}</code>. <code>201</code> with the token, shown once. <code>403</code> for an MCP or read-only session</td></tr><tr><td><code>DELETE /admin/api/tokens</code></td><td><code>{token}</code>. Revokes it. <code>204</code></td></tr><tr><td><code>POST /admin/api/mcp</code></td><td>The scheduler admin MCP server: JSON-RPC over Streamable HTTP, stateless. <code>GET</code> and <code>DELETE</code> answer <code>405</code></td></tr></tbody></table>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">When sign-in says the database is unreachable</strong> <p>A <code>503</code> on the login screen — <em>“Cannot reach the tenant database,
+so no sign-in can be checked”</em> — is not a credential problem and no password
+will fix it. The roster path signs in <em>through</em> your database, so it needs
+that database reachable; when it is not, the scheduler says so instead of
+answering <code>401</code>. Check the scheduler’s log for the reason and the
+database container’s health. A tenant database can reach a state where it keeps
+answering existing connections and its REST endpoints while refusing new
+SDK sessions, so “the app still works” does not rule this out; restarting the
+database container clears it.</p> </div> </div>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">Upgrading to canary.212</strong> <p><code>retry_count</code> on <code>_00_workflow_run</code> became
+<code>option&lt;int&gt;</code>: as a plain <code>int</code> every update to a run created
+before the field existed failed validation, which blocked cancel and the engine’s own
+finalize on those rows. <code>spky migrate</code> applies the new definition and a one-time
+backfill; run it once after upgrading.</p> </div> </div>
+<p>The workflow endpoints are served by the scheduler rather than read from the
+database directly because <code>_00_workflow_run</code>, <code>_00_step_run</code> and
+<code>_00_schedule_run</code> are <code>PERMISSIONS NONE</code> — no record-auth token can read them.
+The scheduler holds root and is the cluster’s only schedule ticker, which makes
+it the right place to serve them.</p>
+<h3 id="why-a-row-ended-the-way-it-did">Why a row ended the way it did</h3>
+<p>Every skip, kill and failure the engine records carries a structured cause on the
+row’s <code>error</code> field — a stable <code>code</code>, a sentence, and whatever ids make the
+sentence actionable — and the dashboard renders that rather than a JSON payload.
+The ones worth knowing by name:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th><code>code</code></th><th>On</th><th>Means</th></tr></thead><tbody><tr><td><code>concurrency_skip</code></td><td><code>_00_schedule_run</code></td><td>The fire was suppressed by <code>concurrency: skip</code>. <code>blocked_by</code> is the run holding the key and <code>since</code> is when it started. A run wedged in <code>running</code> suppresses that key’s fires for as long as it stays there, so the blocking run is what needs acting on — not the skipped rows</td></tr><tr><td><code>upstream_failed</code></td><td><code>_00_step_run</code></td><td>The step is below a failure under <code>on_failure: continue-independent</code>. <code>blocked_by</code> names the dependency one hop up, so the chain can be walked a step at a time</td></tr><tr><td><code>run_halted</code></td><td><code>_00_step_run</code></td><td>The step had not started when the run halted under <code>on_failure: halt</code>. <code>failed_steps</code> names what actually broke, which is elsewhere in the DAG</td></tr><tr><td><code>not_started</code></td><td><code>_00_step_run</code></td><td>The run was killed or reaped before this step started. <code>run_error</code> carries the run’s own reason</td></tr><tr><td><code>never_dispatched</code></td><td><code>_00_step_run</code></td><td>The step was promoted but its job row was never created, and the run stopped before recovery re-dispatched it</td></tr><tr><td><code>lost_dispatch</code></td><td><code>_00_step_run</code></td><td>The step exhausted its dispatch attempts without ever getting a job</td></tr><tr><td><code>job_failed</code></td><td><code>_00_step_run</code>, <code>_00_schedule_run</code></td><td>The step’s job failed. Normally the job’s last <code>errors</code> entry verbatim; synthesized, and saying so, when the job recorded none</td></tr><tr><td><code>job_missing</code></td><td><code>_00_step_run</code>, <code>_00_schedule_run</code></td><td>The job row is gone — deleted, or pruned by retention while the step still pointed at it</td></tr><tr><td><code>step_failed</code></td><td><code>_00_workflow_run</code></td><td>A step failed and the run failed with it. The step’s own row carries the real reason</td></tr><tr><td><code>deadline_exceeded</code></td><td><code>_00_workflow_run</code>, <code>_00_schedule_run</code></td><td>The reaper stopped a run that passed its <code>deadline:</code> (or the project’s <code>run_deadline_secs</code>) without finishing, and killed its jobs</td></tr><tr><td><code>killed</code></td><td><code>_00_workflow_run</code>, <code>_00_schedule_run</code></td><td>An operator cancelled the run</td></tr><tr><td><code>spawn_failed</code></td><td><code>_00_workflow_run</code>, <code>_00_schedule_run</code></td><td>The fire could not create what it needed — the job row, or the run’s steps</td></tr><tr><td><code>bad_dag</code></td><td><code>_00_workflow_run</code></td><td>The frozen DAG on the run does not validate. A redeploy cannot fix a run already in flight; its DAG is frozen at spawn</td></tr><tr><td><code>no_target_table</code></td><td><code>_00_step_run</code></td><td>The step names no outbox table and its schedule has no <code>target_table</code></td></tr></tbody></table>
+<p><code>_00_schedule.last_error</code> is the exception: it is a bare string, because it is why
+a schedule could not be <em>planned or fanned out at all</em> (a bad cron, a failing
+<code>forEach</code>) — which happens before any run row exists to carry a cause.</p>
+<p>Each step in <code>GET /admin/api/workflows/runs/:id</code> carries both <code>created_at</code> and
+<code>started_at</code>, and the distinction matters: the engine creates every step row when
+the run is spawned, so <code>created_at</code> on a step deep in a DAG is the <em>run’s</em> start,
+not the step’s. <code>started_at</code> is stamped when the step’s job is created and is the
+only honest answer to “when did this begin”. The Timeline draws from it, and
+falls back to the moment the step’s last dependency finished — marked as an
+estimate — for runs recorded before the engine stamped it.</p> <nav class="not-prose mt-16 grid gap-3 border-t border-white/[0.08] pt-8 sm:grid-cols-2" aria-label="Page navigation"><a href="/pr-preview/pr-38/docs/self-hosting" rel="prev" class="group flex items-center gap-3 rounded-glass border border-white/[0.08] bg-white/[0.03] p-4 no-underline shadow-glass-inset transition-colors duration-200 hover:border-brand-400/30 hover:bg-white/[0.06]"><svg class="h-4 w-4 shrink-0 text-text-muted transition-all duration-200 group-hover:-translate-x-0.5 group-hover:text-brand-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M11 18l-6-6 6-6"></path></svg><span class="min-w-0"><span class="block text-[11px] font-medium uppercase tracking-wider text-text-muted">
+Previous
+</span><span class="block truncate text-sm font-medium text-text-primary">Self-hosting</span></span></a><a href="/pr-preview/pr-38/docs/reference/mcp" rel="next" class="group flex items-center justify-end gap-3 rounded-glass border border-white/[0.08] bg-white/[0.03] p-4 text-right no-underline shadow-glass-inset transition-colors duration-200 hover:border-brand-400/30 hover:bg-white/[0.06]"><span class="min-w-0"><span class="block text-[11px] font-medium uppercase tracking-wider text-text-muted">
+Next
+</span><span class="block truncate text-sm font-medium text-text-primary">MCP server</span></span><svg class="h-4 w-4 shrink-0 text-text-muted transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-brand-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a></nav> </div> </main> <aside class="hidden xl:block w-[240px] shrink-0 h-[calc(100vh-64px)] sticky top-16 overflow-y-auto py-8 pr-6 pl-4"> <div class="text-sm"> <h4 class="font-medium text-text-primary mb-4 pl-4">On this page</h4> <ul class="space-y-2"> <li> <a href="#opening-it" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="opening-it"> Opening it </a> </li><li> <a href="#why-a-second-port" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="why-a-second-port"> Why a second port </a> </li><li> <a href="#signing-in" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="signing-in"> Signing in </a> </li><li> <a href="#admin-accounts-the-normal-path" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="admin-accounts-the-normal-path"> Admin accounts (the normal path) </a> </li><li> <a href="#break-glass-password" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="break-glass-password"> Break-glass password </a> </li><li> <a href="#session-behaviour" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="session-behaviour"> Session behaviour </a> </li><li> <a href="#standalone-use" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="standalone-use"> Standalone use </a> </li><li> <a href="#what-it-shows" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="what-it-shows"> What it shows </a> </li><li> <a href="#actions" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="actions"> Actions </a> </li><li> <a href="#restarting-an-ssp" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="restarting-an-ssp"> Restarting an SSP </a> </li><li> <a href="#restarting-the-scheduler" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="restarting-the-scheduler"> Restarting the scheduler </a> </li><li> <a href="#cloud-only-actions" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="cloud-only-actions"> Cloud-only actions </a> </li><li> <a href="#operations" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="operations"> Operations </a> </li><li> <a href="#workflows-schedules-and-jobs" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="workflows-schedules-and-jobs"> Workflows, schedules and jobs </a> </li><li> <a href="#access" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="access"> Access </a> </li><li> <a href="#backups" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="backups"> Backups </a> </li><li> <a href="#who-is-connected-and-what-they-registered" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="who-is-connected-and-what-they-registered"> Who is connected, and what they registered </a> </li><li> <a href="#configuration" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="configuration"> Configuration </a> </li><li> <a href="#running-from-a-checkout" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="running-from-a-checkout"> Running from a checkout </a> </li><li> <a href="#api" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-4" data-heading-link="api"> API </a> </li><li> <a href="#why-a-row-ended-the-way-it-did" class="block text-text-tertiary hover:text-text-primary transition-colors truncate pl-6" data-heading-link="why-a-row-ended-the-way-it-did"> Why a row ended the way it did </a> </li> </ul> </div> <script type="module">function r(){const s=document.querySelectorAll("h2, h3, h4"),o=document.querySelectorAll("[data-heading-link]"),d=new IntersectionObserver(e=>{e.forEach(a=>{if(a.isIntersecting){const i=a.target.id;o.forEach(t=>{t.getAttribute("data-heading-link")===i?(t.classList.add("text-brand-400","font-medium"),t.classList.remove("text-text-tertiary")):(t.classList.remove("text-brand-400","font-medium"),t.classList.add("text-text-tertiary"))})}})},{rootMargin:"-100px 0px -66% 0px"});s.forEach(e=>d.observe(e))}document.addEventListener("astro:page-load",r);r();</script> </aside> <!-- Mobile Menu Overlay --> <div id="mobile-menu" class="fixed inset-x-0 bottom-0 top-16 z-40 bg-black/50 backdrop-blur-md lg:hidden hidden transition-opacity"> <div class="h-full w-[85%] max-w-[320px] overflow-y-auto bg-[#0c0c0e]/95 p-6 shadow-glass-lg backdrop-blur-2xl backdrop-saturate-150"> <div class="flex justify-end mb-4"> <button id="mobile-menu-close" class="p-2 text-text-muted hover:text-text-primary hover:bg-white/[0.06] rounded-lg transition-colors"> <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path> </svg> </button> </div> <nav class="space-y-6" data-astro-cid-ssfzsv2f> <details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Start here <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Introduction</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/quickstart" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Quickstart</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/how-it-works" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>How it works</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/install" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Installation</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Schema <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Define your schema</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema/relationships" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Relationships</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema/generated-types" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Generated types</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/schema/migrations" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Migrations</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Client SDK <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/queries" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Reactive queries</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/pagination" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Pagination</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/mutations" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Mutations</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/auth" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Authentication</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/offline-sync" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Offline &amp; sync health</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/feature-flags" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Feature flags</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/buckets" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>File buckets</span> <svg class="ml-auto w-3.5 h-3.5 text-amber-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-label="Experimental" data-astro-cid-ssfzsv2f> <title>Experimental</title> <path d="M9 3h6" data-astro-cid-ssfzsv2f></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3" data-astro-cid-ssfzsv2f></path> <path d="M7 14h10" data-astro-cid-ssfzsv2f></path> </svg> </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/client/crdt" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>CRDT fields</span> <svg class="ml-auto w-3.5 h-3.5 text-amber-300 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-label="Experimental" data-astro-cid-ssfzsv2f> <title>Experimental</title> <path d="M9 3h6" data-astro-cid-ssfzsv2f></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3" data-astro-cid-ssfzsv2f></path> <path d="M7 14h10" data-astro-cid-ssfzsv2f></path> </svg> </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Framework Guides <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/solid" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>SolidJS</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/solid2" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Solid 2 (RC)</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/flutter" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Flutter</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/guide/vanilla" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Vanilla JS / TS</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Backends <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/backend" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>What is a backend</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/backend/add" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Add a backend</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/backend/options" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Backend options</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Background Jobs <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/jobs" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Jobs</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/jobs/schedules" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Schedules</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/jobs/workflows" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Workflows</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Local Development <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>spky dev</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev/servers" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Dev servers &amp; sidecars</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev/env" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Environment variables</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/dev/doctor" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Doctor &amp; troubleshooting</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Deploy <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/getting-started" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Getting started</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/deploying" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Deploying</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/env-variables" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Environment &amp; vault</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/logs" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Logs &amp; monitoring</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/backups" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Backups</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/ci-cd" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>CI/CD</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/cloud/team" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Teams</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/self-hosting" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Self-hosting</span>  </a> </li> </ul> </details><details open name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Operations <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/admin-dashboard" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-white bg-white/[0.06] font-medium border-white/[0.08] shadow-glass-inset" data-astro-cid-ssfzsv2f> <span class="w-1.5 h-1.5 bg-brand-400 rounded-full" data-astro-cid-ssfzsv2f></span> <span data-astro-cid-ssfzsv2f>Admin dashboard</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/mcp" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>MCP server</span>  </a> </li> </ul> </details><details name="docs-sidebar" class="group" data-astro-cid-ssfzsv2f> <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none" data-astro-cid-ssfzsv2f> Reference <svg class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" data-astro-cid-ssfzsv2f> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" data-astro-cid-ssfzsv2f></path> </svg> </summary> <ul class="space-y-0.5 relative ml-2 pl-2" data-astro-cid-ssfzsv2f> <li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/cli" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>CLI</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/config" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>sp00ky.yml</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/client-config" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Client config</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/ai-agents" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>AI coding agents</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/architecture" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Architecture</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/performance" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Performance</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/vault" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Vault architecture</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/ssp-api" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>SSP API</span>  </a> </li><li data-astro-cid-ssfzsv2f> <a href="/pr-preview/pr-38/docs/reference/scheduler-api" class="flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]" data-astro-cid-ssfzsv2f>  <span data-astro-cid-ssfzsv2f>Scheduler API</span>  </a> </li> </ul> </details> </nav>  <script type="module">const d=document.getElementById("mobile-menu-trigger"),o=document.getElementById("mobile-menu-close"),e=document.getElementById("mobile-menu");function n(){e&&(e.classList.toggle("hidden"),e.classList.contains("hidden")?document.body.style.overflow="":document.body.style.overflow="hidden")}d&&d.addEventListener("click",n);o&&o.addEventListener("click",n);e&&e.addEventListener("click",t=>{t.target===e&&n()});e&&e.querySelectorAll("a").forEach(t=>{t.addEventListener("click",()=>{e.classList.add("hidden"),document.body.style.overflow=""})});</script> </div> </div> </div> </body> </html>

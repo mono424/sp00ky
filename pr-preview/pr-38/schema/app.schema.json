@@ -1,0 +1,467 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sp00ky.cloud/schema/app.schema.json",
+  "title": "sp00ky.app.yml",
+  "description": "A single Sp00ky application (backend, frontend, or docker). Lives in the service's own directory and is pulled into the root sp00ky.yml via `apps.<name>.path`.",
+  "type": "object",
+  "required": [
+    "type"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "App type: backend, frontend, or docker (runs a prebuilt image).",
+      "enum": [
+        "backend",
+        "frontend",
+        "docker"
+      ]
+    },
+    "scope": {
+      "type": "string",
+      "description": "Where this app runs. 'all' (default): started by `spky dev` AND deployed to cloud. 'devOnly': local-only process started by `spky dev`, never deployed (no spec/method/deploy required). 'cloudOnly': deployed but skipped by `spky dev`.",
+      "enum": [
+        "all",
+        "devOnly",
+        "cloudOnly"
+      ],
+      "default": "all"
+    },
+    "image": {
+      "type": "string",
+      "description": "Prebuilt docker image to run (required for type: docker), e.g. 'livekit/livekit-server:latest'.",
+      "examples": [
+        "livekit/livekit-server:latest"
+      ]
+    },
+    "ports": {
+      "type": "array",
+      "description": "Published ports for a type: docker app. Each entry is a bare port (7880 → 7880:7880), a host:container map ('3000:8080'), optionally with a protocol ('7882/udp').",
+      "items": {
+        "type": [
+          "string",
+          "integer"
+        ]
+      }
+    },
+    "args": {
+      "type": "array",
+      "description": "Args appended after the image (the container command) for a type: docker app, e.g. ['--dev', '--bind', '0.0.0.0'] or ['go', 'run', '.'].",
+      "items": {
+        "type": "string"
+      }
+    },
+    "volumes": {
+      "type": "array",
+      "description": "Bind/volume mounts for a type: docker app (docker run -v), e.g. ['/var/run/docker.sock:/var/run/docker.sock', '${PROJECT_DIR}/../..:/src', 'cache:/go']. ${PROJECT_DIR} (the absolute dir of sp00ky.yml) is expanded in the host portion (and in env values).",
+      "items": {
+        "type": "string"
+      }
+    },
+    "workdir": {
+      "type": "string",
+      "description": "Working directory inside the container (docker run -w) for a type: docker app."
+    },
+    "dependsOn": {
+      "type": "array",
+      "description": "Names of other type: docker apps that must be ready before this one starts. `spky dev` starts apps in dependency order; an unknown name, a self-dependency, or a cycle is rejected at config load.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "healthcheck": {
+      "type": "string",
+      "description": "Readiness probe for a type: docker app: an HTTP path (e.g. '/health') polled on the app's first published host port until it returns 200. A dependsOn waits for this; without it a dependency is ready once its container is running."
+    },
+    "hosting": {
+      "type": "string",
+      "description": "Whether this backend is deployed to Sp00ky Cloud or self-hosted.",
+      "enum": [
+        "cloud",
+        "external"
+      ],
+      "default": "cloud"
+    },
+    "spec": {
+      "type": "string",
+      "description": "Path to the OpenAPI specification file (required for backends)."
+    },
+    "baseUrl": {
+      "type": "string",
+      "description": "Base URL of the backend service (required when hosting is \"external\").",
+      "examples": [
+        "https://api.example.com"
+      ]
+    },
+    "auth": {
+      "$ref": "#/$defs/authConfig"
+    },
+    "method": {
+      "$ref": "#/$defs/backendMethod"
+    },
+    "dev": {
+      "$ref": "#/$defs/devConfig"
+    },
+    "deploy": {
+      "$ref": "#/$defs/appDeployConfig"
+    },
+    "env": {
+      "$ref": "#/$defs/envConfig"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "backend"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "spec",
+          "method"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "hosting": {
+            "const": "external"
+          }
+        },
+        "required": [
+          "hosting"
+        ]
+      },
+      "then": {
+        "required": [
+          "baseUrl"
+        ]
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "authConfig": {
+      "type": "object",
+      "description": "Authentication configuration for a backend service.",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Authentication type.",
+          "enum": [
+            "token"
+          ]
+        },
+        "token": {
+          "type": "string",
+          "description": "Bearer token included in HTTP requests to this backend. Supports environment variable substitution (e.g. ${API_TOKEN})."
+        }
+      },
+      "additionalProperties": false
+    },
+    "backendMethod": {
+      "type": "object",
+      "description": "Defines how the backend is triggered.",
+      "required": [
+        "type",
+        "schema"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Method type for calling the backend.",
+          "enum": [
+            "outbox"
+          ]
+        },
+        "table": {
+          "type": "string",
+          "description": "SurrealDB outbox table name (e.g. \"jobs_agent\")."
+        },
+        "schema": {
+          "type": "string",
+          "description": "Path to the SurrealQL schema file that defines the job table structure."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How many of this outbox table's jobs may run at once. Defaults to 1. Rows above the limit stay 'pending' and are admitted oldest-first as slots free, so the outbox itself is the queue. Exact per SSP process; best-effort across replicas."
+        }
+      },
+      "additionalProperties": false
+    },
+    "devConfig": {
+      "description": "Dev server configuration. Can be a raw shell command string or a typed object.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Raw shell command to start the dev server (e.g. \"node server.js\")."
+        },
+        {
+          "type": "object",
+          "description": "Typed dev server configuration.",
+          "required": [
+            "type"
+          ],
+          "oneOf": [
+            {
+              "$ref": "#/$defs/devConfigNpm"
+            },
+            {
+              "$ref": "#/$defs/devConfigDocker"
+            },
+            {
+              "$ref": "#/$defs/devConfigUv"
+            }
+          ]
+        }
+      ]
+    },
+    "devConfigNpm": {
+      "type": "object",
+      "description": "Run an npm/pnpm script as the dev server.",
+      "required": [
+        "type",
+        "script"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "npm"
+        },
+        "script": {
+          "type": "string",
+          "description": "npm script name to run (e.g. \"dev\")."
+        },
+        "workdir": {
+          "type": "string",
+          "description": "Working directory relative to sp00ky.yml."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Port the dev server listens on, so `spky dev` can show its URL in the ready box. Optional: without it the CLI uses the URL the server announces (e.g. vite's `Local: http://…`)."
+        }
+      },
+      "additionalProperties": false
+    },
+    "devConfigDocker": {
+      "type": "object",
+      "description": "Build and run a Dockerfile as the dev server.",
+      "required": [
+        "type",
+        "file"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "docker"
+        },
+        "file": {
+          "type": "string",
+          "description": "Dockerfile to build."
+        },
+        "workdir": {
+          "type": "string",
+          "description": "Build context directory relative to sp00ky.yml."
+        },
+        "port": {
+          "type": "string",
+          "description": "Port mapping (e.g. \"3000:3000\")."
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional port mappings (host:container) for apps that listen on more than one port, e.g. REST + gRPC. Merged with `port`."
+        },
+        "platform": {
+          "type": "string",
+          "description": "docker --platform for build + run, e.g. \"linux/arm64\" to build/run natively instead of emulating the deploy arch."
+        }
+      },
+      "additionalProperties": false
+    },
+    "devConfigUv": {
+      "type": "object",
+      "description": "Run a Python script via uv as the dev server.",
+      "required": [
+        "type",
+        "script"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "uv"
+        },
+        "script": {
+          "type": "string",
+          "description": "Python script to run via `uv run` (e.g. \"server.py\")."
+        },
+        "workdir": {
+          "type": "string",
+          "description": "Working directory relative to sp00ky.yml."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Port the dev server listens on, so `spky dev` can show its URL in the ready box. Optional: without it the CLI uses the URL the server announces (e.g. vite's `Local: http://…`)."
+        }
+      },
+      "additionalProperties": false
+    },
+    "appDeployConfig": {
+      "type": "object",
+      "description": "Deployment configuration for an app on Sp00ky Cloud.",
+      "properties": {
+        "dockerfile": {
+          "type": "string",
+          "description": "Dockerfile path relative to sp00ky.yml."
+        },
+        "context": {
+          "type": "string",
+          "description": "Docker build context directory relative to sp00ky.yml. Defaults to the project root."
+        },
+        "port": {
+          "type": "integer",
+          "description": "Port the service listens on inside the container. Defaults to 8080 for backends, 3000 for frontends.",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "ports": {
+          "type": "array",
+          "description": "Additional published ports (e.g. ['3670:3670', '7882:7882/udp']). Used for apps requiring multiple ports. The primary 'port' is still required for Traefik routing.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "grpc_port": {
+          "type": "integer",
+          "description": "Second container port carrying gRPC, exposed by the cloud via a dedicated h2c router at <slug>-<name>-grpc.<domain>. Backend only.",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "expose": {
+          "type": "boolean",
+          "description": "Expose the backend publicly via {slug}-{name}.spky.cloud.",
+          "default": false
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
+        },
+        "healthcheck": {
+          "type": "string",
+          "description": "Health check HTTP path for the scheduler to ping (e.g. \"/health\"). Backend only."
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "HTTP request timeout in seconds for the job runner. Backend only.",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "timeoutOverridable": {
+          "type": "boolean",
+          "description": "When true, the frontend can override the timeout per-job. Backend only.",
+          "default": false
+        },
+        "cmd": {
+          "type": "string",
+          "description": "Command override for the container, replacing the image ENTRYPOINT/CMD."
+        },
+        "build_args": {
+          "$ref": "#/$defs/envConfig",
+          "description": "Build-time secrets/args passed to `docker build --build-arg` (any app type). Same shape as `env`. Build-time only: never injected into the container's runtime env."
+        },
+        "static": {
+          "$ref": "#/$defs/staticDeployConfig"
+        }
+      },
+      "additionalProperties": false
+    },
+    "staticDeployConfig": {
+      "type": "object",
+      "description": "Static SPA hosting (free/Cloudflare plan): build the SPA and ship the output dir to Cloudflare Workers Static Assets instead of a Docker image.",
+      "properties": {
+        "build": {
+          "type": "string",
+          "description": "Build command run in the app dir before upload (e.g. \"npm run build\"). Optional: omit if the output dir already holds a built SPA."
+        },
+        "dir": {
+          "type": "string",
+          "description": "Directory (relative to the app dir) holding the built static site.",
+          "default": "dist"
+        }
+      },
+      "additionalProperties": false
+    },
+    "envConfig": {
+      "description": "Environment variable configuration. Supports multiple forms:\n- \"vault\": fetch all vars from encrypted vault\n- { vault: [KEY1, KEY2] }: fetch only whitelisted vars from vault\n- \"path/to/file\": load from dotenv file\n- { KEY: \"val\" }: inline key-value map\n- { dev: <source>, cloud: <source> }: per-environment split\n- [<source>, ...]: array of sources, merged in order (later overrides earlier)",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "\"vault\" to use encrypted vault, or a path to a dotenv file."
+        },
+        {
+          "type": "object",
+          "description": "Inline key-value map, or a per-environment split with \"dev\" and/or \"cloud\" keys."
+        },
+        {
+          "type": "array",
+          "description": "Array of env sources, merged in order (later entries override earlier ones).",
+          "items": {
+            "$ref": "#/$defs/envSource"
+          }
+        }
+      ]
+    },
+    "envSource": {
+      "description": "A single environment variable source.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "\"vault\" for all encrypted vault vars, or a path to a dotenv file."
+        },
+        {
+          "type": "object",
+          "description": "Inline key-value map, or vault with whitelist: { vault: [KEY1, KEY2] }."
+        }
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "description": "Resource allocation for a VM.",
+      "properties": {
+        "vcpus": {
+          "type": "integer",
+          "description": "Number of virtual CPUs.",
+          "default": 1,
+          "minimum": 1
+        },
+        "memory": {
+          "type": "integer",
+          "description": "Memory in MB.",
+          "default": 512,
+          "minimum": 128
+        },
+        "disk": {
+          "type": "integer",
+          "description": "Disk size in GB.",
+          "default": 5,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

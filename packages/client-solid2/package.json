@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/client-solid2",
-  "version": "0.0.1-canary.244",
+  "version": "0.0.1-canary.245",
   "type": "module",
   "sideEffects": false,
   "description": "Solid 2 native bindings for the sp00ky sync client",

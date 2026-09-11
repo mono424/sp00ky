@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/dashboard",
-  "version": "0.0.1-canary.244",
+  "version": "0.0.1-canary.245",
   "description": "Operator dashboard for a Sp00ky scheduler, served at /admin",
   "private": true,
   "type": "module",

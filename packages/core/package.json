@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/core",
-  "version": "0.0.1-canary.244",
+  "version": "0.0.1-canary.245",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",

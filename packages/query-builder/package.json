@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/query-builder",
-  "version": "0.0.1-canary.244",
+  "version": "0.0.1-canary.245",
   "description": "Type-safe query builder for SurrealDB with relationship support",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

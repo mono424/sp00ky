@@ -440,7 +440,7 @@ pub async fn start_job_recovery_sweep(
                 match connect_remote(&db_config).await {
                     Ok(conn) => db = Some(conn),
                     Err(e) => {
-                        warn!(error = %e, "Cluster job recovery: DB connect failed; retrying next tick");
+                        warn!(error = format!("{e:#}"), "Cluster job recovery: DB connect failed; retrying next tick");
                         continue;
                     }
                 }

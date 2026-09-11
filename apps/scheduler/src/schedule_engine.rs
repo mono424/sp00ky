@@ -181,7 +181,12 @@ pub fn start_schedule_sweep(
                         ))
                     }
                     Err(e) => {
-                        warn!(error = %e, "Schedule sweep: DB connect failed; retrying next tick");
+                        // `{:#}`, not `{}`: the outermost context here is always
+                        // "Failed to open HTTP to <url>", which names the destination
+                        // and never the fault. A tenant database that refuses new
+                        // sessions while answering existing ones looks identical to a
+                        // typo in the URL unless the chain is printed.
+                        warn!(error = format!("{e:#}"), "Schedule sweep: DB connect failed; retrying next tick");
                         continue;
                     }
                 }
@@ -238,7 +243,7 @@ pub fn observe_job_terminal(
                 Ok(conn) => conn,
                 Err(e) => {
                     // The sweep will pick this up; nothing is lost but latency.
-                    debug!(error = %e, "schedule observer could not connect; leaving it to the sweep");
+                    debug!(error = format!("{e:#}"), "schedule observer could not connect; leaving it to the sweep");
                     return;
                 }
             };

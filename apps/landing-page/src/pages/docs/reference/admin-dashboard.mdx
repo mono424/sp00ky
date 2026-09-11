@@ -491,6 +491,18 @@ and port with no path lands on the dashboard.
 | `DELETE /admin/api/tokens` | `{token}`. Revokes it. `204` |
 | `POST /admin/api/mcp` | The scheduler admin MCP server: JSON-RPC over Streamable HTTP, stateless. `GET` and `DELETE` answer `405` |
 
+<Note title="When sign-in says the database is unreachable">
+  A <code>503</code> on the login screen — <em>"Cannot reach the tenant database,
+  so no sign-in can be checked"</em> — is not a credential problem and no password
+  will fix it. The roster path signs in <em>through</em> your database, so it needs
+  that database reachable; when it is not, the scheduler says so instead of
+  answering <code>401</code>. Check the scheduler's log for the reason and the
+  database container's health. A tenant database can reach a state where it keeps
+  answering existing connections and its REST endpoints while refusing new
+  SDK sessions, so "the app still works" does not rule this out; restarting the
+  database container clears it.
+</Note>
+
 <Note title="Upgrading to canary.212">
   <code>retry_count</code> on <code>_00_workflow_run</code> became
   <code>option&lt;int&gt;</code>: as a plain <code>int</code> every update to a run created

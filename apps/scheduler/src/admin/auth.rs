@@ -62,6 +62,19 @@ fn error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// The answer when the tenant database could not be reached at all.
+///
+/// Deliberately NOT [`unauthorized`]: see the call site. Kept beside it so the
+/// two are read together — every future edit to one has to look at the other.
+fn database_unavailable() -> (StatusCode, Json<ErrorBody>) {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Cannot reach the tenant database, so no sign-in can be checked. \
+         This is not a password problem — check the scheduler's log and the \
+         database container.",
+    )
+}
+
 /// The single 401 every failed login returns.
 ///
 /// Deliberately identical for "no such user", "wrong password", "no record
@@ -227,6 +240,21 @@ async fn candidate_accesses(state: &AdminState) -> Vec<String> {
         .collect()
 }
 
+/// What one signin attempt concluded.
+///
+/// The distinction is the whole point: "this password is wrong" and "the database
+/// is unreachable" are the same 401 to a browser, and conflating them is what
+/// turns a database outage into an hour of hunting for a password problem. Only
+/// the first is a credential answer; the second must never be one.
+enum Signin {
+    /// The access method accepted the credentials. Carries the tenant JWT.
+    Accepted(String),
+    /// The access method ran and said no.
+    Rejected,
+    /// We never got to ask. Carries the reason, for the log and the operator.
+    Unavailable(String),
+}
+
 /// Try one access method with both common parameter spellings.
 ///
 /// Apps name the identifier field themselves — the shipped templates use
@@ -238,7 +266,7 @@ async fn try_signin(
     access: &str,
     username: &str,
     password: &str,
-) -> Option<String> {
+) -> Signin {
     for field in ["username", "email"] {
         // A dedicated connection per attempt, never the scheduler's shared root
         // handle: `signin` rebinds the session it runs on, so doing this on the
@@ -246,18 +274,24 @@ async fn try_signin(
         // record user for every other caller.
         let db = match maintenance::db::connect_http_raw(&state.db_config).await {
             Ok(db) => db,
+            // `{:#}` and not `{}`: an anyhow error prints only its outermost
+            // context, and here that context is always "Failed to open HTTP to
+            // <url>" — which says where we were going and never what went wrong.
+            // The chain underneath is the diagnosis.
             Err(e) => {
-                warn!(error = %e, "Admin signin could not open a database connection");
-                return None;
+                let reason = format!("{e:#}");
+                warn!(error = %reason, "Admin signin could not open a database connection");
+                return Signin::Unavailable(reason);
             }
         };
-        if db
+        if let Err(e) = db
             .use_ns(&state.db_config.namespace)
             .use_db(&state.db_config.database)
             .await
-            .is_err()
         {
-            return None;
+            let reason = format!("{e:#}");
+            warn!(error = %reason, "Admin signin could not select the tenant namespace");
+            return Signin::Unavailable(reason);
         }
 
         let mut params = HashMap::new();
@@ -273,13 +307,15 @@ async fn try_signin(
             })
             .await
         {
-            Ok(token) => return Some(token.access.as_insecure_token().to_string()),
+            Ok(token) => {
+                return Signin::Accepted(token.access.as_insecure_token().to_string())
+            }
             Err(e) => {
                 debug!(access, field, error = %e, "Admin record signin attempt failed");
             }
         }
     }
-    None
+    Signin::Rejected
 }
 
 /// Is this record id on the `_00_admin` roster?
@@ -362,12 +398,34 @@ pub async fn login(
     }
 
     let mut jwt = None;
+    let mut unavailable = None;
     for access in &accesses {
-        if let Some(token) = try_signin(&state, access, username, &req.password).await {
-            jwt = Some(token);
-            break;
+        match try_signin(&state, access, username, &req.password).await {
+            Signin::Accepted(token) => {
+                jwt = Some(token);
+                break;
+            }
+            Signin::Rejected => {}
+            // Stop at the first one: every access method signs in through the
+            // same database, so if that database cannot be reached, trying the
+            // rest is a slower way to learn the same thing.
+            Signin::Unavailable(reason) => {
+                unavailable = Some(reason);
+                break;
+            }
         }
     }
+
+    // A database we could not reach is not a credential verdict. Answering 401
+    // here is what made a database outage read as "your password is wrong" —
+    // for everyone, at once, with the real reason only in the container log.
+    // 503 says whose problem it is, and leaks nothing: it is the same answer for
+    // a username that exists and one that does not.
+    if let Some(reason) = unavailable {
+        warn!(%ip, username, error = %reason, "Admin login could not reach the tenant database");
+        return Err(database_unavailable());
+    }
+
     let Some(jwt) = jwt else {
         warn!(%ip, username, "Admin login failed: no access method accepted the credentials");
         return Err(unauthorized());
@@ -407,6 +465,36 @@ pub async fn login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database outage must never be reported as a credential verdict.
+    ///
+    /// This is the regression that cost hours: every login answered
+    /// `401 Invalid credentials` while the tenant database was refusing new
+    /// sessions, so the outage read as "my password stopped working" and the only
+    /// trace of the truth was a warning in the scheduler's container log.
+    #[test]
+    fn an_unreachable_database_is_not_a_credential_answer() {
+        let (status, body) = database_unavailable();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(status, unauthorized().0);
+        assert!(
+            body.error.contains("not a password problem"),
+            "the message has to send the reader at the database, not at their password: {}",
+            body.error
+        );
+        // And the credential answer stays the anti-enumeration 401 it was.
+        assert_eq!(unauthorized().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(unauthorized().1.error, "Invalid credentials");
+    }
+
+    /// The same 503 whether or not the username exists — the outage answer must
+    /// not become the enumeration oracle the 401 was designed to avoid.
+    #[test]
+    fn the_unavailable_answer_carries_nothing_about_the_account() {
+        let (_, body) = database_unavailable();
+        assert!(!body.error.contains("user"), "{}", body.error);
+        assert!(!body.error.contains("account"), "{}", body.error);
+    }
 
     #[test]
     fn constant_time_eq_matches_semantics_of_eq() {

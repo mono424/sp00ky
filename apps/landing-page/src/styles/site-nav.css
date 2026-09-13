@@ -1,0 +1,11 @@
+/* One continuous glass surface shared by all marketing pages. */
+body:has(.marketing-nav) { padding-top: 0; }
+.marketing-nav { transform-origin: top center; transform: translateY(var(--nav-offset, 0px)) scale(var(--nav-scale, 1)); border-radius: var(--nav-radius, 0px); }
+.marketing-nav::before { opacity: var(--nav-glass-opacity, 0); border-radius: inherit; box-shadow: 0 12px 36px rgb(0 0 0 / var(--nav-shadow, 0)); transition: opacity 240ms ease-out, bottom 280ms cubic-bezier(.22, 1, .36, 1); }
+.marketing-nav:has(.mega.open)::before { bottom: calc(-1 * var(--mega-height, 340px)); opacity: 1; }
+.marketing-nav .mega { border-radius: 0 0 var(--nav-radius, 0px) var(--nav-radius, 0px); background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; box-shadow: none; border: none; transition: opacity 180ms ease, visibility 180ms; }
+.marketing-nav .mega.open { transition: opacity 180ms ease 60ms, visibility 0s; }
+.marketing-nav.nav-menu-transition { transition: transform 280ms cubic-bezier(.22, 1, .36, 1), border-radius 280ms ease; }
+@media (prefers-reduced-motion: reduce) {
+  .marketing-nav.nav-menu-transition, .marketing-nav::before, .marketing-nav .mega, .marketing-nav .mega.open { transition: none; }
+}

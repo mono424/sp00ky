@@ -1,0 +1,21 @@
+---
+import { Image } from 'astro:assets';
+import clientArt from '../assets/architecture-client.png';
+import databaseArt from '../assets/architecture-surrealdb.png';
+import engineArt from '../assets/architecture-dbsp.png';
+
+interface Props {
+  id: 'client' | 'database' | 'engine';
+  index?: number;
+}
+const { id, index } = Astro.props;
+const asset = (name: string) => `${import.meta.env.BASE_URL}${name}`;
+const logo = id === 'database' ? 'surrealdb-logo.png' : 'footer-mark-00.svg';
+---
+<div class:list={['plan-layer', `plan-layer-${id}`, { 'is-active': index === 0 }]} data-plan-layer={index}>
+  <Image src={databaseArt} alt="" widths={[480, 768, 1200]} sizes="(max-width: 960px) 340px, 480px" format="webp" quality={88} loading="lazy" class="plan-layer-art" />
+  {id === 'client' && <Image src={clientArt} alt="" widths={[480, 768, 1200]} sizes="(max-width: 960px) 340px, 480px" format="webp" quality={88} loading="lazy" class="plan-client-devices" />}
+  {id === 'engine' && <Image src={engineArt} alt="" widths={[480, 768, 1200]} sizes="(max-width: 960px) 340px, 480px" format="webp" quality={88} loading="lazy" class="plan-engine-circuit" />}
+  <img src={asset(logo)} alt="" class="plan-surface-logo" width="100" height="100" />
+  {id === 'engine' && [0, 1, 2, 3].map((chip) => <img src={asset('footer-mark-00.svg')} alt="" class={`plan-chip-logo plan-chip-${chip}`} width="40" height="26" />)}
+</div>

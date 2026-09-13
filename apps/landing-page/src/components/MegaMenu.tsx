@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Zap,
   Activity,
@@ -61,14 +61,34 @@ function MegaItem({ href, iconKey, title, desc, cloud }: MegaItemProps) {
 export function MegaMenu() {
   const [open, setOpen] = useState(false);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
+
+  const cancelClose = () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+  };
+  useEffect(() => () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+  }, []);
+  useEffect(() => {
+    const menu = panel.current;
+    const header = trigger.current?.closest<HTMLElement>('.nav-root');
+    if (!menu || !header) return;
+    const measure = () => header.style.setProperty('--mega-height', `${menu.offsetHeight}px`);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(menu);
+    return () => observer.disconnect();
+  }, []);
 
   const show = () => {
-    if (closeTimer.current) clearTimeout(closeTimer.current);
+    cancelClose();
     setOpen(true);
   };
   const scheduleClose = () => {
-    if (closeTimer.current) clearTimeout(closeTimer.current);
-    closeTimer.current = setTimeout(() => setOpen(false), 120);
+    cancelClose();
+    closeTimer.current = setTimeout(() => setOpen(false), 220);
   };
 
   const col1 = coreFeatures.slice(0, 3);
@@ -79,19 +99,32 @@ export function MegaMenu() {
       className="mega-trigger"
       onMouseEnter={show}
       onMouseLeave={scheduleClose}
+      onFocus={show}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) scheduleClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          trigger.current?.focus();
+          cancelClose();
+          setOpen(false);
+        }
+      }}
     >
       <button
         type="button"
+        ref={trigger}
         className={`nav-link${open ? ' active' : ''}`}
         aria-expanded={open}
-        onFocus={show}
-        onBlur={scheduleClose}
+        aria-controls="features-panel"
+        onClick={show}
       >
         Features
         <CaretIcon />
       </button>
 
-      <div className={`mega${open ? ' open' : ''}`}>
+      <div ref={panel} id="features-panel" className={`mega${open ? ' open' : ''}`} inert={!open} onMouseEnter={show}>
         <div className="mega-inner">
           <div className="mega-cols">
             <div className="mega-col">

@@ -1,0 +1,154 @@
+---
+import ArchitecturePlate from './ArchitecturePlate.astro';
+import '../styles/architecture.css';
+import { basePath } from '../config/nav';
+
+const asset = (name: string) => `${import.meta.env.BASE_URL}${name}`;
+const layers = [
+  { id: 'client', logo: 'footer-mark-00.svg' },
+  { id: 'database', logo: 'surrealdb-logo.png' },
+  { id: 'engine', logo: 'footer-mark-00.svg' },
+] as const;
+---
+
+<section id="architecture" class="sync-walkthrough" aria-labelledby="architecture-title">
+  <div class="walk-heading">
+    <div>
+      <p class="plan-eyebrow">How it works</p>
+      <h2 id="architecture-title">The magic happens<br /><em>behind your database.</em></h2>
+    </div>
+  </div>
+
+  <div class="walk-layout">
+    <aside class="blueprint" aria-label="Interactive architecture diagram">
+      <div class="blueprint-scene" aria-hidden="true">
+        <svg class="plan-connections" width="100%" height="100%" fill="none">
+          <line data-connection="0" x1="24%" x2="24%" />
+          <line data-connection="1" x1="76%" x2="76%" />
+        </svg>
+        {layers.map((layer, i) => (
+          <ArchitecturePlate id={layer.id} index={i} />
+        ))}
+      </div>
+      <p class="stack-caption">One connected system.<span>Your app. Your database. Your private sync engine.</span></p>
+    </aside>
+
+    <div class="walk-steps">
+      <article id="flow-client" class="walk-step is-active" data-walk-step="0">
+        <div class="mobile-layer-view" aria-hidden="true"><ArchitecturePlate id="client" /></div>
+        <div class="step-brand"><img src={asset('footer-mark-00.svg')} alt="sp00ky" width="36" height="24" /><span>Client</span></div>
+        <h3>Instant on your device.</h3>
+        <p>Read locally. Update immediately. The sp00ky client syncs with SurrealDB through your user’s session, and keeps your app reactive while offline.</p>
+        <a href={`${basePath}/docs/client/offline-sync`}>Explore local-first sync <span aria-hidden="true">↗</span></a>
+      </article>
+      <article id="flow-database" class="walk-step" data-walk-step="1">
+        <div class="mobile-layer-view" aria-hidden="true"><ArchitecturePlate id="database" /></div>
+        <div class="step-brand"><img src={asset('surrealdb-logo.png')} alt="" width="28" height="32" /><span>SurrealDB</span></div>
+        <h3>Your data. Your rules.</h3>
+        <p>SurrealDB handles authentication and data access. sp00ky compiles supported select permissions into live-query filters, so synced views follow the same rules.</p>
+        <a href={`${basePath}/docs/client/auth#row-level-permissions-in-live-queries`}>How permissions work <span aria-hidden="true">↗</span></a>
+      </article>
+      <article id="flow-engine" class="walk-step" data-walk-step="2">
+        <div class="mobile-layer-view" aria-hidden="true"><ArchitecturePlate id="engine" /></div>
+        <div class="step-brand"><img src={asset('footer-mark-00.svg')} alt="sp00ky" width="36" height="24" /><span>DBSP</span></div>
+        <h3>Private by architecture.</h3>
+        <p>DBSP updates affected views and writes per-user sync references back to SurrealDB. Keep its ingest endpoints on your private network. Your app connects only to the database.</p>
+        <a href={`${basePath}/docs/self-hosting`}>Inside the sync engine <span aria-hidden="true">↗</span></a>
+      </article>
+      <div class="walk-finale" data-walk-step="3">
+        <div class="mobile-assembly">
+          <div class="mobile-assembly-scene" aria-hidden="true">
+            {layers.map(layer => <ArchitecturePlate id={layer.id} />)}
+          </div>
+          <p>One connected system.<span>Your app. Your database.<br />Your private sync engine.</span></p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  const walkthrough = document.querySelector<HTMLElement>('.sync-walkthrough');
+  if (walkthrough) {
+    const steps = [...walkthrough.querySelectorAll<HTMLElement>('[data-walk-step]')];
+    const layers = [...walkthrough.querySelectorAll<HTMLElement>('[data-plan-layer]')];
+    const scene = walkthrough.querySelector<HTMLElement>('.blueprint-scene')!;
+    const connections = [...walkthrough.querySelectorAll<SVGLineElement>('[data-connection]')];
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let active = -1;
+    let frame = 0;
+    let visible = false;
+
+    const update = () => {
+      frame = 0;
+      if (!visible) return;
+      const mobile = window.innerWidth <= 960;
+      if (mobile) return;
+      const target = window.innerHeight * .5;
+      const sceneHeight = scene.offsetHeight;
+      // Derive spacing from the rendered hardware, so assembled plates touch
+      // at every screen size rather than leaving viewport-sized gaps.
+      const plateHeight = layers[0].offsetWidth * 2 / 3 / sceneHeight;
+      const seam = plateHeight * .17;
+      const engineCenter = .5;
+      const poses = [
+        { y: [.5, 1.1, 1.5], opacity: [1, 0, 0], gray: [0, 1, 1], links: [0, 0] },
+        { y: [Math.max(plateHeight * .5, .5 - plateHeight * .8), .5, 1.1], opacity: [1, 1, 0], gray: [1, 0, 1], links: [1, 0] },
+        { y: [engineCenter - plateHeight * .55 - seam, engineCenter - plateHeight * .55, engineCenter], opacity: [1, 1, 1], gray: [1, 1, 0], links: [0, 1] },
+        { y: [.5 - seam, .5, .5 + seam], opacity: [1, 1, 1], gray: [0, 0, 0], links: [0, 0] },
+      ];
+      const centers = steps.map(step => step.getBoundingClientRect().top + step.offsetHeight / 2);
+      const distances = centers.map(center => Math.abs(center - target));
+      const next = distances.indexOf(Math.min(...distances));
+      if (next !== active) {
+        active = next;
+        steps.forEach((step, i) => step.classList.toggle('is-active', i === active));
+        layers.forEach((layer, i) => layer.classList.toggle('is-active', i === active || active === 3));
+      }
+      let from = 0;
+      while (from < poses.length - 2 && target > centers[from + 1]) from++;
+      const progress = Math.min(1, Math.max(0, (target - centers[from]) / (centers[from + 1] - centers[from])));
+      // Hold each composition briefly while its explanation is in focus.
+      const blend = Math.min(1, Math.max(0, (progress - .18) / .64));
+      const eased = blend * blend * (3 - 2 * blend);
+      const start = poses[reducedMotion.matches ? next : from];
+      const end = poses[reducedMotion.matches ? next : from + 1];
+      const mix = (a: number, b: number) => a + (b - a) * eased;
+      const positions = start.y.map((y, i) => mix(y, end.y[i]));
+      layers.forEach((layer, i) => {
+        layer.style.setProperty('--layer-y', `${positions[i] * 100}%`);
+        layer.style.setProperty('--layer-offset', `${positions[i] * sceneHeight}px`);
+        layer.style.setProperty('--layer-opacity', mix(start.opacity[i], end.opacity[i]).toFixed(3));
+        layer.style.setProperty('--layer-gray', mix(start.gray[i], end.gray[i]).toFixed(3));
+      });
+      connections.forEach((line, i) => {
+        line.setAttribute('y1', `${positions[i] * 100}%`);
+        line.setAttribute('y2', `${positions[i + 1] * 100}%`);
+        line.style.opacity = mix(start.links[i], end.links[i]).toFixed(3);
+      });
+      const assembled = reducedMotion.matches ? (next === 3 ? 1 : 0) : (from === 2 ? eased : 0);
+      walkthrough.style.setProperty('--assembled', assembled.toFixed(3));
+      if (assembled > .985) walkthrough.classList.add('is-assembled');
+      else if (assembled < .85) walkthrough.classList.remove('is-assembled');
+    };
+    const schedule = () => { if (visible && !frame) frame = requestAnimationFrame(update); };
+    const observer = new IntersectionObserver(([entry]) => {
+      visible = entry.isIntersecting;
+      schedule();
+    });
+    observer.observe(walkthrough);
+    // Mobile illustrations live with their explanations; no sticky surface
+    // or viewport-height pose can cover the content on short/touch screens.
+    const mobileObserver = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) entry.target.classList.add('mobile-visible');
+      });
+    }, { threshold: .18 });
+    walkthrough.querySelectorAll('.mobile-layer-view, .mobile-assembly').forEach(node => mobileObserver.observe(node));
+    walkthrough.classList.add('walk-ready');
+    window.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
+    window.addEventListener('pageshow', schedule);
+    reducedMotion.addEventListener('change', schedule);
+  }
+</script>

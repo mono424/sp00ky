@@ -376,13 +376,23 @@ details[open] .expanded-content {
   left: 0;
   right: 0;
   z-index: 50;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-  /* Heavier opacity + smaller blur radius. Safari's backdrop-filter is one
-     of the slowest paints, especially on a fixed nav that re-rasters on scroll. */
-  background: rgba(9, 9, 11, 0.88);
-  backdrop-filter: saturate(140%) blur(8px);
-  -webkit-backdrop-filter: saturate(140%) blur(8px);
+  isolation: isolate;
+  background: transparent;
 }
+/* A separate glass layer keeps the expanded menu free to blur the page behind
+   it. A backdrop-filter on the header itself would trap the nested panel. */
+.nav-root::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(235, 242, 255, .14), rgba(235, 242, 255, .05)), rgba(16, 22, 38, .52);
+  border-bottom: 1px solid rgba(235, 242, 255, .18);
+  backdrop-filter: blur(24px) saturate(145%);
+  -webkit-backdrop-filter: blur(24px) saturate(145%);
+}
+
 body {
   padding-top: 58px;
 }
@@ -578,23 +588,35 @@ body {
 .mega-trigger {
   position: static;
 }
+/* Fill the small space between the trigger and the panel, without moving the
+   panel's hit area during its fade. */
+.mega::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -18px;
+  height: 18px;
+}
 .mega {
   position: absolute;
   top: 100%;
   left: 0;
   right: 0;
-  background: linear-gradient(180deg, #0b0b0f 0%, #09090b 100%);
+  background: linear-gradient(180deg, rgba(235, 242, 255, .12), rgba(235, 242, 255, .04)), rgba(16, 22, 38, .64);
+  backdrop-filter: blur(24px) saturate(145%);
+  -webkit-backdrop-filter: blur(24px) saturate(145%);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.9);
   opacity: 0;
-  transform: translateY(-6px);
+  visibility: hidden;
   pointer-events: none;
-  transition: opacity 220ms ease, transform 220ms ease;
+  transition: opacity 180ms ease, visibility 180ms;
   z-index: 40;
 }
 .mega.open {
   opacity: 1;
-  transform: translateY(0);
+  visibility: visible;
   pointer-events: auto;
 }
 .mega-inner {
@@ -696,7 +718,7 @@ body {
 }
 .mega-item-desc {
   font-size: 12px;
-  color: #71717a;
+  color: #c1c8d8;
   line-height: 1.4;
   white-space: nowrap;
   overflow: hidden;
@@ -1128,4 +1150,8 @@ body {
     gap: 6px;
     align-items: flex-start;
   }
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .nav-root::before, .mega { background: rgba(16, 22, 38, .97); }
 }

@@ -2,13 +2,21 @@
 // src/pages/index.astro
 // oxlint-disable-next-line no-unassigned-import
 import '../styles/global.css';
+import '../styles/landing.css';
+import { Image, getImage } from 'astro:assets';
+import heroLandscape from '../assets/munich-california-hero.png';
+import heroPortrait from '../assets/munich-california-hero-mobile.png';
 import SiteNav from '../components/SiteNav.astro';
 import SiteFooter from '../components/SiteFooter.astro';
-import { HeroStack } from '../components/HeroStack';
-import { FloatingGhosts } from '../components/FloatingGhosts';
-import { FeatureGrid } from '../components/UnderTheHood';
+import SyncArchitecture from '../components/SyncArchitecture.astro';
+import { ScrollRevealText } from '../components/ScrollRevealText';
 import NewsletterSignup from '../components/NewsletterSignup';
 import { basePath } from '../config/nav';
+
+const mobileHeroWidths = [480, 768, 940];
+const mobileHeroSources = await Promise.all(
+  mobileHeroWidths.map((width) => getImage({ src: heroPortrait, width, format: 'webp', quality: 85 }))
+);
 ---
 
 <html lang="en">
@@ -54,88 +62,101 @@ import { basePath } from '../config/nav';
     <link rel="help" type="text/markdown" href="/llm.txt" title="LLM Info" />
     <title>sp00ky</title>
   </head>
-  <body class="min-h-screen flex flex-col">
+  <body class="landing-page min-h-screen flex flex-col">
     <SiteNav activePath="/" />
 
     <main class="flex-1">
       <!-- HERO -->
-      <section id="home" class="hero-new">
-        <div class="hero-new-bg">
-          <FloatingGhosts client:idle count={14} />
-        </div>
+      <div class="hero-scroll-shell">
+      <section id="home" class="landscape-hero" aria-labelledby="hero-title">
+        <picture>
+          <source
+            media="(max-width: 760px)"
+            srcset={mobileHeroSources.map((source, i) => `${source.src} ${mobileHeroWidths[i]}w`).join(', ')}
+            sizes="100vw"
+            width={heroPortrait.width}
+            height={heroPortrait.height}
+          />
+          <Image
+            src={heroLandscape}
+            alt="An imagined lake between Bavaria and California: Munich towers, an academic stone facade, the Golden Gate Bridge and Berkeley’s Campanile among alpine forests, with a little ghost on the shore."
+            class="landscape-hero-art"
+            widths={[768, 1280, 1672]}
+            sizes="100vw"
+            format="webp"
+            quality={85}
+            loading="eager"
+            fetchpriority="high"
+          />
+        </picture>
+        <div class="landscape-hero-shade" aria-hidden="true"></div>
 
-        <div class="hero-new-inner">
-          <div class="hero-left">
-            <div class="hero-eyebrow">
-              <span class="badge">canary</span>
-              Pre-Alpha · open source
-            </div>
-
-            <h1 class="hero-headline">
+        <div class="landing-intro">
+          <div class="landing-intro-copy">
+            <h1 id="hero-title" class="hero-headline">
               Focus on Product.<br /><span class="accent">We Handle Sync.</span>
             </h1>
 
-            <p class="hero-sub">
-              Sync, offline, and type safety are already handled. You stay focused on the product
-              your users actually see.
-            </p>
+            <div class="hero-actions">
+              <div class="hero-ctas">
+                <a href={`${basePath}/docs`} class="hero-btn hero-btn-primary">Start building <span aria-hidden="true">↗</span></a>
+                <a href="#architecture" class="hero-btn hero-btn-ghost">Explore the engine <span aria-hidden="true">↓</span></a>
+              </div>
 
-            <div class="hero-install">
-              <span class="prompt">$</span>
-              <span class="cmd">npx @spooky-sync/cli@canary create</span>
-              <button class="copy-btn" id="hero-copy-btn" aria-label="Copy install command">
-                <svg
-                  id="hero-copy-icon"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <rect x="9" y="9" width="11" height="11" rx="2"></rect>
-                  <path d="M5 15 H4 a2 2 0 0 1 -2 -2 V4 a2 2 0 0 1 2 -2 h9 a2 2 0 0 1 2 2 v1"></path>
-                </svg>
-                <svg
-                  id="hero-check-icon"
-                  class="hidden"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path d="M20 6 L9 17 l-5 -5"></path>
-                </svg>
-              </button>
+              <div class="hero-install">
+                <span class="prompt">$</span>
+                <span class="cmd">npx @spooky-sync/cli@canary create</span>
+                <button class="copy-btn" id="hero-copy-btn" aria-label="Copy install command">
+                  <svg
+                    id="hero-copy-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <rect x="9" y="9" width="11" height="11" rx="2"></rect>
+                    <path d="M5 15 H4 a2 2 0 0 1 -2 -2 V4 a2 2 0 0 1 2 -2 h9 a2 2 0 0 1 2 2 v1"></path>
+                  </svg>
+                  <svg
+                    id="hero-check-icon"
+                    class="hidden"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="M20 6 L9 17 l-5 -5"></path>
+                  </svg>
+                </button>
+              </div>
             </div>
-
-            <div class="hero-ctas">
-              <a href={`${basePath}/docs`} class="hero-btn hero-btn-primary">
-                Get Started
-              </a>
-              <a
-                href="https://github.com/mono424/sp00ky"
-                target="_blank"
-                rel="noopener"
-                class="hero-btn hero-btn-ghost"
-              >
-                View on Github
-              </a>
-            </div>
-          </div>
-
-          <div class="hero-right">
-            <HeroStack />
           </div>
         </div>
       </section>
+      </div>
 
-      <!-- Local First copy + 4-up FeatureGrid + Try sp00ky card -->
-      <section class="pt-12 pb-16 md:pb-32 border-b border-white/10">
+      <!-- Local-first introduction and live demo -->
+      <section class="pt-12 pb-16 md:pb-32">
         <div class="max-w-7xl mx-auto px-4">
-          <FeatureGrid client:only="react" />
+          <ScrollRevealText
+            client:visible
+            className="text-balance text-4xl md:text-6xl font-medium leading-[1.05] tracking-[-0.045em]"
+            segments={[
+              { text: "It's", preRevealed: true },
+              {
+                text: 'sp00ky.',
+                preRevealed: true,
+                className: 'font-serif font-normal italic tracking-tight text-text-secondary',
+              },
+              {
+                text: 'Data changes, every screen updates. Reactive queries keep every tab, every device, and every user in sync, instantly.',
+              },
+            ]}
+          />
         </div>
 
         <!-- Try Out Now, card style -->
@@ -181,8 +202,11 @@ import { basePath } from '../config/nav';
         </div>
       </section>
 
+      <SyncArchitecture />
+
       <!-- CTA SECTION -->
-      <section class="relative overflow-hidden border-t border-white/5 bg-black py-28 md:py-44">
+      <section class="launch-section relative overflow-hidden bg-black py-28 md:py-44">
+        <div class="launch-atmosphere" aria-hidden="true">
         <!-- ASCII animation background (file is pre-baked ping-pong, so a plain loop suffices)
              Constrained to roughly the form width + 100px and centered, with a feathered fade
              so the edges blend into the section instead of cutting hard. -->
@@ -208,14 +232,6 @@ import { basePath } from '../config/nav';
           </video>
         </div>
 
-        <!-- Top hairline -->
-        <div
-          aria-hidden="true"
-          class="pointer-events-none absolute inset-x-0 top-0 h-px"
-          style="background: linear-gradient(90deg, transparent, rgba(255,255,255,0.18), transparent);"
-        >
-        </div>
-
         <!-- Spotlight halo -->
         <div
           aria-hidden="true"
@@ -228,22 +244,11 @@ import { basePath } from '../config/nav';
           </div>
         </div>
 
+        </div>
         <div
           class="relative z-10 mx-auto max-w-xl px-6 text-center"
           style="text-shadow: 0 1px 2px rgba(0,0,0,0.6), 0 0 18px rgba(0,0,0,0.45);"
         >
-          <!-- Mono eyebrow -->
-          <div
-            class="mb-9 inline-flex items-center gap-2.5 font-mono text-[11px] uppercase tracking-[0.22em] text-text-secondary"
-          >
-            <span
-              class="h-1 w-1 rounded-full bg-emerald-400"
-              style="box-shadow: 0 0 8px rgba(74,222,128,0.7);"></span>
-            <span>Waitlist</span>
-            <span class="text-text-tertiary">·</span>
-            <span>v0.1 beta</span>
-          </div>
-
           <h2
             class="mb-6 text-balance text-5xl font-medium tracking-[-0.04em] text-white md:text-7xl"
             style="text-shadow: 0 2px 4px rgba(0,0,0,0.6), 0 0 32px rgba(0,0,0,0.55);"

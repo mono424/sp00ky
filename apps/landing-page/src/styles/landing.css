@@ -1,0 +1,58 @@
+/* Homepage art direction: cyanotype landscape above an industrial cutaway. */
+body.landing-page { padding-top: 0; }
+.launch-atmosphere {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 160px);
+  mask-image: linear-gradient(to bottom, transparent, #000 160px);
+}
+.hero-scroll-shell { background: #080a0d; }
+.hero-scroll-ready { height: calc(100svh + clamp(160px, 30svh, 300px)); }
+.hero-scroll-ready .landscape-hero { position: sticky; top: 0; transform: translateY(var(--hero-offset, 0px)) scale(var(--hero-scale, 1)); border-radius: var(--hero-radius, 0px); will-change: transform; }
+.landing-page .nav-link,
+.landing-page .nav-github,
+.landing-page .nav-mobile-toggle { color: #edf0ff; }
+.landscape-hero {
+  position: relative;
+  isolation: isolate;
+  min-height: min(720px, 100svh);
+  height: 100svh;
+  background: #07125a;
+  overflow: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-scroll-ready { height: auto; }
+  .hero-scroll-ready .landscape-hero { position: relative; transform: none; border-radius: 0; will-change: auto; }
+}
+.landscape-hero-art,
+.landscape-hero-shade {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.landscape-hero-art { object-fit: cover; object-position: 75% 58%; z-index: -2; }
+.landscape-hero-shade {
+  z-index: -1;
+  background: linear-gradient(90deg, rgba(3, 10, 55, .36), transparent 68%), linear-gradient(180deg, rgba(2, 7, 37, .18), transparent 55%, rgba(2, 7, 37, .5));
+}
+.landing-intro { max-width: 1440px; margin: auto; padding: clamp(112px, 14vh, 160px) 56px 80px; }
+.landing-intro-copy { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 32px; max-width: 690px; }
+.landing-intro .hero-actions { position: absolute; bottom: clamp(88px, 12svh, 144px); left: 50%; transform: translateX(-50%); display: grid; gap: 12px; width: 390px; max-width: calc(100% - 48px); }
+.landing-intro .hero-ctas { display: grid; grid-template-columns: 1fr 1.15fr; gap: 10px; }
+.landing-intro .hero-ctas .hero-btn { justify-content: space-between; min-width: 0; min-height: 46px; font-size: 13px; white-space: nowrap; }
+.landing-intro .hero-headline { font-size: clamp(3.25rem, 5.7vw, 5.2rem); text-shadow: 0 2px 24px #08104b44; }
+.landing-intro .hero-btn { border-radius: 3px; padding: 12px 19px; gap: 24px; transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease; }
+.landing-intro .hero-btn-ghost { color: white; background: #09134b66; border-color: #e8edff66; }
+.landing-intro .hero-btn-ghost:hover { background: #101e6f; }
+.landing-intro .hero-install { width: 100%; min-height: 44px; border-radius: 3px; background: #050b29b3; border-color: #dce6ff55; font-size: 11px; flex-shrink: 0; }
+.landing-intro .copy-btn { color: #e0e7ff; margin-left: auto; }
+@media (max-width: 760px) {
+  .landscape-hero-art { object-position: 75% center; }
+  .landing-intro { padding: 104px 24px 48px; }
+  .landing-intro-copy { gap: 28px; }
+  .landing-intro .hero-headline { font-size: clamp(40px, 8.1vw, 60px); }
+  .landing-intro .hero-ctas .hero-btn { font-size: 12px; padding: 11px 10px; gap: 8px; }
+  .landing-intro .hero-install { padding: 10px; gap: 6px; font-size: clamp(9px, 2.55vw, 11px); }
+}

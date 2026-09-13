@@ -1,0 +1,124 @@
+body.landing-page { overflow-x: clip; }
+.sync-walkthrough {
+  position: relative;
+  z-index: 1;
+  --walk-inset: clamp(12px, 2.2vw, 32px);
+  --walk-background: #101318;
+  --walk-grid: linear-gradient(#a9c8e507 1px, transparent 1px), linear-gradient(90deg, #a9c8e507 1px, transparent 1px);
+  margin: 24px var(--walk-inset);
+  border-radius: 14px;
+  background: var(--walk-background);
+  background-image: radial-gradient(ellipse 65% 600px at 50% 0, #729dc50c, transparent 75%), var(--walk-grid);
+  background-size: auto, 48px 48px, 48px 48px;
+  padding: 96px max(24px, calc((100vw - 1240px) / 2 - var(--walk-inset))) 56px;
+  scroll-margin-top: 82px;
+}
+.walk-heading { text-align: center; padding-bottom: 64px; }
+.plan-eyebrow { font-size: 12px; color: #9ba6b7; margin-bottom: 22px; }
+.walk-heading h2 { font-size: clamp(38px, 4.5vw, 64px); font-weight: 400; line-height: 1.08; letter-spacing: -.04em; margin: 0; }
+.walk-heading h2 em { font-family: Georgia, serif; font-weight: 400; color: #c3cddc; }
+.sync-walkthrough a { color: #e0e6ee; font-size: 12px; text-decoration: none; }
+.sync-walkthrough a:hover { color: #a6d7f0; }
+.walk-step a span { margin-left: 14px; }
+.walk-layout { --walk-gap: 32px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr); align-items: start; column-gap: var(--walk-gap); }
+.walk-steps { grid-column: 1 / -1; grid-row: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr); column-gap: var(--walk-gap); }
+.walk-step:nth-child(1) { grid-column: 3; grid-row: 1; }
+.walk-step:nth-child(2) { grid-column: 1; grid-row: 2; }
+.walk-step:nth-child(3) { grid-column: 3; grid-row: 3; }
+.blueprint { grid-column: 2; grid-row: 1; min-width: 0; position: sticky; top: 90px; }
+.blueprint-scene { position: relative; width: 100%; height: calc(100svh - 180px); margin: auto; }
+.blueprint-scene { transform: scale(calc(1 + var(--assembled, 0) * .08)); transform-origin: center; }
+.blueprint-scene::before { content: ''; position: absolute; inset: 12% -30%; background: radial-gradient(ellipse, #a6dfff22, #8099ff0a 42%, transparent 68%); opacity: var(--assembled, 0); pointer-events: none; }
+.is-assembled .blueprint-scene::before { animation: assembly-bloom 1400ms ease-out both; }
+.plan-layer::after { content: ''; position: absolute; inset: 0; pointer-events: none; mask: url('../assets/architecture-surrealdb-mask.svg') center / 100% 100% no-repeat; background: linear-gradient(110deg, transparent 35%, #d4f0ff66 49%, #fff8 50%, transparent 65%) -180% 0 / 250% 100% no-repeat; opacity: 0; }
+.is-assembled .plan-layer::after { animation: assembly-sweep 1200ms cubic-bezier(.22, 1, .36, 1) both; }
+.is-assembled .plan-layer-database::after { animation-delay: 100ms; }
+.is-assembled .plan-layer-engine::after { animation-delay: 200ms; }
+.plan-connections { position: absolute; inset: 0; height: 100%; width: 100%; stroke: #a5cadd65; stroke-width: 1; stroke-dasharray: 3 6; }
+.plan-layer { position: absolute; width: 100%; left: 50%; top: 0; transform: translate3d(-50%, calc(var(--layer-offset, 0px) - 50%), 0); opacity: var(--layer-opacity, 1); filter: grayscale(var(--layer-gray, 0)); will-change: transform, opacity; }
+.plan-layer-art, .plan-client-devices, .plan-engine-circuit { mask-size: 100% 100%; mask-repeat: no-repeat; }
+.plan-layer-art { mask-image: url('../assets/architecture-surrealdb-mask.svg'); }
+.plan-client-devices, .plan-engine-circuit { position: absolute; inset: 0; width: 100%; height: auto; }
+.plan-client-devices { mask-image: url('../assets/architecture-devices-mask.svg'); transform: translate(.1%, -7.45%) scale(1.052, 1.098); }
+.plan-engine-circuit { mask-image: url('../assets/architecture-circuit-mask.svg'); }
+.sync-walkthrough:not(.walk-ready) .plan-layer { top: var(--layer-y); transform: translate(-50%, -50%); }
+.plan-layer-client { --layer-y: 29%; z-index: 3; }.plan-layer-database { --layer-y: 49%; z-index: 2; }.plan-layer-engine { --layer-y: 69%; z-index: 1; }
+.stack-caption { position: absolute; left: 50%; bottom: 0; transform: translate(-50%, calc((1 - var(--assembled, 0)) * 18px)); width: max-content; max-width: calc(100vw - 48px); margin: 0; text-align: center; font-size: clamp(24px, 2.4vw, 36px); letter-spacing: -.035em; opacity: var(--assembled, 0); }
+.stack-caption span { display: block; margin-top: 8px; font-size: 12px; color: #a8b2c1; letter-spacing: 0; }
+.walk-finale { grid-column: 1 / -1; grid-row: 4; min-height: 100svh; }
+.sync-walkthrough:not(.walk-ready) .walk-finale { display: none; }
+.plan-layer-art { display: block; width: 100%; height: auto; }
+.plan-surface-logo, .plan-chip-logo { position: absolute; height: auto; object-fit: contain; transform: translate(-50%, -50%) matrix(1, .5, -1, .5, 0, 0); }
+.plan-surface-logo { width: 15%; left: 50%; top: 48%; }
+.plan-layer-client .plan-surface-logo { top: 41%; width: 16%; }
+.plan-layer-database .plan-surface-logo { top: 41%; width: 18%; }
+.plan-layer-engine .plan-surface-logo { top: 40.5%; width: 9%; }
+.plan-chip-logo { width: 4%; }
+.plan-chip-0 { left: 40.5%; top: 33%; }.plan-chip-1 { left: 59.5%; top: 33%; }
+.plan-chip-2 { left: 40.5%; top: 48%; }.plan-chip-3 { left: 59.5%; top: 48%; }
+.walk-step { padding: 64px 0; scroll-margin-top: 110px; }
+.walk-ready .walk-step { min-height: 100svh; display: flex; flex-direction: column; justify-content: center; }
+.step-brand { display: flex; align-items: center; gap: 12px; color: #c1cbd8; font-size: 12px; }
+.step-brand img { object-fit: contain; }
+.walk-step h3 { font-size: clamp(28px, 2.8vw, 40px); font-weight: 400; line-height: 1.15; letter-spacing: -.035em; margin: 25px 0 20px; }
+.walk-step p { font-size: 15px; line-height: 1.85; color: #a8b2c1; max-width: 420px; margin: 0 0 26px; }
+@media (max-width: 1050px) {
+  .walk-layout { --walk-gap: 24px; }
+}
+.mobile-layer-view, .mobile-assembly { display: none; }
+@media (min-width: 961px) and (max-height: 650px) {
+  .blueprint { top: 58px; }
+  .blueprint-scene { height: calc(100svh - 100px); width: min(100%, 280px); }
+  .stack-caption { font-size: 13px; }
+  .stack-caption span { display: none; }
+}
+@media (max-width: 960px) {
+  .sync-walkthrough { padding-top: 56px; padding-bottom: 48px; }
+  .walk-heading { padding-bottom: 12px; }
+  .walk-heading h2 { font-size: clamp(32px, 7vw, 42px); }
+  .walk-layout, .walk-steps { display: block; }
+  .blueprint { display: none; }
+  .walk-step, .walk-ready .walk-step { display: block; padding: 24px 0 48px; min-height: 0; max-width: 460px; margin: auto; scroll-margin-top: 96px; }
+  .walk-step h3 { font-size: 32px; margin-top: 20px; }
+  .mobile-layer-view { display: block; position: relative; width: min(100%, 380px); aspect-ratio: 3 / 2; margin: 0 auto 24px; }
+  .mobile-layer-view .plan-layer, .sync-walkthrough:not(.walk-ready) .mobile-layer-view .plan-layer { top: 0; left: 0; transform: none; }
+  .mobile-layer-view .plan-layer, .mobile-assembly .plan-layer { opacity: 1; filter: none; will-change: auto; }
+  .mobile-layer-view.mobile-visible { animation: mobile-layer-arrive 700ms cubic-bezier(.22, 1, .36, 1) both; }
+  .walk-finale, .sync-walkthrough:not(.walk-ready) .walk-finale { display: block; min-height: 0; padding-top: 8px; }
+  .mobile-assembly { display: block; max-width: 400px; margin: auto; text-align: center; }
+  .mobile-assembly-scene { position: relative; aspect-ratio: 1; isolation: isolate; }
+  .mobile-assembly-scene::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(ellipse, #a6dfff22, transparent 65%); }
+  .mobile-assembly .plan-layer, .sync-walkthrough:not(.walk-ready) .mobile-assembly .plan-layer { top: 50%; transform: translate(-50%, calc(-50% + var(--mobile-y, 0%))); }
+  .mobile-assembly .plan-layer-client { --mobile-y: -17%; }
+  .mobile-assembly .plan-layer-engine { --mobile-y: 17%; }
+  .mobile-assembly p { margin: 0; font-size: clamp(24px, 6vw, 32px); letter-spacing: -.035em; }
+  .mobile-assembly p span { display: block; margin-top: 12px; font-size: 13px; line-height: 1.7; color: #a8b2c1; letter-spacing: 0; }
+  .mobile-assembly.mobile-visible .plan-layer { animation: mobile-assembly-connect 1000ms cubic-bezier(.22, 1, .36, 1) both; }
+  .mobile-assembly.mobile-visible .plan-layer::after { animation: assembly-sweep 1200ms 650ms ease-out both; }
+  .mobile-assembly.mobile-visible .mobile-assembly-scene::before { animation: assembly-bloom 1400ms 400ms ease-out both; }
+}
+@keyframes mobile-layer-arrive {
+  from { transform: translateY(20px); opacity: .65; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@keyframes mobile-assembly-connect {
+  from { transform: translate(-50%, calc(-50% + var(--mobile-y, 0%) * 2.4)); }
+  to { transform: translate(-50%, calc(-50% + var(--mobile-y, 0%))); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .plan-layer { will-change: auto; }
+  .mobile-layer-view.mobile-visible, .mobile-assembly.mobile-visible .plan-layer, .mobile-assembly.mobile-visible .plan-layer::after, .mobile-assembly.mobile-visible .mobile-assembly-scene::before { animation: none; }
+  .blueprint-scene { transform: none; }
+  .is-assembled .blueprint-scene::before, .is-assembled .plan-layer::after { animation: none; }
+  .stack-caption { transform: translateX(-50%); }
+}
+@keyframes assembly-bloom {
+  0% { opacity: 0; transform: scale(.8); }
+  35% { opacity: 1; }
+  100% { opacity: .55; transform: scale(1.12); }
+}
+@keyframes assembly-sweep {
+  0% { opacity: 0; background-position: 180% 0; }
+  20% { opacity: .9; }
+  100% { opacity: 0; background-position: -80% 0; }
+}

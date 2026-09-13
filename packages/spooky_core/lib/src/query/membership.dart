@@ -203,3 +203,13 @@ List<String> suspectHashes(
   }
   return out;
 }
+
+/// The record ids a stored `_00_view` / `_00_window` row names. Used by the
+/// orphan collector, which only needs the ids and not their versions.
+Iterable<String> decodeIdsOfView(Map<String, dynamic> row) sync* {
+  final ids = row['ids'];
+  if (ids is! List) return;
+  for (final entry in ids) {
+    if (entry is List && entry.isNotEmpty) yield entry.first.toString();
+  }
+}

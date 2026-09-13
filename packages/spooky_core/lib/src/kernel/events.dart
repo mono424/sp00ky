@@ -228,6 +228,15 @@ class QueryEvictedEvent extends OutEvent {
   String get type => 'query:evicted';
 }
 
+/// One optimistic write, as the host app observes it. The outbox is what
+/// actually drives the push; this is the observation hook.
+class MutationEmittedEvent extends OutEvent {
+  const MutationEmittedEvent(this.event);
+  final MutationEvent event;
+  @override
+  String get type => 'mutation:event';
+}
+
 class MutationSettledEvent extends OutEvent {
   const MutationSettledEvent({
     required this.mutationId,

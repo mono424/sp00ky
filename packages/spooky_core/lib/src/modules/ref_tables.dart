@@ -41,3 +41,44 @@ String listRefTableFor(RefMode mode, Object? userId) {
   final uid = sanitizeUserId(userId);
   return uid != null ? '_00_list_ref_user_$uid' : '_00_list_ref';
 }
+
+/// cyrb53, the hash the TypeScript client uses for a bucket id that fails
+/// sanitization. Ported so the two clients name the same bucket for the same
+/// principal.
+///
+/// Every intermediate is kept as an UNSIGNED 32-bit value. JavaScript's `>>>`
+/// coerces to uint32 before shifting, so a Dart port that leaves values signed
+/// (`int.toSigned(32)`) produces different digests for the same input.
+int cyrb53(String str, [int seed = 0]) {
+  var h1 = (0xdeadbeef ^ seed) & _mask32;
+  var h2 = (0x41c6ce57 ^ seed) & _mask32;
+  for (var i = 0; i < str.length; i++) {
+    final ch = str.codeUnitAt(i);
+    h1 = _imul(h1 ^ ch, 2654435761);
+    h2 = _imul(h2 ^ ch, 1597334677);
+  }
+  h1 = _imul(h1 ^ (h1 >> 16), 2246822507);
+  h1 = (h1 ^ _imul(h2 ^ (h2 >> 13), 3266489909)) & _mask32;
+  h2 = _imul(h2 ^ (h2 >> 16), 2246822507);
+  h2 = (h2 ^ _imul(h1 ^ (h1 >> 13), 3266489909)) & _mask32;
+  return 4294967296 * (2097151 & h2) + h1;
+}
+
+const int _mask32 = 0xFFFFFFFF;
+
+/// JavaScript `Math.imul` over unsigned 32-bit operands. Multiplication is the
+/// same modulo 2^32 whether the operands are read as signed or unsigned, so
+/// masking the product is enough.
+int _imul(int a, int b) => ((a & _mask32) * (b & _mask32)) & _mask32;
+
+/// The local store a principal owns.
+///
+/// An id that fails sanitization still gets a DETERMINISTIC per-user bucket
+/// (the cyrb53 hex of the raw id); falling back to `anon` here would put an
+/// authenticated user in the shared bucket and recreate the cross-user leak.
+String bucketIdForUser(Object? userId) {
+  if (userId == null || userId == anonUserId) return anonUserId;
+  final uid = sanitizeUserId(userId);
+  if (uid != null) return uid;
+  return 'u${cyrb53(userId.toString()).toRadixString(16)}';
+}

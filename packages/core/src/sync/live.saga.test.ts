@@ -68,6 +68,28 @@ describe('liveChange', () => {
     const none = await runPure(liveChange(env, ['zz']), { state: s });
     expect(none.timers.size).toBe(0);
   });
+
+  it('pulls a backed-off poll back to the base cadence, and leaves an already-base one alone', async () => {
+    const entry = buildEntry({ def: { hash: 'a' } });
+    // Coasted up to the cap: the armed timer is the reason a change the poll
+    // has to catch could wait 5s, so the event has to re-arm it, not just zero
+    // the streak the next tick would read.
+    const backedOff = R.patchSync({ pollIdleStreak: 4 })(buildState([entry]));
+    const out = await runPure(liveChange(env, ['a']), { state: backedOff });
+    expect(out.timers.get('poll')).toEqual({ ms: env.pollBaseMs, event: { type: 'PollTick' } });
+
+    // Already at base: re-arming here would push the poll out by another
+    // `pollBaseMs` on every notification and starve it under sustained LIVE.
+    const atBase = R.patchSync({ pollIdleStreak: 0 })(buildState([entry]));
+    const quiet = await runPure(liveChange(env, ['a']), { state: atBase });
+    expect(quiet.timers.has('poll')).toBe(false);
+    expect(quiet.state.membershipDirty.has('a')).toBe(true);
+
+    // An unknown hash is not activity: nothing is touched.
+    const unknown = await runPure(liveChange(env, ['zz']), { state: backedOff });
+    expect(unknown.timers.has('poll')).toBe(false);
+    expect(unknown.state.sync.pollIdleStreak).toBe(4);
+  });
 });
 
 describe('rowOfEdge', () => {

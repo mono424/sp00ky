@@ -47,9 +47,29 @@ export function* liveInvalidate(): Saga<void> {
 
 /** One or more edges of these queries changed on the server. */
 export function* liveChange(env: SagaEnv, hashes: QueryHash[], rows?: InlineRow[]): Saga<void> {
-  const [known, role] = (yield fx.state.read((s) => [hashes.filter((h) => s.queries.has(h)), s.tabRole])) as [QueryHash[], ClientState['tabRole']];
+  const [known, role, streak] = (yield fx.state.read((s) => [hashes.filter((h) => s.queries.has(h)), s.tabRole, s.sync.pollIdleStreak])) as [
+    QueryHash[],
+    ClientState['tabRole'],
+    number,
+  ];
   if (known.length === 0) return;
-  yield fx.state.update(R.patchSync({ pollIdleStreak: 0 }));
+  // Zeroing the streak only decides the delay the NEXT tick picks: `pollTick`
+  // arms its timer at the end of a tick, so a page that had coasted up to the
+  // 5s cap still waited out that armed timer. When the poll is the thing that
+  // catches a change (a notification the server dropped, a row LIVE never
+  // carried) that made the worst case 5s even though LIVE had just proved the
+  // page was active. Re-arm at the base cadence too, so the safety net is back
+  // under us immediately.
+  //
+  // Only when the poll had actually backed off. A `set` on the same key
+  // replaces the pending timer, so re-arming on every event while LIVE is
+  // delivering faster than `pollBaseMs` would push the poll out forever and
+  // starve the full-membership reconciliation it exists to provide. A streak
+  // of 0 means the cadence is already base and there is nothing to correct.
+  if (streak > 0) {
+    yield fx.state.update(R.patchSync({ pollIdleStreak: 0 }));
+    yield fx.timer.set('poll', env.pollBaseMs, { type: 'PollTick' });
+  }
   // Before marking membership dirty: recording the version here is what makes
   // the re-read's `planFetch` find nothing left to pull for this row.
   if (rows && rows.length > 0) yield* landInlineRows(env, rows);

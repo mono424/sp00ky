@@ -167,6 +167,7 @@ class SyncHealth {
     this.kind,
     this.error,
     required this.everConnected,
+    this.connection = ConnectionState.disconnected,
   });
 
   /// [SyncHealthStatus.degraded] once consecutive failures cross the threshold.
@@ -188,7 +189,43 @@ class SyncHealth {
   /// after a working session. Never resets once set.
   final bool everConnected;
 
+  /// Transport state of the socket, independent of [status]: a `connected`
+  /// socket can still be degraded, and a `reconnecting` one is usually still
+  /// healthy for the first few seconds.
+  final ConnectionState connection;
+
   bool get isDegraded => status == SyncHealthStatus.degraded;
+
+  SyncHealth copyWith({
+    SyncHealthStatus? status,
+    int? consecutiveFailures,
+    String? kind,
+    String? error,
+    bool? everConnected,
+    ConnectionState? connection,
+  }) =>
+      SyncHealth(
+        status: status ?? this.status,
+        consecutiveFailures: consecutiveFailures ?? this.consecutiveFailures,
+        kind: kind ?? this.kind,
+        error: error ?? this.error,
+        everConnected: everConnected ?? this.everConnected,
+        connection: connection ?? this.connection,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is SyncHealth &&
+      other.status == status &&
+      other.consecutiveFailures == consecutiveFailures &&
+      other.kind == kind &&
+      other.error == error &&
+      other.everConnected == everConnected &&
+      other.connection == connection;
+
+  @override
+  int get hashCode => Object.hash(
+      status, consecutiveFailures, kind, error, everConnected, connection);
 }
 
 typedef QueryHash = String;
@@ -252,6 +289,9 @@ const int materializationSampleWindow = 100;
 /// [QueryState.materializationSamples]; these are the rolling windows the core
 /// records around its own work.
 class TimingPhase {
+  static const sspStoreApply = 'sspStoreApply';
+  static const sspCircuitStep = 'sspCircuitStep';
+  static const sspTransform = 'sspTransform';
   static const localFetch = 'localFetch';
   static const remoteFetch = 'remoteFetch';
   static const frontend = 'frontend';
@@ -402,4 +442,107 @@ class DebounceOptions {
 class UpdateOptions {
   const UpdateOptions({this.debounced});
   final Object? debounced;
+}
+
+/// Transport state of the remote socket, independent of sync health (TS
+/// `ConnectionState`). A `connected` socket can still be `degraded` (the server
+/// is erroring), and a `reconnecting` socket is usually still healthy for the
+/// first few seconds.
+enum ConnectionState { connecting, connected, reconnecting, disconnected }
+
+/// A row that rode in on a LIVE notification because the subscription was
+/// opened with the body joined on (TS `InlineRow`). `version` is the edge's
+/// version, the same number a membership read would report for this row.
+class InlineRow {
+  const InlineRow({
+    required this.id,
+    required this.version,
+    required this.record,
+  });
+
+  final String id;
+  final int version;
+  final Map<String, dynamic> record;
+}
+
+/// What the server's `_00_query` row says about a view, read alongside its
+/// `_00_list_ref` edges (TS `ServerViewMeta`).
+///
+/// - [present] false: the row is not there (or not readable). The SSP no longer
+///   has this view: a TTL sweep, an SSP reset, a scheduler wipe. An empty edge
+///   set read at the same time is NOT "no rows", it is "no view".
+/// - [state] `'materializing'`: the SSP has (re)computed the set and its edges
+///   are in flight; an empty read is "not landed yet".
+/// - [state] `'ready'`: the edges are committed in the same transaction, so a
+///   [rowCount] of 0 with no edges is a real empty result.
+class ServerViewMeta {
+  const ServerViewMeta({
+    required this.present,
+    this.rowCount,
+    this.state,
+  });
+
+  static const absent = ServerViewMeta(present: false);
+
+  final bool present;
+  final int? rowCount;
+  final String? state;
+}
+
+/// One-shot registration timings (ms), captured once when a query registers
+/// (TS `RegistrationTimings`).
+class RegistrationTimings {
+  const RegistrationTimings({
+    this.parseMs,
+    this.planMs,
+    this.snapshotMs,
+    this.wallMs,
+  });
+
+  static const empty = RegistrationTimings();
+
+  /// SSP surql -> plan parse + permission injection.
+  final double? parseMs;
+
+  /// SSP operator-DAG build.
+  final double? planMs;
+
+  /// SSP initial snapshot evaluation.
+  final double? snapshotMs;
+
+  /// Wall time of the `register_view` round trip.
+  final double? wallMs;
+}
+
+/// Observer for a query's authority flips (TS `QueryAuthorityCallback`): true
+/// once server membership is known for it (registration, poll, durable seed),
+/// false when it is reset by a bucket switch. What `isAuthoritative()` mirrors.
+typedef QueryAuthorityCallback = void Function(bool known);
+
+/// Per-query processing-time breakdown (TS `QueryTimings`).
+class QueryTimings {
+  const QueryTimings({
+    required this.ssp,
+    required this.sspStoreApply,
+    required this.sspCircuitStep,
+    required this.sspTransform,
+    required this.localFetch,
+    required this.remoteFetch,
+    required this.frontend,
+    required this.registration,
+    required this.updateCount,
+    required this.errorCount,
+  });
+
+  /// End-to-end native ingest wall time.
+  final PhaseStat ssp;
+  final PhaseStat sspStoreApply;
+  final PhaseStat sspCircuitStep;
+  final PhaseStat sspTransform;
+  final PhaseStat localFetch;
+  final PhaseStat remoteFetch;
+  final PhaseStat frontend;
+  final RegistrationTimings registration;
+  final int updateCount;
+  final int errorCount;
 }

@@ -25,6 +25,33 @@ class QueryPlanConfig {
   final DateTime lastActiveAt;
 }
 
+/// Circuit ingest operation (TS `IngestRecord.op`). `merge` overlays the given
+/// fields on the stored row, which is what projection widening needs.
+enum IngestOp { create, update, delete, merge }
+
+/// One record handed to the circuit (TS `IngestRecord`).
+class IngestRecord {
+  const IngestRecord({
+    required this.table,
+    required this.op,
+    required this.id,
+    required this.record,
+  });
+
+  final String table;
+  final IngestOp op;
+  final String id;
+  final Map<String, dynamic> record;
+
+  /// The wire spelling the native circuit expects.
+  String get opName => switch (op) {
+        IngestOp.create => 'CREATE',
+        IngestOp.update => 'UPDATE',
+        IngestOp.delete => 'DELETE',
+        IngestOp.merge => 'MERGE',
+      };
+}
+
 /// Implemented by anything that wants raw stream updates (TS
 /// `StreamUpdateReceiver`). [CacheModule] and (later) DevTools implement it.
 abstract class StreamUpdateReceiver {

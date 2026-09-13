@@ -139,9 +139,23 @@ class Sp00kyClient {
 
     if (hasRemote) {
       final client = _remoteClientOverride ?? WebSocketSurrealClient();
+      if (client is WebSocketSurrealClient) {
+        client.connectTimeout =
+            Duration(milliseconds: config.reconnect.connectTimeoutMs);
+      }
       final remote = RemoteDatabaseService(config.database, client, _logger);
+      // Armed before boot: boot is local-first and returns before the network
+      // half has run, so an app that calls `signUp` the instant `init()`
+      // resolves would otherwise reach the server before `use(ns, db)`.
+      remote.armConnectGate();
       _remote = remote;
       final auth = AuthService(config.schema, remote, _persistence, _logger);
+      // Push what is already queued while the session is still valid. Bounded:
+      // an unreachable server must not hold sign-out open. Anything still
+      // pending stays in that user's store and drains on their next sign-in.
+      auth.onBeforeSignOut = () => _runtime
+          .dispatchAsync(const Drain())
+          .timeout(Duration(milliseconds: config.reconnect.connectTimeoutMs));
       _auth = auth;
       _services
         ..remote = remote

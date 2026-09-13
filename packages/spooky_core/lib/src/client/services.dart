@@ -132,7 +132,7 @@ class RemoteAdapter implements RemotePort {
     // path takes over.
     final join = inlineBodies ? ' FETCH out' : '';
     final (uuid, stream) =
-        await _remote.getClient().live('LIVE SELECT * FROM $table$join');
+        await _remote.live('LIVE SELECT * FROM $table$join');
     await _liveSub?.cancel();
     _liveSub = stream.listen((message) {
       if (message.action == 'KILLED') return;
@@ -151,7 +151,7 @@ class RemoteAdapter implements RemotePort {
   Future<void> kill(String uuid) async {
     await _liveSub?.cancel();
     _liveSub = null;
-    await _remote.getClient().kill(uuid);
+    await _remote.kill(uuid);
   }
 
   Future<void> dispose() async {

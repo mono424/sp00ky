@@ -530,6 +530,7 @@ class ReconnectConfig {
     this.retryDelayMaxMs = 15000,
     this.heartbeatIntervalMs = 20000,
     this.heartbeatTimeoutMs = 10000,
+    this.connectTimeoutMs = 10000,
   });
 
   /// Cap on the supervisor's exponential backoff between reconnect attempts.
@@ -543,4 +544,12 @@ class ReconnectConfig {
   /// Deadline for a heartbeat response. Exceeding it means the socket is dead
   /// regardless of what it claims, so the connection is torn down and rebuilt.
   final int heartbeatTimeoutMs;
+
+  /// Deadline for opening a socket.
+  ///
+  /// A refused port fails fast, but a black-holed one (a captive portal, a
+  /// dropped route, a firewall that drops instead of rejecting) never answers
+  /// at all. Without this the revive loop parks inside a single attempt
+  /// forever: it never retries, and never reports the connection as gone.
+  final int connectTimeoutMs;
 }

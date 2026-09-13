@@ -89,13 +89,25 @@ class WebSocketSurrealClient
   @visibleForTesting
   String rpcEndpoint(String endpoint) => _rpcEndpoint(endpoint);
 
+  /// Deadline for [connect]. A refused port fails fast, but a black-holed one
+  /// never answers, and `WebSocketChannel.ready` has no timeout of its own.
+  Duration connectTimeout = const Duration(seconds: 10);
+
   @override
   Future<void> connect(String endpoint) async {
     if (_channel != null) await forceClose();
     final uri = Uri.parse(_rpcEndpoint(endpoint));
     final channel = createChannel(uri);
     _channel = channel;
-    await channel.ready;
+    try {
+      await channel.ready.timeout(connectTimeout);
+    } catch (e) {
+      // Drop the half-open channel: leaving it assigned would make
+      // `isConnected` lie and make the next `connect` wait on `forceClose`.
+      _channel = null;
+      unawaited(channel.sink.close().catchError((Object _) {}));
+      rethrow;
+    }
     channel.stream.listen(
       _onMessage,
       onDone: () => _onSocketEnd(null),
@@ -136,9 +148,10 @@ class WebSocketSurrealClient
     _channel = null;
     if (channel == null) return;
     try {
-      await channel.sink.close();
+      await channel.sink.close().timeout(const Duration(seconds: 2));
     } catch (_) {
-      // A socket that is already gone is exactly what we wanted.
+      // A socket that is already gone, or one too wedged to close, is exactly
+      // the state we wanted to reach.
     }
     _onSocketEnd(null);
   }
@@ -306,7 +319,12 @@ class WebSocketSurrealClient
   Future<void> close() async {
     final channel = _channel;
     _channel = null;
-    await channel?.sink.close();
+    // Bounded: closing a socket that never finished opening can hang, and a
+    // client being torn down must not hold the process open.
+    await channel?.sink
+        .close()
+        .timeout(const Duration(seconds: 2))
+        .catchError((Object _) {});
     for (final c in _liveControllers.values) {
       await c.close();
     }

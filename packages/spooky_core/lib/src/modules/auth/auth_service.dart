@@ -29,6 +29,18 @@ class AuthService {
 
   static const _tokenKey = 'sp00ky_auth_token';
 
+  /// Run before the session is dropped, so a write the user already made can
+  /// still reach the server under their own identity.
+  ///
+  /// Sign-out flips the bucket, and a bucket switch abandons the outgoing
+  /// outbox in the old store: it is only picked up again the next time that
+  /// user signs in, long after the screen that made the write is gone. Pushing
+  /// after the token is cleared is not an option either - the statements would
+  /// run unauthenticated and come back as rejections, which roll the writes
+  /// back. So the flush has to happen here, first, and it is best-effort: a
+  /// failure must never block signing out.
+  Future<void> Function()? onBeforeSignOut;
+
   String? token;
   Map<String, dynamic>? currentUser;
   bool isAuthenticated = false;
@@ -136,7 +148,7 @@ class AuthService {
         return;
       }
 
-      await _remote.getClient().authenticate(tok);
+      await _remote.authenticate(tok);
       final user = await _fetchAuthUser();
       if (user != null && user['id'] != null) {
         await _setSession(tok, user);
@@ -163,6 +175,11 @@ class AuthService {
   }
 
   Future<void> signOut() async {
+    try {
+      await onBeforeSignOut?.call();
+    } catch (err) {
+      _logger.debug('Outbox flush before signOut failed: $err');
+    }
     token = null;
     currentUser = null;
     isAuthenticated = false;
@@ -170,7 +187,7 @@ class AuthService {
     _remote.setAuthToken(null);
     await _persistence.remove(_tokenKey);
     try {
-      await _remote.getClient().invalidate();
+      await _remote.invalidate();
     } catch (err) {
       // Local sign-out already cleared the token/session above; a failed remote
       // invalidate (e.g. server unreachable) must not block signing out.

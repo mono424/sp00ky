@@ -172,4 +172,45 @@ void main() {
       throwsA(isA<StateError>()),
     );
   });
+
+  group('signOut flushes the outbox first', () {
+    test('the hook runs while the session is still valid', () async {
+      // Sign-out flips the bucket, and a bucket switch abandons the outgoing
+      // outbox in the old store. Pushing after the token is cleared would run
+      // the statements unauthenticated and come back as rejections, which roll
+      // the writes back, so the flush has to happen before any of that.
+      final auth = build();
+      auth.currentUser = {'id': 'user:a'};
+      auth.token = 'tok';
+      auth.isAuthenticated = true;
+      remoteClient.invalidated = false;
+
+      String? tokenDuringFlush;
+      var invalidatedDuringFlush = true;
+      auth.onBeforeSignOut = () async {
+        tokenDuringFlush = auth.token;
+        invalidatedDuringFlush = remoteClient.invalidated;
+      };
+
+      await auth.signOut();
+
+      expect(tokenDuringFlush, 'tok');
+      expect(invalidatedDuringFlush, isFalse);
+      expect(auth.token, isNull);
+      expect(auth.isAuthenticated, isFalse);
+      expect(remoteClient.invalidated, isTrue);
+    });
+
+    test('a failing flush never blocks signing out', () async {
+      final auth = build();
+      auth.token = 'tok';
+      auth.isAuthenticated = true;
+      auth.onBeforeSignOut = () async => throw StateError('server gone');
+
+      await auth.signOut();
+
+      expect(auth.token, isNull);
+      expect(auth.isAuthenticated, isFalse);
+    });
+  });
 }

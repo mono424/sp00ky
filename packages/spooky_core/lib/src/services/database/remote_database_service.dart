@@ -27,7 +27,55 @@ class RemoteDatabaseService {
   /// stamped with an empty identity.
   String? _authToken;
 
+  /// Completes when the current connect attempt has finished, successfully or
+  /// not. Every RPC waits on it.
+  ///
+  /// The engine's boot is local-first: it returns before the network half has
+  /// run, so `use(ns, db)` and `authenticate(token)` have NOT happened yet when
+  /// the app makes its first call. A signup issued in that window reaches the
+  /// server with no namespace and fails as "There was a problem with signing
+  /// up". Re-armed on every connect, so an RPC issued during a reconnect waits
+  /// for the new socket's handshake rather than riding the dead one.
+  Completer<void>? _connectGate;
+
+  /// How long an RPC waits for a connect before going ahead anyway. Going ahead
+  /// fails it as a network error, which the outbox and the registrations retry;
+  /// waiting forever would wedge them instead.
+  Duration connectGateTimeout = const Duration(seconds: 20);
+
+  /// Hold RPCs until the first connect attempt finishes. Called before the
+  /// engine boots, so a call made before [connect] still waits for it.
+  void armConnectGate() => _connectGate ??= Completer<void>();
+
+  Future<void> _awaitConnect() async {
+    final gate = _connectGate;
+    if (gate == null || gate.isCompleted) return;
+    await gate.future.timeout(connectGateTimeout, onTimeout: () {
+      _logger.warn('Proceeding without a connected socket: '
+          'no handshake within ${connectGateTimeout.inSeconds}s');
+    });
+  }
+
+  void _openConnectGate() {
+    final gate = _connectGate;
+    if (gate != null && !gate.isCompleted) gate.complete();
+  }
+
   RemoteSurrealClient getClient() => _client;
+
+  /// Gated LIVE subscribe. A LIVE issued before the handshake is rejected with
+  /// "Specify a namespace to use" and then never retried, so the down-path runs
+  /// on the poll alone until the next reconnect.
+  Future<(String, Stream<LiveMessage>)> live(String sql,
+      [Map<String, dynamic>? vars]) async {
+    await _awaitConnect();
+    return _client.live(sql, vars);
+  }
+
+  Future<void> kill(String liveId) async {
+    await _awaitConnect();
+    return _client.kill(liveId);
+  }
   DatabaseConfig getConfig() => _config;
 
   void setAuthToken(String? token) => _authToken = token;
@@ -49,15 +97,24 @@ class RemoteDatabaseService {
     final endpoint = _config.endpoint;
     if (endpoint == null) {
       _logger.warn('No endpoint configured for remote database');
+      _openConnectGate();
       return;
     }
-    await _client.connect(endpoint);
-    await _client.use(namespace: _config.namespace, database: _config.database);
-    final token = _authToken ?? _config.token;
-    if (token != null) {
-      await _client.authenticate(token);
+    final gate = _connectGate;
+    if (gate == null || gate.isCompleted) _connectGate = Completer<void>();
+    try {
+      await _client.connect(endpoint);
+      await _client.use(
+          namespace: _config.namespace, database: _config.database);
+      final token = _authToken ?? _config.token;
+      if (token != null) {
+        await _client.authenticate(token);
+      }
+      _logger.info('Connected to remote database');
+    } finally {
+      // Success or failure: the attempt is over, so held RPCs stop waiting.
+      _openConnectGate();
     }
-    _logger.info('Connected to remote database');
   }
 
   /// Serialized query: chains onto [_queryQueue] so calls never overlap.
@@ -65,6 +122,7 @@ class RemoteDatabaseService {
     final completer = Completer<List<dynamic>>();
     _queryQueue = _queryQueue.then((_) async {
       try {
+        await _awaitConnect();
         completer.complete(await _client.query(sql, vars));
       } catch (err) {
         completer.completeError(err);
@@ -96,6 +154,7 @@ class RemoteDatabaseService {
     final completer = Completer<List<StatementResult>>();
     _queryQueue = _queryQueue.then((_) async {
       try {
+        await _awaitConnect();
         completer.complete(
             await (client as StatementAwareRemote).queryStatements(sql, vars));
       } catch (err) {
@@ -113,10 +172,31 @@ class RemoteDatabaseService {
     return query.extract(raw);
   }
 
-  Future<dynamic> signin(Map<String, dynamic> params) => _client.signin(params);
-  Future<dynamic> signup(Map<String, dynamic> params) => _client.signup(params);
-  Future<dynamic> authenticate(String token) => _client.authenticate(token);
-  Future<void> invalidate() => _client.invalidate();
+  // Auth RPCs wait for the handshake too: `signin`/`signup` carry the
+  // namespace and database the `use` call established, and reach the server
+  // without them if they run first.
+  Future<dynamic> signin(Map<String, dynamic> params) async {
+    await _awaitConnect();
+    return _client.signin(params);
+  }
 
-  Future<void> close() => _client.close();
+  Future<dynamic> signup(Map<String, dynamic> params) async {
+    await _awaitConnect();
+    return _client.signup(params);
+  }
+
+  Future<dynamic> authenticate(String token) async {
+    await _awaitConnect();
+    return _client.authenticate(token);
+  }
+
+  Future<void> invalidate() async {
+    await _awaitConnect();
+    return _client.invalidate();
+  }
+
+  Future<void> close() {
+    _openConnectGate(); // never leave an RPC waiting on a client that is gone
+    return _client.close();
+  }
 }

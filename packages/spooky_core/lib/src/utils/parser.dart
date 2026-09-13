@@ -81,10 +81,13 @@ Map<String, dynamic> parseQueryParams(
 ) {
   final parsed = <String, dynamic>{};
   for (final entry in params.entries) {
-    if (entry.value == null) {
-      parsed[entry.key] = null;
-      continue;
-    }
+    // `null` is Dart's only way to say "not set", where the browser core has
+    // `undefined` (which TS drops here for the same reason). Keeping it would
+    // send SurrealDB a NULL, and an `option<T>` field rejects NULL: an unset
+    // optional on a generated model - whose `toJson` always writes the key -
+    // failed the whole write with "Expected `none | bool` but found `NULL`".
+    // Omitting the key leaves the field NONE, which is what unset means.
+    if (entry.value == null) continue;
     final column =
         tableSchema[entry.key] ?? tableSchema[baseFieldOfParam(entry.key)];
     parsed[entry.key] = column == null

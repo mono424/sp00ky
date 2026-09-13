@@ -11,6 +11,37 @@ import 'package:spooky_core/src/utils/surql.dart';
 import 'package:test/test.dart';
 
 void main() {
+  group('parseQueryParams', () {
+    const columns = {
+      'title': ColumnSchema(type: 'string'),
+      'allow_duplicate': ColumnSchema(type: 'bool', optional: true),
+      'created_at': ColumnSchema(type: 'datetime', dateTime: true),
+    };
+
+    test('drops unset optionals rather than sending SurrealDB a NULL', () {
+      // A generated model's `toJson` always writes the key, so an unset
+      // `option<bool>` arrives as null. Sent as NULL the server rejects the
+      // whole write; omitted, the field is NONE, which is what unset means.
+      final parsed = parseQueryParams(columns, {
+        'title': 'hi',
+        'allow_duplicate': null,
+      });
+      expect(parsed.containsKey('allow_duplicate'), isFalse);
+      expect(parsed['title'], 'hi');
+    });
+
+    test('keeps keys the schema does not declare', () {
+      final parsed = parseQueryParams(columns, {'extra': 7});
+      expect(parsed['extra'], 7);
+    });
+
+    test('coerces declared columns', () {
+      final parsed =
+          parseQueryParams(columns, {'created_at': '2026-09-13T00:00:00Z'});
+      expect(parsed['created_at'], isA<DateTime>());
+    });
+  });
+
   group('RecordId', () {
     test('encode / parse round-trip', () {
       final r = RecordId('thread', 'abc');

@@ -228,7 +228,13 @@ class ConnectionSupervisor {
     _setState(ConnectionState.reconnecting);
     _logger.info('Re-opening the remote connection (attempt $_reviveAttempts)');
     try {
-      await _reconnect();
+      // Bounded: a black-holed endpoint never answers, and an unbounded attempt
+      // would park the loop inside it forever - never retrying, never reporting
+      // the connection as gone.
+      await _reconnect().timeout(
+          Duration(milliseconds: _config.connectTimeoutMs),
+          onTimeout: () => throw TimeoutException(
+              'Connect timed out after ${_config.connectTimeoutMs}ms'));
       // `reviveAttempts` and the heartbeat are reset by the `connected`
       // listener: that is the only signal the handshake actually completed.
     } catch (e) {

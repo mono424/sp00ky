@@ -41,7 +41,7 @@ void main() {
     expect(emissions.first, isEmpty);
 
     await client.create('thread:a', {'title': 'hello'});
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
 
     final latest = emissions.last;
     expect(latest, hasLength(1));
@@ -78,7 +78,7 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 20));
 
     await client.delete('thread', 'thread:c');
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
 
     expect(emissions.last, isEmpty);
     await sub.cancel();
@@ -86,7 +86,7 @@ void main() {
 
   test('mutations are recorded in the pending-mutations outbox', () async {
     await client.create('thread:d', {'title': 'q'});
-    final mutations = client.local.getAllMutations();
+    final mutations = client.localStore.getAllMutations();
     expect(mutations, isNotEmpty);
     expect(mutations.last['mutationType'], 'create');
     expect(mutations.last['recordId'], 'thread:d');

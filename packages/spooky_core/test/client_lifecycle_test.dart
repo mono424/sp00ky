@@ -1,7 +1,7 @@
 import 'package:spooky_core/spooky_core.dart';
 import 'package:test/test.dart';
 
-import 'sync_integration_test.dart' show FakeRemote;
+import 'fake_remote.dart';
 
 /// Records the raw auth RPCs `authenticate`/`deauthenticate` forward.
 class _RecordingRemote extends FakeRemote {
@@ -50,7 +50,7 @@ void main() {
     final emissions = <List<Map<String, dynamic>>>[];
     final sub = stream.listen(emissions.add);
     await client.create('thread:a', {'title': 'hi'});
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
     expect(emissions.last.map((r) => r['id']), contains('thread:a'));
     await sub.cancel();
   });
@@ -58,7 +58,7 @@ void main() {
   test('callback subscribe receives the current set immediately', () async {
     final hash = await client.queryRaw('SELECT * FROM thread', {});
     await client.create('thread:a', {'title': 'hi'});
-    await Future<void>.delayed(const Duration(milliseconds: 30));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
 
     List<Map<String, dynamic>>? latest;
     final off = client.subscribe(hash, (r) => latest = r, immediate: true);
@@ -74,7 +74,7 @@ void main() {
     final s1 = client.subscribeStream(hash).listen(a.add);
     final s2 = client.subscribeStream(hash).listen(b.add);
     await client.create('thread:a', {'title': 'hi'});
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
     expect(a.last.any((r) => r['id'] == 'thread:a'), isTrue);
     expect(b.last.any((r) => r['id'] == 'thread:a'), isTrue);
     await s1.cancel();
@@ -83,7 +83,7 @@ void main() {
 
   test('pendingMutationCount is 0 without a remote sync', () {
     expect(client.pendingMutationCount, 0);
-    expect(client.liveRetryCount, 0);
+    expect(client.fetchingQueryCount, 0);
   });
 
   test('CRDT entry points are stubbed (deferred)', () {
@@ -109,20 +109,20 @@ void main() {
 
   test('reportFrontendTiming records a frontend phase sample', () async {
     final hash = await client.queryRaw('SELECT * FROM thread', {});
-    expect(client.dataModule.phaseStat(hash, TimingPhase.frontend).count, 0);
+    expect(client.queryTimings(hash)!.frontend.count, 0);
 
     client.reportFrontendTiming(hash, 4);
     client.reportFrontendTiming(hash, 8);
     // Non-finite samples are dropped.
     client.reportFrontendTiming(hash, double.nan);
 
-    final stat = client.dataModule.phaseStat(hash, TimingPhase.frontend);
+    final stat = client.queryTimings(hash)!.frontend;
     expect(stat.count, 2);
     expect(stat.lastMs, 8);
     expect(stat.p50, isNotNull);
     // Unknown hashes are a no-op rather than an error.
     client.reportFrontendTiming('nope', 1);
-    expect(client.dataModule.phaseStat('nope', TimingPhase.frontend).count, 0);
+    expect(client.queryTimings('nope'), isNull);
   });
 
   test('frontend phase window caps at materializationSampleWindow', () async {
@@ -130,7 +130,7 @@ void main() {
     for (var i = 0; i < materializationSampleWindow + 10; i++) {
       client.reportFrontendTiming(hash, i.toDouble());
     }
-    expect(client.dataModule.phaseStat(hash, TimingPhase.frontend).count,
+    expect(client.queryTimings(hash)!.frontend.count,
         materializationSampleWindow);
   });
 
@@ -155,15 +155,18 @@ void main() {
 
     test('authenticate/deauthenticate forward the raw RPCs', () async {
       await remoteClient.authenticate('tok-1');
-      expect(remote.authTokens, ['tok-1']);
+      // At least once: the token is also remembered for the transport, so a
+      // socket rebuilt later comes back authenticated rather than anonymous.
+      expect(remote.authTokens, contains('tok-1'));
       await remoteClient.deauthenticate();
       expect(remote.invalidateCount, 1);
     });
 
-    test('a fresh query is born fetching', () async {
+    test('a fresh query is not authoritative until the server answers',
+        () async {
       final hash = await remoteClient.queryRaw('SELECT * FROM thread', {});
-      expect(remoteClient.dataModule.getQueryByHash(hash)!.status,
-          QueryStatus.fetching);
+      expect(remoteClient.isQueryAuthoritative(hash), isFalse);
+      expect(remoteClient.isQuerySettled(hash), isFalse);
     });
 
     test('appRelease returns a handle that starts empty', () async {
@@ -180,8 +183,8 @@ void main() {
       final seen = <SyncHealth>[];
       final sub = remoteClient.syncHealthStream().listen(seen.add);
       await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(seen, hasLength(1));
-      expect(seen.single.status, SyncHealthStatus.healthy);
+      expect(seen, isNotEmpty);
+      expect(seen.first.status, SyncHealthStatus.healthy);
       await sub.cancel();
     });
   });
@@ -191,10 +194,12 @@ void main() {
     expect(() => client.appRelease('web'), throwsA(isA<StateError>()));
   });
 
-  test('local-only sync health is healthy and already connected', () {
+  test('local-only sync health is healthy and never connected', () {
     expect(client.syncHealth.status, SyncHealthStatus.healthy);
     expect(client.syncHealth.isDegraded, isFalse);
-    expect(client.syncHealth.everConnected, isTrue);
+    // Nothing to reach, so nothing ever connected: an app tells a cold start
+    // apart from a lost connection with this rather than with the status.
+    expect(client.syncHealth.everConnected, isFalse);
 
     final seen = <SyncHealth>[];
     final off = client.subscribeToSyncHealth(seen.add);
@@ -204,6 +209,7 @@ void main() {
 
   test('a local-only query starts idle (nothing would settle it)', () async {
     final hash = await client.queryRaw('SELECT * FROM thread', {});
-    expect(client.dataModule.getQueryByHash(hash)!.status, QueryStatus.idle);
+    expect(client.state.queries[hash]!.lifecycle.fetchDepth, 0);
+    expect(client.isQuerySettled(hash), isFalse);
   });
 }

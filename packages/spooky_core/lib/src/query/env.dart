@@ -17,6 +17,7 @@ class SagaEnv {
     this.materializeDebounceMs = k.materializeDebounceMs,
     this.pollBaseMs = k.listRefPollBaseMs,
     this.defaultTtlMs = 600000,
+    this.hasRemote = true,
   });
 
   /// `{ table: { columns: { field: ColumnSchema } } }` plus `backends`.
@@ -30,6 +31,14 @@ class SagaEnv {
   final int materializeDebounceMs;
   final int pollBaseMs;
   final int defaultTtlMs;
+
+  /// False for a purely local client (no endpoint configured).
+  ///
+  /// Dart-only: the browser client always has a server. Without it the outbox
+  /// would drain against nothing, and every push would fail in a way the
+  /// classifier reads as the server rejecting the write - which rolls the write
+  /// back and deletes it.
+  final bool hasRemote;
 }
 
 /// The `_00_list_ref` table this session reads: per-user, anonymous, or global.

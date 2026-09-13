@@ -18,8 +18,14 @@ export 'src/ffi/stream_update.dart'
         RecordVersion,
         RecordVersionArray,
         SspException;
-export 'src/modules/sync/queue/queue_up.dart'
-    show UpEvent, CreateEvent, UpdateEvent, DeleteEvent, MutationCallback;
+export 'src/kernel/events.dart'
+    show RuntimeEvent, OutEvent, MutationEmittedEvent, LogLevel;
+export 'src/mutation/rows.dart'
+    show FailedMutationRow, FailedMutationError, FailedErrorKind, RevertKind;
+export 'src/boot/preload_saga.dart' show PreloadFailedError;
+export 'src/modules/query_host.dart' show QueryHost;
+export 'src/state/client_state.dart' show ClientState, QueryEntry, TabRole;
+export 'src/state/lifecycle.dart' show QueryPhase, RemotePhase;
 export 'src/utils/duration_utils.dart'
     show QueryTimeToLive, defaultTtl, parseDuration;
 export 'src/utils/parser.dart' show ColumnSchema;

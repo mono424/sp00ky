@@ -1,12 +1,12 @@
-import 'dart:async';
-
 import 'package:spooky_core/spooky_core.dart';
+import 'package:spooky_core/src/kernel/events.dart' show Drain, ReadMembership;
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:test/test.dart';
 
-/// Drives the full sync orchestration (up-queue -> remote, down-queue register
-/// + initial fetch, LIVE -> down-sync) against a fake remote client, with no
-/// real SurrealDB server.
+import 'fake_remote.dart';
+
+/// Drives the whole engine against a fake server: register -> membership ->
+/// body fetch -> render, a LIVE change, and the outbox up-path.
 void main() {
   late FakeRemote remote;
   late Sp00kyClient client;
@@ -19,12 +19,13 @@ void main() {
     },
   };
 
-  setUp(() async {
-    remote = FakeRemote();
-    // Pre-seed a token so AuthService.check() hydrates a user and starts LIVE.
+  Future<Sp00kyClient> open() async {
     final persistence = MemoryPersistenceClient();
-    await persistence.set('sp00ky_auth_token', 'tok');
-    client = Sp00kyClient(
+    // A token whose `ID` claim names the user, so boot restores the session
+    // without a round trip (the payload below decodes to {"ID":"user:u1"}).
+    await persistence.set('sp00ky_auth_token',
+        'h.${base64Url('{"ID":"user:u1","AC":"account"}')}.s');
+    final c = Sp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
           endpoint: 'ws://localhost:8000',
@@ -37,226 +38,110 @@ void main() {
       ),
       remoteClient: remote,
     );
-    await client.init();
-    await _settle(); // let the auth-driven LIVE subscription establish
-  });
+    await c.init();
+    return c;
+  }
 
+  setUp(() async {
+    remote = FakeRemote();
+    // The server must recognise the token's user, or `authInit` signs out and
+    // the client switches back to the anonymous bucket mid-test.
+    remote.records['user:u1'] = {'id': 'user:u1', 'name': 'u'};
+    client = await open();
+    // Let boot's network half finish, so the bucket has settled before a test
+    // writes into it.
+    await settle(150);
+  });
   tearDown(() => client.close());
 
-  test('init connects, uses ns/db, and fetches session id', () {
+  test('boot opens the store, restores the session and connects', () async {
+    expect(client.isLocalReady, isTrue);
+    expect(client.state.userId, 'user:u1');
+    expect(client.state.bucketId, isNotNull);
+    await settle();
     expect(remote.connected, isTrue);
     expect(remote.usedNamespace, 'test');
-    expect(remote.queries.any((q) => q.contains('session::id()')), isTrue);
   });
 
-  test('local create is pushed to remote as a CREATE up-event', () async {
-    await client.create('thread:a', {'title': 'hello'});
-    await _settle();
-    expect(
-      remote.queries.any((q) => q.contains('CREATE ONLY \$id SET')),
-      isTrue,
-      reason: 'expected a create statement sent to remote',
-    );
-  });
-
-  test('queryRaw registers the query remotely and fetches list_ref', () async {
-    await client.queryRaw('SELECT * FROM thread', {});
-    await _settle();
-    expect(
-        remote.queries.any((q) => q.contains('fn::query::register')), isTrue);
-    expect(remote.queries.any((q) => q.contains('FROM _00_list_ref')), isTrue);
-  });
-
-  test('a remote LIVE create flows into the query Stream', () async {
-    final hash = await client.queryRaw('SELECT * FROM thread', {});
-    await _settle();
-
-    final emissions = <List<Map<String, dynamic>>>[];
-    final sub = client.subscribeStream(hash).listen(emissions.add);
-    await _settle();
-
-    // Seed the record the engine will fetch, then push a LIVE list_ref CREATE.
-    final queryId = 'query:$hash';
-    remote.records['thread:remote'] = {
-      'id': 'thread:remote',
-      'title': 'live',
-      '_00_rv': 1
-    };
-    remote.pushLive('CREATE', {
-      'in': queryId,
-      'out': 'thread:remote',
-      'version': 1,
-    });
-    await _settle();
-
-    expect(
-      emissions.expand((e) => e).any((r) => r['id'] == 'thread:remote'),
-      isTrue,
-      reason: 'LIVE-delivered record should reach the Stream',
-    );
-    await sub.cancel();
-  });
-
-  // Reproduces the "records sync one by one" report. The batch-coalescing
-  // window only collapses a SINGLE saveBatch (the initial registration fetch).
-  // The LIVE path is different: SurrealDB delivers one `_00_list_ref` message
-  // per record, and `_handleRemoteListRefChange` turns each into a one-record
-  // diff -> its own `syncRecords` -> its own `saveBatch([one])`. So a burst of
-  // N records that land together still produces N separate stream emissions,
-  // each growing the list by one -> the UI renders row-by-row.
-  test('a burst of remote LIVE creates syncs one record at a time (bug repro)',
+  test('a registered query renders the server membership it is given',
       () async {
-    final hash = await client.queryRaw('SELECT * FROM thread', {});
-    await _settle();
+    remote.records['thread:a'] = {'id': 'thread:a', 'title': 'hello'};
+    final hash =
+        await client.queryRaw('SELECT * FROM thread', const {}, ttl: '10m');
+    remote.publish('_00_query:$hash', [('thread:a', 1)]);
 
-    // Seed three records the engine will fetch when their list_ref CREATE lands.
-    final queryId = 'query:$hash';
-    for (var i = 1; i <= 3; i++) {
-      remote.records['thread:r$i'] = {
-        'id': 'thread:r$i',
-        'title': 'live $i',
-        '_00_rv': 1,
-      };
-    }
+    final seen = <List<Map<String, dynamic>>>[];
+    client.subscribe(hash, seen.add);
+    // The registration may have read the membership before it was published;
+    // one forced read is the deterministic equivalent of the next poll tick.
+    await client.dispatch(ReadMembership([hash]));
+    await settle(200);
 
-    final emissions = <List<Map<String, dynamic>>>[];
-    // immediate: false so we only capture emissions caused by the LIVE burst,
-    // not the initial (empty) snapshot on subscribe.
-    final sub = client
-        .subscribeStream(hash, immediate: false)
-        .listen((e) => emissions.add(e));
-    await _settle();
+    expect(client.state.queries[hash]!.remoteArray, [('thread:a', 1)]);
+    expect(remote.lastFetchedIds, ['thread:a']);
+    expect(seen.last.single['title'], 'hello');
+    expect(client.isQueryAuthoritative(hash), isTrue);
+  });
 
-    // A burst: three list_ref CREATEs pushed back-to-back, as a remote bulk
-    // insert of three rows into the same query would deliver them.
-    for (var i = 1; i <= 3; i++) {
-      remote.pushLive('CREATE', {
-        'in': queryId,
-        'out': 'thread:r$i',
-        'version': 1,
-      });
-    }
-    await _settle();
+  test('a LIVE edge lands the row without a poll', () async {
+    final hash =
+        await client.queryRaw('SELECT * FROM thread', const {}, ttl: '10m');
+    await settle();
+    remote.records['thread:b'] = {'id': 'thread:b', 'title': 'pushed'};
+    remote.publish('_00_query:$hash', [('thread:b', 1)]);
+    remote.pushEdge('CREATE', '_00_query:$hash', 'thread:b');
+    await settle(300);
+    expect(client.state.queries[hash]!.remoteArray, [('thread:b', 1)]);
+    expect(client.localStore.getById('thread:b'), isNotNull);
+  });
 
-    // All three records arrive...
-    expect(emissions.last.map((r) => r['id']),
-        containsAll(['thread:r1', 'thread:r2', 'thread:r3']));
+  test('a local write is optimistic, queued, then pushed and acked', () async {
+    remote.blockMutations = true;
+    await client.create('thread:new', {'title': 'draft'});
+    await settle();
+    expect(client.localStore.getById('thread:new'), isNotNull,
+        reason: 'the row is visible before the server has seen it');
+    expect(client.pendingMutationCount, 1);
 
-    // ...but one emission per record (the list grows 1 -> 2 -> 3), instead of a
-    // single coalesced emission. This is the row-by-row sync being reproduced.
-    expect(
-      emissions.length,
-      3,
-      reason: 'LIVE burst currently emits once per record (row-by-row sync)',
-    );
-    expect(
-      emissions.map((e) => e.length).toList(),
-      [1, 2, 3],
-      reason: 'each emission adds exactly one more record',
-    );
+    remote.blockMutations = false;
+    await client.dispatch(const Drain());
+    await settle();
+    expect(client.pendingMutationCount, 0);
+    expect(remote.queries.any((q) => q.startsWith('CREATE ONLY')), isTrue);
+  });
 
-    await sub.cancel();
+  test('a query paints from the durable view row on the next boot', () async {
+    remote.records['thread:a'] = {'id': 'thread:a', 'title': 'cached'};
+    final hash =
+        await client.queryRaw('SELECT * FROM thread', const {}, ttl: '10m');
+    remote.publish('_00_query:$hash', [('thread:a', 1)]);
+    await client.dispatch(ReadMembership([hash]));
+    await settle(200);
+    expect(client.state.queries[hash]!.lifecycle.phase, QueryPhase.live);
+
+    // The store is in memory, so the second client would start empty; assert
+    // the durable row instead, which is what a file-backed store keeps.
+    final view = client.localStore.getAllDocs('_00_view');
+    expect(view, hasLength(1));
+    expect(view.single['confirmed'], isTrue);
+    expect((view.single['ids'] as List).single, ['thread:a', 1]);
   });
 }
 
-Future<void> _settle() =>
-    Future<void>.delayed(const Duration(milliseconds: 60));
-
-/// In-memory fake of [RemoteSurrealClient]. Records queries, answers the few
-/// shapes the sync layer issues, and lets tests push LIVE messages.
-class FakeRemote implements RemoteSurrealClient {
-  bool connected = false;
-  String? usedNamespace;
-  final List<String> queries = [];
-  final Map<String, Map<String, dynamic>> records = {};
-
-  /// Rows the `_00_list_ref` select returns (i.e. the server's view membership).
-  /// Empty by default so a registration finds no records.
-  List<Map<String, dynamic>> listRef = [];
-
-  /// Make mutation pushes hang, so an up-event stays pending in the outbox.
-  bool blockMutations = false;
-
-  final _connected = StreamController<void>.broadcast();
-  final _disconnected = StreamController<void>.broadcast();
-  final _live = StreamController<LiveMessage>.broadcast();
-
-  @override
-  Stream<void> get onConnected => _connected.stream;
-  @override
-  Stream<void> get onDisconnected => _disconnected.stream;
-
-  void pushLive(String action, Map<String, dynamic> value) =>
-      _live.add(LiveMessage(action, value));
-
-  @override
-  Future<void> connect(String endpoint) async => connected = true;
-
-  @override
-  Future<void> use(
-      {required String namespace, required String database}) async {
-    usedNamespace = namespace;
+/// Base64url without padding, as a JWT segment.
+String base64Url(String json) {
+  const chars =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  final bytes = json.codeUnits;
+  final out = StringBuffer();
+  for (var i = 0; i < bytes.length; i += 3) {
+    final b0 = bytes[i];
+    final b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    final b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out.write(chars[b0 >> 2]);
+    out.write(chars[((b0 & 3) << 4) | (b1 >> 4)]);
+    if (i + 1 < bytes.length) out.write(chars[((b1 & 15) << 2) | (b2 >> 6)]);
+    if (i + 2 < bytes.length) out.write(chars[b2 & 63]);
   }
-
-  @override
-  Future<dynamic> authenticate(String token) async => null;
-  @override
-  Future<dynamic> signin(Map<String, dynamic> params) async =>
-      {'access': 'tok'};
-  @override
-  Future<dynamic> signup(Map<String, dynamic> params) async =>
-      {'access': 'tok'};
-  @override
-  Future<void> invalidate() async {}
-
-  @override
-  Future<List<dynamic>> query(String sql, [Map<String, dynamic>? vars]) async {
-    queries.add(sql);
-    if (blockMutations &&
-        (sql.contains('CREATE ONLY') ||
-            sql.startsWith('UPDATE') ||
-            sql.startsWith('DELETE'))) {
-      // A network-classified failure keeps the event queued in the outbox
-      // instead of rolling it back, so it stays pending.
-      throw Exception('connection refused');
-    }
-    if (sql.contains(r'$auth.id')) {
-      return [
-        [
-          {'id': 'user:u1'}
-        ]
-      ];
-    }
-    if (sql.contains('session::id()')) return ['sess-1'];
-    if (sql.contains('fn::query::register')) return [null];
-    if (sql.contains('FROM _00_list_ref')) return [listRef];
-    if (sql.contains('FROM \$idsToFetch')) {
-      final ids = (vars?['idsToFetch'] as List?) ?? const [];
-      return [
-        ids
-            .map((id) => records[id.toString()])
-            .where((r) => r != null)
-            .toList(),
-      ];
-    }
-    if (sql.contains('type::table')) return [<dynamic>[]];
-    return [null];
-  }
-
-  @override
-  Future<(String, Stream<LiveMessage>)> live(String sql,
-      [Map<String, dynamic>? vars]) async {
-    queries.add(sql);
-    return ('live-1', _live.stream);
-  }
-
-  @override
-  Future<void> kill(String liveId) async {}
-
-  @override
-  Future<void> close() async {
-    await _connected.close();
-    await _disconnected.close();
-    await _live.close();
-  }
+  return out.toString();
 }

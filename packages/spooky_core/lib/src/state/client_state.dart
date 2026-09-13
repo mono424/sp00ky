@@ -1,4 +1,5 @@
 import '../kernel/saga.dart' show LaneState, emptyLanes;
+import '../modules/query_builder.dart' show RelationPlan;
 import '../surreal/value.dart';
 import '../types.dart';
 import 'lifecycle.dart';
@@ -37,7 +38,7 @@ class QueryDefinition {
   /// The query's `.related()` plan, resolved from the local cache on every
   /// materialization. Not persisted: the surql, which is, already encodes the
   /// same relation shape.
-  final List<Object> relations;
+  final List<RelationPlan> relations;
 
   /// The query orders itself, so the render set must not be re-sorted by id.
   final bool hasExplicitOrder;

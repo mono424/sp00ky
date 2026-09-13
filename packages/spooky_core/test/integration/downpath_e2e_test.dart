@@ -91,7 +91,7 @@ void main() {
     await client.init();
     addTearDown(client.close);
 
-    // Wait for auth + LIVE to come up (liveRetryCount stabilizes).
+    // Wait for auth and the LIVE subscription to come up.
     await Future<void>.delayed(const Duration(seconds: 1));
 
     // Register a query for the user's own record (created via signup on a

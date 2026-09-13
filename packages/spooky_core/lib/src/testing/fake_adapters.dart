@@ -181,9 +181,10 @@ class FakeServices implements Services {
   }
 
   @override
-  String? hintRead() => _call(ServiceName.hintRead) as String?;
+  Future<String?> hintRead() async => _call(ServiceName.hintRead) as String?;
   @override
-  void hintWrite(String bucketId) => _call(ServiceName.hintWrite, [bucketId]);
+  Future<void> hintWrite(String bucketId) async =>
+      _call(ServiceName.hintWrite, [bucketId]);
   @override
   Future<void> localConnect(String bucketId) async =>
       _call(ServiceName.localConnect, [bucketId]);

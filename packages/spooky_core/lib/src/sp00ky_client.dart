@@ -1,69 +1,88 @@
 import 'dart:async';
 
+import 'boot/boot_saga.dart' as boot_saga;
+import 'boot/preload_saga.dart' as preload_saga;
+import 'client/services.dart';
+import 'client/runtime.dart';
+import 'kernel/effects.dart';
+import 'kernel/events.dart';
+import 'kernel/interpreter.dart';
+import 'kernel/saga.dart';
 import 'modules/app_release/app_release.dart';
 import 'modules/auth/auth_service.dart';
 import 'modules/bucket.dart';
-import 'modules/cache/cache_module.dart';
-import 'modules/data/data_module.dart';
 import 'modules/feature_flag/feature_flag.dart';
+import 'modules/query_host.dart';
 import 'modules/query_builder.dart';
-import 'modules/sync/queue/queue_down.dart';
-import 'modules/sync/queue/queue_up.dart';
-import 'modules/sync/sync.dart';
+import 'modules/ref_tables.dart' show RefMode, anonUserId;
+import 'mutation/jobs.dart';
+import 'mutation/mutation_id.dart';
+import 'mutation/rows.dart';
+import 'mutation/tray_saga.dart' as tray_saga;
+import 'mutation/write_saga.dart' as write_saga;
+import 'query/env.dart';
+import 'query/lifecycle_saga.dart' show evictQuery;
+import 'query/register_saga.dart';
+import 'services/database/connection_supervisor.dart';
 import 'services/database/local_database_service.dart';
-import 'services/database/local_migrator.dart';
 import 'services/database/remote_database_service.dart';
 import 'services/logger/logger.dart';
 import 'services/persistence/memory_persistence.dart';
 import 'services/persistence/sqlite_persistence.dart';
 import 'services/stream_processor/stream_processor_service.dart';
+import 'state/client_state.dart';
+import 'state/lifecycle.dart' show isAuthoritative;
+import 'state/reducers.dart' as r;
+import 'state/selectors.dart' as sel;
 import 'surreal/remote_client.dart';
 import 'surreal/value.dart';
 import 'types.dart';
-import 'utils/duration_utils.dart';
-import 'utils/parser.dart';
 
 /// Main entry point of the pure-Dart Spooky core (TS `Sp00kyClient`).
 ///
-/// Wires the sqlite local store, the FFI stream processor, the cache, the data
-/// module, and (when a remote endpoint is configured) the remote SurrealDB
-/// connection, auth, and bidirectional sync. Live queries are exposed as Dart
-/// `Stream`s (consume with a Flutter `StreamBuilder`).
+/// A thin facade over the saga [Runtime]: every method here either runs one
+/// saga, reads a selector, or attaches a subscriber. Live queries are exposed as
+/// Dart `Stream`s (consume with a Flutter `StreamBuilder`).
 class Sp00kyClient {
-  Sp00kyClient(this.config,
-      {SpookyLogger? logger, RemoteSurrealClient? remoteClient})
-      : _logger = logger ?? SpookyLogger.root(),
+  Sp00kyClient(
+    this.config, {
+    SpookyLogger? logger,
+    RemoteSurrealClient? remoteClient,
+  })  : _logger = logger ?? SpookyLogger.root(),
         _remoteClientOverride = remoteClient;
 
   final Sp00kyConfig config;
   final SpookyLogger _logger;
   final RemoteSurrealClient? _remoteClientOverride;
 
-  late final LocalDatabaseService _local;
+  late final LocalStoreHolder _holder;
   late final StreamProcessorService _streamProcessor;
-  late final CacheModule _cache;
-  late final DataModule _dataModule;
   late final PersistenceClient _persistence;
+  late final ClientServices _services;
+  late final RemoteAdapter? _remoteAdapter;
+  late final Runtime _runtime;
+  late final SagaEnv _env;
 
   RemoteDatabaseService? _remote;
   AuthService? _auth;
-  Sp00kySync? _sync;
+  ConnectionSupervisor? _supervisor;
   FeatureFlagModule? _featureFlags;
   AppReleaseModule? _appReleases;
-
-  /// Query hashes already prewarmed this session, so a repeated [preload] of the
-  /// same query is free.
-  final Set<String> _preloadedHashes = {};
-
-  /// In-flight background init chains (hydrate + register) per query hash, so
-  /// concurrent registrations of one query share a single chain.
-  final Map<String, Future<void>> _pendingQueryInits = {};
+  void Function()? _authUnsubscribe;
 
   bool _initialized = false;
 
-  DataModule get dataModule => _dataModule;
   StreamProcessorService get streamProcessor => _streamProcessor;
-  LocalDatabaseService get local => _local;
+
+  /// The open local store. A diagnostics and test seam; the engine addresses it
+  /// through effects, never directly.
+  LocalDatabaseService get localStore => _holder.db;
+
+  /// The engine state, read-only. For tests and diagnostics.
+  ClientState get state => _runtime.state;
+
+  /// Feed an event into the engine. For adapters, tests and diagnostics.
+  Future<void> dispatch(RuntimeEvent event) => _runtime.dispatchAsync(event);
 
   /// The auth service. Throws if no remote endpoint is configured.
   AuthService get auth {
@@ -72,219 +91,157 @@ class Sp00kyClient {
     return a;
   }
 
-  int get pendingMutationCount => _sync?.pendingMutationCount ?? 0;
-  int get liveRetryCount => _sync?.liveRetryCount ?? 0;
+  // ==================== LIFECYCLE ====================
 
-  /// Subscribe to the pending-mutation count (TS `subscribeToPendingMutations`).
-  /// Returns an unsubscribe fn; a no-op unsubscribe in local-only mode.
-  void Function() subscribeToPendingMutations(void Function(int count) cb) =>
-      _sync?.subscribeToPendingMutations(cb) ?? () {};
-
-  /// Current sync-health snapshot (TS `syncHealth`). A local-only client is
-  /// always healthy: there is nothing to reach.
-  SyncHealth get syncHealth =>
-      _sync?.syncHealth ??
-      const SyncHealth(
-        status: SyncHealthStatus.healthy,
-        consecutiveFailures: 0,
-        everConnected: true,
-      );
-
-  /// Observe sync health (TS `subscribeToSyncHealth`). Fires immediately with
-  /// the current snapshot and again on every healthy<->degraded transition.
-  /// Returns an unsubscribe fn. In local-only mode fires once with the healthy
-  /// snapshot and never again.
-  void Function() subscribeToSyncHealth(void Function(SyncHealth health) cb) {
-    final sync = _sync;
-    if (sync == null) {
-      cb(syncHealth);
-      return () {};
-    }
-    return sync.subscribeToSyncHealth(cb);
-  }
-
-  /// Sync health as a broadcast [Stream], for `StreamBuilder` friendliness
-  /// (consistent with [subscribeStream]). Replays the current snapshot on first
-  /// listen.
-  Stream<SyncHealth> syncHealthStream() {
-    late StreamController<SyncHealth> controller;
-    void Function()? off;
-    controller = StreamController<SyncHealth>.broadcast(
-      onListen: () => off = subscribeToSyncHealth(controller.add),
-      onCancel: () {
-        off?.call();
-        off = null;
-      },
-    );
-    return controller.stream;
-  }
-
-  /// Initialize the client. With a remote endpoint configured, also connects
-  /// remotely, starts auth, fetches the session id, and starts sync (the JS
-  /// `init` sequence). Without one, runs local-first only.
+  /// Initialize the client.
+  ///
+  /// Local boot is network-free and awaited: the store opens, the schema
+  /// provisions, the circuit primes from the local rows and the session is
+  /// restored from the cached token. The network half runs in the background,
+  /// so a query registered right after this paints from cache immediately.
   Future<void> init() async {
     if (_initialized) return;
-
-    _local = LocalDatabaseService.open(_logger,
-        store: config.database.store, path: config.database.localDbPath);
-    _local.provision();
-
-    // Migrate before the stream processor loads state, so a schema change
-    // wipes stale circuit state instead of restoring views over old tables.
-    await LocalMigrator(_local, _logger).provision(config.schemaSurql);
-
+    _holder = LocalStoreHolder(_logger, config.database);
+    // The store has to exist before the persistence client can read the boot
+    // hint out of it; the bucket the hint names replaces it a moment later.
+    _holder.connect(anonUserId);
     _persistence = _resolvePersistence();
     _streamProcessor = StreamProcessorService(_persistence, _logger);
-    await _streamProcessor.init();
-    _streamProcessor.seedPermissionsFromSchema(config.schemaSurql);
-
-    _cache = CacheModule(
-      _local,
-      _streamProcessor,
-      (update) => _dataModule.onStreamUpdate(update),
-      _logger,
-    );
 
     final hasRemote =
         config.database.endpoint != null || _remoteClientOverride != null;
 
-    _dataModule = DataModule(
-      _cache,
-      _local,
-      config.schema,
-      _logger,
-      streamDebounceTime: config.streamDebounceTime,
-      // Only start queries `fetching` when a remote registration will settle
-      // them; a local-only query has no such lifecycle.
-      bornFetching: hasRemote,
-      // Keep the server-side registration alive: re-register on each TTL beat.
-      // Reads `_sync` at fire-time (set later in init); no-op in local-only.
-      onHeartbeat: (hash) => _sync?.enqueueDownEvent(HeartbeatEvent(hash)),
-      // Opt-in query teardown: enqueue the remote `_00_query` cleanup; the local
-      // view + state are freed by sync after the remote delete. No-op when local.
-      onDeregister: (hash) => _sync?.enqueueDownEvent(CleanupEvent(hash)),
+    _services = ClientServices(
+      holder: _holder,
+      ssp: _streamProcessor,
+      persistence: _persistence,
+      schemaSurql: config.schemaSurql,
+      logger: _logger,
+      lateModules: () => [
+        if (_featureFlags != null) _featureFlags!.init,
+        if (_appReleases != null) _appReleases!.init,
+      ],
+    )
+      ..schemaTables = _syncedTables()
+      ..onVersions = (table, entries) =>
+          _runtime.dispatch(VersionsPrimed(entries));
+
+    _env = SagaEnv(
+      schema: config.schema,
+      refMode: RefMode.dedicated,
+      anonLive: config.enableAnonymousLiveQueries,
+      materializeDebounceMs: config.streamDebounceTime,
+      pollBaseMs: config.refSyncIntervalMs,
+      degradeAfter:
+          hasRemote ? (config.syncHealth?.degradeAfterConsecutiveFailures ?? 0) : 0,
+      hasRemote: hasRemote,
     );
 
     if (hasRemote) {
       final client = _remoteClientOverride ?? WebSocketSurrealClient();
       final remote = RemoteDatabaseService(config.database, client, _logger);
-      await remote.connect();
       _remote = remote;
-
       final auth = AuthService(config.schema, remote, _persistence, _logger);
-      await auth.init();
       _auth = auth;
-
-      final sessionId = await _fetchSessionId();
-      await _dataModule.init(sessionId);
-
-      final sync = Sp00kySync(
-        _local,
-        remote,
-        _cache,
-        _dataModule,
-        config.schema,
-        _logger,
-        options: Sp00kySyncOptions(
-          refSyncIntervalMs: config.refSyncIntervalMs,
-          anonymousLiveQueries: config.enableAnonymousLiveQueries,
-          // A null syncHealth config disables degraded reporting, matching the
-          // TS `syncHealth: false`.
-          degradeAfterConsecutiveFailures:
-              config.syncHealth?.degradeAfterConsecutiveFailures ?? 0,
-        ),
-      );
-      _sync = sync;
-
-      _setupCallbacks();
-
-      // The synchronous prefix subtlety (TS sp00ky.ts:318-334):
-      // setCurrentUserId on DataModule MUST run before the first await so the
-      // userQuery's initial fetch sees the right per-user list_ref table.
-      auth.subscribe((userId) async {
-        _dataModule.setCurrentUserId(userId); // sync, before any await
-        // Also synchronous and before any await: a $auth-gated query can
-        // register immediately after this callback (the app's own auth listener
-        // fires from here), and the SSP rejects the registration outright if the
-        // session identity is not already in place.
-        _streamProcessor.setSessionAuth(userId, auth.access);
-        final next = await _fetchSessionId();
-        _dataModule.setSessionId(next);
-        try {
-          await sync.setCurrentUserId(userId);
-        } catch (e) {
-          _logger.error('sync.setCurrentUserId failed', e);
-        }
-      });
-
-      await sync.init();
-
-      // Reactive feature flags: a shared live query over the user's
-      // `_00_user_feature` assignments (TS `FeatureFlagModule`). init() subscribes
-      // to auth so the query follows sign-in/out.
-      final featureFlags = FeatureFlagModule(
-        dataModule: _dataModule,
-        sync: sync,
-        auth: auth,
+      _services
+        ..remote = remote
+        ..auth = auth;
+      _remoteAdapter = RemoteAdapter(remote, _logger,
+          inlineBodies: config.liveInlineBodies);
+      _supervisor = ConnectionSupervisor(
+        reconnect: remote.connect,
+        probe: () => remote.query('RETURN true'),
+        forceClose: remote.forceClose,
+        isConnected: () => remote.isConnected,
+        onConnected: client.onConnected,
+        onDisconnected: client.onDisconnected,
         logger: _logger,
+        config: config.reconnect,
       );
-      featureFlags.init();
-      _featureFlags = featureFlags;
-
-      // Release announcements: a shared live query over the world-readable
-      // `_00_app_release` rows, so an app can prompt (or force) an update when
-      // the deployed version moves past the running build.
-      final appReleases = AppReleaseModule(
-        dataModule: _dataModule,
-        sync: sync,
-        auth: auth,
-        logger: _logger,
-      );
-      appReleases.init();
-      _appReleases = appReleases;
+      _services.supervisor = _supervisor;
     } else {
-      // Local-first only: no session salt.
-      await _dataModule.init('');
-      _setupCallbacks();
+      _remoteAdapter = null;
     }
 
+    _runtime = Runtime(
+      env: _env,
+      adapters: createAdapters(
+        local: LocalStoreAdapter(_holder),
+        remote: _remoteAdapter ?? _OfflineRemote(),
+        ssp: SspAdapter(_streamProcessor),
+        services: _services,
+        mutationId: () => mintMutationId(_clientId),
+      ),
+      logger: _logger,
+      clientId: _clientId,
+    );
+
+    // The circuit's updates are what dirty a query, so they have to reach the
+    // runtime before anything registers.
+    _streamProcessor.addReceiver(_StreamUpdateBridge(_runtime));
+
+    if (hasRemote) {
+      _supervisor!.subscribe(
+          (state) => _runtime.dispatch(ConnectionChanged(state)));
+      _featureFlags = FeatureFlagModule(
+        host: _QueryHost(this),
+        auth: _auth!,
+        logger: _logger,
+      );
+      _appReleases = AppReleaseModule(
+        host: _QueryHost(this),
+        auth: _auth!,
+        logger: _logger,
+      );
+      // The signed-in principal drives routing, the local `$auth`, the bucket
+      // and the salt: all of that is one saga.
+      _authUnsubscribe = _auth!.subscribe(
+          (userId) => _runtime.dispatch(AuthFlip(userId)));
+    }
+
+    await _runtime.run((ctx) => boot_saga.boot(ctx, _env));
     _initialized = true;
     _logger.info('Sp00kyClient initialized');
   }
 
-  void _setupCallbacks() {
-    _dataModule.onMutation(_onMutation);
-    // CRDT seam (deferred): SYNC_REMOTE_DATA_INGESTED -> crdtManager.applyRow.
-    // TODO(crdt): wire when CRDT lands.
+  /// True once the local half of boot has finished, which is when a query can
+  /// paint from cache.
+  bool get isLocalReady => _runtime.state.localReady;
+
+  /// The host came back to the foreground, or the network returned.
+  ///
+  /// The core is framework-agnostic, so the app calls this: in Flutter, from
+  /// `AppLifecycleState.resumed`. It resets the reconnect backoff, probes a
+  /// possibly half-open socket and beats the TTL heartbeat.
+  void wake() {
+    _supervisor?.wake('resumed');
+    _runtime.dispatch(const HeartbeatNow());
   }
 
-  void _onMutation(List<UpEvent> mutations) {
-    _sync?.enqueueMutation(mutations);
-  }
+  /// The host is going away for good: hand this client's views back rather than
+  /// leaving them to expire by TTL.
+  Future<void> detach() => _runtime.dispatchAsync(const AppDetached());
 
-  /// Fetch `session::id()` for the query-hash salt; empty on failure or no remote.
-  Future<String> _fetchSessionId() async {
-    final remote = _remote;
-    if (remote == null) return '';
-    try {
-      final result = await remote.query('RETURN <string>session::id()');
-      final first = result.isNotEmpty ? result.first : null;
-      return first?.toString() ?? '';
-    } catch (err) {
-      // session::id() is only a salt for query-hash isolation; if the remote
-      // round-trip fails, fall back to an empty salt rather than failing init.
-      _logger.debug('session::id() fetch failed; using empty salt: $err');
-      return '';
-    }
+  Future<void> close() async {
+    _authUnsubscribe?.call();
+    _featureFlags?.closeAll();
+    _appReleases?.closeAll();
+    _runtime.dispose();
+    _checkpointCircuit();
+    await _supervisor?.dispose();
+    await _remoteAdapter?.dispose();
+    await _remote?.close();
+    await _streamProcessor.close();
+    _holder.db.close();
+    _initialized = false;
   }
 
   // ==================== QUERIES ====================
 
-  /// One-shot direct remote query, bypassing the local sync layer (TS
-  /// `useRemote(r => r.query(...))`). Returns the per-statement results.
-  /// Throws if no remote endpoint is configured.
-  Future<List<dynamic>> queryRemote(String sql,
-      [Map<String, dynamic>? vars]) {
+  /// One-shot direct remote query, bypassing the sync layer (TS
+  /// `useRemote(r => r.query(...))`). Results are NOT synced into the local
+  /// cache. Throws without a remote endpoint.
+  Future<List<dynamic>> queryRemote(String sql, [Map<String, dynamic>? vars]) {
     final remote = _remote;
     if (remote == null) {
       throw StateError('queryRemote requires a remote endpoint');
@@ -293,177 +250,123 @@ class Sp00kyClient {
   }
 
   /// Register a raw SURQL query and return its hash. The table is parsed from
-  /// the first `FROM <table>` (TS `queryRaw` / `initQuery`).
+  /// the first `FROM <table>`.
   ///
-  /// Local-first paint: the hash comes back as soon as the LOCAL registration
-  /// completes, with `records` already seeded from the local cache, so a
-  /// `StreamBuilder` paints from memory with no network on the paint path.
-  /// Instant-hydrate (opt-in) and the `register` down-event continue in a
-  /// background chain — hydrate strictly BEFORE the enqueue, so a stale one-shot
-  /// snapshot can never land after sync's authoritative `_00_list_ref` overwrite.
-  /// Concurrent registrations of the same query share one chain; a sequential
-  /// re-registration starts a fresh one, so its `register` keeps freshening warm
-  /// data on use.
+  /// Returns as soon as the LOCAL registration completes, so a `StreamBuilder`
+  /// paints from the local store with no network on the paint path. The remote
+  /// registration is dispatched, never awaited.
   Future<String> queryRaw(
     String sql,
     Map<String, dynamic> params, {
     QueryTimeToLive ttl = defaultTtl,
     List<RelationPlan> relations = const [],
-  }) async {
-    final tableName = _parseTableFromSurql(sql);
-    final hash = await _dataModule
-        .query(tableName, sql, params, ttl, relations: relations);
+  }) =>
+      _runtime.run((ctx) => registerLocal(
+            ctx,
+            _env,
+            RegisterInput(
+          tableName: parseTableFromSurql(sql),
+          surql: sql,
+          params: params,
+          ttl: ttl,
+              hasExplicitOrder: _hasOrderBy.hasMatch(sql),
+              relations: relations,
+            ),
+          ));
 
-    if (!_pendingQueryInits.containsKey(hash)) {
-      _pendingQueryInits[hash] = _finishQueryInit(hash, sql, params)
-          .whenComplete(() => _pendingQueryInits.remove(hash));
-    }
-    return hash;
-  }
+  static final _hasOrderBy = RegExp(r'\bORDER\s+BY\b', caseSensitive: false);
 
-  /// Background tail of [queryRaw]: opt-in instant-hydrate for a cold query,
-  /// then the `register` down-event (TS `finishQueryInit`). Never throws — both
-  /// halves catch and log, so an unawaited chain can't surface an unhandled async
-  /// error. No-op in local-only mode: there is nothing to hydrate from and
-  /// nothing to register.
-  Future<void> _finishQueryInit(
-    String hash,
-    String sql,
-    Map<String, dynamic> params,
-  ) async {
-    final sync = _sync;
-    if (sync == null) return;
-
-    if (config.instantHydrate && _dataModule.isCold(hash)) {
-      try {
-        final results = await queryRemote(sql, params);
-        final rows = _firstRowsAsMaps(results);
-        await _dataModule.applyHydration(hash, rows);
-      } catch (err) {
-        _logger.warn('Instant hydrate failed; proceeding with registration: $err');
-      }
-    }
-
-    try {
-      sync.enqueueDownEvent(RegisterEvent(hash));
-    } catch (err) {
-      _logger.error('Failed to enqueue register down-event', err);
-    }
-  }
-
-  /// Smart, awaitable prewarm into the LOCAL cache without registering a live
-  /// view (no `_00_query`, no subscription, no TTL heartbeat) (TS `preload`).
+  /// Prewarm a query without subscribing to it.
   ///
-  /// Cache-aware via a durable freshness marker (`_00_preload`):
-  /// - COLD (never preloaded): fetch the query one-shot, persist the rows, stamp
-  ///   the marker — and AWAIT it. Callers can `await client.preload(...)` to hold
-  ///   the UI until the data is ready.
-  /// - WARM (marker present): returns instantly, NEVER blocks.
-  ///   [PreloadOptions.refresh] decides whether to also kick a one-time silent
-  ///   refetch; the default [PreloadRefresh.onUse] does nothing and the data
-  ///   freshens when the real query mounts.
-  ///
-  /// Best-effort: a fetch failure is a logged no-op that writes no marker, so it
-  /// is retried next time. Deduped per session by query hash. Requires a remote
-  /// endpoint.
+  /// Resolved before on this device: returns at once, and its rows paint from
+  /// cache. Never resolved: resolves once the server's membership and every
+  /// body are local. The entry is evicted like any other query a ttl after it
+  /// was registered, unless a view mounts the same query meanwhile.
   Future<void> preload(
     String sql,
     Map<String, dynamic> params, {
-    PreloadOptions options = const PreloadOptions(),
+    QueryTimeToLive ttl = defaultTtl,
   }) async {
-    if (_remote == null) {
-      throw StateError('preload() requires a remote endpoint');
-    }
-    final tableName = _parseTableFromSurql(sql);
-    final hash = _dataModule.calculateHash({'surql': sql, 'params': params});
-    if (_preloadedHashes.contains(hash)) return;
-
-    final marker = _dataModule.getPreloadMarker(hash);
-
-    // COLD -> fetch + persist + stamp, awaited so the caller can block on it.
-    if (marker == null) {
-      final rowCount = await _fetchAndPersist(sql, params, tableName);
-      if (rowCount >= 0) {
-        _dataModule.writePreloadMarker(hash, rowCount);
-        _preloadedHashes.add(hash);
-      }
-      return;
-    }
-
-    // WARM -> never block. Mark handled for this session, then maybe refresh.
-    _preloadedHashes.add(hash);
-    switch (options.refresh) {
-      case PreloadRefresh.onUse:
-        return;
-      case PreloadRefresh.stale:
-        final age = DateTime.now().millisecondsSinceEpoch - marker.fetchedAt;
-        if (age <= parseDuration(options.staleTime)) return; // still fresh
-      case PreloadRefresh.background:
-        break;
-    }
-
-    unawaited(_fetchAndPersist(sql, params, tableName).then((rowCount) {
-      if (rowCount >= 0) _dataModule.writePreloadMarker(hash, rowCount);
-    }));
+    await _runtime.run((ctx) => preload_saga.preload(
+          ctx,
+          _env,
+          RegisterInput(
+            tableName: parseTableFromSurql(sql),
+            surql: sql,
+            params: params,
+            ttl: ttl,
+            hasExplicitOrder: _hasOrderBy.hasMatch(sql),
+          ),
+        ));
   }
-
-  /// One-shot remote fetch + local persist for a preload query. Returns the row
-  /// count, or -1 on failure (logged, never thrown) so the caller skips stamping
-  /// the freshness marker and retries next time.
-  Future<int> _fetchAndPersist(
-    String sql,
-    Map<String, dynamic> params,
-    String tableName,
-  ) async {
-    try {
-      final rows = _firstRowsAsMaps(await queryRemote(sql, params));
-      await _dataModule.persistSnapshot(tableName, rows);
-      return rows.length;
-    } catch (err) {
-      _logger
-          .warn('Preload fetch failed; data will be fetched on demand: $err');
-      return -1;
-    }
-  }
-
-  /// First statement's rows from a remote result, as records with ids.
-  List<Map<String, dynamic>> _firstRowsAsMaps(List<dynamic> results) => [
-        for (final row in firstRows(results))
-          if (row is Map && row['id'] != null) row.cast<String, dynamic>(),
-      ];
 
   /// Subscribe to a registered query as a broadcast [Stream]. Multiple
-  /// listeners share one internal callback registration; [immediate] replays
-  /// the current result set on first listen (so a `StreamBuilder` renders
-  /// immediately).
+  /// listeners share one internal registration; [immediate] replays the current
+  /// result set on first listen (so a `StreamBuilder` renders immediately).
   Stream<List<Map<String, dynamic>>> subscribeStream(
     String queryHash, {
     bool immediate = true,
-  }) {
-    late StreamController<List<Map<String, dynamic>>> controller;
-    void Function()? off;
-    controller = StreamController<List<Map<String, dynamic>>>.broadcast(
-      onListen: () {
-        off = _dataModule.subscribe(queryHash, controller.add,
-            immediate: immediate);
-      },
-      onCancel: () {
-        off?.call();
-        off = null;
-      },
-    );
-    return controller.stream;
+  }) =>
+      _broadcast<List<Map<String, dynamic>>>((add) =>
+          _runtime.subscribe(queryHash, add, immediate: immediate));
+
+  /// Faithful callback-based subscribe (TS `subscribe`).
+  void Function() subscribe(
+    String hash,
+    QueryUpdateCallback callback, {
+    bool immediate = false,
+  }) =>
+      _runtime.subscribe(hash, callback, immediate: immediate);
+
+  /// A query's fetch status (idle/fetching) via callback.
+  void Function() subscribeQueryStatus(
+    String queryHash,
+    QueryStatusCallback callback, {
+    bool immediate = false,
+  }) =>
+      _runtime.subscribeStatus(queryHash, callback, immediate: immediate);
+
+  Stream<QueryStatus> queryStatusStream(String queryHash,
+          {bool immediate = true}) =>
+      _broadcast<QueryStatus>((add) =>
+          _runtime.subscribeStatus(queryHash, add, immediate: immediate));
+
+  /// A query's authority: true once server membership is known for it (a
+  /// registration, a poll, or the durable `_00_view` seed), false when a bucket
+  /// switch resets it.
+  ///
+  /// This is what tells "no rows yet" apart from "no rows": a binding shows its
+  /// loader while a query is not authoritative, and an empty result only means
+  /// empty once it is.
+  void Function() subscribeQueryAuthority(
+    String queryHash,
+    QueryAuthorityCallback callback, {
+    bool immediate = false,
+  }) =>
+      _runtime.subscribeAuthority(queryHash, callback, immediate: immediate);
+
+  Stream<bool> queryAuthorityStream(String queryHash,
+          {bool immediate = true}) =>
+      _broadcast<bool>((add) =>
+          _runtime.subscribeAuthority(queryHash, add, immediate: immediate));
+
+  bool isQueryAuthoritative(String queryHash) {
+    final entry = _runtime.state.queries[queryHash];
+    return entry != null && isAuthoritative(entry.lifecycle);
   }
 
-  /// A fluent query builder for [table]. Call `.stream()` / `.run()` to
-  /// register and subscribe (TS `query`).
+  /// "This query's rows are authoritative and complete": server membership
+  /// accepted, every body local, nothing left to re-render. What a virtualized
+  /// list gates its end detection on.
+  bool isQuerySettled(String queryHash) =>
+      sel.settled(_runtime.state, queryHash);
+
+  /// A fluent query builder for [table].
   QueryBuilder query(String table) => QueryBuilder(
         table,
         registrar: (sql, vars, ttl, relations) =>
             queryRaw(sql, vars, ttl: ttl, relations: relations),
         subscriber: subscribeStream,
-        // The schema carries the `relationships` codegen emits, which is what
-        // resolves a `.related()` field to its table, cardinality and FK.
         schema: config.schema,
         logger: _logger,
       );
@@ -473,121 +376,169 @@ class Sp00kyClient {
     String sql,
     Map<String, dynamic> params, {
     QueryTimeToLive ttl = defaultTtl,
-  }) async {
-    final hash = await queryRaw(sql, params, ttl: ttl);
-    return subscribeStream(hash);
+  }) async =>
+      subscribeStream(await queryRaw(sql, params, ttl: ttl));
+
+  /// Report the UI reconcile time (ms) for a query. Call this after applying an
+  /// update in a widget to attribute build and paint time to the query.
+  void reportFrontendTiming(String queryHash, double ms) {
+    if (ms.isFinite) {
+      _runtime.update(r.recordPhase(queryHash, TimingPhase.frontend, ms));
+    }
   }
 
-  /// Faithful callback-based subscribe (TS `subscribe`).
-  void Function() subscribe(
-    String hash,
-    QueryUpdateCallback callback, {
-    bool immediate = false,
-  }) =>
-      _dataModule.subscribe(hash, callback, immediate: immediate);
-
-  /// Subscribe to a query's fetch status (idle/fetching) via callback (TS
-  /// `subscribeQueryStatus`). With [immediate] the callback fires synchronously
-  /// with the current status. Returns an unsubscribe fn.
-  void Function() subscribeQueryStatus(
-    String queryHash,
-    QueryStatusCallback callback, {
-    bool immediate = false,
-  }) =>
-      _dataModule.subscribeStatus(queryHash, callback, immediate: immediate);
-
-  /// A query's fetch status (idle/fetching) as a broadcast [Stream], for
-  /// `StreamBuilder` friendliness (consistent with [subscribeStream]).
-  /// [immediate] replays the current status on first listen.
-  Stream<QueryStatus> queryStatusStream(
-    String queryHash, {
-    bool immediate = true,
-  }) {
-    late StreamController<QueryStatus> controller;
-    void Function()? off;
-    controller = StreamController<QueryStatus>.broadcast(
-      onListen: () {
-        off = _dataModule.subscribeStatus(queryHash, controller.add,
-            immediate: immediate);
-      },
-      onCancel: () {
-        off?.call();
-        off = null;
-      },
-    );
-    return controller.stream;
+  /// Per-query processing-time breakdown.
+  QueryTimings? queryTimings(String queryHash) {
+    final entry = _runtime.state.queries[queryHash];
+    return entry == null ? null : sel.phaseTimings(entry);
   }
 
-  /// Report the UI reconcile time (ms) for a query (TS
-  /// `reportFrontendTiming`). Call this after applying an update in a widget to
-  /// attribute build/paint time to the query in its timing breakdown; read it
-  /// back with `dataModule.phaseStat(hash, TimingPhase.frontend)`.
-  void reportFrontendTiming(String queryHash, double ms) =>
-      _dataModule.recordFrontendTiming(queryHash, ms);
-
-  /// Opt-in eager teardown of a query whose last subscriber has left (TS
-  /// `deregisterQuery`): enqueues the remote `_00_query` cleanup and frees the
-  /// local view once it completes. No-op while any subscriber remains. Most
-  /// queries should NOT call this — the default keep-alive avoids
+  /// Opt-in eager teardown of a query whose last subscriber has left: frees the
+  /// local view and forgets the query. No-op while any subscriber remains. Most
+  /// queries should NOT call this - the default keep-alive avoids
   /// re-registration churn on navigation.
-  void deregisterQuery(String queryHash) =>
-      _dataModule.deregisterQuery(queryHash);
+  void deregisterQuery(String queryHash) {
+    final entry = _runtime.state.queries[queryHash];
+    if (entry == null || entry.subscribers > 0) return;
+    unawaited(_runtime.run((ctx) => evictQuery(ctx, queryHash),
+        lane: Lane.serial('mat:$queryHash')));
+  }
+
+  // ==================== MUTATIONS ====================
+
+  Future<Map<String, dynamic>> create(
+      String id, Map<String, dynamic> data) async {
+    final out = await _write(write_saga.WriteInput(
+        kind: MutationEventType.create, recordId: id, data: data));
+    return out.record ?? {...data, 'id': id};
+  }
+
+  Future<Map<String, dynamic>> update(
+    String table,
+    String id,
+    Map<String, dynamic> data, {
+    UpdateOptions? options,
+  }) async {
+    final out = await _write(write_saga.WriteInput(
+      kind: MutationEventType.update,
+      recordId: id,
+      data: data,
+      options: options,
+    ));
+    return out.record ?? {...data, 'id': id};
+  }
+
+  Future<void> delete(String table, String id) async {
+    await _write(write_saga.WriteInput(
+        kind: MutationEventType.delete, recordId: id));
+  }
+
+  Future<write_saga.WriteResult> _write(write_saga.WriteInput input) =>
+      _runtime.run((ctx) => write_saga.write(ctx, _env, input),
+          lane: const Lane.serial('write'));
+
+  /// Enqueue a backend job.
+  Future<void> run(
+    String backend,
+    String path,
+    Map<String, dynamic> payload, {
+    RunOptions? options,
+  }) async {
+    final job = buildJobRecord(config.schema, backend, path, payload,
+        options: options);
+    await create('${job.tableName}:${generateId()}', job.record);
+  }
+
+  // ==================== FAILED WRITES ====================
+
+  /// Writes the server rejected. They are undone locally and parked here rather
+  /// than retried forever, so an app can show them and let the user decide.
+  int get failedMutationCount => _runtime.state.failedCount;
+
+  void Function() subscribeToFailedMutations(void Function(int count) cb) {
+    cb(_runtime.state.failedCount);
+    return _runtime.on(
+        'tray:changed', (e) => cb((e as TrayChangedEvent).count));
+  }
+
+  Future<List<FailedMutationRow>> listFailedMutations() =>
+      _runtime.run(tray_saga.listFailed);
+
+  /// Re-apply a rejected mutation as a new optimistic write.
+  Future<bool> retryFailedMutation(String mutationId) =>
+      _runtime.run((ctx) => tray_saga.retryFailed(ctx, _env, mutationId),
+          lane: const Lane.serial('tray'));
+
+  Future<bool> discardFailedMutation(String mutationId) =>
+      _runtime.run((ctx) => tray_saga.discardFailed(ctx, mutationId),
+          lane: const Lane.serial('tray'));
+
+  // ==================== OBSERVABILITY ====================
+
+  int get pendingMutationCount => sel.pendingMutationCount(_runtime.state);
+
+  void Function() subscribeToPendingMutations(void Function(int count) cb) {
+    cb(pendingMutationCount);
+    return _runtime.on('activity:changed',
+        (e) => cb((e as ActivityChangedEvent).pending));
+  }
+
+  /// How many queries are pulling rows right now: what a global spinner reads.
+  int get fetchingQueryCount => sel.fetchingQueryCount(_runtime.state);
+
+  void Function() subscribeToFetchActivity(void Function(int fetching) cb) {
+    cb(fetchingQueryCount);
+    return _runtime.on('activity:changed',
+        (e) => cb((e as ActivityChangedEvent).fetching));
+  }
+
+  SyncHealth get syncHealth => _runtime.state.sync.health;
+
+  /// Observe sync health. Fires immediately with the current snapshot and again
+  /// on every transition, transport changes included.
+  void Function() subscribeToSyncHealth(void Function(SyncHealth health) cb) {
+    cb(syncHealth);
+    return _runtime.on(
+        'health:changed', (e) => cb((e as HealthChangedEvent).health));
+  }
+
+  Stream<SyncHealth> syncHealthStream() =>
+      _broadcast<SyncHealth>(subscribeToSyncHealth);
 
   // ==================== AUTH ====================
 
-  /// Authenticate the remote connection with a raw token (TS `authenticate`).
-  /// Bypasses [AuthService]: use this when a token comes from outside the
-  /// client (e.g. restored by the host app). Throws without a remote endpoint.
+  /// Authenticate the remote connection with a raw token. Bypasses
+  /// [AuthService]: use this when a token comes from outside the client.
   Future<dynamic> authenticate(String token) {
     final remote = _remote;
     if (remote == null) {
       throw StateError('authenticate() requires a remote endpoint');
     }
+    remote.setAuthToken(token);
     return remote.authenticate(token);
   }
 
-  /// Invalidate the remote session (TS `deauthenticate`). Throws without a
-  /// remote endpoint.
   Future<void> deauthenticate() {
     final remote = _remote;
     if (remote == null) {
       throw StateError('deauthenticate() requires a remote endpoint');
     }
+    remote.setAuthToken(null);
     return remote.invalidate();
   }
 
-  // ==================== FEATURE FLAGS ====================
+  // ==================== FEATURE FLAGS & RELEASES ====================
 
-  /// A reactive handle for feature flag [key] (TS `feature`). Reads the
-  /// signed-in user's `_00_user_feature` assignment over the shared live query;
-  /// an unassigned key resolves to [fallback]. Use `.variant()`, `.enabled()`,
-  /// `.payload<T>()`, or `.subscribe(cb)`; call `.close()` when done.
-  ///
-  /// Requires a remote endpoint (feature flags are server-assigned). Throws in
-  /// local-only mode.
-  FeatureFlagHandle feature(
-    String key, {
-    String? fallback,
-    QueryTimeToLive? ttl,
-  }) {
+  /// A reactive handle for feature flag [key]. Requires a remote endpoint.
+  FeatureFlagHandle feature(String key,
+      {String? fallback, QueryTimeToLive? ttl}) {
     final ff = _featureFlags;
-    if (ff == null) {
-      throw StateError('feature() requires a remote endpoint');
-    }
+    if (ff == null) throw StateError('feature() requires a remote endpoint');
     return ff.feature(key, fallback: fallback, ttl: ttl);
   }
 
-  // ==================== APP RELEASES ====================
-
-  /// A reactive handle for app [app]'s latest announced release (TS
-  /// `appRelease`). Reads the world-readable `_00_app_release` row over the
-  /// shared live query; an app with no row reports no update. Compare against
-  /// the running build with `.updateAvailable(currentVersion)`, and read
-  /// `.mandatory` / `.cacheBust` to decide how to apply it. Call `.close()` when
-  /// done.
-  ///
-  /// Requires a remote endpoint (releases are server-announced). Throws in
-  /// local-only mode.
+  /// A reactive handle for app [app]'s latest announced release. Requires a
+  /// remote endpoint.
   AppReleaseHandle appRelease(String app, {QueryTimeToLive? ttl}) {
     final releases = _appReleases;
     if (releases == null) {
@@ -596,40 +547,14 @@ class Sp00kyClient {
     return releases.release(app, ttl: ttl);
   }
 
-  // ==================== MUTATIONS ====================
+  // ==================== BUCKETS & CRDT ====================
 
-  Future<Map<String, dynamic>> create(String id, Map<String, dynamic> data) =>
-      _dataModule.create(id, data);
-
-  Future<Map<String, dynamic>> update(
-    String table,
-    String id,
-    Map<String, dynamic> data, {
-    UpdateOptions? options,
-  }) =>
-      _dataModule.update(table, id, data, options: options);
-
-  Future<void> delete(String table, String id) => _dataModule.delete(table, id);
-
-  // ==================== BACKENDS & BUCKETS ====================
-
-  /// Enqueue a backend job (TS `run`).
-  Future<void> run(
-    String backend,
-    String path,
-    Map<String, dynamic> payload, {
-    RunOptions? options,
-  }) =>
-      _dataModule.run(backend, path, payload, options: options);
-
-  /// A handle to a storage bucket (TS `bucket`). Requires a remote endpoint.
+  /// A handle to a storage bucket. Requires a remote endpoint.
   BucketHandle bucket(String name) {
     final remote = _remote;
     if (remote == null) throw StateError('bucket() requires a remote endpoint');
     return BucketHandle(name, remote);
   }
-
-  // ==================== CRDT (deferred) ====================
 
   Future<Never> openCrdtField(String table, String recordId, String field,
           [String? fallbackText]) =>
@@ -638,38 +563,110 @@ class Sp00kyClient {
   void closeCrdtField(String table, String recordId, String field) =>
       throw UnimplementedError('CRDT deferred');
 
-  // ==================== LIFECYCLE ====================
+  // ==================== INTERNALS ====================
 
-  Future<void> close() async {
-    _featureFlags?.closeAll();
-    _appReleases?.closeAll();
-    _dataModule.dispose();
-    await _sync?.close();
-    await _remote?.close();
-    await _streamProcessor.close();
-    _local.close();
-    _initialized = false;
+  /// Snapshot the circuit's rows so the next boot restores them instead of
+  /// re-reading every row out of sqlite.
+  ///
+  /// Taken on close only. A process that dies without one still primes, just
+  /// from the rows: the snapshot is a shortcut, never the source of truth.
+  void _checkpointCircuit() {
+    if (!_initialized) return;
+    try {
+      final bytes = _streamProcessor.saveStoreSnapshot();
+      if (bytes != null && bytes.isNotEmpty) _holder.db.putSnapshot(bytes);
+    } catch (error) {
+      _logger.warn('Circuit checkpoint failed: $error');
+    }
   }
+
+  late final String _clientId = generateId().substring(0, 8);
+
+  /// The tables the circuit primes from: every schema table the client syncs.
+  List<String> _syncedTables() => [
+        for (final key in config.schema.keys)
+          if (key != 'access' && key != 'backends' && key != 'relationships')
+            key
+      ];
 
   PersistenceClient _resolvePersistence() {
     final pc = config.persistenceClient;
     if (pc is PersistenceClient) return pc;
     if (pc == 'memory') return MemoryPersistenceClient();
-    // Default to sqlite-backed persistence so stream-processor circuit state
-    // and the auth token survive restarts (with a file-backed store).
-    return SqlitePersistenceClient(_local);
+    // Default to sqlite-backed persistence so the circuit state and the auth
+    // token survive restarts (with a file-backed store).
+    return SqlitePersistenceClient(() => _holder.db);
   }
 
-  /// Parse the target table from a `SELECT ... FROM <table>` query.
-  String _parseTableFromSurql(String sql) {
-    final match = RegExp(r'\bFROM\s+(?:ONLY\s+)?([A-Za-z_][A-Za-z0-9_]*)',
-            caseSensitive: false)
-        .firstMatch(sql);
-    if (match == null) {
-      throw ArgumentError('Could not parse table from query: $sql');
-    }
-    return match.group(1)!;
+  /// A broadcast stream over a callback subscription, so a `StreamBuilder` can
+  /// consume anything the callback API exposes.
+  Stream<T> _broadcast<T>(void Function() Function(void Function(T)) attach) {
+    late StreamController<T> controller;
+    void Function()? off;
+    controller = StreamController<T>.broadcast(
+      onListen: () => off = attach(controller.add),
+      onCancel: () {
+        off?.call();
+        off = null;
+      },
+    );
+    return controller.stream;
   }
+}
+
+/// Parse the target table from a `SELECT ... FROM <table>` query.
+String parseTableFromSurql(String sql) {
+  final match = RegExp(r'\bFROM\s+(?:ONLY\s+)?([A-Za-z_][A-Za-z0-9_]*)',
+          caseSensitive: false)
+      .firstMatch(sql);
+  if (match == null) {
+    throw ArgumentError('Could not parse table from query: $sql');
+  }
+  return match.group(1)!;
+}
+
+/// Feeds the circuit's view updates into the runtime.
+class _StreamUpdateBridge implements StreamUpdateReceiver {
+  _StreamUpdateBridge(this._runtime);
+  final Runtime _runtime;
+
+  @override
+  void onStreamUpdate(update) => _runtime.dispatch(StreamUpdateEvent(update));
+}
+
+/// The remote port of a local-only client: every call fails the way an
+/// unreachable server would, so the sagas take their offline paths.
+class _OfflineRemote implements RemotePort {
+  @override
+  Future<List<StatementResult>> queryStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      Future.error(StateError('No remote endpoint is configured'));
+
+  @override
+  Future<String> live(String table,
+          void Function(List<String>, List<InlineRow>?) onChange) =>
+      Future.error(StateError('No remote endpoint is configured'));
+
+  @override
+  Future<void> kill(String uuid) async {}
+}
+
+/// What the feature-flag and app-release modules need from the client: register
+/// a shared query and subscribe to it.
+class _QueryHost implements QueryHost {
+  _QueryHost(this._client);
+  final Sp00kyClient _client;
+
+  @override
+  Future<String> registerQuery(
+          String table, String surql, Map<String, dynamic> params,
+          QueryTimeToLive ttl) =>
+      _client.queryRaw(surql, params, ttl: ttl);
+
+  @override
+  void Function() subscribe(String hash, QueryUpdateCallback cb,
+          {bool immediate = false}) =>
+      _client.subscribe(hash, cb, immediate: immediate);
 }
 
 /// Re-export so callers can build ids without importing the surreal layer.

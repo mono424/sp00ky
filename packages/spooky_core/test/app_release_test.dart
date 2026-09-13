@@ -1,17 +1,12 @@
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/ffi/stream_processor.dart';
 import 'package:spooky_core/src/modules/app_release/app_release.dart';
-import 'package:spooky_core/src/modules/cache/cache_module.dart';
-import 'package:spooky_core/src/modules/data/data_module.dart';
-import 'package:spooky_core/src/modules/sync/sync.dart';
-import 'package:spooky_core/src/services/database/local_database_service.dart';
-import 'package:spooky_core/src/services/database/remote_database_service.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:spooky_core/src/services/stream_processor/stream_processor_service.dart';
 import 'package:test/test.dart';
 
-import 'sync_integration_test.dart' show FakeRemote;
+import 'fake_query_host.dart';
 
 /// `AppReleaseModule` runs ONE shared live query over the world-readable
 /// `_00_app_release` table and fans per-app snapshots out to handles, so an app
@@ -21,11 +16,6 @@ void main() {
   final logger = SpookyLogger.root('test');
   const schemaSurql =
       'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;';
-  final schema = {
-    'thread': {
-      'columns': {'title': const ColumnSchema(type: 'string')},
-    },
-  };
 
   Map<String, dynamic> releaseRow(
     String app,
@@ -44,73 +34,21 @@ void main() {
       };
 
   group('module behavior', () {
-    late LocalDatabaseService local;
-    late StreamProcessorService sp;
-    late CacheModule cache;
-    late DataModule data;
-    late Sp00kySync sync;
+    late FakeQueryHost host;
     late AppReleaseModule releases;
-    late _AuthStub auth;
+    late FakeAuth auth;
 
-    /// Pushes delivered in the CURRENT test; reset per test because the first
-    /// ingest of a key must be a `CREATE` and the circuit is rebuilt each setUp.
-    var pushes = 0;
-
-    setUp(() async {
-      pushes = 0;
-      local = LocalDatabaseService.open(logger)..provision();
-      sp = StreamProcessorService(MemoryPersistenceClient(), logger);
-      await sp.init();
-      sp.seedPermissionsFromSchema(schemaSurql);
-      late DataModule d;
-      cache = CacheModule(local, sp, (u) => d.onStreamUpdate(u), logger);
-      d = DataModule(cache, local, schema, logger);
-      data = d;
-      await data.init('sess');
-      sync = Sp00kySync(
-        local,
-        RemoteDatabaseService(
-            const DatabaseConfig(namespace: 't', database: 't'),
-            FakeRemote(),
-            logger),
-        cache,
-        data,
-        schema,
-        logger,
-      );
-      auth = _AuthStub();
-      releases = AppReleaseModule(
-          dataModule: data, sync: sync, auth: auth, logger: logger);
+    setUp(() {
+      host = FakeQueryHost();
+      auth = FakeAuth();
+      releases = AppReleaseModule(host: host, auth: auth, logger: logger);
     });
-    tearDown(() async {
-      releases.closeAll();
-      await sync.close();
-      data.dispose();
-      await sp.close();
-      local.close();
-    });
+    tearDown(() => releases.closeAll());
 
-    /// Deliver release rows the way sync would: ingest them through the cache so
-    /// the circuit materializes the shared view and notifies its subscriber.
-    ///
-    /// The op matters. Re-ingesting an already-present key as `CREATE` is a
-    /// no-op in the DBSP circuit (the key's weight is unchanged, so no delta is
-    /// emitted) — a subsequent release must arrive as `UPDATE`, which retracts
-    /// and re-inserts, exactly as the sync engine labels it. `UPDATE` rides the
-    /// stream debounce, so the settle below has to outlast it.
+    /// Deliver release rows the way the shared query would.
     Future<void> push(List<Map<String, dynamic>> rows) async {
       await _tick(); // let the module's registration land
-      pushes++;
-      await cache.saveBatch([
-        for (final row in rows)
-          CacheRecord(
-            table: '_00_app_release',
-            op: pushes == 1 ? 'CREATE' : 'UPDATE',
-            record: row,
-            version: pushes,
-          ),
-      ]);
-      await _settle();
+      host.emit(rows);
     }
 
     test('registers ONE shared, unfiltered query for many apps', () async {
@@ -118,9 +56,8 @@ void main() {
       releases.release('admin');
       await _tick();
 
-      final hashes = data.getActiveQueryHashes();
-      expect(hashes, hasLength(1));
-      final surql = data.getQueryByHash(hashes.single)!.config.surql;
+      expect(host.registrations, hasLength(1));
+      final surql = host.registrations.single.surql;
       expect(surql, contains('FROM _00_app_release'));
       expect(surql, isNot(contains('WHERE')));
     });
@@ -155,7 +92,7 @@ void main() {
       await push([releaseRow('web', '1.0.1', mandatory: true)]);
       expect(web.updateAvailable('1.0.0'), isTrue);
       expect(web.mandatory, isTrue);
-      expect(data.getActiveQueryHashes(), hasLength(1));
+      expect(host.registrations, hasLength(1));
     });
 
     test('seeds a late handle from the already-loaded snapshot', () async {
@@ -194,8 +131,10 @@ void main() {
 
       auth.emit('user:other');
       await _tick();
-      // Still exactly one shared query, re-observed under the new session.
-      expect(data.getActiveQueryHashes(), hasLength(1));
+      // Re-observed under the new session: one registration per observation,
+      // and the previous subscription released.
+      expect(host.registrations, hasLength(2));
+      expect(host.liveSubscriptions, 1);
     });
 
     test('rows without an app or version are ignored', () async {
@@ -253,27 +192,4 @@ void main() {
 
 Future<void> _tick() => Future<void>.delayed(const Duration(milliseconds: 20));
 
-/// Longer than the default 100ms stream debounce, so a debounced UPDATE lands.
-Future<void> _settle() =>
-    Future<void>.delayed(const Duration(milliseconds: 160));
 
-/// Minimal [AuthService] stand-in exposing only the `subscribe` the module uses.
-class _AuthStub implements AuthService {
-  final List<void Function(String?)> _listeners = [];
-
-  void emit(String? userId) {
-    for (final cb in _listeners.toList()) {
-      cb(userId);
-    }
-  }
-
-  @override
-  void Function() subscribe(void Function(String? userId) cb) {
-    _listeners.add(cb);
-    cb(null);
-    return () => _listeners.remove(cb);
-  }
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}

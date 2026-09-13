@@ -1,9 +1,7 @@
 import '../../services/logger/logger.dart';
 import '../../utils/duration_utils.dart';
 import '../auth/auth_service.dart';
-import '../data/data_module.dart';
-import '../sync/queue/queue_down.dart';
-import '../sync/sync.dart';
+import '../query_host.dart';
 
 /// One shared LIVE query over ALL of the signed-in user's assignments — the
 /// `_00_user_feature` select permission scopes it to `user = $auth.id`, so no
@@ -85,17 +83,14 @@ class FeatureFlagHandle {
 /// tears down the query, clears snapshots, and re-observes.
 class FeatureFlagModule {
   FeatureFlagModule({
-    required DataModule dataModule,
-    required Sp00kySync sync,
+    required QueryHost host,
     required AuthService auth,
     required SpookyLogger logger,
-  })  : _dataModule = dataModule,
-        _sync = sync,
+  })  : _host = host,
         _auth = auth,
         _logger = logger.child('FeatureFlagModule');
 
-  final DataModule _dataModule;
-  final Sp00kySync _sync;
+  final QueryHost _host;
   final AuthService _auth;
   final SpookyLogger _logger;
 
@@ -172,16 +167,15 @@ class FeatureFlagModule {
   void _ensureStarted() {
     if (_querySubscription != null || _starting || _handles.isEmpty) return;
     _starting = true;
-    // Mirrors `Sp00kyClient.queryRaw`: register the query (initial down-sync) and
-    // subscribe to the materialized view. Done unawaited like the TS module.
+    // Register the shared query and subscribe to its rows. Unawaited: a handle
+    // reads its fallback until the first result lands.
     () async {
       try {
-        final hash = await _dataModule.query(
+        final hash = await _host.registerQuery(
             '_00_user_feature', featureQuery, const {}, _ttl);
-        _sync.enqueueDownEvent(RegisterEvent(hash));
-        _querySubscription = _dataModule.subscribe(
+        _querySubscription = _host.subscribe(
           hash,
-          (records) => _applyRecords(records),
+          _applyRecords,
           immediate: true,
         );
       } catch (err) {

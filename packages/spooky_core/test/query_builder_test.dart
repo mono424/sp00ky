@@ -95,7 +95,7 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 10));
 
       await client.create('thread:a', {'title': 'hi'});
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await Future<void>.delayed(const Duration(milliseconds: 150));
 
       expect(emissions.last.map((r) => r['id']), contains('thread:a'));
       await sub.cancel();

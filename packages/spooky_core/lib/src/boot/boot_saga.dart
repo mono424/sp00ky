@@ -46,7 +46,7 @@ Future<void> boot(Ctx ctx, SagaEnv env) async {
   await ctx(Fx.dispatch(const LifecycleTick()));
   await ctx(Fx.dispatch(const GcTick()));
   await ctx(Fx.stateUpdate(r.setIdentity(localReady: true)));
-  await ctx(Fx.dispatch(const StartRemote()));
+  if (env.hasRemote) await ctx(Fx.dispatch(const StartRemote()));
 }
 
 /// One-time copy of the legacy `_00_window` rows into `_00_view`.

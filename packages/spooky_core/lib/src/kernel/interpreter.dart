@@ -54,8 +54,8 @@ abstract interface class TimerPort {
 abstract interface class Services {
   /// The bucket this process last used, so boot can open the right store before
   /// the network answers.
-  String? hintRead();
-  void hintWrite(String bucketId);
+  Future<String?> hintRead();
+  Future<void> hintWrite(String bucketId);
 
   Future<void> localConnect(String bucketId);
   Future<void> localSwitchStore(String bucketId);
@@ -231,7 +231,7 @@ class Interpreter implements Ctx {
       case ServiceName.hintRead:
         return s.hintRead();
       case ServiceName.hintWrite:
-        s.hintWrite(args[0] as String);
+        await s.hintWrite(args[0] as String);
       case ServiceName.localConnect:
         await s.localConnect(args[0] as String);
       case ServiceName.localSwitchStore:

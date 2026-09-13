@@ -1,74 +1,33 @@
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/codegen/dart_emitter.dart';
 import 'package:spooky_core/src/codegen/schema_parser.dart';
-import 'package:spooky_core/src/modules/cache/cache_module.dart';
-import 'package:spooky_core/src/modules/data/data_module.dart';
-import 'package:spooky_core/src/modules/data/relation_resolver.dart';
 import 'package:spooky_core/src/modules/relationships.dart';
-import 'package:spooky_core/src/modules/sync/sync.dart';
-import 'package:spooky_core/src/services/database/remote_database_service.dart';
+import 'package:spooky_core/src/query/relation_resolver.dart';
 import 'package:spooky_core/src/services/database/local_database_service.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
-import 'package:spooky_core/src/services/stream_processor/stream_processor_service.dart';
+import 'package:spooky_core/src/utils/sort_rows.dart' show stableKey;
 import 'package:test/test.dart';
 
-/// Serves the two `_00_list_ref` shapes (primary window vs subquery children)
-/// and the record bodies behind them, recording which ids were fetched.
-class _ChildRemote implements RemoteSurrealClient {
-  final Map<String, Map<String, dynamic>> records = {};
-  final List<String> queries = [];
-  final List<String> fetchedIds = [];
-  List<Map<String, dynamic>> primaryListRef = [];
-  List<Map<String, dynamic>> subqueryListRef = [];
+/// A [RelationFetcher] straight over a store, so the resolver's own rules can
+/// be tested without an engine around them.
+class _StoreFetcher implements RelationFetcher {
+  _StoreFetcher(this._local);
+  final LocalDatabaseService _local;
 
   @override
-  Future<List<dynamic>> query(String sql, [Map<String, dynamic>? vars]) async {
-    queries.add(sql);
-    if (sql.contains('parent IS NOT NONE')) return [subqueryListRef];
-    if (sql.contains('parent IS NONE')) return [primaryListRef];
-    if (sql.contains(r'$idsToFetch')) {
-      final ids = (vars?['idsToFetch'] as List?) ?? const [];
-      fetchedIds.addAll(ids.map((id) => id.toString()));
-      return [
-        ids
-            .map((id) => records[id.toString()])
-            .where((r) => r != null)
-            .toList(),
-      ];
-    }
-    if (sql.contains(r'$ids')) return [<dynamic>[]];
-    return [null];
+  Future<List<Map<String, dynamic>>> fetchRelation({
+    required String table,
+    required String matchField,
+    required List<Object?> keys,
+  }) async {
+    final wanted = {for (final key in keys) stableKey(key)};
+    return [
+      for (final row in _local.getAll(table))
+        if (wanted.contains(stableKey(row[matchField]))) row,
+    ];
   }
-
-  @override
-  Future<void> connect(String endpoint) async {}
-  @override
-  Future<void> use(
-      {required String namespace, required String database}) async {}
-  @override
-  Future<dynamic> authenticate(String token) async => null;
-  @override
-  Future<dynamic> signin(Map<String, dynamic> p) async => {'access': 't'};
-  @override
-  Future<dynamic> signup(Map<String, dynamic> p) async => {'access': 't'};
-  @override
-  Future<void> invalidate() async {}
-  @override
-  Future<(String, Stream<LiveMessage>)> live(String sql,
-          [Map<String, dynamic>? vars]) async =>
-      ('l', const Stream<LiveMessage>.empty());
-  @override
-  Future<void> kill(String liveId) async {}
-  @override
-  Stream<void> get onConnected => const Stream.empty();
-  @override
-  Stream<void> get onDisconnected => const Stream.empty();
-  @override
-  Future<void> close() async {}
 }
-
-Future<void> _tick() => Future<void>.delayed(const Duration(milliseconds: 20));
 
 /// `.related()` end to end: relationships derived from the schema, the emitted
 /// correlated subqueries, and the local-cache resolver that attaches joined rows
@@ -277,11 +236,11 @@ DEFINE FIELD threads ON user TYPE string;
 
   group('resolver', () {
     late LocalDatabaseService local;
-    late LocalRelationFetcher fetcher;
+    late _StoreFetcher fetcher;
 
     setUp(() {
       local = LocalDatabaseService.open(logger)..provision();
-      fetcher = LocalRelationFetcher(local);
+      fetcher = _StoreFetcher(local);
       local.create('user:u1', {'name': 'Ada'});
       local.create('user:u2', {'name': 'Linus'});
       local.create('thread:t1', {'title': 'first', 'author': 'user:u1'});
@@ -327,21 +286,21 @@ DEFINE FIELD threads ON user TYPE string;
     List<Map<String, dynamic>> threads([List<String> ids = const ['thread:t1']]) =>
         [for (final id in ids) {...local.getById(id)!}];
 
-    test('a one-relation attaches the single row', () {
+    test('a one-relation attaches the single row', () async {
       final rows = threads();
-      resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
       expect((rows.single['author'] as Map)['name'], 'Ada');
     });
 
-    test('a one-relation with no foreign key attaches null', () {
+    test('a one-relation with no foreign key attaches null', () async {
       final rows = threads(['thread:t3']);
-      resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
       expect(rows.single['author'], isNull);
     });
 
-    test('a many-relation attaches the matching children only', () {
+    test('a many-relation attaches the matching children only', () async {
       final rows = threads(['thread:t1', 'thread:t2']);
-      resolveRelations(
+      await resolveRelations(
           rows, [plan('comments', 'comment', 'many', 'thread')], fetcher);
       expect((rows[0]['comments'] as List).map((c) => c['id']),
           containsAll(['comment:c1', 'comment:c2', 'comment:c3']));
@@ -349,16 +308,16 @@ DEFINE FIELD threads ON user TYPE string;
           ['comment:c4']);
     });
 
-    test('a many-relation with no children attaches an empty list', () {
+    test('a many-relation with no children attaches an empty list', () async {
       final rows = threads(['thread:t3']);
-      resolveRelations(
+      await resolveRelations(
           rows, [plan('comments', 'comment', 'many', 'thread')], fetcher);
       expect(rows.single['comments'], isEmpty);
     });
 
-    test('order and limit apply PER parent', () {
+    test('order and limit apply PER parent', () async {
       final rows = threads(['thread:t1', 'thread:t2']);
-      resolveRelations(
+      await resolveRelations(
         rows,
         [
           plan('comments', 'comment', 'many', 'thread',
@@ -373,9 +332,9 @@ DEFINE FIELD threads ON user TYPE string;
           ['comment:c4']);
     });
 
-    test('a sub-where filters the children', () {
+    test('a sub-where filters the children', () async {
       final rows = threads();
-      resolveRelations(
+      await resolveRelations(
         rows,
         [
           plan('comments', 'comment', 'many', 'thread',
@@ -388,9 +347,9 @@ DEFINE FIELD threads ON user TYPE string;
       expect((rows.single['comments'] as List), hasLength(2));
     });
 
-    test('nested relations resolve a second level', () {
+    test('nested relations resolve a second level', () async {
       final rows = threads();
-      resolveRelations(
+      await resolveRelations(
         rows,
         [
           plan('comments', 'comment', 'many', 'thread',
@@ -403,13 +362,13 @@ DEFINE FIELD threads ON user TYPE string;
       expect(((comments.first as Map)['author'] as Map)['name'], 'Linus');
     });
 
-    test('the alias lands last in key order', () {
+    test('the alias lands last in key order', () async {
       final rows = threads();
-      resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
       expect(rows.single.keys.last, 'author');
     });
 
-    test('nesting past the depth cap throws RelationCycleError', () {
+    test('nesting past the depth cap throws RelationCycleError', () async {
       // Self-join on `id`, so every level keeps matching and the recursion can
       // actually reach the cap (a chain that runs out of children just stops).
       RelationPlan chain(int depth) => plan(
@@ -430,189 +389,64 @@ DEFINE FIELD threads ON user TYPE string;
       );
     });
 
-    test('an empty parent set or plan is a no-op', () {
-      resolveRelations([], [plan('author', 'user', 'one', 'author')], fetcher);
+    test('an empty parent set or plan is a no-op', () async {
+      await resolveRelations([], [plan('author', 'user', 'one', 'author')], fetcher);
       final rows = threads();
-      resolveRelations(rows, const [], fetcher);
+      await resolveRelations(rows, const [], fetcher);
       // `author` is a real column, so it stays the raw foreign key rather than
       // being replaced by a resolved row.
       expect(rows.single['author'], 'user:u1');
     });
   });
 
-  group('subquery child sync', () {
-    late LocalDatabaseService local;
-    late StreamProcessorService sp;
-    late DataModule data;
-    late _ChildRemote remote;
-    late Sp00kySync sync;
+  group('the engine resolves a query\'s relations', () {
+    late Sp00kyClient client;
 
     setUp(() async {
-      local = LocalDatabaseService.open(logger)..provision();
-      sp = StreamProcessorService(MemoryPersistenceClient(), logger);
-      await sp.init();
-      sp.seedPermissionsFromSchema(schemaSurql);
-      late DataModule d;
-      final cache = CacheModule(local, sp, (u) => d.onStreamUpdate(u), logger);
-      d = DataModule(cache, local, schema, logger);
-      data = d;
-      await data.init('sess');
-      remote = _ChildRemote();
-      sync = Sp00kySync(
-        local,
-        RemoteDatabaseService(
-            const DatabaseConfig(namespace: 't', database: 't'), remote, logger),
-        cache,
-        data,
-        schema,
-        logger,
-      );
-    });
-    tearDown(() async {
-      await sync.close();
-      data.dispose();
-      await sp.close();
-      local.close();
-    });
-
-    Future<String> registerRelated() => QueryBuilder(
-          'thread',
+      client = Sp00kyClient(
+        Sp00kyConfig(
+          database: const DatabaseConfig(namespace: 't', database: 't'),
           schema: schema,
-          logger: logger,
-          registrar: (sql, vars, ttl, relations) =>
-              data.query('thread', sql, vars, ttl, relations: relations),
-        ).related('comments').run();
-
-    test('registration fetches the child bodies behind the subquery', () async {
-      remote.records['thread:t1'] = {
-        'id': 'thread:t1',
-        'title': 'first',
-        '_00_rv': 1
-      };
-      remote.records['comment:c1'] = {
-        'id': 'comment:c1',
-        'body': 'hi',
-        'thread': 'thread:t1',
-        '_00_rv': 1,
-      };
-      remote.primaryListRef = [
-        {'out': 'thread:t1', 'version': 1}
-      ];
-      remote.subqueryListRef = [
-        {'out': 'comment:c1', 'version': 1}
-      ];
-
-      final hash = await registerRelated();
-      await sync.syncQuery(hash); // pull the primary window
-      await sync.registerRemoteQueryForTest(hash);
-      await _tick();
-
-      expect(local.getById('comment:c1'), isNotNull,
-          reason: 'a child body must be cached so the relation can resolve');
-      expect(data.getQueryByHash(hash)!.config.subqueryRemoteArray,
-          [('comment:c1', 1)]);
-      expect(data.getQueryByHash(hash)!.config.remoteArray, [('thread:t1', 1)],
-          reason: 'child rows must not leak into the primary window');
+          schemaSurql: schemaSurql,
+          persistenceClient: MemoryPersistenceClient(),
+        ),
+      );
+      await client.init();
     });
-
-    test('an unchanged child set does not refetch', () async {
-      remote.subqueryListRef = [
-        {'out': 'comment:c1', 'version': 1}
-      ];
-      remote.records['comment:c1'] = {
-        'id': 'comment:c1',
-        'body': 'hi',
-        'thread': 'thread:t1',
-        '_00_rv': 1,
-      };
-      final hash = await registerRelated();
-      await sync.registerRemoteQueryForTest(hash);
-      final firstFetches = remote.fetchedIds.length;
-      expect(firstFetches, greaterThan(0));
-
-      await sync.registerRemoteQueryForTest(hash);
-      expect(remote.fetchedIds.length, firstFetches,
-          reason: 'the child diff is idempotent');
-    });
-
-    test('a query with no relations skips the child select entirely', () async {
-      final hash = await data.query('thread', 'SELECT * FROM thread', {}, '10m');
-      await sync.registerRemoteQueryForTest(hash);
-      expect(remote.queries.any((q) => q.contains('parent IS NOT NONE')), isFalse);
-    });
-  });
-
-  group('materialization', () {
-    late LocalDatabaseService local;
-    late StreamProcessorService sp;
-    late DataModule data;
-
-    setUp(() async {
-      local = LocalDatabaseService.open(logger)..provision();
-      sp = StreamProcessorService(MemoryPersistenceClient(), logger);
-      await sp.init();
-      sp.seedPermissionsFromSchema(schemaSurql);
-      late DataModule d;
-      final cache = CacheModule(local, sp, (u) => d.onStreamUpdate(u), logger);
-      d = DataModule(cache, local, schema, logger, bornFetching: false);
-      data = d;
-      await data.init('sess');
-    });
-    tearDown(() async {
-      data.dispose();
-      await sp.close();
-      local.close();
-    });
+    tearDown(() => client.close());
 
     test('a registered query attaches its relations to every row', () async {
-      local.create('user:u1', {'name': 'Ada'});
-      local.create('thread:t1', {'title': 'first', 'author': 'user:u1'});
-      local.create('comment:c1',
-          {'body': 'hi', 'thread': 'thread:t1', 'score': 1, 'author': 'user:u1'});
+      await client.create('user:u1', {'name': 'Ada'});
+      await client.create('thread:t1', {'title': 'first', 'author': 'user:u1'});
+      await client.create('comment:c1', {
+        'body': 'hi',
+        'thread': 'thread:t1',
+        'score': 1,
+        'author': 'user:u1',
+      });
 
-      final builder = QueryBuilder(
-        'thread',
-        schema: schema,
-        logger: logger,
-        registrar: (sql, vars, ttl, relations) =>
-            data.query('thread', sql, vars, ttl, relations: relations),
-      )
+      final hash = await client
+          .query('thread')
           .related('author')
-          .related('comments');
-      final hash = await builder.run();
+          .related('comments')
+          .run();
+      await Future<void>.delayed(const Duration(milliseconds: 250));
 
-      // Ingest so the circuit's view (and therefore the result set) is non-empty.
-      await data.onStreamUpdate(StreamUpdate(
-        queryHash: hash,
-        op: 'CREATE',
-        localArray: [('thread:t1', 1)],
-      ));
-
-      final row = data.getQueryByHash(hash)!.records.single;
+      final row = client.state.queries[hash]!.records.single;
       expect((row['author'] as Map)['name'], 'Ada');
       expect((row['comments'] as List).single['id'], 'comment:c1');
     });
 
     test('materializing does not mutate the cached document', () async {
-      local.create('user:u1', {'name': 'Ada'});
-      local.create('thread:t1', {'title': 'first', 'author': 'user:u1'});
+      await client.create('user:u1', {'name': 'Ada'});
+      await client.create('thread:t1', {'title': 'first', 'author': 'user:u1'});
 
-      final hash = await QueryBuilder(
-        'thread',
-        schema: schema,
-        logger: logger,
-        registrar: (sql, vars, ttl, relations) =>
-            data.query('thread', sql, vars, ttl, relations: relations),
-      ).related('comments').run();
+      final hash = await client.query('thread').related('comments').run();
+      await Future<void>.delayed(const Duration(milliseconds: 250));
 
-      await data.onStreamUpdate(StreamUpdate(
-        queryHash: hash,
-        op: 'CREATE',
-        localArray: [('thread:t1', 1)],
-      ));
-
-      expect(data.getQueryByHash(hash)!.records.single['comments'], isEmpty);
-      expect(local.getById('thread:t1')!.containsKey('comments'), isFalse,
+      expect(client.state.queries[hash]!.records.single['comments'], isEmpty);
+      expect(client.localStore.getById('thread:t1')!.containsKey('comments'),
+          isFalse,
           reason: 'the alias must not be written back into the store');
     });
   });

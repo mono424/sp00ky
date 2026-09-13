@@ -6,6 +6,7 @@ import '../state/reducers.dart' as r;
 import '../state/selectors.dart' show overlay;
 import '../types.dart';
 import 'materialize.dart';
+import 'relation_resolver.dart';
 import 'render_set.dart';
 
 /// Render one query from state: membership (or the SSP's local window), the
@@ -37,6 +38,15 @@ Future<void> materialize(Ctx ctx, QueryHash hash) async {
     rows = await ctx(
         materializeEffect(tableOfIds(ids, entry.def.tableName), ids));
     if (isWindow) rows = applyWindowOrder(entry.def.surql, rows);
+    if (entry.def.relations.isNotEmpty) {
+      // `.related()` projections are resolved from the local cache rather than
+      // re-evaluated by the store: sqlite cannot run the correlated subquery
+      // the surql carries. The rows are copied first so the resolver's in-place
+      // attachment never mutates a row another query is still rendering.
+      rows = [for (final row in rows) {...row}];
+      await resolveRelations(
+          rows, entry.def.relations, CtxRelationFetcher(ctx));
+    }
   } catch (e) {
     await ctx(Fx.stateUpdate(
         r.compose([r.recordError(hash), r.clearDirty(hash)])));

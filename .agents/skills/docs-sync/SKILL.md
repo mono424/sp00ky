@@ -38,7 +38,7 @@ part of the change, not as follow-up work.
   + root `README.md` if it is user-installable.
 - **New / changed export in a client package** (hook, provider prop, option, exported type)
   → the relevant `docs/client/*.mdx` page **and** that package's `AGENTS.md` + `SKILL.md`.
-  Check whether the sibling binding (`client-solid` vs `client-solid2` vs `client-dart`)
+  Check whether the sibling binding (`client-solid` vs `client-solid2` vs `spooky_core`, the Dart core)
   documents the same thing and needs the same edit.
 - **CLI flag or subcommand** → `docs/reference/cli.mdx`; if it changes the local workflow,
   also `docs/dev/*.mdx`.

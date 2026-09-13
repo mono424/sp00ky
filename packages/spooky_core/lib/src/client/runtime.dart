@@ -69,7 +69,7 @@ class Runtime implements InterpreterHost {
   ClientState _state;
 
   final Map<String, Future<void>> _serialLanes = {};
-  final Map<String, Future<void>> _dedupeLanes = {};
+  final Map<String, Future<Object?>> _dedupeLanes = {};
   final Set<_Waiter> _waiters = {};
   final Map<QueryHash, Set<QueryUpdateCallback>> _recordSubs = {};
   final Map<QueryHash, Set<QueryStatusCallback>> _statusSubs = {};
@@ -85,22 +85,26 @@ class Runtime implements InterpreterHost {
   Ctx get ctx => _interpret;
 
   /// Run a saga, optionally on a lane. Errors propagate to the caller.
-  Future<void> run(Saga<void> saga, {Lane? lane}) {
-    Future<void> exec() => saga(_interpret);
+  ///
+  /// A dedupe lane answers the joiner with the run already in flight, so the
+  /// two must have the same result type; a facade call that wants a value back
+  /// uses a serial lane or none.
+  Future<R> run<R>(Saga<R> saga, {Lane? lane}) {
+    Future<R> exec() => saga(_interpret);
     if (lane == null) return exec();
     if (lane.kind == LaneKind.dedupe) {
       final running = _dedupeLanes[lane.key];
-      if (running != null) return running;
-      late final Future<void> p;
+      if (running != null) return running.then((v) => v as R);
+      late final Future<Object?> p;
       p = exec().whenComplete(() {
         if (identical(_dedupeLanes[lane.key], p)) _dedupeLanes.remove(lane.key);
       });
       _dedupeLanes[lane.key] = p;
-      return p;
+      return p.then((v) => v as R);
     }
     final prev = _serialLanes[lane.key] ?? Future<void>.value();
     final p = prev.then((_) => exec(), onError: (_) => exec());
-    final tail = p.catchError((_) {});
+    final tail = p.then<void>((_) {}, onError: (_) {});
     _serialLanes[lane.key] = tail;
     unawaited(tail.then((_) {
       if (identical(_serialLanes[lane.key], tail)) {

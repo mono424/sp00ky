@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:test/test.dart';
 
-import 'sync_integration_test.dart' show FakeRemote;
+import 'fake_remote.dart';
 
 void main() {
   group('run() backend outbox', () {
@@ -50,7 +50,7 @@ void main() {
 
     test('enqueues an outbox record with the route + JSON payload', () async {
       await client.run('jobs', 'process', {'url': 'http://x'});
-      final rows = client.local.getAll('job_outbox');
+      final rows = client.localStore.getAll('job_outbox');
       expect(rows, hasLength(1));
       expect(rows.first['path'], 'process');
       expect(jsonDecode(rows.first['payload'] as String), {'url': 'http://x'});
@@ -60,7 +60,7 @@ void main() {
 
     test('seeds status pending on the optimistic row', () async {
       await client.run('jobs', 'process', {'url': 'http://x'});
-      expect(client.local.getAll('job_outbox').first['status'], 'pending');
+      expect(client.localStore.getAll('job_outbox').first['status'], 'pending');
     });
 
     test('throws on a missing required arg', () async {
@@ -74,7 +74,7 @@ void main() {
       await client.run('jobs', 'process', {'url': 'u'},
           options: const RunOptions(
               maxRetries: 5, retryStrategy: 'exponential', assignedTo: 'w1'));
-      final row = client.local.getAll('job_outbox').first;
+      final row = client.localStore.getAll('job_outbox').first;
       expect(row['max_retries'], 5);
       expect(row['retry_strategy'], 'exponential');
       expect(row['assigned_to'], 'w1');

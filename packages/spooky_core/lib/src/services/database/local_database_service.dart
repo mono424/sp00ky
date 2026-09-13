@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:sqlite3/sqlite3.dart';
 
@@ -72,6 +73,10 @@ class LocalDatabaseService {
       CREATE TABLE IF NOT EXISTS _00_schema (
         hash       TEXT PRIMARY KEY,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS _00_snapshot (
+        id    TEXT PRIMARY KEY,
+        bytes BLOB NOT NULL
       );
       CREATE TABLE IF NOT EXISTS _00_kv (
         id    TEXT PRIMARY KEY,
@@ -253,6 +258,46 @@ class LocalDatabaseService {
 
   void bumpRv(String table, String id) => incrementRv(id);
 
+  /// Every stored row's `(id, _00_rv)` per table, for the boot-time circuit
+  /// prime. Rows are read by their index, not decoded, so this stays cheap on a
+  /// warm store.
+  Map<String, List<(String, int)>> scanVersions(List<String> tables) {
+    final out = <String, List<(String, int)>>{};
+    for (final table in tables) {
+      final rs =
+          _db.select('SELECT id, rv FROM records WHERE tbl = ?', [table]);
+      out[table] = [
+        for (final row in rs)
+          (row['id'] as String, (row['rv'] as num).toInt())
+      ];
+    }
+    return out;
+  }
+
+  // ---- circuit snapshot ------------------------------------------------------
+
+  static const _snapshotId = 'circuit';
+
+  /// The stored circuit snapshot, or null when there is none.
+  Uint8List? getSnapshot() {
+    final rs = _db
+        .select('SELECT bytes FROM _00_snapshot WHERE id = ?', [_snapshotId]);
+    if (rs.isEmpty) return null;
+    final bytes = rs.first['bytes'];
+    return bytes is Uint8List ? bytes : null;
+  }
+
+  void putSnapshot(Uint8List bytes) {
+    _db.execute(
+      'INSERT INTO _00_snapshot (id, bytes) VALUES (?, ?) '
+      'ON CONFLICT(id) DO UPDATE SET bytes = excluded.bytes',
+      [_snapshotId, bytes],
+    );
+  }
+
+  void clearSnapshot() =>
+      _db.execute('DELETE FROM _00_snapshot WHERE id = ?', [_snapshotId]);
+
   // ---- _00_query registry --------------------------------------------------
 
   Map<String, dynamic>? getQueryConfig(String id) {
@@ -376,6 +421,7 @@ class LocalDatabaseService {
     _db.execute('DELETE FROM _00_query');
     _db.execute('DELETE FROM _00_pending_mutations');
     _db.execute('DELETE FROM _00_stream_processor_state');
+    _db.execute('DELETE FROM _00_snapshot');
     kvRemove('_00_stream_processor_state');
   }
 

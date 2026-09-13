@@ -66,6 +66,10 @@ Future<void> refreshFailedCount(Ctx ctx) async {
 /// back, a transport failure leaves the unsent tail queued behind a backoff
 /// timer.
 Future<void> drain(Ctx ctx, SagaEnv env) async {
+  // A client with no endpoint has nothing to push to. Draining anyway would
+  // fail every statement in a way the classifier reads as a rejection, and a
+  // rejection rolls the write back: the local-first write would delete itself.
+  if (!env.hasRemote) return;
   for (;;) {
     final state = await ctx(Fx.stateRead((s) => s));
     final pending =

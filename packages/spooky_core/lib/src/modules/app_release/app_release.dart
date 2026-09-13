@@ -2,9 +2,7 @@ import '../../services/logger/logger.dart';
 import '../../utils/duration_utils.dart';
 import '../../utils/semver.dart';
 import '../auth/auth_service.dart';
-import '../data/data_module.dart';
-import '../sync/queue/queue_down.dart';
-import '../sync/sync.dart';
+import '../query_host.dart';
 
 /// One shared LIVE query over every app's release row (TS `RELEASE_QUERY`).
 ///
@@ -105,17 +103,14 @@ class AppReleaseHandle {
 /// update when the deployed version moves past the running build.
 class AppReleaseModule {
   AppReleaseModule({
-    required DataModule dataModule,
-    required Sp00kySync sync,
+    required QueryHost host,
     required AuthService auth,
     required SpookyLogger logger,
-  })  : _dataModule = dataModule,
-        _sync = sync,
+  })  : _host = host,
         _auth = auth,
         _logger = logger.child('AppReleaseModule');
 
-  final DataModule _dataModule;
-  final Sp00kySync _sync;
+  final QueryHost _host;
   final AuthService _auth;
   final SpookyLogger _logger;
 
@@ -184,14 +179,13 @@ class AppReleaseModule {
   void _ensureStarted() {
     if (_querySubscription != null || _starting || _handles.isEmpty) return;
     _starting = true;
-    // Mirrors `Sp00kyClient.queryRaw`: register the query (initial down-sync)
-    // and subscribe to the materialized view. Unawaited, like the TS module.
+    // Register the shared query and subscribe to its rows. Unawaited: a handle
+    // reports no update until the first result lands.
     () async {
       try {
-        final hash = await _dataModule.query(
+        final hash = await _host.registerQuery(
             '_00_app_release', releaseQuery, const {}, _ttl);
-        _sync.enqueueDownEvent(RegisterEvent(hash));
-        _querySubscription = _dataModule.subscribe(
+        _querySubscription = _host.subscribe(
           hash,
           _applyRecords,
           immediate: true,

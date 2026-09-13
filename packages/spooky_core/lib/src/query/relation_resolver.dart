@@ -1,6 +1,7 @@
-import '../../services/database/local_database_service.dart';
-import '../../utils/sort_rows.dart';
-import '../query_builder.dart' show RelationPlan;
+import '../kernel/effects.dart';
+import '../kernel/saga.dart';
+import '../modules/query_builder.dart' show RelationPlan;
+import '../utils/sort_rows.dart';
 
 /// Nesting depth beyond which a relation tree is treated as cyclic
 /// (TS `MAX_RELATION_DEPTH`).
@@ -18,36 +19,35 @@ class RelationCycleError extends Error {
 }
 
 /// Fetches candidate child rows for one relation level.
-abstract class RelationFetcher {
+abstract interface class RelationFetcher {
   /// Rows of [table] whose [matchField] is one of [keys].
-  List<Map<String, dynamic>> fetchRelation({
+  Future<List<Map<String, dynamic>>> fetchRelation({
     required String table,
     required String matchField,
     required List<Object?> keys,
   });
 }
 
-/// [RelationFetcher] over the local sqlite store.
+/// [RelationFetcher] over the local store, through the effect context.
 ///
-/// Divergence from the TS core, which pushes the match into a local SurrealQL /
-/// SQLite query: this scans the logical table and filters in Dart. The local
-/// store is a document table keyed only by `(tbl, id)`, so a field match has no
-/// index to use either way; scanning keeps the resolver engine-free. Fine for a
-/// client-sized cache — revisit with a JSON1 index if a table ever grows large.
-class LocalRelationFetcher implements RelationFetcher {
-  LocalRelationFetcher(this._local);
-
-  final LocalDatabaseService _local;
+/// Divergence from the browser core, which pushes the match into a local
+/// SurrealQL / SQLite query: this scans the logical table and filters in Dart.
+/// The local store is a document table keyed only by `(table, id)`, so a field
+/// match has no index to use either way. Fine for a client-sized cache.
+class CtxRelationFetcher implements RelationFetcher {
+  const CtxRelationFetcher(this._ctx);
+  final Ctx _ctx;
 
   @override
-  List<Map<String, dynamic>> fetchRelation({
+  Future<List<Map<String, dynamic>>> fetchRelation({
     required String table,
     required String matchField,
     required List<Object?> keys,
-  }) {
+  }) async {
     final wanted = {for (final key in keys) stableKey(key)};
+    final rows = await _ctx(Fx.localGetAll(table));
     return [
-      for (final row in _local.getAll(table))
+      for (final row in rows)
         if (wanted.contains(stableKey(row[matchField]))) row,
     ];
   }
@@ -65,34 +65,30 @@ class LocalRelationFetcher implements RelationFetcher {
 /// [parents] is mutated in place, each alias appended LAST so key order matches
 /// SurrealQL's `SELECT *, <sub> AS alias`.
 ///
-/// Synchronous, unlike the TS core: sqlite reads are synchronous here, and
-/// keeping this sync is what lets `DataModule` materialize (and paint) a query
-/// without an await.
-///
 /// Throws [RelationCycleError] when nesting exceeds [maxRelationDepth].
-void resolveRelations(
+Future<void> resolveRelations(
   List<Map<String, dynamic>> parents,
   List<RelationPlan> relations,
   RelationFetcher fetcher, {
   int depth = 0,
   List<String> path = const [],
-}) {
+}) async {
   if (relations.isEmpty || parents.isEmpty) return;
   if (depth >= maxRelationDepth) {
     throw RelationCycleError([...path, relations.map((r) => r.alias).join('|')]);
   }
   for (final relation in relations) {
-    _resolveOne(parents, relation, fetcher, depth, path);
+    await _resolveOne(parents, relation, fetcher, depth, path);
   }
 }
 
-void _resolveOne(
+Future<void> _resolveOne(
   List<Map<String, dynamic>> parents,
   RelationPlan relation,
   RelationFetcher fetcher,
   int depth,
   List<String> path,
-) {
+) async {
   final isOne = relation.isOne;
   // The child field to match parent keys against.
   final matchField = isOne ? 'id' : relation.foreignKeyField;
@@ -110,7 +106,7 @@ void _resolveOne(
 
   final grouped = <String, List<Map<String, dynamic>>>{};
   if (keys.isNotEmpty) {
-    final children = fetcher.fetchRelation(
+    final children = await fetcher.fetchRelation(
       table: relation.table,
       matchField: matchField,
       keys: keys.values.toList(),
@@ -120,7 +116,7 @@ void _resolveOne(
     // relations, and resolving the deduped child set once keeps nested fan-out
     // at O(depth) batches. Children later dropped by a per-parent limit carry
     // resolved nested data harmlessly — they reach no output row.
-    resolveRelations(
+    await resolveRelations(
       children,
       relation.relations,
       fetcher,

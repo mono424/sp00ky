@@ -69,22 +69,59 @@ class AuthService {
   /// Read the `AC` (access) claim out of a SurrealDB JWT without verifying it.
   /// Verification is the server's job; this only recovers which access method
   /// the existing session used so [access] survives a restart.
-  static String? _accessFromToken(String? jwt) {
-    if (jwt == null) return null;
+  static String? _accessFromToken(String? jwt) => _claimsFromToken(jwt).access;
+
+  /// Restore a session from the cached token WITHOUT a round trip, returning
+  /// the user id it names.
+  ///
+  /// The server still enforces the token on every request; this only lets the
+  /// client act on what it already holds so a warm boot paints as the right
+  /// user before the network answers. `check()` replaces the user row wholesale
+  /// once the server does answer.
+  Future<String?> restoreSessionFromToken() async {
+    final tok = await _persistence.get<String>(_tokenKey);
+    if (tok == null) return null;
+    final claims = _claimsFromToken(tok);
+    final userId = claims.userId;
+    if (userId == null) return null;
+
+    token = tok;
+    // Hand it to the transport too, so a socket rebuilt from scratch later (the
+    // supervisor's revive loop) comes back authenticated. Without this the
+    // client kept reporting this user while its session was anonymous, and
+    // every view registered afterwards was stamped with an empty identity.
+    _remote.setAuthToken(tok);
+    // Only the id: the full row is not in the token. It lands from the local
+    // cache when the app's own `user` query paints.
+    currentUser = {'id': userId};
+    isAuthenticated = true;
+    access = claims.access;
+    _notifyListeners();
+    _logger.debug('Session restored optimistically from the cached token');
+    return userId;
+  }
+
+  /// The `AC` (access method) and `ID` (the auth record id) claims of a SurrealDB
+  /// record-access JWT, read WITHOUT verifying it. Nulls on malformed input.
+  static ({String? access, String? userId}) _claimsFromToken(String? jwt) {
+    if (jwt == null) return (access: null, userId: null);
     final parts = jwt.split('.');
-    if (parts.length < 2) return null;
+    if (parts.length < 2) return (access: null, userId: null);
     try {
       var payload = parts[1].replaceAll('-', '+').replaceAll('_', '/');
       payload = payload.padRight((payload.length + 3) ~/ 4 * 4, '=');
       final decoded = jsonDecode(utf8.decode(base64.decode(payload)));
-      if (decoded is Map && decoded['AC'] is String) {
-        return decoded['AC'] as String;
-      }
+      if (decoded is! Map) return (access: null, userId: null);
+      final ac = decoded['AC'] ?? decoded['ac'];
+      final id = decoded['ID'] ?? decoded['id'];
+      return (
+        access: ac is String ? ac : null,
+        userId: id is String ? id : null,
+      );
     } catch (_) {
-      // A malformed token is not worth failing auth over; the caller falls
-      // back to a null access.
+      // A malformed token is not worth failing auth over.
+      return (access: null, userId: null);
     }
-    return null;
   }
 
   /// Validate an existing or supplied token and hydrate the user.
@@ -130,6 +167,7 @@ class AuthService {
     currentUser = null;
     isAuthenticated = false;
     access = null;
+    _remote.setAuthToken(null);
     await _persistence.remove(_tokenKey);
     try {
       await _remote.getClient().invalidate();
@@ -142,6 +180,7 @@ class AuthService {
   }
 
   Future<void> _setSession(String token, Map<String, dynamic> user) async {
+    _remote.setAuthToken(token);
     this.token = token;
     currentUser = user;
     isAuthenticated = true;

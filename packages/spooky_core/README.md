@@ -1,44 +1,109 @@
 # spooky_core
 
-Pure-Dart port of `@spooky-sync/core`. Framework-agnostic: query subscriptions
-are exposed as Dart `Stream`s, so a Flutter app consumes them with a
-`StreamBuilder`.
-
-It mirrors the JavaScript core module-for-module, with three platform-bound
-pieces handled the Dart way:
-
-- **Materialization** runs client-side through Dart FFI into the same Rust
-  `ssp` DBSP circuit the browser uses (see `packages/ssp-ffi`), instead of
-  WASM.
-- **Local storage** is sqlite (`package:sqlite3`), replacing the embedded
-  SurrealDB WASM engine. Records are stored document-style as JSON.
-- **CRDT** (`openCrdtField`) is deferred; the wiring seam is left in place.
+Pure-Dart core for Spooky local-first sync, the twin of `@spooky-sync/core`.
+Framework-agnostic: query subscriptions are exposed as Dart `Stream`s, so a
+Flutter app consumes them with a `StreamBuilder`.
 
 ## Architecture
 
+The engine is **effects-as-data**, the same shape as the TypeScript core, so a
+fix on either side lands in the obvious file on the other.
+
 ```
-Sp00kyClient
-├── LocalDatabaseService      (sqlite: records + _00_query + outbox + state)
-├── StreamProcessorService    (FFI -> Rust ssp circuit; permission-seeded)
-├── CacheModule               (local write + DBSP ingest bridge)
-└── DataModule                (query registration, subscriptions, mutations)
-        └── exposes Stream<List<Map<String,dynamic>>> via Sp00kyClient
+Sp00kyClient (facade)   every method runs one saga, reads a selector, or
+      │                 attaches a subscriber
+      ├─ Runtime        client/runtime.dart - holds the state, runs sagas on
+      │                 serial/dedupe lanes, fires timers, fans events out and
+      │                 schedules materialization for dirty queries
+      ├─ route()        client/router.dart - event -> (saga, lane)
+      ├─ sagas          query/ mutation/ sync/ boot/ - pure: they name effects
+      │                 and never touch a service, a clock or a Timer
+      └─ Interpreter    kernel/interpreter.dart - the ONLY place an effect
+                        executes, against the adapters below
 ```
 
-The read path: register a query -> the FFI circuit returns a `localArray`
-(`[id, version]` pairs) -> records are resolved from sqlite by id -> emitted on
-the query's `Stream`. Mutations write locally (optimistic), ingest into the
-circuit, and the resulting stream update reaches subscribers.
+Under the interpreter: the sqlite local store, the FFI stream processor (the
+same Rust DBSP circuit the browser runs through WASM), the SurrealDB WebSocket
+client with its connection supervisor, auth, and persistence.
+
+```
+lib/src/
+  kernel/    effects, the saga contract, lanes, the interpreter, constants
+  state/     ClientState, the query lifecycle machine, reducers, selectors
+  query/     register, membership, fetch, materialize, lifecycle (+ their sagas)
+  mutation/  outbox rows, write, drain, rollback, the failed-writes tray
+  sync/      poll, live, connection, health policy
+  boot/      boot, auth flip, bucket switch, preload
+  client/    the runtime, the router, the adapters
+  services/  sqlite store, FFI stream processor, remote socket, supervisor
+  modules/   auth, feature flags, app releases, query builder, buckets
+  testing/   run_pure (canned-effect saga harness), fakes, state builders
+```
+
+### The query lifecycle
+
+`phase` answers "where do this query's rows come from":
+
+- `cold` never resolved on this device: rows come from the SSP's local window,
+  and a binding shows its loader because the query is not authoritative.
+- `cached` a durable `_00_view` row was found: rows come from that id-set, so a
+  relaunch paints from the local store with no network on the paint path.
+- `live` a server membership set was accepted this session.
+- `viewLost` the server's `_00_query` row vanished while we held membership:
+  the rows are KEPT and a re-registration is under way.
+
+An empty result is only empty once the query is authoritative. `_00_query`'s
+`rowCount` and `state` are what tell "no rows" apart from "the view has not
+published its edges yet"; an empty edge read with no `_00_query` row is a lost
+view, never an empty one.
+
+## Deliberate divergences from the browser core
+
+1. **Sagas are functions over an effect context, not generators.** Dart's
+   `yield` is one-way and `Iterator` has no `next(value)`, so a saga is
+   `Future<R> Function(Ctx)` and yields effects by awaiting them. Every property
+   that matters is kept: effects are data, one interpreter executes them, a saga
+   holds no adapter reference, and `testing/run_pure.dart` drives it with canned
+   results. Effects are generic in their result type, so a saga reads
+   `await ctx(Fx.now())` with no cast.
+2. **The local store is a document store.** sqlite cannot run SurrealQL, so the
+   `local.*` effects address it by `(table, id)` and a transaction is data
+   (`LocalTx(List<LocalOp>)`). Materialization resolves the render set by id
+   rather than re-running the query; a windowed query re-applies its own
+   `ORDER BY` because its ids come from `_00_list_ref`, not the circuit.
+   `.related()` projections are resolved from the local cache by
+   `query/relation_resolver.dart`.
+3. **Permission seeding.** The browser circuit is effectively permissive; the
+   native circuit is default-deny. `StreamProcessorService.seedPermissionsFromSchema`
+   extracts each table's `PERMISSIONS FOR select` from `schemaSurql` and seeds
+   the circuit the way the SSP server does at boot. Without it `registerView`
+   fails.
+4. **The transport owns its reconnect.** The SurrealDB Dart client has no
+   reconnect loop, so `ConnectionSupervisor` covers all three ways a connection
+   dies: a closed socket (a revive loop on backoff, forever), a half-open one (a
+   heartbeat with a two-failure budget forces the teardown), and a wake signal.
+   The core is framework-agnostic, so the app calls `client.wake()` - in Flutter,
+   from `AppLifecycleState.resumed`.
+5. **Local-only mode.** With no endpoint configured the client never starts the
+   network half and never drains the outbox: draining against nothing would fail
+   in a way the classifier reads as the server rejecting the write, and a
+   rejection rolls the write back.
+
+Not ported (browser-only): shared tabs, the OPFS blob cache, the SQLite-WASM
+worker and its SurrealQL translator, the DevTools window bridge, the OTel
+exporter. CRDT collaborative fields are still deferred (the seam is in place).
 
 ## Native library
 
 The FFI processor needs `libssp_ffi`. Build and stage it with:
 
 ```bash
-bash packages/ssp-ffi/build-native.sh   # -> packages/spooky_core/native/<platform>/
+bash packages/ssp-ffi/build-native.sh           # host (macOS/Linux/Windows)
+bash packages/ssp-ffi/build-native.sh android   # arm64-v8a + x86_64
+bash packages/ssp-ffi/build-native.sh ios       # xcframework
 ```
 
-`SSP_FFI_PATH` overrides the library location (used in dev/tests).
+`SSP_FFI_PATH` overrides the library location (used in dev and tests).
 
 ## Usage
 
@@ -56,6 +121,25 @@ stream.listen((records) => print(records)); // or StreamBuilder in Flutter
 await client.create('thread:abc', {'title': 'hello'});
 ```
 
+A binding decides when to show a loader from the query's authority, not from its
+status:
+
+```dart
+final loading = !client.isQueryAuthoritative(hash);   // no server answer yet
+final empty = client.isQueryAuthoritative(hash) && rows.isEmpty;
+final complete = client.isQuerySettled(hash);         // sized, for a long list
+```
+
+Writes the server rejects are undone locally and parked, rather than retried
+forever or dropped:
+
+```dart
+client.subscribeToFailedMutations((count) => setState(() => failed = count));
+for (final row in await client.listFailedMutations()) {
+  await client.retryFailedMutation(row.id);   // or discardFailedMutation
+}
+```
+
 ### Compile-time-typed client (codegen)
 
 The dynamic API above (`String` tables, `Map` records) can be wrapped in a fully
@@ -71,115 +155,40 @@ final db = AppDb.open(const DatabaseConfig(namespace: 'app', database: 'app'));
 await db.init();
 
 Stream<List<Thread>> s = db.thread.query()
-    .where([Thread$.published.eq(true), Thread$.score.gt(10)])  // typed fields + operators
+    .where([Thread$.published.eq(true), Thread$.score.gt(10)])
     .orderBy(Thread$.createdAt, desc: true)
-    .watch();                                                   // Stream<List<Thread>>
+    .watch();
 
 await db.thread.create(Thread(id: 'thread:a', title: 'hi', author: uid));
-await db.thread.update('thread:a', ThreadPatch(title: 'renamed'));
-await db.run.api.spookify(id: 'thread:a');                      // typed backend route
-await db.auth.signInAccount(email: 'a@b.c', password: 'pw');    // typed auth
+await db.run.api.spookify(id: 'thread:a');
+await db.auth.signInAccount(email: 'a@b.c', password: 'pw');
 ```
 
 Wrong table/field, wrong operand type, or a missing route/auth arg is a **compile
-error**. The generated facade wraps `Sp00kyClient` (no runtime-core change); the
-typed-query runtime lives in `package:spooky_core/typed.dart`. SurrealQL declares
-no auth-var types (params are typed `String`); backend arg types come from the
-OpenAPI spec (string/int/num/bool, else `dynamic`).
+error**. The generated facade wraps `Sp00kyClient`; the typed-query runtime lives
+in `package:spooky_core/typed.dart`.
 
-## Deliberate divergences from the JS core
-
-1. **Permission seeding.** The browser circuit is effectively permissive; the
-   native circuit is default-deny. `StreamProcessorService.seedPermissionsFromSchema`
-   extracts each table's `PERMISSIONS FOR select` from `schemaSurql` and seeds
-   the circuit (the way the SSP server does at boot). This is required for
-   `registerView` to succeed.
-2. **Local read path.** sqlite can't run SurrealQL, so query results are
-   materialized from the circuit's `localArray` via `getById`, rather than by
-   re-running the registered SURQL. Ordering/limit/projection stay the circuit's
-   responsibility.
-3. **Stream `immediate` default.** `subscribeStream` replays the current result
-   set on first listen so a `StreamBuilder` renders immediately.
-
-## Status
-
-Implemented and tested (340 tests):
-- ssp-ffi C ABI + Dart FFI bindings (round-trip against the real native lib)
-- Foundations: RecordId, durations, surql builders, parser, EventSystem
-- Services: sqlite local store, stream-processor service, persistence
-- Modules: CacheModule, DataModule, Sp00kyClient (local-first read/write,
-  reactive Streams, optimistic mutations, pending-mutation outbox)
-- Remote sync: custom SurrealDB WebSocket JSON-RPC client, `Sp00kySync`
-  (UpQueue/DownQueue/SyncEngine/SyncScheduler), LIVE subscription + poll
-  fallback on `_00_list_ref[_user_<id>]`, reconnect re-registration.
-- `AuthService` and the auth-driven session/sync wiring in `init`.
-- sqlite-backed persistence (`SqlitePersistenceClient`, the default): the DBSP
-  circuit state and auth token survive restarts with a file-backed store.
-- TTL heartbeat lifecycle: each query re-registers at ~90% of its TTL so the
-  server-side registration does not expire.
-- `LocalMigrator`: schema-hash provisioning that wipes stale local data on a
-  schema change (preserving the auth token).
-- `run()` backend job outbox and `bucket()` file storage (`BucketHandle`:
-  put/get/delete/exists/head/copy/rename/list).
-- Fluent `QueryBuilder` (`client.query('table').where(...).orderBy(...).limit(...)
-  .stream()`) compiling to the same SURQL shape as the JS builder.
-- Codegen (`package:spooky_core/codegen.dart` + `dart run spooky_core:spooky_gen
-  <schema.surql> [out.dart]`): parses `DEFINE TABLE`/`DEFINE FIELD` and emits the
-  `ColumnSchema` map (for `Sp00kyConfig.schema`), the schema `relationships`, and
-  typed model classes.
-- **Sync health**: `syncHealth` / `subscribeToSyncHealth` / `syncHealthStream`
-  report `degraded` after a run of failed sync rounds (configurable via
-  `Sp00kyConfig.syncHealth`), with an exponential-backoff self-heal loop and the
-  idle `_00_list_ref` poll feeding health so a quiet client still recovers.
-- **Settled queries**: refcounted `beginFetching`/`endFetching` hold `fetching`
-  across a whole registration and land the debounced result BEFORE flipping to
-  `idle`, so `idle` means "this window is complete" (what a virtualized list
-  needs to size itself).
-- **Windowed queries**: an offset page (`LIMIT n START m`) materializes from the
-  server's authoritative `_00_list_ref` and re-applies the query's `ORDER BY`,
-  instead of re-deriving the page from whatever rows are resident locally.
-- **`preload()`** prewarms the local cache without registering a live view,
-  cache-aware through a durable `_00_preload` marker
-  (`onUse` / `background` / `stale` refresh policies), plus opt-in
-  `instantHydrate` for a cold query's first paint.
-- **`appRelease()`**: release announcements over the world-readable
-  `_00_app_release` table (`updateAvailable`, `mandatory`, `cacheBust`).
-- **`.related()`**: correlated subquery projections, with joined rows resolved
-  from the local cache (level-ordered batched fan-out, per-parent order/limit)
-  and subquery child bodies synced from the `parent`-tagged `_00_list_ref` edges.
-- `SyncScheduler.pause()` / `resume()`, `authenticate()` / `deauthenticate()`,
-  and `reportFrontendTiming()`.
-
-The full sync orchestration (up-queue -> remote, down-queue register + initial
-fetch, LIVE -> down-sync -> Stream) is verified end-to-end against a fake
-remote client. The `WebSocketSurrealClient` wire protocol is also validated
-against **live SurrealDB v2.1.4 and v3.1.2** (connect/signin/use, query with
-RecordId bind vars, LIVE + KILL, lifecycle), and the end-to-end mutation
-up-path (local create/update -> remote) is verified through the real client on
-both versions. The **down-path** (`fn::query::register` -> ssp materialization ->
-`_00_list_ref_user_<id>` -> LIVE/fetch -> Stream) is also validated end-to-end
-against a running ssp + SurrealDB stack, including a root-side UPDATE
-propagating via the LIVE feed (see `test/integration/downpath_e2e_test.dart`,
-point `SURREAL_DEV_WS` at the ssp's SurrealDB).
-
-### Running tests
+## Tests
 
 The `ssp-ffi` Rust cdylib installs `std`'s signal/stack-overflow handlers when
-loaded, which the Dart `test` runner's *secondary* suite isolates don't
-tolerate (a process hosts many suites). So run each test file in its own
-process:
+loaded, which the Dart `test` runner's *secondary* suite isolates do not
+tolerate. So run each test file in its own process:
 
 ```bash
 tool/run_tests.sh                 # unit tests, one process per file
 tool/run_tests.sh --integration   # integration tests (need a server)
 ```
 
-`dart test <single_file>` also works; the aggregate `dart test` (all files in
-one process) is the only thing affected. Real single-process app usage is fine.
+`dart test <single_file>` also works; only the aggregate `dart test` is
+affected. Real single-process app usage is fine.
+
+Every saga has a sibling test that drives it through `testing/run_pure.dart`
+with canned effect results and asserts the effect log, so a saga that yields a
+different sequence than its TypeScript twin fails.
 
 ### Integration tests
 
-Tagged `integration` and skipped unless a server is reachable. To run:
+Tagged `integration` and skipped unless a server is reachable:
 
 ```bash
 docker run -d --name surreal -p 18011:8000 \
@@ -189,16 +198,3 @@ SURREAL_IT_ENDPOINT=ws://127.0.0.1:18011 dart test --tags integration
 ```
 
 Validated against SurrealDB v2.1.4 and v3.1.2.
-
-Not yet implemented (seam in place):
-- CRDT collaborative fields (`openCrdtField`) — needs a Loro binding for Dart.
-
-Deliberately not ported (browser-only in the JS core): the SQLite-WASM worker /
-OPFS engine and its `workerSelect` plan path, the SurrealQL-over-SQLite
-translator, the DevTools window bridge, and the OTel log exporter.
-
-## Tests
-
-```bash
-dart test
-```

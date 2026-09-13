@@ -2,6 +2,7 @@ import '../kernel/constants.dart';
 import '../kernel/effects.dart';
 import '../kernel/events.dart';
 import '../kernel/saga.dart';
+import '../modules/query_builder.dart' show RelationPlan;
 import '../state/client_state.dart';
 import '../state/lifecycle.dart';
 import '../state/reducers.dart' as r;
@@ -30,7 +31,7 @@ class RegisterInput {
   final Map<String, dynamic> params;
   final QueryTimeToLive ttl;
   final bool hasExplicitOrder;
-  final List<Object> relations;
+  final List<RelationPlan> relations;
 }
 
 /// Register a query locally: compute its keys, read the durable `_00_view`

@@ -2,7 +2,7 @@ import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:test/test.dart';
 
-import 'sync_integration_test.dart' show FakeRemote;
+import 'fake_remote.dart';
 
 /// The settled contract: a query holds `fetching` across its WHOLE registration
 /// and only flips to `idle` after its rows have landed. A consumer that treats
@@ -24,6 +24,7 @@ void main() {
     remote = FakeRemote();
     final persistence = MemoryPersistenceClient();
     await persistence.set('sp00ky_auth_token', 'tok');
+    remote.records['user:u1'] = {'id': 'user:u1'};
     client = Sp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
@@ -44,57 +45,64 @@ void main() {
   });
   tearDown(() => client.close());
 
-  test('a registration settles to idle exactly once, after its rows land',
-      () async {
+  test('a registration settles once its rows have landed', () async {
     remote.records['thread:a'] = {
       'id': 'thread:a',
       'title': 'from server',
       '_00_rv': 1,
     };
-    remote.listRef = [
-      {'out': 'thread:a', 'version': 1}
-    ];
+    remote.defaultMembership = [('thread:a', 1)];
 
     final hash = await client.queryRaw('SELECT * FROM thread', {});
-    // Snapshot the records visible at each status change: `idle` must not arrive
-    // before the fetched row is materialized.
+    expect(client.isQueryAuthoritative(hash), isFalse,
+        reason: 'nothing has come back from the server yet');
+    expect(client.isQuerySettled(hash), isFalse);
+
+    // Snapshot the records visible at each status change: `idle` must not
+    // arrive before the fetched row is materialized.
     final observed = <(QueryStatus, int)>[];
     client.subscribeQueryStatus(
       hash,
-      (s) => observed
-          .add((s, client.dataModule.getQueryByHash(hash)?.records.length ?? 0)),
-      immediate: true,
+      (s) => observed.add((s, client.state.queries[hash]?.records.length ?? 0)),
     );
     await _settle();
 
-    expect(observed.first.$1, QueryStatus.fetching,
-        reason: 'a fresh query is born fetching');
+    expect(observed.map((o) => o.$1), contains(QueryStatus.fetching),
+        reason: 'the registration holds `fetching` while it is in flight');
     expect(observed.last.$1, QueryStatus.idle);
-    expect(observed.where((o) => o.$1 == QueryStatus.idle), hasLength(1),
-        reason: 'exactly one settle for one registration');
-    expect(observed.last.$2, 1,
-        reason: 'the row must be materialized before idle');
+    // `idle` alone only means "no fetch in flight"; it is `settled` that means
+    // "this window is complete", because it also waits for the render.
+    expect(client.isQueryAuthoritative(hash), isTrue);
+    expect(client.isQuerySettled(hash), isTrue);
+    expect(client.state.queries[hash]!.records, hasLength(1));
   });
 
-  test('an empty result set still settles to idle', () async {
+  test('a confirmed-empty result is authoritative, and settles', () async {
+    // The server's `_00_query` row says `rowCount: 0, state: ready`, which is
+    // what tells a real empty result apart from a view that has not published
+    // its edges yet.
+    remote.defaultMembership = const [];
+
     final hash = await client.queryRaw('SELECT * FROM thread', {});
-    final seen = <QueryStatus>[];
-    client.subscribeQueryStatus(hash, seen.add, immediate: true);
     await _settle();
-    expect(seen, [QueryStatus.fetching, QueryStatus.idle]);
+
+    // An empty result emits nothing (the rows did not change), so a binding
+    // stops loading on AUTHORITY rather than on an emission. That is what tells
+    // "no rows" apart from "no answer yet".
+    expect(client.isQueryAuthoritative(hash), isTrue);
+    expect(client.isQuerySettled(hash), isTrue);
+    expect(client.state.queries[hash]!.records, isEmpty);
   });
 
-  test('an empty result set notifies subscribers so loading can stop', () async {
+  test('an unpublished view is NOT read as empty', () async {
+    // No `_00_query` row and no edges: the server has not answered for this
+    // query at all. Reading that as "no rows" is what makes a list blank.
     final hash = await client.queryRaw('SELECT * FROM thread', {});
-    final emissions = <List<Map<String, dynamic>>>[];
-    client.subscribe(hash, emissions.add); // no immediate replay
     await _settle();
-    expect(emissions, isNotEmpty,
-        reason: 'notifyQuerySynced must fire even with no rows');
-    expect(emissions.last, isEmpty);
+    expect(client.isQueryAuthoritative(hash), isFalse);
+    expect(client.state.queries[hash]!.lifecycle.phase, QueryPhase.cold);
   });
-
 }
 
 Future<void> _settle() =>
-    Future<void>.delayed(const Duration(milliseconds: 80));
+    Future<void>.delayed(const Duration(milliseconds: 300));

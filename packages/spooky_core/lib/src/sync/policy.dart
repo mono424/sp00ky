@@ -344,7 +344,11 @@ HealthOutput nextHealth(
     return HealthOutput(
       health: SyncHealth(
         status: SyncHealthStatus.healthy,
-        consecutiveFailures: input.health.consecutiveFailures,
+        // Zeroed, unlike the browser core, which spreads the previous snapshot
+        // and leaves a healthy report claiming three consecutive failures. The
+        // snapshot is what an app renders; a healthy one with a failure count
+        // is just wrong.
+        consecutiveFailures: 0,
         everConnected: true,
         connection: input.health.connection,
       ),

@@ -17,7 +17,7 @@ void main() {
     setUp(() {
       db = LocalDatabaseService.open(logger);
       db.provision();
-      persistence = SqlitePersistenceClient(db);
+      persistence = SqlitePersistenceClient(() => db);
     });
     tearDown(() => db.close());
 
@@ -51,14 +51,14 @@ void main() {
       final db1 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db1.provision();
-      await SqlitePersistenceClient(db1).set('sp00ky_auth_token', 'tok-123');
+      await SqlitePersistenceClient(() => db1).set('sp00ky_auth_token', 'tok-123');
       db1.close();
 
       final db2 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db2.provision();
       final restored =
-          await SqlitePersistenceClient(db2).get<String>('sp00ky_auth_token');
+          await SqlitePersistenceClient(() => db2).get<String>('sp00ky_auth_token');
       db2.close();
 
       expect(restored, 'tok-123');
@@ -69,7 +69,7 @@ void main() {
       final db1 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db1.provision();
-      final sp1 = StreamProcessorService(SqlitePersistenceClient(db1), logger);
+      final sp1 = StreamProcessorService(SqlitePersistenceClient(() => db1), logger);
       await sp1.init();
       sp1.seedPermissionsFromSchema(
           'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;');
@@ -91,7 +91,7 @@ void main() {
       final db2 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db2.provision();
-      final sp2 = StreamProcessorService(SqlitePersistenceClient(db2), logger);
+      final sp2 = StreamProcessorService(SqlitePersistenceClient(() => db2), logger);
       await sp2.init(); // loadState() from sqlite
 
       final updates = sp2.ingest(

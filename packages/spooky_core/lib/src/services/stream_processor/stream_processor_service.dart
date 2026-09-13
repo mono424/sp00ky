@@ -183,6 +183,132 @@ class StreamProcessorService {
     _logger.info('Initialized');
   }
 
+  /// Fill the circuit from the LOCAL store.
+  ///
+  /// With a usable snapshot: install it under whatever views have registered
+  /// meanwhile (`loadStoreState` re-primes them), then `reconcile` each table
+  /// against the store's `(id, rv)` list so rows deleted since the checkpoint
+  /// are stepped out and only rows added or changed since are read back and
+  /// ingested. Without one: read every row and ingest it, chunked.
+  ///
+  /// Either way the circuit ends up equal to the local store without touching
+  /// the network, so the first sync diff is a real delta rather than "fetch
+  /// everything". Never throws: a failed prime just means the circuit fills
+  /// from sync instead.
+  Future<void> primeFromLocal({
+    required List<String> tables,
+    required Map<String, List<(String, int)>> versions,
+    required List<Map<String, dynamic>> Function(String table, List<String> ids)
+        selectByIds,
+    Uint8List? snapshot,
+    Set<String> pendingIds = const {},
+    void Function(String table, List<(String, int)> entries)? onVersions,
+  }) async {
+    final processor = _processor;
+    if (processor == null) return;
+    final sw = Stopwatch()..start();
+    var restored = false;
+    if (snapshot != null && snapshot.isNotEmpty) {
+      try {
+        _dispatchUpdates(processor.loadStoreState(snapshot));
+        restored = true;
+      } catch (e) {
+        _logger.warn('Circuit snapshot unreadable; priming from rows: $e');
+      }
+    }
+
+    var ingested = 0;
+    var deleted = 0;
+    for (final table in tables) {
+      final entries = versions[table] ?? const <(String, int)>[];
+      List<String> toFetch;
+      if (restored) {
+        final result = processor.reconcile(table, entries);
+        _dispatchUpdates(result.updates);
+        deleted += result.deleted;
+        toFetch = result.fetch;
+      } else {
+        toFetch = [for (final (id, _) in entries) id];
+      }
+      for (var i = 0; i < toFetch.length; i += _primeChunk) {
+        final chunk = toFetch.sublist(
+            i, i + _primeChunk > toFetch.length ? toFetch.length : i + _primeChunk);
+        final rows = selectByIds(table, chunk);
+        if (rows.isEmpty) continue;
+        _dispatchUpdates(ingestMany([
+          for (final row in rows)
+            IngestRecord(
+              table: table,
+              op: IngestOp.create,
+              id: row['id'].toString(),
+              record: row,
+            )
+        ]));
+        ingested += rows.length;
+      }
+      if (entries.isNotEmpty && onVersions != null) {
+        // A row with a local write still queued is NOT at the server's version,
+        // so it must not be reported as if it were.
+        onVersions(table, [
+          for (final e in entries)
+            if (!pendingIds.contains(e.$1)) e
+        ]);
+      }
+    }
+    _logger.info('Circuit primed from the local store '
+        '(restored: $restored, ingested: $ingested, deleted: $deleted, '
+        '${sw.elapsedMilliseconds}ms)');
+  }
+
+  static const int _primeChunk = 500;
+
+  /// Ingest many records as ONE circuit step. Returns the coalesced updates and
+  /// fans them out, exactly as [ingest] does for a single record.
+  List<StreamUpdate> ingestMany(List<IngestRecord> records) {
+    final processor = _processor;
+    if (processor == null || records.isEmpty) return const [];
+    try {
+      final updates = processor.ingestMany([
+        for (final r in records)
+          {
+            'table': r.table,
+            'op': r.opName,
+            'id': r.id,
+            'record': _normalizeValue(r.record),
+          }
+      ]);
+      if (updates.isNotEmpty) _notifyUpdates(updates);
+      if (!_batching) saveState();
+      return updates;
+    } catch (e) {
+      _logger.error('Batch ingest failed', e);
+      return const [];
+    }
+  }
+
+  /// Throw the circuit away and start from an empty one, keeping the
+  /// permissions and the session identity. Used by a bucket switch: the rows in
+  /// it belong to the store that is being replaced.
+  Future<void> resetCircuit() async {
+    _processor?.dispose();
+    _processor = StreamProcessor.create();
+    await _persistence.remove(_stateKey);
+    _batchBuffer.clear();
+    _batching = false;
+  }
+
+  /// Snapshot the circuit's base collections for the next boot's prime.
+  Uint8List? saveStoreSnapshot() {
+    final processor = _processor;
+    if (processor == null) return null;
+    try {
+      return processor.saveStoreState();
+    } catch (e) {
+      _logger.warn('Circuit snapshot failed: $e');
+      return null;
+    }
+  }
+
   /// Seed per-table `select` permissions from the schema SURQL. Call after
   /// [init] and before registering real-table queries.
   void seedPermissionsFromSchema(String schemaSurql) {

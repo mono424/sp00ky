@@ -57,12 +57,13 @@ class Sp00kyConfig {
     required this.schemaSurql,
     this.logLevel = 'info',
     this.persistenceClient,
-    this.streamDebounceTime = 100,
+    this.streamDebounceTime = 50,
     this.crdtDebounceMs = 500,
     this.refSyncIntervalMs = 500,
     this.enableAnonymousLiveQueries = false,
     this.syncHealth = const SyncHealthConfig(),
-    this.instantHydrate = false,
+    this.liveInlineBodies = false,
+    this.reconnect = const ReconnectConfig(),
   });
 
   final DatabaseConfig database;
@@ -75,6 +76,9 @@ class Sp00kyConfig {
   final String schemaSurql;
   final String logLevel;
   final dynamic persistenceClient;
+  /// Trailing coalesce (ms) before a dirty query re-materializes. Matches the
+  /// browser core's `MATERIALIZE_DEBOUNCE_MS`, so the two clients repaint on
+  /// the same cadence.
   final int streamDebounceTime;
   final int crdtDebounceMs;
   final int refSyncIntervalMs;
@@ -100,45 +104,18 @@ class Sp00kyConfig {
   /// [SyncHealthConfig.disabled] to never report degraded.
   final SyncHealthConfig? syncHealth;
 
-  /// Opt-in instant-hydrate for cold queries: when enabled and a query has not
-  /// yet fetched its server result, the client runs the query's own SURQL
-  /// one-shot against the remote and ingests the rows, so the query displays
-  /// immediately while the realtime registration proceeds in the background
-  /// (TS `Sp00kyConfig.instantHydrate`).
+  /// Ask the LIVE subscription to join the changed row onto its notification
+  /// (`FETCH out`), so a body arrives with the doorbell instead of costing a
+  /// second round trip.
   ///
-  /// Off by default: the register lifecycle is the single freshness path, and a
-  /// query already paints from the local cache with no network on the paint
-  /// path. Enable it when a cold query's first paint matters more than the extra
-  /// round-trip.
-  final bool instantHydrate;
-}
+  /// Only ever an optimisation: a server that ignores the clause, or a row the
+  /// session may not read, simply yields no inline row and the fetch path takes
+  /// over. Requires a server that publishes readable `out` targets.
+  final bool liveInlineBodies;
 
-/// When a warm (already-preloaded) query should be silently refetched
-/// (TS `PreloadRefresh`).
-enum PreloadRefresh {
-  /// Never refetch on preload; the data freshens when the real query mounts and
-  /// registers its live view. The default.
-  onUse,
-
-  /// Always kick a one-time silent refetch in the background.
-  background,
-
-  /// Refetch only when the cached snapshot is older than
-  /// [PreloadOptions.staleTime].
-  stale,
-}
-
-/// Options for `Sp00kyClient.preload` (TS `PreloadOptions`).
-class PreloadOptions {
-  const PreloadOptions({
-    this.refresh = PreloadRefresh.onUse,
-    this.staleTime = '1h',
-  });
-
-  final PreloadRefresh refresh;
-
-  /// Max age of a cached snapshot before [PreloadRefresh.stale] refetches it.
-  final QueryTimeToLive staleTime;
+  /// Transport supervision knobs: the reconnect backoff cap and the liveness
+  /// probe that detects a half-open socket.
+  final ReconnectConfig reconnect;
 }
 
 /// Tunables for sync-health reporting (TS `SyncHealthConfig`).

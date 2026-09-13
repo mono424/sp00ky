@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:meta/meta.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../kernel/effects.dart' show StatementResult;
 import 'cbor_codec.dart';
 
 /// A LIVE-query notification (TS SurrealDB `live` message).
@@ -12,6 +13,19 @@ class LiveMessage {
   /// `'CREATE' | 'UPDATE' | 'DELETE' | 'KILLED'`.
   final String action;
   final Map<String, dynamic> value;
+}
+
+/// Implemented by a client that can answer a multi-statement request WITHOUT
+/// collapsing it: the saga core reads four statements from one register request
+/// and tolerates an error on the last three.
+///
+/// Optional on purpose. [RemoteSurrealClient] keeps its throwing [query] as the
+/// one method every implementation (including the test fakes) must provide;
+/// `statementResults` in the adapter layer falls back to it.
+abstract interface class StatementAwareRemote {
+  /// Per-statement outcomes, in order. Never throws for a failed statement.
+  Future<List<StatementResult>> queryStatements(String sql,
+      [Map<String, dynamic>? vars]);
 }
 
 /// The subset of the SurrealDB client the core needs. Decouples the core from
@@ -47,7 +61,8 @@ abstract class RemoteSurrealClient {
 /// so bind vars carry real record ids / datetimes — SurrealDB won't match a
 /// `record<…>` field against a plain string, which silently broke every
 /// record-filtered query. See [cbor_codec] for the encode/normalize rules.
-class WebSocketSurrealClient implements RemoteSurrealClient {
+class WebSocketSurrealClient
+    implements RemoteSurrealClient, StatementAwareRemote {
   WebSocketSurrealClient();
 
   WebSocketChannel? _channel;
@@ -76,17 +91,56 @@ class WebSocketSurrealClient implements RemoteSurrealClient {
 
   @override
   Future<void> connect(String endpoint) async {
+    if (_channel != null) await forceClose();
     final uri = Uri.parse(_rpcEndpoint(endpoint));
     final channel = createChannel(uri);
     _channel = channel;
     await channel.ready;
     channel.stream.listen(
       _onMessage,
-      onDone: () => _disconnected.add(null),
-      onError: (_) => _disconnected.add(null),
+      onDone: () => _onSocketEnd(null),
+      onError: (Object error) => _onSocketEnd(error),
       cancelOnError: false,
     );
     _connected.add(null);
+  }
+
+  /// The socket ended. Every in-flight RPC is now unanswerable: completing it
+  /// with an error is what lets a caller retry instead of hanging forever, and
+  /// what makes the supervisor's probe fail fast on a dead socket.
+  void _onSocketEnd(Object? error) {
+    final pending = [..._pending.values];
+    _pending.clear();
+    final reason = StateError(
+        'WebSocket closed before the response arrived${error == null ? '' : ': $error'}');
+    for (final completer in pending) {
+      if (!completer.isCompleted) completer.completeError(reason);
+    }
+    // The server-side LIVE queries die with the socket; the sagas re-subscribe
+    // on the next `connected`.
+    for (final controller in _liveControllers.values) {
+      unawaited(controller.close());
+    }
+    _liveControllers.clear();
+    if (!_disconnected.isClosed) _disconnected.add(null);
+  }
+
+  /// True while a socket is open. The supervisor reads this rather than
+  /// tracking the transport itself.
+  bool get isConnected => _channel != null;
+
+  /// Drop the socket without disposing the client, so the supervisor can force
+  /// the close a half-open connection never delivers and then re-open.
+  Future<void> forceClose() async {
+    final channel = _channel;
+    _channel = null;
+    if (channel == null) return;
+    try {
+      await channel.sink.close();
+    } catch (_) {
+      // A socket that is already gone is exactly what we wanted.
+    }
+    _onSocketEnd(null);
   }
 
   String _rpcEndpoint(String endpoint) {
@@ -216,6 +270,23 @@ class WebSocketSurrealClient implements RemoteSurrealClient {
   }
 
   @override
+  Future<List<StatementResult>> queryStatements(String sql,
+      [Map<String, dynamic>? vars]) async {
+    final result = await _rpc('query', [sql, vars ?? const <String, dynamic>{}]);
+    if (result is! List) return [StatementResult.ok(result)];
+    return [
+      for (final stmt in result)
+        if (stmt is Map && stmt.containsKey('result'))
+          if (stmt['status'] != null && stmt['status'] != 'OK')
+            StatementResult.err(stmt['result'].toString())
+          else
+            StatementResult.ok(stmt['result'])
+        else
+          StatementResult.ok(stmt)
+    ];
+  }
+
+  @override
   Future<(String, Stream<LiveMessage>)> live(String sql,
       [Map<String, dynamic>? vars]) async {
     final results = await query(sql, vars);
@@ -233,11 +304,19 @@ class WebSocketSurrealClient implements RemoteSurrealClient {
 
   @override
   Future<void> close() async {
-    await _channel?.sink.close();
+    final channel = _channel;
+    _channel = null;
+    await channel?.sink.close();
     for (final c in _liveControllers.values) {
       await c.close();
     }
     _liveControllers.clear();
+    for (final completer in _pending.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(StateError('Client closed'));
+      }
+    }
+    _pending.clear();
     await _connected.close();
     await _disconnected.close();
   }

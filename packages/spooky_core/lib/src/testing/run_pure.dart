@@ -63,7 +63,7 @@ class _PureCtx implements Ctx {
     final custom = handlers[effect.kind];
     if (custom != null) return await custom(effect, ctx) as R;
     switch (effect) {
-      case StateRead<R>(:final select):
+      case StateRead(:final select):
         return select(ctx.state);
       case StateUpdate(:final fn):
         ctx.state = fn(ctx.state);

@@ -1,0 +1,10 @@
+[mcp_servers.sp00ky]
+command = "npx"
+args = [
+    "@spooky-sync/cli@0.0.1-canary.35",
+    "mcp",
+]
+
+[mcp_servers.spooky-devtools]
+command = "node"
+args = ["apps/devtools-mcp/dist/index.js"]

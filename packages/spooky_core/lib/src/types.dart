@@ -546,3 +546,24 @@ class QueryTimings {
   final int updateCount;
   final int errorCount;
 }
+
+/// Transport supervision knobs (TS `ReconnectConfig`).
+class ReconnectConfig {
+  const ReconnectConfig({
+    this.retryDelayMaxMs = 15000,
+    this.heartbeatIntervalMs = 20000,
+    this.heartbeatTimeoutMs = 10000,
+  });
+
+  /// Cap on the supervisor's exponential backoff between reconnect attempts.
+  final int retryDelayMaxMs;
+
+  /// Cadence of the application-level liveness probe (`RETURN true`) that
+  /// detects a half-open socket the transport never reports as closed. `0`
+  /// disables the heartbeat.
+  final int heartbeatIntervalMs;
+
+  /// Deadline for a heartbeat response. Exceeding it means the socket is dead
+  /// regardless of what it claims, so the connection is torn down and rebuilt.
+  final int heartbeatTimeoutMs;
+}

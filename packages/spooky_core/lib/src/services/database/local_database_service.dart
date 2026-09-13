@@ -163,6 +163,96 @@ class LocalDatabaseService {
     );
   }
 
+  // ---- generic document access ----------------------------------------------
+  //
+  // The saga core addresses the store as a document store by `(table, id)`.
+  // Domain rows and the internal tables that have no dedicated sqlite table
+  // (`_00_view`, `_00_window`, `_00_failed_mutations`) live in `records`;
+  // `_00_query` and `_00_pending_mutations` keep the dedicated tables they
+  // already had, so an existing local database keeps working.
+
+  int _epoch = 0;
+
+  /// Bumped whenever the store this service points at is replaced. A write
+  /// fenced with a stale epoch is dropped rather than landing in the wrong
+  /// bucket.
+  int get epoch => _epoch;
+
+  void bumpEpoch() => _epoch++;
+
+  bool _isQueryRegistry(String table) => table == '_00_query';
+  bool _isOutbox(String table) => table == '_00_pending_mutations';
+
+  Map<String, dynamic>? _withId(Map<String, dynamic>? doc, String id) {
+    if (doc == null) return null;
+    return doc['id'] == null ? {...doc, 'id': id} : doc;
+  }
+
+  Map<String, dynamic>? getDoc(String table, String id) {
+    if (_isQueryRegistry(table)) return _withId(getQueryConfig(id), id);
+    if (_isOutbox(table)) {
+      final rs =
+          _db.select('SELECT doc FROM _00_pending_mutations WHERE id = ?', [id]);
+      if (rs.isEmpty) return null;
+      return _withId(
+          jsonDecode(rs.first['doc'] as String) as Map<String, dynamic>, id);
+    }
+    return getById(id);
+  }
+
+  /// Resolve many rows by id, in the order asked. Ids the store does not hold
+  /// are dropped: this is the materialization read.
+  List<Map<String, dynamic>> getDocs(String table, List<String> ids) {
+    final out = <Map<String, dynamic>>[];
+    for (final id in ids) {
+      final doc = getDoc(table, id);
+      if (doc != null) out.add(doc);
+    }
+    return out;
+  }
+
+  List<Map<String, dynamic>> getAllDocs(String table) {
+    if (_isQueryRegistry(table)) return getAllQueryConfigs();
+    if (_isOutbox(table)) {
+      final rs = _db.select('SELECT id, doc FROM _00_pending_mutations');
+      return [
+        for (final row in rs)
+          _withId(jsonDecode(row['doc'] as String) as Map<String, dynamic>,
+              row['id'] as String)!
+      ];
+    }
+    return getAll(table);
+  }
+
+  void putDoc(String table, String id, Map<String, dynamic> data,
+      {bool merge = false}) {
+    if (_isQueryRegistry(table)) {
+      if (merge) {
+        patchQueryConfig(id, data);
+      } else {
+        putQueryConfig(id, data);
+      }
+      return;
+    }
+    if (_isOutbox(table)) {
+      putMutation(id, data);
+      return;
+    }
+    if (merge) {
+      upsertMerge(id, data);
+    } else {
+      replace(id, data);
+    }
+  }
+
+  void deleteDoc(String table, String id) {
+    if (_isQueryRegistry(table)) return deleteQueryConfig(id);
+    if (_isOutbox(table)) return deleteMutation(id);
+    return delete(id);
+  }
+
+  void bumpRv(String table, String id) => incrementRv(id);
+
   // ---- _00_query registry --------------------------------------------------
 
   Map<String, dynamic>? getQueryConfig(String id) {

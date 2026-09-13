@@ -40,21 +40,37 @@ void main() {
       await root.connect(endpoint).timeout(const Duration(seconds: 3));
       await root.signin({'user': 'root', 'pass': 'root'});
       await root.use(namespace: ns, database: db);
-      // Sign up a fresh user via the `account` access to get a user token.
+      // Create the test user as ROOT, then sign in through the `account`
+      // access. Going through SIGNUP instead would have to satisfy whatever
+      // gate the deployed schema puts on it (an invite code, a trial window),
+      // which is the app's business and not this test's.
+      const password = 'pw-12345';
       final email = 'dp_${DateTime.now().microsecondsSinceEpoch}@e2e.test';
+      final created = await root.query(
+        r'CREATE ONLY user SET email = $email, '
+        r'password = crypto::argon2::generate($password)',
+        {'email': email, 'password': password},
+      );
+      final row = created.isNotEmpty ? created.first : null;
+      userId = row is Map ? row['id']?.toString() : null;
+      if (userId == null) throw StateError('could not create the test user');
+      createdIds.add(userId!); // clean up the test user
+
       final sc = WebSocketSurrealClient();
       await sc.connect(endpoint);
       await sc.use(namespace: ns, database: db);
-      token = (await sc.signup({
+      token = (await sc.signin({
         'access': 'account',
-        'variables': {'email': email, 'password': 'pw-12345'},
+        'variables': {'email': email, 'password': password},
       })) as String?;
-      // Resolve the user's record id.
-      final who = await sc.query(r'SELECT VALUE id FROM ONLY $auth.id');
-      userId = who.isNotEmpty ? who.first?.toString() : null;
-      if (userId != null) createdIds.add(userId!); // clean up the test user
       await sc.close();
     } catch (e) {
+      for (final id in createdIds) {
+        try {
+          await root.query('DELETE \$id', {'id': RecordId.parse(id)});
+        } catch (_) {}
+      }
+      createdIds.clear();
       await root.close();
       markTestSkipped('Dev stack not reachable at $endpoint: $e');
       return;

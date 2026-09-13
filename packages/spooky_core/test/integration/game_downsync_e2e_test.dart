@@ -69,18 +69,29 @@ DEFINE TABLE game PERMISSIONS FOR select WHERE true;
       await root.signin({'user': 'root', 'pass': 'root'});
       await root.use(namespace: ns, database: db);
 
+      // Created as ROOT and signed in, rather than signed up: the deployed
+      // schema may gate SIGNUP (an invite code, a trial window) and that is the
+      // app's business, not this test's.
+      const password = 'pw-12345';
       final email = 'gd_${DateTime.now().microsecondsSinceEpoch}@e2e.test';
+      final created = await root.query(
+        r'CREATE ONLY user SET email = $email, '
+        r'password = crypto::argon2::generate($password)',
+        {'email': email, 'password': password},
+      );
+      final row = created.isNotEmpty ? created.first : null;
+      userId = row is Map ? row['id']?.toString() : null;
+      if (userId == null) throw StateError('could not create the test user');
+      createdIds.add(userId!);
+
       final sc = WebSocketSurrealClient();
       await sc.connect(endpoint);
       await sc.use(namespace: ns, database: db);
-      token = (await sc.signup({
+      token = (await sc.signin({
         'access': 'account',
-        'variables': {'email': email, 'password': 'pw-12345'},
+        'variables': {'email': email, 'password': password},
       })) as String?;
-      final who = await sc.query(r'SELECT VALUE id FROM ONLY $auth.id');
-      userId = who.isNotEmpty ? who.first?.toString() : null;
       await sc.close();
-      if (userId != null) createdIds.add(userId!);
     } catch (e) {
       await root.close();
       markTestSkipped('Dev stack not reachable at $endpoint: $e');
@@ -191,7 +202,10 @@ DEFINE TABLE game PERMISSIONS FOR select WHERE true;
         reason: 'a newly-created game should appear in the live query');
 
     // (c) realtime DELETE: removing it out-of-band drops it from the window.
-    await root.query('DELETE type::record(\$id)', {'id': added});
+    // Retried: the SSP is re-materializing the same row, and SurrealDB answers
+    // a racing write with a retryable transaction conflict.
+    await _withRetry(
+        () => root.query('DELETE type::record(\$id)', {'id': added}));
     createdIds.remove(added);
     final sawDelete = await waitUntil(() => !latestIds().contains(added));
     expect(sawDelete, isTrue,
@@ -201,4 +215,19 @@ DEFINE TABLE game PERMISSIONS FOR select WHERE true;
     expect(seeded.every(latestIds().contains), isTrue,
         reason: 'the original games should remain; got ${latestIds()}');
   }, timeout: const Timeout(Duration(seconds: 90)));
+}
+
+/// Retry a root write that a concurrent SSP transaction can conflict with.
+Future<T> _withRetry<T>(Future<T> Function() run, {int attempts = 5}) async {
+  Object? last;
+  for (var i = 0; i < attempts; i++) {
+    try {
+      return await run();
+    } catch (e) {
+      last = e;
+      if (!e.toString().toLowerCase().contains('conflict')) rethrow;
+      await Future<void>.delayed(Duration(milliseconds: 100 * (i + 1)));
+    }
+  }
+  throw StateError('write kept conflicting: $last');
 }

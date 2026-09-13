@@ -65,19 +65,28 @@ void main() {
       await root.signin({'user': 'root', 'pass': 'root'});
       await root.use(namespace: ns, database: db);
 
-      // The example `account` access signs up with a unique `username`
-      // (len > 3, UNIQUE) + `password`; share keys are optional.
-      final username = 'ff_${DateTime.now().microsecondsSinceEpoch}';
+      // Created as ROOT and signed in, rather than signed up: the deployed
+      // schema may gate SIGNUP (an invite code, a trial window) and that is the
+      // app's business, not this test's.
+      const password = 'pw-12345';
+      final email = 'ff_${DateTime.now().microsecondsSinceEpoch}@e2e.test';
+      final created = await root.query(
+        r'CREATE ONLY user SET email = $email, '
+        r'password = crypto::argon2::generate($password)',
+        {'email': email, 'password': password},
+      );
+      final row = created.isNotEmpty ? created.first : null;
+      userId = row is Map ? row['id']?.toString() : null;
+      if (userId == null) throw StateError('could not create the test user');
+      createdUserIds.add(userId!);
+
       final sc = WebSocketSurrealClient();
       await sc.connect(endpoint);
       await sc.use(namespace: ns, database: db);
-      token = (await sc.signup({
+      token = (await sc.signin({
         'access': 'account',
-        'variables': {'username': username, 'password': 'pw-12345'},
+        'variables': {'email': email, 'password': password},
       })) as String?;
-      final who = await sc.query(r'SELECT VALUE id FROM ONLY $auth.id');
-      userId = who.isNotEmpty ? who.first?.toString() : null;
-      if (userId != null) createdUserIds.add(userId!);
       await sc.close();
 
       // A flag definition the client can never read (PERMISSIONS NONE), enabled

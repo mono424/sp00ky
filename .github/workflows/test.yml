@@ -38,3 +38,25 @@ jobs:
 
       - name: Test core with coverage
         run: pnpm --filter @spooky-sync/core test:coverage
+
+  dart-core:
+    name: Dart core (native, analysis, codegen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build host FFI library
+        run: bash packages/ssp-ffi/build-native.sh
+      - name: Resolve Dart dependencies
+        working-directory: packages/spooky_core
+        run: dart pub get
+      - name: Analyze Dart core and tests
+        working-directory: packages/spooky_core
+        run: dart analyze lib test
+      - name: Run native and codegen tests in separate processes
+        working-directory: packages/spooky_core
+        env:
+          SSP_FFI_PATH: ${{ github.workspace }}/packages/spooky_core/native/linux/libssp_ffi.so
+        run: bash tool/run_tests.sh

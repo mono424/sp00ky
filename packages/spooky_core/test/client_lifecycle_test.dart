@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:test/test.dart';
 
@@ -18,7 +19,7 @@ class _RecordingRemote extends FakeRemote {
   Future<void> invalidate() async => invalidateCount++;
 }
 
-/// Local-only Sp00kyClient surface: init, queries as Streams, callback
+/// Local-only InProcessSp00kyClient surface: init, queries as Streams, callback
 /// subscribe, mutation counts, CRDT stubs, and double-init/close safety.
 void main() {
   final schema = {
@@ -28,9 +29,9 @@ void main() {
   };
   const schemaSurql = 'DEFINE TABLE thread PERMISSIONS FOR select WHERE true;';
 
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
   setUp(() async {
-    client = Sp00kyClient(Sp00kyConfig(
+    client = InProcessSp00kyClient(Sp00kyConfig(
       database: const DatabaseConfig(namespace: 't', database: 't'),
       schema: schema,
       schemaSurql: schemaSurql,
@@ -130,17 +131,17 @@ void main() {
     for (var i = 0; i < materializationSampleWindow + 10; i++) {
       client.reportFrontendTiming(hash, i.toDouble());
     }
-    expect(client.queryTimings(hash)!.frontend.count,
-        materializationSampleWindow);
+    expect(
+        client.queryTimings(hash)!.frontend.count, materializationSampleWindow);
   });
 
   group('with a remote endpoint', () {
     late _RecordingRemote remote;
-    late Sp00kyClient remoteClient;
+    late InProcessSp00kyClient remoteClient;
 
     setUp(() async {
       remote = _RecordingRemote();
-      remoteClient = Sp00kyClient(
+      remoteClient = InProcessSp00kyClient(
         Sp00kyConfig(
           database: const DatabaseConfig(
               endpoint: 'ws://x', namespace: 't', database: 't'),

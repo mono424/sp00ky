@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:test/test.dart';
@@ -10,7 +11,7 @@ import 'fake_remote.dart';
 /// short page) depends on that ordering.
 void main() {
   late FakeRemote remote;
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
 
   const schemaSurql =
       'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;';
@@ -25,7 +26,7 @@ void main() {
     final persistence = MemoryPersistenceClient();
     await persistence.set('sp00ky_auth_token', 'tok');
     remote.records['user:u1'] = {'id': 'user:u1'};
-    client = Sp00kyClient(
+    client = InProcessSp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
           endpoint: 'ws://localhost:8000',

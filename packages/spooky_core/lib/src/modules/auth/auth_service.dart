@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'sp00ky_auth.dart';
+import '../../utils/error_classification.dart';
 
 import '../../events/event_system.dart';
 import '../../services/database/remote_database_service.dart';
@@ -16,7 +18,7 @@ EventSystem createAuthEventSystem() =>
 
 /// Auth state management (TS `AuthService`). The TS conditional access-param
 /// types collapse to runtime `Map` validation against `schema['access']`.
-class AuthService {
+class AuthService implements Sp00kyAuth {
   AuthService(
       this._schema, this._remote, this._persistence, SpookyLogger logger)
       : _logger = logger.child('AuthService');
@@ -40,11 +42,33 @@ class AuthService {
   /// back. So the flush has to happen here, first, and it is best-effort: a
   /// failure must never block signing out.
   Future<void> Function()? onBeforeSignOut;
+  Future<void> Function(String?)? onSessionChanged;
+  int _generation = 0;
+  Future<void>? _checking;
+  bool needsVerification = false;
+  AuthVerificationError? _verificationError;
+  AuthVerificationError? get verificationError => _verificationError;
 
-  String? token;
-  Map<String, dynamic>? currentUser;
-  bool isAuthenticated = false;
-  bool isLoading = true;
+  void dispose() {
+    _generation++;
+    onSessionChanged = null;
+    onBeforeSignOut = null;
+  }
+
+  Future<void> publishSession() async {
+    final generation = _generation;
+    await onSessionChanged?.call(currentUser?['id']?.toString());
+    if (generation == _generation) _notifyListeners();
+  }
+
+  String? _token;
+  String? get token => _token;
+  Map<String, dynamic>? _currentUser;
+  Map<String, dynamic>? get currentUser => _currentUser;
+  bool _isAuthenticated = false;
+  bool get isAuthenticated => _isAuthenticated;
+  bool _isLoading = true;
+  bool get isLoading => _isLoading;
 
   /// The record-access method the session was opened with (TS `auth.access`),
   /// e.g. "account". Needed for SSP permission injection: a table permission
@@ -52,7 +76,8 @@ class AuthService {
   ///
   /// Set on signIn/signUp, and recovered from the token's `AC` claim on
   /// [check] so it survives a restart (where no signIn call happens).
-  String? access;
+  String? _access;
+  String? get access => _access;
 
   EventSystem get eventSystem => _events;
 
@@ -77,7 +102,6 @@ class AuthService {
         AuthEventTypes.authStateChanged, currentUser?['id']?.toString());
   }
 
-
   /// Read the `AC` (access) claim out of a SurrealDB JWT without verifying it.
   /// Verification is the server's job; this only recovers which access method
   /// the existing session used so [access] survives a restart.
@@ -90,14 +114,16 @@ class AuthService {
   /// client act on what it already holds so a warm boot paints as the right
   /// user before the network answers. `check()` replaces the user row wholesale
   /// once the server does answer.
-  Future<String?> restoreSessionFromToken() async {
+  Future<String?> restoreSessionFromToken({bool notify = true}) async {
+    _isLoading = false;
     final tok = await _persistence.get<String>(_tokenKey);
     if (tok == null) return null;
     final claims = _claimsFromToken(tok);
     final userId = claims.userId;
     if (userId == null) return null;
 
-    token = tok;
+    _token = tok;
+    needsVerification = true;
     // Hand it to the transport too, so a socket rebuilt from scratch later (the
     // supervisor's revive loop) comes back authenticated. Without this the
     // client kept reporting this user while its session was anonymous, and
@@ -105,10 +131,11 @@ class AuthService {
     _remote.setAuthToken(tok);
     // Only the id: the full row is not in the token. It lands from the local
     // cache when the app's own `user` query paints.
-    currentUser = {'id': userId};
-    isAuthenticated = true;
-    access = claims.access;
-    _notifyListeners();
+    _currentUser = Map.unmodifiable({'id': userId});
+    _isAuthenticated = true;
+    _access = claims.access;
+    _isLoading = false;
+    if (notify) await publishSession();
     _logger.debug('Session restored optimistically from the cached token');
     return userId;
   }
@@ -137,34 +164,65 @@ class AuthService {
   }
 
   /// Validate an existing or supplied token and hydrate the user.
-  Future<void> check([String? accessToken]) async {
-    isLoading = true;
+  Future<void> check([String? accessToken]) {
+    if (accessToken != null) return _check(accessToken);
+    return _checking ??= _check(null).whenComplete(() => _checking = null);
+  }
+
+  Future<void> _check(String? accessToken) async {
+    final generation = _generation;
+    final previousToken = token;
+    _isLoading = true;
     try {
       final tok = accessToken ?? await _persistence.get<String>(_tokenKey);
+      if (generation != _generation) return;
       if (tok == null) {
-        isLoading = false;
-        isAuthenticated = false;
-        _notifyListeners();
+        needsVerification = false;
         return;
       }
-
       await _remote.authenticate(tok);
+      if (generation != _generation) return;
       final user = await _fetchAuthUser();
+      if (generation != _generation) return;
       if (user != null && user['id'] != null) {
         await _setSession(tok, user);
+        if (generation == _generation) {
+          needsVerification = false;
+          _verificationError = null;
+        }
       } else {
-        await signOut();
+        throw StateError('Invalid authentication: account not found');
       }
-    } catch (error) {
-      _logger.error('Auth check failed', error);
-      await signOut();
+    } catch (error, stack) {
+      if (generation != _generation) return;
+      _verificationError = AuthVerificationError(
+          classifySyncError(error), error.toString(), stack.toString());
+      final message = error.toString().toLowerCase();
+      final rejected = message.contains('invalid authentication') ||
+          message.contains('invalid token') ||
+          message.contains('token expired') ||
+          message.contains('authentication failed') ||
+          message.contains('problem with authentication');
+      if (rejected) {
+        await _signOut(flush: false);
+      } else {
+        needsVerification = previousToken != null;
+        _logger.warn('Auth verification deferred: $error');
+      }
+      // A newly supplied credential must never appear to succeed offline.
+      if (accessToken != null ||
+          previousToken == null ||
+          classifySyncError(error) != 'network') rethrow;
     } finally {
-      isLoading = false;
+      if (generation == _generation) {
+        _isLoading = false;
+        _notifyListeners();
+      }
     }
   }
 
   Future<Map<String, dynamic>?> _fetchAuthUser() async {
-    final result = await _remote.query('SELECT * FROM ONLY \$auth.id');
+    final result = await _remote.queryAuthUser();
     final first = result.isNotEmpty ? result.first : null;
     if (first is List)
       return first.isNotEmpty
@@ -174,57 +232,104 @@ class AuthService {
     return null;
   }
 
-  Future<void> signOut() async {
+  Future<void> signOut() => _signOut();
+
+  Future<void> _signOut({bool flush = true}) async {
+    final generation = ++_generation;
+    _isLoading = false;
     try {
-      await onBeforeSignOut?.call();
+      if (flush) await onBeforeSignOut?.call();
     } catch (err) {
       _logger.debug('Outbox flush before signOut failed: $err');
     }
-    token = null;
-    currentUser = null;
-    isAuthenticated = false;
-    access = null;
-    _remote.setAuthToken(null);
-    await _persistence.remove(_tokenKey);
+    if (generation != _generation) return;
+    final transition = _remote.beginSessionTransition();
     try {
-      await _remote.invalidate();
-    } catch (err) {
-      // Local sign-out already cleared the token/session above; a failed remote
-      // invalidate (e.g. server unreachable) must not block signing out.
-      _logger.debug('Remote token invalidate failed during signOut: $err');
+      needsVerification = false;
+      _verificationError = null;
+      _token = null;
+      _currentUser = null;
+      _isAuthenticated = false;
+      _access = null;
+      _remote.setAuthToken(null);
+      await _persistence.remove(_tokenKey);
+      await publishSession();
+      try {
+        await _remote.invalidate().timeout(const Duration(seconds: 2));
+      } catch (err) {
+        // Local sign-out already cleared the token/session above; a failed remote
+        // invalidate (e.g. server unreachable) must not block signing out.
+        _logger.debug('Remote token invalidate failed during signOut: $err');
+      }
+    } finally {
+      _remote.endSessionTransition(transition);
     }
-    _notifyListeners();
   }
 
   Future<void> _setSession(String token, Map<String, dynamic> user) async {
     _remote.setAuthToken(token);
-    this.token = token;
-    currentUser = user;
-    isAuthenticated = true;
+    _token = token;
+    _currentUser = Map.unmodifiable(user);
+    _isAuthenticated = true;
     // The token is authoritative for the access method, and is the only source
     // on a restored session (no signIn call ran). Keep any explicitly-set value
     // as the fallback for tokens without an AC claim.
-    access = _accessFromToken(token) ?? access;
+    _access = _accessFromToken(token) ?? access;
     await _persistence.set(_tokenKey, token);
     // _notifyListeners is LAST: subscribers may register $auth-gated queries
     // synchronously, and they need token/currentUser/access already in place.
-    _notifyListeners();
+    _isLoading = false;
+    await publishSession();
   }
 
   Future<void> signUp(String accessName, Map<String, dynamic> params) async {
     _validateAccessParams(accessName, 'signup', params);
-    access = accessName;
-    final result =
-        await _remote.signup({'access': accessName, 'variables': params});
-    await check(_extractAccessToken(result));
+    final generation = ++_generation;
+    final transition = _remote.beginSessionTransition();
+    try {
+      final result =
+          await _remote.signup({'access': accessName, 'variables': params});
+      if (generation != _generation) {
+        await _remote.forceClose();
+        return;
+      }
+      final credential = _extractAccessToken(result);
+      if (credential == null)
+        throw StateError('Authentication returned no token');
+      await check(credential);
+    } catch (_) {
+      // A failed verification may follow a successful socket sign-in. Restore
+      // the transport to the still-current saved session before app work runs.
+      await _remote.forceClose();
+      rethrow;
+    } finally {
+      _remote.endSessionTransition(transition);
+    }
   }
 
   Future<void> signIn(String accessName, Map<String, dynamic> params) async {
     _validateAccessParams(accessName, 'signIn', params);
-    access = accessName;
-    final result =
-        await _remote.signin({'access': accessName, 'variables': params});
-    await check(_extractAccessToken(result));
+    final generation = ++_generation;
+    final transition = _remote.beginSessionTransition();
+    try {
+      final result =
+          await _remote.signin({'access': accessName, 'variables': params});
+      if (generation != _generation) {
+        await _remote.forceClose();
+        return;
+      }
+      final credential = _extractAccessToken(result);
+      if (credential == null)
+        throw StateError('Authentication returned no token');
+      await check(credential);
+    } catch (_) {
+      // A failed verification may follow a successful socket sign-in. Restore
+      // the transport to the still-current saved session before app work runs.
+      await _remote.forceClose();
+      rethrow;
+    } finally {
+      _remote.endSessionTransition(transition);
+    }
   }
 
   void _validateAccessParams(

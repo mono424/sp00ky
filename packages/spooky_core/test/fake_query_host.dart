@@ -38,6 +38,8 @@ class FakeQueryHost implements QueryHost {
 
 /// Minimal [AuthService] stand-in exposing only the `subscribe` a module uses.
 class FakeAuth implements AuthService {
+  @override
+  AuthVerificationError? get verificationError => null;
   final List<void Function(String?)> _listeners = [];
   String? userId;
 

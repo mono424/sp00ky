@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/services/database/remote_database_service.dart';
@@ -9,13 +11,19 @@ import 'package:test/test.dart';
 /// Fake remote client recording auth calls and answering the `$auth.id` fetch.
 class FakeAuthRemote implements RemoteSurrealClient {
   Map<String, dynamic>? authUser; // returned by SELECT * FROM ONLY $auth.id
+  Object? authenticationError;
+  Completer<void>? queryGate;
   bool authenticated = false;
   bool invalidated = false;
   Map<String, dynamic>? lastSignin;
   Map<String, dynamic>? lastSignup;
 
   @override
-  Future<dynamic> authenticate(String token) async => authenticated = true;
+  Future<dynamic> authenticate(String token) async {
+    if (authenticationError != null) throw authenticationError!;
+    return authenticated = true;
+  }
+
   @override
   Future<void> invalidate() async => invalidated = true;
   @override
@@ -33,6 +41,7 @@ class FakeAuthRemote implements RemoteSurrealClient {
   @override
   Future<List<dynamic>> query(String sql, [Map<String, dynamic>? vars]) async {
     if (sql.contains(r'$auth.id')) {
+      await queryGate?.future;
       return [
         authUser == null ? <dynamic>[] : [authUser]
       ];
@@ -95,6 +104,78 @@ void main() {
       logger,
     );
     persistence = MemoryPersistenceClient();
+  });
+
+  String jwt() =>
+      'h.${base64Url.encode(utf8.encode('{"ID":"user:1","AC":"account"}'))}.s';
+  test(
+      'unreachable verification retains a restored session and later refreshes it',
+      () async {
+    await persistence.set('sp00ky_auth_token', jwt());
+    final auth = build();
+    await auth.restoreSessionFromToken();
+    remoteClient.authenticationError = const SocketException('offline');
+    await auth.check();
+    expect(auth.currentUser?['id'], 'user:1');
+    expect(auth.isAuthenticated, true);
+    expect(await persistence.get<String>('sp00ky_auth_token'), jwt());
+    expect(auth.verificationError?.category, 'network');
+    expect(auth.needsVerification, true);
+    remoteClient.authenticationError = null;
+    remoteClient.authUser = {'id': 'user:1', 'username': 'restored'};
+    await auth.check();
+    expect(auth.currentUser?['username'], 'restored');
+    expect(auth.verificationError, isNull);
+    expect(auth.needsVerification, false);
+  });
+  test(
+      'explicit rejection clears restored auth, but a new offline login throws',
+      () async {
+    await persistence.set('sp00ky_auth_token', jwt());
+    final auth = build();
+    await auth.restoreSessionFromToken();
+    remoteClient.authenticationError =
+        StateError('There was a problem with authentication');
+    await expectLater(auth.check(), throwsStateError);
+    expect(auth.isAuthenticated, false);
+    expect(await persistence.get<String>('sp00ky_auth_token'), isNull);
+    remoteClient.authenticationError = const SocketException('offline');
+    await expectLater(auth.signIn('account', {'email': 'a', 'password': 'b'}),
+        throwsA(isA<SocketException>()));
+    expect(auth.isAuthenticated, false);
+  });
+  test('late verification cannot restore a session after sign-out', () async {
+    await persistence.set('sp00ky_auth_token', jwt());
+    final auth = build();
+    await auth.restoreSessionFromToken();
+    remoteClient.authUser = {'id': 'user:1'};
+    remoteClient.queryGate = Completer<void>();
+    final check = auth.check();
+    await Future<void>.delayed(Duration.zero);
+    await auth.signOut();
+    remoteClient.queryGate!.complete();
+    await check;
+    expect(auth.currentUser, isNull);
+    expect(await persistence.get<String>('sp00ky_auth_token'), isNull);
+  });
+  test('auth notifications wait for the local account transition', () async {
+    final auth = build();
+    remoteClient.authUser = {'id': 'user:1'};
+    final gate = Completer<void>();
+    final entered = Completer<void>();
+    auth.onSessionChanged = (_) {
+      entered.complete();
+      return gate.future;
+    };
+    final seen = <String?>[];
+    auth.subscribe(seen.add);
+    final login = auth.signIn('account', {'email': 'a', 'password': 'b'});
+    await entered.future;
+    expect(seen, [null]);
+    gate.complete();
+    await login;
+    await Future<void>.delayed(Duration.zero);
+    expect(seen.last, 'user:1');
   });
 
   test('check() with no token leaves unauthenticated', () async {
@@ -180,9 +261,8 @@ void main() {
       // the statements unauthenticated and come back as rejections, which roll
       // the writes back, so the flush has to happen before any of that.
       final auth = build();
-      auth.currentUser = {'id': 'user:a'};
-      auth.token = 'tok';
-      auth.isAuthenticated = true;
+      remoteClient.authUser = {'id': 'user:a'};
+      await auth.check('tok');
       remoteClient.invalidated = false;
 
       String? tokenDuringFlush;
@@ -203,8 +283,8 @@ void main() {
 
     test('a failing flush never blocks signing out', () async {
       final auth = build();
-      auth.token = 'tok';
-      auth.isAuthenticated = true;
+      remoteClient.authUser = {'id': 'user:a'};
+      await auth.check('tok');
       auth.onBeforeSignOut = () async => throw StateError('server gone');
 
       await auth.signOut();

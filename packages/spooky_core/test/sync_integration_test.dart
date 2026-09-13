@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/kernel/events.dart' show Drain, ReadMembership;
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
@@ -9,7 +10,7 @@ import 'fake_remote.dart';
 /// body fetch -> render, a LIVE change, and the outbox up-path.
 void main() {
   late FakeRemote remote;
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
 
   const schemaSurql =
       'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;';
@@ -19,13 +20,13 @@ void main() {
     },
   };
 
-  Future<Sp00kyClient> open() async {
+  Future<InProcessSp00kyClient> open() async {
     final persistence = MemoryPersistenceClient();
     // A token whose `ID` claim names the user, so boot restores the session
     // without a round trip (the payload below decodes to {"ID":"user:u1"}).
     await persistence.set('sp00ky_auth_token',
         'h.${base64Url('{"ID":"user:u1","AC":"account"}')}.s');
-    final c = Sp00kyClient(
+    final c = InProcessSp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
           endpoint: 'ws://localhost:8000',

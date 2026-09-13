@@ -1,12 +1,14 @@
 @Tags(['integration'])
 library;
 
+import 'package:spooky_core/advanced.dart';
+
 import 'dart:io';
 
 import 'package:spooky_core/spooky_core.dart';
 import 'package:test/test.dart';
 
-/// End-to-end mutation sync (up-path) through the real Sp00kyClient against a
+/// End-to-end mutation sync (up-path) through the real InProcessSp00kyClient against a
 /// live SurrealDB: a local create flows through the up-queue and lands in the
 /// remote database. (The down-path register/list_ref needs the ssp server and
 /// is out of scope here.)
@@ -22,7 +24,7 @@ void main() {
   const schemaSurql =
       'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;';
 
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
   late _RootVerifier verifier;
 
   setUp(() async {
@@ -37,7 +39,7 @@ void main() {
       return;
     }
 
-    client = Sp00kyClient(
+    client = InProcessSp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
             endpoint: '', namespace: 'e2e', database: 'e2e'),

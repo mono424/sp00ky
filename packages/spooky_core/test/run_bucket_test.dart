@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'dart:convert';
 
 import 'package:spooky_core/spooky_core.dart';
@@ -7,7 +8,7 @@ import 'fake_remote.dart';
 
 void main() {
   group('run() backend outbox', () {
-    late Sp00kyClient client;
+    late InProcessSp00kyClient client;
 
     final schema = {
       // The outbox table must declare the columns the outbox record uses,
@@ -38,7 +39,7 @@ void main() {
     };
 
     setUp(() async {
-      client = Sp00kyClient(Sp00kyConfig(
+      client = InProcessSp00kyClient(Sp00kyConfig(
         database: const DatabaseConfig(namespace: 't', database: 't'),
         schema: schema,
         schemaSurql:
@@ -83,11 +84,11 @@ void main() {
 
   group('bucket() file storage', () {
     late FakeRemote remote;
-    late Sp00kyClient client;
+    late InProcessSp00kyClient client;
 
     setUp(() async {
       remote = FakeRemote();
-      client = Sp00kyClient(
+      client = InProcessSp00kyClient(
         Sp00kyConfig(
           database: const DatabaseConfig(
               endpoint: 'ws://x', namespace: 't', database: 't'),

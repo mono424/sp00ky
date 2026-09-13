@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/codegen/dart_emitter.dart';
 import 'package:spooky_core/src/codegen/schema_parser.dart';
@@ -69,11 +70,36 @@ DEFINE FIELD name ON user TYPE string;
     },
     'relationships': [
       {'from': 'thread', 'field': 'author', 'to': 'user', 'cardinality': 'one'},
-      {'from': 'comment', 'field': 'thread', 'to': 'thread', 'cardinality': 'one'},
-      {'from': 'comment', 'field': 'author', 'to': 'user', 'cardinality': 'one'},
-      {'from': 'user', 'field': 'threads', 'to': 'thread', 'cardinality': 'many'},
-      {'from': 'thread', 'field': 'comments', 'to': 'comment', 'cardinality': 'many'},
-      {'from': 'user', 'field': 'comments', 'to': 'comment', 'cardinality': 'many'},
+      {
+        'from': 'comment',
+        'field': 'thread',
+        'to': 'thread',
+        'cardinality': 'one'
+      },
+      {
+        'from': 'comment',
+        'field': 'author',
+        'to': 'user',
+        'cardinality': 'one'
+      },
+      {
+        'from': 'user',
+        'field': 'threads',
+        'to': 'thread',
+        'cardinality': 'many'
+      },
+      {
+        'from': 'thread',
+        'field': 'comments',
+        'to': 'comment',
+        'cardinality': 'many'
+      },
+      {
+        'from': 'user',
+        'field': 'comments',
+        'to': 'comment',
+        'cardinality': 'many'
+      },
     ],
   };
 
@@ -101,7 +127,8 @@ DEFINE FIELD name ON user TYPE string;
       expect(rel!.to, 'comment');
       expect(rel.cardinality, 'many');
       expect(rel.foreignKeyField, 'thread',
-          reason: 'a many-relation matches the child field named after the parent');
+          reason:
+              'a many-relation matches the child field named after the parent');
       expect(find('user', 'threads')?.to, 'thread');
       expect(find('user', 'comments')?.to, 'comment');
     });
@@ -166,14 +193,16 @@ DEFINE FIELD threads ON user TYPE string;
     });
 
     test('a modifier shapes select / where / orderBy / limit', () {
-      final (sql, _) = builder('thread').related(
-        'comments',
-        (c) => c
-            .select(['id', 'body'])
-            .where({'score': 5})
-            .orderBy('score', 'DESC')
-            .limit(3),
-      ).build();
+      final (sql, _) = builder('thread')
+          .related(
+            'comments',
+            (c) => c
+                .select(['id', 'body'])
+                .where({'score': 5})
+                .orderBy('score', 'DESC')
+                .limit(3),
+          )
+          .build();
       expect(
         sql,
         'SELECT *, (SELECT id, body FROM comment WHERE thread=\$parent.id AND score = 5 ORDER BY score DESC LIMIT 3) AS comments FROM thread;',
@@ -283,18 +312,23 @@ DEFINE FIELD threads ON user TYPE string;
           relations: relations,
         );
 
-    List<Map<String, dynamic>> threads([List<String> ids = const ['thread:t1']]) =>
-        [for (final id in ids) {...local.getById(id)!}];
+    List<Map<String, dynamic>> threads(
+            [List<String> ids = const ['thread:t1']]) =>
+        [
+          for (final id in ids) {...local.getById(id)!}
+        ];
 
     test('a one-relation attaches the single row', () async {
       final rows = threads();
-      await resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(
+          rows, [plan('author', 'user', 'one', 'author')], fetcher);
       expect((rows.single['author'] as Map)['name'], 'Ada');
     });
 
     test('a one-relation with no foreign key attaches null', () async {
       final rows = threads(['thread:t3']);
-      await resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(
+          rows, [plan('author', 'user', 'one', 'author')], fetcher);
       expect(rows.single['author'], isNull);
     });
 
@@ -304,8 +338,7 @@ DEFINE FIELD threads ON user TYPE string;
           rows, [plan('comments', 'comment', 'many', 'thread')], fetcher);
       expect((rows[0]['comments'] as List).map((c) => c['id']),
           containsAll(['comment:c1', 'comment:c2', 'comment:c3']));
-      expect((rows[1]['comments'] as List).map((c) => c['id']),
-          ['comment:c4']);
+      expect((rows[1]['comments'] as List).map((c) => c['id']), ['comment:c4']);
     });
 
     test('a many-relation with no children attaches an empty list', () async {
@@ -328,8 +361,7 @@ DEFINE FIELD threads ON user TYPE string;
       // Top 2 of thread:t1 by score, not the global top 2 (which would be c4).
       expect((rows[0]['comments'] as List).map((c) => c['id']),
           ['comment:c1', 'comment:c3']);
-      expect((rows[1]['comments'] as List).map((c) => c['id']),
-          ['comment:c4']);
+      expect((rows[1]['comments'] as List).map((c) => c['id']), ['comment:c4']);
     });
 
     test('a sub-where filters the children', () async {
@@ -364,7 +396,8 @@ DEFINE FIELD threads ON user TYPE string;
 
     test('the alias lands last in key order', () async {
       final rows = threads();
-      await resolveRelations(rows, [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(
+          rows, [plan('author', 'user', 'one', 'author')], fetcher);
       expect(rows.single.keys.last, 'author');
     });
 
@@ -384,13 +417,15 @@ DEFINE FIELD threads ON user TYPE string;
       );
       // One level under the cap is fine.
       expect(
-        () => resolveRelations(threads(), [chain(maxRelationDepth - 2)], fetcher),
+        () =>
+            resolveRelations(threads(), [chain(maxRelationDepth - 2)], fetcher),
         returnsNormally,
       );
     });
 
     test('an empty parent set or plan is a no-op', () async {
-      await resolveRelations([], [plan('author', 'user', 'one', 'author')], fetcher);
+      await resolveRelations(
+          [], [plan('author', 'user', 'one', 'author')], fetcher);
       final rows = threads();
       await resolveRelations(rows, const [], fetcher);
       // `author` is a real column, so it stays the raw foreign key rather than
@@ -400,10 +435,10 @@ DEFINE FIELD threads ON user TYPE string;
   });
 
   group('the engine resolves a query\'s relations', () {
-    late Sp00kyClient client;
+    late InProcessSp00kyClient client;
 
     setUp(() async {
-      client = Sp00kyClient(
+      client = InProcessSp00kyClient(
         Sp00kyConfig(
           database: const DatabaseConfig(namespace: 't', database: 't'),
           schema: schema,

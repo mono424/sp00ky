@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:test/test.dart';
@@ -11,9 +12,10 @@ import 'package:test/test.dart';
 /// WhitePawn's `mobile_native_libs_test`, which points the engine at a
 /// guaranteed-dead port on purpose.
 void main() {
-  Sp00kyClient build(String endpoint) => Sp00kyClient(Sp00kyConfig(
-        database: DatabaseConfig(
-            endpoint: endpoint, namespace: 't', database: 't'),
+  InProcessSp00kyClient build(String endpoint) =>
+      InProcessSp00kyClient(Sp00kyConfig(
+        database:
+            DatabaseConfig(endpoint: endpoint, namespace: 't', database: 't'),
         schema: {
           'thread': {
             'columns': {'title': const ColumnSchema(type: 'string')},
@@ -24,7 +26,8 @@ void main() {
         reconnect: const ReconnectConfig(connectTimeoutMs: 300),
       ));
 
-  test('boot is local-only, so an unreachable server never blocks it', () async {
+  test('boot is local-only, so an unreachable server never blocks it',
+      () async {
     final client = build('ws://127.0.0.1:1/rpc');
     final sw = Stopwatch()..start();
     await client.init().timeout(const Duration(seconds: 5));

@@ -1,6 +1,8 @@
 @Tags(['integration'])
 library;
 
+import 'package:spooky_core/advanced.dart';
+
 import 'dart:io';
 
 import 'package:spooky_core/spooky_core.dart';
@@ -98,7 +100,7 @@ void main() {
     final persistence = MemoryPersistenceClient();
     await persistence.set('sp00ky_auth_token', token);
 
-    final client = Sp00kyClient(Sp00kyConfig(
+    final client = InProcessSp00kyClient(Sp00kyConfig(
       database: DatabaseConfig(endpoint: endpoint, namespace: ns, database: db),
       schema: schema,
       schemaSurql: schemaSurql,

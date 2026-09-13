@@ -26,6 +26,36 @@ class RemoteDatabaseService {
   /// its session was anonymous, and every view registered afterwards was
   /// stamped with an empty identity.
   String? _authToken;
+  int _authEpoch = 0;
+  int _transition = 0;
+  Completer<void>? _identityGate;
+
+  int beginSessionTransition() {
+    _authEpoch++;
+    if (_identityGate == null || _identityGate!.isCompleted) {
+      _identityGate = Completer<void>();
+    }
+    return ++_transition;
+  }
+
+  void endSessionTransition(int transition) {
+    if (transition == _transition && !(_identityGate?.isCompleted ?? true)) {
+      _identityGate!.complete();
+    }
+  }
+
+  Future<void> _awaitIdentity() async {
+    await _identityGate?.future;
+  }
+
+  // Verification reads bypass the app query queue: that queue may be waiting
+  // for this very transition to finish. They cannot write account cache data.
+  Future<List<dynamic>> queryAuthUser() async {
+    await _awaitConnect();
+    return _client.query(r'SELECT * FROM ONLY $auth.id');
+  }
+
+  void Function()? onHandshake;
 
   /// Completes when the current connect attempt has finished, successfully or
   /// not. Every RPC waits on it.
@@ -68,17 +98,46 @@ class RemoteDatabaseService {
   /// on the poll alone until the next reconnect.
   Future<(String, Stream<LiveMessage>)> live(String sql,
       [Map<String, dynamic>? vars]) async {
+    final epoch = _authEpoch;
+    await _awaitIdentity();
     await _awaitConnect();
-    return _client.live(sql, vars);
+    _checkEpoch(epoch);
+    final result = await _client.live(sql, vars);
+    _checkEpoch(epoch);
+    return result;
   }
 
   Future<void> kill(String liveId) async {
     await _awaitConnect();
     return _client.kill(liveId);
   }
+
   DatabaseConfig getConfig() => _config;
 
-  void setAuthToken(String? token) => _authToken = token;
+  void setAuthToken(String? token) {
+    if (token != _authToken) _authEpoch++;
+    _authToken = token;
+  }
+
+  void _checkEpoch(int epoch) {
+    if (epoch != _authEpoch)
+      throw StateError('Account changed during remote operation');
+  }
+
+  Future<T> _authRpc<T>(Future<T> Function() rpc) async {
+    final epoch = _authEpoch;
+    await _awaitConnect();
+    _checkEpoch(epoch);
+    try {
+      final result = await rpc();
+      _checkEpoch(epoch);
+      return result;
+    } finally {
+      // A late auth RPC can change the server socket's identity even when its
+      // result is discarded locally. Reconnect with the current saved token.
+      if (epoch != _authEpoch) await forceClose();
+    }
+  }
 
   /// True while a socket is open, for the supervisor.
   bool get isConnected {
@@ -106,24 +165,35 @@ class RemoteDatabaseService {
       await _client.connect(endpoint);
       await _client.use(
           namespace: _config.namespace, database: _config.database);
+      final epoch = _authEpoch;
       final token = _authToken ?? _config.token;
       if (token != null) {
         await _client.authenticate(token);
+      }
+      if (epoch != _authEpoch) {
+        await forceClose();
+        _checkEpoch(epoch);
       }
       _logger.info('Connected to remote database');
     } finally {
       // Success or failure: the attempt is over, so held RPCs stop waiting.
       _openConnectGate();
+      scheduleMicrotask(() => onHandshake?.call());
     }
   }
 
   /// Serialized query: chains onto [_queryQueue] so calls never overlap.
   Future<List<dynamic>> query(String sql, [Map<String, dynamic>? vars]) {
+    final epoch = _authEpoch;
     final completer = Completer<List<dynamic>>();
     _queryQueue = _queryQueue.then((_) async {
       try {
+        await _awaitIdentity();
         await _awaitConnect();
-        completer.complete(await _client.query(sql, vars));
+        _checkEpoch(epoch);
+        final result = await _client.query(sql, vars);
+        _checkEpoch(epoch);
+        completer.complete(result);
       } catch (err) {
         completer.completeError(err);
       }
@@ -151,12 +221,17 @@ class RemoteDatabaseService {
         onError: (Object e) => [StatementResult.err(e.toString())],
       );
     }
+    final epoch = _authEpoch;
     final completer = Completer<List<StatementResult>>();
     _queryQueue = _queryQueue.then((_) async {
       try {
+        await _awaitIdentity();
         await _awaitConnect();
-        completer.complete(
-            await (client as StatementAwareRemote).queryStatements(sql, vars));
+        _checkEpoch(epoch);
+        final result =
+            await (client as StatementAwareRemote).queryStatements(sql, vars);
+        _checkEpoch(epoch);
+        completer.complete(result);
       } catch (err) {
         completer.completeError(err);
       }
@@ -175,27 +250,19 @@ class RemoteDatabaseService {
   // Auth RPCs wait for the handshake too: `signin`/`signup` carry the
   // namespace and database the `use` call established, and reach the server
   // without them if they run first.
-  Future<dynamic> signin(Map<String, dynamic> params) async {
-    await _awaitConnect();
-    return _client.signin(params);
-  }
+  Future<dynamic> signin(Map<String, dynamic> params) =>
+      _authRpc(() => _client.signin(params));
 
-  Future<dynamic> signup(Map<String, dynamic> params) async {
-    await _awaitConnect();
-    return _client.signup(params);
-  }
+  Future<dynamic> signup(Map<String, dynamic> params) =>
+      _authRpc(() => _client.signup(params));
 
-  Future<dynamic> authenticate(String token) async {
-    await _awaitConnect();
-    return _client.authenticate(token);
-  }
+  Future<dynamic> authenticate(String token) =>
+      _authRpc(() => _client.authenticate(token));
 
-  Future<void> invalidate() async {
-    await _awaitConnect();
-    return _client.invalidate();
-  }
+  Future<void> invalidate() => _authRpc(_client.invalidate);
 
   Future<void> close() {
+    endSessionTransition(_transition);
     _openConnectGate(); // never leave an RPC waiting on a client that is gone
     return _client.close();
   }

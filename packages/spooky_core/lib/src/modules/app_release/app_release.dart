@@ -1,7 +1,7 @@
 import '../../services/logger/logger.dart';
 import '../../utils/duration_utils.dart';
 import '../../utils/semver.dart';
-import '../auth/auth_service.dart';
+import '../auth/sp00ky_auth.dart';
 import '../query_host.dart';
 
 /// One shared LIVE query over every app's release row (TS `RELEASE_QUERY`).
@@ -104,14 +104,14 @@ class AppReleaseHandle {
 class AppReleaseModule {
   AppReleaseModule({
     required QueryHost host,
-    required AuthService auth,
+    required Sp00kyAuth auth,
     required SpookyLogger logger,
   })  : _host = host,
         _auth = auth,
         _logger = logger.child('AppReleaseModule');
 
   final QueryHost _host;
-  final AuthService _auth;
+  final Sp00kyAuth _auth;
   final SpookyLogger _logger;
 
   final Set<AppReleaseHandle> _handles = {};

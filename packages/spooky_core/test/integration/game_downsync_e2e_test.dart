@@ -1,6 +1,8 @@
 @Tags(['integration'])
 library;
 
+import 'package:spooky_core/advanced.dart';
+
 import 'dart:io';
 
 import 'package:spooky_core/spooky_core.dart';
@@ -157,7 +159,7 @@ DEFINE TABLE game PERMISSIONS FOR select WHERE true;
     final persistence = MemoryPersistenceClient();
     await persistence.set('sp00ky_auth_token', token);
 
-    final client = Sp00kyClient(Sp00kyConfig(
+    final client = InProcessSp00kyClient(Sp00kyConfig(
       database: DatabaseConfig(endpoint: endpoint, namespace: ns, database: db),
       schema: schema,
       schemaSurql: schemaSurql,
@@ -179,8 +181,7 @@ DEFINE TABLE game PERMISSIONS FOR select WHERE true;
         ? <String>{}
         : emissions.last.map((r) => r['id'].toString()).toSet();
 
-    Future<bool> waitUntil(bool Function() pred,
-        {int seconds = 20}) async {
+    Future<bool> waitUntil(bool Function() pred, {int seconds = 20}) async {
       final deadline = DateTime.now().add(Duration(seconds: seconds));
       while (DateTime.now().isBefore(deadline)) {
         if (pred()) return true;

@@ -41,3 +41,7 @@ export 'src/modules/app_release/app_release.dart'
 export 'src/modules/query_builder.dart'
     show QueryBuilder, QueryOp, RelationPlan;
 export 'src/modules/relationships.dart' show SchemaRelationship;
+
+export 'src/modules/auth/sp00ky_auth.dart'
+    show Sp00kyAuth, AuthVerificationError;
+export 'src/client/worker_protocol.dart' show WorkerFailure;

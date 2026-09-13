@@ -1,6 +1,6 @@
 import '../../services/logger/logger.dart';
 import '../../utils/duration_utils.dart';
-import '../auth/auth_service.dart';
+import '../auth/sp00ky_auth.dart';
 import '../query_host.dart';
 
 /// One shared LIVE query over ALL of the signed-in user's assignments — the
@@ -84,14 +84,14 @@ class FeatureFlagHandle {
 class FeatureFlagModule {
   FeatureFlagModule({
     required QueryHost host,
-    required AuthService auth,
+    required Sp00kyAuth auth,
     required SpookyLogger logger,
   })  : _host = host,
         _auth = auth,
         _logger = logger.child('FeatureFlagModule');
 
   final QueryHost _host;
-  final AuthService _auth;
+  final Sp00kyAuth _auth;
   final SpookyLogger _logger;
 
   final Set<FeatureFlagHandle> _handles = {};
@@ -124,7 +124,8 @@ class FeatureFlagModule {
   /// Get a reactive handle for [key]. Late callers are seeded immediately from
   /// the already-resolved shared query so an assigned key doesn't flash its
   /// fallback.
-  FeatureFlagHandle feature(String key, {String? fallback, QueryTimeToLive? ttl}) {
+  FeatureFlagHandle feature(String key,
+      {String? fallback, QueryTimeToLive? ttl}) {
     final handle = FeatureFlagHandle(key, fallback);
     _handles.add(handle);
     handle._attachOnClose(() => _handles.remove(handle));

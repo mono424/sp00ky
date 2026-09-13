@@ -83,7 +83,8 @@ class LocalStoreAdapter implements LocalPort {
       _holder.db.getAllDocs(table);
 
   @override
-  void put(String table, String id, Map<String, dynamic> data, WriteMode mode) =>
+  void put(
+          String table, String id, Map<String, dynamic> data, WriteMode mode) =>
       _holder.db.putDoc(table, id, data, merge: mode == WriteMode.merge);
 
   @override
@@ -131,8 +132,7 @@ class RemoteAdapter implements RemotePort {
     // a row the session cannot read, simply yields no inline row and the fetch
     // path takes over.
     final join = inlineBodies ? ' FETCH out' : '';
-    final (uuid, stream) =
-        await _remote.live('LIVE SELECT * FROM $table$join');
+    final (uuid, stream) = await _remote.live('LIVE SELECT * FROM $table$join');
     await _liveSub?.cancel();
     _liveSub = stream.listen((message) {
       if (message.action == 'KILLED') return;
@@ -263,8 +263,12 @@ class ClientServices implements Services {
   Future<void> localConnect(String bucketId) async => holder.connect(bucketId);
 
   @override
-  Future<void> localSwitchStore(String bucketId) async =>
-      holder.connect(bucketId);
+  Future<void> localSwitchStore(String bucketId) async {
+    final snapshot = ssp.saveStoreSnapshot();
+    if (snapshot != null && snapshot.isNotEmpty)
+      holder.db.putSnapshot(snapshot);
+    holder.connect(bucketId);
+  }
 
   @override
   String localCurrentBucketId() => holder.bucketId;
@@ -306,7 +310,6 @@ class ClientServices implements Services {
   @override
   Future<void> sspReset() async {
     await ssp.resetCircuit();
-    holder.db.clearSnapshot();
   }
 
   @override
@@ -314,7 +317,7 @@ class ClientServices implements Services {
 
   @override
   Future<String?> authRestoreSession() async =>
-      auth?.restoreSessionFromToken();
+      auth?.restoreSessionFromToken(notify: false);
 
   @override
   Future<void> authInit() async => auth?.init();

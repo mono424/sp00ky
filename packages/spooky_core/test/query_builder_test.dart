@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:test/test.dart';
 
@@ -73,9 +74,9 @@ void main() {
   });
 
   group('QueryBuilder integration with the client', () {
-    late Sp00kyClient client;
+    late InProcessSp00kyClient client;
     setUp(() async {
-      client = Sp00kyClient(Sp00kyConfig(
+      client = InProcessSp00kyClient(Sp00kyConfig(
         database: const DatabaseConfig(namespace: 't', database: 't'),
         schema: {
           'thread': {'columns': <String, dynamic>{}}

@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/kernel/events.dart' show PollTick, SyncOutcome;
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
@@ -20,18 +21,18 @@ void main() {
   };
 
   late FakeRemote remote;
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
 
-  Future<Sp00kyClient> open({int degradeAfter = 3}) async {
-    final c = Sp00kyClient(
+  Future<InProcessSp00kyClient> open({int degradeAfter = 3}) async {
+    final c = InProcessSp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
             endpoint: 'ws://x', namespace: 't', database: 't'),
         schema: schema,
         schemaSurql: schemaSurql,
         persistenceClient: MemoryPersistenceClient(),
-        syncHealth: SyncHealthConfig(
-            degradeAfterConsecutiveFailures: degradeAfter),
+        syncHealth:
+            SyncHealthConfig(degradeAfterConsecutiveFailures: degradeAfter),
         // Keep the poll off the critical path of these assertions.
         refSyncIntervalMs: 3600000,
       ),

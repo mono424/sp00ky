@@ -4,13 +4,55 @@ Pure-Dart core for Spooky local-first sync, the twin of `@spooky-sync/core`.
 Framework-agnostic: query subscriptions are exposed as Dart `Stream`s, so a
 Flutter app consumes them with a `StreamBuilder`.
 
+## Startup and execution
+
+`Sp00kyClient(config)` owns one persistent background isolate. SQLite, native
+query processing, network decoding and synchronization execute there. Generated
+`AppDb(client)` works unchanged. Callbacks and stream listeners run in the caller
+isolate; only subscribed rows and small status updates are mirrored.
+
+`await client.init()` means the saved identity is restored, its local account
+store is open and cached queries are readable. It does not wait for connection,
+verification, uploads or refreshed membership. Concurrent calls share that work.
+Transport failures preserve a restored session. Explicit rejected credentials
+or a confirmed missing account clear it; other verification failures can be
+inspected through `auth.verificationError` and retried with `wake()`, reconnect,
+or the existing connection probe.
+
+Flutter supplies an absolute `localDbPath`, calls `checkpoint()` when hidden and
+`wake()` on resume. `close()` checkpoints and releases the worker. A failed worker
+rejects outstanding operations and ends subscriptions; it never falls back to
+the UI thread. Use `await client.inspectState()` for on-demand diagnostics.
+
+Session routing lives in a sibling `*.session.db` SQLite file. Its atomic row
+contains the active token and account. Existing anonymous boot hints and account
+tokens are migrated once, including an explicit signed-out marker. Account
+SQLite files, memberships and pending writes keep their format. Snapshots are
+optional accelerators; SQLite rows remain authoritative.
+
+Custom persistence and injected transports require the explicit advanced client:
+
+```dart
+import 'package:spooky_core/advanced.dart';
+final client = InProcessSp00kyClient(config, remoteClient: customTransport);
+```
+
+This also provides the rollback execution mode without changing account files.
+Keep the new session metadata when rolling back execution mode. Downgrading to
+an older package that does not understand that metadata is not the same rollback
+and can restore its legacy credentials. Direct stores, native handles and
+runtime dispatch are available only through the advanced client. Auth is exposed
+as `Sp00kyAuth`: use auth operations and live profile queries instead of assigning
+`auth.currentUser`.
+
 ## Architecture
 
 The engine is **effects-as-data**, the same shape as the TypeScript core, so a
 fix on either side lands in the obvious file on the other.
 
 ```
-Sp00kyClient (facade)   every method runs one saga, reads a selector, or
+Sp00kyClient (worker proxy) -> persistent native isolate
+InProcessSp00kyClient  every method runs one saga, reads a selector, or
       │                 attaches a subscriber
       ├─ Runtime        client/runtime.dart - holds the state, runs sagas on
       │                 serial/dedupe lanes, fires timers, fans events out and

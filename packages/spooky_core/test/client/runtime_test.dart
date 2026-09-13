@@ -15,6 +15,7 @@ import 'package:spooky_core/src/types.dart';
 import 'package:test/test.dart';
 
 import '../saga_helpers.dart';
+import 'package:spooky_core/src/kernel/effects.dart';
 
 ({Runtime runtime, FakeAdapters fakes}) build({ClientState? state}) {
   final fakes = FakeAdapters();
@@ -39,6 +40,27 @@ import '../saga_helpers.dart';
 }
 
 void main() {
+  test('a late continuation cannot write or emit into the next account',
+      () async {
+    final built = build();
+    addTearDown(built.runtime.dispose);
+    final gate = Completer<void>();
+    final started = Completer<void>();
+    final operation = built.runtime.run((ctx) async {
+      started.complete();
+      await gate.future;
+      await ctx(Fx.localPut('thread', 'thread:old', {'title': 'old account'}));
+      await ctx(Fx.stateUpdate(r.setIdentity(userId: 'user:old')));
+    });
+    final failure = expectLater(operation, throwsStateError);
+    await started.future;
+    built.fakes.local.bumpEpoch();
+    gate.complete();
+    await failure;
+    expect(built.fakes.local.tables['thread'], isNull);
+    expect(built.runtime.state.userId, isNull);
+  });
+
   test('a serial lane runs one saga at a time, in arrival order', () async {
     final rt = build().runtime;
     final order = <String>[];
@@ -146,10 +168,7 @@ void main() {
     // One write acked while another is queued: the pending count stays 1.
     rt.update(r.outboxReplace([
       buildOutboxItem(
-          id: '1',
-          recordId: 'a:1',
-          status: OutboxStatus.acked,
-          ackedAt: 1),
+          id: '1', recordId: 'a:1', status: OutboxStatus.acked, ackedAt: 1),
       buildOutboxItem(id: '2', recordId: 'b:2'),
     ]));
     rt.update(r.outboxReplace(const []));

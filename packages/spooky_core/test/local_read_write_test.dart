@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:test/test.dart';
 
@@ -5,7 +6,7 @@ import 'package:test/test.dart';
 /// create/update/delete drive reactive Stream updates through the FFI DBSP
 /// processor and sqlite materialization.
 void main() {
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
 
   const schemaSurql =
       'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;';
@@ -19,7 +20,7 @@ void main() {
   };
 
   setUp(() async {
-    client = Sp00kyClient(Sp00kyConfig(
+    client = InProcessSp00kyClient(Sp00kyConfig(
       database: const DatabaseConfig(namespace: 'test', database: 'test'),
       schema: schema,
       schemaSurql: schemaSurql,

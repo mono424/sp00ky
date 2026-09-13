@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import '../kernel/events.dart';
+import '../kernel/effects.dart';
 import '../kernel/interpreter.dart';
 import '../kernel/saga.dart';
 import '../query/env.dart';
@@ -90,8 +91,17 @@ class Runtime implements InterpreterHost {
   /// A dedupe lane answers the joiner with the run already in flight, so the
   /// two must have the same result type; a facade call that wants a value back
   /// uses a serial lane or none.
-  Future<R> run<R>(Saga<R> saga, {Lane? lane}) {
-    Future<R> exec() => saga(_interpret);
+  Future<R> run<R>(Saga<R> saga,
+      {Lane? lane, bool allowsAccountChange = false}) {
+    final epoch = _adapters.local.epoch;
+    Future<R> exec() async {
+      if (_disposed) throw StateError('runtime disposed');
+      return saga(allowsAccountChange
+          ? _interpret
+          : _AccountCtx(
+              _interpret, () => !_disposed && _adapters.local.epoch == epoch));
+    }
+
     if (lane == null) return exec();
     if (lane.kind == LaneKind.dedupe) {
       final running = _dedupeLanes[lane.key];
@@ -122,7 +132,12 @@ class Runtime implements InterpreterHost {
   Future<void> dispatchAsync(RuntimeEvent event) {
     if (_disposed) return Future<void>.value();
     final target = route(_env, event);
-    return run(target.saga, lane: target.lane).catchError((Object error) {
+    return run(target.saga,
+            lane: target.lane,
+            allowsAccountChange: event is AuthFlip ||
+                event is BucketSwitch ||
+                event is StartRemote)
+        .catchError((Object error) {
       _logger.error('saga failed for ${event.type}', error);
     });
   }
@@ -238,7 +253,8 @@ class Runtime implements InterpreterHost {
   }
 
   void _notify(OutEvent event) {
-    for (final cb in _listeners[event.type] ?? const <void Function(OutEvent)>{}) {
+    for (final cb
+        in _listeners[event.type] ?? const <void Function(OutEvent)>{}) {
       _safely(() => cb(event));
     }
     for (final cb in _listeners['*'] ?? const <void Function(OutEvent)>{}) {
@@ -327,5 +343,20 @@ class Runtime implements InterpreterHost {
       w.done.completeError(StateError('runtime disposed'));
     }
     _waiters.clear();
+  }
+}
+
+/// Every continuation is fenced, including its error handler and finalizer.
+/// A late remote response can never update the next account's state or circuit.
+class _AccountCtx extends Ctx {
+  _AccountCtx(this.inner, this.current);
+  final Ctx inner;
+  final bool Function() current;
+  @override
+  Future<R> call<R>(Effect<R> effect) async {
+    if (!current()) throw StateError('Account changed during operation');
+    final result = await inner(effect);
+    if (!current()) throw StateError('Account changed during operation');
+    return result;
   }
 }

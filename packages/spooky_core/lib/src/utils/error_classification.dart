@@ -1,5 +1,7 @@
 const _networkErrorPatterns = [
   'connection',
+  // Session fencing cancels transport work, never rejects the user's write.
+  'account changed',
   // Surreal's ConnectionUnavailableError reads "You must be connected to a
   // SurrealDB instance..." — it contains "connected", not "connection", so it
   // slips past the pattern above. The WS client throws it while the socket is

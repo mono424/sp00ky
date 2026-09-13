@@ -1,3 +1,4 @@
+import 'boot_saga.dart' show primeCircuit;
 import '../kernel/effects.dart';
 import '../kernel/events.dart';
 import '../kernel/saga.dart';
@@ -22,7 +23,13 @@ Future<void> bucketSwitch(Ctx ctx, SagaEnv env, String target) async {
       await ctx(Fx.service<String>(ServiceName.localCurrentBucketId));
   if (state.pendingBucket != target || current == target) return;
 
-  for (final key in const ['poll', 'outbox', 'membership', 'fetch', 'ack-prune']) {
+  for (final key in const [
+    'poll',
+    'outbox',
+    'membership',
+    'fetch',
+    'ack-prune'
+  ]) {
     await ctx(Fx.timerClear(key));
   }
   await ctx(Fx.stateUpdate(r.clearBucketState()));
@@ -37,7 +44,8 @@ Future<void> bucketSwitch(Ctx ctx, SagaEnv env, String target) async {
     await ctx(Fx.service<String?>(ServiceName.authAccess)),
   ]));
   await ctx(Fx.stateUpdate(r.setIdentity(bucketId: target)));
-  await ctx(Fx.dispatch(const PrimeCircuit()));
+  await loadOutbox(ctx, env);
+  await primeCircuit(ctx);
 
   final token = await ctx(Fx.service<String?>(ServiceName.authToken));
   if (token != null) {
@@ -50,7 +58,6 @@ Future<void> bucketSwitch(Ctx ctx, SagaEnv env, String target) async {
     }
   }
   await rebindQueries(ctx);
-  await loadOutbox(ctx, env);
   await ctx(Fx.dispatch(const EnsureRegistered()));
   await ctx(Fx.dispatch(const LiveStart()));
   // The switch cleared the poll timer, and only the tick itself re-arms it: a

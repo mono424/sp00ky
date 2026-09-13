@@ -1,6 +1,8 @@
 @Tags(['integration'])
 library;
 
+import 'package:spooky_core/advanced.dart';
+
 import 'dart:io';
 
 import 'package:spooky_core/spooky_core.dart';
@@ -106,8 +108,10 @@ void main() {
   tearDown(() async {
     if (!reachable) return; // root was never initialized (skipped in setUp)
     try {
-      await root.query(r'DELETE _00_user_feature WHERE key = $k', {'k': flagKey});
-      await root.query(r'DELETE _00_feature_flag WHERE key = $k', {'k': flagKey});
+      await root
+          .query(r'DELETE _00_user_feature WHERE key = $k', {'k': flagKey});
+      await root
+          .query(r'DELETE _00_feature_flag WHERE key = $k', {'k': flagKey});
     } catch (_) {}
     for (final id in createdUserIds) {
       try {
@@ -139,7 +143,7 @@ void main() {
     final persistence = MemoryPersistenceClient();
     await persistence.set('sp00ky_auth_token', token);
 
-    final client = Sp00kyClient(Sp00kyConfig(
+    final client = InProcessSp00kyClient(Sp00kyConfig(
       database: DatabaseConfig(endpoint: endpoint, namespace: ns, database: db),
       schema: schema,
       schemaSurql: schemaSurql,

@@ -1,4 +1,8 @@
+import 'package:spooky_core/advanced.dart';
 import 'dart:io';
+import 'dart:typed_data';
+import 'package:spooky_core/src/services/database/local_database_service.dart';
+import 'package:spooky_core/src/services/logger/logger.dart';
 
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
@@ -20,8 +24,8 @@ void main() {
   setUp(() => dir = Directory.systemTemp.createTempSync('spooky-prime'));
   tearDown(() => dir.deleteSync(recursive: true));
 
-  Future<Sp00kyClient> open() async {
-    final c = Sp00kyClient(Sp00kyConfig(
+  Future<InProcessSp00kyClient> open() async {
+    final c = InProcessSp00kyClient(Sp00kyConfig(
       database: DatabaseConfig(
         namespace: 't',
         database: 't',
@@ -58,21 +62,31 @@ void main() {
     expect(client.state.queries[hash]!.records.single['title'], 'kept');
   });
 
-  test('a missing snapshot primes from the rows instead', () async {
-    var client = await open();
-    await client.create('thread:a', {'title': 'kept'});
-    await Future<void>.delayed(const Duration(milliseconds: 150));
-    await client.close();
+  for (final mode in ['missing', 'corrupt', 'stale']) {
+    test('$mode snapshot rebuilds from authoritative SQLite rows', () async {
+      var client = await open();
+      await client.create('thread:a', {'title': 'original'});
+      await client.create('thread:b', {'title': 'deleted'});
+      await client.checkpoint();
+      await client.close();
 
-    // Simulate a process that died before it could checkpoint.
-    final wiped = await open();
-    wiped.localStore.clearSnapshot();
-    await wiped.close();
+      // Edit the actual closed store, with no client close that could replace
+      // the altered snapshot. This models writes after an older checkpoint.
+      final raw = LocalDatabaseService.open(SpookyLogger.root('test'),
+          store: StoreType.indexeddb, path: '${dir.path}/spooky.anon.db');
+      raw.provision();
+      if (mode == 'missing') raw.clearSnapshot();
+      if (mode == 'corrupt') raw.putSnapshot(Uint8List.fromList([1, 2, 3]));
+      raw.putDoc('thread', 'thread:a', {'title': 'latest', '_00_rv': 5});
+      raw.deleteDoc('thread', 'thread:b');
+      raw.close();
 
-    client = await open();
-    addTearDown(client.close);
-    final hash = await client.queryRaw('SELECT * FROM thread', const {});
-    await Future<void>.delayed(const Duration(milliseconds: 150));
-    expect(client.state.queries[hash]!.records.single['title'], 'kept');
-  });
+      client = await open();
+      addTearDown(client.close);
+      final stream = await client.queryStream('SELECT * FROM thread', {});
+      final rows = await stream.firstWhere((r) => r.isNotEmpty);
+      expect(rows, hasLength(1));
+      expect(rows.single['title'], 'latest');
+    });
+  }
 }

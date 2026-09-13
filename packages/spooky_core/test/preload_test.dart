@@ -1,3 +1,4 @@
+import 'package:spooky_core/advanced.dart';
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:test/test.dart';
@@ -19,7 +20,7 @@ void main() {
   };
 
   late FakeRemote remote;
-  late Sp00kyClient client;
+  late InProcessSp00kyClient client;
 
   setUp(() async {
     remote = FakeRemote();
@@ -29,7 +30,7 @@ void main() {
       '_00_rv': 1,
     };
     remote.defaultMembership = [('thread:a', 1)];
-    client = Sp00kyClient(
+    client = InProcessSp00kyClient(
       Sp00kyConfig(
         database: const DatabaseConfig(
             endpoint: 'ws://x', namespace: 't', database: 't'),

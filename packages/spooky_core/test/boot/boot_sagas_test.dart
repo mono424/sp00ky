@@ -18,9 +18,8 @@ import '../saga_helpers.dart';
 EffectHandler services(Map<ServiceName, Object? Function()> answers) =>
     (e, __) => answers[(e as ServiceEffect).name]?.call();
 
-List<ServiceName> serviceNames(RunPureResult<void> out) => [
-      for (final e in out.ofKind('service')) (e as ServiceEffect).name
-    ];
+List<ServiceName> serviceNames(RunPureResult<void> out) =>
+    [for (final e in out.ofKind('service')) (e as ServiceEffect).name];
 
 void main() {
   group('boot', () {
@@ -55,8 +54,7 @@ void main() {
       expect(out.state.saltUserId, 'user:u1');
       expect(names, contains(ServiceName.sspSetSessionAuth));
       expect(out.state.localReady, isTrue);
-      expect(out.dispatched.map((e) => e.type),
-          ['PrimeCircuit', 'LifecycleTick', 'GcTick', 'StartRemote']);
+      expect(out.dispatched.map((e) => e.type), ['LifecycleTick', 'GcTick']);
     });
 
     test('no hint and no session: the anon bucket, no identity seeded',
@@ -241,9 +239,8 @@ void main() {
       final out = await runPure<void>(
         (ctx) => persistVerifiedUser(
             ctx, env(schema: {...testSchema, 'user': <String, dynamic>{}})),
-        state: buildState([
-          buildEntry(def: buildDefinition(hash: 'a', tableName: 'user'))
-        ]),
+        state: buildState(
+            [buildEntry(def: buildDefinition(hash: 'a', tableName: 'user'))]),
         handlers: defaults(over: {
           'service': services({
             ServiceName.authCurrentUser: () =>
@@ -317,13 +314,8 @@ void main() {
       );
       expect(
           out.dispatched.map((e) => e.type),
-          containsAllInOrder([
-            'PrimeCircuit',
-            'EnsureRegistered',
-            'LiveStart',
-            'PollTick',
-            'Drain'
-          ]));
+          containsAllInOrder(
+              ['EnsureRegistered', 'LiveStart', 'PollTick', 'Drain']));
       // The poll timer is cleared by the switch, so only the tick re-arms it.
       expect(out.log.where((e) => e.kind == 'timer.clear'), hasLength(5));
     });
@@ -339,7 +331,9 @@ void main() {
                   remote: RemotePhase.registered,
                   fetchDepth: 0,
                   notified: true),
-              remoteArray: [('thing:old', 1)],
+              remoteArray: [
+                ('thing:old', 1)
+              ],
               records: [
                 {'id': 'thing:old'}
               ]),

@@ -48,6 +48,30 @@ void main() {
   });
 
   group('overlay and outbox counts', () {
+    test('unsynced ids: pending outbox items and debounced patches, not acked',
+        () {
+      final s = buildState(const [], [
+        r.outboxReplace([
+          buildOutboxItem(id: '1', recordId: 'thing:1'),
+          buildOutboxItem(
+              id: '2',
+              type: MutationEventType.update,
+              recordId: 'thing:2',
+              status: OutboxStatus.acked,
+              ackedAt: 1),
+        ]),
+        r.mergePendingWrite(const PendingWrite(
+          key: 'thing:3',
+          table: 'thing',
+          recordId: 'thing:3',
+          data: {'n': 1},
+          before: null,
+          firstAt: 0,
+        )),
+      ]);
+      expect(sel.unsyncedRecordIds(s).toList()..sort(), ['thing:1', 'thing:3']);
+    });
+
     test('derives writes/deletes from pending and acked items', () {
       final s = buildState(const [], [
         r.outboxReplace([

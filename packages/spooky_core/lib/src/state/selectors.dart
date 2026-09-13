@@ -56,6 +56,15 @@ bool hasAckedWrites(ClientState s) =>
 int pendingMutationCount(ClientState s) =>
     s.outbox.where((i) => i.status == OutboxStatus.pending).length;
 
+/// Record ids with a local write the server has not acknowledged yet: a queued
+/// outbox item, or a debounced patch not flushed to the outbox. An acked item
+/// is synced, so it does not count.
+Set<String> unsyncedRecordIds(ClientState s) => {
+      for (final i in s.outbox)
+        if (i.status == OutboxStatus.pending) i.recordId,
+      for (final w in s.pendingWrites.values) w.recordId,
+    };
+
 int fetchingQueryCount(ClientState s) =>
     s.queries.values.where((e) => e.lifecycle.fetchDepth > 0).length;
 

@@ -110,6 +110,14 @@ Mutations made while offline sit in a queue. `pendingMutationCount` is how many 
 Useful for a "3 changes not yet saved" indicator, and for warning before the user closes the tab
 with unsynced work.
 
+The Dart client also reports *which* records are still waiting. `unsyncedRecordIds` is the set of
+record ids with a write the server has not acknowledged yet, and `subscribeToUnsyncedRecords` fires
+whenever that set changes, even when the count stays the same because one write was acknowledged as
+another was queued. Use it for a per-row indicator, like one tick while a message is only on the
+device and two once it is stored.
+
+<CodeBlock code={unsyncedCode} lang="dart" />
+
 ## Where data lives locally
 
 Set `database.store` in your [client config](/docs/reference/client-config):
@@ -238,6 +246,17 @@ onCleanup(db.subscribeToPendingMutations(setPending));
 <Show when={pending() > 0}>
   {pending()} change{pending() === 1 ? '' : 's'} not yet synced
 </Show>`;
+
+export const unsyncedCode = `// Dart: one tick while the row is only on this device, two once it is stored.
+Set<String> unsynced = client.unsyncedRecordIds;
+final stop = client.subscribeToUnsyncedRecords((ids) {
+  setState(() => unsynced = ids);
+});
+
+final stored = !unsynced.contains(conversation.id);
+
+// In dispose():
+stop();`;
 
 export const preloadCode = `// warm the thread list before the user navigates to it
 await db.preload(db.query('thread').orderBy('created_at', 'desc').limit(20).build());

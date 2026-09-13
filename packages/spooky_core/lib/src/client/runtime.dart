@@ -78,6 +78,7 @@ class Runtime implements InterpreterHost {
   final Map<String, Set<void Function(OutEvent)>> _listeners = {};
   final Set<QueryHash> _scheduledMaterialize = {};
   ({int fetching, int pending}) _lastActivity = (fetching: 0, pending: 0);
+  Set<String> _lastUnsynced = const {};
   late SyncHealth _lastHealth;
   bool _disposed = false;
 
@@ -175,6 +176,12 @@ class Runtime implements InterpreterHost {
       _lastActivity = activity;
       _notify(ActivityChangedEvent(
           fetching: activity.fetching, pending: activity.pending));
+    }
+    final unsynced = unsyncedRecordIds(next);
+    if (unsynced.length != _lastUnsynced.length ||
+        !unsynced.containsAll(_lastUnsynced)) {
+      _lastUnsynced = unsynced;
+      _notify(UnsyncedChangedEvent(unsynced));
     }
     // Health is notified from here, not from the saga that folds a sync round:
     // `connection` moves through `setConnection` on a transport event with no

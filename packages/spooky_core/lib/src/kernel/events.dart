@@ -287,6 +287,16 @@ class ActivityChangedEvent extends OutEvent {
   String get type => 'activity:changed';
 }
 
+/// The set of record ids with unacknowledged local writes changed. Separate
+/// from [ActivityChangedEvent] because the count can stay equal while the set
+/// moves (one write acked as another is queued).
+class UnsyncedChangedEvent extends OutEvent {
+  const UnsyncedChangedEvent(this.recordIds);
+  final Set<String> recordIds;
+  @override
+  String get type => 'unsynced:changed';
+}
+
 enum LogLevel { debug, info, warn, error }
 
 class LogEvent extends OutEvent {

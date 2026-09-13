@@ -497,6 +497,21 @@ class Sp00kyClient {
         (e) => cb((e as ActivityChangedEvent).pending));
   }
 
+  /// Record ids with a local write the server has not acknowledged yet (queued
+  /// in the outbox, or a debounced patch not flushed to it). The per-record
+  /// counterpart of [pendingMutationCount]: what a "sending" versus "synced"
+  /// indicator on one row reads.
+  Set<String> get unsyncedRecordIds => sel.unsyncedRecordIds(_runtime.state);
+
+  /// Observe [unsyncedRecordIds]. Fires immediately and again whenever the set
+  /// changes, including a write acked in the same moment another is queued.
+  void Function() subscribeToUnsyncedRecords(
+      void Function(Set<String> recordIds) cb) {
+    cb(unsyncedRecordIds);
+    return _runtime.on('unsynced:changed',
+        (e) => cb((e as UnsyncedChangedEvent).recordIds));
+  }
+
   /// How many queries are pulling rows right now: what a global spinner reads.
   int get fetchingQueryCount => sel.fetchingQueryCount(_runtime.state);
 

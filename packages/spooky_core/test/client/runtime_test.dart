@@ -131,6 +131,37 @@ void main() {
         reason: 'an unchanged health value must not re-notify');
   });
 
+  test('unsynced ids notify when the set moves at an unchanged count', () {
+    final built = build(state: buildState([buildEntry()]));
+    final rt = built.runtime;
+    final activity = <int>[];
+    final unsynced = <List<String>>[];
+    rt.on('activity:changed',
+        (e) => activity.add((e as ActivityChangedEvent).pending));
+    rt.on('unsynced:changed', (e) {
+      unsynced.add((e as UnsyncedChangedEvent).recordIds.toList()..sort());
+    });
+
+    rt.update(r.outboxReplace([buildOutboxItem(id: '1', recordId: 'a:1')]));
+    // One write acked while another is queued: the pending count stays 1.
+    rt.update(r.outboxReplace([
+      buildOutboxItem(
+          id: '1',
+          recordId: 'a:1',
+          status: OutboxStatus.acked,
+          ackedAt: 1),
+      buildOutboxItem(id: '2', recordId: 'b:2'),
+    ]));
+    rt.update(r.outboxReplace(const []));
+
+    expect(activity, [1, 0]);
+    expect(unsynced, [
+      ['a:1'],
+      ['b:2'],
+      <String>[],
+    ]);
+  });
+
   test('record and authority subscriptions fan out and refcount', () {
     final built = build(
         state: buildState([

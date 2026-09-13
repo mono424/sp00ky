@@ -212,6 +212,30 @@ onCleanup(db.subscribeToPendingMutations(setPending));
 <span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">&#x3C;/</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">Show</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">></span></span></code></pre> </div> </div> </div> 
 <p>Useful for a “3 changes not yet saved” indicator, and for warning before the user closes the tab
 with unsynced work.</p>
+<p>The Dart client also reports <em>which</em> records are still waiting. <code>unsyncedRecordIds</code> is the set of
+record ids with a write the server has not acknowledged yet, and <code>subscribeToUnsyncedRecords</code> fires
+whenever that set changes, even when the count stays the same because one write was acknowledged as
+another was queued. Use it for a per-row indicator, like one tick while a message is only on the
+device and two once it is stored.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="// Dart: one tick while the row is only on this device, two once it is stored.
+Set<String> unsynced = client.unsyncedRecordIds;
+final stop = client.subscribeToUnsyncedRecords((ids) {
+  setState(() => unsynced = ids);
+});
+
+final stored = !unsynced.contains(conversation.id);
+
+// In dispose():
+stop();"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="dart"><code><span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// Dart: one tick while the row is only on this device, two once it is stored.</span></span>
+<span class="line"><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">Set</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">&#x3C;</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">String</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">> unsynced </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> client.unsyncedRecordIds;</span></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">final</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> stop </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> client.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">subscribeToUnsyncedRecords</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">((ids) {</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">  setState</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(() </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=></span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> unsynced </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> ids);</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">});</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">final</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> stored </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">=</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583"> !</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">unsynced.</span><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">contains</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">(conversation.id);</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">// In dispose():</span></span>
+<span class="line"><span style="--shiki-light:#6F42C1;--shiki-dark:#B392F0">stop</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">();</span></span></code></pre> </div> </div> </div> 
 <h2 id="where-data-lives-locally">Where data lives locally</h2>
 <p>Set <code>database.store</code> in your <a href="/docs/reference/client-config">client config</a>:</p>
 

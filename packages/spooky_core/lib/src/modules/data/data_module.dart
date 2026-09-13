@@ -18,7 +18,7 @@ import '../cache/cache_module.dart';
 import '../query_builder.dart' show RelationPlan;
 import '../sync/queue/queue_up.dart';
 import 'relation_resolver.dart';
-import 'window_query.dart';
+import '../../query/window_query.dart';
 
 /// Unified query and mutation management (TS `DataModule`).
 ///

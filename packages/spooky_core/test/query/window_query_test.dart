@@ -1,4 +1,4 @@
-import 'package:spooky_core/src/modules/data/window_query.dart';
+import 'package:spooky_core/src/query/window_query.dart';
 import 'package:spooky_core/src/utils/sort_rows.dart';
 import 'package:test/test.dart';
 

@@ -70,6 +70,17 @@ void main() {
       );
       expect(classifySyncError('ConnectionUnavailableError'), 'network');
     });
+    test('transient server states are network, so the outbox retries them', () {
+      // 2026-09-08 on whitepawn: a 1200-game import lost 752 games because each
+      // of these was classified `application`, rolled back locally and dropped.
+      expect(
+        classifySyncError(Exception(
+            'Transaction conflict: Resource busy: . This transaction can be retried')),
+        'network',
+      );
+      expect(classifySyncError('Specify a namespace to use'), 'network');
+      expect(classifySyncError('Specify a database to use'), 'network');
+    });
     test('everything else is application', () {
       expect(classifySyncError(StateError('bad data')), 'application');
       expect(classifySyncError('permission denied'), 'application');

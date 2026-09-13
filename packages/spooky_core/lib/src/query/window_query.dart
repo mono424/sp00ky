@@ -1,4 +1,4 @@
-import '../../utils/sort_rows.dart';
+import '../utils/sort_rows.dart';
 
 /// How to materialize a windowed (`LIMIT n START m`, m>0) query's rows.
 ///

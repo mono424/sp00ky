@@ -851,7 +851,7 @@ class Sp00kySync {
   /// local cache, separately from the primary window (TS `syncSubqueryChildren`).
   ///
   /// The SSP writes each matched child as a `_00_list_ref` edge tagged
-  /// `parent`/`parent_rel`; [buildSubqueryListRefSelect] pulls those pairs at any
+  /// `parent`/`parent_rel`; [subqueryListRefSelect] pulls those pairs at any
   /// nesting depth. Added/updated bodies are fetched through [SyncEngine], which
   /// saves them into sqlite AND the circuit — the parent view then re-emits (its
   /// subquery depends on the child table), so the next materialization resolves
@@ -871,7 +871,7 @@ class Sp00kySync {
     if (queryState.config.relations.isEmpty) return;
 
     final results = await _remote.query(
-        buildSubqueryListRefSelect(listRefTable()), {'in': queryState.config.id});
+        subqueryListRefSelect(listRefTable()), {'in': queryState.config.id});
     final fresh = _parseListRefRows(results);
     final prev = queryState.config.subqueryRemoteArray ?? const [];
     if (recordVersionArraysEqual(fresh, prev)) return; // nothing new
@@ -889,7 +889,7 @@ class Sp00kySync {
 
   Future<RecordVersionArray> _fetchListRef(RecordId queryId) async {
     final results = await _remote
-        .query(buildListRefSelect(listRefTable()), {'in': queryId});
+        .query(listRefSelect(listRefTable()), {'in': queryId});
     return _parseListRefRows(results);
   }
 

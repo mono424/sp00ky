@@ -59,6 +59,41 @@ Map<String, dynamic> parseParams(
   return parsed;
 }
 
+/// The schema field an `OR`-group parameter was minted from: the query builder
+/// names the n-th alternative of a field `field__or<n>` so each binding is
+/// distinct, and both spellings must re-type through the same column
+/// (TS `baseFieldOfParam`).
+final _orSuffix = RegExp(r'^(.+)__or\d+$');
+
+String baseFieldOfParam(String name) =>
+    _orSuffix.firstMatch(name)?.group(1) ?? name;
+
+/// Re-type values from the schema, KEEPING keys the schema does not declare
+/// (TS `parseQueryParams`).
+///
+/// This is the record-payload variant of [parseParams]: an outbox payload or a
+/// create/update body may legitimately carry fields the local schema does not
+/// know about, and dropping them would lose the write. [parseParams] keeps its
+/// narrower "declared columns only" behaviour for query parameters.
+Map<String, dynamic> parseQueryParams(
+  Map<String, ColumnSchema> tableSchema,
+  Map<String, dynamic> params,
+) {
+  final parsed = <String, dynamic>{};
+  for (final entry in params.entries) {
+    if (entry.value == null) {
+      parsed[entry.key] = null;
+      continue;
+    }
+    final column =
+        tableSchema[entry.key] ?? tableSchema[baseFieldOfParam(entry.key)];
+    parsed[entry.key] = column == null
+        ? entry.value
+        : _parseValue(entry.key, column, entry.value);
+  }
+  return parsed;
+}
+
 dynamic _parseValue(String name, ColumnSchema column, dynamic value) {
   if (column.recordId) {
     if (value is RecordId) return value;

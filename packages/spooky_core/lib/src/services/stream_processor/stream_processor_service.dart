@@ -296,14 +296,8 @@ class StreamProcessorService {
     if (initial == null) {
       throw StateError('Failed to register query plan');
     }
-    final update = StreamUpdate(
-      queryHash: initial.queryHash,
-      localArray: initial.localArray,
-      resultHash: initial.resultHash,
-      delta: initial.delta,
-    );
     saveState();
-    return update;
+    return initial.update;
   }
 
   /// Current session identity used for permission injection. Empty strings

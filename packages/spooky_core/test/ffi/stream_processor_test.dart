@@ -20,8 +20,9 @@ void main() {
         'lastActiveAt': '2026-01-01T00:00:00.000Z',
       });
       expect(initial, isNotNull);
-      expect(initial!.queryHash, 'q1');
-      expect(initial.localArray, isEmpty);
+      expect(initial!.update.queryHash, 'q1');
+      expect(initial.update.localArray, isEmpty);
+      expect(initial.missingFields, isEmpty);
 
       final updates = sp.ingest('thread', 'CREATE', 'thread:a', {
         'id': 'thread:a',

@@ -54,6 +54,12 @@ class StreamUpdate {
     this.delta = ViewDelta.empty,
     this.op,
     this.materializationTimeMs,
+    this.storeApplyMs,
+    this.circuitStepMs,
+    this.transformMs,
+    this.parseMs,
+    this.planMs,
+    this.snapshotMs,
   });
 
   /// The query id this update is for (WASM `query_id`).
@@ -70,6 +76,16 @@ class StreamUpdate {
 
   /// End-to-end ingest latency for the FFI call that produced this update.
   final double? materializationTimeMs;
+
+  /// Per-phase circuit time (ms). The ingest path fills
+  /// [storeApplyMs]/[circuitStepMs]/[transformMs]; the register path fills
+  /// [parseMs]/[planMs]/[snapshotMs]. The unused side stays null.
+  final double? storeApplyMs;
+  final double? circuitStepMs;
+  final double? transformMs;
+  final double? parseMs;
+  final double? planMs;
+  final double? snapshotMs;
 
   /// Build from the decoded `WasmViewUpdate` JSON.
   factory StreamUpdate.fromWasm(
@@ -90,7 +106,21 @@ class StreamUpdate {
           : ViewDelta.empty,
       op: op,
       materializationTimeMs: materializationTimeMs,
+      storeApplyMs: _ms(json['timing_store_apply_ms']),
+      circuitStepMs: _ms(json['timing_circuit_step_ms']),
+      transformMs: _ms(json['timing_transform_ms']),
+      parseMs: _ms(json['timing_parse_ms']),
+      planMs: _ms(json['timing_plan_ms']),
+      snapshotMs: _ms(json['timing_snapshot_ms']),
     );
+  }
+
+  /// The native side writes `0` for the phases a call did not run; report those
+  /// as "not measured" rather than as a zero-millisecond phase.
+  static double? _ms(Object? raw) {
+    if (raw is! num) return null;
+    final v = raw.toDouble();
+    return v == 0 ? null : v;
   }
 }
 
@@ -100,4 +130,31 @@ class SspException implements Exception {
   final String message;
   @override
   String toString() => 'SspException: $message';
+}
+
+/// What `registerView` answers with: the initial view update plus, under
+/// projection, the fields this plan evaluates that stored rows do not hold.
+class Registration {
+  const Registration({required this.update, this.missingFields = const {}});
+
+  final StreamUpdate update;
+  final Map<String, List<String>> missingFields;
+}
+
+/// What `reconcile` answers with.
+class Reconciled {
+  const Reconciled({
+    required this.fetch,
+    required this.deleted,
+    required this.updates,
+  });
+
+  /// Ids (the caller's spelling) whose body the store lacks or holds stale.
+  final List<String> fetch;
+
+  /// Rows deleted because the caller's list did not have them.
+  final int deleted;
+
+  /// View updates produced by those deletes.
+  final List<StreamUpdate> updates;
 }

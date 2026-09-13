@@ -210,3 +210,153 @@ pub unsafe extern "C" fn ssp_load_state(
         Ok(Value::Null)
     })
 }
+
+/// Ingest many record changes as ONE circuit step. `items_json` is a JSON array
+/// of `{table, op, id, record}`. Returns `{"ok":[WasmViewUpdate,...]}`.
+///
+/// # Safety
+/// See [`ssp_ingest`].
+#[no_mangle]
+pub unsafe extern "C" fn ssp_ingest_many(
+    ptr: *mut Processor,
+    items_json: *const c_char,
+) -> *mut c_char {
+    ffi_call(|| {
+        if ptr.is_null() {
+            anyhow::bail!("null processor handle");
+        }
+        let p = &mut *ptr;
+        let items: Vec<processor::IngestItem> = serde_json::from_str(cstr(items_json)?)?;
+        Ok(serde_json::to_value(p.ingest_many(items)?)?)
+    })
+}
+
+/// Compare one table against the caller's authoritative `[[id, rv], ...]` list.
+/// Returns `{"ok":{fetch, deleted, updates}}`.
+///
+/// # Safety
+/// See [`ssp_ingest`].
+#[no_mangle]
+pub unsafe extern "C" fn ssp_reconcile(
+    ptr: *mut Processor,
+    table: *const c_char,
+    entries_json: *const c_char,
+) -> *mut c_char {
+    ffi_call(|| {
+        if ptr.is_null() {
+            anyhow::bail!("null processor handle");
+        }
+        let p = &mut *ptr;
+        let table = cstr(table)?;
+        let entries: Vec<(String, i64)> = serde_json::from_str(cstr(entries_json)?)?;
+        Ok(serde_json::to_value(p.reconcile(table, &entries))?)
+    })
+}
+
+/// Highest `_00_rv` folded into each table. Returns `{"ok":{table: rv, ...}}`.
+///
+/// # Safety
+/// `ptr` must be a valid processor handle.
+#[no_mangle]
+pub unsafe extern "C" fn ssp_max_row_versions(ptr: *const Processor) -> *mut c_char {
+    ffi_call(|| {
+        if ptr.is_null() {
+            anyhow::bail!("null processor handle");
+        }
+        let p = &*ptr;
+        Ok(serde_json::to_value(p.max_row_versions())?)
+    })
+}
+
+/// Keep only the fields registered plans evaluate per stored row.
+/// Returns `{"ok":null}` or `{"err":"..."}`.
+///
+/// # Safety
+/// See [`ssp_ingest`].
+#[no_mangle]
+pub unsafe extern "C" fn ssp_set_projection(ptr: *mut Processor, enabled: bool) -> *mut c_char {
+    ffi_call(|| {
+        if ptr.is_null() {
+            anyhow::bail!("null processor handle");
+        }
+        let p = &mut *ptr;
+        p.set_projection(enabled);
+        Ok(Value::Null)
+    })
+}
+
+/// Snapshot the base collections as raw bytes.
+///
+/// The snapshot is megabytes on a warm client, so it does NOT travel through
+/// the JSON envelope: on success `*out_ptr`/`*out_len` describe a buffer this
+/// library owns, which the caller MUST release with [`ssp_bytes_free`] after
+/// copying it out. The returned envelope carries only the outcome
+/// (`{"ok":null}` or `{"err":"..."}`); on error the out-params are left as a
+/// null pointer and a zero length.
+///
+/// # Safety
+/// `ptr` must be a valid processor handle; `out_ptr` and `out_len` must be
+/// valid, writable pointers.
+#[no_mangle]
+pub unsafe extern "C" fn ssp_save_store_state(
+    ptr: *const Processor,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> *mut c_char {
+    ffi_call(|| {
+        if ptr.is_null() {
+            anyhow::bail!("null processor handle");
+        }
+        if out_ptr.is_null() || out_len.is_null() {
+            anyhow::bail!("null out parameter");
+        }
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        let p = &*ptr;
+        let mut bytes = p.save_store_state()?.into_boxed_slice();
+        *out_len = bytes.len();
+        *out_ptr = bytes.as_mut_ptr();
+        // The buffer is now owned by the caller until `ssp_bytes_free`.
+        std::mem::forget(bytes);
+        Ok(Value::Null)
+    })
+}
+
+/// Release a buffer handed out by [`ssp_save_store_state`].
+///
+/// # Safety
+/// `ptr`/`len` must be exactly what a single [`ssp_save_store_state`] call
+/// wrote, and must not have been freed already.
+#[no_mangle]
+pub unsafe extern "C" fn ssp_bytes_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)));
+}
+
+/// Install a snapshot written by [`ssp_save_store_state`] under the views that
+/// are already registered. Returns `{"ok":[WasmViewUpdate,...]}` with each
+/// view's new full result.
+///
+/// # Safety
+/// `ptr` must be a valid processor handle; `bytes`/`len` must describe a
+/// readable buffer owned by the caller for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn ssp_load_store_state(
+    ptr: *mut Processor,
+    bytes: *const u8,
+    len: usize,
+) -> *mut c_char {
+    ffi_call(|| {
+        if ptr.is_null() {
+            anyhow::bail!("null processor handle");
+        }
+        if bytes.is_null() {
+            anyhow::bail!("null snapshot pointer");
+        }
+        let p = &mut *ptr;
+        let slice = std::slice::from_raw_parts(bytes, len);
+        Ok(serde_json::to_value(p.load_store_state(slice)?)?)
+    })
+}

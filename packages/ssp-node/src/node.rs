@@ -1536,7 +1536,8 @@ impl SspNode {
             let total = circuit.synthesized_row_versions();
             let record_counts = deltas.iter().map(|d| d.records.len()).collect::<Vec<_>>();
             let view_ids = deltas.iter().map(|d| d.query_id.clone()).collect::<Vec<_>>();
-            let source = payload.record.get("_00_rv").and_then(|v| v.as_i64()).filter(|v| *v > 0)
+            // Deletes only remove membership; their deleted version need not become visible.
+            let source = payload.record.get("_00_rv").and_then(|v| v.as_i64()).filter(|v| *v > 0 && op != Operation::Delete)
                 .map(|v| (payload.id.clone(), v));
             let mut cleanup = Vec::new();
             if op == Operation::Delete && valid_record_id(&payload.id) {
@@ -2005,6 +2006,7 @@ pub(crate) async fn wait_for_row_committed(
     row_id: &str,
     expected_version: i64,
     timeout: std::time::Duration,
+    probes: &tokio::sync::Semaphore,
 ) -> bool {
     if !valid_record_id(row_id) {
         return false;
@@ -2012,13 +2014,15 @@ pub(crate) async fn wait_for_row_committed(
     let start = web_time::Instant::now();
     let mut backoff_ms: u64 = 10;
     while start.elapsed() < timeout {
-        if let Ok(rows) = db
-            .query(
+        let result = {
+            let Ok(_probe) = probes.acquire().await else { return false; };
+            db.query(
                 "SELECT VALUE version FROM ONLY _00_version WHERE record_id = type::record($rid) LIMIT 1",
                 &[("rid", json!(row_id))],
             )
             .await
-        {
+        };
+        if let Ok(rows) = result {
             if let Some(v) = rows.first().and_then(|v| v.as_i64()) {
                 if v >= expected_version {
                     return true;

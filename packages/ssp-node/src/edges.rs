@@ -166,14 +166,19 @@ impl PublicationCleanup {
     }
 }
 struct PublicationWork {
-    permit: PublicationPermit,
+    permit: Arc<PublicationPermit>,
     deltas: Vec<ViewDelta>,
     versions: CapturedVersions,
     epochs: HashMap<String, u64>,
     source: Option<(String, i64)>,
+    source_ready: Arc<std::sync::atomic::AtomicBool>,
+    source_cancel: Arc<tokio::sync::Notify>,
     cleanup: Vec<PublicationCleanup>,
     ready: Arc<std::sync::atomic::AtomicU8>,
     retry_at: Option<web_time::Instant>,
+}
+impl Drop for PublicationWork {
+    fn drop(&mut self) { self.source_cancel.notify_one(); }
 }
 /// Registration metadata must exist before its initial publication can run.
 /// A dropped handler cancels its slot and invalidates dependent queued work.
@@ -300,8 +305,9 @@ impl EdgePublisher {
             stats.views = views;
         }
         let generation = permit.generation;
-        state.queue.push_back(PublicationWork { permit, deltas, versions: CapturedVersions(versions), epochs: epochs.clone(),
-            source, cleanup, ready: ready.clone(), retry_at: None });
+        state.queue.push_back(PublicationWork { permit: Arc::new(permit), deltas, versions: CapturedVersions(versions), epochs: epochs.clone(),
+            source_ready: Arc::new(std::sync::atomic::AtomicBool::new(source.is_none())),
+            source_cancel: Arc::new(tokio::sync::Notify::new()), source, cleanup, ready: ready.clone(), retry_at: None });
         drop(state);
         self.0.wake.notify_one();
         if let Some(telemetry) = self.0.telemetry.get() {
@@ -345,13 +351,44 @@ impl EdgePublisher {
         let publisher = self.clone();
         let scheduler = platform.scheduler.clone();
         let telemetry = platform.telemetry.clone();
+        let source_db = platform.db.clone();
+        let spawner = platform.spawner.clone();
         platform.spawner.spawn(Box::pin(async move {
-            publisher.run(db, processor, gate, mode, scheduler, telemetry, window).await;
+            publisher.run(db, processor, gate, mode, scheduler, telemetry, window, source_db, spawner).await;
         }));
     }
     async fn run(&self, db: Arc<dyn Db>, processor: Arc<RwLock<Circuit>>, gate: Arc<tokio::sync::Mutex<()>>,
-        mode: RefMode, scheduler: Arc<dyn Scheduler>, telemetry: Arc<dyn Telemetry>, window: Duration) {
+        mode: RefMode, scheduler: Arc<dyn Scheduler>, telemetry: Arc<dyn Telemetry>, window: Duration,
+        source_db: Arc<dyn Db>, spawner: Arc<dyn crate::ports::Spawner>) {
+        // Limit active probes, not entire visibility waits: all admitted source
+        // deadlines run concurrently, without serial five-second waves.
+        let probes = Arc::new(tokio::sync::Semaphore::new(16));
         loop {
+            let sources = {
+                let mut state = self.0.state.lock().unwrap();
+                state.queue.iter_mut().filter_map(|work| work.source.take().map(|source|
+                    (source, work.permit.clone(), work.source_ready.clone(), work.source_cancel.clone())))
+                    .collect::<Vec<_>>()
+            };
+            for ((row, version), permit, ready, cancel) in sources {
+                let db = source_db.clone();
+                let scheduler = scheduler.clone();
+                let probes = probes.clone();
+                let queue = self.0.clone();
+                spawner.spawn(Box::pin(async move {
+                    // The shared lease outlives canceled queued work until this
+                    // task and its DB future have actually been dropped.
+                    let _permit = permit;
+                    tokio::select! {
+                        _ = cancel.notified() => {},
+                        _ = scheduler.sleep(Duration::from_secs(5)) => {},
+                        _ = crate::node::wait_for_row_committed(db.as_ref(), scheduler.as_ref(), &row, version,
+                            Duration::from_secs(5), probes.as_ref()) => {},
+                    }
+                    ready.store(true, std::sync::atomic::Ordering::Release);
+                    queue.wake.notify_one();
+                }));
+            }
             let notified = self.0.wake.notified();
             let work = {
                 let mut state = self.0.state.lock().unwrap();
@@ -366,7 +403,7 @@ impl EdgePublisher {
                     // Cross-view orphan cleanup is a global barrier. Ordinary
                     // publications only wait for earlier work for their views.
                     let global = !work.cleanup.is_empty();
-                    if ready == 1 && work.retry_at.map_or(true, |at| at <= web_time::Instant::now())
+                    if ready == 1 && work.source_ready.load(std::sync::atomic::Ordering::Acquire) && work.retry_at.map_or(true, |at| at <= web_time::Instant::now())
                         && !work.epochs.keys().any(|id| blocked.contains(id))
                         && (!global || index == 0) {
                         chosen = Some(index); break;
@@ -396,9 +433,6 @@ impl EdgePublisher {
                     || (work.cleanup.is_empty() && work.epochs.iter().all(|(id, epoch)| state.epochs.get(id) != Some(epoch)))
             };
             if obsolete { continue; }
-            if let Some((row, version)) = work.source.take() {
-                crate::node::wait_for_row_committed(db.as_ref(), scheduler.as_ref(), &row, version, Duration::from_secs(5)).await;
-            }
             let publication = gate.lock().await;
             let wait = web_time::Instant::now();
             {
@@ -2009,12 +2043,24 @@ mod publication_tests {
         source_started: tokio::sync::Notify,
         source_release: tokio::sync::Notify,
         block_source: AtomicBool,
+        hold_all_sources: AtomicBool,
+        source_delay_ms: std::sync::atomic::AtomicU64,
+        active_probes: std::sync::atomic::AtomicUsize,
+        max_probes: std::sync::atomic::AtomicUsize,
         sql: Mutex<Vec<String>>,
     }
     #[async_trait::async_trait]
     impl Db for TestDb {
         async fn query(&self, sql: &str, _binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
             if sql.contains("SELECT VALUE version") {
+                struct Active<'a>(&'a std::sync::atomic::AtomicUsize);
+                impl Drop for Active<'_> { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
+                let active = self.active_probes.fetch_add(1, Ordering::AcqRel) + 1;
+                let _active = Active(&self.active_probes);
+                self.max_probes.fetch_max(active, Ordering::AcqRel);
+                if self.hold_all_sources.load(Ordering::Acquire) { std::future::pending::<()>().await; }
+                let delay = self.source_delay_ms.load(Ordering::Acquire);
+                if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
                 if self.block_source.swap(false, Ordering::AcqRel) {
                     self.source_started.notify_one();
                     self.source_release.notified().await;
@@ -2033,7 +2079,7 @@ mod publication_tests {
     impl Scheduler for FastScheduler {
         async fn schedule(&self, _: TimerKind, _: u64) {}
         async fn cancel(&self, _: &TimerKind) {}
-        async fn sleep(&self, _: Duration) { tokio::time::sleep(Duration::from_millis(2)).await; }
+        async fn sleep(&self, duration: Duration) { tokio::time::sleep(duration).await; }
     }
     fn circuit() -> Arc<RwLock<Circuit>> {
         let mut c = Circuit::new();
@@ -2045,9 +2091,13 @@ mod publication_tests {
             removals: if add { vec![] } else { vec![id.into()] }, updates: vec![], records: vec![],
             result_hash: String::new(), subquery_items: vec![], auth_id: String::new(), initial: false }
     }
+    struct TestSpawner;
+    impl crate::ports::Spawner for TestSpawner {
+        fn spawn(&self, fut: crate::ports::LocalBoxFuture) { tokio::spawn(fut); }
+    }
     fn start(p: EdgePublisher, db: Arc<TestDb>, c: Arc<RwLock<Circuit>>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { p.run(db, c, Arc::new(tokio::sync::Mutex::new(())), RefMode::Single,
-            Arc::new(FastScheduler), Arc::new(NoopTelemetry), Duration::ZERO).await })
+        tokio::spawn(async move { p.run(db.clone(), c, Arc::new(tokio::sync::Mutex::new(())), RefMode::Single,
+            Arc::new(FastScheduler), Arc::new(NoopTelemetry), Duration::ZERO, db, Arc::new(TestSpawner)).await })
     }
     async fn drained(p: &EdgePublisher) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2097,6 +2147,99 @@ mod publication_tests {
         assert_eq!(sql.len(), 2);
         assert!(sql[0].contains("RELATE "));
         assert!(sql[1].contains("DELETE (SELECT"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_source_wait_allows_unrelated_view_and_preserves_same_view_order() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        c.write().await.add_query(ssp::operator::QueryPlan { id: "other".into(), root: ssp::operator::OperatorPlan::Scan { table: "thread".into() } }, None, None);
+        let db = Arc::new(TestDb::default());
+        db.block_source.store(true, Ordering::Release);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await,
+            Some(("thread:a".into(), 9)), false, vec![]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", false)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c.clone());
+        db.source_started.notified().await;
+        let mut other = delta("thread:b", true);
+        other.query_id = "other".into();
+        other.initial = true;
+        p.enqueue(p.try_reserve(0).unwrap(), vec![other], &*c.read().await, None, false, vec![]);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while db.sql.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.expect("unrelated registration publishes while source DB remains blocked");
+        // Use real elapsed time: the five-second visibility fallback must not
+        // fire early, and the same-view delete must still wait for the add.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(db.sql.lock().unwrap().len(), 1);
+        assert!(db.sql.lock().unwrap()[0].contains("thread:b"));
+        assert_eq!(p.snapshot().pending_batches, 2);
+        db.source_release.notify_one();
+        drained(&p).await;
+        let sql = db.sql.lock().unwrap();
+        assert!(sql[1].contains("RELATE "));
+        assert!(sql[2].contains("DELETE (SELECT"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_source_burst_probes_concurrently_with_hard_probe_bound() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.source_delay_ms.store(100, Ordering::Release);
+        for i in 0..32 {
+            let id = format!("thread:r{i}");
+            p.enqueue(p.try_reserve(0).unwrap(), vec![delta(&id, true)], &*c.read().await,
+                Some((id, 9)), false, vec![]);
+        }
+        let begin = web_time::Instant::now();
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::timeout(Duration::from_secs(1), drained(&p)).await
+            .expect("32 real100ms source probes must overlap, not take3.2 seconds");
+        assert!(begin.elapsed() >= Duration::from_millis(200));
+        assert_eq!(db.max_probes.load(Ordering::Acquire), 16);
+        assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
+        assert_eq!(db.sql.lock().unwrap().len(), 32);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_source_deadline_includes_probe_capacity_and_network_wait() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.hold_all_sources.store(true, Ordering::Release);
+        for i in 0..32 {
+            let id = format!("thread:r{i}");
+            p.enqueue(p.try_reserve(0).unwrap(), vec![delta(&id, true)], &*c.read().await,
+                Some((id, 9)), false, vec![]);
+        }
+        let begin = web_time::Instant::now();
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while p.snapshot().pending_batches > 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("all source deadlines expire together, including probes waiting for capacity");
+        assert!(begin.elapsed() >= Duration::from_secs(5));
+        assert_eq!(db.max_probes.load(Ordering::Acquire), 16);
+        assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
+        assert_eq!(db.sql.lock().unwrap().len(), 32);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_invalidated_source_wait_cancels_and_releases_shared_lease() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 1, ..Default::default() });
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.block_source.store(true, Ordering::Release);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await,
+            Some(("thread:a".into(), 9)), false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        db.source_started.notified().await;
+        assert!(p.try_reserve(0).is_none());
+        p.invalidate_all();
+        drained(&p).await;
+        assert!(p.try_reserve(0).is_some());
+        assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
+        assert!(db.sql.lock().unwrap().is_empty());
         task.abort();
     }
     #[tokio::test]

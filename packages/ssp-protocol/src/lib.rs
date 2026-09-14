@@ -461,5 +461,7 @@ mod tests {
 /// Call only when INFO FOR DB contains `_00_version`; replicas already carry
 /// `_00_rv`, and bare integration databases may have no version table.
 pub fn with_durable_row_versions(page_query: &str) -> String {
-    page_query.replacen("SELECT *", "SELECT *, ((SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1) AS _00_rv", 1)
+    // Bind the outer id before planning the lookup. A correlated $parent.id
+    // predicate makes SurrealDB scan the entire ledger for every source row.
+    page_query.replacen("SELECT *", "SELECT *, { LET $spky_row_id = id; RETURN (SELECT VALUE version FROM _00_version WHERE record_id = $spky_row_id LIMIT 1)[0] ?? _00_rv ?? 1; } AS _00_rv", 1)
 }

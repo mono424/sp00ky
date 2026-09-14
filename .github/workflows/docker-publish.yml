@@ -1,6 +1,12 @@
 name: Docker Publish
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable server image tag (does not publish npm packages)
+        required: true
+        type: string
   push:
     tags:
       - "sp00ky/v*"
@@ -18,7 +24,17 @@ jobs:
     steps:
       - name: Extract version from tag
         id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+            [[ "$TAG" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]] || exit 1
+            echo "version=$TAG" >> "$GITHUB_OUTPUT"
+            echo "channel=" >> "$GITHUB_OUTPUT"
+            echo "is_canary=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           TAG="${GITHUB_REF#refs/tags/sp00ky/v}"
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
           # Same three channels as the npm publish: an alpha moves only its own
@@ -133,7 +149,9 @@ jobs:
         id: tags
         run: |
           TAGS="${{ matrix.image }}:${{ needs.prepare.outputs.version }}"
-          TAGS="$TAGS,${{ matrix.image }}:${{ needs.prepare.outputs.channel }}"
+          if [ -n "${{ needs.prepare.outputs.channel }}" ]; then
+            TAGS="$TAGS,${{ matrix.image }}:${{ needs.prepare.outputs.channel }}"
+          fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push

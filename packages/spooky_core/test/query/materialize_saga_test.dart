@@ -12,9 +12,29 @@ import 'package:test/test.dart';
 import '../saga_helpers.dart';
 
 QueryLifecycle life(QueryPhase phase) => QueryLifecycle(
-    phase: phase, remote: RemotePhase.unregistered, fetchDepth: 0, notified: false);
+    phase: phase,
+    remote: RemotePhase.unregistered,
+    fetchDepth: 0,
+    notified: false);
 
 void main() {
+  test('an unchanged empty result is emitted only after it settles', () async {
+    for (final phase in [QueryPhase.cold, QueryPhase.live]) {
+      final out = await runPure<void>(
+        (ctx) => materialize(ctx, 'empty'),
+        state: r.markDirty(['empty'])(buildState([
+          buildEntry(
+              def: buildDefinition(hash: 'empty'), lifecycle: life(phase)),
+        ])),
+        handlers: defaults(over: {
+          'local.getMany': (_, __) => <Map<String, dynamic>>[],
+        }),
+      );
+      expect(out.emitted.whereType<QueryRecordsEvent>(),
+          phase == QueryPhase.live ? hasLength(1) : isEmpty);
+    }
+  });
+
   test('no entry: nothing happens', () async {
     final out = await runPure<void>(
       (ctx) => materialize(ctx, 'nope'),
@@ -68,8 +88,8 @@ void main() {
         'local.getMany': (_, __) => <Map<String, dynamic>>[],
       }),
     );
-    expect((out.ofKind('local.getMany').single as LocalGetMany).ids,
-        ['thing:1']);
+    expect(
+        (out.ofKind('local.getMany').single as LocalGetMany).ids, ['thing:1']);
   });
 
   test('the outbox overlay adds local writes and hides local deletes',
@@ -87,9 +107,7 @@ void main() {
         r.outboxReplace([
           buildOutboxItem(id: 'm1', recordId: 'thing:2'),
           buildOutboxItem(
-              id: 'm2',
-              recordId: 'thing:3',
-              type: MutationEventType.delete),
+              id: 'm2', recordId: 'thing:3', type: MutationEventType.delete),
         ]),
       ]),
       handlers: defaults(over: {
@@ -200,8 +218,8 @@ void main() {
 
     test('an unknown hash is ignored', () async {
       final out = await runPure<void>(
-        (ctx) => streamUpdate(ctx,
-            const StreamUpdate(queryHash: 'nope', localArray: [])),
+        (ctx) => streamUpdate(
+            ctx, const StreamUpdate(queryHash: 'nope', localArray: [])),
         handlers: defaults(),
       );
       expect(out.state.dirty, isEmpty);

@@ -349,6 +349,38 @@ impl ResyncDirective {
     }
 }
 
+/// Bounded, sanitized publication backlog details. No source rows or bindings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationViewMetrics {
+    pub query_id: String,
+    pub pending_operations: u64,
+    pub pending_bytes: u64,
+    pub oldest_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationConnectionMetrics {
+    pub generation: u64,
+    pub last_reconnect_duration_ms: Option<u64>,
+    pub reconnect_failures: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationMetrics {
+    pub pending_batches: u64,
+    pub pending_operations: u64,
+    pub pending_bytes: u64,
+    pub oldest_age_ms: u64,
+    pub parked_batches: u64,
+    pub last_success_at_ms: Option<u64>,
+    pub overload_total: u64,
+    #[serde(default)]
+    pub connection: Option<PublicationConnectionMetrics>,
+    /// At most eight views, ranked by backlog by the publisher.
+    #[serde(default)]
+    pub worst_views: Vec<PublicationViewMetrics>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SspHeartbeat {
     pub ssp_id: String,
@@ -357,11 +389,37 @@ pub struct SspHeartbeat {
     pub cpu_usage: Option<f64>,
     pub memory_usage: Option<f64>,
     pub version: String,
+    /// Absent on older SSPs. Older schedulers ignore this additional field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationMetrics>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_publication_is_backward_compatible() {
+        let legacy = serde_json::json!({
+            "ssp_id": "ssp-0", "timestamp": 123, "views": 2,
+            "cpu_usage": null, "memory_usage": null, "version": "old"
+        });
+        let heartbeat: SspHeartbeat = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(heartbeat.publication.is_none());
+        assert_eq!(serde_json::to_value(heartbeat).unwrap(), legacy);
+
+        let mut current = legacy;
+        current["publication"] = serde_json::json!({
+            "pending_batches": 2, "pending_operations": 15, "pending_bytes": 512,
+            "oldest_age_ms": 500, "parked_batches": 1,
+            "last_success_at_ms": null, "overload_total": 0
+        });
+        let heartbeat: SspHeartbeat = serde_json::from_value(current).unwrap();
+        let publication = heartbeat.publication.unwrap();
+        assert_eq!(publication.pending_operations, 15);
+        assert!(publication.connection.is_none());
+        assert!(publication.worst_views.is_empty());
+    }
 
     #[test]
     fn anon_routes_to_dedicated_anon_table_in_both_modes() {

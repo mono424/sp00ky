@@ -1,8 +1,9 @@
 import { For, Show, batch, createMemo, createResource, createSignal, onCleanup, type Accessor } from 'solid-js';
 import { A, useParams } from '@solidjs/router';
 import { api } from '../api/client';
+import type { PublicationMetrics } from '../api/types';
 import { Cell, Empty, KeyValue, PageHead, Panel, Pill, Rail } from '../components/Chrome';
-import { decodeParam, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
+import { decodeParam, formatBytes, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
 
 interface IncidentEvent {
   at: number;
@@ -22,6 +23,10 @@ interface Incident {
   started_at: number;
   ended_at: number | null;
   max_buffered_events: number;
+  max_publication_operations?: number;
+  max_publication_bytes?: number;
+  max_publication_age_ms?: number;
+  publication?: PublicationMetrics | null;
   event_count: number;
   events: IncidentEvent[];
 }
@@ -164,6 +169,28 @@ export function IncidentDetail() {
             ['Started', stamp(incident().started_at)],
             ['Ended', incident().ended_at == null ? 'Still open' : stamp(incident().ended_at!)],
           ]} /></Panel>
+          <Show when={incident().publication}>{(publication) => <Panel title="Publication backlog" sub="Sampled from SSP heartbeats during this incident. Peaks may fall between samples.">
+            <KeyValue rows={[
+              ['Peak pending operations', formatCount(incident().max_publication_operations)],
+              ['Peak pending bytes', formatBytes(incident().max_publication_bytes)],
+              ['Longest observed wait', formatDuration(incident().max_publication_age_ms ?? 0)],
+              ['Parked batches at last nonempty sample', formatCount(publication().parked_batches)],
+              ['Last successful publication', publication().last_success_at_ms == null ? 'Not reported' : stamp(publication().last_success_at_ms!)],
+              ['Overload rejections since SSP start', formatCount(publication().overload_total)],
+            ]} />
+            <Show when={publication().connection}>{(connection) => <KeyValue rows={[
+              ['Database session generation', formatCount(connection().generation)],
+              ['Last reconnect attempt', connection().last_reconnect_duration_ms == null ? 'No reconnect attempted' : formatDuration(connection().last_reconnect_duration_ms!)],
+              ['Failed reconnect attempts', formatCount(connection().reconnect_failures)],
+            ]} />}</Show>
+            <Show when={publication().worst_views.length}>
+              <div class="table-scroll"><table><thead><tr><th>View</th><th>Pending operations</th><th>Pending bytes</th><th>Oldest wait</th></tr></thead>
+                <tbody><For each={publication().worst_views}>{(view) => <tr>
+                  <td><A class="mono" href={`/views/${encodeURIComponent(view.query_id)}`}>{view.query_id}</A></td>
+                  <td>{formatCount(view.pending_operations)}</td><td>{formatBytes(view.pending_bytes)}</td><td>{formatDuration(view.oldest_age_ms)}</td>
+                </tr>}</For></tbody></table></div>
+            </Show>
+          </Panel>}</Show>
           <Panel title="Timeline" sub={`${incident().events.length} retained of ${formatCount(incident().event_count)} recorded events. Oldest first.`}>
             <Show when={incident().events.length} fallback={<Empty>No timeline events retained.</Empty>}>
               <ol style={{ margin: '0', padding: '0', 'list-style': 'none' }}>

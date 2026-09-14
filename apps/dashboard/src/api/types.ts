@@ -121,7 +121,20 @@ export interface BootstrapProgress {
   current_table?: string | null;
 }
 
+export interface PublicationMetrics {
+  pending_batches: number;
+  pending_operations: number;
+  pending_bytes: number;
+  oldest_age_ms: number;
+  parked_batches: number;
+  last_success_at_ms: number | null;
+  overload_total: number;
+  connection?: { generation: number; last_reconnect_duration_ms: number | null; reconnect_failures: number } | null;
+  worst_views: { query_id: string; pending_operations: number; pending_bytes: number; oldest_age_ms: number }[];
+}
+
 export interface SspEntity {
+  publication?: PublicationMetrics | null;
   entity: 'ssp';
   id: string;
   ip: string | null;

@@ -11,6 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub struct Metrics {
+    meter: opentelemetry::metrics::Meter,
     pub ingest_counter: opentelemetry::metrics::Counter<u64>,
     pub ingest_duration: opentelemetry::metrics::Histogram<f64>,
     pub view_count: opentelemetry::metrics::UpDownCounter<i64>,
@@ -139,6 +140,7 @@ impl Metrics {
             .build();
 
         Self {
+            meter: meter.clone(),
             ingest_counter: meter
                 .u64_counter("ssp_ingest_total")
                 .with_description("Total number of ingest operations")
@@ -166,6 +168,32 @@ impl Metrics {
                 .build(),
             ingest_total,
         }
+    }
+
+    /// Export backlog levels without touching the circuit or database.
+    pub fn observe_publication(&self, publisher: ssp_node::edges::EdgePublisher, connection: crate::SharedDb) {
+        type Read = fn(&ssp_protocol::PublicationMetrics) -> u64;
+        let instruments: [(&str, Read); 6] = [
+            ("ssp_edge_pending_batches", |s| s.pending_batches),
+            ("ssp_edge_pending_operations", |s| s.pending_operations),
+            ("ssp_edge_pending_bytes", |s| s.pending_bytes),
+            ("ssp_edge_oldest_age_milliseconds", |s| s.oldest_age_ms),
+            ("ssp_edge_parked_batches", |s| s.parked_batches),
+            ("ssp_edge_overload_rejections", |s| s.overload_total),
+        ];
+        for (name, read) in instruments {
+            let queue = publisher.clone();
+            self.meter.u64_observable_gauge(name)
+                .with_callback(move |observer| observer.observe(read(&queue.snapshot()), &[]))
+                .build();
+        }
+        self.meter.u64_observable_gauge("ssp_edge_last_success_epoch_milliseconds")
+            .with_callback(move |observer| {
+                if let Some(at) = publisher.snapshot().last_success_at_ms { observer.observe(at, &[]); }
+            }).build();
+        self.meter.u64_observable_gauge("ssp_edge_connection_generation")
+            .with_callback(move |observer| observer.observe(connection.reconnect_metrics().0, &[]))
+            .build();
     }
 
     pub fn inc_ingest(&self, count: u64, _: &[KeyValue]) {

@@ -43,8 +43,8 @@ pub struct NodeConfig {
     /// dedicated `_00_list_ref_anon` table that anyone can SELECT, so a
     /// logged-out client's `_00_list_ref` poll can read its window.
     pub anonymous_live_queries: bool,
-    /// Coalescing window (ms) for query edge-update writes to `_00_list_ref`.
-    /// `0` disables batching (each update flushes immediately).
+    /// Idle-to-active debounce (ms) for the bounded query-edge publisher.
+    /// Queued work drains without per-item delays. `0` starts immediately.
     pub query_update_throttle_ms: u64,
     /// How often (ms) the per-view metrics (`rowCount`, `updateCount`, the
     /// materialization percentiles on `_00_query`) are flushed. The ingest path

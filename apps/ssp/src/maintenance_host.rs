@@ -15,6 +15,7 @@ pub struct SspHost {
     pub db: SharedDb,
     pub processor: Arc<RwLock<Circuit>>,
     pub publication_gate: Arc<tokio::sync::Mutex<()>>,
+    pub publisher: ssp_node::edges::EdgePublisher,
     pub status: Arc<RwLock<SspStatus>>,
     /// Platform ports (Db for the edge wipe, Telemetry for view-count gauges).
     pub platform: ssp_node::Platform,
@@ -56,6 +57,7 @@ impl MaintenanceHost for SspHost {
     /// from the restored database.
     async fn post_restore(&self, _dump_path: &std::path::Path) -> Result<RestoreOutcome> {
         let _publication = self.publication_gate.lock().await;
+        self.publisher.invalidate_all();
         // 1. Registered views are tied to live clients; rows restored from the
         //    dump point at sessions that no longer exist (mirrors the
         //    scheduler's startup `DELETE _00_query`).

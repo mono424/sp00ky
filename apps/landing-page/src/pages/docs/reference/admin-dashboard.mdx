@@ -630,3 +630,11 @@ not the step's. `started_at` is stamped when the step's job is created and is th
 only honest answer to "when did this begin". The Timeline draws from it, and
 falls back to the moment the step's last dependency finished — marked as an
 estimate — for runs recorded before the engine stamped it.
+
+
+Incident details show publication backlog when an SSP heartbeat sample was
+available: peak queued operations and bytes, longest observed wait, parked
+batches, last successful publication, and related view links. Bulk database
+session generation and reconnect timing distinguish database recovery from
+circuit evaluation. The SSP page also shows its current publication backlog.
+These are sampled measurements; a spike between samples can be missed.

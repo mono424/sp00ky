@@ -384,7 +384,7 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
     // notices the closed channel on its first send and latches itself off, so
     // it never issues a drain query on a host that could not run the result.
     let (job_queue_tx, _job_rx) = tokio::sync::mpsc::channel(64);
-    let (edge_update_tx, _edge_rx) = tokio::sync::mpsc::unbounded_channel();
+    let edge_update_tx = ssp_node::edges::EdgePublisher::default();
     let job_config = Arc::new(ssp_node::jobs::JobConfig::from_json(&cfg.job_config));
     let job_control = ssp_node::jobs::JobControl::new();
     let job_dispatcher = Arc::new(ssp_node::jobs::JobDispatcher::new(
@@ -398,6 +398,7 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         true,
     ));
     SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
         status: Arc::new(RwLock::new(SspStatus::Bootstrapping)),
         // Merged views are a server-side memory optimisation; this shell

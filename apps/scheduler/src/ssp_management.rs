@@ -681,6 +681,7 @@ async fn handle_heartbeat(
             heartbeat.memory_usage,
             heartbeat.version.clone(),
         );
+        pool.update_publication(&heartbeat.ssp_id, heartbeat.publication.clone());
         resync_requested = pool.take_resync(&heartbeat.ssp_id);
         has_overflow = pool.has_buffer_overflow(&heartbeat.ssp_id);
     }

@@ -703,3 +703,12 @@ Times are epoch milliseconds. The backlog is sampled, so it is a lower bound
 on the true peak. Event summaries are sanitized descriptions, not raw SQL.
 MCP tools `incidents_list` and `incident_get` share these endpoints and permissions.
 See [incident retention and restart semantics](/docs/reference/admin-dashboard#incident-history).
+
+
+Incident records may also include `publication`, the last nonempty SSP heartbeat
+snapshot sampled while the episode was open, plus `max_publication_operations`,
+`max_publication_bytes`, and `max_publication_age_ms`. These are sampled peaks,
+not a complete transaction trace. `publication.worst_views` contains at most
+eight query IDs and backlog sizes, with no source rows or query bindings.
+Older history files and SSPs omit these optional details. Each SSP in the
+overview exposes the latest `publication` snapshot, or `null` when unavailable.

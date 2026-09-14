@@ -69,6 +69,7 @@ pub struct SspPool {
     /// at phase boundaries and bails when superseded by a re-registration,
     /// so a stale poll task never removes or admits the newer registration.
     registration_gen: HashMap<String, u64>,
+    publication: HashMap<String, ssp_protocol::PublicationMetrics>,
     strategy: LoadBalanceStrategy,
     round_robin_index: usize,
     max_buffer_size: usize,
@@ -88,6 +89,7 @@ impl SspPool {
             buffer_overflowed: HashSet::new(),
             state_since: HashMap::new(),
             registration_gen: HashMap::new(),
+            publication: HashMap::new(),
             strategy,
             round_robin_index: 0,
             max_buffer_size,
@@ -366,6 +368,7 @@ impl SspPool {
     /// `handle_register`; the returned gen is captured by the spawned poll
     /// task and re-checked via `registration_gen` at phase boundaries.
     pub fn bump_registration_gen(&mut self, ssp_id: &str) -> u64 {
+        self.publication.remove(ssp_id);
         let gen = self.registration_gen.entry(ssp_id.to_string()).or_insert(0);
         *gen += 1;
         if *gen > 1 { crate::admin::incidents::emit(ssp_id, "registered_again", "open", "SSP registered again; restart or rebootstrap observed", None); }
@@ -375,6 +378,22 @@ impl SspPool {
     /// Current registration generation for this SSP id (0 = never registered).
     pub fn registration_gen(&self, ssp_id: &str) -> u64 {
         self.registration_gen.get(ssp_id).copied().unwrap_or(0)
+    }
+
+    pub fn publication(&self, ssp_id: &str) -> Option<&ssp_protocol::PublicationMetrics> {
+        self.publication.get(ssp_id)
+    }
+
+    pub fn update_publication(&mut self, ssp_id: &str, metrics: Option<ssp_protocol::PublicationMetrics>) {
+        if let Some(mut metrics) = metrics {
+            metrics.worst_views.truncate(8);
+            for view in &mut metrics.worst_views {
+                view.query_id = view.query_id.chars().take(256).collect();
+            }
+            self.publication.insert(ssp_id.to_owned(), metrics);
+        } else {
+            self.publication.remove(ssp_id);
+        }
     }
 
     /// SSPs stuck in `Bootstrapping`/`Replaying` longer than `max_age` as of
@@ -437,6 +456,7 @@ impl SspPool {
 
     /// Remove an SSP
     pub fn remove(&mut self, ssp_id: &str) -> Option<SspInfo> {
+        self.publication.remove(ssp_id);
         if self.ssps.contains_key(ssp_id) {
             crate::admin::incidents::emit(ssp_id, "removed", "open", "SSP removed from routing; heartbeat, bootstrap deadline or administrative removal", None);
         }
@@ -457,6 +477,7 @@ impl SspPool {
     /// Used when the replica has been restored and SSPs must re-register
     /// against the new state. Returns the count of SSPs removed.
     pub fn clear_all(&mut self) -> usize {
+        self.publication.clear();
         let count = self.ssps.len();
         self.ssps.clear();
         self.ssp_states.clear();

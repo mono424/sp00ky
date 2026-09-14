@@ -1,8 +1,9 @@
 //! Query edge-update service (ported from `apps/ssp/src/edge_updates.rs`).
 //!
 //! The circuit emits a [`ViewDelta`] whenever a registered query's window
-//! changes. Each delta's `_00_list_ref` edge writes are coalesced over a
-//! window and flushed as ONE aggregated SurrealDB transaction.
+//! changes. The production [`EdgePublisher`] retains bounded admission through
+//! ordered publication and retries. Legacy coalescing helpers remain available
+//! for callers using the lower-level sink interface.
 //!
 //! Portability note: the previous shell version bound the `_00_query`
 //! incantation record id as a `surrealdb::RecordId` param (`$fromN`). The core
@@ -83,6 +84,380 @@ pub async fn write_deltas_unlocked(
     let left = write_deltas_with_versions(db, deltas, &versions, mode, telemetry).await;
     telemetry.histogram_ms("edge_publish", start.elapsed().as_secs_f64() * 1000.0);
     left
+}
+
+
+// Cooperative yield without depending on Tokio's native runtime feature.
+async fn publication_yield() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded { std::task::Poll::Ready(()) } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }).await
+}
+
+/// Admission thresholds for the production publication queue. Slots are a hard
+/// limit, including requests preparing their deltas. Bytes and operations are
+/// measured after circuit evaluation: already admitted slots may overshoot
+/// these thresholds, and new admission then stops until publication catches up.
+#[derive(Clone, Copy)]
+pub struct PublicationLimits {
+    pub slots: usize,
+    pub bytes: u64,
+    pub operations: u64,
+}
+impl Default for PublicationLimits {
+    fn default() -> Self { Self { slots: 256, bytes: 64 * 1024 * 1024, operations: 100_000 } }
+}
+
+#[derive(Clone)]
+pub struct EdgePublisher(Arc<PublicationQueue>);
+struct PublicationQueue {
+    state: std::sync::Mutex<PublicationState>,
+    wake: tokio::sync::Notify,
+    started: std::sync::atomic::AtomicBool,
+    telemetry: std::sync::OnceLock<Arc<dyn Telemetry>>,
+    limits: PublicationLimits,
+}
+#[derive(Default)]
+struct PublicationState {
+    generation: u64,
+    next: u64,
+    epochs: HashMap<String, u64>,
+    leases: HashMap<u64, PublicationLeaseStats>,
+    queue: std::collections::VecDeque<PublicationWork>,
+    last_success: Option<u64>,
+    overloaded: u64,
+}
+struct PublicationLeaseStats {
+    at: u64,
+    bytes: u64,
+    operations: u64,
+    parked: bool,
+    views: Vec<(String, u64, u64)>,
+}
+/// A reservation must be obtained before any ingest side effects. Dropping an
+/// unqueued reservation returns capacity, including validation/error paths.
+pub struct PublicationPermit {
+    queue: std::sync::Weak<PublicationQueue>,
+    id: u64,
+    generation: u64,
+}
+impl Drop for PublicationPermit {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.upgrade() {
+            queue.state.lock().unwrap().leases.remove(&self.id);
+            queue.wake.notify_one();
+        }
+    }
+}
+/// Table lifecycle and orphan deletes share the same ordered publication lane.
+pub enum PublicationCleanup {
+    Statement(String),
+    EnsureUser(String),
+    DropUser(String),
+}
+impl PublicationCleanup {
+    fn bytes(&self) -> u64 {
+        match self { Self::Statement(s) | Self::EnsureUser(s) | Self::DropUser(s) => s.capacity() as u64 }
+    }
+}
+struct PublicationWork {
+    permit: PublicationPermit,
+    deltas: Vec<ViewDelta>,
+    versions: CapturedVersions,
+    epochs: HashMap<String, u64>,
+    source: Option<(String, i64)>,
+    cleanup: Vec<PublicationCleanup>,
+    ready: Arc<std::sync::atomic::AtomicU8>,
+    retry_at: Option<web_time::Instant>,
+}
+/// Registration metadata must exist before its initial publication can run.
+/// A dropped handler cancels its slot and invalidates dependent queued work.
+pub struct PublicationReady {
+    publisher: EdgePublisher,
+    ready: Arc<std::sync::atomic::AtomicU8>,
+    epochs: HashMap<String, u64>,
+    generation: u64,
+    complete: bool,
+}
+impl PublicationReady {
+    pub fn is_current(&self) -> bool {
+        let state = self.publisher.0.state.lock().unwrap();
+        state.generation == self.generation && self.epochs.iter().all(|(id, epoch)|
+            state.epochs.get(id).copied().unwrap_or(0) == *epoch)
+    }
+    pub fn complete(mut self) {
+        self.complete = true;
+        self.ready.store(1, std::sync::atomic::Ordering::Release);
+        self.publisher.0.wake.notify_one();
+    }
+}
+impl Drop for PublicationReady {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.ready.store(2, std::sync::atomic::Ordering::Release);
+            let mut state = self.publisher.0.state.lock().unwrap();
+            if state.generation == self.generation {
+                for (id, epoch) in &self.epochs {
+                    if state.epochs.get(id).copied().unwrap_or(0) == *epoch {
+                        state.epochs.remove(id);
+                    }
+                }
+            }
+            drop(state);
+            self.publisher.0.wake.notify_one();
+        }
+    }
+}
+
+impl EdgePublisher {
+    pub fn new(limits: PublicationLimits) -> Self {
+        Self(Arc::new(PublicationQueue { state: Default::default(), wake: Default::default(),
+            started: Default::default(), telemetry: Default::default(), limits }))
+    }
+    /// The estimate covers request-owned input before evaluation. Oversize input
+    /// is refused immediately. Delta sizes replace this estimate when enqueued.
+    pub fn try_reserve(&self, input_bytes: usize) -> Option<PublicationPermit> {
+        let mut state = self.0.state.lock().unwrap();
+        let bytes = state.leases.values().map(|s| s.bytes).sum::<u64>();
+        let operations = state.leases.values().map(|s| s.operations).sum::<u64>();
+        if state.leases.len() >= self.0.limits.slots
+            || bytes.saturating_add(input_bytes as u64) > self.0.limits.bytes
+            || operations >= self.0.limits.operations {
+            state.overloaded += 1;
+            return None;
+        }
+        let id = state.next;
+        state.next += 1;
+        let generation = state.generation;
+        state.leases.insert(id, PublicationLeaseStats { at: crate::now_epoch_ms(), bytes: input_bytes as u64,
+            operations: 0, parked: false, views: vec![] });
+        Some(PublicationPermit { queue: Arc::downgrade(&self.0), id, generation })
+    }
+    pub fn is_current(&self, permit: &PublicationPermit) -> bool {
+        self.0.state.lock().unwrap().generation == permit.generation
+    }
+    /// Call under the publication gate and circuit lifecycle lock.
+    pub fn invalidate_all(&self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.generation += 1;
+        state.epochs.clear();
+        drop(state);
+        self.0.wake.notify_one();
+    }
+    /// Call under the circuit lock on every cold registration, and under the
+    /// publication gate before unregistering. Reused IDs receive a new epoch.
+    pub fn invalidate_view(&self, query_id: &str) {
+        let mut state = self.0.state.lock().unwrap();
+        state.epochs.remove(&ssp::canonical_query_id(query_id));
+        drop(state);
+        self.0.wake.notify_one();
+    }
+    pub fn prune_epochs(&self, circuit: &Circuit) {
+        self.0.state.lock().unwrap().epochs.retain(|id, _| circuit.is_registered(id));
+    }
+    /// Enqueue at the circuit mutation/snapshot point, while its lock is held.
+    /// A registration passes `metadata_pending`; complete the returned guard
+    /// only after its metadata write succeeds.
+    pub fn enqueue(&self, permit: PublicationPermit, deltas: Vec<ViewDelta>, circuit: &Circuit,
+        source: Option<(String, i64)>, metadata_pending: bool, cleanup: Vec<PublicationCleanup>) -> Option<PublicationReady> {
+        if deltas.is_empty() && cleanup.is_empty() { return None; }
+        let capture_started = web_time::Instant::now();
+        let ready = Arc::new(std::sync::atomic::AtomicU8::new(if metadata_pending { 0 } else { 1 }));
+        let mut versions = HashMap::new();
+        let mut views = Vec::new();
+        for d in &deltas {
+            let operations = (d.additions.len() + d.removals.len() + d.updates.len() + d.subquery_items.len()) as u64;
+            let bytes = std::mem::size_of::<ViewDelta>() as u64 + d.query_id.len() as u64 + d.auth_id.len() as u64
+                + d.result_hash.len() as u64
+                + d.additions.iter().chain(&d.removals).chain(&d.updates).chain(&d.records)
+                    .map(|s| (s.capacity() + std::mem::size_of::<String>()) as u64).sum::<u64>()
+                + d.subquery_items.iter().map(|s| (std::mem::size_of::<ssp::circuit::SubqueryDeltaItem>()
+                    + s.id.capacity() + s.parent_key.capacity() + s.alias.capacity()) as u64).sum::<u64>();
+            views.push((d.query_id.clone(), operations, bytes));
+            for key in d.additions.iter().chain(&d.updates).chain(d.subquery_items.iter().map(|i| &i.id)) {
+                versions.entry(key.clone()).or_insert_with(|| CircuitVersions(circuit).version_of(key));
+            }
+        }
+        let mut state = self.0.state.lock().unwrap();
+        let epochs = deltas.iter().map(|d| {
+            let id = ssp::canonical_query_id(&d.query_id);
+            let epoch = if let Some(epoch) = state.epochs.get(&id) { *epoch } else {
+                state.next += 1;
+                let epoch = state.next;
+                state.epochs.insert(id.clone(), epoch);
+                epoch
+            };
+            (id, epoch)
+        }).collect::<HashMap<_, _>>();
+        if let Some(stats) = state.leases.get_mut(&permit.id) {
+            stats.operations = views.iter().map(|v| v.1).sum::<u64>() + cleanup.len() as u64;
+            stats.bytes = views.iter().map(|v| v.2).sum::<u64>() + cleanup.iter().map(PublicationCleanup::bytes).sum::<u64>();
+            stats.views = views;
+        }
+        let generation = permit.generation;
+        state.queue.push_back(PublicationWork { permit, deltas, versions: CapturedVersions(versions), epochs: epochs.clone(),
+            source, cleanup, ready: ready.clone(), retry_at: None });
+        drop(state);
+        self.0.wake.notify_one();
+        if let Some(telemetry) = self.0.telemetry.get() {
+            telemetry.histogram_ms("edge_lock_hold", capture_started.elapsed().as_secs_f64() * 1000.0);
+        }
+        metadata_pending.then(|| PublicationReady { publisher: self.clone(), ready, epochs, generation, complete: false })
+    }
+    pub fn snapshot(&self) -> ssp_protocol::PublicationMetrics {
+        let state = self.0.state.lock().unwrap();
+        let now = crate::now_epoch_ms();
+        let mut views: HashMap<String, ssp_protocol::PublicationViewMetrics> = HashMap::new();
+        for lease in state.leases.values() {
+            for (id, operations, bytes) in &lease.views {
+                let v = views.entry(id.clone()).or_insert_with(|| ssp_protocol::PublicationViewMetrics {
+                    query_id: id.clone(), ..Default::default()
+                });
+                v.pending_operations += operations;
+                v.pending_bytes += bytes;
+                v.oldest_age_ms = v.oldest_age_ms.max(now.saturating_sub(lease.at));
+            }
+        }
+        let mut worst_views: Vec<_> = views.into_values().collect();
+        worst_views.sort_by_key(|v| std::cmp::Reverse(v.pending_bytes));
+        worst_views.truncate(8);
+        ssp_protocol::PublicationMetrics {
+            pending_batches: state.leases.len() as u64,
+            pending_operations: state.leases.values().map(|s| s.operations).sum(),
+            pending_bytes: state.leases.values().map(|s| s.bytes).sum(),
+            oldest_age_ms: state.leases.values().map(|s| now.saturating_sub(s.at)).max().unwrap_or(0),
+            parked_batches: state.leases.values().filter(|s| s.parked).count() as u64,
+            last_success_at_ms: state.last_success,
+            overload_total: state.overloaded,
+            worst_views,
+            ..Default::default()
+        }
+    }
+    pub fn start(&self, platform: &crate::platform::Platform, db: Arc<dyn Db>, processor: Arc<RwLock<Circuit>>,
+        gate: Arc<tokio::sync::Mutex<()>>, mode: RefMode, window: Duration) {
+        if self.0.started.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+        let _ = self.0.telemetry.set(platform.telemetry.clone());
+        let publisher = self.clone();
+        let scheduler = platform.scheduler.clone();
+        let telemetry = platform.telemetry.clone();
+        platform.spawner.spawn(Box::pin(async move {
+            publisher.run(db, processor, gate, mode, scheduler, telemetry, window).await;
+        }));
+    }
+    async fn run(&self, db: Arc<dyn Db>, processor: Arc<RwLock<Circuit>>, gate: Arc<tokio::sync::Mutex<()>>,
+        mode: RefMode, scheduler: Arc<dyn Scheduler>, telemetry: Arc<dyn Telemetry>, window: Duration) {
+        loop {
+            let notified = self.0.wake.notified();
+            let work = {
+                let mut state = self.0.state.lock().unwrap();
+                let mut blocked = HashSet::new();
+                let mut chosen = None;
+                for (index, work) in state.queue.iter().enumerate() {
+                    let stale = state.generation != work.permit.generation ||
+                        (work.cleanup.is_empty() && work.epochs.iter().all(|(id, epoch)|
+                            state.epochs.get(id).copied().unwrap_or(0) != *epoch));
+                    let ready = work.ready.load(std::sync::atomic::Ordering::Acquire);
+                    if stale || ready == 2 { chosen = Some(index); break; }
+                    // Cross-view orphan cleanup is a global barrier. Ordinary
+                    // publications only wait for earlier work for their views.
+                    let global = !work.cleanup.is_empty();
+                    if ready == 1 && work.retry_at.map_or(true, |at| at <= web_time::Instant::now())
+                        && !work.epochs.keys().any(|id| blocked.contains(id))
+                        && (!global || index == 0) {
+                        chosen = Some(index); break;
+                    }
+                    blocked.extend(work.epochs.keys().cloned());
+                    if global { break; }
+                }
+                chosen.and_then(|index| state.queue.remove(index))
+            };
+            let Some(mut work) = work else {
+                let idle = self.0.state.lock().unwrap().queue.is_empty();
+                if idle {
+                    notified.await;
+                    // Debounce a new burst once. Never impose a fixed delay
+                    // per queued item, which would cap drain throughput.
+                    if !window.is_zero() { scheduler.sleep(window).await; }
+                } else {
+                    tokio::select! { _ = notified => {}, _ = scheduler.sleep(Duration::from_millis(50)) => {} }
+                }
+                publication_yield().await;
+                continue;
+            };
+            publication_yield().await;
+            let obsolete = {
+                let state = self.0.state.lock().unwrap();
+                state.generation != work.permit.generation || work.ready.load(std::sync::atomic::Ordering::Acquire) == 2
+                    || (work.cleanup.is_empty() && work.epochs.iter().all(|(id, epoch)| state.epochs.get(id) != Some(epoch)))
+            };
+            if obsolete { continue; }
+            if let Some((row, version)) = work.source.take() {
+                crate::node::wait_for_row_committed(db.as_ref(), scheduler.as_ref(), &row, version, Duration::from_secs(5)).await;
+            }
+            let publication = gate.lock().await;
+            let wait = web_time::Instant::now();
+            {
+                let circuit = processor.read().await;
+                telemetry.histogram_ms("edge_lock_wait", wait.elapsed().as_secs_f64() * 1000.0);
+                let hold = web_time::Instant::now();
+                let state = self.0.state.lock().unwrap();
+                work.deltas.retain(|d| circuit.is_registered(&d.query_id)
+                    && state.generation == work.permit.generation
+                    && state.epochs.get(&ssp::canonical_query_id(&d.query_id)).copied().unwrap_or(0)
+                        == work.epochs[&ssp::canonical_query_id(&d.query_id)]);
+                telemetry.histogram_ms("edge_lock_hold", hold.elapsed().as_secs_f64() * 1000.0);
+            }
+            if self.0.state.lock().unwrap().generation != work.permit.generation { continue; }
+            if work.deltas.is_empty() && work.cleanup.is_empty() { continue; }
+            let publish = web_time::Instant::now();
+            while let Some(cleanup) = work.cleanup.first() {
+                let result = match cleanup {
+                    PublicationCleanup::Statement(sql) => query_retrying(db.as_ref(), sql, &[]).await.map(|_| ()).map_err(anyhow::Error::from),
+                    PublicationCleanup::EnsureUser(user) => crate::tables::ensure_user_tables(db.as_ref(), mode, user).await,
+                    PublicationCleanup::DropUser(user) => crate::tables::drop_user_tables(db.as_ref(), mode, user).await,
+                };
+                match result {
+                    Ok(_) => { work.cleanup.remove(0); }
+                    Err(e) if crate::tables::is_missing_table_error(&e.to_string()) => { work.cleanup.remove(0); }
+                    Err(_) => break,
+                }
+            }
+            if work.cleanup.is_empty() {
+                let mut tables_ready = true;
+                for delta in work.deltas.iter().filter(|d| d.initial) {
+                    if crate::tables::ensure_user_tables(db.as_ref(), mode, &delta.auth_id).await.is_err() {
+                        tables_ready = false; break;
+                    }
+                }
+                if tables_ready {
+                    work.deltas = write_deltas_with_versions(db.as_ref(), std::mem::take(&mut work.deltas), &work.versions, mode, telemetry.as_ref()).await;
+                }
+            }
+            telemetry.histogram_ms("edge_publish", publish.elapsed().as_secs_f64() * 1000.0);
+            drop(publication);
+            if work.deltas.is_empty() && work.cleanup.is_empty() {
+                self.0.state.lock().unwrap().last_success = Some(crate::now_epoch_ms());
+            } else {
+                let failed: HashSet<_> = work.deltas.iter().map(|d| ssp::canonical_query_id(&d.query_id)).collect();
+                work.epochs.retain(|id, _| failed.contains(id));
+                work.retry_at = Some(web_time::Instant::now() + if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(5) });
+                let mut state = self.0.state.lock().unwrap();
+                if let Some(stats) = state.leases.get_mut(&work.permit.id) { stats.parked = true; }
+                // Moving ahead of disjoint earlier work is safe; overlapping
+                // work could not have been selected in the first place.
+                state.queue.push_front(work);
+            }
+        }
+    }
+
+}
+impl Default for EdgePublisher {
+    fn default() -> Self { Self::new(PublicationLimits::default()) }
 }
 
 /// One delta's edge-write statements.
@@ -1619,5 +1994,205 @@ mod tests {
             free_pos < first_pos,
             "an unparked view must not wait for the parked one: {w:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+    use crate::ports::{DbError, NoopTelemetry, TimerKind};
+
+    #[derive(Default)]
+    struct TestDb {
+        fail: AtomicBool,
+        source_started: tokio::sync::Notify,
+        source_release: tokio::sync::Notify,
+        block_source: AtomicBool,
+        sql: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl Db for TestDb {
+        async fn query(&self, sql: &str, _binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+            if sql.contains("SELECT VALUE version") {
+                if self.block_source.swap(false, Ordering::AcqRel) {
+                    self.source_started.notify_one();
+                    self.source_release.notified().await;
+                }
+                return Ok(vec![json!(99)]);
+            }
+            if sql.starts_with("SELECT VALUE id FROM ONLY") { return Ok(vec![json!("_00_query:q")]); }
+            if self.fail.load(Ordering::Acquire) && sql.contains("thread:a") { return Err(DbError::Transport("offline".into())); }
+            self.sql.lock().unwrap().push(sql.into());
+            Ok(vec![])
+        }
+        async fn version(&self) -> Result<String, DbError> { Ok("test".into()) }
+    }
+    struct FastScheduler;
+    #[async_trait::async_trait]
+    impl Scheduler for FastScheduler {
+        async fn schedule(&self, _: TimerKind, _: u64) {}
+        async fn cancel(&self, _: &TimerKind) {}
+        async fn sleep(&self, _: Duration) { tokio::time::sleep(Duration::from_millis(2)).await; }
+    }
+    fn circuit() -> Arc<RwLock<Circuit>> {
+        let mut c = Circuit::new();
+        c.add_query(ssp::operator::QueryPlan { id: "q".into(), root: ssp::operator::OperatorPlan::Scan { table: "thread".into() } }, None, None);
+        Arc::new(RwLock::new(c))
+    }
+    fn delta(id: &str, add: bool) -> ViewDelta {
+        ViewDelta { query_id: "q".into(), additions: if add { vec![id.into()] } else { vec![] },
+            removals: if add { vec![] } else { vec![id.into()] }, updates: vec![], records: vec![],
+            result_hash: String::new(), subquery_items: vec![], auth_id: String::new(), initial: false }
+    }
+    fn start(p: EdgePublisher, db: Arc<TestDb>, c: Arc<RwLock<Circuit>>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { p.run(db, c, Arc::new(tokio::sync::Mutex::new(())), RefMode::Single,
+            Arc::new(FastScheduler), Arc::new(NoopTelemetry), Duration::ZERO).await })
+    }
+    async fn drained(p: &EdgePublisher) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while p.snapshot().pending_batches > 0 { tokio::task::yield_now().await; }
+        }).await.expect("publication queue drained");
+    }
+    #[test]
+    fn publication_admission_bounds_slots_and_input_and_releases_unused_permits() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 1, bytes: 128, operations: 10 });
+        assert!(p.try_reserve(129).is_none());
+        let permit = p.try_reserve(128).unwrap();
+        assert!(p.try_reserve(0).is_none());
+        assert_eq!(p.snapshot().pending_bytes, 128);
+        assert_eq!(p.snapshot().overload_total, 2);
+        drop(permit);
+        assert!(p.try_reserve(0).is_some());
+    }
+    #[tokio::test]
+    async fn publication_measured_operations_stop_further_admission() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 2, bytes: 4096, operations: 1 });
+        let c = circuit();
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        assert_eq!(p.snapshot().pending_operations, 1);
+        assert!(p.try_reserve(0).is_none());
+        assert_eq!(p.snapshot().worst_views[0].query_id, "q");
+    }
+    #[tokio::test]
+    async fn publication_registration_barrier_and_commit_wait_preserve_add_delete_order() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.block_source.store(true, Ordering::Release);
+        let ready = p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await,
+            Some(("thread:a".into(), 9)), true, vec![]).unwrap();
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", false)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c.clone());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(db.sql.lock().unwrap().is_empty(), "metadata must precede initial publication");
+        ready.complete();
+        db.source_started.notified().await;
+        assert!(c.try_write().is_ok(), "source commit wait must not hold the circuit");
+        assert!(db.sql.lock().unwrap().is_empty(), "delete cannot overtake the blocked add");
+        assert_eq!(p.snapshot().pending_batches, 2);
+        db.source_release.notify_one();
+        drained(&p).await;
+        let sql = db.sql.lock().unwrap();
+        assert_eq!(sql.len(), 2);
+        assert!(sql[0].contains("RELATE "));
+        assert!(sql[1].contains("DELETE (SELECT"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_parked_work_keeps_permit_until_recovery() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 1, ..Default::default() });
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.fail.store(true, Ordering::Release);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while p.snapshot().parked_batches == 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(p.try_reserve(0).is_none());
+        assert_eq!(p.snapshot().pending_operations, 1);
+        db.fail.store(false, Ordering::Release);
+        drained(&p).await;
+        assert!(p.snapshot().last_success_at_ms.is_some());
+        assert!(p.try_reserve(0).is_some());
+        assert_eq!(db.sql.lock().unwrap().len(), 1);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_poisoned_view_does_not_block_unrelated_registration() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        c.write().await.add_query(ssp::operator::QueryPlan { id: "other".into(), root: ssp::operator::OperatorPlan::Scan { table: "thread".into() } }, None, None);
+        let db = Arc::new(TestDb::default());
+        db.fail.store(true, Ordering::Release);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", false)], &*c.read().await, None, false, vec![]);
+        let mut other = delta("thread:b", true);
+        other.query_id = "other".into();
+        other.initial = true;
+        p.enqueue(p.try_reserve(0).unwrap(), vec![other], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while db.sql.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(db.sql.lock().unwrap()[0].contains("thread:b"));
+        assert_eq!(p.snapshot().parked_batches, 1);
+        db.fail.store(false, Ordering::Release);
+        drained(&p).await;
+        let sql = db.sql.lock().unwrap();
+        assert!(sql[1].contains("RELATE "));
+        assert!(sql[2].contains("DELETE (SELECT"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_empty_registration_still_blocks_dependent_ingest() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        let empty = c.read().await.snapshot_delta("q", String::new()).unwrap();
+        assert!(empty.additions.is_empty());
+        let ready = p.enqueue(p.try_reserve(0).unwrap(), vec![empty], &*c.read().await, None, true, vec![]).unwrap();
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(db.sql.lock().unwrap().is_empty());
+        ready.complete();
+        drained(&p).await;
+        assert!(db.sql.lock().unwrap().last().unwrap().contains("thread:a"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_lifecycle_discards_old_registration_and_reset_work() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:old", true)], &*c.read().await, None, false, vec![]);
+        p.invalidate_view("_00_query:q");
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:middle", true)], &*c.read().await, None, false, vec![]);
+        let obsolete = p.try_reserve(0).unwrap();
+        p.invalidate_all();
+        assert!(!p.is_current(&obsolete));
+        drop(obsolete);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:new", true)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        drained(&p).await;
+        let sql = db.sql.lock().unwrap();
+        assert_eq!(sql.len(), 1);
+        assert!(sql[0].contains("thread:new"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_canceled_registration_discards_dependent_work() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        let ready = p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, true, vec![]).unwrap();
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", false)], &*c.read().await, None, false, vec![]);
+        drop(ready);
+        let task = start(p.clone(), db.clone(), c);
+        drained(&p).await;
+        assert!(db.sql.lock().unwrap().is_empty());
+        task.abort();
     }
 }

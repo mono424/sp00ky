@@ -57,6 +57,14 @@ pub struct Incident {
     pub started_at: u64,
     pub ended_at: Option<u64>,
     pub max_buffered_events: usize,
+    #[serde(default)]
+    pub max_publication_operations: u64,
+    #[serde(default)]
+    pub max_publication_bytes: u64,
+    #[serde(default)]
+    pub max_publication_age_ms: u64,
+    #[serde(default)]
+    pub publication: Option<ssp_protocol::PublicationMetrics>,
     pub event_count: u64,
     pub events: VecDeque<Event>,
 }
@@ -153,6 +161,10 @@ impl Incidents {
                 started_at: event.at,
                 ended_at: terminal.then_some(event.at),
                 max_buffered_events: 0,
+                max_publication_operations: 0,
+                max_publication_bytes: 0,
+                max_publication_age_ms: 0,
+                publication: None,
                 event_count: 1,
                 events: VecDeque::from([event.clone()]),
             });
@@ -223,6 +235,45 @@ impl Incidents {
         self.persist().await;
     }
 
+    fn sample_entities(&self, entities: &[Value]) {
+        let mut h = self.history.lock().unwrap();
+        let mut changed = false;
+        for row in h.rows.iter_mut().filter(|r| r.state == "open") {
+            if let Some(entity) = entities
+                .iter()
+                .find(|v| v["id"].as_str() == Some(&row.component))
+            {
+                let buffered = entity["buffered_events"].as_u64().unwrap_or(0) as usize;
+                if buffered > row.max_buffered_events {
+                    row.max_buffered_events = buffered;
+                    changed = true;
+                }
+                if let Ok(publication) = serde_json::from_value::<ssp_protocol::PublicationMetrics>(
+                    entity["publication"].clone(),
+                ) {
+                    // Keep the last nonempty sample so a recovery heartbeat
+                    // cannot erase the views responsible for the backlog.
+                    if publication.pending_batches > 0 || row.publication.is_none() {
+                        row.max_publication_operations = row
+                            .max_publication_operations
+                            .max(publication.pending_operations);
+                        row.max_publication_bytes =
+                            row.max_publication_bytes.max(publication.pending_bytes);
+                        row.max_publication_age_ms =
+                            row.max_publication_age_ms.max(publication.oldest_age_ms);
+                        if row.publication.as_ref() != Some(&publication) {
+                            row.publication = Some(publication);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            h.revision += 1;
+        }
+    }
+
     pub fn spawn(self: &Arc<Self>, state: AdminState) {
         // Subscribe before the first await; no polling gap on short incidents.
         let mut rx = state.logs.subscribe();
@@ -251,16 +302,7 @@ impl Incidents {
                     _ = tick.tick() => {
                         this.expire(super::ops::now_ms());
                         let entities = crate::metrics::build_entities(&state.metrics).await;
-                        { let mut h = this.history.lock().unwrap();
-                            let mut changed = false;
-                            for row in h.rows.iter_mut().filter(|r| r.state == "open") {
-                                if let Some(entity) = entities.iter().find(|v| v["id"].as_str() == Some(&row.component)) {
-                                    let buffered = entity["buffered_events"].as_u64().unwrap_or(0) as usize;
-                                    if buffered > row.max_buffered_events { row.max_buffered_events = buffered; changed = true; }
-                                }
-                            }
-                            if changed { h.revision += 1; }
-                        }
+                        this.sample_entities(&entities);
                         let revision = this.history.lock().unwrap().revision;
                         if revision != saved { this.persist().await; saved = revision; }
                     }
@@ -346,6 +388,49 @@ pub async fn detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn publication_samples_preserve_independent_peaks_and_survive_restart() {
+        use ssp_protocol::{PublicationMetrics, PublicationViewMetrics};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incidents.json");
+        let history = Incidents::open(path.clone());
+        history.observe(event("open"));
+        let first = PublicationMetrics {
+            pending_batches: 2,
+            pending_operations: 100,
+            pending_bytes: 200,
+            oldest_age_ms: 300,
+            ..Default::default()
+        };
+        history.sample_entities(&[json!({"id": "ssp-0", "buffered_events": 50, "publication": first})]);
+        let last_nonempty = PublicationMetrics {
+            pending_batches: 1,
+            pending_operations: 10,
+            pending_bytes: 900,
+            oldest_age_ms: 1200,
+            worst_views: vec![PublicationViewMetrics {
+                query_id: "query:slow".into(),
+                pending_operations: 10,
+                pending_bytes: 900,
+                oldest_age_ms: 1200,
+            }],
+            ..Default::default()
+        };
+        history.sample_entities(&[json!({"id": "ssp-0", "buffered_events": 5, "publication": last_nonempty})]);
+        history.sample_entities(&[json!({"id": "ssp-0", "buffered_events": 0, "publication": PublicationMetrics::default()})]);
+        history.observe(event("recovered"));
+        history.persist().await;
+        let restored = Incidents::open(path);
+        let h = restored.history.lock().unwrap();
+        let row = &h.rows[0];
+        assert_eq!(row.state, "recovered");
+        assert_eq!(row.max_buffered_events, 50);
+        assert_eq!(row.max_publication_operations, 100);
+        assert_eq!(row.max_publication_bytes, 900);
+        assert_eq!(row.max_publication_age_ms, 1200);
+        assert_eq!(row.publication.as_ref(), Some(&last_nonempty));
+    }
+
     #[test]
     fn emitted_transitions_roundtrip_through_log_ring_into_history() {
         use tracing_subscriber::prelude::*;

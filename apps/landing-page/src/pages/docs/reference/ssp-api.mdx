@@ -831,3 +831,36 @@ Publication includes retries; transaction timing includes conflict retries for
 one planned transaction. Existing per-view ingest timings describe a shared
 circuit step and can include lock wait. They do not measure edge publication.
 Timeout logs report statement bytes/count rather than entire SQL batches.
+
+
+### Publication admission and backlog
+
+The native publisher reserves one of 256 slots before ingest side effects or
+circuit evaluation. A slot stays reserved while registration metadata, source
+commit visibility, database publication, or retries are pending. When capacity
+is exhausted, ingest returns HTTP 503 before accepting the event; the scheduler
+retains it in its WAL and delivers it again. A prolonged overload can therefore
+show as lagging while memory use is protected, with explicit bootstrap recovery
+if the scheduler's replay buffer overflows.
+
+New admission also stops at measured pending-delta thresholds of 64 MiB or
+100,000 operations. These are admission thresholds, not a strict RSS or total
+byte cap: deltas are sized after evaluation, so already reserved slots can
+overshoot them. Large individual memberships remain atomic. Source-commit waits
+and metadata barriers preserve publication order; disjoint views may proceed
+while an earlier failed view waits for retry. Internal lifecycle generations
+prevent queued work from an old registration or restore from recreating edges.
+
+SSP heartbeat data includes optional `publication` measurements: pending batches,
+operations and estimated bytes, oldest age, parked batches, last successful
+publication, overload rejections, and at most eight views with the largest
+backlog. Older schedulers ignore the field; older SSPs omit it. The native shell
+also includes bulk database session generation and reconnect attempt timing.
+These values require no database query or circuit lock to collect.
+
+OpenTelemetry exports `ssp_edge_pending_batches`, `ssp_edge_pending_operations`,
+`ssp_edge_pending_bytes`, `ssp_edge_oldest_age_milliseconds`,
+`ssp_edge_parked_batches`, `ssp_edge_overload_rejections`,
+`ssp_edge_last_success_epoch_milliseconds`, and `ssp_edge_connection_generation`.
+Timeout logs include a bounded statement fingerprint and session generation;
+they do not include the SQL batch or bindings.

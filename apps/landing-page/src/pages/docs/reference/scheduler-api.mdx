@@ -682,3 +682,33 @@ The scheduler monitors SSP health via heartbeats:
 - Scheduler marks SSPs as stale after 15 seconds without heartbeat (configurable)
 - Stale SSPs are removed from the pool
 - Queries assigned to stale SSPs are reassigned to healthy SSPs
+
+## Persistent incident API
+
+These authenticated, read-only endpoints are on the admin listener:
+
+- `GET /admin/api/incidents`: newest-first history. Optional filters: `component`,
+  `state` (`open`, `recovered`, `interrupted`, `failed`, `recorded`), `severity`
+  (`warning`, `info`), `since` and `before` (start-time epoch milliseconds).
+  `offset` defaults to 0; `limit` defaults to 50 and is clamped to 1-200.
+  Returns `incidents`, `total`, `offset`, `limit`, `storage_error`, and `server_time_ms`.
+- `GET /admin/api/incidents/:id`: returns `incident`, or 404 after retention removed it.
+- `GET /admin/api/overview` includes `incidents` with `open`, `total`,
+  `retention_days`, and `storage_error`.
+
+An incident carries `id`, `component`, `kind`, `severity`, `state`, `started_at`,
+`ended_at`, `max_buffered_events`, `event_count`, and `events`. Each event has
+`at`, `component`, `kind`, `state`, `summary`, `operation_id`, and `version`.
+Times are epoch milliseconds. The backlog is sampled, so it is a lower bound
+on the true peak. Event summaries are sanitized descriptions, not raw SQL.
+MCP tools `incidents_list` and `incident_get` share these endpoints and permissions.
+See [incident retention and restart semantics](/docs/reference/admin-dashboard#incident-history).
+
+
+Incident records may also include `publication`, the last nonempty SSP heartbeat
+snapshot sampled while the episode was open, plus `max_publication_operations`,
+`max_publication_bytes`, and `max_publication_age_ms`. These are sampled peaks,
+not a complete transaction trace. `publication.worst_views` contains at most
+eight query IDs and backlog sizes, with no source rows or query bindings.
+Older history files and SSPs omit these optional details. Each SSP in the
+overview exposes the latest `publication` snapshot, or `null` when unavailable.

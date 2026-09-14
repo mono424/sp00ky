@@ -129,6 +129,9 @@ pub struct ReconnectingDb {
     /// Consecutive probe failures that were NOT a dead session (transport
     /// errors). See [`TRANSPORT_FAILURES_BEFORE_RECONNECT`].
     transport_failures: std::sync::atomic::AtomicU32,
+    generation: std::sync::atomic::AtomicU64,
+    last_reconnect_ms: std::sync::atomic::AtomicU64,
+    reconnect_failures: std::sync::atomic::AtomicU64,
 }
 
 impl ReconnectingDb {
@@ -139,12 +142,23 @@ impl ReconnectingDb {
             config,
             wake: tokio::sync::Notify::new(),
             transport_failures: std::sync::atomic::AtomicU32::new(0),
+            generation: std::sync::atomic::AtomicU64::new(1),
+            last_reconnect_ms: std::sync::atomic::AtomicU64::new(0),
+            reconnect_failures: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// Connect (signin + ns/db select) and wrap the result.
     pub async fn connect(config: &DbConfig) -> Result<std::sync::Arc<Self>> {
         Ok(Self::new(connect_http(config).await?, config.clone()))
+    }
+
+    /// Successful session generation, most recent reconnect attempt duration,
+    /// and failed reconnect attempts. Read-only, with no database calls.
+    pub fn reconnect_metrics(&self) -> (u64, Option<u64>, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let duration = self.last_reconnect_ms.load(Relaxed);
+        (self.generation.load(Relaxed), duration.checked_sub(1), self.reconnect_failures.load(Relaxed))
     }
 
     /// The handle to use right now.
@@ -269,13 +283,16 @@ impl ReconnectingDb {
         // namespace/database exist (the raw handle's caller defined them), and
         // the replacement has to come back with them selected.
         let reconnect = connect_http(&self.config);
-        match tokio::time::timeout(
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
             std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
             reconnect,
         )
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("connect timed out")))
-        {
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("connect timed out")));
+        let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128 - 1) as u64;
+        self.last_reconnect_ms.store(elapsed_ms + 1, std::sync::atomic::Ordering::Relaxed);
+        match result {
             Ok(fresh) => {
                 *self
                     .current
@@ -283,11 +300,13 @@ impl ReconnectingDb {
                     .expect("ReconnectingDb lock poisoned") = std::sync::Arc::new(fresh);
                 self.transport_failures
                     .store(0, std::sync::atomic::Ordering::Relaxed);
-                tracing::info!("Reconnected to SurrealDB with a fresh session");
+                let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(generation, elapsed_ms, "Reconnected to SurrealDB with a fresh session");
                 true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "SurrealDB reconnect failed; retrying next tick");
+                self.reconnect_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(error = %e, elapsed_ms, "SurrealDB reconnect failed; retrying next tick");
                 false
             }
         }

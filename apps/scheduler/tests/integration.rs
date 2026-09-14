@@ -2748,6 +2748,27 @@ mod admin_plane {
     }
 
     #[tokio::test]
+    async fn incidents_are_authenticated_filterable_and_survive_router_rebuild() {
+        let h = TestHarness::new().await;
+        let now = scheduler::admin::ops::now_ms();
+        let path = h.config.wal_path.parent().unwrap().join("incidents.json");
+        let rows = json!([
+            {"id":"recent", "component":"ssp-0", "kind":"lagging", "severity":"warning", "state":"recovered", "started_at":now-200, "ended_at":now-100, "max_buffered_events":33, "event_count":1, "events":[]},
+            {"id":"older", "component":"scheduler", "kind":"heartbeat", "severity":"warning", "state":"open", "started_at":now-400, "ended_at":null, "max_buffered_events":0, "event_count":1, "events":[]}
+        ]);
+        std::fs::write(&path, rows.to_string()).unwrap();
+        let app = admin_app(&h, Some("incident-test"));
+        assert_eq!(app.clone().oneshot(get("/admin/api/incidents")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let token = breakglass_token(&app, "incident-test").await;
+        let request = |path: &str| Request::builder().uri(path).header("Authorization", format!("Bearer {token}")).body(axum::body::Body::empty()).unwrap();
+        let filtered = body_json(app.clone().oneshot(request("/admin/api/incidents?component=ssp-0&state=recovered&limit=1")).await.unwrap()).await;
+        assert_eq!(filtered["total"], 1); assert_eq!(filtered["incidents"][0]["id"], "recent");
+        let older = body_json(app.clone().oneshot(request("/admin/api/incidents/older")).await.unwrap()).await;
+        assert_eq!(older["incident"]["state"], "interrupted");
+        assert_eq!(app.oneshot(request("/admin/api/incidents/missing")).await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn config_is_reachable_without_a_token() {
         let h = TestHarness::new().await;
         let res = admin_app(&h, None)
@@ -2985,6 +3006,55 @@ mod admin_plane {
         assert!(body["operations"].is_array());
         assert_eq!(body["cloud_linked"], false);
         assert!(body["server_time_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_publication_reaches_overview_with_bounded_views() {
+        let h = TestHarness::new().await;
+        h.add_ready_ssp("ssp-1", "http://10.0.0.1:8667").await;
+        let app = admin_app(&h, Some("pw"));
+        let token = breakglass_token(&app, "pw").await;
+        let mut payload = json!({
+            "ssp_id": "ssp-1", "timestamp": 123, "views": 5,
+            "cpu_usage": 45.0, "memory_usage": 60.0, "version": "test",
+            "publication": {
+                "pending_batches": 4, "pending_operations": 33, "pending_bytes": 4096,
+                "oldest_age_ms": 2500, "parked_batches": 1,
+                "last_success_at_ms": 100, "overload_total": 2,
+                "connection": {"generation": 3, "last_reconnect_duration_ms": 17, "reconnect_failures": 1},
+                "worst_views": (0..12).map(|i| json!({
+                    "query_id": format!("{i}:{}", "é".repeat(300)),
+                    "pending_operations": 20 - i, "pending_bytes": 512, "oldest_age_ms": 2500
+                })).collect::<Vec<_>>()
+            }
+        });
+        let (status, _) = post_json(h.ssp_router(), "/ssp/heartbeat", &payload).await;
+        assert_eq!(status, StatusCode::OK);
+        let response = app.clone().oneshot(get_auth("/admin/api/overview", &token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let publication = &body["ssps"][0]["publication"];
+        assert_eq!(publication["pending_operations"], 33);
+        assert_eq!(publication["pending_bytes"], 4096);
+        assert_eq!(publication["oldest_age_ms"], 2500);
+        assert_eq!(publication["parked_batches"], 1);
+        assert_eq!(publication["overload_total"], 2);
+        assert_eq!(publication["connection"]["generation"], 3);
+        assert_eq!(publication["connection"]["last_reconnect_duration_ms"], 17);
+        let views = publication["worst_views"].as_array().unwrap();
+        assert_eq!(views.len(), 8);
+        for (i, view) in views.iter().enumerate() {
+            let id = view["query_id"].as_str().unwrap();
+            assert_eq!(id.chars().count(), 256);
+            assert!(id.starts_with(&format!("{i}:")));
+        }
+
+        // An older SSP heartbeat must remove stale publication data after rollback.
+        payload.as_object_mut().unwrap().remove("publication");
+        let (status, _) = post_json(h.ssp_router(), "/ssp/heartbeat", &payload).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body_json(app.oneshot(get_auth("/admin/api/overview", &token)).await.unwrap()).await;
+        assert!(body["ssps"][0]["publication"].is_null());
     }
 
     #[tokio::test]

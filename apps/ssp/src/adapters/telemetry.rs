@@ -26,6 +26,7 @@ impl Telemetry for OtelTelemetry {
                 self.metrics.inc_ingest(value, &[]);
             }
             "edge_operations" => self.metrics.edge_operations.add(value, &[]),
+            "edge_publish_failures" => self.metrics.edge_publish_failures.add(value, &[]),
             "ttl_cleanup" => self.metrics.ttl_cleanup_count.add(value, &[]),
             other => tracing::debug!(name = other, "unmapped telemetry counter"),
         }
@@ -33,6 +34,10 @@ impl Telemetry for OtelTelemetry {
 
     fn histogram_ms(&self, name: &'static str, value: f64) {
         match name {
+            "edge_lock_wait" => self.metrics.edge_lock_wait.record(value, &[]),
+            "edge_lock_hold" => self.metrics.edge_lock_hold.record(value, &[]),
+            "edge_publish" => self.metrics.edge_publish.record(value, &[]),
+            "edge_transaction" => self.metrics.edge_transaction.record(value, &[]),
             "ingest_duration" => self.metrics.ingest_duration.record(value, &[]),
             other => tracing::debug!(name = other, "unmapped telemetry histogram"),
         }

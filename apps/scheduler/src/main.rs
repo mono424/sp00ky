@@ -31,7 +31,8 @@ async fn run() -> Result<()> {
     // the scheduler's own lines aren't buried. `SPKY_LOG_FORMAT=compact` (set
     // by `spky dev`) drops the timestamp: the CLI re-prefixes each line anyway.
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("scheduler=info,warn"));
+        .unwrap_or_else(|_| EnvFilter::new("scheduler=info,warn"))
+        .add_directive("scheduler::incident=info".parse().expect("static incident directive"));
     let compact = std::env::var("SPKY_LOG_FORMAT").as_deref() == Ok("compact");
 
     // A second sink beside stdout: a bounded in-memory ring the admin

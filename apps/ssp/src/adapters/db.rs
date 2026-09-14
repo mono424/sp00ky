@@ -68,15 +68,21 @@ impl SurrealSdkDb {
             Some(limit) => match tokio::time::timeout(limit, fut).await {
                 Ok(result) => result,
                 Err(_) => {
+                    use std::hash::{Hash, Hasher};
                     let n = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                     // The engine cannot tell us a hung session is dead — it
                     // simply never returns — so the timeout IS the signal, and
                     // `force_reconnect` is what actually replaces the handle.
                     self.db.force_reconnect();
+                    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+                    what.hash(&mut fingerprint);
                     tracing::warn!(
                         timeout_secs = limit.as_secs(),
                         consecutive = n,
-                        statement = what,
+                        statement_bytes = what.len(),
+                        statement_count = what.bytes().filter(|b| *b == b';').count(),
+                        statement_fingerprint = format_args!("{:016x}", fingerprint.finish()),
+                        connection_generation = self.db.reconnect_metrics().0,
                         "SurrealDB call exceeded the SSP timeout; reconnecting"
                     );
                     return Err(DbError::Transport(format!(

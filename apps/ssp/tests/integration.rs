@@ -135,13 +135,10 @@ impl TestHarness {
 
     fn app(&self) -> Router {
         // Shared with the node below so a migrated handler and a shell handler
-        // observe the same view-metrics + edge channel. No flusher is spawned
-        // (rx dropped) so edge sends fall back to a direct write.
+        // observe the same view metrics and bounded publication queue. The
+        // node starts the publisher on its first admitted request.
         let view_metrics = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let edge_update_tx = {
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            tx
-        };
+        let edge_update_tx = ssp_node::edges::EdgePublisher::default();
         let state = AppState {
             db: Arc::clone(&self.db),
             processor: Arc::clone(&self.processor),
@@ -172,6 +169,7 @@ impl TestHarness {
                 let (platform, _timer_rx) =
                     ssp_server::adapters::vm_platform(Arc::clone(&self.db), Arc::clone(&self.metrics));
                 Arc::new(ssp_node::SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
                     platform,
                     status: Arc::clone(&self.status),
                     processor: Arc::clone(&self.processor),

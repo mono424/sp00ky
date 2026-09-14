@@ -11,10 +11,16 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub struct Metrics {
+    meter: opentelemetry::metrics::Meter,
     pub ingest_counter: opentelemetry::metrics::Counter<u64>,
     pub ingest_duration: opentelemetry::metrics::Histogram<f64>,
     pub view_count: opentelemetry::metrics::UpDownCounter<i64>,
     pub edge_operations: opentelemetry::metrics::Counter<u64>,
+    pub edge_publish_failures: opentelemetry::metrics::Counter<u64>,
+    pub edge_lock_wait: opentelemetry::metrics::Histogram<f64>,
+    pub edge_lock_hold: opentelemetry::metrics::Histogram<f64>,
+    pub edge_publish: opentelemetry::metrics::Histogram<f64>,
+    pub edge_transaction: opentelemetry::metrics::Histogram<f64>,
     pub ttl_cleanup_count: opentelemetry::metrics::Counter<u64>,
 
     // Internal tracking for rate calculation
@@ -134,6 +140,7 @@ impl Metrics {
             .build();
 
         Self {
+            meter: meter.clone(),
             ingest_counter: meter
                 .u64_counter("ssp_ingest_total")
                 .with_description("Total number of ingest operations")
@@ -150,12 +157,43 @@ impl Metrics {
                 .u64_counter("ssp_edge_operations_total")
                 .with_description("Total edge operations by type")
                 .build(),
+            edge_publish_failures: meter.u64_counter("ssp_edge_publish_failures_total").build(),
+            edge_lock_wait: meter.f64_histogram("ssp_edge_lock_wait_milliseconds").build(),
+            edge_lock_hold: meter.f64_histogram("ssp_edge_lock_hold_milliseconds").build(),
+            edge_publish: meter.f64_histogram("ssp_edge_publish_milliseconds").build(),
+            edge_transaction: meter.f64_histogram("ssp_edge_transaction_milliseconds").build(),
             ttl_cleanup_count: meter
                 .u64_counter("ssp_ttl_cleanup_total")
                 .with_description("Total queries removed by TTL expiry")
                 .build(),
             ingest_total,
         }
+    }
+
+    /// Export backlog levels without touching the circuit or database.
+    pub fn observe_publication(&self, publisher: ssp_node::edges::EdgePublisher, connection: crate::SharedDb) {
+        type Read = fn(&ssp_protocol::PublicationMetrics) -> u64;
+        let instruments: [(&str, Read); 6] = [
+            ("ssp_edge_pending_batches", |s| s.pending_batches),
+            ("ssp_edge_pending_operations", |s| s.pending_operations),
+            ("ssp_edge_pending_bytes", |s| s.pending_bytes),
+            ("ssp_edge_oldest_age_milliseconds", |s| s.oldest_age_ms),
+            ("ssp_edge_parked_batches", |s| s.parked_batches),
+            ("ssp_edge_overload_rejections", |s| s.overload_total),
+        ];
+        for (name, read) in instruments {
+            let queue = publisher.clone();
+            self.meter.u64_observable_gauge(name)
+                .with_callback(move |observer| observer.observe(read(&queue.snapshot()), &[]))
+                .build();
+        }
+        self.meter.u64_observable_gauge("ssp_edge_last_success_epoch_milliseconds")
+            .with_callback(move |observer| {
+                if let Some(at) = publisher.snapshot().last_success_at_ms { observer.observe(at, &[]); }
+            }).build();
+        self.meter.u64_observable_gauge("ssp_edge_connection_generation")
+            .with_callback(move |observer| observer.observe(connection.reconnect_metrics().0, &[]))
+            .build();
     }
 
     pub fn inc_ingest(&self, count: u64, _: &[KeyValue]) {

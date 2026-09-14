@@ -557,6 +557,7 @@ pub async fn build_entities(state: &MetricsState) -> Vec<serde_json::Value> {
                     "last_heartbeat_seconds_ago": last_heartbeat_seconds_ago,
                     "state_seconds": state_seconds,
                     "buffered_events": pool.buffer_size(&ssp.id),
+                    "publication": pool.publication(&ssp.id),
                     "bootstrap": ssp.bootstrap,
                     "env": ssp_env,
                 })

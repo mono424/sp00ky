@@ -142,6 +142,25 @@ describe('liveChange with the body joined on', () => {
     expect([...out.state.membershipDirty]).toEqual(['a']);
   });
 
+  it('leaves a failed inline body for the fetch path without advancing its version', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a' } })]);
+    const out = await runPure(liveChange(env, ['a'], [row(7)]), {
+      state: s,
+      handlers: {
+        'local.execute': () => { throw new Error('stale local epoch'); },
+      },
+    });
+    expect(out.state.versions.has('game:g1')).toBe(false);
+    expect([...out.state.membershipDirty]).toEqual(['a']);
+    expect(out.log.filter((e) => e.kind === 'ssp.ingest')).toHaveLength(0);
+    expect(out.emitted).toContainEqual({
+      type: 'log',
+      level: 'debug',
+      message: 'inline live body not landed; the fetch path will pull it',
+      data: { ids: ['game:g1'] },
+    });
+  });
+
   it('writes one copy when the same row arrives for several views', async () => {
     const s = buildState([buildEntry({ def: { hash: 'a' } })]);
     const out = await runPure(liveChange(env, ['a'], [row(7), row(7), row(8)]), { state: s, handlers });

@@ -142,6 +142,9 @@ pub const TOOLS: &[ToolDef] = &[
     tool!("backend_get", "One backend with its probe history and masked environment.", "GET", "/backends/{name}",
         path_params = &[req("name", "string", "Backend name as listed by backends_list")], read_only = true),
     // ---- Views (who is connected, and what they are watching) ----
+    tool!("incidents_list", "Persistent incident history: automatic lag, recovery, heartbeat failures and operator actions. History survives scheduler restart.", "GET", "/incidents",
+        query = &[p("component", "string", "SSP id or scheduler"), p("state", "string", "open, recovered, interrupted, failed or recorded"), p("severity", "string", "warning or info"), p("since", "integer", "Earliest start, epoch milliseconds"), p("before", "integer", "Latest start, epoch milliseconds"), p("offset", "integer", "Page offset"), p("limit", "integer", "Page size, maximum 200")], read_only = true),
+    tool!("incident_get", "One incident and its bounded event timeline, version, recovery and operation correlation.", "GET", "/incidents/{id}", path_params = &[req("id", "string", "Incident id from incidents_list")], read_only = true),
     tool!("presence", "Live users, sessions and registered views right now, with a recent sample history and the heaviest users. A client refreshes its liveness on a 0.9 x ttl timer (about 9 minutes by default), so a closed tab decays out of these numbers rather than vanishing from them.", "GET", "/presence", read_only = true),
     tool!("views_list", "Registered live queries. Sort by slowest to find what is costing materialization time, or filter to one user or SSP.", "GET", "/views",
         query = &[

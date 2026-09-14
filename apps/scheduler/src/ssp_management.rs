@@ -681,6 +681,7 @@ async fn handle_heartbeat(
             heartbeat.memory_usage,
             heartbeat.version.clone(),
         );
+        pool.update_publication(&heartbeat.ssp_id, heartbeat.publication.clone());
         resync_requested = pool.take_resync(&heartbeat.ssp_id);
         has_overflow = pool.has_buffer_overflow(&heartbeat.ssp_id);
     }
@@ -997,20 +998,27 @@ async fn poll_and_replay_ssp(
                 // Drop pool lock before making HTTP call
                 drop(pool);
 
-                if let Err(e) = transport
+                let outcome = transport
                     .post_to_ssp(&ssp_url, "/ingest", &ingest_payload)
-                    .await
-                {
+                    .await;
+                pool = ssp_pool.write().await;
+                anyhow::ensure!(
+                    pool.registration_gen(&ssp_id) == generation,
+                    "SSP '{}' bootstrap superseded by re-registration during final replay",
+                    ssp_id
+                );
+                if let Err(e) = outcome {
                     warn!(
                         "Failed to replay final event to SSP '{}': {}",
                         ssp_id, e
                     );
+                    pool.mark_for_resync(&ssp_id);
+                    anyhow::bail!("Final replay failed for SSP '{}': {}", ssp_id, e);
                 }
-
-                // Re-acquire for next iteration (but mark_ready already called)
-                pool = ssp_pool.write().await;
             }
         }
+        // Keep recovery correlated with this registration while holding the pool lock.
+        crate::admin::incidents::emit(&ssp_id, "ready", "recovered", "Bootstrap verification and final replay completed", None);
     }
 
     // Phase 6: Unfreeze snapshot if no other SSPs are bootstrapping/replaying

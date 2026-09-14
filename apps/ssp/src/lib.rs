@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use ssp::circuit::{Circuit, Record, ViewDelta};
+use ssp::circuit::{Circuit, Record};
 use ssp::circuit::view::OutputFormat;
 use tokio::signal;
 use tracing::{debug, error, info, warn};
@@ -79,12 +79,10 @@ pub struct AppState {
     /// (`"unknown"` if the query failed). Surfaced via `/info` so the DevTools
     /// can report the SurrealDB backend version.
     pub surrealdb_version: String,
-    /// Sender into the edge-update coalescing flusher. View edge writes
-    /// (`_00_list_ref`) from ingests and registrations are pushed here and
-    /// batched into one transaction per `Config::query_update_throttle_ms`
-    /// window by the `edge_updates::run_edge_update_service` task instead of one
-    /// transaction per update.
-    pub edge_update_tx: mpsc::UnboundedSender<Vec<ViewDelta>>,
+    /// Shared bounded publication queue. Accepted work retains capacity until
+    /// publication or lifecycle invalidation, including source-commit waits
+    /// and parked retries. The throttle debounces only the start of a burst.
+    pub edge_update_tx: ssp_node::edges::EdgePublisher,
     /// Backend health monitoring — standalone mode only (`None` in cluster
     /// mode, where the scheduler owns backend healthchecks). Populated from
     /// `SPKY_BACKENDS` and live-updatable via `PUT /backends`.
@@ -914,24 +912,20 @@ pub async fn run_server() -> anyhow::Result<()> {
         crdt::allow_list_from_env(),
     ));
 
-    // Coalescing flusher for query edge-updates: edge writes to `_00_list_ref`
-    // (from ingests and registrations) are batched into one transaction per
-    // `query_update_throttle_ms` window so a burst of view updates lands as a
-    // few batched LIVE deliveries instead of one transaction per record (which
-    // paced a fresh client's window sync over ~10s). See `Config`.
-    let (edge_update_tx, edge_update_rx) = mpsc::unbounded_channel::<Vec<ViewDelta>>();
-    platform.spawner.spawn(Box::pin(edge_updates::run_edge_update_service(
-        edge_update_rx,
-        edge_updates::SurrealEdgeSink {
-            db: Arc::clone(&platform.db),
-            processor: processor_arc.clone(),
-            telemetry: Arc::clone(&platform.telemetry),
-            mode: config.ref_mode,
-        },
-        Arc::clone(&platform.scheduler),
-        std::time::Duration::from_millis(config.query_update_throttle_ms),
-        edge_updates::MAX_EDGE_BATCH,
-    )));
+    // Bounded publisher for query edges. New bursts debounce for the configured
+    // window; queued work then drains without a delay per item. Failed views
+    // retain their slots and ordering while disjoint views can publish.
+    // Bulk publication gets its own HTTP session. A slow edge transaction or
+    // reconnect must not queue control-path work behind the same SDK handle.
+    let edge_db = connect_database(&config).await?;
+    let edge_connection_for_heartbeat = Arc::clone(&edge_db);
+    maintenance::db::spawn_periodic_resignin(Arc::clone(&edge_db), maintenance::db::RESIGNIN_INTERVAL_SECS);
+    let edge_db: Arc<dyn ssp_node::Db> = Arc::new(adapters::SurrealSdkDb::new(edge_db));
+    let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let edge_update_tx = ssp_node::edges::EdgePublisher::default();
+    metrics.observe_publication(edge_update_tx.clone(), Arc::clone(&edge_connection_for_heartbeat));
+    edge_update_tx.start(&platform, edge_db, processor_arc.clone(), publication_gate.clone(), config.ref_mode,
+        std::time::Duration::from_millis(config.query_update_throttle_ms));
 
     // Standalone mode: this SSP owns the maintenance plane the scheduler
     // provides in cluster mode — backend health monitoring and the
@@ -988,6 +982,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         platform: platform.clone(),
         status: status.clone(),
         processor: processor_arc.clone(),
+        publication_gate: publication_gate.clone(),
         job_config: job_config.clone(),
         job_control: job_control.clone(),
         job_dispatcher: Arc::clone(&job_dispatcher),
@@ -1080,6 +1075,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         node: Arc::clone(&node),
     };
 
+    let publication_for_heartbeat = state.edge_update_tx.clone();
     let mut app = create_app(state);
 
     // `/logs` is the one route that cannot live in the portable core: it is an
@@ -1104,6 +1100,8 @@ pub async fn run_server() -> anyhow::Result<()> {
         // `Authorization: Bearer $SPKY_AUTH_SECRET` when targeting an SSP).
         let host: Arc<dyn maintenance::MaintenanceHost> =
             Arc::new(maintenance_host::SspHost {
+                publisher: publication_for_heartbeat.clone(),
+                publication_gate: publication_gate.clone(),
                 db: db.clone(),
                 processor: processor_arc.clone(),
                 status: status.clone(),
@@ -1481,8 +1479,14 @@ pub async fn run_server() -> anyhow::Result<()> {
 
                 let views = heartbeat_view_count(&processor_clone, &mut last_views);
 
+                let mut publication = publication_for_heartbeat.snapshot();
+                let (generation, last_reconnect_duration_ms, reconnect_failures) = edge_connection_for_heartbeat.reconnect_metrics();
+                publication.connection = Some(ssp_protocol::PublicationConnectionMetrics {
+                    generation, last_reconnect_duration_ms, reconnect_failures,
+                });
                 let payload = ssp_protocol::SspHeartbeat {
                     ssp_id: ssp_id.clone(),
+                    publication: Some(publication),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -2351,7 +2355,6 @@ pub async fn ttl_cleanup_sweep(
 }
 
 // --- Helper Functions ---
-
 
 
 

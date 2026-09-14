@@ -254,6 +254,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         true,
     ));
     let node = SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
         status: Arc::new(RwLock::new(opts.status)),
         processor: Arc::new(RwLock::new(Circuit::new())),
@@ -273,7 +274,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         backend_health,
         crdt_cache: Arc::new(ssp_node::crdt::CrdtCache::new(8, ssp_node::crdt::CrdtAllowList::permissive())),
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        edge_update_tx: { let (tx, _rx) = mpsc::unbounded_channel(); tx },
+        edge_update_tx: ssp_node::edges::EdgePublisher::default(),
         anonymous_live_queries: false,
         standalone: true,
         schedule_engine: opts.schedules.then(|| {
@@ -1728,7 +1729,14 @@ async fn row_count_of(h: &Harness, key: &str) -> i64 {
     v.unwrap_or(-1)
 }
 
+async fn publication_drained(h: &Harness) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.node.edge_update_tx.snapshot().pending_batches > 0 { tokio::task::yield_now().await; }
+    }).await.expect("publication drained");
+}
+
 async fn state_of(h: &Harness, key: &str) -> String {
+    publication_drained(h).await;
     let v: Option<String> = h
         .raw_db
         .query(format!("SELECT VALUE state FROM ONLY _00_query:{key}"))
@@ -1740,6 +1748,7 @@ async fn state_of(h: &Harness, key: &str) -> String {
 }
 
 async fn edge_count_of(h: &Harness, key: &str) -> i64 {
+    publication_drained(h).await;
     let n: Option<i64> = h
         .raw_db
         .query(format!("SELECT VALUE count() FROM _00_list_ref WHERE in = _00_query:{key} GROUP ALL"))
@@ -1751,10 +1760,9 @@ async fn edge_count_of(h: &Harness, key: &str) -> i64 {
 }
 
 // `_00_query.state` is how a client tells "the SSP is still publishing this
-// view" from "the SSP says this view is empty". The test node has no flusher
-// task (its receiver is dropped), so registration edges take the direct write
-// path and both the edges and the `ready` flip are in the DB by the time
-// `/view/register` answers.
+// view" from "the SSP says this view is empty". The test node now uses the
+// same bounded publisher as production. Settlement assertions wait for that
+// publisher rather than relying on a closed-channel synchronous fallback.
 
 #[tokio::test]
 async fn cold_register_of_a_populated_view_ends_ready_with_one_edge_per_row() {
@@ -1838,6 +1846,9 @@ async fn re_registration_republishes_a_view_whose_rows_went_missing() {
     // The re-registration now takes the warm path against an empty DB.
     let r = h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap();
     assert_eq!(r.status, 200, "warm re-register: {:?}", json_of(&r));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.node.edge_update_tx.snapshot().pending_batches > 0 { tokio::task::yield_now().await; }
+    }).await.expect("warm repair publication drained");
 
     assert_eq!(
         row_count_of(&h, "v1").await,
@@ -2057,4 +2068,21 @@ async fn ledger_snapshot_recovery_sees_low_version_updates_and_deletions() {
     ssp_node::bootstrap::rebuild_from_db(&MemDb(Arc::clone(&h.raw_db)), &fresh, 200).await.unwrap();
     assert_eq!(h.node.processor.read().await.compute_table_hashes(),
         fresh.read().await.compute_table_hashes());
+}
+
+#[tokio::test]
+async fn publication_saturation_rejects_ingest_before_circuit_and_job_side_effects() {
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://worker")], ..Default::default() }).await;
+    insert_job(&h.raw_db, "full", "pending").await;
+    let mut held = Vec::new();
+    while let Some(permit) = h.node.edge_update_tx.try_reserve(0) { held.push(permit); }
+    let body = json!({ "table": "job", "op": "CREATE", "id": "job:full", "record": { "status": "pending" } });
+    let result = h.node.route(authed(Method::Post, "/ingest", body.clone())).await.unwrap();
+    assert_eq!(result.status, 503);
+    assert!(h.node.processor.read().await.store.get_record_version_by_key("job:full").is_none());
+    assert!(h.job_rx.lock().await.try_recv().is_err(), "no job dispatch before admission");
+    assert_eq!(job_status(&h.raw_db, "full").await.as_deref(), Some("pending"));
+    drop(held);
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap().status, 200);
+    assert!(h.job_rx.lock().await.try_recv().is_ok(), "scheduler replay can retry after capacity returns");
 }

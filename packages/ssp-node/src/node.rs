@@ -12,7 +12,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use ssp::circuit::Circuit;
@@ -33,6 +33,8 @@ pub struct SspNode {
     pub platform: Platform,
     pub status: Arc<RwLock<SspStatus>>,
     pub processor: Arc<RwLock<Circuit>>,
+    /// Publication and lifecycle cleanup ordering, independent of ingest.
+    pub publication_gate: Arc<tokio::sync::Mutex<()>>,
     pub job_config: Arc<JobConfig>,
     pub job_control: JobControl,
     /// Admission control for job execution. Everything that wants to run a job
@@ -69,10 +71,10 @@ pub struct SspNode {
     pub crdt_cache: Arc<crate::crdt::CrdtCache>,
     /// Per-view latency state, keyed by view id.
     pub view_metrics: Arc<crate::view_metrics::ViewMetrics>,
-    /// Coalescing edge-update channel (view register/ingest push `ViewDelta`s
-    /// here; the `run_edge_update_service` task batches them). Sender is cheap
-    /// to clone and wasm-safe (`tokio::sync::mpsc`).
-    pub edge_update_tx: mpsc::UnboundedSender<Vec<ssp::circuit::ViewDelta>>,
+    /// Bounded publication admission and ordered work queue. Reservations
+    /// cover preparation, source-commit waiting, publication and parked retries;
+    /// lifecycle epochs prevent superseded work from reaching replacement views.
+    pub edge_update_tx: crate::edges::EdgePublisher,
     /// When true, anonymous (empty auth) registrations route to the shared
     /// world-readable `_00_list_ref_anon` table.
     pub anonymous_live_queries: bool,
@@ -158,6 +160,13 @@ fn err_json(status: u16, code: &str, message: impl Into<String>) -> ApiResponse 
 }
 
 impl SspNode {
+    fn publication_admission(&self, bytes: usize) -> Option<crate::edges::PublicationPermit> {
+        self.edge_update_tx.start(&self.platform, self.platform.db.clone(), self.processor.clone(),
+            self.publication_gate.clone(), self.ref_mode, std::time::Duration::ZERO);
+        self.edge_update_tx.try_reserve(bytes)
+    }
+
+
     /// Dispatch one request. `None` = the route is not (yet) served by the
     /// core — the shell keeps handling it in its own framework layer.
     pub async fn route(&self, req: ApiRequest) -> Option<ApiResponse> {
@@ -233,6 +242,8 @@ impl SspNode {
     }
 
     async fn reset_handler(&self) -> ApiResponse {
+        let _publication = self.publication_gate.lock().await;
+        self.edge_update_tx.invalidate_all();
         info!("Resetting circuit state");
         wipe_circuit_and_edges(
             self.platform.db.as_ref(),
@@ -280,16 +291,15 @@ impl SspNode {
     pub async fn republish_restored_views(&self) -> anyhow::Result<()> {
         let ids = self.processor.read().await.view_ids();
         for id in ids {
-            let circuit = self.processor.read().await;
-            let deltas = circuit.snapshot_deltas_for_view(&id);
+            let deltas = self.processor.read().await.snapshot_deltas_for_view(&id);
             for delta in &deltas {
                 self.platform.db.query(
                     "UPDATE type::record('_00_query', $qid) SET rowCount = $count, state = 'materializing'",
                     &[("qid", json!(delta.query_id)), ("count", json!(delta.records.len()))],
                 ).await.map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
             }
-            let left = crate::edges::write_deltas_resilient(
-                self.platform.db.as_ref(), deltas, &circuit, self.ref_mode,
+            let left = crate::edges::write_deltas_unlocked(
+                self.platform.db.as_ref(), deltas, &self.processor, &self.publication_gate, self.ref_mode,
                 self.platform.telemetry.as_ref(),
             ).await;
             anyhow::ensure!(left.is_empty(), "restored view membership repair failed");
@@ -299,7 +309,12 @@ impl SspNode {
 
     pub async fn reload(&self) -> anyhow::Result<()> {
         *self.status.write().await = SspStatus::Bootstrapping;
-        *self.processor.write().await = Circuit::new();
+        {
+            let _publication = self.publication_gate.lock().await;
+            let mut circuit = self.processor.write().await;
+            self.edge_update_tx.invalidate_all();
+            *circuit = Circuit::new();
+        }
         self.apply_circuit_policy().await;
         match crate::bootstrap::rebuild_from_db(
             self.platform.db.as_ref(),
@@ -859,10 +874,12 @@ impl SspNode {
         else {
             return Some(err_json(422, "bad_body", "invalid unregister payload"));
         };
+        let _publication = self.publication_gate.lock().await;
         debug!("Unregistering view: {}", payload.id);
         // Circuit keys are the bare `<hash>` (see `ssp::canonical_query_id`);
         // callers may send either spelling. `view_metrics` is keyed the same.
         let view_key = ssp::canonical_query_id(&payload.id);
+        self.edge_update_tx.invalidate_view(&view_key);
 
         // Look up the auth_id from the View before removing it, so the edge
         // cleanup targets the right per-user `_00_list_ref_user_<id>`.
@@ -922,6 +939,7 @@ impl SspNode {
     /// read them (`_00_list_ref` is gated `auth_id = $auth.id`) and nothing
     /// would ever clean them up once the row is rebuilt under a real identity.
     async fn discard_view_without_identity(&self, view_id: &str) -> bool {
+        let _publication = self.publication_gate.lock().await;
         let stale_table = {
             let mut circuit = self.processor.write().await;
             match circuit.get_view(view_id) {
@@ -937,6 +955,7 @@ impl SspNode {
                 return false;
             }
             let table = crate::tables::list_ref_table(self.ref_mode, "");
+            self.edge_update_tx.invalidate_view(view_id);
             circuit.remove_query(view_id);
             table
         };
@@ -995,6 +1014,7 @@ impl SspNode {
         incantation_id: &str,
         meta: &Value,
         auth_id: &str,
+        permit: crate::edges::PublicationPermit,
     ) {
         // Read the row count and the STORED auth id: the latter is what
         // `build_edge_batch` routes on, so the probe has to look in the same
@@ -1115,30 +1135,11 @@ impl SspNode {
         // Snapshot the live view rather than rebuilding it: `snapshot_delta`
         // clones the cache and leaves the graph and dependency map alone,
         // which is exactly what the early return above exists to protect.
-        let delta = {
+        {
             let circuit = self.processor.read().await;
-            circuit.snapshot_delta(view_id, view_auth)
-        };
-        let Some(delta) = delta else { return };
-
-        if let Err(send_err) = self.edge_update_tx.send(vec![delta]) {
-            let circuit = self.processor.read().await;
-            let left = crate::edges::write_deltas_resilient(
-                self.platform.db.as_ref(),
-                send_err.0,
-                &circuit,
-                self.ref_mode,
-                self.platform.telemetry.as_ref(),
-            )
-            .await;
-            if !left.is_empty() {
-                error!(
-                    views = left.len(),
-                    "stranded-view republish not written after retries (direct path)"
-                );
-                self.platform
-                    .telemetry
-                    .counter("edge_deltas_dropped", left.len() as u64);
+            if !self.edge_update_tx.is_current(&permit) { return; }
+            if let Some(delta) = circuit.snapshot_delta(view_id, view_auth) {
+                self.edge_update_tx.enqueue(permit, vec![delta], &circuit, None, false, vec![]);
             }
         }
         self.platform.telemetry.counter("stranded_view_repaired", 1);
@@ -1150,6 +1151,9 @@ impl SspNode {
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
         }
+        let Some(permit) = self.publication_admission(req.body.len()) else {
+            return Some(err_json(503, "publication_backlog", "Publication backlog is full; retry this request"));
+        };
         let Ok(payload) = serde_json::from_slice::<Value>(&req.body) else {
             return Some(err_json(422, "bad_body", "invalid register payload"));
         };
@@ -1325,7 +1329,7 @@ impl SspNode {
             // The metadata write above is all the warm path used to do. That
             // assumes the DB still holds the edges this view published when it
             // was cold — see `repair_stranded_view` for when it does not.
-            self.repair_stranded_view(&data.plan.id, &incantation_id, &data.metadata, &auth_id)
+            self.repair_stranded_view(&data.plan.id, &incantation_id, &data.metadata, &auth_id, permit)
                 .await;
 
             return Some(ok_json(Value::Null));
@@ -1358,9 +1362,13 @@ impl SspNode {
             }
         };
 
-        let update = {
+        let (initial_row_count, initial_state, publication_ready) = {
             let mut circuit = self.processor.write().await;
-            match &merge_owner {
+            if !self.edge_update_tx.is_current(&permit) || *self.status.read().await != SspStatus::Ready {
+                return Some(err_json(503, "publication_epoch", "Circuit restarted; retry registration"));
+            }
+            self.edge_update_tx.invalidate_view(&data.plan.id);
+            let update = match &merge_owner {
                 Some(owner) => {
                     info!(
                         target: "ssp::edges",
@@ -1384,7 +1392,13 @@ impl SspNode {
                     }
                     delta
                 }
-            }
+            };
+            // Even an empty registration owns an ordered metadata barrier.
+            let update = update.or_else(|| circuit.snapshot_delta(&data.plan.id, auth_id.clone()));
+            let row_count = update.as_ref().map(|d| d.records.len() as i64).unwrap_or(0);
+            let state = crate::edges::publish_state_for(update.as_ref());
+            let ready = self.edge_update_tx.enqueue(permit, update.into_iter().collect(), &circuit, None, true, vec![]);
+            (row_count, state, ready)
         };
         let registration_time_ms = register_start.elapsed().as_secs_f64() * 1000.0;
         self.platform.telemetry.gauge_add("view_count", 1);
@@ -1397,13 +1411,11 @@ impl SspNode {
             .or_default();
 
         let params = data.metadata.get("safe_params").cloned().unwrap_or(Value::Null);
-        let initial_row_count = update.as_ref().map(|d| d.records.len() as i64).unwrap_or(0);
         // Publish state for the client. A delta with anything to write goes to
         // the flusher, which flips the row to `ready` in the same transaction
         // as the edges; a delta with nothing to write is skipped by
         // `build_edge_batch`, so the row has to be born `ready` here or it
         // would say `materializing` forever.
-        let initial_state = crate::edges::publish_state_for(update.as_ref());
 
         // createdAt is DEFAULT time::now() READONLY (set only on insert);
         // counters default to 0 if absent.
@@ -1442,27 +1454,18 @@ impl SspNode {
             .await
         {
             error!("Failed to upsert incantation metadata: {}", e);
+            {
+                let _publication = self.publication_gate.lock().await;
+                let mut circuit = self.processor.write().await;
+                if publication_ready.as_ref().map_or(true, |ready| ready.is_current()) {
+                    self.edge_update_tx.invalidate_view(&data.plan.id);
+                    circuit.remove_query(&data.plan.id);
+                }
+            }
             return Some(err_json(500, "db_error", "Database error"));
         }
 
-        // Initial edges → coalescing flusher; direct write if the flusher is gone.
-        if let Some(delta) = update {
-            if let Err(send_err) = self.edge_update_tx.send(vec![delta]) {
-                let circuit = self.processor.read().await;
-                let left = crate::edges::write_deltas_resilient(
-                    self.platform.db.as_ref(),
-                    send_err.0,
-                    &circuit,
-                    self.ref_mode,
-                    self.platform.telemetry.as_ref(),
-                )
-                .await;
-                if !left.is_empty() {
-                    error!(views = left.len(), "registration edges not written after retries (direct path)");
-                    self.platform.telemetry.counter("edge_deltas_dropped", left.len() as u64);
-                }
-            }
-        }
+        if let Some(ready) = publication_ready { ready.complete(); }
 
         Some(ok_json(Value::Null))
     }
@@ -1475,6 +1478,9 @@ impl SspNode {
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
         }
+        let Some(permit) = self.publication_admission(req.body.len()) else {
+            return Some(err_json(503, "publication_backlog", "Publication backlog is full; retry this request"));
+        };
         let Ok(payload) = serde_json::from_slice::<ssp_protocol::IngestRequest>(&req.body) else {
             error!("Invalid ingest JSON payload");
             return Some(ApiResponse::json(400, Value::Null));
@@ -1489,22 +1495,9 @@ impl SspNode {
         // heartbeat seq, owner, job timing), so it has to survive. Cloning it
         // first meant building the tree twice, on every ingested record.
         let clean = ssp::sanitizer::normalize_record_ref(&payload.record);
-        let db = self.platform.db.as_ref();
 
-        // Pre-emptively create / drop the user's dedicated tables so the
-        // client's post-auth LIVE doesn't race lazy creation.
-        if payload.table == "user" && op == Operation::Create {
-            if let Err(e) =
-                crate::tables::ensure_user_tables(db, self.ref_mode, &payload.id).await
-            {
-                warn!(target: "ssp::ingest", error = ?e, auth_id = %payload.id, "Pre-emptive ensure_user_tables failed");
-            }
-        }
-        if payload.table == "user" && op == Operation::Delete {
-            if let Err(e) = crate::tables::drop_user_tables(db, self.ref_mode, &payload.id).await {
-                warn!(target: "ssp::ingest", error = ?e, auth_id = %payload.id, "drop_user_tables failed");
-            }
-        }
+        // User table lifecycle is ordered with publication below. Dropping a
+        // table on this request path could race older queued RELATE statements.
 
         // Job routing.
         if let Some(backend_info) = self.job_config.job_tables.get(&payload.table).cloned() {
@@ -1533,13 +1526,48 @@ impl SspNode {
             Operation::Delete => Change::delete(&payload.table, &payload.id),
         };
         let step_start = web_time::Instant::now();
-        let (deltas, rv_made_up, rv_made_up_total, rv_missing_total) = {
+        let (record_counts, view_ids, rv_made_up, rv_made_up_total, rv_missing_total) = {
             let mut circuit = self.processor.write().await;
+            if !self.edge_update_tx.is_current(&permit) || *self.status.read().await != SspStatus::Ready {
+                return Some(err_json(503, "publication_epoch", "Circuit restarted; retry ingest"));
+            }
             let before = circuit.synthesized_row_versions();
             let deltas = circuit.step(ChangeSet { changes: vec![change] });
             let total = circuit.synthesized_row_versions();
+            let record_counts = deltas.iter().map(|d| d.records.len()).collect::<Vec<_>>();
+            let view_ids = deltas.iter().map(|d| d.query_id.clone()).collect::<Vec<_>>();
+            // Deletes only remove membership; their deleted version need not become visible.
+            let source = payload.record.get("_00_rv").and_then(|v| v.as_i64()).filter(|v| *v > 0 && op != Operation::Delete)
+                .map(|v| (payload.id.clone(), v));
+            let mut cleanup = Vec::new();
+            if op == Operation::Delete && valid_record_id(&payload.id) {
+                if let Some(owner) = payload.record.get("owner").and_then(|v| v.as_str()) {
+                    let table = crate::tables::list_ref_table(self.ref_mode, owner);
+                    cleanup.push(crate::edges::PublicationCleanup::Statement(format!("DELETE {table} WHERE out = {}", payload.id)));
+                }
+                if self.anonymous_live_queries {
+                    cleanup.push(crate::edges::PublicationCleanup::Statement(format!("DELETE _00_list_ref_anon WHERE out = {}", payload.id)));
+                }
+            }
+            if payload.table == "user" {
+                if op == Operation::Create {
+                    cleanup.push(crate::edges::PublicationCleanup::EnsureUser(payload.id.clone()));
+                } else if op == Operation::Delete {
+                    let mut released = Vec::new();
+                    for id in circuit.view_ids() {
+                        if circuit.get_view(&id).is_some_and(|v| v.auth_id == payload.id) { released.push(id.clone()); }
+                        released.extend(circuit.subscribers_of(&id).iter().filter(|s| s.auth_id == payload.id).map(|s| s.query_id.clone()));
+                    }
+                    for id in released {
+                        self.edge_update_tx.invalidate_view(&id);
+                        circuit.detach_subscriber(&id);
+                    }
+                    cleanup.push(crate::edges::PublicationCleanup::DropUser(payload.id.clone()));
+                }
+            }
+            self.edge_update_tx.enqueue(permit, deltas, &circuit, source, false, cleanup);
             (
-                deltas,
+                record_counts, view_ids,
                 total - before,
                 total,
                 circuit.synthesized_row_versions_missing(),
@@ -1586,87 +1614,12 @@ impl SspNode {
             }
         }
 
-        if !deltas.is_empty() {
-            // Fan out edge writes off the request path. Waiting on `_00_version`
-            // ensures the list_ref UPDATE lands AFTER the source row is readable
-            // downstream (see docs/surrealdb-bugs/ws-row-cache-stale-after-update.md).
-            let expected_version = payload
-                .record
-                .get("_00_rv")
-                .and_then(|v| v.as_i64())
-                .filter(|&v| v > 0);
-            let row_id = payload.id.clone();
-            let record_counts: Vec<usize> = deltas.iter().map(|d| d.records.len()).collect();
-            let view_ids: Vec<String> = deltas.iter().map(|d| d.query_id.clone()).collect();
-
-            let db_c = Arc::clone(&self.platform.db);
-            let scheduler_c = Arc::clone(&self.platform.scheduler);
-            let telemetry_c = Arc::clone(&self.platform.telemetry);
-            let edge_tx = self.edge_update_tx.clone();
-            let processor_c = Arc::clone(&self.processor);
-            let view_metrics_c = Arc::clone(&self.view_metrics);
-            let ref_mode = self.ref_mode;
-
-            self.platform.spawner.spawn(Box::pin(async move {
-                if let Some(expected) = expected_version {
-                    wait_for_row_committed(
-                        db_c.as_ref(),
-                        scheduler_c.as_ref(),
-                        &row_id,
-                        expected,
-                        std::time::Duration::from_secs(5),
-                    )
-                    .await;
-                }
-                if let Err(send_err) = edge_tx.send(deltas) {
-                    let deltas = send_err.0;
-                    let circuit = processor_c.read().await;
-                    let left = crate::edges::write_deltas_resilient(db_c.as_ref(), deltas, &circuit, ref_mode, telemetry_c.as_ref()).await;
-                    if !left.is_empty() {
-                        error!(views = left.len(), "edge deltas not written after retries (direct path)");
-                        telemetry_c.counter("edge_deltas_dropped", left.len() as u64);
-                    }
-                }
-                // In memory only; a timer flushes the dirty views to `_00_query`
-                // (see flush_view_metrics). Writing per ingest contended with the
-                // edge transaction on the same rows and lost edge writes.
-                note_view_metrics(&view_metrics_c, record_counts, view_ids, materialization_time_ms).await;
-            }));
+        if !view_ids.is_empty() {
+            note_view_metrics(&self.view_metrics, record_counts, view_ids, materialization_time_ms).await;
         }
 
-        // Orphan-proof delete: drop every edge pointing at the deleted record,
-        // independently of the circuit deltas (the circuit cache can be
-        // incomplete after a missed ingest / restart).
-        if op == Operation::Delete {
-            if let Some(owner) = payload.record.get("owner").and_then(|v| v.as_str()) {
-                if valid_record_id(&payload.id) {
-                    let list_ref = crate::tables::list_ref_table(self.ref_mode, owner);
-                    // out is a validated record-id literal.
-                    let stmt = format!("DELETE {list_ref} WHERE out = {}", payload.id);
-                    let db_c = Arc::clone(&self.platform.db);
-                    let id_log = payload.id.clone();
-                    self.platform.spawner.spawn(Box::pin(async move {
-                        if let Err(e) = db_c.query(&stmt, &[]).await {
-                            let msg = e.to_string();
-                            if crate::tables::is_missing_table_error(&msg) {
-                                // The owner never registered a view, so they
-                                // have no per-user table and no edges to drop.
-                                debug!(target: "ssp::ingest", id = %id_log, "list_ref cleanup skipped: the owner has no per-user table");
-                            } else {
-                                error!(target: "ssp::ingest", id = %id_log, error = %msg, "list_ref delete cleanup failed");
-                            }
-                        }
-                    }));
-                }
-            }
-            if self.anonymous_live_queries && valid_record_id(&payload.id) {
-                let stmt = format!("DELETE _00_list_ref_anon WHERE out = {}", payload.id);
-                let db_c = Arc::clone(&self.platform.db);
-                self.platform.spawner.spawn(Box::pin(async move {
-                    let _ = db_c.query(&stmt, &[]).await;
-                }));
-            }
-        }
+        // Orphan cleanup is queued with the deletion above, so it cannot
+        // overtake a later recreation and erase its freshly published edges.
 
         self.platform
             .telemetry
@@ -1872,13 +1825,16 @@ impl SspNode {
     }
 
     pub async fn ttl_cleanup_sweep(&self) -> usize {
-        ttl_cleanup_sweep(
+        let _publication = self.publication_gate.lock().await;
+        let removed = ttl_cleanup_sweep(
             self.platform.db.as_ref(),
             &self.processor,
             self.platform.telemetry.as_ref(),
             self.ref_mode,
         )
-        .await
+        .await;
+        self.edge_update_tx.prune_epochs(&*self.processor.read().await);
+        removed
     }
 }
 
@@ -2044,12 +2000,13 @@ fn rows_of(results: Vec<Value>) -> Vec<Value> {
 /// deferred list_ref writes land after the source row is readable downstream.
 /// Returns `true` if observed within `timeout`, `false` on timeout (caller
 /// proceeds anyway). Times through the `Scheduler` port so it is portable.
-async fn wait_for_row_committed(
+pub(crate) async fn wait_for_row_committed(
     db: &dyn Db,
     scheduler: &dyn crate::ports::Scheduler,
     row_id: &str,
     expected_version: i64,
     timeout: std::time::Duration,
+    probes: &tokio::sync::Semaphore,
 ) -> bool {
     if !valid_record_id(row_id) {
         return false;
@@ -2057,13 +2014,15 @@ async fn wait_for_row_committed(
     let start = web_time::Instant::now();
     let mut backoff_ms: u64 = 10;
     while start.elapsed() < timeout {
-        if let Ok(rows) = db
-            .query(
+        let result = {
+            let Ok(_probe) = probes.acquire().await else { return false; };
+            db.query(
                 "SELECT VALUE version FROM ONLY _00_version WHERE record_id = type::record($rid) LIMIT 1",
                 &[("rid", json!(row_id))],
             )
             .await
-        {
+        };
+        if let Ok(rows) = result {
             if let Some(v) = rows.first().and_then(|v| v.as_i64()) {
                 if v >= expected_version {
                     return true;

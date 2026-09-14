@@ -360,6 +360,7 @@ pub async fn scheduler_restart(
                 session.subject.clone(),
                 json!({ "supervised": state.supervised }),
             );
+            state.incidents.flush_operation(&op).await;
             warn!(by = %session.subject, supervised = state.supervised, "Scheduler restart requested from the dashboard; exiting");
             tokio::spawn(async move {
                 // Let the 202 leave the socket first. The operation itself is
@@ -466,7 +467,6 @@ pub async fn cloud_restart(
         by = %session.subject, roles = ?req.roles, upgrade = req.upgrade, clean = req.clean, surreal = req.surreal,
         "Cloud restart requested from the dashboard"
     );
-    let (_, cloud) = link.post("/restart", payload).await?;
 
     // Will this process survive? Empty roles means scheduler + SSPs; clean
     // always forces the scheduler in. If not, there is nobody left to mark
@@ -481,8 +481,15 @@ pub async fn cloud_restart(
         OpKind::CloudRestart,
         None,
         session.subject.clone(),
-        json!({ "cloud": cloud, "roles": req.roles, "upgrade": req.upgrade, "clean": req.clean, "surreal": req.surreal, "restarts_scheduler": restarts_scheduler }),
+        json!({ "roles": req.roles, "upgrade": req.upgrade, "clean": req.clean, "surreal": req.surreal, "restarts_scheduler": restarts_scheduler }),
     );
+
+    state.incidents.flush_operation(&op).await;
+    let (_, cloud) = match link.post("/restart", payload).await {
+        Ok(response) => response,
+        Err(error) => { state.ops.fail(&op.id, "Cloud restart request failed"); return Err(error); }
+    };
+    state.ops.progress(&op.id, json!({ "cloud": cloud }));
 
     if restarts_scheduler {
         state.ops.progress(

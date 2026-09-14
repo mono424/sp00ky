@@ -192,7 +192,7 @@ fn build_node(
     // itself off on the first closed send rather than querying for a backlog it
     // could never work through.
     let (job_queue_tx, _job_rx) = mpsc::channel(64);
-    let (edge_update_tx, _edge_rx) = mpsc::unbounded_channel();
+    let edge_update_tx = ssp_node::edges::EdgePublisher::default();
     let job_config = Arc::new(ssp_node::jobs::JobConfig::default());
     let job_control = ssp_node::jobs::JobControl::new();
     let job_dispatcher = Arc::new(ssp_node::jobs::JobDispatcher::new(
@@ -206,6 +206,7 @@ fn build_node(
         true,
     ));
     let node = Arc::new(SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
         status: Arc::new(RwLock::new(SspStatus::Bootstrapping)),
         processor: Arc::new(RwLock::new(Circuit::new())),

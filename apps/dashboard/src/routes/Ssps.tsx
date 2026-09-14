@@ -4,7 +4,7 @@ import { Bento, Empty, PageHead, Panel, Pill, StatusDot, Tile } from '../compone
 import { BootstrapProgress } from '../components/BootstrapProgress';
 import { ActivityStrip, OpBadge } from '../components/Actions';
 import { AllSspsActions, SspActions, SspLogsLink } from '../components/ClusterActions';
-import { formatCount, formatUptime } from '../lib/format';
+import { formatBytes, formatCount, formatDuration, formatUptime } from '../lib/format';
 import { sspTone } from '../lib/status';
 import type { Overview } from '../api/types';
 
@@ -80,6 +80,12 @@ export function Ssps(props: { data: Overview | undefined; refresh: () => void })
                         <dt>Buffered events</dt>
                         <dd>{formatCount(ssp.buffered_events)}</dd>
                       </dl>
+
+                      <Show when={ssp.publication}>{(publication) => <dl class="kv">
+                        <dt>Pending publication</dt><dd>{formatCount(publication().pending_operations)} operations · {formatBytes(publication().pending_bytes)}</dd>
+                        <dt>Oldest publication wait</dt><dd>{formatDuration(publication().oldest_age_ms)}</dd>
+                        <dt>Parked batches</dt><dd>{formatCount(publication().parked_batches)}</dd>
+                      </dl>}</Show>
 
                       <Show when={ssp.env && Object.keys(ssp.env).length > 0}>
                         <details>

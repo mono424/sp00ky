@@ -129,6 +129,18 @@ impl Incidents {
 
     fn observe(&self, event: Event) {
         let mut h = self.history.lock().unwrap();
+        // Restart intent arrives both through tracing and the synchronous
+        // pre-exit flush. Deduplicate that delivery even if the log feed runs
+        // after completion, when it must not reopen the operation.
+        if event.operation_id.as_ref().is_some_and(|id| h.rows.iter().any(|row| {
+            row.component == event.component && row.events.iter().any(|prior| {
+                prior.operation_id.as_ref() == Some(id)
+                    && prior.kind == event.kind && prior.state == event.state
+                    && prior.summary == event.summary
+            })
+        })) {
+            return;
+        }
         // Correlate automatic SSP failures into one episode. Operator actions
         // have their own identity and cannot accidentally close that episode.
         let existing = h.rows.iter().position(|r| {
@@ -388,6 +400,28 @@ pub async fn detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn duplicate_operator_delivery_does_not_append_or_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let mut request = event("open");
+        request.kind = "operator_action".into();
+        request.operation_id = Some("restart-1".into());
+        history.observe(request.clone());
+        request.at += 1;
+        history.observe(request.clone());
+        let mut completed = request.clone();
+        completed.state = "recovered".into();
+        completed.summary = "Operator action completed".into();
+        history.observe(completed.clone());
+        history.observe(completed);
+        history.observe(request);
+        let h = history.history.lock().unwrap();
+        assert_eq!(h.rows.len(), 1);
+        assert_eq!(h.rows[0].event_count, 2);
+        assert_eq!(h.rows[0].state, "recovered");
+    }
+
     #[tokio::test]
     async fn publication_samples_preserve_independent_peaks_and_survive_restart() {
         use ssp_protocol::{PublicationMetrics, PublicationViewMetrics};

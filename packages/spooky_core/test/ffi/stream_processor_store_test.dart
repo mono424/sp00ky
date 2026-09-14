@@ -35,7 +35,11 @@ void main() {
       final updates = sp.ingestMany([
         row('a'),
         row('b'),
-        {...row('a'), 'op': 'UPDATE', 'record': {'id': 'thread:a', 'title': 'last', '_00_rv': 2}},
+        {
+          ...row('a'),
+          'op': 'UPDATE',
+          'record': {'id': 'thread:a', 'title': 'last', '_00_rv': 2}
+        },
       ]);
       expect(updates, hasLength(1), reason: 'one coalesced update per view');
       final u = updates.single;
@@ -52,24 +56,27 @@ void main() {
 
       // A fresh circuit registers its view against an empty store, then the
       // snapshot lands underneath it and the view catches up.
-      final restored = StreamProcessor.create()..setPermission('thread', 'true');
+      final restored = StreamProcessor.create()
+        ..setPermission('thread', 'true');
       addTearDown(restored.dispose);
       final reg = restored.registerView(view('q1'))!;
       expect(reg.update.localArray, isEmpty);
 
       final updates = restored.loadStoreState(snapshot);
       final caught = updates.firstWhere((u) => u.queryHash == 'q1');
-      expect(caught.localArray.map((e) => e.$1).toSet(),
-          {'thread:a', 'thread:b'});
+      expect(
+          caught.localArray.map((e) => e.$1).toSet(), {'thread:a', 'thread:b'});
       expect(restored.loadStoreState(snapshot.sublist(0, 0)), isEmpty);
     });
 
-    test('loading a corrupt snapshot reports an error rather than crashing', () {
+    test('loading a corrupt snapshot reports an error rather than crashing',
+        () {
       expect(() => sp.loadStoreState(sp.saveStoreState()..[0] = 0x00),
           throwsA(isA<SspException>()));
     });
 
-    test('reconcile deletes what the caller no longer has and asks for the rest',
+    test(
+        'reconcile deletes what the caller no longer has and asks for the rest',
         () {
       sp.registerView(view('q1'));
       sp.ingestMany([row('a'), row('b', rv: 1)]);

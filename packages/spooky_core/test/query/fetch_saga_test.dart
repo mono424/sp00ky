@@ -10,10 +10,12 @@ import 'package:test/test.dart';
 
 import '../saga_helpers.dart';
 
-ClientState primed(List<QueryEntry> entries, [List<r.Reducer> extra = const []]) =>
+ClientState primed(List<QueryEntry> entries,
+        [List<r.Reducer> extra = const []]) =>
     r.setIdentity(primed: true)(buildState(entries, extra));
 
-QueryEntry liveQuery(String hash, List<(String, int)> remoteArray) => buildEntry(
+QueryEntry liveQuery(String hash, List<(String, int)> remoteArray) =>
+    buildEntry(
       def: buildDefinition(hash: hash),
       lifecycle: const QueryLifecycle(
           phase: QueryPhase.live,
@@ -37,7 +39,8 @@ void main() {
     expect(out.state.sync.fetchAttempts, 0);
   });
 
-  test('fetches the deduped set once, writes and ingests bodies, balances depth',
+  test(
+      'fetches the deduped set once, writes and ingests bodies, balances depth',
       () async {
     final out = await runPure<void>(
       (ctx) => fetchRows(ctx, env()),
@@ -140,8 +143,8 @@ void main() {
     );
     expect(ingestFailed.timers['fetch'], isNull);
     expect(ingestFailed.state.versions['thing:1'], 1);
-    expect(ingestFailed.emitted.whereType<LogEvent>().single.level,
-        LogLevel.warn);
+    expect(
+        ingestFailed.emitted.whereType<LogEvent>().single.level, LogLevel.warn);
   });
 
   test('loops until the plan is empty', () async {

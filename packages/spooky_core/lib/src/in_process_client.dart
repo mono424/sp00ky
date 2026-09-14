@@ -75,6 +75,14 @@ class InProcessSp00kyClient extends Sp00kyClient {
 
   bool _initialized = false;
   bool sessionTransitioning = false;
+
+  /// Fires once during [init], as soon as the cached token has been decoded
+  /// and before the circuit primes. [auth] is readable at that point (the
+  /// restored user id, token and access); queries still wait for [init] to
+  /// resolve. A host uses it to paint the signed-in identity without waiting
+  /// for the rest of the local boot.
+  void Function()? onSessionRestored;
+  Timer? _checkpointTimer;
   bool _closed = false;
   Future<void>? _initializing;
   Future<void>? _checkpoint;
@@ -175,6 +183,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
       auth.onBeforeSignOut = () => _runtime
           .dispatchAsync(const Drain())
           .timeout(Duration(milliseconds: config.reconnect.connectTimeoutMs));
+      auth.onSessionRestored = () => onSessionRestored?.call();
       _auth = auth;
       _services
         ..remote = remote
@@ -254,6 +263,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
     await _runtime.run((ctx) => boot_saga.boot(ctx, _env),
         allowsAccountChange: true);
     _initialized = true;
+    _startCheckpoints();
     await _auth?.publishSession();
     if (_env.hasRemote) _runtime.dispatch(const StartRemote());
     _logger.info('Sp00kyClient initialized');
@@ -297,7 +307,9 @@ class InProcessSp00kyClient extends Sp00kyClient {
     try {
       _runtime.dispose();
     } catch (_) {}
-    _checkpointCircuit();
+    _checkpointTimer?.cancel();
+    _checkpointTimer = null;
+    _checkpointCircuit(force: true);
     await _supervisor?.dispose();
     await _remoteAdapter?.dispose();
     await _remote?.close();
@@ -658,8 +670,11 @@ class InProcessSp00kyClient extends Sp00kyClient {
   /// Snapshot the circuit's rows so the next boot restores them instead of
   /// re-reading every row out of sqlite.
   ///
-  /// Also taken on close and before changing accounts. A process that dies
-  /// without one still primes, just
+  /// The only persistence the circuit has: nothing is written per ingest. It
+  /// runs here on demand (a host calls it when it goes to the background), on
+  /// the interval [Sp00kyConfig.circuitCheckpointMs] while rows are dirty, on
+  /// close and before changing accounts. A no-op while nothing changed since
+  /// the last snapshot. A process that dies without one still primes, just
   /// from the rows: the snapshot is a shortcut, never the source of truth.
   Future<void> checkpoint() {
     if (!_initialized || _closed) return Future.value();
@@ -669,11 +684,27 @@ class InProcessSp00kyClient extends Sp00kyClient {
         () => _checkpoint = null);
   }
 
-  void _checkpointCircuit() {
+  void _startCheckpoints() {
+    final ms = config.circuitCheckpointMs;
+    if (ms <= 0) return;
+    _checkpointTimer?.cancel();
+    _checkpointTimer = Timer.periodic(Duration(milliseconds: ms), (_) {
+      if (_closed || !_initialized) return;
+      if (_streamProcessor.dirtyRows < StreamProcessorService.checkpointMinRows)
+        return;
+      unawaited(checkpoint());
+    });
+  }
+
+  void _checkpointCircuit({bool force = false}) {
     if (!_initialized) return;
+    if (!force && !_streamProcessor.snapshotDirty) return;
     try {
       final bytes = _streamProcessor.saveStoreSnapshot();
-      if (bytes != null && bytes.isNotEmpty) _holder.db.putSnapshot(bytes);
+      if (bytes != null && bytes.isNotEmpty) {
+        _holder.db.putSnapshot(bytes);
+        _streamProcessor.clearDirty();
+      }
     } catch (error) {
       _logger.warn('Circuit checkpoint failed: $error');
     }

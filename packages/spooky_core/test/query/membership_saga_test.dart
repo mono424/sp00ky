@@ -57,8 +57,8 @@ void main() {
       );
       expect(out.result, MembershipOutcome.viewLost);
       expect(out.state.queries['a']!.lifecycle.phase, QueryPhase.viewLost);
-      expect(out.state.queries['a']!.lifecycle.remote,
-          RemotePhase.unregistered);
+      expect(
+          out.state.queries['a']!.lifecycle.remote, RemotePhase.unregistered);
       expect(out.emitted.whereType<QueryViewLostEvent>(), hasLength(1));
       expect(out.dispatched.single, isA<EnsureRegistered>());
       // The rows are KEPT: a lost view is not an empty one.
@@ -99,7 +99,8 @@ void main() {
       expect(out.dispatched.whereType<FetchRows>(), hasLength(1));
     });
 
-    test('a verified removal applies an empty set with no server row', () async {
+    test('a verified removal applies an empty set with no server row',
+        () async {
       final out = await runPure<MembershipOutcome>(
         (ctx) => applyMembership(ctx, 'a', const [], verifiedRemoval: true),
         state: buildState([
@@ -150,8 +151,7 @@ void main() {
         state: state,
         handlers: defaults(),
       );
-      expect(changed.state.queries['a']!.subqueryRemoteArray,
-          [('child:2', 1)]);
+      expect(changed.state.queries['a']!.subqueryRemoteArray, [('child:2', 1)]);
       expect(changed.dispatched.single, isA<FetchRows>());
     });
   });
@@ -190,7 +190,8 @@ void main() {
       expect(out.dispatched.whereType<SyncOutcome>().last.ok, isTrue);
     });
 
-    test('an equal set on a live query applies nothing; a cached one still flips',
+    test(
+        'an equal set on a live query applies nothing; a cached one still flips',
         () async {
       final live = await runPure<MembershipRead>(
         (ctx) => readMembership(ctx, env(), ['a'], force: true),
@@ -311,8 +312,8 @@ void main() {
                   remoteArray: [('thing:1', 1)])
             ])),
             handlers: defaults(over: {
-              'remote.query': (_, __) => snapshot(
-                  meta: {'rowCount': 1, 'state': 'materializing'}),
+              'remote.query': (_, __) =>
+                  snapshot(meta: {'rowCount': 1, 'state': 'materializing'}),
             }),
           );
       expect((await tick(0)).timers['membership']!.ms, 150);

@@ -75,7 +75,8 @@ void main() {
       );
     });
 
-    test('empty with no readable row: view-lost when holding, ignored when cold',
+    test(
+        'empty with no readable row: view-lost when holding, ignored when cold',
         () {
       expect(
         decideMembershipOutcome(const MembershipDecisionInput(
@@ -207,7 +208,8 @@ void main() {
           isFalse);
     });
 
-    test('suspectHashes flags held queries with a missing or silently empty row',
+    test(
+        'suspectHashes flags held queries with a missing or silently empty row',
         () {
       final snaps = {
         'missing': ListRefSnapshot(

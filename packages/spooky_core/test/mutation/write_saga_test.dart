@@ -40,7 +40,8 @@ void main() {
           )),
       state: buildState([buildEntry(def: buildDefinition(hash: 'a'))]),
       handlers: defaults(over: {
-        'local.get': (_, __) => {'id': 'thing:1', 'title': 'hello', '_00_rv': 1},
+        'local.get': (_, __) =>
+            {'id': 'thing:1', 'title': 'hello', '_00_rv': 1},
       }),
     );
     final tx = out.ofKind('local.tx').single as LocalTx;
@@ -150,8 +151,8 @@ void main() {
               recordId: 'thing:1',
               data: {'title': 'b'},
               options: UpdateOptions(
-                  debounced: DebounceOptions(
-                      key: DebounceKey.recordId, delay: 50)),
+                  debounced:
+                      DebounceOptions(key: DebounceKey.recordId, delay: 50)),
             )),
         state: first.state,
         handlers: defaults(over: {
@@ -182,8 +183,8 @@ void main() {
           'local.get': (_, __) => {'id': 'thing:1', 'title': 'a'},
         }),
       );
-      expect(second.state.pendingWrites['thing:1']!.before!['title'],
-          'original');
+      expect(
+          second.state.pendingWrites['thing:1']!.before!['title'], 'original');
       // The only read is the post-write read-back: a merged write never
       // re-reads the before row, which is what keeps the original.
       expect(second.ofKind('local.get'), hasLength(1));

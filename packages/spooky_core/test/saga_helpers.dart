@@ -47,7 +47,8 @@ Map<String, EffectHandler> defaults({
       'remote.kill': (_, __) => null,
       'ssp.register': (e, __) => RegisterResult(
             localArray:
-                sspLocalArray?.call((e as SspRegister).plan.queryHash) ?? const [],
+                sspLocalArray?.call((e as SspRegister).plan.queryHash) ??
+                    const [],
             timings: const RegistrationTimings(parseMs: 1),
           ),
       'ssp.unregister': (_, __) => null,

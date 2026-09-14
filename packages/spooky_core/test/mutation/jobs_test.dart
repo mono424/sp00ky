@@ -56,13 +56,17 @@ void main() {
     expect(() => buildJobRecord(schema, 'api', '/spookify', const {}),
         throwsArgumentError);
     expect(
-        () => buildJobRecord(const {
+        () => buildJobRecord(
+            const {
               'backends': {
                 'api': {
                   'routes': {'/x': <String, dynamic>{}}
                 }
               }
-            }, 'api', '/x', const {}),
+            },
+            'api',
+            '/x',
+            const {}),
         throwsArgumentError);
   });
 }

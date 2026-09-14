@@ -108,6 +108,27 @@ void main() {
 
   String jwt() =>
       'h.${base64Url.encode(utf8.encode('{"ID":"user:1","AC":"account"}'))}.s';
+  test('onSessionRestored fires on a token restore only', () async {
+    await persistence.set('sp00ky_auth_token', jwt());
+    final auth = build();
+    var restored = 0;
+    String? seenBeforeNotify;
+    auth.onSessionRestored = () {
+      restored++;
+      seenBeforeNotify = auth.currentUser?['id']?.toString();
+    };
+    var notified = 0;
+    auth.subscribe((_) => notified++);
+    notified = 0; // the subscribe itself fires once
+    expect(await auth.restoreSessionFromToken(notify: false), 'user:1');
+    expect(restored, 1);
+    expect(seenBeforeNotify, 'user:1');
+    expect(notified, 0, reason: 'notify: false publishes nothing');
+    expect(auth.isAuthenticated, true);
+    await auth.signOut();
+    expect(restored, 1, reason: 'sign-out is not a restore');
+  });
+
   test(
       'unreachable verification retains a restored session and later refreshes it',
       () async {

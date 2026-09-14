@@ -41,8 +41,7 @@ void main() {
           isTrue);
       expect(
           identical(
-              applyWindowOrder(
-                  'SELECT * FROM thing LIMIT 10 START 10', rows),
+              applyWindowOrder('SELECT * FROM thing LIMIT 10 START 10', rows),
               rows),
           isTrue);
     });

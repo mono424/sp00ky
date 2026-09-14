@@ -46,7 +46,8 @@ void main() {
       );
     });
 
-    test('adds pending writes the local view admits, never twice, never deleted',
+    test(
+        'adds pending writes the local view admits, never twice, never deleted',
         () {
       expect(
         buildRenderIds(

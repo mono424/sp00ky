@@ -7,8 +7,7 @@ import 'package:test/test.dart';
 
 void main() {
   group('hash inputs (golden against the previous DataModule formulas)', () {
-    const input = QueryKeyInput(
-        surql: 'SELECT * FROM thing', params: {'a': 1});
+    const input = QueryKeyInput(surql: 'SELECT * FROM thing', params: {'a': 1});
 
     test('the salted key is {surql, params, sessionId} in that key order', () {
       expect(queryHashInput(input, 's1'),
@@ -31,7 +30,8 @@ void main() {
           '{"surql":"S","params":{"r":"user:u1","d":"2026-01-02T03:04:05.000Z"}}');
     });
 
-    test('the same query hashes the same across two clients of one session', () {
+    test('the same query hashes the same across two clients of one session',
+        () {
       final a = sha256.convert(utf8.encode(queryHashInput(input, 's1')));
       final b = sha256.convert(utf8.encode(queryHashInput(input, 's1')));
       expect(a.toString(), b.toString());

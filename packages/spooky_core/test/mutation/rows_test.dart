@@ -29,8 +29,8 @@ void main() {
       final b = mintMutationId('tabA');
       expect(a.compareTo(b), lessThan(0));
       expect(mutationOwnerClientId(a), 'tabA');
-      expect(mutationOwnerClientId('_00_pending_mutations:1700000000000'),
-          isNull);
+      expect(
+          mutationOwnerClientId('_00_pending_mutations:1700000000000'), isNull);
     });
   });
 
@@ -68,7 +68,8 @@ void main() {
 
       expect(parsePendingRow(null), isNull);
       expect(parsePendingRow({'mutationType': 'nope'}), isNull);
-      expect(parsePendingRow({'mutationType': 'create', 'recordId': 1}), isNull);
+      expect(
+          parsePendingRow({'mutationType': 'create', 'recordId': 1}), isNull);
       // A create with no payload cannot be replayed.
       expect(
           parsePendingRow({
@@ -187,13 +188,15 @@ void main() {
         );
 
     test('a create reverts by delete', () {
-      final plan = planRevert(row(MutationEventType.create, data: {'a': 1}), null);
+      final plan =
+          planRevert(row(MutationEventType.create, data: {'a': 1}), null);
       expect(plan.revert, RevertKind.full);
       expect(plan.ops.single, isA<DeleteOp>());
       expect(plan.circuit.op, IngestOp.delete);
     });
 
-    test('update and delete restore beforeRecord, or are partial without it', () {
+    test('update and delete restore beforeRecord, or are partial without it',
+        () {
       final restored =
           planRevert(row(MutationEventType.update), {'a': 0, 'id': 'thing:1'});
       expect(restored.revert, RevertKind.full);

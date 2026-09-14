@@ -26,8 +26,8 @@ void main() {
         (ctx) => pollTick(ctx, env()),
         handlers: defaults(),
       );
-      expect((ok.ofKind('remote.query').single as RemoteQuery).sql,
-          'RETURN true');
+      expect(
+          (ok.ofKind('remote.query').single as RemoteQuery).sql, 'RETURN true');
       expect(ok.dispatched.whereType<SyncOutcome>().single.ok, isTrue);
 
       final down = await runPure<void>(
@@ -82,8 +82,7 @@ void main() {
         ], [
           r.patchSync(pollIdleStreak: 3),
           r.outboxReplace([
-            buildOutboxItem(
-                id: 'm1', status: OutboxStatus.acked, ackedAt: 1)
+            buildOutboxItem(id: 'm1', status: OutboxStatus.acked, ackedAt: 1)
           ]),
         ]),
         handlers: defaults(over: {
@@ -122,9 +121,8 @@ void main() {
 
     test('kills the previous subscription when connected, ignoring errors',
         () async {
-      final state = r.setConnection(ConnectionState.connected)(
-          r.patchSync(liveUuid: 'old', liveTable: '_00_list_ref_user_u1')(
-              buildState()));
+      final state = r.setConnection(ConnectionState.connected)(r.patchSync(
+          liveUuid: 'old', liveTable: '_00_list_ref_user_u1')(buildState()));
       final out = await runPure<void>(
         (ctx) => liveStart(ctx, env()),
         state: state,
@@ -192,12 +190,14 @@ void main() {
     test('lands a joined body so the fetch plan has nothing left to pull',
         () async {
       final out = await runPure<void>(
-        (ctx) => liveChange(ctx, env(), ['a'], const [
-              InlineRow(
-                  id: 'thing:1',
-                  version: 3,
-                  record: {'id': 'thing:1', 'title': 'pushed'}),
-            ]),
+        (ctx) => liveChange(ctx, env(), [
+          'a'
+        ], const [
+          InlineRow(
+              id: 'thing:1',
+              version: 3,
+              record: {'id': 'thing:1', 'title': 'pushed'}),
+        ]),
         state: buildState([buildEntry(def: buildDefinition(hash: 'a'))]),
         handlers: defaults(),
       );
@@ -209,9 +209,11 @@ void main() {
 
     test('ignores a body already held at that version or newer', () async {
       final out = await runPure<void>(
-        (ctx) => liveChange(ctx, env(), ['a'], const [
-              InlineRow(id: 'thing:1', version: 2, record: {'id': 'thing:1'}),
-            ]),
+        (ctx) => liveChange(ctx, env(), [
+          'a'
+        ], const [
+          InlineRow(id: 'thing:1', version: 2, record: {'id': 'thing:1'}),
+        ]),
         state: r.setVersions([('thing:1', 3)])(
             buildState([buildEntry(def: buildDefinition(hash: 'a'))])),
         handlers: defaults(),
@@ -223,8 +225,7 @@ void main() {
   group('connectionChanged', () {
     test('a drop arms resubscribe and invalidates LIVE', () async {
       final out = await runPure<void>(
-        (ctx) =>
-            connectionChanged(ctx, env(), ConnectionState.disconnected),
+        (ctx) => connectionChanged(ctx, env(), ConnectionState.disconnected),
         state: r.patchSync(liveUuid: 'u', liveTable: 't')(buildState()),
         handlers: defaults(),
       );
@@ -247,8 +248,7 @@ void main() {
     test('a reconnect drops every registration and re-drives, once per window',
         () async {
       final dropped = await runPure<void>(
-        (ctx) =>
-            connectionChanged(ctx, env(), ConnectionState.disconnected),
+        (ctx) => connectionChanged(ctx, env(), ConnectionState.disconnected),
         state: buildState([
           buildEntry(def: buildDefinition(hash: 'a'), lifecycle: registered)
         ]),
@@ -260,13 +260,12 @@ void main() {
         now: 100000,
         handlers: defaults(),
       );
-      expect(back.state.queries['a']!.lifecycle.remote,
-          RemotePhase.unregistered);
+      expect(
+          back.state.queries['a']!.lifecycle.remote, RemotePhase.unregistered);
       expect(back.state.sync.needsResubscribe, isFalse);
       expect(back.dispatched.map((e) => e.type),
           ['EnsureRegistered', 'LiveStart', 'Drain']);
-      expect(
-          (back.dispatched.first as EnsureRegistered).requireAuth, isTrue);
+      expect((back.dispatched.first as EnsureRegistered).requireAuth, isTrue);
 
       // A second reconnect inside the cooldown only clears the flag.
       final burst = await runPure<void>(
@@ -356,8 +355,8 @@ void main() {
         ))(degraded()),
         handlers: defaults(),
       );
-      expect(out.state.queries['a']!.lifecycle.remote,
-          RemotePhase.unregistered);
+      expect(
+          out.state.queries['a']!.lifecycle.remote, RemotePhase.unregistered);
       expect((out.dispatched.single as EnsureRegistered).requireAuth, isTrue);
     });
 

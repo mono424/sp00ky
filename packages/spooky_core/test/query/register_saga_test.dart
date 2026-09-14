@@ -40,7 +40,8 @@ void main() {
       expect(read.table, sql.viewTable);
     });
 
-    test('cached: a durable view row seeds membership; unconfirmed empty stays cold',
+    test(
+        'cached: a durable view row seeds membership; unconfirmed empty stays cold',
         () async {
       final seeded = await runPure<String>(
         (ctx) => registerLocal(ctx, env(), input),
@@ -63,8 +64,7 @@ void main() {
           'local.get': (_, __) => {'ids': <dynamic>[], 'confirmed': false},
         }),
       );
-      expect(
-          unconfirmed.state.queries[unconfirmed.result]!.lifecycle.phase,
+      expect(unconfirmed.state.queries[unconfirmed.result]!.lifecycle.phase,
           QueryPhase.cold);
 
       final failedRead = await runPure<String>(
@@ -127,7 +127,8 @@ void main() {
       expect(out.dispatched.map((e) => (e as RegisterRemote).hash), ['a']);
     });
 
-    test('with requireAuth: probes \$auth.id, retries on a timer, then gives up',
+    test(
+        'with requireAuth: probes \$auth.id, retries on a timer, then gives up',
         () async {
       final state = r.setIdentity(userId: 'user:u1')(
           buildState([buildEntry(def: buildDefinition(hash: 'a'))]));
@@ -142,7 +143,8 @@ void main() {
       expect(blind.dispatched, isEmpty);
       expect(blind.timers['ensure-registered']!.ms, 500);
       expect(
-          (blind.timers['ensure-registered']!.event as EnsureRegistered).attempt,
+          (blind.timers['ensure-registered']!.event as EnsureRegistered)
+              .attempt,
           1);
 
       final exhausted = await runPure<void>(
@@ -153,8 +155,8 @@ void main() {
         }),
       );
       expect(exhausted.timers, isEmpty);
-      expect(exhausted.emitted.whereType<LogEvent>().single.level,
-          LogLevel.warn);
+      expect(
+          exhausted.emitted.whereType<LogEvent>().single.level, LogLevel.warn);
 
       final visible = await runPure<void>(
         (ctx) => ensureRegistered(ctx, env(), requireAuth: true),

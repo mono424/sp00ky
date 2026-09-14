@@ -435,6 +435,11 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
   }
 
   try {
+    // The restored session goes out the moment the cached token is decoded,
+    // before the circuit primes: the host paints the signed-in identity while
+    // the rest of the local boot is still running. Delivered ahead of the
+    // command port, which the host only receives once init() has finished.
+    client.onSessionRestored = state;
     await client.init();
     if (config.database.endpoint != null)
       observers.add(client.auth.subscribe((_) {

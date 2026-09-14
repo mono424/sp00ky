@@ -51,25 +51,29 @@ void main() {
       final db1 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db1.provision();
-      await SqlitePersistenceClient(() => db1).set('sp00ky_auth_token', 'tok-123');
+      await SqlitePersistenceClient(() => db1)
+          .set('sp00ky_auth_token', 'tok-123');
       db1.close();
 
       final db2 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db2.provision();
-      final restored =
-          await SqlitePersistenceClient(() => db2).get<String>('sp00ky_auth_token');
+      final restored = await SqlitePersistenceClient(() => db2)
+          .get<String>('sp00ky_auth_token');
       db2.close();
 
       expect(restored, 'tok-123');
     });
 
-    test('stream-processor state restores across a restart', () async {
-      // Session 1: register a view, ingest a row, persist state to sqlite.
+    test('rows survive a restart through the snapshot, never a state dump',
+        () async {
+      // Session 1: register a view, ingest a row. No per-ingest persistence:
+      // the kv store must stay empty until the client checkpoints.
       final db1 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db1.provision();
-      final sp1 = StreamProcessorService(SqlitePersistenceClient(() => db1), logger);
+      final sp1 =
+          StreamProcessorService(SqlitePersistenceClient(() => db1), logger);
       await sp1.init();
       sp1.seedPermissionsFromSchema(
           'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;');
@@ -82,25 +86,47 @@ void main() {
       ));
       sp1.ingest(
           'thread', 'CREATE', 'thread:a', {'id': 'thread:a', 'title': 't'});
-      await sp1.saveState();
+      expect(db1.kvGet('_00_stream_processor_state'), isNull,
+          reason: 'an ingest must not write the circuit to sqlite');
+      expect(sp1.snapshotDirty, isTrue);
+      db1.putSnapshot(sp1.saveStoreSnapshot()!);
+      sp1.clearDirty();
       await sp1.close();
       db1.close();
 
-      // Session 2: a fresh processor must restore the registered view from
-      // persisted state, so a matching ingest still produces an update for q1.
+      // Session 2: a legacy state dump left by an older core is dropped on
+      // init, and the rows come back from the snapshot under a fresh view.
       final db2 = LocalDatabaseService.open(logger,
           store: StoreType.indexeddb, path: dbPath);
       db2.provision();
-      final sp2 = StreamProcessorService(SqlitePersistenceClient(() => db2), logger);
-      await sp2.init(); // loadState() from sqlite
-
-      final updates = sp2.ingest(
-          'thread', 'CREATE', 'thread:b', {'id': 'thread:b', 'title': 'u'});
+      db2.kvSet('_00_stream_processor_state', '"{}"');
+      final sp2 =
+          StreamProcessorService(SqlitePersistenceClient(() => db2), logger);
+      await sp2.init();
+      expect(db2.kvGet('_00_stream_processor_state'), isNull,
+          reason: 'the legacy circuit dump is removed on boot');
+      sp2.seedPermissionsFromSchema(
+          'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;');
+      await sp2.primeFromLocal(
+        tables: const ['thread'],
+        versions: {
+          'thread': [('thread:a', 1)]
+        },
+        selectByIds: (_, __) => const [],
+        snapshot: db2.getSnapshot(),
+      );
+      final initial = sp2.registerQueryPlan(QueryPlanConfig(
+        queryHash: 'q2',
+        surql: 'SELECT * FROM thread',
+        params: {},
+        ttl: '10m',
+        lastActiveAt: DateTime.utc(2026),
+      ));
       await sp2.close();
       db2.close();
 
-      expect(updates.any((u) => u.queryHash == 'q1'), isTrue,
-          reason: 'view q1 should have been restored from persisted state');
+      expect(initial?.localArray.map((e) => e.$1), contains('thread:a'),
+          reason: 'the row restored from the snapshot feeds a new view');
     });
   });
 }

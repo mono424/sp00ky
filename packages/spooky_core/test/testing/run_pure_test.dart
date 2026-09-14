@@ -50,7 +50,8 @@ void main() {
       expect(out.log.first.kind, 'state.read');
     });
 
-    test('state.wait passes when the predicate holds and throws when it would block',
+    test(
+        'state.wait passes when the predicate holds and throws when it would block',
         () async {
       final ok = await runPure<String>((ctx) async {
         await ctx(Fx.stateWait((s) => s.failedCount == 0));

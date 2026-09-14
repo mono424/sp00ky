@@ -58,7 +58,8 @@ void main() {
       sp2.loadState(state); // must not throw
     });
 
-    test('accepts a .related()-shaped subquery view and tracks both tables', () {
+    test('accepts a .related()-shaped subquery view and tracks both tables',
+        () {
       // Gate for the Dart `.related()` support: the client registers the FULL
       // surql (subquery projections included) with the native circuit, and a
       // change to a CHILD row has to re-emit the parent view — otherwise a
@@ -79,7 +80,10 @@ void main() {
       final afterParent = sp.ingest(
           'thread', 'CREATE', 'thread:a', {'id': 'thread:a', 'title': 't'});
       expect(
-          afterParent.firstWhere((e) => e.queryHash == 'q3').localArray.map((e) => e.$1),
+          afterParent
+              .firstWhere((e) => e.queryHash == 'q3')
+              .localArray
+              .map((e) => e.$1),
           contains('thread:a'));
 
       final afterChild = sp.ingest('comment', 'CREATE', 'comment:c1',

@@ -77,16 +77,19 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
   }
 
   @override
-  Future<void> use({required String namespace, required String database}) async {
+  Future<void> use(
+      {required String namespace, required String database}) async {
     usedNamespace = namespace;
   }
 
   @override
   Future<dynamic> authenticate(String token) async => null;
   @override
-  Future<dynamic> signin(Map<String, dynamic> params) async => {'access': 'tok'};
+  Future<dynamic> signin(Map<String, dynamic> params) async =>
+      {'access': 'tok'};
   @override
-  Future<dynamic> signup(Map<String, dynamic> params) async => {'access': 'tok'};
+  Future<dynamic> signup(Map<String, dynamic> params) async =>
+      {'access': 'tok'};
   @override
   Future<void> invalidate() async {}
 

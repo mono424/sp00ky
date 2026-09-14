@@ -42,7 +42,8 @@ void main() {
 
     test('reducers on an unknown hash are identity', () {
       final s = buildState([e('a')]);
-      expect(identical(r.applyLifecycle('x', const NotifiedEvent())(s), s), isTrue);
+      expect(identical(r.applyLifecycle('x', const NotifiedEvent())(s), s),
+          isTrue);
       expect(identical(r.setLocalArray('x', const [])(s), s), isTrue);
       expect(identical(r.commitMembership('x', [('thing:1', 1)], true)(s), s),
           isTrue);
@@ -80,8 +81,8 @@ void main() {
           buildOutboxItem(id: 'm3', recordId: 'thing:1'),
         ]),
       ]);
-      final s1 = r.commitMembership('a', [('thing:1', 2)], true)(
-          s0.copyWith(dirty: const {}));
+      final s1 = r.commitMembership(
+          'a', [('thing:1', 2)], true)(s0.copyWith(dirty: const {}));
       final entry = s1.queries['a']!;
       expect(entry.remoteArray, [('thing:1', 2)]);
       expect(entry.lifecycle.phase, QueryPhase.live);
@@ -99,7 +100,8 @@ void main() {
       expect(s2.queries['a']!.subqueryRemoteArray, [('child:1', 1)]);
     });
 
-    test('setRecords clears dirt, counts changes, samples timing, marks notified',
+    test(
+        'setRecords clears dirt, counts changes, samples timing, marks notified',
         () {
       final s0 = r.markDirty(['a'])(buildState([e('a')]));
       final rows = <Row>[
@@ -113,9 +115,13 @@ void main() {
       expect(en.telemetry.phaseLast[TimingPhase.localFetch], 12.0);
       expect(en.lifecycle.notified, isTrue);
       expect(s1.dirty.contains('a'), isFalse);
-      final s2 = r.setRecords('a', [
-        {'id': 'other'}
-      ], false, null)(s1);
+      final s2 = r.setRecords(
+          'a',
+          [
+            {'id': 'other'}
+          ],
+          false,
+          null)(s1);
       expect(identical(s2.queries['a']!.records, rows), isTrue);
       expect(s2.queries['a']!.telemetry.updateCount, 1);
       expect(s2.queries['a']!.telemetry.phaseSamples[TimingPhase.localFetch],
@@ -223,14 +229,16 @@ void main() {
   });
 
   group('versions', () {
-    test('setVersions dirties queries naming the id; deleteVersions removes', () {
+    test('setVersions dirties queries naming the id; deleteVersions removes',
+        () {
       final s0 = buildState([
         e('a', remoteArray: [('thing:1', 1)]),
         e('b', localArray: [('thing:2', 1)]),
         e('c'),
       ]);
       expect(identical(r.setVersions(const [])(s0), s0), isTrue);
-      final s1 = r.setVersions([('thing:1', 1), ('thing:2', 1), ('thing:9', 1)])(s0);
+      final s1 =
+          r.setVersions([('thing:1', 1), ('thing:2', 1), ('thing:9', 1)])(s0);
       expect(s1.dirty.toList()..sort(), ['a', 'b']);
       expect(identical(r.setVersions([('thing:1', 1)])(s1), s1), isTrue);
       final s2 = r.deleteVersions(['thing:9', 'nope'])(s1);
@@ -314,7 +322,8 @@ void main() {
   });
 
   group('bucket switch reducers', () {
-    test('rebindQuery swaps the id and sync state; clearBucketState wipes slices',
+    test(
+        'rebindQuery swaps the id and sync state; clearBucketState wipes slices',
         () {
       final s0 = buildState([
         e('a',
@@ -368,8 +377,7 @@ void main() {
   group('identity / connection / compose', () {
     test('sets fields and short-circuits on no change', () {
       final s0 = buildState();
-      final s1 =
-          r.setIdentity(sessionId: 's', userId: 'u', bucketId: 'b')(s0);
+      final s1 = r.setIdentity(sessionId: 's', userId: 'u', bucketId: 'b')(s0);
       expect(s1.sessionId, 's');
       expect(s1.userId, 'u');
       expect(s1.bucketId, 'b');

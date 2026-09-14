@@ -191,5 +191,3 @@ void main() {
 }
 
 Future<void> _tick() => Future<void>.delayed(const Duration(milliseconds: 20));
-
-

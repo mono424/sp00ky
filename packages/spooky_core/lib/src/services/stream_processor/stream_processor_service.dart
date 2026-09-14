@@ -59,8 +59,15 @@ abstract class StreamUpdateReceiver {
 }
 
 /// Wraps the native FFI [StreamProcessor], mirroring the TS
-/// `StreamProcessorService`: receiver fan-out, state load/save, timed ingest,
-/// and query-plan registration.
+/// `StreamProcessorService`: receiver fan-out, snapshot dirty tracking, timed
+/// ingest, and query-plan registration.
+///
+/// Persistence is snapshot-only, as in the browser core: an ingest only marks
+/// the store dirty ([markSnapshotDirty]) and the client checkpoints the base
+/// rows on an interval, on hidden and on close ([saveStoreSnapshot]). Nothing
+/// is serialized per change. Views are never persisted: every query is
+/// re-registered under a fresh session salt on boot, so a saved view would
+/// only ever be stepped and never read.
 ///
 /// Divergence from the browser client: [seedPermissionsFromSchema] seeds the
 /// circuit's per-table select permissions from `schemaSurql` (the browser
@@ -85,7 +92,36 @@ class StreamProcessorService {
   bool _batching = false;
   final Map<String, StreamUpdate> _batchBuffer = {};
 
-  static const _stateKey = '_00_stream_processor_state';
+  /// The kv row older cores wrote a full circuit dump into on every ingest.
+  /// Only ever removed now: it could reach tens of megabytes and was parsed on
+  /// every boot for views that were dead on arrival.
+  static const _legacyStateKey = '_00_stream_processor_state';
+
+  /// Rows ingested since the last checkpoint below which the periodic
+  /// checkpoint stays idle. A single LIVE row is not worth a full snapshot.
+  static const int checkpointMinRows = 50;
+
+  bool _snapshotDirty = false;
+  int _dirtyRows = 0;
+
+  /// True once a row was ingested since the last [clearDirty].
+  bool get snapshotDirty => _snapshotDirty;
+
+  /// Rows ingested since the last [clearDirty].
+  int get dirtyRows => _dirtyRows;
+
+  /// Record that the store changed by [rows] rows. Cheap: the snapshot itself
+  /// is the client's checkpoint, never taken here.
+  void markSnapshotDirty([int rows = 1]) {
+    _snapshotDirty = true;
+    _dirtyRows += rows;
+  }
+
+  /// The client took a snapshot; the store is clean again.
+  void clearDirty() {
+    _snapshotDirty = false;
+    _dirtyRows = 0;
+  }
 
   /// Built-in `select` permissions for server-provisioned meta tables the client
   /// reads through the local view but that never appear in an app's `schemaSurql`
@@ -158,8 +194,7 @@ class StreamProcessorService {
   }
 
   /// Close the coalescing window and flush: dispatch one coalesced
-  /// [StreamUpdate] per buffered queryHash, then persist processor state once
-  /// for the whole batch (instead of once per ingest).
+  /// [StreamUpdate] per buffered queryHash.
   void endBatch() {
     if (!_batching) return;
     _batching = false;
@@ -168,17 +203,18 @@ class StreamProcessorService {
     if (buffered.isNotEmpty) {
       _dispatchUpdates(buffered);
     }
-    // The processor state after the last ingest is cumulative, so a single
-    // snapshot covers the whole batch. Kept fire-and-forget like the per-ingest
-    // call it replaces.
-    saveState();
   }
 
-  /// Initialize the native processor and load any persisted circuit state.
+  /// Initialize the native processor. The rows come from [primeFromLocal];
+  /// the legacy per-ingest state dump, if an older core left one, is dropped.
   Future<void> init() async {
     if (_initialized) return;
     _processor ??= StreamProcessor.create();
-    await loadState();
+    try {
+      await _persistence.remove(_legacyStateKey);
+    } catch (e) {
+      _logger.debug('Legacy circuit state not removed: $e');
+    }
     _initialized = true;
     _logger.info('Initialized');
   }
@@ -208,52 +244,70 @@ class StreamProcessorService {
     if (processor == null) return;
     final sw = Stopwatch()..start();
     var restored = false;
-    if (snapshot != null && snapshot.isNotEmpty) {
-      try {
-        _dispatchUpdates(processor.loadStoreState(snapshot));
-        restored = true;
-      } catch (e) {
-        _logger.warn('Circuit snapshot unreadable; priming from rows: $e');
-      }
-    }
-
     var ingested = 0;
     var deleted = 0;
-    for (final table in tables) {
-      final entries = versions[table] ?? const <(String, int)>[];
-      List<String> toFetch;
-      if (restored) {
-        final result = processor.reconcile(table, entries);
-        _dispatchUpdates(result.updates);
-        deleted += result.deleted;
-        toFetch = result.fetch;
-      } else {
-        toFetch = [for (final (id, _) in entries) id];
+    // One coalesced update per query for the whole prime, and no persistence
+    // in the middle of it: the checkpoint below covers the lot.
+    beginBatch();
+    try {
+      if (snapshot != null && snapshot.isNotEmpty) {
+        try {
+          _notifyUpdates(processor.loadStoreState(snapshot));
+          restored = true;
+        } catch (e) {
+          _logger.warn('Circuit snapshot unreadable; priming from rows: $e');
+        }
       }
-      for (var i = 0; i < toFetch.length; i += _primeChunk) {
-        final chunk = toFetch.sublist(
-            i, i + _primeChunk > toFetch.length ? toFetch.length : i + _primeChunk);
-        final rows = selectByIds(table, chunk);
-        if (rows.isEmpty) continue;
-        _dispatchUpdates(ingestMany([
-          for (final row in rows)
-            IngestRecord(
-              table: table,
-              op: IngestOp.create,
-              id: row['id'].toString(),
-              record: row,
-            )
-        ]));
-        ingested += rows.length;
+      for (final table in tables) {
+        final entries = versions[table] ?? const <(String, int)>[];
+        List<String> toFetch;
+        if (restored) {
+          final result = processor.reconcile(table, entries);
+          _notifyUpdates(result.updates);
+          deleted += result.deleted;
+          toFetch = result.fetch;
+        } else {
+          toFetch = [for (final (id, _) in entries) id];
+        }
+        for (var i = 0; i < toFetch.length; i += _primeChunk) {
+          final chunk = toFetch.sublist(
+              i,
+              i + _primeChunk > toFetch.length
+                  ? toFetch.length
+                  : i + _primeChunk);
+          final rows = selectByIds(table, chunk);
+          if (rows.isEmpty) continue;
+          ingestMany([
+            for (final row in rows)
+              IngestRecord(
+                table: table,
+                op: IngestOp.create,
+                id: row['id'].toString(),
+                record: row,
+              )
+          ]);
+          ingested += rows.length;
+        }
+        if (entries.isNotEmpty && onVersions != null) {
+          // A row with a local write still queued is NOT at the server's version,
+          // so it must not be reported as if it were.
+          onVersions(table, [
+            for (final e in entries)
+              if (!pendingIds.contains(e.$1)) e
+          ]);
+        }
       }
-      if (entries.isNotEmpty && onVersions != null) {
-        // A row with a local write still queued is NOT at the server's version,
-        // so it must not be reported as if it were.
-        onVersions(table, [
-          for (final e in entries)
-            if (!pendingIds.contains(e.$1)) e
-        ]);
-      }
+    } finally {
+      endBatch();
+    }
+    // A prime from rows means there is no usable snapshot on disk yet, so the
+    // next interval checkpoint writes one. A restored snapshot only needs one
+    // when the reconcile actually changed rows.
+    if (!restored && ingested > 0) {
+      markSnapshotDirty(
+          ingested < checkpointMinRows ? checkpointMinRows : ingested);
+    } else if (ingested > 0 || deleted > 0) {
+      markSnapshotDirty(ingested + deleted);
     }
     _logger.info('Circuit primed from the local store '
         '(restored: $restored, ingested: $ingested, deleted: $deleted, '
@@ -278,7 +332,7 @@ class StreamProcessorService {
           }
       ]);
       if (updates.isNotEmpty) _notifyUpdates(updates);
-      if (!_batching) saveState();
+      markSnapshotDirty(records.length);
       return updates;
     } catch (e) {
       _logger.error('Batch ingest failed', e);
@@ -292,9 +346,9 @@ class StreamProcessorService {
   Future<void> resetCircuit() async {
     _processor?.dispose();
     _processor = StreamProcessor.create();
-    await _persistence.remove(_stateKey);
     _batchBuffer.clear();
     _batching = false;
+    clearDirty();
   }
 
   /// Snapshot the circuit's base collections for the next boot's prime.
@@ -324,37 +378,8 @@ class StreamProcessorService {
         'table permissions');
   }
 
-  Future<void> loadState() async {
-    final processor = _processor;
-    if (processor == null) return;
-    try {
-      final state = await _persistence.get<String>(_stateKey);
-      if (state != null && state.isNotEmpty) {
-        processor.loadState(state);
-        _logger.info('Loaded state from persistence');
-      } else {
-        _logger.info('No saved state found');
-      }
-    } catch (e) {
-      _logger.error('Failed to load state', e);
-    }
-  }
-
-  Future<void> saveState() async {
-    final processor = _processor;
-    if (processor == null) return;
-    try {
-      final state = processor.saveState();
-      if (state.isNotEmpty) {
-        await _persistence.set(_stateKey, state);
-      }
-    } catch (e) {
-      _logger.error('Failed to save state', e);
-    }
-  }
-
-  /// Ingest a record change, fan out resulting updates, and persist state.
-  /// Mirrors the TS `ingest` (sync FFI call, then async state save).
+  /// Ingest a record change and fan out the resulting updates. The store is
+  /// marked dirty for the next checkpoint; nothing is written here.
   List<StreamUpdate> ingest(
       String table, String op, String id, Map<String, dynamic> record) {
     final processor = _processor;
@@ -380,11 +405,7 @@ class StreamProcessorService {
             .toList();
         _notifyUpdates(updates);
       }
-      // While batching, `endBatch` persists once for the whole batch, so skip
-      // the redundant per-record snapshot here.
-      if (!_batching) {
-        saveState();
-      }
+      markSnapshotDirty();
       return rawUpdates;
     } catch (e) {
       _logger.error('Ingest failed', e);
@@ -422,7 +443,6 @@ class StreamProcessorService {
     if (initial == null) {
       throw StateError('Failed to register query plan');
     }
-    saveState();
     return initial.update;
   }
 
@@ -449,7 +469,6 @@ class StreamProcessorService {
     if (processor == null) return;
     try {
       processor.unregisterView(queryHash);
-      saveState();
     } catch (e) {
       _logger.error('Error unregistering query plan', e);
     }

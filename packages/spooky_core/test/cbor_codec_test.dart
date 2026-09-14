@@ -29,8 +29,8 @@ void main() {
     test('DateTime is encoded as custom datetime (tag 12), decoded to ISO', () {
       final dt = DateTime.utc(2026, 1, 2, 3, 4, 5, 6);
       final bytes = surrealCborEncode({'when': dt});
-      expect(
-          _rawField(bytes, 'when').tags, contains(SurrealCborTag.customDatetime));
+      expect(_rawField(bytes, 'when').tags,
+          contains(SurrealCborTag.customDatetime));
       expect((surrealCborDecode(bytes) as Map)['when'], dt.toIso8601String());
     });
 

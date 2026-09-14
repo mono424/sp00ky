@@ -19,7 +19,8 @@ const registered = QueryLifecycle(
 
 void main() {
   group('lifecycleTick', () {
-    test('evicts idle queries, heartbeats the rest, reschedules at half the ttl',
+    test(
+        'evicts idle queries, heartbeats the rest, reschedules at half the ttl',
         () async {
       final out = await runPure<void>(
         (ctx) => lifecycleTick(ctx, env()),
@@ -74,8 +75,8 @@ void main() {
           'remote.query': (_, __) => [const StatementResult.ok(<Object>[])],
         }),
       );
-      expect(out.state.queries['a']!.lifecycle.remote,
-          RemotePhase.unregistered);
+      expect(
+          out.state.queries['a']!.lifecycle.remote, RemotePhase.unregistered);
       expect(out.dispatched.whereType<EnsureRegistered>(), hasLength(1));
       expect(out.emitted.whereType<LogEvent>().single.level, LogLevel.warn);
     });
@@ -131,8 +132,7 @@ void main() {
           buildEntry(def: buildDefinition(hash: 'a'))
         ], [
           r.outboxReplace([
-            buildOutboxItem(
-                id: 'old', status: OutboxStatus.acked, ackedAt: 0),
+            buildOutboxItem(id: 'old', status: OutboxStatus.acked, ackedAt: 0),
             buildOutboxItem(
                 id: 'fresh', status: OutboxStatus.acked, ackedAt: 99000),
           ]),
@@ -174,10 +174,8 @@ void main() {
               : <Map<String, dynamic>>[],
         }),
       );
-      final deleted = out
-          .ofKind('local.delete')
-          .map((e) => (e as LocalDelete).id)
-          .toList();
+      final deleted =
+          out.ofKind('local.delete').map((e) => (e as LocalDelete).id).toList();
       expect(deleted, ['thing:orphan'],
           reason: 'internal rows and anything a view or the outbox names stay');
       expect(out.state.versions.containsKey('thing:orphan'), isFalse);

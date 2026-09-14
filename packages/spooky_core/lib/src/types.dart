@@ -64,6 +64,7 @@ class Sp00kyConfig {
     this.syncHealth = const SyncHealthConfig(),
     this.liveInlineBodies = false,
     this.reconnect = const ReconnectConfig(),
+    this.circuitCheckpointMs = 30000,
   });
 
   final DatabaseConfig database;
@@ -116,6 +117,13 @@ class Sp00kyConfig {
   /// Transport supervision knobs: the reconnect backoff cap and the liveness
   /// probe that detects a half-open socket.
   final ReconnectConfig reconnect;
+
+  /// How often (ms) the circuit's rows are snapshotted to the local store
+  /// while they are dirty, so the next boot restores them instead of
+  /// re-reading every row. Matches the browser core's `circuitCheckpointMs`.
+  /// `0` disables the interval; `checkpoint()`, close and account switches
+  /// still snapshot.
+  final int circuitCheckpointMs;
 }
 
 /// Tunables for sync-health reporting (TS `SyncHealthConfig`).

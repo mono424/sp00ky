@@ -66,7 +66,8 @@ void main() {
       expect(game.fields.map((f) => f.name), ['title']);
     });
 
-    test('a blank line orphans an annotation instead of leaking it forward', () {
+    test('a blank line orphans an annotation instead of leaking it forward',
+        () {
       const surql = '''
         -- @nosync
 
@@ -85,8 +86,8 @@ void main() {
       final user = parseSchema(surql).single;
       expect(user.fields.map((f) => f.name), ['email', 'avatar_blob']);
       expect(user.fields.firstWhere((f) => f.name == 'email').opaque, isFalse);
-      expect(
-          user.fields.firstWhere((f) => f.name == 'avatar_blob').opaque, isTrue);
+      expect(user.fields.firstWhere((f) => f.name == 'avatar_blob').opaque,
+          isTrue);
     });
 
     test('non-annotation prose between marker and field still attaches', () {
@@ -101,7 +102,8 @@ void main() {
       expect(user.fields.map((f) => f.name), ['email']);
     });
 
-    test('stripServerOnlyFields removes the field and its annotation block', () {
+    test('stripServerOnlyFields removes the field and its annotation block',
+        () {
       const surql = '''DEFINE TABLE user SCHEMAFULL;
 DEFINE FIELD email ON user TYPE string;
 -- @nosync
@@ -117,7 +119,8 @@ DEFINE TABLE game SCHEMAFULL;''';
       expect(parseSchema(out).map((t) => t.name), ['user', 'game']);
     });
 
-    test('excludes a table carrying the materialized sp00ky:nosync COMMENT', () {
+    test('excludes a table carrying the materialized sp00ky:nosync COMMENT',
+        () {
       const surql = '''
         DEFINE TABLE user SCHEMAFULL;
         DEFINE TABLE signup_code TYPE NORMAL SCHEMAFULL COMMENT 'sp00ky:nosync' PERMISSIONS NONE;
@@ -148,7 +151,8 @@ DEFINE TABLE game SCHEMAFULL;''';
       expect(tables, isNot(contains('_00_feature_flag')));
     });
 
-    test('a DEFINE FIELD after a comment containing a semicolon is still parsed',
+    test(
+        'a DEFINE FIELD after a comment containing a semicolon is still parsed',
         () {
       // The parser must strip comments before splitting on `;`. A `;` inside a
       // `-- ...` comment used to fragment the following statement, leaving the
@@ -166,7 +170,8 @@ DEFINE TABLE game SCHEMAFULL;''';
         -- the create stays valid; mirrors stream_presence.moves.
         DEFINE FIELD restream_providers ON TABLE broadcast TYPE array<string> DEFAULT [];
       ''';
-      final table = parseSchema(surql).singleWhere((t) => t.name == 'broadcast');
+      final table =
+          parseSchema(surql).singleWhere((t) => t.name == 'broadcast');
       final names = table.fields.map((f) => f.name).toList();
       expect(names, containsAll(['owner', 'enabled', 'restream_providers']));
       final owner = table.fields.firstWhere((f) => f.name == 'owner');

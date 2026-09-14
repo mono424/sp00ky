@@ -43,6 +43,12 @@ class AuthService implements Sp00kyAuth {
   /// failure must never block signing out.
   Future<void> Function()? onBeforeSignOut;
   Future<void> Function(String?)? onSessionChanged;
+
+  /// Fires once, from [restoreSessionFromToken], the moment the cached token
+  /// has been decoded: before the circuit primes and before any listener is
+  /// notified. Lets a host publish the restored identity ahead of the rest of
+  /// boot. Never fires for sign-in, sign-up or sign-out.
+  void Function()? onSessionRestored;
   int _generation = 0;
   Future<void>? _checking;
   bool needsVerification = false;
@@ -53,6 +59,7 @@ class AuthService implements Sp00kyAuth {
     _generation++;
     onSessionChanged = null;
     onBeforeSignOut = null;
+    onSessionRestored = null;
   }
 
   Future<void> publishSession() async {
@@ -135,6 +142,7 @@ class AuthService implements Sp00kyAuth {
     _isAuthenticated = true;
     _access = claims.access;
     _isLoading = false;
+    onSessionRestored?.call();
     if (notify) await publishSession();
     _logger.debug('Session restored optimistically from the cached token');
     return userId;

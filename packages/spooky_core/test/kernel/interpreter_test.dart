@@ -46,15 +46,17 @@ void main() {
     expect(await ctx(Fx.localGetAll('thing')), isEmpty);
     // Unfenced, or fenced with the current epoch, still lands.
     await ctx(Fx.localPut('thing', 'thing:1', {'a': 1}));
-    await ctx(Fx.localPut('thing', 'thing:2', {'a': 1},
-        epoch: fakes.local.epoch));
+    await ctx(
+        Fx.localPut('thing', 'thing:2', {'a': 1}, epoch: fakes.local.epoch));
     expect(await ctx(Fx.localGetAll('thing')), hasLength(2));
   });
 
   test('a remote request can carry a deadline', () async {
     final fakes = FakeAdapters(
       remote: FakeRemotePort((_, __) {}, answer: (sql, vars) async {
-        if (sql == 'SLOW') return Future.delayed(const Duration(seconds: 5), () => const <StatementResult>[]);
+        if (sql == 'SLOW')
+          return Future.delayed(
+              const Duration(seconds: 5), () => const <StatementResult>[]);
         return const [StatementResult.ok(true)];
       }),
     );

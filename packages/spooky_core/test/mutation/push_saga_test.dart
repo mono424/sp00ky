@@ -94,7 +94,8 @@ void main() {
       expect(out.emitted.whereType<MutationRolledBackEvent>(), hasLength(1));
     });
 
-    test('a transient server state keeps the tail queued instead of dropping it',
+    test(
+        'a transient server state keeps the tail queued instead of dropping it',
         () async {
       // The 2026-09-08 import loss: these read as application errors before,
       // so every queued CREATE behind a stalled database was rolled back.
@@ -188,8 +189,8 @@ void main() {
     });
 
     test('an empty outbox does nothing', () async {
-      final out = await runPure<void>((ctx) => drain(ctx, env()),
-          handlers: defaults());
+      final out =
+          await runPure<void>((ctx) => drain(ctx, env()), handlers: defaults());
       expect(out.log, hasLength(1));
     });
 
@@ -202,8 +203,8 @@ void main() {
         ]),
         handlers: defaults(over: {
           'local.get': storeWith({
-            '$pendingTable:m1': pendingDoc('m1',
-                type: 'update', data: {'owner': 'user:u1'})
+            '$pendingTable:m1':
+                pendingDoc('m1', type: 'update', data: {'owner': 'user:u1'})
           }),
           'remote.query': (_, __) => [const StatementResult.ok(null)],
         }),
@@ -229,8 +230,8 @@ void main() {
           v: 2,
         );
 
-    const err = FailedMutationError(
-        message: 'nope', kind: FailedErrorKind.application);
+    const err =
+        FailedMutationError(message: 'nope', kind: FailedErrorKind.application);
 
     test('a create: tray move first, then the local delete and circuit DELETE',
         () async {

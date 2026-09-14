@@ -20,7 +20,8 @@ class _SlowRemote implements RemoteSurrealClient, StatementAwareRemote {
   }
 
   @override
-  Future<void> use({required String namespace, required String database}) async {
+  Future<void> use(
+      {required String namespace, required String database}) async {
     calls.add('use');
   }
 
@@ -85,7 +86,9 @@ void main() {
       remote = _SlowRemote();
       service = RemoteDatabaseService(
         const DatabaseConfig(
-            endpoint: 'ws://example.invalid', namespace: 'main', database: 'main'),
+            endpoint: 'ws://example.invalid',
+            namespace: 'main',
+            database: 'main'),
         remote,
         SpookyLogger.root('test'),
       );
@@ -122,7 +125,9 @@ void main() {
       final failing = _FailingRemote();
       final svc = RemoteDatabaseService(
         const DatabaseConfig(
-            endpoint: 'ws://example.invalid', namespace: 'main', database: 'main'),
+            endpoint: 'ws://example.invalid',
+            namespace: 'main',
+            database: 'main'),
         failing,
         SpookyLogger.root('test'),
       );

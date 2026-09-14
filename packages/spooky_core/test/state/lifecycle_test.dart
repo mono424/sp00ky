@@ -32,7 +32,8 @@ void main() {
             QueryPhase.live);
       }
       expect(
-          transition(at(QueryPhase.viewLost), const MembershipAppliedEvent(true))
+          transition(
+                  at(QueryPhase.viewLost), const MembershipAppliedEvent(true))
               .phase,
           QueryPhase.live);
     });

@@ -14,7 +14,8 @@ void main() {
       expect(r!.orderBy, [('sort_index', 'asc'), ('date', 'desc')]);
     });
 
-    test('returns null for START 0 (an offset-free window is not windowed)', () {
+    test('returns null for START 0 (an offset-free window is not windowed)',
+        () {
       expect(
         buildWindowMaterialization(
             'SELECT * FROM game WHERE database = \$database ORDER BY date desc LIMIT 30 START 0;'),
@@ -36,7 +37,8 @@ void main() {
     });
 
     test('an empty ORDER BY keeps the id-set order', () {
-      final r = buildWindowMaterialization('SELECT * FROM game LIMIT 30 START 30;');
+      final r =
+          buildWindowMaterialization('SELECT * FROM game LIMIT 30 START 30;');
       expect(r, isNotNull);
       expect(r!.orderBy, isEmpty);
     });
@@ -72,8 +74,8 @@ void main() {
     });
 
     test('tolerates a trailing semicolon after ORDER BY', () {
-      final r =
-          buildWindowMaterialization('SELECT * FROM game START 5 ORDER BY date desc;');
+      final r = buildWindowMaterialization(
+          'SELECT * FROM game START 5 ORDER BY date desc;');
       expect(r!.orderBy, [('date', 'desc')]);
     });
 

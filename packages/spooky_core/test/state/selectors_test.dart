@@ -13,7 +13,10 @@ QueryLifecycle life({
   bool notified = false,
 }) =>
     QueryLifecycle(
-        phase: phase, remote: remote, fetchDepth: fetchDepth, notified: notified);
+        phase: phase,
+        remote: remote,
+        fetchDepth: fetchDepth,
+        notified: notified);
 
 QueryEntry e(
   String hash, {
@@ -37,8 +40,7 @@ QueryEntry e(
 void main() {
   group('basic lookups', () {
     test('queryByHash / activeHashes / hashesForTable / queryStatus', () {
-      final s =
-          buildState([e('a', tableName: 't1'), e('b', tableName: 't2')]);
+      final s = buildState([e('a', tableName: 't1'), e('b', tableName: 't2')]);
       expect(sel.queryByHash(s, 'a')?.def.hash, 'a');
       expect(sel.activeHashes(s), ['a', 'b']);
       expect(sel.hashesForTable(s, 't2'), ['b']);
@@ -109,8 +111,7 @@ void main() {
       ], [
         r.setVersions([('thing:1', 2), ('thing:2', 0)]),
         r.outboxReplace([
-          buildOutboxItem(
-              type: MutationEventType.delete, recordId: 'thing:3'),
+          buildOutboxItem(type: MutationEventType.delete, recordId: 'thing:3'),
         ]),
       ]);
       expect(sel.needed(s, 'a'), [('thing:2', 1)]);
@@ -148,8 +149,8 @@ void main() {
       expect(plan.versions['child:1'], 2);
       expect(sel.planFetch(buildState()).chunks, isEmpty);
       expect(sel.neededChildren(s, 'missing'), isEmpty);
-      expect(sel.neededChildren(r.setVersions([('child:1', 2)])(s), 'b'),
-          isEmpty);
+      expect(
+          sel.neededChildren(r.setVersions([('child:1', 2)])(s), 'b'), isEmpty);
     });
 
     test('settled requires live, complete, clean, notified', () {
@@ -168,8 +169,7 @@ void main() {
           sel.settled(
               buildState([
                 e('a',
-                    lifecycle:
-                        life(phase: QueryPhase.cached, notified: true))
+                    lifecycle: life(phase: QueryPhase.cached, notified: true))
               ]),
               'a'),
           isFalse);

@@ -6,8 +6,8 @@ void main() {
     test('regular user → per-user table in dedicated mode', () {
       expect(listRefTableFor(RefMode.dedicated, 'user:abc'),
           '_00_list_ref_user_abc');
-      expect(listRefTableFor(RefMode.dedicated, 'abc'),
-          '_00_list_ref_user_abc');
+      expect(
+          listRefTableFor(RefMode.dedicated, 'abc'), '_00_list_ref_user_abc');
     });
 
     test('single mode → the global table', () {
@@ -16,16 +16,16 @@ void main() {
 
     test('null / unsanitizable user → the global table', () {
       expect(listRefTableFor(RefMode.dedicated, null), '_00_list_ref');
-      expect(listRefTableFor(RefMode.dedicated, 'user:bad id!'),
-          '_00_list_ref');
+      expect(
+          listRefTableFor(RefMode.dedicated, 'user:bad id!'), '_00_list_ref');
     });
 
     group('anonymous sentinel', () {
       test('resolves to the shared _00_list_ref_anon in both modes', () {
         expect(listRefTableFor(RefMode.dedicated, anonUserId),
             '_00_list_ref_anon');
-        expect(listRefTableFor(RefMode.single, anonUserId),
-            '_00_list_ref_anon');
+        expect(
+            listRefTableFor(RefMode.single, anonUserId), '_00_list_ref_anon');
       });
 
       test('a real user record "user:anon" is NOT the sentinel', () {

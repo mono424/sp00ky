@@ -39,7 +39,8 @@ void main() {
     expect(db.getQueryConfig('_00_query:h'), isNotNull);
   });
 
-  test('a schema change wipes stale local data', () async {
+  test('schema upgrades and rollbacks preserve cached rows and pending writes',
+      () async {
     await migrator.provision(schemaA);
     db.create('thread:a', {'title': 'x', '_00_rv': 1});
     db.putQueryConfig('_00_query:h', {'surql': 'SELECT * FROM thread'});
@@ -47,14 +48,17 @@ void main() {
     db.kvSet('_00_stream_processor_state', 'STALE-STATE');
     db.kvSet('sp00ky_auth_token', 'tok'); // independent of data schema
 
-    await migrator.provision(schemaB); // different schema -> wipe
+    await migrator.provision(schemaB);
 
-    expect(db.getById('thread:a'), isNull);
-    expect(db.getQueryConfig('_00_query:h'), isNull);
-    expect(db.getAllMutations(), isEmpty);
+    expect(db.getById('thread:a'), isNotNull);
+    expect(db.getQueryConfig('_00_query:h'), isNotNull);
+    expect(db.getAllMutations(), hasLength(1));
     expect(db.kvGet('_00_stream_processor_state'), isNull);
     // Auth token must survive a data-schema migration.
     expect(db.kvGet('sp00ky_auth_token'), 'tok');
+    await migrator.provision(schemaA);
+    expect(db.getById('thread:a'), isNotNull);
+    expect(db.getAllMutations(), hasLength(1));
   });
 
   test('schema hash is a stable SHA-1 hex of the schema text', () async {

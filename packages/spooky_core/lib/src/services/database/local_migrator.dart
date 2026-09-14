@@ -12,11 +12,9 @@ String schemaSha1(String schemaSurql) =>
 /// Provisions the local store against a schema and migrates on change
 /// (TS `LocalMigrator`).
 ///
-/// The JS migrator runs `DEFINE/REMOVE DATABASE` against SurrealDB; the sqlite
-/// store needs no per-table DDL (records are document-style JSON), so the
-/// faithful mapping is: hash the schema, and on a hash change wipe stale local
-/// data (so it can't conflict with the new schema), then record the new hash.
-/// Unchanged schema is a no-op.
+/// SQLite stores documents, so application schema changes need no destructive
+/// table migration. Keep cached rows, memberships and queued writes. Rebuild
+/// the circuit using the new schema and reconcile rows through normal sync.
 class LocalMigrator {
   LocalMigrator(this._local, SpookyLogger logger)
       : _logger = logger.child('LocalMigrator');
@@ -32,8 +30,11 @@ class LocalMigrator {
       return;
     }
 
-    _logger.info('[Provisioning] Schema changed, resetting local data');
-    _local.resetLocalData();
-    _local.recordSchemaHash(hash, DateTime.now().toUtc().toIso8601String());
+    _logger.info('[Provisioning] Schema changed, rebuilding circuit');
+    _local.tx(() {
+      _local.clearSnapshot();
+      _local.kvRemove('_00_stream_processor_state');
+      _local.recordSchemaHash(hash, DateTime.now().toUtc().toIso8601String());
+    });
   }
 }

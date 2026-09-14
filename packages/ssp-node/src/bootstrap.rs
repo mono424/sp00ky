@@ -176,6 +176,7 @@ pub async fn rebuild_from_db(
 
     // 1. Tables + their DEFINE strings (skip _00_* and @nosync tables).
     let info_json = q1(db, "INFO FOR DB").await.context("INFO FOR DB")?;
+    let has_versions = info_json.get("tables").and_then(|v| v.get("_00_version")).is_some();
     let table_defs: Vec<(String, String)> = match info_json.get("tables") {
         Some(Value::Object(tables_map)) => tables_map
             .iter()
@@ -247,10 +248,11 @@ pub async fn rebuild_from_db(
         let mut record_count = 0usize;
         let mut after_id: Option<String> = None;
         loop {
-            let result = q1(
-                db,
-                &bootstrap_page_query(table, page_size, after_id.as_deref(), omit),
-            )
+            let query = bootstrap_page_query(table, page_size, after_id.as_deref(), omit);
+            let query = if has_versions {
+                ssp_protocol::with_durable_row_versions(&query)
+            } else { query };
+            let result = q1(db, &query)
             .await
             .with_context(|| format!("page-query {table}"))?;
             let rows: Vec<Value> = match result {
@@ -336,9 +338,9 @@ pub async fn rebuild_from_db(
                 // un-merges the whole tenant: these rows are exactly the
                 // registrations that were sharing graphs before the restart,
                 // and rebuilding them one graph apiece is the memory blowup
-                // merging exists to prevent. The delta is discarded on both
-                // branches for the same reason: the row's `_00_list_ref` edges
-                // are already in the DB, which is where they were read from.
+                // merging exists to prevent. Initial deltas are deferred here:
+                // the host republishes all restored memberships before Ready,
+                // once the complete circuit has been loaded and verified.
                 let owner = if circuit.merge_views() {
                     circuit
                         .owner_for_merge_key(&data.merge_key)

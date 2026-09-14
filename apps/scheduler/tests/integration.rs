@@ -135,7 +135,7 @@ impl TestHarness {
             seq_counter: Arc::clone(&self.seq_counter),
             wal: Arc::clone(&self.wal),
             drain_lock: Arc::clone(&self.drain_lock),
-            db_config: Arc::new(self.config.db.clone()),
+            db_slot: scheduler::admin::new_db_slot(),
             job_tables: Arc::new(vec![]),
             observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
@@ -211,7 +211,7 @@ impl TestHarness {
                     seq_counter: Arc::clone(&self.seq_counter),
                     wal: Arc::clone(&self.wal),
                     drain_lock: Arc::clone(&self.drain_lock),
-                    db_config: Arc::new(self.config.db.clone()),
+                    db_slot: scheduler::admin::new_db_slot(),
                     job_tables: Arc::new(vec![]),
                     observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                     snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
@@ -275,7 +275,7 @@ impl TestHarness {
                 seq_counter: Arc::clone(&self.seq_counter),
                 wal: Arc::clone(&self.wal),
                 drain_lock: Arc::clone(&self.drain_lock),
-                db_config: Arc::new(self.config.db.clone()),
+                db_slot: scheduler::admin::new_db_slot(),
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
@@ -1505,7 +1505,7 @@ mod bootstrap_protocol_tests {
                 seq_counter: Arc::clone(&h.seq_counter),
                 wal: Arc::clone(&h.wal),
                 drain_lock: Arc::clone(&h.drain_lock),
-                db_config: Arc::new(h.config.db.clone()),
+                db_slot: scheduler::admin::new_db_slot(),
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
@@ -2071,7 +2071,7 @@ mod bootstrap_protocol_tests {
                 seq_counter: Arc::clone(&h.seq_counter),
                 wal: Arc::clone(&h.wal),
                 drain_lock: Arc::clone(&h.drain_lock),
-                db_config: Arc::new(h.config.db.clone()),
+                db_slot: scheduler::admin::new_db_slot(),
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
@@ -2580,7 +2580,7 @@ mod drift_tests {
                 seq_counter: Arc::clone(&h.seq_counter),
                 wal: Arc::clone(&h.wal),
                 drain_lock: Arc::clone(&h.drain_lock),
-                db_config: Arc::new(h.config.db.clone()),
+                db_slot: scheduler::admin::new_db_slot(),
                 job_tables: Arc::new(vec![]),
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
@@ -4167,4 +4167,21 @@ mod admin_plane {
         let body = body_json(res).await;
         assert_eq!(body["code"], "cloud_auth");
     }
+}
+
+#[tokio::test]
+async fn replica_clone_preserves_durable_row_versions() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+        source_dir.path().join("source").to_str().unwrap()).await.unwrap();
+    source.use_ns("test").use_db("test").await.unwrap();
+    source.query("DEFINE TABLE user SCHEMALESS PERMISSIONS FULL; \
+        CREATE user:existing SET public_key = 'new'; \
+        CREATE _00_version:existing SET record_id = user:existing, version = 7;")
+        .await.unwrap().check().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let mut replica = Replica::new(replica_dir.path().join("replica")).await.unwrap();
+    replica.ingest_all(&source).await.unwrap();
+    assert_eq!(replica.query("SELECT public_key, _00_rv FROM user").await.unwrap(),
+        json!([{ "public_key": "new", "_00_rv": 7 }]));
 }

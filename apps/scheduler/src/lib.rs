@@ -254,9 +254,8 @@ pub enum SchedulerStatus {
 pub struct Scheduler {
     config: SchedulerConfig,
     /// Filled in by `start()` once the shared root handle exists. The admin
-    /// plane reads it through `admin::SharedDbSlot`; nothing else needs it,
-    /// because every other consumer is handed the `Arc` directly at the point
-    /// `start()` creates it.
+    /// plane and ingest observers use this slot because their HTTP handlers
+    /// are created before the upstream connection is ready.
     pub db_slot: crate::admin::SharedDbSlot,
     transport: Arc<HttpTransport>,
     pub replica: Arc<RwLock<Replica>>,
@@ -349,7 +348,7 @@ impl Scheduler {
             seq_counter: Arc::clone(&self.seq_counter),
             wal: Arc::clone(&self.wal),
             drain_lock: Arc::clone(&self.drain_lock),
-            db_config: Arc::new(self.config().db.clone()),
+            db_slot: Arc::clone(&self.db_slot),
             job_tables: Arc::new(crate::schedule_engine::job_tables_from_env()),
             observer_permits: Arc::clone(&self.observer_permits),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),

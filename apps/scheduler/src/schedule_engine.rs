@@ -220,7 +220,7 @@ pub fn start_schedule_sweep(
 pub fn observe_job_terminal(
     ssp_pool: Arc<RwLock<SspPool>>,
     transport: Arc<HttpTransport>,
-    db_config: Arc<DbConfig>,
+    db_slot: crate::admin::SharedDbSlot,
     permits: Arc<tokio::sync::Semaphore>,
     job_id: String,
     status: String,
@@ -228,10 +228,9 @@ pub fn observe_job_terminal(
     if !matches!(status.as_str(), "success" | "failed") {
         return;
     }
-    // Bounded and time-boxed: each observer opens a fresh upstream session
-    // with no request timeout, so unbounded spawns accumulated hung tasks and
-    // leaked server-side sessions whenever the upstream stalled. Dropping on
-    // saturation or timeout is safe — the sweep heals within one tick.
+    // Reuse the scheduler connection: opening a session for every completed
+    // job can exhaust the upstream HTTP session limit. Keep work bounded and
+    // time-boxed; the sweep heals events dropped on saturation or timeout.
     let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
         debug!(job_id = %job_id, "schedule observers saturated; leaving it to the sweep");
         return;
@@ -239,15 +238,11 @@ pub fn observe_job_terminal(
     tokio::spawn(async move {
         let _permit = permit;
         let work = async {
-            let conn = match maintenance::db::connect_http(&db_config).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // The sweep will pick this up; nothing is lost but latency.
-                    debug!(error = format!("{e:#}"), "schedule observer could not connect; leaving it to the sweep");
-                    return;
-                }
+            let Some(db) = db_slot.read().await.clone() else {
+                debug!("schedule observer waiting for scheduler initialization; leaving it to the sweep");
+                return;
             };
-            let engine = build_engine(conn, ssp_pool, transport);
+            let engine = build_engine_over(Arc::new(SharedDb(db)), ssp_pool, transport);
             match engine.observe_job_terminal(&job_id, &status).await {
                 Ok(true) => debug!(job_id = %job_id, %status, "schedule engine advanced on job completion"),
                 Ok(false) => {}

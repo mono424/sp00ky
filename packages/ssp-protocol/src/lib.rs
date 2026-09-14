@@ -456,3 +456,10 @@ mod tests {
         assert_eq!(omit_clause(&fields), " OMIT blob, secret_token");
     }
 }
+
+/// Include durable row versions when scanning upstream application tables.
+/// Call only when INFO FOR DB contains `_00_version`; replicas already carry
+/// `_00_rv`, and bare integration databases may have no version table.
+pub fn with_durable_row_versions(page_query: &str) -> String {
+    page_query.replacen("SELECT *", "SELECT *, ((SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1) AS _00_rv", 1)
+}

@@ -150,7 +150,10 @@ impl Runtime {
     pub async fn bootstrap(&self) {
         let node = &self.node;
         *node.status.write().await = SspStatus::Bootstrapping;
-        match self.bootstrap_inner().await {
+        match async {
+            self.bootstrap_inner().await?;
+            node.republish_restored_views().await
+        }.await {
             Ok(()) => {
                 *node.status.write().await = SspStatus::Ready;
                 tracing::info!("Runtime::bootstrap complete — Ready");
@@ -191,6 +194,18 @@ impl Runtime {
                 // rebuilding once.
                 match Circuit::restore(&blob) {
                     Ok(restored) => {
+                        // Ledger versions are per record, not a table-wide clock.
+                        // An old row can change from 1 to 2 while another is at
+                        // 1000, so max-version catch-up would miss that update.
+                        let info = db.query("INFO FOR DB", &[]).await
+                            .map_err(|e| anyhow::anyhow!("snapshot schema check failed: {e}"))?;
+                        if info.first().and_then(|v| v.get("tables"))
+                            .and_then(|v| v.get("_00_version")).is_some() {
+                            *node.processor.write().await = Circuit::new();
+                            node.apply_circuit_policy().await;
+                            crate::bootstrap::rebuild_from_db(db, &node.processor, page_size).await?;
+                            return Ok(());
+                        }
                         *node.processor.write().await = restored;
                         // The restored circuit is a fresh object; re-apply.
                         node.apply_circuit_policy().await;

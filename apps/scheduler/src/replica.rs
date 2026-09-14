@@ -1034,6 +1034,10 @@ impl Replica {
         F: FnMut(Vec<Value>) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        let mut info = remote_db.query("INFO FOR DB").await?;
+        let info: surrealdb::types::Value = info.take(0)?;
+        let has_versions = info.into_json_value().get("tables")
+            .and_then(|v| v.get("_00_version")).is_some();
         let omit_clause = ssp_protocol::omit_clause(omit);
         let target_page_bytes: usize = 32 * 1024 * 1024;
         // Probe with the same projection the real pages use, or the auto-tuned
@@ -1081,6 +1085,9 @@ impl Replica {
         let mut after_id: Option<String> = None;
         loop {
             let query = keyset_page_query(table_name, page_size, after_id.as_deref(), omit);
+            let query = if has_versions {
+                ssp_protocol::with_durable_row_versions(&query)
+            } else { query };
             trace!(table = %table_name, after_id = ?after_id, page_size, "remote page query: {}", query);
             let resp = remote_db.query(query).await;
             let page: Vec<Value> = match resp {

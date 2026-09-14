@@ -2002,3 +2002,59 @@ async fn ingest_floors_missing_or_stale_row_versions() {
     assert_eq!(version().await, Some(12));
     assert_eq!(h.node.processor.read().await.synthesized_row_versions(), 2);
 }
+
+#[tokio::test]
+async fn reload_repairs_versions_deleted_memberships_and_shared_empty_views() {
+    let h = build(HarnessOpts { merge_views: true, ..Default::default() }).await;
+    h.raw_db.query("DEFINE TABLE thread SCHEMALESS PERMISSIONS FULL; \
+        CREATE thread:1 SET title = 'current', public_key = 'new'; \
+        CREATE _00_version:v1 SET record_id = thread:1, version = 7;")
+        .await.unwrap().check().unwrap();
+    for (id, surql) in [("v1", "SELECT * FROM thread"), ("v2", "SELECT * FROM thread"),
+                       ("empty", "SELECT * FROM thread WHERE title = 'deleted'")] {
+        h.raw_db.query("CREATE type::record('_00_query', $id) SET surql = $sql, \
+            clientId = 'c', auth_id = '', params = {}, ttl = 30m, lastActiveAt = time::now(), rowCount = 2;")
+            .bind(("id", id)).bind(("sql", surql)).await.unwrap().check().unwrap();
+        h.raw_db.query(format!("RELATE _00_query:{id}->_00_list_ref->thread:1 SET version = 1; \
+            RELATE _00_query:{id}->_00_list_ref->thread:deleted SET version = 1;"))
+            .await.unwrap().check().unwrap();
+    }
+    for _ in 0..2 {
+        h.node.reload().await.unwrap();
+        for id in ["v1", "v2"] {
+            let mut result = h.raw_db.query(format!("SELECT version, out FROM _00_list_ref WHERE in = _00_query:{id}"))
+                .await.unwrap();
+            let rows: surrealdb::types::Value = result.take(0).unwrap();
+            assert_eq!(rows.into_json_value(), json!([{ "out": "thread:1", "version": 7 }]));
+            assert_eq!(row_count_of(&h, id).await, 1);
+            assert_eq!(state_of(&h, id).await, "ready");
+        }
+        assert_eq!(edge_count_of(&h, "empty").await, 0);
+        assert_eq!(row_count_of(&h, "empty").await, 0);
+        assert_eq!(state_of(&h, "empty").await, "ready");
+        assert_eq!(h.node.processor.read().await.graph_count(), 2);
+    }
+}
+
+#[tokio::test]
+async fn ledger_snapshot_recovery_sees_low_version_updates_and_deletions() {
+    let store = MemStore::default();
+    let h = build(HarnessOpts { circuit_store: Some(Arc::new(store)), ..Default::default() }).await;
+    h.raw_db.query("DEFINE TABLE thread SCHEMALESS PERMISSIONS FULL; \
+        CREATE thread:low SET title = 'old'; CREATE thread:high SET title = 'high'; \
+        CREATE _00_version:low SET record_id = thread:low, version = 1; \
+        CREATE _00_version:high SET record_id = thread:high, version = 1000;")
+        .await.unwrap().check().unwrap();
+    let runtime = ssp_node::Runtime::new(Arc::clone(&h.node));
+    runtime.bootstrap().await;
+    runtime.checkpoint().await;
+    h.raw_db.query("UPDATE thread:low SET title = 'new'; UPDATE _00_version:low SET version = 2; \
+        DELETE thread:high; DELETE _00_version:high;").await.unwrap().check().unwrap();
+    *h.node.processor.write().await = Circuit::new();
+    runtime.bootstrap().await;
+    assert_eq!(*h.node.status.read().await, SspStatus::Ready);
+    let fresh = Arc::new(RwLock::new(Circuit::new()));
+    ssp_node::bootstrap::rebuild_from_db(&MemDb(Arc::clone(&h.raw_db)), &fresh, 200).await.unwrap();
+    assert_eq!(h.node.processor.read().await.compute_table_hashes(),
+        fresh.read().await.compute_table_hashes());
+}

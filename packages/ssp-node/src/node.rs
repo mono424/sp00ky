@@ -274,6 +274,29 @@ impl SspNode {
         circuit.set_monotonic_row_versions(true);
     }
 
+    /// Restored graphs can differ from persisted edges after missed writes.
+    /// Replace each graph's memberships, including subscribers and empty views,
+    /// before accepting registrations. Never assume surviving edges are current.
+    pub async fn republish_restored_views(&self) -> anyhow::Result<()> {
+        let ids = self.processor.read().await.view_ids();
+        for id in ids {
+            let circuit = self.processor.read().await;
+            let deltas = circuit.snapshot_deltas_for_view(&id);
+            for delta in &deltas {
+                self.platform.db.query(
+                    "UPDATE type::record('_00_query', $qid) SET rowCount = $count, state = 'materializing'",
+                    &[("qid", json!(delta.query_id)), ("count", json!(delta.records.len()))],
+                ).await.map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
+            }
+            let left = crate::edges::write_deltas_resilient(
+                self.platform.db.as_ref(), deltas, &circuit, self.ref_mode,
+                self.platform.telemetry.as_ref(),
+            ).await;
+            anyhow::ensure!(left.is_empty(), "restored view membership repair failed");
+        }
+        Ok(())
+    }
+
     pub async fn reload(&self) -> anyhow::Result<()> {
         *self.status.write().await = SspStatus::Bootstrapping;
         *self.processor.write().await = Circuit::new();
@@ -286,6 +309,10 @@ impl SspNode {
         .await
         {
             Ok(()) => {
+                if let Err(e) = self.republish_restored_views().await {
+                    *self.status.write().await = SspStatus::Failed;
+                    return Err(e);
+                }
                 *self.status.write().await = SspStatus::Ready;
                 Ok(())
             }

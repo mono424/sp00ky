@@ -33,15 +33,13 @@ pub struct IngestState {
     /// Serializes every `drain_and_apply` caller (periodic updater, SSP
     /// registration, pre-backup); see `Scheduler::drain_lock`.
     pub drain_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Upstream DB connection details, for the schedule engine's observer hook.
-    pub db_config: Arc<crate::config::DbConfig>,
+    /// Shared upstream connection, published after scheduler initialization.
+    pub db_slot: crate::admin::SharedDbSlot,
     /// Outbox tables from `SPKY_JOB_CONFIG`: only an UPDATE on one of these can
     /// be a job finishing, so everything else skips the hook entirely.
     pub job_tables: Arc<Vec<String>>,
-    /// Caps concurrent `observe_job_terminal` tasks. Each one opens a fresh
-    /// upstream SurrealDB session; unbounded spawning leaked sessions and
-    /// memory whenever the upstream was slow. Saturation is safe to drop —
-    /// the schedule sweep reaches the same conclusion within one tick.
+    /// Caps concurrent `observe_job_terminal` tasks on the shared connection.
+    /// Saturation is safe to drop: the schedule sweep heals within one tick.
     pub observer_permits: Arc<tokio::sync::Semaphore>,
     /// Lock-free mirror of the replica's `snapshot_seq`
     /// (`Replica::snapshot_seq_cell`). Health/metrics probes read this so
@@ -322,7 +320,7 @@ async fn handle_ingest(
             crate::schedule_engine::observe_job_terminal(
                 Arc::clone(&state.ssp_pool),
                 Arc::clone(&state.transport),
-                Arc::clone(&state.db_config),
+                Arc::clone(&state.db_slot),
                 Arc::clone(&state.observer_permits),
                 request.id.clone(),
                 status.to_string(),

@@ -170,14 +170,15 @@ pub fn build_edge_batch(
             idempotent: delta.initial,
             ..Default::default()
         };
-        // Skip deltas with nothing to write. A delta that changes ONLY subquery
+        // Empty full snapshots still delete stale memberships. Skip only empty
+        // incremental deltas. A delta that changes ONLY subquery
         // children (a comment added to a thread already in the view — the
         // parent's membership is unchanged) still carries `subquery_items` that
         // must become `_00_list_ref` edges, so it must NOT be skipped. Skipping
         // it (the old behavior) is why reverse-link children like comments never
         // synced while forward links, whose delta also carried a parent
         // addition/content-update, worked.
-        if !delta_has_edges(delta) {
+        if !delta.initial && !delta_has_edges(delta) {
             continue;
         }
 

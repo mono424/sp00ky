@@ -1178,6 +1178,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         let register_max_wait_secs = config.register_max_wait_secs;
         let bootstrap_page_size = config.bootstrap_page_size;
         let bootstrap_warnings = Arc::clone(&node.bootstrap_warnings);
+        let bootstrap_node = Arc::clone(&node);
 
         tokio::spawn(async move {
             // Choose bootstrap source based on mode. The metadata source
@@ -1418,6 +1419,12 @@ pub async fn run_server() -> anyhow::Result<()> {
                             verified = !expected_hashes.is_empty(),
                             "Bootstrap complete"
                         );
+                        drop(guard);
+                        if let Err(e) = bootstrap_node.republish_restored_views().await {
+                            error!(error = %e, "Bootstrap membership repair failed");
+                            *status.write().await = SspStatus::Failed;
+                            break;
+                        }
                         *status.write().await = SspStatus::Ready;
                         break;
                     }

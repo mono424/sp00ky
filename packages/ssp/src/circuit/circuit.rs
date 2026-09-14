@@ -1754,6 +1754,13 @@ impl Circuit {
         self.snapshot_delta_from(query_id, query_id.to_string(), auth_id)
     }
 
+    /// Full membership for an operator graph and its active subscribers.
+    pub fn snapshot_deltas_for_view(&self, query_id: &str) -> Vec<ViewDelta> {
+        let Some(view) = self.get_view(query_id) else { return vec![] };
+        self.snapshot_delta(query_id, view.auth_id.clone())
+            .map(|delta| self.fan_out(delta)).unwrap_or_default()
+    }
+
     /// Subscribers sharing `owner`'s graph, excluding the owner itself.
     pub fn subscribers_of(&self, owner: &str) -> &[Subscriber] {
         self.subscribers.get(owner).map(|v| v.as_slice()).unwrap_or(&[])

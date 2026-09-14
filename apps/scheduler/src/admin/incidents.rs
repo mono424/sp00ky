@@ -169,6 +169,26 @@ impl Incidents {
             "retention_days": 30, "storage_error": h.storage_error})
     }
 
+    fn observe_line(&self, line: &maintenance::log_ring::LogLine) {
+        if line.target == TARGET {
+            if let Some(payload) = line.fields.strip_prefix("incident=") {
+                if let Ok(event) = serde_json::from_str::<Event>(payload) {
+                    self.observe(event);
+                }
+            }
+        }
+    }
+
+    fn expire(&self, now: u64) {
+        let mut h = self.history.lock().unwrap();
+        let before = h.rows.len();
+        h.rows
+            .retain(|r| now.saturating_sub(r.ended_at.unwrap_or(r.started_at)) <= RETENTION_MS);
+        if h.rows.len() != before {
+            h.revision += 1;
+        }
+    }
+
     async fn persist(self: &Arc<Self>) {
         let _save = self.persistence.lock().await;
         let rows = {
@@ -222,18 +242,14 @@ impl Incidents {
             loop {
                 tokio::select! {
                     line = rx.recv() => match line {
-                        Ok(line) if line.target == TARGET => {
-                            if let Some(payload) = line.fields.strip_prefix("incident=") {
-                                if let Ok(event) = serde_json::from_str::<Event>(payload) { this.observe(event); }
-                            }
-                        }
-                        Ok(_) => {},
+                        Ok(line) => this.observe_line(&line),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             this.observe(Event { at: super::ops::now_ms(), component: "scheduler".into(), kind: "history_gap".into(), state: "recorded".into(), summary: "Log feed overflowed; some incident transitions may be missing".into(), operation_id: None, version: env!("CARGO_PKG_VERSION").into() });
                         }
                         Err(_) => break,
                     },
                     _ = tick.tick() => {
+                        this.expire(super::ops::now_ms());
                         let entities = crate::metrics::build_entities(&state.metrics).await;
                         { let mut h = this.history.lock().unwrap();
                             let mut changed = false;
@@ -330,6 +346,67 @@ pub async fn detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn emitted_transitions_roundtrip_through_log_ring_into_history() {
+        use tracing_subscriber::prelude::*;
+        let ring = maintenance::log_ring::LogRing::new(10);
+        let mut rx = ring.subscribe();
+        let subscriber =
+            tracing_subscriber::registry().with(maintenance::log_ring::LogRingLayer::new(ring));
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let summary = "Delivery failed: \"quoted\" text\\path\nnext line";
+        tracing::subscriber::with_default(subscriber, || {
+            emit("ssp-0", "lagging", "open", summary, None);
+            emit("ssp-0", "ready", "recovered", "Replay completed", None);
+        });
+        for _ in 0..2 {
+            history.observe_line(&rx.try_recv().expect("incident reached live log feed"));
+        }
+        let h = history.history.lock().unwrap();
+        assert_eq!(h.rows.len(), 1);
+        assert_eq!(h.rows[0].state, "recovered");
+        assert_eq!(h.rows[0].event_count, 2);
+        assert_eq!(h.rows[0].events[0].summary, summary);
+        assert_eq!(h.rows[0].events[1].kind, "ready");
+    }
+
+    #[tokio::test]
+    async fn retention_bounds_count_and_expires_without_new_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incidents.json");
+        let history = Incidents::open(path.clone());
+        let mut initial = event("recorded");
+        initial.at = RETENTION_MS + 1;
+        history.observe(initial);
+        {
+            let mut h = history.history.lock().unwrap();
+            let template = h.rows[0].clone();
+            h.rows = (0..MAX_INCIDENTS + 1)
+                .map(|i| {
+                    let mut row = template.clone();
+                    row.id = i.to_string();
+                    row
+                })
+                .collect();
+            trim(&mut h.rows, RETENTION_MS + 1);
+            assert_eq!(h.rows.len(), MAX_INCIDENTS);
+            assert_eq!(h.rows.back().unwrap().id, (MAX_INCIDENTS - 1).to_string());
+        }
+        history.expire(2 * RETENTION_MS + 1);
+        assert_eq!(history.summary()["total"], MAX_INCIDENTS);
+        let before = history.history.lock().unwrap().revision;
+        history.expire(2 * RETENTION_MS + 2);
+        assert_eq!(history.summary()["total"], 0);
+        assert_eq!(history.history.lock().unwrap().revision, before + 1);
+        history.persist().await;
+        let stored: Vec<Incident> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            stored.is_empty(),
+            "periodic expiry must also remove durable rows"
+        );
+    }
+
     fn event(state: &str) -> Event {
         Event {
             at: super::super::ops::now_ms(),

@@ -15,6 +15,11 @@ pub struct Metrics {
     pub ingest_duration: opentelemetry::metrics::Histogram<f64>,
     pub view_count: opentelemetry::metrics::UpDownCounter<i64>,
     pub edge_operations: opentelemetry::metrics::Counter<u64>,
+    pub edge_publish_failures: opentelemetry::metrics::Counter<u64>,
+    pub edge_lock_wait: opentelemetry::metrics::Histogram<f64>,
+    pub edge_lock_hold: opentelemetry::metrics::Histogram<f64>,
+    pub edge_publish: opentelemetry::metrics::Histogram<f64>,
+    pub edge_transaction: opentelemetry::metrics::Histogram<f64>,
     pub ttl_cleanup_count: opentelemetry::metrics::Counter<u64>,
 
     // Internal tracking for rate calculation
@@ -150,6 +155,11 @@ impl Metrics {
                 .u64_counter("ssp_edge_operations_total")
                 .with_description("Total edge operations by type")
                 .build(),
+            edge_publish_failures: meter.u64_counter("ssp_edge_publish_failures_total").build(),
+            edge_lock_wait: meter.f64_histogram("ssp_edge_lock_wait_milliseconds").build(),
+            edge_lock_hold: meter.f64_histogram("ssp_edge_lock_hold_milliseconds").build(),
+            edge_publish: meter.f64_histogram("ssp_edge_publish_milliseconds").build(),
+            edge_transaction: meter.f64_histogram("ssp_edge_transaction_milliseconds").build(),
             ttl_cleanup_count: meter
                 .u64_counter("ssp_ttl_cleanup_total")
                 .with_description("Total queries removed by TTL expiry")

@@ -919,12 +919,19 @@ pub async fn run_server() -> anyhow::Result<()> {
     // `query_update_throttle_ms` window so a burst of view updates lands as a
     // few batched LIVE deliveries instead of one transaction per record (which
     // paced a fresh client's window sync over ~10s). See `Config`.
+    // Bulk publication gets its own HTTP session. A slow edge transaction or
+    // reconnect must not queue control-path work behind the same SDK handle.
+    let edge_db = connect_database(&config).await?;
+    maintenance::db::spawn_periodic_resignin(Arc::clone(&edge_db), maintenance::db::RESIGNIN_INTERVAL_SECS);
+    let edge_db: Arc<dyn ssp_node::Db> = Arc::new(adapters::SurrealSdkDb::new(edge_db));
+    let publication_gate = Arc::new(tokio::sync::Mutex::new(()));
     let (edge_update_tx, edge_update_rx) = mpsc::unbounded_channel::<Vec<ViewDelta>>();
     platform.spawner.spawn(Box::pin(edge_updates::run_edge_update_service(
         edge_update_rx,
         edge_updates::SurrealEdgeSink {
-            db: Arc::clone(&platform.db),
+            db: edge_db,
             processor: processor_arc.clone(),
+            publication_gate: publication_gate.clone(),
             telemetry: Arc::clone(&platform.telemetry),
             mode: config.ref_mode,
         },
@@ -988,6 +995,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         platform: platform.clone(),
         status: status.clone(),
         processor: processor_arc.clone(),
+        publication_gate: publication_gate.clone(),
         job_config: job_config.clone(),
         job_control: job_control.clone(),
         job_dispatcher: Arc::clone(&job_dispatcher),
@@ -1104,6 +1112,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         // `Authorization: Bearer $SPKY_AUTH_SECRET` when targeting an SSP).
         let host: Arc<dyn maintenance::MaintenanceHost> =
             Arc::new(maintenance_host::SspHost {
+                publication_gate: publication_gate.clone(),
                 db: db.clone(),
                 processor: processor_arc.clone(),
                 status: status.clone(),

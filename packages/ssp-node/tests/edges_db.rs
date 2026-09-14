@@ -180,12 +180,148 @@ async fn subquery_child_edge_gets_non_none_parent() {
 async fn edge_sink_flush_writes_through_port() {
     let raw = mem().await;
     seed(&raw, "sink", "user:z").await;
+    let mut circuit = Circuit::new();
+    circuit.add_query(ssp::operator::plan::QueryPlan { id: "sink".into(), root: ssp::operator::plan::OperatorPlan::Scan { table: "user".into() } }, None, None);
     let sink = SurrealEdgeSink {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         db: Arc::new(MemDb(Arc::clone(&raw))),
-        processor: Arc::new(RwLock::new(Circuit::new())),
+        processor: Arc::new(RwLock::new(circuit)),
         telemetry: Arc::new(NoopTelemetry),
         mode: RefMode::Single,
     };
     sink.flush(vec![delta("view:sink", vec!["user:z"], vec![])]).await;
     assert_eq!(edge_count(&raw).await, 1, "SurrealEdgeSink wrote through the Db port");
+}
+
+async fn edge_rows(raw: &Surreal<MemEngine>) -> Vec<Value> {
+    let mut response = raw.query(
+        "SELECT type::string(id) AS edge_id, type::string(in) AS owner, type::string(out) AS target, version, type::string(parent) AS parent, parent_rel FROM _00_list_ref ORDER BY owner, target",
+    ).await.unwrap();
+    let rows: surrealdb::types::Value = response.take(0).unwrap();
+    rows.into_json_value().as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn graph_indexed_updates_preserve_child_links_and_other_view_versions() {
+    use serde_json::json;
+    use ssp::circuit::store::{Change, ChangeSet, Record};
+
+    let raw = mem().await;
+    seed(&raw, "changed", "thread:main").await;
+    raw.query("CREATE _00_query:other SET clientId = 'c2', auth_id = 'user:a'; CREATE user:author; CREATE thread:untouched;")
+        .await.unwrap().check().unwrap();
+    let db = MemDb(raw.clone());
+    let mut circuit = Circuit::new();
+    circuit.load(vec![
+        Record::new("thread", "thread:main", json!({"_00_rv": 11})),
+        Record::new("thread", "thread:untouched", json!({"_00_rv": 13})),
+        Record::new("user", "user:author", json!({"_00_rv": 17})),
+    ]);
+    let mut initial = delta("view:changed", vec!["thread:main", "thread:untouched"], vec![]);
+    initial.subquery_items.push(SubqueryDeltaItem {
+        id: "user:author".into(), parent_key: "thread:main".into(),
+        alias: "author".into(), op: SubqueryOp::Add,
+    });
+    let mut other = initial.clone();
+    other.query_id = "view:other".into();
+    run_edge_writes(&db, &[&initial, &other], &circuit, RefMode::Single, &NoopTelemetry).await;
+    let before = edge_rows(&raw).await;
+    assert_eq!(before.len(), 6);
+
+    circuit.step(ChangeSet { changes: vec![
+        Change::update("thread", "thread:main", json!({"_00_rv": 101, "changed": true})),
+        Change::update("user", "user:author", json!({"_00_rv": 107, "changed": true})),
+    ] });
+    let mut update = delta("view:changed", vec![], vec![]);
+    update.updates.push("thread:main".into());
+    update.subquery_items.push(SubqueryDeltaItem {
+        id: "user:author".into(), parent_key: "thread:main".into(),
+        alias: "author".into(), op: SubqueryOp::Update,
+    });
+    run_edge_writes(&db, &[&update], &circuit, RefMode::Single, &NoopTelemetry).await;
+    let after = edge_rows(&raw).await;
+    assert_eq!(after.len(), before.len());
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(new["edge_id"], old["edge_id"], "updates retain edge identity");
+        assert_eq!(new["parent"], old["parent"], "child ownership survives updates");
+        assert_eq!(new["parent_rel"], old["parent_rel"]);
+        let expected = match (new["owner"].as_str().unwrap(), new["target"].as_str().unwrap()) {
+            ("_00_query:changed", "thread:main") => json!(101),
+            ("_00_query:changed", "user:author") => json!(107),
+            _ => old["version"].clone(),
+        };
+        assert_eq!(new["version"], expected, "only the selected view and target receive captured versions");
+    }
+    let child = after.iter().find(|row| row["owner"] == "_00_query:changed" && row["target"] == "user:author").unwrap();
+    assert!(child["parent"].as_str().unwrap().starts_with("_00_list_ref:"));
+    run_edge_writes(&db, &[&update], &circuit, RefMode::Single, &NoopTelemetry).await;
+    assert_eq!(edge_rows(&raw).await, after, "replayed updates create no duplicate edges");
+}
+
+struct RecordingMemDb {
+    inner: MemDb,
+    queries: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl Db for RecordingMemDb {
+    async fn query(&self, sql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        self.queries.lock().unwrap().push(sql.to_string());
+        self.inner.query(sql, binds).await
+    }
+    async fn version(&self) -> Result<String, DbError> { self.inner.version().await }
+}
+
+#[tokio::test]
+async fn chunked_version_only_publish_and_replay_update_every_edge_once() {
+    use serde_json::json;
+    use ssp::circuit::store::{Change, ChangeSet, Record};
+    use ssp_node::edges::MAX_TX_STATEMENTS;
+
+    let raw = mem().await;
+    seed(&raw, "large", "user:author").await;
+    let targets: Vec<String> = (0..501).map(|i| format!("thread:r{i}")).collect();
+    let creates = targets.iter().map(|id| format!("CREATE {id};")).collect::<String>();
+    raw.query(creates).await.unwrap().check().unwrap();
+    let db = RecordingMemDb { inner: MemDb(raw.clone()), queries: Default::default() };
+    let mut circuit = Circuit::new();
+    circuit.load(targets.iter().map(|id| Record::new("thread", id, json!({"_00_rv": 1})))
+        .chain(std::iter::once(Record::new("user", "user:author", json!({"_00_rv": 2})))));
+    let mut initial = delta("view:large", targets.iter().map(String::as_str).collect(), vec![]);
+    initial.initial = true;
+    initial.subquery_items.push(SubqueryDeltaItem {
+        id: "user:author".into(), parent_key: targets[0].clone(), alias: "author".into(), op: SubqueryOp::Add,
+    });
+    run_edge_writes(&db, &[&initial], &circuit, RefMode::Single, &NoopTelemetry).await;
+    let before = edge_rows(&raw).await;
+    assert_eq!(before.len(), 502);
+
+    circuit.step(ChangeSet { changes: targets.iter().map(|id| Change::update("thread", id, json!({"_00_rv": 9001, "changed": true})))
+        .chain(std::iter::once(Change::update("user", "user:author", json!({"_00_rv": 9002, "changed": true})))).collect() });
+    let mut update = delta("view:large", vec![], vec![]);
+    update.updates = targets;
+    update.subquery_items.push(SubqueryDeltaItem {
+        id: "user:author".into(), parent_key: "thread:r0".into(), alias: "author".into(), op: SubqueryOp::Update,
+    });
+    db.queries.lock().unwrap().clear();
+    run_edge_writes(&db, &[&update], &circuit, RefMode::Single, &NoopTelemetry).await;
+    {
+        let queries = db.queries.lock().unwrap();
+        assert_eq!(queries.len(), 2, "version-only delta crosses the transaction cap");
+        assert_eq!(queries.iter().map(|sql| sql.matches("UPDATE (").count()).sum::<usize>(), 502);
+        for sql in queries.iter() {
+            let body_statements = sql.split(';').map(str::trim)
+                .filter(|s| !s.is_empty() && !s.starts_with("BEGIN") && !s.starts_with("COMMIT")).count();
+            assert!(body_statements <= MAX_TX_STATEMENTS, "transaction has {body_statements} statements");
+        }
+    }
+    let after = edge_rows(&raw).await;
+    assert_eq!(after.len(), 502);
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(new["edge_id"], old["edge_id"]);
+        assert_eq!(new["parent"], old["parent"]);
+        assert_eq!(new["version"], if new["target"] == "user:author" { json!(9002) } else { json!(9001) });
+    }
+    run_edge_writes(&db, &[&update], &circuit, RefMode::Single, &NoopTelemetry).await;
+    assert_eq!(edge_rows(&raw).await, after, "replaying every committed chunk is idempotent");
 }

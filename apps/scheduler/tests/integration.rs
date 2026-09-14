@@ -2748,6 +2748,27 @@ mod admin_plane {
     }
 
     #[tokio::test]
+    async fn incidents_are_authenticated_filterable_and_survive_router_rebuild() {
+        let h = TestHarness::new().await;
+        let now = scheduler::admin::ops::now_ms();
+        let path = h.config.wal_path.parent().unwrap().join("incidents.json");
+        let rows = json!([
+            {"id":"recent", "component":"ssp-0", "kind":"lagging", "severity":"warning", "state":"recovered", "started_at":now-200, "ended_at":now-100, "max_buffered_events":33, "event_count":1, "events":[]},
+            {"id":"older", "component":"scheduler", "kind":"heartbeat", "severity":"warning", "state":"open", "started_at":now-400, "ended_at":null, "max_buffered_events":0, "event_count":1, "events":[]}
+        ]);
+        std::fs::write(&path, rows.to_string()).unwrap();
+        let app = admin_app(&h, Some("incident-test"));
+        assert_eq!(app.clone().oneshot(get("/admin/api/incidents")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let token = breakglass_token(&app, "incident-test").await;
+        let request = |path: &str| Request::builder().uri(path).header("Authorization", format!("Bearer {token}")).body(axum::body::Body::empty()).unwrap();
+        let filtered = body_json(app.clone().oneshot(request("/admin/api/incidents?component=ssp-0&state=recovered&limit=1")).await.unwrap()).await;
+        assert_eq!(filtered["total"], 1); assert_eq!(filtered["incidents"][0]["id"], "recent");
+        let older = body_json(app.clone().oneshot(request("/admin/api/incidents/older")).await.unwrap()).await;
+        assert_eq!(older["incident"]["state"], "interrupted");
+        assert_eq!(app.oneshot(request("/admin/api/incidents/missing")).await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn config_is_reachable_without_a_token() {
         let h = TestHarness::new().await;
         let res = admin_app(&h, None)

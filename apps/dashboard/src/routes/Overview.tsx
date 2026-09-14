@@ -222,7 +222,15 @@ export function Overview(props: {
           </div>
         </Show>
 
-        <ActivityStrip operations={props.data?.operations} />
+        <Show when={props.data?.incidents}>
+        <A href="/incidents" class="btn btn-sm" style={{ 'margin-bottom': '16px' }}>
+          Incident history · {props.data?.incidents?.open ?? 0} open
+        </A>
+        <Show when={props.data?.incidents?.storage_error}>
+          <div class="error-banner">Incident history storage is unavailable. Open incident history for details.</div>
+        </Show>
+      </Show>
+      <ActivityStrip operations={props.data?.operations} />
 
         <Show when={props.data} fallback={<SkeletonBento />}>
           {(data) => (

@@ -33,6 +33,8 @@ pub struct SspNode {
     pub platform: Platform,
     pub status: Arc<RwLock<SspStatus>>,
     pub processor: Arc<RwLock<Circuit>>,
+    /// Publication and lifecycle cleanup ordering, independent of ingest.
+    pub publication_gate: Arc<tokio::sync::Mutex<()>>,
     pub job_config: Arc<JobConfig>,
     pub job_control: JobControl,
     /// Admission control for job execution. Everything that wants to run a job
@@ -233,6 +235,7 @@ impl SspNode {
     }
 
     async fn reset_handler(&self) -> ApiResponse {
+        let _publication = self.publication_gate.lock().await;
         info!("Resetting circuit state");
         wipe_circuit_and_edges(
             self.platform.db.as_ref(),
@@ -280,16 +283,15 @@ impl SspNode {
     pub async fn republish_restored_views(&self) -> anyhow::Result<()> {
         let ids = self.processor.read().await.view_ids();
         for id in ids {
-            let circuit = self.processor.read().await;
-            let deltas = circuit.snapshot_deltas_for_view(&id);
+            let deltas = self.processor.read().await.snapshot_deltas_for_view(&id);
             for delta in &deltas {
                 self.platform.db.query(
                     "UPDATE type::record('_00_query', $qid) SET rowCount = $count, state = 'materializing'",
                     &[("qid", json!(delta.query_id)), ("count", json!(delta.records.len()))],
                 ).await.map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
             }
-            let left = crate::edges::write_deltas_resilient(
-                self.platform.db.as_ref(), deltas, &circuit, self.ref_mode,
+            let left = crate::edges::write_deltas_unlocked(
+                self.platform.db.as_ref(), deltas, &self.processor, &self.publication_gate, self.ref_mode,
                 self.platform.telemetry.as_ref(),
             ).await;
             anyhow::ensure!(left.is_empty(), "restored view membership repair failed");
@@ -859,6 +861,7 @@ impl SspNode {
         else {
             return Some(err_json(422, "bad_body", "invalid unregister payload"));
         };
+        let _publication = self.publication_gate.lock().await;
         debug!("Unregistering view: {}", payload.id);
         // Circuit keys are the bare `<hash>` (see `ssp::canonical_query_id`);
         // callers may send either spelling. `view_metrics` is keyed the same.
@@ -922,6 +925,7 @@ impl SspNode {
     /// read them (`_00_list_ref` is gated `auth_id = $auth.id`) and nothing
     /// would ever clean them up once the row is rebuilt under a real identity.
     async fn discard_view_without_identity(&self, view_id: &str) -> bool {
+        let _publication = self.publication_gate.lock().await;
         let stale_table = {
             let mut circuit = self.processor.write().await;
             match circuit.get_view(view_id) {
@@ -1122,11 +1126,11 @@ impl SspNode {
         let Some(delta) = delta else { return };
 
         if let Err(send_err) = self.edge_update_tx.send(vec![delta]) {
-            let circuit = self.processor.read().await;
-            let left = crate::edges::write_deltas_resilient(
+            let left = crate::edges::write_deltas_unlocked(
                 self.platform.db.as_ref(),
                 send_err.0,
-                &circuit,
+                &self.processor,
+                &self.publication_gate,
                 self.ref_mode,
                 self.platform.telemetry.as_ref(),
             )
@@ -1448,11 +1452,11 @@ impl SspNode {
         // Initial edges → coalescing flusher; direct write if the flusher is gone.
         if let Some(delta) = update {
             if let Err(send_err) = self.edge_update_tx.send(vec![delta]) {
-                let circuit = self.processor.read().await;
-                let left = crate::edges::write_deltas_resilient(
+                let left = crate::edges::write_deltas_unlocked(
                     self.platform.db.as_ref(),
                     send_err.0,
-                    &circuit,
+                    &self.processor,
+                    &self.publication_gate,
                     self.ref_mode,
                     self.platform.telemetry.as_ref(),
                 )
@@ -1604,6 +1608,7 @@ impl SspNode {
             let telemetry_c = Arc::clone(&self.platform.telemetry);
             let edge_tx = self.edge_update_tx.clone();
             let processor_c = Arc::clone(&self.processor);
+            let publication_gate = Arc::clone(&self.publication_gate);
             let view_metrics_c = Arc::clone(&self.view_metrics);
             let ref_mode = self.ref_mode;
 
@@ -1620,8 +1625,7 @@ impl SspNode {
                 }
                 if let Err(send_err) = edge_tx.send(deltas) {
                     let deltas = send_err.0;
-                    let circuit = processor_c.read().await;
-                    let left = crate::edges::write_deltas_resilient(db_c.as_ref(), deltas, &circuit, ref_mode, telemetry_c.as_ref()).await;
+                    let left = crate::edges::write_deltas_unlocked(db_c.as_ref(), deltas, &processor_c, &publication_gate, ref_mode, telemetry_c.as_ref()).await;
                     if !left.is_empty() {
                         error!(views = left.len(), "edge deltas not written after retries (direct path)");
                         telemetry_c.counter("edge_deltas_dropped", left.len() as u64);
@@ -1872,6 +1876,7 @@ impl SspNode {
     }
 
     pub async fn ttl_cleanup_sweep(&self) -> usize {
+        let _publication = self.publication_gate.lock().await;
         ttl_cleanup_sweep(
             self.platform.db.as_ref(),
             &self.processor,

@@ -12,7 +12,7 @@
 //! RecordId. The `out`/`parent`/subquery record ids keep the existing literal
 //! interpolation (they arrive already-validated from the circuit).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +44,45 @@ impl RecordVersions for CircuitVersions<'_> {
     fn version_of(&self, key: &str) -> i64 {
         self.0.store.get_record_version_by_key(key).unwrap_or(1)
     }
+}
+
+/// An immutable version snapshot. Never retain the circuit guard during I/O.
+struct CapturedVersions(HashMap<String, i64>);
+impl RecordVersions for CapturedVersions {
+    fn version_of(&self, key: &str) -> i64 { self.0.get(key).copied().unwrap_or(1) }
+}
+
+/// The production publication boundary: capture only the required versions,
+/// then release the circuit before database calls, retries and orphan probes.
+pub async fn write_deltas_unlocked(
+    db: &dyn Db,
+    mut deltas: Vec<ViewDelta>,
+    processor: &RwLock<Circuit>,
+    publication_gate: &tokio::sync::Mutex<()>,
+    mode: RefMode,
+    telemetry: &dyn Telemetry,
+) -> Vec<ViewDelta> {
+    let _publication = publication_gate.lock().await;
+    let wait = web_time::Instant::now();
+    let versions = {
+        let circuit = processor.read().await;
+        telemetry.histogram_ms("edge_lock_wait", wait.elapsed().as_secs_f64() * 1000.0);
+        let hold = web_time::Instant::now();
+        deltas.retain(|d| circuit.is_registered(&d.query_id));
+        let source = CircuitVersions(&circuit);
+        let mut versions = HashMap::new();
+        for d in &deltas {
+            for key in d.additions.iter().chain(&d.updates).chain(d.subquery_items.iter().map(|i| &i.id)) {
+                versions.entry(key.clone()).or_insert_with(|| source.version_of(key));
+            }
+        }
+        telemetry.histogram_ms("edge_lock_hold", hold.elapsed().as_secs_f64() * 1000.0);
+        CapturedVersions(versions)
+    };
+    let start = web_time::Instant::now();
+    let left = write_deltas_with_versions(db, deltas, &versions, mode, telemetry).await;
+    telemetry.histogram_ms("edge_publish", start.elapsed().as_secs_f64() * 1000.0);
+    left
 }
 
 /// One delta's edge-write statements.
@@ -167,7 +206,9 @@ pub fn build_edge_batch(
     for (idx, delta) in deltas.iter().enumerate() {
         let mut group = DeltaStatements {
             delta: idx,
-            idempotent: delta.initial,
+            idempotent: delta.initial || (delta.additions.is_empty()
+                && delta.removals.is_empty()
+                && delta.subquery_items.iter().all(|i| i.op == SubqueryOp::Update)),
             ..Default::default()
         };
         // Empty full snapshots still delete stale memberships. Skip only empty
@@ -251,7 +292,7 @@ pub fn build_edge_batch(
             let version = versions.version_of(id);
             group.updated += 1;
             group.body.push(format!(
-                "UPDATE {list_ref} SET version = {version} WHERE in = {from} AND out = {out}",
+                "UPDATE (SELECT VALUE id FROM {from}->{list_ref} WHERE out = {out}) SET version = {version} RETURN NONE",
                 list_ref = list_ref,
                 version = version,
                 from = from,
@@ -309,7 +350,7 @@ pub fn build_edge_batch(
                     let version = versions.version_of(&item.id);
                     group.updated += 1;
                     group.body.push(format!(
-                        "UPDATE {list_ref} SET version = {version} WHERE in = {from} AND out = {id}",
+                        "UPDATE (SELECT VALUE id FROM {from}->{list_ref} WHERE out = {id}) SET version = {version} RETURN NONE",
                         list_ref = list_ref, from = from, id = item.id, version = version,
                     ));
                 }
@@ -326,6 +367,10 @@ pub fn build_edge_batch(
                 }
             }
         }
+
+        let mut seen_updates = HashSet::new();
+        group.body.retain(|statement| !statement.starts_with("UPDATE ") || seen_updates.insert(statement.clone()));
+        group.updated = seen_updates.len() as u64;
 
         // The edges of a full publish are now in this transaction; say so on
         // the row in the LAST one, so a client can never read `ready` with
@@ -372,10 +417,9 @@ pub struct PlannedTx {
 /// Split a batch into transactions of at most `max_statements` statements.
 ///
 /// Whole deltas are packed together while they fit. A delta too big for one
-/// transaction is split only when it is idempotent (a full publish, which
-/// opens with `DELETE $from->list_ref`); an incremental delta always rides in
-/// one transaction, however large, because replaying half of it would
-/// duplicate edges.
+/// transaction is split only when replay is safe: a full publish (which opens
+/// with `DELETE $from->list_ref`) or version-only updates. Incremental
+/// membership changes stay atomic because replaying half could duplicate edges.
 pub fn plan_transactions(batch: &EdgeBatch, max_statements: usize) -> Vec<PlannedTx> {
     let cap = max_statements.max(1);
     let mut planned = Vec::new();
@@ -491,11 +535,21 @@ pub async fn write_deltas_resilient(
     mode: RefMode,
     telemetry: &dyn Telemetry,
 ) -> Vec<ViewDelta> {
+    write_deltas_with_versions(db, deltas, &CircuitVersions(circuit), mode, telemetry).await
+}
+
+async fn write_deltas_with_versions(
+    db: &dyn Db,
+    deltas: Vec<ViewDelta>,
+    versions: &(impl RecordVersions + Sync),
+    mode: RefMode,
+    telemetry: &dyn Telemetry,
+) -> Vec<ViewDelta> {
     if deltas.is_empty() {
         return Vec::new();
     }
     let refs: Vec<&ViewDelta> = deltas.iter().collect();
-    let batch = build_edge_batch(&refs, mode, &CircuitVersions(circuit));
+    let batch = build_edge_batch(&refs, mode, versions);
     if batch.is_empty() {
         return Vec::new();
     }
@@ -525,7 +579,15 @@ pub async fn write_deltas_resilient(
             .iter()
             .map(|(name, key)| (name.as_str(), json!(key)))
             .collect();
-        if let Err(e) = query_retrying(db, &plan.sql, &binds).await {
+        let started = web_time::Instant::now();
+        let outcome = query_retrying(db, &plan.sql, &binds).await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        telemetry.histogram_ms("edge_transaction", elapsed_ms);
+        if let Err(e) = outcome {
+            telemetry.counter("edge_publish_failures", 1);
+            warn!(target: "ssp::edges", view_id = %deltas[plan.deltas[0]].query_id,
+                elapsed_ms, statement_bytes = plan.sql.len(), operations = op_count,
+                "Edge transaction failed; publication remains pending");
             error = Some(e.to_string());
             failed.extend(plan.deltas);
         }
@@ -562,9 +624,9 @@ pub async fn write_deltas_resilient(
         let mut left = deltas;
         let right = left.split_off(left.len() / 2);
         let mut leftovers =
-            Box::pin(write_deltas_resilient(db, left, circuit, mode, telemetry)).await;
+            Box::pin(write_deltas_with_versions(db, left, versions, mode, telemetry)).await;
         leftovers
-            .extend(Box::pin(write_deltas_resilient(db, right, circuit, mode, telemetry)).await);
+            .extend(Box::pin(write_deltas_with_versions(db, right, versions, mode, telemetry)).await);
         return leftovers;
     }
 
@@ -938,17 +1000,18 @@ impl CarryState {
 pub struct SurrealEdgeSink {
     pub db: Arc<dyn Db>,
     pub processor: Arc<RwLock<Circuit>>,
+    pub publication_gate: Arc<tokio::sync::Mutex<()>>,
     pub telemetry: Arc<dyn Telemetry>,
     pub mode: RefMode,
 }
 
 impl EdgeSink for SurrealEdgeSink {
     async fn flush(&self, deltas: Vec<ViewDelta>) -> Vec<ViewDelta> {
-        let circuit = self.processor.read().await;
-        write_deltas_resilient(
+        write_deltas_unlocked(
             self.db.as_ref(),
             deltas,
-            &circuit,
+            &self.processor,
+            &self.publication_gate,
             self.mode,
             self.telemetry.as_ref(),
         )
@@ -980,6 +1043,66 @@ mod tests {
             auth_id: auth_id.to_string(),
             initial: false,
         }
+    }
+
+    struct SlowDb { entered: tokio::sync::Notify, release: tokio::sync::Notify }
+    #[async_trait::async_trait]
+    impl Db for SlowDb {
+        async fn query(&self, _: &str, _: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(vec![Value::Null])
+        }
+        async fn version(&self) -> Result<String, DbError> { Ok("test".into()) }
+    }
+
+    #[tokio::test]
+    async fn stalled_publication_does_not_hold_the_ingest_circuit_lock() {
+        let db = Arc::new(SlowDb { entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+        let processor = Arc::new(RwLock::new(Circuit::new()));
+        processor.write().await.add_query(ssp::operator::plan::QueryPlan { id: "abc".into(), root: ssp::operator::plan::OperatorPlan::Scan { table: "game".into() } }, None, None);
+        let sink = SurrealEdgeSink { db: db.clone(), processor: processor.clone(), publication_gate: Arc::new(tokio::sync::Mutex::new(())), telemetry: Arc::new(crate::ports::NoopTelemetry), mode: RefMode::Single };
+        let mut d = delta("abc", "user:a"); d.updates.push("game:1".into());
+        let writer = tokio::spawn(async move { sink.flush(vec![d]).await });
+        db.entered.notified().await;
+        // The network call is still blocked. Before the fix this timed out.
+        let mut circuit = tokio::time::timeout(Duration::from_millis(250), processor.write()).await.expect("publication blocked ingest");
+        circuit.step(ssp::circuit::ChangeSet { changes: vec![ssp::circuit::Change::create("game", "game:1", json!({"id": "game:1"}))] });
+        drop(circuit);
+        db.release.notify_one();
+        assert!(writer.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_for_publication_and_queued_detached_work_is_discarded() {
+        let db = Arc::new(SlowDb { entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+        let processor = Arc::new(RwLock::new(Circuit::new()));
+        processor.write().await.add_query(ssp::operator::plan::QueryPlan { id: "abc".into(), root: ssp::operator::plan::OperatorPlan::Scan { table: "game".into() } }, None, None);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let sink = Arc::new(SurrealEdgeSink { db: db.clone(), processor: processor.clone(), publication_gate: gate.clone(), telemetry: Arc::new(crate::ports::NoopTelemetry), mode: RefMode::Single });
+        let mut d = delta("abc", "user:a"); d.initial = true; d.additions.push("game:1".into());
+        let writer = { let sink = sink.clone(); let d = d.clone(); tokio::spawn(async move { sink.flush(vec![d]).await }) };
+        db.entered.notified().await;
+        assert!(tokio::time::timeout(Duration::from_millis(25), gate.lock()).await.is_err(), "cleanup must wait for in-flight publication");
+        db.release.notify_one();
+        assert!(writer.await.unwrap().is_empty());
+        { let _cleanup = gate.lock().await; processor.write().await.detach_subscriber("abc"); }
+        // SlowDb would block if queued work recreated the detached view's edges.
+        let left = tokio::time::timeout(Duration::from_millis(250), sink.flush(vec![d])).await.expect("detached publication reached database");
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn version_only_deltas_split_safely_and_deduplicate_updates() {
+        let mut d = delta("abc", "user:a");
+        d.updates = (0..600).map(|n| format!("game:{n}")).collect();
+        d.updates.push("game:1".into());
+        let batch = build_edge_batch(&[&d], RefMode::Single, &ConstV(2));
+        assert_eq!(batch.deltas[0].body.len(), 600);
+        let txs = plan_transactions(&batch, 100);
+        assert!(txs.len() > 1);
+        assert!(txs.iter().all(|t| t.sql.matches(";\n").count() <= 101));
+        assert_eq!(txs.iter().map(|t| t.sql.matches("UPDATE ").count()).sum::<usize>(), 600);
     }
 
     #[test]

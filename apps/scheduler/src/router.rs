@@ -100,6 +100,7 @@ impl SspPool {
     pub fn record_catchup_failure(&mut self, ssp_id: &str) -> u32 {
         let entry = self.catchup_failures.entry(ssp_id.to_string()).or_insert(0);
         *entry += 1;
+        crate::admin::incidents::emit(ssp_id, "integrity_failure", "open", "Bootstrap or catch-up integrity verification failed", None);
         *entry
     }
 
@@ -117,6 +118,7 @@ impl SspPool {
             .entry(ssp_id.to_string())
             .or_insert(0);
         *entry += 1;
+        crate::admin::incidents::emit(ssp_id, "integrity_failure", "open", "Bootstrap or catch-up integrity verification failed", None);
         *entry
     }
 
@@ -138,6 +140,9 @@ impl SspPool {
     /// sticky: an integrity check that later flags the same SSP with a plain
     /// `Resync` must not quietly downgrade what the operator asked for.
     pub fn mark_for_resync_with(&mut self, ssp_id: &str, kind: ResyncKind) {
+        if !self.forced_resync.contains_key(ssp_id) {
+            crate::admin::incidents::emit(ssp_id, "resync_requested", "open", "SSP instructed to restart and resynchronize on its next heartbeat", None);
+        }
         let entry = self
             .forced_resync
             .entry(ssp_id.to_string())
@@ -285,6 +290,10 @@ impl SspPool {
 
     /// Mark SSP as ready and return any remaining buffered messages
     pub fn mark_ready(&mut self, ssp_id: &str) -> Vec<RecordUpdate> {
+        if self.message_buffers.get(ssp_id).map_or(true, |b| b.is_empty()) {
+            let reason = if self.is_lagging(ssp_id) { "Missed events replayed; SSP ready without a restart" } else { "Bootstrap and replay completed; SSP ready" };
+            crate::admin::incidents::emit(ssp_id, "ready", "recovered", reason, None);
+        }
         self.ssp_states.insert(ssp_id.to_string(), SspState::Ready);
         self.state_since.insert(ssp_id.to_string(), Instant::now());
         self.buffer_overflowed.remove(ssp_id);
@@ -327,6 +336,7 @@ impl SspPool {
         }
         self.ssp_states
             .insert(ssp_id.to_string(), SspState::Lagging);
+        crate::admin::incidents::emit(ssp_id, "lagging", "open", "Live ingest delivery failed or timed out; subsequent events are buffered", None);
         self.state_since.insert(ssp_id.to_string(), Instant::now());
         true
     }
@@ -358,6 +368,7 @@ impl SspPool {
     pub fn bump_registration_gen(&mut self, ssp_id: &str) -> u64 {
         let gen = self.registration_gen.entry(ssp_id.to_string()).or_insert(0);
         *gen += 1;
+        if *gen > 1 { crate::admin::incidents::emit(ssp_id, "registered_again", "open", "SSP registered again; restart or rebootstrap observed", None); }
         *gen
     }
 
@@ -426,6 +437,9 @@ impl SspPool {
 
     /// Remove an SSP
     pub fn remove(&mut self, ssp_id: &str) -> Option<SspInfo> {
+        if self.ssps.contains_key(ssp_id) {
+            crate::admin::incidents::emit(ssp_id, "removed", "open", "SSP removed from routing; heartbeat, bootstrap deadline or administrative removal", None);
+        }
         self.ssp_states.remove(ssp_id);
         self.message_buffers.remove(ssp_id);
         self.ssp_snapshot_seqs.remove(ssp_id);

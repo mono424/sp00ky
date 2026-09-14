@@ -4,7 +4,7 @@ use crate::circuit::store::{Change, ChangeSet, Operation, Record, Store};
 use crate::circuit::view::{OutputFormat, View};
 use crate::operator::{OperatorPlan, QueryPlan};
 use crate::types::{make_key, raw_id, Sp00kyValue};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 // Portable monotonic clock: std::time on native, performance.now() on wasm32
 // (std::time::Instant panics there).
 use web_time::Instant;
@@ -311,56 +311,78 @@ fn compute_current_subquery_set(
     result
 }
 
-/// Diff two subquery sets and produce delta items.
+/// Recognize direct correlated children whose affected parents can be bounded.
+/// Nested projections and joins retain conservative invalidation.
+fn has_precise_subqueries(plan: &OperatorPlan) -> bool {
+    use crate::operator::plan::Projection;
+    fn child(plan: &OperatorPlan, key: &crate::operator::plan::SubqueryParentKey) -> Option<bool> {
+        use crate::operator::predicate::Predicate;
+        fn correlated(p: &Predicate, key: &crate::operator::plan::SubqueryParentKey) -> bool {
+            match p {
+                Predicate::Eq { field, value } => {
+                    field.segments() == [key.child_field.as_str()]
+                        && value.get("$param").and_then(|v| v.as_str())
+                            == Some(format!("parent.{}", key.parent_field).as_str())
+                }
+                Predicate::And { predicates } => predicates.iter().any(|p| correlated(p, key)),
+                _ => false,
+            }
+        }
+        match plan {
+            OperatorPlan::Scan { .. } => Some(false),
+            OperatorPlan::Filter { input, predicate } => Some(child(input, key)? || correlated(predicate, key)),
+            // A global limit below the correlation can evict another parent's
+            // child. Only a limit applied after correlation is parent-local.
+            OperatorPlan::Limit { input, .. } => child(input, key).filter(|correlated| *correlated),
+            OperatorPlan::Distinct { input } => child(input, key),
+            OperatorPlan::Project { input, projections }
+                if projections.iter().all(|p| !matches!(p, Projection::Subquery { .. })) => child(input, key),
+            _ => None,
+        }
+    }
+    match plan {
+        OperatorPlan::Scan { .. } => true,
+        OperatorPlan::Filter { input, .. } | OperatorPlan::Limit { input, .. }
+        | OperatorPlan::Distinct { input } => has_precise_subqueries(input),
+        OperatorPlan::Project { input, projections } => {
+            has_precise_subqueries(input) && projections.iter().all(|p| match p {
+                Projection::Subquery { plan, parent_key: Some(key), .. } => {
+                    (key.child_field == "id" || key.parent_field == "id") && child(plan, key) == Some(true)
+                }
+                Projection::Subquery { .. } => false,
+                _ => true,
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Diff memberships, including moves, and only publish retained children that changed.
+/// `None` preserves conservative updates for unsupported dependency shapes.
 fn diff_subquery_sets(
     old: &HashMap<RowKey, (RowKey, String)>,
     new: &HashMap<RowKey, (RowKey, String)>,
-    store: &Store,
+    changed: Option<&HashSet<RowKey>>,
 ) -> Vec<SubqueryDeltaItem> {
     let mut items = Vec::new();
-
-    // Additions: in new but not old
-    for (key, (parent_key, alias)) in new {
-        if !old.contains_key(key) {
-            items.push(SubqueryDeltaItem {
-                id: key.to_string(),
-                parent_key: parent_key.to_string(),
-                alias: alias.clone(),
-                op: SubqueryOp::Add,
-            });
-        }
-    }
-
-    // Removals: in old but not new
+    // Remove old ownership before adding new ownership for a reparented child.
     for (key, (parent_key, alias)) in old {
-        if !new.contains_key(key) {
+        if new.get(key) != old.get(key) {
             items.push(SubqueryDeltaItem {
-                id: key.to_string(),
-                parent_key: parent_key.to_string(),
-                alias: alias.clone(),
-                op: SubqueryOp::Remove,
+                id: key.to_string(), parent_key: parent_key.to_string(),
+                alias: alias.clone(), op: SubqueryOp::Remove,
             });
         }
     }
-
-    // Updates: in both, check if version changed
     for (key, (parent_key, alias)) in new {
-        if old.contains_key(key) {
-            // Check if the record version changed
-            let old_version = store.get_record_version_by_key(key);
-            // We always emit an update for records that exist in both sets
-            // when there's any change to subquery tables (the caller determines when to recompute)
-            if old_version.is_some() {
-                items.push(SubqueryDeltaItem {
-                    id: key.to_string(),
-                    parent_key: parent_key.to_string(),
-                    alias: alias.clone(),
-                    op: SubqueryOp::Update,
-                });
-            }
+        let same_membership = old.get(key) == new.get(key);
+        if !same_membership || changed.map_or(true, |keys| keys.contains(key)) {
+            items.push(SubqueryDeltaItem {
+                id: key.to_string(), parent_key: parent_key.to_string(), alias: alias.clone(),
+                op: if same_membership { SubqueryOp::Update } else { SubqueryOp::Add },
+            });
         }
     }
-
     items
 }
 
@@ -906,28 +928,13 @@ impl Circuit {
             .cloned()
             .collect();
 
-        // Detect subquery table changes: if any table referenced in a subquery
-        // projection had changes, all cached parent records need re-fetching.
-        if !view.subquery_tables.is_empty() {
-            let has_subquery_changes = view.subquery_tables.iter().any(|t| {
-                table_deltas.contains_key(t) || content_updates.contains_key(t)
-            });
-            if has_subquery_changes {
-                view.bump_content_generation();
-                for key in view.cache.keys() {
-                    if !updates.contains(key) {
-                        updates.push(key.clone());
-                    }
-                }
-            }
-        }
-
         let has_membership_changes = !view_delta.is_empty();
-        let has_content_updates = !updates.is_empty();
-
-        if !has_membership_changes && !has_content_updates {
-            return None;
-        }
+        let has_subquery_table_changes = view.subquery_tables.iter().any(|t| {
+            table_deltas.contains_key(t) || content_updates.contains_key(t)
+        });
+        let precise = has_precise_subqueries(&view.plan.root);
+        let changed: HashSet<RowKey> = table_deltas.values().flat_map(|delta| delta.keys())
+            .chain(content_updates.values().flat_map(|keys| keys.iter())).cloned().collect();
 
         // Categorize membership changes before applying
         let additions: Vec<String> = view_delta
@@ -945,30 +952,56 @@ impl Circuit {
 
         // Apply delta to view cache
         view.apply_delta(&view_delta);
-        let new_hash = view.compute_hash();
-
-        // For content-only updates, the hash won't change (keys unchanged),
-        // but we still want to emit the delta so consumers know about data changes.
-        if new_hash == view.last_hash && !has_content_updates {
-            return None;
-        }
-
-        if new_hash != view.last_hash {
-            view.last_hash = new_hash.clone();
-        }
-
-        // Compute subquery record diffs when relevant tables changed
-        let has_subquery_table_changes = view.subquery_tables.iter().any(|t| {
-            table_deltas.contains_key(t) || content_updates.contains_key(t)
-        });
-        let subquery_items = if has_membership_changes || has_subquery_table_changes {
-            let new_subquery_set = compute_current_subquery_set(&self.store, view);
-            let items = diff_subquery_sets(&view.subquery_cache, &new_subquery_set, &self.store);
-            view.subquery_cache = new_subquery_set;
+        // Parent content changes can replace a reverse FK without changing membership.
+        let subquery_items = if has_membership_changes || has_subquery_table_changes || !updates.is_empty() {
+            let new_set = compute_current_subquery_set(&self.store, view);
+            let items = diff_subquery_sets(&view.subquery_cache, &new_set, precise.then_some(&changed));
+            if has_subquery_table_changes {
+                if precise {
+                    let mut affected = HashSet::new();
+                    for item in &items {
+                        affected.insert(RowKey::from(item.parent_key.as_str()));
+                    }
+                    // The legacy child cache stores one owner per child. Follow
+                    // every reverse FK to invalidate all parents sharing a child.
+                    for (_, table, key, _) in view.plan.root.subquery_projection_info() {
+                        if let Some(key) = key.filter(|key| key.child_field == "id") {
+                            for parent in view.cache.keys() {
+                                let row = self.store.get_row_by_key(parent);
+                                if let Some(fk) = row.get(&key.parent_field).as_str() {
+                                    if changed.contains(&make_key(&table, raw_id(fk))) {
+                                        affected.insert(parent.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    updates.extend(affected.into_iter().filter(|key| view.cache.contains_key(key)));
+                } else {
+                    updates.extend(view.cache.keys().cloned());
+                }
+            }
+            view.subquery_cache = new_set;
             items
         } else {
             vec![]
         };
+        updates.sort();
+        updates.dedup();
+        updates.retain(|key| !additions.iter().any(|id| id == key.as_ref())
+            && !removals.iter().any(|id| id == key.as_ref()));
+        let has_content_updates = !updates.is_empty() || !subquery_items.is_empty();
+        if !has_membership_changes && !has_content_updates {
+            return None;
+        }
+        if has_subquery_table_changes && has_content_updates {
+            view.bump_content_generation();
+        }
+        let new_hash = view.compute_hash();
+        if new_hash == view.last_hash && !has_content_updates {
+            return None;
+        }
+        view.last_hash = new_hash;
 
         let records: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
 
@@ -1764,6 +1797,14 @@ impl Circuit {
     /// Subscribers sharing `owner`'s graph, excluding the owner itself.
     pub fn subscribers_of(&self, owner: &str) -> &[Subscriber] {
         self.subscribers.get(owner).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Whether this registration still receives publications, including holders
+    /// of merged graphs and excluding a detached owner whose graph is retained.
+    pub fn is_registered(&self, query_id: &str) -> bool {
+        let key = crate::canonical_query_id(query_id);
+        (self.views.contains_key(&key) && !self.detached_owners.contains(&key))
+            || self.owner_of(&key).is_some()
     }
 
     /// Owner whose graph `query_id` is attached to, if it is a subscriber.
@@ -3592,11 +3633,115 @@ mod tests {
             )],
         });
 
-        // Should still emit delta (subquery table change bumps content_generation)
-        // but NO subquery items since parent not in view
+        assert!(deltas.is_empty(), "an unrelated child must not invalidate this view");
+    }
+
+    #[test]
+    fn joined_150_insights_only_publish_changed_game() {
+        let mut circuit = Circuit::new();
+        let mut records = Vec::new();
+        for i in 0..150 {
+            records.push(Record::new("game", &format!("game:{i}"), json!({"score": 0})));
+            records.push(Record::new("game_insight", &format!("game_insight:{i}"),
+                json!({"game": format!("game:{i}")})));
+        }
+        records.push(Record::new("game", "game:unrelated", json!({"score": 0})));
+        circuit.load(records);
+        circuit.add_query(reverse_one_to_one_query("q1", "game_insight", "game", "game", "game"), None, None);
+        assert!(circuit.step(ChangeSet { changes: vec![Change::update("game", "game:unrelated", json!({"score": 1}))] }).is_empty());
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::update("game", "game:42", json!({"score": 1}))] });
         assert_eq!(deltas.len(), 1);
-        let adds: Vec<_> = deltas[0].subquery_items.iter().filter(|i| i.op == SubqueryOp::Add).collect();
-        assert!(adds.is_empty());
+        assert_eq!(deltas[0].updates, ["game_insight:42"]);
+        assert_eq!(deltas[0].subquery_items.len(), 1);
+        assert_eq!(deltas[0].subquery_items[0].id, "game:42");
+        assert_eq!(deltas[0].subquery_items[0].op, SubqueryOp::Update);
+
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::delete("game", "game:42")] });
+        assert_eq!(deltas[0].updates, ["game_insight:42"]);
+        assert_eq!(deltas[0].subquery_items.len(), 1);
+        assert_eq!(deltas[0].subquery_items[0].op, SubqueryOp::Remove);
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::create("game", "game:42", json!({"score": 2}))] });
+        assert_eq!(deltas[0].updates, ["game_insight:42"]);
+        assert_eq!(deltas[0].subquery_items.len(), 1);
+        assert_eq!(deltas[0].subquery_items[0].op, SubqueryOp::Add);
+    }
+
+    #[test]
+    fn shared_game_updates_every_parent() {
+        let mut circuit = Circuit::new();
+        circuit.load(vec![
+            Record::new("game", "game:1", json!({"score": 0})),
+            Record::new("game_insight", "game_insight:1", json!({"game": "game:1"})),
+            Record::new("game_insight", "game_insight:2", json!({"game": "game:1"})),
+        ]);
+        circuit.add_query(reverse_one_to_one_query("q1", "game_insight", "game", "game", "game"), None, None);
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::update("game", "game:1", json!({"score": 1}))] });
+        assert_eq!(deltas[0].updates, ["game_insight:1", "game_insight:2"]);
+        assert_eq!(deltas[0].subquery_items.len(), 1);
+    }
+
+    #[test]
+    fn joined_window_reordering_removes_evicted_child() {
+        let mut circuit = Circuit::new();
+        let mut records = Vec::new();
+        for i in 1..=3 {
+            records.push(Record::new("game", &format!("game:{i}"), json!({})));
+            records.push(Record::new("game_insight", &format!("game_insight:{i}"),
+                json!({"game": format!("game:{i}"), "computed_at": i})));
+        }
+        circuit.load(records);
+        let mut query = reverse_one_to_one_query("q1", "game_insight", "game", "game", "game");
+        query.root = OperatorPlan::Limit {
+            input: Box::new(query.root), limit: 2, start: 0,
+            order_by: Some(vec![OrderSpec { field: Path::new("computed_at"), direction: "desc".into() }]),
+        };
+        circuit.add_query(query, None, None);
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::update("game_insight", "game_insight:1",
+            json!({"game": "game:1", "computed_at": 4}))] });
+        assert_eq!(deltas[0].additions, ["game_insight:1"]);
+        assert_eq!(deltas[0].removals, ["game_insight:2"]);
+        assert!(deltas[0].updates.is_empty());
+        assert_eq!(deltas[0].subquery_items.len(), 2);
+        assert!(deltas[0].subquery_items.iter().any(|item| item.id == "game:2" && item.op == SubqueryOp::Remove));
+        assert!(deltas[0].subquery_items.iter().any(|item| item.id == "game:1" && item.op == SubqueryOp::Add));
+    }
+
+    #[test]
+    fn child_reparent_invalidates_old_and_new_parent() {
+        let mut circuit = Circuit::new();
+        circuit.load(vec![
+            Record::new("thread", "thread:1", json!({})),
+            Record::new("thread", "thread:2", json!({})),
+            Record::new("comment", "comment:1", json!({"thread": "thread:1"})),
+        ]);
+        circuit.add_query(subquery_query_with_parent_key("q1", "thread", "comment", "comments", "thread"), None, None);
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::update("comment", "comment:1", json!({"thread": "thread:2"}))] });
+        assert_eq!(deltas[0].updates, ["thread:1", "thread:2"]);
+        let items = &deltas[0].subquery_items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].op, SubqueryOp::Remove);
+        assert_eq!(items[0].parent_key, "thread:1");
+        assert_eq!(items[1].op, SubqueryOp::Add);
+        assert_eq!(items[1].parent_key, "thread:2");
+    }
+
+    #[test]
+    fn parent_fk_change_refreshes_subquery_membership() {
+        let mut circuit = Circuit::new();
+        circuit.load(vec![
+            Record::new("game", "game:1", json!({})),
+            Record::new("game", "game:2", json!({})),
+            Record::new("game_insight", "game_insight:1", json!({"game": "game:1"})),
+        ]);
+        circuit.add_query(reverse_one_to_one_query("q1", "game_insight", "game", "game", "game"), None, None);
+        let deltas = circuit.step(ChangeSet { changes: vec![Change::update("game_insight", "game_insight:1", json!({"game": "game:2"}))] });
+        assert_eq!(deltas[0].updates, ["game_insight:1"]);
+        let items = &deltas[0].subquery_items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "game:1");
+        assert_eq!(items[0].op, SubqueryOp::Remove);
+        assert_eq!(items[1].id, "game:2");
+        assert_eq!(items[1].op, SubqueryOp::Add);
     }
 
     // ── Nested subquery tracking tests ─────────────────────────────

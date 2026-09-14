@@ -26,6 +26,7 @@ pub mod backups;
 pub mod cloud;
 pub mod config;
 pub mod jobs;
+pub mod incidents;
 pub mod logs;
 pub mod mcp;
 pub mod ops;
@@ -93,6 +94,7 @@ pub struct AdminState {
     pub heartbeat_interval_ms: u64,
     /// Long-running actions, watched by the dashboard.
     pub ops: Arc<Operations>,
+    pub incidents: Arc<incidents::Incidents>,
     /// Live users / sessions / registered views, sampled on a timer so every
     /// reader serves from memory.
     pub presence: Arc<presence::PresenceTracker>,
@@ -322,6 +324,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/logout", post(logout_handler))
         .route("/overview", get(overview::overview))
         .route("/presence", get(presence::presence))
+        .route("/incidents", get(incidents::list))
+        .route("/incidents/:id", get(incidents::detail))
         .route("/views", get(presence::list_views))
         .route("/views/:key", get(presence::view_detail))
         .route("/backends", get(backends::list))
@@ -449,6 +453,7 @@ pub fn build(config: AdminConfig, deps: AdminDeps) -> (AdminState, Router) {
         health_check_interval_secs: scheduler_config.health_check_interval_secs,
         heartbeat_interval_ms: scheduler_config.heartbeat_interval_ms,
         ops: Operations::new(),
+        incidents: incidents::Incidents::open(scheduler_config.wal_path.parent().unwrap_or_else(|| std::path::Path::new(".")).join("incidents.json")),
         presence: presence::PresenceTracker::new(&config_for_presence),
         jobs: jobs::JobSampler::new(&config_for_presence),
         cloud: deps.cloud,
@@ -467,6 +472,7 @@ pub fn build(config: AdminConfig, deps: AdminDeps) -> (AdminState, Router) {
     // admin reader uses, and simply does nothing until that slot fills.
     Arc::clone(&state.presence).spawn(state.clone());
     Arc::clone(&state.jobs).spawn(state.clone());
+    state.incidents.spawn(state.clone());
     (state, router)
 }
 

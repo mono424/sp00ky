@@ -206,6 +206,7 @@ fn build_node(
         true,
     ));
     let node = Arc::new(SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
         status: Arc::new(RwLock::new(SspStatus::Bootstrapping)),
         processor: Arc::new(RwLock::new(Circuit::new())),

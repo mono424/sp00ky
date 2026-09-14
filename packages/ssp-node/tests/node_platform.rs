@@ -254,6 +254,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         true,
     ));
     let node = SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
         status: Arc::new(RwLock::new(opts.status)),
         processor: Arc::new(RwLock::new(Circuit::new())),

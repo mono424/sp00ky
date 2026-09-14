@@ -172,6 +172,7 @@ export interface BackendDetail extends BackendSummary {
 }
 
 export interface Overview {
+  incidents?: { open: number; total: number; retention_days: number; storage_error: string | null };
   scheduler: SchedulerEntity | null;
   ssps: SspEntity[];
   backends: BackendSummary[];

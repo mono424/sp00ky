@@ -411,7 +411,9 @@ fn record(stats: &Arc<HeartbeatStats>, alerter: &Alerter, outcome: &CycleOutcome
         CycleOutcome::Ok { e2e_ms } => {
             stats.last_e2e_ms.store(*e2e_ms, Ordering::Relaxed);
             stats.last_ok_epoch_ms.store(now, Ordering::Relaxed);
-            stats.consecutive_failures.store(0, Ordering::Relaxed);
+            if stats.consecutive_failures.swap(0, Ordering::Relaxed) > 0 {
+                crate::admin::incidents::emit("scheduler", "heartbeat", "recovered", "End-to-end heartbeat recovered", None);
+            }
             stats.push_sample(Sample { ts: now, ms: Some(*e2e_ms), ok: true });
             *stats.blocked_reason.lock().unwrap() = None;
             debug!(e2e_ms, "heartbeat ok");
@@ -434,6 +436,7 @@ fn record(stats: &Arc<HeartbeatStats>, alerter: &Alerter, outcome: &CycleOutcome
             // A failure is a measurement: we asked and it did not work.
             *stats.blocked_reason.lock().unwrap() = None;
             warn!(stage, %detail, failures, "heartbeat failed");
+            crate::admin::incidents::emit("scheduler", "heartbeat", "open", &format!("End-to-end heartbeat failed at {stage}"), None);
             alerter.observe(false, failures, || {
                 serde_json::json!({
                     "component": "scheduler_heartbeat",

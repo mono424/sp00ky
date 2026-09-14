@@ -76,7 +76,8 @@ impl SurrealSdkDb {
                     tracing::warn!(
                         timeout_secs = limit.as_secs(),
                         consecutive = n,
-                        statement = what,
+                        statement_bytes = what.len(),
+                        statement_count = what.bytes().filter(|b| *b == b';').count(),
                         "SurrealDB call exceeded the SSP timeout; reconnecting"
                     );
                     return Err(DbError::Transport(format!(

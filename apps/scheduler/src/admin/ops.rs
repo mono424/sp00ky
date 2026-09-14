@@ -110,6 +110,7 @@ impl Operations {
                 }
             }
         }
+        super::incidents::emit(op.target.as_deref().unwrap_or("scheduler"), "operator_action", "open", &format!("Operator action {:?} requested", op.kind), Some(&op.id));
         self.publish();
         op
     }
@@ -155,6 +156,11 @@ impl Operations {
             }
         };
         if changed {
+            if let Some(op) = self.get(id) {
+                if op.status != OpStatus::Running {
+                    super::incidents::emit(op.target.as_deref().unwrap_or("scheduler"), "operator_action", if op.status == OpStatus::Done { "recovered" } else { "failed" }, &format!("Operator action {:?} {:?}", op.kind, op.status), Some(&op.id));
+                }
+            }
             self.publish();
         }
     }

@@ -809,3 +809,25 @@ Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.
 2. Check job status updates in database
 3. Review SSP logs for job execution errors
 4. Verify backend API connectivity and authentication
+
+## Publication isolation and latency
+
+Edge publication captures the versions it needs under a short circuit read lock
+and releases that lock before database I/O. Ingest can continue while publication
+is slow. Cleanup uses a separate publication gate, and queued deltas for detached
+registrations are discarded. The native SSP uses a separate database session for
+bulk publication, including its token refresh and reconnect lifecycle.
+
+Version updates locate a view's edges through the graph index and return no row
+bodies. Version-only deltas are idempotent and can be split at the transaction
+statement cap; membership-changing incremental deltas remain atomic. Direct
+correlated joins invalidate affected parents and children; complex joins retain
+conservative invalidation when precise dependency tracking is unavailable.
+
+Additional OpenTelemetry instruments expose `ssp_edge_lock_wait_milliseconds`,
+`ssp_edge_lock_hold_milliseconds`, `ssp_edge_publish_milliseconds`,
+`ssp_edge_transaction_milliseconds`, and `ssp_edge_publish_failures_total`.
+Publication includes retries; transaction timing includes conflict retries for
+one planned transaction. Existing per-view ingest timings describe a shared
+circuit step and can include lock wait. They do not measure edge publication.
+Timeout logs report statement bytes/count rather than entire SQL batches.

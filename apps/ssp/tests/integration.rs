@@ -172,6 +172,7 @@ impl TestHarness {
                 let (platform, _timer_rx) =
                     ssp_server::adapters::vm_platform(Arc::clone(&self.db), Arc::clone(&self.metrics));
                 Arc::new(ssp_node::SspNode {
+        publication_gate: Arc::new(tokio::sync::Mutex::new(())),
                     platform,
                     status: Arc::clone(&self.status),
                     processor: Arc::clone(&self.processor),

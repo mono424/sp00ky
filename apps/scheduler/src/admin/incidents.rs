@@ -1,0 +1,382 @@
+//! Durable, bounded incident history independent of the upstream database.
+//! Producers emit only typed, sanitized events; a background task owns disk I/O.
+use super::{api_error, AdminState, ApiError};
+use axum::{
+    extract::{Path, Query, State},
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    collections::VecDeque,
+    path::{Path as FsPath, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+const MAX_INCIDENTS: usize = 2000;
+const MAX_EVENTS: usize = 64;
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const TARGET: &str = "scheduler::incident";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub at: u64,
+    pub component: String,
+    pub kind: String,
+    pub state: String,
+    pub summary: String,
+    pub operation_id: Option<String>,
+    pub version: String,
+}
+
+/// Summaries must be operator-safe descriptions, never SQL, bindings or tokens.
+pub fn emit(component: &str, kind: &str, state: &str, summary: &str, operation_id: Option<&str>) {
+    let event = Event {
+        at: super::ops::now_ms(),
+        component: component.chars().take(128).collect(),
+        kind: kind.into(),
+        state: state.into(),
+        summary: summary.chars().take(384).collect(),
+        operation_id: operation_id.map(str::to_owned),
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+    if let Ok(payload) = serde_json::to_string(&event) {
+        tracing::info!(target: "scheduler::incident", incident = %payload, "Incident transition");
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Incident {
+    pub id: String,
+    pub component: String,
+    pub kind: String,
+    pub severity: String,
+    pub state: String,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+    pub max_buffered_events: usize,
+    pub event_count: u64,
+    pub events: VecDeque<Event>,
+}
+
+#[derive(Default)]
+struct History {
+    rows: VecDeque<Incident>,
+    revision: u64,
+    storage_error: Option<String>,
+}
+
+pub struct Incidents {
+    history: Mutex<History>,
+    path: PathBuf,
+    persistence: tokio::sync::Mutex<()>,
+}
+
+impl Incidents {
+    pub fn open(path: PathBuf) -> Arc<Self> {
+        let loaded = (|| -> anyhow::Result<VecDeque<Incident>> {
+            if !path.exists() {
+                return Ok(VecDeque::new());
+            }
+            anyhow::ensure!(
+                std::fs::metadata(&path)?.len() <= MAX_FILE_BYTES,
+                "incident file exceeds size limit"
+            );
+            Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
+        })();
+        let mut history = History::default();
+        match loaded {
+            Ok(rows) => history.rows = rows,
+            Err(e) => history.storage_error = Some(format!("Could not load incident history: {e}")),
+        }
+        let now = super::ops::now_ms();
+        for row in &mut history.rows {
+            if row.state == "open" {
+                row.state = "interrupted".into();
+                row.ended_at = Some(now);
+                append(
+                    row,
+                    Event {
+                        at: now,
+                        component: row.component.clone(),
+                        kind: "scheduler_restart".into(),
+                        state: "interrupted".into(),
+                        summary: "Scheduler restarted before recovery was observed".into(),
+                        operation_id: None,
+                        version: env!("CARGO_PKG_VERSION").into(),
+                    },
+                );
+            }
+        }
+        history.revision = 1;
+        trim(&mut history.rows, now);
+        Arc::new(Self {
+            history: Mutex::new(history),
+            path,
+            persistence: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    fn observe(&self, event: Event) {
+        let mut h = self.history.lock().unwrap();
+        // Correlate automatic SSP failures into one episode. Operator actions
+        // have their own identity and cannot accidentally close that episode.
+        let existing = h.rows.iter().position(|r| {
+            event.state != "recorded"
+                && r.state == "open"
+                && r.component == event.component
+                && r.events.front().and_then(|e| e.operation_id.as_deref())
+                    == event.operation_id.as_deref()
+        });
+        if let Some(i) = existing {
+            let row = &mut h.rows[i];
+            if event.state != "open" {
+                row.state = event.state.clone();
+                row.ended_at = Some(event.at);
+            }
+            append(row, event.clone());
+        } else if event.state == "open" || event.state == "recorded" {
+            let terminal = event.state == "recorded";
+            h.rows.push_front(Incident {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                component: event.component.clone(),
+                kind: event.kind.clone(),
+                severity: if event.operation_id.is_some() || terminal {
+                    "info"
+                } else {
+                    "warning"
+                }
+                .into(),
+                state: event.state.clone(),
+                started_at: event.at,
+                ended_at: terminal.then_some(event.at),
+                max_buffered_events: 0,
+                event_count: 1,
+                events: VecDeque::from([event.clone()]),
+            });
+        } else {
+            return;
+        }
+        h.revision += 1;
+        trim(&mut h.rows, event.at);
+    }
+
+    pub fn summary(&self) -> Value {
+        let h = self.history.lock().unwrap();
+        json!({"open": h.rows.iter().filter(|r| r.state == "open").count(), "total": h.rows.len(),
+            "retention_days": 30, "storage_error": h.storage_error})
+    }
+
+    async fn persist(self: &Arc<Self>) {
+        let _save = self.persistence.lock().await;
+        let rows = {
+            let h = self.history.lock().unwrap();
+            if h.storage_error.is_some() {
+                return;
+            }
+            h.rows.clone()
+        };
+        let path = self.path.clone();
+        let result = tokio::task::spawn_blocking(move || save(&path, &rows)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            self.history.lock().unwrap().storage_error = Some(
+                "Incident persistence failed; history is memory-only until scheduler restart"
+                    .into(),
+            );
+            tracing::error!("Incident history persistence failed");
+        }
+    }
+
+    /// A process-ending action must reach disk before its delayed exit fires.
+    pub async fn flush_operation(self: &Arc<Self>, op: &super::ops::Operation) {
+        self.observe(Event {
+            at: op.started_at,
+            component: op.target.clone().unwrap_or_else(|| "scheduler".into()),
+            kind: "operator_action".into(),
+            state: "open".into(),
+            summary: format!("Operator action {:?} requested", op.kind),
+            operation_id: Some(op.id.clone()),
+            version: env!("CARGO_PKG_VERSION").into(),
+        });
+        self.persist().await;
+    }
+
+    pub fn spawn(self: &Arc<Self>, state: AdminState) {
+        // Subscribe before the first await; no polling gap on short incidents.
+        let mut rx = state.logs.subscribe();
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.observe(Event {
+                at: super::ops::now_ms(),
+                component: "scheduler".into(),
+                kind: "scheduler_start".into(),
+                state: "recorded".into(),
+                summary: "Scheduler incident recorder started".into(),
+                operation_id: None,
+                version: env!("CARGO_PKG_VERSION").into(),
+            });
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut saved = 0;
+            loop {
+                tokio::select! {
+                    line = rx.recv() => match line {
+                        Ok(line) if line.target == TARGET => {
+                            if let Some(payload) = line.fields.strip_prefix("incident=") {
+                                if let Ok(event) = serde_json::from_str::<Event>(payload) { this.observe(event); }
+                            }
+                        }
+                        Ok(_) => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            this.observe(Event { at: super::ops::now_ms(), component: "scheduler".into(), kind: "history_gap".into(), state: "recorded".into(), summary: "Log feed overflowed; some incident transitions may be missing".into(), operation_id: None, version: env!("CARGO_PKG_VERSION").into() });
+                        }
+                        Err(_) => break,
+                    },
+                    _ = tick.tick() => {
+                        let entities = crate::metrics::build_entities(&state.metrics).await;
+                        { let mut h = this.history.lock().unwrap();
+                            let mut changed = false;
+                            for row in h.rows.iter_mut().filter(|r| r.state == "open") {
+                                if let Some(entity) = entities.iter().find(|v| v["id"].as_str() == Some(&row.component)) {
+                                    let buffered = entity["buffered_events"].as_u64().unwrap_or(0) as usize;
+                                    if buffered > row.max_buffered_events { row.max_buffered_events = buffered; changed = true; }
+                                }
+                            }
+                            if changed { h.revision += 1; }
+                        }
+                        let revision = this.history.lock().unwrap().revision;
+                        if revision != saved { this.persist().await; saved = revision; }
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn append(row: &mut Incident, event: Event) {
+    row.event_count += 1;
+    if row.events.len() == MAX_EVENTS {
+        row.events.remove(1);
+    }
+    row.events.push_back(event);
+}
+fn trim(rows: &mut VecDeque<Incident>, now: u64) {
+    rows.retain(|r| now.saturating_sub(r.ended_at.unwrap_or(r.started_at)) <= RETENTION_MS);
+    rows.truncate(MAX_INCIDENTS);
+    // Keep the durable representation below its documented cap, even with
+    // unusually long component names. In-memory and disk retention agree.
+    while serde_json::to_vec(rows)
+        .map(|v| v.len() as u64 > MAX_FILE_BYTES)
+        .unwrap_or(false)
+    {
+        rows.pop_back();
+    }
+}
+fn save(path: &FsPath, rows: &VecDeque<Incident>) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| FsPath::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(&serde_json::to_vec(rows)?)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[derive(Default, Deserialize)]
+pub struct Filters {
+    pub component: Option<String>,
+    pub state: Option<String>,
+    pub severity: Option<String>,
+    pub since: Option<u64>,
+    pub before: Option<u64>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+pub async fn list(State(state): State<AdminState>, Query(q): Query<Filters>) -> Json<Value> {
+    let h = state.incidents.history.lock().unwrap();
+    let rows: Vec<_> = h
+        .rows
+        .iter()
+        .filter(|r| {
+            q.component.as_ref().map_or(true, |c| c == &r.component)
+                && q.state.as_ref().map_or(true, |s| s == &r.state)
+                && q.severity.as_ref().map_or(true, |s| s == &r.severity)
+                && q.since.map_or(true, |t| r.started_at >= t)
+                && q.before.map_or(true, |t| r.started_at <= t)
+        })
+        .collect();
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    Json(
+        json!({"incidents": rows.iter().skip(offset).take(limit).collect::<Vec<_>>(), "total": rows.len(), "offset": offset, "limit": limit, "storage_error": h.storage_error, "server_time_ms": super::ops::now_ms()}),
+    )
+}
+pub async fn detail(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let h = state.incidents.history.lock().unwrap();
+    h.rows
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| Json(json!({"incident": r})))
+        .ok_or_else(|| api_error(axum::http::StatusCode::NOT_FOUND, "Incident not found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn event(state: &str) -> Event {
+        Event {
+            at: super::super::ops::now_ms(),
+            component: "ssp-0".into(),
+            kind: "lagging".into(),
+            state: state.into(),
+            summary: "Delivery failed".into(),
+            operation_id: None,
+            version: "test".into(),
+        }
+    }
+    #[test]
+    fn episodes_coalesce_recover_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incidents.json");
+        let s = Incidents::open(path.clone());
+        s.observe(event("open"));
+        s.observe(event("open"));
+        s.observe(event("recovered"));
+        {
+            let h = s.history.lock().unwrap();
+            assert_eq!(h.rows.len(), 1);
+            assert_eq!(h.rows[0].event_count, 3);
+            assert_eq!(h.rows[0].state, "recovered");
+            save(&path, &h.rows).unwrap();
+        }
+        let s = Incidents::open(path.clone());
+        assert_eq!(s.history.lock().unwrap().rows[0].state, "recovered");
+        s.observe(event("open"));
+        save(&path, &s.history.lock().unwrap().rows).unwrap();
+        let s = Incidents::open(path);
+        assert_eq!(s.history.lock().unwrap().rows[0].state, "interrupted");
+    }
+    #[test]
+    fn bounded_events_keep_start_and_latest_and_corrupt_history_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incidents.json");
+        let s = Incidents::open(path.clone());
+        for _ in 0..100 {
+            s.observe(event("open"));
+        }
+        let h = s.history.lock().unwrap();
+        assert_eq!(h.rows[0].event_count, 100);
+        assert_eq!(h.rows[0].events.len(), MAX_EVENTS);
+        drop(h);
+        std::fs::write(&path, "broken").unwrap();
+        let s = Incidents::open(path);
+        assert!(s.summary()["storage_error"].is_string());
+    }
+}

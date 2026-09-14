@@ -12,6 +12,39 @@ Every scheduler serves an operator dashboard. It shows the health of the
 scheduler and its SSPs, the end-to-end sync latency, the status of your
 backends, live logs, and workflow runs as they happen.
 
+## Incident history
+
+The **Incidents** navigation item keeps automatic lag, heartbeat failures,
+bootstrap integrity failures, removal/re-registration, recovery, and operator
+actions in one timeline. Every navigation entry has a labeled icon on desktop
+and mobile. The overview links to history and shows the number of open episodes.
+
+Filter by component (for example `ssp-0`), state, severity, and start time. Open
+an incident to see its duration, largest sampled event backlog, server version,
+operation id when present, and event timeline. **Recovered** means the scheduler
+observed recovery. **Interrupted** means the scheduler restarted before it could
+observe recovery. Lag followed by replay is described separately from an SSP
+re-registering; re-registration alone does not prove a container crash.
+
+History is stored in `incidents.json` beside the scheduler WAL, independently
+of SurrealDB. Keep that directory on persistent storage. Retention is bounded
+by 30 days, 2,000 incidents, 64 events per incident (first and newest retained),
+and an 8 MiB file cap. Counts include compacted events. Ordinary events flush
+once per second; a scheduler restart or cloud restart request flushes its action
+before exit/dispatch. Abrupt termination can lose the last unflushed second.
+A clean restart that wipes the scheduler volume also wipes its incident history.
+
+A missing or unreadable history file is reported in the dashboard; malformed
+history is not overwritten. The incident logging target stays enabled even
+with `RUST_LOG=warn`. A dropped log-feed segment becomes a visible history-gap
+record. Stored summaries contain no query bindings, SQL, or credentials.
+Detailed logs remain available through the Logs page and are independently
+subject to their retention limits. History starts when this version is deployed;
+it does not reconstruct older incidents from arbitrary log text.
+
+The read-only MCP tools `incidents_list` and `incident_get` expose the same
+history as the dashboard. See the [scheduler API](/docs/reference/scheduler-api).
+
 ## Opening it
 
 The dashboard is bundled into the official `mono424/spooky-scheduler` image and

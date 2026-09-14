@@ -733,6 +733,12 @@ overshoot them. Large individual memberships remain atomic. Source-commit waits
 and metadata barriers preserve publication order; disjoint views may proceed
 while an earlier failed view waits for retry. Internal lifecycle generations
 prevent queued work from an old registration or restore from recreating edges.</p>
+<p>Source-commit visibility checks run outside the writer on the control database
+session, with at most 16 simultaneous probes. Each wait has a five-second total
+deadline, including probe-capacity and network waits, after which the existing
+visibility fallback applies. Same-view work remains ordered, while unrelated
+views can publish during a wait. Deletes do not wait for a deleted row to become
+visible. A canceled probe retains its admission slot until its task has stopped.</p>
 <p>SSP heartbeat data includes optional <code>publication</code> measurements: pending batches,
 operations and estimated bytes, oldest age, parked batches, last successful
 publication, overload rejections, and at most eight views with the largest

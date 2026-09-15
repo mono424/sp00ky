@@ -1,9 +1,10 @@
-import { For, Show, batch, createMemo, createResource, createSignal, onCleanup, type Accessor } from 'solid-js';
-import { A, useParams } from '@solidjs/router';
+import { For, Show, createMemo, createResource, createSignal, onCleanup, type Accessor } from 'solid-js';
+import { A, useNavigate, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import type { PublicationMetrics } from '../api/types';
-import { Cell, Empty, KeyValue, PageHead, Panel, Pill, Rail } from '../components/Chrome';
+import { Cell, Chips, Empty, KeyValue, PageHead, Panel, Pill, Rail, SkeletonList, Stale } from '../components/Chrome';
 import { decodeParam, formatBytes, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
+import { readStash, writeStash } from '../lib/stash';
 
 interface IncidentEvent {
   at: number;
@@ -39,24 +40,52 @@ interface IncidentList {
   server_time_ms: number;
 }
 
+/**
+ * The page fetches one window of history (the newest `WINDOW` episodes in the
+ * chosen range) and every filter applies on the client, instantly. Thirty
+ * days of a busy tenant is a few hundred rows; a form that round-trips per
+ * filter change was the wrong shape for "show me what is open right now".
+ */
+const WINDOW = 400;
+const RANGES: { key: string; label: string; ms: number }[] = [
+  { key: '24h', label: '24 h', ms: 24 * 3_600_000 },
+  { key: '7d', label: '7 days', ms: 7 * 24 * 3_600_000 },
+  { key: '30d', label: '30 days', ms: 30 * 24 * 3_600_000 },
+];
 const STATES = ['open', 'recovered', 'interrupted', 'failed', 'recorded'];
-const PAGE_SIZE = 25;
 const label = (value: string) => value.replace(/_/g, ' ');
 const stamp = (value: number) => new Date(value).toLocaleString();
+const clock = (value: number) =>
+  new Date(value).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 const tone = (state: string) => state === 'recovered' ? 'ok'
   : state === 'failed' ? 'bad' : state === 'open' || state === 'interrupted' ? 'warn' : 'idle';
 const duration = (incident: Incident, now: number) =>
   formatDuration(Math.max(0, (incident.ended_at ?? now) - incident.started_at));
+const dayKey = (ms: number) => {
+  const d = new Date(ms);
+  const today = new Date();
+  const same = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+  if (same(d, today)) return 'Today';
+  const yesterday = new Date(today.getTime() - 86_400_000);
+  if (same(d, yesterday)) return 'Yesterday';
+  return d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+};
 
 /** Match the dashboard's resource polling, with cleanup and no overlapping polls. */
-function usePoll<T>(path: Accessor<string>) {
-  const [result, { refetch }] = createResource(path, (url) => api.getResult<T>(url));
+function usePoll<T>(path: Accessor<string>, stash?: string) {
+  const [result, { refetch }] = createResource(path, async (url) => {
+    const r = await api.getResult<T>(url);
+    if (r.ok && stash) writeStash(stash, r.value);
+    return r;
+  });
   const timer = setInterval(() => {
     if (!result.loading && !document.hidden) void refetch();
   }, 5000);
   onCleanup(() => clearInterval(timer));
+  const cached = stash ? readStash<T>(stash)?.value : undefined;
   return {
-    data: () => { const r = result(); return r?.ok ? r.value : undefined; },
+    data: () => { const r = result(); return r?.ok ? r.value : (r ? undefined : cached); },
+    stale: () => !result() && cached != null,
     error: () => { const r = result(); return r && !r.ok ? r.message : undefined; },
     loading: () => result.loading,
     refresh: () => { if (!result.loading) void refetch(); },
@@ -64,82 +93,132 @@ function usePoll<T>(path: Accessor<string>) {
 }
 
 export function Incidents() {
-  const [component, setComponent] = createSignal('');
+  const navigate = useNavigate();
+  const [range, setRange] = createSignal('7d');
   const [state, setState] = createSignal('');
-  const [severity, setSeverity] = createSignal('');
-  const [since, setSince] = createSignal('');
-  const [before, setBefore] = createSignal('');
-  const [filters, setFilters] = createSignal('');
-  const [offset, setOffset] = createSignal(0);
-  const path = createMemo(() => `/incidents?limit=${PAGE_SIZE}&offset=${offset()}${filters()}`);
-  const poll = usePoll<IncidentList>(path);
+  const [component, setComponent] = createSignal('');
+  const [search, setSearch] = createSignal('');
+  const [shown, setShown] = createSignal(60);
 
-  const apply = (event: SubmitEvent) => {
-    event.preventDefault();
-    const query = new URLSearchParams();
-    if (component().trim()) query.set('component', component().trim());
-    if (state()) query.set('state', state());
-    if (severity()) query.set('severity', severity());
-    if (since()) query.set('since', String(Date.parse(since())));
-    if (before()) query.set('before', String(Date.parse(before())));
-    batch(() => {
-      setOffset(0);
-      setFilters(query.size ? `&${query}` : '');
-    });
-  };
-  const reset = () => batch(() => {
-    setComponent(''); setState(''); setSeverity(''); setSince(''); setBefore('');
-    setOffset(0); setFilters('');
+  const since = createMemo(() => {
+    const r = RANGES.find((x) => x.key === range());
+    // Re-evaluated with the range only: the window's edge moving a few
+    // seconds per poll is not worth a new resource key.
+    return r ? Date.now() - r.ms : 0;
   });
+  const path = createMemo(() => `/incidents?limit=${WINDOW}${since() ? `&since=${since()}` : ''}`);
+  const poll = usePoll<IncidentList>(path, `incidents:${range()}`);
+  const now = () => poll.data()?.server_time_ms ?? Date.now();
+  const all = () => poll.data()?.incidents ?? [];
+
+  const components = createMemo(() => {
+    const seen = new Map<string, number>();
+    for (const i of all()) seen.set(i.component, (seen.get(i.component) ?? 0) + 1);
+    return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  });
+  const stateCounts = createMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const i of all()) counts[i.state] = (counts[i.state] ?? 0) + 1;
+    return counts;
+  });
+  const filtered = createMemo(() => {
+    const q = search().trim().toLowerCase();
+    return all().filter((i) =>
+      (!state() || i.state === state()) &&
+      (!component() || i.component === component()) &&
+      (!q || `${i.component} ${i.kind} ${i.severity} ${i.events.map((e) => e.summary).join(' ')}`.toLowerCase().includes(q)));
+  });
+  const groups = createMemo(() => {
+    const out: { day: string; items: Incident[] }[] = [];
+    for (const i of filtered().slice(0, shown())) {
+      const day = dayKey(i.started_at);
+      const last = out[out.length - 1];
+      if (last && last.day === day) last.items.push(i);
+      else out.push({ day, items: [i] });
+    }
+    return out;
+  });
+  const open = () => stateCounts().open ?? 0;
+  const warnings = () => all().filter((i) => i.severity !== 'info').length;
+  const longest = () => all().reduce((m, i) => Math.max(m, (i.ended_at ?? now()) - i.started_at), 0);
+  const latest = () => all()[0];
+  const reset = () => { setState(''); setComponent(''); setSearch(''); setShown(60); };
+  const filtering = () => !!(state() || component() || search().trim());
 
   return <>
-    <PageHead crumb="Dashboard" title="Incidents" subtitle="Recorded failures, recovery and operator actions. Refreshes every 5 seconds."
-      actions={<><A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
+    <PageHead crumb="Dashboard" title="Incidents" subtitle="Lag, recoveries, heartbeat failures and operator actions, as the scheduler recorded them."
+      actions={<><Stale when={poll.stale()} /><A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
         <button class="btn btn-sm" onClick={poll.refresh} disabled={poll.loading()}>Refresh</button></>} />
     <div class="page-body stack">
-      <Panel title="History" sub="Newest first. Filter by component, state, severity or start time.">
-        <form class="filters" onSubmit={apply}>
-          <label>Component <input type="text" placeholder="e.g. ssp-0" value={component()} onInput={(e) => setComponent(e.currentTarget.value)} /></label>
-          <label>State <select value={state()} onChange={(e) => setState(e.currentTarget.value)}>
-            <option value="">All states</option><For each={STATES}>{(s) => <option value={s}>{label(s)}</option>}</For>
-          </select></label>
-          <label>Severity <select value={severity()} onChange={(e) => setSeverity(e.currentTarget.value)}>
-            <option value="">All severities</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option>
-          </select></label>
-          <label>From <input type="datetime-local" value={since()} max={before() || undefined} onInput={(e) => setSince(e.currentTarget.value)} /></label>
-          <label>Through <input type="datetime-local" value={before()} min={since() || undefined} onInput={(e) => setBefore(e.currentTarget.value)} /></label>
-          <button type="submit" class="btn btn-primary btn-sm">Apply filters</button>
-          <button type="button" class="btn btn-sm" onClick={reset}>Clear</button>
-        </form>
-      </Panel>
       <Show when={poll.error()}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
-      <Show when={poll.data()} fallback={<Show when={!poll.error()}><Empty>Loading incidents…</Empty></Show>}>
-        {(data) => <>
-          <Show when={data().storage_error}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
-          <Panel title={`${formatCount(data().total)} incident${data().total === 1 ? '' : 's'}`} flush>
-            <Show when={data().incidents.length} fallback={<Empty>{filters() ? 'No incidents match these filters.' : 'No incidents recorded yet.'}</Empty>}>
-              <div class="table-scroll" aria-busy={poll.loading()}><table>
-                <thead><tr><th>Incident</th><th>State</th><th>Severity</th><th>Started</th><th>Duration</th><th>Events</th><th>Peak buffered</th></tr></thead>
-                <tbody><For each={data().incidents}>{(incident) => <tr>
-                  <td><A href={`/incidents/${encodeURIComponent(incident.id)}`}>{incident.component} · {label(incident.kind)}</A>
-                    <div class="id" style={{ 'margin-top': '4px', 'white-space': 'normal' }}>{incident.events[incident.events.length - 1]?.summary}</div></td>
-                  <td data-label="State"><Pill tone={tone(incident.state)} dot pulse={incident.state === 'open'}>{label(incident.state)}</Pill></td>
-                  <td data-label="Severity" class="dim">{label(incident.severity)}</td>
-                  <td data-label="Started" class="dim" title={stamp(incident.started_at)}>{formatRelativeTime(incident.started_at)}</td>
-                  <td data-label="Duration" class="mono">{duration(incident, data().server_time_ms)}{incident.state === 'open' ? ' ongoing' : ''}</td>
-                  <td data-label="Events" class="mono">{formatCount(incident.event_count)}</td>
-                  <td data-label="Peak buffered" class="mono">{formatCount(incident.max_buffered_events)}</td>
-                </tr>}</For></tbody>
-              </table></div>
+      <Show when={poll.data()?.storage_error}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
+
+      <Rail>
+        <Cell label="Open now" tone={open() > 0 ? 'warn' : 'ok'} value={formatCount(open())}
+          foot={open() > 0 ? 'recovery not yet observed' : 'nothing ongoing'} />
+        <Cell label={`In the last ${RANGES.find((r) => r.key === range())?.label ?? 'range'}`} value={formatCount(all().length)}
+          foot={`${formatCount(warnings())} warning${warnings() === 1 ? '' : 's'}, ${formatCount(all().length - warnings())} informational`} />
+        <Cell label="Longest episode" value={all().length ? formatDuration(longest()) : '—'} foot="start to recovery" />
+        <Cell label="Latest" value={latest() ? formatRelativeTime(latest()!.started_at) : '—'}
+          foot={latest() ? `${latest()!.component} · ${label(latest()!.kind)}` : 'no incidents recorded'} />
+      </Rail>
+
+      <Panel flush>
+        <div class="toolbar">
+          <div class="toolbar-groups">
+            <Chips label="Range" value={range()} onChange={(k) => { setRange(k); setShown(60); }}
+              options={RANGES.map((r) => ({ key: r.key, label: r.label }))} />
+            <Chips label="State" value={state()} onChange={(k) => { setState(k); setShown(60); }}
+              options={[{ key: '', label: 'All', count: all().length },
+                ...STATES.filter((s) => stateCounts()[s]).map((s) => ({ key: s, label: label(s), count: stateCounts()[s], tone: tone(s) }))]} />
+            <Show when={components().length > 1}>
+              <Chips label="Component" value={component()} onChange={(k) => { setComponent(k); setShown(60); }}
+                options={[{ key: '', label: 'All' }, ...components().map(([c, n]) => ({ key: c, label: c, count: n }))]} />
             </Show>
-            <div class="panel-body spread" style={{ 'flex-wrap': 'wrap', gap: '12px' }}>
-              <span class="dim" aria-live="polite">{data().incidents.length ? `${data().offset + 1}-${data().offset + data().incidents.length} of ${formatCount(data().total)}` : '0 shown'}</span>
-              <div class="row"><button class="btn btn-sm" disabled={poll.loading() || offset() === 0} onClick={() => setOffset(Math.max(0, offset() - PAGE_SIZE))}>Previous</button>
-                <button class="btn btn-sm" disabled={poll.loading() || data().offset + data().incidents.length >= data().total} onClick={() => setOffset(offset() + PAGE_SIZE)}>Next</button></div>
+          </div>
+          <div class="row">
+            <input type="search" placeholder="Search kind or summary" value={search()} onInput={(e) => { setSearch(e.currentTarget.value); setShown(60); }} aria-label="Search incidents" />
+            <Show when={filtering()}><button type="button" class="btn btn-sm" onClick={reset}>Clear</button></Show>
+          </div>
+        </div>
+
+        <Show when={poll.data()} fallback={<Show when={!poll.error()}><SkeletonList rows={7} /></Show>}>
+          <Show when={filtered().length} fallback={<Empty>{filtering() ? 'Nothing matches these filters.' : 'No incidents in this range.'}</Empty>}>
+            <div class="feed" aria-busy={poll.loading()}>
+              <For each={groups()}>{(group) => <>
+                <div class="feed-day">{group.day}</div>
+                <For each={group.items}>{(incident) => {
+                  const last = incident.events[incident.events.length - 1];
+                  return <div class="feed-row" role="link" tabIndex={0} onClick={() => navigate(`/incidents/${encodeURIComponent(incident.id)}`)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') navigate(`/incidents/${encodeURIComponent(incident.id)}`); }}>
+                    <div class="feed-time" title={stamp(incident.started_at)}>{clock(incident.started_at)}</div>
+                    <div class="feed-mark" classList={{ [tone(incident.state)]: true, open: incident.state === 'open' }} />
+                    <div>
+                      <div class="feed-title">
+                        <span class="mono">{incident.component}</span>
+                        <span>{label(incident.kind)}</span>
+                        <Pill tone={tone(incident.state)} dot pulse={incident.state === 'open'}>{label(incident.state)}</Pill>
+                        <Show when={incident.severity !== 'info'}><span class="id">{incident.severity}</span></Show>
+                      </div>
+                      <Show when={last?.summary}><div class="feed-summary">{last!.summary}</div></Show>
+                    </div>
+                    <div class="feed-meta">
+                      <span title="duration">{duration(incident, now())}{incident.state === 'open' ? ' ongoing' : ''}</span>
+                      <span title="recorded events">{formatCount(incident.event_count)} event{incident.event_count === 1 ? '' : 's'}</span>
+                      <Show when={incident.max_buffered_events > 0}><span title="peak buffered events">{formatCount(incident.max_buffered_events)} buffered</span></Show>
+                    </div>
+                  </div>;
+                }}</For>
+              </>}</For>
             </div>
-          </Panel>
-        </>}
-      </Show>
+            <div class="panel-body spread" style={{ 'flex-wrap': 'wrap', gap: '12px' }}>
+              <span class="dim" aria-live="polite">{Math.min(shown(), filtered().length)} of {formatCount(filtered().length)} shown
+                <Show when={(poll.data()?.total ?? 0) > all().length}> · {formatCount(poll.data()!.total)} in the range, newest {WINDOW} loaded</Show></span>
+              <Show when={filtered().length > shown()}><button class="btn btn-sm" onClick={() => setShown(shown() + 60)}>Show more</button></Show>
+            </div>
+          </Show>
+        </Show>
+      </Panel>
     </div>
   </>;
 }
@@ -155,7 +234,7 @@ export function IncidentDetail() {
         <button class="btn btn-sm" onClick={poll.refresh} disabled={poll.loading()}>Refresh</button></>} />
     <div class="page-body stack">
       <Show when={poll.error()}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
-      <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><Empty>Loading incident…</Empty></Show>}>
+      <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><Panel flush><SkeletonList rows={4} /></Panel></Show>}>
         {(incident) => <>
           <Rail>
             <Cell label="State" tone={tone(incident().state)} value={label(incident().state)} foot={incident().severity} />

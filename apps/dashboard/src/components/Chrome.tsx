@@ -428,9 +428,9 @@ export function Segments(props: {
   );
 }
 
-/** The overview's own shape while the first poll is in flight. */
-export function SkeletonBento() {
-  const shape: { span: 3 | 4 | 6 | 8 | 12; rows?: 2 }[] = [
+/** A page's own bento shape while its first poll is in flight. */
+export function SkeletonBento(props: { shape?: { span: 3 | 4 | 6 | 8 | 12; rows?: 2 }[] }) {
+  const shape: { span: 3 | 4 | 6 | 8 | 12; rows?: 2 }[] = props.shape ?? [
     { span: 6, rows: 2 },
     { span: 3 },
     { span: 3 },
@@ -456,5 +456,98 @@ export function SkeletonBento() {
         )}
       </For>
     </Bento>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Filters and charts                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One row of toggle chips. A chip filter applies the moment it is clicked:
+ * there is nothing to "apply", and an operator scanning for the open
+ * incidents should not have to fill in a form to find them.
+ */
+export function Chips(props: {
+  label?: string;
+  value: string;
+  options: { key: string; label: string; count?: number; tone?: string }[];
+  onChange: (key: string) => void;
+}) {
+  return (
+    <div class="chips" role="group" aria-label={props.label}>
+      <Show when={props.label}>
+        <span class="chips-label">{props.label}</span>
+      </Show>
+      <For each={props.options}>
+        {(o) => (
+          <button
+            type="button"
+            class="chip"
+            classList={{ on: props.value === o.key, [o.tone ?? '']: !!o.tone }}
+            aria-pressed={props.value === o.key}
+            onClick={() => props.onChange(o.key)}
+          >
+            {o.label}
+            <Show when={o.count != null}>
+              <span class="chip-n">{o.count}</span>
+            </Show>
+          </button>
+        )}
+      </For>
+    </div>
+  );
+}
+
+/**
+ * A horizontal bar of stacked segments against a shared scale, for reading
+ * several queues at a glance. `max` is the scale (the deepest lane), so every
+ * lane on the page is comparable; `cap` draws a tick where a ceiling sits.
+ */
+export function LaneBar(props: {
+  segments: { value: number; tone: string; title?: string }[];
+  max: number;
+  cap?: number;
+}) {
+  const scale = () => Math.max(1, props.max, props.cap ?? 0);
+  const width = (n: number) => `${Math.min(100, (n / scale()) * 100)}%`;
+  return (
+    <div class="lane-bar" role="img">
+      <For each={props.segments.filter((s) => s.value > 0)}>
+        {(s) => (
+          <span
+            class="lane-seg"
+            classList={{ [s.tone]: true }}
+            style={{ width: width(s.value) }}
+            title={s.title}
+          />
+        )}
+      </For>
+      <Show when={props.cap && props.cap > 0}>
+        <span class="lane-cap" style={{ left: width(props.cap!) }} title={`concurrency ${props.cap}`} />
+      </Show>
+    </div>
+  );
+}
+
+/** Placeholder rows while a list's first page is in flight. */
+export function SkeletonList(props: { rows?: number }) {
+  return (
+    <div class="skeleton-list" aria-hidden="true">
+      <For each={Array.from({ length: props.rows ?? 6 })}>
+        {(_, i) => <div class="skeleton-row" style={{ '--i': String(i()) }} />}
+      </For>
+    </div>
+  );
+}
+
+/** "Painted from the last visit" marker while a live poll is in flight. */
+export function Stale(props: { when: boolean }) {
+  return (
+    <Show when={props.when}>
+      <Pill tone="idle" dot pulse>
+        refreshing
+      </Pill>
+    </Show>
   );
 }

@@ -187,10 +187,36 @@ impl Incidents {
         trim(&mut h.rows, event.at);
     }
 
+    /// The overview's incident block: counts plus the last day's episodes, so
+    /// the dashboard can draw a 24 h strip without a second request.
     pub fn summary(&self) -> Value {
         let h = self.history.lock().unwrap();
-        json!({"open": h.rows.iter().filter(|r| r.state == "open").count(), "total": h.rows.len(),
-            "retention_days": 30, "storage_error": h.storage_error})
+        let now = super::ops::now_ms();
+        let day = now.saturating_sub(24 * 60 * 60 * 1000);
+        let recent: Vec<Value> = h
+            .rows
+            .iter()
+            .filter(|r| r.state == "open" || r.ended_at.unwrap_or(r.started_at) >= day)
+            .take(60)
+            .map(|r| json!({
+                "id": r.id, "component": r.component, "kind": r.kind, "severity": r.severity,
+                "state": r.state, "started_at": r.started_at, "ended_at": r.ended_at,
+            }))
+            .collect();
+        let latest = h.rows.front().map(|r| json!({
+            "id": r.id, "component": r.component, "kind": r.kind, "severity": r.severity,
+            "state": r.state, "started_at": r.started_at, "ended_at": r.ended_at,
+        }));
+        json!({
+            "open": h.rows.iter().filter(|r| r.state == "open").count(),
+            "total": h.rows.len(),
+            "last_24h": h.rows.iter().filter(|r| r.started_at >= day).count(),
+            "recent": recent,
+            "latest": latest,
+            "retention_days": 30,
+            "storage_error": h.storage_error,
+            "server_time_ms": now,
+        })
     }
 
     fn observe_line(&self, line: &maintenance::log_ring::LogLine) {

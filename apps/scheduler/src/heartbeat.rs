@@ -382,6 +382,11 @@ async fn run_one_cycle(
     // Poll until every target reports hb_seq >= the seq we just wrote.
     let deadline = started + Duration::from_secs(timeout_secs);
     let mut pending: Vec<(String, String)> = targets;
+    // Short first waits, doubling: the probe measures the pipeline, not the
+    // poll cadence. With the changefeed transport the change lands a few ms
+    // after the write returns, so a fixed 500 ms sleep after the first miss
+    // reported half a second for a ~10 ms pipeline.
+    let mut backoff = Duration::from_millis(5);
     loop {
         let mut still_pending = Vec::new();
         for (id, url) in pending {
@@ -411,7 +416,8 @@ async fn run_one_cycle(
                 detail: format!("SSPs never saw hb_seq {}: {}", hb_seq, missing.join(", ")),
             };
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(250));
     }
 }
 

@@ -32,6 +32,7 @@ export const docsNav = [
       { text: 'Mutations', href: `${basePath}/docs/client/mutations` },
       { text: 'Authentication', href: `${basePath}/docs/client/auth` },
       { text: 'Offline & sync health', href: `${basePath}/docs/client/offline-sync` },
+      { text: 'Query allowlist', href: `${basePath}/docs/guide/query-allowlist` },
       { text: 'Feature flags', href: `${basePath}/docs/client/feature-flags` },
       { text: 'File buckets', href: `${basePath}/docs/client/buckets`, experimental: true },
       { text: 'CRDT fields', href: `${basePath}/docs/client/crdt`, experimental: true },

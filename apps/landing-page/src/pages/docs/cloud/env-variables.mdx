@@ -173,6 +173,15 @@ Sp00ky Cloud provides encrypted environment variable storage that syncs across y
 
 All values are encrypted at rest using the tenant's [Shared Vault](/docs/reference/vault). For details on the encryption model, key hierarchy, and security properties, see the vault documentation.
 
+<Note title="Infrastructure knobs are not vault variables">
+The SSP, scheduler and SurrealDB containers take their environment from the control plane, with
+<code>deployment.env</code> in <code>sp00ky.yml</code> as the per-role override. A few of those are
+derived from <code>sp00ky.yml</code> for you: <code>SPKY_INGEST_TRANSPORT</code> and
+<code>SPKY_CHANGEFEED_RETENTION</code> from <code>sync.transport</code>, and
+<code>SPKY_SSP_QUERY_ALLOWLIST</code> from <code>sync.queryAllowlist</code>. See
+<a href="/docs/cloud/deploying#infrastructure-environment-variables">Deploying</a>.
+</Note>
+
 ## Quick Start
 
 <CodeBlock

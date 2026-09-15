@@ -116,6 +116,10 @@ connect gate, the per-statement timeout and the concurrency limit) and resolves 
 result array. Prefer it over `db.useRemote(s => s.query(...))`, which hands out the bare SDK
 client and can race a reconnect.
 
+All three bypass the query builder, so with the [query allowlist](/docs/guide/query-allowlist)
+switched on (`sync.queryAllowlist: warn` or `enforce`) they throw unless the client config sets
+[`allowRawRemote: true`](/docs/reference/client-config#allowrawremote).
+
 ## Next
 
 <CardGrid>

@@ -149,6 +149,20 @@ Register a new view (live query) with the SSP.
 - `200 OK` - View registered, initial results returned
 - `400 Bad Request` - Invalid view registration payload
 - `401 Unauthorized` - Missing or invalid authentication
+- `403 Forbidden` - The query's shape is not in the query allowlist and
+  `SPKY_SSP_QUERY_ALLOWLIST=enforce`. Body:
+  ```json
+  {
+    "error": "not_allowlisted",
+    "message": "shape of query on `game` is not in the allowlist (42 entries from 2 releases). Regenerate the allowlist (spky generate) and redeploy."
+  }
+  ```
+  Decided on the parsed shape before any database write, so a refused
+  registration leaves no `_00_query` row behind. Under `warn` the same miss is
+  logged (`allowlist miss (warn mode): admitted`, target `ssp::policy`) and the
+  view registers. The scheduler relays this status and body to the client
+  unchanged. Shapes over `_00_app_release` / `_00_user_feature` are always
+  admitted. See the [Query allowlist guide](/docs/guide/query-allowlist).
 - `503 Service Unavailable` - SSP is not in Ready state (`SSP_NOT_READY`)
 
 **What the SSP writes:** the `_00_query` row for the view (`UPSERT`) with
@@ -342,9 +356,28 @@ Get entity information for this SSP (no authentication required).
     "uptime_seconds": 3204,
     "circuit_tables": { "thread": 12, "user": 3 },
     "circuit_hashes": { "thread": "ab12…", "user": "cd34…" },
-    "bootstrap_warnings": []
+    "bootstrap_warnings": [],
+    "query_allowlist": {
+      "mode": "warn",
+      "loaded_at_epoch_ms": 1757923200000,
+      "entries": 42,
+      "sources": [{ "app": "web", "version": "1.4.0", "released_at": "2026-09-15T08:00:00Z", "entries": 42 }],
+      "skipped": [],
+      "counters": { "checked": 118, "allowed_static": 101, "allowed_any": 9, "allowed_builtin": 6, "warned": 2, "refused": 0 },
+      "last_refused": [{ "at_epoch_ms": 1757923400000, "table": "game", "surql": "SELECT id, pgn FROM game WHERE white = $w;", "reason": "shape of query on `game` is not in the allowlist (42 entries from 1 release)" }]
+    }
   }]
   ```
+
+`query_allowlist` reports the [query allowlist](/docs/guide/query-allowlist)
+gate: `mode` (`off`, `warn`, `enforce`), when the `_00_query_allowlist` rows
+were last loaded, how many compiled `entries` that gave, one `sources` row per
+`<app>__<version>` row loaded, `skipped` as `[name, error]` pairs for entries
+whose SurrealQL did not compile, the decision `counters` since start
+(`warned` counts misses admitted under `warn`, `refused` the 403s under
+`enforce`), and the last 20 misses in `last_refused`. The list is reloaded at
+every Ready transition, whenever a `_00_query_allowlist` row changes, and at
+most once per 5 s after a miss.
 
 `bootstrap_warnings` is non-empty when the last bootstrap loaded zero rows
 for a table that upstream SurrealDB has rows in. That is the scheduler's
@@ -647,6 +680,7 @@ SPKY_SSP_MEMORY_LIMIT_MB=1024    # memory ceiling reported for load balancing
 SPKY_SSP_REGISTER_MAX_WAIT_SECS=180 # give up registering and exit (default: 180)
 SPKY_SSP_VIEW_METRICS_FLUSH_MS=2000 # view metrics flush interval (default: 2000)
 SPKY_SSP_ANON_LIVE_QUERIES=false # allow LIVE queries with no auth context
+SPKY_SSP_QUERY_ALLOWLIST=off     # off | warn | enforce: refuse view shapes the app does not ship
 ```
 
 ### Scheduler Integration

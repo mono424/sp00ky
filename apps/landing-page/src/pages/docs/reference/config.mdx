@@ -36,11 +36,11 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `surrealdb` | object | (none) | DB connection. Sub-fields: `namespace`, `database`, `username`, `password`, `hosting` (`cloud` or `external`), `endpoint` (required when `hosting: external`). |
 | `schema` | path | (none) | Directory containing your `.surql` schema sources. See [Schema](/docs/schema). |
 | `buckets` | path[] | `[]` | Bucket definition files referenced from your schema. See [Buckets](/docs/client/buckets). |
-| `clientTypes` | array | `[]` | Codegen targets. Each entry has `format` (`typescript` or `dart`), an `output` path, and (dart only) an optional `workdir`. See [Client types](#client-types). |
+| `clientTypes` | array | `[]` | Codegen targets. Each entry has `format` (`typescript` or `dart`), an `output` path, (dart only) an optional `workdir`, and (typescript only) optional `queries`, `allowlistOutput` and `app` for the [query allowlist](#query-allowlist). See [Client types](#client-types). |
 | `version` | string \| object | latest stable | Pin SSP and scheduler image tags. Accepts a single tag, a `{dev, cloud}` split, or a `path:` override pointing at a local binary. |
 | `logLevel` | string \| object | `info` | Log verbosity for the SSP and scheduler. Accepts `trace`, `debug`, `info`, `warn`, `error`, `off`, target=level directives, or a `{dev, cloud}` split. Under `spky dev` a bare level applies to the sp00ky crates only (third-party crates stay at `warn`); pass a full directive list such as `ssp=debug,hyper=info,warn` to control those too. |
 | `refMode` | `dedicated` \| `single` | `dedicated` | Storage layout for the SSP's `_00_list_ref` table. `dedicated` gives each user their own table and works around a SurrealDB v3 LIVE-permission gap. |
-| `sync` | object | `{ transport: http }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`. See [Sync transport](#sync-transport). |
+| `sync` | object | `{ transport: http, queryAllowlist: off }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`, see [Sync transport](#sync-transport); and whether the SSP refuses query shapes the app does not ship: `queryAllowlist`, see [Query allowlist](#query-allowlist). |
 | `apps` | map | `{}` | Your frontend and backend services. See [Apps](#apps) below. |
 | `schedules` | map \| path | `{}` | Server-side cron/interval jobs. See [Schedules](/docs/jobs/schedules). |
 | `workflows` | map \| path | `{}` | Server-side workflow DAGs. See [Workflows](/docs/jobs/workflows). |
@@ -137,6 +137,18 @@ What a deploy does with it: `spky deploy` / `spky migrate` add `CHANGEFEED <rete
 Set `sync.transport` before the first deploy of a database or plan a short window: the scheduler must run with `SPKY_INGEST_TRANSPORT=changefeed` from the moment the schema stops posting, or nothing arrives. Deploy the schema, then restart the scheduler with the new env. The changefeed tail starts one second before the restart's clone, so the window is replayed rather than lost.
 </Note>
 
+## Query allowlist
+
+`sync.queryAllowlist` decides what the SSP does with a view registration whose **shape** is not one `spky generate` recorded from the app's query module (`clientTypes[].queries`). Off by default.
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `queryAllowlist` | `off` \| `warn` \| `enforce` | `off` | `off`: any parseable query registers. `warn`: the SSP logs `allowlist miss`, counts it, and admits the registration; the discovery mode for switching on. `enforce`: the registration is refused with HTTP 403 `not_allowlisted`. |
+
+<CodeBlock code={ymlAllowlist} lang="yaml" />
+
+What it changes elsewhere: the SSP receives `SPKY_SSP_QUERY_ALLOWLIST` (cloud: merged into the `ssp` role's `deployment.env`; `spky dev`: injected into the container). The generated TypeScript `schema` carries `policy: { queryAllowlist }`, and when it is `warn` or `enforce` the client SDK refuses `useRemote`, `remoteQuery` and `queryRaw` unless [`allowRawRemote`](/docs/reference/client-config#allowrawremote) is set. `spky deploy`, `spky release` and `spky dev` publish the allowlist JSON as `_00_query_allowlist` rows; under `enforce` a missing or stale JSON fails the deploy. Matching rules, sidecar exports and the rollout recipe are in the [Query allowlist guide](/docs/guide/query-allowlist).
+
 ## Retention
 
 Finished jobs and run history are deleted automatically, asymmetrically by outcome: a success is read once if at all, a failure is what you went looking for.
@@ -182,7 +194,10 @@ Either section can also live in its own file, per entry or wholesale, useful onc
 
 `clientTypes` is a list of codegen targets; `spky generate` (run with no args) regenerates every entry from your schema. Each entry has a `format` and an `output` path (relative to `sp00ky.yml`):
 
-- **`typescript`**: the CLI's built-in generator emits a typed schema module (e.g. `schema.gen.ts`).
+- **`typescript`**: the CLI's built-in generator emits a typed schema module (e.g. `schema.gen.ts`). Three optional keys feed the [query allowlist](#query-allowlist):
+  - `queries`: path to the app's query module (relative to `sp00ky.yml`), the file that exports the `q*` builder functions. When set, `spky generate` runs it through `@spooky-sync/query-allowlist` after the schema module is written and records the resulting SurrealQL shapes.
+  - `allowlistOutput`: where the allowlist JSON goes. Defaults to `<queries>.allowlist.json` next to the module. Commit it; deploy reads it and does not regenerate.
+  - `app`: the app name the `_00_query_allowlist` rows are keyed by. Defaults to the frontend app in `apps:`.
 - **`dart`**: runs spooky_core's richer generator (`dart run spooky_core:spooky_gen`), which emits the typed client, `Patch` classes, and `spookySchema`/`surqlSchema`. Because that tool resolves `spooky_core` from the enclosing Dart package, it runs from the package directory, **auto-derived from `output`'s nearest ancestor `pubspec.yaml`**. Set the optional `workdir` only to override that. (This replaces a manual `dart run spooky_core:spooky_gen` / Makefile step.)
 
 A project can list several outputs, e.g. a TypeScript web client plus one or more Dart clients (a Flutter app, a renderer), and keep them all in sync from one command.
@@ -244,6 +259,16 @@ export const ymlApps = `apps:
     image: livekit/livekit-server:latest
     ports: [7880, 7881, "7882/udp"]
     args: ["--dev", "--bind", "0.0.0.0"]`;
+
+export const ymlAllowlist = `sync:
+  queryAllowlist: warn          # off | warn | enforce
+
+clientTypes:
+  - format: typescript
+    output: ./src/schema.gen.ts
+    queries: ./src/lib/query.ts # recorded by spky generate
+    # allowlistOutput: ./src/lib/query.ts.allowlist.json
+    # app: web`;
 
 export const ymlRetention = `retention:
   success: 6h        # job rows that succeeded

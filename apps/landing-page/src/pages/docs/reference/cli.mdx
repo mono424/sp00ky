@@ -17,8 +17,8 @@ somewhere else, and `spky <command> --help` for the flags of any single command.
 | Command | What it does |
 | --- | --- |
 | `spky init` | Scaffold a new project: schema, app, config, first migration. |
-| `spky dev` | Start the local stack: SurrealDB, SSP, scheduler, your apps. [Docs](/docs/dev) |
-| `spky generate` (`gen`) | Generate client types from `sp00ky.yml`, or a single file via `--input`/`--output`. `--format json\|typescript\|dart\|surql`, `--all`, `--append`, `--no-header`, `--mode`, `--endpoint`, `--secret`, `--modules-dir`. [Docs](/docs/schema/generated-types) |
+| `spky dev` | Start the local stack: SurrealDB, SSP, scheduler, your apps. With `sync.queryAllowlist` on, passes the mode to the SSP and publishes the allowlist JSON as version `dev` on every start. [Docs](/docs/dev) |
+| `spky generate` (`gen`) | Generate client types from `sp00ky.yml`, or a single file via `--input`/`--output`. `--format json\|typescript\|dart\|surql`, `--all`, `--append`, `--no-header`, `--mode`, `--endpoint`, `--secret`, `--modules-dir`. For a `typescript` entry with `queries`, also records the [query allowlist](/docs/guide/query-allowlist) by running the query module through `@spooky-sync/query-allowlist` (the app's `node_modules/.bin/spooky-query-allowlist`, else `npx`) and writes `<queries>.allowlist.json`; commit it. [Docs](/docs/schema/generated-types) |
 | `spky migrate` | Database migrations: `create`, `apply`, `prod`, `status`, `fix`. `prod` migrates the cloud deployment without deploying. [Docs](/docs/schema/migrations) |
 | `spky lint` | Validate `sp00ky.yml`. |
 | `spky doctor [--json]` | Project health: config, codegen freshness, migrations, Docker. [Docs](/docs/dev/doctor) |
@@ -57,9 +57,9 @@ somewhere else, and `spky <command> --help` for the flags of any single command.
 | --- | --- |
 | `spky login`, `spky logout` | Authenticate with Sp00ky Cloud. |
 | `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. [Docs](/docs/cloud/getting-started) |
-| `spky deploy` | Build, upload, provision, migrate, deploy. [Docs](/docs/cloud/deploying) |
+| `spky deploy` | Build, upload, provision, migrate, deploy. With `sync.queryAllowlist` on, also publishes the committed allowlist JSON as `_00_query_allowlist:<app>__<version>` (the frontend's `package.json` version) and keeps the previous version's row; under `enforce`, a missing or stale JSON (`sourceHash` no longer matches the query module) fails the deploy, under `warn` it warns. [Docs](/docs/cloud/deploying) |
 | `spky push` | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. |
-| `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. |
+| `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. Also publishes the app's allowlist JSON under the announced version, so a regenerated [query allowlist](/docs/guide/query-allowlist) goes live without a restart. |
 | `spky env` | Encrypted variables and the vault: `set`, `list`, `rm`, `pull`, `import`, `unlock`, `passphrase`, `share-ci`, `reset`. `set --file <path>` reads a multi-line value (a PEM key) from disk, scoped with `--dev` or `--prod`. `reset` takes `request`, `approve <email>`, `complete`, `list`. [Docs](/docs/cloud/env-variables) |
 | `spky domain` | Custom domains: `add`, `list`, `remove`. `add --app <name>` picks which app serves it, `add --status` attaches it to the public uptime page. |
 | `spky backup` | Database backups: `list`, `create`, `restore`, `delete`, `configure`, `reset`. [Docs](/docs/cloud/backups) |

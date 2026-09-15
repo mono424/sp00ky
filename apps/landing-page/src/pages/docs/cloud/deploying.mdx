@@ -158,7 +158,12 @@ One pair is set for you: with `sync.transport: changefeed` in `sp00ky.yml`,
 `spky deploy` merges `SPKY_INGEST_TRANSPORT` and `SPKY_CHANGEFEED_RETENTION`
 into the `scheduler` and `ssp` roles (your own keys win on a clash), so the
 scheduler tails the feed the schema just gained. See
-[Sync transport](/docs/reference/config#sync-transport).
+[Sync transport](/docs/reference/config#sync-transport). Likewise, with
+`sync.queryAllowlist` set to `warn` or `enforce`, `spky deploy` merges
+`SPKY_SSP_QUERY_ALLOWLIST=<mode>` into the `ssp` role and publishes the committed allowlist JSON
+as `_00_query_allowlist` rows keyed by the frontend's `package.json` version; under `enforce` a
+missing or stale JSON fails the deploy. See the
+[Query allowlist guide](/docs/guide/query-allowlist).
 
 `SPKY_SSP_DB_TIMEOUT_SECS` is the knob most worth knowing here: it bounds how
 long a single SSP database call may take before it fails and the connection is

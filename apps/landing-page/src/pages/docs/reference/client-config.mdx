@@ -114,6 +114,17 @@ Defaults to `true`. Bodies are rendered from the local store, so the circuit
 never needs the rest; on rows with large text fields this is the difference
 between a few hundred megabytes of wasm heap and a few megabytes.
 
+#### `allowRawRemote`
+
+Opt back in to the raw remote escape hatches (`db.useRemote`, `db.remoteQuery`,
+`db.queryRaw`) when the generated schema's `policy.queryAllowlist` is `warn` or
+`enforce`. With the [query allowlist](/docs/guide/query-allowlist) on, the SSP
+only registers shapes `spky generate` recorded from the query builder, so a
+hand-written SurrealQL string can never be allowlisted; these methods throw
+(`... is disabled because sync.queryAllowlist is on for this schema`) unless
+this flag is `true`. Defaults to `false`. The gate is client-side only: direct
+SurrealDB reads under table `PERMISSIONS` are unchanged.
+
 ## Diagnostics
 
 The client exposes a small number of read-only getters intended for
@@ -191,6 +202,12 @@ export const code2 = `interface SyncedDbConfig<Schema> {
 
   /** Keep only evaluated fields per row in the in-browser circuit (default: true) */
   circuitProjection?: boolean;
+
+  /**
+   * Allow useRemote / remoteQuery / queryRaw while the generated schema's
+   * policy.queryAllowlist is 'warn' or 'enforce' (default: false)
+   */
+  allowRawRemote?: boolean;
 }`;
 
 export const code1 = `import { SyncedDb, type SyncedDbConfig } from '@spooky-sync/client-solid';

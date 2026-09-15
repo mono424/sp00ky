@@ -182,7 +182,15 @@ Register a new view (live query) with the scheduler. The scheduler will assign i
     "assigned_at": 1707654321
   }
   ```
+- `400 Bad Request` - The SSP rejected the payload (`rejected`); relayed verbatim
+- `403 Forbidden` - The SSP refused the shape under the query allowlist (`not_allowlisted`); relayed verbatim
+- `409 Conflict` - The SSP found the view registered under another identity (`auth_mismatch`); relayed verbatim
 - `503 Service Unavailable` - No SSPs available
+
+The SSP's own verdict is relayed with its status: a 4xx is the client's problem and reaches it as
+such, not folded into a 500 that reads as an outage. The body is the SSP's
+`{"error": "...", "message": "..."}` unchanged. See the SSP's
+[`POST /view/register`](/docs/reference/ssp-api#post-viewregister).
 
 **Example:**
 
@@ -706,6 +714,7 @@ is no env-var override path for them.
 - `400 Bad Request` - Invalid request format or parameters
 - `404 Not Found` - Resource not found (e.g., unregistered SSP)
 - `409 Conflict` - State conflict (e.g., buffer overflow)
+- `403 Forbidden` - Relayed from the SSP on `/view/register`: the query shape is not allowlisted (`not_allowlisted`)
 - `500 Internal Server Error` - Server error
 - `503 Service Unavailable` - No SSPs available
 

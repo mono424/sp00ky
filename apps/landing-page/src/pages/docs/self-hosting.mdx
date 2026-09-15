@@ -220,6 +220,7 @@ All `SPKY_*` vars below are read directly from the process environment.
 | `SPKY_SSP_BOOTSTRAP_PAGE_SIZE` | Rows pulled per `/proxy/query` page | `500` |
 | `SPKY_SSP_REGISTER_MAX_WAIT_SECS` | How long to keep retrying scheduler registration before exiting for a restart | `180` |
 | `SPKY_SSP_ANON_LIVE_QUERIES` | Allow live queries from unauthenticated clients (`1`/`true` to enable) | `false` |
+| `SPKY_SSP_QUERY_ALLOWLIST` | `off`, `warn` or `enforce`. Compare every `/view/register` shape against the `_00_query_allowlist` rows the CLI publishes; `warn` logs and admits a miss, `enforce` refuses it with 403 `not_allowlisted`. Mirrors `sync.queryAllowlist` in `sp00ky.yml`. See the [Query allowlist guide](/docs/guide/query-allowlist). | `off` |
 | `SPKY_SSP_VIEW_METRICS_FLUSH_MS` | How often view metrics are flushed to the database | `2000` |
 | `SPKY_SSP_MEMORY_LIMIT_MB` | Memory ceiling this SSP reports itself against. The heartbeat sends usage as a fraction of it, which is what the scheduler's `LeastLoad` strategy ranks on, so an unset or wrong value skews balancing. | `1024` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector endpoint for SSP metrics | *(unset)* |

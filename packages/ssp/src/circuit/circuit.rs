@@ -175,6 +175,8 @@ pub struct Circuit {
     /// matches nothing, because `resolve_field` returns `None` for the absent key
     /// and the comparison silently evaluates false.
     opaque_fields: HashMap<String, std::collections::BTreeSet<String>>,
+    /// Per-table root column names from `INFO FOR TABLE` (query allowlist).
+    columns: HashMap<String, std::collections::BTreeSet<String>>,
     /// Whether base collections keep only the fields registered plans
     /// evaluate (see `Collection::retained`). Off on the server, where the
     /// whole body is the product; on for a browser circuit, which renders from
@@ -405,6 +407,7 @@ impl Circuit {
             permissions: HashMap::new(),
             link_targets: HashMap::new(),
             opaque_fields: HashMap::new(),
+            columns: HashMap::new(),
             projection: false,
             missing_fields: BTreeMap::new(),
         }
@@ -456,6 +459,22 @@ impl Circuit {
         fields: std::collections::BTreeSet<String>,
     ) {
         self.opaque_fields.insert(table.into(), fields);
+    }
+
+    /// Read-only access to the per-table root column set (for admitting a
+    /// caller-supplied WHERE under the query allowlist).
+    pub fn columns(&self) -> &HashMap<String, std::collections::BTreeSet<String>> {
+        &self.columns
+    }
+
+    /// Register the root column names of `table` from `INFO FOR TABLE`.
+    /// Replaces any previous set.
+    pub fn set_columns(
+        &mut self,
+        table: impl Into<String>,
+        columns: std::collections::BTreeSet<String>,
+    ) {
+        self.columns.insert(table.into(), columns);
     }
 
     /// Bulk-load initial data into base collections.
@@ -1509,6 +1528,7 @@ impl Circuit {
             // `permissions` (none of the three is part of the serialized snapshot).
             link_targets: HashMap::new(),
             opaque_fields: HashMap::new(),
+            columns: HashMap::new(),
             projection: false,
             missing_fields: BTreeMap::new(),
         };

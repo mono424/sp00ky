@@ -25,6 +25,10 @@ pub mod view {
         /// the plan alone is not sufficient (plans reference params, they never
         /// bake them, so two different users produce identical plans).
         pub merge_key: String,
+        /// The client's query shape BEFORE permission injection, for the
+        /// allowlist. Post-injection the plan carries the tenant's
+        /// PERMISSIONS filters, which are not part of what the app asked for.
+        pub shape: crate::allowlist::Shape,
     }
 
     /// Prepares a view registration request using DBSP types.
@@ -100,6 +104,8 @@ pub mod view {
         let mut root_op: OperatorPlan = serde_json::from_value(root_op_val)
             .map_err(|e| anyhow!("Invalid Operator JSON: {}", e))?;
 
+        let shape = crate::allowlist::Shape::of(&root_op);
+
         let safe_params = sanitizer::parse_params(params.clone());
         let safe_params_val = safe_params.clone().unwrap_or(json!({}));
 
@@ -168,6 +174,7 @@ pub mod view {
             format,
             parse_ms,
             merge_key,
+            shape,
         })
     }
 

@@ -49,6 +49,7 @@ pub fn bootstrap_page_query(
 struct TableFieldMeta {
     link_targets: Vec<(String, String)>,
     opaque: BTreeSet<String>,
+    columns: BTreeSet<String>,
 }
 
 /// Read `INFO FOR TABLE <table>` and split it into link targets + opaque fields.
@@ -58,6 +59,7 @@ struct TableFieldMeta {
 async fn table_field_meta(db: &dyn Db, table: &str) -> anyhow::Result<TableFieldMeta> {
     let info = q1(db, &format!("INFO FOR TABLE {}", table)).await?;
     let opaque = ssp_protocol::opaque_fields_from_info(&info);
+    let columns = ssp_protocol::columns_from_info(&info);
     let link_targets = info
         .get("fields")
         .and_then(|f| f.as_object())
@@ -75,6 +77,7 @@ async fn table_field_meta(db: &dyn Db, table: &str) -> anyhow::Result<TableField
     Ok(TableFieldMeta {
         link_targets,
         opaque,
+        columns,
     })
 }
 
@@ -209,6 +212,7 @@ pub async fn rebuild_from_db(
     // 1c. Record-link map (field -> target table) and the per-table opaque-field
     //     OMIT set, both from INFO FOR TABLE.
     let mut opaque_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut columns_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     {
         let mut resolved: Vec<(String, String, String)> = Vec::new();
         for table in &tables {
@@ -223,6 +227,7 @@ pub async fn rebuild_from_db(
                 info!(table = %table, fields = ?meta.opaque, "Omitting opaque fields from bootstrap scan");
                 opaque_by_table.insert(table.clone(), meta.opaque);
             }
+            columns_by_table.insert(table.clone(), meta.columns);
             for (field_name, target) in meta.link_targets {
                 resolved.push((table.clone(), field_name, target));
             }
@@ -237,6 +242,9 @@ pub async fn rebuild_from_db(
             // silently matching nothing.
             for (table, fields) in &opaque_by_table {
                 circuit.set_opaque_fields(table.clone(), fields.clone());
+            }
+            for (table, cols) in &columns_by_table {
+                circuit.set_columns(table.clone(), cols.clone());
             }
         }
     }

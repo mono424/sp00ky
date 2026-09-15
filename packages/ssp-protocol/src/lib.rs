@@ -118,6 +118,27 @@ pub fn opaque_fields_from_info(info_for_table: &serde_json::Value) -> BTreeSet<S
         .collect()
 }
 
+/// Root column names of a table from its `INFO FOR TABLE` output: the head
+/// segment of every declared field (`meta.secret` → `meta`, `tags[*]` →
+/// `tags`), minus the `_00_*` bookkeeping fields. This is what a builder
+/// `where` may reference when the query allowlist admits a caller-supplied
+/// predicate (`ssp::allowlist::validate_builder_where`).
+pub fn columns_from_info(info_for_table: &serde_json::Value) -> BTreeSet<String> {
+    let Some(fields) = info_for_table.get("fields").and_then(|f| f.as_object()) else {
+        return BTreeSet::new();
+    };
+    fields
+        .keys()
+        .map(|name| {
+            name.split(|c| c == '.' || c == '[')
+                .next()
+                .unwrap_or(name)
+                .to_string()
+        })
+        .filter(|root| !root.is_empty() && !root.starts_with("_00_"))
+        .collect()
+}
+
 /// Render an `OMIT` clause for a `SELECT` over `fields`, e.g. `" OMIT a, b"`.
 /// Empty when there is nothing to omit, so callers can splice it into a query
 /// string unconditionally. Shared so every producer (scheduler replica, SSP

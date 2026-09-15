@@ -147,6 +147,7 @@ struct HarnessOpts {
     ref_mode: ssp_protocol::RefMode,
     /// Share one operator graph across registrations computing the same thing.
     merge_views: bool,
+    query_allowlist: ssp::allowlist::Mode,
     circuit_store: Option<Arc<dyn ssp_node::CircuitStore>>,
     /// Wire the declarative-schedule engine (as a standalone VM node does).
     schedules: bool,
@@ -160,6 +161,7 @@ impl Default for HarnessOpts {
             backend_counts: None,
             ref_mode: ssp_protocol::RefMode::Single,
             merge_views: false,
+            query_allowlist: ssp::allowlist::Mode::Off,
             circuit_store: None,
             schedules: false,
         }
@@ -276,6 +278,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
         edge_update_tx: ssp_node::edges::EdgePublisher::default(),
         anonymous_live_queries: false,
+        query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(opts.query_allowlist)),
         standalone: true,
         schedule_engine: opts.schedules.then(|| {
             ssp_node::schedules::build_engine(
@@ -2085,4 +2088,281 @@ async fn publication_saturation_rejects_ingest_before_circuit_and_job_side_effec
     drop(held);
     assert_eq!(h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap().status, 200);
     assert!(h.job_rx.lock().await.try_recv().is_ok(), "scheduler replay can retry after capacity returns");
+}
+
+// --- Query allowlist ---------------------------------------------------------
+//
+// The gate sits in `register_view_handler` right after the id is canonicalised
+// and before any `_00_query` write. The allowlist itself lives in
+// `_00_query_allowlist` rows; the harness never runs the Ready transition
+// (`republish_restored_views`), so these tests load it the way a deploy does:
+// the table's ingest notification.
+
+const ALLOWLIST_ROW: &str = "_00_query_allowlist:web__1_0_0";
+
+/// Enforce/warn/off harness with a permissioned table `t` (columns `id`,
+/// `owner`, `name`) and the synced meta table `_00_app_release`, both on the
+/// raw DB (schema as the CLI writes it) and on the circuit (what the gate and
+/// the permission injector read).
+async fn allowlist_harness(mode: ssp::allowlist::Mode) -> Harness {
+    let h = build(HarnessOpts { query_allowlist: mode, ..Default::default() }).await;
+    h.raw_db
+        .query(
+            "DEFINE TABLE t SCHEMAFULL PERMISSIONS FOR select WHERE owner = $auth.id FOR create, update, delete NONE; \
+             DEFINE FIELD owner ON t TYPE string; \
+             DEFINE FIELD name ON t TYPE string; \
+             DEFINE TABLE _00_app_release SCHEMAFULL PERMISSIONS FOR select WHERE true FOR create, update, delete NONE; \
+             DEFINE FIELD app ON TABLE _00_app_release TYPE string; \
+             DEFINE FIELD version ON TABLE _00_app_release TYPE string; \
+             DEFINE FIELD released_at ON TABLE _00_app_release TYPE datetime DEFAULT time::now();",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    {
+        let mut c = h.node.processor.write().await;
+        c.set_permission("t", "owner = $auth.id");
+        c.set_columns("t", ["id", "owner", "name"].into_iter().map(String::from).collect());
+        c.set_permission("_00_app_release", "true");
+    }
+    h
+}
+
+async fn seed_allowlist(h: &Harness, entries: Value) {
+    h.raw_db
+        .query(format!(
+            "CREATE {ALLOWLIST_ROW} SET app = 'web', version = '1.0.0', entries = $entries, released_at = time::now()"
+        ))
+        .bind(("entries", entries))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+}
+
+/// What the `_00_query_allowlist` DEFINE EVENT posts after a CLI write.
+async fn notify_allowlist(h: &Harness) {
+    let body = json!({ "table": "_00_query_allowlist", "op": "CREATE", "id": ALLOWLIST_ROW, "record": {} });
+    let r = h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap();
+    assert_eq!(r.status, 200, "allowlist ingest: {:?}", json_of(&r));
+}
+
+async fn register_surql(h: &Harness, id: &str, surql: &str) -> ApiResponse {
+    let payload = json!({
+        "id": id,
+        "surql": surql,
+        "clientId": "c1",
+        "ttl": "30m",
+        "lastActiveAt": "2024-01-01T00:00:00Z",
+        "params": {
+            "auth": { "id": "user:alice" },
+            "owner": "user:alice", "o": "user:alice",
+            "x": "t:0", "s": "hunter2"
+        }
+    });
+    h.node.route(authed(Method::Post, "/view/register", payload)).await.unwrap()
+}
+
+async fn allowlist_info(h: &Harness) -> Value {
+    let r = h.node.route(req(Method::Get, "/info", None, Value::Null)).await.unwrap();
+    json_of(&r)[0]["query_allowlist"].clone()
+}
+
+/// Rows in `_00_query`. The table is created by the first successful
+/// registration, so "does not exist" is the strongest form of "no row".
+async fn query_row_count(h: &Harness) -> usize {
+    let rows: Result<Vec<Value>, _> = h.raw_db.query("SELECT id FROM _00_query").await.unwrap().take(0);
+    match rows {
+        Ok(rows) => rows.len(),
+        Err(e) if e.to_string().contains("does not exist") => 0,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[tokio::test]
+async fn allowlist_enforce_admits_a_shipped_shape_after_the_ingest_notification() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Enforce).await;
+    seed_allowlist(
+        &h,
+        json!([{ "name": "qT", "surql": "SELECT * FROM t WHERE owner = $o LIMIT 1", "whereMode": "static" }]),
+    )
+    .await;
+    notify_allowlist(&h).await;
+
+    let info = allowlist_info(&h).await;
+    assert_eq!(info["mode"], "enforce");
+    assert_eq!(info["entries"], 1, "loaded by the ingest notification: {info}");
+    assert!(info["loaded_at_epoch_ms"].as_u64().unwrap() > 0);
+    assert_eq!(info["sources"][0]["app"], "web");
+    assert_eq!(info["sources"][0]["version"], "1.0.0");
+    assert_eq!(info["skipped"].as_array().unwrap().len(), 0);
+
+    // Same shape, different param name and LIMIT: that is what a live client sends.
+    let r = register_surql(&h, "v1", "SELECT * FROM t WHERE owner = $owner LIMIT 50").await;
+    assert_eq!(r.status, 200, "allowlisted shape: {:?}", json_of(&r));
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
+
+    let c = &allowlist_info(&h).await["counters"];
+    assert_eq!(c["checked"], 1);
+    assert_eq!(c["allowed_static"], 1);
+    assert_eq!(c["refused"], 0);
+    assert_eq!(c["warned"], 0);
+}
+
+#[tokio::test]
+async fn allowlist_enforce_refuses_an_unknown_shape_before_any_db_write() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Enforce).await;
+    seed_allowlist(
+        &h,
+        json!([{ "name": "qT", "surql": "SELECT * FROM t WHERE owner = $o LIMIT 1", "whereMode": "static" }]),
+    )
+    .await;
+    notify_allowlist(&h).await;
+
+    // Projects a column the app never asks for.
+    let surql = "SELECT id, name FROM t WHERE owner = $owner LIMIT 50";
+    let r = register_surql(&h, "v1", surql).await;
+    assert_eq!(r.status, 403, "unknown shape: {:?}", json_of(&r));
+    assert_eq!(json_of(&r)["code"], "not_allowlisted");
+    assert!(
+        json_of(&r)["message"].as_str().unwrap().contains("not in the allowlist"),
+        "reason names the miss: {:?}",
+        json_of(&r)
+    );
+
+    // Refused before the circuit or the DB was touched.
+    assert_eq!(h.node.processor.read().await.view_count(), 0);
+    assert_eq!(query_row_count(&h).await, 0, "no _00_query row for a refused registration");
+    assert!(!h.node.view_metrics.read().await.contains_key("v1"));
+
+    let info = allowlist_info(&h).await;
+    assert_eq!(info["counters"]["checked"], 1);
+    assert_eq!(info["counters"]["refused"], 1);
+    assert_eq!(info["counters"]["warned"], 0);
+    let samples = info["last_refused"].as_array().unwrap();
+    assert_eq!(samples.len(), 1, "{info}");
+    assert_eq!(samples[0]["surql"], surql);
+    assert_eq!(samples[0]["table"], "t");
+    assert!(samples[0]["reason"].as_str().unwrap().contains("not in the allowlist"));
+}
+
+#[tokio::test]
+async fn allowlist_warn_admits_an_unknown_shape_and_counts_it() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Warn).await;
+    // Empty allowlist: every app shape is a miss.
+    let r = register_surql(&h, "v1", "SELECT id, name FROM t WHERE owner = $owner LIMIT 50").await;
+    assert_eq!(r.status, 200, "warn mode admits: {:?}", json_of(&r));
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
+    assert_eq!(query_row_count(&h).await, 1);
+
+    let info = allowlist_info(&h).await;
+    assert_eq!(info["mode"], "warn");
+    assert_eq!(info["counters"]["checked"], 1);
+    assert_eq!(info["counters"]["warned"], 1);
+    assert_eq!(info["counters"]["refused"], 0);
+    assert_eq!(info["last_refused"].as_array().unwrap().len(), 1, "the miss is sampled for discovery");
+}
+
+#[tokio::test]
+async fn allowlist_off_never_consults_the_gate() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Off).await;
+    let r = register_surql(&h, "v1", "SELECT id, name FROM t WHERE owner = $owner LIMIT 50").await;
+    assert_eq!(r.status, 200);
+
+    let info = allowlist_info(&h).await;
+    assert_eq!(info["mode"], "off");
+    assert_eq!(info["counters"]["checked"], 0);
+    assert_eq!(info["loaded_at_epoch_ms"], 0, "off never loads");
+    assert_eq!(info["last_refused"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn allowlist_any_entry_admits_builder_grammar_over_known_columns_only() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Enforce).await;
+    seed_allowlist(
+        &h,
+        json!([{ "name": "qTWindow", "surql": "SELECT id, owner FROM t ORDER BY id ASC LIMIT 1", "whereMode": "any" }]),
+    )
+    .await;
+    notify_allowlist(&h).await;
+
+    // Caller-supplied WHERE over real columns, paged: admitted as `any`.
+    let r = register_surql(
+        &h,
+        "v1",
+        "SELECT id, owner FROM t WHERE owner = $o AND id > $x ORDER BY id ASC LIMIT 20 START 20",
+    )
+    .await;
+    assert_eq!(r.status, 200, "builder where: {:?}", json_of(&r));
+
+    // Same skeleton, but probing a column the table does not have.
+    let r = register_surql(
+        &h,
+        "v2",
+        "SELECT id, owner FROM t WHERE secret = $s ORDER BY id ASC LIMIT 20",
+    )
+    .await;
+    assert_eq!(r.status, 403, "unknown column: {:?}", json_of(&r));
+    assert_eq!(json_of(&r)["code"], "not_allowlisted");
+    let reason = json_of(&r)["message"].as_str().unwrap();
+    assert!(reason.contains("not a column"), "{reason}");
+    assert!(reason.contains("qTWindow"), "names the matched entry: {reason}");
+
+    let c = &allowlist_info(&h).await["counters"];
+    assert_eq!(c["checked"], 2);
+    assert_eq!(c["allowed_any"], 1);
+    assert_eq!(c["refused"], 1);
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
+}
+
+#[tokio::test]
+async fn allowlist_builtin_meta_table_is_admitted_with_an_empty_allowlist() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Enforce).await;
+    // Nothing seeded: the sync core's own registration must still pass.
+    let r = register_surql(&h, "rel", "SELECT * FROM _00_app_release").await;
+    assert_eq!(r.status, 200, "builtin: {:?}", json_of(&r));
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
+
+    let info = allowlist_info(&h).await;
+    assert_eq!(info["entries"], 0);
+    assert_eq!(info["counters"]["checked"], 1);
+    assert_eq!(info["counters"]["allowed_builtin"], 1);
+    assert_eq!(info["counters"]["refused"], 0);
+}
+
+#[tokio::test]
+async fn allowlist_ingest_notification_reloads_immediately() {
+    let h = allowlist_harness(ssp::allowlist::Mode::Enforce).await;
+    let surql = "SELECT * FROM t WHERE owner = $owner LIMIT 50";
+
+    // Empty allowlist: refused. This miss also performs the one self-reload
+    // (the table is still empty) and stamps `loaded_at`, so the throttle now
+    // blocks another self-reload for 5 s.
+    let r = register_surql(&h, "v1", surql).await;
+    assert_eq!(r.status, 403, "{:?}", json_of(&r));
+    let before = allowlist_info(&h).await;
+    assert_eq!(before["entries"], 0);
+    assert!(before["loaded_at_epoch_ms"].as_u64().unwrap() > 0, "first miss self-reloaded: {before}");
+
+    // The CLI writes the release row; its DEFINE EVENT posts the notification.
+    seed_allowlist(
+        &h,
+        json!([{ "name": "qT", "surql": "SELECT * FROM t WHERE owner = $o LIMIT 1", "whereMode": "static" }]),
+    )
+    .await;
+    // Still refused until the SSP hears about it (inside the throttle window).
+    let r = register_surql(&h, "v1", surql).await;
+    assert_eq!(r.status, 403, "throttled miss stays refused: {:?}", json_of(&r));
+    notify_allowlist(&h).await;
+
+    let after = allowlist_info(&h).await;
+    assert_eq!(after["entries"], 1, "notification reloaded without waiting: {after}");
+    let r = register_surql(&h, "v1", surql).await;
+    assert_eq!(r.status, 200, "same registration after the reload: {:?}", json_of(&r));
+
+    let c = &after["counters"];
+    assert_eq!(c["refused"], 2);
+    assert_eq!(allowlist_info(&h).await["counters"]["allowed_static"], 1);
+    assert_eq!(query_row_count(&h).await, 1);
 }

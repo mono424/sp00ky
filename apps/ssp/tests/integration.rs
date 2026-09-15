@@ -192,6 +192,7 @@ impl TestHarness {
                     view_metrics: Arc::clone(&view_metrics),
                     edge_update_tx: edge_update_tx.clone(),
                     anonymous_live_queries: false,
+                    query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(ssp::allowlist::Mode::Off)),
                     standalone: true,
                     // These tests drive the HTTP surface, not the schedule sweep.
                     schedule_engine: None,

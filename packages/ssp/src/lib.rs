@@ -4,6 +4,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod allowlist;
 pub mod converter;
 pub mod merge_key;
 pub mod permission_inject;

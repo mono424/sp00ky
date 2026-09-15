@@ -78,6 +78,8 @@ pub struct SspNode {
     /// When true, anonymous (empty auth) registrations route to the shared
     /// world-readable `_00_list_ref_anon` table.
     pub anonymous_live_queries: bool,
+    /// Query allowlist state + gate (`NodeConfig.query_allowlist`).
+    pub query_allowlist: Arc<crate::allowlist_state::QueryAllowlist>,
     /// `true` when no scheduler fronts this SSP (standalone mode): this node
     /// handles all jobs and owns the recovery sweep.
     pub standalone: bool,
@@ -288,7 +290,22 @@ impl SspNode {
     /// Restored graphs can differ from persisted edges after missed writes.
     /// Replace each graph's memberships, including subscribers and empty views,
     /// before accepting registrations. Never assume surviving edges are current.
+    /// (Re)load the query allowlist from `_00_query_allowlist` against the
+    /// circuit's current link map. Runs on every Ready transition (entries are
+    /// compiled with the link map, so a schema change must recompile them)
+    /// and on the table's ingest notification.
+    pub async fn refresh_query_allowlist(&self) {
+        if !self.query_allowlist.enabled() {
+            return;
+        }
+        let links = self.processor.read().await.link_targets().clone();
+        self.query_allowlist
+            .reload(self.platform.db.as_ref(), &links)
+            .await;
+    }
+
     pub async fn republish_restored_views(&self) -> anyhow::Result<()> {
+        self.refresh_query_allowlist().await;
         let ids = self.processor.read().await.view_ids();
         for id in ids {
             let deltas = self.processor.read().await.snapshot_deltas_for_view(&id);
@@ -673,6 +690,7 @@ impl SspNode {
 
         let uptime_seconds = crate::now_epoch_ms().saturating_sub(self.start_epoch_ms) / 1000;
         let bootstrap_warnings = self.bootstrap_warnings.read().await.clone();
+        let query_allowlist = self.query_allowlist.info().await;
 
         json!([
             {
@@ -691,6 +709,7 @@ impl SspNode {
                 "ref_mode": ref_mode_str,
                 "env": env_vars,
                 "bootstrap_warnings": bootstrap_warnings,
+                "query_allowlist": query_allowlist,
             }
         ])
     }
@@ -1184,6 +1203,33 @@ impl SspNode {
         let mut data = data;
         data.plan.id = ssp::canonical_query_id(&data.plan.id);
 
+        // Query allowlist: refuse (or log) a shape the app does not ship.
+        // Decided on the pre-injection shape, before any DB write, so a
+        // refused registration leaves no `_00_query` row behind.
+        if self.query_allowlist.enabled() {
+            let surql = data.metadata.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let (columns, links) = {
+                let circuit = self.processor.read().await;
+                (circuit.columns().clone(), circuit.link_targets().clone())
+            };
+            let decision = self
+                .query_allowlist
+                .decide_with_refresh(&data.shape, &columns, &surql, self.platform.db.as_ref(), &links)
+                .await;
+            if let ssp::allowlist::Decision::Refused { reason } = decision {
+                let table = data.shape.root_table().unwrap_or_default();
+                if self.query_allowlist.mode == ssp::allowlist::Mode::Enforce {
+                    warn!(target: "ssp::policy", table = %table, surql = %surql, reason = %reason, "Refusing non-allowlisted view registration");
+                    return Some(err_json(
+                        403,
+                        "not_allowlisted",
+                        format!("{reason}. Regenerate the allowlist (spky generate) and redeploy."),
+                    ));
+                }
+                warn!(target: "ssp::policy", table = %table, surql = %surql, reason = %reason, "allowlist miss (warn mode): admitted");
+            }
+        }
+
         // Auth identity for per-user routing (anon remap when enabled).
         let auth_id = {
             let raw = data.metadata.get("authId").and_then(|v| v.as_str()).unwrap_or("");
@@ -1489,6 +1535,16 @@ impl SspNode {
             warn!(op = %payload.op, "Invalid operation type");
             return Some(ApiResponse::json(400, Value::Null));
         };
+
+        // `_00_query_allowlist` never enters the circuit: its only effect on
+        // this node is "reload the allowlist". Intercepted before the circuit
+        // step so the table never gets a collection (same idea as the
+        // scheduler skipping replica apply for excluded meta tables).
+        if payload.table == "_00_query_allowlist" {
+            drop(permit);
+            self.refresh_query_allowlist().await;
+            return Some(ok_json(json!({ "status": "ok" })));
+        }
 
         let start = crate::now_epoch_ms();
         // Borrowed: `payload.record` is read again further down (job routing,

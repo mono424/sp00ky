@@ -195,6 +195,15 @@ pub fn load_config() -> Config {
             .as_deref()
             .and_then(ssp_protocol::RefMode::parse_str)
             .unwrap_or_default(),
+        query_allowlist: std::env::var("SPKY_SSP_QUERY_ALLOWLIST")
+            .ok()
+            .map(|v| {
+                v.parse::<ssp::allowlist::Mode>().unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "SPKY_SSP_QUERY_ALLOWLIST ignored");
+                    ssp::allowlist::Mode::Off
+                })
+            })
+            .unwrap_or_default(),
         anonymous_live_queries: std::env::var("SPKY_SSP_ANON_LIVE_QUERIES")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
@@ -1002,6 +1011,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         view_metrics: view_metrics.clone(),
         edge_update_tx: edge_update_tx.clone(),
         anonymous_live_queries: config.anonymous_live_queries,
+        query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(config.query_allowlist)),
         standalone: config.scheduler_url.is_none(),
         schedule_engine,
         ttl_cleanup_interval_secs: config.ttl_cleanup_interval_secs,
@@ -1995,6 +2005,7 @@ async fn self_bootstrap_with_metadata(
     // loading them here would put the circuit permanently out of step with the
     // ingest payload's key set.
     let mut opaque_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut columns_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     {
         let mut resolved: Vec<(String, String, String)> = Vec::new();
         for table in &tables {
@@ -2014,6 +2025,7 @@ async fn self_bootstrap_with_metadata(
                 );
                 opaque_by_table.insert(table.clone(), opaque);
             }
+            columns_by_table.insert(table.clone(), ssp_protocol::columns_from_info(&info));
             let Some(fields) = info.get("fields").and_then(|f| f.as_object()) else {
                 continue;
             };
@@ -2038,6 +2050,9 @@ async fn self_bootstrap_with_metadata(
             // silently matching nothing.
             for (table, fields) in &opaque_by_table {
                 circuit.set_opaque_fields(table.clone(), fields.clone());
+            }
+            for (table, cols) in &columns_by_table {
+                circuit.set_columns(table.clone(), cols.clone());
             }
         }
     }

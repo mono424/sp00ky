@@ -213,6 +213,7 @@ struct NodeConfigCf {
     job_config: String, // SPKY_JOB_CONFIG JSON (outbox backend routing)
     ref_mode: ssp_protocol::RefMode,
     anonymous_live_queries: bool,
+    query_allowlist: ssp::allowlist::Mode,
 }
 
 fn read_config(env: &Env) -> Result<NodeConfigCf> {
@@ -247,6 +248,7 @@ fn read_config(env: &Env) -> Result<NodeConfigCf> {
             var("SPKY_ANON_LIVE_QUERIES").trim().to_ascii_lowercase().as_str(),
             "1" | "true"
         ),
+        query_allowlist: var("SPKY_QUERY_ALLOWLIST").parse().unwrap_or_default(),
     })
 }
 
@@ -339,6 +341,7 @@ impl SspNodeDo {
             job_config: String::new(),
             ref_mode: ssp_protocol::RefMode::Dedicated,
             anonymous_live_queries: false,
+            query_allowlist: ssp::allowlist::Mode::Off,
         });
 
         let http: Arc<dyn HttpClient> = Arc::new(CfHttp);
@@ -425,6 +428,7 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
         edge_update_tx,
         anonymous_live_queries: cfg.anonymous_live_queries,
+        query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(cfg.query_allowlist)),
         standalone: true,
         // No schedule engine on Workers: this shell drops `_job_rx`, so there is
         // no runner to execute anything a fired schedule would spawn. Scheduling

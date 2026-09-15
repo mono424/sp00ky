@@ -38,6 +38,11 @@ pub struct NodeConfig {
     /// version that delivers cross-session LIVE notifications correctly
     /// through permission rules.
     pub ref_mode: ssp_protocol::RefMode,
+    /// Query allowlist enforcement (`ssp::allowlist::Mode`): `off` never
+    /// consults it, `warn` logs + counts a miss and admits it, `enforce`
+    /// refuses a miss with 403 `not_allowlisted`. Env:
+    /// `SPKY_SSP_QUERY_ALLOWLIST`, default `off`.
+    pub query_allowlist: ssp::allowlist::Mode,
     /// Enable realtime sync for unauthenticated (anonymous) clients. When
     /// `true`, anonymous query registrations (empty `auth_id`) are routed to a
     /// dedicated `_00_list_ref_anon` table that anyone can SELECT, so a

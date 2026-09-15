@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::router::SspPool;
 use crate::transport::HttpTransport;
@@ -184,13 +184,36 @@ async fn register_query(
     // Assign query to SSP in tracker
     state.query_tracker.assign(query_id.clone(), ssp_id.clone()).await;
 
-    // Send registration to SSP via HTTP POST /view/register
-    if let Err(e) = state
+    // Send registration to SSP via HTTP POST /view/register. The SSP's own
+    // verdict is relayed with its status: a 4xx (400 `rejected`, 403
+    // `not_allowlisted`, 409 `auth_mismatch`) is the client's problem and
+    // must reach it as such, not folded into a 500 that reads as an outage.
+    let outcome = state
         .transport
-        .post_to_ssp(&ssp_url, "/view/register", &request)
-        .await
-    {
-        error!("Failed to send query registration to SSP: {}", e);
+        .post_to_ssp_status(&ssp_url, "/view/register", &request)
+        .await;
+    let failure = match outcome {
+        Ok((status, _)) if status.is_success() => None,
+        Ok((status, body)) if status.is_client_error() => {
+            warn!(query = %query_id, %status, body = %body, "SSP refused query registration");
+            Some((status, body))
+        }
+        Ok((status, body)) => {
+            error!("SSP returned {} for query registration: {}", status, body);
+            Some((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to send to SSP: SSP returned {status}: {body}"),
+            ))
+        }
+        Err(e) => {
+            error!("Failed to send query registration to SSP: {}", e);
+            Some((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to send to SSP: {}", e),
+            ))
+        }
+    };
+    if let Some(err) = failure {
         // Remove from tracker on failure
         state.query_tracker.unassign(&query_id).await;
         // Decrement query count on failure
@@ -198,10 +221,7 @@ async fn register_query(
             let mut pool = state.ssp_pool.write().await;
             pool.decrement_query_count(&ssp_id);
         }
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to send to SSP: {}", e),
-        ));
+        return Err(err);
     }
 
     let assignment = QueryAssignment {

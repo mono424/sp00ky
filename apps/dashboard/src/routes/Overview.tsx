@@ -35,6 +35,7 @@ import type {
   JobTotals,
   Overview as OverviewData,
   PresenceSample,
+  IncidentSummary,
 } from '../api/types';
 
 /**
@@ -91,6 +92,8 @@ function PresenceTile(props: {
 export function Overview(props: {
   data: OverviewData | undefined;
   error?: string;
+  /** Painted from the stash; a live poll has not replaced it yet. */
+  stale?: boolean;
   /** Re-poll the overview now, e.g. right after an action. */
   refresh: () => void;
 }) {
@@ -198,9 +201,14 @@ export function Overview(props: {
         title="Overview"
         actions={
           <>
-            <Show when={props.data && !props.error}>
+            <Show when={props.data && !props.error && !props.stale}>
               <Pill tone="live" dot pulse>
                 live
+              </Pill>
+            </Show>
+            <Show when={props.stale}>
+              <Pill tone="idle" dot pulse>
+                refreshing
               </Pill>
             </Show>
             <Show when={sched()}>
@@ -222,14 +230,9 @@ export function Overview(props: {
           </div>
         </Show>
 
-        <Show when={props.data?.incidents}>
-        <A href="/incidents" class="btn btn-sm" style={{ 'margin-bottom': '16px' }}>
-          Incident history · {props.data?.incidents?.open ?? 0} open
-        </A>
         <Show when={props.data?.incidents?.storage_error}>
           <div class="error-banner">Incident history storage is unavailable. Open incident history for details.</div>
         </Show>
-      </Show>
       <ActivityStrip operations={props.data?.operations} />
 
         <Show when={props.data} fallback={<SkeletonBento />}>
@@ -576,6 +579,11 @@ export function Overview(props: {
                 )}
               </Show>
 
+              {/* ---- incidents: the last day as a strip ---- */}
+              <Show when={data().incidents}>
+                {(inc) => <IncidentsTile i={10} summary={inc()} />}
+              </Show>
+
               {/* ---- the fleets in detail ---- */}
               <Tile
                 i={10}
@@ -725,5 +733,74 @@ export function Overview(props: {
         </Show>
       </div>
     </>
+  );
+}
+
+
+/**
+ * The last 24 hours of incidents as a strip: one marker per episode placed by
+ * its start time, as wide as it lasted, pulsing while it is still open. The
+ * readout is what is open right now; the foot names the latest episode. A
+ * quiet day is an empty strip, which is itself the answer.
+ */
+function IncidentsTile(props: { i: number; summary: IncidentSummary }) {
+  const s = () => props.summary;
+  const now = () => s().server_time_ms ?? Date.now();
+  const DAY = 24 * 3_600_000;
+  const start = () => now() - DAY;
+  const pct = (ms: number) => `${Math.min(100, Math.max(0, ((ms - start()) / DAY) * 100))}%`;
+  const recent = () => s().recent ?? [];
+  const tone = (state: string) =>
+    state === 'recovered' ? 'ok' : state === 'failed' ? 'bad' : state === 'open' || state === 'interrupted' ? 'warn' : 'idle';
+  const label = (v: string) => v.replace(/_/g, ' ');
+  return (
+    <Tile
+      i={props.i}
+      span={12}
+      label="Incidents"
+      sub={s().open > 0 ? 'recovery not yet observed on an open episode' : `${formatCount(s().last_24h ?? recent().length)} in the last 24 h, none open`}
+      to="/incidents"
+      tone={s().open > 0 ? 'warn' : 'ok'}
+      pulse={s().open > 0}
+    >
+      <div class="row" style={{ 'align-items': 'flex-end', gap: '20px', 'flex-wrap': 'wrap' }}>
+        <Readout value={formatCount(s().open)} unit="open" />
+        <div class="stat3" style={{ flex: '1 1 260px' }}>
+          <div>
+            <div class="k">Last 24 h</div>
+            <div class="v">{formatCount(s().last_24h ?? recent().length)}</div>
+          </div>
+          <div>
+            <div class="k">Retained</div>
+            <div class="v">{formatCount(s().total)}</div>
+          </div>
+          <div>
+            <div class="k">Latest</div>
+            <div class="v" style={{ 'font-size': '13px', 'font-family': 'var(--sans)' }}>
+              <Show when={s().latest} fallback="none">
+                {(l) => <A href={`/incidents/${encodeURIComponent(l().id)}`}>{l().component} · {label(l().kind)} · {formatRelativeTime(l().started_at)}</A>}
+              </Show>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="strip" role="img" aria-label={`${recent().length} incidents in the last 24 hours`}>
+        <For each={[6, 12, 18]}>
+          {(h) => <span class="strip-tick" style={{ left: `${(h / 24) * 100}%` }}><span>-{24 - h}h</span></span>}
+        </For>
+        <For each={recent()}>
+          {(r) => (
+            <A
+              class="strip-mark"
+              classList={{ [tone(r.state)]: true, open: r.state === 'open' }}
+              href={`/incidents/${encodeURIComponent(r.id)}`}
+              style={{ left: pct(r.started_at), width: `max(3px, calc(${pct(r.ended_at ?? now())} - ${pct(r.started_at)}))` }}
+              title={`${r.component} · ${label(r.kind)} · ${label(r.state)} · ${formatRelativeTime(r.started_at)}`}
+            />
+          )}
+        </For>
+        <span class="strip-now" />
+      </div>
+    </Tile>
   );
 }

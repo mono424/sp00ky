@@ -185,7 +185,7 @@ export interface BackendDetail extends BackendSummary {
 }
 
 export interface Overview {
-  incidents?: { open: number; total: number; retention_days: number; storage_error: string | null };
+  incidents?: IncidentSummary;
   scheduler: SchedulerEntity | null;
   ssps: SspEntity[];
   backends: BackendSummary[];
@@ -849,4 +849,27 @@ export interface LogLine {
   target: string;
   message: string;
   fields?: string;
+}
+
+/** One episode as the overview's incident block carries it. */
+export interface IncidentBrief {
+  id: string;
+  component: string;
+  kind: string;
+  severity: string;
+  state: string;
+  started_at: number;
+  ended_at: number | null;
+}
+
+/** `overview.incidents`: counts plus the last day's episodes for the strip. */
+export interface IncidentSummary {
+  open: number;
+  total: number;
+  last_24h?: number;
+  recent?: IncidentBrief[];
+  latest?: IncidentBrief | null;
+  retention_days: number;
+  storage_error: string | null;
+  server_time_ms?: number;
 }

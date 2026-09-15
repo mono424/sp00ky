@@ -12,18 +12,24 @@ import { A, useNavigate, useParams } from '@solidjs/router';
 import { api, openStream } from '../api/client';
 import {
   Bento,
+  Chips,
   CopyId,
   Empty,
   KeyValue,
+  LaneBar,
   PageHead,
   Panel,
   Pill,
   Readout,
   Reason,
   ReasonLine,
+  SkeletonBento,
+  SkeletonList,
+  Stale,
   StatusDot,
   Tile,
 } from '../components/Chrome';
+import { readStash, writeStash } from '../lib/stash';
 import { Sparkline, type Point } from '../components/Sparkline';
 import {
   decodeParam,
@@ -170,7 +176,10 @@ function isStalled(job: Pick<JobSummary, 'status' | 'lease_until'>): boolean {
 
 export function Jobs() {
   const navigate = useNavigate();
-  const [page, setPage] = createSignal<JobsListResponse | null>(null);
+  // Paint the last frame we saw before the stream's first one arrives.
+  const cached = readStash<JobsListResponse>('jobs');
+  const [page, setPage] = createSignal<JobsListResponse | null>(cached?.value ?? null);
+  const [stale, setStale] = createSignal(cached != null);
   const [error, setError] = createSignal<string | null>(null);
   const [connected, setConnected] = createSignal(false);
 
@@ -209,6 +218,7 @@ export function Jobs() {
         if (cancelled) return;
         if (res.ok) {
           setPage(res.value);
+          setStale(false);
           setError(null);
         } else {
           setError(res.message);
@@ -231,7 +241,10 @@ export function Jobs() {
       onEvent: (event, data) => {
         if (event !== 'jobs') return;
         try {
-          setPage(JSON.parse(data) as JobsListResponse);
+          const frame = JSON.parse(data) as JobsListResponse;
+          setPage(frame);
+          setStale(false);
+          writeStash('jobs', frame);
         } catch {
           /* a malformed frame must not tear down the stream */
         }
@@ -255,6 +268,18 @@ export function Jobs() {
       ms: s.pending,
       ok: true,
     }));
+  const throughputPoints = (): Point[] =>
+    (totals()?.samples ?? []).map((s) => ({
+      ts: s.t,
+      ms: s.throughput_1m,
+      ok: true,
+    }));
+  /** The deepest lane sets the scale every lane is drawn against. */
+  const laneMax = () =>
+    tables().reduce(
+      (m, t) => Math.max(m, t.counts.pending + t.in_flight + t.counts.failed, t.concurrency),
+      1,
+    );
 
   const refresh = () => {
     // The stream pushes the next frame on its own; a filtered view is on a
@@ -274,6 +299,7 @@ export function Jobs() {
         subtitle="Every outbox job, whatever created it"
         actions={
           <div class="row">
+            <Stale when={stale()} />
             <Pill tone={connected() ? 'live' : 'idle'}>
               <StatusDot tone={connected() ? 'ok' : 'idle'} />
               {connected() ? 'live' : filtered() ? 'filtered' : 'connecting…'}
@@ -316,30 +342,43 @@ export function Jobs() {
             </div>
           </Show>
 
-          <Show when={totals()}>
+          <Show when={totals()} fallback={<SkeletonBento shape={[{ span: 6, rows: 2 }, { span: 3 }, { span: 3 }, { span: 3 }, { span: 3 }, { span: 12 }]} />}>
             {(t) => (
               <Bento>
+                {/* ---- hero: the queue over time ---- */}
                 <Tile
                   i={0}
-                  span={3}
-                  label="Pending"
+                  span={6}
+                  rows={2}
+                  hero
+                  label="Queue depth"
                   sub={
                     t().oldest_pending
-                      ? `oldest ${relativeStamp(t().oldest_pending)}`
+                      ? `oldest pending ${relativeStamp(t().oldest_pending)}`
                       : 'nothing queued'
                   }
-                  tone={t().counts.pending > 0 ? 'warn' : 'ok'}
+                  tone={stalled() > 0 ? 'bad' : t().counts.pending > 0 ? 'warn' : 'ok'}
                 >
-                  <Readout value={formatCount(t().counts.pending)} />
-                  <Show when={points().length > 1}>
+                  <div class="row" style={{ 'align-items': 'flex-end', gap: '20px', 'flex-wrap': 'wrap' }}>
+                    <Readout value={formatCount(t().counts.pending)} unit="pending" />
+                    <div class="stat3" style={{ flex: '1 1 200px' }}>
+                      <div>
+                        <div class="k">In flight</div>
+                        <div class="v">{formatCount(t().in_flight)}</div>
+                      </div>
+                      <div>
+                        <div class="k">Stalled</div>
+                        <div class="v" classList={{ 'tone-bad': stalled() > 0 }}>{formatCount(stalled())}</div>
+                      </div>
+                      <div>
+                        <div class="k">Tables</div>
+                        <div class="v">{formatCount(t().tables)}</div>
+                      </div>
+                    </div>
+                  </div>
+                  <Show when={points().length > 1} fallback={<div class="tile-foot tile-end">collecting samples…</div>}>
                     <div class="tile-plot tile-end">
-                      <Sparkline
-                        points={points()}
-                        fill
-                        bare
-                        format={formatCount}
-                        ariaLabel="Pending jobs"
-                      />
+                      <Sparkline points={points()} fill format={formatCount} ariaLabel="Pending jobs over time" />
                     </div>
                   </Show>
                 </Tile>
@@ -347,16 +386,15 @@ export function Jobs() {
                 <Tile
                   i={1}
                   span={3}
-                  label="In flight"
-                  sub={
-                    stalled() > 0
-                      ? `${formatCount(stalled())} stalled: lease expired, nobody is working on them`
-                      : 'leases live'
-                  }
-                  tone={stalled() > 0 ? 'bad' : 'ok'}
-                  pulse={t().in_flight > 0}
+                  label="Throughput"
+                  sub="succeeded per minute"
                 >
-                  <Readout value={formatCount(t().in_flight)} />
+                  <Readout value={formatCount(t().throughput_1m)} unit="per min" />
+                  <Show when={throughputPoints().length > 1}>
+                    <div class="tile-plot tile-end">
+                      <Sparkline points={throughputPoints()} bare format={formatCount} ariaLabel="Throughput" />
+                    </div>
+                  </Show>
                 </Tile>
 
                 <Tile
@@ -369,151 +407,126 @@ export function Jobs() {
                   <Readout value={formatCount(t().counts.failed)} />
                 </Tile>
 
-                <Tile i={3} span={3} label="Throughput" sub="succeeded in the last minute">
-                  <Readout value={formatCount(t().throughput_1m)} unit="per min" />
+                <Tile
+                  i={3}
+                  span={3}
+                  label="In flight"
+                  sub={
+                    stalled() > 0
+                      ? `${formatCount(stalled())} stalled: lease expired, nobody is working on them`
+                      : 'every lease live'
+                  }
+                  tone={stalled() > 0 ? 'bad' : 'ok'}
+                  pulse={t().in_flight > 0}
+                >
+                  <Readout value={formatCount(t().in_flight)} />
+                </Tile>
+
+                <Tile i={4} span={3} label="Succeeded" sub="retained in the window">
+                  <Readout value={formatCount(t().counts.success)} />
+                </Tile>
+
+                {/* ---- lanes: one queue per table, one scale ---- */}
+                <Tile
+                  i={5}
+                  span={12}
+                  flush
+                  label="Queues"
+                  sub="Each outbox table on one scale. The tick is the concurrency the dispatcher admits on."
+                  actions={
+                    <Show when={tables().length > 0}>
+                      <button class="btn btn-sm" onClick={clearAll}>Clear terminal jobs</button>
+                    </Show>
+                  }
+                >
+                  <Show
+                    when={tables().length > 0}
+                    fallback={
+                      <Empty>
+                        No outbox tables. <span class="mono">spky deploy</span> writes
+                        the list to <span class="mono">_00_retention.job_tables</span>.
+                      </Empty>
+                    }
+                  >
+                    <div class="lanes">
+                      <For each={tables()}>
+                        {(lane) => (
+                          <div class="lane">
+                            <div class="lane-name">
+                              <StatusDot tone={lane.error ? 'bad' : lane.stalled > 0 ? 'bad' : lane.in_flight >= lane.concurrency && lane.counts.pending > 0 ? 'warn' : 'ok'} />
+                              <button
+                                type="button"
+                                class="link"
+                                style={{ font: 'inherit', background: 'none', border: '0', padding: '0', color: 'inherit', cursor: 'pointer' }}
+                                onClick={() => setTable(table() === lane.table ? '' : lane.table)}
+                                title="Filter the list to this table"
+                              >
+                                {lane.table}
+                              </button>
+                              <Show when={lane.error}><ReasonLine error={lane.error} /></Show>
+                            </div>
+                            <LaneBar
+                              max={laneMax()}
+                              cap={lane.concurrency}
+                              segments={[
+                                { value: lane.in_flight - lane.stalled, tone: 'ok', title: `${lane.in_flight - lane.stalled} in flight` },
+                                { value: lane.stalled, tone: 'bad', title: `${lane.stalled} stalled` },
+                                { value: lane.counts.pending, tone: 'accent', title: `${lane.counts.pending} pending` },
+                                { value: lane.counts.failed, tone: 'warn', title: `${lane.counts.failed} failed in the last hour` },
+                              ]}
+                            />
+                            <div class="lane-figures">
+                              <span><b>{formatCount(lane.counts.pending)}</b> pending</span>
+                              <span classList={{ 'tone-warn': lane.in_flight >= lane.concurrency && lane.counts.pending > 0 }}>
+                                <b>{lane.in_flight}</b>/{lane.concurrency} in flight
+                              </span>
+                              <span classList={{ 'tone-bad': lane.counts.failed > 0 }}><b>{formatCount(lane.counts.failed)}</b> failed</span>
+                              <span class="ghost">{lane.oldest_pending ? relativeStamp(lane.oldest_pending) : '—'}</span>
+                            </div>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                    <div class="lane-legend">
+                      <span class="ok">in flight</span>
+                      <span class="bad">stalled</span>
+                      <span class="accent">pending</span>
+                      <span class="warn">failed, last hour</span>
+                      <span style={{ 'margin-left': 'auto' }}>tick: concurrency</span>
+                    </div>
+                  </Show>
                 </Tile>
               </Bento>
             )}
           </Show>
 
-          <Panel
-            title="Filters"
-            sub="Origin is the one this page exists for: application jobs have no other surface."
-          >
-            <div class="filters">
-              <select
-                value={origin()}
-                onChange={(e) => setOrigin(e.currentTarget.value)}
-                aria-label="Origin"
-              >
-                <option value="">Any origin</option>
-                <For each={ORIGINS}>
-                  {(o) => (
-                    <option value={o.key} title={o.hint}>
-                      {o.label}
-                    </option>
-                  )}
-                </For>
-              </select>
-              <select
-                value={status()}
-                onChange={(e) => setStatus(e.currentTarget.value)}
-                aria-label="Status"
-              >
-                <option value="">Any status</option>
-                <For each={STATUSES}>{(s) => <option value={s}>{s}</option>}</For>
-              </select>
-              <Show when={tables().length > 1}>
-                <select
-                  value={table()}
-                  onChange={(e) => setTable(e.currentTarget.value)}
-                  aria-label="Table"
-                >
-                  <option value="">Every table</option>
-                  <For each={tables()}>
-                    {(t) => <option value={t.table}>{t.table}</option>}
-                  </For>
-                </select>
-              </Show>
-              <input
-                class="grow"
-                placeholder="Search the path or the id"
-                value={search()}
-                onInput={(e) => setSearch(e.currentTarget.value)}
-              />
-              <Show when={filtered()}>
-                <button
-                  class="btn btn-sm"
-                  onClick={() => {
-                    setStatus('');
-                    setOrigin('');
-                    setTable('');
-                    setSearch('');
-                  }}
-                >
-                  Clear filters
-                </button>
-              </Show>
-            </div>
-          </Panel>
-
-          <Panel
-            title="Outbox tables"
-            sub="Depth against the concurrency the dispatcher admits on."
-            flush
-          >
-            <Show
-              when={tables().length > 0}
-              fallback={
-                <Empty>
-                  No outbox tables. <span class="mono">spky deploy</span> writes
-                  the list to <span class="mono">_00_retention.job_tables</span>.
-                </Empty>
-              }
-            >
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Table</th>
-                      <th>Pending</th>
-                      <th>In flight</th>
-                      <th>Failed (1h)</th>
-                      <th>Oldest pending</th>
-                      <th />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <For each={tables()}>
-                      {(t) => (
-                        <tr>
-                          <td>
-                            <div class="row">
-                              <StatusDot tone={t.error ? 'bad' : 'ok'} />
-                              <span class="mono">{t.table}</span>
-                            </div>
-                            <Show when={t.error}>
-                              <ReasonLine error={t.error} />
-                            </Show>
-                          </td>
-                          <td class="dim" data-label="Pending">
-                            {formatCount(t.counts.pending)}
-                          </td>
-                          <td data-label="In flight">
-                            {/* Against the ceiling, because "3 in flight" says
-                                nothing until you know whether the limit is 3. */}
-                            <span classList={{ 'tone-warn': t.in_flight >= t.concurrency }}>
-                              {t.in_flight} / {t.concurrency}
-                            </span>
-                            <Show when={t.stalled > 0}>
-                              <span class="mini">{t.stalled} stalled</span>
-                            </Show>
-                          </td>
-                          <td class="dim" data-label="Failed (1h)">
-                            {formatCount(t.counts.failed)}
-                          </td>
-                          <td class="ghost" data-label="Oldest pending">
-                            {relativeStamp(t.oldest_pending)}
-                          </td>
-                          <td data-label="Actions" data-empty={true}>
-                            <div class="row-actions">
-                              <button
-                                class="btn btn-sm"
-                                onClick={() =>
-                                  void clearJobs({ table: t.table }, refresh)
-                                }
-                              >
-                                Clear terminal
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </For>
-                  </tbody>
-                </table>
+          <Panel flush>
+            <div class="toolbar">
+              <div class="toolbar-groups">
+                <Chips label="Status" value={status()} onChange={setStatus}
+                  options={[{ key: '', label: 'Any' }, ...STATUSES.map((s) => ({ key: s, label: s, tone: s === 'failed' ? 'bad' : s === 'pending' ? 'warn' : s === 'success' ? 'ok' : undefined }))]} />
+                <Chips label="Origin" value={origin()} onChange={setOrigin}
+                  options={[{ key: '', label: 'Any' }, ...ORIGINS.map((o) => ({ key: o.key, label: o.label }))]} />
+                <Show when={tables().length > 1}>
+                  <Chips label="Table" value={table()} onChange={setTable}
+                    options={[{ key: '', label: 'Every' }, ...tables().map((t) => ({ key: t.table, label: t.table, count: t.counts.pending + t.in_flight }))]} />
+                </Show>
               </div>
-            </Show>
+              <div class="row">
+                <input
+                  type="search"
+                  placeholder="Search the path or the id"
+                  value={search()}
+                  onInput={(e) => setSearch(e.currentTarget.value)}
+                  aria-label="Search jobs"
+                />
+                <Show when={filtered()}>
+                  <button class="btn btn-sm" onClick={() => { setStatus(''); setOrigin(''); setTable(''); setSearch(''); }}>
+                    Clear
+                  </button>
+                </Show>
+              </div>
+            </div>
           </Panel>
 
           <Panel
@@ -521,18 +534,11 @@ export function Jobs() {
             sub={`${jobs().length} shown${
               page()?.live === false ? ', matching the filters' : ', newest activity first'
             }`}
-            actions={
-              <Show when={tables().length > 0}>
-                <button class="btn btn-sm" onClick={clearAll}>
-                  Clear terminal jobs
-                </button>
-              </Show>
-            }
             flush
           >
             <Show
               when={jobs().length > 0}
-              fallback={
+              fallback={<Show when={page()} fallback={<SkeletonList rows={6} />}>
                 <Empty>
                   <Show
                     when={filtered()}
@@ -547,7 +553,7 @@ export function Jobs() {
                     Nothing matches those filters.
                   </Show>
                 </Empty>
-              }
+              </Show>}
             >
               <div class="table-scroll">
                 <table>

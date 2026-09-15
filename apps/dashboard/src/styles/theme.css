@@ -2909,3 +2909,376 @@ td .ident {
     font-size: 40px;
   }
 }
+
+/* ================================================================
+   CHIPS — instant filters
+   ================================================================ */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.chips-label {
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--ink-faint);
+  margin-right: 4px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-dim);
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.chip:hover {
+  border-color: var(--rule-strong);
+  color: var(--ink);
+}
+.chip.on {
+  background: var(--accent-wash);
+  border-color: var(--accent-line);
+  color: var(--ink);
+}
+.chip.warn.on {
+  background: var(--warn-wash);
+  border-color: rgba(217, 164, 65, 0.45);
+}
+.chip.bad.on {
+  background: var(--bad-wash);
+  border-color: rgba(224, 107, 102, 0.45);
+}
+.chip.ok.on {
+  background: var(--ok-wash);
+  border-color: rgba(87, 185, 139, 0.45);
+}
+.chip-n {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+.chip.on .chip-n {
+  color: var(--ink-dim);
+}
+
+/* The toolbar above a list: chips left, search right, one line when it fits. */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--rule);
+}
+.toolbar-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+.toolbar input {
+  width: 220px;
+  max-width: 100%;
+}
+
+/* ================================================================
+   FEED — incidents as a day-grouped timeline
+   ================================================================ */
+
+.feed {
+  display: flex;
+  flex-direction: column;
+}
+.feed-day {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 18px;
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--ink-faint);
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--rule);
+}
+.feed-row {
+  display: grid;
+  grid-template-columns: 64px 4px minmax(0, 1fr) auto;
+  gap: 0 14px;
+  align-items: start;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--rule);
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.feed-row:hover {
+  background: var(--bg-hover);
+}
+.feed-time {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+  padding-top: 2px;
+}
+.feed-mark {
+  align-self: stretch;
+  border-radius: 2px;
+  background: var(--idle);
+  min-height: 34px;
+}
+.feed-mark.ok {
+  background: var(--ok);
+}
+.feed-mark.warn {
+  background: var(--warn);
+}
+.feed-mark.bad {
+  background: var(--bad);
+}
+.feed-mark.open {
+  animation: seg-pulse 1.6s ease-in-out infinite;
+}
+.feed-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-weight: 500;
+}
+.feed-title .id {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.feed-summary {
+  color: var(--ink-dim);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.feed-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+@media (max-width: 720px) {
+  .feed-row {
+    grid-template-columns: 4px minmax(0, 1fr);
+  }
+  .feed-time,
+  .feed-meta {
+    display: none;
+  }
+}
+
+/* The last 24 h as a strip on the overview: one marker per episode, placed
+   by start time, wide when it lasted. */
+.strip {
+  position: relative;
+  height: 28px;
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  border: 1px solid var(--rule);
+  overflow: hidden;
+}
+.strip-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--rule);
+}
+.strip-tick span {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--ink-ghost);
+}
+.strip-mark {
+  position: absolute;
+  top: 8px;
+  height: 12px;
+  min-width: 3px;
+  border-radius: 3px;
+  background: var(--idle);
+  opacity: 0.9;
+}
+.strip-mark.warn {
+  background: var(--warn);
+}
+.strip-mark.bad {
+  background: var(--bad);
+}
+.strip-mark.ok {
+  background: var(--ok);
+}
+.strip-mark.open {
+  animation: seg-pulse 1.6s ease-in-out infinite;
+}
+.strip-now {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
+/* ================================================================
+   LANES — one queue per row, on one scale
+   ================================================================ */
+
+.lanes {
+  display: flex;
+  flex-direction: column;
+}
+.lane {
+  display: grid;
+  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) auto;
+  gap: 0 16px;
+  align-items: center;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--rule);
+}
+.lane:last-child {
+  border-bottom: 0;
+}
+.lane-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lane-bar {
+  position: relative;
+  display: flex;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  overflow: visible;
+}
+.lane-seg {
+  height: 100%;
+  min-width: 2px;
+  transition: width 0.4s var(--ease-out);
+}
+.lane-seg:first-child {
+  border-radius: 3px 0 0 3px;
+}
+.lane-seg:last-of-type {
+  border-radius: 0 3px 3px 0;
+}
+.lane-seg.accent {
+  background: var(--accent);
+}
+.lane-seg.ok {
+  background: var(--ok);
+}
+.lane-seg.warn {
+  background: var(--warn);
+}
+.lane-seg.bad {
+  background: var(--bad);
+}
+.lane-cap {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  background: var(--ink-faint);
+  border-radius: 1px;
+}
+.lane-figures {
+  display: flex;
+  gap: 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+.lane-figures b {
+  font-weight: 500;
+  color: var(--ink);
+}
+.lane-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 10px 18px 12px;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+.lane-legend span::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  background: var(--idle);
+}
+.lane-legend .accent::before {
+  background: var(--accent);
+}
+.lane-legend .ok::before {
+  background: var(--ok);
+}
+.lane-legend .bad::before {
+  background: var(--bad);
+}
+.lane-legend .warn::before {
+  background: var(--warn);
+}
+@media (max-width: 720px) {
+  .lane {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+}
+
+/* ================================================================
+   SKELETONS
+   ================================================================ */
+
+.skeleton-list {
+  display: flex;
+  flex-direction: column;
+}
+.skeleton-row {
+  height: 52px;
+  border-bottom: 1px solid var(--rule);
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.035) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}

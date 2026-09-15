@@ -11,6 +11,7 @@ import {
 } from './api/client';
 import type { LoginResponse, Overview as OverviewData } from './api/types';
 import { Shell } from './components/Shell';
+import { readStash, writeStash } from './lib/stash';
 import { ConfirmHost, ToastHost } from './components/Actions';
 import { Login } from './routes/Login';
 import { Overview } from './routes/Overview';
@@ -35,14 +36,15 @@ export function App() {
   const [session, setSession] = createSignal<LoginResponse | null>(null);
   const [overview, setOverview] = createSignal<OverviewData | undefined>();
   const [overviewError, setOverviewError] = createSignal<string | undefined>();
+  /** True until the first live overview replaces what the stash painted. */
+  const [stale, setStale] = createSignal(false);
+
+  type Me = { subject: string; label: string; mode: LoginResponse['mode'] };
 
   const checkSession = async (token: string): Promise<boolean> => {
     try {
-      const me = await api.get<{
-        subject: string;
-        label: string;
-        mode: LoginResponse['mode'];
-      }>('/me');
+      const me = await api.get<Me>('/me');
+      writeStash('me', me);
       setSession({
         token,
         subject: me.subject,
@@ -62,8 +64,34 @@ export function App() {
     // A token in storage may be from a previous scheduler process. With a
     // cluster secret set the scheduler signs tokens and they survive a
     // restart; without one they do not. Either way the server decides.
+    //
+    // It decides AFTER the first paint, though: with a token and the last
+    // session + overview in the stash, the shell renders immediately from
+    // that, marked stale, and the `/me` round trip only ever takes it away.
+    // Before this the whole app was blank for one round trip on every open.
     const token = getToken();
-    if (token) await checkSession(token);
+    if (token) {
+      const me = readStash<Me>('me');
+      const cached = readStash<OverviewData>('overview');
+      if (me && cached) {
+        setSession({
+          token,
+          subject: me.value.subject,
+          label: me.value.label,
+          mode: me.value.mode,
+          expires_in_secs: 0,
+        });
+        setOverview(cached.value);
+        setStale(true);
+        setReady(true);
+      }
+      const ok = await checkSession(token);
+      if (!ok) {
+        setSession(null);
+        setOverview(undefined);
+        setStale(false);
+      }
+    }
     setReady(true);
   });
 
@@ -75,7 +103,10 @@ export function App() {
   const poll = async () => {
     if (!session() || restarting()) return;
     try {
-      setOverview(await api.get<OverviewData>('/overview'));
+      const next = await api.get<OverviewData>('/overview');
+      setOverview(next);
+      setStale(false);
+      writeStash('overview', next);
       setOverviewError(undefined);
     } catch (err) {
       setOverviewError(
@@ -167,7 +198,7 @@ export function App() {
                 <Route path="/incidents" component={Incidents} />
                 <Route path="/incidents/:id" component={IncidentDetail} />
                 <Route path="/access" component={Access} />
-                <Route path="*" component={() => <Overview data={overview()} refresh={poll} />} />
+                <Route path="*" component={() => <Overview data={overview()} stale={stale()} refresh={poll} />} />
               </Router>
             )}
           </Show>

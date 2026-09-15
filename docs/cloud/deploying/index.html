@@ -107,6 +107,10 @@ routing while health checks still pass).</p>
 <p>Values take effect when containers are next created, so run <code>spky deploy</code> or
 <code>spky restart</code> after changing them. Omitting the key entirely keeps the previous
 setting; an explicit empty map clears it.</p>
+<p><code>deployment.env</code>, the <code>sync:</code> block and the top-level <code>anonymousLiveQueries</code>
+are read from <code>sp00ky.yml</code> on every deploy, whether <code>spky deploy</code> runs it or a
+<a href="/docs/cloud/ci-cd">git-linked build</a> does. Both paths write the same values,
+so a push after a CLI deploy never reverts them.</p>
 <p>One pair is set for you: with <code>sync.transport: changefeed</code> in <code>sp00ky.yml</code>,
 <code>spky deploy</code> merges <code>SPKY_INGEST_TRANSPORT</code> and <code>SPKY_CHANGEFEED_RETENTION</code>
 into the <code>scheduler</code> and <code>ssp</code> roles (your own keys win on a clash), so the

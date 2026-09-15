@@ -67,3 +67,9 @@ Link a GitHub repository for automated deployments on push:
 <Note>
   GitHub integration installs a GitHub App on your repository. Pushes to the configured branch automatically trigger a build and deploy.
 </Note>
+
+A linked build reads `sp00ky.yml` from the pushed commit the same way
+`spky deploy` reads it locally: the apps and their `deploy:` blocks, the
+`surrealdb:` block, `anonymousLiveQueries`, `deployment.env` and `sync:`. Keep
+the committed manifest in step with what you last deployed by hand, because
+the push is what the next deployment is built from.

@@ -87,6 +87,11 @@ lower it to fail faster than the scheduler’s own 30s call timeout.</p>
 <code>SPKY_CLOUD_PROJECT</code>, which Sp00ky Cloud injects so the <a href="/docs/reference/admin-dashboard#configuration">admin dashboard</a>
 can reach the control plane, and <code>SPKY_PROJECT_SLUG</code>, the backup storage prefix for a scheduler
 that is not linked.</p>
+<p>When <code>sp00ky.yml</code> sets <code>sync.transport: changefeed</code>, <code>spky dev</code> also passes
+<code>SPKY_INGEST_TRANSPORT=changefeed</code> and <code>SPKY_CHANGEFEED_RETENTION</code> to the scheduler and SSP
+containers (and to host binaries started from a <code>path:</code> override), so the running stack
+matches the schema it just applied. See <a href="/docs/reference/config#sync-transport">Sync transport</a>
+and the full <code>SPKY_CHANGEFEED_*</code> list in <a href="/docs/self-hosting#scheduler">Self-hosting</a>.</p>
 <p>Two variables go the other way, from your shell into the CLI: <code>SPKY_VERBOSE=1</code> is the same as
 <code>spky dev --verbose</code>, and <code>SPKY_LOG_FORMAT=compact</code> is what <code>spky dev</code> sets on the SSP and scheduler
 so their log lines drop the timestamp (the CLI prefixes them itself).</p>

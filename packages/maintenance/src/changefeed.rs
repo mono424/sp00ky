@@ -447,14 +447,22 @@ impl TailerStats {
         }
     }
 
-    /// Age of the cursor, i.e. how far behind the newest commit the tail can
-    /// be at most. `None` until the first poll.
+    /// How far behind the newest commit the tail can be at most: the age of
+    /// the cursor, capped by the age of the last successful poll (an empty
+    /// poll proves nothing newer than the cursor had committed at that
+    /// moment, so an idle feed does not read as a growing lag). `None`
+    /// until the first poll.
     pub fn lag_ms(&self, now_ms: u64) -> Option<u64> {
         let cursor = self.cursor();
         if cursor == 0 {
             return None;
         }
-        Some(now_ms.saturating_sub(stamp_ms(cursor)))
+        let cursor_age = now_ms.saturating_sub(stamp_ms(cursor));
+        let last_ok = self.last_success_ms.load(Ordering::Relaxed);
+        if last_ok == 0 {
+            return Some(cursor_age);
+        }
+        Some(cursor_age.min(now_ms.saturating_sub(last_ok)))
     }
 
     pub fn json(&self, now_ms: u64) -> Value {
@@ -1033,8 +1041,13 @@ mod tests {
         assert_eq!(stats.lag_ms(now), Some(5_000));
         assert!(stats.raise_cursor_in(stats.generation(), stamp_from_ms(now - 100)));
         assert_eq!(stats.lag_ms(now), Some(100));
+        // An idle feed: the last poll (empty) was 20 ms ago, so at most 20 ms
+        // of commits can be unseen, however old the cursor is.
+        stats.last_success_ms.store(now - 20, Ordering::Relaxed);
+        assert_eq!(stats.lag_ms(now), Some(20));
+        assert_eq!(stats.json(now)["lag_ms"], 20);
         let j = stats.json(now);
         assert_eq!(j["doorbell"], "reconnecting");
-        assert_eq!(j["lag_ms"], 100);
+        assert_eq!(j["lag_ms"], 20);
     }
 }

@@ -7,9 +7,15 @@ backends, live logs, and workflow runs as they happen.</p>
 <p>The <strong>Incidents</strong> navigation item keeps automatic lag, heartbeat failures,
 bootstrap integrity failures, removal/re-registration, recovery, and operator
 actions in one timeline. Every navigation entry has a labeled icon on desktop
-and mobile. The overview links to history and shows the number of open episodes.</p>
-<p>Filter by component (for example <code>ssp-0</code>), state, severity, and start time. Open
-an incident to see its duration, largest sampled event backlog, server version,
+and mobile. The overview carries an <strong>Incidents</strong> tile: the open count, the
+last 24 hours as a strip with one marker per episode (as wide as it lasted,
+pulsing while open), and a link to the latest one.</p>
+<p>The page opens on a rail (open now, count in the range, longest episode, latest)
+above a day-grouped feed. Filters are chips that apply the moment they are
+clicked: range (24 h, 7 days, 30 days), state and component, each with its
+count, plus a search over kind and summary. The chips filter the newest 400
+episodes of the range on the client, so switching between them costs no request.
+Open an incident to see its duration, largest sampled event backlog, server version,
 operation id when present, and event timeline. <strong>Recovered</strong> means the scheduler
 observed recovery. <strong>Interrupted</strong> means the scheduler restarted before it could
 observe recovery. Lag followed by replay is described separately from an SSP
@@ -101,7 +107,9 @@ at an IP address is exactly how a scheduler is usually reached.</p>
 <h2 id="what-it-shows">What it shows</h2>
 <p><strong>Overview</strong> — a grid of tiles, one per question: the end-to-end sync latency
 with a 30-minute chart as the large tile, then SSPs ready, backends healthy,
-ingest lag and the scheduler’s own details beside it. A tile whose subject is
+ingest lag and the scheduler’s own details beside it. The page paints from the
+last state it saw the moment it opens (marked <strong>refreshing</strong>) and swaps in the
+live poll a moment later, so a reload never shows an empty frame. A tile whose subject is
 degraded is tinted, so the problem is the first thing on the page. The
 latency is the scheduler’s own heartbeat probe: it writes <code>_00_heartbeat:probe</code>
 upstream and times the full round trip through <code>/ingest</code>, the WAL, the
@@ -146,8 +154,14 @@ the workflow step when the owning run still exists — a terminal run is pruned 
 its own retention window well before the jobs that outlived it, so “scheduled
 work whose fire has aged out” and “a job nobody can account for” are deliberately
 not drawn the same.</p>
-<p>Filter by origin (<code>schedule</code>, <code>workflow</code>, <code>app</code>), by status, by table, or by a
-substring of the path. The filter is pushed into SurrealQL rather than applied to
+<p>The top of the page is the queue itself: a <strong>Queue depth</strong> tile with the pending
+count and its history from the sampler, throughput, failures in the last hour,
+in-flight and succeeded beside it, then <strong>Queues</strong>, one lane per outbox table
+drawn on a shared scale (in flight, stalled, pending and failed as segments,
+a tick where the table’s concurrency sits). Clicking a lane’s name filters the
+list below to that table.</p>
+<p>Filter with the chips by origin (<code>schedule</code>, <code>workflow</code>, <code>app</code>), by status, by
+table, or by a substring of the path. The filter is pushed into SurrealQL rather than applied to
 the page that was already fetched, so asking for application jobs on a busy table
 returns them instead of reporting none.</p>
 <p>The tiles above the list are the queue itself: pending depth with the age of the

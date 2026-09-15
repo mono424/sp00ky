@@ -17,7 +17,7 @@ fn delta(query_id: &str) -> ViewDelta {
         additions: vec!["user:x".to_string()],
         removals: vec![],
         updates: vec![],
-        records: vec![],
+        row_count: 0,
         result_hash: String::new(),
         subquery_items: vec![],
         auth_id: "user:a".to_string(),

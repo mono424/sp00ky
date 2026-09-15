@@ -279,7 +279,7 @@ impl EdgePublisher {
             let operations = (d.additions.len() + d.removals.len() + d.updates.len() + d.subquery_items.len()) as u64;
             let bytes = std::mem::size_of::<ViewDelta>() as u64 + d.query_id.len() as u64 + d.auth_id.len() as u64
                 + d.result_hash.len() as u64
-                + d.additions.iter().chain(&d.removals).chain(&d.updates).chain(&d.records)
+                + d.additions.iter().chain(&d.removals).chain(&d.updates)
                     .map(|s| (s.capacity() + std::mem::size_of::<String>()) as u64).sum::<u64>()
                 + d.subquery_items.iter().map(|s| (std::mem::size_of::<ssp::circuit::SubqueryDeltaItem>()
                     + s.id.capacity() + s.parent_key.capacity() + s.alias.capacity()) as u64).sum::<u64>();
@@ -1446,7 +1446,7 @@ mod tests {
             additions: vec![],
             removals: vec![],
             updates: vec![],
-            records: vec![],
+            row_count: 0,
             result_hash: String::new(),
             subquery_items: vec![],
             auth_id: auth_id.to_string(),
@@ -2088,7 +2088,7 @@ mod publication_tests {
     }
     fn delta(id: &str, add: bool) -> ViewDelta {
         ViewDelta { query_id: "q".into(), additions: if add { vec![id.into()] } else { vec![] },
-            removals: if add { vec![] } else { vec![id.into()] }, updates: vec![], records: vec![],
+            removals: if add { vec![] } else { vec![id.into()] }, updates: vec![], row_count: 0,
             result_hash: String::new(), subquery_items: vec![], auth_id: String::new(), initial: false }
     }
     struct TestSpawner;

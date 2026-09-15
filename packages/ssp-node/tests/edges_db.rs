@@ -72,7 +72,7 @@ fn delta(query_id: &str, additions: Vec<&str>, removals: Vec<&str>) -> ViewDelta
         additions: additions.into_iter().map(String::from).collect(),
         removals: removals.into_iter().map(String::from).collect(),
         updates: vec![],
-        records: vec![],
+        row_count: 0,
         result_hash: String::new(),
         subquery_items: vec![],
         auth_id: "user:a".to_string(),
@@ -145,7 +145,7 @@ async fn subquery_child_edge_gets_non_none_parent() {
         additions: vec!["thread:t".to_string()],
         removals: vec![],
         updates: vec![],
-        records: vec![],
+        row_count: 0,
         result_hash: String::new(),
         subquery_items: vec![SubqueryDeltaItem {
             id: "user:u".to_string(),

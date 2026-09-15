@@ -65,8 +65,11 @@ pub struct ViewDelta {
     pub removals: Vec<String>,
     /// Keys whose content changed but remain in the view.
     pub updates: Vec<String>,
-    /// All keys currently in the view (for flat/tree modes).
-    pub records: Vec<String>,
+    /// Rows in the view after this delta. A count, deliberately: carrying every
+    /// key per delta cost O(view) memory and publication budget for each
+    /// ingest event (231 KB per event on a 5k-row view), and nothing read the
+    /// keys — the SSP only ever wanted the number.
+    pub row_count: usize,
     /// Hash of the current view state.
     pub result_hash: String,
     /// Subquery record changes (additions/updates/removals for child records).
@@ -709,6 +712,15 @@ impl Circuit {
     }
 
     /// Get a reference to a view's state.
+    /// Every key currently in a view. Membership on demand for the shells that
+    /// ship it to a client (`ssp-wasm`, `ssp-ffi`); a delta itself carries only
+    /// `row_count`. Empty for an unknown view.
+    pub fn view_keys(&self, query_id: &str) -> Vec<String> {
+        self.get_view(query_id)
+            .map(|view| view.cache.keys().map(|k| k.to_string()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn get_view(&self, query_id: &str) -> Option<&View> {
         self.views
             .get(query_id)
@@ -786,14 +798,12 @@ impl Circuit {
             .collect();
         view.subquery_cache = new_subquery_set;
 
-        let records: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
-
         Some(ViewDelta {
             query_id: query_id.to_string(),
             additions,
             removals: vec![],
             updates: vec![],
-            records,
+            row_count: view.cache.len(),
             result_hash: view.last_hash.clone(),
             subquery_items,
             auth_id: view.auth_id.clone(),
@@ -1022,8 +1032,6 @@ impl Circuit {
         }
         view.last_hash = new_hash;
 
-        let records: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
-
         Some(ViewDelta {
             query_id: query_id.to_string(),
             additions,
@@ -1032,7 +1040,7 @@ impl Circuit {
             // — at the one boundary that leaves the circuit, rather than
             // throughout it.
             updates: updates.iter().map(|k| k.to_string()).collect(),
-            records,
+            row_count: view.cache.len(),
             result_hash: view.last_hash.clone(),
             subquery_items,
             auth_id: view.auth_id.clone(),
@@ -1327,7 +1335,7 @@ impl Circuit {
                         additions: vec![],
                         removals: previous,
                         updates: vec![],
-                        records: vec![],
+                        row_count: 0,
                         result_hash: view.last_hash.clone(),
                         subquery_items: vec![],
                         auth_id: view.auth_id.clone(),
@@ -1776,7 +1784,7 @@ impl Circuit {
     ) -> Option<ViewDelta> {
         let view = self.get_view(source)?;
 
-        let records: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
+        let additions: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
         let subquery_items: Vec<SubqueryDeltaItem> = view
             .subquery_cache
             .iter()
@@ -1790,10 +1798,10 @@ impl Circuit {
 
         Some(ViewDelta {
             query_id: crate::canonical_query_id(&query_id),
-            additions: records.clone(),
+            row_count: additions.len(),
+            additions,
             removals: vec![],
             updates: vec![],
-            records,
             result_hash: view.last_hash.clone(),
             subquery_items,
             auth_id,
@@ -3979,8 +3987,12 @@ mod snapshot_and_projection_tests {
         c
     }
 
-    fn records(delta: &ViewDelta) -> Vec<String> {
-        let mut r = delta.records.clone();
+    /// The view's membership after `delta` — read from the circuit, since a
+    /// delta carries only the count.
+    fn records(c: &Circuit, delta: &ViewDelta) -> Vec<String> {
+        let view = c.get_view(&delta.query_id).expect("view registered");
+        assert_eq!(view.cache.len(), delta.row_count, "row_count matches the view");
+        let mut r: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
         r.sort();
         r
     }
@@ -4037,9 +4049,9 @@ mod snapshot_and_projection_tests {
         let by_id: HashMap<String, ViewDelta> =
             deltas.into_iter().map(|d| (d.query_id.clone(), d)).collect();
         assert_eq!(by_id.len(), 3, "every view republished");
-        assert_eq!(records(&by_id["all"]).len(), 6);
-        assert_eq!(records(&by_id["top2"]), vec!["thread:t4", "thread:t5"]);
-        assert_eq!(records(&by_id["pub"]), vec!["thread:t0", "thread:t2", "thread:t4"]);
+        assert_eq!(records(&b, &by_id["all"]).len(), 6);
+        assert_eq!(records(&b, &by_id["top2"]), vec!["thread:t4", "thread:t5"]);
+        assert_eq!(records(&b, &by_id["pub"]), vec!["thread:t0", "thread:t2", "thread:t4"]);
         assert_eq!(b.permissions()["thread"], "true", "config survives the swap");
 
         // Operator state was primed from the restored rows: a later row that
@@ -4048,7 +4060,7 @@ mod snapshot_and_projection_tests {
             changes: vec![Change::create("thread", "t9", row(9))],
         });
         let top = next.iter().find(|d| d.query_id == "top2").expect("top2 stepped");
-        assert_eq!(records(top), vec!["thread:t5", "thread:t9"]);
+        assert_eq!(records(&b, top), vec!["thread:t5", "thread:t9"]);
         assert_eq!(top.removals, vec!["thread:t4".to_string()]);
     }
 
@@ -4058,7 +4070,7 @@ mod snapshot_and_projection_tests {
         c.add_query(scan("q", "thread"), None, None);
         let deltas = c.replace_store(Store::new());
         assert_eq!(deltas.len(), 1);
-        assert!(deltas[0].records.is_empty());
+        assert_eq!(deltas[0].row_count, 0);
         let mut removed = deltas[0].removals.clone();
         removed.sort();
         assert_eq!(removed, vec!["thread:t0", "thread:t1"]);
@@ -4123,7 +4135,7 @@ mod snapshot_and_projection_tests {
                 .collect(),
         });
         let top = widen.iter().find(|d| d.query_id == "top2").expect("top2 stepped");
-        assert_eq!(records(top), vec!["thread:t2", "thread:t3"]);
+        assert_eq!(records(&c, top), vec!["thread:t2", "thread:t3"]);
         let stored = c.store.get_row_by_key("thread:t3").to_owned_value();
         assert_eq!(
             stored,
@@ -4219,7 +4231,7 @@ mod snapshot_and_projection_tests {
         let next = c.step(ChangeSet {
             changes: vec![Change::create("thread", "t99", row(99))],
         });
-        assert_eq!(records(&next[0]), vec!["thread:t8", "thread:t9", "thread:t99"]);
+        assert_eq!(records(&c, &next[0]), vec!["thread:t8", "thread:t9", "thread:t99"]);
     }
 }
 

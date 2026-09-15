@@ -312,7 +312,7 @@ impl SspNode {
             for delta in &deltas {
                 self.platform.db.query(
                     "UPDATE type::record('_00_query', $qid) SET rowCount = $count, state = 'materializing'",
-                    &[("qid", json!(delta.query_id)), ("count", json!(delta.records.len()))],
+                    &[("qid", json!(delta.query_id)), ("count", json!(delta.row_count))],
                 ).await.map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
             }
             let left = crate::edges::write_deltas_unlocked(
@@ -1441,7 +1441,7 @@ impl SspNode {
             };
             // Even an empty registration owns an ordered metadata barrier.
             let update = update.or_else(|| circuit.snapshot_delta(&data.plan.id, auth_id.clone()));
-            let row_count = update.as_ref().map(|d| d.records.len() as i64).unwrap_or(0);
+            let row_count = update.as_ref().map(|d| d.row_count as i64).unwrap_or(0);
             let state = crate::edges::publish_state_for(update.as_ref());
             let ready = self.edge_update_tx.enqueue(permit, update.into_iter().collect(), &circuit, None, true, vec![]);
             (row_count, state, ready)
@@ -1590,7 +1590,7 @@ impl SspNode {
             let before = circuit.synthesized_row_versions();
             let deltas = circuit.step(ChangeSet { changes: vec![change] });
             let total = circuit.synthesized_row_versions();
-            let record_counts = deltas.iter().map(|d| d.records.len()).collect::<Vec<_>>();
+            let record_counts = deltas.iter().map(|d| d.row_count).collect::<Vec<_>>();
             let view_ids = deltas.iter().map(|d| d.query_id.clone()).collect::<Vec<_>>();
             // Deletes only remove membership; their deleted version need not become visible.
             let source = payload.record.get("_00_rv").and_then(|v| v.as_i64()).filter(|v| *v > 0 && op != Operation::Delete)

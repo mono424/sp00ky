@@ -129,10 +129,13 @@ fn version_for(circuit: &Circuit, key: &str) -> i64 {
 
 /// Transform a single ViewDelta to WasmViewUpdate.
 fn transform_single_delta(delta: &ViewDelta, circuit: &Circuit) -> WasmViewUpdate {
-    let result_data: Vec<(String, i64)> = delta
-        .records
-        .iter()
-        .map(|key| (key.clone(), version_for(circuit, key)))
+    let result_data: Vec<(String, i64)> = circuit
+        .view_keys(&delta.query_id)
+        .into_iter()
+        .map(|key| {
+            let version = version_for(circuit, &key);
+            (key, version)
+        })
         .collect();
 
     let additions: Vec<WasmDeltaRecord> = delta

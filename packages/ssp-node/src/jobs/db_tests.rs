@@ -1307,6 +1307,66 @@ fn create_job_in_open_transaction(
     })
 }
 
+/// A port that answers the first `conflicts` statements containing `needle` with
+/// SurrealDB's lock-contention error, then behaves normally. Counts the unleased
+/// fallback claims it sees.
+struct ConflictOnce {
+    inner: Arc<dyn Db>,
+    needle: &'static str,
+    conflicts: std::sync::atomic::AtomicUsize,
+    fallbacks: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Db for ConflictOnce {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if surql.contains("status = 'processing'") && !surql.contains("lease_epoch") {
+            self.fallbacks.fetch_add(1, SeqCst);
+        }
+        if surql.contains(self.needle) && self.conflicts.load(SeqCst) > 0 {
+            self.conflicts.fetch_sub(1, SeqCst);
+            return Err(DbError::Query(
+                "Transaction conflict: Resource busy. This transaction can be retried".into(),
+            ));
+        }
+        self.inner.query(surql, binds).await
+    }
+
+    async fn version(&self) -> Result<String, DbError> {
+        self.inner.version().await
+    }
+}
+
+/// Whitepawn 2026-09-15: the claim's UPDATE and the assignee stamp hit the same
+/// row within a millisecond and one of them lost with "Resource busy" — hundreds
+/// of times a day. The claim read ANY query error as "outbox schema not deployed"
+/// and re-ran itself without a lease, silently dropping the fencing token.
+#[tokio::test]
+async fn a_claim_that_loses_a_write_conflict_retries_and_keeps_its_lease() {
+    let (port, raw) = mem_db().await;
+    insert_job(&raw, "c9", "pending").await;
+    let db = ConflictOnce {
+        inner: port,
+        needle: "lease_epoch",
+        conflicts: std::sync::atomic::AtomicUsize::new(2),
+        fallbacks: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let claim = claim_processing(&db, "job:c9", "ssp-a", 60).await.expect("claim");
+
+    assert_eq!(claim, Claim::Fenced(1), "the retry lands the leased claim");
+    assert_eq!(
+        db.fallbacks.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a conflict never downgrades to the unleased claim"
+    );
+    assert_eq!(
+        select_string(&raw, "SELECT VALUE assignee FROM ONLY job:c9").await.as_deref(),
+        Some("ssp-a")
+    );
+}
+
 /// The bug behind "outbox jobs only run when the recovery sweep finds them": the
 /// claim reached a row whose creating transaction had not committed yet, read
 /// "matched nothing" as "claimed elsewhere", and dropped the job.

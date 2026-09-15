@@ -21,8 +21,9 @@
 //! is bootstrapping. Between drains a busy table's replica count legitimately
 //! trails upstream by everything still buffered. So the periodic check is a
 //! step of that same tick, run right after a drain, over the tables that have
-//! NOTHING still buffered — the caller passes the busy ones and they sit this
-//! pass out, keeping whatever streak they had. Skipping the whole check
+//! NOTHING still buffered — the check samples the busy set itself, after the
+//! upstream counts and again after the replica counts, and those tables sit
+//! this pass out, keeping whatever streak they had. Skipping the whole check
 //! instead (the original rule) meant a tenant whose scheduler writes job rows
 //! several times a second never checked at all after startup. The only
 //! mismatch acted on at first sight is the one that cannot be drain lag: a
@@ -124,6 +125,22 @@ pub trait UpstreamCounts: Send + Sync {
     fn note_stalled(&self) {}
 }
 
+/// Tables that received events since the last drain. Asked twice per check,
+/// after the upstream counts and after the replica counts, so the set covers
+/// the whole comparison window and not just its start.
+#[async_trait]
+pub trait BusyTables: Send + Sync {
+    async fn busy_tables(&self) -> BTreeSet<String>;
+}
+
+/// A fixed set: the startup pass (nothing ingested yet) and tests.
+#[async_trait]
+impl BusyTables for BTreeSet<String> {
+    async fn busy_tables(&self) -> BTreeSet<String> {
+        self.clone()
+    }
+}
+
 /// Upstream counts read through the scheduler's shared SurrealDB handle.
 pub struct SurrealUpstream {
     pub db: Arc<maintenance::db::ReconnectingDb>,
@@ -223,16 +240,21 @@ impl DriftReport {
 pub async fn check_once(
     upstream: &dyn UpstreamCounts,
     replica: &Arc<RwLock<Replica>>,
-    skip: &BTreeSet<String>,
+    busy: &dyn BusyTables,
 ) -> Result<DriftReport> {
     let upstream_counts = upstream.upstream_counts().await?;
+    // Sampled AFTER the upstream counts, not before them: those are one serial
+    // `count()` per table, seconds on a large database, and a row written
+    // upstream while they run sits in the event buffer, not the replica.
+    // Sampling first read every job-table churn as drift on whitepawn
+    // (2026-09-15: seven automatic re-clones in a day, each restarting every
+    // SSP) — the replica a few rows AHEAD of upstream on tables whose rows had
+    // just been deleted upstream.
+    let mut skip = busy.busy_tables().await;
     let mut tables = BTreeMap::new();
     {
         let rep = replica.read().await;
         for (table, upstream_count) in upstream_counts {
-            if skip.contains(&table) {
-                continue;
-            }
             let replica_count = rep.count_table(&table).await.unwrap_or(0) as u64;
             tables.insert(
                 table,
@@ -243,6 +265,9 @@ pub async fn check_once(
             );
         }
     }
+    // And once more: the replica counts take time as well.
+    skip.extend(busy.busy_tables().await);
+    tables.retain(|table, _| !skip.contains(table));
     Ok(DriftReport {
         checked_at_epoch_ms: now_epoch_ms(),
         tables,
@@ -394,13 +419,13 @@ pub trait Recloner: Send + Sync {
 
 /// Run one check + decision + remediation. Returns the action taken.
 ///
-/// Called by the snapshot updater AFTER a drain that emptied the buffer, with
-/// `drain_lock` released (the re-clone takes the replica write lock itself and
-/// can run for minutes). Also called once at startup.
+/// Called by the snapshot updater after each drain, with the event buffer as
+/// the busy source and `drain_lock` released (the re-clone takes the replica
+/// write lock itself and can run for minutes). Also called once at startup.
 pub async fn run_check(
     hook: &DriftHook,
     replica: &Arc<RwLock<Replica>>,
-    skip: &BTreeSet<String>,
+    busy: &dyn BusyTables,
 ) -> Action {
     if !hook.cfg.enabled {
         return Action::Clean;
@@ -413,7 +438,7 @@ pub async fn run_check(
     // updater parked in an upstream `count()` that never answered).
     let report = match tokio::time::timeout(
         hook.cfg.check_timeout,
-        check_once(&*hook.upstream, replica, skip),
+        check_once(&*hook.upstream, replica, busy),
     )
     .await
     {
@@ -621,6 +646,48 @@ mod tests {
             !report.tables.contains_key("job"),
             "a table with buffered events is not judged on counts that cannot agree yet"
         );
+    }
+
+    #[tokio::test]
+    async fn a_table_that_turns_busy_while_the_check_runs_is_not_judged() {
+        // The whitepawn 2026-09-15 shape: a job row is deleted upstream while
+        // the upstream counts are still running, so upstream reads one row
+        // fewer than the replica drained a moment earlier. The busy set taken
+        // before the counts did not contain the table; the one taken after
+        // does, and that is the one that must win.
+        struct Fixed;
+        #[async_trait]
+        impl UpstreamCounts for Fixed {
+            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+                Ok([("game".to_string(), Some(0u64)), ("job".to_string(), Some(9u64))]
+                    .into_iter()
+                    .collect())
+            }
+        }
+        /// Empty the first time it is asked, `job` from then on.
+        struct LandsLate(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl BusyTables for LandsLate {
+            async fn busy_tables(&self) -> BTreeSet<String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return BTreeSet::new();
+                }
+                ["job".to_string()].into_iter().collect()
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let replica = Arc::new(RwLock::new(
+            Replica::new(tmp.path().join("replica")).await.unwrap(),
+        ));
+        let busy = LandsLate(std::sync::atomic::AtomicUsize::new(0));
+
+        let report = check_once(&Fixed, &replica, &busy).await.unwrap();
+        assert!(report.tables.contains_key("game"), "an idle table is still compared");
+        assert!(
+            !report.tables.contains_key("job"),
+            "a table that received an event during the check is not judged this pass"
+        );
+        assert_eq!(busy.0.load(std::sync::atomic::Ordering::SeqCst), 2, "sampled around the replica counts");
     }
 
     #[test]

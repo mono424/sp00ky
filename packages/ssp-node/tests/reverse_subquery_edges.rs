@@ -330,7 +330,7 @@ async fn subquery_only_delta_still_writes_edges() {
         additions: vec![],
         removals: vec![],
         updates: vec![],
-        records: vec![],
+        row_count: 0,
         result_hash: String::new(),
         subquery_items: vec![SubqueryDeltaItem {
             id: "comment:c".to_string(),

@@ -65,6 +65,18 @@ fn touched_tables<'a>(events: impl IntoIterator<Item = &'a BufferedEvent>) -> BT
         .collect()
 }
 
+/// The drift check's busy source: whatever the event buffer holds at the
+/// moment it asks. Read live rather than snapshotted before the check, so an
+/// event that lands while the upstream counts run still excludes its table.
+struct BufferBusy(Arc<RwLock<VecDeque<BufferedEvent>>>);
+
+#[async_trait::async_trait]
+impl crate::drift::BusyTables for BufferBusy {
+    async fn busy_tables(&self) -> BTreeSet<String> {
+        touched_tables(self.0.read().await.iter())
+    }
+}
+
 /// Boot-time WAL recovery. Returns the backlog (events past the persisted
 /// `snapshot_seq`, in order) and the seq the counter resumes from.
 ///
@@ -1192,18 +1204,20 @@ pub async fn snapshot_updater_tick(
     // alone re-clone. Busy tables are the ones that cannot be judged; every
     // other table can.
     //
+    // The busy set is read by the check itself, while it runs (`BufferBusy`),
+    // not snapshotted here: the upstream counts take seconds, and a job row
+    // deleted upstream in that window left the replica one row ahead — which
+    // a pre-check snapshot could not know about. That was seven re-clones and
+    // seven SSP restarts in one day on whitepawn (2026-09-15).
+    //
     // The lock is released first: a re-clone takes the replica write lock for
     // minutes and must not hold up registrations behind `drain_lock` with it.
     let Some(hook) = drift else { return };
     if !hook.cfg.enabled {
         return;
     }
-    let busy = touched_tables(event_buffer.read().await.iter());
     drop(_guard);
-    if !busy.is_empty() {
-        debug!(tables = busy.len(), "Drift check: skipping tables with buffered events");
-    }
-    crate::drift::run_check(hook, replica, &busy).await;
+    crate::drift::run_check(hook, replica, &BufferBusy(Arc::clone(event_buffer))).await;
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 use super::dispatcher::JobDispatcher;
 use super::types::{JobControl, JobEntry};
 use crate::api::Method;
+use crate::db_retry::{is_write_conflict, query_retrying};
 use crate::ports::{Db, HttpClient, HttpError, OutboundRequest, Scheduler, Spawner};
 
 /// SQL boolean expression (for recovery-sweep `WHERE` clauses): is a pending job
@@ -628,6 +629,12 @@ impl Claim {
 ///
 /// `<duration>(string::concat(...))` is the only way to build a duration from a bound
 /// number in SurrealQL — a duration cannot be multiplied by an int parameter.
+///
+/// A lost optimistic-concurrency race is retried, and a conflict that outlives the
+/// retry budget is an error, never the unleased fallback: the assignee stamp
+/// (`set_assignee_helper`) lands on the same row within the same millisecond as this
+/// claim, and reading its "Resource busy" as "schema not deployed" quietly threw the
+/// lease and fencing token away on hundreds of jobs a day (whitepawn 2026-09-15).
 pub async fn claim_processing(
     db: &dyn Db,
     job_id: &str,
@@ -635,20 +642,20 @@ pub async fn claim_processing(
     lease_secs: u64,
 ) -> Result<Claim> {
     validate_job_id(job_id)?;
-    let attempt = db
-        .query(
-            "UPDATE type::record($id) SET status = 'processing', assignee = $me, \
-             lease_epoch = (lease_epoch ?? 0) + 1, \
-             lease_until = time::now() + <duration>(string::concat(<string>$lease, 's')), \
-             updated_at = time::now() \
-             WHERE status = 'pending' RETURN AFTER",
-            &[
-                ("id", json!(job_id)),
-                ("me", json!(assignee)),
-                ("lease", json!(lease_secs)),
-            ],
-        )
-        .await;
+    let attempt = query_retrying(
+        db,
+        "UPDATE type::record($id) SET status = 'processing', assignee = $me, \
+         lease_epoch = (lease_epoch ?? 0) + 1, \
+         lease_until = time::now() + <duration>(string::concat(<string>$lease, 's')), \
+         updated_at = time::now() \
+         WHERE status = 'pending' RETURN AFTER",
+        &[
+            ("id", json!(job_id)),
+            ("me", json!(assignee)),
+            ("lease", json!(lease_secs)),
+        ],
+    )
+    .await;
 
     match attempt {
         Ok(results) => Ok(match claimed_epoch(&results) {
@@ -660,6 +667,11 @@ pub async fn claim_processing(
             // silently discard the job's outcome.
             None => Claim::Unfenced,
         }),
+        // Still contended after the budget: the row stays `pending` and the
+        // dispatcher drain or the recovery sweep brings it back.
+        Err(e) if is_write_conflict(&e) => {
+            Err(anyhow::Error::from(e).context("Failed to claim job"))
+        }
         Err(crate::ports::DbError::Query(e)) => {
             warn!(
                 job_id = %job_id,
@@ -667,15 +679,15 @@ pub async fn claim_processing(
                 "Could not lease this job (is the outbox schema up to date? run `spky deploy`) — \
                  claiming it without a lease; it falls back to the old staleness rule"
             );
-            let results = db
-                .query(
-                    "UPDATE type::record($id) SET status = 'processing', \
-                     updated_at = time::now() \
-                     WHERE status = 'pending' RETURN AFTER",
-                    &[("id", json!(job_id))],
-                )
-                .await
-                .context("Failed to claim job")?;
+            let results = query_retrying(
+                db,
+                "UPDATE type::record($id) SET status = 'processing', \
+                 updated_at = time::now() \
+                 WHERE status = 'pending' RETURN AFTER",
+                &[("id", json!(job_id))],
+            )
+            .await
+            .context("Failed to claim job")?;
             Ok(if updated_any(&results) { Claim::Unfenced } else { Claim::Lost })
         }
         Err(e) => Err(anyhow::Error::from(e).context("Failed to claim job")),
@@ -876,10 +888,12 @@ pub async fn update_status_fenced(
 /// Deliberately does **not** touch `updated_at`: the recovery staleness clock
 /// must keep measuring from the row's last real status change, not from this
 /// ownership stamp (which happens right after create). Written server-side
-/// (root) only.
+/// (root) only. Retried on a write conflict: the runner's claim UPDATEs the
+/// same row at the same moment, and one of the two used to lose every time.
 pub async fn set_assignee_helper(db: &dyn Db, job_id: &str, assignee: &str) -> Result<()> {
     validate_job_id(job_id)?;
-    db.query(
+    query_retrying(
+        db,
         "UPDATE type::record($id) SET assignee = $assignee RETURN NONE",
         &[("id", json!(job_id)), ("assignee", json!(assignee))],
     )

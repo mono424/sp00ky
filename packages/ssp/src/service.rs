@@ -342,7 +342,7 @@ mod start_window_isolation_tests {
     use std::collections::HashMap;
 
     // Mirrors register_view_handler: surql -> prepare_registration_dbsp ->
-    // add_query_with_auth(Streaming) -> the returned ViewDelta.records is what the
+    // add_query_with_auth(Streaming) -> the returned ViewDelta.additions is what the
     // SSP writes into _00_list_ref. For START 50 over 120 rows it must be the
     // window [50,100), not the top-50.
     #[test]
@@ -373,7 +373,7 @@ mod start_window_isolation_tests {
         let update = circuit
             .add_query_with_auth(data.plan, data.safe_params, Some(OutputFormat::Streaming), String::new())
             .expect("delta");
-        let mut got = update.records.clone();
+        let mut got = update.additions.clone();
         got.sort();
         eprintln!("records.len={} first={:?} last={:?}", got.len(), got.first(), got.last());
         assert_eq!(got.len(), 50, "window size");

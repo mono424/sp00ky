@@ -384,6 +384,40 @@ pub struct ClientTypeConfig {
     /// TypeScript. Defaults to the sp00ky.yml directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// For `format: typescript`: the app's query module (relative to
+    /// sp00ky.yml), e.g. `../../apps/web/src/lib/query.ts`. When set, `spky
+    /// generate` runs it against a recording client
+    /// (`@spooky-sync/query-allowlist`) and writes the query allowlist JSON
+    /// that `spky deploy` / `spky release` / `spky dev` publish to
+    /// `_00_query_allowlist`. See `sync.queryAllowlist`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queries: Option<String>,
+    /// Where the allowlist JSON goes (relative to sp00ky.yml). Defaults to
+    /// `<queries>.allowlist.json` next to the query module. Commit it: deploy
+    /// reads it, it does not regenerate.
+    #[serde(default, rename = "allowlistOutput", skip_serializing_if = "Option::is_none")]
+    pub allowlist_output: Option<String>,
+    /// App name the allowlist rows are keyed by. Defaults to the frontend
+    /// app in `apps:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+}
+
+impl ClientTypeConfig {
+    /// `(queries path, allowlist json path)` resolved against `base_dir`, when
+    /// this entry declares a query module.
+    pub fn allowlist_paths(&self, base_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+        let queries = base_dir.join(self.queries.as_deref()?);
+        let out = match &self.allowlist_output {
+            Some(o) => base_dir.join(o),
+            None => {
+                let mut name = queries.file_name().unwrap_or_default().to_os_string();
+                name.push(".allowlist.json");
+                queries.with_file_name(name)
+            }
+        };
+        Some((queries, out))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -509,6 +543,35 @@ pub struct SyncConfig {
     /// A scheduler that falls further behind than this re-clones.
     #[serde(default, rename = "changefeedRetention", skip_serializing_if = "Option::is_none")]
     pub changefeed_retention: Option<String>,
+    /// Query allowlist enforcement on the SSP. `off` (default): any parseable
+    /// query registers. `warn`: the SSP logs and counts a registration whose
+    /// shape is not in the allowlist generated from the app's query module
+    /// (`clientTypes[].queries`) but admits it. `enforce`: such a
+    /// registration is refused with 403 `not_allowlisted`. Reaches the SSP as
+    /// `SPKY_SSP_QUERY_ALLOWLIST`; the generated client schema carries it as
+    /// `policy.queryAllowlist` so `useRemote`/`remoteQuery`/`queryRaw` are
+    /// gated client-side too (`allowRawRemote: true` opts back in).
+    #[serde(default, rename = "queryAllowlist", skip_serializing_if = "Option::is_none")]
+    pub query_allowlist: Option<QueryAllowlistMode>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryAllowlistMode {
+    #[default]
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl QueryAllowlistMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -547,12 +610,29 @@ impl SyncConfig {
         self.transport() == SyncTransport::Changefeed
     }
 
+    pub fn query_allowlist(&self) -> QueryAllowlistMode {
+        self.query_allowlist.unwrap_or_default()
+    }
+
+    /// True when the infra containers need env beyond the historical default
+    /// (the control plane keeps its previous setting when nothing is sent).
+    pub fn needs_infra_env(&self) -> bool {
+        self.is_changefeed() || self.query_allowlist() != QueryAllowlistMode::Off
+    }
+
     /// Env the infra containers need to agree with this schema.
     pub fn infra_env(&self) -> Vec<(String, String)> {
-        vec![
+        let mut env = vec![
             ("SPKY_INGEST_TRANSPORT".to_string(), self.transport().as_str().to_string()),
             ("SPKY_CHANGEFEED_RETENTION".to_string(), self.retention().to_string()),
-        ]
+        ];
+        if self.query_allowlist() != QueryAllowlistMode::Off {
+            env.push((
+                "SPKY_SSP_QUERY_ALLOWLIST".to_string(),
+                self.query_allowlist().as_str().to_string(),
+            ));
+        }
+        env
     }
 }
 

@@ -430,6 +430,40 @@ pub fn generate_sp00ky_events(
     }
     events.push_str("};\n\n");
 
+    // ===================================================================
+    // _00_query_allowlist (per-release query shapes; SSP reload trigger)
+    // ===================================================================
+    // Root-only rows written by `spky deploy` / `spky release` / `spky dev`.
+    // Never synced to clients and never loaded into the circuit: the SSP's
+    // `/ingest` handler intercepts this table and re-reads the allowlist from
+    // the DB, so a new release's shapes are admitted without an SSP restart.
+    // The payload therefore carries only the identity, not `entries`.
+    if post_ingest {
+        for (suffix, when, side) in [
+            ("mutation", "$before != $after AND $event != \"DELETE\"", "$after"),
+            ("delete", "$event = \"DELETE\"", "$before"),
+        ] {
+            events.push_str(&format!(
+                "-- Table: _00_query_allowlist {} (server-written; SSP reload trigger)\n",
+                if suffix == "mutation" { "Mutation" } else { "Delete" }
+            ));
+            events.push_str(&format!(
+                "DEFINE EVENT OVERWRITE _00_query_allowlist_{suffix} ON TABLE _00_query_allowlist\nWHEN {when}\nTHEN {{\n"
+            ));
+            events.push_str("    LET $payload = {\n");
+            events.push_str("        table: '_00_query_allowlist',\n");
+            events.push_str("        op: $event,\n");
+            events.push_str(&format!("        id: <string>({side}.id OR \"\"),\n"));
+            events.push_str(&format!(
+                "        record: {{ id: <string>({side}.id OR \"\"), app: {side}.app, version: {side}.version, released_at: <string>({side}.released_at OR \"\") }},\n"
+            ));
+            events.push_str("        hash: \"\"\n");
+            events.push_str("    };\n");
+            events.push_str(&ingest_post());
+            events.push_str("};\n\n");
+        }
+    }
+
     events.push_str("-- Table: _00_app_release Deletion (ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_app_release_delete ON TABLE _00_app_release\n");
     events.push_str("WHEN $event = \"DELETE\"\nTHEN {\n");

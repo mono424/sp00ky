@@ -2463,7 +2463,8 @@ fn run_codegen(
         );
 
         let include_modules = *mode == DeployMode::Surrealism;
-        let generator = CodeGenerator::new(output_format, !no_header, include_modules);
+        let generator = CodeGenerator::new(output_format, !no_header, include_modules)
+            .with_query_allowlist(crate::backend::sync_settings_for(config_path).query_allowlist());
         let output_content = generator
             .generate_with_schema(
                 &json_schema_string,
@@ -2801,6 +2802,18 @@ fn handle_generate(config_path: &Path) -> Result<()> {
             Path::new("../../packages/surrealism-modules"),
             false,
         )?;
+
+        // Query allowlist: run the app's query module against the schema just
+        // generated and write the JSON that deploy/release/dev publish.
+        if let Some((queries, out)) = ct.allowlist_paths(base_dir) {
+            let app = ct
+                .app
+                .clone()
+                .or_else(|| config.frontend().map(|(n, _)| n.to_string()))
+                .unwrap_or_else(|| "app".to_string());
+            println!("    Query allowlist: {} → {}", queries.display(), out.display());
+            codegen::run_query_allowlist(&queries, &output_path, &out, &app)?;
+        }
     }
 
     println!("\nAll clientTypes generated successfully.");

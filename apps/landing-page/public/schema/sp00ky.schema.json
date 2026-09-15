@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://sp00ky.cloud/schema/sp00ky.schema.json",
   "title": "sp00ky.yml",
-  "description": "Configuration file for Sp00ky \u2014 an offline-first, real-time sync framework built on SurrealDB.",
+  "description": "Configuration file for Sp00ky — an offline-first, real-time sync framework built on SurrealDB.",
   "type": "object",
   "properties": {
     "slug": {
@@ -69,7 +69,7 @@
       ]
     },
     "logLevel": {
-      "description": "`RUST_LOG` directive applied to the Scheduler and SSP containers (both `spky dev` and `spky cloud deploy`). A plain string applies everywhere (e.g. `trace`, `info,ssp=debug`). A `{dev, cloud}` map sets per-environment levels. Unset \u2192 defaults to `info`.",
+      "description": "`RUST_LOG` directive applied to the Scheduler and SSP containers (both `spky dev` and `spky cloud deploy`). A plain string applies everywhere (e.g. `trace`, `info,ssp=debug`). A `{dev, cloud}` map sets per-environment levels. Unset → defaults to `info`.",
       "oneOf": [
         {
           "type": "string",
@@ -201,6 +201,9 @@
       "type": "boolean",
       "description": "Enable realtime sync for unauthenticated (anonymous) clients. When true, the SSP materializes anonymous query registrations into a world-readable `_00_list_ref_anon` table so logged-out visitors get live updates. Defaults to false (anonymous clients can read one-shot but never sync live).",
       "default": false
+    },
+    "sync": {
+      "$ref": "#/$defs/syncConfig"
     }
   },
   "additionalProperties": false,
@@ -480,7 +483,19 @@
         },
         "workdir": {
           "type": "string",
-          "description": "For format: dart \u2014 optional override for the directory (relative to sp00ky.yml) to run the Dart generator from. Must be a Dart package that depends on spooky_core. By default it's auto-derived from `output`'s nearest ancestor pubspec.yaml. Ignored for TypeScript."
+          "description": "For format: dart — optional override for the directory (relative to sp00ky.yml) to run the Dart generator from. Must be a Dart package that depends on spooky_core. By default it's auto-derived from `output`'s nearest ancestor pubspec.yaml. Ignored for TypeScript."
+        },
+        "queries": {
+          "type": "string",
+          "description": "For format: typescript. The app's query module (relative to sp00ky.yml). spky generate runs it against a recording client and writes the query allowlist JSON that deploy/release/dev publish to _00_query_allowlist. See sync.queryAllowlist."
+        },
+        "allowlistOutput": {
+          "type": "string",
+          "description": "Where the allowlist JSON goes (relative to sp00ky.yml). Defaults to <queries>.allowlist.json. Commit it: deploy reads it, it does not regenerate."
+        },
+        "app": {
+          "type": "string",
+          "description": "App name the allowlist rows are keyed by. Defaults to the frontend app in apps:."
         }
       },
       "additionalProperties": false
@@ -820,7 +835,7 @@
             },
             "steps": {
               "type": "object",
-              "description": "Steps by name. Order is irrelevant \u2014 `dependsOn` decides execution.",
+              "description": "Steps by name. Order is irrelevant — `dependsOn` decides execution.",
               "additionalProperties": {
                 "$ref": "#/$defs/workflowStep"
               }
@@ -848,6 +863,42 @@
           }
         }
       ]
+    },
+    "syncConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How mutations reach the sync engine and which query shapes it accepts.",
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": [
+            "http",
+            "changefeed"
+          ],
+          "default": "http",
+          "description": "'http' (default): every generated event http::posts the mutation to the scheduler inside the user's transaction. 'changefeed': synced tables carry a CHANGEFEED clause and the scheduler tails it post-commit."
+        },
+        "changefeedRetention": {
+          "type": "string",
+          "default": "1d",
+          "examples": [
+            "1d",
+            "12h",
+            "1d12h"
+          ],
+          "description": "Retention of the CHANGEFEED clause, in the form SurrealDB renders."
+        },
+        "queryAllowlist": {
+          "type": "string",
+          "enum": [
+            "off",
+            "warn",
+            "enforce"
+          ],
+          "default": "off",
+          "description": "Query allowlist enforcement on the SSP. 'off': any parseable query registers. 'warn': a registration whose shape is not in the allowlist generated from clientTypes[].queries is logged and counted but admitted. 'enforce': it is refused with 403 not_allowlisted. Also gates useRemote/remoteQuery/queryRaw in the client SDK (allowRawRemote: true opts back in)."
+        }
+      }
     }
   }
 }

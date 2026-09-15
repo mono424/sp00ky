@@ -1666,6 +1666,147 @@ pub(crate) fn write_app_release_row(
     }
 }
 
+/// Publish the query allowlist JSON files `spky generate` wrote
+/// (`clientTypes[].queries`) as `_00_query_allowlist:<app>__<version>` rows and
+/// prune each app to its current + previous version, so a rollout never refuses
+/// the release still open in a tab. Best-effort like `write_app_release_row`
+/// under `off`/`warn`; under `enforce` a missing or stale allowlist is an
+/// error, because deploying it would refuse every query of the new release.
+pub(crate) fn write_query_allowlist_rows(
+    db_url: &str,
+    db_password: &str,
+    namespace: &str,
+    database: &str,
+    config: &backend::Sp00kyConfig,
+    config_dir: &std::path::Path,
+    version: &str,
+) -> Result<()> {
+    let mode = config.sync().query_allowlist();
+    let entries_with_queries: Vec<_> = config
+        .client_types
+        .iter()
+        .filter_map(|ct| ct.allowlist_paths(config_dir).map(|paths| (ct, paths)))
+        .collect();
+    if entries_with_queries.is_empty() {
+        if mode != backend::QueryAllowlistMode::Off {
+            println!(
+                "  ▸ Warning: sync.queryAllowlist is '{}' but no clientTypes entry declares `queries`; the SSP allowlist stays empty.",
+                mode.as_str()
+            );
+        }
+        return Ok(());
+    }
+    let surreal_client = if db_password.is_empty() {
+        crate::surreal_client::SurrealClient::new_unauthenticated(db_url, namespace, database)
+    } else {
+        crate::surreal_client::SurrealClient::new(db_url, namespace, database, "root", db_password)
+    };
+    let strict = mode == backend::QueryAllowlistMode::Enforce;
+    for (ct, (queries_path, json_path)) in entries_with_queries {
+        let app: String = ct
+            .app
+            .clone()
+            .or_else(|| config.frontend().map(|(n, _)| n.to_string()))
+            .unwrap_or_else(|| "app".to_string())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let raw = match fs::read_to_string(&json_path) {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!(
+                    "query allowlist {} not found ({e}); run `spky generate` and commit it",
+                    json_path.display()
+                );
+                if strict {
+                    anyhow::bail!("{msg}");
+                }
+                println!("  ▸ Warning: {msg}");
+                continue;
+            }
+        };
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", json_path.display()))?;
+        let entries = doc.get("entries").cloned().unwrap_or_else(|| serde_json::json!([]));
+        let source_hash = doc.get("sourceHash").and_then(|v| v.as_str()).unwrap_or("");
+        // Stale check: the JSON must have been generated from the query module
+        // as it is now, or the deploy ships shapes the app no longer registers.
+        if let Ok(src) = fs::read(&queries_path) {
+            use sha2::Digest;
+            let now = hex::encode(sha2::Sha256::digest(&src));
+            if !source_hash.is_empty() && now != source_hash {
+                let msg = format!(
+                    "query allowlist {} is stale: {} changed since `spky generate`",
+                    json_path.display(),
+                    queries_path.display()
+                );
+                if strict {
+                    anyhow::bail!("{msg}");
+                }
+                println!("  ▸ Warning: {msg}");
+            }
+        }
+        let safe_version: String = version
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let id = format!("{app}__{safe_version}");
+        let count = entries.as_array().map(|a| a.len()).unwrap_or(0);
+        let q = format!(
+            "UPSERT _00_query_allowlist:⟨{id}⟩ SET app = '{app}', version = '{version}', \
+             source_hash = '{source_hash}', entries = {entries}, released_at = time::now();",
+            version = version.replace('\'', ""),
+            entries = serde_json::to_string(&entries)?,
+        );
+        match surreal_client.query(&q) {
+            Ok(res) if res.iter().all(|r| r.status == "OK") => println!(
+                "  ▸ Query allowlist published: {} v{} ({} shapes, {})",
+                app,
+                version,
+                count,
+                mode.as_str()
+            ),
+            Ok(res) => {
+                let err = res.iter().find(|r| r.status != "OK").and_then(|r| r.result.clone());
+                let msg = format!("failed to publish query allowlist for '{app}': {err:?}");
+                if strict {
+                    anyhow::bail!("{msg}");
+                }
+                println!("  ▸ Warning: {msg}");
+                continue;
+            }
+            Err(e) => {
+                let msg = format!("failed to publish query allowlist for '{app}': {e:?}");
+                if strict {
+                    anyhow::bail!("{msg}");
+                }
+                println!("  ▸ Warning: {msg}");
+                continue;
+            }
+        }
+        // Keep current + previous. Two statements rather than an ORDER BY
+        // subquery: SurrealDB v3 rejects ORDER BY on a field outside a VALUE
+        // projection.
+        let list = format!(
+            "SELECT id, released_at FROM _00_query_allowlist WHERE app = '{app}' ORDER BY released_at DESC;"
+        );
+        if let Ok(res) = surreal_client.query(&list) {
+            let rows = res
+                .first()
+                .and_then(|r| r.result.as_ref())
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for row in rows.iter().skip(2) {
+                if let Some(old) = row.get("id").and_then(|v| v.as_str()) {
+                    let _ = surreal_client.query(&format!("DELETE {old};"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `spky release <app>`: manually announce a release by updating the app's
 /// `_00_app_release` row on the cloud deployment — the same write `spky
 /// deploy` performs automatically for frontends, for when you need to (re)set
@@ -1706,6 +1847,15 @@ pub fn release(
 
     let cloud = resolve_cloud_surreal(&config_path)?;
     let resolved = config.resolved_surrealdb();
+    write_query_allowlist_rows(
+        &cloud.url,
+        &cloud.password,
+        &resolved.namespace,
+        &resolved.database,
+        &config,
+        config_dir,
+        &version,
+    )?;
     write_app_release_row(
         &cloud.url,
         &cloud.password,
@@ -2921,7 +3071,7 @@ pub fn deploy(
         .and_then(|d| d.env.clone())
         .unwrap_or_default();
     let sync = config.sync();
-    if sync.is_changefeed() || !infra_env_map.is_empty() {
+    if sync.needs_infra_env() || !infra_env_map.is_empty() {
         for role in ["scheduler", "ssp"] {
             let entry = infra_env_map.entry(role.to_string()).or_default();
             for (k, v) in sync.infra_env() {
@@ -3170,16 +3320,27 @@ pub fn deploy(
                                             .as_str()
                                             .unwrap_or("");
                                         match frontend_package_version(config_dir, frontend_app) {
-                                            Some(version) => write_app_release_row(
-                                                db_url,
-                                                db_password,
-                                                &resolved.namespace,
-                                                &resolved.database,
-                                                frontend_name,
-                                                &version,
-                                                cache_bust,
-                                                mandatory,
-                                            ),
+                                            Some(version) => {
+                                                write_query_allowlist_rows(
+                                                    db_url,
+                                                    db_password,
+                                                    &resolved.namespace,
+                                                    &resolved.database,
+                                                    &config,
+                                                    config_dir,
+                                                    &version,
+                                                )?;
+                                                write_app_release_row(
+                                                    db_url,
+                                                    db_password,
+                                                    &resolved.namespace,
+                                                    &resolved.database,
+                                                    frontend_name,
+                                                    &version,
+                                                    cache_bust,
+                                                    mandatory,
+                                                )
+                                            }
                                             None => println!(
                                                 "  ▸ Warning: no versioned package.json found for frontend '{}'; release row not updated.",
                                                 frontend_name

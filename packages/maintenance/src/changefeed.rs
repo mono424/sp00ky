@@ -49,6 +49,7 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
     "_00_user_feature",
     "_00_app_release",
     "_00_heartbeat",
+    "_00_query_allowlist",
 ];
 
 /// Low 16 bits of a versionstamp are a per-millisecond counter.

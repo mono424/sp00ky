@@ -2597,6 +2597,19 @@ fn apply_internal_sp00ky_schema(
         mode,
         Some(&endpoint),
         Some(secret),
+    )?;
+
+    // Publish the query allowlist so a `warn`/`enforce` dev SSP has something to
+    // compare against. Version "dev": one row, overwritten on every start.
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    crate::cloud::write_query_allowlist_rows(
+        surreal_url,
+        "root",
+        &resolved_surreal.namespace,
+        &resolved_surreal.database,
+        &config,
+        config_dir,
+        "dev",
     )
 }
 

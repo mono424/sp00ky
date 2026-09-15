@@ -526,6 +526,7 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
     "_00_user_feature",
     "_00_app_release",
     "_00_heartbeat",
+    "_00_query_allowlist",
 ];
 
 /// Whether a table takes a `CHANGEFEED` clause: every user table that syncs

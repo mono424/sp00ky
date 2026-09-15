@@ -32,6 +32,9 @@ pub struct CodeGenerator {
     format: OutputFormat,
     include_header: bool,
     include_modules: bool,
+    /// `sync.queryAllowlist` of the manifest, emitted as `schema.policy` so the
+    /// client SDK can gate its raw-remote escape hatches to match the SSP.
+    query_allowlist: crate::backend::QueryAllowlistMode,
 }
 
 impl CodeGenerator {
@@ -40,7 +43,13 @@ impl CodeGenerator {
             format,
             include_header,
             include_modules,
+            query_allowlist: crate::backend::QueryAllowlistMode::Off,
         }
+    }
+
+    pub fn with_query_allowlist(mut self, mode: crate::backend::QueryAllowlistMode) -> Self {
+        self.query_allowlist = mode;
+        self
     }
 
     pub fn new_with_header(format: OutputFormat, include_header: bool) -> Self {
@@ -563,6 +572,14 @@ impl CodeGenerator {
             tables_lines.push("  },".to_string());
         }
 
+        // Sync policy the SSP enforces, mirrored so the client SDK refuses
+        // `useRemote`/`remoteQuery`/`queryRaw` unless `allowRawRemote` is set.
+        tables_lines.push("  policy: {".to_string());
+        tables_lines.push(format!(
+            "    queryAllowlist: '{}' as const,",
+            self.query_allowlist.as_str()
+        ));
+        tables_lines.push("  },".to_string());
         tables_lines.push("} as const;".to_string());
         tables_lines.push("".to_string());
 
@@ -1463,4 +1480,81 @@ mod tests {
         assert!(out.contains("field: 'owner' as const"), "plain record links still emitted");
         assert!(!out.contains("'nowhere'"), "a ref to an unknown table is dropped");
     }
+}
+
+/// Run the app's query module through `@spooky-sync/query-allowlist` and write
+/// the allowlist JSON that deploy/release/dev publish to `_00_query_allowlist`.
+///
+/// The generator is JavaScript (it has to execute `query.ts`), so this shells
+/// out like `run_quicktype`: the app's own `node_modules/.bin` binary when the
+/// app depends on the package, else `npx` pinned to this CLI's version.
+pub fn run_query_allowlist(
+    queries: &std::path::Path,
+    schema_ts: &std::path::Path,
+    out: &std::path::Path,
+    app: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        queries.exists(),
+        "query module not found at {} (clientTypes[].queries)",
+        queries.display()
+    );
+    anyhow::ensure!(
+        schema_ts.exists(),
+        "generated schema not found at {} (run the typescript clientTypes entry first)",
+        schema_ts.display()
+    );
+
+    let bin_name = "spooky-query-allowlist";
+    let local_bin = queries
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join("node_modules").join(".bin").join(bin_name))
+        .find(|p| p.exists());
+
+    let mut cmd = match &local_bin {
+        Some(bin) => Command::new(bin),
+        None => {
+            let mut c = Command::new("npx");
+            c.arg("-y")
+                .arg(format!("@spooky-sync/query-allowlist@{}", env!("CARGO_PKG_VERSION")));
+            c
+        }
+    };
+    cmd.arg("--queries")
+        .arg(queries)
+        .arg("--schema")
+        .arg(schema_ts)
+        .arg("--out")
+        .arg(out)
+        .arg("--app")
+        .arg(app);
+    if let Some(dir) = queries.parent() {
+        cmd.current_dir(dir);
+    }
+
+    let output = cmd.output().with_context(|| {
+        format!(
+            "Failed to execute {} (is Node installed, and is @spooky-sync/query-allowlist a devDependency of the app?)",
+            local_bin
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "npx @spooky-sync/query-allowlist".to_string())
+        )
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().chain(stderr.lines()) {
+        if !line.trim().is_empty() {
+            println!("    {line}");
+        }
+    }
+    if !output.status.success() {
+        anyhow::bail!(
+            "query allowlist generation failed for {} (exit {:?})",
+            queries.display(),
+            output.status.code()
+        );
+    }
+    Ok(())
 }

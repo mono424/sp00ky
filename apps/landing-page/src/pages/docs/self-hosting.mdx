@@ -343,7 +343,7 @@ staleness flag are built on.
 | `SPKY_CHANGEFEED_FALLBACK_DOWN_MS` | Poll interval while the doorbell is reconnecting. | `250` |
 | `SPKY_CHANGEFEED_GAP_MARGIN_SECS` | Clock-skew allowance subtracted from the retention in the gap check. | `300` |
 | `SPKY_CHANGEFEED_POLL_LIMIT` | Transactions per `SHOW CHANGES`. | `500` |
-| `SPKY_CHANGEFEED_POLL_TIMEOUT_SECS` | Deadline for one `SHOW CHANGES`; past it the upstream handle is replaced. | `30` |
+| `SPKY_CHANGEFEED_POLL_TIMEOUT_SECS` | Deadline for one `SHOW CHANGES`; past it the request is abandoned and the tail's session replaced. Also the ceiling of the outage a wedged `SHOW CHANGES` can cause on SurrealDB 3.1.5, so keep it short. | `5` |
 | `SPKY_BOOTSTRAP_RECLONE_AFTER` | Consecutive bootstrap integrity failures before the replica is re-cloned from upstream | `3` |
 | `SPKY_BOOTSTRAP_ADMIT_AFTER` | Consecutive bootstrap integrity failures before the SSP is admitted to broadcast anyway, restoring sync. Floored at the re-clone threshold, so admit never precedes a re-clone attempt. | `5` |
 | `SPKY_CATCHUP_RECLONE_AFTER` | Same escalation for the catch-up gate | `3` |

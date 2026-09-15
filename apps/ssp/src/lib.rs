@@ -1017,9 +1017,14 @@ pub async fn run_server() -> anyhow::Result<()> {
     // `SHOW CHANGES` itself when the schema was deployed with
     // `sync.transport: changefeed`. In cluster mode the scheduler tails.
     if standalone {
+        // Its own session, for the same reason the scheduler's tail has one:
+        // a `SHOW CHANGES` the server does not answer must not park the
+        // node's control path behind it.
+        let tail_db = connect_database(&config).await?;
+        maintenance::db::spawn_periodic_resignin(Arc::clone(&tail_db), maintenance::db::RESIGNIN_INTERVAL_SECS);
         let _changefeed_stats = changefeed::spawn_if_configured(
             &config,
-            db.clone(),
+            tail_db,
             node.clone(),
             processor_arc.clone(),
             status.clone(),

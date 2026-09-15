@@ -149,6 +149,11 @@ Values take effect when containers are next created, so run `spky deploy` or
 `spky restart` after changing them. Omitting the key entirely keeps the previous
 setting; an explicit empty map clears it.
 
+`deployment.env`, the `sync:` block and the top-level `anonymousLiveQueries`
+are read from `sp00ky.yml` on every deploy, whether `spky deploy` runs it or a
+[git-linked build](/docs/cloud/ci-cd) does. Both paths write the same values,
+so a push after a CLI deploy never reverts them.
+
 One pair is set for you: with `sync.transport: changefeed` in `sp00ky.yml`,
 `spky deploy` merges `SPKY_INGEST_TRANSPORT` and `SPKY_CHANGEFEED_RETENTION`
 into the `scheduler` and `ssp` roles (your own keys win on a clash), so the

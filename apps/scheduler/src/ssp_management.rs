@@ -28,6 +28,9 @@ pub struct SspManagementState {
     pub transport: Arc<HttpTransport>,
     pub config: Arc<SchedulerConfig>,
     pub status: Arc<RwLock<SchedulerStatus>>,
+    /// The changefeed tail's cursor, reset by every re-clone to just before
+    /// the clone started so the tail replays what committed during it.
+    pub changefeed: Arc<maintenance::changefeed::TailerStats>,
     pub event_buffer: Arc<RwLock<VecDeque<BufferedEvent>>>,
     /// Global sequence counter — the seq the replica reflects after a re-clone.
     pub seq_counter: Arc<AtomicU64>,
@@ -113,6 +116,7 @@ async fn handle_resync(
         status: Arc::clone(&state.status),
         seq_counter: Arc::clone(&state.seq_counter),
         reclone_lock: Arc::clone(&state.reclone_lock),
+        changefeed: Arc::clone(&state.changefeed),
     };
     run_resync(&args, mode, req.tables).await.map(Json)
 }
@@ -132,6 +136,7 @@ pub struct ResyncArgs {
     pub status: Arc<RwLock<SchedulerStatus>>,
     pub seq_counter: Arc<AtomicU64>,
     pub reclone_lock: Arc<Mutex<()>>,
+    pub changefeed: Arc<maintenance::changefeed::TailerStats>,
 }
 
 /// Run a `reclone` or `rehash` and flag every SSP to re-verify afterwards.
@@ -195,6 +200,7 @@ pub async fn run_resync(
                 &state.replica,
                 &state.seq_counter,
                 &state.reclone_lock,
+                &state.changefeed,
             )
             .await
             {
@@ -377,6 +383,7 @@ async fn handle_bootstrap_verify(
             &state.replica,
             &state.seq_counter,
             &state.reclone_lock,
+            &state.changefeed,
         )
         .await
         {
@@ -575,6 +582,7 @@ async fn handle_register(
     let reclone_lock = state.reclone_lock.clone();
 
     let replica = state.replica.clone();
+    let changefeed = Arc::clone(&state.changefeed);
     tokio::spawn(async move {
         if let Err(e) = poll_and_replay_ssp(
             ssp_id.clone(),
@@ -589,6 +597,7 @@ async fn handle_register(
             replica,
             seq_counter,
             reclone_lock,
+            changefeed,
         )
         .await
         {
@@ -738,6 +747,7 @@ async fn poll_and_replay_ssp(
     replica: Arc<RwLock<Replica>>,
     seq_counter: Arc<AtomicU64>,
     reclone_lock: Arc<Mutex<()>>,
+    changefeed: Arc<maintenance::changefeed::TailerStats>,
 ) -> Result<()> {
     let poll_interval = std::time::Duration::from_millis(config.ssp_poll_interval_ms);
     let timeout = std::time::Duration::from_secs(config.bootstrap_timeout_secs);
@@ -938,7 +948,7 @@ async fn poll_and_replay_ssp(
                         "Catch-up failed {} times — re-cloning replica from upstream before the next attempt",
                         fails,
                     );
-                    match reclone_replica_from_upstream(&config, &replica, &seq_counter, &reclone_lock).await {
+                    match reclone_replica_from_upstream(&config, &replica, &seq_counter, &reclone_lock, &changefeed).await {
                         Ok(true) => {
                             info!("Replica re-cloned from upstream; flagging all SSPs to re-bootstrap from the fresh snapshot");
                             ssp_pool.write().await.mark_all_for_resync();
@@ -1397,11 +1407,18 @@ pub(crate) async fn reclone_replica_from_upstream(
     replica: &Arc<RwLock<Replica>>,
     seq_counter: &Arc<AtomicU64>,
     reclone_lock: &Arc<Mutex<()>>,
+    changefeed: &Arc<maintenance::changefeed::TailerStats>,
 ) -> Result<bool> {
     let _guard = match reclone_lock.try_lock() {
         Ok(g) => g,
         Err(_) => return Ok(false),
     };
+
+    // The tail resumes from just before this clone's cut: a change that
+    // commits while the tables are being paged out is either in the clone
+    // already or replayed from the feed, and the rv-monotonic apply makes
+    // the overlap a no-op. Taken BEFORE the fetch, like `seq` below.
+    let fresh_cursor = maintenance::changefeed::fresh_cursor(maintenance::changefeed::now_ms());
 
     let db = crate::restore::connect_remote(&config.db)
         .await
@@ -1431,10 +1448,12 @@ pub(crate) async fn reclone_replica_from_upstream(
         rep.load_from_spool(&manifest)
             .await
             .context("reclone: spool load failed")?;
+        rep.set_changefeed_vs(fresh_cursor);
         rep.set_snapshot_state(seq, None)
             .await
             .context("reclone: set_snapshot_state failed")?;
     }
+    changefeed.reset_cursor(fresh_cursor);
 
     info!(seq, "Catch-up breaker: replica re-clone from upstream complete");
     Ok(true)

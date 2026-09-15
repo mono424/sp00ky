@@ -646,6 +646,7 @@ fn run_direct_mode(
             db_name: resolved_surreal.database.clone(),
             db_user: resolved_surreal.username_literal(),
             db_pass: resolved_surreal.password_literal(),
+            sync_env: config.sync().infra_env(),
         };
 
         let step = ui::step("Scheduler");
@@ -723,6 +724,7 @@ fn run_direct_mode(
         db_user: resolved_surreal.username_literal(),
         db_pass: resolved_surreal.password_literal(),
         job_config: job_config_json,
+        sync_env: config.sync().infra_env(),
         ref_mode: config.resolved_ref_mode().as_str().to_string(),
         anon_live: if config.resolved_anonymous_live_queries() {
             "1"
@@ -1693,6 +1695,8 @@ struct SchedulerLaunchSpec {
     db_name: String,
     db_user: String,
     db_pass: String,
+    /// `SPKY_INGEST_TRANSPORT` and friends, from `sync:` in the manifest.
+    sync_env: Vec<(String, String)>,
 }
 
 impl SchedulerLaunchSpec {
@@ -1718,6 +1722,8 @@ struct SspLaunchSpec {
     cluster: bool,
     scheduler_url: String,
     advertise: String,
+    /// Same `sync:` env as the scheduler's, so a standalone SSP tails too.
+    sync_env: Vec<(String, String)>,
 }
 
 impl SspLaunchSpec {
@@ -1747,7 +1753,8 @@ fn start_scheduler(spec: &SchedulerLaunchSpec, step: Option<&ui::Step>) -> Resul
             let db_name = format!("SPKY_DB_NAME={}", spec.db_name);
             let db_user = format!("SPKY_DB_USER={}", spec.db_user);
             let db_pass = format!("SPKY_DB_PASS={}", spec.db_pass);
-            docker(&[
+            let sync_env: Vec<String> = spec.sync_env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let mut args: Vec<&str> = vec![
                 "run",
                 "-d",
                 "--name",
@@ -1782,8 +1789,13 @@ fn start_scheduler(spec: &SchedulerLaunchSpec, step: Option<&ui::Step>) -> Resul
                 "SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS=2",
                 "-e",
                 "SPKY_LOG_FORMAT=compact",
-                image,
-            ])?;
+            ];
+            for e in &sync_env {
+                args.push("-e");
+                args.push(e);
+            }
+            args.push(image.as_str());
+            docker(&args)?;
             Ok(spawn_log_tail(SCHEDULER_CONTAINER, "scheduler"))
         }
         LaunchKind::Host { binary } => {
@@ -1813,6 +1825,9 @@ fn start_scheduler(spec: &SchedulerLaunchSpec, step: Option<&ui::Step>) -> Resul
                 .env("SPKY_AUTH_SECRET", "mysecret")
                 .env("SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS", "2")
                 .env("SPKY_LOG_FORMAT", "compact");
+            for (k, v) in &spec.sync_env {
+                cmd.env(k, v);
+            }
             Ok(spawn_prefixed(&mut cmd, sink))
         }
     }
@@ -1887,6 +1902,10 @@ fn start_ssp(spec: &SspLaunchSpec, step: Option<&ui::Step>) -> Result<LogTailGua
                 args.push("-e".into());
                 args.push(advertise);
             }
+            for (k, v) in &spec.sync_env {
+                args.push("-e".into());
+                args.push(format!("{k}={v}"));
+            }
             args.push("-v".into());
             args.push(data_mount);
             args.push(image.clone());
@@ -1928,6 +1947,9 @@ fn start_ssp(spec: &SspLaunchSpec, step: Option<&ui::Step>) -> Result<LogTailGua
                 cmd.env("SPKY_SCHEDULER_URL", &spec.scheduler_url)
                     .env("SPKY_SSP_ID", "ssp-1")
                     .env("SPKY_SSP_ADVERTISE_ADDR", &spec.advertise);
+            }
+            for (k, v) in &spec.sync_env {
+                cmd.env(k, v);
             }
             Ok(spawn_prefixed(&mut cmd, sink))
         }

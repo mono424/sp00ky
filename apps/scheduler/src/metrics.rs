@@ -121,6 +121,8 @@ pub struct MetricsState {
     /// Replica-vs-upstream drift state (see `crate::drift`).
     pub drift: Arc<RwLock<crate::drift::DriftState>>,
     pub drift_config: crate::drift::DriftConfig,
+    /// Changefeed tail state; idle (never enabled) under the `http` transport.
+    pub changefeed: Arc<maintenance::changefeed::TailerStats>,
 }
 
 /// Create metrics router
@@ -338,9 +340,17 @@ async fn health_check(
         .heartbeat
         .snapshot(&state.heartbeat_config, now_ms, false);
 
+    // A tail that lost its place (gap: re-clone in progress or failing) or
+    // stopped completing polls degrades like a stale heartbeat does: changes
+    // are not reaching clients, and a restart does not fix the upstream.
+    let changefeed = state.changefeed.json(now_ms);
+    let changefeed_bad = state.changefeed.enabled.load(std::sync::atomic::Ordering::Relaxed)
+        && (state.changefeed.gap.load(std::sync::atomic::Ordering::Relaxed)
+            || state.changefeed.stalled.load(std::sync::atomic::Ordering::Relaxed));
+
     let (status_code, status_str) = if !ssps_ok || all_backends_down {
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
-    } else if ssps_ok && all_backends_ok && !stalled && !lag_exceeded && !heartbeat_stale {
+    } else if ssps_ok && all_backends_ok && !stalled && !lag_exceeded && !heartbeat_stale && !changefeed_bad {
         (StatusCode::OK, "healthy")
     } else {
         (StatusCode::OK, "degraded")
@@ -366,7 +376,8 @@ async fn health_check(
             "lag": pending.lag,
             "stalled": stalled,
         },
-        "heartbeat": heartbeat
+        "heartbeat": heartbeat,
+        "changefeed": changefeed
     })))
 }
 
@@ -607,6 +618,7 @@ pub async fn build_entities(state: &MetricsState) -> Vec<serde_json::Value> {
         "latest_seq": pending.latest_seq,
         "lag": pending.lag,
         "heartbeat": heartbeat,
+        "changefeed": state.changefeed.json(now_ms),
         "env": mask_sensitive_env(env_vars),
     })];
 

@@ -39,6 +39,16 @@ pub struct SchedulerConfig {
     /// SSPs would publish each edge delta k times. Env
     /// `SPKY_CLEAR_VIEWS_ON_START`.
     pub clear_views_on_start: bool,
+    /// How row changes reach the scheduler. `http`: the generated DB events
+    /// `http::post` every mutation to `/ingest` inside the user's transaction
+    /// (the historical path). `changefeed`: the scheduler tails SurrealDB's
+    /// native `CHANGEFEED` (post-commit, ordered, resumable) and the events
+    /// only keep the version bookkeeping. Must match the deployed schema
+    /// (`sync.transport` in sp00ky.yml). Env `SPKY_INGEST_TRANSPORT`.
+    pub ingest_transport: IngestTransport,
+    /// Changefeed tail tunables; only read when `ingest_transport` is
+    /// `changefeed`.
+    pub changefeed: ChangefeedSettings,
     #[serde(skip)]
     pub scheduler_id: String,
     #[serde(skip)]
@@ -57,6 +67,10 @@ pub enum LoadBalanceStrategy {
     LeastQueries,
     LeastLoad,
 }
+
+// `IngestTransport` and `ChangefeedSettings` live in the shared `maintenance`
+// crate: the standalone SSP reads the same env keys for its own tail.
+pub use maintenance::changefeed::{ChangefeedSettings, IngestTransport};
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -92,6 +106,8 @@ impl Default for SchedulerConfig {
             health_check_interval_secs: 15,
             feature_flag_sweep_interval_secs: 30,
             clear_views_on_start: true,
+            ingest_transport: IngestTransport::Http,
+            changefeed: ChangefeedSettings::default(),
             scheduler_id: String::new(),
             backends: vec![],
         }
@@ -181,6 +197,14 @@ impl SchedulerConfig {
             }
         }
 
+        if let Ok(v) = std::env::var("SPKY_INGEST_TRANSPORT") {
+            match IngestTransport::parse(&v) {
+                Some(t) => scheduler_config.ingest_transport = t,
+                None => tracing::warn!(value = %v, "SPKY_INGEST_TRANSPORT not recognised (http|changefeed); keeping the default"),
+            }
+        }
+        scheduler_config.changefeed.apply_env();
+
         // Parse backend health check targets from JSON env var
         // (SPKY_BACKENDS preferred, SPKY_SCHEDULER_BACKENDS legacy fallback).
         scheduler_config.backends = maintenance::backend_health::backends_from_env();
@@ -218,5 +242,17 @@ mod env_bool_tests {
     #[test]
     fn the_wipe_is_on_by_default() {
         assert!(SchedulerConfig::default().clear_views_on_start);
+    }
+
+    #[test]
+    fn ingest_transport_defaults_to_http_and_parses_both_spellings() {
+        assert_eq!(SchedulerConfig::default().ingest_transport, IngestTransport::Http);
+        assert_eq!(IngestTransport::parse(" ChangeFeed "), Some(IngestTransport::Changefeed));
+        assert_eq!(IngestTransport::parse("cdc"), Some(IngestTransport::Changefeed));
+        assert_eq!(IngestTransport::parse("http"), Some(IngestTransport::Http));
+        assert_eq!(IngestTransport::parse("events"), None);
+        let cf = ChangefeedSettings::default();
+        assert_eq!(cf.retention_ms(), 24 * 3_600_000);
+        assert!(cf.tailer_config().stall_after.as_secs() >= 30);
     }
 }

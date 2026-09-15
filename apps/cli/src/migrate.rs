@@ -891,8 +891,27 @@ pub fn apply_internal_schema(
     meta_tables_remote =
         crate::schema_builder::substitute_crdt_update_rule(&meta_tables_remote, &content, &parser);
 
+    // `sync:` from the manifest decides the ingest transport. Under the
+    // changefeed the meta tables that feed the tail get their clause and the
+    // `_00_dbsp_cleanup` event is removed (a `_00_query` DELETE reaches the
+    // scheduler through the feed); under http the event posts as before.
+    let sync = crate::backend::sync_settings_for(config_path);
+    let changefeed = sync.is_changefeed();
+    if changefeed {
+        if !crate::schema_builder::valid_changefeed_retention(sync.retention()) {
+            anyhow::bail!(
+                "sync.changefeedRetention `{}` is not a SurrealDB duration in rendered form (1d, 12h, 1d12h)",
+                sync.retention()
+            );
+        }
+        ui::detail(format!("ingest transport: changefeed (retention {})", sync.retention()));
+        meta_tables_remote =
+            crate::schema_builder::add_changefeed_clauses(&meta_tables_remote, "", sync.retention());
+        meta_tables_remote = crate::schema_builder::strip_dbsp_cleanup_event(&meta_tables_remote);
+    }
+
     // Replace unregister_view for singlenode/cluster mode — uses $sp00ky_endpoint param
-    if *mode == DeployMode::Singlenode || *mode == DeployMode::Cluster {
+    if (*mode == DeployMode::Singlenode || *mode == DeployMode::Cluster) && !changefeed {
         let unregister_call = "let $result = mod::dbsp::unregister_view(<string>$before.id);";
         // Wrapped in a `SELECT ... TIMEOUT` for the same reason as the
         // per-table `/ingest` events: this runs inside the transaction that
@@ -926,10 +945,32 @@ pub fn apply_internal_schema(
         mode,
         endpoint,
         secret,
+        sync.transport(),
     );
     let event_count = sp00ky_events.matches("DEFINE EVENT").count();
     ui::detail(format!("{} per-table events", event_count));
     internal_sql.push_str(&sp00ky_events);
+
+    // 3b'. The CHANGEFEED clause on every synced user table. ALTER, not
+    // DEFINE: it keeps whatever the user's migration defined and is
+    // idempotent, so it can run after every migration batch, which is when
+    // a `DEFINE TABLE OVERWRITE` without the clause would have dropped it.
+    if changefeed {
+        let synced: Vec<&str> = parser
+            .tables
+            .iter()
+            .filter(|(name, t)| {
+                crate::schema_builder::table_takes_changefeed(name, t.is_relation, t.no_sync)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        ui::detail(format!("changefeed clause on {} table(s)", synced.len()));
+        internal_sql.push('\n');
+        internal_sql.push_str(&crate::schema_builder::changefeed_alter_statements(
+            synced.into_iter(),
+            sync.retention(),
+        ));
+    }
 
     // 3c. Platform job fields on outbox tables. The SSP stamps `assignee`
     // when it claims a job on pickup/recover; a SCHEMAFULL user outbox table

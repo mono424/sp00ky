@@ -2910,11 +2910,30 @@ pub fn deploy(
     // Per-role env for the infra containers (`deployment.env` in sp00ky.yml).
     // Omitted when unset so the control plane keeps the previous setting, the
     // same contract as `log_level` above.
-    let infra_env = config
+    // `sync.transport` must reach the scheduler and SSP containers as
+    // `SPKY_INGEST_TRANSPORT` (plus the retention the tail's gap check uses),
+    // merged over the operator's own `deployment.env`. Under the default http
+    // transport with no `deployment.env` the field stays omitted, so the
+    // control plane keeps whatever it has (the historical contract).
+    let mut infra_env_map = config
         .deployment
         .as_ref()
-        .and_then(|d| d.env.as_ref())
-        .map(|e| serde_json::json!(e));
+        .and_then(|d| d.env.clone())
+        .unwrap_or_default();
+    let sync = config.sync();
+    if sync.is_changefeed() || !infra_env_map.is_empty() {
+        for role in ["scheduler", "ssp"] {
+            let entry = infra_env_map.entry(role.to_string()).or_default();
+            for (k, v) in sync.infra_env() {
+                entry.entry(k).or_insert(v);
+            }
+        }
+    }
+    let infra_env = if infra_env_map.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(infra_env_map))
+    };
 
     let deploy_body = serde_json::json!({
         "infra_env": infra_env,

@@ -63,4 +63,10 @@ pub struct BufferedEvent {
     pub update: RecordUpdate,
     /// Unix timestamp when this event was received
     pub received_at: u64,
+    /// SurrealDB changefeed versionstamp the event was read at, `0` for an
+    /// event that arrived over HTTP `/ingest`. The tail resumes from the
+    /// highest one in the WAL after a restart (`serde(default)` keeps WALs
+    /// written before this field readable).
+    #[serde(default)]
+    pub versionstamp: u64,
 }

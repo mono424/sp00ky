@@ -30,6 +30,7 @@ pub mod feature_flags;
 pub mod heartbeat;
 pub mod schedule_engine;
 pub mod drift;
+pub mod changefeed;
 
 use anyhow::{Context, Result};
 
@@ -136,6 +137,8 @@ pub async fn drain_and_apply(
     // Track which tables this batch touched so the snapshot-state writer
     // only rehashes the affected tables, not the whole replica.
     let touched = touched_tables(&events);
+    // And the changefeed position the rows will reflect once applied.
+    let max_versionstamp = events.iter().map(|e| e.versionstamp).max().unwrap_or(0);
 
     // Nothing to apply, and every hash current: done. A dirty table with
     // nothing to apply still needs its from-content rehash below — the
@@ -211,6 +214,7 @@ pub async fn drain_and_apply(
     debug!(touched = touched.len(), rehashed = hashed.len(), "Drain hashes folded; rehashed only dirty tables");
     {
         let mut rep = replica.write().await;
+        rep.set_changefeed_vs(max_versionstamp);
         if let Err(e) = rep.commit_snapshot_state(max_seq, hashed, failed).await {
             error!(error = %e, "Failed to persist snapshot state");
         }
@@ -293,6 +297,15 @@ pub struct Scheduler {
     /// `ingest::Fanout`). One consumer per scheduler, or delivery order and
     /// the `Lagging` bookkeeping would race.
     fanout: Arc<crate::ingest::Fanout>,
+    /// Changefeed tail state (cursor, lag, doorbell), surfaced via `/health`
+    /// and reset by every re-clone. Idle when the transport is `http`.
+    pub changefeed: Arc<maintenance::changefeed::TailerStats>,
+    /// Rings the tail: the doorbell, the heartbeat probe after its own write,
+    /// an operator.
+    pub changefeed_notify: Arc<tokio::sync::Notify>,
+    /// The query router's state, attached by `main` before `start()`, so the
+    /// tail can tear down views for the `_00_query` deletes it reads.
+    query_state_slot: std::sync::OnceLock<crate::query::QueryState>,
 }
 
 impl Scheduler {
@@ -334,7 +347,16 @@ impl Scheduler {
             drift_config: crate::drift::DriftConfig::from_env(),
             reclone_lock: Arc::new(tokio::sync::Mutex::new(())),
             fanout: crate::ingest::Fanout::start(),
+            changefeed: maintenance::changefeed::TailerStats::new(),
+            changefeed_notify: Arc::new(tokio::sync::Notify::new()),
+            query_state_slot: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Hand the tail the query router's tracker. Must run before `start()`
+    /// when the transport is `changefeed`; a second call is ignored.
+    pub fn attach_query_state(&self, state: crate::query::QueryState) {
+        let _ = self.query_state_slot.set(state);
     }
 
     /// Get ingest state for HTTP handlers
@@ -398,7 +420,21 @@ impl Scheduler {
             heartbeat_config: self.heartbeat_config.clone(),
             drift: Arc::clone(&self.drift),
             drift_config: self.drift_config.clone(),
+            changefeed: Arc::clone(&self.changefeed),
         }
+    }
+
+    /// The re-clone bound to this scheduler's replica, as the drift check and
+    /// the changefeed gap handler use it.
+    fn recloner(&self) -> Arc<SchedulerRecloner> {
+        Arc::new(SchedulerRecloner {
+            config: self.config.clone(),
+            replica: Arc::clone(&self.replica),
+            seq_counter: Arc::clone(&self.seq_counter),
+            reclone_lock: Arc::clone(&self.reclone_lock),
+            ssp_pool: Arc::clone(&self.ssp_pool),
+            changefeed: Arc::clone(&self.changefeed),
+        })
     }
 
     /// The drift hook the snapshot updater and the startup pass run: upstream
@@ -409,14 +445,47 @@ impl Scheduler {
             cfg: self.drift_config.clone(),
             upstream: Arc::new(crate::drift::SurrealUpstream { db }),
             state: Arc::clone(&self.drift),
-            reclone: Arc::new(SchedulerRecloner {
-                config: self.config.clone(),
-                replica: Arc::clone(&self.replica),
-                seq_counter: Arc::clone(&self.seq_counter),
-                reclone_lock: Arc::clone(&self.reclone_lock),
-                ssp_pool: Arc::clone(&self.ssp_pool),
-            }),
+            reclone: self.recloner(),
         })
+    }
+
+    /// Start the changefeed tail: resume from the highest versionstamp the
+    /// replica or the WAL knows (both persisted), else from just before now.
+    async fn spawn_changefeed_tail(&self, db: Arc<maintenance::db::ReconnectingDb>) {
+        let Some(query_state) = self.query_state_slot.get().cloned() else {
+            error!("Changefeed transport configured but no query state attached; view teardown would be lost, tail NOT started");
+            return;
+        };
+        let persisted = self.replica.read().await.changefeed_vs();
+        let wal_vs = match self.wal.read().await.max_versionstamp() {
+            Ok(vs) => vs,
+            Err(e) => {
+                warn!(error = %e, "Could not read the WAL's changefeed stamps; resuming from the replica's cursor");
+                0
+            }
+        };
+        let resume = persisted.max(wal_vs);
+        if resume > 0 {
+            // `SINCE` is inclusive; everything at `resume` is already ours.
+            self.changefeed.reset_cursor(resume + 1);
+        }
+        info!(
+            persisted_ms = maintenance::changefeed::stamp_ms(persisted),
+            wal_ms = maintenance::changefeed::stamp_ms(wal_vs),
+            retention = %self.config.changefeed.retention,
+            doorbell = self.config.changefeed.doorbell,
+            "Ingest transport: changefeed"
+        );
+        crate::changefeed::spawn(
+            db,
+            self.config.db.clone(),
+            self.ingest_state(),
+            query_state,
+            self.recloner(),
+            &self.config.changefeed,
+            Arc::clone(&self.changefeed),
+            Arc::clone(&self.changefeed_notify),
+        );
     }
 
     /// Get proxy state for HTTP handlers
@@ -562,6 +631,8 @@ impl Scheduler {
             // so reset before re-cloning. Safe because `needs_bootstrap` is
             // gated on `snapshot_seq == 0` — no committed snapshot to lose.
             replica.reset().await.context("Failed to reset replica before bootstrap")?;
+            // Where the changefeed tail resumes: just before this clone's cut.
+            let clone_cursor = maintenance::changefeed::fresh_cursor(maintenance::changefeed::now_ms());
 
             trace!(
                 ns = %self.config.db.namespace,
@@ -583,6 +654,7 @@ impl Scheduler {
                 Duration::from_secs(self.config.clone_timeout_secs),
                 async {
                     replica.ingest_all(&db).await?;
+                    replica.set_changefeed_vs(clone_cursor);
                     // Pass `None` for touched_tables so set_snapshot_state
                     // hashes every table we just ingested — that hash is the
                     // integrity baseline an SSP gets handed at /ssp/register.
@@ -718,6 +790,17 @@ impl Scheduler {
         // periodic drift check after each drain).
         self.spawn_snapshot_updater(Some(drift_hook));
 
+        // The changefeed tail, when that is how changes arrive. The heartbeat
+        // probe pokes it after its own write (the probe row carries no
+        // `_00_version`, so the doorbell does not ring for it).
+        let changefeed_poke = if self.config.ingest_transport == crate::config::IngestTransport::Changefeed {
+            self.spawn_changefeed_tail(Arc::clone(&shared_db)).await;
+            Some(Arc::clone(&self.changefeed_notify))
+        } else {
+            info!("Ingest transport: http (DB events post to /ingest)");
+            None
+        };
+
         // Keep the handle's HTTP auth token fresh, and replace the handle
         // outright if its session dies.
         maintenance::db::spawn_periodic_resignin(
@@ -742,6 +825,7 @@ impl Scheduler {
             Arc::clone(&self.transport),
             Arc::clone(&self.heartbeat),
             self.heartbeat_config.clone(),
+            changefeed_poke,
         );
 
         // Keep running until shutdown signal
@@ -868,6 +952,7 @@ struct SchedulerRecloner {
     seq_counter: Arc<AtomicU64>,
     reclone_lock: Arc<tokio::sync::Mutex<()>>,
     ssp_pool: Arc<RwLock<SspPool>>,
+    changefeed: Arc<maintenance::changefeed::TailerStats>,
 }
 
 #[async_trait::async_trait]
@@ -878,6 +963,7 @@ impl crate::drift::Recloner for SchedulerRecloner {
             &self.replica,
             &self.seq_counter,
             &self.reclone_lock,
+            &self.changefeed,
         )
         .await?;
         if done {
@@ -1104,6 +1190,7 @@ mod drain_tests {
                 version: 0,
             },
             received_at: 0,
+            versionstamp: 0,
         }
     }
 

@@ -87,6 +87,8 @@ async fn run() -> Result<()> {
         query_tracker: std::sync::Arc::clone(&query_tracker),
     };
     let query_router = scheduler::query::create_query_router(query_state.clone());
+    // The changefeed tail tears down views through the same tracker.
+    scheduler.attach_query_state(query_state.clone());
     
     let job_state = scheduler::job_scheduler::JobState {
         ssp_pool: std::sync::Arc::clone(&query_state.ssp_pool),
@@ -106,6 +108,7 @@ async fn run() -> Result<()> {
         reclone_lock: scheduler.reclone_lock.clone(),
         wal: scheduler.wal.clone(),
         drain_lock: scheduler.drain_lock.clone(),
+        changefeed: std::sync::Arc::clone(&scheduler.changefeed),
     };
     let ssp_router = scheduler::ssp_management::create_ssp_router(ssp_mgmt_state);
 
@@ -212,6 +215,7 @@ async fn run() -> Result<()> {
                     status: std::sync::Arc::clone(&scheduler.status),
                     seq_counter: std::sync::Arc::clone(&scheduler.seq_counter),
                     reclone_lock: scheduler.reclone_lock.clone(),
+                    changefeed: std::sync::Arc::clone(&scheduler.changefeed),
                 },
                 cloud,
                 auth_secret: std::env::var("SPKY_AUTH_SECRET").ok().filter(|s| !s.is_empty()),

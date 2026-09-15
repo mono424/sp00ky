@@ -229,6 +229,7 @@ pub fn spawn(
     transport: Arc<HttpTransport>,
     stats: Arc<HeartbeatStats>,
     cfg: Config,
+    poke: Option<Arc<tokio::sync::Notify>>,
 ) {
     if cfg.interval_secs == 0 {
         info!("E2E heartbeat disabled (SPKY_HEARTBEAT_INTERVAL_SECS=0)");
@@ -272,7 +273,8 @@ pub fn spawn(
                 let ssp_pool = Arc::clone(&ssp_pool);
                 let transport = Arc::clone(&transport);
                 let timeout_secs = cfg.timeout_secs;
-                async move { run_one_cycle(&db, &ssp_pool, &transport, timeout_secs).await }
+                let poke = poke.clone();
+                async move { run_one_cycle(&db, &ssp_pool, &transport, timeout_secs, poke.as_deref()).await }
             });
             let outcome = match tokio::time::timeout(cycle_budget, cycle).await {
                 Ok(Ok(outcome)) => outcome,
@@ -320,6 +322,7 @@ async fn run_one_cycle(
     ssp_pool: &Arc<RwLock<SspPool>>,
     transport: &Arc<HttpTransport>,
     timeout_secs: u64,
+    poke: Option<&tokio::sync::Notify>,
 ) -> CycleOutcome {
     // Snapshot (id, url) of ready SSPs — take-and-drop, never held across
     // an await (the whole point of this probe is catching lock convoys, not
@@ -346,7 +349,15 @@ async fn run_one_cycle(
         .query("UPSERT _00_heartbeat:probe SET hb_seq = $s")
         .bind(("s", hb_seq as i64));
     match tokio::time::timeout(Duration::from_secs(timeout_secs), write).await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => {
+            // With the changefeed transport the probe row does not write
+            // `_00_version`, so the doorbell stays silent for it; the
+            // scheduler rings its own tail instead of waiting out the
+            // fallback interval.
+            if let Some(poke) = poke {
+                poke.notify_one();
+            }
+        }
         Ok(Err(e)) => {
             let msg = e.to_string();
             db.note_error(&msg);

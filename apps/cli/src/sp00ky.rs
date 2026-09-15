@@ -1,5 +1,5 @@
 use crate::annotations::has_annotation;
-use crate::backend::DeployMode;
+use crate::backend::{DeployMode, SyncTransport};
 use crate::parser::{FieldDefinition, FieldType, TableSchema};
 use std::collections::BTreeMap;
 
@@ -60,6 +60,7 @@ pub fn generate_sp00ky_events(
     mode: &DeployMode,
     _endpoint: Option<&str>,
     _secret: Option<&str>,
+    transport: SyncTransport,
 ) -> String {
     // 2. Generate Events
     let mut events = String::from("\n-- ==================================================\n-- AUTO-GENERATED SP00KY EVENTS\n-- ==================================================\n\n");
@@ -125,6 +126,10 @@ pub fn generate_sp00ky_events(
     // Remote Logic: DBSP Ingest (Surrealism) OR Sidecar HTTP Call
 
     let is_http = *mode == DeployMode::Singlenode || *mode == DeployMode::Cluster;
+    // With the changefeed transport the events keep the version bookkeeping
+    // (`_00_version` is what the tail reads `_00_rv` from) and post nothing:
+    // the scheduler reads the committed change from `SHOW CHANGES`.
+    let post_ingest = is_http && transport == SyncTransport::Http;
 
     // Sort table names for deterministic output
     let mut sorted_table_names: Vec<_> = tables.keys().collect();
@@ -222,7 +227,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        _00_rv: (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $after.id)\n");
         events.push_str("    };\n");
 
-        if is_http {
+        if post_ingest {
             events.push_str("    LET $payload = {\n");
             events.push_str(&format!("        table: '{}',\n", table_name));
             events.push_str("        op: $event,\n");
@@ -232,7 +237,7 @@ pub fn generate_sp00ky_events(
             events.push_str("    };\n");
 
             events.push_str(&ingest_post());
-        } else {
+        } else if !is_http {
             // Surrealism / WASM Mode
             events.push_str(&format!(
                 "    mod::dbsp::ingest('{}', $event, <string>($after.id OR \"\"), $plain_after);\n",
@@ -288,7 +293,7 @@ pub fn generate_sp00ky_events(
         }
         events.push_str("    };\n");
 
-        if is_http {
+        if post_ingest {
             events.push_str("    LET $payload = {\n");
             events.push_str(&format!("        table: '{}',\n", table_name));
             events.push_str("        op: \"DELETE\",\n");
@@ -298,7 +303,7 @@ pub fn generate_sp00ky_events(
             events.push_str("    };\n");
 
             events.push_str(&ingest_post());
-        } else {
+        } else if !is_http {
             events.push_str(&format!("    mod::dbsp::ingest('{}', \"DELETE\", <string>($before.id OR \"\"), $plain_before);\n", table_name));
             events.push_str("    mod::dbsp::save_state(NONE);\n");
         }
@@ -340,7 +345,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        evaluated_at: <string>($after.evaluated_at OR \"\"),\n");
     events.push_str("        _00_rv: (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $after.id)\n");
     events.push_str("    };\n");
-    if is_http {
+    if post_ingest {
         events.push_str("    LET $payload = {\n");
         events.push_str("        table: '_00_user_feature',\n");
         events.push_str("        op: $event,\n");
@@ -349,7 +354,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
         events.push_str(&ingest_post());
-    } else {
+    } else if !is_http {
         events.push_str("    mod::dbsp::ingest('_00_user_feature', $event, <string>($after.id OR \"\"), $plain_after);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
     }
@@ -367,7 +372,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        payload: $before.payload,\n");
     events.push_str("        evaluated_at: <string>($before.evaluated_at OR \"\")\n");
     events.push_str("    };\n");
-    if is_http {
+    if post_ingest {
         events.push_str("    LET $payload = {\n");
         events.push_str("        table: '_00_user_feature',\n");
         events.push_str("        op: \"DELETE\",\n");
@@ -376,7 +381,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
         events.push_str(&ingest_post());
-    } else {
+    } else if !is_http {
         events.push_str("    mod::dbsp::ingest('_00_user_feature', \"DELETE\", <string>($before.id OR \"\"), $plain_before);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
     }
@@ -410,7 +415,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        released_at: <string>($after.released_at OR \"\"),\n");
     events.push_str("        _00_rv: (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $after.id)\n");
     events.push_str("    };\n");
-    if is_http {
+    if post_ingest {
         events.push_str("    LET $payload = {\n");
         events.push_str("        table: '_00_app_release',\n");
         events.push_str("        op: $event,\n");
@@ -419,7 +424,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
         events.push_str(&ingest_post());
-    } else {
+    } else if !is_http {
         events.push_str("    mod::dbsp::ingest('_00_app_release', $event, <string>($after.id OR \"\"), $plain_after);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
     }
@@ -437,7 +442,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        mandatory: $before.mandatory,\n");
     events.push_str("        released_at: <string>($before.released_at OR \"\")\n");
     events.push_str("    };\n");
-    if is_http {
+    if post_ingest {
         events.push_str("    LET $payload = {\n");
         events.push_str("        table: '_00_app_release',\n");
         events.push_str("        op: \"DELETE\",\n");
@@ -446,7 +451,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
         events.push_str(&ingest_post());
-    } else {
+    } else if !is_http {
         events.push_str("    mod::dbsp::ingest('_00_app_release', \"DELETE\", <string>($before.id OR \"\"), $plain_before);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
     }
@@ -470,7 +475,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        hb_seq: $after.hb_seq,\n");
     events.push_str("        sent_at: <string>($after.sent_at OR \"\")\n");
     events.push_str("    };\n");
-    if is_http {
+    if post_ingest {
         events.push_str("    LET $payload = {\n");
         events.push_str("        table: '_00_heartbeat',\n");
         events.push_str("        op: $event,\n");
@@ -479,7 +484,7 @@ pub fn generate_sp00ky_events(
         events.push_str("        hash: \"\"\n");
         events.push_str("    };\n");
         events.push_str(&ingest_post());
-    } else {
+    } else if !is_http {
         events.push_str("    mod::dbsp::ingest('_00_heartbeat', $event, <string>($after.id OR \"\"), $plain_after);\n");
         events.push_str("    mod::dbsp::save_state(NONE);\n");
     }
@@ -496,7 +501,38 @@ mod tests {
     // (the user-table loop produces nothing), so these assertions target the
     // `_00_user_feature` ingest-notify events specifically.
     fn gen(is_client: bool, mode: DeployMode) -> String {
-        generate_sp00ky_events(&BTreeMap::new(), "", is_client, &mode, None, None)
+        generate_sp00ky_events(&BTreeMap::new(), "", is_client, &mode, None, None, SyncTransport::Http)
+    }
+
+    /// The changefeed transport keeps every event (the `_00_version`
+    /// bookkeeping is what stamps `_00_rv` in the feed) but posts nothing.
+    #[test]
+    fn changefeed_transport_keeps_versioning_and_drops_the_post() {
+        use crate::parser::SchemaParser;
+        let schema = r#"
+DEFINE TABLE doc SCHEMAFULL;
+DEFINE FIELD body ON TABLE doc TYPE string;
+"#;
+        let mut parser = SchemaParser::new();
+        parser.parse_file(schema).unwrap();
+        let out = generate_sp00ky_events(
+            &parser.tables,
+            schema,
+            false,
+            &DeployMode::Cluster,
+            None,
+            None,
+            SyncTransport::Changefeed,
+        );
+        assert!(out.contains("DEFINE EVENT OVERWRITE _00_doc_mutation"));
+        assert!(out.contains("DEFINE EVENT OVERWRITE _00_doc_delete"));
+        assert!(out.contains("CREATE _00_version SET record_id = $after.id"), "version rows still written");
+        assert!(out.contains("DELETE _00_version WHERE record_id = $before.id"));
+        assert!(!out.contains("http::post"), "no network call inside the transaction");
+        assert!(!out.contains("mod::dbsp::ingest"), "not the surrealism path either");
+        // The http transport on the same schema still posts.
+        let http = generate_sp00ky_events(&parser.tables, schema, false, &DeployMode::Cluster, None, None, SyncTransport::Http);
+        assert!(http.contains("http::post($sp00ky_endpoint + '/ingest'"));
     }
 
     #[test]
@@ -599,6 +635,7 @@ DEFINE FIELD token ON TABLE secrets TYPE string;
                 &DeployMode::Singlenode,
                 None,
                 None,
+                SyncTransport::Http,
             );
             assert!(
                 out.contains("ON TABLE public"),
@@ -645,6 +682,7 @@ DEFINE FIELD body ON TABLE doc TYPE string;
             &DeployMode::Singlenode,
             None,
             None,
+            SyncTransport::Http,
         );
 
         for excluded in ["import_batch", "thumbnail", "body"] {

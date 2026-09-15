@@ -129,4 +129,12 @@ impl EventWal {
         let events = self.read_all()?;
         Ok(events.last().map(|e| e.seq))
     }
+
+    /// Highest changefeed versionstamp any WAL entry carries (`0` when none
+    /// does): where the tail resumes after a restart, together with the
+    /// replica's persisted cursor.
+    pub fn max_versionstamp(&self) -> Result<u64> {
+        let events = self.read_all()?;
+        Ok(events.iter().map(|e| e.versionstamp).max().unwrap_or(0))
+    }
 }

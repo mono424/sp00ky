@@ -2459,6 +2459,7 @@ fn run_codegen(
             mode,
             endpoint,
             secret,
+            crate::backend::sync_settings_for(config_path).transport(),
         );
 
         let include_modules = *mode == DeployMode::Surrealism;

@@ -138,6 +138,9 @@ struct SnapshotState {
     /// fold the recovered WAL backlog (some of it is already in the rows) and
     /// rehashes those tables from content instead.
     applying: bool,
+    /// Changefeed cursor the rows are known to include (see
+    /// [`Replica::changefeed_vs`]).
+    changefeed_vs: u64,
 }
 
 /// Chunk of replica data for bootstrap
@@ -212,6 +215,11 @@ pub struct Replica {
     /// drain, after writing rows and before committing. Cleared by the next
     /// commit.
     interrupted_apply: bool,
+    /// Highest SurrealDB changefeed versionstamp whose changes are folded into
+    /// the rows, persisted with the snapshot state. Together with the WAL's
+    /// own stamps it is where the tail resumes after a restart; a re-clone
+    /// sets it to just before the clone started.
+    changefeed_vs: u64,
     /// Lock-free mirror of `snapshot_seq` for health/metrics readers. A drain
     /// or reclone holds the replica write lock for a long time; probes must
     /// never queue behind it just to read one number.
@@ -266,6 +274,7 @@ impl Replica {
             hashes: snapshot_hashes,
             tables: known_tables,
             applying: interrupted_apply,
+            changefeed_vs,
         } = Self::read_snapshot_state_from_db(&db).await.unwrap_or_default();
         if snapshot_seq > 0 {
             info!(
@@ -285,6 +294,7 @@ impl Replica {
             known_tables,
             dirty_hashes,
             interrupted_apply,
+            changefeed_vs,
             // Re-derived from upstream DDL on the first clone/rediscover; a
             // fresh process starts with no exclusions.
             opaque_fields: BTreeMap::new(),
@@ -295,6 +305,28 @@ impl Replica {
     /// Get current snapshot sequence number
     pub fn snapshot_seq(&self) -> u64 {
         self.snapshot_seq
+    }
+
+    /// The persisted changefeed cursor (see the field doc).
+    pub fn changefeed_vs(&self) -> u64 {
+        self.changefeed_vs
+    }
+
+    /// Record the changefeed position the rows reflect; persisted by the next
+    /// snapshot-state commit. Never moves backwards except through `reset`.
+    pub fn set_changefeed_vs(&mut self, versionstamp: u64) {
+        if versionstamp > self.changefeed_vs {
+            self.changefeed_vs = versionstamp;
+        }
+    }
+
+    /// A row as the replica holds it (opaque fields omitted), or `None`. The
+    /// changefeed carries only the id of a deleted row, and the SSP's delete
+    /// path wants the row's `owner` to drop its per-user edges, so the tail
+    /// reads the before-image here before applying the delete.
+    pub async fn row(&self, table: &str, id: &str) -> Result<Option<Value>> {
+        let thing_id = build_thing_id(table, id);
+        Ok(self.read_row_for_hash(table, &thing_id).await?.map(|(_, row)| row))
     }
 
     /// Shared lock-free view of `snapshot_seq` (see `seq_cell`). Clone once at
@@ -486,10 +518,11 @@ impl Replica {
         // `applying = false`: the batch whose rows were written under the
         // marker is now described by `seq` + `hashes`.
         self.db
-            .query("UPSERT _00_metadata:snapshot SET seq = $seq, hashes = $hashes, tables = $tables, applying = false")
+            .query("UPSERT _00_metadata:snapshot SET seq = $seq, hashes = $hashes, tables = $tables, applying = false, changefeed_vs = $changefeed_vs")
             .bind(("seq", seq))
             .bind(("hashes", hashes_value))
             .bind(("tables", tables_value))
+            .bind(("changefeed_vs", self.changefeed_vs))
             .await
             .context("Failed to persist snapshot state")?;
         self.interrupted_apply = false;
@@ -713,6 +746,26 @@ impl Replica {
         Ok(Self::first_row_json(v).and_then(|row| self.hash_pair_for(table, row)))
     }
 
+    /// The `_00_rv` the replica holds for a record, `None` when the row is
+    /// absent or unversioned.
+    async fn stored_rv(&self, thing_id: &str) -> Result<Option<i64>> {
+        let mut response = match self
+            .db
+            .query(format!("SELECT VALUE _00_rv FROM ONLY {}", thing_id))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if is_missing_error(&e) => return Ok(None),
+            Err(e) => return Err(anyhow::Error::from(e).context("stored_rv: SELECT failed")),
+        };
+        let v: surrealdb::types::Value = match response.take(0) {
+            Ok(v) => v,
+            Err(e) if is_missing_error(&e) => return Ok(None),
+            Err(e) => return Err(anyhow::Error::from(e).context("stored_rv: take(0) failed")),
+        };
+        Ok(v.into_json_value().as_i64())
+    }
+
     /// Fold one applied event into `table`'s accumulator: the before-image
     /// out, the after-image in. A table whose accumulator cannot be parsed
     /// is marked dirty instead, so the next drain rehashes it from content.
@@ -742,7 +795,7 @@ impl Replica {
         db: &Surreal<surrealdb::engine::local::Db>,
     ) -> Result<SnapshotState> {
         let mut response = db
-            .query("SELECT seq, hashes, tables, applying FROM _00_metadata:snapshot")
+            .query("SELECT seq, hashes, tables, applying, changefeed_vs FROM _00_metadata:snapshot")
             .await
             .context("Failed to query snapshot metadata")?;
 
@@ -754,6 +807,7 @@ impl Replica {
 
         let seq = row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
         let applying = row.get("applying").and_then(|v| v.as_bool()).unwrap_or(false);
+        let changefeed_vs = row.get("changefeed_vs").and_then(|v| v.as_u64()).unwrap_or(0);
         let hashes: BTreeMap<String, String> = row
             .get("hashes")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -771,6 +825,7 @@ impl Replica {
             hashes,
             tables: known,
             applying,
+            changefeed_vs,
         })
     }
 
@@ -1407,6 +1462,30 @@ impl Replica {
         let mut after: Option<(String, Value)> = None;
         let mut fold_failed = false;
 
+        // Idempotency for replayed changes. The changefeed tail replays the
+        // window between a clone's cut and the tail's start, a WAL recovered
+        // after a crash re-delivers what the last drain already folded, and
+        // the http->changefeed switch delivers a few rows through both paths.
+        // A row whose stored `_00_rv` is not older than the incoming one has
+        // nothing to learn from it, so the write (and its hash fold) is
+        // skipped rather than applied twice.
+        if matches!(op, RecordOp::Create | RecordOp::Update) {
+            let incoming = record
+                .as_ref()
+                .and_then(|r| r.get("_00_rv"))
+                .and_then(|v| v.as_i64());
+            if let Some(incoming) = incoming {
+                match self.stored_rv(&thing_id).await {
+                    Ok(Some(stored)) if stored >= incoming => {
+                        debug!(table, id, stored, incoming, "Skipping a change the replica already holds");
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(e) => debug!(table, id, error = %e, "Could not read the stored _00_rv; applying anyway"),
+                }
+            }
+        }
+
         if tracking && matches!(op, RecordOp::Update) {
             match self.read_row_for_hash(table, &thing_id).await {
                 Ok(row) => before = row,
@@ -1456,14 +1535,19 @@ impl Replica {
                     if let Some(obj) = data.as_object_mut() {
                         obj.remove("id");
                     }
+                    // UPSERT, not UPDATE: since SurrealDB 2 an UPDATE of a
+                    // record that does not exist is a no-op, so an update
+                    // whose create the replica never saw (a change feed
+                    // entry read past a clone cut, a restart) would leave the
+                    // row missing until the next re-clone.
                     let mut response = self
                         .db
-                        .query(format!("UPDATE {} MERGE $data RETURN AFTER", thing_id))
+                        .query(format!("UPSERT {} MERGE $data RETURN AFTER", thing_id))
                         .bind(("data", data))
                         .await
-                        .with_context(|| format!("UPDATE {} send failed", thing_id))?
+                        .with_context(|| format!("UPSERT {} send failed", thing_id))?
                         .check()
-                        .with_context(|| format!("UPDATE {} returned a statement error", thing_id))?;
+                        .with_context(|| format!("UPSERT {} returned a statement error", thing_id))?;
                     if tracking {
                         match response.take::<surrealdb::types::Value>(0) {
                             Ok(v) => after = Self::first_row_json(v).and_then(|r| self.hash_pair_for(table, r)),
@@ -1554,6 +1638,7 @@ impl Replica {
         self.known_tables.clear();
         self.dirty_hashes.clear();
         self.interrupted_apply = false;
+        self.changefeed_vs = 0;
         self.opaque_fields.clear();
         info!(path = ?self.db_path, "Replica reset (REMOVE DATABASE)");
         Ok(())
@@ -1847,6 +1932,59 @@ mod tests {
     /// Reset must wipe data in place without tripping RocksDB's file lock, and
     /// the handle must stay usable. This would have caught the original bug
     /// (dropping + reopening at the same path failed with "No locks available").
+    /// The changefeed tail replays a clone's overlap window and a recovered
+    /// WAL re-delivers what the last drain already folded: both must be
+    /// no-ops for a row already at that version, and an UPDATE for a row the
+    /// replica never saw must create it rather than vanish.
+    #[tokio::test]
+    async fn apply_is_idempotent_on_rv_and_upserts_unknown_updates() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut replica = Replica::new(tmp.path().join("replica")).await?;
+        let row = |x: i64, rv: i64| Some(serde_json::json!({ "x": x, "_00_rv": rv }));
+
+        replica.apply("game", RecordOp::Create, "game:a", row(1, 3)).await?;
+        // Older and equal versions are skipped.
+        replica.apply("game", RecordOp::Update, "game:a", row(99, 2)).await?;
+        replica.apply("game", RecordOp::Update, "game:a", row(98, 3)).await?;
+        assert_eq!(replica.row("game", "game:a").await?.unwrap()["x"], 1);
+        // A newer one lands.
+        replica.apply("game", RecordOp::Update, "game:a", row(2, 4)).await?;
+        assert_eq!(replica.row("game", "game:a").await?.unwrap()["x"], 2);
+        // A replayed CREATE for a row already ahead is skipped, not an error.
+        replica.apply("game", RecordOp::Create, "game:a", row(0, 1)).await?;
+        assert_eq!(replica.row("game", "game:a").await?.unwrap()["x"], 2);
+        // An UPDATE for a row the replica never saw creates it.
+        replica.apply("game", RecordOp::Update, "game:b", row(7, 1)).await?;
+        assert_eq!(replica.row("game", "game:b").await?.unwrap()["x"], 7);
+        assert!(replica.row("game", "game:zzz").await?.is_none());
+        // Unversioned rows keep the old behaviour: every write applies.
+        replica.apply("game", RecordOp::Update, "game:b", Some(serde_json::json!({ "x": 8 }))).await?;
+        assert_eq!(replica.row("game", "game:b").await?.unwrap()["x"], 8);
+        Ok(())
+    }
+
+    /// The cursor rides `_00_metadata:snapshot` with the seq, so a restart
+    /// resumes the tail where the rows are. (Read back through the metadata
+    /// reader rather than by reopening the path: the embedded RocksDB keeps
+    /// its lock until the runtime tears the engine down.)
+    #[tokio::test]
+    async fn changefeed_cursor_persists_with_the_snapshot_state() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut replica = Replica::new(tmp.path().join("replica")).await?;
+        replica.set_changefeed_vs(500);
+        replica.set_changefeed_vs(400); // never backwards
+        assert_eq!(replica.changefeed_vs(), 500);
+        replica.set_snapshot_seq(7).await?;
+
+        let persisted = Replica::read_snapshot_state_from_db(&replica.db).await?;
+        assert_eq!(persisted.changefeed_vs, 500);
+        assert_eq!(persisted.seq, 7);
+
+        replica.reset().await?;
+        assert_eq!(replica.changefeed_vs(), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reset_wipes_data_and_stays_usable() -> Result<()> {
         let tmp = tempfile::tempdir()?;

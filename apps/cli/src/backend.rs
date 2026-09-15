@@ -473,6 +473,97 @@ pub struct Sp00kyConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub anonymous_live_queries: Option<bool>,
+    /// How row changes reach the scheduler (`sync.transport`) and the
+    /// `CHANGEFEED` retention that goes with the `changefeed` transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncConfig>,
+}
+
+impl Sp00kyConfig {
+    /// `sync:` with defaults filled in.
+    pub fn sync(&self) -> SyncConfig {
+        self.sync.clone().unwrap_or_default()
+    }
+}
+
+/// `sync:` in sp00ky.yml.
+///
+/// ```yaml
+/// sync:
+///   transport: changefeed   # http (default) | changefeed
+///   changefeedRetention: 1d # SurrealDB duration, rendered form (1d, 12h)
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SyncConfig {
+    /// `http` (default): every generated `_00_<table>_*` event `http::post`s
+    /// the mutation to the scheduler inside the user's transaction.
+    /// `changefeed`: every synced table carries a `CHANGEFEED` clause, the
+    /// scheduler tails it post-commit, and the events keep only the version
+    /// bookkeeping. The scheduler and SSP containers receive
+    /// `SPKY_INGEST_TRANSPORT` to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<SyncTransport>,
+    /// Retention of the `CHANGEFEED` clause. Use the form SurrealDB renders
+    /// (`1d`, `12h`, `1d12h`), or every deploy diffs the table definition.
+    /// A scheduler that falls further behind than this re-clones.
+    #[serde(default, rename = "changefeedRetention", skip_serializing_if = "Option::is_none")]
+    pub changefeed_retention: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncTransport {
+    #[default]
+    Http,
+    Changefeed,
+}
+
+impl SyncTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Changefeed => "changefeed",
+        }
+    }
+}
+
+impl SyncConfig {
+    pub const DEFAULT_RETENTION: &'static str = "1d";
+
+    pub fn transport(&self) -> SyncTransport {
+        self.transport.unwrap_or_default()
+    }
+
+    pub fn retention(&self) -> &str {
+        self.changefeed_retention
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(Self::DEFAULT_RETENTION)
+    }
+
+    pub fn is_changefeed(&self) -> bool {
+        self.transport() == SyncTransport::Changefeed
+    }
+
+    /// Env the infra containers need to agree with this schema.
+    pub fn infra_env(&self) -> Vec<(String, String)> {
+        vec![
+            ("SPKY_INGEST_TRANSPORT".to_string(), self.transport().as_str().to_string()),
+            ("SPKY_CHANGEFEED_RETENTION".to_string(), self.retention().to_string()),
+        ]
+    }
+}
+
+/// The `sync:` settings of the manifest at `config_path`, defaults when there
+/// is none. Every schema producer (server schema, internal schema, codegen)
+/// reads them through here so they cannot disagree.
+pub fn sync_settings_for(config_path: Option<&Path>) -> SyncConfig {
+    config_path
+        .filter(|p| p.exists())
+        .map(|p| load_config(p).sync())
+        .unwrap_or_default()
 }
 
 // `RefMode` lives in `ssp-protocol` so the CLI, the SSP server, and any

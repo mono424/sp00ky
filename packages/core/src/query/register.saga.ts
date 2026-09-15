@@ -129,6 +129,15 @@ export function* ensureRegistered(env: SagaEnv, opts: { requireAuth?: boolean; a
 const stmt = (results: StatementResult[], i: number): StatementResult | undefined => results[i];
 
 /**
+ * The SSP answers a registration whose shape is not on the query allowlist
+ * with HTTP 403 `{"error":"not_allowlisted"}`. It reaches the client as the
+ * `fn::query::register` statement error carrying SurrealDB's http error text
+ * (status reason and/or body), and no retry can change the answer.
+ */
+export const isNotAllowlisted = (error: unknown): boolean =>
+  /not_allowlisted|\b403\b|forbidden/i.test(String((error as { message?: unknown })?.message ?? error));
+
+/**
  * One remote registration: `fn::query::register` plus the edge/meta/children
  * read in ONE request, then membership application. Concurrent with every
  * other registration; retried on its own backoff; stops when the entry is
@@ -174,6 +183,23 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
   } catch (error) {
     const current = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
     if (!current) return;
+    if (isNotAllowlisted(error)) {
+      yield fx.state.update(R.applyLifecycle(hash, { type: 'remote-failed' }));
+      yield fx.emit({
+        type: 'log',
+        level: 'error',
+        message: 'query refused: not allowlisted',
+        data: {
+          hash,
+          table: entry.def.tableName,
+          surql: entry.def.surql,
+          params: Object.keys(entry.def.params ?? {}),
+          hint: 'Add or regenerate the query allowlist: spky generate, then spky deploy (or restart spky dev).',
+        },
+      });
+      yield fx.dispatch({ type: 'SyncOutcome', ok: false, error });
+      return;
+    }
     const attempts = current.registerAttempts + 1;
     yield fx.state.update(R.bumpRegisterAttempts(hash));
     yield fx.emit({ type: 'log', level: 'warn', message: 'remote registration failed', data: { hash, attempts, error } });

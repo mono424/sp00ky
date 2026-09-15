@@ -4,7 +4,7 @@ import { runPure, sha256Hex } from '../testing/run-pure';
 import { buildEntry, buildState } from '../testing/build';
 import { defaultEnv } from './env';
 import { queryHashInput } from './hash';
-import { ensureRegistered, registerLocal, registerRemote } from './register.saga';
+import { ensureRegistered, isNotAllowlisted, registerLocal, registerRemote } from './register.saga';
 import * as R from '../state/reducers';
 import { emptyState } from '../state/client-state';
 import type { StatementResult } from '../kernel/effects';
@@ -212,6 +212,40 @@ describe('registerRemote', () => {
     expect(last.state.queries.get('a')!.lifecycle.remote).toBe('failed');
     expect(last.timers.size).toBe(0);
   });
+  it('not allowlisted: 403/Forbidden/not_allowlisted fails after ONE attempt with an error log, no retry timer', async () => {
+    for (const text of ['HTTP 403 Forbidden', 'There was an error processing a remote HTTP request: {"error":"not_allowlisted"}', 'status 403']) {
+      const out = await runPure(registerRemote(env, 'a'), {
+        state: buildState([entry]),
+        handlers: { 'remote.query': () => [{ status: 'ERR', error: text }] },
+      });
+      const e = out.state.queries.get('a')!;
+      expect(e.lifecycle).toMatchObject({ remote: 'failed', phase: 'cold', fetchDepth: 0 });
+      expect(e.registerAttempts).toBe(0);
+      expect(out.timers.size).toBe(0);
+      expect(out.emitted).toContainEqual(
+        expect.objectContaining({
+          type: 'log',
+          level: 'error',
+          message: 'query refused: not allowlisted',
+          data: expect.objectContaining({ hash: 'a', table: entry.def.tableName, surql: entry.def.surql, params: [] }),
+        })
+      );
+      expect(out.dispatched).toContainEqual(expect.objectContaining({ type: 'SyncOutcome', ok: false }));
+    }
+    const thrown = await runPure(registerRemote(env, 'a'), {
+      state: buildState([entry]),
+      handlers: {
+        'remote.query': () => {
+          throw new Error('Forbidden');
+        },
+      },
+    });
+    expect(thrown.state.queries.get('a')!.lifecycle.remote).toBe('failed');
+    expect(thrown.timers.size).toBe(0);
+    expect(isNotAllowlisted(new Error('socket closed'))).toBe(false);
+    expect(isNotAllowlisted('HTTP 4030')).toBe(false);
+  });
+
   it('tolerates ERR meta/children statements: edges still apply, missing meta reads as no row', async () => {
     const out = await runPure(registerRemote(env, 'a'), {
       state: buildState([entry]),

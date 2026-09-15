@@ -323,6 +323,15 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    */
   enableAnonymousLiveQueries?: boolean;
   /**
+   * Opt in to the raw remote escape hatches (`useRemote`, `remoteQuery`,
+   * `queryRaw`) when the generated schema's `policy.queryAllowlist` is `warn`
+   * or `enforce`. With the allowlist on, the server only accepts query shapes
+   * that `spky generate` collected from the query builder, so a hand-written
+   * SurrealQL string cannot be allowlisted and these methods throw unless this
+   * flag is `true`. Defaults to `false`.
+   */
+  allowRawRemote?: boolean;
+  /**
    * Surface sustained sync failures as a "degraded" health status that the app
    * can observe via `subscribeToSyncHealth` (or the client-solid
    * `useSyncStatus` hook) to render a "can't reach the server" banner.

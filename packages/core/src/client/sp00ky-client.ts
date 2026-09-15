@@ -269,7 +269,22 @@ export class Sp00kyClient<S extends SchemaStructure> {
     return this.runtime.run(registerLocal(this.env, this.registerInput(table, q, ttl)));
   }
 
+  /**
+   * The raw remote escape hatches bypass the query builder, so their shapes
+   * can never be on the server's query allowlist. When the generated schema
+   * says the allowlist is on, refuse them unless the app opted in explicitly.
+   */
+  private assertRawRemoteAllowed(method: string): void {
+    const mode = this.config.schema.policy?.queryAllowlist;
+    if ((mode === 'warn' || mode === 'enforce') && !this.config.allowRawRemote) {
+      throw new Error(
+        `sp00ky: ${method} is disabled because sync.queryAllowlist is on for this schema; pass allowRawRemote: true in the client config to opt in`
+      );
+    }
+  }
+
   async queryRaw(sql: string, params: Record<string, any>, ttl: QueryTimeToLive): Promise<string> {
+    this.assertRawRemoteAllowed('queryRaw');
     const tableName = sql.split('FROM ')[1]?.split(' ')[0] ?? '';
     return this.runtime.run(registerLocal(this.env, { tableName, surql: sql, params, ttl }));
   }
@@ -436,10 +451,12 @@ export class Sp00kyClient<S extends SchemaStructure> {
   }
 
   async useRemote<T>(fn: (client: Surreal) => Promise<T> | T): Promise<T> {
+    this.assertRawRemoteAllowed('useRemote');
     return fn(this.services.remote.getClient());
   }
 
   async remoteQuery<T extends unknown[]>(sql: string, vars?: Record<string, unknown>): Promise<T> {
+    this.assertRawRemoteAllowed('remoteQuery');
     return this.services.remote.query<T>(sql, vars);
   }
 

@@ -180,6 +180,16 @@ export interface SchemaStructure {
   readonly backends: Record<string, HTTPOutboxBackendDefinition>;
   readonly access?: Record<string, AccessDefinition>;
   readonly buckets?: readonly BucketDefinitionSchema[];
+  /**
+   * Server-side policy the CLI codegen copies from `sp00ky.yml` into the
+   * generated `schema` constant. `queryAllowlist` mirrors `sync.queryAllowlist`:
+   * `warn` / `enforce` mean the SSP only accepts query shapes collected at
+   * `spky generate` time, so the client refuses raw remote calls unless
+   * `allowRawRemote` is set.
+   */
+  readonly policy?: {
+    readonly queryAllowlist?: 'off' | 'warn' | 'enforce';
+  };
 }
 
 export interface HTTPOutboxBackendDefinition {

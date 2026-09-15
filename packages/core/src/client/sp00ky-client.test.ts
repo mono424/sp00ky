@@ -225,6 +225,29 @@ describe('Sp00kyClient facade (builder, devtools source, event fan-out)', () => 
     runtime.emit({ type: 'activity:changed', fetching: 0, pending: 4 });
     expect(pending).toEqual([0, 4]);
   });
+  it('gates queryRaw/useRemote/remoteQuery behind allowRawRemote when the schema policy turns the allowlist on', async () => {
+    const services = fakeServiceBundle<any>();
+    const a = fakeAdapters({});
+    const runtime = new Runtime({ env: defaultEnv(schema), adapters: a.adapters, logger: services.logger, tabId: 't' });
+    const withPolicy = (mode: string | undefined, allowRawRemote?: boolean) =>
+      new Sp00kyClient<any>(
+        { ...config, schema: mode === undefined ? schema : { ...schema, policy: { queryAllowlist: mode } }, allowRawRemote } as any,
+        { services, runtime }
+      );
+    const msg = (m: string) => `sp00ky: ${m} is disabled because sync.queryAllowlist is on for this schema; pass allowRawRemote: true in the client config to opt in`;
+    for (const mode of ['warn', 'enforce']) {
+      const gated = withPolicy(mode);
+      await expect(gated.queryRaw('SELECT * FROM thing', {}, '10m')).rejects.toThrow(msg('queryRaw'));
+      await expect(gated.useRemote(() => 1)).rejects.toThrow(msg('useRemote'));
+      await expect(gated.remoteQuery('RETURN 1')).rejects.toThrow(msg('remoteQuery'));
+      expect(a.names().filter((n) => n === 'remote.query')).toEqual([]);
+    }
+    for (const client of [withPolicy('enforce', true), withPolicy('off'), withPolicy(undefined)]) {
+      await expect(client.useRemote(() => 1)).resolves.toBe(1);
+      await expect(client.remoteQuery('RETURN 1')).resolves.toBeDefined();
+    }
+  });
+
   it('honours config knobs when building the saga env', () => {
     const services = fakeServiceBundle<any>();
     const a = fakeAdapters();

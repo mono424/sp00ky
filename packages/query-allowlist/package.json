@@ -1,0 +1,54 @@
+{
+  "name": "@spooky-sync/query-allowlist",
+  "version": "0.0.1-canary.250",
+  "description": "Runs an app's q* query module against a recording client and writes the raw-surql allowlist the SSP enforces",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "spooky-query-allowlist": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "AGENTS.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "build:watch": "tsdown --watch",
+    "dev": "tsdown --watch",
+    "test": "vitest run",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "surrealdb",
+    "query-allowlist",
+    "sp00ky"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mono424/sp00ky.git",
+    "directory": "packages/query-allowlist"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@spooky-sync/query-builder": "workspace:*",
+    "jiti": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsdown": "^0.12.4",
+    "typescript": "^5.6.2",
+    "vitest": "^3.2.0",
+    "surrealdb": "2.0.3"
+  }
+}

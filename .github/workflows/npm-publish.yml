@@ -107,7 +107,7 @@ jobs:
       - name: Rewrite workspace deps to release version
         run: |
           V="${{ needs.prepare.outputs.version }}"
-          for f in packages/query-builder/package.json packages/ssp-wasm/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json apps/devtools-mcp/package.json; do
+          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json apps/devtools-mcp/package.json; do
             jq --arg v "$V" 'reduce ("dependencies","optionalDependencies","peerDependencies") as $k (.; if (.[$k]|type)=="object" then .[$k] |= with_entries(if (.value|type)=="string" and (.value|startswith("workspace:")) then .value=$v else . end) else . end)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
@@ -120,6 +120,17 @@ jobs:
 
       - name: Publish query-builder
         working-directory: packages/query-builder
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
+      # 1b. Build and publish @spooky-sync/query-allowlist (depends on query-builder)
+      - name: Set version — query-allowlist
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/query-allowlist/package.json > tmp.json && mv tmp.json packages/query-allowlist/package.json
+
+      - name: Build query-allowlist
+        run: pnpm --filter @spooky-sync/query-allowlist build
+
+      - name: Publish query-allowlist
+        working-directory: packages/query-allowlist
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
       # 2. Build and publish @spooky-sync/ssp-wasm

@@ -351,7 +351,7 @@ impl Default for TailerConfig {
             fallback: Duration::from_secs(2),
             fallback_down: Duration::from_millis(250),
             poll_limit: 500,
-            poll_timeout: Duration::from_secs(30),
+            poll_timeout: Duration::from_secs(5),
             retention_ms: 24 * 3_600_000,
             gap_margin_ms: 5 * 60_000,
             stall_after: Duration::from_secs(60),
@@ -368,6 +368,11 @@ pub struct TailerStats {
     pub last_poll_ms: AtomicU64,
     pub last_success_ms: AtomicU64,
     pub last_entries: AtomicU64,
+    /// Duration of the last completed poll and the longest one since start:
+    /// a `SHOW CHANGES` that takes seconds is the symptom to watch for.
+    pub last_poll_duration_ms: AtomicU64,
+    pub max_poll_duration_ms: AtomicU64,
+    pub poll_timeouts: AtomicU64,
     pub records_total: AtomicU64,
     pub wakes: AtomicU64,
     pub gap: AtomicBool,
@@ -474,6 +479,9 @@ impl TailerStats {
             "lag_ms": self.lag_ms(now_ms),
             "polls": self.polls.load(Ordering::Relaxed),
             "last_poll_ms": self.last_poll_ms.load(Ordering::Relaxed),
+            "last_poll_duration_ms": self.last_poll_duration_ms.load(Ordering::Relaxed),
+            "max_poll_duration_ms": self.max_poll_duration_ms.load(Ordering::Relaxed),
+            "poll_timeouts": self.poll_timeouts.load(Ordering::Relaxed),
             "last_success_ms": self.last_success_ms.load(Ordering::Relaxed),
             "records_1m": self.records_last_minute(now_ms),
             "records_total": self.records_total.load(Ordering::Relaxed),
@@ -598,6 +606,10 @@ pub async fn run_tailer(
                         "Changefeed poll timed out; reconnecting"
                     );
                     stats.set_error(Some("poll timed out".into()));
+                    stats.poll_timeouts.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .max_poll_duration_ms
+                        .fetch_max(cfg.poll_timeout.as_millis() as u64, Ordering::Relaxed);
                     source.note_stalled();
                     break;
                 }
@@ -607,6 +619,19 @@ pub async fn run_tailer(
                 .last_entries
                 .store(batch.entries as u64, Ordering::Relaxed);
             let poll_ms = started.elapsed().as_millis() as u64;
+            stats
+                .last_poll_duration_ms
+                .store(poll_ms, Ordering::Relaxed);
+            stats
+                .max_poll_duration_ms
+                .fetch_max(poll_ms, Ordering::Relaxed);
+            if poll_ms >= 1_000 {
+                warn!(
+                    poll_ms,
+                    entries = batch.entries,
+                    "Changefeed poll took over a second"
+                );
+            }
             if batch.entries > 0 {
                 debug!(
                     entries = batch.entries,
@@ -778,8 +803,13 @@ pub struct ChangefeedSettings {
     pub gap_margin_secs: u64,
     /// Transactions per `SHOW CHANGES`. Env `SPKY_CHANGEFEED_POLL_LIMIT`.
     pub poll_limit: usize,
-    /// Deadline for one `SHOW CHANGES`; past it the upstream handle is
-    /// replaced. Env `SPKY_CHANGEFEED_POLL_TIMEOUT_SECS`.
+    /// Deadline for one `SHOW CHANGES`; past it the request is abandoned and
+    /// the upstream handle replaced. Short on purpose: on SurrealDB 3.1.5 a
+    /// `SHOW CHANGES` request has been seen to wedge the whole server (every
+    /// session hangs, CPU idle) for exactly as long as the request lives, so
+    /// the deadline is also the ceiling of that outage. A healthy poll is
+    /// milliseconds; a 20k-row transaction entry is ~70 ms.
+    /// Env `SPKY_CHANGEFEED_POLL_TIMEOUT_SECS`.
     pub poll_timeout_secs: u64,
 }
 
@@ -793,7 +823,7 @@ impl Default for ChangefeedSettings {
             retention: "1d".to_string(),
             gap_margin_secs: 300,
             poll_limit: 500,
-            poll_timeout_secs: 30,
+            poll_timeout_secs: 5,
         }
     }
 }

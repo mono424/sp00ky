@@ -451,7 +451,22 @@ impl Scheduler {
 
     /// Start the changefeed tail: resume from the highest versionstamp the
     /// replica or the WAL knows (both persisted), else from just before now.
-    async fn spawn_changefeed_tail(&self, db: Arc<maintenance::db::ReconnectingDb>) {
+    ///
+    /// The tail gets a session of its own. The SDK's HTTP engine serialises a
+    /// session behind a per-session lock, and a `SHOW CHANGES` that SurrealDB
+    /// does not answer (seen on 3.1.5) would otherwise park the heartbeat
+    /// write, the feature-flag sweep and the drift count behind it until the
+    /// poll deadline replaces the handle. On its own session, an abandoned
+    /// poll costs the tail one reconnect and nobody else anything.
+    async fn spawn_changefeed_tail(&self) {
+        let db = match maintenance::db::ReconnectingDb::connect(&self.config.db).await {
+            Ok(db) => db,
+            Err(e) => {
+                error!(error = %e, "Changefeed transport configured but the tail's database session could not be opened; tail NOT started");
+                return;
+            }
+        };
+        maintenance::db::spawn_periodic_resignin(Arc::clone(&db), maintenance::db::RESIGNIN_INTERVAL_SECS);
         let Some(query_state) = self.query_state_slot.get().cloned() else {
             error!("Changefeed transport configured but no query state attached; view teardown would be lost, tail NOT started");
             return;
@@ -754,9 +769,26 @@ impl Scheduler {
         // previous `db.clone()` per consumer meant several independent sessions
         // to lose and several to re-establish.
         let shared_db = maintenance::db::ReconnectingDb::new(db, self.config.db.clone());
+        // The admin plane (presence and job samplers, dashboard reads) gets
+        // its own session: its scans are the slow readers on this process,
+        // and a slow read plus the periodic re-signin's write lock is what
+        // parks every other request on a shared SDK session. The heartbeat
+        // probe, the feature-flag sweep and the drift check keep `shared_db`.
+        // Falls back to the shared handle if a second session cannot be
+        // opened, which is strictly what ran before.
+        let admin_db = match maintenance::db::ReconnectingDb::connect(&self.config.db).await {
+            Ok(db) => {
+                maintenance::db::spawn_periodic_resignin(Arc::clone(&db), maintenance::db::RESIGNIN_INTERVAL_SECS);
+                db
+            }
+            Err(e) => {
+                warn!(error = %e, "Could not open a dedicated admin database session; sharing the main one");
+                Arc::clone(&shared_db)
+            }
+        };
         // Publish it for the admin plane, which came up with the HTTP servers
         // (before this point) and answers 503 until this lands.
-        *self.db_slot.write().await = Some(Arc::clone(&shared_db));
+        *self.db_slot.write().await = Some(admin_db);
         let drift_hook = self.drift_hook(Arc::clone(&shared_db));
 
         // The check the integrity check above cannot do: compare the replica
@@ -794,7 +826,7 @@ impl Scheduler {
         // probe pokes it after its own write (the probe row carries no
         // `_00_version`, so the doorbell does not ring for it).
         let changefeed_poke = if self.config.ingest_transport == crate::config::IngestTransport::Changefeed {
-            self.spawn_changefeed_tail(Arc::clone(&shared_db)).await;
+            self.spawn_changefeed_tail().await;
             Some(Arc::clone(&self.changefeed_notify))
         } else {
             info!("Ingest transport: http (DB events post to /ingest)");

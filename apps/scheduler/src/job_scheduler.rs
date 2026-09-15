@@ -14,9 +14,8 @@ use surrealdb::engine::remote::http::Client;
 use surrealdb::types::RecordId;
 use surrealdb::Surreal;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::config::DbConfig;
 use crate::router::SspPool;
 use crate::transport::{HttpTransport, SspInfo};
 
@@ -387,11 +386,6 @@ fn job_tables_from_json(raw: &str) -> Vec<String> {
     }
 }
 
-/// Connect a fresh SurrealDB client to the upstream, mirroring `Scheduler::start`.
-async fn connect_remote(db: &DbConfig) -> Result<Surreal<Client>> {
-    maintenance::db::connect_http(db).await
-}
-
 /// The row's `assignee` has left the pool (or was never stamped).
 ///
 /// This is a reason to reclaim a row EARLY. It is deliberately not a precondition for
@@ -416,10 +410,17 @@ fn is_orphaned(row: &Value, live: &HashSet<String>) -> bool {
 }
 
 /// Start the cluster job recovery sweep (scheduler-driven, cluster mode only).
+///
+/// Reads through the admin session slot (a `ReconnectingDb` that re-signs on a
+/// timer) rather than a private connection: a root signin lives one hour, and
+/// a handle that only reconnected after a failed pass lost one pass per hour,
+/// on the hour (`401 Unauthorized` at 17:54, 18:55, 19:56 on whitepawn,
+/// 2026-09-15). The slot is empty until `Scheduler::start` has connected; a
+/// tick that finds it empty simply waits for the next one.
 pub async fn start_job_recovery_sweep(
     ssp_pool: Arc<RwLock<SspPool>>,
     transport: Arc<HttpTransport>,
-    db_config: Arc<DbConfig>,
+    db_slot: crate::admin::SharedDbSlot,
 ) {
     let job_tables = job_tables_from_env();
     if job_tables.is_empty() {
@@ -428,29 +429,25 @@ pub async fn start_job_recovery_sweep(
     }
 
     tokio::spawn(async move {
-        // Connect lazily, rebuilding the handle on the next tick if a pass fails.
-        let mut db: Option<Surreal<Client>> = None;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             JOB_RECOVERY_INTERVAL_SECS,
         ));
         loop {
             interval.tick().await;
 
-            if db.is_none() {
-                match connect_remote(&db_config).await {
-                    Ok(conn) => db = Some(conn),
-                    Err(e) => {
-                        warn!(error = format!("{e:#}"), "Cluster job recovery: DB connect failed; retrying next tick");
-                        continue;
-                    }
-                }
-            }
-            let conn = db.as_ref().unwrap();
+            let Some(db) = db_slot.read().await.clone() else {
+                debug!("Cluster job recovery: database session not ready yet");
+                continue;
+            };
+            let handle = db.handle();
 
             for table in &job_tables {
-                if let Err(e) = recover_table_once(conn, &ssp_pool, &transport, table).await {
-                    warn!(table = %table, error = %e, "Cluster job recovery pass failed; will reconnect");
-                    db = None; // force a reconnect on the next tick
+                if let Err(e) = recover_table_once(&handle, &ssp_pool, &transport, table).await {
+                    let msg = format!("{e:#}");
+                    // A session the server has forgotten is healed by the
+                    // shared handle's refresh, not by this loop.
+                    db.note_error(&msg);
+                    warn!(table = %table, error = %msg, "Cluster job recovery pass failed");
                     break;
                 }
             }

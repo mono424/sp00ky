@@ -247,7 +247,7 @@ async fn run() -> Result<()> {
     scheduler::job_scheduler::start_job_recovery_sweep(
         std::sync::Arc::clone(&job_state.ssp_pool),
         std::sync::Arc::clone(&transport),
-        std::sync::Arc::new(scheduler.config().db.clone()),
+        std::sync::Arc::clone(&scheduler.db_slot),
     ).await;
 
     // Declarative schedules + workflows. The scheduler is the cluster's single

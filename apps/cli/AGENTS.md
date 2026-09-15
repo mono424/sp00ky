@@ -140,6 +140,23 @@ apps:
       - "gomod:/go"
 ```
 
+## Sync transport (`sync.transport`)
+
+`sync.transport: changefeed` changes what the schema pipeline emits, in three
+places that must agree: `sp00ky::generate_sp00ky_events` keeps the
+`_00_version` bookkeeping but drops the `http::post` (`post_ingest`),
+`schema_builder::add_changefeed_clauses` puts `CHANGEFEED <retention> INCLUDE
+ORIGINAL` on every synced `DEFINE TABLE` in the desired schema (after
+`COMMENT`, before `PERMISSIONS`, the order SurrealDB renders, or `schema
+diff` sees a phantom change forever), and `migrate::apply_internal_schema`
+emits `ALTER TABLE IF EXISTS ... CHANGEFEED` for every synced user table after
+the events (a user migration's `DEFINE TABLE OVERWRITE` without the clause
+drops the feed; the ALTER puts it back on every deploy) plus `REMOVE EVENT
+_00_dbsp_cleanup`. `backend::sync_settings_for(config_path)` is the single
+reader of the setting. The scheduler/SSP get `SPKY_INGEST_TRANSPORT` through
+`deployment.env` (cloud) or the dev launch specs. Retention must be in
+SurrealDB's rendered form (`1d`, not `24h`): `valid_changefeed_retention`.
+
 ## Common gotchas
 
 - **`schema.gen.ts` must be regenerated after every `.surql` change.** `spky generate`. CI typically asserts no drift.

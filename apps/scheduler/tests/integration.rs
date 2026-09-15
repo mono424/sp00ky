@@ -146,6 +146,7 @@ impl TestHarness {
 
     fn ssp_router(&self) -> Router {
         let state = SspManagementState {
+            changefeed: maintenance::changefeed::TailerStats::new(),
             ssp_pool: Arc::clone(&self.ssp_pool),
             replica: Arc::clone(&self.replica),
             transport: Arc::clone(&self.transport),
@@ -237,6 +238,7 @@ impl TestHarness {
             db_slot: scheduler::admin::new_db_slot(),
             backup,
             resync: ssp_management::ResyncArgs {
+            changefeed: maintenance::changefeed::TailerStats::new(),
                 ssp_pool: Arc::clone(&self.ssp_pool),
                 replica: Arc::clone(&self.replica),
                 config: Arc::clone(&self.config),
@@ -258,6 +260,7 @@ impl TestHarness {
 
     fn metrics_state(&self) -> MetricsState {
         MetricsState {
+            changefeed: maintenance::changefeed::TailerStats::new(),
             ssp_pool: Arc::clone(&self.ssp_pool),
             query_tracker: Arc::clone(&self.query_tracker),
             job_tracker: Arc::clone(&self.job_tracker),
@@ -2115,6 +2118,7 @@ mod bootstrap_protocol_tests {
                 version: 2,
             },
             received_at: 0,
+            versionstamp: 0,
         };
 
         let sched = scheduler::Scheduler::new(config, Arc::new(HttpTransport::new()))
@@ -2233,6 +2237,7 @@ mod bootstrap_protocol_tests {
                         version: 2,
                     },
                     received_at: 0,
+                    versionstamp: 0,
                 })
                 .unwrap();
             // Stopped here: seq 2 is in the WAL, not in the rows.
@@ -2563,6 +2568,7 @@ mod drift_tests {
 
         // The metrics router renders the same state under `/health/snapshot`.
         let state = MetricsState {
+            changefeed: maintenance::changefeed::TailerStats::new(),
             ssp_pool: Arc::clone(&h.ssp_pool),
             query_tracker: Arc::clone(&h.query_tracker),
             job_tracker: Arc::clone(&h.job_tracker),

@@ -40,6 +40,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `version` | string \| object | latest stable | Pin SSP and scheduler image tags. Accepts a single tag, a `{dev, cloud}` split, or a `path:` override pointing at a local binary. |
 | `logLevel` | string \| object | `info` | Log verbosity for the SSP and scheduler. Accepts `trace`, `debug`, `info`, `warn`, `error`, `off`, target=level directives, or a `{dev, cloud}` split. Under `spky dev` a bare level applies to the sp00ky crates only (third-party crates stay at `warn`); pass a full directive list such as `ssp=debug,hyper=info,warn` to control those too. |
 | `refMode` | `dedicated` \| `single` | `dedicated` | Storage layout for the SSP's `_00_list_ref` table. `dedicated` gives each user their own table and works around a SurrealDB v3 LIVE-permission gap. |
+| `sync` | object | `{ transport: http }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`. See [Sync transport](#sync-transport). |
 | `apps` | map | `{}` | Your frontend and backend services. See [Apps](#apps) below. |
 | `schedules` | map \| path | `{}` | Server-side cron/interval jobs. See [Schedules](/docs/jobs/schedules). |
 | `workflows` | map \| path | `{}` | Server-side workflow DAGs. See [Workflows](/docs/jobs/workflows). |
@@ -112,6 +113,29 @@ deploy:
 ```
 
 The referenced file holds a single app config (the same fields you'd inline under `apps.<name>`) and validates against its own [`app.schema.json`](https://sp00ky.cloud/schema/app.schema.json). Its relative paths are resolved from the service directory, and at load time the whole thing is merged into one effective config. Any field you also set alongside `path` in the root file wins (main overrides sub). The split is entirely optional, leave your apps inline and nothing changes.
+
+## Sync transport
+
+`sync.transport` decides how a committed row change reaches the scheduler (and from there the SSPs and your clients).
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `transport` | `http` \| `changefeed` | `http` | `http`: every generated `_00_<table>_mutation` / `_delete` event calls the scheduler's `/ingest` with `http::post` **inside the user's transaction**. `changefeed`: every synced table carries a SurrealDB `CHANGEFEED` clause and the scheduler tails `SHOW CHANGES FOR DATABASE`; the events keep only the `_00_version` bookkeeping and never make a network call. |
+| `changefeedRetention` | duration | `1d` | Retention of the `CHANGEFEED` clause, in the form SurrealDB renders it (`1d`, `12h`, `1d12h`). A scheduler that falls further behind than this re-clones its replica. |
+
+```yaml
+sync:
+  transport: changefeed
+  changefeedRetention: 1d
+```
+
+Why `changefeed`: the feed is written by the same commit as the row, so it is post-commit only (a transaction that fails after its event fired can no longer announce a change that never happened), ordered by commit versionstamp, durable and resumable. User writes stop waiting on the scheduler: a scheduler restart delays delivery instead of failing writes, and no transaction holds row locks for the length of a network call. Propagation rides a `LIVE SELECT` doorbell on `_00_version` plus a 2 s safety-net poll, about 8 ms from commit to SSP.
+
+What a deploy does with it: `spky deploy` / `spky migrate` add `CHANGEFEED <retention> INCLUDE ORIGINAL` to every synced table (`ALTER TABLE IF EXISTS`, so your own table definitions are kept and a migration that redefined a table gets the clause back), remove the `_00_dbsp_cleanup` event, and generate events that do not post. The scheduler and SSP containers receive `SPKY_INGEST_TRANSPORT` and `SPKY_CHANGEFEED_RETENTION` automatically (cloud: merged into `deployment.env`; `spky dev`: injected into the containers). Switching back to `http` regenerates the posting events; the `CHANGEFEED` clauses stay and are harmless.
+
+<Note>
+Set `sync.transport` before the first deploy of a database or plan a short window: the scheduler must run with `SPKY_INGEST_TRANSPORT=changefeed` from the moment the schema stops posting, or nothing arrives. Deploy the schema, then restart the scheduler with the new env. The changefeed tail starts one second before the restart's clone, so the window is replayed rather than lost.
+</Note>
 
 ## Retention
 

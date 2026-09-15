@@ -26,8 +26,13 @@ pub struct QueryAssignment {
 /// Query tracker state
 #[derive(Clone)]
 pub struct QueryTracker {
-    /// Map query_id -> ssp_id
-    assignments: Arc<RwLock<HashMap<String, String>>>,
+    /// Map query_id -> (ssp_id, unix ms of the latest registration).
+    ///
+    /// The timestamp is what makes an asynchronous unregister safe: a view
+    /// teardown that arrives after the client already re-registered the same
+    /// id (a tab closed and reopened, a strict-mode double mount) must not
+    /// tear down the fresh registration. See [`unregister_local`].
+    assignments: Arc<RwLock<HashMap<String, (String, u64)>>>,
 }
 
 impl QueryTracker {
@@ -37,16 +42,24 @@ impl QueryTracker {
         }
     }
 
-    /// Assign a query to an SSP
+    /// Assign a query to an SSP, stamping the registration time. Called on
+    /// every registration, sticky ones included, so the stamp always says
+    /// when the client last (re)registered.
     pub async fn assign(&self, query_id: String, ssp_id: String) {
         let mut assignments = self.assignments.write().await;
-        assignments.insert(query_id, ssp_id);
+        assignments.insert(query_id, (ssp_id, now_ms()));
     }
 
     /// Get SSP assigned to a query
     pub async fn get_assignment(&self, query_id: &str) -> Option<String> {
         let assignments = self.assignments.read().await;
-        assignments.get(query_id).cloned()
+        assignments.get(query_id).map(|(ssp, _)| ssp.clone())
+    }
+
+    /// Unix ms of the query's latest registration.
+    pub async fn assigned_at_ms(&self, query_id: &str) -> Option<u64> {
+        let assignments = self.assignments.read().await;
+        assignments.get(query_id).map(|(_, at)| *at)
     }
 
     /// Unassign a query (when client disconnects)
@@ -60,7 +73,7 @@ impl QueryTracker {
         let mut assignments = self.assignments.write().await;
         let removed: Vec<String> = assignments
             .iter()
-            .filter(|(_, sid)| *sid == ssp_id)
+            .filter(|(_, (sid, _))| sid == ssp_id)
             .map(|(qid, _)| qid.clone())
             .collect();
         
@@ -74,8 +87,18 @@ impl QueryTracker {
     /// Get all assignments
     pub async fn all(&self) -> HashMap<String, String> {
         let assignments = self.assignments.read().await;
-        assignments.clone()
+        assignments
+            .iter()
+            .map(|(q, (s, _))| (q.clone(), s.clone()))
+            .collect()
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Shared state for query handlers
@@ -196,54 +219,130 @@ async fn register_query(
     Ok(Json(assignment))
 }
 
-/// Handle query unregistration
+/// Handle query unregistration.
+///
+/// Acknowledges as soon as the tracker is updated and forwards to the SSP in
+/// the background. With the `http` transport this request is made by the
+/// `_00_dbsp_cleanup` DB event INSIDE the transaction deleting the
+/// `_00_query` row, and the SSP's own TTL sweep is one such deleter: a
+/// synchronous forward made the sweep wait on the scheduler, which waited on
+/// the SSP, which waited on the sweep's lock (2026-09-14, ten seconds per
+/// expired row until the event's TIMEOUT cut it). Nothing about the forward
+/// needs the caller to wait for it.
 async fn unregister_query(
     State(state): State<QueryState>,
     Json(request): Json<ViewUnregisterRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let query_id = &request.id;
+    unregister_local(&state, &request.id, Some(now_ms())).await;
+    Ok(StatusCode::OK)
+}
+
+/// Tear down a view registration: clear the tracker now, tell the SSP in the
+/// background. Shared by the HTTP route and the changefeed tail (a
+/// `_00_query` DELETE in the feed).
+///
+/// `deleted_at_ms` is when the `_00_query` row was deleted. A registration
+/// stamped AFTER that is a client that re-registered the same id since, and
+/// its view stays: the delete the caller saw is older than the view the SSP
+/// now serves. Returns whether a teardown was forwarded.
+pub async fn unregister_local(state: &QueryState, query_id: &str, deleted_at_ms: Option<u64>) -> bool {
     info!("Unregistering query: {}", query_id);
 
-    // Get SSP assignment and URL. Unregister is idempotent: if the query
-    // isn't tracked (e.g. fired by `_00_dbsp_cleanup` on a stale row after a
-    // scheduler restart), there's nothing to forward — return OK so the
-    // SurrealDB DELETE event doesn't surface a 404.
-    let (ssp_id, ssp_url) = {
-        let Some(ssp_id) = state.query_tracker.get_assignment(query_id).await else {
-            info!("Unregister for unknown query {} — treating as already unregistered", query_id);
-            return Ok(StatusCode::OK);
-        };
+    // Unregister is idempotent: if the query isn't tracked (e.g. fired by
+    // `_00_dbsp_cleanup` on a stale row after a scheduler restart), there's
+    // nothing to forward.
+    let Some(ssp_id) = state.query_tracker.get_assignment(query_id).await else {
+        info!("Unregister for unknown query {} — treating as already unregistered", query_id);
+        return false;
+    };
+    if let (Some(deleted), Some(assigned)) =
+        (deleted_at_ms, state.query_tracker.assigned_at_ms(query_id).await)
+    {
+        if assigned > deleted {
+            info!(
+                query_id,
+                assigned_ms = assigned,
+                deleted_ms = deleted,
+                "Unregister is older than the query's latest registration; keeping the view"
+            );
+            return false;
+        }
+    }
 
+    // Tracker first, so a re-registration racing this call selects afresh
+    // instead of sticking to an assignment that is being torn down.
+    state.query_tracker.unassign(query_id).await;
+
+    let ssp_url = {
         let pool = state.ssp_pool.read().await;
         match pool.get(&ssp_id) {
-            Some(ssp) => (ssp_id.clone(), ssp.url.clone()),
+            Some(ssp) => ssp.url.clone(),
             None => {
-                drop(pool);
-                state.query_tracker.unassign(query_id).await;
                 info!("Unregister for query {} whose SSP {} is gone — cleared tracker", query_id, ssp_id);
-                return Ok(StatusCode::OK);
+                return false;
             }
         }
     };
 
-    // Send unregistration to SSP via HTTP POST /view/unregister
-    if let Err(e) = state
-        .transport
-        .post_to_ssp(&ssp_url, "/view/unregister", &request)
-        .await
-    {
-        error!("Failed to send query unregistration to SSP: {}", e);
+    let transport = Arc::clone(&state.transport);
+    let ssp_pool = Arc::clone(&state.ssp_pool);
+    let request = ViewUnregisterRequest { id: query_id.to_string() };
+    let query_id = query_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = transport
+            .post_to_ssp(&ssp_url, "/view/unregister", &request)
+            .await
+        {
+            error!("Failed to send query unregistration to SSP: {}", e);
+        }
+        ssp_pool.write().await.decrement_query_count(&ssp_id);
+        info!("Unregistered query {}", query_id);
+    });
+    true
+}
+
+#[cfg(test)]
+mod unregister_tests {
+    use super::*;
+    use crate::config::LoadBalanceStrategy;
+
+    fn state() -> QueryState {
+        QueryState {
+            ssp_pool: Arc::new(RwLock::new(SspPool::new(LoadBalanceStrategy::LeastQueries, 16))),
+            transport: Arc::new(HttpTransport::new()),
+            query_tracker: Arc::new(QueryTracker::new()),
+        }
     }
 
-    // Decrement query count
-    {
-        let mut pool = state.ssp_pool.write().await;
-        pool.decrement_query_count(&ssp_id);
+    /// A teardown read from the changefeed (or a DB event that arrived late)
+    /// must not remove a view the client registered again since the delete.
+    #[tokio::test]
+    async fn unregister_keeps_a_registration_newer_than_the_delete() {
+        let state = state();
+        state.query_tracker.assign("q1".into(), "ssp-0".into()).await;
+        let assigned = state.query_tracker.assigned_at_ms("q1").await.unwrap();
+
+        assert!(!unregister_local(&state, "q1", Some(assigned - 10_000)).await);
+        assert_eq!(state.query_tracker.get_assignment("q1").await.as_deref(), Some("ssp-0"), "older delete keeps the view");
+
+        // A delete after the registration clears the tracker even when the
+        // SSP is gone (nothing to forward to).
+        assert!(!unregister_local(&state, "q1", Some(assigned + 10_000)).await);
+        assert!(state.query_tracker.get_assignment("q1").await.is_none());
+
+        // Unknown queries are a no-op.
+        assert!(!unregister_local(&state, "nope", None).await);
     }
 
-    // Unassign from tracker
-    state.query_tracker.unassign(query_id).await;
-
-    info!("Unregistered query {}", query_id);
-    Ok(StatusCode::OK)
+    #[tokio::test]
+    async fn tracker_all_and_unassign_ssp_keep_working_with_timestamps() {
+        let tracker = QueryTracker::new();
+        tracker.assign("a".into(), "ssp-0".into()).await;
+        tracker.assign("b".into(), "ssp-1".into()).await;
+        let all = tracker.all().await;
+        assert_eq!(all.get("a").map(String::as_str), Some("ssp-0"));
+        let removed = tracker.unassign_ssp("ssp-0").await;
+        assert_eq!(removed, vec!["a".to_string()]);
+        assert!(tracker.assigned_at_ms("b").await.is_some());
+    }
 }

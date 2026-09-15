@@ -149,6 +149,12 @@ Values take effect when containers are next created, so run `spky deploy` or
 `spky restart` after changing them. Omitting the key entirely keeps the previous
 setting; an explicit empty map clears it.
 
+One pair is set for you: with `sync.transport: changefeed` in `sp00ky.yml`,
+`spky deploy` merges `SPKY_INGEST_TRANSPORT` and `SPKY_CHANGEFEED_RETENTION`
+into the `scheduler` and `ssp` roles (your own keys win on a clash), so the
+scheduler tails the feed the schema just gained. See
+[Sync transport](/docs/reference/config#sync-transport).
+
 `SPKY_SSP_DB_TIMEOUT_SECS` is the knob most worth knowing here: it bounds how
 long a single SSP database call may take before it fails and the connection is
 rebuilt (default 15s, `0` disables). It exists because the SurrealDB HTTP

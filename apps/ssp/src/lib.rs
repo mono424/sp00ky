@@ -19,6 +19,7 @@ use tokio::signal;
 use tracing::{debug, error, info, warn};
 
 // Expose modules for use in main.rs and tests
+mod changefeed;
 pub mod adapters;
 pub mod crdt;
 pub mod edge_updates;
@@ -1011,6 +1012,19 @@ pub async fn run_server() -> anyhow::Result<()> {
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
     });
     let runtime = ssp_node::Runtime::new(node.clone());
+
+    // Standalone changefeed tail: with no scheduler in front, this node reads
+    // `SHOW CHANGES` itself when the schema was deployed with
+    // `sync.transport: changefeed`. In cluster mode the scheduler tails.
+    if standalone {
+        let _changefeed_stats = changefeed::spawn_if_configured(
+            &config,
+            db.clone(),
+            node.clone(),
+            processor_arc.clone(),
+            status.clone(),
+        );
+    }
 
     // Timer dispatcher: the VM shell's `on_timer` equivalent. Portable arms
     // (JobRecoverySweep/TtlCleanup/CircuitCheckpoint) run + re-arm in the core

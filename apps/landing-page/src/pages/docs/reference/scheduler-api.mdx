@@ -210,8 +210,17 @@ Unregister a view from its assigned SSP.
 ```
 
 **Response:**
-- `200 OK` - View unregistered successfully
-- `404 Not Found` - View not found
+- `200 OK` - Teardown accepted. The tracker is cleared before the response;
+  the SSP is told in the background, so a caller (the `_00_dbsp_cleanup` DB
+  event under the `http` transport, which runs inside the transaction that
+  deleted the `_00_query` row) never waits on the SSP.
+- An unknown view is also `200` (idempotent).
+
+A teardown is dropped when the same view id was registered again after the
+delete it stems from (a tab closed and reopened): the registration's
+timestamp wins over an older delete. Under the `changefeed` transport this
+route is not called by the database at all; the scheduler reads the
+`_00_query` DELETE from the feed and applies the same rule.
 
 ---
 
@@ -463,6 +472,31 @@ Health check endpoint.
   ```json
   {"status": "unavailable"}
   ```
+
+The body also carries `scheduler` (replica lag), `heartbeat` (the end-to-end
+probe) and `changefeed`:
+
+```json
+{
+  "changefeed": {
+    "enabled": true,
+    "cursor_ms": 1789416134292,
+    "lag_ms": 7,
+    "records_1m": 80,
+    "doorbell": "connected",
+    "doorbell_reconnects": 0,
+    "gap": false,
+    "stalled": false,
+    "last_error": null
+  }
+}
+```
+
+`enabled` is `false` under `SPKY_INGEST_TRANSPORT=http`. `lag_ms` is the age
+of the tail's cursor, i.e. how far behind the newest commit it can be at
+most. `gap` means the cursor fell out of the feed's retention and the
+replica is being re-cloned; `stalled` means no poll has completed for a
+while. Either one reports the stack `degraded`.
 
 **Example:**
 

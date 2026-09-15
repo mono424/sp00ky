@@ -211,6 +211,7 @@ All `SPKY_*` vars below are read directly from the process environment.
 | `SPKY_SSP_ADVERTISE_ADDR` | Externally reachable `host:port` for this SSP | *(unset)* |
 | `HEARTBEAT_INTERVAL_MS` | Heartbeat interval in ms | `5000` |
 | `TTL_CLEANUP_INTERVAL_SECS` | View TTL cleanup interval | `60` |
+| `SPKY_INGEST_TRANSPORT` | Standalone mode only (no `SPKY_SCHEDULER_URL`): `changefeed` makes the SSP tail SurrealDB's `CHANGEFEED` itself instead of receiving `/ingest` posts from the DB events. Takes the same `SPKY_CHANGEFEED_*` knobs as the scheduler. In cluster mode the scheduler tails. | `http` |
 | `SPKY_SSP_REF_MODE` | `_00_list_ref` storage layout: `dedicated` (per-user tables; works around the SurrealDB v3 LIVE permission gap) or `single` (legacy shared table). Mirrors `refMode` in `sp00ky.yml`. | `dedicated` |
 | `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS` | Window (ms) over which the SSP coalesces query edge-update writes to `_00_list_ref` into one batched transaction, so a burst of view updates lands as a few batched `LIVE` deliveries instead of one transaction per record. `0` disables batching (flush each update immediately). See [Architecture](/docs/reference/architecture#edge-update-batching). | `100` |
 | `SPKY_JOB_CONFIG` | JSON-encoded `{ "job_tables": { … } }` describing backends the SSP can dispatch to. | *(unset)* |
@@ -334,6 +335,15 @@ staleness flag are built on.
 | `SPKY_CLONE_TIMEOUT_SECS` | Ceiling on the initial replica clone. Overrunning it fails startup and exits, rather than leaving the scheduler wedged in `cloning` and answering 503 to every SSP for the life of the container. | `900` |
 | `SPKY_BOOTSTRAP_TIMEOUT_SECS` | How long an SSP may take to bootstrap before the scheduler reaps it. Also half of what the dashboard waits on before calling a restart failed. | `300` |
 | `SPKY_CLEAR_VIEWS_ON_START` | Wipe every registered view (`_00_query`) when the scheduler starts. `false` keeps them: the replica clones them, the SSPs re-register them at bootstrap, and clients keep their views across a scheduler restart with no re-registration; the SSP TTL sweep retires rows nobody heartbeats. Leave `true` on tenants with more than one SSP for now (every SSP would compute every view). | `true` |
+| `SPKY_INGEST_TRANSPORT` | `http` (the generated DB events post to `/ingest`) or `changefeed` (the scheduler tails SurrealDB's `CHANGEFEED`; must match the schema deployed with `sync.transport`). See [Sync transport](/docs/reference/config#sync-transport). | `http` |
+| `SPKY_CHANGEFEED_RETENTION` | The schema's `CHANGEFEED` retention, rendered form (`1d`). A cursor older than this minus the margin is a gap: the replica is re-cloned. | `1d` |
+| `SPKY_CHANGEFEED_DOORBELL` | `LIVE SELECT id FROM _00_version` over WebSocket as the wake-up for the tail; `false` = poll only. | `true` |
+| `SPKY_CHANGEFEED_DEBOUNCE_MS` | Wait after a doorbell wake before polling, so a bulk transaction costs one poll. | `5` |
+| `SPKY_CHANGEFEED_FALLBACK_MS` | Safety-net poll interval while the doorbell is connected. | `2000` |
+| `SPKY_CHANGEFEED_FALLBACK_DOWN_MS` | Poll interval while the doorbell is reconnecting. | `250` |
+| `SPKY_CHANGEFEED_GAP_MARGIN_SECS` | Clock-skew allowance subtracted from the retention in the gap check. | `300` |
+| `SPKY_CHANGEFEED_POLL_LIMIT` | Transactions per `SHOW CHANGES`. | `500` |
+| `SPKY_CHANGEFEED_POLL_TIMEOUT_SECS` | Deadline for one `SHOW CHANGES`; past it the upstream handle is replaced. | `30` |
 | `SPKY_BOOTSTRAP_RECLONE_AFTER` | Consecutive bootstrap integrity failures before the replica is re-cloned from upstream | `3` |
 | `SPKY_BOOTSTRAP_ADMIT_AFTER` | Consecutive bootstrap integrity failures before the SSP is admitted to broadcast anyway, restoring sync. Floored at the re-clone threshold, so admit never precedes a re-clone attempt. | `5` |
 | `SPKY_CATCHUP_RECLONE_AFTER` | Same escalation for the catch-up gate | `3` |

@@ -2027,6 +2027,17 @@ impl Circuit {
             .unwrap_or(false)
     }
 
+    /// The row as the store holds it (the last body ingested for it), or
+    /// `None`. A standalone SSP tailing the changefeed reads a deleted row's
+    /// before-image here, because the feed carries only its id.
+    pub fn record(&self, table: &str, id: &str) -> Option<serde_json::Value> {
+        let coll = self.store.collections.get(table)?;
+        if !coll.has_row(id) {
+            return None;
+        }
+        Some(serde_json::Value::from(coll.get_row(id).to_owned_value()))
+    }
+
     /// Highest `_00_rv` currently folded into each table's rows (`-1` when a
     /// table has no versioned row). This is the resume-point a `CircuitStore`
     /// snapshot carries: on a warm restart, catch-up loads only rows whose

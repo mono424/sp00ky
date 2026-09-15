@@ -185,6 +185,19 @@ async fn handle_ingest(
     State(state): State<IngestState>,
     Json(request): Json<IngestRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    ingest_event(&state, request, 0).await.map(|_| StatusCode::OK)
+}
+
+/// Take one row change into the pipeline: WAL, buffer, job-terminal observer,
+/// SSP fan-out. Shared by the HTTP `/ingest` route (the generated DB events)
+/// and the changefeed tail, which passes the commit `versionstamp` it read the
+/// change at so the WAL can say where the tail resumes after a restart.
+/// Returns the seq the event was assigned.
+pub async fn ingest_event(
+    state: &IngestState,
+    request: IngestRequest,
+    versionstamp: u64,
+) -> Result<u64, (StatusCode, String)> {
     // Gate. A 503 here is not a soft failure upstream: the `_00_<table>_*`
     // DB events `http::post` to this endpoint inside the user's transaction,
     // so a refused ingest ABORTS the user's write. That is acceptable only
@@ -246,7 +259,7 @@ async fn handle_ingest(
             foreign_table = %foreign,
             "Ignoring ingest event whose record id belongs to another table (cascaded edge delete?)"
         );
-        return Ok(StatusCode::OK);
+        return Ok(0);
     }
 
     // Assign monotonic sequence number
@@ -270,6 +283,7 @@ async fn handle_ingest(
         seq,
         update: record_update,
         received_at: now,
+        versionstamp,
     };
 
     // Write-ahead: append to WAL before processing. The append is synchronous
@@ -338,7 +352,7 @@ async fn handle_ingest(
     });
 
     info!(seq, "Ingest accepted");
-    Ok(StatusCode::OK)
+    Ok(seq)
 }
 
 /// Deliver one ingested event to the SSPs. Runs on the [`Fanout`] consumer,

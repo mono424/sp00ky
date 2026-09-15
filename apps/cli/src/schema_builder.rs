@@ -216,6 +216,14 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
     // cloning values the ingest payload deliberately drops.
     content = add_opaque_field_markers(&content, &raw_content);
 
+    // `sync.transport: changefeed`: every synced table carries a CHANGEFEED
+    // clause, in the desired schema too, so `schema diff` never generates a
+    // migration that would redefine the table without it.
+    let sync = crate::backend::sync_settings_for(config.config_path.as_deref());
+    if sync.is_changefeed() {
+        content = add_changefeed_clauses(&content, &raw_content, sync.retention());
+    }
+
     // Process sp00ky config/backends
     let mut backend_processor = BackendProcessor::new();
     if let Some(config_path) = &config.config_path {
@@ -240,7 +248,12 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
 
     // Remote meta tables (server-side)
     content.push('\n');
-    content.push_str(include_str!("meta_tables_remote.surql"));
+    let mut meta_remote = include_str!("meta_tables_remote.surql").to_string();
+    if sync.is_changefeed() {
+        meta_remote = add_changefeed_clauses(&meta_remote, "", sync.retention());
+        meta_remote = strip_dbsp_cleanup_event(&meta_remote);
+    }
+    content.push_str(&meta_remote);
 
     // Scheduling tables (`_00_schedule*`)
     content.push('\n');
@@ -284,8 +297,12 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
     content = content.replace("{{CRDT_UPDATE_RULE}}", &crdt_rule);
 
     // Replace unregister_view call (this transforms event handlers in user
-    // schema, not function definitions — always apply it)
-    if config.mode == DeployMode::Singlenode || config.mode == DeployMode::Cluster {
+    // schema, not function definitions). Only for the http transport: with
+    // the changefeed the `_00_dbsp_cleanup` event is gone (see above) and a
+    // `_00_query` DELETE reaches the scheduler through the feed.
+    if (config.mode == DeployMode::Singlenode || config.mode == DeployMode::Cluster)
+        && !sync.is_changefeed()
+    {
         let unregister_call = "let $result = mod::dbsp::unregister_view(<string>$before.id);";
         let unregister_http =
             "let $payload = { id: <string>$before.id };\n    let $result = http::post($sp00ky_endpoint + '/view/unregister', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });";
@@ -338,6 +355,7 @@ pub fn build_server_events(config: &SchemaBuilderConfig) -> Result<String> {
         &config.mode,
         config.endpoint.as_deref(),
         config.secret.as_deref(),
+        crate::backend::sync_settings_for(config.config_path.as_deref()).transport(),
     ))
 }
 
@@ -495,6 +513,136 @@ pub fn add_nosync_markers(content: &str, source: &str) -> String {
         i += 1;
     }
     out.join("\n")
+}
+
+/// Meta tables that carry a `CHANGEFEED` clause under the changefeed
+/// transport, besides the user's synced tables. Mirrors
+/// `maintenance::changefeed::CHANGEFEED_META_TABLES`: `_00_version` rides
+/// along so the tail can stamp `_00_rv` from the same transaction,
+/// `_00_query` for its DELETE (view teardown), `_00_heartbeat` for the probe.
+pub const CHANGEFEED_META_TABLES: &[&str] = &[
+    "_00_version",
+    "_00_query",
+    "_00_user_feature",
+    "_00_app_release",
+    "_00_heartbeat",
+];
+
+/// Whether a table takes a `CHANGEFEED` clause: every user table that syncs
+/// (not `@nosync`, not a relation) plus the meta tables above.
+pub fn table_takes_changefeed(table: &str, is_relation: bool, no_sync: bool) -> bool {
+    if table.starts_with("_00_") {
+        return CHANGEFEED_META_TABLES.contains(&table);
+    }
+    !is_relation && !no_sync
+}
+
+/// Is `s` a duration in the form SurrealDB renders (`1d`, `12h`, `1d12h`,
+/// `90m`, `30s`, `1w`)? Anything else would make every deploy diff the
+/// table definition against what `INFO FOR DB` prints back.
+pub fn valid_changefeed_retention(s: &str) -> bool {
+    let re = Regex::new(r"^(\d+[wdhms])+$").expect("static regex");
+    re.is_match(s.trim())
+}
+
+/// Add `CHANGEFEED <retention> INCLUDE ORIGINAL` to the `DEFINE TABLE` of
+/// every table that syncs (see [`table_takes_changefeed`]); `source` is the
+/// annotated user schema (`-- @nosync`), empty for the meta tables.
+///
+/// Placement follows SurrealDB's own rendering, `... COMMENT '..' CHANGEFEED
+/// 1d INCLUDE ORIGINAL PERMISSIONS ...`: after a COMMENT, before PERMISSIONS,
+/// else before the terminating `;`. A statement that already carries a
+/// CHANGEFEED clause is left alone.
+pub fn add_changefeed_clauses(content: &str, source: &str, retention: &str) -> String {
+    let nosync: std::collections::HashSet<String> = annotations::extract_table_annotations(source)
+        .into_iter()
+        .filter(|(_, anns)| anns.iter().any(|a| a.name == "nosync"))
+        .map(|(t, _)| t)
+        .collect();
+    let define_table_re =
+        Regex::new(r"(?i)^\s*DEFINE\s+TABLE\s+(?:OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?(\w+)")
+            .expect("static regex");
+    let relation_re = Regex::new(r"(?i)\bTYPE\s+RELATION\b").expect("static regex");
+    let changefeed_re = Regex::new(r"(?i)\bCHANGEFEED\b").expect("static regex");
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let Some(caps) = define_table_re.captures(line) else {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        };
+        let table = caps[1].to_string();
+        // Accumulate the (possibly multi-line) statement up to its `;`.
+        let mut stmt: Vec<String> = Vec::new();
+        while i < lines.len() {
+            stmt.push(lines[i].to_string());
+            let done = lines[i].contains(';');
+            i += 1;
+            if done {
+                break;
+            }
+        }
+        let stmt = stmt.join("\n");
+        let is_relation = relation_re.is_match(&stmt);
+        if !table_takes_changefeed(&table, is_relation, nosync.contains(&table))
+            || changefeed_re.is_match(&stmt)
+        {
+            out.push(stmt);
+            continue;
+        }
+        out.push(inject_changefeed_clause(&stmt, retention));
+    }
+    out.join("\n")
+}
+
+fn inject_changefeed_clause(stmt: &str, retention: &str) -> String {
+    let clause = format!("CHANGEFEED {} INCLUDE ORIGINAL", retention.trim());
+    let permissions_re = Regex::new(r"(?i)\bPERMISSIONS\b").expect("static regex");
+    if let Some(m) = permissions_re.find(stmt) {
+        let (head, tail) = stmt.split_at(m.start());
+        return format!("{} {} {}", head.trim_end(), clause, tail.trim_start());
+    }
+    if let Some(pos) = stmt.rfind(';') {
+        let (head, tail) = stmt.split_at(pos);
+        format!("{} {}{}", head.trim_end(), clause, tail)
+    } else {
+        format!("{} {}", stmt.trim_end(), clause)
+    }
+}
+
+/// `ALTER TABLE IF EXISTS <t> CHANGEFEED ...` for every table in `tables`.
+/// Idempotent and definition-preserving, so it runs at the end of every
+/// internal-schema apply: a user migration that redefined a table without
+/// the clause (SurrealDB drops it on `DEFINE TABLE OVERWRITE`) gets it back.
+pub fn changefeed_alter_statements<'a>(tables: impl Iterator<Item = &'a str>, retention: &str) -> String {
+    let mut out = String::new();
+    for table in tables {
+        out.push_str(&format!(
+            "ALTER TABLE IF EXISTS {} CHANGEFEED {} INCLUDE ORIGINAL;\n",
+            table,
+            retention.trim()
+        ));
+    }
+    out
+}
+
+/// Drop the `_00_dbsp_cleanup` event: under the changefeed transport a
+/// `_00_query` DELETE reaches the scheduler through the feed, and the event's
+/// in-transaction call to `/view/unregister` is exactly the coupling the
+/// transport removes. Emits a `REMOVE EVENT` so a database deployed with the
+/// http transport loses the event on the switch.
+pub fn strip_dbsp_cleanup_event(content: &str) -> String {
+    let re = Regex::new(r"(?s)DEFINE EVENT (?:OVERWRITE )?_00_dbsp_cleanup ON TABLE _00_query.*?\n\};")
+        .expect("static regex");
+    re.replace(
+        content,
+        "REMOVE EVENT IF EXISTS _00_dbsp_cleanup ON TABLE _00_query;",
+    )
+    .into_owned()
 }
 
 /// Insert/merge the `sp00ky:nosync` marker into a single `DEFINE TABLE`
@@ -1095,5 +1243,48 @@ mod outbox_platform_field_tests {
         if let Err(e) = parse_with_capabilities(ddl, &Capabilities::all()) {
             panic!("schedule_tables.surql does not parse: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod changefeed_clause_tests {
+    use super::*;
+
+    #[test]
+    fn clause_lands_where_surrealdb_renders_it() {
+        let src = "-- @nosync\nDEFINE TABLE secrets SCHEMALESS;\nDEFINE TABLE game SCHEMAFULL\n    PERMISSIONS FOR select WHERE true;\nDEFINE TABLE plain SCHEMALESS COMMENT 'x';\nDEFINE TABLE edge TYPE RELATION IN a OUT b;\nDEFINE TABLE _00_list_ref SCHEMALESS;\nDEFINE TABLE OVERWRITE _00_version SCHEMALESS PERMISSIONS FULL;\n";
+        let out = add_changefeed_clauses(src, src, "1d");
+        assert!(out.contains("DEFINE TABLE secrets SCHEMALESS;"), "nosync untouched");
+        assert!(out.contains("DEFINE TABLE game SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FOR select WHERE true;"), "{out}");
+        assert!(out.contains("DEFINE TABLE plain SCHEMALESS COMMENT 'x' CHANGEFEED 1d INCLUDE ORIGINAL;"), "{out}");
+        assert!(out.contains("DEFINE TABLE edge TYPE RELATION IN a OUT b;"), "relations untouched");
+        assert!(out.contains("DEFINE TABLE _00_list_ref SCHEMALESS;"), "edges tables untouched");
+        assert!(out.contains("DEFINE TABLE OVERWRITE _00_version SCHEMALESS CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FULL;"), "{out}");
+        // Idempotent.
+        assert_eq!(add_changefeed_clauses(&out, src, "1d"), out);
+    }
+
+    #[test]
+    fn retention_must_be_in_rendered_form() {
+        for ok in ["1d", "12h", "1d12h", "90m", "30s", "1w"] {
+            assert!(valid_changefeed_retention(ok), "{ok}");
+        }
+        for bad in ["24 hours", "1x", "", "d1", "1.5d"] {
+            assert!(!valid_changefeed_retention(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn alter_statements_and_event_removal() {
+        let alters = changefeed_alter_statements(["game", "doc"].into_iter(), "1d");
+        assert_eq!(
+            alters,
+            "ALTER TABLE IF EXISTS game CHANGEFEED 1d INCLUDE ORIGINAL;\nALTER TABLE IF EXISTS doc CHANGEFEED 1d INCLUDE ORIGINAL;\n"
+        );
+        let meta = include_str!("meta_tables_remote.surql");
+        let stripped = strip_dbsp_cleanup_event(meta);
+        assert!(!stripped.contains("DEFINE EVENT OVERWRITE _00_dbsp_cleanup"));
+        assert!(stripped.contains("REMOVE EVENT IF EXISTS _00_dbsp_cleanup ON TABLE _00_query;"));
+        assert!(!stripped.contains("mod::dbsp::unregister_view"));
     }
 }

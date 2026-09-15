@@ -257,6 +257,26 @@ deferred task waits for the row's `_00_version` to become readable
 on its own connection (a clean proxy for "parent transaction is
 committed") before bumping the per-user edge.
 
+### Ingest transports
+
+How a committed row change leaves SurrealDB is chosen per project
+(`sync.transport` in `sp00ky.yml`):
+
+- **`http`** (default): the generated `_00_<table>_mutation` / `_delete`
+  events call the scheduler's `/ingest` with `http::post` inside the user's
+  transaction. Simple, but the event fires before the commit, the write waits
+  on the scheduler, and a scheduler outage fails writes.
+- **`changefeed`**: every synced table carries `CHANGEFEED <retention>
+  INCLUDE ORIGINAL`; the scheduler tails `SHOW CHANGES FOR DATABASE` and
+  feeds the same pipeline. The feed is post-commit only and ordered by commit
+  versionstamp (`commit_unix_ms << 16 | counter`), so a failed transaction
+  never announces anything and the tail resumes from its last stamp after a
+  restart. `_00_version` is written by the same transaction, so `_00_rv`
+  comes from the same feed entry. A `LIVE SELECT` on `_00_version` over
+  WebSocket wakes the tail about half a millisecond after a commit; a 2 s
+  poll is the safety net. A cursor older than the retention triggers a
+  replica re-clone, the same remediation the drift check uses.
+
 ### Edge-Update Batching
 
 The SSP does not write one transaction per record. View deltas, from

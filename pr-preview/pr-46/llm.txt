@@ -1,0 +1,87 @@
+# Sp00ky
+
+> The reactive, local-first framework for SurrealDB.
+
+Write your schema in SurrealQL and Sp00ky derives the rest: typed clients, live queries that
+stay correct without refetching, offline-first local storage, background jobs, and
+one-command deploys.
+
+## Documentation
+
+### Start here
+
+- [Introduction](https://sp00ky.cloud/docs): Sp00ky is a reactive, local-first framework for SurrealDB. Write a query once and it stays correct, live, offline, and typed end to end.
+- [Quickstart](https://sp00ky.cloud/docs/quickstart): From an empty directory to a live, offline-capable app syncing across two browser tabs. About five minutes.
+- [How it works](https://sp00ky.cloud/docs/how-it-works): Why a query written once stays correct forever, the whole mental model in one page.
+- [Installation](https://sp00ky.cloud/docs/install): Install the CLI and client SDKs, then bring up the stack. For a new project, spky init does all of this for you.
+
+### Schema
+
+- [Define your schema](https://sp00ky.cloud/docs/schema): Your .surql files are the single source of truth. Everything else (client types, sync, permissions) is derived from them.
+- [Relationships](https://sp00ky.cloud/docs/schema/relationships): Model 1:1, 1:N and many-to-many links in SurrealQL, and pull them into a query with .related().
+- [Generated types](https://sp00ky.cloud/docs/schema/generated-types): spky generate turns your .surql schema into typed TypeScript or Dart clients. Run it after every schema edit.
+- [Migrations](https://sp00ky.cloud/docs/schema/migrations): Diff your schema, review the SurrealQL, apply it. Plus drift detection and repair.
+
+### Client SDK
+
+- [Reactive queries](https://sp00ky.cloud/docs/client/queries): Declare a query once. It stays correct forever, across components, tabs, devices and backend jobs.
+- [Pagination](https://sp00ky.cloud/docs/client/pagination): Pagination is .limit() and .offset(), and every page stays live, so inserts and deletes reconcile themselves.
+- [Mutations](https://sp00ky.cloud/docs/client/mutations): Create, update and delete. Writes land locally first, then sync. Your UI never waits on the network.
+- [Authentication](https://sp00ky.cloud/docs/client/auth): Sign users in with SurrealDB access methods, and scope every live query with row-level permissions.
+- [Offline & sync health](https://sp00ky.cloud/docs/client/offline-sync): Your app already works offline. This page is about showing the user what's going on, and tuning what gets cached.
+- [Feature flags](https://sp00ky.cloud/docs/client/feature-flags): Define a flag, target users with rules or a rollout percentage, and read it reactively in your app.
+- [File buckets](https://sp00ky.cloud/docs/client/buckets): Upload, download and isolate files per user, declared in your schema like any other resource.
+- [CRDT fields](https://sp00ky.cloud/docs/client/crdt): Collaborative text fields backed by Loro, multiple people editing one field without conflicts.
+
+### Framework Guides
+
+- [SolidJS](https://sp00ky.cloud/docs/guide/solid): Wire Sp00ky into a Solid app end to end: client setup, live queries, auth and mutations.
+- [Flutter](https://sp00ky.cloud/docs/guide/flutter): Generate Dart models from your schema and build an offline-first mobile app.
+- [Vanilla JS / TS](https://sp00ky.cloud/docs/guide/vanilla): Use the core client directly, with no framework bindings.
+
+### Backends
+
+- [What is a backend](https://sp00ky.cloud/docs/backend): Your own HTTP service, called through the database instead of over the network. That one change is what makes server calls reactive and offline-safe.
+- [Add a backend](https://sp00ky.cloud/docs/backend/add): Scaffold the outbox table, describe your routes in OpenAPI, and call them with a typed db.run().
+- [Backend options](https://sp00ky.cloud/docs/backend/options): Auth tokens, request timeouts, environment variables, and running a backend you host yourself.
+
+### Background Jobs
+
+- [Jobs](https://sp00ky.cloud/docs/jobs): A job is one backend call, stored as a row. Watch it, retry it, kill it, from your app or the CLI.
+- [Schedules](https://sp00ky.cloud/docs/jobs/schedules): Recurring work declared in sp00ky.yml. Each cycle creates an ordinary job row, with cron, fan-out and concurrency control.
+- [Workflows](https://sp00ky.cloud/docs/jobs/workflows): A DAG of steps, each one a job. Steps read their dependencies’ output, retry individually, and can fan out.
+
+### Local Development
+
+- [spky dev](https://sp00ky.cloud/docs/dev): One command brings up SurrealDB, the SSP, the scheduler and your own apps, with migrations already applied.
+- [Dev servers & sidecars](https://sp00ky.cloud/docs/dev/servers): Have spky dev start your frontend, backend and third-party containers alongside the stack.
+- [Environment variables](https://sp00ky.cloud/docs/dev/env): What Sp00ky injects automatically, and how to add your own from files, the vault, or per environment.
+- [Doctor & troubleshooting](https://sp00ky.cloud/docs/dev/doctor): Start with spky doctor. It names the broken thing and prints the command that fixes it.
+
+### Deploy
+
+- [Getting started](https://sp00ky.cloud/docs/cloud/getting-started): Log in, create a project, and get your first deployment running.
+- [Deploying](https://sp00ky.cloud/docs/cloud/deploying): One command builds your images, provisions infrastructure, runs migrations and cuts over DNS.
+- [Environment & vault](https://sp00ky.cloud/docs/cloud/env-variables): Encrypted environment variables: set them once, share them with your team, inject them at deploy time.
+- [Logs & monitoring](https://sp00ky.cloud/docs/cloud/logs): Tail and search logs across every service, set log levels, and publish a public status page.
+- [Backups](https://sp00ky.cloud/docs/cloud/backups): Create, list and restore database snapshots, and schedule them to run automatically.
+- [CI/CD](https://sp00ky.cloud/docs/cloud/ci-cd): API keys for automated deploys, and GitHub push-to-deploy.
+- [Teams](https://sp00ky.cloud/docs/cloud/team): Invite members, manage roles, and handle vault passphrase resets.
+- [Self-hosting](https://sp00ky.cloud/docs/self-hosting): Run the scheduler and SSP yourself, single node or distributed, with the environment variables each needs.
+
+### Reference
+
+- [CLI](https://sp00ky.cloud/docs/reference/cli): Every spky command, grouped by what you're trying to do. Run spky <command> --help for full flags.
+- [sp00ky.yml](https://sp00ky.cloud/docs/reference/config): Every key in the project config the CLI reads: apps, schedules, schema paths, versions and per-environment overrides.
+- [Client config](https://sp00ky.cloud/docs/reference/client-config): SyncedDbConfig, the object you hand to new SyncedDb(): connection, local store, log level and sync timings.
+- [AI coding agents](https://sp00ky.cloud/docs/reference/ai-agents): AGENTS.md, spky doctor --json, cookbook recipes and MCP. The feedback loop that keeps an agent honest.
+- [MCP server](https://sp00ky.cloud/docs/reference/mcp): Give your editor or agent live introspection into a running Sp00ky project.
+- [Architecture](https://sp00ky.cloud/docs/reference/architecture): The sidecar model in full: scheduler, SSP pool, incremental view circuits, and how they scale.
+- [Performance](https://sp00ky.cloud/docs/reference/performance): Measured latency and throughput, what actually drives cost, and how to reproduce the numbers.
+- [Vault architecture](https://sp00ky.cloud/docs/reference/vault): How environment variables are encrypted, what the key hierarchy protects, and what it does not.
+- [SSP API](https://sp00ky.cloud/docs/reference/ssp-api): HTTP contract for the stream processor: ingest, bootstrap, view management, debugging and configuration.
+- [Scheduler API](https://sp00ky.cloud/docs/reference/scheduler-api): HTTP contract for the cluster coordinator: ingest, proxy, view registration, SSP lifecycle and job dispatch.
+
+## Source Code
+
+- [GitHub Repository](https://github.com/mono424/sp00ky)

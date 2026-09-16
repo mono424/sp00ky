@@ -60,3 +60,22 @@ jobs:
         env:
           SSP_FFI_PATH: ${{ github.workspace }}/packages/spooky_core/native/linux/libssp_ffi.so
         run: bash tool/run_tests.sh
+
+  dart-flutter:
+    name: Dart flutter bindings (analysis, widget tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Flutter dependencies
+        working-directory: packages/spooky_flutter
+        run: flutter pub get
+      - name: Analyze Flutter bindings
+        working-directory: packages/spooky_flutter
+        run: flutter analyze
+      - name: Run widget tests
+        working-directory: packages/spooky_flutter
+        run: flutter test

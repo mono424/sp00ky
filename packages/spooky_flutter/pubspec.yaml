@@ -1,0 +1,19 @@
+name: spooky_flutter
+description: Flutter bindings for spooky_core - render bucket files through the local blob cache.
+version: 0.0.1-canary.255
+publish_to: none
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+  flutter: '>=3.22.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  spooky_core:
+    path: ../spooky_core
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0

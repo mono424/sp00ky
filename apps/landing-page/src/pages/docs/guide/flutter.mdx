@@ -9,6 +9,35 @@ import Note from '../../../components/ui/Note.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
+export const code5 = `// pubspec.yaml
+// dependencies:
+//   spooky_core:
+//     git: { url: https://github.com/mono424/sp00ky.git, path: packages/spooky_core }
+//   spooky_flutter:
+//     git: { url: https://github.com/mono424/sp00ky.git, path: packages/spooky_flutter }
+
+final client = Sp00kyClient(Sp00kyConfig(
+  database: DatabaseConfig(endpoint: endpoint, namespace: 'app', database: 'app'),
+  schema: spookySchema,
+  schemaSurql: surqlSchema,
+  // Keep bucket files between runs. Without a directory the cache is
+  // in-memory: reads still dedupe, nothing survives a restart.
+  blobCache: BlobCacheConfig(
+    directory: '\${(await getApplicationSupportDirectory()).path}/sp00ky-blobs',
+  ),
+));
+
+// Anywhere in the widget tree:
+BucketImage(
+  bucket: client.bucket('puzzle_covers'),
+  path: '\${coverKey}_t.webp',
+  fallback: const CoverFallback(),
+  fit: BoxFit.cover,
+)
+
+// Or the bytes, for anything that is not an <img>:
+final Uint8List? pdf = await client.bucket('exports').read('report.pdf');`;
+
 export const code4 = `# Recommended: drive from sp00ky.yml's clientTypes entries
 spky generate
 
@@ -290,6 +319,31 @@ Here's how to use the database in a Flutter widget:
   lang="dart"
   code={code1}
 />
+
+## Images and files
+
+Bucket reads are not HTTP: they are SurrealQL over the sync socket, one at a
+time behind the app's own queries, so a cover that is re-read on every screen
+is paid for in full every time. `bucket().read()` goes through a local blob
+cache instead. Give it a directory and the bytes stay on disk under
+`<directory>/<user>/<bucket>/<path>`; a warm read never touches the socket, and
+`spooky_flutter`'s `BucketImage` adds Flutter's own decoded-image cache on top,
+so a shelf scrolled back into view paints on its first frame.
+
+<CodeBlock
+  fileName="lib/sync/database.dart"
+  lang="dart"
+  code={code5}
+/>
+
+The cache is the same shape as the web client's ([buckets](/docs/client/buckets)):
+files never expire by age, the least recently used are evicted past
+`maxBytes` (default 256 MB), files are kept per signed-in user, and
+`put`/`delete` on a path invalidate it. A missing file is remembered for the
+process, so a row pointing at a cover that was never uploaded costs one remote
+read, not one per rebuild. `bucket.evict(path)` and `bucket.prefetch(paths)`
+give the app manual control; `clearOnSignOut: true` wipes a user's files when
+they sign out.
 
 ## Next steps
 

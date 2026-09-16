@@ -23,6 +23,7 @@ const CARGO_TOML_PACKAGES = [
 // Dart packages whose pubspec.yaml version tracks the canary release line.
 const PUBSPEC_PACKAGES = [
   "packages/spooky_core/pubspec.yaml",
+  "packages/spooky_flutter/pubspec.yaml",
 ];
 
 const CLI_PLATFORM_PACKAGES = [

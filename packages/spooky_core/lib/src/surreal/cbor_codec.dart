@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:cbor/cbor.dart';
 
 import 'value.dart';
@@ -59,6 +61,9 @@ CborValue valueToCbor(Object? v) {
   if (v is int) return CborInt(BigInt.from(v));
   if (v is double) return CborFloat(v);
   if (v is String) return CborString(v);
+  // A byte buffer is a SurrealDB `bytes` value, not an array of ints: the
+  // latter is what `f"...".put()` would store, and it is not a file.
+  if (v is Uint8List) return CborBytes(v);
   if (v is List) return CborList(v.map(valueToCbor).toList());
   if (v is Map) {
     return CborMap({
@@ -122,7 +127,10 @@ Object? cborToValue(CborValue v) {
   if (v is CborInt) return v.toInt();
   if (v is CborFloat) return v.value;
   if (v is CborString) return v.toString();
-  if (v is CborBytes) return v.bytes;
+  if (v is CborBytes) {
+    final bytes = v.bytes;
+    return bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+  }
   if (v is CborList) return v.map(cborToValue).toList();
   if (v is CborMap) {
     final out = <String, dynamic>{};

@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:cbor/cbor.dart';
 import 'package:spooky_core/src/surreal/cbor_codec.dart';
 import 'package:spooky_core/src/surreal/value.dart';
@@ -54,6 +56,15 @@ void main() {
       expect(out['nil'], isNull);
       expect((out['list'] as List)[2], 't:x');
       expect((out['nested'] as Map)['a'], 'u:1');
+    });
+
+    test('Uint8List round-trips as a CBOR byte string, not an int array', () {
+      final payload = Uint8List.fromList([0, 137, 80, 78, 255]);
+      final bytes = surrealCborEncode({'content': payload});
+      expect(_rawField(bytes, 'content'), isA<CborBytes>());
+      final out = surrealCborDecode(bytes) as Map;
+      expect(out['content'], isA<Uint8List>());
+      expect(out['content'], payload);
     });
 
     test('RPC envelope shape (id/method/params) round-trips', () {

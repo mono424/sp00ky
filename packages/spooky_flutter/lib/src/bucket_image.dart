@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -75,11 +76,13 @@ class BucketImageProvider extends ImageProvider<BucketImageProvider> {
 
 /// An image out of a bucket, with a fallback that stays painted underneath.
 ///
-/// The fallback is not swapped out for the image: it stays under it so a
-/// transparent cover never shows the page through, and so a late download
-/// fades in over the placeholder rather than popping. A bitmap Flutter already
-/// has decoded paints synchronously with no fade at all.
-class BucketImage extends StatelessWidget {
+/// A cached cover comes off disk and decodes in a frame or two, so it is
+/// shown as soon as it is there: no placeholder flash, no fade. Only an image
+/// that takes longer than [instantWindow] (a first download) gets the
+/// fallback, and then fades in over it. The fallback stays under the image so
+/// a transparent cover never shows the page through. A bitmap Flutter already
+/// has decoded paints synchronously.
+class BucketImage extends StatefulWidget {
   const BucketImage({
     super.key,
     required this.bucket,
@@ -90,6 +93,7 @@ class BucketImage extends StatelessWidget {
     this.width,
     this.height,
     this.fadeDuration = const Duration(milliseconds: 200),
+    this.instantWindow = const Duration(milliseconds: 120),
     this.semanticLabel,
   });
 
@@ -98,44 +102,100 @@ class BucketImage extends StatelessWidget {
   /// Null or empty paints only the fallback and never touches the bucket.
   final String? path;
 
-  /// Painted while loading, under the image once it arrives, and alone when
-  /// the file does not exist.
+  /// Painted while a slow load is in progress, under the image once it
+  /// arrives, and alone when the file does not exist.
   final Widget? fallback;
   final BoxFit fit;
   final AlignmentGeometry alignment;
   final double? width;
   final double? height;
 
-  /// Fade of a freshly decoded image over the fallback. Zero disables it.
+  /// Fade of a slow image over the fallback. Zero disables it.
   final Duration fadeDuration;
+
+  /// How long a load may take and still count as instant: shown without the
+  /// fallback appearing first and without a fade.
+  final Duration instantWindow;
   final String? semanticLabel;
 
   @override
+  State<BucketImage> createState() => _BucketImageState();
+}
+
+class _BucketImageState extends State<BucketImage> {
+  Timer? _slow;
+
+  /// The load outlived [BucketImage.instantWindow]: paint the fallback and
+  /// fade the image in when it lands.
+  bool _isSlow = false;
+  bool _painted = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _arm();
+  }
+
+  @override
+  void didUpdateWidget(BucketImage old) {
+    super.didUpdateWidget(old);
+    if (old.path != widget.path || old.bucket.name != widget.bucket.name) {
+      _arm();
+    }
+  }
+
+  @override
+  void dispose() {
+    _slow?.cancel();
+    super.dispose();
+  }
+
+  void _arm() {
+    _slow?.cancel();
+    _isSlow = false;
+    _painted = false;
+    _slow = Timer(widget.instantWindow, () {
+      if (mounted && !_painted) setState(() => _isSlow = true);
+    });
+  }
+
+  void _onFrame() {
+    if (_painted) return;
+    _painted = true;
+    _slow?.cancel();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final path = this.path;
+    final path = widget.path;
+    final fallback = widget.fallback;
     final placeholder = fallback ?? const SizedBox.shrink();
     if (path == null || path.isEmpty) return placeholder;
     return Image(
-      image: BucketImageProvider(bucket, path),
-      fit: fit,
-      alignment: alignment,
-      width: width,
-      height: height,
+      image: BucketImageProvider(widget.bucket, path),
+      fit: widget.fit,
+      alignment: widget.alignment,
+      width: widget.width,
+      height: widget.height,
       gaplessPlayback: true,
-      semanticLabel: semanticLabel,
-      excludeFromSemantics: semanticLabel == null,
+      semanticLabel: widget.semanticLabel,
+      excludeFromSemantics: widget.semanticLabel == null,
       errorBuilder: (_, __, ___) => placeholder,
       frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-        if (wasSynchronouslyLoaded || fadeDuration == Duration.zero) {
-          return child;
+        if (frame != null || wasSynchronouslyLoaded) _onFrame();
+        if (wasSynchronouslyLoaded) return child;
+        if (!_isSlow) {
+          // Still inside the instant window: hold the slot empty rather than
+          // flash the fallback for the frame or two a disk read takes.
+          return frame == null ? const SizedBox.expand() : child;
         }
         return Stack(
           fit: StackFit.passthrough,
           children: [
-            if (fallback != null) fallback!,
+            if (fallback != null) fallback,
             AnimatedOpacity(
               opacity: frame == null ? 0 : 1,
-              duration: fadeDuration,
+              duration: widget.fadeDuration,
               curve: Curves.easeOut,
               child: child,
             ),

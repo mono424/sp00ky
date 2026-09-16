@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -120,6 +121,56 @@ void main() {
             await settle(tester);
             expect(find.text('fallback'), findsOneWidget);
             expect(find.byType(RawImage), findsNothing);
+          }));
+
+  testWidgets(
+      'a slow load shows the fallback, then the image',
+      (tester) => tester.runAsync(() async {
+            png = await _png();
+            final gate = Completer<void>();
+            final cache = BlobCache(
+              store: FileBlobStore(tmp),
+              fetchRemote: (key) async {
+                await gate.future;
+                remoteCalls.add(key.id);
+                return png;
+              },
+              logger: SpookyLogger.root('test'),
+              maxBytes: 1 << 20,
+            );
+            final bucket =
+                BucketHandle.withQuery('covers', _noQuery, blobs: cache);
+            await tester
+                .pumpWidget(app(bucket, fallback: const Text('fallback')));
+            await tester.pump();
+            expect(find.text('fallback'), findsNothing,
+                reason: 'inside the instant window nothing flashes');
+            await Future<void>.delayed(const Duration(milliseconds: 200));
+            await tester.pump();
+            expect(find.text('fallback'), findsOneWidget);
+            gate.complete();
+            await settle(tester);
+            expect(painted(tester), isTrue);
+            expect(find.text('fallback'), findsOneWidget,
+                reason: 'the fallback stays under the image');
+          }));
+
+  testWidgets(
+      'an image that lands inside the window never shows the fallback',
+      (tester) => tester.runAsync(() async {
+            png = await _png();
+            await tester.pumpWidget(app(handle()));
+            await settle(tester); // warm the disk
+            imageCache.clear();
+            await tester.pumpWidget(const SizedBox());
+            await tester
+                .pumpWidget(app(handle(), fallback: const Text('fallback')));
+            for (var i = 0; i < 4; i++) {
+              await Future<void>.delayed(const Duration(milliseconds: 20));
+              await tester.pump();
+            }
+            expect(painted(tester), isTrue);
+            expect(find.text('fallback'), findsNothing);
           }));
 
   testWidgets('a null path paints only the fallback and never fetches',

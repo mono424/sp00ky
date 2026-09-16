@@ -1,6 +1,6 @@
 [package]
 name = "scheduler"
-version = "0.0.1-canary.252"
+version = "0.0.1-canary.253"
 edition = "2021"
 
 [dependencies]

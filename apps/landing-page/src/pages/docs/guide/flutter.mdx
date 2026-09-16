@@ -336,6 +336,11 @@ so a shelf scrolled back into view paints on its first frame.
   code={code5}
 />
 
+`BucketImage` shows a cached image as soon as it has decoded, with no
+placeholder flash and no fade; only a load that outlives `instantWindow`
+(120 ms by default, in practice a first download) paints the fallback and
+fades the image in over it.
+
 The cache is the same shape as the web client's ([buckets](/docs/client/buckets)):
 files never expire by age, the least recently used are evicted past
 `maxBytes` (default 256 MB), files are kept per signed-in user, and
@@ -344,6 +349,20 @@ process, so a row pointing at a cover that was never uploaded costs one remote
 read, not one per rebuild. `bucket.evict(path)` and `bucket.prefetch(paths)`
 give the app manual control; `clearOnSignOut: true` wipes a user's files when
 they sign out.
+
+## Startup
+
+`await client.init()` restores the circuit from a snapshot of the local store
+and reconciles it against the cached rows, without touching the network, so a
+query registered right after it paints from cache. The core writes that
+snapshot itself while the circuit has changed (shortly after boot, then every
+`circuitCheckpointMs`, default 30 s); also call `client.checkpoint()` when the
+app is paused, since it is free when nothing changed. A store without a
+snapshot still boots, from its rows, and gets one on the next checkpoint.
+
+To have a screen's first frame already hold its rows, keep that query open
+from startup (subscribe once, share the latest rows) rather than subscribing
+when the screen mounts.
 
 ## Next steps
 

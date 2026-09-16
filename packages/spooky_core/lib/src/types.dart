@@ -65,6 +65,7 @@ class Sp00kyConfig {
     this.liveInlineBodies = false,
     this.reconnect = const ReconnectConfig(),
     this.blobCache = const BlobCacheConfig(),
+    this.circuitCheckpointMs = 30000,
   });
 
   final DatabaseConfig database;
@@ -122,6 +123,12 @@ class Sp00kyConfig {
   /// Where bucket files read through `bucket().read()` are kept between runs.
   /// See [BlobCacheConfig].
   final BlobCacheConfig blobCache;
+
+  /// How often a dirty circuit is snapshotted to the local store (TS
+  /// `circuitCheckpointMs`). The snapshot is what lets the next launch restore
+  /// the circuit and reconcile, instead of re-reading every cached row; the
+  /// host's own lifecycle checkpoint only helps when it gets to run.
+  final int circuitCheckpointMs;
 }
 
 /// Local cache for bucket files (TS `Sp00kyConfig.blobCache`).

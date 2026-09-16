@@ -20,7 +20,16 @@ inspected through `auth.verificationError` and retried with `wake()`, reconnect,
 or the existing connection probe.
 
 Flutter supplies an absolute `localDbPath`, calls `checkpoint()` when hidden and
-`wake()` on resume. `close()` checkpoints and releases the worker. A failed worker
+`wake()` on resume. `close()` checkpoints and releases the worker.
+
+A checkpoint writes the circuit's store (no views) as one snapshot, and the next
+boot restores it and reconciles against the rows' `_00_rv`, so startup costs a
+restore rather than re-ingesting every cached row. The core also checkpoints on
+its own while the circuit is dirty (5 s after boot, then every
+`circuitCheckpointMs`, default 30 s), because a swipe-killed app often never
+runs its lifecycle hook; `checkpoint()` is a no-op when nothing changed. The
+circuit is never serialized per ingest or per registration: that full-state
+JSON is gone (older stores have it dropped on boot). A failed worker
 rejects outstanding operations and ends subscriptions; it never falls back to
 the UI thread. Use `await client.inspectState()` for on-demand diagnostics.
 

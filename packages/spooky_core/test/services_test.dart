@@ -1,7 +1,6 @@
 import 'package:spooky_core/src/ffi/stream_update.dart';
 import 'package:spooky_core/src/services/database/local_database_service.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
-import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:spooky_core/src/services/stream_processor/permission_extractor.dart';
 import 'package:spooky_core/src/services/stream_processor/stream_processor_service.dart';
 import 'package:test/test.dart';
@@ -85,12 +84,17 @@ void main() {
       expect(db.getById('thread:a'), isNull);
     });
 
-    test('query config + stream state round-trip', () {
+    test('query config round-trip', () {
       db.putQueryConfig('_00_query:h', {'surql': 'SELECT * FROM thread'});
       expect(
           db.getQueryConfig('_00_query:h')!['surql'], 'SELECT * FROM thread');
-      db.setStreamState('STATE');
-      expect(db.getStreamState(), 'STATE');
+    });
+
+    test('legacy full-circuit state is dropped', () {
+      db.kvSet('_00_stream_processor_state', 'x' * 1024);
+      db.dropLegacyStreamState();
+      expect(db.kvGet('_00_stream_processor_state'), isNull);
+      db.dropLegacyStreamState(); // idempotent
     });
 
     test('tx rolls back on throw', () {
@@ -108,7 +112,7 @@ void main() {
   group('StreamProcessorService', () {
     test('seeds permissions then registers + ingests through receivers',
         () async {
-      final sp = StreamProcessorService(MemoryPersistenceClient(), logger);
+      final sp = StreamProcessorService(logger);
       await sp.init();
       sp.seedPermissionsFromSchema(
           'DEFINE TABLE thread SCHEMAFULL PERMISSIONS FOR select WHERE true;');

@@ -78,6 +78,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
   bool _closed = false;
   Future<void>? _initializing;
   Future<void>? _checkpoint;
+  Timer? _checkpointTimer;
   Future<void>? _closing;
   SessionPersistence? _sessionPersistence;
 
@@ -124,7 +125,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
     // hint out of it; the bucket the hint names replaces it a moment later.
     _holder.connect(anonUserId);
     _persistence = _resolvePersistence();
-    _streamProcessor = StreamProcessorService(_persistence, _logger);
+    _streamProcessor = StreamProcessorService(_logger);
 
     final hasRemote =
         config.database.endpoint != null || _remoteClientOverride != null;
@@ -254,6 +255,13 @@ class InProcessSp00kyClient extends Sp00kyClient {
     await _runtime.run((ctx) => boot_saga.boot(ctx, _env),
         allowsAccountChange: true);
     _initialized = true;
+    // Soon after boot, so a store that had to be rebuilt from rows is
+    // snapshotted before the app can be killed; late enough that the first
+    // screen's queries are not queued behind the write.
+    _armCheckpoints(Duration(
+        milliseconds: config.circuitCheckpointMs < _firstCheckpointMs
+            ? config.circuitCheckpointMs
+            : _firstCheckpointMs));
     await _auth?.publishSession();
     if (_env.hasRemote) _runtime.dispatch(const StartRemote());
     _logger.info('Sp00kyClient initialized');
@@ -285,6 +293,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
 
   Future<void> _close() async {
     _closed = true;
+    _checkpointTimer?.cancel();
     if (_initializing == null) return;
     try {
       await _initializing;
@@ -645,7 +654,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
     final remote = _remote;
     if (remote == null) throw StateError('bucket() requires a remote endpoint');
     return BucketHandle(name, remote,
-        blobs: blobCache, namespace: blobNamespace);
+        blobs: blobCache, namespace: blobNamespaceWhenReady);
   }
 
   Future<Never> openCrdtField(String table, String recordId, String field,
@@ -660,9 +669,11 @@ class InProcessSp00kyClient extends Sp00kyClient {
   /// Snapshot the circuit's rows so the next boot restores them instead of
   /// re-reading every row out of sqlite.
   ///
-  /// Also taken on close and before changing accounts. A process that dies
-  /// without one still primes, just
-  /// from the rows: the snapshot is a shortcut, never the source of truth.
+  /// Taken by a timer while the circuit is dirty, on close, and before
+  /// changing accounts; a no-op when nothing changed since the last one, so a
+  /// host may call it on every lifecycle change. A process that dies without
+  /// one still primes, just from the rows (and from an older snapshot plus a
+  /// reconcile): the snapshot is a shortcut, never the source of truth.
   Future<void> checkpoint() {
     if (!_initialized || _closed) return Future.value();
     return _checkpoint ??= _runtime.run((ctx) async {
@@ -672,13 +683,35 @@ class InProcessSp00kyClient extends Sp00kyClient {
   }
 
   void _checkpointCircuit() {
-    if (!_initialized) return;
+    if (!_initialized || !_streamProcessor.snapshotDirty) return;
     try {
+      final sw = Stopwatch()..start();
       final bytes = _streamProcessor.saveStoreSnapshot();
-      if (bytes != null && bytes.isNotEmpty) _holder.db.putSnapshot(bytes);
+      if (bytes != null && bytes.isNotEmpty) {
+        _holder.db.putSnapshot(bytes);
+        _streamProcessor.markSnapshotClean();
+        _logger.debug('Circuit checkpoint: ${bytes.length} bytes in '
+            '${sw.elapsedMilliseconds}ms');
+      }
     } catch (error) {
       _logger.warn('Circuit checkpoint failed: $error');
     }
+  }
+
+  /// Below this many changed rows the checkpoint timer stays quiet (TS
+  /// `CHECKPOINT_MIN_ROWS`); close and an explicit [checkpoint] still write.
+  static const int _checkpointMinRows = 50;
+  static const int _firstCheckpointMs = 5000;
+
+  void _armCheckpoints(Duration delay) {
+    _checkpointTimer?.cancel();
+    _checkpointTimer = Timer(delay, () {
+      if (_closed) return;
+      if (_streamProcessor.dirtyRows >= _checkpointMinRows) {
+        unawaited(checkpoint());
+      }
+      _armCheckpoints(Duration(milliseconds: config.circuitCheckpointMs));
+    });
   }
 
   late final String _clientId = generateId().substring(0, 8);

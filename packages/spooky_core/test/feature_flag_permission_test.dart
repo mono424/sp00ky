@@ -1,7 +1,6 @@
 import 'package:spooky_core/src/ffi/stream_processor.dart';
 import 'package:spooky_core/src/ffi/stream_update.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
-import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:spooky_core/src/services/stream_processor/stream_processor_service.dart';
 import 'package:test/test.dart';
 
@@ -60,7 +59,7 @@ void main() {
   group('StreamProcessorService built-in feature-flag seed', () {
     late StreamProcessorService svc;
     setUp(() async {
-      svc = StreamProcessorService(MemoryPersistenceClient(), logger);
+      svc = StreamProcessorService(logger);
       await svc.init();
     });
     tearDown(() => svc.close());

@@ -24,7 +24,7 @@ void main() {
   setUp(() => dir = Directory.systemTemp.createTempSync('spooky-prime'));
   tearDown(() => dir.deleteSync(recursive: true));
 
-  Future<InProcessSp00kyClient> open() async {
+  Future<InProcessSp00kyClient> open({int checkpointMs = 30000}) async {
     final c = InProcessSp00kyClient(Sp00kyConfig(
       database: DatabaseConfig(
         namespace: 't',
@@ -35,6 +35,7 @@ void main() {
       schema: schema,
       schemaSurql: schemaSurql,
       persistenceClient: MemoryPersistenceClient(),
+      circuitCheckpointMs: checkpointMs,
     ));
     await c.init();
     return c;
@@ -60,6 +61,45 @@ void main() {
     expect(client.state.queries[hash]!.localArray.map((e) => e.$1),
         contains('thread:a'));
     expect(client.state.queries[hash]!.records.single['title'], 'kept');
+  });
+
+  test('a store rebuilt from rows is snapshotted without waiting for close',
+      () async {
+    // Rows on disk and no snapshot: what a killed app leaves behind.
+    final raw = LocalDatabaseService.open(SpookyLogger.root('test'),
+        store: StoreType.indexeddb, path: '${dir.path}/spooky.anon.db');
+    raw.provision();
+    raw.putDoc('thread', 'thread:a', {'title': 'a', '_00_rv': 1});
+    raw.close();
+
+    final client = await open(checkpointMs: 50);
+    addTearDown(client.close);
+    expect(client.localStore.getSnapshot(), isNull);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(client.localStore.getSnapshot(), isNotNull,
+        reason: 'the checkpoint timer writes it, no close needed');
+  });
+
+  test('a checkpoint of an unchanged circuit writes nothing', () async {
+    final client = await open();
+    addTearDown(client.close);
+    await client.create('thread:a', {'title': 'a'});
+    await client.queryRaw('SELECT * FROM thread', const {});
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    await client.checkpoint();
+    expect(client.localStore.getSnapshot(), isNotNull);
+
+    client.localStore.clearSnapshot();
+    await client.checkpoint();
+    expect(client.localStore.getSnapshot(), isNull,
+        reason: 'nothing changed since the last snapshot');
+
+    await client.create('thread:b', {'title': 'b'});
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    await client.checkpoint();
+    expect(client.localStore.getSnapshot(), isNotNull);
+    // The full circuit is never persisted any more.
+    expect(client.localStore.kvGet('_00_stream_processor_state'), isNull);
   });
 
   for (final mode in ['missing', 'corrupt', 'stale']) {

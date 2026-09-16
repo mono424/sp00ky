@@ -2,7 +2,6 @@ import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/ffi/stream_processor.dart';
 import 'package:spooky_core/src/modules/app_release/app_release.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
-import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:spooky_core/src/services/stream_processor/stream_processor_service.dart';
 import 'package:test/test.dart';
 
@@ -169,7 +168,7 @@ void main() {
 
     test('the built-in seed permits the view when the schema omits the table',
         () async {
-      final svc = StreamProcessorService(MemoryPersistenceClient(), logger);
+      final svc = StreamProcessorService(logger);
       await svc.init();
       addTearDown(svc.close);
       svc.seedPermissionsFromSchema(schemaSurql);
@@ -191,5 +190,3 @@ void main() {
 }
 
 Future<void> _tick() => Future<void>.delayed(const Duration(milliseconds: 20));
-
-

@@ -27,7 +27,7 @@ Object? _jsonEncodable(Object? value) {
 ///
 /// Domain records are stored document-style as JSON in a single `records`
 /// table partitioned by logical table name, so arbitrary records round-trip.
-/// Dedicated tables hold query state, stream-processor state, the pending
+/// Dedicated tables hold query state, the circuit snapshot, the pending
 /// mutation outbox, and the schema hash. The materialization read path resolves
 /// result sets from the DBSP `localArray` via [getById] rather than executing
 /// SurrealQL (sqlite cannot run SurrealQL).
@@ -61,10 +61,6 @@ class LocalDatabaseService {
       CREATE TABLE IF NOT EXISTS _00_query (
         id  TEXT PRIMARY KEY,
         doc TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS _00_stream_processor_state (
-        id    TEXT PRIMARY KEY,
-        state TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS _00_pending_mutations (
         id  TEXT PRIMARY KEY,
@@ -196,8 +192,8 @@ class LocalDatabaseService {
   Map<String, dynamic>? getDoc(String table, String id) {
     if (_isQueryRegistry(table)) return _withId(getQueryConfig(id), id);
     if (_isOutbox(table)) {
-      final rs =
-          _db.select('SELECT doc FROM _00_pending_mutations WHERE id = ?', [id]);
+      final rs = _db
+          .select('SELECT doc FROM _00_pending_mutations WHERE id = ?', [id]);
       if (rs.isEmpty) return null;
       return _withId(
           jsonDecode(rs.first['doc'] as String) as Map<String, dynamic>, id);
@@ -267,8 +263,7 @@ class LocalDatabaseService {
       final rs =
           _db.select('SELECT id, rv FROM records WHERE tbl = ?', [table]);
       out[table] = [
-        for (final row in rs)
-          (row['id'] as String, (row['rv'] as num).toInt())
+        for (final row in rs) (row['id'] as String, (row['rv'] as num).toInt())
       ];
     }
     return out;
@@ -356,22 +351,13 @@ class LocalDatabaseService {
     return docs;
   }
 
-  // ---- stream processor state ----------------------------------------------
+  // ---- legacy stream processor state ---------------------------------------
 
-  String? getStreamState() {
-    final rs = _db.select(
-        "SELECT state FROM _00_stream_processor_state WHERE id = '_00_stream_processor_state'");
-    if (rs.isEmpty) return null;
-    return rs.first['state'] as String;
-  }
-
-  void setStreamState(String state) {
-    _db.execute(
-      'INSERT INTO _00_stream_processor_state (id, state) VALUES '
-      "('_00_stream_processor_state', ?) "
-      'ON CONFLICT(id) DO UPDATE SET state = excluded.state',
-      [state],
-    );
+  /// Remove the full-circuit JSON older clients persisted (a dedicated table
+  /// and a `_00_kv` row). Only the store snapshot is used now.
+  void dropLegacyStreamState() {
+    _db.execute('DROP TABLE IF EXISTS _00_stream_processor_state');
+    kvRemove('_00_stream_processor_state');
   }
 
   // ---- generic key-value (backs SqlitePersistenceClient) --------------------
@@ -414,15 +400,14 @@ class LocalDatabaseService {
   // ---- migration ------------------------------------------------------------
 
   /// Wipe cached domain data, query registrations, the outbox, and the
-  /// persisted circuit state on a schema change. Preserves the schema-hash
+  /// circuit snapshot on a schema change. Preserves the schema-hash
   /// table and the auth token (the `sp00ky_auth_token` kv key).
   void resetLocalData() {
     _db.execute('DELETE FROM records');
     _db.execute('DELETE FROM _00_query');
     _db.execute('DELETE FROM _00_pending_mutations');
-    _db.execute('DELETE FROM _00_stream_processor_state');
     _db.execute('DELETE FROM _00_snapshot');
-    kvRemove('_00_stream_processor_state');
+    dropLegacyStreamState();
   }
 
   // ---- transactions ---------------------------------------------------------

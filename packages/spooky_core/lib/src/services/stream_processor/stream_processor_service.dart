@@ -59,20 +59,18 @@ abstract class StreamUpdateReceiver {
 }
 
 /// Wraps the native FFI [StreamProcessor], mirroring the TS
-/// `StreamProcessorService`: receiver fan-out, state load/save, timed ingest,
-/// and query-plan registration.
+/// `StreamProcessorService`: receiver fan-out, the boot prime, snapshot
+/// bookkeeping, timed ingest and query-plan registration.
 ///
 /// Divergence from the browser client: [seedPermissionsFromSchema] seeds the
 /// circuit's per-table select permissions from `schemaSurql` (the browser
 /// relies on its deployed circuit already being permissive). Without this,
 /// `registerView` hits the circuit's default-deny. See [permission_extractor].
 class StreamProcessorService {
-  StreamProcessorService(this._persistence, SpookyLogger logger,
-      {StreamProcessor? processor})
+  StreamProcessorService(SpookyLogger logger, {StreamProcessor? processor})
       : _logger = logger.child('StreamProcessorService'),
         _processor = processor;
 
-  final PersistenceClient _persistence;
   final SpookyLogger _logger;
   StreamProcessor? _processor;
   bool _initialized = false;
@@ -85,7 +83,31 @@ class StreamProcessorService {
   bool _batching = false;
   final Map<String, StreamUpdate> _batchBuffer = {};
 
-  static const _stateKey = '_00_stream_processor_state';
+  /// Snapshot bookkeeping. The circuit is persisted ONLY as a store-only
+  /// snapshot ([saveStoreSnapshot]), written by the client's checkpoint timer
+  /// and on the way out, never per ingest or per registration: serializing
+  /// the circuit walks every row, and on a real store that is hundreds of
+  /// milliseconds that used to be paid by every `queryRaw`.
+  bool _dirty = false;
+  int _dirtyRows = 0;
+
+  /// True when the circuit holds rows the stored snapshot does not.
+  bool get snapshotDirty => _dirty;
+
+  /// How many row changes the stored snapshot is behind by (approximate).
+  int get dirtyRows => _dirtyRows;
+
+  void _markDirty(int rows) {
+    if (rows <= 0) return;
+    _dirty = true;
+    _dirtyRows += rows;
+  }
+
+  /// The snapshot was written: nothing is pending any more.
+  void markSnapshotClean() {
+    _dirty = false;
+    _dirtyRows = 0;
+  }
 
   /// Built-in `select` permissions for server-provisioned meta tables the client
   /// reads through the local view but that never appear in an app's `schemaSurql`
@@ -168,17 +190,13 @@ class StreamProcessorService {
     if (buffered.isNotEmpty) {
       _dispatchUpdates(buffered);
     }
-    // The processor state after the last ingest is cumulative, so a single
-    // snapshot covers the whole batch. Kept fire-and-forget like the per-ingest
-    // call it replaces.
-    saveState();
   }
 
-  /// Initialize the native processor and load any persisted circuit state.
+  /// Initialize the native processor. The circuit starts empty; the boot
+  /// prime fills it from the local store ([primeFromLocal]).
   Future<void> init() async {
     if (_initialized) return;
     _processor ??= StreamProcessor.create();
-    await loadState();
     _initialized = true;
     _logger.info('Initialized');
   }
@@ -232,7 +250,10 @@ class StreamProcessorService {
       }
       for (var i = 0; i < toFetch.length; i += _primeChunk) {
         final chunk = toFetch.sublist(
-            i, i + _primeChunk > toFetch.length ? toFetch.length : i + _primeChunk);
+            i,
+            i + _primeChunk > toFetch.length
+                ? toFetch.length
+                : i + _primeChunk);
         final rows = selectByIds(table, chunk);
         if (rows.isEmpty) continue;
         _dispatchUpdates(ingestMany([
@@ -255,12 +276,23 @@ class StreamProcessorService {
         ]);
       }
     }
+    // A prime that could not restore rebuilt the whole store from rows: the
+    // next checkpoint has to write it even if nothing else changes, or every
+    // launch pays for the same rebuild. Reconciled ingests were already
+    // counted by [ingestMany]; the deletions were not.
+    if (!restored && ingested > 0) {
+      _markDirty(ingested < _checkpointFloor ? _checkpointFloor : ingested);
+    }
+    _markDirty(deleted);
     _logger.info('Circuit primed from the local store '
         '(restored: $restored, ingested: $ingested, deleted: $deleted, '
         '${sw.elapsedMilliseconds}ms)');
   }
 
   static const int _primeChunk = 500;
+
+  /// Enough dirty rows that the client's checkpoint timer writes a snapshot.
+  static const int _checkpointFloor = 50;
 
   /// Ingest many records as ONE circuit step. Returns the coalesced updates and
   /// fans them out, exactly as [ingest] does for a single record.
@@ -278,7 +310,7 @@ class StreamProcessorService {
           }
       ]);
       if (updates.isNotEmpty) _notifyUpdates(updates);
-      if (!_batching) saveState();
+      _markDirty(records.length);
       return updates;
     } catch (e) {
       _logger.error('Batch ingest failed', e);
@@ -292,9 +324,11 @@ class StreamProcessorService {
   Future<void> resetCircuit() async {
     _processor?.dispose();
     _processor = StreamProcessor.create();
-    await _persistence.remove(_stateKey);
     _batchBuffer.clear();
     _batching = false;
+    // The new circuit is empty and belongs to the next store, which has its
+    // own snapshot: nothing here may be written over it.
+    markSnapshotClean();
   }
 
   /// Snapshot the circuit's base collections for the next boot's prime.
@@ -324,37 +358,8 @@ class StreamProcessorService {
         'table permissions');
   }
 
-  Future<void> loadState() async {
-    final processor = _processor;
-    if (processor == null) return;
-    try {
-      final state = await _persistence.get<String>(_stateKey);
-      if (state != null && state.isNotEmpty) {
-        processor.loadState(state);
-        _logger.info('Loaded state from persistence');
-      } else {
-        _logger.info('No saved state found');
-      }
-    } catch (e) {
-      _logger.error('Failed to load state', e);
-    }
-  }
-
-  Future<void> saveState() async {
-    final processor = _processor;
-    if (processor == null) return;
-    try {
-      final state = processor.saveState();
-      if (state.isNotEmpty) {
-        await _persistence.set(_stateKey, state);
-      }
-    } catch (e) {
-      _logger.error('Failed to save state', e);
-    }
-  }
-
-  /// Ingest a record change, fan out resulting updates, and persist state.
-  /// Mirrors the TS `ingest` (sync FFI call, then async state save).
+  /// Ingest a record change and fan out resulting updates. Mirrors the TS
+  /// `ingest`.
   List<StreamUpdate> ingest(
       String table, String op, String id, Map<String, dynamic> record) {
     final processor = _processor;
@@ -380,11 +385,7 @@ class StreamProcessorService {
             .toList();
         _notifyUpdates(updates);
       }
-      // While batching, `endBatch` persists once for the whole batch, so skip
-      // the redundant per-record snapshot here.
-      if (!_batching) {
-        saveState();
-      }
+      _markDirty(1);
       return rawUpdates;
     } catch (e) {
       _logger.error('Ingest failed', e);
@@ -422,7 +423,6 @@ class StreamProcessorService {
     if (initial == null) {
       throw StateError('Failed to register query plan');
     }
-    saveState();
     return initial.update;
   }
 
@@ -449,7 +449,6 @@ class StreamProcessorService {
     if (processor == null) return;
     try {
       processor.unregisterView(queryHash);
-      saveState();
     } catch (e) {
       _logger.error('Error unregistering query plan', e);
     }

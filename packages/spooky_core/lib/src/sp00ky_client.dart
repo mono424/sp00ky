@@ -132,7 +132,7 @@ abstract class Sp00kyClient {
           await BucketHandle.withQuery(key.bucket, queryRemote).get(key.path)),
       logger: SpookyLogger.root(),
       maxBytes: cfg.maxBytes,
-      namespace: blobNamespace(),
+      namespace: isLocalReady ? blobNamespace() : anonUserId,
     );
     if (cfg.clearOnSignOut && config.database.endpoint != null) {
       String? lastUser = auth.currentUser?['id']?.toString();
@@ -164,7 +164,20 @@ abstract class Sp00kyClient {
   BlobCacheStats get blobCacheStats => blobCache.stats;
 
   BucketHandle bucket(String name) => BucketHandle.withQuery(name, queryRemote,
-      blobs: blobCache, namespace: blobNamespace);
+      blobs: blobCache, namespace: blobNamespaceWhenReady);
+
+  /// [blobNamespace] once the local boot has restored the session. Before
+  /// that the user is not known yet, and a cover read would be filed (and
+  /// fetched) under the anonymous namespace.
+  Future<String> blobNamespaceWhenReady() async {
+    try {
+      await init();
+    } catch (_) {
+      // A client that cannot boot still serves what it can.
+    }
+    return blobNamespace();
+  }
+
   Future<Never> openCrdtField(String table, String recordId, String field,
           [String? fallbackText]) =>
       throw UnimplementedError('CRDT deferred');

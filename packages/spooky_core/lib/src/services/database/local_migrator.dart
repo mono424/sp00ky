@@ -24,6 +24,10 @@ class LocalMigrator {
 
   Future<void> provision(String schemaSurql) async {
     final hash = schemaSha1(schemaSurql);
+    // The full circuit used to be persisted here as JSON after every ingest.
+    // Only the store snapshot is read now; drop the dead row (megabytes on a
+    // real store). A no-op once it is gone.
+    _local.dropLegacyStreamState();
 
     if (_local.latestSchemaHash() == hash) {
       _logger.info('[Provisioning] Schema up to date, skipping migration');
@@ -33,7 +37,6 @@ class LocalMigrator {
     _logger.info('[Provisioning] Schema changed, rebuilding circuit');
     _local.tx(() {
       _local.clearSnapshot();
-      _local.kvRemove('_00_stream_processor_state');
       _local.recordSchemaHash(hash, DateTime.now().toUtc().toIso8601String());
     });
   }

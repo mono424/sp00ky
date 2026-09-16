@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -37,12 +38,12 @@ String blurhashSidecarPath(String path) => '$path.bh';
 /// body for an op doesn't throw.
 class BucketHandle {
   BucketHandle(this._bucketName, RemoteDatabaseService remote,
-      {BlobCache? blobs, String Function()? namespace})
+      {BlobCache? blobs, FutureOr<String> Function()? namespace})
       : _query = remote.query,
         _blobs = blobs,
         _namespace = namespace;
   BucketHandle.withQuery(this._bucketName, this._query,
-      {BlobCache? blobs, String Function()? namespace})
+      {BlobCache? blobs, FutureOr<String> Function()? namespace})
       : _blobs = blobs,
         _namespace = namespace;
 
@@ -51,8 +52,10 @@ class BucketHandle {
   final BlobCache? _blobs;
 
   /// The cache namespace for the signed-in user, resolved per call so the
-  /// handle follows an auth flip without subscribing to it.
-  final String Function()? _namespace;
+  /// handle follows an auth flip without subscribing to it. May wait: a read
+  /// issued before the client has restored its session must not land in the
+  /// anonymous namespace.
+  final FutureOr<String> Function()? _namespace;
 
   String get name => _bucketName;
 
@@ -70,10 +73,9 @@ class BucketHandle {
   Future<BlobCache>? _cache() {
     final blobs = _blobs;
     if (blobs == null) return null;
-    final ns = _namespace?.call();
-    return ns == null
-        ? Future.value(blobs)
-        : blobs.setNamespace(ns).then((_) => blobs);
+    final resolve = _namespace;
+    if (resolve == null) return Future.value(blobs);
+    return Future.sync(resolve).then(blobs.setNamespace).then((_) => blobs);
   }
 
   Future<void> put(String path, Object content) async {

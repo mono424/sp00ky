@@ -1,6 +1,5 @@
 import 'package:spooky_core/src/ffi/stream_update.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
-import 'package:spooky_core/src/services/persistence/memory_persistence.dart';
 import 'package:spooky_core/src/services/stream_processor/stream_processor_service.dart';
 import 'package:test/test.dart';
 
@@ -17,7 +16,7 @@ void main() {
     late List<StreamUpdate> received;
 
     setUp(() async {
-      sp = StreamProcessorService(MemoryPersistenceClient(), logger);
+      sp = StreamProcessorService(logger);
       await sp.init();
       sp.seedPermissionsFromSchema(
           'DEFINE TABLE user SCHEMAFULL PERMISSIONS FOR select WHERE true;');
@@ -72,7 +71,8 @@ void main() {
       expect(update.materializationTimeMs, isNotNull);
     });
 
-    test('batch-ingest of new records matching a FILTERED query emits them', () {
+    test('batch-ingest of new records matching a FILTERED query emits them',
+        () {
       // The app's initial down-sync path: register a record-filtered query, then
       // bulk-fetch the matching rows and ingest them as ONE batch (the live
       // per-record path doesn't fire for rows that pre-existed before the LIVE
@@ -82,7 +82,8 @@ void main() {
           'DEFINE TABLE game PERMISSIONS FOR select WHERE true;');
       sp.registerQueryPlan(QueryPlanConfig(
         queryHash: 'qg',
-        surql: r'SELECT * FROM game WHERE database = $db ORDER BY sort_index ASC',
+        surql:
+            r'SELECT * FROM game WHERE database = $db ORDER BY sort_index ASC',
         // Param as the sanitized string form the app's local circuit receives
         // (a RecordId is stringified for the FFI's jsonEncode).
         params: {'db': 'game_database:DBS_x'},

@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/query-allowlist",
-  "version": "0.0.1-canary.255",
+  "version": "0.0.1-canary.256",
   "description": "Runs an app's q* query module against a recording client and writes the raw-surql allowlist the SSP enforces",
   "type": "module",
   "main": "./dist/index.js",

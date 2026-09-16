@@ -133,7 +133,7 @@ pub trait BusyTables: Send + Sync {
     async fn busy_tables(&self) -> BTreeSet<String>;
 }
 
-/// A fixed set: the startup pass (nothing ingested yet) and tests.
+/// A fixed set, for tests.
 #[async_trait]
 impl BusyTables for BTreeSet<String> {
     async fn busy_tables(&self) -> BTreeSet<String> {

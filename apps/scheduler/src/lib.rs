@@ -806,12 +806,15 @@ impl Scheduler {
         // The check the integrity check above cannot do: compare the replica
         // against UPSTREAM. A persisted snapshot that missed writes made while
         // nothing was listening (a bulk migration with the stack down) is
-        // internally consistent and serves every SSP an empty table. Nothing
-        // is buffered yet, so counts are comparable, and no SSP can register
-        // until `Ready`, so a re-clone here costs nobody a bootstrap.
+        // internally consistent and serves every SSP an empty table. No SSP
+        // can register until `Ready`, so a re-clone here costs nobody a
+        // bootstrap. The buffer is NOT empty after a restart: it holds the
+        // WAL backlog recovered above, which the first tick applies — so the
+        // tables in it are excluded here exactly as on a tick, or every job
+        // table reads as drift on every restart (whitepawn 2026-09-16 00:41).
         let drift_started = std::time::Instant::now();
         // Startup pass: nothing has been ingested yet, so no table is busy.
-        match crate::drift::run_check(&drift_hook, &self.replica, &BTreeSet::new()).await {
+        match crate::drift::run_check(&drift_hook, &self.replica, &BufferBusy(Arc::clone(&self.event_buffer))).await {
             crate::drift::Action::Clean => info!(
                 elapsed_ms = drift_started.elapsed().as_millis() as u64,
                 "Startup drift check passed"

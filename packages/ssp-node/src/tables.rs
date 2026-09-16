@@ -15,7 +15,8 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use ssp_protocol::{list_ref_table_for, sanitize_user_id, RefMode, ANON_AUTH_ID};
@@ -57,6 +58,31 @@ fn mark_user_table_ensured(uid: &str) {
 fn forget_user_table(uid: &str) {
     if let Ok(mut set) = ensured_user_tables().lock() {
         set.remove(uid);
+    }
+}
+
+/// One in-flight `DEFINE` per user. A login registers its views in one burst,
+/// and before this every registration issued the same DDL against the same
+/// catalog at once; RocksDB refused all but one with "Resource busy", the
+/// retry budget (no backoff) lost the same race five times over, and the
+/// registration answered 500 — five times in one second for one user on
+/// whitepawn, 2026-09-15. The first caller defines the table; the rest wait
+/// on its lock and then find the memo set.
+static ENSURING_USER_TABLES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn ensure_lock(uid: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let map = ENSURING_USER_TABLES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(uid.to_string()).or_default())
+}
+
+fn release_ensure_lock(uid: &str) {
+    if let Some(map) = ENSURING_USER_TABLES.get() {
+        if let Ok(mut map) = map.lock() {
+            map.remove(uid);
+        }
     }
 }
 
@@ -160,6 +186,13 @@ pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Re
     if user_table_ensured(&uid) {
         return Ok(());
     }
+    let lock = ensure_lock(&uid);
+    let _in_flight = lock.lock().await;
+    // A concurrent registration for the same user may have defined it while
+    // this one waited.
+    if user_table_ensured(&uid) {
+        return Ok(());
+    }
 
     let tbl = format!("_00_list_ref_user_{}", uid);
     let ddl = format!(
@@ -182,6 +215,7 @@ pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Re
         .await
         .with_context(|| format!("Failed to ensure per-user list_ref table for {}", auth_id))?;
     mark_user_table_ensured(&uid);
+    release_ensure_lock(&uid);
     Ok(())
 }
 
@@ -328,11 +362,34 @@ mod ensure_once_tests {
             _binds: &[(&str, serde_json::Value)],
         ) -> Result<Vec<serde_json::Value>, DbError> {
             self.statements.lock().unwrap().push(surql.to_string());
+            // Stay in flight for a moment so concurrent callers overlap the way
+            // a real DDL round-trip lets them.
+            tokio::task::yield_now().await;
             Ok(vec![])
         }
         async fn version(&self) -> Result<String, DbError> {
             Ok("test".into())
         }
+    }
+
+    /// The login burst: every view of a fresh session registers at once, so
+    /// `ensure_user_tables` runs N times concurrently for one user. One DDL
+    /// must reach the database, not N racing copies of it.
+    #[tokio::test]
+    async fn a_concurrent_burst_for_one_user_defines_the_table_once() {
+        let auth_id = "user:ensureburst_d4e5f6";
+        let db = RecordingDb::default();
+        let (a, b, c, d, e) = tokio::join!(
+            ensure_user_tables(&db, RefMode::Dedicated, auth_id),
+            ensure_user_tables(&db, RefMode::Dedicated, auth_id),
+            ensure_user_tables(&db, RefMode::Dedicated, auth_id),
+            ensure_user_tables(&db, RefMode::Dedicated, auth_id),
+            ensure_user_tables(&db, RefMode::Dedicated, auth_id),
+        );
+        for r in [a, b, c, d, e] {
+            r.expect("ensure");
+        }
+        assert_eq!(ddl_count(&db, "_00_list_ref_user_ensureburst_d4e5f6"), 1, "one DEFINE for the burst");
     }
 
     fn ddl_count(db: &RecordingDb, needle: &str) -> usize {

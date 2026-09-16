@@ -131,9 +131,16 @@ view, never an empty one.
    in a way the classifier reads as the server rejecting the write, and a
    rejection rolls the write back.
 
-Not ported (browser-only): shared tabs, the OPFS blob cache, the SQLite-WASM
-worker and its SurrealQL translator, the DevTools window bridge, the OTel
-exporter. CRDT collaborative fields are still deferred (the seam is in place).
+Not ported (browser-only): shared tabs, the SQLite-WASM worker and its
+SurrealQL translator, the DevTools window bridge, the OTel exporter. CRDT
+collaborative fields are still deferred (the seam is in place).
+
+The blob cache is ported with files on disk in place of OPFS
+(`Sp00kyConfig.blobCache.directory`; in-memory without one). Its manifest is
+rebuilt from a directory walk at start rather than kept in a `_00_blob` table,
+so there is nothing to migrate; `pin` and `revalidate: 'head'` are not ported.
+`bucket().read()` is the cached read, `get()` the raw one; `spooky_flutter`
+renders through it with `BucketImage`.
 
 ## Native library
 
@@ -161,6 +168,9 @@ final stream = await client.queryStream('SELECT * FROM thread', {});
 stream.listen((records) => print(records)); // or StreamBuilder in Flutter
 
 await client.create('thread:abc', {'title': 'hello'});
+
+// Bucket files, cached on disk after the first read (see blobCache).
+final bytes = await client.bucket('covers').read('abc_t.webp');
 ```
 
 A binding decides when to show a loader from the query's authority, not from its

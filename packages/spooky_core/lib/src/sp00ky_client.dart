@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'client/worker_client.dart';
 import 'modules/auth/sp00ky_auth.dart';
 import 'modules/query_builder.dart';
@@ -6,7 +7,9 @@ import 'modules/query_host.dart';
 import 'modules/bucket.dart';
 import 'modules/feature_flag/feature_flag.dart';
 import 'modules/app_release/app_release.dart';
+import 'modules/ref_tables.dart' show anonUserId, bucketIdForUser;
 import 'mutation/rows.dart';
+import 'services/blobs/blob_cache.dart';
 import 'services/logger/logger.dart';
 import 'state/client_state.dart';
 import 'types.dart';
@@ -108,9 +111,60 @@ abstract class Sp00kyClient {
   void closeModules() {
     _flags?.closeAll();
     _releases?.closeAll();
+    _blobsAuthUnsubscribe?.call();
+    _blobsAuthUnsubscribe = null;
   }
 
-  BucketHandle bucket(String name) => BucketHandle.withQuery(name, queryRemote);
+  BlobCache? _blobs;
+  void Function()? _blobsAuthUnsubscribe;
+
+  /// The one blob cache for this client, built on first use from
+  /// [Sp00kyConfig.blobCache]. Misses read the bucket through [queryRemote];
+  /// the raw handle used for that has no cache of its own.
+  BlobCache get blobCache => _blobs ??= _createBlobCache();
+
+  BlobCache _createBlobCache() {
+    final cfg = config.blobCache;
+    final dir = cfg.directory;
+    final cache = BlobCache(
+      store: dir == null ? MemoryBlobStore() : FileBlobStore(Directory(dir)),
+      fetchRemote: (key) async => bucketContentToBytes(
+          await BucketHandle.withQuery(key.bucket, queryRemote).get(key.path)),
+      logger: SpookyLogger.root(),
+      maxBytes: cfg.maxBytes,
+      namespace: blobNamespace(),
+    );
+    if (cfg.clearOnSignOut && config.database.endpoint != null) {
+      String? lastUser = auth.currentUser?['id']?.toString();
+      _blobsAuthUnsubscribe = auth.subscribe((userId) {
+        final previous = lastUser;
+        lastUser = userId;
+        if (userId == null && previous != null) {
+          unawaited(cache.clear(bucketIdForUser(previous)));
+        }
+      });
+    }
+    return cache;
+  }
+
+  /// The cache namespace for the signed-in user: the same per-user bucket id
+  /// the local store is split by, so two accounts on one device never see
+  /// each other's files.
+  String blobNamespace() {
+    if (config.database.endpoint == null) return anonUserId;
+    try {
+      return bucketIdForUser(auth.currentUser?['id']);
+    } on StateError {
+      // Auth not wired yet (an in-process client before init): anonymous.
+      return anonUserId;
+    }
+  }
+
+  /// Snapshot of the blob cache's counters, for diagnostics.
+  BlobCacheStats get blobCacheStats => blobCache.stats;
+
+  BucketHandle bucket(String name) => BucketHandle.withQuery(name, queryRemote,
+      blobs: blobCache, namespace: blobNamespace);
   Future<Never> openCrdtField(String table, String recordId, String field,
           [String? fallbackText]) =>
       throw UnimplementedError('CRDT deferred');

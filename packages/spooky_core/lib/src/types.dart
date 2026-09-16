@@ -64,6 +64,7 @@ class Sp00kyConfig {
     this.syncHealth = const SyncHealthConfig(),
     this.liveInlineBodies = false,
     this.reconnect = const ReconnectConfig(),
+    this.blobCache = const BlobCacheConfig(),
   });
 
   final DatabaseConfig database;
@@ -76,6 +77,7 @@ class Sp00kyConfig {
   final String schemaSurql;
   final String logLevel;
   final dynamic persistenceClient;
+
   /// Trailing coalesce (ms) before a dirty query re-materializes. Matches the
   /// browser core's `MATERIALIZE_DEBOUNCE_MS`, so the two clients repaint on
   /// the same cadence.
@@ -116,6 +118,38 @@ class Sp00kyConfig {
   /// Transport supervision knobs: the reconnect backoff cap and the liveness
   /// probe that detects a half-open socket.
   final ReconnectConfig reconnect;
+
+  /// Where bucket files read through `bucket().read()` are kept between runs.
+  /// See [BlobCacheConfig].
+  final BlobCacheConfig blobCache;
+}
+
+/// Local cache for bucket files (TS `Sp00kyConfig.blobCache`).
+///
+/// Bucket reads are not HTTP: they are SurrealQL over the sync socket, one at
+/// a time behind the app's own queries, so a cover that is re-read on every
+/// screen is paid for in full every time. With a [directory] the bytes are
+/// kept on disk under `<directory>/<user bucket>/<bucket>/<path>` and a warm
+/// read never touches the socket. Without one the cache lives in memory: reads
+/// still dedupe within the process, nothing survives a restart.
+class BlobCacheConfig {
+  const BlobCacheConfig({
+    this.directory,
+    this.maxBytes = 256 * 1024 * 1024,
+    this.clearOnSignOut = false,
+  });
+
+  /// Root of the on-disk cache. In Flutter, something under
+  /// `getApplicationSupportDirectory()`; null keeps the cache in memory.
+  final String? directory;
+
+  /// Budget for one user's files. Least recently used entries are evicted
+  /// once it is exceeded; nothing expires by age.
+  final int maxBytes;
+
+  /// Wipe the signed-out user's files on sign-out. Off by default so signing
+  /// back in on the same device is warm.
+  final bool clearOnSignOut;
 }
 
 /// Tunables for sync-health reporting (TS `SyncHealthConfig`).

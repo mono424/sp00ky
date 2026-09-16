@@ -294,6 +294,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
     _auth?.dispose();
     _featureFlags?.closeAll();
     _appReleases?.closeAll();
+    closeModules();
     try {
       _runtime.dispose();
     } catch (_) {}
@@ -643,7 +644,8 @@ class InProcessSp00kyClient extends Sp00kyClient {
   BucketHandle bucket(String name) {
     final remote = _remote;
     if (remote == null) throw StateError('bucket() requires a remote endpoint');
-    return BucketHandle(name, remote);
+    return BucketHandle(name, remote,
+        blobs: blobCache, namespace: blobNamespace);
   }
 
   Future<Never> openCrdtField(String table, String recordId, String field,

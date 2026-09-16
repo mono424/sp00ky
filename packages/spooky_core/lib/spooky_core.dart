@@ -33,7 +33,8 @@ export 'src/utils/semver.dart' show semverGt;
 export 'src/surreal/remote_client.dart'
     show RemoteSurrealClient, WebSocketSurrealClient, LiveMessage;
 export 'src/modules/auth/auth_service.dart' show AuthService, AuthEventTypes;
-export 'src/modules/bucket.dart' show BucketHandle;
+export 'src/modules/bucket.dart' show BucketHandle, bucketContentToBytes;
+export 'src/services/blobs/blob_cache.dart' show BlobCacheStats, BlobKey;
 export 'src/modules/feature_flag/feature_flag.dart'
     show FeatureFlagModule, FeatureFlagHandle, FeatureFlagSnapshot;
 export 'src/modules/app_release/app_release.dart'

@@ -21,8 +21,6 @@ use std::time::Duration;
 use anyhow::Result;
 use schedule_core::{EngineConfig, JobKill, ScheduleDb, ScheduleDbError, ScheduleEngine};
 use serde_json::Value;
-use surrealdb::engine::remote::http::Client;
-use surrealdb::Surreal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 

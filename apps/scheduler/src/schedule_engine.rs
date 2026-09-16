@@ -26,7 +26,6 @@ use surrealdb::Surreal;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::config::DbConfig;
 use crate::job_scheduler::JobActionRequest;
 use crate::router::SspPool;
 use crate::transport::{HttpTransport, SspInfo};
@@ -36,8 +35,13 @@ use crate::transport::{HttpTransport, SspInfo};
 /// job-completion event heals quickly.
 const SCHEDULE_SWEEP_INTERVAL_SECS: u64 = 5;
 
-/// `ScheduleDb` over the scheduler's own SurrealDB HTTP connection.
-struct RemoteDb(Surreal<Client>);
+/// `ScheduleDb` over the scheduler's shared re-signing SurrealDB session.
+///
+/// Every query takes the current handle, so a token refresh or a reconnect
+/// behind `ReconnectingDb` is picked up on the next statement. A private
+/// connection here lost one sweep pass per hour to `401 Unauthorized` (root
+/// signins live one hour; whitepawn 2026-09-15 at 23:00:07 and 00:00:17).
+struct RemoteDb(Arc<maintenance::db::ReconnectingDb>);
 
 #[async_trait::async_trait]
 impl ScheduleDb for RemoteDb {
@@ -46,11 +50,16 @@ impl ScheduleDb for RemoteDb {
         surql: &str,
         binds: &[(&str, Value)],
     ) -> Result<Vec<Value>, ScheduleDbError> {
-        let mut q = self.0.query(surql);
+        let handle = self.0.handle();
+        let mut q = handle.query(surql);
         for (name, value) in binds {
             q = q.bind(((*name).to_string(), value.clone()));
         }
-        let mut response = q.await.map_err(|e| ScheduleDbError::Transport(e.to_string()))?;
+        let mut response = q.await.map_err(|e| {
+            let msg = e.to_string();
+            self.0.note_error(&msg);
+            ScheduleDbError::Transport(msg)
+        })?;
         let n = response.num_statements();
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -150,7 +159,7 @@ pub fn build_engine_over(
 }
 
 fn build_engine(
-    db: Surreal<Client>,
+    db: Arc<maintenance::db::ReconnectingDb>,
     ssp_pool: Arc<RwLock<SspPool>>,
     transport: Arc<HttpTransport>,
 ) -> ScheduleEngine {
@@ -158,38 +167,27 @@ fn build_engine(
 }
 
 /// Start the cluster schedule sweep. One task, one ticker, for the whole cluster.
+///
+/// Reads and writes through the admin session slot (a `ReconnectingDb`); the
+/// slot is empty until `Scheduler::start` has connected, and a tick that finds
+/// it empty waits for the next one.
 pub fn start_schedule_sweep(
     ssp_pool: Arc<RwLock<SspPool>>,
     transport: Arc<HttpTransport>,
-    db_config: Arc<DbConfig>,
+    db_slot: crate::admin::SharedDbSlot,
 ) {
     tokio::spawn(async move {
-        // Connect lazily and rebuild the handle whenever a pass fails, so a
-        // database blip costs one tick rather than the task.
         let mut engine: Option<ScheduleEngine> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(SCHEDULE_SWEEP_INTERVAL_SECS));
         loop {
             interval.tick().await;
 
             if engine.is_none() {
-                match maintenance::db::connect_http(&db_config).await {
-                    Ok(conn) => {
-                        engine = Some(build_engine(
-                            conn,
-                            Arc::clone(&ssp_pool),
-                            Arc::clone(&transport),
-                        ))
-                    }
-                    Err(e) => {
-                        // `{:#}`, not `{}`: the outermost context here is always
-                        // "Failed to open HTTP to <url>", which names the destination
-                        // and never the fault. A tenant database that refuses new
-                        // sessions while answering existing ones looks identical to a
-                        // typo in the URL unless the chain is printed.
-                        warn!(error = format!("{e:#}"), "Schedule sweep: DB connect failed; retrying next tick");
-                        continue;
-                    }
-                }
+                let Some(db) = db_slot.read().await.clone() else {
+                    debug!("Schedule sweep: database session not ready yet");
+                    continue;
+                };
+                engine = Some(build_engine(db, Arc::clone(&ssp_pool), Arc::clone(&transport)));
             }
 
             match engine.as_ref().unwrap().tick_pass().await {
@@ -198,10 +196,9 @@ pub fn start_schedule_sweep(
                         debug!(?report, "schedule sweep");
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "Schedule sweep pass failed; will reconnect");
-                    engine = None;
-                }
+                // The shared handle heals itself (`note_error` in `RemoteDb`);
+                // the next tick simply runs against the refreshed session.
+                Err(e) => error!(error = %e, "Schedule sweep pass failed"),
             }
         }
     });

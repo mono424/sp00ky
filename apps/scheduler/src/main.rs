@@ -255,7 +255,7 @@ async fn run() -> Result<()> {
     scheduler::schedule_engine::start_schedule_sweep(
         std::sync::Arc::clone(&job_state.ssp_pool),
         std::sync::Arc::clone(&transport),
-        std::sync::Arc::new(scheduler.config().db.clone()),
+        std::sync::Arc::clone(&scheduler.db_slot),
     );
 
     // Spawn the single-consumer backup worker

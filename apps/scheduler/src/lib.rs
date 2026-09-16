@@ -101,7 +101,7 @@ pub fn recover_wal_backlog(
     let max_wal_seq = recovered_events.last().map(|e| e.seq).unwrap_or(0);
     let initial_seq = max_wal_seq.max(snapshot_seq);
 
-    let mut event_buffer: VecDeque<BufferedEvent> = recovered_events
+    let event_buffer: VecDeque<BufferedEvent> = recovered_events
         .into_iter()
         .filter(|e| e.seq > snapshot_seq)
         .collect();

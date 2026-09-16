@@ -122,17 +122,6 @@ jobs:
         working-directory: packages/query-builder
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
-      # 1b. Build and publish @spooky-sync/query-allowlist (depends on query-builder)
-      - name: Set version — query-allowlist
-        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/query-allowlist/package.json > tmp.json && mv tmp.json packages/query-allowlist/package.json
-
-      - name: Build query-allowlist
-        run: pnpm --filter @spooky-sync/query-allowlist build
-
-      - name: Publish query-allowlist
-        working-directory: packages/query-allowlist
-        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
-
       # 2. Build and publish @spooky-sync/ssp-wasm
       - name: Set version — ssp-wasm
         run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/ssp-wasm/package.json > tmp.json && mv tmp.json packages/ssp-wasm/package.json
@@ -189,6 +178,22 @@ jobs:
 
       - name: Publish devtools-mcp
         working-directory: apps/devtools-mcp
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
+      # 7. Build and publish @spooky-sync/query-allowlist (depends on query-builder).
+      # Last and non-fatal on purpose: OIDC trusted publishing cannot CREATE a
+      # package, so until someone publishes this package once by hand and adds
+      # the trusted publisher on npmjs.com, this step 404s. Putting it first
+      # blocked core / client-solid2 / devtools-mcp from canary.251 to .254.
+      - name: Set version — query-allowlist
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/query-allowlist/package.json > tmp.json && mv tmp.json packages/query-allowlist/package.json
+
+      - name: Build query-allowlist
+        run: pnpm --filter @spooky-sync/query-allowlist build
+
+      - name: Publish query-allowlist
+        working-directory: packages/query-allowlist
+        continue-on-error: true
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
   build-cli-binaries:

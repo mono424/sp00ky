@@ -193,7 +193,7 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
           hash,
           table: entry.def.tableName,
           surql: entry.def.surql,
-          params: Object.keys(entry.def.params ?? {}),
+          params: Object.keys(entry.def.params),
           hint: 'Add or regenerate the query allowlist: spky generate, then spky deploy (or restart spky dev).',
         },
       });

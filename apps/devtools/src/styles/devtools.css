@@ -3136,75 +3136,163 @@ body {
   border-color: var(--sys-color-primary);
 }
 
-/* ---- Access tab: impersonation ---------------------------------------- */
-.impersonation-active,
-.impersonation-warning {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sys-spacing-2);
-  padding: var(--sys-spacing-3);
-  border: 1px solid var(--sys-color-error);
-  border-left-width: 4px;
-  border-radius: var(--sys-radius-sm);
-  background: color-mix(in srgb, var(--sys-color-error) 10%, transparent);
-}
-.impersonation-warning {
-  margin: var(--sys-spacing-2) 0;
-}
-.btn.impersonation-stop {
-  align-self: flex-start;
-  border-color: var(--sys-color-error);
-  color: var(--sys-color-error);
-}
-.impersonation-search {
-  width: 100%;
-  box-sizing: border-box;
-  margin: var(--sys-spacing-2) 0;
-}
-.impersonation-results {
-  display: flex;
-  flex-direction: column;
-  max-height: 240px;
-  overflow-y: auto;
+/* ---- Access tab: impersonation ----------------------------------------
+   Dense like the rest of the panel: one card for the live session, one for
+   the picker. The thin hazard strip on the active card is the same pattern
+   the client injects into the page, so the two read as one feature. */
+.imp-card {
   border: 1px solid var(--sys-color-divider);
   border-radius: var(--sys-radius-sm);
+  background: var(--sys-color-surface-container-low);
+  overflow: hidden;
 }
-.impersonation-user {
+.imp-card + .imp-card {
+  margin-top: var(--sys-spacing-3);
+}
+.imp-card.active {
+  border-color: var(--sys-color-warning);
+}
+.imp-stripe {
+  height: 4px;
+  background: repeating-linear-gradient(45deg, #f2b600 0 6px, #1c1403 6px 12px);
+}
+.imp-body {
+  padding: var(--sys-spacing-3);
+}
+.imp-head {
   display: flex;
   align-items: center;
   gap: var(--sys-spacing-2);
-  padding: var(--sys-spacing-2);
+}
+.imp-head .imp-title {
+  font-size: var(--sys-typescale-label-size);
+  font-weight: 600;
+  color: var(--sys-color-on-surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.imp-head .imp-actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--sys-spacing-1);
+  flex: none;
+}
+.imp-kv {
+  margin-top: var(--sys-spacing-2);
+}
+.imp-note {
+  margin: 0 0 var(--sys-spacing-2);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--sys-color-on-surface-subtle);
+}
+.imp-field {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 3px var(--sys-spacing-2);
+  background: var(--sys-color-cdt-base-container);
+  color: var(--sys-color-on-surface);
+  border: 1px solid var(--sys-color-outline);
+  border-radius: var(--sys-radius-xs);
+  font-size: 11px;
+}
+.imp-field:focus-visible {
+  outline: 1px solid var(--sys-color-primary);
+  outline-offset: -1px;
+}
+.imp-field + .imp-field {
+  margin-top: var(--sys-spacing-2);
+}
+.imp-list {
+  margin-top: var(--sys-spacing-2);
+  max-height: 168px;
+  overflow-y: auto;
+  border: 1px solid var(--sys-color-outline-variant);
+  border-radius: var(--sys-radius-xs);
+}
+.imp-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sys-spacing-2);
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px var(--sys-spacing-2);
   border: 0;
-  border-bottom: 1px solid var(--sys-color-divider);
+  border-bottom: 1px solid var(--sys-color-outline-variant);
   background: transparent;
-  color: inherit;
+  color: var(--sys-color-on-surface);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.impersonation-user:last-child {
+.imp-row:last-child {
   border-bottom: 0;
 }
-.impersonation-user:hover:not(:disabled) {
+.imp-row:hover:not(:disabled) {
   background: var(--sys-color-state-hover);
 }
-.impersonation-user.selected {
-  background: var(--sys-color-state-focus, var(--sys-color-state-hover));
+.imp-row.selected {
+  background: var(--sys-color-state-selected);
 }
-.impersonation-user:disabled {
-  opacity: 0.55;
+.imp-row:disabled {
   cursor: not-allowed;
+  color: var(--sys-color-text-disabled);
 }
-.impersonation-tag {
-  margin-left: auto;
-  padding: 1px 6px;
-  border-radius: var(--sys-radius-sm);
-  border: 1px solid currentColor;
+.imp-row .imp-id {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.imp-row .imp-sub {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 11px;
 }
-.impersonation-confirm {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sys-spacing-2);
+.imp-tag {
+  margin-left: auto;
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--sys-color-divider);
+  border-radius: 999px;
+  font-size: 10px;
+  color: var(--sys-color-on-surface-subtle);
+}
+.imp-confirm {
   margin-top: var(--sys-spacing-3);
+  padding-top: var(--sys-spacing-3);
+  border-top: 1px solid var(--sys-color-outline-variant);
+}
+.imp-buttons {
+  display: flex;
+  align-items: center;
+  gap: var(--sys-spacing-2);
+  margin-top: var(--sys-spacing-2);
+}
+.imp-buttons .muted {
+  font-size: 11px;
+}
+.imp-warn {
+  color: var(--sys-color-warning);
+}
+.imp-sessions {
+  margin-top: var(--sys-spacing-3);
+}
+.imp-sessions-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--sys-color-on-surface-subtle);
+  margin-bottom: var(--sys-spacing-1);
+}
+/* Stop is the one action here with consequences; the rest of the panel's
+   buttons are deliberately quiet, so it gets the warning accent only. */
+.storage-persist-btn.imp-stop {
+  border-color: var(--sys-color-warning);
+  color: var(--sys-color-warning);
 }

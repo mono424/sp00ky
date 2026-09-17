@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, Show } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from 'solid-js';
 import { useDevTools } from '../../context/DevToolsContext';
 import type { ImpersonationUser } from '../../types/devtools';
 
@@ -17,8 +17,6 @@ export function ImpersonationSection() {
     isImpersonationBusy,
     fetchImpersonation,
     isSp00kyAvailable,
-    searchImpersonationUsers,
-    startImpersonation,
     stopImpersonation,
   } = useDevTools();
 
@@ -31,32 +29,65 @@ export function ImpersonationSection() {
   });
 
   const status = () => impersonation();
+  const current = () => status()?.current ?? null;
 
   return (
     <div class="mcp-section">
-      <h3>Impersonate</h3>
+      <div class="flags-section-head">
+        <h3>Impersonate</h3>
+        <Show when={status()}>
+          {(s) => (
+            <div class={`status-pill ${pillClass(s())}`}>
+              <span class="status-dot" />
+              {pillLabel(s())}
+            </div>
+          )}
+        </Show>
+      </div>
+
       <Show when={impersonationError()}>
         <div class="storage-health-banner error">{impersonationError()}</div>
       </Show>
+
       <Show when={status()} fallback={<div class="empty-state">Loading…</div>}>
-        <Show when={status()!.current} fallback={<StartPanel />}>
-          {(current) => (
-            <div class="impersonation-active">
-              <div>
-                Acting as <span class="mono">{current().target}</span> (you are{' '}
-                <span class="mono">{current().admin}</span>). The page shows a warning bar while
-                this lasts, and every write is recorded in <code>_00_impersonation_write</code>.
+        <Show when={current()} fallback={<StartCard />}>
+          {(session) => (
+            <div class="imp-card active">
+              <div class="imp-stripe" />
+              <div class="imp-body">
+                <div class="imp-head">
+                  <span class="imp-title">
+                    Acting as <span class="mono">{session().target}</span>
+                  </span>
+                  <span class="imp-actions">
+                    <button
+                      class="storage-persist-btn imp-stop"
+                      disabled={isImpersonationBusy()}
+                      onClick={() => void stopImpersonation()}
+                    >
+                      {isImpersonationBusy() ? 'Stopping…' : 'Stop'}
+                    </button>
+                  </span>
+                </div>
+                <div class="kv imp-kv">
+                  <div class="kv-row">
+                    <span class="kv-k">Admin</span>
+                    <span class="kv-v mono">{session().admin}</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-k">Token renews</span>
+                    <span class="kv-v muted">{formatWhen(session().tokenExpiresAt) ?? 'automatically'}</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-k">Session</span>
+                    <span class="kv-v mono muted">{session().session}</span>
+                  </div>
+                </div>
+                <p class="imp-note" style="margin: 8px 0 0;">
+                  The page shows a warning while this lasts, and every write is recorded in{' '}
+                  <code>_00_impersonation_write</code>.
+                </p>
               </div>
-              <Show when={formatWhen(current().tokenExpiresAt)}>
-                {(when) => <div class="muted">Token renews automatically; current one expires {when()}.</div>}
-              </Show>
-              <button
-                class="btn impersonation-stop"
-                disabled={isImpersonationBusy()}
-                onClick={() => void stopImpersonation()}
-              >
-                {isImpersonationBusy() ? 'Stopping…' : 'Stop impersonating'}
-              </button>
             </div>
           )}
         </Show>
@@ -64,7 +95,8 @@ export function ImpersonationSection() {
     </div>
   );
 
-  function StartPanel() {
+  function StartCard() {
+    const { searchImpersonationUsers, startImpersonation } = useDevTools();
     const [search, setSearch] = createSignal('');
     const [results, setResults] = createSignal<ImpersonationUser[]>([]);
     const [searchError, setSearchError] = createSignal<string | null>(null);
@@ -94,7 +126,9 @@ export function ImpersonationSection() {
     });
     onCleanup(() => clearTimeout(timer));
 
-    const canStart = () => !!target() && reason().trim().length >= 3 && !isImpersonationBusy();
+    const reasonOk = () => reason().trim().length >= 3;
+    const canStart = () => !!target() && reasonOk() && !isImpersonationBusy();
+    const sessions = createMemo(() => status()?.active ?? []);
 
     const start = async () => {
       const t = target();
@@ -113,8 +147,8 @@ export function ImpersonationSection() {
         fallback={
           <div class="empty-state">
             Impersonation is off for this project. Turn it on with{' '}
-            <code>impersonation: {'{'} enabled: true {'}'}</code> in <code>sp00ky.yml</code>, then
-            redeploy. While it is off, the server has no way to issue an impersonation token.
+            <code>impersonation: {'{'} enabled: true {'}'}</code> in <code>sp00ky.yml</code> and
+            redeploy; until then the server cannot issue an impersonation token.
           </div>
         }
       >
@@ -122,96 +156,140 @@ export function ImpersonationSection() {
           when={status()!.isAdmin}
           fallback={
             <div class="empty-state">
-              Only admins can impersonate. Grant access with <code>spky admin add &lt;user&gt;</code>.
+              Admins only. Grant access with <code class="mono">spky admin add &lt;user&gt;</code>.
             </div>
           }
         >
-          <p class="muted">
-            The page switches to the chosen user's session: it sees and changes exactly what they
-            can. Admins cannot be impersonated. Sessions are time-limited and audited.
-          </p>
-          <input
-            class="flags-target-input impersonation-search"
-            placeholder="Search users by id or name"
-            value={search()}
-            onInput={(e) => setSearch(e.currentTarget.value)}
-          />
-          <Show when={searchError()}>
-            <div class="storage-health-banner error">{searchError()}</div>
-          </Show>
-          <div class="impersonation-results">
-            <For each={results()} fallback={<div class="empty-state">No matching users.</div>}>
-              {(user) => (
-                <button
-                  class="impersonation-user"
-                  classList={{ selected: target()?.id === user.id }}
-                  disabled={user.is_admin}
-                  title={user.is_admin ? 'Admins cannot be impersonated' : `Select ${user.id}`}
-                  onClick={() => {
-                    setTarget(user);
-                    setConfirming(false);
-                  }}
-                >
-                  <span class="mono">{user.id}</span>
-                  <span class="muted">{describe(user)}</span>
-                  <Show when={user.is_admin}>
-                    <span class="impersonation-tag">admin</span>
-                  </Show>
-                </button>
-              )}
-            </For>
-          </div>
-          <Show when={target()}>
-            {(t) => (
-              <div class="impersonation-confirm">
-                <input
-                  class="flags-target-input"
-                  placeholder="Reason (required, kept in the audit log)"
-                  value={reason()}
-                  onInput={(e) => setReason(e.currentTarget.value)}
-                />
-                <Show
-                  when={confirming()}
+          <div class="imp-card">
+            <div class="imp-body">
+              <p class="imp-note">
+                The page switches to this user's session and sees exactly what they can. Admins
+                cannot be impersonated; sessions are time-limited and audited.
+              </p>
+              <input
+                class="imp-field"
+                placeholder="Search users by id, name or email"
+                value={search()}
+                onInput={(e) => setSearch(e.currentTarget.value)}
+              />
+              <Show when={searchError()}>
+                <div class="storage-health-banner error">{searchError()}</div>
+              </Show>
+              <div class="imp-list">
+                <For
+                  each={results()}
                   fallback={
-                    <button class="btn" disabled={!canStart()} onClick={() => setConfirming(true)}>
-                      Impersonate {t().id}
-                    </button>
+                    <div class="empty-state" style="padding: 12px;">
+                      {search().trim() ? 'No matching users.' : 'No users yet.'}
+                    </div>
                   }
                 >
-                  <div class="impersonation-warning">
-                    This page will act as <span class="mono">{t().id}</span> until you stop.
-                  </div>
-                  <div class="flags-variant-group">
-                    <button class="btn impersonation-stop" disabled={!canStart()} onClick={() => void start()}>
-                      {isImpersonationBusy() ? 'Starting…' : 'Start impersonating'}
+                  {(user) => (
+                    <button
+                      class="imp-row"
+                      classList={{ selected: target()?.id === user.id }}
+                      disabled={user.is_admin}
+                      title={user.is_admin ? 'Admins cannot be impersonated' : `Select ${user.id}`}
+                      onClick={() => {
+                        setTarget(user);
+                        setConfirming(false);
+                      }}
+                    >
+                      <span class="imp-id mono">{user.id}</span>
+                      <span class="imp-sub muted">{describe(user)}</span>
+                      <Show when={user.is_admin}>
+                        <span class="imp-tag">admin</span>
+                      </Show>
                     </button>
-                    <button class="btn" onClick={() => setConfirming(false)}>
-                      Cancel
-                    </button>
-                  </div>
-                </Show>
+                  )}
+                </For>
               </div>
-            )}
-          </Show>
-          <Show when={(status()!.active ?? []).length > 0}>
-            <h4>Open sessions</h4>
-            <div class="kv">
-              <For each={status()!.active}>
-                {(s) => (
-                  <div class="kv-row">
-                    <span class="kv-k mono">{s.admin}</span>
-                    <span class="kv-v mono muted">
-                      → {s.target} · {s.reason} · until {formatWhen(s.expires_at) ?? '?'}
-                    </span>
+
+              <Show when={target()}>
+                {(t) => (
+                  <div class="imp-confirm">
+                    <div class="kv">
+                      <div class="kv-row">
+                        <span class="kv-k">Target</span>
+                        <span class="kv-v mono">{t().id}</span>
+                      </div>
+                    </div>
+                    <input
+                      class="imp-field"
+                      placeholder="Reason (required, kept in the audit log)"
+                      value={reason()}
+                      onInput={(e) => setReason(e.currentTarget.value)}
+                    />
+                    <Show
+                      when={confirming()}
+                      fallback={
+                        <div class="imp-buttons">
+                          <button
+                            class="storage-persist-btn"
+                            disabled={!canStart()}
+                            onClick={() => setConfirming(true)}
+                          >
+                            Impersonate
+                          </button>
+                          <Show when={!reasonOk()}>
+                            <span class="muted">A reason of at least 3 characters is required.</span>
+                          </Show>
+                        </div>
+                      }
+                    >
+                      <div class="imp-buttons">
+                        <button
+                          class="storage-persist-btn"
+                          disabled={!canStart()}
+                          onClick={() => void start()}
+                        >
+                          {isImpersonationBusy() ? 'Starting…' : 'Start as this user'}
+                        </button>
+                        <button class="btn" onClick={() => setConfirming(false)}>
+                          Cancel
+                        </button>
+                        <span class="muted imp-warn">This page will act as {t().id}.</span>
+                      </div>
+                    </Show>
                   </div>
                 )}
-              </For>
+              </Show>
+
+              <Show when={sessions().length > 0}>
+                <div class="imp-sessions">
+                  <div class="imp-sessions-title">Open sessions</div>
+                  <div class="kv">
+                    <For each={sessions()}>
+                      {(s) => (
+                        <div class="kv-row">
+                          <span class="kv-k mono">{s.admin}</span>
+                          <span class="kv-v mono muted">
+                            {s.target} · {s.reason} · until {formatWhen(s.expires_at) ?? '?'}
+                          </span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </div>
+              </Show>
             </div>
-          </Show>
+          </div>
         </Show>
       </Show>
     );
   }
+}
+
+function pillLabel(status: { enabled?: boolean; isAdmin?: boolean; current?: unknown }): string {
+  if (status.current) return 'Active';
+  if (!status.enabled) return 'Disabled';
+  return status.isAdmin ? 'Available' : 'Admins only';
+}
+
+function pillClass(status: { enabled?: boolean; isAdmin?: boolean; current?: unknown }): string {
+  if (status.current) return 'status-updating';
+  if (!status.enabled) return 'status-destroyed';
+  return status.isAdmin ? 'status-active' : 'status-initializing';
 }
 
 /** The project's search fields, flattened to one line. */

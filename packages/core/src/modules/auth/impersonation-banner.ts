@@ -1,18 +1,22 @@
 import type { ImpersonationInfo } from './impersonation';
 
-/** Default height of the warning layer the page is shifted down by. The
- *  effective height is published as the CSS variable
+/** Default height of the warning bar above the framed page. The effective
+ *  height is published as the CSS variable
  *  `--sp00ky-impersonation-banner-height` on `<html>` (`0px` when hidden), so
  *  an app can offset its own fixed header. */
-export const BANNER_HEIGHT_PX = 44;
+export const BANNER_HEIGHT_PX = 40;
 
-/** Default radius of the page's new top corners. */
+/** Default gutter left, right and below the framed page. */
+export const FRAME_INSET_PX = 10;
+
+/** Default radius of the framed page's corners. */
 export const PAGE_RADIUS_PX = 14;
 
-/** Default hazard stripes: the warning layer, and the `<html>` backdrop the
- *  page's rounded corners reveal. */
-export const BANNER_STRIPES =
-  'repeating-linear-gradient(45deg, #f2b600 0 14px, #1c1403 14px 28px)';
+/** The default backdrop: a warm amber-to-orange wash with a faint diagonal
+ *  hazard rake over it. Layered background-image, topmost layer first. */
+export const BANNER_BACKGROUND =
+  'repeating-linear-gradient(45deg, rgba(69, 26, 3, .07) 0 9px, rgba(69, 26, 3, 0) 9px 18px),' +
+  ' linear-gradient(135deg, #fbbf24 0%, #fb923c 52%, #f59e0b 100%)';
 
 const HOST_TAG = 'sp00ky-impersonation-banner';
 
@@ -28,26 +32,27 @@ export const CUSTOM_BANNER_GRACE_MS = 2500;
  * level.
  */
 export interface ImpersonationBannerTheme {
-  /** Height of the bar, and therefore how far the page is pushed down. */
+  /** Height of the warning bar above the page. */
   heightPx?: number;
-  /** Radius of the page's new top corners. `0` squares them off. */
+  /** Gutter left, right and below the page. `0` frames only from the top. */
+  insetPx?: number;
+  /** Radius of the framed page's corners. `0` squares them off. */
   radiusPx?: number;
-  /** Background of the warning layer. Any CSS `background` value. */
+  /** The backdrop behind the page. Any CSS `background` value. */
   background?: string;
-  /** Background of the pill the text sits in. */
-  pill?: string;
-  /** Text colour inside the pill. */
-  pillText?: string;
+  /** Colour of the warning text on the backdrop. */
+  text?: string;
   /** Background of the Stop button. */
   accent?: string;
   /** Text colour of the Stop button. */
   accentText?: string;
   /** Label for the Stop button. Defaults to `Stop`. */
   stopLabel?: string;
-  /** The warning sentence. Defaults to `Impersonating <target> as <admin>`. */
+  /** The warning sentence. Defaults to `Impersonating <target> as <admin>`.
+   *  Wrap a run in `**` to emphasise it; the result is text, never markup. */
   label?: (info: ImpersonationInfo) => string;
-  /** Drop the page shift and the rounded corners, leaving only the bar.
-   *  The CSS variable is still published, so the app can do its own offset. */
+  /** Keep the bar but leave the page's own layout completely alone. The CSS
+   *  variable is still published, so the app can do its own offset. */
   noPageShift?: boolean;
 }
 
@@ -68,7 +73,8 @@ export interface ImpersonationBannerConfig {
   theme?: ImpersonationBannerTheme;
 }
 
-interface ResolvedTheme extends Required<Omit<ImpersonationBannerTheme, 'label' | 'stopLabel'>> {
+interface ResolvedTheme
+  extends Required<Omit<ImpersonationBannerTheme, 'label' | 'stopLabel'>> {
   stopLabel: string;
   label: (info: ImpersonationInfo) => string;
 }
@@ -76,23 +82,39 @@ interface ResolvedTheme extends Required<Omit<ImpersonationBannerTheme, 'label' 
 function resolveTheme(theme: ImpersonationBannerTheme = {}): ResolvedTheme {
   return {
     heightPx: theme.heightPx ?? BANNER_HEIGHT_PX,
+    insetPx: theme.insetPx ?? FRAME_INSET_PX,
     radiusPx: theme.radiusPx ?? PAGE_RADIUS_PX,
-    background: theme.background ?? BANNER_STRIPES,
-    pill: theme.pill ?? 'rgba(14, 11, 2, .88)',
-    pillText: theme.pillText ?? '#fde68a',
-    accent: theme.accent ?? '#fde68a',
-    accentText: theme.accentText ?? '#1c1403',
+    background: theme.background ?? BANNER_BACKGROUND,
+    text: theme.text ?? '#45230a',
+    accent: theme.accent ?? '#45230a',
+    accentText: theme.accentText ?? '#fff7ed',
     stopLabel: theme.stopLabel ?? 'Stop',
     noPageShift: theme.noPageShift ?? false,
     label: theme.label ?? ((info) => `Impersonating **${info.target}** as ${info.admin}`),
   };
 }
 
-/** Keeps only the area OUTSIDE a corner's curve, so the nub is striped and
- *  everything inside the curve stays the app's own. `center` is the curve's
- *  centre inside the corner square. */
-function cornerMask(center: string, radius: number): string {
-  return `radial-gradient(circle ${radius}px at ${center}, transparent 0 ${radius}px, #000 ${radius}px)`;
+/**
+ * How much the page has to shrink to fit inside the frame, and how wide its
+ * layout box must be to fill the frame at that scale.
+ *
+ * Pure so the arithmetic is unit tested: the frame takes `heightPx` off the
+ * top and `insetPx` off the other three sides, and the page is scaled
+ * uniformly (one factor for both axes, so nothing is distorted) by the
+ * vertical ratio. `width` is the CSS width the page's box needs, since a
+ * zoomed box occupies `width * scale` of its parent.
+ */
+export function frameMetrics(
+  viewport: { width: number; height: number },
+  theme: { heightPx: number; insetPx: number }
+): { scale: number; width: number; contentHeight: number } {
+  const { width: w, height: h } = viewport;
+  const contentHeight = Math.max(1, h - theme.heightPx - theme.insetPx);
+  const contentWidth = Math.max(1, w - theme.insetPx * 2);
+  // Uniform: the vertical fit decides, so the aspect ratio is untouched and
+  // the page keeps every pixel of its height reachable.
+  const scale = h > 0 ? contentHeight / h : 1;
+  return { scale, width: contentWidth / scale, contentHeight };
 }
 
 // The shadow root keeps app CSS away from the bar, but the host element itself
@@ -110,58 +132,39 @@ export function bannerCss(t: ResolvedTheme): string {
   transform: none !important;
   clip-path: none !important;
 }
-.layer {
-  position: fixed; inset: 0 0 auto 0; z-index: 2147483646; pointer-events: none;
-  height: ${t.heightPx}px; background: ${t.background};
-}
-/* The page's rounded top corners, drawn over whatever the app puts there.
-   The body element's own border-radius rounds its background, but a fixed app
-   header is not clipped by it, so each corner is also painted here: a striped
-   square masked down to the nub OUTSIDE the corner's curve, so the app's own
-   colour still shows inside it. */
-.corners {
-  position: fixed; left: 0; right: 0; top: ${t.heightPx}px;
-  height: ${t.radiusPx}px; z-index: 2147483646; pointer-events: none;
-}
-.corner {
-  position: absolute; top: 0; width: ${t.radiusPx}px; height: ${t.radiusPx}px;
-  background: ${t.background};
-}
-.corner.left {
-  left: 0;
-  -webkit-mask: ${cornerMask('100% 100%', t.radiusPx)};
-  mask: ${cornerMask('100% 100%', t.radiusPx)};
-}
-.corner.right {
-  right: 0;
-  -webkit-mask: ${cornerMask('0% 100%', t.radiusPx)};
-  mask: ${cornerMask('0% 100%', t.radiusPx)};
-}
+/* The bar. The backdrop itself is painted on the root element, which is
+   BEHIND the page's sheet; an overlay here would cover the page. The bar
+   repeats that background with a fixed attachment, so its gradient lines up
+   with the root's to the pixel. */
 .bar {
   position: fixed; inset: 0 0 auto 0; height: ${t.heightPx}px; z-index: 2147483647;
   display: flex; align-items: center; justify-content: center; gap: 10px;
-  padding: 0 12px; box-sizing: border-box;
-  font: 600 13px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 0 ${Math.max(t.insetPx, 10)}px; box-sizing: border-box;
+  background-image: ${t.background};
+  background-attachment: fixed;
+  color: ${t.text};
+  font: 600 12.5px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+  letter-spacing: .01em;
 }
-.pill {
-  display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%;
-  padding: 6px 10px; border-radius: 999px;
-  background: ${t.pill}; color: ${t.pillText};
-  box-shadow: 0 1px 6px rgba(0, 0, 0, .45);
+.sign {
+  flex: none; display: grid; place-items: center;
+  width: 17px; height: 17px; border-radius: 50%;
+  background: ${t.text}; color: #fff7ed;
+  font-size: 11px; font-weight: 800;
 }
-.sign { flex: none; font-size: 14px; line-height: 1; }
 .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.text b { font-weight: 800; }
 button {
   flex: none; cursor: pointer; border: 0; border-radius: 999px;
   background: ${t.accent}; color: ${t.accentText};
-  font: 800 12px/1 system-ui, sans-serif; padding: 7px 12px;
-  box-shadow: 0 1px 6px rgba(0, 0, 0, .45);
+  font: 700 11.5px/1 system-ui, sans-serif; padding: 6px 11px;
+  box-shadow: 0 1px 2px rgba(69, 26, 3, .35);
 }
-button:hover { filter: brightness(1.12); }
+button:hover { filter: brightness(1.15); }
 button:disabled { opacity: .6; cursor: progress; }
 @media (max-width: 520px) {
-  .bar { gap: 6px; padding: 0 8px; }
-  .pill { padding: 5px 8px; }
+  .bar { gap: 7px; padding: 0 8px; font-size: 11.5px; }
+  .sign { display: none; }
 }
 `;
 }
@@ -169,20 +172,24 @@ button:disabled { opacity: .6; cursor: progress; }
 /**
  * The "you are impersonating" warning.
  *
- * Drawn as a layer the page sits on top of: hazard stripes fill the top of the
- * viewport, the page is pushed down by the bar's height and its new top
- * corners are rounded, so the stripes show through around them. The bar itself
- * lives in a closed shadow root, so app styles cannot hide or restyle it; the
- * page-shifting styles are set inline and `!important` on `<html>` / `<body>`
- * (nothing in a stylesheet outranks that), and the previous inline styles are
- * restored on unmount.
+ * The page becomes a sheet on a warm striped backdrop: a bar across the top
+ * names the session, and the page itself is scaled down to sit inside the
+ * remaining frame with rounded corners. Scaled, not pushed: growing the
+ * document moved the bottom of an app-shell layout off-screen, while a
+ * uniform scale keeps the aspect ratio and every pixel reachable, and
+ * `100vh`/`100dvh` layouts still resolve to exactly the frame.
+ *
+ * The bar lives in a closed shadow root, so app styles cannot hide or
+ * restyle it; the framing is written as `!important` inline styles on
+ * `<html>` / `<body>` (nothing in a stylesheet outranks that) and the
+ * previous inline styles are restored on unmount.
  *
  * Every piece of text goes through `textContent`.
  */
 export class ImpersonationBanner {
   private host: HTMLElement | null = null;
   private text: HTMLElement | null = null;
-  /** `style` attributes as the page had them before the shift. */
+  /** `style` attributes as the page had them before the frame. */
   private saved: { html: string | null; body: string | null } | null = null;
   private theme: ResolvedTheme;
   private mode: 'default' | 'custom' | 'none';
@@ -191,6 +198,7 @@ export class ImpersonationBanner {
   /** The app said its own banner is on screen for this impersonation. */
   private acknowledged = false;
   private warnedAboutNone = false;
+  private onResize: (() => void) | null = null;
 
   constructor(
     private onStop: () => Promise<void>,
@@ -198,6 +206,10 @@ export class ImpersonationBanner {
   ) {
     this.mode = config.mode ?? 'default';
     this.theme = resolveTheme(config.theme);
+  }
+
+  static supported(): boolean {
+    return typeof document !== 'undefined' && typeof document.createElement === 'function';
   }
 
   /**
@@ -209,10 +221,6 @@ export class ImpersonationBanner {
     this.acknowledged = true;
     this.clearFallback();
     if (this.mode === 'custom') this.teardown();
-  }
-
-  static supported(): boolean {
-    return typeof document !== 'undefined' && typeof document.createElement === 'function';
   }
 
   update(info: ImpersonationInfo | null): void {
@@ -230,7 +238,7 @@ export class ImpersonationBanner {
         // oxlint-disable-next-line no-console
         console.warn(
           '[sp00ky] impersonation is active and impersonationBanner.mode is "none": ' +
-            'nothing marks this page as another user\'s session.'
+            "nothing marks this page as another user's session."
         );
       }
       return;
@@ -257,17 +265,22 @@ export class ImpersonationBanner {
   /** Mount (if needed) and write the current identities into the bar. */
   private render(info: ImpersonationInfo): void {
     this.mount();
+    const label = this.theme.label(info);
     const text = this.text!;
     text.textContent = '';
-    text.append(...labelNodes(this.theme.label(info)));
-    text.title = `${this.theme.label(info)}. Every write is audited.`;
+    text.append(...labelNodes(label));
+    text.title = `${label.replace(/\*\*/g, '')}. Every write is audited.`;
   }
 
-  /** Remove the bar and undo the page shift. */
+  /** Remove the bar and put the page back exactly as it was. */
   private teardown(): void {
     this.host?.remove();
     this.host = this.text = null;
     if (typeof document === 'undefined') return;
+    if (this.onResize) {
+      window.removeEventListener('resize', this.onResize);
+      this.onResize = null;
+    }
     if (this.saved) {
       restoreStyle(document.documentElement, this.saved.html);
       restoreStyle(document.body, this.saved.body);
@@ -288,29 +301,13 @@ export class ImpersonationBanner {
     const style = document.createElement('style');
     style.textContent = bannerCss(this.theme);
 
-    // The striped ground the bar's text sits on: fixed, so it stays put while
-    // the page scrolls underneath. Never takes a click.
-    const layer = document.createElement('div');
-    layer.className = 'layer';
-    layer.setAttribute('aria-hidden', 'true');
-    const corners = document.createElement('div');
-    corners.className = 'corners';
-    corners.setAttribute('aria-hidden', 'true');
-    for (const side of ['left', 'right']) {
-      const corner = document.createElement('div');
-      corner.className = `corner ${side}`;
-      corners.append(corner);
-    }
-    if (this.theme.noPageShift || this.theme.radiusPx <= 0) corners.remove();
-
     const bar = document.createElement('div');
     bar.className = 'bar';
     bar.setAttribute('role', 'alert');
-    const pill = document.createElement('div');
-    pill.className = 'pill';
     const sign = document.createElement('span');
     sign.className = 'sign';
-    sign.textContent = '⚠';
+    sign.textContent = '!';
+    sign.setAttribute('aria-hidden', 'true');
     const text = document.createElement('span');
     text.className = 'text';
     const button = document.createElement('button');
@@ -322,73 +319,87 @@ export class ImpersonationBanner {
         button.disabled = false;
       });
     });
-    pill.append(sign, text);
-    bar.append(pill, button);
-    root.append(style, layer, corners, bar);
-    // Hosted on `<html>`, not `<body>`: the page shift clips `<body>` to the
-    // rounded top, and a bar inside it would be clipped away with everything
-    // else.
+    bar.append(sign, text, button);
+    root.append(style, bar);
+    // Hosted on `<html>`, not `<body>`: the body is the framed sheet, and a
+    // bar inside it would be scaled and clipped along with the page.
     document.documentElement.appendChild(host);
 
-    this.shiftPage();
+    this.frame();
     this.host = host;
     this.text = text;
   }
 
   /**
-   * Push the page below the warning and round its new top edge.
+   * Turn `<body>` into the framed sheet.
    *
-   * `<html>` carries the stripes as its background, because that is what the
-   * page's rounded corners reveal. `<body>` therefore has to be painted
-   * opaque: most apps colour it themselves, but a transparent one would let
-   * the stripes through behind the whole page, so its resolved colour is
-   * computed first and pinned.
+   * `zoom`, not `transform`: it scales at layout level, so `100vh` children
+   * resolve to the frame instead of overflowing it, scrollbars stay correct,
+   * and `position: fixed` keeps meaning the viewport (a transform would make
+   * the body a containing block and every fixed header would scroll away).
+   * The body's CSS width is widened by `1 / scale` so the scaled box still
+   * fills the frame.
    */
-  private shiftPage(): void {
+  private frame(): void {
     const root = document.documentElement;
     const body = document.body;
     if (!root || !body) return;
-    const { heightPx, radiusPx, background, noPageShift } = this.theme;
-    // Published even when the shift is off, so an app doing its own offset
+    const { heightPx, insetPx, radiusPx, noPageShift } = this.theme;
+    // Published even when the framing is off, so an app doing its own offset
     // has one number to read either way.
     root.style.setProperty('--sp00ky-impersonation-banner-height', `${heightPx}px`);
     if (noPageShift) return;
 
     this.saved = { html: root.getAttribute('style'), body: body.getAttribute('style') };
     const surface = resolveSurface(root, body);
-    root.style.setProperty('background-image', background, 'important');
-    root.style.setProperty('padding-top', `${heightPx}px`, 'important');
-    root.style.setProperty('box-sizing', 'border-box', 'important');
+    // The root paints the backdrop: it is the one box that is guaranteed to
+    // be behind the page's sheet. `overflow: hidden` keeps the document
+    // itself from scrolling — the sheet is fixed and scrolls internally.
+    root.style.setProperty('background', this.theme.background, 'important');
+    root.style.setProperty('overflow', 'hidden', 'important');
 
-    body.style.setProperty('background-color', surface, 'important');
-    if (radiusPx > 0) {
-      body.style.setProperty('border-radius', `${radiusPx}px ${radiusPx}px 0 0`, 'important');
-      // Clips the app's own content — a fixed header included — to the rounded
-      // top, which is what makes the page read as a sheet over the stripes.
-      body.style.setProperty(
-        'clip-path',
-        `inset(0 round ${radiusPx}px ${radiusPx}px 0 0)`,
-        'important'
+    const apply = () => {
+      const { scale, width } = frameMetrics(
+        { width: window.innerWidth, height: window.innerHeight },
+        { heightPx, insetPx }
       );
-    }
-    body.style.setProperty('box-shadow', '0 -6px 18px rgba(0, 0, 0, .35)', 'important');
-    // An app sized to `100vh` would otherwise overflow by the bar's height and
-    // put a scrollbar on a page that had none.
-    body.style.setProperty('min-height', `calc(100vh - ${heightPx}px)`, 'important');
+      body.style.setProperty('position', 'fixed', 'important');
+      body.style.setProperty('top', `${heightPx}px`, 'important');
+      body.style.setProperty('left', `${insetPx}px`, 'important');
+      body.style.setProperty('margin', '0', 'important');
+      body.style.setProperty('zoom', String(scale), 'important');
+      body.style.setProperty('width', `${width}px`, 'important');
+      body.style.setProperty('height', '100vh', 'important');
+      body.style.setProperty('overflow', 'auto', 'important');
+      body.style.setProperty('background-color', surface, 'important');
+      body.style.setProperty('box-shadow', '0 6px 24px rgba(69, 26, 3, .28)', 'important');
+      if (radiusPx > 0) {
+        const radius = `${radiusPx / scale}px`;
+        body.style.setProperty('border-radius', radius, 'important');
+        // Clips the page's own fixed layers (a loading overlay, a modal
+        // backdrop) to the sheet, so nothing paints over the frame.
+        body.style.setProperty('clip-path', `inset(0 round ${radius})`, 'important');
+      }
+    };
+    apply();
+    this.onResize = apply;
+    window.addEventListener('resize', apply);
   }
 }
 
-/** Put an element's inline styles back exactly as they were. */
+/** Put an element's inline styles back exactly as they were. An element that
+ *  had no `style` attribute (or an empty one) ends up without one again. */
 function restoreStyle(el: HTMLElement | null, saved: string | null): void {
   if (!el) return;
-  if (saved === null) el.removeAttribute('style');
-  else el.setAttribute('style', saved);
+  if (saved) el.setAttribute('style', saved);
+  else el.removeAttribute('style');
 }
 
 /**
- * The colour to paint `<body>` with while the stripes sit behind it: whatever
- * the page already paints (body first, then html), and failing that the canvas
- * colour for the viewer's colour scheme.
+ * The colour to paint the sheet with: whatever the page already paints (body
+ * first, then html), and failing that the canvas colour for the viewer's
+ * colour scheme. A transparent sheet would show the backdrop through the
+ * whole page.
  */
 function resolveSurface(root: HTMLElement, body: HTMLElement): string {
   for (const el of [body, root]) {
@@ -407,10 +418,9 @@ function isTransparent(color: string): boolean {
 }
 
 /**
- * The label, with every `<b>…</b>`-free segment as a text node and the record
- * ids emphasised. The label is a plain string (an app's own function can
- * return anything), so it never reaches the DOM as markup: `**bold**` marks
- * emphasis instead.
+ * The label as DOM nodes, emphasising the runs between `**` markers. The
+ * label is a plain string (an app's own function can return anything), so it
+ * never reaches the DOM as markup.
  */
 function labelNodes(label: string): Node[] {
   return labelSegments(label).map(({ text, bold }) => {

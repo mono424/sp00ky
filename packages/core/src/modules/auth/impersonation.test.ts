@@ -283,24 +283,50 @@ describe('timers', () => {
 
 describe('banner configuration', () => {
   it('builds CSS from the theme, defaults included', async () => {
-    const { bannerCss, BANNER_STRIPES } = await import('./impersonation-banner');
+    const { bannerCss, BANNER_BACKGROUND } = await import('./impersonation-banner');
     // `bannerCss` takes a resolved theme; the client resolves it, so this
     // pins the rendered output for a fully specified one.
     const css = bannerCss({
       heightPx: 60,
+      insetPx: 16,
       radiusPx: 0,
       background: 'var(--brand-warning)',
-      pill: '#000',
-      pillText: '#fff',
+      text: '#222',
       accent: '#f00',
       accentText: '#fff',
       stopLabel: 'Leave',
       noPageShift: true,
       label: () => 'x',
     });
-    expect(css).toContain('height: 60px; background: var(--brand-warning)');
-    expect(css).toContain('background: #000; color: #fff');
-    expect(css).not.toContain(BANNER_STRIPES);
+    expect(css).toContain('height: 60px');
+    expect(css).toContain('background-image: var(--brand-warning)');
+    expect(css).toContain('background: #f00; color: #fff');
+    expect(css).not.toContain(BANNER_BACKGROUND);
+  });
+
+  it('scales the page to the frame without distorting it', async () => {
+    const { frameMetrics } = await import('./impersonation-banner');
+    const theme = { heightPx: 40, insetPx: 10 };
+
+    const desktop = frameMetrics({ width: 1440, height: 900 }, theme);
+    // 900 - 40 - 10 = 850 of 900: one factor for both axes, so the aspect
+    // ratio is untouched and nothing is cropped.
+    expect(desktop.scale).toBeCloseTo(850 / 900);
+    expect(desktop.contentHeight).toBe(850);
+    // A zoomed box occupies width * scale, so the layout box is widened to
+    // still fill the frame exactly.
+    expect(desktop.width * desktop.scale).toBeCloseTo(1440 - 20);
+
+    const phone = frameMetrics({ width: 390, height: 844 }, theme);
+    expect(phone.contentHeight).toBe(844 - 50);
+    expect(phone.width * phone.scale).toBeCloseTo(370);
+
+    // Degenerate viewports (a hidden tab reporting 0) must not divide by zero
+    // or hand back a negative box.
+    const zero = frameMetrics({ width: 0, height: 0 }, theme);
+    expect(zero.scale).toBe(1);
+    expect(zero.contentHeight).toBeGreaterThan(0);
+    expect(zero.width).toBeGreaterThan(0);
   });
 
   it('emphasises the label between ** markers instead of parsing markup', async () => {
@@ -314,5 +340,16 @@ describe('banner configuration', () => {
     expect(__test.labelSegments('<img src=x onerror=alert(1)>')).toEqual([
       { text: '<img src=x onerror=alert(1)>', bold: false },
     ]);
+  });
+
+  it('resolves a partial theme over the defaults', async () => {
+    const { __test, BANNER_HEIGHT_PX } = await import('./impersonation-banner');
+    const theme = __test.resolveTheme({ insetPx: 0, stopLabel: 'Exit' });
+    expect(theme.insetPx).toBe(0);
+    expect(theme.stopLabel).toBe('Exit');
+    expect(theme.heightPx).toBe(BANNER_HEIGHT_PX);
+    expect(theme.label({ target: 'user:b', admin: 'user:a', session: 's', tokenExpiresAt: null })).toBe(
+      'Impersonating **user:b** as user:a'
+    );
   });
 });

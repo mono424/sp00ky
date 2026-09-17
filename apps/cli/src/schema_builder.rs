@@ -23,13 +23,16 @@ pub struct SchemaBuilderConfig {
 pub fn build_remote_functions_schema(mode: &DeployMode, endpoint: &str, secret: &str) -> String {
     let mut content = String::new();
 
-    // Set database-level params so events can reference them without hardcoding
+    // Set database-level params so events can reference them without
+    // hardcoding. PERMISSIONS NONE: a param defaults to FULL, which let any
+    // signed-in user `RETURN $sp00ky_secret`. Events run elevated, so the
+    // per-table ingest events still read them.
     content.push_str(&format!(
-        "DEFINE PARAM OVERWRITE $sp00ky_endpoint VALUE '{}';\n",
+        "DEFINE PARAM OVERWRITE $sp00ky_endpoint VALUE '{}' PERMISSIONS NONE;\n",
         endpoint
     ));
     content.push_str(&format!(
-        "DEFINE PARAM OVERWRITE $sp00ky_secret VALUE '{}';\n\n",
+        "DEFINE PARAM OVERWRITE $sp00ky_secret VALUE '{}' PERMISSIONS NONE;\n\n",
         secret
     ));
 

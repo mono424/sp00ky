@@ -23,7 +23,7 @@
 //! standalone SSP provide the source (a database handle) and the sink (their
 //! ingest path).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +51,10 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
     "_00_heartbeat",
     "_00_query_allowlist",
 ];
+
+/// How far past `poll_limit` the tail widens a poll that one transaction
+/// filled on its own.
+const MAX_POLL_LIMIT_FACTOR: usize = 64;
 
 /// Low 16 bits of a versionstamp are a per-millisecond counter.
 const STAMP_SHIFT: u32 = 16;
@@ -145,6 +149,9 @@ pub struct ParsedBatch {
     pub records: Vec<ChangeRecord>,
     /// Number of versionstamp entries (transactions) in the result.
     pub entries: usize,
+    /// Number of feed keys the result spans, the unit `LIMIT` counts. See
+    /// [`ParsedBatch::is_full`].
+    pub keys: usize,
     /// Highest versionstamp seen; `SINCE` is inclusive so the next cursor is
     /// this plus one.
     pub max_versionstamp: Option<u64>,
@@ -160,6 +167,54 @@ impl ParsedBatch {
             _ => current,
         }
     }
+
+    /// Whether the result stopped on `LIMIT` rather than at the end of the
+    /// feed.
+    ///
+    /// `LIMIT` does not count transactions. SurrealDB stores one feed key per
+    /// (versionstamp, table), all of a transaction's rows in one table sharing
+    /// it, and `LIMIT n` stops after n keys. A full result can therefore end
+    /// in the middle of its last transaction: verified on 3.1 (whitepawn,
+    /// 2026-09-17), `LIMIT 1` at a transaction that wrote `_00_version` and
+    /// `puzzle` returns that transaction with the version row only.
+    pub fn is_full(&self, limit: usize) -> bool {
+        self.keys >= limit
+    }
+
+    /// Drop the last transaction of a full result, which may be cut short, so
+    /// the next poll (from [`ParsedBatch::next_cursor`], which is then that
+    /// transaction's own versionstamp) reads it whole. `false`, and nothing
+    /// changed, when it is the only transaction in the result.
+    pub fn hold_back_last(&mut self) -> bool {
+        let Some(last) = self.max_versionstamp else {
+            return false;
+        };
+        if self.entries < 2 {
+            return false;
+        }
+        self.records.retain(|r| r.versionstamp < last);
+        self.entries -= 1;
+        // Every earlier entry is at or after the poll's `SINCE` and below
+        // `last`, so `last - 1` still passes `next_cursor`'s guard.
+        self.max_versionstamp = Some(last - 1);
+        true
+    }
+}
+
+/// The table a single change is stored under, for [`ParsedBatch::keys`].
+fn change_table(change: &Value) -> Option<String> {
+    let row = change
+        .get("delete")
+        .or_else(|| change.get("current"))
+        .or_else(|| change.get("update").filter(|u| u.is_object()));
+    if let Some(row) = row {
+        return record_id_of(row).and_then(|id| table_of(&id).map(str::to_owned));
+    }
+    change
+        .get("define_table")
+        .and_then(|d| d.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_owned)
 }
 
 /// Table name of a record id (`game:abc` -> `game`). Escaped ids keep their
@@ -205,8 +260,23 @@ pub fn parse_show_changes(result: &Value) -> ParsedBatch {
         out.entries += 1;
         out.max_versionstamp = Some(out.max_versionstamp.map_or(vs, |m| m.max(vs)));
         let Some(changes) = entry.get("changes").and_then(|c| c.as_array()) else {
+            out.keys += 1;
             continue;
         };
+        // A change whose table cannot be read counts as a key of its own:
+        // overcounting only makes a result look full, which costs a re-read,
+        // while undercounting would let a cut transaction through.
+        let mut tables: HashSet<String> = HashSet::new();
+        let mut unknown = 0;
+        for change in changes {
+            match change_table(change) {
+                Some(table) => {
+                    tables.insert(table);
+                }
+                None => unknown += 1,
+            }
+        }
+        out.keys += (tables.len() + unknown).max(1);
 
         // First pass: the transaction's version stamps.
         let mut versions: HashMap<String, i64> = HashMap::new();
@@ -333,7 +403,8 @@ pub struct TailerConfig {
     pub fallback: Duration,
     /// Poll interval while the doorbell is down.
     pub fallback_down: Duration,
-    /// `LIMIT` per `SHOW CHANGES` (entries, i.e. transactions).
+    /// `LIMIT` per `SHOW CHANGES`. SurrealDB counts feed keys, one per
+    /// (transaction, table), not transactions; see [`ParsedBatch::is_full`].
     pub poll_limit: usize,
     /// Deadline for one `SHOW CHANGES`.
     pub poll_timeout: Duration,
@@ -583,15 +654,15 @@ pub async fn run_tailer(
             continue;
         }
 
-        // Drain: keep polling while a poll returns entries.
+        // Drain: keep polling while a poll comes back full.
+        let mut limit = cfg.poll_limit;
         loop {
             let generation = stats.generation();
             let since = stats.cursor();
             let started = std::time::Instant::now();
             stats.polls.fetch_add(1, Ordering::Relaxed);
             let polled =
-                tokio::time::timeout(cfg.poll_timeout, source.show_changes(since, cfg.poll_limit))
-                    .await;
+                tokio::time::timeout(cfg.poll_timeout, source.show_changes(since, limit)).await;
             let now = now_ms();
             stats.last_poll_ms.store(now, Ordering::Relaxed);
             let result = match polled {
@@ -615,7 +686,23 @@ pub async fn run_tailer(
                     break;
                 }
             };
-            let batch = parse_show_changes(&result);
+            let mut batch = parse_show_changes(&result);
+            // A full result may end inside its last transaction, and the
+            // cursor moves past every versionstamp it delivers: hold that
+            // transaction back for the next poll to read whole. When it is the
+            // only one, it alone filled the limit, so read it again with room.
+            let full = batch.is_full(limit);
+            if full && !batch.hold_back_last() {
+                if limit < cfg.poll_limit.saturating_mul(MAX_POLL_LIMIT_FACTOR) {
+                    limit = limit.saturating_mul(2);
+                    debug!(limit, "One transaction filled the poll; re-reading it with a larger limit");
+                    continue;
+                }
+                warn!(
+                    limit,
+                    "One transaction spans more feed keys than the largest poll; delivering what was read, the rest of it is lost"
+                );
+            }
             stats
                 .last_entries
                 .store(batch.entries as u64, Ordering::Relaxed);
@@ -644,7 +731,6 @@ pub async fn run_tailer(
             }
 
             let next = batch.next_cursor(since);
-            let entries = batch.entries;
             let mut delivered: u64 = 0;
             let mut retry = false;
             let mut last_vs = since;
@@ -691,9 +777,10 @@ pub async fn run_tailer(
                 stats.note_records(delivered, now);
                 sink.persist_cursor(stats.cursor()).await;
             }
-            if entries < cfg.poll_limit {
+            if !full {
                 break;
             }
+            limit = cfg.poll_limit;
         }
 
         // Stall detection: no successful poll for a while, with the loop alive.
@@ -802,7 +889,8 @@ pub struct ChangefeedSettings {
     /// Clock-skew allowance for the gap check. Env
     /// `SPKY_CHANGEFEED_GAP_MARGIN_SECS`.
     pub gap_margin_secs: u64,
-    /// Transactions per `SHOW CHANGES`. Env `SPKY_CHANGEFEED_POLL_LIMIT`.
+    /// Feed keys (one per transaction and table) per `SHOW CHANGES`. Env
+    /// `SPKY_CHANGEFEED_POLL_LIMIT`.
     pub poll_limit: usize,
     /// Deadline for one `SHOW CHANGES`; past it the request is abandoned and
     /// the upstream handle replaced. Short on purpose: on SurrealDB 3.1.5 a
@@ -986,6 +1074,164 @@ mod tests {
         assert_eq!(batch.skipped, 5);
         assert_eq!(batch.max_versionstamp, Some(117271319530962946));
         assert_eq!(batch.next_cursor(0), 117271319530962947);
+    }
+
+    #[test]
+    fn counts_one_key_per_transaction_and_table() {
+        // define_table(game) | version+game | version+game | version+game
+        // | _00_query | plain (two rows, one key).
+        let batch = parse_show_changes(&fixture());
+        assert_eq!(batch.keys, 9);
+        assert!(batch.is_full(9));
+        assert!(!batch.is_full(10));
+    }
+
+    #[test]
+    fn holding_back_the_last_transaction_rereads_it() {
+        let mut batch = parse_show_changes(&fixture());
+        assert!(batch.hold_back_last());
+        assert_eq!(batch.entries, 5);
+        assert!(batch.records.iter().all(|r| !r.id.starts_with("plain:")));
+        // SINCE is inclusive: the next poll starts AT the held-back entry.
+        assert_eq!(batch.next_cursor(0), 117271319530962946);
+
+        let mut single = parse_show_changes(&json!([
+            {"changes":[{"update":{"id":"game:a"}}],"versionstamp":7u64}
+        ]));
+        assert!(!single.hold_back_last());
+        assert_eq!(single.records.len(), 1);
+        assert_eq!(single.next_cursor(0), 8);
+    }
+
+    /// A feed that cuts results the way SurrealDB 3.1 does: `LIMIT` counts
+    /// (versionstamp, table) keys, so a transaction can be split across polls.
+    struct KeyLimitedFeed {
+        /// (versionstamp, table, change), in key order.
+        keys: Vec<(u64, String, Vec<Value>)>,
+    }
+
+    impl KeyLimitedFeed {
+        fn new(txns: &[(u64, Vec<&str>)]) -> Self {
+            let mut keys = Vec::new();
+            for (vs, ids) in txns {
+                let mut by_table: std::collections::BTreeMap<String, Vec<Value>> =
+                    Default::default();
+                for id in ids.iter() {
+                    let row = if id.starts_with("_00_version:") {
+                        json!({"update": {"id": id, "record_id": "x:y", "version": 1}})
+                    } else {
+                        json!({"update": {"id": id}})
+                    };
+                    by_table
+                        .entry(table_of(id).unwrap().to_string())
+                        .or_default()
+                        .push(row);
+                }
+                for (table, changes) in by_table {
+                    keys.push((*vs, table, changes));
+                }
+            }
+            Self { keys }
+        }
+    }
+
+    #[async_trait]
+    impl ChangeSource for KeyLimitedFeed {
+        async fn show_changes(&self, since: u64, limit: usize) -> anyhow::Result<Value> {
+            let mut entries: Vec<Value> = Vec::new();
+            for (vs, _, changes) in self.keys.iter().filter(|k| k.0 >= since).take(limit) {
+                match entries.last_mut() {
+                    Some(e) if e["versionstamp"] == json!(vs) => e["changes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(changes.iter().cloned()),
+                    _ => entries.push(json!({"versionstamp": vs, "changes": changes})),
+                }
+            }
+            Ok(Value::Array(entries))
+        }
+        fn note_stalled(&self) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ChangeSink for RecordingSink {
+        fn ready(&self) -> bool {
+            true
+        }
+        async fn before_image(&self, _table: &str, _id: &str) -> Option<Value> {
+            None
+        }
+        async fn deliver(&self, record: ChangeRecord) -> Result<(), SinkError> {
+            self.ids.lock().unwrap().push(record.id);
+            Ok(())
+        }
+        async fn on_gap(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run the tail over `feed` until it has delivered `expected` records.
+    async fn tail_until(feed: KeyLimitedFeed, poll_limit: usize, expected: usize) -> Vec<String> {
+        let sink = Arc::new(RecordingSink::default());
+        let stats = TailerStats::new();
+        stats.set_cursor(1);
+        let cfg = TailerConfig {
+            poll_limit,
+            fallback: Duration::from_millis(5),
+            fallback_down: Duration::from_millis(5),
+            retention_ms: 0,
+            ..TailerConfig::default()
+        };
+        let task = tokio::spawn(run_tailer(
+            Arc::new(feed),
+            Arc::clone(&sink) as Arc<dyn ChangeSink>,
+            cfg,
+            Arc::clone(&stats),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while sink.ids.lock().unwrap().len() < expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Give a runaway tail the chance to deliver something extra.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let ids = sink.ids.lock().unwrap().clone();
+        ids
+    }
+
+    /// whitepawn 2026-09-17: a full poll ended after a transaction's
+    /// `_00_version` key, the cursor moved past it, and `puzzle:PZ_n58d2ng`
+    /// never reached the scheduler.
+    #[tokio::test]
+    async fn a_transaction_cut_by_the_limit_is_delivered_whole() {
+        let ids: Vec<[String; 2]> = (1..=7)
+            .map(|n| [format!("_00_version:v{n}"), format!("game:g{n}")])
+            .collect();
+        let txns: Vec<(u64, Vec<&str>)> = ids
+            .iter()
+            .zip(11u64..)
+            .map(|(pair, vs)| (vs, pair.iter().map(String::as_str).collect()))
+            .collect();
+        // Odd limit: every full poll ends between a version key and its row.
+        let ids = tail_until(KeyLimitedFeed::new(&txns), 3, 7).await;
+        let expected: Vec<String> = (1..=7).map(|n| format!("game:g{n}")).collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_wider_than_the_limit_is_read_with_a_larger_one() {
+        let feed = KeyLimitedFeed::new(&[
+            (11, vec!["_00_version:v1", "a:1", "b:1", "c:1", "d:1"]),
+            (12, vec!["_00_version:v2", "e:1"]),
+        ]);
+        let ids = tail_until(feed, 2, 5).await;
+        assert_eq!(ids, vec!["a:1", "b:1", "c:1", "d:1", "e:1"]);
     }
 
     #[test]

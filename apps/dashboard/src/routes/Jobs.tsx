@@ -448,43 +448,59 @@ export function Jobs() {
                       </Empty>
                     }
                   >
-                    <div class="lanes">
+                    <div class="lanes" role="table" aria-label="Outbox queues">
+                      <div class="lane lane-head" role="row">
+                        <span role="columnheader">Table</span>
+                        <span role="columnheader">Queue</span>
+                        <span class="num" role="columnheader">Pending</span>
+                        <span class="num" role="columnheader">In flight</span>
+                        <span class="num" role="columnheader">Failed 1h</span>
+                        <span class="num" role="columnheader">Oldest</span>
+                      </div>
                       <For each={tables()}>
-                        {(lane) => (
-                          <div class="lane">
-                            <div class="lane-name">
-                              <StatusDot tone={lane.error ? 'bad' : lane.stalled > 0 ? 'bad' : lane.in_flight >= lane.concurrency && lane.counts.pending > 0 ? 'warn' : 'ok'} />
-                              <button
-                                type="button"
-                                class="link"
-                                style={{ font: 'inherit', background: 'none', border: '0', padding: '0', color: 'inherit', cursor: 'pointer' }}
-                                onClick={() => setTable(table() === lane.table ? '' : lane.table)}
-                                title="Filter the list to this table"
-                              >
-                                {lane.table}
-                              </button>
-                              <Show when={lane.error}><ReasonLine error={lane.error} /></Show>
-                            </div>
-                            <LaneBar
-                              max={laneMax()}
-                              cap={lane.concurrency}
-                              segments={[
-                                { value: lane.in_flight - lane.stalled, tone: 'ok', title: `${lane.in_flight - lane.stalled} in flight` },
-                                { value: lane.stalled, tone: 'bad', title: `${lane.stalled} stalled` },
-                                { value: lane.counts.pending, tone: 'accent', title: `${lane.counts.pending} pending` },
-                                { value: lane.counts.failed, tone: 'warn', title: `${lane.counts.failed} failed in the last hour` },
-                              ]}
-                            />
-                            <div class="lane-figures">
-                              <span><b>{formatCount(lane.counts.pending)}</b> pending</span>
-                              <span classList={{ 'tone-warn': lane.in_flight >= lane.concurrency && lane.counts.pending > 0 }}>
-                                <b>{lane.in_flight}</b>/{lane.concurrency} in flight
+                        {(lane) => {
+                          const saturated = () => lane.in_flight >= lane.concurrency && lane.counts.pending > 0;
+                          const running = () => lane.in_flight - lane.stalled;
+                          return (
+                            <div class="lane" role="row" classList={{ active: table() === lane.table }}>
+                              <div class="lane-name" role="cell">
+                                <StatusDot tone={lane.error || lane.stalled > 0 ? 'bad' : saturated() ? 'warn' : 'ok'} />
+                                <button
+                                  type="button"
+                                  class="lane-link"
+                                  onClick={() => setTable(table() === lane.table ? '' : lane.table)}
+                                  title="Filter the list to this table"
+                                >
+                                  {lane.table}
+                                </button>
+                                <Show when={lane.error}><ReasonLine error={lane.error} /></Show>
+                              </div>
+                              <LaneBar
+                                max={laneMax()}
+                                cap={lane.concurrency}
+                                segments={[
+                                  { value: running(), tone: 'ok', title: `${running()} in flight` },
+                                  { value: lane.stalled, tone: 'bad', title: `${lane.stalled} stalled` },
+                                  { value: lane.counts.pending, tone: 'accent', title: `${lane.counts.pending} pending` },
+                                  { value: lane.counts.failed, tone: 'warn', title: `${lane.counts.failed} failed in the last hour` },
+                                ]}
+                              />
+                              <span class="num" role="cell" data-label="pending">
+                                <b classList={{ zero: lane.counts.pending === 0 }}>{formatCount(lane.counts.pending)}</b>
                               </span>
-                              <span classList={{ 'tone-bad': lane.counts.failed > 0 }}><b>{formatCount(lane.counts.failed)}</b> failed</span>
-                              <span class="ghost">{lane.oldest_pending ? relativeStamp(lane.oldest_pending) : '—'}</span>
+                              <span class="num" role="cell" data-label="in flight" classList={{ 'tone-warn': saturated() }}>
+                                <b classList={{ zero: lane.in_flight === 0 }}>{lane.in_flight}</b>
+                                <span class="lane-of">/{lane.concurrency}</span>
+                              </span>
+                              <span class="num" role="cell" data-label="failed" classList={{ 'tone-bad': lane.counts.failed > 0 }}>
+                                <b classList={{ zero: lane.counts.failed === 0 }}>{formatCount(lane.counts.failed)}</b>
+                              </span>
+                              <span class="num lane-age" role="cell" data-label="oldest" classList={{ empty: !lane.oldest_pending }}>
+                                {lane.oldest_pending ? relativeStamp(lane.oldest_pending) : '·'}
+                              </span>
                             </div>
-                          </div>
-                        )}
+                          );
+                        }}
                       </For>
                     </div>
                     <div class="lane-legend">
@@ -492,7 +508,7 @@ export function Jobs() {
                       <span class="bad">stalled</span>
                       <span class="accent">pending</span>
                       <span class="warn">failed, last hour</span>
-                      <span style={{ 'margin-left': 'auto' }}>tick: concurrency</span>
+                      <span class="cap">concurrency</span>
                     </div>
                   </Show>
                 </Tile>

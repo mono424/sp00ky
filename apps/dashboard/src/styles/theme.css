@@ -3146,115 +3146,238 @@ td .ident {
    ================================================================ */
 
 .lanes {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  /* One grid for every row (each row is a subgrid), so the bars start and
+     end at the same x and the figures line up whatever their width. */
+  grid-template-columns: minmax(120px, 220px) minmax(160px, 1fr) repeat(4, max-content);
+  column-gap: 28px;
 }
 .lane {
+  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) auto;
-  gap: 0 16px;
+  grid-template-columns: subgrid;
   align-items: center;
-  padding: 10px 18px;
+  padding: 13px 18px;
   border-bottom: 1px solid var(--rule);
+  transition: background-color 0.15s ease;
 }
-.lane:last-child {
-  border-bottom: 0;
+.lane:not(.lane-head):hover {
+  background: rgba(255, 255, 255, 0.018);
+}
+.lane.active {
+  background: var(--accent-wash);
+}
+.lane-head {
+  padding-block: 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-ghost);
 }
 .lane-name {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-family: var(--mono);
-  font-size: 12px;
-  white-space: nowrap;
+  gap: 10px;
+  min-width: 0;
+}
+.lane-link {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
 }
+.lane-link:hover {
+  color: var(--accent);
+}
+.lanes .num {
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.lane-head .num {
+  font-family: var(--sans);
+  font-size: 10.5px;
+  color: var(--ink-ghost);
+}
+.lanes .num b {
+  font-weight: 500;
+}
+.lanes .num b.zero {
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+.lanes .num.tone-warn b,
+.lanes .num.tone-warn .lane-of {
+  color: var(--warn);
+}
+.lanes .num.tone-bad b {
+  color: var(--bad);
+}
+.lane-of {
+  color: var(--ink-ghost);
+}
+.lanes .num.lane-age {
+  color: var(--ink-faint);
+  min-width: 5.5em;
+}
+
+/* ---- the bar ---- */
 .lane-bar {
   position: relative;
+  padding-block: 5px;
+}
+.lane-track {
+  position: relative;
   display: flex;
-  height: 12px;
-  border-radius: 3px;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
   background: var(--bg-sunken);
-  overflow: visible;
+  box-shadow:
+    inset 0 0 0 1px var(--rule),
+    inset 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+.lane-capzone {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.045) 0 3px,
+    transparent 3px 6px
+  );
+  transition: width 0.5s var(--ease-out);
 }
 .lane-seg {
+  --seg: var(--idle);
+  position: relative;
   height: 100%;
-  min-width: 2px;
-  transition: width 0.4s var(--ease-out);
+  min-width: 4px;
+  background-color: var(--seg);
+  /* A soft top light, so the fill reads as a solid rather than a flat block. */
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 70%);
+  transition: width 0.5s var(--ease-out);
 }
-.lane-seg:first-child {
-  border-radius: 3px 0 0 3px;
+/* A thin cut between kinds, in the track's own colour. */
+.lane-seg + .lane-seg {
+  box-shadow: inset 2px 0 0 var(--bg-raised);
 }
-.lane-seg:last-of-type {
-  border-radius: 0 3px 3px 0;
+.lane-seg:last-child {
+  border-radius: 0 999px 999px 0;
 }
 .lane-seg.accent {
-  background: var(--accent);
+  --seg: var(--accent);
 }
 .lane-seg.ok {
-  background: var(--ok);
+  --seg: var(--ok);
 }
 .lane-seg.warn {
-  background: var(--warn);
+  --seg: var(--warn);
 }
 .lane-seg.bad {
-  background: var(--bad);
+  --seg: var(--bad);
 }
 .lane-cap {
   position: absolute;
-  top: -3px;
-  bottom: -3px;
+  top: 1px;
+  bottom: 1px;
   width: 2px;
-  background: var(--ink-faint);
-  border-radius: 1px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: var(--ink);
+  /* A ring in the tile colour keeps the tick legible on any fill. */
+  box-shadow: 0 0 0 2px var(--bg-raised);
+  opacity: 0.8;
 }
-.lane-figures {
-  display: flex;
-  gap: 14px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--ink-dim);
-  white-space: nowrap;
-}
-.lane-figures b {
-  font-weight: 500;
-  color: var(--ink);
-}
+
 .lane-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 14px;
-  padding: 10px 18px 12px;
+  align-items: center;
+  gap: 8px 18px;
+  padding: 12px 18px 14px;
   font-size: 11px;
   color: var(--ink-faint);
 }
+.lane-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
 .lane-legend span::before {
   content: '';
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
-  margin-right: 6px;
-  vertical-align: -1px;
-  background: var(--idle);
+  width: 14px;
+  height: 6px;
+  border-radius: 999px;
+  background-color: var(--idle);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 70%);
 }
 .lane-legend .accent::before {
-  background: var(--accent);
+  background-color: var(--accent);
 }
 .lane-legend .ok::before {
-  background: var(--ok);
+  background-color: var(--ok);
 }
 .lane-legend .bad::before {
-  background: var(--bad);
+  background-color: var(--bad);
 }
 .lane-legend .warn::before {
-  background: var(--warn);
+  background-color: var(--warn);
 }
+.lane-legend .cap {
+  margin-left: auto;
+}
+.lane-legend .cap::before {
+  width: 2px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--ink);
+  opacity: 0.8;
+}
+
 @media (max-width: 720px) {
+  .lanes {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    column-gap: 12px;
+  }
   .lane {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 6px;
+    row-gap: 8px;
+  }
+  .lane-head {
+    display: none;
+  }
+  .lane-name,
+  .lane > .lane-bar {
+    grid-column: 1 / -1;
+  }
+  .lanes .num {
+    text-align: left;
+  }
+  .lanes .num::after {
+    content: ' ' attr(data-label);
+    font-family: var(--sans);
+    font-size: 11px;
+    color: var(--ink-faint);
+  }
+  .lanes .num.lane-age {
+    min-width: 0;
+  }
+  .lanes .num.empty {
+    visibility: hidden;
+  }
+  .lane-legend .cap {
+    margin-left: 0;
   }
 }
 

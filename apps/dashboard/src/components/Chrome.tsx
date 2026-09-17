@@ -511,19 +511,26 @@ export function LaneBar(props: {
 }) {
   const scale = () => Math.max(1, props.max, props.cap ?? 0);
   const width = (n: number) => `${Math.min(100, (n / scale()) * 100)}%`;
+  const shown = () => props.segments.filter((s) => s.value > 0);
+  const hasCap = () => !!props.cap && props.cap > 0;
   return (
-    <div class="lane-bar" role="img">
-      <For each={props.segments.filter((s) => s.value > 0)}>
-        {(s) => (
-          <span
-            class="lane-seg"
-            classList={{ [s.tone]: true }}
-            style={{ width: width(s.value) }}
-            title={s.title}
-          />
-        )}
-      </For>
-      <Show when={props.cap && props.cap > 0}>
+    <div
+      class="lane-bar"
+      role="img"
+      aria-label={shown().map((s) => s.title).filter(Boolean).join(', ') || 'empty'}
+    >
+      <div class="lane-track">
+        {/* The share of the scale the dispatcher admits at once. */}
+        <Show when={hasCap()}>
+          <span class="lane-capzone" style={{ width: width(props.cap!) }} />
+        </Show>
+        <For each={shown()}>
+          {(s) => (
+            <span class={`lane-seg ${s.tone}`} style={{ width: width(s.value) }} title={s.title} />
+          )}
+        </For>
+      </div>
+      <Show when={hasCap()}>
         <span class="lane-cap" style={{ left: width(props.cap!) }} title={`concurrency ${props.cap}`} />
       </Show>
     </div>

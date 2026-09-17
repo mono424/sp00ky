@@ -581,7 +581,7 @@ impl Replica {
 
     /// Opaque fields to `OMIT` when scanning `table`. Empty for a table with no
     /// annotated fields, or before the first discovery has run.
-    fn omit_for(&self, table: &str) -> &BTreeSet<String> {
+    pub(crate) fn omit_for(&self, table: &str) -> &BTreeSet<String> {
         static EMPTY: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
         self.opaque_fields
             .get(table)
@@ -1078,7 +1078,7 @@ impl Replica {
     /// clone inserts each page and drops it, which keeps peak memory at one
     /// page instead of one table. Buffering the whole table first put ~220MB
     /// of `analysis` in a single `Vec` on a scheduler capped at 1GB.
-    async fn page_table<C, F, Fut>(
+    pub(crate) async fn page_table<C, F, Fut>(
         remote_db: &surrealdb::Surreal<C>,
         table_name: &str,
         omit: &BTreeSet<String>,
@@ -1196,6 +1196,68 @@ impl Replica {
             }
         }
         Ok(total)
+    }
+
+    /// The current rows of `table` upstream for the given record ids (as the
+    /// replica spells them, `table:key`), keyed by that same spelling, with the
+    /// same projection and `_00_rv` a clone reads. Ids that no longer exist
+    /// are simply absent.
+    pub(crate) async fn fetch_rows_by_id<C>(
+        remote_db: &surrealdb::Surreal<C>,
+        table: &str,
+        ids: &[String],
+        omit: &BTreeSet<String>,
+    ) -> Result<std::collections::HashMap<String, Value>>
+    where
+        C: surrealdb::Connection,
+    {
+        let mut info = remote_db.query("INFO FOR DB").await?;
+        let info: surrealdb::types::Value = info.take(0)?;
+        let has_versions = info.into_json_value().get("tables")
+            .and_then(|v| v.get("_00_version")).is_some();
+        let query = format!(
+            "SELECT *{} FROM $ids.map(|$i| <record> $i)",
+            ssp_protocol::omit_clause(omit)
+        );
+        let query = if has_versions {
+            ssp_protocol::with_durable_row_versions(&query)
+        } else {
+            query
+        };
+        let mut out = std::collections::HashMap::new();
+        for chunk in ids.chunks(500) {
+            let mut response = remote_db
+                .query(&query)
+                .bind(("ids", chunk.to_vec()))
+                .await
+                .with_context(|| format!("SELECT {} rows by id from {}", chunk.len(), table))?;
+            let rows = match response.take::<surrealdb::types::Value>(0) {
+                Ok(v) => v.into_json_value(),
+                Err(e) if is_missing_error(&e) => break,
+                Err(e) => return Err(anyhow::anyhow!("take(0) failed for rows of {}: {}", table, e)),
+            };
+            for row in rows.as_array().into_iter().flatten() {
+                if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+                    out.insert(id.to_string(), row.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every row id of `table` with its `_00_rv` (`None` when the row carries
+    /// none), as the replica holds them right now.
+    pub async fn row_versions(&self, table: &str) -> Result<std::collections::HashMap<String, Option<i64>>> {
+        let rows = self.query(&format!("SELECT id, _00_rv FROM {}", table)).await?;
+        Ok(rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let id = row.get("id")?.as_str()?.to_string();
+                Some((id, row.get("_00_rv").and_then(|v| v.as_i64())))
+            })
+            .collect())
     }
 
     /// Bulk-insert records into a replica table in bounded batches. The

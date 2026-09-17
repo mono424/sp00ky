@@ -455,8 +455,17 @@ impl Scheduler {
     fn drift_hook(&self, db: Arc<maintenance::db::ReconnectingDb>) -> Arc<crate::drift::DriftHook> {
         Arc::new(crate::drift::DriftHook {
             cfg: self.drift_config.clone(),
-            upstream: Arc::new(crate::drift::SurrealUpstream { db }),
+            upstream: Arc::new(crate::drift::SurrealUpstream { db: Arc::clone(&db) }),
             state: Arc::clone(&self.drift),
+            repair: Arc::new(SchedulerRepairer {
+                db,
+                replica: Arc::clone(&self.replica),
+                feed: crate::drift::IngestRepairFeed {
+                    ingest: self.ingest_state(),
+                    changefeed: Arc::clone(&self.changefeed),
+                    changefeed_notify: Arc::clone(&self.changefeed_notify),
+                },
+            }),
             reclone: self.recloner(),
         })
     }
@@ -1022,6 +1031,26 @@ impl crate::drift::Recloner for SchedulerRecloner {
 
     fn in_progress(&self) -> bool {
         self.reclone_lock.try_lock().is_err()
+    }
+}
+
+/// The drift module's in-place table repair, over the scheduler's upstream
+/// handle and its own ingest pipeline.
+struct SchedulerRepairer {
+    db: Arc<maintenance::db::ReconnectingDb>,
+    replica: Arc<RwLock<Replica>>,
+    feed: crate::drift::IngestRepairFeed,
+}
+
+#[async_trait::async_trait]
+impl crate::drift::TableRepairer for SchedulerRepairer {
+    async fn repair(&self, table: &str, max_rows: usize) -> Result<crate::drift::RepairOutcome> {
+        let handle = self.db.handle();
+        crate::drift::repair_table(&*handle, &self.replica, &self.feed, table, max_rows).await
+    }
+
+    fn note_stalled(&self) {
+        self.db.force_reconnect();
     }
 }
 

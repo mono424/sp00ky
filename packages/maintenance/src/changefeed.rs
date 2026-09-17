@@ -452,6 +452,10 @@ pub struct TailerStats {
     pub stalled: AtomicBool,
     pub doorbell_connected: AtomicBool,
     pub doorbell_reconnects: AtomicU64,
+    /// Local time at which the last poll that drained the feed dry STARTED:
+    /// every change committed before it has been delivered. See
+    /// [`TailerStats::caught_up_ms`].
+    caught_up_ms: AtomicU64,
     pub last_error: std::sync::Mutex<Option<String>>,
     /// Bumped by [`TailerStats::reset_cursor`]; a poll that started under an
     /// older generation must not raise the cursor past a reset.
@@ -484,6 +488,12 @@ impl TailerStats {
     pub fn reset_cursor(&self, cursor: u64) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.cursor.store(cursor, Ordering::Relaxed);
+    }
+
+    /// Every change committed before this local time (unix ms) has been
+    /// delivered to the sink. 0 until the first drained poll.
+    pub fn caught_up_ms(&self) -> u64 {
+        self.caught_up_ms.load(Ordering::Relaxed)
     }
 
     pub fn generation(&self) -> u64 {
@@ -660,6 +670,7 @@ pub async fn run_tailer(
             let generation = stats.generation();
             let since = stats.cursor();
             let started = std::time::Instant::now();
+            let started_ms = now_ms();
             stats.polls.fetch_add(1, Ordering::Relaxed);
             let polled =
                 tokio::time::timeout(cfg.poll_timeout, source.show_changes(since, limit)).await;
@@ -778,6 +789,8 @@ pub async fn run_tailer(
                 sink.persist_cursor(stats.cursor()).await;
             }
             if !full {
+                // Nothing left that was visible when this poll started.
+                stats.caught_up_ms.fetch_max(started_ms, Ordering::Relaxed);
                 break;
             }
             limit = cfg.poll_limit;
@@ -1187,6 +1200,7 @@ mod tests {
             retention_ms: 0,
             ..TailerConfig::default()
         };
+        let started_ms = now_ms();
         let task = tokio::spawn(run_tailer(
             Arc::new(feed),
             Arc::clone(&sink) as Arc<dyn ChangeSink>,
@@ -1201,6 +1215,8 @@ mod tests {
         // Give a runaway tail the chance to deliver something extra.
         tokio::time::sleep(Duration::from_millis(50)).await;
         task.abort();
+        // Drained dry at least once since the tail started.
+        assert!(stats.caught_up_ms() >= started_ms);
         let ids = sink.ids.lock().unwrap().clone();
         ids
     }

@@ -275,16 +275,18 @@ fn print_scheduler_drift() {
     let stuck = list("stuck");
     let auto = drift.get("auto_reclone_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
     let reclones = drift.get("auto_reclones").and_then(|v| v.as_u64()).unwrap_or(0);
+    let repairs = drift.get("auto_repairs").and_then(|v| v.as_u64()).unwrap_or(0);
     let mode = if auto { "on" } else { "off" };
+    let totals = format!(
+        "auto-repair {}, {} table repair(s) and {} re-clone(s) so far",
+        mode, repairs, reclones
+    );
     if mismatched.is_empty() && stuck.is_empty() {
-        println!(
-            "{} Scheduler drift check: clean (auto-reclone {}, {} automatic re-clone(s) so far)",
-            PREFIX, mode, reclones
-        );
+        println!("{} Scheduler drift check: clean ({})", PREFIX, totals);
     } else {
         println!(
-            "{} Scheduler drift check: mismatched {:?}, stuck {:?} (auto-reclone {}, {} automatic re-clone(s) so far)",
-            PREFIX, mismatched, stuck, mode, reclones
+            "{} Scheduler drift check: mismatched {:?}, stuck {:?} ({})",
+            PREFIX, mismatched, stuck, totals
         );
     }
 }

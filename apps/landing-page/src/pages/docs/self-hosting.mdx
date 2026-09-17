@@ -264,9 +264,11 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | `SPKY_DB_PASS` | SurrealDB password | `root` |
 | `SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS` | Snapshot update interval (seconds) | `300` |
 | `SPKY_DRIFT_CHECK` | Compare the replica's row counts against upstream at startup and after each snapshot drain | `true` |
-| `SPKY_DRIFT_AUTO_RECLONE` | Re-clone the replica and re-bootstrap every SSP when the check finds rows missing (`false` = report only) | `true` |
+| `SPKY_DRIFT_AUTO_RECLONE` | Act when the check confirms a mismatch: repair the table in place by sending the rows that differ through the ingest pipeline, and re-clone the replica (re-bootstrapping every SSP) only when a repair cannot fix it (`false` = report only) | `true` |
 | `SPKY_DRIFT_CONFIRM_TICKS` | Consecutive checks a non-zero count mismatch must persist before acting (an empty table upstream has rows for is acted on immediately) | `2` |
 | `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` | Minimum seconds between automatic re-clones | `3600` |
+| `SPKY_DRIFT_REPAIR_MAX_ROWS` | Most rows one in-place table repair may send; a bigger difference falls back to a re-clone | `2000` |
+| `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` | Deadline for one table repair; past it the repair is abandoned, the upstream connection replaced, and the repair retried on the next check | `300` |
 | `SPKY_DRIFT_CHECK_TIMEOUT_SECS` | Deadline for one drift check; past it the check is abandoned and the upstream connection replaced, so a wedged query cannot stop the replica draining | `120` |
 | `SPKY_BOOTSTRAP_PAGE_SIZE` | Rows read per bootstrap page from the replica | `500` |
 | `SPKY_AUTH_SECRET` | Optional shared secret; when set, callers to `/proxy/*` must send `Authorization: Bearer <secret>`. Also signs admin dashboard sessions, so setting it is what makes them survive a restart. | *(empty)* |

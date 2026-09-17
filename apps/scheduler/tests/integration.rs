@@ -2523,6 +2523,17 @@ mod drift_tests {
         }
     }
 
+    /// A repair that always finds too much to do, so these tests exercise
+    /// the re-clone it escalates to.
+    struct TooLarge;
+
+    #[async_trait::async_trait]
+    impl drift::TableRepairer for TooLarge {
+        async fn repair(&self, _table: &str, _max_rows: usize) -> anyhow::Result<drift::RepairOutcome> {
+            Ok(drift::RepairOutcome::TooLarge)
+        }
+    }
+
     fn hook(h: &TestHarness, upstream: &[(&str, u64)], cfg: DriftConfig) -> (Arc<DriftHook>, Arc<RecordingRecloner>) {
         let recloner = Arc::new(RecordingRecloner {
             calls: AtomicUsize::new(0),
@@ -2534,13 +2545,14 @@ mod drift_tests {
                 upstream.iter().map(|(t, n)| (t.to_string(), Some(*n))).collect(),
             )),
             state: Arc::new(RwLock::new(DriftState::default())),
+            repair: Arc::new(TooLarge),
             reclone: recloner.clone(),
         });
         (hook, recloner)
     }
 
     #[tokio::test]
-    async fn an_empty_replica_table_upstream_has_rows_for_reclones_and_flags_ssps() {
+    async fn an_empty_replica_table_too_large_to_repair_reclones_and_flags_ssps() {
         let h = TestHarness::new().await;
         h.add_ready_ssp("ssp-a", "http://localhost:9999").await;
         // Upstream has contacts; the replica has never seen the table.
@@ -4305,4 +4317,171 @@ async fn changefeed_delete_does_not_wait_for_a_recloning_replica() {
     .await
     .expect("before_image waited for the re-clone's write lock");
     assert_eq!(image, None);
+}
+
+/// A drifted table is repaired in place: the lost, stale and deleted rows go
+/// through the ingest pipeline, so the replica AND the SSPs converge, and no
+/// re-clone or re-bootstrap happens (whitepawn 2026-09-17: one lost `puzzle`
+/// row re-cloned 196k rows and restarted the SSP).
+#[tokio::test]
+async fn drift_repair_pushes_the_difference_through_ingest() {
+    use scheduler::drift::{self, IngestRepairFeed, RepairOutcome, RepairStats};
+
+    // A fake SSP that records what it is sent.
+    let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let recorder = Arc::clone(&seen);
+    let ssp = Router::new().route(
+        "/ingest",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(body);
+                axum::Json(json!({ "ok": true }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, ssp).await.unwrap() });
+
+    let h = TestHarness::new().await;
+    h.add_ready_ssp("ssp-0", &format!("http://{addr}")).await;
+
+    let upstream_dir = tempfile::tempdir().unwrap();
+    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+        upstream_dir.path().join("upstream").to_str().unwrap()).await.unwrap();
+    upstream.use_ns("test").use_db("test").await.unwrap();
+    upstream.query("DEFINE TABLE puzzle SCHEMALESS PERMISSIONS FULL; \
+        DEFINE TABLE _00_version SCHEMALESS PERMISSIONS FULL; \
+        CREATE puzzle:a SET t = 1; CREATE _00_version:a SET record_id = puzzle:a, version = 1; \
+        CREATE puzzle:b SET t = 1; CREATE _00_version:b SET record_id = puzzle:b, version = 1; \
+        CREATE puzzle:c SET t = 1; CREATE _00_version:c SET record_id = puzzle:c, version = 1;")
+        .await.unwrap().check().unwrap();
+    h.replica.write().await.ingest_all(&upstream).await.unwrap();
+
+    // Upstream moves on while nothing reaches the replica.
+    upstream.query("CREATE puzzle:lost SET t = 1; CREATE _00_version:lost SET record_id = puzzle:lost, version = 1; \
+        CREATE puzzle:⟨with-dash⟩ SET t = 1; CREATE _00_version:dash SET record_id = puzzle:⟨with-dash⟩, version = 1; \
+        UPDATE puzzle:b SET t = 2; UPDATE _00_version:b SET version = 2; \
+        DELETE puzzle:c; DELETE _00_version:c;")
+        .await.unwrap().check().unwrap();
+
+    let feed = IngestRepairFeed {
+        ingest: h.ingest_state(),
+        changefeed: maintenance::changefeed::TailerStats::new(),
+        changefeed_notify: Arc::new(tokio::sync::Notify::new()),
+    };
+
+    // More rows differ than allowed: nothing is sent.
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 1).await.unwrap();
+    assert_eq!(outcome, RepairOutcome::TooLarge);
+    assert!(h.event_buffer.read().await.is_empty());
+
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 100).await.unwrap();
+    assert_eq!(
+        outcome,
+        RepairOutcome::Applied(RepairStats { created: 2, updated: 1, deleted: 1, corrected: 0 })
+    );
+
+    // The SSP got the same four changes the replica will apply.
+    h.fanout.idle().await;
+    let mut sent: Vec<(String, String)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| (b["op"].as_str().unwrap().to_string(), b["id"].as_str().unwrap().to_string()))
+        .collect();
+    sent.sort();
+    assert_eq!(
+        sent,
+        vec![
+            ("CREATE".to_string(), "puzzle:`with-dash`".to_string()),
+            ("CREATE".to_string(), "puzzle:lost".to_string()),
+            ("DELETE".to_string(), "puzzle:c".to_string()),
+            ("UPDATE".to_string(), "puzzle:b".to_string()),
+        ]
+    );
+
+    scheduler::drain_and_apply(&h.event_buffer, &h.replica, &h.wal).await.unwrap();
+    let rows = h.replica.read().await
+        .query("SELECT id, t, _00_rv FROM puzzle ORDER BY id").await.unwrap();
+    assert_eq!(rows, json!([
+        { "id": "puzzle:a", "t": 1, "_00_rv": 1 },
+        { "id": "puzzle:b", "t": 2, "_00_rv": 2 },
+        { "id": "puzzle:lost", "t": 1, "_00_rv": 1 },
+        { "id": "puzzle:`with-dash`", "t": 1, "_00_rv": 1 },
+    ]));
+
+    // Converged: a second pass finds nothing.
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 100).await.unwrap();
+    assert_eq!(outcome, RepairOutcome::NothingToDo);
+}
+
+/// A row the repair re-creates is deleted upstream a moment later, and that
+/// delete reached the pipeline BEFORE the repair's CREATE. Without the re-read
+/// the replica and the SSPs would hold the row forever.
+#[tokio::test]
+async fn drift_repair_corrects_a_row_deleted_while_it_ran() {
+    use scheduler::drift::{self, IngestRepairFeed, PendingChange, RepairFeed, RepairOp, RepairOutcome, RepairStats};
+
+    struct DeletesAfterFirstEmit<'a> {
+        inner: IngestRepairFeed,
+        upstream: &'a surrealdb::Surreal<surrealdb::engine::local::Db>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RepairFeed for DeletesAfterFirstEmit<'_> {
+        async fn wait_ingested(&self, unix_ms: u64) -> bool {
+            self.inner.wait_ingested(unix_ms).await
+        }
+        async fn pending(&self, table: &str) -> Vec<PendingChange> {
+            self.inner.pending(table).await
+        }
+        async fn emit(&self, table: &str, op: RepairOp, id: &str, record: Value) -> anyhow::Result<()> {
+            self.inner.emit(table, op, id, record).await?;
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                self.upstream
+                    .query("DELETE puzzle:lost; DELETE _00_version:lost;")
+                    .await?
+                    .check()?;
+            }
+            Ok(())
+        }
+    }
+
+    let h = TestHarness::new().await;
+    let upstream_dir = tempfile::tempdir().unwrap();
+    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+        upstream_dir.path().join("upstream").to_str().unwrap()).await.unwrap();
+    upstream.use_ns("test").use_db("test").await.unwrap();
+    upstream.query("DEFINE TABLE puzzle SCHEMALESS PERMISSIONS FULL; \
+        DEFINE TABLE _00_version SCHEMALESS PERMISSIONS FULL; \
+        CREATE puzzle:a SET t = 1; CREATE _00_version:a SET record_id = puzzle:a, version = 1;")
+        .await.unwrap().check().unwrap();
+    h.replica.write().await.ingest_all(&upstream).await.unwrap();
+    upstream.query("CREATE puzzle:lost SET t = 1; CREATE _00_version:lost SET record_id = puzzle:lost, version = 1;")
+        .await.unwrap().check().unwrap();
+
+    let feed = DeletesAfterFirstEmit {
+        inner: IngestRepairFeed {
+            ingest: h.ingest_state(),
+            changefeed: maintenance::changefeed::TailerStats::new(),
+            changefeed_notify: Arc::new(tokio::sync::Notify::new()),
+        },
+        upstream: &upstream,
+        fired: Default::default(),
+    };
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 100).await.unwrap();
+    assert_eq!(outcome, RepairOutcome::Applied(RepairStats { created: 1, corrected: 1, ..Default::default() }));
+
+    let ops: Vec<(String, String)> = h.event_buffer.read().await.iter()
+        .map(|e| (format!("{:?}", e.update.operation), e.update.record_id.clone()))
+        .collect();
+    assert_eq!(ops, vec![
+        ("Create".to_string(), "puzzle:lost".to_string()),
+        ("Delete".to_string(), "puzzle:lost".to_string()),
+    ]);
+    scheduler::drain_and_apply(&h.event_buffer, &h.replica, &h.wal).await.unwrap();
+    assert_eq!(h.replica.read().await.query("SELECT VALUE id FROM puzzle").await.unwrap(), json!(["puzzle:a"]));
 }

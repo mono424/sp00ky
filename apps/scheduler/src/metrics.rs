@@ -72,12 +72,15 @@ pub struct SchedulerMetrics {
     /// pipeline, which is exactly how this probe failed on 2026-08-09.
     /// Sync tables whose replica row count differed from upstream on the
     /// last drift check (`crate::drift`). Non-zero for more than one check
-    /// means a re-clone is due or blocked (cooldown, disabled, stuck).
+    /// means a repair is due or blocked (disabled, deferred, stuck).
     pub replica_drift_tables: usize,
-    /// Tables an automatic re-clone did not fix; they need an operator.
+    /// Tables an automatic repair or re-clone did not fix; they need an
+    /// operator.
     pub replica_stuck_tables: usize,
     /// Automatic replica re-clones since the scheduler started.
     pub replica_auto_reclones: u64,
+    /// Automatic in-place table repairs since the scheduler started.
+    pub replica_auto_repairs: u64,
     pub heartbeat_last_e2e_ms: Option<u64>,
     /// Epoch-ms of the last successful probe (`None` = never / off).
     pub heartbeat_last_ok_epoch_ms: Option<u64>,
@@ -211,12 +214,13 @@ async fn get_metrics(
     let hb = &state.heartbeat;
     let hb_last_e2e = hb.last_e2e_ms.load(std::sync::atomic::Ordering::Relaxed);
     let hb_last_ok = hb.last_ok_epoch_ms.load(std::sync::atomic::Ordering::Relaxed);
-    let (drift_tables, stuck_tables, auto_reclones) = {
+    let (drift_tables, stuck_tables, auto_reclones, auto_repairs) = {
         let d = state.drift.read().await;
         (
             d.last_report.as_ref().map(|r| r.mismatched_tables().len()).unwrap_or(0),
             d.stuck.len(),
             d.auto_reclones,
+            d.auto_repairs,
         )
     };
     let metrics = Metrics {
@@ -233,6 +237,7 @@ async fn get_metrics(
             replica_drift_tables: drift_tables,
             replica_stuck_tables: stuck_tables,
             replica_auto_reclones: auto_reclones,
+            replica_auto_repairs: auto_repairs,
             heartbeat_last_e2e_ms: (hb_last_e2e != u64::MAX).then_some(hb_last_e2e),
             heartbeat_last_ok_epoch_ms: (hb_last_ok > 0).then_some(hb_last_ok),
             heartbeat_consecutive_failures: hb

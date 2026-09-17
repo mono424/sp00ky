@@ -545,14 +545,19 @@ persists across consecutive checks.
       "stuck": [],
       "last_auto_reclone": null,
       "auto_reclones": 0,
+      "last_auto_repair": null,
+      "auto_repairs": 0,
+      "repair_max_rows": 2000,
       "last_error": null
     }
   }
   ```
 
 `drift.mismatched` lists tables whose counts differed on the last check.
-`drift.stuck` lists tables an automatic re-clone did not fix; those need an
-operator (a row the replica schema rejects, typically). `drift.upstream` is
+`drift.stuck` lists tables an automatic repair or re-clone did not fix; those
+need an operator (a row the replica schema rejects, typically).
+`drift.auto_repairs` counts in-place table repairs, `drift.auto_reclones` the
+full re-clones a repair escalated to. `drift.upstream` is
 `null` for a table whose upstream count could not be read.
 
 **Example:**
@@ -688,9 +693,11 @@ job_tables:
 - `SPKY_DB_PASS` - SurrealDB password (overrides `db.password`)
 - `SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS` - Override for `snapshot_update_interval_secs` (default: `300`)
 - `SPKY_DRIFT_CHECK` - Compare replica row counts against upstream at startup and after each snapshot drain (default: `true`)
-- `SPKY_DRIFT_AUTO_RECLONE` - Re-clone the replica and re-bootstrap every SSP when the check finds the replica missing rows (default: `true`; `false` reports only, via `/health/snapshot`, `/metrics` and `spky verify`)
+- `SPKY_DRIFT_AUTO_RECLONE` - Act on a confirmed mismatch (default: `true`; `false` reports only, via `/health/snapshot`, `/metrics` and `spky verify`). The table is repaired in place: its ids and `_00_rv`s are compared with upstream, and the rows that are missing, stale or deleted go through the ingest pipeline as ordinary events, so the replica and every SSP converge without a bootstrap. Only a repair that finds no difference, would exceed `SPKY_DRIFT_REPAIR_MAX_ROWS`, or fails falls back to re-cloning the replica and re-bootstrapping every SSP. A table still off after either is reported as stuck until its counts change
 - `SPKY_DRIFT_CONFIRM_TICKS` - Consecutive checks a non-zero count mismatch must persist before it is acted on; an empty replica table upstream has rows for is acted on at first sight (default: `2`)
 - `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` - Minimum spacing between automatic re-clones (default: `3600`)
+- `SPKY_DRIFT_REPAIR_MAX_ROWS` - Most rows one in-place table repair may send through the ingest pipeline (default: `2000`)
+- `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` - Deadline for one table repair; on the deadline it is abandoned, the upstream connection is replaced and the repair is retried on the next check (default: `300`)
 - `SPKY_DRIFT_CHECK_TIMEOUT_SECS` - Deadline for one drift check. The check is the last step of the snapshot updater's tick, so a check that never answers would stop the replica draining; on the deadline it is abandoned, the upstream connection is replaced and the tick finishes (default: `120`)
 - `SPKY_BACKENDS` - JSON-encoded backend health-check list (`SPKY_SCHEDULER_BACKENDS` accepted as legacy fallback)
 - `SPKY_BOOTSTRAP_PAGE_SIZE` - Rows read per bootstrap page from the replica (default: `500`)

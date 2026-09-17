@@ -29,8 +29,17 @@
 //! mismatch acted on at first sight is the one that cannot be drain lag: a
 //! table with ZERO replica rows that upstream has rows for. Every other
 //! mismatch has to repeat across consecutive checks.
+//!
+//! What it does about a confirmed mismatch is a per-table repair
+//! ([`repair_table`]): diff the table's ids and `_00_rv`s against upstream and
+//! push the difference through the ingest pipeline as ordinary events, so the
+//! replica and every SSP converge without anyone re-bootstrapping. Only a
+//! repair that cannot explain the mismatch, or would be too large, falls back
+//! to re-cloning the whole replica and re-bootstrapping every SSP, which is
+//! what every mismatch used to cost (whitepawn 2026-09-17: one missing
+//! `puzzle` row re-cloned 196k rows and restarted the SSP).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +50,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::replica::Replica;
+use maintenance::changefeed::TailerStats;
 
 /// Tunables, read from the environment by [`DriftConfig::from_env`].
 #[derive(Debug, Clone)]
@@ -49,14 +59,22 @@ pub struct DriftConfig {
     /// including the startup pass.
     pub enabled: bool,
     /// `SPKY_DRIFT_AUTO_RECLONE` (default true). Off keeps detection and
-    /// reporting but never acts.
+    /// reporting but never acts, neither by repair nor by re-clone.
     pub auto_reclone: bool,
     /// `SPKY_DRIFT_CONFIRM_TICKS` (default 2): consecutive checks a non-zero
     /// count mismatch must persist before it is acted on.
     pub confirm_ticks: u32,
     /// `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` (default 3600): minimum spacing
-    /// between two automatic re-clones.
+    /// between two automatic re-clones. Repairs have none: each needs a
+    /// fresh confirmed mismatch, and one that does not fix its table latches.
     pub reclone_cooldown: Duration,
+    /// `SPKY_DRIFT_REPAIR_MAX_ROWS` (default 2000): the most rows one table
+    /// repair may push through the ingest pipeline. A bigger difference is
+    /// cheaper as a re-clone and a bootstrap than as that many events.
+    pub repair_max_rows: usize,
+    /// `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` (default 300): deadline for one table
+    /// repair, for the same reason as `check_timeout`.
+    pub repair_timeout: Duration,
     /// `SPKY_DRIFT_CHECK_TIMEOUT_SECS` (default 120): deadline for one whole
     /// check. The check is the last step of the snapshot updater's tick, and
     /// that tick is a serial loop — a check that never returns stops the
@@ -71,6 +89,8 @@ impl Default for DriftConfig {
             auto_reclone: true,
             confirm_ticks: 2,
             reclone_cooldown: Duration::from_secs(3600),
+            repair_max_rows: 2000,
+            repair_timeout: Duration::from_secs(300),
             check_timeout: Duration::from_secs(120),
         }
     }
@@ -90,6 +110,12 @@ impl DriftConfig {
         }
         if let Some(n) = env_u64("SPKY_DRIFT_RECLONE_COOLDOWN_SECS") {
             cfg.reclone_cooldown = Duration::from_secs(n);
+        }
+        if let Some(n) = env_u64("SPKY_DRIFT_REPAIR_MAX_ROWS") {
+            cfg.repair_max_rows = n as usize;
+        }
+        if let Some(n) = env_u64("SPKY_DRIFT_REPAIR_TIMEOUT_SECS") {
+            cfg.repair_timeout = Duration::from_secs(n.max(1));
         }
         if let Some(n) = env_u64("SPKY_DRIFT_CHECK_TIMEOUT_SECS") {
             cfg.check_timeout = Duration::from_secs(n.max(1));
@@ -281,7 +307,10 @@ pub enum Action {
     Clean,
     /// Mismatches exist but are not (yet, or not allowed to be) acted on.
     Report { tables: Vec<String> },
-    /// Re-clone the replica from upstream and re-bootstrap every SSP.
+    /// Repair these tables in place ([`repair_table`]).
+    Repair { tables: Vec<String> },
+    /// Re-clone the replica from upstream and re-bootstrap every SSP: what a
+    /// repair escalates to when it cannot fix a table.
     Reclone { tables: Vec<String> },
 }
 
@@ -292,35 +321,38 @@ pub struct DriftState {
     pub last_report: Option<DriftReport>,
     /// Consecutive checks each table has been mismatched (non-zero shape).
     pub streaks: BTreeMap<String, u32>,
-    /// Tables that stayed mismatched right after an automatic re-clone. Only
-    /// reported from then on, until their counts change: a table the clone
-    /// cannot load (a row the replica schema rejects) would otherwise re-clone
-    /// the whole replica every cooldown and bounce every SSP with it.
+    /// Tables that stayed mismatched right after an automatic repair or
+    /// re-clone. Only reported from then on, until their counts change: a
+    /// table neither can fix (a row the replica rejects) would otherwise be
+    /// acted on forever.
     pub stuck: BTreeMap<String, TableCounts>,
     #[serde(skip)]
     pub last_auto_reclone: Option<Instant>,
     pub last_auto_reclone_epoch_ms: Option<u64>,
     pub auto_reclones: u64,
+    pub last_auto_repair_epoch_ms: Option<u64>,
+    /// Table repairs that pushed at least one row since start.
+    pub auto_repairs: u64,
     /// Mismatch set of the last report, so `Report` logs only on change.
     pub last_reported: BTreeSet<String>,
     pub last_error: Option<String>,
-    /// Set right after an auto re-clone; the next check compares against it
-    /// to find tables the re-clone did not fix.
+    /// Tables just repaired or re-cloned; the next check that compares one
+    /// latches it as stuck if it is still off.
     #[serde(skip)]
-    pub verify_after_reclone: bool,
+    pub verify_tables: BTreeSet<String>,
 }
 
 /// Fold a report into the state and decide. Pure, so the escalation rules are
 /// unit-testable without a replica or an upstream.
-pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig, now: Instant) -> Action {
-    let mut zero_shape: Vec<String> = Vec::new();
-    let mut confirmed: Vec<String> = Vec::new();
+pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig) -> Action {
+    let mut actionable: Vec<String> = Vec::new();
     let mut mismatched: Vec<String> = Vec::new();
 
     for (table, counts) in &report.tables {
+        let verifying = state.verify_tables.remove(table);
         if let Some(stuck) = state.stuck.get(table) {
             if *stuck == *counts {
-                // Unchanged since the re-clone that did not fix it.
+                // Unchanged since the action that did not fix it.
                 mismatched.push(table.clone());
                 continue;
             }
@@ -331,22 +363,22 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig, n
             continue;
         }
         mismatched.push(table.clone());
-        if state.verify_after_reclone {
-            // The re-clone just ran and this table is still off: latch it.
+        if verifying {
+            // Just repaired or re-cloned and still off: latch it.
+            state.streaks.remove(table);
             state.stuck.insert(table.clone(), *counts);
             continue;
         }
         if counts.replica_empty_upstream_not() {
-            zero_shape.push(table.clone());
+            actionable.push(table.clone());
             continue;
         }
         let streak = state.streaks.entry(table.clone()).or_insert(0);
         *streak += 1;
         if *streak >= cfg.confirm_ticks {
-            confirmed.push(table.clone());
+            actionable.push(table.clone());
         }
     }
-    state.verify_after_reclone = false;
     // A table missing from the report was not compared this pass (its events
     // are still buffered), so its streak stands: only a table that WAS
     // compared and came back clean loses it.
@@ -359,26 +391,25 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig, n
         state.last_reported.clear();
         return Action::Clean;
     }
+    if !actionable.is_empty() && cfg.auto_reclone {
+        return Action::Repair { tables: actionable };
+    }
+    Action::Report { tables: mismatched }
+}
 
-    let mut actionable: Vec<String> = zero_shape;
-    actionable.extend(confirmed);
-    actionable.sort();
-    actionable.dedup();
-
+/// Take the re-clone slot if the cooldown allows one now.
+fn claim_reclone(state: &mut DriftState, cfg: &DriftConfig, now: Instant) -> bool {
     let in_cooldown = state
         .last_auto_reclone
         .map(|t| now.duration_since(t) < cfg.reclone_cooldown)
         .unwrap_or(false);
-
-    if !actionable.is_empty() && cfg.auto_reclone && !in_cooldown {
-        state.last_auto_reclone = Some(now);
-        state.last_auto_reclone_epoch_ms = Some(now_epoch_ms());
-        state.auto_reclones += 1;
-        state.streaks.clear();
-        state.verify_after_reclone = true;
-        return Action::Reclone { tables: actionable };
+    if !cfg.auto_reclone || in_cooldown {
+        return false;
     }
-    Action::Report { tables: mismatched }
+    state.last_auto_reclone = Some(now);
+    state.last_auto_reclone_epoch_ms = Some(now_epoch_ms());
+    state.auto_reclones += 1;
+    true
 }
 
 /// Log a `Report` outcome, once per change of the mismatch set.
@@ -406,6 +437,7 @@ pub struct DriftHook {
     pub cfg: DriftConfig,
     pub upstream: Arc<dyn UpstreamCounts>,
     pub state: Arc<RwLock<DriftState>>,
+    pub repair: Arc<dyn TableRepairer>,
     pub reclone: Arc<dyn Recloner>,
 }
 
@@ -423,10 +455,362 @@ pub trait Recloner: Send + Sync {
     }
 }
 
+/// One table's in-place repair. Production is [`repair_table`] over the
+/// scheduler's upstream handle; tests substitute an outcome.
+#[async_trait]
+pub trait TableRepairer: Send + Sync {
+    async fn repair(&self, table: &str, max_rows: usize) -> Result<RepairOutcome>;
+
+    /// Called when a repair was abandoned on its deadline, like
+    /// [`UpstreamCounts::note_stalled`].
+    fn note_stalled(&self) {}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairOp {
+    Create,
+    Update,
+    Delete,
+}
+
+impl RepairOp {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RepairOp::Create => "CREATE",
+            RepairOp::Update => "UPDATE",
+            RepairOp::Delete => "DELETE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RepairStats {
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    /// Rows re-sent because upstream changed them while the repair ran.
+    pub corrected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// These rows were pushed through the ingest pipeline.
+    Applied(RepairStats),
+    /// Ids and versions agree: the repair cannot explain the count mismatch.
+    NothingToDo,
+    /// More than `max_rows` rows differ.
+    TooLarge,
+    /// The ingest side had not caught up with the upstream read in time; try
+    /// again on the next check.
+    Deferred,
+}
+
+/// A change the ingest pipeline holds but has not applied to the replica yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChange {
+    pub id: String,
+    pub deleted: bool,
+    pub rv: Option<i64>,
+}
+
+/// What a repair needs from the ingest side.
+#[async_trait]
+pub trait RepairFeed: Send + Sync {
+    /// Wait until every change committed upstream before `unix_ms` has been
+    /// ingested. `false` when that did not happen in time.
+    async fn wait_ingested(&self, unix_ms: u64) -> bool;
+    /// `table`'s changes that are ingested but not yet applied, in order.
+    async fn pending(&self, table: &str) -> Vec<PendingChange>;
+    /// Push one change through the pipeline, exactly as if the feed (or the
+    /// DB event) had delivered it.
+    async fn emit(&self, table: &str, op: RepairOp, id: &str, record: serde_json::Value) -> Result<()>;
+}
+
+/// The scheduler's ingest pipeline as a [`RepairFeed`].
+pub struct IngestRepairFeed {
+    pub ingest: crate::ingest::IngestState,
+    pub changefeed: Arc<TailerStats>,
+    pub changefeed_notify: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl RepairFeed for IngestRepairFeed {
+    async fn wait_ingested(&self, unix_ms: u64) -> bool {
+        // Over HTTP the DB event posts inside the writing transaction, so a
+        // change is ingested before it is even committed. With no tail
+        // running yet (the startup pass runs before it starts, and before any
+        // SSP can be ready), what the tail later replays lands on rows the
+        // repair already wrote and is skipped by the replica's rv check.
+        if !self.changefeed.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.changefeed.caught_up_ms() < unix_ms {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.changefeed_notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    async fn pending(&self, table: &str) -> Vec<PendingChange> {
+        self.ingest
+            .event_buffer
+            .read()
+            .await
+            .iter()
+            .filter(|e| e.update.table == table)
+            .map(|e| PendingChange {
+                id: e.update.record_id.clone(),
+                deleted: matches!(e.update.operation, crate::messages::RecordOp::Delete),
+                rv: e
+                    .update
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("_00_rv"))
+                    .and_then(|v| v.as_i64()),
+            })
+            .collect()
+    }
+
+    async fn emit(&self, table: &str, op: RepairOp, id: &str, record: serde_json::Value) -> Result<()> {
+        let request = ssp_protocol::IngestRequest {
+            table: table.to_string(),
+            op: op.as_str().to_string(),
+            id: id.to_string(),
+            record,
+            job_assignee: None,
+        };
+        crate::ingest::ingest_event(&self.ingest, request, 0)
+            .await
+            .map(|_| ())
+            .map_err(|(status, reason)| anyhow::anyhow!("ingest refused the repair ({status}): {reason}"))
+    }
+}
+
+/// `true` when upstream holds a strictly newer version than the replica. A
+/// side without a version says nothing either way.
+fn upstream_newer(upstream: Option<i64>, local: Option<i64>) -> bool {
+    matches!((upstream, local), (Some(u), Some(l)) if u > l)
+}
+
+/// The replica's rows with the not-yet-applied changes laid over them: what
+/// the replica will hold after the next drain.
+pub fn overlay_pending(
+    mut rows: HashMap<String, Option<i64>>,
+    pending: &[PendingChange],
+) -> HashMap<String, Option<i64>> {
+    for change in pending {
+        if change.deleted {
+            rows.remove(&change.id);
+        } else {
+            rows.insert(change.id.clone(), change.rv);
+        }
+    }
+    rows
+}
+
+/// Decide a table repair. Pure.
+///
+/// - `before`: the replica's rows, read BEFORE upstream was.
+/// - `upstream`: upstream's rows and versions.
+/// - `after`: the replica's rows read AFTER upstream was and after every change
+///   committed before that read was ingested, pending changes laid over.
+/// - `touched`: ids with a change still pending at that point.
+///
+/// A row upstream but in neither local read, and with nothing pending, was
+/// lost: CREATE. A row upstream at a newer version than `after`: UPDATE. A row
+/// in both local reads but not upstream, and nothing pending (a pending change
+/// could be its re-creation after the upstream read): DELETE. Rows that
+/// appeared locally between the reads are changes the upstream read may simply
+/// predate, so they are never judged.
+pub fn plan_repair(
+    before: &HashMap<String, Option<i64>>,
+    upstream: &HashMap<String, Option<i64>>,
+    after: &HashMap<String, Option<i64>>,
+    touched: &HashSet<String>,
+) -> Vec<(RepairOp, String)> {
+    let mut plan: Vec<(RepairOp, String)> = Vec::new();
+    for (id, up_rv) in upstream {
+        match after.get(id) {
+            None if !before.contains_key(id) && !touched.contains(id) => {
+                plan.push((RepairOp::Create, id.clone()));
+            }
+            Some(local) if upstream_newer(*up_rv, *local) => {
+                plan.push((RepairOp::Update, id.clone()));
+            }
+            _ => {}
+        }
+    }
+    for id in before.keys() {
+        if !upstream.contains_key(id) && after.contains_key(id) && !touched.contains(id) {
+            plan.push((RepairOp::Delete, id.clone()));
+        }
+    }
+    plan.sort_by(|a, b| a.1.cmp(&b.1));
+    plan
+}
+
+/// Re-read after the repair's events are in the pipeline: anything upstream
+/// changed since its first read gets the row as it is now. Pure.
+///
+/// `emitted` carries the version each CREATE/UPDATE was sent at; `current` is
+/// upstream now, keyed by id. Only UPDATE and DELETE come out: a row that
+/// exists locally by now must not be re-created.
+pub fn plan_corrections(
+    emitted: &[(RepairOp, String, Option<i64>)],
+    current: &HashMap<String, serde_json::Value>,
+) -> Vec<(RepairOp, String)> {
+    let mut out = Vec::new();
+    for (op, id, sent_rv) in emitted {
+        let now = current.get(id);
+        match (op, now) {
+            (RepairOp::Delete, Some(_)) => out.push((RepairOp::Update, id.clone())),
+            (RepairOp::Delete, None) => {}
+            (_, None) => out.push((RepairOp::Delete, id.clone())),
+            (_, Some(row)) => {
+                let now_rv = row.get("_00_rv").and_then(|v| v.as_i64());
+                if now_rv != *sent_rv {
+                    out.push((RepairOp::Update, id.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Repair one table in place: push the rows the replica is missing, holds
+/// stale, or holds but upstream deleted, through the ingest pipeline, so the
+/// replica AND every SSP receive them as ordinary events.
+///
+/// Every step is ordered against the live pipeline:
+/// 1. read the replica's ids;
+/// 2. page upstream (keeping full rows only for candidates, capped);
+/// 3. wait until everything committed before the end of that read has been
+///    ingested, so a row still in flight is not mistaken for a lost one;
+/// 4. read the pending changes, then the replica again (in that order, so a
+///    drain in between shows up in the second read), and plan;
+/// 5. emit the plan;
+/// 6. re-read the planned rows upstream and emit corrections. A change
+///    committed before this re-read is caught by it; one committed after is
+///    ingested after the repair's events and overrides them. That matters
+///    because an SSP applies a repeated or stale row as new, and a CREATE that
+///    raced a DELETE would resurrect the row.
+pub async fn repair_table<C: surrealdb::Connection>(
+    upstream: &surrealdb::Surreal<C>,
+    replica: &Arc<RwLock<Replica>>,
+    feed: &dyn RepairFeed,
+    table: &str,
+    max_rows: usize,
+) -> Result<RepairOutcome> {
+    let (omit, before) = {
+        let rep = replica.read().await;
+        (rep.omit_for(table).clone(), rep.row_versions(table).await?)
+    };
+
+    let mut up: HashMap<String, Option<i64>> = HashMap::new();
+    let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut too_large = false;
+    Replica::page_table(upstream, table, &omit, |page| {
+        for row in page {
+            let Some(id) = row.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+                continue;
+            };
+            let rv = row.get("_00_rv").and_then(|v| v.as_i64());
+            let candidate = before.get(&id).map_or(true, |local| upstream_newer(rv, *local));
+            up.insert(id.clone(), rv);
+            if candidate {
+                if rows.len() >= max_rows {
+                    too_large = true;
+                } else {
+                    rows.insert(id, row);
+                }
+            }
+        }
+        std::future::ready(if too_large {
+            Err(anyhow::anyhow!("repair too large"))
+        } else {
+            Ok(())
+        })
+    })
+    .await
+    .or_else(|e| if too_large { Ok(0) } else { Err(e) })
+    .with_context(|| format!("repair: page upstream {table}"))?;
+    if too_large {
+        return Ok(RepairOutcome::TooLarge);
+    }
+    let read_at = now_epoch_ms();
+
+    if !feed.wait_ingested(read_at).await {
+        return Ok(RepairOutcome::Deferred);
+    }
+    let pending = feed.pending(table).await;
+    let after = overlay_pending(replica.read().await.row_versions(table).await?, &pending);
+    let touched: HashSet<String> = pending.iter().map(|c| c.id.clone()).collect();
+
+    let plan = plan_repair(&before, &up, &after, &touched);
+    if plan.is_empty() {
+        return Ok(RepairOutcome::NothingToDo);
+    }
+    if plan.len() > max_rows {
+        return Ok(RepairOutcome::TooLarge);
+    }
+
+    let mut stats = RepairStats::default();
+    let mut emitted: Vec<(RepairOp, String, Option<i64>)> = Vec::with_capacity(plan.len());
+    for (op, id) in &plan {
+        let record = match op {
+            RepairOp::Delete => {
+                // The SSPs' delete path reads the row's owner from it.
+                let row = replica.read().await.row(table, id).await.ok().flatten();
+                row.unwrap_or_else(|| serde_json::json!({}))
+            }
+            _ => match rows.get(id) {
+                Some(row) => row.clone(),
+                None => {
+                    warn!(table, id, "repair: planned row was not kept from the upstream read; skipped");
+                    continue;
+                }
+            },
+        };
+        let rv = record.get("_00_rv").and_then(|v| v.as_i64());
+        if *op == RepairOp::Delete {
+            // Kept as the before-image, should a correction delete it again.
+            rows.insert(id.clone(), record.clone());
+        }
+        feed.emit(table, *op, id, record).await?;
+        match op {
+            RepairOp::Create => stats.created += 1,
+            RepairOp::Update => stats.updated += 1,
+            RepairOp::Delete => stats.deleted += 1,
+        }
+        emitted.push((*op, id.clone(), if *op == RepairOp::Delete { None } else { rv }));
+    }
+
+    let ids: Vec<String> = emitted.iter().map(|(_, id, _)| id.clone()).collect();
+    let current = Replica::fetch_rows_by_id(upstream, table, &ids, &omit)
+        .await
+        .with_context(|| format!("repair: re-read {table}"))?;
+    for (op, id) in plan_corrections(&emitted, &current) {
+        let record = match op {
+            RepairOp::Delete => rows.get(&id).cloned().unwrap_or_else(|| serde_json::json!({})),
+            _ => match current.get(&id) {
+                Some(row) => row.clone(),
+                None => continue,
+            },
+        };
+        feed.emit(table, op, &id, record).await?;
+        stats.corrected += 1;
+    }
+    Ok(RepairOutcome::Applied(stats))
+}
+
 /// Run one check + decision + remediation. Returns the action taken.
 ///
 /// Called by the snapshot updater after each drain, with the event buffer as
-/// the busy source and `drain_lock` released (the re-clone takes the replica
+/// the busy source and `drain_lock` released (a re-clone takes the replica
 /// write lock itself and can run for minutes). Also called once at startup.
 pub async fn run_check(
     hook: &DriftHook,
@@ -469,31 +853,103 @@ pub async fn run_check(
     let action = {
         let mut st = hook.state.write().await;
         st.last_error = None;
-        let action = decide(&report, &mut st, &hook.cfg, Instant::now());
+        let action = decide(&report, &mut st, &hook.cfg);
         if let Action::Report { tables } = &action {
             log_report(&report, &mut st, tables, &hook.cfg);
         }
         action
     };
-    if let Action::Reclone { tables } = &action {
-        let detail: Vec<String> = tables
-            .iter()
-            .filter_map(|t| report.tables.get(t).map(|c| format!("{t}: upstream={:?} replica={}", c.upstream, c.replica)))
-            .collect();
-        error!(
-            tables = ?detail,
-            "Replica drift: the replica is missing rows upstream has; re-cloning from upstream and re-bootstrapping every SSP"
-        );
-        match hook.reclone.reclone_and_resync().await {
-            Ok(true) => info!(tables = ?tables, "Replica drift: re-clone complete"),
-            Ok(false) => warn!("Replica drift: a re-clone was already running; will re-check next tick"),
-            Err(e) => {
-                error!(error = %e, "Replica drift: automatic re-clone failed");
-                hook.state.write().await.last_error = Some(format!("reclone: {e}"));
+    let Action::Repair { tables } = &action else {
+        return action;
+    };
+    let detail = |t: &str| {
+        report
+            .tables
+            .get(t)
+            .map(|c| format!("{t}: upstream={:?} replica={}", c.upstream, c.replica))
+            .unwrap_or_else(|| t.to_string())
+    };
+
+    let mut escalate: Vec<String> = Vec::new();
+    for table in tables {
+        warn!(table = %detail(table), "Replica drift: repairing the table in place");
+        let outcome = tokio::time::timeout(
+            hook.cfg.repair_timeout,
+            hook.repair.repair(table, hook.cfg.repair_max_rows),
+        )
+        .await;
+        let mut st = hook.state.write().await;
+        match outcome {
+            Ok(Ok(RepairOutcome::Applied(stats))) => {
+                info!(table = %table, ?stats, "Replica drift: table repaired");
+                crate::admin::incidents::emit(
+                    "scheduler",
+                    "drift_repair",
+                    "recorded",
+                    &format!(
+                        "Replica drift on {}: repaired in place ({} created, {} updated, {} deleted, {} corrected)",
+                        detail(table), stats.created, stats.updated, stats.deleted, stats.corrected
+                    ),
+                    None,
+                );
+                st.streaks.remove(table);
+                st.verify_tables.insert(table.clone());
+                st.auto_repairs += 1;
+                st.last_auto_repair_epoch_ms = Some(now_epoch_ms());
+            }
+            Ok(Ok(RepairOutcome::Deferred)) => {
+                // The streak stands, so the next check tries again.
+                info!(table = %table, "Replica drift: ingest had not caught up with the repair's read; retrying next check");
+            }
+            Err(_) => {
+                warn!(table = %table, timeout_secs = hook.cfg.repair_timeout.as_secs(), "Replica drift: repair timed out; reconnecting upstream and retrying next check");
+                hook.repair.note_stalled();
+                st.last_error = Some(format!("repair of {table} timed out"));
+            }
+            Ok(Ok(RepairOutcome::NothingToDo)) => {
+                warn!(table = %table, "Replica drift: ids and versions agree with upstream, the repair cannot explain the counts");
+                escalate.push(table.clone());
+            }
+            Ok(Ok(RepairOutcome::TooLarge)) => {
+                warn!(table = %table, max_rows = hook.cfg.repair_max_rows, "Replica drift: too many rows differ to repair in place");
+                escalate.push(table.clone());
+            }
+            Ok(Err(e)) => {
+                error!(table = %table, error = %e, "Replica drift: repair failed");
+                st.last_error = Some(format!("repair of {table}: {e}"));
+                escalate.push(table.clone());
             }
         }
     }
-    action
+    if escalate.is_empty() {
+        return action;
+    }
+
+    if !claim_reclone(&mut *hook.state.write().await, &hook.cfg, Instant::now()) {
+        warn!(tables = ?escalate, "Replica drift: a re-clone is due but the cooldown holds; retrying next check");
+        return action;
+    }
+    let details: Vec<String> = escalate.iter().map(|t| detail(t)).collect();
+    error!(
+        tables = ?details,
+        "Replica drift: the replica is missing rows upstream has; re-cloning from upstream and re-bootstrapping every SSP"
+    );
+    match hook.reclone.reclone_and_resync().await {
+        Ok(true) => {
+            info!(tables = ?escalate, "Replica drift: re-clone complete");
+            let mut st = hook.state.write().await;
+            for t in &escalate {
+                st.streaks.remove(t);
+                st.verify_tables.insert(t.clone());
+            }
+        }
+        Ok(false) => warn!("Replica drift: a re-clone was already running; will re-check next tick"),
+        Err(e) => {
+            error!(error = %e, "Replica drift: automatic re-clone failed");
+            hook.state.write().await.last_error = Some(format!("reclone: {e}"));
+        }
+    }
+    Action::Reclone { tables: escalate }
 }
 
 /// JSON for `/health/snapshot` and friends.
@@ -515,6 +971,9 @@ pub fn state_json(state: &DriftState, cfg: &DriftConfig) -> serde_json::Value {
         "stuck": state.stuck.keys().collect::<Vec<_>>(),
         "last_auto_reclone": state.last_auto_reclone_epoch_ms,
         "auto_reclones": state.auto_reclones,
+        "last_auto_repair": state.last_auto_repair_epoch_ms,
+        "auto_repairs": state.auto_repairs,
+        "repair_max_rows": cfg.repair_max_rows,
         "last_error": state.last_error,
     })
 }
@@ -570,6 +1029,12 @@ mod tests {
                 unreachable!("a timed-out check decides nothing")
             }
         }
+        #[async_trait]
+        impl TableRepairer for NeverReclones {
+            async fn repair(&self, _table: &str, _max_rows: usize) -> Result<RepairOutcome> {
+                unreachable!("a timed-out check decides nothing")
+            }
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let replica = Arc::new(RwLock::new(
@@ -583,6 +1048,7 @@ mod tests {
             },
             upstream: Arc::new(Hangs(Arc::clone(&stalled))),
             state: Arc::new(RwLock::new(DriftState::default())),
+            repair: Arc::new(NeverReclones),
             reclone: Arc::new(NeverReclones),
         };
 
@@ -598,32 +1064,30 @@ mod tests {
     #[test]
     fn matching_counts_are_clean() {
         let mut st = DriftState::default();
-        let a = decide(&report(&[("game", Some(10), 10), ("user", Some(0), 0)]), &mut st, &cfg(), Instant::now());
+        let a = decide(&report(&[("game", Some(10), 10), ("user", Some(0), 0)]), &mut st, &cfg());
         assert_eq!(a, Action::Clean);
         assert!(st.streaks.is_empty());
     }
 
     #[test]
-    fn an_empty_replica_table_reclones_on_first_sight() {
+    fn an_empty_replica_table_is_acted_on_at_first_sight() {
         // The observed case: contact had 5386 rows upstream, 0 in the replica.
         let mut st = DriftState::default();
-        let a = decide(&report(&[("contact", Some(5386), 0), ("game", Some(7), 7)]), &mut st, &cfg(), Instant::now());
-        assert_eq!(a, Action::Reclone { tables: vec!["contact".into()] });
-        assert_eq!(st.auto_reclones, 1);
-        assert!(st.verify_after_reclone);
+        let a = decide(&report(&[("contact", Some(5386), 0), ("game", Some(7), 7)]), &mut st, &cfg());
+        assert_eq!(a, Action::Repair { tables: vec!["contact".into()] });
     }
 
     #[test]
     fn a_partial_mismatch_needs_consecutive_checks() {
         let mut st = DriftState::default();
         let r = report(&[("game", Some(101), 100)]);
-        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Report { tables: vec!["game".into()] });
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Report { tables: vec!["game".into()] });
         assert_eq!(st.streaks["game"], 1);
         // A clean read in between resets the streak: it was drain lag.
-        assert_eq!(decide(&report(&[("game", Some(101), 101)]), &mut st, &cfg(), Instant::now()), Action::Clean);
+        assert_eq!(decide(&report(&[("game", Some(101), 101)]), &mut st, &cfg()), Action::Clean);
         assert!(st.streaks.is_empty());
-        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Report { tables: vec!["game".into()] });
-        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Reclone { tables: vec!["game".into()] });
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Report { tables: vec!["game".into()] });
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Repair { tables: vec!["game".into()] });
     }
 
     #[tokio::test]
@@ -703,55 +1167,265 @@ mod tests {
         // never reach `confirm_ticks`.
         let mut st = DriftState::default();
         let r = report(&[("game", Some(101), 100)]);
-        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Report { tables: vec!["game".into()] });
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Report { tables: vec!["game".into()] });
         assert_eq!(st.streaks["game"], 1);
 
         // `game` is busy this pass, so it is not in the report at all.
-        let a = decide(&report(&[("user", Some(3), 3)]), &mut st, &cfg(), Instant::now());
+        let a = decide(&report(&[("user", Some(3), 3)]), &mut st, &cfg());
         assert_eq!(a, Action::Clean);
         assert_eq!(st.streaks["game"], 1, "the streak survives a pass that skipped the table");
 
         // Back in the report and still off: this is the second sighting.
-        assert_eq!(decide(&r, &mut st, &cfg(), Instant::now()), Action::Reclone { tables: vec!["game".into()] });
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Repair { tables: vec!["game".into()] });
     }
 
     #[test]
     fn unreadable_upstream_counts_are_not_drift() {
         let mut st = DriftState::default();
-        let a = decide(&report(&[("game", None, 0)]), &mut st, &cfg(), Instant::now());
+        let a = decide(&report(&[("game", None, 0)]), &mut st, &cfg());
         assert_eq!(a, Action::Clean);
     }
 
     #[test]
-    fn cooldown_and_disabled_downgrade_to_report() {
+    fn a_table_still_off_after_its_repair_latches_and_disabled_only_reports() {
         let mut st = DriftState::default();
         let r = report(&[("contact", Some(5), 0)]);
-        let t0 = Instant::now();
-        assert!(matches!(decide(&r, &mut st, &cfg(), t0), Action::Reclone { .. }));
-        // Still zero right after the re-clone: latched as stuck, reported only.
-        assert_eq!(decide(&r, &mut st, &cfg(), t0 + Duration::from_secs(1)), Action::Report { tables: vec!["contact".into()] });
+        assert!(matches!(decide(&r, &mut st, &cfg()), Action::Repair { .. }));
+        // run_check marks what it repaired.
+        st.verify_tables.insert("contact".into());
+        // Still zero right after: latched as stuck, reported only.
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Report { tables: vec!["contact".into()] });
         assert!(st.stuck.contains_key("contact"));
-        // Its counts change: the latch lifts, but the cooldown still holds.
+        assert_eq!(decide(&r, &mut st, &cfg()), Action::Report { tables: vec!["contact".into()] });
+        // Its counts change: the latch lifts and it may be acted on again.
         let r2 = report(&[("contact", Some(6), 0)]);
-        assert_eq!(decide(&r2, &mut st, &cfg(), t0 + Duration::from_secs(2)), Action::Report { tables: vec!["contact".into()] });
+        assert!(matches!(decide(&r2, &mut st, &cfg()), Action::Repair { .. }));
         assert!(!st.stuck.contains_key("contact"));
-        // Past the cooldown it may act again.
-        assert!(matches!(decide(&r2, &mut st, &cfg(), t0 + Duration::from_secs(3601)), Action::Reclone { .. }));
 
         let mut off = DriftState::default();
         let c = DriftConfig { auto_reclone: false, ..DriftConfig::default() };
-        assert_eq!(decide(&r, &mut off, &c, Instant::now()), Action::Report { tables: vec!["contact".into()] });
-        assert_eq!(off.auto_reclones, 0);
+        assert_eq!(decide(&r, &mut off, &c), Action::Report { tables: vec!["contact".into()] });
+    }
+
+    #[test]
+    fn a_verify_mark_waits_for_a_pass_that_compares_the_table() {
+        let mut st = DriftState::default();
+        st.verify_tables.insert("game".into());
+        // `game` busy: not in the report, the mark stays.
+        decide(&report(&[("user", Some(1), 1)]), &mut st, &cfg());
+        assert!(st.verify_tables.contains("game"));
+        decide(&report(&[("game", Some(2), 2)]), &mut st, &cfg());
+        assert!(st.verify_tables.is_empty());
     }
 
     #[test]
     fn a_fixed_table_clears_its_stuck_latch() {
         let mut st = DriftState::default();
-        let t0 = Instant::now();
-        decide(&report(&[("contact", Some(5), 0)]), &mut st, &cfg(), t0);
-        decide(&report(&[("contact", Some(5), 0)]), &mut st, &cfg(), t0);
+        st.verify_tables.insert("contact".into());
+        decide(&report(&[("contact", Some(5), 0)]), &mut st, &cfg());
         assert!(st.stuck.contains_key("contact"));
-        assert_eq!(decide(&report(&[("contact", Some(5), 5)]), &mut st, &cfg(), t0), Action::Clean);
+        assert_eq!(decide(&report(&[("contact", Some(5), 5)]), &mut st, &cfg()), Action::Clean);
         assert!(st.stuck.is_empty());
+    }
+
+    fn versions(rows: &[(&str, Option<i64>)]) -> HashMap<String, Option<i64>> {
+        rows.iter().map(|(id, rv)| (id.to_string(), *rv)).collect()
+    }
+
+    fn ids(rows: &[&str]) -> HashSet<String> {
+        rows.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn repair_plan_finds_lost_stale_and_deleted_rows() {
+        let before = versions(&[("p:kept", Some(1)), ("p:stale", Some(1)), ("p:gone", Some(1))]);
+        let upstream = versions(&[("p:kept", Some(1)), ("p:stale", Some(3)), ("p:lost", Some(2))]);
+        let after = before.clone();
+        let plan = plan_repair(&before, &upstream, &after, &HashSet::new());
+        assert_eq!(
+            plan,
+            vec![
+                (RepairOp::Delete, "p:gone".to_string()),
+                (RepairOp::Create, "p:lost".to_string()),
+                (RepairOp::Update, "p:stale".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn repair_plan_leaves_in_flight_changes_to_the_pipeline() {
+        let before = versions(&[("p:old", Some(1)), ("p:recreated", Some(1))]);
+        // Upstream read: `new` just committed, `old` and `recreated` deleted.
+        let upstream = versions(&[("p:new", Some(1)), ("p:moved_on", Some(5))]);
+        // After catching up: `new` arrived (pending), `old` delete is pending,
+        // `recreated` came back after the upstream read, `moved_on` was
+        // created and updated past the read.
+        let pending = vec![
+            PendingChange { id: "p:new".into(), deleted: false, rv: Some(1) },
+            PendingChange { id: "p:old".into(), deleted: true, rv: None },
+            PendingChange { id: "p:recreated".into(), deleted: false, rv: Some(2) },
+            PendingChange { id: "p:moved_on".into(), deleted: false, rv: Some(6) },
+        ];
+        let after = overlay_pending(before.clone(), &pending);
+        let touched: HashSet<String> = pending.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(after.get("p:moved_on"), Some(&Some(6)));
+        assert!(!after.contains_key("p:old"));
+        assert!(plan_repair(&before, &upstream, &after, &touched).is_empty());
+
+        // A row the replica had at the first read but lost by the second is a
+        // local delete the upstream read predates: never re-created.
+        let before = versions(&[("p:x", Some(1))]);
+        let upstream = versions(&[("p:x", Some(1))]);
+        assert!(plan_repair(&before, &upstream, &HashMap::new(), &ids(&[])).is_empty());
+        // Rows without versions are judged on presence only.
+        let before = versions(&[("p:y", None)]);
+        let upstream = versions(&[("p:y", Some(4))]);
+        assert!(plan_repair(&before, &upstream, &before, &ids(&[])).is_empty());
+    }
+
+    #[test]
+    fn corrections_follow_what_upstream_did_during_the_repair() {
+        let emitted = vec![
+            (RepairOp::Create, "p:same".to_string(), Some(2)),
+            (RepairOp::Create, "p:deleted_since".to_string(), Some(2)),
+            (RepairOp::Update, "p:updated_since".to_string(), Some(3)),
+            (RepairOp::Delete, "p:recreated_since".to_string(), None),
+            (RepairOp::Delete, "p:still_gone".to_string(), None),
+        ];
+        let current: HashMap<String, serde_json::Value> = [
+            ("p:same", serde_json::json!({"id": "p:same", "_00_rv": 2})),
+            ("p:updated_since", serde_json::json!({"id": "p:updated_since", "_00_rv": 4})),
+            ("p:recreated_since", serde_json::json!({"id": "p:recreated_since", "_00_rv": 1})),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            plan_corrections(&emitted, &current),
+            vec![
+                (RepairOp::Delete, "p:deleted_since".to_string()),
+                (RepairOp::Update, "p:updated_since".to_string()),
+                (RepairOp::Update, "p:recreated_since".to_string()),
+            ]
+        );
+    }
+
+    struct FixedCounts(BTreeMap<String, Option<u64>>);
+    #[async_trait]
+    impl UpstreamCounts for FixedCounts {
+        async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct Scripted {
+        outcome: std::sync::Mutex<Option<Result<RepairOutcome>>>,
+        repairs: std::sync::atomic::AtomicUsize,
+        reclones: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(outcome: Result<RepairOutcome>) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: std::sync::Mutex::new(Some(outcome)),
+                repairs: Default::default(),
+                reclones: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl TableRepairer for Scripted {
+        async fn repair(&self, _table: &str, _max_rows: usize) -> Result<RepairOutcome> {
+            self.repairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut slot = self.outcome.lock().unwrap();
+            match slot.as_ref() {
+                Some(Ok(o)) => Ok(o.clone()),
+                Some(Err(_)) => Err(slot.take().unwrap().unwrap_err()),
+                None => Err(anyhow::anyhow!("already failed")),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Recloner for Scripted {
+        async fn reclone_and_resync(&self) -> Result<bool> {
+            self.reclones.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    async fn drifted_hook(script: Arc<Scripted>) -> (DriftHook, Arc<RwLock<Replica>>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let replica = Arc::new(RwLock::new(
+            Replica::new(tmp.path().join("replica")).await.unwrap(),
+        ));
+        let hook = DriftHook {
+            cfg: DriftConfig::default(),
+            // Nothing in the replica: acted on at first sight.
+            upstream: Arc::new(FixedCounts([("puzzle".to_string(), Some(48u64))].into_iter().collect())),
+            state: Arc::new(RwLock::new(DriftState::default())),
+            repair: script.clone(),
+            reclone: script,
+        };
+        (hook, replica, tmp)
+    }
+
+    #[tokio::test]
+    async fn a_repaired_table_costs_no_reclone() {
+        let script = Scripted::new(Ok(RepairOutcome::Applied(RepairStats { created: 1, ..Default::default() })));
+        let (hook, replica, _tmp) = drifted_hook(script.clone()).await;
+        let action = run_check(&hook, &replica, &BTreeSet::new()).await;
+        assert_eq!(action, Action::Repair { tables: vec!["puzzle".into()] });
+        assert_eq!(script.reclones.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let st = hook.state.read().await;
+        assert_eq!(st.auto_repairs, 1);
+        assert_eq!(st.auto_reclones, 0);
+        assert!(st.verify_tables.contains("puzzle"));
+    }
+
+    #[tokio::test]
+    async fn a_repair_that_cannot_help_escalates_to_one_reclone_per_cooldown() {
+        for outcome in [Ok(RepairOutcome::NothingToDo), Ok(RepairOutcome::TooLarge), Err(anyhow::anyhow!("boom"))] {
+            let script = Scripted::new(outcome);
+            let (hook, replica, _tmp) = drifted_hook(script.clone()).await;
+            let action = run_check(&hook, &replica, &BTreeSet::new()).await;
+            assert_eq!(action, Action::Reclone { tables: vec!["puzzle".into()] });
+            assert_eq!(script.reclones.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(hook.state.read().await.auto_reclones, 1);
+
+            // The re-clone did not fix it: latched, nothing more happens.
+            run_check(&hook, &replica, &BTreeSet::new()).await;
+            assert!(hook.state.read().await.stuck.contains_key("puzzle"));
+            assert_eq!(script.repairs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        // Inside the cooldown the repair is retried, the re-clone is not.
+        let script = Scripted::new(Ok(RepairOutcome::TooLarge));
+        let (hook, replica, _tmp) = drifted_hook(script.clone()).await;
+        hook.state.write().await.last_auto_reclone = Some(Instant::now());
+        let action = run_check(&hook, &replica, &BTreeSet::new()).await;
+        assert_eq!(action, Action::Repair { tables: vec!["puzzle".into()] });
+        assert_eq!(script.reclones.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_repair_is_retried_on_the_next_check() {
+        let script = Scripted::new(Ok(RepairOutcome::Deferred));
+        let (hook, replica, _tmp) = drifted_hook(script.clone()).await;
+        // One row locally, so the mismatch needs confirming first.
+        replica
+            .write()
+            .await
+            .apply("puzzle", crate::replica::RecordOp::Create, "puzzle:a", Some(serde_json::json!({"t": 1})))
+            .await
+            .unwrap();
+        assert!(matches!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Report { .. }));
+        assert!(matches!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Repair { .. }));
+        // Deferred keeps the streak: acted on again right away.
+        assert!(matches!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Repair { .. }));
+        assert_eq!(script.repairs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(script.reclones.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(hook.state.read().await.stuck.is_empty());
     }
 }

@@ -38,6 +38,12 @@ pub fn normalize_url(url: &str) -> (&str, bool) {
 pub async fn connect_http_raw(
     db_config: &DbConfig,
 ) -> Result<surrealdb::Surreal<surrealdb::engine::remote::http::Client>> {
+    Ok(open_http(db_config).await?.0)
+}
+
+/// [`connect_http_raw`], plus how long the root token it signed in with lives
+/// (`None` when the token could not be read).
+async fn open_http(db_config: &DbConfig) -> Result<(HttpDb, Option<std::time::Duration>)> {
     let (addr, secure) = normalize_url(&db_config.url);
 
     let db = if secure {
@@ -50,14 +56,15 @@ pub async fn connect_http_raw(
             .with_context(|| format!("Failed to open HTTP to {}", db_config.url))?
     };
 
-    db.signin(surrealdb::opt::auth::Root {
-        username: db_config.username.clone(),
-        password: db_config.password.clone(),
-    })
-    .await
-    .context("Remote SurrealDB signin failed")?;
+    let token = db
+        .signin(surrealdb::opt::auth::Root {
+            username: db_config.username.clone(),
+            password: db_config.password.clone(),
+        })
+        .await
+        .context("Remote SurrealDB signin failed")?;
 
-    Ok(db)
+    Ok((db, token_lifetime(token.access.as_insecure_token())))
 }
 
 /// Open a fresh HTTP connection to the main SurrealDB: root signin plus
@@ -65,14 +72,45 @@ pub async fn connect_http_raw(
 pub async fn connect_http(
     db_config: &DbConfig,
 ) -> Result<surrealdb::Surreal<surrealdb::engine::remote::http::Client>> {
-    let db = connect_http_raw(db_config).await?;
+    Ok(open_http_selected(db_config).await?.0)
+}
+
+async fn open_http_selected(db_config: &DbConfig) -> Result<(HttpDb, Option<std::time::Duration>)> {
+    let (db, token_life) = open_http(db_config).await?;
 
     db.use_ns(&db_config.namespace)
         .use_db(&db_config.database)
         .await
         .context("Failed to select remote namespace/database")?;
 
-    Ok(db)
+    Ok((db, token_life))
+}
+
+/// How long a JWT is valid (`exp - iat`), read from its payload WITHOUT
+/// verifying it: the server just issued it to us, and the only use is deciding
+/// when to sign in again.
+fn token_lifetime(jwt: &str) -> Option<std::time::Duration> {
+    use base64::Engine as _;
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = claims.get("exp")?.as_u64()?;
+    let iat = claims.get("iat")?.as_u64()?;
+    exp.checked_sub(iat)
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+/// How long a handle may serve before [`ReconnectingDb::refresh`] replaces it:
+/// half its token's life, so a rotation that fails still leaves the other half
+/// to retry in before requests start coming back unauthenticated.
+fn rotation_delay(token_life: Option<std::time::Duration>) -> std::time::Duration {
+    token_life
+        .map(|life| life / 2)
+        .unwrap_or(std::time::Duration::from_secs(FALLBACK_ROTATION_SECS))
+        .max(std::time::Duration::from_secs(1))
 }
 
 /// The concrete HTTP-engine handle every long-lived caller talks to.
@@ -119,6 +157,24 @@ pub fn is_dead_session_error(msg: &str) -> bool {
 /// handle (which attaches a fresh session) and swaps it in atomically. Callers
 /// hold the `ReconnectingDb`, not the raw handle, so they pick up the
 /// replacement on their next call without being restarted.
+///
+/// # Never write to a session other tasks are using
+///
+/// SurrealDB 3.1.x deadlocks a session when a session write (`signin`,
+/// `authenticate`, `use`, `let`) lands between the two session reads inside
+/// its `query()` handler (`rpc/protocol.rs`: the first read guard is still
+/// held when `run_query` takes the second, and tokio's fair `RwLock` parks
+/// the second read behind the queued writer). Every later request on that
+/// session then queues behind the writer forever, and a client timeout does
+/// not cancel them. This type used to refresh its token with a `signin` on the
+/// shared handle every minute, which wedged the scheduler's heartbeat, drift
+/// check and snapshot tick roughly hourly on whitepawn (2026-09-16).
+///
+/// So the handle in use is never written to: the liveness probe is a
+/// read-only `version()`, and the token is renewed by building a new handle
+/// (signed in before anyone else can see it) and swapping it in once the old
+/// token is half spent. Requests still running on the old handle finish
+/// normally, and dropping its last `Arc` detaches its session.
 pub struct ReconnectingDb {
     /// Only ever held long enough to clone the `Arc`; never across an await.
     current: std::sync::RwLock<std::sync::Arc<HttpDb>>,
@@ -132,11 +188,26 @@ pub struct ReconnectingDb {
     generation: std::sync::atomic::AtomicU64,
     last_reconnect_ms: std::sync::atomic::AtomicU64,
     reconnect_failures: std::sync::atomic::AtomicU64,
+    /// When the current handle's token is half spent and the handle should be
+    /// replaced by a freshly signed-in one.
+    rotate_at: std::sync::Mutex<tokio::time::Instant>,
+    /// Planned token rotations. Kept apart from `generation`, which counts
+    /// reconnects after a failure and is what dashboards read as trouble.
+    rotations: std::sync::atomic::AtomicU64,
 }
 
 impl ReconnectingDb {
-    /// Wrap an already-connected handle.
+    /// Wrap an already-connected handle. Its token lifetime is unknown here, so
+    /// the first rotation uses the fallback delay; later ones read the token.
     pub fn new(db: HttpDb, config: DbConfig) -> std::sync::Arc<Self> {
+        Self::with_token_life(db, config, None)
+    }
+
+    fn with_token_life(
+        db: HttpDb,
+        config: DbConfig,
+        token_life: Option<std::time::Duration>,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             current: std::sync::RwLock::new(std::sync::Arc::new(db)),
             config,
@@ -145,12 +216,20 @@ impl ReconnectingDb {
             generation: std::sync::atomic::AtomicU64::new(1),
             last_reconnect_ms: std::sync::atomic::AtomicU64::new(0),
             reconnect_failures: std::sync::atomic::AtomicU64::new(0),
+            rotate_at: std::sync::Mutex::new(tokio::time::Instant::now() + rotation_delay(token_life)),
+            rotations: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// Connect (signin + ns/db select) and wrap the result.
     pub async fn connect(config: &DbConfig) -> Result<std::sync::Arc<Self>> {
-        Ok(Self::new(connect_http(config).await?, config.clone()))
+        let (db, token_life) = open_http_selected(config).await?;
+        Ok(Self::with_token_life(db, config.clone(), token_life))
+    }
+
+    /// Planned token rotations so far (see [`ReconnectingDb::refresh`]).
+    pub fn rotations(&self) -> u64 {
+        self.rotations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Successful session generation, most recent reconnect attempt duration,
@@ -198,40 +277,44 @@ impl ReconnectingDb {
 
     /// One maintenance pass. Returns `true` if the handle is usable afterwards.
     ///
-    /// Ordering matters: `signin` doubles as the liveness probe *and* the token
-    /// refresh, so a healthy handle costs exactly one request per tick. Only
-    /// when it fails do we pay for a reconnect.
+    /// A healthy handle with a young token costs one read-only `version()`
+    /// request. A half-spent token costs a new connection, and a dead session a
+    /// reconnect. Nothing here writes to the session of the handle in use (see
+    /// the type docs for the deadlock that rule prevents).
     pub async fn refresh(&self) -> bool {
         let db = self.handle();
-        let probe = db.signin(surrealdb::opt::auth::Root {
-            username: self.config.username.clone(),
-            password: self.config.password.clone(),
-        });
-        // Time-boxed, because this probe is routed through the very session it
-        // is testing: when that session is gone in the hanging way, an
-        // un-bounded signin parks forever and takes the whole recovery loop
-        // with it — the handle is then never replaced and every consumer stays
-        // wedged until the container restarts. That is the failure this type
-        // exists to prevent, so it must not be reachable from inside it.
+        // `version()` still travels through the session with the bearer token,
+        // so a forgotten session or a rejected token surfaces here just as the
+        // old signin probe did. Time-boxed, because a session gone in the
+        // hanging way never answers, and a probe that parks forever would take
+        // the whole recovery loop with it.
         let err = match tokio::time::timeout(
             std::time::Duration::from_secs(REFRESH_PROBE_TIMEOUT_SECS),
-            probe,
+            db.version(),
         )
         .await
         {
             Ok(Ok(_)) => {
                 self.transport_failures
                     .store(0, std::sync::atomic::Ordering::Relaxed);
+                let due = tokio::time::Instant::now()
+                    >= *self.rotate_at.lock().expect("ReconnectingDb lock poisoned");
+                if !due {
+                    return true;
+                }
+                // A failed rotation keeps the old handle: its token still has
+                // half its life left, and the next tick tries again.
+                self.replace(Replacement::Rotation).await;
                 return true;
             }
             Ok(Err(e)) => e.to_string(),
             Err(_) => {
                 tracing::warn!(
                     timeout_secs = REFRESH_PROBE_TIMEOUT_SECS,
-                    "SurrealDB re-signin timed out; treating the session as gone"
+                    "SurrealDB liveness probe timed out; treating the session as gone"
                 );
                 // Fall through to the reconnect below rather than the
-                // "transient blip" branch: a signin that never returns is the
+                // "transient blip" branch: a probe that never returns is the
                 // dead-session signature, not a slow server.
                 String::new()
             }
@@ -242,8 +325,8 @@ impl ReconnectingDb {
             // blip the existing session may still be perfectly valid once it
             // passes, so the first few failures leave it alone. But not
             // forever: on 2026-09-06 the control plane recreated the database
-            // container at a new address, and this handle — pinned to the old
-            // one — failed every probe with a transport error for 35 minutes
+            // container at a new address, and this handle, pinned to the old
+            // one, failed every probe with a transport error for 35 minutes
             // while a fresh connection to the same name worked instantly. A
             // sustained transport failure is exactly the case where a new
             // connection (and a fresh name resolution) is the only thing that
@@ -258,7 +341,7 @@ impl ReconnectingDb {
                     error = %err,
                     streak,
                     limit = TRANSPORT_FAILURES_BEFORE_RECONNECT,
-                    "SurrealDB re-signin failed; retrying next tick"
+                    "SurrealDB liveness probe failed; retrying next tick"
                 );
                 return false;
             }
@@ -274,47 +357,86 @@ impl ReconnectingDb {
             );
         }
 
-        // The reconnect gets a deadline for the same reason the probe does —
-        // `connect_http` performs its own signin and can hang just as easily,
-        // and a recovery path that can hang is not a recovery path.
+        self.replace(Replacement::Reconnect).await
+    }
 
-        // Always reconnect via `connect_http`, even for handles originally
-        // opened with `connect_http_raw`: by the time a reconnect is needed the
-        // namespace/database exist (the raw handle's caller defined them), and
-        // the replacement has to come back with them selected.
-        let reconnect = connect_http(&self.config);
+    /// Build a new handle and swap it in. Returns whether the swap happened.
+    async fn replace(&self, kind: Replacement) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The connect gets a deadline for the same reason the probe does:
+        // `open_http_selected` signs in and can hang just as easily, and a
+        // recovery path that can hang is not a recovery path.
+        //
+        // Always select the namespace/database, even for handles originally
+        // opened with `connect_http_raw`: by now they exist (the raw handle's
+        // caller defined them), and the replacement has to come back with
+        // them selected.
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(RECONNECT_TIMEOUT_SECS),
-            reconnect,
+            open_http_selected(&self.config),
         )
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("connect timed out")));
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128 - 1) as u64;
-        self.last_reconnect_ms.store(elapsed_ms + 1, std::sync::atomic::Ordering::Relaxed);
+        if kind == Replacement::Reconnect {
+            self.last_reconnect_ms.store(elapsed_ms + 1, Relaxed);
+        }
         match result {
-            Ok(fresh) => {
-                *self
-                    .current
-                    .write()
-                    .expect("ReconnectingDb lock poisoned") = std::sync::Arc::new(fresh);
-                self.transport_failures
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                tracing::info!(generation, elapsed_ms, "Reconnected to SurrealDB with a fresh session");
+            Ok((fresh, token_life)) => {
+                *self.current.write().expect("ReconnectingDb lock poisoned") =
+                    std::sync::Arc::new(fresh);
+                *self.rotate_at.lock().expect("ReconnectingDb lock poisoned") =
+                    tokio::time::Instant::now() + rotation_delay(token_life);
+                self.transport_failures.store(0, Relaxed);
+                match kind {
+                    Replacement::Reconnect => {
+                        let generation = self.generation.fetch_add(1, Relaxed) + 1;
+                        tracing::info!(generation, elapsed_ms, "Reconnected to SurrealDB with a fresh session");
+                    }
+                    Replacement::Rotation => {
+                        let rotations = self.rotations.fetch_add(1, Relaxed) + 1;
+                        tracing::debug!(
+                            rotations,
+                            elapsed_ms,
+                            token_life_secs = token_life.map(|life| life.as_secs()),
+                            "Rotated to a freshly signed-in SurrealDB session"
+                        );
+                    }
+                }
                 true
             }
             Err(e) => {
-                self.reconnect_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(error = %e, elapsed_ms, "SurrealDB reconnect failed; retrying next tick");
+                match kind {
+                    Replacement::Reconnect => {
+                        self.reconnect_failures.fetch_add(1, Relaxed);
+                        tracing::warn!(error = %e, elapsed_ms, "SurrealDB reconnect failed; retrying next tick");
+                    }
+                    Replacement::Rotation => {
+                        tracing::warn!(
+                            error = %e,
+                            elapsed_ms,
+                            "SurrealDB token rotation failed; keeping the current session and retrying next tick"
+                        );
+                    }
+                }
                 false
             }
         }
     }
 }
 
-/// Keep a long-lived handle usable: refresh its auth token and replace it
-/// outright if its server-side session dies.
+/// Why [`ReconnectingDb::replace`] builds a new handle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replacement {
+    /// The current session is dead or unreachable.
+    Reconnect,
+    /// The current session is fine but its token is half spent.
+    Rotation,
+}
+
+/// Keep a long-lived handle usable: probe it, rotate it before its token
+/// expires, and replace it outright if its server-side session dies.
 ///
 /// Ticks on `interval_secs`, and early whenever [`ReconnectingDb::note_error`]
 /// sees a dead-session error on the data path — so the common case (SurrealDB
@@ -361,13 +483,16 @@ pub async fn resignin_once(db: &ReconnectingDb) {
 
 /// Default cadence for [`spawn_periodic_resignin`].
 ///
-/// This is both the token-refresh cadence (well below the shortest common token
-/// duration of 1h) and the worst-case detection window for a SurrealDB restart
-/// that no data-path error has reported yet — hence a minute rather than the
-/// token lifetime.
+/// This is the worst-case detection window for a SurrealDB restart that no
+/// data-path error has reported yet, and the granularity of token rotation
+/// (a rotation happens on the first tick after the token is half spent).
 pub const RESIGNIN_INTERVAL_SECS: u64 = 60;
 
-/// Deadline for the liveness/token-refresh signin in [`ReconnectingDb::refresh`].
+/// Rotation delay when the token's lifetime cannot be read: half of the one
+/// hour SurrealDB gives root tokens.
+const FALLBACK_ROTATION_SECS: u64 = 30 * 60;
+
+/// Deadline for the liveness probe in [`ReconnectingDb::refresh`].
 /// Generous for a healthy server (which answers in milliseconds) and short
 /// enough that a dead session is replaced within one tick rather than parking
 /// the recovery loop forever.
@@ -385,8 +510,8 @@ fn transport_streak_exhausted(streak: u32) -> bool {
     streak >= TRANSPORT_FAILURES_BEFORE_RECONNECT
 }
 
-/// Deadline for building the replacement handle. `connect_http` signs in too,
-/// so it can hang exactly like the probe it is replacing.
+/// Deadline for building a replacement handle. The connect signs in, so it can
+/// hang exactly like a probe on a wedged session.
 const RECONNECT_TIMEOUT_SECS: u64 = 15;
 
 #[cfg(test)]
@@ -394,7 +519,32 @@ mod tests {
     use super::normalize_url;
 
     use super::is_dead_session_error;
+    use super::{rotation_delay, token_lifetime, FALLBACK_ROTATION_SECS};
     use super::{transport_streak_exhausted, TRANSPORT_FAILURES_BEFORE_RECONNECT};
+    use std::time::Duration;
+
+    fn jwt(claims: &str) -> String {
+        use base64::Engine as _;
+        let part = |raw: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+        format!("{}.{}.sig", part(r#"{"alg":"HS512","typ":"JWT"}"#), part(claims))
+    }
+
+    /// Root tokens live one hour, so the handle is replaced after half of it.
+    #[test]
+    fn rotation_happens_at_half_the_token_life() {
+        let token = jwt(r#"{"iat":1789607000,"nbf":1789607000,"exp":1789610600,"ac":null,"id":"root"}"#);
+        assert_eq!(token_lifetime(&token), Some(Duration::from_secs(3600)));
+        assert_eq!(rotation_delay(token_lifetime(&token)), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn unreadable_tokens_fall_back_to_the_root_default() {
+        let fallback = Duration::from_secs(FALLBACK_ROTATION_SECS);
+        for token in ["", "not-a-jwt", "a.%%%.c", &jwt(r#"{"exp":10}"#), &jwt(r#"{"iat":10,"exp":10}"#)] {
+            assert_eq!(rotation_delay(token_lifetime(token)), fallback, "token {token:?}");
+        }
+        assert_eq!(rotation_delay(Some(Duration::from_millis(10))), Duration::from_secs(1));
+    }
 
     #[test]
     fn transport_failures_reconnect_only_after_the_streak() {

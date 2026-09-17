@@ -13,6 +13,7 @@ reqwest = { version = "0.12", features = ["json"] }
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 surrealdb = { version = "3.1.2", default-features = false, features = ["protocol-http", "rustls"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }

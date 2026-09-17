@@ -15,7 +15,7 @@
 //! Requires Docker. Run with:
 //!   cargo test -p maintenance --test session_recovery -- --ignored --nocapture
 
-use maintenance::db::{connect_http, DbConfig, ReconnectingDb};
+use maintenance::db::{connect_http, connect_http_raw, DbConfig, ReconnectingDb};
 
 const IMAGE: &str = "surrealdb/surrealdb:v3.0.5";
 const CONTAINER: &str = "spky-session-recovery-test";
@@ -140,4 +140,133 @@ async fn run_scenario() {
         .query("RETURN 1")
         .await
         .expect("reconnecting handle should work again after refresh");
+}
+
+/// A SurrealDB 3.1.5 container on a free port, removed on drop.
+struct Server {
+    name: String,
+    url: String,
+}
+
+impl Server {
+    async fn start(name: &str) -> Server {
+        let _ = docker(&["rm", "-f", name]);
+        let run = docker(&[
+            "run", "-d", "--name", name, "-p", "127.0.0.1::8000",
+            "surrealdb/surrealdb:v3.1.5", "start", "--user", "root", "--pass", "root",
+        ]);
+        assert!(run.status.success(), "docker run failed: {}", String::from_utf8_lossy(&run.stderr));
+        let port = docker(&["port", name, "8000"]);
+        let server = Server {
+            name: name.to_string(),
+            url: format!("http://{}", String::from_utf8_lossy(&port.stdout).trim()),
+        };
+        for _ in 0..120 {
+            if matches!(reqwest::get(format!("{}/health", server.url)).await, Ok(r) if r.status().is_success()) {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let root = connect_http_raw(&server.config("root")).await.expect("root connect");
+                // A root user whose tokens live two seconds, so rotation (and
+                // what happens without it) is observable in a test.
+                root.query(
+                    "DEFINE NAMESPACE test; USE NS test; DEFINE DATABASE test;
+                     DEFINE USER rot ON ROOT PASSWORD 'rot' ROLES OWNER DURATION FOR TOKEN 2s, FOR SESSION NONE;",
+                )
+                .await
+                .expect("setup")
+                .check()
+                .expect("setup statements");
+                return server;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        panic!("SurrealDB never became healthy at {}", server.url);
+    }
+
+    fn config(&self, user: &str) -> DbConfig {
+        DbConfig {
+            url: self.url.clone(),
+            namespace: "test".to_string(),
+            database: "test".to_string(),
+            username: user.to_string(),
+            password: user.to_string(),
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = docker(&["rm", "-f", &self.name]);
+    }
+}
+
+/// The token is renewed by swapping in a new handle, never by signing in on
+/// the one in use, and the swap happens before the old token runs out.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn reconnecting_db_rotates_before_its_token_expires() {
+    let server = Server::start("spky-session-rotation-test").await;
+    let cfg = server.config("rot");
+    let plain = connect_http(&cfg).await.expect("plain connect");
+    let db = ReconnectingDb::connect(&cfg).await.expect("reconnecting connect");
+
+    assert!(db.refresh().await);
+    assert_eq!(db.rotations(), 0, "a fresh token must not rotate");
+
+    for _ in 0..4 {
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(db.refresh().await);
+    }
+    assert!(db.rotations() >= 3, "expected a rotation per half-spent token, got {}", db.rotations());
+    assert_eq!(db.reconnect_metrics().0, 1, "a rotation is not a reconnect");
+
+    // Well past the first token's expiry: the rotated handle still works, the
+    // handle that was never renewed does not.
+    db.handle()
+        .query("INFO FOR DB")
+        .await
+        .expect("rotated handle")
+        .check()
+        .expect("rotated handle answers");
+    let stale = plain.query("INFO FOR DB").await.and_then(|r| r.check());
+    assert!(stale.is_err(), "a 2s token still worked after 4s; the rotation test proves nothing");
+}
+
+/// The 2026-09-16 wedge: a session write on a shared handle, landing between
+/// the two session reads of a concurrent `query()`, deadlocks the session on
+/// SurrealDB 3.1.x. With a signin as the probe, this loop wedged 4 of 60 and 7
+/// of 250 bursts on a CPU-throttled server. The refresh must never do that,
+/// rotation included (the 2s token makes it rotate throughout).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn refresh_under_load_never_wedges_the_shared_session() {
+    let server = Server::start("spky-session-wedge-test").await;
+    let throttle = docker(&["update", "--cpus", "0.1", &server.name]);
+    assert!(throttle.status.success(), "docker update failed");
+    let db = ReconnectingDb::connect(&server.config("rot")).await.expect("connect");
+
+    let deadline = std::time::Duration::from_secs(8);
+    let mut wedged = 0;
+    for burst in 0..150 {
+        let mut readers = Vec::new();
+        for r in 0..16u64 {
+            let handle = db.handle();
+            readers.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_micros(r * 300)).await;
+                tokio::time::timeout(deadline, handle.query("INFO FOR DB")).await.is_ok()
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_micros(2000)).await;
+        let refreshed = tokio::time::timeout(deadline, db.refresh()).await.is_ok();
+        let mut answered = 0;
+        for reader in readers {
+            answered += usize::from(reader.await.unwrap());
+        }
+        if answered != 16 || !refreshed {
+            wedged += 1;
+            eprintln!("burst {burst}: refresh returned={refreshed}, {answered}/16 queries answered");
+        }
+    }
+    assert_eq!(wedged, 0, "{wedged} of 150 bursts wedged");
+    assert!(db.rotations() > 0, "the run never rotated, so rotation was not exercised");
+    assert_eq!(db.reconnect_metrics().0, 1, "no probe should have needed a reconnect");
 }

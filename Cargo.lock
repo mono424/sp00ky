@@ -3927,6 +3927,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.7.9",
+ "base64 0.22.1",
  "chrono",
  "flate2",
  "futures-util",

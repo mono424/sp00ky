@@ -41,6 +41,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `logLevel` | string \| object | `info` | Log verbosity for the SSP and scheduler. Accepts `trace`, `debug`, `info`, `warn`, `error`, `off`, target=level directives, or a `{dev, cloud}` split. Under `spky dev` a bare level applies to the sp00ky crates only (third-party crates stay at `warn`); pass a full directive list such as `ssp=debug,hyper=info,warn` to control those too. |
 | `refMode` | `dedicated` \| `single` | `dedicated` | Storage layout for the SSP's `_00_list_ref` table. `dedicated` gives each user their own table and works around a SurrealDB v3 LIVE-permission gap. |
 | `sync` | object | `{ transport: http, queryAllowlist: off }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`, see [Sync transport](#sync-transport); and whether the SSP refuses query shapes the app does not ship: `queryAllowlist`, see [Query allowlist](#query-allowlist). |
+| `impersonation` | object | `{ enabled: false }` | Lets admins act as other users from the DevTools. See [Impersonation](#impersonation). |
 | `apps` | map | `{}` | Your frontend and backend services. See [Apps](#apps) below. |
 | `schedules` | map \| path | `{}` | Server-side cron/interval jobs. See [Schedules](/docs/jobs/schedules). |
 | `workflows` | map \| path | `{}` | Server-side workflow DAGs. See [Workflows](/docs/jobs/workflows). |
@@ -148,6 +149,20 @@ Set `sync.transport` before the first deploy of a database or plan a short windo
 <CodeBlock code={ymlAllowlist} lang="yaml" />
 
 What it changes elsewhere: the SSP receives `SPKY_SSP_QUERY_ALLOWLIST` (cloud: merged into the `ssp` role's `deployment.env`; `spky dev`: injected into the container). The generated TypeScript `schema` carries `policy: { queryAllowlist }`, and when it is `warn` or `enforce` the client SDK refuses `useRemote`, `remoteQuery` and `queryRaw` unless [`allowRawRemote`](/docs/reference/client-config#allowrawremote) is set. `spky deploy`, `spky release` and `spky dev` publish the allowlist JSON as `_00_query_allowlist` rows; under `enforce` a missing or stale JSON fails the deploy. Matching rules, sidecar exports and the rollout recipe are in the [Query allowlist guide](/docs/guide/query-allowlist).
+
+## Impersonation
+
+`impersonation` lets a `_00_admin` member act as any non-admin user from the DevTools Access tab. Off by default; when off, every deploy removes the access method and functions, which also invalidates tokens issued earlier.
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Turns the feature on. Needs a non-empty `SPKY_AUTH_SECRET`; the token signing key is derived from it. |
+| `tokenTtl` | duration | `15m` | Lifetime of one token, between `1m` and `1h`. The client renews it before it expires. One unit only (`30m`, `1h`). |
+| `maxDuration` | duration | `2h` | Hard cap on one impersonation session. At least `tokenTtl`. |
+| `userTable` | identifier | `user` | The table whose records can be impersonated. |
+| `searchFields` | identifier[] | `[username, email, name]` | Fields the DevTools user picker searches and shows. Missing fields are ignored. |
+
+What it changes elsewhere: the SSP and scheduler receive `SPKY_IMPERSONATION=on` (cloud: merged into both roles' `deployment.env`; `spky dev`: injected into the containers). The generated TypeScript `schema` carries `policy: { impersonation }`, which the DevTools read to decide whether to offer the feature. Only `singlenode` and `cluster` modes support it. Usage, the security model and the audit tables are in [Admin impersonation](/docs/client/impersonation).
 
 ## Retention
 

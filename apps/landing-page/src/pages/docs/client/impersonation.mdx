@@ -1,0 +1,136 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Admin impersonation
+description: Let an admin act as another user from the DevTools, with a warning bar, time-limited tokens and an audit log.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const ymlCode = `impersonation:
+  enabled: true              # default false
+  tokenTtl: 15m              # lifetime of one token (1m to 1h); renewed automatically
+  maxDuration: 2h            # hard cap on one impersonation session
+  userTable: user            # the table whose records can be impersonated
+  searchFields: [username, email]   # what the DevTools user picker searches`;
+
+export const adminCode = `# Only admins can impersonate, and admins cannot be impersonated
+spky admin add alice`;
+
+export const vanillaCode = `import { client } from './db'; // your Sp00kyClient instance
+
+// Admin session required; the server refuses everyone else.
+const users = await client.auth.searchImpersonationTargets('bob');
+await client.auth.impersonate(users[0].id, 'Support ticket #4211');
+
+client.auth.impersonation;              // { session, target, admin, tokenExpiresAt }
+client.auth.subscribeImpersonation((info) => console.log(info));
+
+await client.auth.stopImpersonating();  // back to the admin session`;
+
+export const solidCode = `import { Show } from 'solid-js';
+import { useImpersonation } from '@spooky-sync/client-solid';
+
+export function DangerZone() {
+  const { isImpersonating } = useImpersonation();
+  // The client already shows its own warning bar. Use the hook for extras,
+  // such as hiding actions an admin should not take on someone's behalf.
+  return (
+    <Show when={!isImpersonating()}>
+      <DeleteAccountButton />
+    </Show>
+  );
+}`;
+
+export const auditCode = `-- Who impersonated whom, why, and until when
+SELECT * FROM _00_impersonation ORDER BY started_at DESC;
+
+-- Every write made while impersonating
+SELECT * FROM _00_impersonation_write WHERE session = _00_impersonation:abc;
+
+-- End a session from the server side (takes effect on the next check, within a minute)
+UPDATE _00_impersonation:abc SET ended_at = time::now();`;
+
+export const cssCode = `/* The bar is fixed to the top of the viewport. Offset your own fixed header: */
+.app-header {
+  top: var(--sp00ky-impersonation-banner-height, 0px);
+}`;
+
+Impersonation lets an admin see and use the app exactly as one of its users does, which is the fastest way to reproduce "it looks wrong for me" reports. It is **off unless a project enables it**, it is started from the DevTools **Access** tab, and while it lasts every page shows a red warning bar with a **Stop** button.
+
+<Warning>
+An impersonating admin has the target user's full access, writes included. Grant `spky admin add` only to people you would trust with every account. Every session and every write is recorded.
+</Warning>
+
+## Enable it
+
+Add the `impersonation` block to `sp00ky.yml` and redeploy (or restart `spky dev`):
+
+<CodeBlock code={ymlCode} lang="yaml" fileName="sp00ky.yml" />
+
+Then make sure the people who may impersonate are admins:
+
+<CodeBlock code={adminCode} lang="bash" />
+
+With `enabled` absent or `false`, every deploy **removes** the impersonation access method and functions from the database, so no impersonation token can be issued or used, including tokens handed out before you turned it off. The SSP and scheduler also refuse to sign tokens unless `SPKY_IMPERSONATION` is on, and they never sign one without a non-empty `SPKY_AUTH_SECRET`.
+
+## Use it from the DevTools
+
+1. Sign in to the app as an admin and open the DevTools **Access** tab.
+2. Under **Impersonate**, search for a user. Admins are listed but cannot be picked.
+3. Enter a reason (it goes into the audit log), click **Impersonate**, and confirm.
+
+The page switches to the user's session: queries, permissions and live updates behave exactly as they do for that user. Their data lives in its own local bucket, which is deleted from your device when you stop. **Stop impersonating** in the warning bar or in the Access tab returns you to your own session.
+
+## How it is secured
+
+- **Server-enforced.** The client only asks. `fn::_00_impersonate::start` runs in the admin's own SurrealDB session and is permitted only for `_00_admin` members. The backend then signs a token for a dedicated `_00_impersonate` access method, with a key derived from `SPKY_AUTH_SECRET` that never leaves the backend.
+- **Checked on every authenticate.** The access method re-validates the session row each time the token is used. The session must be open and unexpired, its admin must still be on the roster, and its target must exist and must not be an admin.
+- **Short-lived.** A token lives `tokenTtl` and the client renews it before it expires. Nothing is renewed past `maxDuration`.
+- **Revocable.** Stopping, ending the row server-side, removing the admin from the roster, disabling the feature, or rotating `SPKY_AUTH_SECRET` all end the session. An open connection notices within a minute.
+- **No escalation.** An impersonated session cannot start another one, cannot read the audit tables, and session rows cannot be edited except to end them.
+- **Visible.** The warning bar lives in a closed shadow root and survives app CSS.
+
+<Note>
+While impersonating, `$access` in SurrealDB is `_00_impersonate`, not the user's usual access method. Rules written against `$auth.id` behave exactly as for the user, and so does the SSP's view permission check. A table rule that compares `$access` directly (for example `$access = "account"`) does not match an impersonated session.
+</Note>
+
+## Audit trail
+
+<CodeBlock code={auditCode} lang="sql" />
+
+## In your app
+
+The warning bar is always shown; you do not have to render anything. It publishes its height as a CSS variable:
+
+<CodeBlock code={cssCode} lang="css" />
+
+To react to impersonation yourself, use the hook (Solid) or the auth service (any client):
+
+<CodeBlock code={solidCode} lang="tsx" />
+
+<CodeBlock code={vanillaCode} lang="typescript" />
+
+<PropTable props={[
+    { name: 'auth.impersonation', type: 'ImpersonationInfo | null', default: '-', desc: 'The active impersonation, derived from the token in use.' },
+    { name: 'auth.impersonate(targetId, reason)', type: 'Promise<ImpersonationInfo>', default: '-', desc: 'Start. Admins only; `reason` needs at least 3 characters.' },
+    { name: 'auth.stopImpersonating()', type: 'Promise<void>', default: '-', desc: 'Return to the admin session. Always leaves the target, even offline.' },
+    { name: 'auth.subscribeImpersonation(cb)', type: '() => void', default: '-', desc: 'Called immediately and on every change. Returns an unsubscribe.' },
+    { name: 'auth.searchImpersonationTargets(search)', type: 'Promise<ImpersonationCandidate[]>', default: '-', desc: 'The DevTools user search. Admins only.' },
+    { name: 'auth.listActiveImpersonations()', type: 'Promise<ActiveImpersonation[]>', default: '-', desc: 'Open sessions. Admins only.' },
+    { name: 'useImpersonation()', type: '{ impersonation, isImpersonating, stop }', default: '-', desc: 'Solid hook in `@spooky-sync/client-solid` and `client-solid2`.' },
+]} />
+
+Signing out while impersonating ends the impersonation and signs the admin out too.
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Authentication" href="/docs/client/auth" description="Sign-in, sessions and access methods." />
+  <LinkCard title="Feature flags" href="/docs/client/feature-flags" description="The other admin-only controls in the Access tab." />
+  <LinkCard title="Configuration" href="/docs/reference/config#impersonation" description="Every impersonation setting in sp00ky.yml." />
+</CardGrid>

@@ -221,6 +221,22 @@ curl -X POST http://localhost:8667/view/unregister \
 
 ---
 
+## Impersonation
+
+Two routes behind the `fn::_00_impersonate::*` SurrealDB functions (see
+[Admin impersonation](/docs/client/impersonation)). Both return `404` unless
+`SPKY_IMPERSONATION=on` and `SPKY_AUTH_SECRET` is non-empty. The SSP serves
+them in singlenode mode, where the functions call it directly.
+
+**Authentication:** Required (the shared bearer)
+
+| Endpoint | Body | Behaviour |
+| --- | --- | --- |
+| `POST /impersonate/mint` | `{"session", "target", "admin", "access", "ns", "db", "ttl_secs", "session_remaining_secs"}` | Signs an HS256 token for the `_00_impersonate` access method, bound to the `_00_impersonation` row in `session`. Expiry is `min(ttl_secs, 1h, session_remaining_secs)`. Stateless: every revocation check runs in the access method's `AUTHENTICATE` block. `200 {token, exp}`; `400 invalid` for a session that is not an `_00_impersonation` record, a target equal to the admin, or an expired session |
+| `POST /impersonate/users` | `{"table", "fields", "search", "limit"}` | Root-backed search for the DevTools user picker: rows of `table` whose id or any of `fields` contains `search` (case-insensitive), at most `limit` (max 100), each with `is_admin`. `table` and `fields` must be plain identifiers (`400 invalid` otherwise) |
+
+---
+
 ## State Management
 
 ### POST /reset
@@ -681,6 +697,7 @@ SPKY_SSP_REGISTER_MAX_WAIT_SECS=180 # give up registering and exit (default: 180
 SPKY_SSP_VIEW_METRICS_FLUSH_MS=2000 # view metrics flush interval (default: 2000)
 SPKY_SSP_ANON_LIVE_QUERIES=false # allow LIVE queries with no auth context
 SPKY_SSP_QUERY_ALLOWLIST=off     # off | warn | enforce: refuse view shapes the app does not ship
+SPKY_IMPERSONATION=off           # on: serve /impersonate/* (set from impersonation.enabled)
 ```
 
 ### Scheduler Integration

@@ -46,7 +46,11 @@ export { useQuery } from './lib/use-query';
 export { createPreload } from './lib/create-preload';
 export type { PreloadOptions, PreloadRefresh } from '@spooky-sync/core';
 export { useSyncStatus, type UseSyncStatus } from './lib/use-sync-status';
-export { useImpersonation, type UseImpersonation } from './lib/use-impersonation';
+export {
+  useImpersonation,
+  type UseImpersonation,
+  type UseImpersonationOptions,
+} from './lib/use-impersonation';
 export type {
   SyncHealth,
   SyncHealthStatus,
@@ -284,6 +288,16 @@ export class SyncedDb<S extends SchemaStructure> {
    */
   public async deauthenticate(): Promise<void> {
     await this.signOut();
+  }
+
+  /**
+   * Tell the client that this app's own impersonation banner is on screen.
+   * Only needed with `impersonationBanner: { mode: 'custom' }`; the
+   * `useImpersonation({ rendersBanner: true })` hook calls it for you.
+   */
+  public acknowledgeImpersonationBanner(): void {
+    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
+    this.sp00ky.acknowledgeImpersonationBanner();
   }
 
   /**

@@ -61,6 +61,42 @@ export const cssCode = `/* The page is already shifted down by the warning. A he
   top: var(--sp00ky-impersonation-banner-height, 0px);
 }`;
 
+export const themeCode = `createClient({
+  // ...
+  impersonationBanner: {
+    theme: {
+      heightPx: 56,
+      radiusPx: 22,
+      background: 'linear-gradient(90deg, #6d28d9, #db2777)',
+      pill: '#fff',
+      pillText: '#3b0764',
+      accent: '#3b0764',
+      accentText: '#fff',
+      stopLabel: 'End session',
+      // \`**…**\` marks the emphasised part; the label is text, never markup.
+      label: (info) => 'Support mode: **' + info.target + '**',
+    },
+  },
+});`;
+
+export const ownBannerCode = `// 1. Tell the client you are rendering it.
+createClient({ /* ... */ impersonationBanner: { mode: 'custom' } });
+
+// 2. Render it, and acknowledge it while it is on screen.
+function ImpersonationBar() {
+  const { impersonation, stop } = useImpersonation({ rendersBanner: true });
+  return (
+    <Show when={impersonation()}>
+      {(info) => (
+        <div class="my-impersonation-bar">
+          Acting as {info().target}
+          <button onClick={() => void stop()}>Stop</button>
+        </div>
+      )}
+    </Show>
+  );
+}`;
+
 Impersonation lets an admin see and use the app exactly as one of its users does, which is the fastest way to reproduce "it looks wrong for me" reports. It is **off unless a project enables it**, it is started from the DevTools **Access** tab, and while it lasts the app is unmistakable: hazard stripes run across the top of the viewport, the page is pushed down onto them with its top corners rounded, and the warning names who you are acting as next to a **Stop** button.
 
 <Warning>
@@ -94,7 +130,7 @@ The page switches to the user's session: queries, permissions and live updates b
 - **Short-lived.** A token lives `tokenTtl` and the client renews it before it expires. Nothing is renewed past `maxDuration`.
 - **Revocable.** Stopping, ending the row server-side, removing the admin from the roster, disabling the feature, or rotating `SPKY_AUTH_SECRET` all end the session. An open connection notices within a minute.
 - **No escalation.** An impersonated session cannot start another one, cannot read the audit tables, and session rows cannot be edited except to end them.
-- **Visible.** The warning lives in a closed shadow root, and the page shift is written as `!important` inline styles, so no app stylesheet can hide or undo either. Both are reverted exactly when impersonation ends.
+- **Visible.** The warning lives in a closed shadow root, and the page shift is written as `!important` inline styles, so no app stylesheet can hide or undo either. Both are reverted exactly when impersonation ends. An app can restyle or replace the banner (see [Make it yours](#make-it-yours)); replacing it keeps a fallback, and only an explicit `mode: 'none'` turns the warning off.
 
 <Note>
 While impersonating, `$access` in SurrealDB is `_00_impersonate`, not the user's usual access method. Rules written against `$auth.id` behave exactly as for the user, and so does the SSP's view permission check. A table rule that compares `$access` directly (for example `$access = "account"`) does not match an impersonated session.
@@ -106,9 +142,36 @@ While impersonating, `$access` in SurrealDB is `_00_impersonate`, not the user's
 
 ## In your app
 
-The warning is always shown, and the page is shifted and rounded for you; you do not have to render anything. The shift publishes its height as a CSS variable, which anything of yours that is fixed to the top of the viewport should use:
+By default the warning is shown and the page is shifted and rounded for you; you do not have to render anything. The shift publishes its height as a CSS variable, which anything of yours that is fixed to the top of the viewport should use:
 
 <CodeBlock code={cssCode} lang="css" />
+
+### Make it yours
+
+`impersonationBanner` in the client config covers three cases.
+
+**Restyle the built-in one.** Pass a `theme`; anything you leave out keeps its default. Colours take any CSS value, so your own tokens work.
+
+<CodeBlock code={themeCode} lang="typescript" />
+
+<PropTable props={[
+  { name: 'heightPx', type: 'number', default: '44', desc: 'Bar height, and how far the page is pushed down.' },
+  { name: 'radiusPx', type: 'number', default: '14', desc: "The page's new top corners. `0` squares them off." },
+  { name: 'background', type: 'string', default: 'hazard stripes', desc: 'Any CSS `background` for the warning layer.' },
+  { name: 'pill', type: 'string', default: 'near-black', desc: 'Background of the pill the text sits in.' },
+  { name: 'pillText', type: 'string', default: 'amber', desc: 'Text colour inside the pill.' },
+  { name: 'accent', type: 'string', default: 'amber', desc: 'Stop button background.' },
+  { name: 'accentText', type: 'string', default: 'near-black', desc: 'Stop button text colour.' },
+  { name: 'stopLabel', type: 'string', default: "'Stop'", desc: 'Label of the button that ends the session.' },
+  { name: 'label', type: '(info) => string', default: 'Impersonating …', desc: 'The sentence. Wrap a part in `**` to emphasise it; the result is text, never markup.' },
+  { name: 'noPageShift', type: 'boolean', default: 'false', desc: 'Keep the bar but leave the page where it is (do your own offset with the CSS variable).' },
+]} />
+
+**Render your own.** Set `mode: 'custom'` and build the bar yourself from `useImpersonation()`. Acknowledge it while it is on screen, so the client knows a warning is actually visible; the Solid hook does that for you with `rendersBanner: true`. If nothing acknowledges within about 2.5 seconds, the built-in banner appears, on the assumption that your banner failed to render rather than that nobody should be warned.
+
+<CodeBlock code={ownBannerCode} lang="tsx" />
+
+**Show nothing.** `mode: 'none'` renders nothing, ever, and does not fall back. It is your call, and then it is your job to make an impersonated session obvious: the page otherwise looks exactly like an ordinary session of someone else's account. The client logs one console warning to say so.
 
 To react to impersonation yourself, use the hook (Solid) or the auth service (any client):
 

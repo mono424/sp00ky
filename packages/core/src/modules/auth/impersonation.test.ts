@@ -280,3 +280,39 @@ describe('timers', () => {
     timers.clear();
   });
 });
+
+describe('banner configuration', () => {
+  it('builds CSS from the theme, defaults included', async () => {
+    const { bannerCss, BANNER_STRIPES } = await import('./impersonation-banner');
+    // `bannerCss` takes a resolved theme; the client resolves it, so this
+    // pins the rendered output for a fully specified one.
+    const css = bannerCss({
+      heightPx: 60,
+      radiusPx: 0,
+      background: 'var(--brand-warning)',
+      pill: '#000',
+      pillText: '#fff',
+      accent: '#f00',
+      accentText: '#fff',
+      stopLabel: 'Leave',
+      noPageShift: true,
+      label: () => 'x',
+    });
+    expect(css).toContain('height: 60px; background: var(--brand-warning)');
+    expect(css).toContain('background: #000; color: #fff');
+    expect(css).not.toContain(BANNER_STRIPES);
+  });
+
+  it('emphasises the label between ** markers instead of parsing markup', async () => {
+    const { __test } = await import('./impersonation-banner');
+    // A label is a plain string an app supplies, so markup in it must stay text.
+    expect(__test.labelSegments('Impersonating **user:bob** as user:alice')).toEqual([
+      { text: 'Impersonating ', bold: false },
+      { text: 'user:bob', bold: true },
+      { text: ' as user:alice', bold: false },
+    ]);
+    expect(__test.labelSegments('<img src=x onerror=alert(1)>')).toEqual([
+      { text: '<img src=x onerror=alert(1)>', bold: false },
+    ]);
+  });
+});

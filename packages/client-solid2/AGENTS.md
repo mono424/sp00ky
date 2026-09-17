@@ -46,7 +46,7 @@ Provider props are identical to client-solid: `config`, `fallback`, `preload` (a
   - Options: `enabled?: () => boolean`, `deregisterOnCleanup?: boolean`.
 - **`createSubmission(fn)`** — button pending/error state around a mutation: `submit()`, `pending()`, `error()`, `result()`, `clearError()`. There is deliberately no `action()` / `createOptimisticStore` layer (see `src/lib/create-submission.ts`).
 - **`useSyncActivity(options?)`** — `{ fetchingQueries, pendingMutations, isDownloading, isUploading }`. One subscription on the engine's aggregate fetch count plus the outbox depth; both are debounced ON by their delay (`downloadDelayMs` 200, `uploadDelayMs` 150) and off at once, and `isUploading()` additionally needs `pendingMutations() > uploadThreshold` (0, so any unacknowledged write counts). Drive a logo/traffic indicator off it; pair with `useSyncStatus().connection()` / `.isOffline()` to switch the same mark to a reconnecting or offline state and show the unsaved count.
-- **`createPreload`**, **`usePendingMutations`**, **`useSyncStatus`**, **`useImpersonation`**, **`useStorageStatus`**, **`useFeatureFlag`**, **`useAppRelease`**, **`useCrdtField`**, **`useFileUpload`**, **`useDownloadFile`** — same shapes as client-solid.
+- **`createPreload`**, **`usePendingMutations`**, **`useSyncStatus`**, **`useImpersonation`** (`{ rendersBanner: true }` when the app draws its own banner), **`useStorageStatus`**, **`useFeatureFlag`**, **`useAppRelease`**, **`useCrdtField`**, **`useFileUpload`**, **`useDownloadFile`** — same shapes as client-solid.
 - **`conflate`**, **`fromSubscription`** — the async-iterable helpers the hooks are built on; useful for wrapping other engine subscriptions.
 
 ## Mutations

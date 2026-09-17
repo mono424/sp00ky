@@ -81,6 +81,8 @@ export class Sp00kyClient<S extends SchemaStructure> {
   private readonly appReleases: AppReleaseModule<S>;
   /** Teardown for subscriptions the client itself owns. */
   private readonly disposers: Array<() => void> = [];
+  /** Assigned in `wireAdapters`, which the constructor always runs. */
+  private impersonationBanner!: ImpersonationBanner;
   private readonly devTools: DevToolsService;
   private hub: LeaderSyncHub | null = null;
   private forwarder: SyncForwarder | null = null;
@@ -177,10 +179,18 @@ export class Sp00kyClient<S extends SchemaStructure> {
     s.streamProcessor.addReceiver(receiver);
     s.connectionSupervisor.subscribe((state) => void this.runtime.dispatch({ type: 'ConnectionChanged', state }));
     s.auth.subscribe((userId) => void this.runtime.dispatch({ type: 'AuthFlip', userId }));
-    // The impersonation banner is not optional: whoever is looking at the page
-    // must be able to tell, and leave, whatever the app renders.
-    const banner = new ImpersonationBanner(() => s.auth.stopImpersonating());
-    this.disposers.push(s.auth.subscribeImpersonation((info) => banner.update(info)), () => banner.unmount());
+    // Whoever is looking at the page should be able to tell, and leave. The
+    // app can restyle this, replace it (`mode: 'custom'`, with a fallback if
+    // its own never renders) or take the job over entirely (`mode: 'none'`).
+    this.impersonationBanner = new ImpersonationBanner(
+      () => s.auth.stopImpersonating(),
+      this.config.impersonationBanner
+    );
+    const banner = this.impersonationBanner;
+    this.disposers.push(
+      s.auth.subscribeImpersonation((info) => banner.update(info)),
+      () => banner.unmount()
+    );
     this.runtime.on('tabs:broadcast', (e) => {
       if (e.type !== 'tabs:broadcast') return;
       const msg = e.message as { type: string; records?: unknown[]; mutationId?: string };
@@ -466,6 +476,17 @@ export class Sp00kyClient<S extends SchemaStructure> {
   async remoteQuery<T extends unknown[]>(sql: string, vars?: Record<string, unknown>): Promise<T> {
     this.assertRawRemoteAllowed('remoteQuery');
     return this.services.remote.query<T>(sql, vars);
+  }
+
+  /**
+   * Tell the client that the app's own impersonation banner is on screen.
+   * Only meaningful with `impersonationBanner: { mode: 'custom' }`, where it
+   * cancels the fallback that would otherwise show the built-in banner. Call
+   * it while the custom banner is rendered (the Solid `useImpersonation`
+   * hook does it for you with `rendersBanner: true`).
+   */
+  acknowledgeImpersonationBanner(): void {
+    this.impersonationBanner.acknowledge();
   }
 
   feature(key: string, options?: FeatureFlagOptions): FeatureFlagHandle {

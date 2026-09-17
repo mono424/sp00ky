@@ -1,3 +1,4 @@
+import type { ImpersonationBannerConfig } from './modules/auth/impersonation-banner';
 import type { RecordId, SchemaStructure, QueryPlan } from '@spooky-sync/query-builder';
 import type { Level, LoggerOptions } from 'pino';
 import type { PushEventOptions } from './events/index';
@@ -331,6 +332,17 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    * flag is `true`. Defaults to `false`.
    */
   allowRawRemote?: boolean;
+  /**
+   * How the "you are impersonating" warning is shown while an admin acts as
+   * another user. The built-in one (hazard stripes at the top, the page
+   * shifted down onto them) needs no configuration; this is for restyling it,
+   * or replacing it with the app's own.
+   *
+   * See `ImpersonationBannerConfig`. Replacing it does not mean "no warning":
+   * if the app has not acknowledged its own banner shortly after impersonation
+   * starts, the built-in one appears anyway.
+   */
+  impersonationBanner?: ImpersonationBannerConfig;
   /**
    * Surface sustained sync failures as a "degraded" health status that the app
    * can observe via `subscribeToSyncHealth` (or the client-solid

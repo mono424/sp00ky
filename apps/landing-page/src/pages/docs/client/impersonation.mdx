@@ -55,12 +55,13 @@ SELECT * FROM _00_impersonation_write WHERE session = _00_impersonation:abc;
 -- End a session from the server side (takes effect on the next check, within a minute)
 UPDATE _00_impersonation:abc SET ended_at = time::now();`;
 
-export const cssCode = `/* The bar is fixed to the top of the viewport. Offset your own fixed header: */
+export const cssCode = `/* The page is already shifted down by the warning. A header of your own that
+   is fixed to the top of the viewport needs the offset too: */
 .app-header {
   top: var(--sp00ky-impersonation-banner-height, 0px);
 }`;
 
-Impersonation lets an admin see and use the app exactly as one of its users does, which is the fastest way to reproduce "it looks wrong for me" reports. It is **off unless a project enables it**, it is started from the DevTools **Access** tab, and while it lasts every page shows a red warning bar with a **Stop** button.
+Impersonation lets an admin see and use the app exactly as one of its users does, which is the fastest way to reproduce "it looks wrong for me" reports. It is **off unless a project enables it**, it is started from the DevTools **Access** tab, and while it lasts the app is unmistakable: hazard stripes run across the top of the viewport, the page is pushed down onto them with its top corners rounded, and the warning names who you are acting as next to a **Stop** button.
 
 <Warning>
 An impersonating admin has the target user's full access, writes included. Grant `spky admin add` only to people you would trust with every account. Every session and every write is recorded.
@@ -93,7 +94,7 @@ The page switches to the user's session: queries, permissions and live updates b
 - **Short-lived.** A token lives `tokenTtl` and the client renews it before it expires. Nothing is renewed past `maxDuration`.
 - **Revocable.** Stopping, ending the row server-side, removing the admin from the roster, disabling the feature, or rotating `SPKY_AUTH_SECRET` all end the session. An open connection notices within a minute.
 - **No escalation.** An impersonated session cannot start another one, cannot read the audit tables, and session rows cannot be edited except to end them.
-- **Visible.** The warning bar lives in a closed shadow root and survives app CSS.
+- **Visible.** The warning lives in a closed shadow root, and the page shift is written as `!important` inline styles, so no app stylesheet can hide or undo either. Both are reverted exactly when impersonation ends.
 
 <Note>
 While impersonating, `$access` in SurrealDB is `_00_impersonate`, not the user's usual access method. Rules written against `$auth.id` behave exactly as for the user, and so does the SSP's view permission check. A table rule that compares `$access` directly (for example `$access = "account"`) does not match an impersonated session.
@@ -105,7 +106,7 @@ While impersonating, `$access` in SurrealDB is `_00_impersonate`, not the user's
 
 ## In your app
 
-The warning bar is always shown; you do not have to render anything. It publishes its height as a CSS variable:
+The warning is always shown, and the page is shifted and rounded for you; you do not have to render anything. The shift publishes its height as a CSS variable, which anything of yours that is fixed to the top of the viewport should use:
 
 <CodeBlock code={cssCode} lang="css" />
 

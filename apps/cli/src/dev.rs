@@ -646,7 +646,7 @@ fn run_direct_mode(
             db_name: resolved_surreal.database.clone(),
             db_user: resolved_surreal.username_literal(),
             db_pass: resolved_surreal.password_literal(),
-            sync_env: config.sync().infra_env(),
+            sync_env: dev_infra_env(&config),
         };
 
         let step = ui::step("Scheduler");
@@ -724,7 +724,7 @@ fn run_direct_mode(
         db_user: resolved_surreal.username_literal(),
         db_pass: resolved_surreal.password_literal(),
         job_config: job_config_json,
-        sync_env: config.sync().infra_env(),
+        sync_env: dev_infra_env(&config),
         ref_mode: config.resolved_ref_mode().as_str().to_string(),
         anon_live: if config.resolved_anonymous_live_queries() {
             "1"
@@ -1338,6 +1338,13 @@ fn surreal_to_target_endpoint(mode: &DeployMode, versions: &ResolvedVersions) ->
 /// Apply the remote functions with Docker-internal endpoints so that
 /// SurrealDB (running inside the Docker network) can reach the SSP/scheduler
 /// via container names instead of `localhost`.
+/// Env the dev scheduler/SSP containers need to match the schema.
+fn dev_infra_env(config: &backend::Sp00kyConfig) -> Vec<(String, String)> {
+    let mut env = config.sync().infra_env();
+    env.extend(config.impersonation().infra_env());
+    env
+}
+
 fn apply_remote_functions(
     surreal_url: &str,
     mode: &DeployMode,
@@ -1347,7 +1354,10 @@ fn apply_remote_functions(
     let endpoint = surreal_to_target_endpoint(mode, versions);
     let secret = "mysecret";
 
-    let functions_sql = schema_builder::build_remote_functions_schema(mode, &endpoint, secret);
+    let impersonation =
+        backend::impersonation_settings_for(Some(Path::new(DEFAULT_CONFIG_PATH)));
+    let functions_sql =
+        schema_builder::build_remote_functions_schema(mode, &endpoint, secret, &impersonation);
 
     let client = SurrealClient::new(
         surreal_url,

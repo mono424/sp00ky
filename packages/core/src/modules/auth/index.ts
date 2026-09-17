@@ -10,6 +10,32 @@ export * from './events/index';
 import { AuthEventTypes, createAuthEventSystem } from './events/index';
 import type { PersistenceClient } from '../../types';
 import { classifySyncError } from '../../utils/error-classification';
+import {
+  decodeTokenClaims,
+  impersonationFromToken,
+  sameImpersonation,
+  ImpersonationTimers,
+  ORIGIN_TOKEN_KEY,
+} from './impersonation';
+import type { ImpersonationInfo } from './impersonation';
+export * from './impersonation';
+
+/** What `fn::_00_impersonate::list_users` returns per row. */
+export interface ImpersonationCandidate {
+  id: string;
+  is_admin: boolean;
+  [field: string]: unknown;
+}
+
+/** An open session, as `fn::_00_impersonate::active` lists it. */
+export interface ActiveImpersonation {
+  session: string;
+  target: string;
+  admin: string;
+  reason: string;
+  started_at: unknown;
+  expires_at: unknown;
+}
 
 // Helper to pretty print types
 type Prettify<T> = {
@@ -36,38 +62,6 @@ type ExtractAccessParams<
       }>
     : never;
 
-/**
- * Read the claims of a SurrealDB record-access JWT WITHOUT verifying it. The
- * server still enforces the token on every request; this is only so the client
- * can act on what it already holds before a round trip completes.
- *
- * `AC` is the access-method name — the in-browser SSP needs it to resolve
- * `$access` in table permission predicates (mirrors the session's `$access`
- * that the server's `fn::query::register` reads). `ID` is the `$auth.id` record
- * id, which is what lets a warm boot restore a session locally.
- *
- * Returns nulls on any malformed input.
- */
-function decodeTokenClaims(token: string): { access: string | null; userId: string | null } {
-  try {
-    const payload = token.split('.')[1];
-    if (!payload) return { access: null, userId: null };
-    let b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-    b64 += '='.repeat((4 - (b64.length % 4)) % 4);
-    const json =
-      typeof atob === 'function' ? atob(b64) : Buffer.from(b64, 'base64').toString('binary');
-    const claims = JSON.parse(json) as Record<string, unknown>;
-    const ac = claims.AC ?? claims.ac;
-    const id = claims.ID ?? claims.id;
-    return {
-      access: typeof ac === 'string' ? ac : null,
-      userId: typeof id === 'string' ? id : null,
-    };
-  } catch {
-    return { access: null, userId: null };
-  }
-}
-
 function decodeAccessFromToken(token: string): string | null {
   return decodeTokenClaims(token).access;
 }
@@ -87,6 +81,28 @@ export class AuthService<S extends SchemaStructure> {
   public isLoading: boolean = true;
 
   private events = createAuthEventSystem();
+
+  /** The impersonation last announced, for change detection. */
+  private announcedImpersonation: ImpersonationInfo | null = null;
+  /** Target of an impersonation that just ended, until the client purges its
+   *  local bucket (see `consumeEndedImpersonation`). */
+  private endedImpersonationTarget: string | null = null;
+  private impersonationTimers = new ImpersonationTimers({
+    current: () => this.impersonation,
+    renew: () => this.renewImpersonation(),
+    stillActive: async () => {
+      const [row] = await this.remote.query<[unknown]>('RETURN fn::_00_impersonate::current()');
+      return row !== null && row !== undefined;
+    },
+    endedRemotely: async (reason) => {
+      this.logger.warn(
+        { reason, Category: 'sp00ky-client::AuthService::impersonation' },
+        'Impersonation ended on the server; returning to the admin session'
+      );
+      await this.stopImpersonating({ serverEnded: true });
+    },
+    isNetworkError: (error) => classifySyncError(error) === 'network',
+  });
 
   public get eventSystem() {
     return this.events;
@@ -127,6 +143,160 @@ export class AuthService<S extends SchemaStructure> {
   private notifyListeners() {
     const userId = this.currentUser?.id || null;
     this.events.emit(AuthEventTypes.AuthStateChanged, userId);
+    const impersonation = this.impersonation;
+    if (!sameImpersonation(impersonation, this.announcedImpersonation)) {
+      this.announcedImpersonation = impersonation;
+      this.events.emit(AuthEventTypes.ImpersonationChanged, impersonation);
+    }
+    this.impersonationTimers.sync();
+  }
+
+  /**
+   * The impersonation the current session is, or null. Derived from the
+   * token in use, so it always describes the identity the server sees.
+   */
+  get impersonation(): ImpersonationInfo | null {
+    return this.isAuthenticated ? impersonationFromToken(this.token) : null;
+  }
+
+  /** Subscribe to impersonation changes; called immediately with the current value. */
+  subscribeImpersonation(cb: (info: ImpersonationInfo | null) => void): () => void {
+    cb(this.impersonation);
+    const id = this.events.subscribe(AuthEventTypes.ImpersonationChanged, (event) => {
+      cb(event.payload);
+    });
+    return () => {
+      this.events.unsubscribe(id);
+    };
+  }
+
+  /**
+   * Act as `targetId` (a record id such as `user:abc`). Admins only, and only
+   * when the project enabled `impersonation` in sp00ky.yml: the server refuses
+   * everything else. `reason` is recorded in the audit log.
+   *
+   * The admin's session is kept aside and restored by
+   * {@link stopImpersonating}. Local data switches to the target's bucket
+   * exactly as on a sign-in, and that bucket is removed on stop.
+   */
+  async impersonate(targetId: string, reason: string): Promise<ImpersonationInfo> {
+    if (this.impersonation) throw new Error('Already impersonating; stop first.');
+    if (!this.isAuthenticated || !this.token) throw new Error('Sign in as an admin first.');
+    const originToken = this.token;
+    const [started] = await this.remote.query<[{ token: string }]>(
+      'RETURN fn::_00_impersonate::start($target, $reason)',
+      { target: targetId, reason }
+    );
+    if (!started?.token) throw new Error('The server did not return an impersonation token.');
+
+    await this.persistenceClient.set(ORIGIN_TOKEN_KEY, originToken);
+    try {
+      await this.remote.getClient().authenticate(started.token);
+    } catch (error) {
+      // The server refused the session it just issued (for example the
+      // target is an admin, or no longer exists). Nothing changed locally
+      // yet; put the admin's token back on the transport.
+      await this.persistenceClient.remove(ORIGIN_TOKEN_KEY);
+      this.remote.setAuthToken(originToken);
+      await this.remote.getClient().authenticate(originToken).catch(() => undefined);
+      throw error;
+    }
+    await this.check(started.token);
+    // A method call, not the getter: TS narrowed the getter to null above.
+    const info = impersonationFromToken(this.isAuthenticated ? this.token : null);
+    if (!info) {
+      await this.stopImpersonating();
+      throw new Error('Impersonation could not be established.');
+    }
+    this.logger.info(
+      { target: info.target, session: info.session, Category: 'sp00ky-client::AuthService::impersonate' },
+      'Impersonation started'
+    );
+    return info;
+  }
+
+  /**
+   * Return to the admin session. Always leaves the impersonated identity,
+   * even when the server cannot be reached: the admin token is restored
+   * locally first and verified afterwards, and a rejected admin token ends in
+   * a full sign-out rather than staying on the target.
+   */
+  async stopImpersonating(opts: { serverEnded?: boolean } = {}): Promise<void> {
+    const info = this.impersonation;
+    if (!info) return;
+    this.impersonationTimers.clear();
+    if (!opts.serverEnded) {
+      try {
+        await this.remote.query('RETURN fn::_00_impersonate::stop($session)', { session: info.session });
+      } catch (error) {
+        // The token expires on its own; the local switch below is what matters.
+        this.logger.warn(
+          { error, Category: 'sp00ky-client::AuthService::stopImpersonating' },
+          'Could not end the impersonation session on the server'
+        );
+      }
+    }
+    this.endedImpersonationTarget = info.target;
+    const origin = await this.persistenceClient.get<string>(ORIGIN_TOKEN_KEY);
+    await this.persistenceClient.remove(ORIGIN_TOKEN_KEY);
+    if (!origin || impersonationFromToken(origin)) {
+      await this.signOut();
+      return;
+    }
+    const { access, userId } = decodeTokenClaims(origin);
+    if (!userId) {
+      await this.signOut();
+      return;
+    }
+    // Optimistic switch back, as a warm boot does, then verify.
+    this.token = origin;
+    this.remote.setAuthToken(origin);
+    this.currentUser = { id: userId };
+    this.access = access ?? this.defaultAccessName();
+    await this.persistenceClient.set('sp00ky_auth_token', origin);
+    this.notifyListeners();
+    await this.check(origin);
+    this.logger.info(
+      { target: info.target, Category: 'sp00ky-client::AuthService::stopImpersonating' },
+      'Impersonation stopped'
+    );
+  }
+
+  /** Re-sign the impersonation token before it expires. */
+  async renewImpersonation(): Promise<void> {
+    if (!this.impersonation) return;
+    const [renewed] = await this.remote.query<[{ token: string }]>('RETURN fn::_00_impersonate::renew()');
+    if (!renewed?.token) throw new Error('Impersonation renewal returned no token.');
+    this.remote.setAuthToken(renewed.token);
+    await this.remote.getClient().authenticate(renewed.token);
+    this.token = renewed.token;
+    await this.persistenceClient.set('sp00ky_auth_token', renewed.token);
+    this.notifyListeners();
+  }
+
+  /** Users an admin may pick from. Admin-only on the server. */
+  async searchImpersonationTargets(search: string): Promise<ImpersonationCandidate[]> {
+    const [rows] = await this.remote.query<[ImpersonationCandidate[]]>(
+      'RETURN fn::_00_impersonate::list_users($search)',
+      { search }
+    );
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  /** Open impersonation sessions. Admin-only on the server. */
+  async listActiveImpersonations(): Promise<ActiveImpersonation[]> {
+    const [rows] = await this.remote.query<[ActiveImpersonation[]]>('RETURN fn::_00_impersonate::active()');
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  /**
+   * The target of an impersonation that ended, once. The bucket switch calls
+   * this after leaving a bucket so it can delete that user's local data.
+   */
+  consumeEndedImpersonation(): string | null {
+    const target = this.endedImpersonationTarget;
+    this.endedImpersonationTarget = null;
+    return target;
   }
 
   /**
@@ -178,8 +348,9 @@ export class AuthService<S extends SchemaStructure> {
   async check(accessToken?: string) {
     this.isLoading = true;
 
+    let token: string | undefined;
     try {
-      const token = accessToken || (await this.persistenceClient.get<string>('sp00ky_auth_token'));
+      token = accessToken || (await this.persistenceClient.get<string>('sp00ky_auth_token')) || undefined;
 
       if (!token) {
         this.logger.debug(
@@ -236,7 +407,7 @@ export class AuthService<S extends SchemaStructure> {
             { Category: 'sp00ky-client::AuthService::check' },
             'Token valid but user not found via fallback'
           );
-          await this.signOut();
+          await this.rejectToken(token);
         }
       }
     } catch (error) {
@@ -255,7 +426,7 @@ export class AuthService<S extends SchemaStructure> {
           { error, stack: (error as Error).stack, Category: 'sp00ky-client::AuthService::check' },
           'Auth check failed'
         );
-        await this.signOut();
+        await this.rejectToken(token);
       }
     } finally {
       this.isLoading = false;
@@ -263,9 +434,42 @@ export class AuthService<S extends SchemaStructure> {
   }
 
   /**
-   * Sign out and clear session
+   * The server refused `token`. A refused impersonation token (stopped,
+   * expired, or revoked) returns to the admin session instead of signing the
+   * admin out; anything else signs out.
+   */
+  private async rejectToken(token: string | undefined): Promise<void> {
+    if (token && impersonationFromToken(token)) {
+      if (!this.impersonation || this.token !== token) {
+        // A boot or explicit check with an impersonation token that is not
+        // the session in memory yet: adopt it so stop has something to leave.
+        this.token = token;
+        this.isAuthenticated = true;
+      }
+      await this.stopImpersonating({ serverEnded: true });
+      return;
+    }
+    await this.signOut();
+  }
+
+  /**
+   * Sign out and clear session. While impersonating this ends the
+   * impersonation and signs the admin out too.
    */
   async signOut() {
+    const impersonating = this.impersonation;
+    this.impersonationTimers.clear();
+    if (impersonating) {
+      this.endedImpersonationTarget = impersonating.target;
+      try {
+        await this.remote.query('RETURN fn::_00_impersonate::stop($session)', {
+          session: impersonating.session,
+        });
+      } catch (_e) {
+        // The token expires on its own.
+      }
+    }
+    await this.persistenceClient.remove(ORIGIN_TOKEN_KEY);
     this.token = null;
     this.remote.setAuthToken(null);
     this.currentUser = null;

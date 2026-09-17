@@ -172,6 +172,11 @@ async fn run() -> Result<()> {
         .merge(proxy_router)
         .merge(metrics_router)
         .merge(backup_router)
+        .merge(scheduler::impersonation::create_impersonation_router(
+            scheduler::impersonation::ImpersonationState::from_env(std::sync::Arc::clone(
+                &scheduler.db_slot,
+            )),
+        ))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(http_timeout_secs),

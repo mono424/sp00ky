@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod impersonation;
 pub mod snapshot_hash;
 
 /// Storage mode for the SSP's per-query reference tables (`_00_query`,

@@ -31,6 +31,7 @@ pub mod heartbeat;
 pub mod schedule_engine;
 pub mod drift;
 pub mod changefeed;
+pub mod impersonation;
 
 use anyhow::{Context, Result};
 

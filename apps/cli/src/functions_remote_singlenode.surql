@@ -19,9 +19,12 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
     -- predicate. Predicates like `published = true OR $access = "account"
     -- AND author.id = $auth.id` evaluate to "only published rows" if
     -- $access is missing — invisible-by-default for record-access users.
+    -- An impersonated session authenticates through `_00_impersonate`; its
+    -- token carries the target's own access method so the SSP resolves
+    -- `$access` in permission predicates the way it would for that user.
     LET $params_with_auth = object::extend($params_in, {
         auth: { id: <string>($auth.id OR '') },
-        access: <string>($access OR '')
+        access: <string>($token.spky_as_access OR $access OR '')
     });
     -- User-scoped identity for the registration. The SSP propagates
     -- this onto each `_00_list_ref` row so the table's permission

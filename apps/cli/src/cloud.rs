@@ -1527,8 +1527,12 @@ fn apply_remote_fns_and_internal_schema(
             String::new()
         });
 
-    let functions_sql =
-        crate::schema_builder::build_remote_functions_schema(&mode, &fn_endpoint, &auth_secret);
+    let functions_sql = crate::schema_builder::build_remote_functions_schema(
+        &mode,
+        &fn_endpoint,
+        &auth_secret,
+        &config.impersonation(),
+    );
     if let Err(e) = crate::migrate::apply_remote_functions_if_changed(&surreal_client, &functions_sql)
     {
         println!("  ▸ Warning: failed to apply remote functions: {:?}", e);
@@ -3071,10 +3075,15 @@ pub fn deploy(
         .and_then(|d| d.env.clone())
         .unwrap_or_default();
     let sync = config.sync();
-    if sync.needs_infra_env() || !infra_env_map.is_empty() {
+    // `impersonation.enabled` switches the mint route on in both containers.
+    // Sent whenever it is on; when it is off it rides along only if the map is
+    // sent anyway. A control plane that keeps an old "on" is harmless: the
+    // disabled deploy removed the functions that are its only caller.
+    let impersonation = config.impersonation();
+    if sync.needs_infra_env() || impersonation.enabled() || !infra_env_map.is_empty() {
         for role in ["scheduler", "ssp"] {
             let entry = infra_env_map.entry(role.to_string()).or_default();
-            for (k, v) in sync.infra_env() {
+            for (k, v) in sync.infra_env().into_iter().chain(impersonation.infra_env()) {
                 entry.entry(k).or_insert(v);
             }
         }
@@ -5793,10 +5802,13 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                     } else {
                         docker_alias_endpoint(&mode)
                     };
+                    // No secret on this path, so impersonation renders its
+                    // removal block; the next full deploy restores it.
                     let functions_sql = crate::schema_builder::build_remote_functions_schema(
                         &mode,
                         &fn_endpoint,
                         "",
+                        &config.impersonation(),
                     );
                     // Raw execute (not apply_remote_functions_if_changed) on
                     // purpose: `/backups/reset` wipes the DB and this flow does

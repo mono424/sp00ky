@@ -236,6 +236,23 @@ export class SqliteCacheEngine implements LocalStore {
     throw new Error('SqliteCacheEngine has no SurrealDB client (getClient is unavailable).');
   }
 
+  /**
+   * See `LocalStore.dropBucket`. Each bucket is its own OPFS SAH pool, whose
+   * directory sqlite-wasm names `.<pool name>` (`sp00ky-<bucket>`, see
+   * sqlite-open.ts). Fails harmlessly while a worker still holds its handles.
+   */
+  async dropBucket(bucketId: string): Promise<void> {
+    if (bucketId === this.bucketId) throw new Error('Cannot drop the open bucket.');
+    const storage = typeof navigator !== 'undefined' ? navigator.storage : undefined;
+    if (!storage?.getDirectory) return;
+    const root = await storage.getDirectory();
+    try {
+      await root.removeEntry(`.sp00ky-${bucketId}`, { recursive: true });
+    } catch (error) {
+      if ((error as DOMException)?.name !== 'NotFoundError') throw error;
+    }
+  }
+
   /** LocalStore alias; SQLite has no in-flight gate, so this maps to a rebuild. */
   switchStore(bucketId: string): Promise<void> {
     return this.switchBucket(bucketId);

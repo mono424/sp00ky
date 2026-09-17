@@ -14,7 +14,12 @@ export interface DevToolsEvent {
 }
 
 import type { QueryState, QueryTimings } from '../../types';
-import type { AuthService } from '../auth/index';
+import type {
+  AuthService,
+  ActiveImpersonation,
+  ImpersonationCandidate,
+  ImpersonationInfo,
+} from '../auth/index';
 import { AuthEventTypes } from '../auth/events/index';
 import {
   type BackendInfo,
@@ -42,6 +47,19 @@ export interface DevToolsQuerySource {
   getActiveQueries(): QueryState[];
   getQueryById(id: RecordId<string>): QueryState | undefined;
   phaseTimings(q: QueryState): QueryTimings;
+}
+
+export type ImpersonationOp = 'status' | 'listUsers' | 'start' | 'stop';
+
+export interface ImpersonationOpResult {
+  success: boolean;
+  error?: string;
+  /** Whether the generated schema says the project enabled impersonation. */
+  enabled?: boolean;
+  isAdmin?: boolean;
+  current?: ImpersonationInfo | null;
+  active?: ActiveImpersonation[];
+  users?: ImpersonationCandidate[];
 }
 
 export class DevToolsService implements StreamUpdateReceiver {
@@ -400,6 +418,7 @@ export class DevToolsService implements StreamUpdateReceiver {
       auth: {
         authenticated: this.authService.isAuthenticated,
         userId: this.authService.currentUser?.id,
+        impersonation: this.authService.impersonation,
       },
       version: this.version,
       versions: {
@@ -429,6 +448,51 @@ export class DevToolsService implements StreamUpdateReceiver {
         tabs: this.tabsInfoProvider?.() ?? null,
       },
     });
+  }
+
+  /**
+   * The Access tab's impersonation controls. Errors come back as
+   * `{ success: false, error }` with the server's own message, so the panel
+   * can show why (not an admin, feature disabled, target is an admin).
+   */
+  public async impersonationOp(
+    op: ImpersonationOp,
+    args: Record<string, unknown>
+  ): Promise<ImpersonationOpResult> {
+    const enabled = this.schema.policy?.impersonation === true;
+    try {
+      switch (op) {
+        case 'status': {
+          const current = this.authService.impersonation;
+          const snapshot = await this.flagsAdmin.getFlags().catch(() => null);
+          const isAdmin = snapshot?.isAdmin === true;
+          const active =
+            enabled && isAdmin && !current
+              ? await this.authService.listActiveImpersonations().catch(() => [])
+              : [];
+          return this.serializeForDevTools({ success: true, enabled, isAdmin, current, active });
+        }
+        case 'listUsers':
+          return this.serializeForDevTools({
+            success: true,
+            users: await this.authService.searchImpersonationTargets(String(args.search ?? '')),
+          });
+        case 'start': {
+          const current = await this.authService.impersonate(
+            String(args.target ?? ''),
+            String(args.reason ?? '')
+          );
+          return this.serializeForDevTools({ success: true, current });
+        }
+        case 'stop':
+          await this.authService.stopImpersonating();
+          return { success: true, current: null };
+        default:
+          return { success: false, error: `Unknown impersonation op: ${String(op)}` };
+      }
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   /**
@@ -631,6 +695,12 @@ export class DevToolsService implements StreamUpdateReceiver {
         // are denied outright. The override methods are purely local and
         // work signed out.
         getFlags: () => this.flagsAdmin.getFlags(),
+        // ---- Impersonation (Access tab) --------------------------------
+        // Every op is authorized by SurrealDB (`fn::_00_impersonate::*` are
+        // admin-only and absent unless the project enabled the feature);
+        // nothing here grants anything.
+        impersonationOp: (op: ImpersonationOp, args?: Record<string, unknown>) =>
+          this.impersonationOp(op, args ?? {}),
         setFlagEnabled: (key: string, enabled: boolean) =>
           this.flagsAdmin.setFlagEnabled(key, enabled),
         setFlagUserVariant: (key: string, variant: string, remove: boolean, userId?: string) =>

@@ -5,7 +5,7 @@ import { fakeServices } from '../testing/services';
 import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import * as R from '../state/reducers';
 import { defaultEnv } from '../query/env';
-import { bucketSwitch, rebindQueries } from './bucket-switch.saga';
+import { bucketSwitch, dropImpersonatedBucket, rebindQueries } from './bucket-switch.saga';
 
 const env = defaultEnv({ tables: [] } as any);
 const base = (over: Partial<ReturnType<typeof buildState>> = {}) => ({ ...buildState(), pendingBucket: 'u2', bucketId: 'u1', ...over });
@@ -57,6 +57,7 @@ describe('bucketSwitch', () => {
       'auth.sessionAuthId',
       'auth.access',
       'ssp.setSessionAuth',
+      'auth.consumeEndedImpersonation',
       'auth.token',
       'persistence.set',
     ]);
@@ -125,6 +126,34 @@ describe('bucketSwitch', () => {
     });
     await expect(runPure(bucketSwitch(env, 'u2', () => void (released = true)), { state: base(), handlers: { service: svc.handler } })).rejects.toThrow('disk');
     expect(released).toBe(true);
+  });
+});
+
+describe('dropImpersonatedBucket', () => {
+  it('drops the bucket it just left when that was the impersonated user', async () => {
+    const svc = fakeServices({ 'auth.consumeEndedImpersonation': () => 'user:bob' });
+    await runPure(dropImpersonatedBucket('bob'), { state: buildState(), handlers: { service: svc.handler } });
+    expect(svc.calls).toEqual([
+      ['auth.consumeEndedImpersonation', []],
+      ['local.dropBucket', ['bob']],
+    ]);
+  });
+  it('leaves every other bucket alone', async () => {
+    for (const [ended, left] of [[null, 'bob'], ['user:bob', 'alice'], ['user:bob', 'anon']] as const) {
+      const svc = fakeServices({ 'auth.consumeEndedImpersonation': () => ended });
+      await runPure(dropImpersonatedBucket(left), { state: buildState(), handlers: { service: svc.handler } });
+      expect(svc.names()).toEqual(['auth.consumeEndedImpersonation']);
+    }
+  });
+  it('logs a failed delete instead of failing the switch', async () => {
+    const svc = fakeServices({
+      'auth.consumeEndedImpersonation': () => 'user:bob',
+      'local.dropBucket': async () => {
+        throw new Error('handles still open');
+      },
+    });
+    const out = await runPure(dropImpersonatedBucket('bob'), { state: buildState(), handlers: { service: svc.handler } });
+    expect(out.emitted.filter((e) => e.type === 'log')).toHaveLength(1);
   });
 });
 

@@ -202,6 +202,29 @@
     }
   });
 
+  // Impersonation (Access tab). Same shape as SP00KY_FLAG_OP. The page's core
+  // answers `{ success, error, ... }` itself; authorization happens in
+  // SurrealDB, so this only relays.
+  window.addEventListener('SP00KY_IMPERSONATE_OP', async (event: any) => {
+    const { requestId, op, args } = event.detail;
+    const sp00ky = (window as any).__00__;
+    const respond = (payload: { success: boolean; data?: any; error?: string }) => {
+      window.postMessage(
+        { type: 'SP00KY_IMPERSONATE_RESPONSE', source: 'sp00ky-devtools-page', requestId, ...payload },
+        '*'
+      );
+    };
+    if (typeof sp00ky?.impersonationOp !== 'function') {
+      respond({ success: false, error: 'impersonation is not supported by this core version' });
+      return;
+    }
+    try {
+      respond({ success: true, data: await sp00ky.impersonationOp(op, args || {}) });
+    } catch (err: any) {
+      respond({ success: false, error: err?.message || String(err) });
+    }
+  });
+
   // Try immediately, then fast retries, then long-tail fallback
   if (!checkForSp00ky()) {
     // Fast retries for normal case

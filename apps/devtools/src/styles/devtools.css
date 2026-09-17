@@ -3135,3 +3135,76 @@ body {
   background: var(--sys-color-primary-container);
   border-color: var(--sys-color-primary);
 }
+
+/* ---- Access tab: impersonation ---------------------------------------- */
+.impersonation-active,
+.impersonation-warning {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sys-spacing-2);
+  padding: var(--sys-spacing-3);
+  border: 1px solid var(--sys-color-error);
+  border-left-width: 4px;
+  border-radius: var(--sys-radius-sm);
+  background: color-mix(in srgb, var(--sys-color-error) 10%, transparent);
+}
+.impersonation-warning {
+  margin: var(--sys-spacing-2) 0;
+}
+.btn.impersonation-stop {
+  align-self: flex-start;
+  border-color: var(--sys-color-error);
+  color: var(--sys-color-error);
+}
+.impersonation-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin: var(--sys-spacing-2) 0;
+}
+.impersonation-results {
+  display: flex;
+  flex-direction: column;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--sys-color-divider);
+  border-radius: var(--sys-radius-sm);
+}
+.impersonation-user {
+  display: flex;
+  align-items: center;
+  gap: var(--sys-spacing-2);
+  padding: var(--sys-spacing-2);
+  border: 0;
+  border-bottom: 1px solid var(--sys-color-divider);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.impersonation-user:last-child {
+  border-bottom: 0;
+}
+.impersonation-user:hover:not(:disabled) {
+  background: var(--sys-color-state-hover);
+}
+.impersonation-user.selected {
+  background: var(--sys-color-state-focus, var(--sys-color-state-hover));
+}
+.impersonation-user:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.impersonation-tag {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: var(--sys-radius-sm);
+  border: 1px solid currentColor;
+  font-size: 11px;
+}
+.impersonation-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sys-spacing-2);
+  margin-top: var(--sys-spacing-3);
+}

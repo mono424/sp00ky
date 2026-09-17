@@ -47,6 +47,7 @@ export { createQuery, useQuery, type CreateQueryResult, type QueryOptions } from
 export { createPreload } from './lib/create-preload';
 export type { PreloadOptions, PreloadRefresh } from '@spooky-sync/core';
 export { useSyncStatus, type UseSyncStatus } from './lib/use-sync-status';
+export { useImpersonation, type UseImpersonation } from './lib/use-impersonation';
 export {
   useSyncActivity,
   type UseSyncActivity,

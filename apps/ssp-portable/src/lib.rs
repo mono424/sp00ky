@@ -233,6 +233,7 @@ fn build_node(
         view_metrics: Arc::new(RwLock::new(HashMap::new())),
         edge_update_tx,
         anonymous_live_queries: false,
+        impersonation: false,
         query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(ssp::allowlist::Mode::Off)),
         standalone: true,
         // No schedule engine: this shell has no job runner wired (`_job_rx` is

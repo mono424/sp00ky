@@ -951,6 +951,20 @@ pub fn apply_internal_schema(
     ui::detail(format!("{} per-table events", event_count));
     internal_sql.push_str(&sp00ky_events);
 
+    // 3b''. Impersonation audit events. Emitted in both states: enabled
+    // defines them, disabled removes any left from an earlier deploy.
+    let impersonation = crate::backend::impersonation_settings_for(config_path);
+    impersonation.validate()?;
+    let audit_on = impersonation.enabled() && *mode != DeployMode::Surrealism;
+    if audit_on {
+        ui::detail("impersonation audit events");
+    }
+    internal_sql.push('\n');
+    internal_sql.push_str(&crate::schema_builder::build_impersonation_audit_events(
+        crate::schema_builder::audited_tables(&parser),
+        audit_on,
+    ));
+
     // 3b'. The CHANGEFEED clause on every synced user table. ALTER, not
     // DEFINE: it keeps whatever the user's migration defined and is
     // idempotent, so it can run after every migration batch, which is when

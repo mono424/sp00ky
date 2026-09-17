@@ -84,10 +84,14 @@ impl MigrationEngine for Sp00kyEngine {
         // 2. Remote functions (if configured) — skipped when unchanged.
         if let Some(ref rf) = self.remote_functions {
             let client = self.make_client();
+            let impersonation = crate::backend::impersonation_settings_for(
+                self.internal_schema.as_ref().and_then(|is| is.config_path.as_deref()),
+            );
             let sql = crate::schema_builder::build_remote_functions_schema(
                 &rf.deploy_mode,
                 &rf.endpoint,
                 &rf.secret,
+                &impersonation,
             );
             crate::migrate::apply_remote_functions_if_changed(&client, &sql)?;
         }

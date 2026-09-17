@@ -3,6 +3,7 @@ import { useDevTools } from '../../context/DevToolsContext';
 import { JsonView } from '../ui/JsonView';
 import { formatTime, formatRelativeTime } from '../../utils/formatters';
 import type { FlagRow } from '../../types/devtools';
+import { ImpersonationSection } from './ImpersonationSection';
 
 /**
  * Everything about *who this browser is* and *what it is allowed to see*: the
@@ -164,6 +165,8 @@ export function AccessTab() {
           </div>
         </div>
       </div>
+
+      <ImpersonationSection />
 
       {/* ---- Flags ------------------------------------------------------ */}
       <div class="mcp-section">

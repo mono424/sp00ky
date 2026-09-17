@@ -85,6 +85,11 @@ pub enum RouteId {
     JobKill,
     JobRetry,
     JobRecover,
+    /// Sign an admin impersonation token (`ssp_protocol::impersonation`).
+    /// Called by `fn::_00_impersonate::*` with the shared bearer.
+    ImpersonateMint,
+    /// Root-backed user search for the impersonation picker.
+    ImpersonateUsers,
     // -- standalone maintenance plane (authenticated) --
     BackendsUpdate,
     BackupCreate,
@@ -121,6 +126,8 @@ impl RouteId {
             (Post, ["job", "kill"]) => RouteId::JobKill,
             (Post, ["job", "retry"]) => RouteId::JobRetry,
             (Post, ["job", "recover"]) => RouteId::JobRecover,
+            (Post, ["impersonate", "mint"]) => RouteId::ImpersonateMint,
+            (Post, ["impersonate", "users"]) => RouteId::ImpersonateUsers,
             (Put, ["backends"]) => RouteId::BackendsUpdate,
             (Post, ["backup", "create"]) => RouteId::BackupCreate,
             (Get, ["backup", "status"]) => RouteId::BackupStatus,
@@ -160,6 +167,7 @@ mod tests {
             (Method::Get, "/debug/heartbeat", RouteId::DebugHeartbeat),
             (Method::Get, "/debug/memory", RouteId::DebugMemory),
             (Method::Put, "/backends", RouteId::BackendsUpdate),
+            (Method::Post, "/impersonate/mint", RouteId::ImpersonateMint),
             (Method::Get, "/backup/status/b1", RouteId::BackupStatusById { backup_id: "b1".into() }),
             (Method::Get, "/backup/restore/status/r1", RouteId::BackupRestoreStatusById { restore_id: "r1".into() }),
             (Method::Get, "/health", RouteId::Health),
@@ -177,6 +185,7 @@ mod tests {
         assert!(RouteId::Ingest.requires_auth());
         assert!(RouteId::BackupCreate.requires_auth());
         assert!(RouteId::DebugHeartbeat.requires_auth());
+        assert!(RouteId::ImpersonateMint.requires_auth());
         assert!(!RouteId::Health.requires_auth());
         assert!(!RouteId::Version.requires_auth());
     }

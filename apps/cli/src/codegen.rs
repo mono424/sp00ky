@@ -35,6 +35,9 @@ pub struct CodeGenerator {
     /// `sync.queryAllowlist` of the manifest, emitted as `schema.policy` so the
     /// client SDK can gate its raw-remote escape hatches to match the SSP.
     query_allowlist: crate::backend::QueryAllowlistMode,
+    /// `impersonation.enabled`, emitted as `schema.policy.impersonation` so the
+    /// DevTools only offer impersonation where the server supports it.
+    impersonation: bool,
 }
 
 impl CodeGenerator {
@@ -44,7 +47,13 @@ impl CodeGenerator {
             include_header,
             include_modules,
             query_allowlist: crate::backend::QueryAllowlistMode::Off,
+            impersonation: false,
         }
+    }
+
+    pub fn with_impersonation(mut self, enabled: bool) -> Self {
+        self.impersonation = enabled;
+        self
     }
 
     pub fn with_query_allowlist(mut self, mode: crate::backend::QueryAllowlistMode) -> Self {
@@ -579,6 +588,7 @@ impl CodeGenerator {
             "    queryAllowlist: '{}' as const,",
             self.query_allowlist.as_str()
         ));
+        tables_lines.push(format!("    impersonation: {} as const,", self.impersonation));
         tables_lines.push("  },".to_string());
         tables_lines.push("} as const;".to_string());
         tables_lines.push("".to_string());

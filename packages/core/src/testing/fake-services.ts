@@ -24,7 +24,7 @@ export function fakeServiceBundle<S extends SchemaStructure>(over: Partial<Servi
     streamProcessor: { addReceiver: (r: unknown) => void receivers.push(r), checkpoint: async () => undefined, dispose: noop } as any,
     migrator: {} as any,
     crdt: { closeAll: noop, dispose: noop, open: async () => 'field', close: noop } as any,
-    auth: { subscribe: (cb: (u: string | null) => void) => (authListeners.push(cb), noop), currentUser: null, isAuthenticated: false, eventSystem: { subscribe: noop } } as any,
+    auth: { subscribe: (cb: (u: string | null) => void) => (authListeners.push(cb), noop), subscribeImpersonation: () => noop, currentUser: null, isAuthenticated: false, impersonation: null, eventSystem: { subscribe: noop } } as any,
     tabs: null,
     tabsUnsupportedReason: 'test',
     tabId: 'tab-test',

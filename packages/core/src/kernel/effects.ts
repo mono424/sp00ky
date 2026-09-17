@@ -75,6 +75,7 @@ export interface ServiceCalls {
   'local.beginSwitch': () => () => void;
   'local.currentBucketId': () => string;
   'local.usesSurqlSchema': () => boolean;
+  'local.dropBucket': (bucketId: string) => Promise<void>;
   'migrator.provision': () => Promise<void>;
   'blobs.start': (bucketId: string) => Promise<void>;
   'blobs.setNamespace': (bucketId: string) => Promise<void>;
@@ -91,6 +92,7 @@ export interface ServiceCalls {
   'auth.access': () => string | null;
   'auth.token': () => string | null;
   'auth.currentUser': () => Record<string, unknown> | null;
+  'auth.consumeEndedImpersonation': () => string | null;
   'remote.connect': () => Promise<void>;
   'remote.releaseViews': (ids: unknown[]) => void;
   'supervisor.start': () => void;

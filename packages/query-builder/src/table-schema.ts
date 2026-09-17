@@ -185,10 +185,12 @@ export interface SchemaStructure {
    * generated `schema` constant. `queryAllowlist` mirrors `sync.queryAllowlist`:
    * `warn` / `enforce` mean the SSP only accepts query shapes collected at
    * `spky generate` time, so the client refuses raw remote calls unless
-   * `allowRawRemote` is set.
+   * `allowRawRemote` is set. `impersonation` mirrors `impersonation.enabled`;
+   * the server enforces it, the client only uses it to offer the feature.
    */
   readonly policy?: {
     readonly queryAllowlist?: 'off' | 'warn' | 'enforce';
+    readonly impersonation?: boolean;
   };
 }
 

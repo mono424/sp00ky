@@ -17,6 +17,8 @@ import {
   type QueryMark,
   type StorageInfo,
   type FlagsSnapshot,
+  type ImpersonationStatus,
+  type ImpersonationUser,
   type Sp00kyFrame,
 } from '../types/devtools';
 import { useChromeConnection } from '../hooks/useChromeConnection';
@@ -102,6 +104,14 @@ interface DevToolsContextValue {
   ) => Promise<void>;
   setFlagOverride: (key: string, variant: string | null) => Promise<void>;
   clearFlagOverrides: () => Promise<void>;
+  impersonation: () => ImpersonationStatus | null;
+  impersonationError: () => string | null;
+  /** True while a start/stop is in flight. */
+  isImpersonationBusy: () => boolean;
+  fetchImpersonation: () => Promise<void>;
+  searchImpersonationUsers: (search: string) => Promise<ImpersonationUser[]>;
+  startImpersonation: (target: string, reason: string) => Promise<boolean>;
+  stopImpersonation: () => Promise<void>;
 }
 
 /** Union of two table-name lists, preserving `a`'s order then appending new `b`. */
@@ -171,6 +181,10 @@ export const DevToolsProvider: ParentComponent = (props) => {
   const [flagsError, setFlagsError] = createSignal<string | null>(null);
   const [isFetchingFlags, setIsFetchingFlags] = createSignal(false);
   const [isMutatingFlag, setIsMutatingFlag] = createSignal<string | null>(null);
+  // Access tab, impersonation half: also an on-demand remote read.
+  const [impersonation, setImpersonation] = createSignal<ImpersonationStatus | null>(null);
+  const [impersonationError, setImpersonationError] = createSignal<string | null>(null);
+  const [isImpersonationBusy, setIsImpersonationBusy] = createSignal(false);
   const [mcpStatus, setMcpStatus] = createSignal<McpStatus>({ enabled: false, connected: false, port: 9315 });
 
   // Bumped by the toolbar Refresh when the Database tab is active. Read by
@@ -389,6 +403,7 @@ export const DevToolsProvider: ParentComponent = (props) => {
       case 'SP00KY_QUERY_RESPONSE':
       case 'SP00KY_STORAGE_INFO_RESPONSE':
       case 'SP00KY_FLAG_RESPONSE':
+      case 'SP00KY_IMPERSONATE_RESPONSE':
         settlePending(message as any);
         break;
 
@@ -410,6 +425,8 @@ export const DevToolsProvider: ParentComponent = (props) => {
         // store, so it's stale by definition. Drop it rather than render it.
         setFlagsSnapshot(null);
         setFlagsError(null);
+        setImpersonation(null);
+        setImpersonationError(null);
         setTimeout(() => {
           checkSp00ky();
         }, 500);
@@ -708,6 +725,7 @@ export const DevToolsProvider: ParentComponent = (props) => {
       bumpDbRefresh();
       void fetchStorageInfo();
       void fetchFlags();
+      void fetchImpersonation();
       sendMessage({ type: 'GET_MCP_STATUS' });
       return;
     }
@@ -749,8 +767,9 @@ export const DevToolsProvider: ParentComponent = (props) => {
         break;
       case 'access':
         // The session half rides the baseline getState(); the flag snapshot is
-        // a separate remote read.
+        // a separate remote read, as is the impersonation status.
         void fetchFlags();
+        void fetchImpersonation();
         break;
       case 'versions':
         refreshVersions(beginOp());
@@ -1130,23 +1149,26 @@ export const DevToolsProvider: ParentComponent = (props) => {
   };
 
   /**
-   * Dispatch a flag op into the page and await the correlated response.
+   * Dispatch an Access-tab op into the page and await the correlated response.
    *
-   * 30s, not the 15s storage budget or the 10s query one: a write calls
+   * 30s, not the 15s storage budget or the 10s query one: a flag write calls
    * `fn::feature::materialize`, which re-evaluates the flag for EVERY user and
-   * upserts a row each. That is O(users) server-side work in one statement.
+   * upserts a row each, and an impersonation start switches the page's whole
+   * local store. Both are long single operations.
    */
-  const flagOpRequest = (
-    op: 'list' | 'setEnabled' | 'setUserVariant' | 'setOverride' | 'clearOverrides',
+  const pageOpRequest = (
+    channel: 'flag' | 'impersonate',
+    op: string,
     args?: Record<string, unknown>
   ) => {
     return new Promise<any>((resolve, reject) => {
       const requestId = Math.random().toString(36).substring(7);
+      const label = channel === 'flag' ? 'Flag' : 'Impersonation';
 
       const timeoutId = setTimeout(() => {
         if (pendingQueries.has(requestId)) {
           pendingQueries.delete(requestId);
-          reject('Flag request timed out (30s)');
+          reject(`${label} request timed out (30s)`);
         }
       }, 30000);
 
@@ -1162,19 +1184,21 @@ export const DevToolsProvider: ParentComponent = (props) => {
       });
 
       if (!isMainFrame()) {
-        sendMessage({ type: 'FLAG_OP', payload: { op, requestId, args } } as any);
+        const type = channel === 'flag' ? 'FLAG_OP' : 'IMPERSONATE_OP';
+        sendMessage({ type, payload: { op, requestId, args } } as any);
         return;
       }
 
-      hostPage.flagOp(
-        op,
+      const dispatch = channel === 'flag' ? hostPage.flagOp : hostPage.impersonateOp;
+      dispatch(
+        op as never,
         requestId,
         args,
         (result) => {
           if (result && !result.success) {
             clearTimeout(timeoutId);
             pendingQueries.delete(requestId);
-            reject(result.error || 'Failed to dispatch flag event');
+            reject(result.error || `Failed to dispatch ${channel} event`);
           }
         },
         (err) => {
@@ -1184,6 +1208,73 @@ export const DevToolsProvider: ParentComponent = (props) => {
         }
       );
     });
+  };
+
+  const flagOpRequest = (
+    op: 'list' | 'setEnabled' | 'setUserVariant' | 'setOverride' | 'clearOverrides',
+    args?: Record<string, unknown>
+  ) => pageOpRequest('flag', op, args);
+
+  /** Impersonation ops answer `{ success, error }` inside `data`; unwrap it. */
+  const impersonateOpRequest = async (
+    op: 'status' | 'listUsers' | 'start' | 'stop',
+    args?: Record<string, unknown>
+  ): Promise<ImpersonationStatus & { users?: ImpersonationUser[] }> => {
+    const result = await pageOpRequest('impersonate', op, args);
+    if (!result?.success) throw new Error(result?.error || `Impersonation ${op} failed`);
+    return result;
+  };
+
+  const fetchImpersonation = async () => {
+    try {
+      const status = await impersonateOpRequest('status');
+      setImpersonation(status);
+      setImpersonationError(null);
+    } catch (e) {
+      setImpersonationError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const searchImpersonationUsers = async (search: string) => {
+    const result = await impersonateOpRequest('listUsers', { search });
+    return result.users ?? [];
+  };
+
+  const startImpersonation = async (target: string, reason: string) => {
+    if (isImpersonationBusy()) return false;
+    setIsImpersonationBusy(true);
+    try {
+      await impersonateOpRequest('start', { target, reason });
+      setImpersonationError(null);
+      return true;
+    } catch (e) {
+      setImpersonationError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setIsImpersonationBusy(false);
+      // Who the page is changed, so both halves of the tab are stale.
+      checkSp00ky();
+      void fetchImpersonation();
+      setFlagsSnapshot(null);
+      void fetchFlags();
+    }
+  };
+
+  const stopImpersonation = async () => {
+    if (isImpersonationBusy()) return;
+    setIsImpersonationBusy(true);
+    try {
+      await impersonateOpRequest('stop');
+      setImpersonationError(null);
+    } catch (e) {
+      setImpersonationError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsImpersonationBusy(false);
+      checkSp00ky();
+      void fetchImpersonation();
+      setFlagsSnapshot(null);
+      void fetchFlags();
+    }
   };
 
   const fetchFlags = async () => {
@@ -1445,6 +1536,13 @@ export const DevToolsProvider: ParentComponent = (props) => {
     setFlagUserVariant,
     setFlagOverride,
     clearFlagOverrides,
+    impersonation,
+    impersonationError,
+    isImpersonationBusy,
+    fetchImpersonation,
+    searchImpersonationUsers,
+    startImpersonation,
+    stopImpersonation,
   };
 
   return <DevToolsContext.Provider value={contextValue}>{props.children}</DevToolsContext.Provider>;

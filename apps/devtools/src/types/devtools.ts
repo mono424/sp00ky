@@ -287,6 +287,30 @@ export interface FlagOverride {
   payload?: unknown;
 }
 
+/** Mirrors core's `ImpersonationInfo`; dates arrive serialized. */
+export interface ImpersonationInfo {
+  session: string;
+  target: string;
+  admin: string;
+  tokenExpiresAt: string | null;
+}
+
+/** `window.__00__.impersonationOp('status')`. */
+export interface ImpersonationStatus {
+  /** The generated schema says the project enabled impersonation. */
+  enabled?: boolean;
+  isAdmin?: boolean;
+  current?: ImpersonationInfo | null;
+  active?: Array<{ session: string; target: string; admin: string; reason: string; expires_at: string }>;
+}
+
+/** A row of the user picker. Extra fields are the project's `searchFields`. */
+export interface ImpersonationUser {
+  id: string;
+  is_admin: boolean;
+  [field: string]: unknown;
+}
+
 export interface FlagsSnapshot {
   at: number;
   userId: string | null;

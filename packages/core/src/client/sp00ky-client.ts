@@ -54,6 +54,7 @@ import { DEGRADE_AFTER_FAILURES, OUTBOX_BATCH_SIZE, PUSH_TIMEOUT_MS } from '../k
 import { Runtime } from './runtime';
 import { createAdapters, createServices, createTabsCoordinator, type ServiceHost, type Services } from './services';
 import { BucketHandle } from './bucket-handle';
+import { ImpersonationBanner } from '../modules/auth/impersonation-banner';
 import type { LeaderSyncHub, SyncForwarder } from '../services/tabs/coordinator';
 
 const UNKNOWN_STORAGE_HEALTH: StorageHealth = Object.freeze({ status: 'unknown', fallback: false });
@@ -78,6 +79,8 @@ export class Sp00kyClient<S extends SchemaStructure> {
   private readonly runtime: Runtime;
   private readonly featureFlags: FeatureFlagModule<S>;
   private readonly appReleases: AppReleaseModule<S>;
+  /** Teardown for subscriptions the client itself owns. */
+  private readonly disposers: Array<() => void> = [];
   private readonly devTools: DevToolsService;
   private hub: LeaderSyncHub | null = null;
   private forwarder: SyncForwarder | null = null;
@@ -174,6 +177,10 @@ export class Sp00kyClient<S extends SchemaStructure> {
     s.streamProcessor.addReceiver(receiver);
     s.connectionSupervisor.subscribe((state) => void this.runtime.dispatch({ type: 'ConnectionChanged', state }));
     s.auth.subscribe((userId) => void this.runtime.dispatch({ type: 'AuthFlip', userId }));
+    // The impersonation banner is not optional: whoever is looking at the page
+    // must be able to tell, and leave, whatever the app renders.
+    const banner = new ImpersonationBanner(() => s.auth.stopImpersonating());
+    this.disposers.push(s.auth.subscribeImpersonation((info) => banner.update(info)), () => banner.unmount());
     this.runtime.on('tabs:broadcast', (e) => {
       if (e.type !== 'tabs:broadcast') return;
       const msg = e.message as { type: string; records?: unknown[]; mutationId?: string };
@@ -224,6 +231,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
   async close(): Promise<void> {
     const s = this.services;
     s.connectionSupervisor.dispose();
+    for (const dispose of this.disposers.splice(0)) dispose();
     this.runtime.dispose();
     await this.featureFlags.closeAll();
     await this.appReleases.closeAll();

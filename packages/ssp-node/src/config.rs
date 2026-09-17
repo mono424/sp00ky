@@ -48,6 +48,10 @@ pub struct NodeConfig {
     /// dedicated `_00_list_ref_anon` table that anyone can SELECT, so a
     /// logged-out client's `_00_list_ref` poll can read its window.
     pub anonymous_live_queries: bool,
+    /// Sign admin impersonation tokens on `POST /impersonate/mint`
+    /// (`ssp_protocol::impersonation`). Set by the CLI when `impersonation`
+    /// is enabled in sp00ky.yml. Env: `SPKY_IMPERSONATION`, default off.
+    pub impersonation: bool,
     /// Idle-to-active debounce (ms) for the bounded query-edge publisher.
     /// Queued work drains without per-item delays. `0` starts immediately.
     pub query_update_throttle_ms: u64,

@@ -249,6 +249,10 @@ await db.auth.signOut();
 const unsub = db.auth.subscribe((userId) => { ... });
 ```
 
+Admin impersonation (only when `impersonation.enabled` in sp00ky.yml; started from the
+DevTools Access tab, enforced by the server). The client renders its own warning bar with a
+Stop button; `useImpersonation()` returns `{ impersonation, isImpersonating, stop }` for extras.
+
 ## File Upload & Download
 
 See [references/file-hooks.md](references/file-hooks.md) for details.

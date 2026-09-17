@@ -151,6 +151,8 @@ struct HarnessOpts {
     circuit_store: Option<Arc<dyn ssp_node::CircuitStore>>,
     /// Wire the declarative-schedule engine (as a standalone VM node does).
     schedules: bool,
+    /// Serve `POST /impersonate/mint`.
+    impersonation: bool,
 }
 
 impl Default for HarnessOpts {
@@ -164,6 +166,7 @@ impl Default for HarnessOpts {
             query_allowlist: ssp::allowlist::Mode::Off,
             circuit_store: None,
             schedules: false,
+            impersonation: false,
         }
     }
 }
@@ -278,6 +281,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
         edge_update_tx: ssp_node::edges::EdgePublisher::default(),
         anonymous_live_queries: false,
+        impersonation: opts.impersonation,
         query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(opts.query_allowlist)),
         standalone: true,
         schedule_engine: opts.schedules.then(|| {
@@ -2412,4 +2416,88 @@ async fn allowlist_ingest_notification_reloads_immediately() {
     assert_eq!(c["refused"], 2);
     assert_eq!(allowlist_info(&h).await["counters"]["allowed_static"], 1);
     assert_eq!(query_row_count(&h).await, 1);
+}
+
+// ---------------------------------------------------------------------------
+// POST /impersonate/mint
+// ---------------------------------------------------------------------------
+
+fn mint_body() -> Value {
+    json!({
+        "session": "_00_impersonation:s1",
+        "target": "user:bob",
+        "admin": "user:alice",
+        "access": "account",
+        "ns": "test",
+        "db": "test",
+        "ttl_secs": 900,
+        "session_remaining_secs": 60,
+    })
+}
+
+#[tokio::test]
+async fn impersonate_mint_is_404_when_disabled() {
+    let h = build(HarnessOpts::default()).await;
+    let r = h.node.route(authed(Method::Post, "/impersonate/mint", mint_body())).await.unwrap();
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test]
+async fn impersonate_mint_requires_the_bearer() {
+    let h = build(HarnessOpts { impersonation: true, ..Default::default() }).await;
+    let r = h.node.route(req(Method::Post, "/impersonate/mint", Some("wrong"), mint_body())).await.unwrap();
+    assert_eq!(r.status, 401);
+    let r = h.node.route(req(Method::Post, "/impersonate/mint", None, mint_body())).await.unwrap();
+    assert_eq!(r.status, 401);
+}
+
+#[tokio::test]
+async fn impersonate_mint_signs_a_token_clamped_to_the_session() {
+    let h = build(HarnessOpts { impersonation: true, ..Default::default() }).await;
+    let r = h.node.route(authed(Method::Post, "/impersonate/mint", mint_body())).await.unwrap();
+    assert_eq!(r.status, 200);
+    let body = json_of(&r);
+    assert_eq!(body["token"].as_str().unwrap().split('.').count(), 3);
+    let now = ssp_node::now_epoch_ms() / 1000;
+    let exp = body["exp"].as_u64().unwrap();
+    assert!(exp <= now + 60 && exp + 5 >= now + 60, "exp {exp} not clamped to the session");
+}
+
+#[tokio::test]
+async fn impersonate_mint_rejects_a_self_impersonation() {
+    let h = build(HarnessOpts { impersonation: true, ..Default::default() }).await;
+    let mut body = mint_body();
+    body["target"] = json!("user:alice");
+    let r = h.node.route(authed(Method::Post, "/impersonate/mint", body)).await.unwrap();
+    assert_eq!(r.status, 400);
+}
+
+#[tokio::test]
+async fn impersonate_users_searches_with_root_access() {
+    let h = build(HarnessOpts { impersonation: true, ..Default::default() }).await;
+    h.raw_db
+        .query(
+            "CREATE user:alice SET username = 'alice', email = 'a@x.io';
+             CREATE user:bob SET username = 'bob', email = 'bob@x.io';
+             CREATE _00_admin:1 SET user = user:alice;",
+        )
+        .await
+        .unwrap();
+    let body = json!({ "table": "user", "fields": ["username", "email"], "search": "BOB", "limit": 10 });
+    let r = h.node.route(authed(Method::Post, "/impersonate/users", body)).await.unwrap();
+    assert_eq!(r.status, 200);
+    let rows = json_of(&r).as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], "user:bob");
+    assert_eq!(rows[0]["is_admin"], false);
+
+    let body = json!({ "table": "user", "fields": ["username"], "search": "", "limit": 10 });
+    let r = h.node.route(authed(Method::Post, "/impersonate/users", body)).await.unwrap();
+    let rows = json_of(&r).as_array().unwrap().clone();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|r| r["id"] == "user:alice" && r["is_admin"] == true), "{rows:?}");
+
+    let bad = json!({ "table": "user; REMOVE TABLE user", "fields": [], "search": "" });
+    let r = h.node.route(authed(Method::Post, "/impersonate/users", bad)).await.unwrap();
+    assert_eq!(r.status, 400);
 }

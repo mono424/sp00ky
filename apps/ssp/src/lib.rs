@@ -210,6 +210,9 @@ pub fn load_config() -> Config {
                 v == "1" || v == "true"
             })
             .unwrap_or(false),
+        impersonation: ssp_protocol::impersonation::env_enabled(
+            std::env::var(ssp_protocol::impersonation::ENV_FLAG).ok().as_deref(),
+        ),
         query_update_throttle_ms: std::env::var("SPKY_SSP_QUERY_UPDATE_THROTTLE_MS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1011,6 +1014,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         view_metrics: view_metrics.clone(),
         edge_update_tx: edge_update_tx.clone(),
         anonymous_live_queries: config.anonymous_live_queries,
+        impersonation: config.impersonation,
         query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(config.query_allowlist)),
         standalone: config.scheduler_url.is_none(),
         schedule_engine,

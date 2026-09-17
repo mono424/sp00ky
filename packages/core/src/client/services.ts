@@ -249,6 +249,9 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
     'local.beginSwitch': () => s.local.beginSwitch(),
     'local.currentBucketId': () => s.local.currentBucketId,
     'local.usesSurqlSchema': () => s.local.usesSurqlSchema,
+    'local.dropBucket': async (bucketId) => {
+      await s.local.dropBucket?.(bucketId);
+    },
     'migrator.provision': () => s.migrator.provision(config.schemaSurql),
     'blobs.start': async (bucketId) => {
       s.blobs.setMaxBytes(await resolveBlobBudget(config.blobCache?.maxBytes));
@@ -278,6 +281,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
     'auth.access': () => s.auth.access,
     'auth.token': () => s.auth.token,
     'auth.currentUser': () => (s.auth.currentUser as Record<string, unknown> | null) ?? null,
+    'auth.consumeEndedImpersonation': () => s.auth.consumeEndedImpersonation(),
     'remote.connect': () => s.remote.connect(),
     'remote.releaseViews': (ids) => {
       const list = ids

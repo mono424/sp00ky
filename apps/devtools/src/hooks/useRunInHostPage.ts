@@ -286,17 +286,19 @@ export function useRunInHostPage(
   };
 
   /**
-   * Feature flag read/write (Access tab). Same eval-dispatch-only contract as
-   * `storageOp`: page-script.ts awaits the async work and posts a
-   * SP00KY_FLAG_RESPONSE correlated by requestId.
+   * Dispatch a request/response op into the page (Access tab: feature flags,
+   * impersonation). Same eval-dispatch-only contract as `storageOp`:
+   * page-script.ts awaits the async work and posts a response correlated by
+   * requestId.
    *
-   * `args` is JSON-serialized rather than interpolated. Unlike storage ops it
-   * carries user-visible strings — flag keys, variants, user record ids — that
-   * come from the database, so string concatenation here would be an eval
-   * injection.
+   * `args` is JSON-serialized rather than interpolated. It carries strings
+   * that come from the database (flag keys, user record ids, a typed reason),
+   * so string concatenation here would be an eval injection. `eventName` and
+   * `op` are fixed by the callers below.
    */
-  const flagOp = (
-    op: 'list' | 'setEnabled' | 'setUserVariant' | 'setOverride' | 'clearOverrides',
+  const pageOp = (
+    eventName: 'SP00KY_FLAG_OP' | 'SP00KY_IMPERSONATE_OP',
+    op: string,
     requestId: string,
     args: Record<string, unknown> | undefined,
     onSuccess: (result: { success: boolean; error?: string }) => void,
@@ -305,10 +307,10 @@ export function useRunInHostPage(
     run(
       `(function() {
         try {
-            window.dispatchEvent(new CustomEvent('SP00KY_FLAG_OP', {
+            window.dispatchEvent(new CustomEvent(${JSON.stringify(eventName)}, {
                 detail: {
-                    requestId: '${requestId}',
-                    op: '${op}',
+                    requestId: ${JSON.stringify(requestId)},
+                    op: ${JSON.stringify(op)},
                     args: ${JSON.stringify(args ?? null)}
                 }
             }));
@@ -322,6 +324,22 @@ export function useRunInHostPage(
     );
   };
 
+  const flagOp = (
+    op: 'list' | 'setEnabled' | 'setUserVariant' | 'setOverride' | 'clearOverrides',
+    requestId: string,
+    args: Record<string, unknown> | undefined,
+    onSuccess: (result: { success: boolean; error?: string }) => void,
+    onError?: (error: any) => void
+  ): void => pageOp('SP00KY_FLAG_OP', op, requestId, args, onSuccess, onError);
+
+  const impersonateOp = (
+    op: 'status' | 'listUsers' | 'start' | 'stop',
+    requestId: string,
+    args: Record<string, unknown> | undefined,
+    onSuccess: (result: { success: boolean; error?: string }) => void,
+    onError?: (error: any) => void
+  ): void => pageOp('SP00KY_IMPERSONATE_OP', op, requestId, args, onSuccess, onError);
+
   return {
     run,
     getSp00kyState,
@@ -330,6 +348,7 @@ export function useRunInHostPage(
     runQuery,
     storageOp,
     flagOp,
+    impersonateOp,
     updateTableRow,
     deleteTableRow,
     clearHistory,

@@ -511,6 +511,10 @@ pub struct Sp00kyConfig {
     /// `CHANGEFEED` retention that goes with the `changefeed` transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncConfig>,
+    /// Admin impersonation from the DevTools. Off unless `enabled: true`;
+    /// when off, every deploy removes the access method and functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impersonation: Option<ImpersonationConfig>,
 }
 
 impl Sp00kyConfig {
@@ -518,6 +522,141 @@ impl Sp00kyConfig {
     pub fn sync(&self) -> SyncConfig {
         self.sync.clone().unwrap_or_default()
     }
+
+    /// `impersonation:` with defaults filled in.
+    pub fn impersonation(&self) -> ImpersonationConfig {
+        self.impersonation.clone().unwrap_or_default()
+    }
+}
+
+/// `impersonation:` in sp00ky.yml.
+///
+/// ```yaml
+/// impersonation:
+///   enabled: true           # default false
+///   tokenTtl: 15m           # lifetime of one token; the client renews it
+///   maxDuration: 2h         # hard cap on one impersonation session
+///   userTable: user         # table the DevTools user search reads
+///   searchFields: [username, email]
+/// ```
+///
+/// An admin (a `_00_admin` row) can then act as any non-admin user. Every
+/// session is recorded in `_00_impersonation` and every write made during
+/// one in `_00_impersonation_write`. Needs a non-empty `SPKY_AUTH_SECRET`:
+/// the token signing key is derived from it.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ImpersonationConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, rename = "tokenTtl", skip_serializing_if = "Option::is_none")]
+    pub token_ttl: Option<String>,
+    #[serde(default, rename = "maxDuration", skip_serializing_if = "Option::is_none")]
+    pub max_duration: Option<String>,
+    #[serde(default, rename = "userTable", skip_serializing_if = "Option::is_none")]
+    pub user_table: Option<String>,
+    #[serde(default, rename = "searchFields", skip_serializing_if = "Option::is_none")]
+    pub search_fields: Option<Vec<String>>,
+}
+
+impl ImpersonationConfig {
+    pub const DEFAULT_TOKEN_TTL: &'static str = "15m";
+    pub const DEFAULT_MAX_DURATION: &'static str = "2h";
+    pub const DEFAULT_USER_TABLE: &'static str = "user";
+    pub const DEFAULT_SEARCH_FIELDS: [&'static str; 3] = ["username", "email", "name"];
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn token_ttl(&self) -> &str {
+        self.token_ttl.as_deref().map(str::trim).unwrap_or(Self::DEFAULT_TOKEN_TTL)
+    }
+
+    pub fn max_duration(&self) -> &str {
+        self.max_duration.as_deref().map(str::trim).unwrap_or(Self::DEFAULT_MAX_DURATION)
+    }
+
+    pub fn user_table(&self) -> &str {
+        self.user_table.as_deref().map(str::trim).unwrap_or(Self::DEFAULT_USER_TABLE)
+    }
+
+    pub fn search_fields(&self) -> Vec<String> {
+        match &self.search_fields {
+            Some(f) => f.iter().map(|s| s.trim().to_string()).collect(),
+            None => Self::DEFAULT_SEARCH_FIELDS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Reject values that would be spliced into SurrealQL unchecked.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        let ttl = parse_simple_duration(self.token_ttl()).ok_or_else(|| {
+            anyhow::anyhow!("impersonation.tokenTtl `{}` must look like 30s, 15m or 1h", self.token_ttl())
+        })?;
+        let max = parse_simple_duration(self.max_duration()).ok_or_else(|| {
+            anyhow::anyhow!("impersonation.maxDuration `{}` must look like 30m, 2h or 1d", self.max_duration())
+        })?;
+        if ttl < 60 || ttl > ssp_protocol::impersonation::MAX_TOKEN_TTL_SECS {
+            anyhow::bail!("impersonation.tokenTtl must be between 1m and 1h");
+        }
+        if max < ttl {
+            anyhow::bail!("impersonation.maxDuration must be at least impersonation.tokenTtl");
+        }
+        if !is_identifier(self.user_table()) {
+            anyhow::bail!("impersonation.userTable `{}` is not a plain table name", self.user_table());
+        }
+        for f in self.search_fields() {
+            if !is_identifier(&f) {
+                anyhow::bail!("impersonation.searchFields entry `{f}` is not a plain field name");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn token_ttl_secs(&self) -> u64 {
+        parse_simple_duration(self.token_ttl()).unwrap_or(900)
+    }
+
+    /// Env the SSP and scheduler need to serve `/impersonate/*`.
+    pub fn infra_env(&self) -> Vec<(String, String)> {
+        vec![(
+            ssp_protocol::impersonation::ENV_FLAG.to_string(),
+            if self.enabled() { "on" } else { "off" }.to_string(),
+        )]
+    }
+}
+
+/// `30s` / `15m` / `2h` / `1d` to seconds. One unit only, which is also the
+/// form SurrealDB renders, so the value can be spliced in as a duration.
+pub fn parse_simple_duration(s: &str) -> Option<u64> {
+    let unit = s.chars().last()?;
+    let n: u64 = s[..s.len() - unit.len_utf8()].parse().ok().filter(|n| *n > 0)?;
+    let mult = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+pub fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The `impersonation:` settings of the manifest at `config_path`, defaults
+/// (disabled) when there is none.
+pub fn impersonation_settings_for(config_path: Option<&Path>) -> ImpersonationConfig {
+    config_path
+        .filter(|p| p.exists())
+        .map(|p| load_config(p).impersonation())
+        .unwrap_or_default()
 }
 
 /// `sync:` in sp00ky.yml.

@@ -2464,7 +2464,8 @@ fn run_codegen(
 
         let include_modules = *mode == DeployMode::Surrealism;
         let generator = CodeGenerator::new(output_format, !no_header, include_modules)
-            .with_query_allowlist(crate::backend::sync_settings_for(config_path).query_allowlist());
+            .with_query_allowlist(crate::backend::sync_settings_for(config_path).query_allowlist())
+            .with_impersonation(crate::backend::impersonation_settings_for(config_path).enabled());
         let output_content = generator
             .generate_with_schema(
                 &json_schema_string,

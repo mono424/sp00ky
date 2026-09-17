@@ -64,7 +64,7 @@ No `action()`/`createOptimisticStore` layer — deliberate; see create-submissio
 
 ## Hooks
 
-Same shapes as client-solid: `useDb`, `usePendingMutations`, `useSyncStatus`, `useSyncActivity` (`isDownloading` / `isUploading` / `fetchingQueries` / `pendingMutations`, for a traffic indicator), `useStorageStatus`, `useFeatureFlag`, `useAppRelease`, `useCrdtField`, `useFileUpload`, `useDownloadFile`, `createPreload`.
+Same shapes as client-solid: `useDb`, `usePendingMutations`, `useSyncStatus`, `useImpersonation`, `useSyncActivity` (`isDownloading` / `isUploading` / `fetchingQueries` / `pendingMutations`, for a traffic indicator), `useStorageStatus`, `useFeatureFlag`, `useAppRelease`, `useCrdtField`, `useFileUpload`, `useDownloadFile`, `createPreload`.
 
 ## Testing note
 

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::annotations;
-use crate::backend::{BackendProcessor, DeployMode};
+use crate::backend::{BackendProcessor, DeployMode, ImpersonationConfig};
 use crate::parser::SchemaParser;
 use regex::Regex;
 
@@ -20,7 +20,12 @@ pub struct SchemaBuilderConfig {
 /// Build ONLY the remote functions SQL (heartbeat + mode-specific functions
 /// with endpoint/secret substitution).  Used by `dev.rs` to apply functions
 /// separately with Docker-internal URLs.
-pub fn build_remote_functions_schema(mode: &DeployMode, endpoint: &str, secret: &str) -> String {
+pub fn build_remote_functions_schema(
+    mode: &DeployMode,
+    endpoint: &str,
+    secret: &str,
+    impersonation: &ImpersonationConfig,
+) -> String {
     let mut content = String::new();
 
     // Set database-level params so events can reference them without
@@ -55,7 +60,84 @@ pub fn build_remote_functions_schema(mode: &DeployMode, endpoint: &str, secret: 
         content.push_str(functions_remote_surrealism);
     }
 
+    // Impersonation needs the HTTP backend routes, so it exists only in the
+    // modes that have them; everywhere else the removal block runs.
+    let http_mode = *mode == DeployMode::Singlenode || *mode == DeployMode::Cluster;
+    content.push('\n');
+    content.push_str(&build_impersonation_schema(
+        if http_mode { Some(impersonation) } else { None },
+        endpoint,
+        secret,
+    ));
+
     content
+}
+
+/// Functions a disabled deploy removes. Kept next to the template so a new
+/// `fn::_00_impersonate::*` cannot be forgotten here.
+const IMPERSONATION_FUNCTIONS: [&str; 6] = ["start", "renew", "stop", "current", "list_users", "active"];
+
+/// The impersonation access method + functions (`impersonation_remote.surql`)
+/// when the feature is on and a signing key can be derived, the statements
+/// that remove them otherwise. Removing the access method is what revokes
+/// tokens already issued, so a disabled deploy must always emit it.
+/// The `_00_impersonation*` tables stay either way: they are the audit log.
+pub fn build_impersonation_schema(
+    settings: Option<&ImpersonationConfig>,
+    endpoint: &str,
+    secret: &str,
+) -> String {
+    use ssp_protocol::impersonation::{derive_key, ACCESS_NAME};
+    let enabled = settings.filter(|s| s.enabled() && s.validate().is_ok());
+    let key = derive_key(secret);
+    let (Some(settings), Some(key)) = (enabled, key) else {
+        let mut out = String::from("-- Admin impersonation: disabled\n");
+        out.push_str(&format!("REMOVE ACCESS IF EXISTS {ACCESS_NAME} ON DATABASE;\n"));
+        for f in IMPERSONATION_FUNCTIONS {
+            out.push_str(&format!("REMOVE FUNCTION IF EXISTS fn::_00_impersonate::{f};\n"));
+        }
+        return out;
+    };
+    let fields = settings
+        .search_fields()
+        .iter()
+        .map(|f| format!("'{f}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    include_str!("impersonation_remote.surql")
+        .replace("{{ACCESS_NAME}}", ACCESS_NAME)
+        .replace("{{IMPERSONATION_KEY}}", &key)
+        .replace("{{TOKEN_TTL_SECS}}", &settings.token_ttl_secs().to_string())
+        .replace("{{TOKEN_TTL}}", settings.token_ttl())
+        .replace("{{MAX_DURATION}}", settings.max_duration())
+        .replace("{{USER_TABLE}}", settings.user_table())
+        .replace("{{SEARCH_FIELDS}}", &format!("[{fields}]"))
+        .replace("{{ENDPOINT}}", endpoint)
+        .replace("{{SECRET}}", secret)
+}
+
+/// Per-table `_00_imp_audit` events: one `_00_impersonation_write` row for
+/// every write made by an impersonated session. A separate event (not part
+/// of the ingest events) so a project without impersonation keeps its event
+/// definitions byte-identical; when disabled, the events are removed.
+pub fn build_impersonation_audit_events<'a>(
+    tables: impl IntoIterator<Item = &'a str>,
+    enabled: bool,
+) -> String {
+    let mut out = String::new();
+    for table in tables {
+        if enabled {
+            out.push_str(&format!(
+                "DEFINE EVENT OVERWRITE _00_imp_audit ON TABLE {table} WHEN $token.spky_imp != NONE THEN {{\n    \
+                 CREATE _00_impersonation_write SET session = type::record($token.spky_imp), \
+                 admin = <string>$token.spky_admin, tb = '{table}', record = ($after.id OR $before.id), \
+                 action = $event, at = time::now();\n}};\n"
+            ));
+        } else {
+            out.push_str(&format!("REMOVE EVENT IF EXISTS _00_imp_audit ON TABLE {table};\n"));
+        }
+    }
+    out
 }
 
 /// Platform-written job fields injected onto every outbox table.
@@ -282,7 +364,10 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
         let endpoint = config.endpoint.as_deref().unwrap_or(default_endpoint);
         let secret = config.secret.as_deref().unwrap_or("");
 
-        let functions_sql = build_remote_functions_schema(&config.mode, endpoint, secret);
+        let impersonation =
+            crate::backend::impersonation_settings_for(config.config_path.as_deref());
+        let functions_sql =
+            build_remote_functions_schema(&config.mode, endpoint, secret, &impersonation);
         content.push('\n');
         content.push_str(&functions_sql);
     }
@@ -351,7 +436,7 @@ pub fn build_server_events(config: &SchemaBuilderConfig) -> Result<String> {
         .parse_file(&content)
         .context("Failed to parse schema for sp00ky event generation")?;
 
-    Ok(crate::sp00ky::generate_sp00ky_events(
+    let mut events = crate::sp00ky::generate_sp00ky_events(
         &parser.tables,
         &content,
         false, // is_client = false (server-side events)
@@ -359,7 +444,24 @@ pub fn build_server_events(config: &SchemaBuilderConfig) -> Result<String> {
         config.endpoint.as_deref(),
         config.secret.as_deref(),
         crate::backend::sync_settings_for(config.config_path.as_deref()).transport(),
-    ))
+    );
+    let impersonation = crate::backend::impersonation_settings_for(config.config_path.as_deref());
+    events.push('\n');
+    events.push_str(&build_impersonation_audit_events(
+        audited_tables(&parser),
+        impersonation.enabled() && config.mode != DeployMode::Surrealism,
+    ));
+    Ok(events)
+}
+
+/// User tables that get an `_00_imp_audit` event: every table the app
+/// defines, relations included (an impersonated write can be a RELATE).
+pub fn audited_tables(parser: &SchemaParser) -> impl Iterator<Item = &str> {
+    parser
+        .tables
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !name.starts_with("_00_"))
 }
 
 /// Build the `FOR create, update WHERE ...` expression for `_00_crdt` and
@@ -1290,5 +1392,88 @@ mod changefeed_clause_tests {
         assert!(!stripped.contains("DEFINE EVENT OVERWRITE _00_dbsp_cleanup"));
         assert!(stripped.contains("REMOVE EVENT IF EXISTS _00_dbsp_cleanup ON TABLE _00_query;"));
         assert!(!stripped.contains("mod::dbsp::unregister_view"));
+    }
+}
+
+#[cfg(test)]
+mod impersonation_tests {
+    use super::*;
+
+    fn enabled() -> ImpersonationConfig {
+        ImpersonationConfig { enabled: Some(true), ..Default::default() }
+    }
+
+    #[test]
+    fn disabled_renders_only_removals() {
+        let sql = build_impersonation_schema(Some(&ImpersonationConfig::default()), "http://ssp", "s");
+        assert!(sql.contains("REMOVE ACCESS IF EXISTS _00_impersonate ON DATABASE;"));
+        for f in IMPERSONATION_FUNCTIONS {
+            assert!(sql.contains(&format!("REMOVE FUNCTION IF EXISTS fn::_00_impersonate::{f};")));
+        }
+        assert!(!sql.contains("DEFINE"));
+    }
+
+    #[test]
+    fn empty_secret_or_unsupported_mode_disables() {
+        assert!(build_impersonation_schema(Some(&enabled()), "http://ssp", "").contains("REMOVE ACCESS"));
+        assert!(build_impersonation_schema(None, "http://ssp", "s").contains("REMOVE ACCESS"));
+        let sql = build_remote_functions_schema(&DeployMode::Surrealism, "http://ssp", "s", &enabled());
+        assert!(sql.contains("REMOVE ACCESS IF EXISTS _00_impersonate"));
+    }
+
+    #[test]
+    fn invalid_settings_disable_instead_of_rendering() {
+        let bad = ImpersonationConfig { user_table: Some("user; REMOVE TABLE user".into()), ..enabled() };
+        assert!(bad.validate().is_err());
+        assert!(build_impersonation_schema(Some(&bad), "http://ssp", "s").contains("REMOVE ACCESS"));
+    }
+
+    #[test]
+    fn enabled_renders_every_placeholder() {
+        let sql = build_impersonation_schema(Some(&enabled()), "http://ssp:8667", "s3cret");
+        assert!(!sql.contains("{{"), "unrendered placeholder");
+        let key = ssp_protocol::impersonation::derive_key("s3cret").unwrap();
+        assert!(sql.contains(&format!("KEY '{key}'")));
+        assert!(sql.contains("DURATION FOR TOKEN 15m, FOR SESSION 15m"));
+        assert!(sql.contains("time::now() + 2h"));
+        assert!(sql.contains("ttl_secs: 900"));
+        assert!(sql.contains("http://ssp:8667/impersonate/mint"));
+        assert!(sql.contains("fields: ['username', 'email', 'name']"));
+        for f in IMPERSONATION_FUNCTIONS {
+            assert!(sql.contains(&format!("fn::_00_impersonate::{f}(")), "{f} missing from template");
+        }
+    }
+
+    #[test]
+    fn secret_params_are_locked() {
+        let sql = build_remote_functions_schema(&DeployMode::Singlenode, "http://ssp", "s", &enabled());
+        assert!(sql.contains("$sp00ky_secret VALUE 's' PERMISSIONS NONE;"));
+        assert!(sql.contains("$sp00ky_endpoint VALUE 'http://ssp' PERMISSIONS NONE;"));
+    }
+
+    #[test]
+    fn audit_events_toggle() {
+        let on = build_impersonation_audit_events(["note", "thread"], true);
+        assert_eq!(on.matches("DEFINE EVENT OVERWRITE _00_imp_audit ON TABLE").count(), 2);
+        assert!(on.contains("tb = 'thread'"));
+        let off = build_impersonation_audit_events(["note"], false);
+        assert_eq!(off, "REMOVE EVENT IF EXISTS _00_imp_audit ON TABLE note;\n");
+    }
+
+    #[test]
+    fn duration_and_identifier_parsing() {
+        use crate::backend::{is_identifier, parse_simple_duration};
+        assert_eq!(parse_simple_duration("15m"), Some(900));
+        assert_eq!(parse_simple_duration("2h"), Some(7200));
+        assert_eq!(parse_simple_duration("1h30m"), None);
+        assert_eq!(parse_simple_duration("0m"), None);
+        assert_eq!(parse_simple_duration("m"), None);
+        assert!(is_identifier("user_2"));
+        assert!(!is_identifier("2user"));
+        assert!(!is_identifier("user-x"));
+        let short = ImpersonationConfig { token_ttl: Some("30s".into()), ..enabled() };
+        assert!(short.validate().is_err());
+        let inverted = ImpersonationConfig { max_duration: Some("5m".into()), ..enabled() };
+        assert!(inverted.validate().is_err());
     }
 }

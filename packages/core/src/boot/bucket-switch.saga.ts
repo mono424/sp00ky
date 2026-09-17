@@ -5,7 +5,7 @@ import { fx } from '../kernel/effects';
 import type { ClientState, QueryEntry } from '../state/client-state';
 import { seedLifecycle, isAuthoritative } from '../state/lifecycle';
 import * as R from '../state/reducers';
-import { ANON_USER_ID } from '../modules/ref-tables';
+import { ANON_USER_ID, bucketIdForUser } from '../modules/ref-tables';
 import type { SagaEnv } from '../query/env';
 import { queryHashInput } from '../query/hash';
 import { isResolvedBefore, parseViewRow } from '../query/membership';
@@ -62,6 +62,7 @@ export function* bucketSwitch(env: SagaEnv, target: string, release: (() => void
   } finally {
     gate();
   }
+  yield* dropImpersonatedBucket(current);
   const token = (yield fx.service('auth.token')) as string | null;
   if (token) {
     try {
@@ -80,6 +81,21 @@ export function* bucketSwitch(env: SagaEnv, target: string, release: (() => void
   // not deliver was never noticed.
   yield fx.dispatch({ type: 'PollTick' });
   yield fx.dispatch({ type: 'Drain' });
+}
+
+/**
+ * An impersonation just ended and this switch left its bucket: delete that
+ * user's local data from the admin's device. Best-effort; a failure only
+ * leaves rows the server already let this admin read.
+ */
+export function* dropImpersonatedBucket(left: string): Saga<void> {
+  const ended = (yield fx.service('auth.consumeEndedImpersonation')) as string | null;
+  if (!ended || left === ANON_USER_ID || bucketIdForUser(ended) !== left) return;
+  try {
+    yield fx.service('local.dropBucket', left);
+  } catch (error) {
+    yield fx.emit({ type: 'log', level: 'warn', message: 'could not delete the impersonated bucket', data: { bucket: left, error } });
+  }
 }
 
 /** Re-seed every active query from the new store and rebuild its SSP view. */

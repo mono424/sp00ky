@@ -162,6 +162,8 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     window.dispatchEvent(new CustomEvent('SP00KY_STORAGE_OP', { detail: message.payload }));
   } else if (message.type === 'FLAG_OP') {
     window.dispatchEvent(new CustomEvent('SP00KY_FLAG_OP', { detail: message.payload }));
+  } else if (message.type === 'IMPERSONATE_OP') {
+    window.dispatchEvent(new CustomEvent('SP00KY_IMPERSONATE_OP', { detail: message.payload }));
   } else if (message.type === 'REFRESH_VERSIONS') {
     window.dispatchEvent(new CustomEvent('SP00KY_REFRESH_VERSIONS', { detail: message.payload }));
   }

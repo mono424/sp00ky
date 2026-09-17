@@ -255,6 +255,13 @@ export class LocalDatabaseService extends AbstractDatabaseService {
     );
   }
 
+  /** See `LocalStore.dropBucket`. A memory store keeps nothing to delete. */
+  async dropBucket(bucketId: string): Promise<void> {
+    if (bucketId === this.bucketId) throw new Error('Cannot drop the open bucket.');
+    if ((this.getConfig().store ?? 'memory') === 'memory') return;
+    await dropLocalIndexedDbStores(this.logger, bucketStoreName(bucketId));
+  }
+
   /**
    * Open `storeUrl` on `client` with tiered recovery:
    * tier 1 retries the same store (transient idb-handle races — preserves the

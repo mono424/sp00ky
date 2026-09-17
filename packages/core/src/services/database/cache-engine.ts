@@ -135,6 +135,12 @@ export interface LocalStore extends LocalCacheEngine {
    * client facade, so adding this needs no change on their side.
    */
   readonly storageHealth?: StorageHealth;
+  /**
+   * Delete a bucket's persisted store. Never the open one. OPTIONAL and
+   * best-effort: used to remove an impersonated user's data from the admin's
+   * device once the impersonation ends.
+   */
+  dropBucket?(bucketId: string): Promise<void>;
   /** Fires immediately with the current snapshot, then on every change.
    *  Returns an unsubscribe function. */
   subscribeToStorageHealth?(cb: (health: StorageHealth) => void): () => void;

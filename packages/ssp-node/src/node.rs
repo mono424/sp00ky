@@ -78,6 +78,8 @@ pub struct SspNode {
     /// When true, anonymous (empty auth) registrations route to the shared
     /// world-readable `_00_list_ref_anon` table.
     pub anonymous_live_queries: bool,
+    /// Serve `POST /impersonate/mint` (`NodeConfig.impersonation`). Off: 404.
+    pub impersonation: bool,
     /// Query allowlist state + gate (`NodeConfig.query_allowlist`).
     pub query_allowlist: Arc<crate::allowlist_state::QueryAllowlist>,
     /// `true` when no scheduler fronts this SSP (standalone mode): this node
@@ -189,6 +191,8 @@ impl SspNode {
             RouteId::JobKill => self.job_kill_handler(&req).await?,
             RouteId::JobRetry => self.job_retry_handler(&req).await?,
             RouteId::JobRecover => self.job_recover_handler(&req).await?,
+            RouteId::ImpersonateMint => self.impersonate_mint_handler(&req),
+            RouteId::ImpersonateUsers => self.impersonate_users_handler(&req).await,
             RouteId::Health => self.health_handler().await,
             RouteId::Info => self.info_handler().await,
             RouteId::InfoText => self.info_text_handler().await,
@@ -213,6 +217,55 @@ impl SspNode {
             response.headers.push(("Access-Control-Allow-Origin", "*".to_string()));
         }
         Some(response)
+    }
+
+    /// `POST /impersonate/mint`. The bearer check above already ran; an empty
+    /// secret is refused by the signer itself (the derived key would be public).
+    fn impersonate_mint_handler(&self, req: &ApiRequest) -> ApiResponse {
+        use ssp_protocol::impersonation::{mint, MintError, MintRequest};
+        if !self.impersonation {
+            return err_json(404, "not_found", "impersonation is disabled");
+        }
+        let Ok(body) = serde_json::from_slice::<MintRequest>(&req.body) else {
+            return err_json(422, "bad_body", "invalid mint payload");
+        };
+        match mint(&self.auth_secret, &body, crate::now_epoch_ms() / 1000) {
+            Ok(out) => {
+                info!(
+                    session = %body.session,
+                    admin = %body.admin,
+                    target = %body.target,
+                    exp = out.exp,
+                    "impersonation token minted"
+                );
+                ok_json(json!(out))
+            }
+            Err(MintError::Disabled) => {
+                err_json(404, "not_found", "impersonation needs SPKY_AUTH_SECRET")
+            }
+            Err(MintError::Invalid(why)) => err_json(400, "invalid", why),
+        }
+    }
+
+    /// `POST /impersonate/users`: the picker's search, run with this node's
+    /// root connection because an admin session cannot read other users.
+    async fn impersonate_users_handler(&self, req: &ApiRequest) -> ApiResponse {
+        use ssp_protocol::impersonation::{derive_key, users_query, MintError, UsersRequest};
+        if !self.impersonation || derive_key(&self.auth_secret).is_none() {
+            return err_json(404, "not_found", "impersonation is disabled");
+        }
+        let Ok(body) = serde_json::from_slice::<UsersRequest>(&req.body) else {
+            return err_json(422, "bad_body", "invalid users payload");
+        };
+        let (surql, q) = match users_query(&body) {
+            Ok(v) => v,
+            Err(MintError::Invalid(why)) => return err_json(400, "invalid", why),
+            Err(MintError::Disabled) => return err_json(404, "not_found", "impersonation is disabled"),
+        };
+        match self.platform.db.query(&surql, &[("q", json!(q))]).await {
+            Ok(mut results) => ok_json(results.drain(..).next().unwrap_or_else(|| json!([]))),
+            Err(e) => err_json(500, "query_failed", e.to_string()),
+        }
     }
 
     fn version_handler(&self) -> ApiResponse {

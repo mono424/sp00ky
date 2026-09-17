@@ -456,14 +456,19 @@ persists across consecutive checks.</p>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;stuck&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [],</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;last_auto_reclone&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;auto_reclones&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;last_auto_repair&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;auto_repairs&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;repair_max_rows&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">2000</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;last_error&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
 </li>
 </ul>
 <p><code>drift.mismatched</code> lists tables whose counts differed on the last check.
-<code>drift.stuck</code> lists tables an automatic re-clone did not fix; those need an
-operator (a row the replica schema rejects, typically). <code>drift.upstream</code> is
+<code>drift.stuck</code> lists tables an automatic repair or re-clone did not fix; those
+need an operator (a row the replica schema rejects, typically).
+<code>drift.auto_repairs</code> counts in-place table repairs, <code>drift.auto_reclones</code> the
+full re-clones a repair escalated to. <code>drift.upstream</code> is
 <code>null</code> for a table whose upstream count could not be read.</p>
 <p><strong>Example:</strong></p>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:9667/health/snapshot</span></span></code></pre>
@@ -576,9 +581,11 @@ operator (a row the replica schema rejects, typically). <code>drift.upstream</co
 <li><code>SPKY_DB_PASS</code> - SurrealDB password (overrides <code>db.password</code>)</li>
 <li><code>SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS</code> - Override for <code>snapshot_update_interval_secs</code> (default: <code>300</code>)</li>
 <li><code>SPKY_DRIFT_CHECK</code> - Compare replica row counts against upstream at startup and after each snapshot drain (default: <code>true</code>)</li>
-<li><code>SPKY_DRIFT_AUTO_RECLONE</code> - Re-clone the replica and re-bootstrap every SSP when the check finds the replica missing rows (default: <code>true</code>; <code>false</code> reports only, via <code>/health/snapshot</code>, <code>/metrics</code> and <code>spky verify</code>)</li>
+<li><code>SPKY_DRIFT_AUTO_RECLONE</code> - Act on a confirmed mismatch (default: <code>true</code>; <code>false</code> reports only, via <code>/health/snapshot</code>, <code>/metrics</code> and <code>spky verify</code>). The table is repaired in place: its ids and <code>_00_rv</code>s are compared with upstream, and the rows that are missing, stale or deleted go through the ingest pipeline as ordinary events, so the replica and every SSP converge without a bootstrap. Only a repair that finds no difference, would exceed <code>SPKY_DRIFT_REPAIR_MAX_ROWS</code>, or fails falls back to re-cloning the replica and re-bootstrapping every SSP. A table still off after either is reported as stuck until its counts change</li>
 <li><code>SPKY_DRIFT_CONFIRM_TICKS</code> - Consecutive checks a non-zero count mismatch must persist before it is acted on; an empty replica table upstream has rows for is acted on at first sight (default: <code>2</code>)</li>
 <li><code>SPKY_DRIFT_RECLONE_COOLDOWN_SECS</code> - Minimum spacing between automatic re-clones (default: <code>3600</code>)</li>
+<li><code>SPKY_DRIFT_REPAIR_MAX_ROWS</code> - Most rows one in-place table repair may send through the ingest pipeline (default: <code>2000</code>)</li>
+<li><code>SPKY_DRIFT_REPAIR_TIMEOUT_SECS</code> - Deadline for one table repair; on the deadline it is abandoned, the upstream connection is replaced and the repair is retried on the next check (default: <code>300</code>)</li>
 <li><code>SPKY_DRIFT_CHECK_TIMEOUT_SECS</code> - Deadline for one drift check. The check is the last step of the snapshot updater’s tick, so a check that never answers would stop the replica draining; on the deadline it is abandoned, the upstream connection is replaced and the tick finishes (default: <code>120</code>)</li>
 <li><code>SPKY_BACKENDS</code> - JSON-encoded backend health-check list (<code>SPKY_SCHEDULER_BACKENDS</code> accepted as legacy fallback)</li>
 <li><code>SPKY_BOOTSTRAP_PAGE_SIZE</code> - Rows read per bootstrap page from the replica (default: <code>500</code>)</li>

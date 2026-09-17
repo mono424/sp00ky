@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::Value;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use maintenance::changefeed::{
     ChangeOp, ChangeRecord, ChangeSink, ChangeSource, ReconnectingSource, SinkError, TailerConfig,
@@ -58,6 +58,18 @@ impl ChangeSink for IngestSink {
 
     async fn before_image(&self, table: &str, id: &str) -> Option<Value> {
         if ssp_protocol::table_excluded_from_sync(table) {
+            return None;
+        }
+        // A re-clone holds the replica's write lock for its whole reset and
+        // load. Waiting for it parked the tail, and every event behind this
+        // delete (the heartbeat probe included), for 63 s on whitepawn
+        // (2026-09-17). The before-image only travels to the SSPs, and every
+        // SSP re-bootstraps from the new replica once the re-clone finishes,
+        // so a delete forwarded without one during it loses nothing. The
+        // SSPs already take a delete with an empty record (a row the replica
+        // never had).
+        if self.recloner.in_progress() {
+            debug!(table, id, "Re-clone running; delete forwarded without its before-image");
             return None;
         }
         let replica = self.ingest.replica.read().await;

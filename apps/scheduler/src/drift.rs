@@ -415,6 +415,12 @@ pub trait Recloner: Send + Sync {
     /// Re-clone the replica and flag every SSP for re-bootstrap. `Ok(false)`
     /// when a re-clone was already in progress.
     async fn reclone_and_resync(&self) -> Result<bool>;
+
+    /// Whether a re-clone is running right now. It holds the replica's write
+    /// lock for its whole reset and load, a minute or more.
+    fn in_progress(&self) -> bool {
+        false
+    }
 }
 
 /// Run one check + decision + remediation. Returns the action taken.

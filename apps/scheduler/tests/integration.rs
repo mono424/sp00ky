@@ -126,7 +126,11 @@ impl TestHarness {
     }
 
     fn ingest_router(&self) -> Router {
-        let state = IngestState {
+        ingest::create_ingest_router(self.ingest_state())
+    }
+
+    fn ingest_state(&self) -> IngestState {
+        IngestState {
             replica: Arc::clone(&self.replica),
             transport: Arc::clone(&self.transport),
             ssp_pool: Arc::clone(&self.ssp_pool),
@@ -140,8 +144,7 @@ impl TestHarness {
             observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
-        };
-        ingest::create_ingest_router(state)
+        }
     }
 
     fn ssp_router(&self) -> Router {
@@ -4260,4 +4263,46 @@ async fn replica_clone_preserves_durable_row_versions() {
     replica.ingest_all(&source).await.unwrap();
     assert_eq!(replica.query("SELECT public_key, _00_rv FROM user").await.unwrap(),
         json!([{ "public_key": "new", "_00_rv": 7 }]));
+}
+
+/// whitepawn 2026-09-17: a feed DELETE arrived while a drift re-clone held the
+/// replica's write lock, the tail waited 63 s for the before-image, and the
+/// heartbeat probe queued behind it failed. During a re-clone the delete must
+/// go through without waiting.
+#[tokio::test]
+async fn changefeed_delete_does_not_wait_for_a_recloning_replica() {
+    use maintenance::changefeed::ChangeSink;
+    use scheduler::changefeed::IngestSink;
+
+    struct Recloning;
+    #[async_trait::async_trait]
+    impl scheduler::drift::Recloner for Recloning {
+        async fn reclone_and_resync(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn in_progress(&self) -> bool {
+            true
+        }
+    }
+
+    let h = TestHarness::new().await;
+    let sink = IngestSink {
+        ingest: h.ingest_state(),
+        query: QueryState {
+            ssp_pool: Arc::clone(&h.ssp_pool),
+            transport: Arc::clone(&h.transport),
+            query_tracker: Arc::clone(&h.query_tracker),
+        },
+        recloner: Arc::new(Recloning),
+        stats: maintenance::changefeed::TailerStats::new(),
+    };
+    // What the re-clone holds for its whole reset and load.
+    let _reset = h.replica.write().await;
+    let image = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sink.before_image("user", "user:gone"),
+    )
+    .await
+    .expect("before_image waited for the re-clone's write lock");
+    assert_eq!(image, None);
 }

@@ -1019,6 +1019,10 @@ impl crate::drift::Recloner for SchedulerRecloner {
         }
         Ok(done)
     }
+
+    fn in_progress(&self) -> bool {
+        self.reclone_lock.try_lock().is_err()
+    }
 }
 
 /// One iteration of the periodic snapshot updater. Extracted from the spawn

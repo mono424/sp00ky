@@ -1827,6 +1827,34 @@ impl Circuit {
         self.subscribers.get(owner).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Whether `query_id` is already registered, as `(graph, auth_id)`: the
+    /// graph it reads (its own for an owner, the owner's for a merged
+    /// subscriber) and the identity it registered with. `None` for an unknown
+    /// id.
+    ///
+    /// This, not [`Circuit::get_view`], answers "is this a re-registration?".
+    /// `get_view` sees only graph owners, so a merged subscriber registering
+    /// again (clients do this routinely) looked brand new: it re-attached,
+    /// bumped its publication epoch (dropping the snapshot still queued for
+    /// it), queued another full snapshot and reset its row to `materializing`.
+    /// Under load the client re-registered faster than those snapshots could
+    /// land, and the same views looped every second or two (whitepawn,
+    /// 2026-09-16).
+    ///
+    /// A detached owner still counts as registered, as it did through
+    /// `get_view`: the cold path would `views.insert` over its live graph.
+    pub fn registration(&self, query_id: &str) -> Option<(String, String)> {
+        let key = crate::canonical_query_id(query_id);
+        if let Some(view) = self.views.get(&key) {
+            return Some((key, view.auth_id.clone()));
+        }
+        self.subscribers.iter().find_map(|(owner, subs)| {
+            subs.iter()
+                .find(|s| s.query_id == key)
+                .map(|s| (owner.clone(), s.auth_id.clone()))
+        })
+    }
+
     /// Whether this registration still receives publications, including holders
     /// of merged graphs and excluding a detached owner whose graph is retained.
     pub fn is_registered(&self, query_id: &str) -> bool {
@@ -2394,6 +2422,39 @@ mod tests {
         for want in ["owner", "sub1", "sub2"] {
             assert!(ids.iter().any(|id| id == want), "{want} missing from {ids:?}");
         }
+    }
+
+    /// A merged subscriber registering again is a re-registration, not a new
+    /// view: `registration` finds it under its owner's graph with its own
+    /// identity, in either id spelling.
+    #[test]
+    fn registration_finds_owners_and_merged_subscribers() {
+        let mut circuit = Circuit::new();
+        circuit.store.ensure_collection("thread");
+        circuit.add_query_with_auth(scan_query("owner", "thread"), None, None, "user:alice".into());
+        circuit.attach_subscriber("owner", "sub1".to_string(), "user:bob".to_string());
+
+        assert!(circuit.get_view("sub1").is_none(), "a subscriber owns no view of its own");
+        assert_eq!(
+            circuit.registration("sub1"),
+            Some(("owner".to_string(), "user:bob".to_string()))
+        );
+        assert_eq!(
+            circuit.registration("_00_query:sub1"),
+            Some(("owner".to_string(), "user:bob".to_string()))
+        );
+        assert_eq!(
+            circuit.registration("owner"),
+            Some(("owner".to_string(), "user:alice".to_string()))
+        );
+        assert_eq!(circuit.registration("stranger"), None);
+
+        // A detached owner still holds its graph, so it still counts.
+        assert!(!circuit.detach_subscriber("owner"));
+        assert!(circuit.registration("owner").is_some());
+        // A subscriber that left does not.
+        circuit.detach_subscriber("sub1");
+        assert_eq!(circuit.registration("sub1"), None);
     }
 
     /// A detached owner keeps its graph serving subscribers but must not

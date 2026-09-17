@@ -159,11 +159,125 @@ pub enum PublicationCleanup {
     Statement(String),
     EnsureUser(String),
     DropUser(String),
+    /// Drop every `table` edge pointing at `record`, a row that was just
+    /// deleted. SurrealDB removes the edges a record has when it is deleted,
+    /// but a queued `RELATE` that lands afterwards recreates one pointing at
+    /// nothing, so this runs in queue order, behind that `RELATE`.
+    ///
+    /// Structured rather than a `Statement` so a publication round can fold a
+    /// run of them into one statement per table: a bulk
+    /// delete used to cost one round trip per row, per table, one after
+    /// another, and deleting a 3,728-game database held every other
+    /// publication behind ~7,500 of them (whitepawn, 2026-09-16).
+    DropEdgesTo { table: String, record: String },
 }
 impl PublicationCleanup {
     fn bytes(&self) -> u64 {
-        match self { Self::Statement(s) | Self::EnsureUser(s) | Self::DropUser(s) => s.capacity() as u64 }
+        match self {
+            Self::Statement(s) | Self::EnsureUser(s) | Self::DropUser(s) => s.capacity() as u64,
+            Self::DropEdgesTo { table, record } => (table.capacity() + record.capacity()) as u64,
+        }
     }
+}
+
+/// Most queued items one publication round takes. Matches the default
+/// admission slots, so a full queue drains in a handful of rounds.
+const MAX_ROUND_ITEMS: usize = 256;
+
+/// Edge statements one round may carry before it stops taking more work. Kept
+/// to a few transactions so the publication gate is not held for long.
+const MAX_ROUND_OPERATIONS: usize = 4 * MAX_TX_STATEMENTS;
+
+/// Records per coalesced edge drop (see [`flush_edge_drops`]).
+const MAX_EDGE_DROP_RECORDS: usize = 500;
+
+/// Run a round's cleanup in queue order, folding each run of
+/// [`PublicationCleanup::DropEdgesTo`] into one statement per table.
+///
+/// All or nothing: on the first failure it stops and reports `false`, and the
+/// caller keeps every item's cleanup for the retry. Every step is idempotent,
+/// so re-running the ones that already succeeded is harmless.
+async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]) -> bool {
+    let mut drops: Vec<(String, Vec<String>)> = Vec::new();
+    for cleanup in items.iter().flat_map(|c| c.iter()) {
+        if let PublicationCleanup::DropEdgesTo { table, record } = cleanup {
+            match drops.iter_mut().find(|(t, _)| t == table) {
+                Some((_, records)) => records.push(record.clone()),
+                None => drops.push((table.clone(), vec![record.clone()])),
+            }
+            continue;
+        }
+        // Anything else is ordered against the drops before it.
+        if !flush_edge_drops(db, &mut drops).await {
+            return false;
+        }
+        let result = match cleanup {
+            PublicationCleanup::Statement(sql) => query_retrying(db, sql, &[]).await.map(|_| ()).map_err(anyhow::Error::from),
+            PublicationCleanup::EnsureUser(user) => tables::ensure_user_tables(db, mode, user).await,
+            PublicationCleanup::DropUser(user) => tables::drop_user_tables(db, mode, user).await,
+            PublicationCleanup::DropEdgesTo { .. } => unreachable!("folded above"),
+        };
+        if let Err(e) = result {
+            if !tables::is_missing_table_error(&e.to_string()) {
+                warn!(target: "ssp::edges", error = %e, "Publication cleanup failed; the round stays pending");
+                return false;
+            }
+        }
+    }
+    flush_edge_drops(db, &mut drops).await
+}
+
+async fn flush_edge_drops(db: &dyn Db, drops: &mut Vec<(String, Vec<String>)>) -> bool {
+    for (table, records) in drops.drain(..) {
+        for chunk in records.chunks(MAX_EDGE_DROP_RECORDS) {
+            // Both halves are validated identifiers: the table comes from
+            // `list_ref_table`, the records passed `valid_record_id` at ingest.
+            // Walked from the records rather than `DELETE table WHERE out IN`,
+            // which scans every edge of every view in the table. SurrealDB
+            // keeps the reverse index of an edge even when its record is
+            // gone, so this finds a dangling one too. `array::flatten`: one
+            // list per record, and DELETE refuses a nested array.
+            let sql = format!("DELETE array::flatten((SELECT VALUE id FROM [{}]<-{table}))", chunk.join(", "));
+            if let Err(e) = query_retrying(db, &sql, &[]).await {
+                if !tables::is_missing_table_error(&e.to_string()) {
+                    warn!(target: "ssp::edges", table = %table, records = chunk.len(), error = %e,
+                        "Dropping edges of deleted records failed; the round stays pending");
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Work a round skips and drops: its generation or every view epoch it was
+/// captured under has moved on, or its registration was abandoned.
+fn work_obsolete(state: &PublicationState, work: &PublicationWork) -> bool {
+    state.generation != work.permit.generation
+        || work.ready.load(std::sync::atomic::Ordering::Acquire) == 2
+        || (work.cleanup.is_empty() && work.epochs.iter().all(|(id, epoch)|
+            state.epochs.get(id).copied().unwrap_or(0) != *epoch))
+}
+
+/// Work whose registration metadata and source row are in place and whose
+/// retry delay, if parked, has passed.
+fn work_selectable(work: &PublicationWork, now: web_time::Instant) -> bool {
+    work.ready.load(std::sync::atomic::Ordering::Acquire) == 1
+        && work.source_ready.load(std::sync::atomic::Ordering::Acquire)
+        && work.retry_at.is_none_or(|at| at <= now)
+}
+
+/// Work that can share a round. Table lifecycle (and free-form statements)
+/// keeps a round of its own, so no delta ahead of it is written after it.
+fn work_mergeable(work: &PublicationWork) -> bool {
+    work.cleanup.iter().all(|c| matches!(c, PublicationCleanup::DropEdgesTo { .. }))
+}
+
+/// A queued item's edge statements, for sizing a round.
+fn work_operations(work: &PublicationWork) -> usize {
+    work.cleanup.len() + work.deltas.iter()
+        .map(|d| d.additions.len() + d.removals.len() + d.updates.len() + d.subquery_items.len() + usize::from(d.initial))
+        .sum::<usize>()
 }
 struct PublicationWork {
     permit: Arc<PublicationPermit>,
@@ -245,6 +359,13 @@ impl EdgePublisher {
     }
     pub fn is_current(&self, permit: &PublicationPermit) -> bool {
         self.0.state.lock().unwrap().generation == permit.generation
+    }
+    /// Whether any admitted publication (queued or being written) carries a
+    /// delta for `query_id`.
+    pub fn has_pending(&self, query_id: &str) -> bool {
+        let id = ssp::canonical_query_id(query_id);
+        self.0.state.lock().unwrap().leases.values()
+            .any(|lease| lease.views.iter().any(|(view, _, _)| ssp::canonical_query_id(view) == id))
     }
     /// Call under the publication gate and circuit lifecycle lock.
     pub fn invalidate_all(&self) {
@@ -390,20 +511,17 @@ impl EdgePublisher {
                 }));
             }
             let notified = self.0.wake.notified();
-            let work = {
+            let mut round = {
                 let mut state = self.0.state.lock().unwrap();
+                let now = web_time::Instant::now();
                 let mut blocked = HashSet::new();
                 let mut chosen = None;
                 for (index, work) in state.queue.iter().enumerate() {
-                    let stale = state.generation != work.permit.generation ||
-                        (work.cleanup.is_empty() && work.epochs.iter().all(|(id, epoch)|
-                            state.epochs.get(id).copied().unwrap_or(0) != *epoch));
-                    let ready = work.ready.load(std::sync::atomic::Ordering::Acquire);
-                    if stale || ready == 2 { chosen = Some(index); break; }
+                    if work_obsolete(&state, work) { chosen = Some(index); break; }
                     // Cross-view orphan cleanup is a global barrier. Ordinary
                     // publications only wait for earlier work for their views.
                     let global = !work.cleanup.is_empty();
-                    if ready == 1 && work.source_ready.load(std::sync::atomic::Ordering::Acquire) && work.retry_at.map_or(true, |at| at <= web_time::Instant::now())
+                    if work_selectable(work, now)
                         && !work.epochs.keys().any(|id| blocked.contains(id))
                         && (!global || index == 0) {
                         chosen = Some(index); break;
@@ -411,9 +529,34 @@ impl EdgePublisher {
                     blocked.extend(work.epochs.keys().cloned());
                     if global { break; }
                 }
-                chosen.and_then(|index| state.queue.remove(index))
+                let mut round = Vec::new();
+                if let Some(index) = chosen {
+                    let first = state.queue.remove(index).expect("chosen index is in the queue");
+                    // At the head of the queue, keep taking the ready work
+                    // behind it into the same round. Nothing is ahead of any of
+                    // it, so order is kept by publishing in queue order, and a
+                    // burst (a bulk delete is one item per row) costs a few
+                    // transactions instead of one round trip per row.
+                    if index == 0 && !work_obsolete(&state, &first) && work_mergeable(&first) {
+                        let mut operations = work_operations(&first);
+                        round.push(first);
+                        while round.len() < MAX_ROUND_ITEMS {
+                            let Some(next) = state.queue.front() else { break };
+                            if work_obsolete(&state, next) || !work_selectable(next, now) || !work_mergeable(next) {
+                                break;
+                            }
+                            let more = work_operations(next);
+                            if operations + more > MAX_ROUND_OPERATIONS { break; }
+                            operations += more;
+                            round.extend(state.queue.pop_front());
+                        }
+                    } else {
+                        round.push(first);
+                    }
+                }
+                round
             };
-            let Some(mut work) = work else {
+            if round.is_empty() {
                 let idle = self.0.state.lock().unwrap().queue.is_empty();
                 if idle {
                     notified.await;
@@ -425,14 +568,15 @@ impl EdgePublisher {
                 }
                 publication_yield().await;
                 continue;
-            };
+            }
             publication_yield().await;
-            let obsolete = {
+            {
                 let state = self.0.state.lock().unwrap();
-                state.generation != work.permit.generation || work.ready.load(std::sync::atomic::Ordering::Acquire) == 2
-                    || (work.cleanup.is_empty() && work.epochs.iter().all(|(id, epoch)| state.epochs.get(id) != Some(epoch)))
-            };
-            if obsolete { continue; }
+                if round.iter().all(|work| work_obsolete(&state, work)) {
+                    drop(state);
+                    continue;
+                }
+            }
             let publication = gate.lock().await;
             let wait = web_time::Instant::now();
             {
@@ -440,50 +584,77 @@ impl EdgePublisher {
                 telemetry.histogram_ms("edge_lock_wait", wait.elapsed().as_secs_f64() * 1000.0);
                 let hold = web_time::Instant::now();
                 let state = self.0.state.lock().unwrap();
-                work.deltas.retain(|d| circuit.is_registered(&d.query_id)
-                    && state.generation == work.permit.generation
-                    && state.epochs.get(&ssp::canonical_query_id(&d.query_id)).copied().unwrap_or(0)
-                        == work.epochs[&ssp::canonical_query_id(&d.query_id)]);
+                for work in &mut round {
+                    let (generation, epochs) = (work.permit.generation, &work.epochs);
+                    work.deltas.retain(|d| circuit.is_registered(&d.query_id)
+                        && state.generation == generation
+                        && state.epochs.get(&ssp::canonical_query_id(&d.query_id)).copied().unwrap_or(0)
+                            == epochs[&ssp::canonical_query_id(&d.query_id)]);
+                }
                 telemetry.histogram_ms("edge_lock_hold", hold.elapsed().as_secs_f64() * 1000.0);
             }
-            if self.0.state.lock().unwrap().generation != work.permit.generation { continue; }
-            if work.deltas.is_empty() && work.cleanup.is_empty() { continue; }
-            let publish = web_time::Instant::now();
-            while let Some(cleanup) = work.cleanup.first() {
-                let result = match cleanup {
-                    PublicationCleanup::Statement(sql) => query_retrying(db.as_ref(), sql, &[]).await.map(|_| ()).map_err(anyhow::Error::from),
-                    PublicationCleanup::EnsureUser(user) => crate::tables::ensure_user_tables(db.as_ref(), mode, user).await,
-                    PublicationCleanup::DropUser(user) => crate::tables::drop_user_tables(db.as_ref(), mode, user).await,
-                };
-                match result {
-                    Ok(_) => { work.cleanup.remove(0); }
-                    Err(e) if crate::tables::is_missing_table_error(&e.to_string()) => { work.cleanup.remove(0); }
-                    Err(_) => break,
-                }
+            {
+                let generation = self.0.state.lock().unwrap().generation;
+                round.retain(|work| work.permit.generation == generation);
             }
-            if work.cleanup.is_empty() {
+            if round.iter().all(|work| work.deltas.is_empty() && work.cleanup.is_empty()) {
+                drop(publication);
+                continue;
+            }
+            let publish = web_time::Instant::now();
+            let cleanups: Vec<&[PublicationCleanup]> = round.iter().map(|work| work.cleanup.as_slice()).collect();
+            if run_cleanup(db.as_ref(), mode, &cleanups).await {
+                for work in &mut round { work.cleanup.clear(); }
                 let mut tables_ready = true;
-                for delta in work.deltas.iter().filter(|d| d.initial) {
+                for delta in round.iter().flat_map(|work| &work.deltas).filter(|d| d.initial) {
                     if crate::tables::ensure_user_tables(db.as_ref(), mode, &delta.auth_id).await.is_err() {
                         tables_ready = false; break;
                     }
                 }
                 if tables_ready {
-                    work.deltas = write_deltas_with_versions(db.as_ref(), std::mem::take(&mut work.deltas), &work.versions, mode, telemetry.as_ref()).await;
+                    // One write for the whole round, in queue order. Versions
+                    // are the newest captured for each key: every item in the
+                    // round has passed its own source wait.
+                    let mut versions: HashMap<String, i64> = HashMap::new();
+                    let mut deltas = Vec::new();
+                    let mut owners = Vec::new();
+                    for (item, work) in round.iter_mut().enumerate() {
+                        for (key, version) in &work.versions.0 {
+                            let entry = versions.entry(key.clone()).or_insert(*version);
+                            *entry = (*entry).max(*version);
+                        }
+                        for delta in std::mem::take(&mut work.deltas) {
+                            owners.push(item);
+                            deltas.push(delta);
+                        }
+                    }
+                    let failed: HashSet<usize> = write_delta_positions(db.as_ref(), &deltas, (0..deltas.len()).collect(),
+                        &CapturedVersions(versions), mode, telemetry.as_ref(), &mut HashSet::new()).await.into_iter().collect();
+                    for (position, delta) in deltas.into_iter().enumerate() {
+                        if failed.contains(&position) { round[owners[position]].deltas.push(delta); }
+                    }
                 }
             }
             telemetry.histogram_ms("edge_publish", publish.elapsed().as_secs_f64() * 1000.0);
             drop(publication);
-            if work.deltas.is_empty() && work.cleanup.is_empty() {
+            let (done, parked): (Vec<_>, Vec<_>) = round.into_iter()
+                .partition(|work| work.deltas.is_empty() && work.cleanup.is_empty());
+            if !done.is_empty() {
                 self.0.state.lock().unwrap().last_success = Some(crate::now_epoch_ms());
-            } else {
+            }
+            // Released outside the queue lock: a permit's drop takes it.
+            drop(done);
+            if parked.is_empty() { continue; }
+            let retry_at = web_time::Instant::now() + if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(5) };
+            let mut state = self.0.state.lock().unwrap();
+            // Back to the front, in their original order. Moving ahead of
+            // disjoint earlier work is safe; overlapping work could not have
+            // been selected in the first place.
+            for mut work in parked.into_iter().rev() {
                 let failed: HashSet<_> = work.deltas.iter().map(|d| ssp::canonical_query_id(&d.query_id)).collect();
                 work.epochs.retain(|id, _| failed.contains(id));
-                work.retry_at = Some(web_time::Instant::now() + if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(5) });
-                let mut state = self.0.state.lock().unwrap();
+                work.retry_at = Some(retry_at);
                 if let Some(stats) = state.leases.get_mut(&work.permit.id) { stats.parked = true; }
-                // Moving ahead of disjoint earlier work is safe; overlapping
-                // work could not have been selected in the first place.
                 state.queue.push_front(work);
             }
         }
@@ -701,7 +872,7 @@ pub fn build_edge_batch(
             let version = versions.version_of(id);
             group.updated += 1;
             group.body.push(format!(
-                "UPDATE (SELECT VALUE id FROM {from}->{list_ref} WHERE out = {out}) SET version = {version} RETURN NONE",
+                "UPDATE (SELECT VALUE id FROM {out}<-{list_ref} WHERE in = {from}) SET version = {version} RETURN NONE",
                 list_ref = list_ref,
                 version = version,
                 from = from,
@@ -725,8 +896,16 @@ pub fn build_edge_batch(
             // that view and dropped it after the settled-write grace. The
             // unfiltered `DELETE $from->edge` still works and is used as-is
             // by the unregister and TTL paths.
+            //
+            // Walked from the ROW, not from the view: `$from->edge WHERE out =
+            // x` reads every edge of the view to find one, so emptying a view
+            // of N rows cost N x N edge reads. A 5,000-row view took 171 ms
+            // per removal that way and 0.9 ms this way (SurrealDB 3.1.5), and
+            // deleting a 3,728-game database stalled publication for minutes
+            // (whitepawn, 2026-09-16). `x<-edge` holds only the views x is in.
+            // Same for the version updates and subquery children below.
             group.body.push(format!(
-                "DELETE (SELECT VALUE id FROM {from}->{list_ref} WHERE out = {out})",
+                "DELETE (SELECT VALUE id FROM {out}<-{list_ref} WHERE in = {from})",
                 from = from,
                 list_ref = list_ref,
                 out = id,
@@ -749,7 +928,7 @@ pub fn build_edge_batch(
                          version = {version}, \
                          clientId = {cid}, \
                          auth_id = {aid}, \
-                         parent = (SELECT VALUE id FROM {list_ref} WHERE in = {from} AND out = {parent} LIMIT 1)[0], \
+                         parent = (SELECT VALUE id FROM {parent}<-{list_ref} WHERE in = {from} LIMIT 1)[0], \
                          parent_rel = '{alias}'",
                         from = from, list_ref = list_ref, id = item.id, cid = cid, aid = aid,
                         version = version, parent = item.parent_key, alias = item.alias,
@@ -759,7 +938,7 @@ pub fn build_edge_batch(
                     let version = versions.version_of(&item.id);
                     group.updated += 1;
                     group.body.push(format!(
-                        "UPDATE (SELECT VALUE id FROM {from}->{list_ref} WHERE out = {id}) SET version = {version} RETURN NONE",
+                        "UPDATE (SELECT VALUE id FROM {id}<-{list_ref} WHERE in = {from}) SET version = {version} RETURN NONE",
                         list_ref = list_ref, from = from, id = item.id, version = version,
                     ));
                 }
@@ -768,7 +947,7 @@ pub fn build_edge_batch(
                     // Same subquery form as the primary removal above (see
                     // the note there).
                     group.body.push(format!(
-                        "DELETE (SELECT VALUE id FROM {from}->{list_ref} WHERE out = {id})",
+                        "DELETE (SELECT VALUE id FROM {id}<-{list_ref} WHERE in = {from})",
                         from = from,
                         list_ref = list_ref,
                         id = item.id,
@@ -954,13 +1133,39 @@ async fn write_deltas_with_versions(
     mode: RefMode,
     telemetry: &dyn Telemetry,
 ) -> Vec<ViewDelta> {
-    if deltas.is_empty() {
-        return Vec::new();
+    let positions = (0..deltas.len()).collect();
+    let failed = write_delta_positions(db, &deltas, positions, versions, mode, telemetry, &mut HashSet::new()).await;
+    let mut slots: Vec<Option<ViewDelta>> = deltas.into_iter().map(Some).collect();
+    failed.into_iter().filter_map(|p| slots[p].take()).collect()
+}
+
+/// [`write_deltas_with_versions`] over positions into `all`, which must be in
+/// publication order. Returns the positions that were not written, ascending.
+///
+/// Deltas of one view never land out of order. Once a view's delta fails
+/// (`poisoned`), its later deltas are returned without being attempted: one
+/// publication round carries many ingests' deltas, and letting a later
+/// removal land while the addition before it waits for a retry would bring
+/// the edge back when that retry succeeds.
+async fn write_delta_positions(
+    db: &dyn Db,
+    all: &[ViewDelta],
+    positions: Vec<usize>,
+    versions: &(impl RecordVersions + Sync),
+    mode: RefMode,
+    telemetry: &dyn Telemetry,
+    poisoned: &mut HashSet<String>,
+) -> Vec<usize> {
+    let view = |p: usize| ssp::canonical_query_id(&all[p].query_id);
+    let (mut held, positions): (Vec<usize>, Vec<usize>) =
+        positions.into_iter().partition(|&p| poisoned.contains(&view(p)));
+    if positions.is_empty() {
+        return held;
     }
-    let refs: Vec<&ViewDelta> = deltas.iter().collect();
+    let refs: Vec<&ViewDelta> = positions.iter().map(|&p| &all[p]).collect();
     let batch = build_edge_batch(&refs, mode, versions);
     if batch.is_empty() {
-        return Vec::new();
+        return held;
     }
     let op_count: usize = batch.deltas.iter().map(|d| d.body.len()).sum();
 
@@ -968,18 +1173,20 @@ async fn write_deltas_with_versions(
         created = batch.created(),
         updated = batch.updated(),
         deleted = batch.deleted(),
-        views = deltas.len(),
+        views = refs.len(),
         "Processing edge operations"
     );
 
     // Run the planned transactions in order. A delta whose transaction failed
     // is not carried into the ones after it: for a split publish those hold
     // the rest of the same membership, and replaying them over a retry that
-    // has already re-published it would duplicate every edge.
+    // has already re-published it would duplicate every edge. Nor is any later
+    // delta of a view that has failed.
     let mut failed: HashSet<usize> = HashSet::new();
     let mut error: Option<String> = None;
     for plan in plan_transactions(&batch, MAX_TX_STATEMENTS) {
-        if plan.deltas.iter().any(|d| failed.contains(d)) {
+        if plan.deltas.iter().any(|&d| failed.contains(&d) || poisoned.contains(&view(positions[d]))) {
+            poisoned.extend(plan.deltas.iter().map(|&d| view(positions[d])));
             failed.extend(plan.deltas);
             continue;
         }
@@ -994,10 +1201,11 @@ async fn write_deltas_with_versions(
         telemetry.histogram_ms("edge_transaction", elapsed_ms);
         if let Err(e) = outcome {
             telemetry.counter("edge_publish_failures", 1);
-            warn!(target: "ssp::edges", view_id = %deltas[plan.deltas[0]].query_id,
+            warn!(target: "ssp::edges", view_id = %refs[plan.deltas[0]].query_id,
                 elapsed_ms, statement_bytes = plan.sql.len(), operations = op_count,
                 "Edge transaction failed; publication remains pending");
             error = Some(e.to_string());
+            poisoned.extend(plan.deltas.iter().map(|&d| view(positions[d])));
             failed.extend(plan.deltas);
         }
     }
@@ -1012,31 +1220,30 @@ async fn write_deltas_with_versions(
 
     let Some(e) = error else {
         debug!(target: "ssp::edges", operations = op_count, "Edge update transaction completed");
-        return Vec::new();
+        return held;
     };
 
-    // Only the deltas whose transaction failed are retried; the rest are
-    // committed.
-    let mut slots: Vec<Option<ViewDelta>> = deltas.into_iter().map(Some).collect();
-    let deltas: Vec<ViewDelta> = {
-        let mut idx: Vec<usize> = failed.into_iter().collect();
-        idx.sort_unstable();
-        idx.into_iter().filter_map(|i| slots[i].take()).collect()
-    };
+    // Only the deltas whose transaction failed (or that were held back behind
+    // one) are retried; the rest are committed.
+    let mut retry: Vec<usize> = failed.into_iter().map(|d| positions[d]).collect();
+    retry.sort_unstable();
 
-    if deltas.len() > 1 {
+    if retry.len() > 1 {
         // Split on ANY error, not just a conflict: a statement that is wrong
         // (not merely contended) must be isolated, not retried as part of
-        // everything else forever.
+        // everything else forever. The halves run in order and share
+        // `poisoned`, so a view that fails again in the left half holds its
+        // later deltas in the right one.
         telemetry.counter("edge_batch_split", 1);
-        warn!(target: "ssp::edges", error = %e, views = deltas.len(), operations = op_count, "Edge update transaction failed after retries; splitting the batch");
-        let mut left = deltas;
-        let right = left.split_off(left.len() / 2);
-        let mut leftovers =
-            Box::pin(write_deltas_with_versions(db, left, versions, mode, telemetry)).await;
-        leftovers
-            .extend(Box::pin(write_deltas_with_versions(db, right, versions, mode, telemetry)).await);
-        return leftovers;
+        warn!(target: "ssp::edges", error = %e, views = retry.len(), operations = op_count, "Edge update transaction failed after retries; splitting the batch");
+        for &p in &retry {
+            poisoned.remove(&view(p));
+        }
+        let right = retry.split_off(retry.len() / 2);
+        held.extend(Box::pin(write_delta_positions(db, all, retry, versions, mode, telemetry, poisoned)).await);
+        held.extend(Box::pin(write_delta_positions(db, all, right, versions, mode, telemetry, poisoned)).await);
+        held.sort_unstable();
+        return held;
     }
 
     // A view the client has since released (TTL sweep, unsubscribe, a
@@ -1044,13 +1251,16 @@ async fn write_deltas_with_versions(
     // `_00_query` record to relate from, so its deltas can never land and
     // nobody is waiting for them. Those are dropped here, deliberately,
     // instead of being carried forever.
-    if view_is_gone(db, &deltas[0].query_id).await {
+    let failed_delta = &all[retry[0]];
+    if view_is_gone(db, &failed_delta.query_id).await {
         telemetry.counter("edge_deltas_orphaned", 1);
-        info!(target: "ssp::edges", view_id = %deltas[0].query_id, operations = op_count, "Edge delta dropped: its view is no longer registered");
-        return Vec::new();
+        info!(target: "ssp::edges", view_id = %failed_delta.query_id, operations = op_count, "Edge delta dropped: its view is no longer registered");
+        return held;
     }
-    error!(target: "ssp::edges", error = %e, view_id = %deltas[0].query_id, operations = op_count, "Edge delta not written after retries");
-    deltas
+    error!(target: "ssp::edges", error = %e, view_id = %failed_delta.query_id, operations = op_count, "Edge delta not written after retries");
+    held.extend(retry);
+    held.sort_unstable();
+    held
 }
 
 /// Whether the `_00_query` record behind a view id is gone. Only a definite
@@ -1669,11 +1879,9 @@ mod tests {
             .filter(|s| s.starts_with("DELETE"))
             .collect();
         assert_eq!(deletes.len(), 2);
+        assert_eq!(deletes[0], "DELETE (SELECT VALUE id FROM message:old<-_00_list_ref WHERE in = $from0)");
+        assert_eq!(deletes[1], "DELETE (SELECT VALUE id FROM child:gone<-_00_list_ref WHERE in = $from0)");
         for stmt in deletes {
-            assert!(
-                stmt.starts_with("DELETE (SELECT VALUE id FROM $from0->_00_list_ref WHERE out = "),
-                "{stmt}"
-            );
             assert!(
                 !stmt.contains("DELETE $from0->"),
                 "filtered graph-path delete must not be emitted: {stmt}"
@@ -2045,6 +2253,8 @@ mod publication_tests {
         block_source: AtomicBool,
         hold_all_sources: AtomicBool,
         source_delay_ms: std::sync::atomic::AtomicU64,
+        /// Fail any statement containing this, on top of `fail`.
+        fail_marker: Mutex<Option<String>>,
         active_probes: std::sync::atomic::AtomicUsize,
         max_probes: std::sync::atomic::AtomicUsize,
         sql: Mutex<Vec<String>>,
@@ -2069,6 +2279,9 @@ mod publication_tests {
             }
             if sql.starts_with("SELECT VALUE id FROM ONLY") { return Ok(vec![json!("_00_query:q")]); }
             if self.fail.load(Ordering::Acquire) && sql.contains("thread:a") { return Err(DbError::Transport("offline".into())); }
+            if let Some(marker) = self.fail_marker.lock().unwrap().as_deref() {
+                if sql.contains(marker) { return Err(DbError::Transport("offline".into())); }
+            }
             self.sql.lock().unwrap().push(sql.into());
             Ok(vec![])
         }
@@ -2098,6 +2311,16 @@ mod publication_tests {
     fn start(p: EdgePublisher, db: Arc<TestDb>, c: Arc<RwLock<Circuit>>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move { p.run(db.clone(), c, Arc::new(tokio::sync::Mutex::new(())), RefMode::Single,
             Arc::new(FastScheduler), Arc::new(NoopTelemetry), Duration::ZERO, db, Arc::new(TestSpawner)).await })
+    }
+    /// Every statement the publisher sent, in order, across transactions.
+    fn statements(db: &TestDb) -> Vec<String> {
+        db.sql.lock().unwrap().iter()
+            .flat_map(|sql| sql.split(";\n").map(|s| s.trim_end_matches(';').to_string()).collect::<Vec<_>>())
+            .filter(|s| !s.starts_with("BEGIN") && !s.starts_with("COMMIT") && !s.starts_with("LET "))
+            .collect()
+    }
+    fn position_of(statements: &[String], needle: &str) -> usize {
+        statements.iter().position(|s| s.contains(needle)).unwrap_or_else(|| panic!("no statement contains {needle}: {statements:#?}"))
     }
     async fn drained(p: &EdgePublisher) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2143,10 +2366,10 @@ mod publication_tests {
         assert_eq!(p.snapshot().pending_batches, 2);
         db.source_release.notify_one();
         drained(&p).await;
-        let sql = db.sql.lock().unwrap();
-        assert_eq!(sql.len(), 2);
-        assert!(sql[0].contains("RELATE "));
-        assert!(sql[1].contains("DELETE (SELECT"));
+        let st = statements(&db);
+        assert_eq!(st.len(), 2, "{st:#?}");
+        assert!(st[0].starts_with("RELATE "));
+        assert!(st[1].starts_with("DELETE (SELECT"));
         task.abort();
     }
     #[tokio::test]
@@ -2176,9 +2399,8 @@ mod publication_tests {
         assert_eq!(p.snapshot().pending_batches, 2);
         db.source_release.notify_one();
         drained(&p).await;
-        let sql = db.sql.lock().unwrap();
-        assert!(sql[1].contains("RELATE "));
-        assert!(sql[2].contains("DELETE (SELECT"));
+        let st = statements(&db);
+        assert!(position_of(&st, "->_00_list_ref->thread:a") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
         task.abort();
     }
     #[tokio::test]
@@ -2199,7 +2421,11 @@ mod publication_tests {
         assert!(begin.elapsed() >= Duration::from_millis(200));
         assert_eq!(db.max_probes.load(Ordering::Acquire), 16);
         assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
-        assert_eq!(db.sql.lock().unwrap().len(), 32);
+        let st = statements(&db);
+        assert_eq!(st.len(), 32, "{st:#?}");
+        for i in 1..32 {
+            assert!(position_of(&st, &format!("->thread:r{} ", i - 1)) < position_of(&st, &format!("->thread:r{i} ")));
+        }
         task.abort();
     }
     #[tokio::test]
@@ -2221,7 +2447,11 @@ mod publication_tests {
         assert!(begin.elapsed() >= Duration::from_secs(5));
         assert_eq!(db.max_probes.load(Ordering::Acquire), 16);
         assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
-        assert_eq!(db.sql.lock().unwrap().len(), 32);
+        let st = statements(&db);
+        assert_eq!(st.len(), 32, "{st:#?}");
+        for i in 1..32 {
+            assert!(position_of(&st, &format!("->thread:r{} ", i - 1)) < position_of(&st, &format!("->thread:r{i} ")));
+        }
         task.abort();
     }
     #[tokio::test]
@@ -2280,12 +2510,13 @@ mod publication_tests {
             while db.sql.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
         }).await.unwrap();
         assert!(db.sql.lock().unwrap()[0].contains("thread:b"));
-        assert_eq!(p.snapshot().parked_batches, 1);
+        assert!(!db.sql.lock().unwrap()[0].contains("thread:a"));
+        // The delete is held behind the failed add, so both are parked.
+        assert_eq!(p.snapshot().parked_batches, 2);
         db.fail.store(false, Ordering::Release);
         drained(&p).await;
-        let sql = db.sql.lock().unwrap();
-        assert!(sql[1].contains("RELATE "));
-        assert!(sql[2].contains("DELETE (SELECT"));
+        let st = statements(&db);
+        assert!(position_of(&st, "->_00_list_ref->thread:a") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
         task.abort();
     }
     #[tokio::test]
@@ -2336,6 +2567,96 @@ mod publication_tests {
         let task = start(p.clone(), db.clone(), c);
         drained(&p).await;
         assert!(db.sql.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn publication_reports_pending_views_until_they_land() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        assert!(!p.has_pending("q"));
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        assert!(p.has_pending("q"));
+        assert!(p.has_pending("_00_query:q"), "either id spelling");
+        assert!(!p.has_pending("other"));
+        let task = start(p.clone(), db.clone(), c);
+        drained(&p).await;
+        assert!(!p.has_pending("q"));
+        task.abort();
+    }
+
+    /// Deleting a big collection is one ingest per row, each with its edge
+    /// cleanup. Published one by one that was ~3 round trips per row; a round
+    /// folds the cleanup per table and the removals into a single transaction.
+    #[tokio::test]
+    async fn publication_bulk_delete_folds_cleanup_and_deltas_into_few_round_trips() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        for i in 0..200 {
+            let id = format!("thread:d{i}");
+            p.enqueue(p.try_reserve(0).unwrap(), vec![delta(&id, false)], &*c.read().await, None, false, vec![
+                PublicationCleanup::DropEdgesTo { table: "_00_list_ref_user_u".into(), record: id.clone() },
+                PublicationCleanup::DropEdgesTo { table: "_00_list_ref_anon".into(), record: id },
+            ]);
+        }
+        let task = start(p.clone(), db.clone(), c);
+        drained(&p).await;
+        let sql = db.sql.lock().unwrap().clone();
+        assert_eq!(sql.len(), 3, "200 deletes: two cleanup statements and one transaction, got {sql:#?}");
+        assert!(sql[0].starts_with("DELETE array::flatten((SELECT VALUE id FROM [thread:d0, thread:d1, "));
+        assert!(sql[0].ends_with("]<-_00_list_ref_user_u))"));
+        assert!(sql[1].ends_with("]<-_00_list_ref_anon))"));
+        for i in 0..200 {
+            assert!(sql[0].contains(&format!("thread:d{i}]")) || sql[0].contains(&format!("thread:d{i},")));
+        }
+        assert_eq!(sql[2].matches("DELETE (SELECT").count(), 200);
+        assert!(p.snapshot().last_success_at_ms.is_some());
+        task.abort();
+    }
+
+    /// Table lifecycle is not folded into a round: the delta queued before it
+    /// is written before it, and the delta after it after it.
+    #[tokio::test]
+    async fn publication_lifecycle_cleanup_keeps_a_round_of_its_own() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![], &*c.read().await, None, false,
+            vec![PublicationCleanup::Statement("REMOVE TABLE lifecycle_marker".into())]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:b", true)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        drained(&p).await;
+        let sql = db.sql.lock().unwrap().clone();
+        assert_eq!(sql.len(), 3, "{sql:#?}");
+        assert!(sql[0].contains("thread:a"));
+        assert_eq!(sql[1], "REMOVE TABLE lifecycle_marker");
+        assert!(sql[2].contains("thread:b"));
+        task.abort();
+    }
+
+    /// In a merged round, a later delta of a view must not land while an
+    /// earlier one of the same view is waiting for a retry: the delete would
+    /// go first and the retried add would bring the edge back.
+    #[tokio::test]
+    async fn publication_failed_add_holds_the_later_delete_of_its_view() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        *db.fail_marker.lock().unwrap() = Some("->thread:a SET".into());
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", false)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while p.snapshot().parked_batches < 2 { tokio::task::yield_now().await; }
+        }).await.expect("both items parked");
+        assert!(statements(&db).is_empty(), "nothing of the view may land: {:#?}", statements(&db));
+        *db.fail_marker.lock().unwrap() = None;
+        drained(&p).await;
+        let st = statements(&db);
+        assert!(position_of(&st, "->thread:a SET") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
         task.abort();
     }
 }

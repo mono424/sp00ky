@@ -47,6 +47,12 @@ impl Db for MemDb {
 async fn mem() -> Arc<Surreal<MemEngine>> {
     let db = Surreal::new::<Mem>(()).await.unwrap();
     db.use_ns("t").use_db("t").await.unwrap();
+    // The rows live in the circuit only, but their tables exist in any real
+    // database, and edge writes walk from a row (`thread:t<-_00_list_ref`),
+    // which SurrealDB refuses for a table it has never heard of.
+    db.query("DEFINE TABLE user SCHEMALESS; DEFINE TABLE thread SCHEMALESS; DEFINE TABLE comment SCHEMALESS; DEFINE TABLE job SCHEMALESS;")
+        .await
+        .unwrap();
     Arc::new(db)
 }
 
@@ -354,3 +360,4 @@ async fn subquery_only_delta_still_writes_edges() {
          comment on an already-in-view thread never syncs (production bug)"
     );
 }
+

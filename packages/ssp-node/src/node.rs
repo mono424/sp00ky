@@ -904,7 +904,7 @@ impl SspNode {
         // cleanup targets the right per-user `_00_list_ref_user_<id>`.
         let auth_id = {
             let circuit = self.processor.read().await;
-            circuit.get_view(&view_key).map(|v| v.auth_id.clone()).unwrap_or_default()
+            circuit.registration(&view_key).map(|(_, auth)| auth).unwrap_or_default()
         };
         {
             let mut circuit = self.processor.write().await;
@@ -961,21 +961,30 @@ impl SspNode {
         let _publication = self.publication_gate.lock().await;
         let stale_table = {
             let mut circuit = self.processor.write().await;
-            match circuit.get_view(view_id) {
-                Some(v) if v.auth_id.is_empty() => {}
+            match circuit.registration(view_id) {
+                Some((_, auth)) if auth.is_empty() => {}
                 _ => return false,
             }
-            // Merging is off by default, but when it is on another
-            // registration may be reading this graph. Leave it alone rather
-            // than tear it out from under them; that view is readable by
-            // whoever owns it and this caller can wait for its own cold build
-            // on the next distinct id.
-            if !circuit.subscribers_of(view_id).is_empty() {
-                return false;
-            }
             let table = crate::tables::list_ref_table(self.ref_mode, "");
-            self.edge_update_tx.invalidate_view(view_id);
-            circuit.remove_query(view_id);
+            if circuit.get_view(view_id).is_some() {
+                // Merging is off by default, but when it is on another
+                // registration may be reading this graph. Leave it alone rather
+                // than tear it out from under them; that view is readable by
+                // whoever owns it and this caller can wait for its own cold
+                // build on the next distinct id.
+                if !circuit.subscribers_of(view_id).is_empty() {
+                    return false;
+                }
+                self.edge_update_tx.invalidate_view(view_id);
+                circuit.remove_query(view_id);
+            } else {
+                // A merged subscriber: it holds a claim on someone else's
+                // graph, not a graph of its own, so releasing it costs nobody
+                // anything. Joining with the caller's identity instead would
+                // keep serving it rows computed for the empty one.
+                self.edge_update_tx.invalidate_view(view_id);
+                circuit.detach_subscriber(view_id);
+            }
             table
         };
         self.platform.telemetry.gauge_add("view_count", -1);
@@ -1038,10 +1047,13 @@ impl SspNode {
         // Read the row count and the STORED auth id: the latter is what
         // `build_edge_batch` routes on, so the probe has to look in the same
         // table a republish would write to.
-        let (expected_rows, view_auth) = {
+        // A merged subscriber reads its owner's graph but publishes under its
+        // own identity, so the two come from different places.
+        let (graph, expected_rows, view_auth) = {
             let circuit = self.processor.read().await;
-            match circuit.get_view(view_id) {
-                Some(v) => (v.cache.len() as i64, v.auth_id.clone()),
+            let Some((graph, auth)) = circuit.registration(view_id) else { return };
+            match circuit.get_view(&graph) {
+                Some(v) => (graph, v.cache.len() as i64, auth),
                 None => return,
             }
         };
@@ -1082,6 +1094,13 @@ impl SspNode {
         // genuinely empty (`rowCount = 0` is then the truth, not a default
         // standing in for one).
         if row_present && (expected_rows == 0 || edge_count > 0) {
+            return;
+        }
+        // No edges yet, but a publication for this view is already queued or
+        // being written: that is the repair. Queuing another full snapshot on
+        // every re-registration piled them up behind a slow queue. A missing
+        // row is different: deleting it dropped its edges, so it needs one.
+        if row_present && self.edge_update_tx.has_pending(view_id) {
             return;
         }
 
@@ -1157,7 +1176,7 @@ impl SspNode {
         {
             let circuit = self.processor.read().await;
             if !self.edge_update_tx.is_current(&permit) { return; }
-            if let Some(delta) = circuit.snapshot_delta(view_id, view_auth) {
+            if let Some(delta) = circuit.snapshot_delta_from(&graph, view_id.to_string(), view_auth) {
                 self.edge_update_tx.enqueue(permit, vec![delta], &circuit, None, false, vec![]);
             }
         }
@@ -1254,9 +1273,12 @@ impl SspNode {
         let raw_id = data.metadata.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
         let incantation_id = crate::edges::format_incantation_id(raw_id);
 
+        // `registration`, not `get_view`: a merged subscriber owns no view of
+        // its own, and treating its re-registration as new re-published its
+        // whole membership every time (see `Circuit::registration`).
         let view_existed = {
             let circuit = self.processor.read().await;
-            circuit.get_view(&data.plan.id).is_some()
+            circuit.registration(&data.plan.id).is_some()
         };
 
         // A view registered before its session had an identity is not merely
@@ -1288,7 +1310,7 @@ impl SspNode {
             // "no results" from "edges still flushing".
             let existing_auth = {
                 let circuit = self.processor.read().await;
-                circuit.get_view(&data.plan.id).map(|v| v.auth_id.clone())
+                circuit.registration(&data.plan.id).map(|(_, auth)| auth)
             };
 
             // Query ids are derived from (surql, params, auth), so a caller
@@ -1598,11 +1620,16 @@ impl SspNode {
             let mut cleanup = Vec::new();
             if op == Operation::Delete && valid_record_id(&payload.id) {
                 if let Some(owner) = payload.record.get("owner").and_then(|v| v.as_str()) {
-                    let table = crate::tables::list_ref_table(self.ref_mode, owner);
-                    cleanup.push(crate::edges::PublicationCleanup::Statement(format!("DELETE {table} WHERE out = {}", payload.id)));
+                    cleanup.push(crate::edges::PublicationCleanup::DropEdgesTo {
+                        table: crate::tables::list_ref_table(self.ref_mode, owner),
+                        record: payload.id.clone(),
+                    });
                 }
                 if self.anonymous_live_queries {
-                    cleanup.push(crate::edges::PublicationCleanup::Statement(format!("DELETE _00_list_ref_anon WHERE out = {}", payload.id)));
+                    cleanup.push(crate::edges::PublicationCleanup::DropEdgesTo {
+                        table: "_00_list_ref_anon".to_string(),
+                        record: payload.id.clone(),
+                    });
                 }
             }
             if payload.table == "user" {

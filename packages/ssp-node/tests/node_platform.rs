@@ -1420,6 +1420,53 @@ async fn two_registrations_of_one_computation_share_one_graph() {
     }
 }
 
+// A client registers the same id again routinely (a "view lost" read, a
+// reconnect). For a merged subscriber that used to take the COLD path every
+// time, because the subscriber owns no view of its own: it re-attached, reset
+// its row to `materializing` and re-published its whole membership, and under
+// load the same views looped every second or two (whitepawn, 2026-09-16).
+#[tokio::test]
+async fn registering_a_merged_subscriber_again_is_a_warm_join() {
+    let h = merging_harness().await;
+    for id in ["_00_query:a", "_00_query:b"] {
+        let r = h.node.route(authed(Method::Post, "/view/register", merge_register(id, "user:alice"))).await.unwrap();
+        assert_eq!(r.status, 200, "register {id}: {:?}", json_of(&r));
+    }
+    assert_eq!(*h.telemetry_gauge.lock().unwrap(), 2, "two cold registrations");
+
+    for id in ["_00_query:b", "_00_query:b", "_00_query:a"] {
+        let r = h.node.route(authed(Method::Post, "/view/register", merge_register(id, "user:alice"))).await.unwrap();
+        assert_eq!(r.status, 200, "re-register {id}: {:?}", json_of(&r));
+    }
+    assert_eq!(
+        *h.telemetry_gauge.lock().unwrap(), 2,
+        "re-registering an owner or a subscriber is not a new view"
+    );
+    let c = h.node.processor.read().await;
+    assert_eq!(c.graph_count(), 1);
+    assert_eq!(c.subscribers_of("a").len(), 1, "b is attached once");
+}
+
+// A merged subscriber that registered with no identity is rebuilt for a
+// caller that has one, the same as an owner: joining it would keep serving
+// rows computed for the empty identity.
+#[tokio::test]
+async fn a_subscriber_without_identity_is_rebuilt_for_a_caller_with_one() {
+    let h = merging_harness().await;
+    for (id, auth) in [("_00_query:a", ""), ("_00_query:b", "")] {
+        let r = h.node.route(authed(Method::Post, "/view/register", merge_register(id, auth))).await.unwrap();
+        assert_eq!(r.status, 200, "register {id}: {:?}", json_of(&r));
+    }
+    assert_eq!(h.node.processor.read().await.registration("b").map(|(_, auth)| auth), Some(String::new()));
+
+    let r = h.node.route(authed(Method::Post, "/view/register", merge_register("_00_query:b", "user:alice"))).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    assert_eq!(
+        h.node.processor.read().await.registration("b").map(|(_, auth)| auth),
+        Some("user:alice".to_string())
+    );
+}
+
 // A restart must not un-merge the tenant.
 //
 // Boot re-registration reads `_00_query` and rebuilds a graph per row. Without

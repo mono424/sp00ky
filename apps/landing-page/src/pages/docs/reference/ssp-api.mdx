@@ -852,7 +852,9 @@ is slow. Cleanup uses a separate publication gate, and queued deltas for detache
 registrations are discarded. The native SSP uses a separate database session for
 bulk publication, including its token refresh and reconnect lifecycle.
 
-Version updates locate a view's edges through the graph index and return no row
+Removals, version updates and subquery parent lookups find an edge by walking
+from its row (`row<-list_ref WHERE in = view`), so they cost the few views that
+row is in rather than every edge of the view. Version updates return no row
 bodies. Version-only deltas are idempotent and can be split at the transaction
 statement cap; membership-changing incremental deltas remain atomic. Direct
 correlated joins invalidate affected parents and children; complex joins retain
@@ -884,6 +886,18 @@ overshoot them. Large individual memberships remain atomic. Source-commit waits
 and metadata barriers preserve publication order; disjoint views may proceed
 while an earlier failed view waits for retry. Internal lifecycle generations
 prevent queued work from an old registration or restore from recreating edges.
+
+Ready work at the head of the queue is published together, in rounds of up to
+256 admitted requests. A round writes its deltas in queue order in as few
+transactions as the statement cap allows, and folds the edge cleanup for
+deleted rows into one statement per table, so a bulk delete costs a handful of
+round trips instead of several per row. Table lifecycle work (per-user tables
+created or dropped) keeps a round of its own. If a delta of a view fails, later
+deltas of that view in the same round wait for its retry rather than landing
+first. Registering an id that is already registered, including a merged
+subscriber sharing another registration's graph, joins the existing view and
+does not publish its membership again unless its edges are missing and no
+publication for it is pending.
 
 Source-commit visibility checks run outside the writer on the control database
 session, with at most 16 simultaneous probes. Each wait has a five-second total

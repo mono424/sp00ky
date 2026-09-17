@@ -1,6 +1,6 @@
 {
   "name": "@example/e2e",
-  "version": "0.0.1-canary.264",
+  "version": "0.0.1-canary.265",
   "private": true,
   "scripts": {
     "test": "playwright test",

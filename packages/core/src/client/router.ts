@@ -2,7 +2,7 @@ import type { RuntimeEvent } from '../kernel/events';
 import type { Lane, Saga } from '../kernel/saga';
 import type { SagaEnv } from '../query/env';
 import { ensureRegistered, registerRemote } from '../query/register.saga';
-import { readDirtyMembership, readMembership } from '../query/membership.saga';
+import { readDirtyMembership, readMembership, recoverLostView } from '../query/membership.saga';
 import { fetchRows } from '../query/fetch.saga';
 import { materialize, streamUpdate } from '../query/materialize.saga';
 import { ackPrune, gcTick, lifecycleTick } from '../query/lifecycle.saga';
@@ -37,6 +37,8 @@ export function route(env: SagaEnv, event: RuntimeEvent): RouteTarget {
       return { saga: ensureRegistered(env, { requireAuth: event.requireAuth, attempt: event.attempt }), lane: serial('ensure') };
     case 'RegisterRemote':
       return { saga: registerRemote(env, event.hash, event.retry), lane: dedupe(`register:${event.hash}`) };
+    case 'RecoverLostView':
+      return { saga: recoverLostView(event.hash), lane: dedupe(`view-lost:${event.hash}`) };
     case 'ReadDirtyMembership':
       return { saga: readDirtyMembership(env), lane: serial('membership') };
     case 'ReadMembership':

@@ -193,16 +193,20 @@ describe('registerRemote', () => {
       handlers: { 'remote.query': () => [{ status: 'ERR', error: 'denied' }] },
     });
     expect(errStmt.state.queries.get('a')!.registerAttempts).toBe(1);
-    const edgesErr = await runPure(registerRemote(env, 'a'), {
-      state: buildState([entry]),
-      handlers: { 'remote.query': () => [okStmt(null), { status: 'ERR', error: 'no table' }, okStmt(null), okStmt(null)] },
-    });
-    expect(edgesErr.state.queries.get('a')!.registerAttempts).toBe(1);
-    const noArray = await runPure(registerRemote(env, 'a'), {
-      state: buildState([entry]),
-      handlers: { 'remote.query': () => [okStmt(null), okStmt('nope'), okStmt(null), okStmt(null)] },
-    });
-    expect(noArray.state.queries.get('a')!.registerAttempts).toBe(1);
+    // The register statement answered but the read-back did not: the query
+    // IS registered, and its membership is read again rather than guessed.
+    for (const readBack of [
+      [okStmt(null), { status: 'ERR', error: 'no table' }, okStmt(null), okStmt(null)],
+      [okStmt(null), okStmt('nope'), okStmt(null), okStmt(null)],
+    ] as StatementResult[][]) {
+      const out = await runPure(registerRemote(env, 'a'), { state: buildState([entry]), handlers: { 'remote.query': () => readBack } });
+      const e = out.state.queries.get('a')!;
+      expect(e.registerAttempts).toBe(0);
+      expect(e.lifecycle).toMatchObject({ remote: 'registered', fetchDepth: 0 });
+      expect(out.state.membershipDirty.has('a')).toBe(true);
+      expect(out.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
+      expect(out.dispatched).toContainEqual({ type: 'SyncOutcome', ok: false, error: 'registration read-back failed' });
+    }
     const empty = await runPure(registerRemote(env, 'a'), { state: buildState([entry]), handlers: { 'remote.query': () => [] } });
     expect(empty.state.queries.get('a')!.registerAttempts).toBe(1);
     const last = await runPure(registerRemote(env, 'a'), {
@@ -246,18 +250,22 @@ describe('registerRemote', () => {
     expect(isNotAllowlisted('HTTP 4030')).toBe(false);
   });
 
-  it('tolerates ERR meta/children statements: edges still apply, missing meta reads as no row', async () => {
-    const out = await runPure(registerRemote(env, 'a'), {
-      state: buildState([entry]),
-      handlers: {
-        'remote.query': () => [okStmt(null), okStmt([{ out: new RecordId('thing', '1'), version: 1 }]), { status: 'ERR', error: 'meta' }, { status: 'ERR', error: 'kids' }],
-        'local.upsert': () => undefined,
-      },
-    });
-    const e = out.state.queries.get('a')!;
-    expect(e.lifecycle).toMatchObject({ phase: 'live', remote: 'registered' });
-    expect(e.serverState).toBeNull();
-    expect(e.subqueryRemoteArray).toEqual([]);
+  it('an ERR meta or children statement applies nothing and re-reads, instead of reading as a lost row', async () => {
+    const lostBefore = buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'view-lost' }, remoteArray: [['thing:1', 1]], viewLostCount: 1 });
+    for (const [meta, kids] of [
+      [{ status: 'ERR', error: 'meta' }, okStmt([])],
+      [okStmt({ rowCount: 1, state: 'ready' }), { status: 'ERR', error: 'kids' }],
+    ] as StatementResult[][]) {
+      const out = await runPure(registerRemote(env, 'a'), {
+        state: buildState([lostBefore]),
+        handlers: { 'remote.query': () => [okStmt(null), okStmt([{ out: new RecordId('thing', '1'), version: 1 }]), meta, kids] },
+      });
+      const e = out.state.queries.get('a')!;
+      expect(e.lifecycle).toMatchObject({ phase: 'view-lost', remote: 'registered' });
+      expect(e.viewLostCount).toBe(1);
+      expect(out.dispatched.filter((d) => d.type === 'EnsureRegistered')).toEqual([]);
+      expect(out.state.membershipDirty.has('a')).toBe(true);
+    }
   });
   it('stops when the entry disappears mid-flight', async () => {
     const out = await runPure(registerRemote(env, 'a'), {

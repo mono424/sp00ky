@@ -23,6 +23,13 @@ export const RETRY_BASE_MS = 500;
 export const RETRY_MAX_MS = 15_000;
 /** Registration attempts before a query is reported as failed to settle. */
 export const REGISTER_MAX_RETRIES = 3;
+/**
+ * Pacing of repeated view-lost recovery. The first re-registration after a
+ * `_00_query` row reads as gone is immediate; each further one for the same
+ * query, before the row has been seen again, waits on this backoff.
+ */
+export const VIEW_LOST_RETRY_BASE_MS = 1_000;
+export const VIEW_LOST_RETRY_MAX_MS = 30_000;
 /** `_00_list_ref` poll cadence (fallback when LIVE is quiet). */
 export const LIST_REF_POLL_BASE_MS = 500;
 export const LIST_REF_POLL_MAX_MS = 5_000;

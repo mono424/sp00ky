@@ -14,8 +14,8 @@ import { parseDuration } from '../utils/index';
 import type { SagaEnv } from './env';
 import { listRefTable } from './env';
 import { queryHashInput, viewKeyInput } from './hash';
-import { isResolvedBefore, parseViewRow, snapshotFromSingle } from './membership';
-import { applyMembership, applySubqueryChildren } from './membership.saga';
+import { FAILED, isResolvedBefore, parseViewRow, snapshotFromSingle } from './membership';
+import { applyMembership, applySubqueryChildren, markMembershipDirty } from './membership.saga';
 import * as sql from './sql';
 
 export interface RegisterInput {
@@ -86,6 +86,8 @@ export function* registerLocal(env: SagaEnv, input: RegisterInput): Saga<QueryHa
       lastHeartbeatAt: null,
       lastPolledAt: null,
       registerAttempts: 0,
+      viewLostCount: 0,
+      viewLostRetryAt: null,
       telemetry: { ...emptyTelemetry(), registrationTimings: reg.timings },
     };
     yield fx.state.update(R.putQuery(entry));
@@ -163,15 +165,23 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
     if (!stillThere) return;
     const register = stmt(results, 0);
     if (!register || register.status === 'ERR') throw new Error(register?.status === 'ERR' ? register.error : 'register returned nothing');
-    const edges = stmt(results, 1);
-    const meta = stmt(results, 2);
-    const children = stmt(results, 3);
+    const answer = (r: StatementResult | undefined): unknown => (r?.status === 'OK' ? r.result : FAILED);
     const snap = snapshotFromSingle(
-      edges?.status === 'OK' ? (edges.result as never) : null,
-      meta?.status === 'OK' ? (meta.result as never) : null,
-      children?.status === 'OK' ? (children.result as never) : null
+      answer(stmt(results, 1)) as never,
+      answer(stmt(results, 2)) as never,
+      answer(stmt(results, 3)) as never
     );
-    if (!snap) throw new Error(edges?.status === 'ERR' ? edges.error : 'edge read returned no array');
+    if (!snap) {
+      // Registered, but the read-back did not answer. That says nothing about
+      // the row, so read membership again rather than guess: a guess of
+      // "gone" re-registered the query, and under load the next read-back
+      // failed the same way.
+      yield fx.state.update(R.compose(R.applyLifecycle(hash, { type: 'remote-registered' }), R.resetRegisterAttempts(hash)));
+      yield fx.emit({ type: 'log', level: 'debug', message: 'registration read-back did not answer; re-reading membership', data: { hash } });
+      yield* markMembershipDirty([hash]);
+      yield fx.dispatch({ type: 'SyncOutcome', ok: false, error: 'registration read-back failed' });
+      return;
+    }
     const outcome = yield* applyMembership(hash, snap.primary, snap.meta);
     if (outcome === 'ignored' && snap.meta.present && snap.meta.state === 'materializing') {
       yield fx.state.update(R.compose(R.markMembershipDirty([hash]), R.setMembershipReread(hash, 1)));

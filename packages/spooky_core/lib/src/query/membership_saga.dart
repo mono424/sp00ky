@@ -33,6 +33,12 @@ Future<MembershipOutcome> applyMembership(
               }
             : null)));
   }
+  // The row is there: whatever made it read as gone has passed.
+  if (meta != null &&
+      meta.present &&
+      (entry.viewLostCount > 0 || entry.viewLostRetryAt != null)) {
+    await ctx(Fx.stateUpdate(r.setViewLost(hash, 0, null)));
+  }
   final outcome = decideMembershipOutcome(MembershipDecisionInput(
     phase: entry.lifecycle.phase,
     held: entry.remoteArray.length,
@@ -46,11 +52,33 @@ Future<MembershipOutcome> applyMembership(
       await ctx(Fx.stateUpdate(r.applyLifecycle(hash, const RowMissingEvent())));
       await ctx(Fx.emit(QueryViewLostEvent(hash)));
     }
-    if (entry.lifecycle.remote != RemotePhase.unregistered) {
-      await ctx(
-          Fx.stateUpdate(r.applyLifecycle(hash, const RemoteDroppedEvent())));
+    // A recovery is already scheduled: every read in the meantime would
+    // otherwise re-register again.
+    if (entry.viewLostRetryAt != null) return outcome;
+    if (entry.viewLostCount == 0) {
+      await ctx(Fx.stateUpdate(r.setViewLost(hash, 1, null)));
+      if (entry.lifecycle.remote != RemotePhase.unregistered) {
+        await ctx(Fx.stateUpdate(
+            r.applyLifecycle(hash, const RemoteDroppedEvent())));
+      }
+      await ctx(Fx.dispatch(const EnsureRegistered()));
+      return outcome;
     }
-    await ctx(Fx.dispatch(const EnsureRegistered()));
+    // Re-registered already and the row still reads as gone. Under load that
+    // repeated every read, each one costing the server a registration while it
+    // was still publishing the last, so from here on it is paced.
+    final delay = backoffMs(entry.viewLostCount - 1,
+        base: viewLostRetryBaseMs, max: viewLostRetryMaxMs);
+    final now = await ctx(Fx.now());
+    await ctx(Fx.stateUpdate(
+        r.setViewLost(hash, entry.viewLostCount + 1, now + delay)));
+    await ctx(Fx.log(LogLevel.debug,
+        'view still lost; re-registering after a delay', {
+      'hash': hash,
+      'attempt': entry.viewLostCount + 1,
+      'delayMs': delay,
+    }));
+    await ctx(Fx.timerSet('view-lost:$hash', delay, RecoverLostView(hash)));
     return outcome;
   }
   final wasAuthoritative = isAuthoritative(entry.lifecycle);
@@ -71,6 +99,20 @@ Future<MembershipOutcome> applyMembership(
   return outcome;
 }
 
+/// The paced view-lost re-registration. A no-op when the row has been seen
+/// since (the pacing was reset) or the query recovered or went away.
+Future<void> recoverLostView(Ctx ctx, QueryHash hash) async {
+  final entry = await ctx(Fx.stateRead((s) => s.queries[hash]));
+  if (entry == null || entry.viewLostRetryAt == null) return;
+  await ctx(Fx.stateUpdate(r.setViewLost(hash, entry.viewLostCount, null)));
+  if (entry.lifecycle.phase != QueryPhase.viewLost) return;
+  if (entry.lifecycle.remote != RemotePhase.unregistered) {
+    await ctx(
+        Fx.stateUpdate(r.applyLifecycle(hash, const RemoteDroppedEvent())));
+  }
+  await ctx(Fx.dispatch(RegisterRemote(hash)));
+}
+
 /// Replace the subquery child set; bodies follow through the fetch plan.
 Future<void> applySubqueryChildren(
     Ctx ctx, QueryHash hash, RecordVersionArray children) async {
@@ -86,10 +128,11 @@ Future<void> applySubqueryChildren(
 /// The result of one membership read.
 typedef MembershipRead = ({bool changed, bool failed});
 
+/// One statement's result, or [statementFailed] when it did not answer.
 Object? _stmt(Object? results, int i) {
-  if (results is! List<StatementResult>) return null;
+  if (results is! List<StatementResult>) return statementFailed;
   final r = sql.stmt(results, i);
-  return r != null && r.isOk ? r.result : null;
+  return r != null && r.isOk ? r.result : statementFailed;
 }
 
 /// Read the server membership of many queries in as few round trips as the row
@@ -155,17 +198,26 @@ Future<MembershipRead> readMembership(
     if (chunk.length == 1) {
       final snap = snapshotFromSingle(_stmt(res.value, 0), _stmt(res.value, 1),
           _stmt(res.value, 2));
-      if (snap != null) snapshots[chunk.first] = snap;
+      if (snap != null) {
+        snapshots[chunk.first] = snap;
+      } else {
+        failed = true;
+      }
       continue;
     }
     final hashById = {
       for (final h in chunk) byHash[h]!.def.id.encode(): h,
     };
     final edges = _stmt(res.value, 0);
-    final batch = snapshotsFromBatch(edges, _stmt(res.value, 1), hashById);
+    final counts = _stmt(res.value, 1);
+    if (edges is! List || identical(counts, statementFailed)) {
+      failed = true;
+      continue;
+    }
+    final batch = snapshotsFromBatch(edges, counts, hashById);
     final held = {for (final h in chunk) h: byHash[h]!.remoteArray.length};
     final suspect = suspectHashes(
-        batch, held, edges is List ? edges.length : 0).toSet();
+        batch, held, edges.length).toSet();
     for (final e in batch.entries) {
       if (suspect.contains(e.key)) {
         rereads.add(byHash[e.key]!);
@@ -184,7 +236,11 @@ Future<MembershipRead> readMembership(
       }
       final snap = snapshotFromSingle(_stmt(res.value, 0), _stmt(res.value, 1),
           _stmt(res.value, 2));
-      if (snap != null) snapshots[rereads[i].def.hash] = snap;
+      if (snap != null) {
+        snapshots[rereads[i].def.hash] = snap;
+      } else {
+        failed = true;
+      }
     }
   }
 

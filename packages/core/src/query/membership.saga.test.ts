@@ -4,7 +4,7 @@ import { runPure } from '../testing/run-pure';
 import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import * as R from '../state/reducers';
 import { defaultEnv } from './env';
-import { applyMembership, applySubqueryChildren, markMembershipDirty, readDirtyMembership, readMembership } from './membership.saga';
+import { applyMembership, applySubqueryChildren, markMembershipDirty, readDirtyMembership, readMembership, recoverLostView } from './membership.saga';
 import type { StatementResult } from '../kernel/effects';
 
 const env = defaultEnv({ tables: [] } as any);
@@ -26,9 +26,51 @@ describe('applyMembership', () => {
     expect(out.state.queries.get('a')!.lifecycle).toMatchObject({ phase: 'view-lost', remote: 'unregistered' });
     expect(out.emitted).toEqual([{ type: 'query:view-lost', hash: 'a' }]);
     expect(out.dispatched).toEqual([{ type: 'EnsureRegistered' }]);
-    const again = await runPure(applyMembership('a', []), { state: out.state });
-    expect(again.emitted).toEqual([]);
-    expect(again.dispatched).toEqual([{ type: 'EnsureRegistered' }]);
+    expect(out.state.queries.get('a')!).toMatchObject({ viewLostCount: 1, viewLostRetryAt: null });
+  });
+  it('view-lost again before the row is seen: paced, and reads while it waits do nothing', async () => {
+    const lost = buildState([
+      buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'view-lost', remote: 'registered' }, remoteArray: [['t:1', 1]], viewLostCount: 1 }),
+    ]);
+    const again = await runPure(applyMembership('a', []), { state: lost, now: 1_000 });
+    expect(again.result).toBe('view-lost');
+    expect(again.emitted.filter((e) => e.type === 'query:view-lost')).toEqual([]);
+    expect(again.dispatched).toEqual([]);
+    expect(again.state.queries.get('a')!).toMatchObject({ viewLostCount: 2, viewLostRetryAt: 2_000 });
+    expect(again.state.queries.get('a')!.lifecycle.remote).toBe('registered');
+    expect(again.timers.get('view-lost:a')).toEqual({ ms: 1_000, event: { type: 'RecoverLostView', hash: 'a' } });
+
+    const waiting = await runPure(applyMembership('a', []), { state: again.state, now: 1_500 });
+    expect(waiting.dispatched).toEqual([]);
+    expect(waiting.timers.size).toBe(0);
+    expect(waiting.state.queries.get('a')!).toMatchObject({ viewLostCount: 2, viewLostRetryAt: 2_000 });
+
+    // The next retry waits longer.
+    const third = buildState([
+      buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'view-lost', remote: 'registered' }, remoteArray: [['t:1', 1]], viewLostCount: 3 }),
+    ]);
+    expect((await runPure(applyMembership('a', []), { state: third })).timers.get('view-lost:a')!.ms).toBe(4_000);
+  });
+  it('recoverLostView re-registers only while still lost and still scheduled', async () => {
+    const scheduled = (phase: 'view-lost' | 'live', retryAt: number | null) =>
+      buildState([
+        buildEntry({ def: { hash: 'a' }, lifecycle: { phase, remote: 'registered' }, remoteArray: [['t:1', 1]], viewLostCount: 2, viewLostRetryAt: retryAt }),
+      ]);
+    const due = await runPure(recoverLostView('a'), { state: scheduled('view-lost', 2_000) });
+    expect(due.dispatched).toEqual([{ type: 'RegisterRemote', hash: 'a' }]);
+    expect(due.state.queries.get('a')!).toMatchObject({ viewLostRetryAt: null, viewLostCount: 2 });
+    expect(due.state.queries.get('a')!.lifecycle.remote).toBe('unregistered');
+    expect((await runPure(recoverLostView('a'), { state: scheduled('view-lost', null) })).dispatched).toEqual([]);
+    expect((await runPure(recoverLostView('a'), { state: scheduled('live', 2_000) })).dispatched).toEqual([]);
+    expect((await runPure(recoverLostView('zz'), { state: scheduled('view-lost', 2_000) })).dispatched).toEqual([]);
+  });
+  it('seeing the row again resets the pacing', async () => {
+    const s = buildState([
+      buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'view-lost', remote: 'registered' }, remoteArray: [['t:1', 1]], viewLostCount: 3, viewLostRetryAt: 9_000 }),
+    ]);
+    const out = await runPure(applyMembership('a', [], { present: true, rowCount: 1, state: 'materializing' }), { state: s });
+    expect(out.result).toBe('ignored');
+    expect(out.state.queries.get('a')!).toMatchObject({ viewLostCount: 0, viewLostRetryAt: null });
   });
   it('applied: commits, writes the view row, flips authority once, releases acked items, asks for bodies', async () => {
     const s = buildState(
@@ -100,6 +142,32 @@ describe('readMembership', () => {
     expect(out.state.membershipDirty.size).toBe(0);
     expect(out.dispatched.at(-1)).toEqual({ type: 'SyncOutcome', ok: true, error: undefined });
   });
+  it('a meta statement that errored is a failed read, not a lost row', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live', remote: 'registered' }, remoteArray: [['thing:1', 1]] })]);
+    const out = await runPure(readMembership(env, ['a']), {
+      state: s,
+      handlers: {
+        'remote.query': () => [ok([]), { status: 'ERR', error: 'The query was not executed due to a failed transaction' }, ok([])],
+      },
+    });
+    expect(out.result).toEqual({ changed: false, failed: true });
+    expect(out.state.queries.get('a')!.lifecycle).toMatchObject({ phase: 'live', remote: 'registered' });
+    expect(out.dispatched.filter((e) => e.type === 'EnsureRegistered')).toEqual([]);
+    expect(out.dispatched.at(-1)).toEqual({ type: 'SyncOutcome', ok: false, error: 'membership read failed' });
+  });
+  it('a batch whose meta statement errored is a failed read for every query in it', async () => {
+    const s = buildState([
+      buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'cached', remote: 'registered' } }),
+      buildEntry({ def: { hash: 'b', id: qid('b') }, lifecycle: { phase: 'cached', remote: 'registered' } }),
+    ]);
+    const out = await runPure(readMembership(env, ['a', 'b']), {
+      state: s,
+      handlers: { 'remote.query': () => [ok([]), { status: 'ERR', error: 'timeout' }] },
+    });
+    expect(out.result.failed).toBe(true);
+    for (const h of ['a', 'b']) expect(out.state.queries.get(h)!.lifecycle.phase).toBe('cached');
+    expect(out.dispatched.filter((e) => e.type === 'EnsureRegistered')).toEqual([]);
+  });
   it('equal set on a live query applies nothing; a cached query with the same set still flips to live', async () => {
     const live = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1]], serverState: 'ready' })]);
     const handlers = { 'remote.query': () => [ok([out1('1')]), ok({ rowCount: 1, state: 'ready' }), ok([])], 'local.upsert': () => undefined };
@@ -137,7 +205,7 @@ describe('readMembership', () => {
     expect(out.state.queries.get('b')!.remoteArray).toEqual([['thing:2', 1], ['thing:3', 1]]);
     expect(out.result.changed).toBe(true);
   });
-  it('failures: a failed chunk or re-read reports failed; a non-array primary is skipped', async () => {
+  it('failures: a failed chunk or re-read reports failed; a non-array primary is a failed read', async () => {
     const s = buildState([
       buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1]] }),
       buildEntry({ def: { hash: 'b', id: qid('b') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:2', 1]] }),
@@ -167,13 +235,16 @@ describe('readMembership', () => {
     expect(n).toBe(3);
     const single = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1]] })]);
     const notArray = await runPure(readMembership(env, ['a']), { state: single, handlers: { 'remote.query': () => [ok('x'), ok(null), ok(null)] } });
-    expect(notArray.result).toEqual({ changed: false, failed: false });
+    expect(notArray.result).toEqual({ changed: false, failed: true });
+    expect(notArray.state.queries.get('a')!.lifecycle.phase).toBe('live');
     const batchNotArray = await runPure(readMembership(env, ['a', 'b']), { state: s, handlers: { 'remote.query': () => [ok(null), ok(null)] } });
-    expect(batchNotArray.result).toEqual({ changed: false, failed: false });
+    expect(batchNotArray.result).toEqual({ changed: false, failed: true });
     const undefinedResult = await runPure(readMembership(env, ['a']), { state: single, handlers: { 'remote.query': () => undefined } });
-    expect(undefinedResult.result).toEqual({ changed: false, failed: false });
+    expect(undefinedResult.result).toEqual({ changed: false, failed: true });
     const errStmt = await runPure(readMembership(env, ['a']), { state: single, handlers: { 'remote.query': () => [{ status: 'ERR', error: 'x' }, ok(null), ok(null)] } });
-    expect(errStmt.result).toEqual({ changed: false, failed: false });
+    expect(errStmt.result).toEqual({ changed: false, failed: true });
+    // None of those is evidence the view is gone.
+    for (const r of [notArray, undefinedResult, errStmt]) expect(r.dispatched.filter((d) => d.type === 'EnsureRegistered')).toEqual([]);
   });
   it('materializing views walk the re-read ladder then stop', async () => {
     const s = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'cold' } })]);

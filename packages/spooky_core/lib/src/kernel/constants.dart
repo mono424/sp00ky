@@ -36,6 +36,12 @@ const int retryMaxMs = 15000;
 /// Registration attempts before a query is reported as failed to settle.
 const int registerMaxRetries = 3;
 
+/// Pacing of repeated view-lost recovery. The first re-registration after a
+/// `_00_query` row reads as gone is immediate; each further one for the same
+/// query, before the row has been seen again, waits on this backoff.
+const int viewLostRetryBaseMs = 1000;
+const int viewLostRetryMaxMs = 30000;
+
 /// `_00_list_ref` poll cadence (fallback when LIVE is quiet).
 const int listRefPollBaseMs = 500;
 const int listRefPollMaxMs = 5000;

@@ -104,6 +104,16 @@ MembershipOutcome decideMembershipOutcome(MembershipDecisionInput input) {
 
 // ---- list_ref snapshots ------------------------------------------------------
 
+/// A statement that did not answer (an ERR, or no result at all). Kept apart
+/// from a `null` result, which is the server saying "no such row": reading a
+/// failed statement as a missing row turned every timeout under load into a
+/// lost view and re-registered it, over and over (whitepawn, 2026-09-16).
+const Object statementFailed = _StatementFailed();
+
+class _StatementFailed {
+  const _StatementFailed();
+}
+
 class ListRefSnapshot {
   ListRefSnapshot({
     required this.primary,
@@ -127,11 +137,16 @@ RecordVersionArray _toPairs(Object? rows) {
 }
 
 /// Fold the single-query statement batch (edges, meta, children) into a
-/// snapshot. Returns null when the edge statement did not answer with a list,
-/// which the caller treats as a failed read rather than an empty one.
+/// snapshot. Returns null when any of the three did not answer (the edges not
+/// a list, or [statementFailed]), which the caller treats as a failed read:
+/// half an answer is not one, and a missing meta would read as a lost view.
 ListRefSnapshot? snapshotFromSingle(
     Object? items, Object? metaRow, Object? children) {
-  if (items is! List) return null;
+  if (items is! List ||
+      identical(metaRow, statementFailed) ||
+      identical(children, statementFailed)) {
+    return null;
+  }
   return ListRefSnapshot(
     primary: _toPairs(items),
     subquery: _toPairs(children),
@@ -141,14 +156,14 @@ ListRefSnapshot? snapshotFromSingle(
 
 /// Fold the many-query statement batch into one snapshot per hash. Every hash
 /// in [hashById] gets a snapshot; a query whose row did not come back reads
-/// `present: false`.
+/// `present: false`. Empty when either statement did not answer.
 Map<String, ListRefSnapshot> snapshotsFromBatch(
   Object? edges,
   Object? counts,
   Map<String, String> hashById,
 ) {
   final out = <String, ListRefSnapshot>{};
-  if (edges is! List) return out;
+  if (edges is! List || identical(counts, statementFailed)) return out;
   for (final hash in hashById.values) {
     out[hash] = ListRefSnapshot(
       primary: [],

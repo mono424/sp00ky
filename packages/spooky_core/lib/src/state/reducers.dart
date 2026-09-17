@@ -174,6 +174,19 @@ Reducer setRegistrationTimings(QueryHash hash, RegistrationTimings timings) =>
 Reducer bumpRegisterAttempts(QueryHash hash) => (s) => _withEntry(
     s, hash, (e) => e.copyWith(registerAttempts: e.registerAttempts + 1));
 
+/// View-lost recovery pacing; see `QueryEntry.viewLostCount`.
+Reducer setViewLost(QueryHash hash, int count, int? retryAt) =>
+    (s) => _withEntry(
+        s,
+        hash,
+        (e) => e.viewLostCount == count && e.viewLostRetryAt == retryAt
+            ? e
+            : e.copyWith(
+                viewLostCount: count,
+                viewLostRetryAt: retryAt,
+                clearViewLostRetryAt: retryAt == null,
+              ));
+
 Reducer resetRegisterAttempts(QueryHash hash) => (s) => _withEntry(s, hash,
     (e) => e.registerAttempts == 0 ? e : e.copyWith(registerAttempts: 0));
 

@@ -45,6 +45,8 @@ QueryEntry buildEntry({
   int? lastHeartbeatAt,
   int? lastPolledAt,
   int registerAttempts = 0,
+  int viewLostCount = 0,
+  int? viewLostRetryAt,
   QueryTelemetry? telemetry,
 }) =>
     QueryEntry(
@@ -60,6 +62,8 @@ QueryEntry buildEntry({
       lastHeartbeatAt: lastHeartbeatAt,
       lastPolledAt: lastPolledAt,
       registerAttempts: registerAttempts,
+      viewLostCount: viewLostCount,
+      viewLostRetryAt: viewLostRetryAt,
       telemetry: telemetry ?? emptyTelemetry(),
     );
 

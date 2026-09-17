@@ -38,6 +38,8 @@ export function buildEntry(over: DeepPartial<QueryEntry> & { def?: Partial<Query
     lastHeartbeatAt: over.lastHeartbeatAt ?? null,
     lastPolledAt: over.lastPolledAt ?? null,
     registerAttempts: over.registerAttempts ?? 0,
+    viewLostCount: over.viewLostCount ?? 0,
+    viewLostRetryAt: over.viewLostRetryAt ?? null,
     telemetry: { ...emptyTelemetry(), ...(over.telemetry as object) },
   };
 }

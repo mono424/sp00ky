@@ -61,8 +61,108 @@ void main() {
           RemotePhase.unregistered);
       expect(out.emitted.whereType<QueryViewLostEvent>(), hasLength(1));
       expect(out.dispatched.single, isA<EnsureRegistered>());
+      expect(out.state.queries['a']!.viewLostCount, 1);
       // The rows are KEPT: a lost view is not an empty one.
       expect(out.state.queries['a']!.remoteArray, [('thing:1', 1)]);
+    });
+
+    test('view-lost again before the row is seen: paced, reads in between do nothing',
+        () async {
+      ClientState lost(int count, {int? retryAt}) => buildState([
+            buildEntry(
+              def: buildDefinition(hash: 'a'),
+              lifecycle:
+                  life(QueryPhase.viewLost, remote: RemotePhase.registered),
+              remoteArray: [('thing:1', 1)],
+              viewLostCount: count,
+              viewLostRetryAt: retryAt,
+            )
+          ]);
+      final again = await runPure<MembershipOutcome>(
+        (ctx) => applyMembership(ctx, 'a', const []),
+        state: lost(1),
+        now: 1000,
+        handlers: defaults(),
+      );
+      expect(again.result, MembershipOutcome.viewLost);
+      expect(again.dispatched, isEmpty);
+      expect(again.emitted.whereType<QueryViewLostEvent>(), isEmpty);
+      final e = again.state.queries['a']!;
+      expect(e.viewLostCount, 2);
+      expect(e.viewLostRetryAt, 2000);
+      expect(e.lifecycle.remote, RemotePhase.registered);
+      expect(again.timers['view-lost:a']!.ms, 1000);
+      expect(again.timers['view-lost:a']!.event, isA<RecoverLostView>());
+
+      final waiting = await runPure<MembershipOutcome>(
+        (ctx) => applyMembership(ctx, 'a', const []),
+        state: again.state,
+        now: 1500,
+        handlers: defaults(),
+      );
+      expect(waiting.dispatched, isEmpty);
+      expect(waiting.timers, isEmpty);
+      expect(waiting.state.queries['a']!.viewLostRetryAt, 2000);
+
+      final third = await runPure<MembershipOutcome>(
+        (ctx) => applyMembership(ctx, 'a', const []),
+        state: lost(3),
+        handlers: defaults(),
+      );
+      expect(third.timers['view-lost:a']!.ms, 4000);
+    });
+
+    test('seeing the row again resets the pacing', () async {
+      final out = await runPure<MembershipOutcome>(
+        (ctx) => applyMembership(ctx, 'a', const [],
+            meta: const ServerViewMeta(
+                present: true, rowCount: 1, state: 'materializing')),
+        state: buildState([
+          buildEntry(
+            def: buildDefinition(hash: 'a'),
+            lifecycle: life(QueryPhase.viewLost, remote: RemotePhase.registered),
+            remoteArray: [('thing:1', 1)],
+            viewLostCount: 3,
+            viewLostRetryAt: 9000,
+          )
+        ]),
+        handlers: defaults(),
+      );
+      expect(out.result, MembershipOutcome.ignored);
+      expect(out.state.queries['a']!.viewLostCount, 0);
+      expect(out.state.queries['a']!.viewLostRetryAt, isNull);
+    });
+
+    test('recoverLostView re-registers only while still lost and scheduled',
+        () async {
+      ClientState scheduled(QueryPhase phase, int? retryAt) => buildState([
+            buildEntry(
+              def: buildDefinition(hash: 'a'),
+              lifecycle: life(phase, remote: RemotePhase.registered),
+              remoteArray: [('thing:1', 1)],
+              viewLostCount: 2,
+              viewLostRetryAt: retryAt,
+            )
+          ]);
+      final due = await runPure<void>(
+        (ctx) => recoverLostView(ctx, 'a'),
+        state: scheduled(QueryPhase.viewLost, 2000),
+        handlers: defaults(),
+      );
+      expect(due.dispatched.single, isA<RegisterRemote>());
+      expect(due.state.queries['a']!.viewLostRetryAt, isNull);
+      expect(due.state.queries['a']!.lifecycle.remote, RemotePhase.unregistered);
+      for (final (phase, retryAt) in [
+        (QueryPhase.viewLost, null),
+        (QueryPhase.live, 2000),
+      ]) {
+        final out = await runPure<void>(
+          (ctx) => recoverLostView(ctx, 'a'),
+          state: scheduled(phase, retryAt),
+          handlers: defaults(),
+        );
+        expect(out.dispatched, isEmpty);
+      }
     });
 
     test('applied: commits, writes the view row, flips authority once, fetches',
@@ -188,6 +288,58 @@ void main() {
       expect(out.state.membershipDirty, isEmpty);
       expect(out.state.queries['a']!.lastPolledAt, isNotNull);
       expect(out.dispatched.whereType<SyncOutcome>().last.ok, isTrue);
+    });
+
+    test('a meta statement that errored is a failed read, not a lost row',
+        () async {
+      final out = await runPure<MembershipRead>(
+        (ctx) => readMembership(ctx, env(), ['a'], force: true),
+        state: buildState([
+          buildEntry(
+            def: buildDefinition(hash: 'a'),
+            lifecycle: life(QueryPhase.live, remote: RemotePhase.registered),
+            remoteArray: [('thing:1', 1)],
+          )
+        ]),
+        handlers: defaults(over: {
+          'remote.query': (_, __) => [
+                const StatementResult.ok(<Object?>[]),
+                const StatementResult.err('transaction failed'),
+                const StatementResult.ok(<Object?>[]),
+              ],
+        }),
+      );
+      expect(out.result.failed, isTrue);
+      final e = out.state.queries['a']!;
+      expect(e.lifecycle.phase, QueryPhase.live);
+      expect(e.lifecycle.remote, RemotePhase.registered);
+      expect(out.dispatched.whereType<EnsureRegistered>(), isEmpty);
+      expect(out.dispatched.whereType<SyncOutcome>().last.ok, isFalse);
+    });
+
+    test('a batch whose meta statement errored is a failed read for all of it',
+        () async {
+      final out = await runPure<MembershipRead>(
+        (ctx) => readMembership(ctx, env(), ['a', 'b'], force: true),
+        state: buildState([
+          for (final h in ['a', 'b'])
+            buildEntry(
+              def: buildDefinition(hash: h),
+              lifecycle: life(QueryPhase.cached, remote: RemotePhase.registered),
+            )
+        ]),
+        handlers: defaults(over: {
+          'remote.query': (_, __) => [
+                const StatementResult.ok(<Object?>[]),
+                const StatementResult.err('timeout'),
+              ],
+        }),
+      );
+      expect(out.result.failed, isTrue);
+      for (final h in ['a', 'b']) {
+        expect(out.state.queries[h]!.lifecycle.phase, QueryPhase.cached);
+      }
+      expect(out.dispatched.whereType<EnsureRegistered>(), isEmpty);
     });
 
     test('an equal set on a live query applies nothing; a cached one still flips',

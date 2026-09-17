@@ -40,6 +40,10 @@ RouteTarget route(SagaEnv env, RuntimeEvent event) => switch (event) {
           (ctx) => registerRemote(ctx, env, hash, retry: retry),
           Lane.dedupe('register:$hash'),
         ),
+      RecoverLostView(:final hash) => RouteTarget(
+          (ctx) => recoverLostView(ctx, hash),
+          Lane.dedupe('view-lost:$hash'),
+        ),
       ReadDirtyMembership() => RouteTarget(
           (ctx) => readDirtyMembership(ctx, env),
           const Lane.serial('membership'),

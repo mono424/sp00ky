@@ -12,6 +12,7 @@ export type RuntimeEvent =
   | { type: 'SyncOutcome'; ok: boolean; error?: unknown }
   | { type: 'AckPrune' }
   | { type: 'ReadDirtyMembership' }
+  | { type: 'RecoverLostView'; hash: QueryHash }
   | { type: 'ReadMembership'; hashes: QueryHash[] }
   | { type: 'FetchRows' }
   | { type: 'Materialize'; hash: QueryHash }

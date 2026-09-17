@@ -58,6 +58,13 @@ export interface QueryEntry {
   readonly lastHeartbeatAt: number | null;
   readonly lastPolledAt: number | null;
   readonly registerAttempts: number;
+  /**
+   * Re-registrations issued because the `_00_query` row read as gone, since
+   * the row was last seen. Paces the next one (see `applyMembership`).
+   */
+  readonly viewLostCount: number;
+  /** When the paced re-registration is due; null when none is pending. */
+  readonly viewLostRetryAt: number | null;
   readonly telemetry: QueryTelemetry;
 }
 

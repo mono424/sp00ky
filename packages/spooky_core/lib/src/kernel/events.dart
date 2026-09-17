@@ -41,6 +41,13 @@ class AckPrune extends RuntimeEvent {
   String get type => 'AckPrune';
 }
 
+class RecoverLostView extends RuntimeEvent {
+  const RecoverLostView(this.hash);
+  final QueryHash hash;
+  @override
+  String get type => 'RecoverLostView';
+}
+
 class ReadDirtyMembership extends RuntimeEvent {
   const ReadDirtyMembership();
   @override

@@ -2,7 +2,13 @@ import type { QueryHash, RecordVersionArray, ServerViewMeta } from '../types';
 import type { Saga } from '../kernel/saga';
 import type { Settled, StatementResult } from '../kernel/effects';
 import { fx } from '../kernel/effects';
-import { MATERIALIZING_REREAD_LADDER_MS, MEMBERSHIP_COALESCE_MS } from '../kernel/constants';
+import {
+  MATERIALIZING_REREAD_LADDER_MS,
+  MEMBERSHIP_COALESCE_MS,
+  VIEW_LOST_RETRY_BASE_MS,
+  VIEW_LOST_RETRY_MAX_MS,
+  backoffMs,
+} from '../kernel/constants';
 import type { ClientState, QueryEntry } from '../state/client-state';
 import { isAuthoritative } from '../state/lifecycle';
 import * as R from '../state/reducers';
@@ -12,6 +18,7 @@ import type { SagaEnv } from './env';
 import { listRefTable } from './env';
 import * as sql from './sql';
 import {
+  FAILED,
   decideMembershipOutcome,
   snapshotFromSingle,
   snapshotsFromBatch,
@@ -34,6 +41,10 @@ export function* applyMembership(
   const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
   if (!entry) return 'ignored';
   if (meta) yield fx.state.update(R.setServerState(hash, meta.present ? meta.state : null));
+  // The row is there: whatever made it read as gone has passed.
+  if (meta?.present && (entry.viewLostCount > 0 || entry.viewLostRetryAt !== null)) {
+    yield fx.state.update(R.setViewLost(hash, 0, null));
+  }
   const outcome = decideMembershipOutcome({
     phase: entry.lifecycle.phase,
     held: entry.remoteArray.length,
@@ -47,10 +58,30 @@ export function* applyMembership(
       yield fx.state.update(R.applyLifecycle(hash, { type: 'row-missing' }));
       yield fx.emit({ type: 'query:view-lost', hash });
     }
-    if (entry.lifecycle.remote !== 'unregistered') {
-      yield fx.state.update(R.applyLifecycle(hash, { type: 'remote-dropped' }));
+    // A recovery is already scheduled: every read in the meantime would
+    // otherwise re-register again.
+    if (entry.viewLostRetryAt !== null) return outcome;
+    if (entry.viewLostCount === 0) {
+      yield fx.state.update(R.setViewLost(hash, 1, null));
+      if (entry.lifecycle.remote !== 'unregistered') {
+        yield fx.state.update(R.applyLifecycle(hash, { type: 'remote-dropped' }));
+      }
+      yield fx.dispatch({ type: 'EnsureRegistered' });
+      return outcome;
     }
-    yield fx.dispatch({ type: 'EnsureRegistered' });
+    // Re-registered already and the row still reads as gone. Under load that
+    // repeated every read, each one costing the server a registration while it
+    // was still publishing the last, so from here on it is paced.
+    const delay = backoffMs(entry.viewLostCount - 1, VIEW_LOST_RETRY_BASE_MS, VIEW_LOST_RETRY_MAX_MS);
+    const now = (yield fx.now()) as number;
+    yield fx.state.update(R.setViewLost(hash, entry.viewLostCount + 1, now + delay));
+    yield fx.emit({
+      type: 'log',
+      level: 'debug',
+      message: 'view still lost; re-registering after a delay',
+      data: { hash, attempt: entry.viewLostCount + 1, delayMs: delay },
+    });
+    yield fx.timer.set(`view-lost:${hash}`, delay, { type: 'RecoverLostView', hash });
     return outcome;
   }
   const wasAuthoritative = isAuthoritative(entry.lifecycle);
@@ -66,6 +97,21 @@ export function* applyMembership(
   return outcome;
 }
 
+/**
+ * The paced view-lost re-registration. A no-op when the row has been seen
+ * since (the pacing was reset) or the query recovered or went away.
+ */
+export function* recoverLostView(hash: QueryHash): Saga<void> {
+  const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
+  if (!entry || entry.viewLostRetryAt === null) return;
+  yield fx.state.update(R.setViewLost(hash, entry.viewLostCount, null));
+  if (entry.lifecycle.phase !== 'view-lost') return;
+  if (entry.lifecycle.remote !== 'unregistered') {
+    yield fx.state.update(R.applyLifecycle(hash, { type: 'remote-dropped' }));
+  }
+  yield fx.dispatch({ type: 'RegisterRemote', hash });
+}
+
 /** Replace the subquery child set; bodies follow through the fetch plan. */
 export function* applySubqueryChildren(hash: QueryHash, children: RecordVersionArray): Saga<void> {
   const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
@@ -75,10 +121,11 @@ export function* applySubqueryChildren(hash: QueryHash, children: RecordVersionA
 }
 
 const ok = (r: Settled): r is { ok: true; value: unknown } => r.ok;
+/** One statement's result, or `FAILED` when it did not answer (see `FAILED`). */
 const stmt = (results: unknown, i: number): unknown => {
-  if (!Array.isArray(results)) return null;
+  if (!Array.isArray(results)) return FAILED;
   const r = (results as StatementResult[])[i];
-  return r && r.status === 'OK' ? r.result : null;
+  return r && r.status === 'OK' ? r.result : FAILED;
 };
 
 /**
@@ -123,11 +170,17 @@ export function* readMembership(
     if (chunk.length === 1) {
       const snap = snapshotFromSingle(stmt(r.value, 0) as never, stmt(r.value, 1) as never, stmt(r.value, 2) as never);
       if (snap) snapshots.set(chunk[0], snap);
+      else failed = true;
       return;
     }
     const hashById = new Map(chunk.map((h) => [encodeRecordId(byHash.get(h)!.def.id), h]));
     const edges = stmt(r.value, 0) as never[] | null;
-    const batch = snapshotsFromBatch(edges, stmt(r.value, 1) as never, hashById);
+    const counts = stmt(r.value, 1);
+    if (!Array.isArray(edges) || counts === FAILED) {
+      failed = true;
+      return;
+    }
+    const batch = snapshotsFromBatch(edges, counts as never, hashById);
     const held = new Map(chunk.map((h) => [h, byHash.get(h)!.remoteArray.length]));
     const suspect = new Set(suspectHashes(batch, held, Array.isArray(edges) ? edges.length : 0));
     for (const [h, snap] of batch) {
@@ -144,6 +197,7 @@ export function* readMembership(
       }
       const snap = snapshotFromSingle(stmt(r.value, 0) as never, stmt(r.value, 1) as never, stmt(r.value, 2) as never);
       if (snap) snapshots.set(rereads[i].def.hash, snap);
+      else failed = true;
     });
   }
 

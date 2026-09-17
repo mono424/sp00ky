@@ -188,6 +188,16 @@ export const bumpRegisterAttempts =
   (s) =>
     withEntry(s, hash, (e) => ({ ...e, registerAttempts: e.registerAttempts + 1 }));
 
+/** View-lost recovery pacing; see `QueryEntry.viewLostCount`. */
+export const setViewLost =
+  (hash: QueryHash, viewLostCount: number, viewLostRetryAt: number | null): Reducer =>
+  (s) =>
+    withEntry(s, hash, (e) =>
+      e.viewLostCount === viewLostCount && e.viewLostRetryAt === viewLostRetryAt
+        ? e
+        : { ...e, viewLostCount, viewLostRetryAt }
+    );
+
 export const resetRegisterAttempts =
   (hash: QueryHash): Reducer =>
   (s) =>
@@ -421,6 +431,8 @@ export const rebindQuery =
       lastHeartbeatAt: null,
       lastPolledAt: null,
       registerAttempts: 0,
+      viewLostCount: 0,
+      viewLostRetryAt: null,
     }));
     return rebound === s ? s : { ...rebound, dirty: addAll(rebound.dirty, [hash]) };
   };

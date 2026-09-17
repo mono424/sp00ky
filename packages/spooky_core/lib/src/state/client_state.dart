@@ -116,6 +116,8 @@ class QueryEntry {
     required this.lastHeartbeatAt,
     required this.lastPolledAt,
     required this.registerAttempts,
+    this.viewLostCount = 0,
+    this.viewLostRetryAt,
     required this.telemetry,
   });
 
@@ -135,6 +137,13 @@ class QueryEntry {
   final int? lastHeartbeatAt;
   final int? lastPolledAt;
   final int registerAttempts;
+
+  /// Re-registrations issued because the `_00_query` row read as gone, since
+  /// the row was last seen. Paces the next one (see `applyMembership`).
+  final int viewLostCount;
+
+  /// When the paced re-registration is due; null when none is pending.
+  final int? viewLostRetryAt;
   final QueryTelemetry telemetry;
 
   QueryEntry copyWith({
@@ -152,6 +161,9 @@ class QueryEntry {
     int? lastHeartbeatAt,
     int? lastPolledAt,
     int? registerAttempts,
+    int? viewLostCount,
+    int? viewLostRetryAt,
+    bool clearViewLostRetryAt = false,
     QueryTelemetry? telemetry,
   }) =>
       QueryEntry(
@@ -170,6 +182,10 @@ class QueryEntry {
         lastHeartbeatAt: lastHeartbeatAt ?? this.lastHeartbeatAt,
         lastPolledAt: lastPolledAt ?? this.lastPolledAt,
         registerAttempts: registerAttempts ?? this.registerAttempts,
+        viewLostCount: viewLostCount ?? this.viewLostCount,
+        viewLostRetryAt: clearViewLostRetryAt
+            ? null
+            : (viewLostRetryAt ?? this.viewLostRetryAt),
         telemetry: telemetry ?? this.telemetry,
       );
 }

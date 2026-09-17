@@ -183,16 +183,29 @@ Future<void> registerRemote(Ctx ctx, SagaEnv env, QueryHash hash,
     if (register == null || !register.isOk) {
       throw StateError(register?.error ?? 'register returned nothing');
     }
-    final edges = sql.stmt(results, 1);
-    final meta = sql.stmt(results, 2);
-    final children = sql.stmt(results, 3);
+    Object? answer(StatementResult? res) =>
+        res != null && res.isOk ? res.result : statementFailed;
     final snap = snapshotFromSingle(
-      edges != null && edges.isOk ? edges.result : null,
-      meta != null && meta.isOk ? meta.result : null,
-      children != null && children.isOk ? children.result : null,
+      answer(sql.stmt(results, 1)),
+      answer(sql.stmt(results, 2)),
+      answer(sql.stmt(results, 3)),
     );
     if (snap == null) {
-      throw StateError(edges?.error ?? 'edge read returned no array');
+      // Registered, but the read-back did not answer. That says nothing about
+      // the row, so read membership again rather than guess: a guess of
+      // "gone" re-registered the query, and under load the next read-back
+      // failed the same way.
+      await ctx(Fx.stateUpdate(r.compose([
+        r.applyLifecycle(hash, const RemoteRegisteredEvent()),
+        r.resetRegisterAttempts(hash),
+      ])));
+      await ctx(Fx.log(LogLevel.debug,
+          'registration read-back did not answer; re-reading membership',
+          {'hash': hash}));
+      await markMembershipDirty(ctx, [hash]);
+      await ctx(Fx.dispatch(
+          const SyncOutcome(false, 'registration read-back failed')));
+      return;
     }
     final outcome =
         await applyMembership(ctx, hash, snap.primary, meta: snap.meta);

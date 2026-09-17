@@ -313,21 +313,44 @@ void main() {
       expect(out.state.queries['a']!.remoteArray, isEmpty);
     });
 
-    test('tolerates ERR meta and children: the edges still apply', () async {
-      final out = await runPure<void>(
-        (ctx) => registerRemote(ctx, env(), 'a'),
-        state: withQuery(),
-        handlers: defaults(over: {
-          'remote.query': (_, __) => [
-                const StatementResult.ok(null),
-                StatementResult.ok(edges([('thing:1', 1)])),
-                const StatementResult.err('no permission on _00_query'),
-                const StatementResult.err('no children'),
-              ],
-        }),
-      );
-      expect(out.state.queries['a']!.remoteArray, [('thing:1', 1)]);
-      expect(out.state.queries['a']!.serverState, isNull);
+    test(
+        'an ERR meta or children statement applies nothing and re-reads, '
+        'instead of reading as a lost row', () async {
+      for (final readBack in [
+        [
+          StatementResult.ok(edges([('thing:1', 1)])),
+          const StatementResult.err('timeout'),
+          const StatementResult.ok(<Object?>[]),
+        ],
+        [
+          StatementResult.ok(edges([('thing:1', 1)])),
+          const StatementResult.ok({'rowCount': 1, 'state': 'ready'}),
+          const StatementResult.err('no children'),
+        ],
+      ]) {
+        final out = await runPure<void>(
+          (ctx) => registerRemote(ctx, env(), 'a'),
+          state: withQuery(
+            lifecycle: const QueryLifecycle(
+                phase: QueryPhase.viewLost,
+                remote: RemotePhase.unregistered,
+                fetchDepth: 0,
+                notified: false),
+            remoteArray: const [('thing:1', 1)],
+          ),
+          handlers: defaults(over: {
+            'remote.query': (_, __) =>
+                [const StatementResult.ok(null), ...readBack],
+          }),
+        );
+        final e = out.state.queries['a']!;
+        expect(e.lifecycle.phase, QueryPhase.viewLost);
+        expect(e.lifecycle.remote, RemotePhase.registered);
+        expect(e.registerAttempts, 0);
+        expect(out.dispatched.whereType<EnsureRegistered>(), isEmpty);
+        expect(out.state.membershipDirty, contains('a'));
+        expect(out.timers['membership']?.event, isA<ReadDirtyMembership>());
+      }
     });
   });
 }

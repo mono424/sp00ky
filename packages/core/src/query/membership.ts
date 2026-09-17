@@ -76,6 +76,15 @@ export function decideMembershipOutcome(input: MembershipDecisionInput): Members
 
 // ---- list_ref snapshots ------------------------------------------------------
 
+/**
+ * A statement that did not answer (an ERR, or no result at all). Kept apart
+ * from a `null` result, which is the server saying "no such row": reading a
+ * failed statement as a missing row turned every timeout under load into a
+ * lost view and re-registered it, over and over (whitepawn, 2026-09-16).
+ */
+export const FAILED: unique symbol = Symbol('statement failed');
+export type Answer<T> = T | null | typeof FAILED;
+
 export interface ListRefEdgeRow {
   in: RecordId<string>;
   out: RecordId<string>;
@@ -92,28 +101,32 @@ export interface ListRefSnapshot {
 const toPairs = (rows: Array<{ out: RecordId<string>; version: number }> | null | undefined): RecordVersionArray =>
   dedupeRecordVersions(Array.isArray(rows) ? rows.map((r) => [encodeRecordId(r.out), r.version]) : []);
 
-/** Fold the single-query statement batch (edges, meta, children) into a snapshot. */
+/**
+ * Fold the single-query statement batch (edges, meta, children) into a
+ * snapshot. `null` when any of the three did not answer: half an answer is
+ * not one, and a missing meta would read as a lost view.
+ */
 export function snapshotFromSingle(
-  items: Array<{ out: RecordId<string>; version: number }> | null,
-  metaRow: QueryMetaRow | null,
-  children: Array<{ out: RecordId<string>; version: number }> | null
+  items: Answer<Array<{ out: RecordId<string>; version: number }>>,
+  metaRow: Answer<QueryMetaRow>,
+  children: Answer<Array<{ out: RecordId<string>; version: number }>>
 ): ListRefSnapshot | null {
-  if (!Array.isArray(items)) return null;
+  if (!Array.isArray(items) || metaRow === FAILED || children === FAILED) return null;
   return { primary: toPairs(items), subquery: toPairs(children), meta: metaFromRow(metaRow) };
 }
 
 /**
  * Fold the many-query statement batch into one snapshot per hash. Every hash
  * in `hashById` gets a snapshot; a query whose row did not come back reads
- * `present: false`.
+ * `present: false`. Empty when either statement did not answer.
  */
 export function snapshotsFromBatch(
-  edges: ListRefEdgeRow[] | null,
-  counts: Array<QueryMetaRow | null> | null,
+  edges: Answer<ListRefEdgeRow[]>,
+  counts: Answer<Array<QueryMetaRow | null>>,
   hashById: ReadonlyMap<string, string>
 ): Map<string, ListRefSnapshot> {
   const out = new Map<string, ListRefSnapshot>();
-  if (!Array.isArray(edges)) return out;
+  if (!Array.isArray(edges) || counts === FAILED) return out;
   for (const hash of hashById.values()) {
     out.set(hash, { primary: [], subquery: [], meta: { present: false, rowCount: null, state: null } });
   }

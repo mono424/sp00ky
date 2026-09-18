@@ -57,6 +57,7 @@ one-command deploys.
 - [Dev servers & sidecars](https://sp00ky.cloud/docs/dev/servers): Have spky dev start your frontend, backend and third-party containers alongside the stack.
 - [Environment variables](https://sp00ky.cloud/docs/dev/env): What Sp00ky injects automatically, and how to add your own from files, the vault, or per environment.
 - [Doctor & troubleshooting](https://sp00ky.cloud/docs/dev/doctor): Start with spky doctor. It names the broken thing and prints the command that fixes it.
+- [DevTools extension](https://sp00ky.cloud/docs/reference/devtools): The Chrome DevTools panel: live queries and their timings, the local cache, storage health, sessions, feature flags, impersonation, stack versions and the client event log.
 
 ### Deploy
 

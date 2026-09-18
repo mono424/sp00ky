@@ -119,13 +119,87 @@ fn parse_cmp_op(input: &str) -> IResult<&str, &str> {
     ))(input)
 }
 
+/// Comparison operators accepted with a param on the LHS.
+///
+/// Separate from [`parse_cmp_op`] so membership can be accepted here without
+/// also reaching the field-LHS leaf, where `field IN [...]` has different
+/// semantics and would silently lower to an equality. `INSIDE` is tried before
+/// `IN` because it is the longer keyword and shares its prefix.
+fn parse_param_cmp_op(input: &str) -> IResult<&str, &str> {
+    alt((
+        tag(">="),
+        tag("<="),
+        tag("!="),
+        tag("="),
+        tag(">"),
+        tag("<"),
+        tag_no_case("INSIDE"),
+        tag_no_case("IN"),
+    ))(input)
+}
+
+/// Parse a bracketed list of string literals: `['account', '_00_impersonate']`.
+///
+/// Only reachable on the RHS of a `$param INSIDE [...]` membership test. Kept
+/// out of [`parse_value_entry`] so an array literal cannot appear anywhere the
+/// rest of the converter does not already handle one.
+fn parse_string_array(input: &str) -> IResult<&str, Vec<Value>> {
+    let (input, _) = ws(char('['))(input)?;
+    let (input, items) = separated_list1(ws(char(',')), ws(parse_string_literal))(input)?;
+    let (input, _) = ws(char(']'))(input)?;
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ParsedValue::Json(v) => values.push(v),
+            // A `*`-suffixed member would be a prefix match, which membership
+            // does not mean. Fail the branch rather than silently widen it.
+            _ => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Tag,
+                )))
+            }
+        }
+    }
+    Ok((input, values))
+}
+
 /// Parse `$param OP value` — comparison with the param on the LHS. Returns
 /// a `paramcmp`-flavored predicate JSON ({ "type": "parameq", "param", "value" }).
-/// CONTAINS / INSIDE are not supported with a param-LHS.
+/// CONTAINS is not supported with a param-LHS.
 fn parse_leaf_param_lhs(input: &str) -> IResult<&str, Value> {
     let (input, _) = ws(char('$'))(input)?;
     let (input, param) = parse_identifier(input)?;
-    let (input, op) = ws(parse_cmp_op)(input)?;
+    let (input, op) = ws(parse_param_cmp_op)(input)?;
+
+    // `$access INSIDE ['account', '_00_impersonate']` is how SurrealDB spells
+    // "this access method is one of these", and it is what every account-scoped
+    // permission became when impersonation shipped. Desugar it to an OR of
+    // equalities: the plan stays a flat Filter, which is what
+    // `permission_inject` accepts, and no new predicate type has to be taught
+    // to the operators downstream.
+    //
+    // Without this the whole permission failed to parse and the SSP rejected
+    // the view outright, which takes every live query on that table down at
+    // once, for every client.
+    if op.eq_ignore_ascii_case("INSIDE") || op.eq_ignore_ascii_case("IN") {
+        let (input, values) = ws(parse_string_array)(input)?;
+        let predicates: Vec<Value> = values
+            .into_iter()
+            .map(|value| json!({ "type": "parameq", "param": param, "value": value }))
+            .collect();
+        // One member is just an equality; wrapping it in an OR would only cost
+        // the reader. Mirrors `parse_or_expression`.
+        return Ok((
+            input,
+            if predicates.len() == 1 {
+                predicates[0].clone()
+            } else {
+                json!({ "type": "or", "predicates": predicates })
+            },
+        ));
+    }
+
     let (input, right) = ws(parse_value_entry)(input)?;
 
     let type_str = match op.to_uppercase().as_str() {
@@ -136,8 +210,8 @@ fn parse_leaf_param_lhs(input: &str) -> IResult<&str, Value> {
         "<" => "paramlt",
         "<=" => "paramlte",
         _ => {
-            // CONTAINS / INSIDE with a param-LHS aren't supported; fail this
-            // alt branch so the outer parser can try the next alternative.
+            // CONTAINS with a param-LHS isn't supported; fail this alt branch so
+            // the outer parser can try the next alternative.
             return Err(nom::Err::Error(nom::error::Error::new(
                 input,
                 nom::error::ErrorKind::Tag,
@@ -858,6 +932,70 @@ mod tests {
     use super::*;
     use crate::operator::plan::OperatorPlan as Operator;
     use crate::operator::plan::Projection;
+
+    /// `$access INSIDE [...]` is what every account-scoped permission became
+    /// when impersonation shipped. It used to fail to parse, and a permission
+    /// that does not parse makes the SSP reject the view registration outright,
+    /// which takes every live query on that table down for every client.
+    #[test]
+    fn param_membership_lowers_to_an_or_of_equalities() {
+        let sql = "SELECT * FROM renderer_device \
+                   WHERE $access INSIDE ['account', '_00_impersonate'] AND owner = $auth.id";
+        let plan = convert_surql_to_dbsp(sql).expect("membership permission should parse");
+        let operator: Operator =
+            serde_json::from_value(plan).expect("should deserialize to an operator");
+        // A flat Filter over a Scan is what `permission_inject` accepts; an OR
+        // of `parameq` leaves keeps it flat.
+        match operator {
+            Operator::Filter { input, .. } => {
+                assert!(matches!(*input, Operator::Scan { .. }), "expected a flat filter over a scan");
+            }
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    /// The spelling SurrealDB canonicalises to, and the one the impersonation
+    /// migration wrote, must both parse.
+    #[test]
+    fn param_membership_accepts_both_in_and_inside() {
+        for op in ["IN", "INSIDE"] {
+            let sql = format!(
+                "SELECT * FROM presence WHERE $access {op} ['account', '_00_impersonate'] AND owner = $auth.id"
+            );
+            assert!(
+                convert_surql_to_dbsp(&sql).is_ok(),
+                "`$access {op} [...]` should parse"
+            );
+        }
+    }
+
+    /// A one-member list is just an equality; it must not grow an OR wrapper.
+    #[test]
+    fn param_membership_of_one_is_a_plain_equality() {
+        let sql = "SELECT * FROM presence WHERE $access INSIDE ['account']";
+        let plan = convert_surql_to_dbsp(sql).expect("single-member membership should parse");
+        let predicate = plan
+            .get("predicate")
+            .expect("expected a filter predicate")
+            .clone();
+        assert_eq!(predicate["type"], "parameq", "got {predicate}");
+        assert_eq!(predicate["param"], "access");
+        assert_eq!(predicate["value"], "account");
+    }
+
+    /// The real `stream_presence` permission: membership AND an owner check,
+    /// OR two record-link subqueries. This is the one that took the livestream
+    /// board off the web.
+    #[test]
+    fn stream_presence_permission_parses() {
+        let sql = "SELECT * FROM stream_presence WHERE \
+                   $access INSIDE ['account', '_00_impersonate'] AND owner = $auth.id \
+                   OR owner INSIDE (SELECT VALUE owner FROM broadcast WHERE share_visibility = 'public')";
+        assert!(
+            convert_surql_to_dbsp(sql).is_ok(),
+            "the stream_presence select permission should parse"
+        );
+    }
 
     #[test]
     fn test_parse_failing_subquery() {

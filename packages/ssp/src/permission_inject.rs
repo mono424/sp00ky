@@ -802,6 +802,32 @@ mod tests {
         }
     }
 
+    /// The exact `renderer_device` permission that shipped with impersonation.
+    /// It used to fail to parse, and `prepare_registration_dbsp` turns a failed
+    /// parse into a rejected view registration, so every live query on the
+    /// table went down at once for every client. Four of whitepawn's fourteen
+    /// affected tables were livestream tables; the rest were direct messages,
+    /// linkups, presence, saved puzzles and statistics.
+    #[test]
+    fn impersonation_membership_permission_injects() {
+        let mut plan = OperatorPlan::Scan {
+            table: "renderer_device".into(),
+        };
+        let perms = perms_with(&[(
+            "renderer_device",
+            "$access INSIDE ['account', '_00_impersonate'] AND owner = $auth.id",
+        )]);
+        let params = json!({"auth": {"id": "user:a"}, "access": "account"});
+        inject_permissions(&mut plan, &perms, Some(&params)).unwrap();
+
+        match plan {
+            OperatorPlan::Filter { input, .. } => {
+                assert!(matches!(*input, OperatorPlan::Scan { .. }));
+            }
+            other => panic!("expected a flat Filter over the scan, got {other:?}"),
+        }
+    }
+
     /// Identifier-vs-identifier in a permission expression (e.g. `author = otherfield`)
     /// gets routed through the converter as a `__JOIN_CANDIDATE__` and lifted
     /// into a `Join` operator. We can't AND a Join into a scan filter, so the

@@ -1,0 +1,71 @@
+{
+  "generatedBy": "apps/dashboard/screenshots/capture.mjs",
+  "width": 1440,
+  "deviceScaleFactor": 2,
+  "theme": "dark",
+  "frame": {
+    "chrome": "tools/screenshots/frame.html",
+    "devtools": false,
+    "title": "Sp00ky Admin",
+    "url": "acme-admin.spky.cloud",
+    "chromeHeight": 78,
+    "barHeight": 0
+  },
+  "shots": [
+    {
+      "name": "overview",
+      "caption": "The overview: cluster health, sync latency, presence and activity at a glance.",
+      "file": "overview.png"
+    },
+    {
+      "name": "ssps",
+      "caption": "Every SSP with its status, view count, lag and publication backlog.",
+      "file": "ssps.png"
+    },
+    {
+      "name": "views",
+      "caption": "The registered views, who subscribes to them and what they cost.",
+      "file": "views.png"
+    },
+    {
+      "name": "jobs",
+      "caption": "The outbox: queued, running and failed jobs, with kill and retry.",
+      "file": "jobs.png"
+    },
+    {
+      "name": "schedules",
+      "caption": "Cron schedules, their next run, and pause, resume or trigger.",
+      "file": "schedules.png"
+    },
+    {
+      "name": "workflows",
+      "caption": "Workflow runs as they happen, with cancel, rerun and retry.",
+      "file": "workflows.png"
+    },
+    {
+      "name": "incidents",
+      "caption": "Lag, heartbeat failures, restarts and recoveries as one timeline.",
+      "file": "incidents.png"
+    },
+    {
+      "name": "backends",
+      "caption": "Your own services, their health checks and response times.",
+      "file": "backends.png"
+    },
+    {
+      "name": "backups",
+      "caption": "The backup catalog, its schedule, and restoring from a snapshot.",
+      "file": "backups.png"
+    },
+    {
+      "name": "logs",
+      "caption": "Live logs from the scheduler, an SSP or one of your backends.",
+      "file": "logs.png"
+    },
+    {
+      "name": "access",
+      "caption": "Who may sign in, and the long-lived tokens issued for MCP.",
+      "file": "access.png"
+    }
+  ]
+}

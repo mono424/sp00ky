@@ -1,16 +1,22 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Admin dashboard
-description: "The operator dashboard the scheduler serves at /admin: sign-in, cluster overview, restart and backup actions, backend health, live logs and workflow runs."
+description: 'The operator dashboard the scheduler serves at /admin: sign-in, cluster overview, restart and backup actions, backend health, live logs and workflow runs.'
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
 import Note from '../../../components/ui/Note.astro';
+import Screenshot from '../../../components/ui/Screenshot.astro';
 import Warning from '../../../components/ui/Warning.astro';
 
 Every scheduler serves an operator dashboard. It shows the health of the
 scheduler and its SSPs, the end-to-end sync latency, the status of your
 backends, live logs, and workflow runs as they happen.
+
+<Screenshot
+  src="/docs/admin/overview.png"
+  caption="The overview: sync latency, SSPs, backends, presence and the outbox queue."
+/>
 
 ## Incident history
 
@@ -31,6 +37,11 @@ operation id when present, and event timeline. **Recovered** means the scheduler
 observed recovery. **Interrupted** means the scheduler restarted before it could
 observe recovery. Lag followed by replay is described separately from an SSP
 re-registering; re-registration alone does not prove a container crash.
+
+<Screenshot
+  src="/docs/admin/incidents.png"
+  caption="Every episode in one timeline, with filters that apply on the client."
+/>
 
 History is stored in `incidents.json` beside the scheduler WAL, independently
 of SurrealDB. Keep that directory on persistent storage. Retention is bounded
@@ -173,10 +184,20 @@ that is bootstrapping or replaying shows a progress bar: tables loaded and rows
 read when the SSP reports it, and otherwise the phase with its elapsed time
 against the scheduler's bootstrap budget.
 
+<Screenshot
+  src="/docs/admin/ssps.png"
+  caption="Each SSP with its phase, live views, heartbeat and publication backlog."
+/>
+
 **Backends** — status and response time for everything in `SPKY_BACKENDS`, with
 a detail page carrying a ~30-minute response-time history and the resolved
 healthcheck URL. Environment values are masked by the scheduler before they
 leave it.
+
+<Screenshot
+  src="/docs/admin/backends.png"
+  caption="Your own services, their resolved health-check URLs and response times."
+/>
 
 **Workflows** — runs updating in real time, and a run page built around a
 timeline: every step plotted on one shared axis, so where the time went is
@@ -188,6 +209,11 @@ hatched at the origin rather than as a bar, because it has not run. The
 scheduler runs a single shared poller behind the live list, so ten open
 dashboards cost your database exactly what one does, and a closed one costs
 nothing.
+
+<Screenshot
+  src="/docs/admin/workflows.png"
+  caption="Runs updating live, each carrying its own failure reason."
+/>
 
 An expanded step also loads its **job**, which is where a failure says what
 actually happened: the step row keeps only the attempt that ended the job, while
@@ -204,6 +230,11 @@ suppressed says so at the top of the page, naming the run that is holding the
 key — a wall of `skipped` rows looks like "nothing to do" and means "something
 is still running".
 
+<Screenshot
+  src="/docs/admin/schedules.png"
+  caption="Definitions, cadence, last outcome and next fire."
+/>
+
 **Jobs** — every outbox job in one list, whatever created it. This is the only
 place two whole classes of work are visible at all: a `kind: job` schedule's
 fires, and jobs your own code created, which belong to no schedule and no
@@ -219,6 +250,11 @@ in-flight and succeeded beside it, then **Queues**, one lane per outbox table
 drawn on a shared scale (in flight, stalled, pending and failed as segments,
 a tick where the table's concurrency sits). Clicking a lane's name filters the
 list below to that table.
+
+<Screenshot
+  src="/docs/admin/jobs.png"
+  caption="Queue depth, throughput and failures, then one lane per outbox table."
+/>
 
 Filter with the chips by origin (`schedule`, `workflow`, `app`), by status, by
 table, or by a substring of the path. The filter is pushed into SurrealQL rather than applied to
@@ -239,28 +275,31 @@ reports a failure rate that climbs as successes age out; a bounded window is the
 only honest denominator, and it is the one `spky jobs` uses too.
 
 <Note title="What the Jobs page costs your database">
-  Every job aggregate is a scan of one of your own tables, so the scheduler takes
-  them <em>once</em>, in a single sampler that every reader serves from — the
-  same bargain the presence sampler strikes. It reads every 15 seconds while
-  nobody has the page open and every 2 seconds while someone does, so ten open
-  dashboards cost what one does and an idle cluster costs almost nothing. Tune
-  both with <code>SPKY_ADMIN_JOB_INTERVAL_SECS</code> and
+  Every job aggregate is a scan of one of your own tables, so the scheduler takes them <em>once</em>
+  , in a single sampler that every reader serves from — the same bargain the presence sampler
+  strikes. It reads every 15 seconds while nobody has the page open and every 2 seconds while
+  someone does, so ten open dashboards cost what one does and an idle cluster costs almost nothing.
+  Tune both with <code>SPKY_ADMIN_JOB_INTERVAL_SECS</code> and
   <code>SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS</code>, or set the first to <code>0</code>
-  to switch the sampler off entirely: the list and its filters still work, the
-  totals and the Overview tile then say they are not being measured rather than
-  showing zeros.
+  to switch the sampler off entirely: the list and its filters still work, the totals and the
+  Overview tile then say they are not being measured rather than showing zeros.
 </Note>
 
 **Logs** — a live tail of the scheduler's or any SSP's log output, with level
 and text filters. If a viewer falls behind, the gap is shown explicitly rather
 than hidden.
 
+<Screenshot
+  src="/docs/admin/logs.png"
+  caption="A live tail of the scheduler or any SSP, filtered by level and text."
+/>
+
 Backends have no log stream: the scheduler reaches them with HTTP health checks
 and has no access to their output.
 
 ## Actions
 
-Everything the dashboard can *do*, as opposed to show, goes through the
+Everything the dashboard can _do_, as opposed to show, goes through the
 scheduler. Every action logs the signed-in subject, and the long-running ones
 answer `202` with an **operation** the dashboard watches (see below).
 
@@ -272,11 +311,11 @@ in the pool; the SSP's next heartbeat is answered with `409` and a JSON
 same register, bootstrap and verify path every SSP takes on boot. A restart
 from the dashboard is indistinguishable from one by Docker.
 
-| Mode | What happens |
-| --- | --- |
-| `restart` | Flag, `409`, exit, relaunch. The SSP restores its circuit snapshot and catches up the delta. |
-| `clean` | The directive carries `clean: true`, so before exiting the SSP deletes its `snapshot.json` and its arena directory. The relaunch is a cold rebuild from the database. Use it when the snapshot itself is suspect. |
-| `reload` | No exit. The scheduler calls the SSP's `POST /admin/reload`, which rebuilds the circuit in-process from the database. Picks up tables and permissions defined after the last bootstrap. |
+| Mode      | What happens                                                                                                                                                                                                      |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `restart` | Flag, `409`, exit, relaunch. The SSP restores its circuit snapshot and catches up the delta.                                                                                                                      |
+| `clean`   | The directive carries `clean: true`, so before exiting the SSP deletes its `snapshot.json` and its arena directory. The relaunch is a cold rebuild from the database. Use it when the snapshot itself is suspect. |
+| `reload`  | No exit. The scheduler calls the SSP's `POST /admin/reload`, which rebuilds the circuit in-process from the database. Picks up tables and permissions defined after the last bootstrap.                           |
 
 Nothing happens until the next heartbeat (5 s by default). An operation is
 marked **done** when the SSP has re-registered and reached `ready`, and
@@ -295,11 +334,11 @@ one while this one is still missing. Only one roll runs at a time.
 
 ### Restarting the scheduler
 
-| Mode | What happens |
-| --- | --- |
+| Mode      | What happens                                                                                                                                                                                                                    |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `restart` | The scheduler answers `202`, waits for the response to flush, and calls `exit(0)`. Sp00ky Cloud runs it under Docker's `unless-stopped`, which relaunches on any exit code, and the startup integrity check runs again on boot. |
-| `reclone` | Resets the local replica and re-fetches everything from upstream SurrealDB, then flags every SSP to re-verify. The same thing `POST /admin/resync` on the ingest port does. Runs as an operation, because it can take minutes. |
-| `rehash` | Keeps the replica's rows and recomputes the persisted snapshot hashes from them, then flags every SSP. Repairs hash-metadata drift without a refetch. |
+| `reclone` | Resets the local replica and re-fetches everything from upstream SurrealDB, then flags every SSP to re-verify. The same thing `POST /admin/resync` on the ingest port does. Runs as an operation, because it can take minutes.  |
+| `rehash`  | Keeps the replica's rows and recomputes the persisted snapshot hashes from them, then flags every SSP. Repairs hash-metadata drift without a refetch.                                                                           |
 
 A scheduler run from a checkout has no supervisor and simply stops.
 `GET /admin/api/config` reports `supervised` (true when `SPKY_ENV=cloud`) so
@@ -351,20 +390,19 @@ log: the audit trail is the scheduler's own log output.
 
 ### Workflows, schedules and jobs
 
-| Action | What happens |
-| --- | --- |
-| Cancel a run | Sets `kill_requested` **and** runs the kill immediately: every dispatched step's job gets `/job/kill` broadcast to the ready SSPs. Sub-second, with the flag as the durable fallback the next sweep would act on. `409` unless the run is `running`. |
-| Rerun | A brand-new ad-hoc run with the same frozen DAG, input and target table, `trigger: manual`, and `rerun_of` pointing at the source. It has no owning schedule run, never counts towards `concurrency: skip`, and rolls up under `(ad-hoc)`. Any source status is allowed. |
-| Retry from failed | Only for a `failed` or `killed` run. Resets `failed` and `skipped` steps to `blocked`, keeps successful steps and their outputs, reopens the run (and its owning schedule run, so the outcome is mirrored there) and dispatches the reset steps again under new job ids of the form `<table>:wf_<run key>_<step>_r<n>`. Old job rows are left as history; a job row is never deleted or re-created under the same id. Refused with `409 step <name>'s job is still processing; wait for the kill to settle` while a killed step's job has not gone terminal on its SSP, because resetting it before the kill lands would run the step twice. |
-| Pause / resume a schedule | Writes `paused` on the `_00_schedule` row, the same field `spky schedules pause` writes. |
-| Run a schedule now | Writes `trigger_requested_at`. `409` while the schedule is paused (pause wins over a queued trigger, so the fire would silently never happen) or disabled in its config. |
-| Kill / retry a step's job | The cluster `/job/kill` (broadcast to every ready SSP) and `/job/retry` (one SSP is picked). The SSP's own verdict is relayed: a `409` for a job that is not terminal, a `404` for one it does not know. |
+| Action                    | What happens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cancel a run              | Sets `kill_requested` **and** runs the kill immediately: every dispatched step's job gets `/job/kill` broadcast to the ready SSPs. Sub-second, with the flag as the durable fallback the next sweep would act on. `409` unless the run is `running`.                                                                                                                                                                                                                                                                                                                                                                                         |
+| Rerun                     | A brand-new ad-hoc run with the same frozen DAG, input and target table, `trigger: manual`, and `rerun_of` pointing at the source. It has no owning schedule run, never counts towards `concurrency: skip`, and rolls up under `(ad-hoc)`. Any source status is allowed.                                                                                                                                                                                                                                                                                                                                                                     |
+| Retry from failed         | Only for a `failed` or `killed` run. Resets `failed` and `skipped` steps to `blocked`, keeps successful steps and their outputs, reopens the run (and its owning schedule run, so the outcome is mirrored there) and dispatches the reset steps again under new job ids of the form `<table>:wf_<run key>_<step>_r<n>`. Old job rows are left as history; a job row is never deleted or re-created under the same id. Refused with `409 step <name>'s job is still processing; wait for the kill to settle` while a killed step's job has not gone terminal on its SSP, because resetting it before the kill lands would run the step twice. |
+| Pause / resume a schedule | Writes `paused` on the `_00_schedule` row, the same field `spky schedules pause` writes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Run a schedule now        | Writes `trigger_requested_at`. `409` while the schedule is paused (pause wins over a queued trigger, so the fire would silently never happen) or disabled in its config.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Kill / retry a step's job | The cluster `/job/kill` (broadcast to every ready SSP) and `/job/retry` (one SSP is picked). The SSP's own verdict is relayed: a `409` for a job that is not terminal, a `404` for one it does not know.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 <Note>
-Retrying the latest fire of a schedule leaves `_00_schedule.last_run_status`
-at `failed` even when the retry succeeds: the engine only lets a failure
-overwrite an equal `last_run_at`. The run and schedule-run rows are correct;
-only that summary field lags.
+  Retrying the latest fire of a schedule leaves `_00_schedule.last_run_status` at `failed` even when
+  the retry succeeds: the engine only lets a failure overwrite an equal `last_run_at`. The run and
+  schedule-run rows are correct; only that summary field lags.
 </Note>
 
 A scheduler upgraded before `spky deploy` has migrated the schedule tables
@@ -382,10 +420,10 @@ days, and is shown once; the page prints the `claude mcp add` command and the
 Cursor and VS Code snippets with everything filled in. Paste a token back to
 revoke it.
 
-| Scope | Meaning |
-| --- | --- |
+| Scope  | Meaning                                                                                         |
+| ------ | ----------------------------------------------------------------------------------------------- |
 | `read` | May only make `GET` requests to the API. Any other method answers `403 This token is read-only` |
-| `full` | Everything the signed-in operator can do |
+| `full` | Everything the signed-in operator can do                                                        |
 
 The bearer middleware enforces that on every request, so a read token binds an
 agent exactly as it binds a browser. `POST /admin/api/mcp` is the single
@@ -400,14 +438,24 @@ further tokens; only a person's own session can. Tokens follow the
 [session rules](#session-behaviour): signed and restart-proof when
 `SPKY_AUTH_SECRET` is set, in memory otherwise.
 
+<Screenshot
+  src="/docs/admin/access.png"
+  caption="Minting an MCP token, and the tools an agent can then call."
+/>
+
 ## Backups
+
+<Screenshot
+  src="/docs/admin/backups.png"
+  caption="The catalog, the schedule Sp00ky Cloud runs it on, and restore."
+/>
 
 The Backups tab merges two sources rather than choosing between them:
 
 - **This scheduler** executes backups and restores. Its registries know the
   live state of anything in flight, including restore stages nothing else can
   see. They are in memory and forget on restart, which the tab says under
-  *Restore history* when it is empty.
+  _Restore history_ when it is empty.
 - **Sp00ky Cloud**, when linked, owns the catalog, the schedule, retention and
   deletion.
 
@@ -433,9 +481,9 @@ the main database restored but the replica not is the deliberately stuck
 tab calls it out with the recovery step.
 
 <Warning>
-A restore wipes the database, evicts every SSP (they re-bootstrap against the
-restored state) and requires your migrations to be run again. The dialog asks
-you to type `restore` before it proceeds.
+  A restore wipes the database, evicts every SSP (they re-bootstrap against the restored state) and
+  requires your migrations to be run again. The dialog asks you to type `restore` before it
+  proceeds.
 </Warning>
 
 ## Who is connected, and what they registered
@@ -449,27 +497,31 @@ shared / slow / errored counts. Each chart keeps its own scale; views outnumber
 users by one to two orders of magnitude, and a shared axis would flatten the
 users line onto the baseline.
 
-**Views** is the tab you open to ask *which* queries are registered: a
+<Screenshot
+  src="/docs/admin/views.png"
+  caption="Every registered live query, what it costs and who is watching it."
+/>
+
+**Views** is the tab you open to ask _which_ queries are registered: a
 filterable, sortable table of every live query with its owner, SSP, row count,
 subscribers, materialization percentiles and time to expiry. Clicking one opens
 its SurrealQL and params, every subscribing session with its age, that view's
 heap inside its SSP, and the other live sessions running the identical query.
 
 Everything is derived from `_00_query`, the registry of live queries. One row
-there is one *client session x query* — the query id is hashed with a
+there is one _client session x query_ — the query id is hashed with a
 per-browser-session salt, so two tabs of the same person register two rows.
 That is what makes the rollup possible: distinct `auth_id` counts people,
 distinct `clientId` counts open tabs, and the row count is registered views.
 
 <Note title="Liveness is TTL-shaped, not instant">
-A client proves it is still watching by refreshing `lastActiveAt` on a
-<code>0.9 &times; ttl</code> timer — about nine minutes at the default
-<code>10m</code>. A row counts as live while <code>lastActiveAt + ttl &gt;
-time::now()</code>, the same rule the TTL sweep uses, so a closed tab *decays*
-out of these counts over minutes rather than leaving at once. Every row on the
-Views tab carries its own <code>expires</code> so you can see which ones are on
-the way out. There is no finer signal to be had: the client's WebSocket goes to
-SurrealDB, not to the scheduler, so there is no connection to count.
+  A client proves it is still watching by refreshing `lastActiveAt` on a<code>0.9 &times; ttl</code>{' '}
+  timer — about nine minutes at the default
+  <code>10m</code>. A row counts as live while <code>lastActiveAt + ttl &gt; time::now()</code>, the
+  same rule the TTL sweep uses, so a closed tab *decays* out of these counts over minutes rather
+  than leaving at once. Every row on the Views tab carries its own <code>expires</code> so you can
+  see which ones are on the way out. There is no finer signal to be had: the client's WebSocket goes
+  to SurrealDB, not to the scheduler, so there is no connection to count.
 </Note>
 
 One background sampler feeds both surfaces, so ten open dashboards cost the
@@ -478,24 +530,24 @@ already makes rather than a request of their own.
 
 ## Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `SPKY_ADMIN_ENABLED` | `true` | Set to `0`/`false`/`off` to disable the admin listener entirely |
-| `SPKY_ADMIN_PORT` | `9668` | Admin listener port |
-| `SPKY_ADMIN_HOST` | `0.0.0.0` | Admin listener bind address |
-| `SPKY_ADMIN_DIR` | `/usr/share/spooky/dashboard` | Where the built dashboard lives |
-| `SPKY_ADMIN_PASSWORD` | unset | Break-glass password. Unset disables password-only login |
-| `SPKY_ADMIN_ACCESS` | auto | Pins the record-access method used for sign-in |
-| `SPKY_ADMIN_SESSION_TTL_SECS` | `28800` | Session lifetime (8 hours) |
-| `SPKY_ADMIN_PRESENCE_INTERVAL_SECS` | `15` | How often the presence sampler reads `_00_query`. One sampler serves every open dashboard |
-| `SPKY_ADMIN_SLOW_VIEW_MS` | `250` | Materialization p99 at which a view counts as slow. `?slow_ms=` overrides it per request |
-| `SPKY_ADMIN_LARGE_VIEW_ROWS` | `1000` | Row count from which a view is flagged **large** on the Views tab and the Overview. Every row of an unwindowed live view is republished as an edge on each cold registration, so a few thousand at once can stall the database; `?large=true` filters the list to them |
-| `SPKY_ADMIN_PRESENCE_MAX_ROWS` | `20000` | Ceiling on rows one presence or views query may pull back |
-| `SPKY_ADMIN_JOB_INTERVAL_SECS` | `15` | How often the job sampler reads the outbox tables while nobody has the Jobs page open. `0` switches the sampler off: the Jobs list still works, the totals and the Overview tile report that they are not measured |
-| `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | `2` | The cadence while at least one dashboard holds `/admin/api/jobs/stream` open. Clamped to no slower than the idle interval |
-| `SPKY_CLOUD_API_URL` | unset | Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane |
-| `SPKY_CLOUD_PROJECT` | unset | The project slug, injected alongside it |
-| `SPKY_PROJECT_SLUG` | `default` | Storage prefix for backups on an unlinked scheduler |
+| Variable                            | Default                       | Meaning                                                                                                                                                                                                                                                                |
+| ----------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SPKY_ADMIN_ENABLED`                | `true`                        | Set to `0`/`false`/`off` to disable the admin listener entirely                                                                                                                                                                                                        |
+| `SPKY_ADMIN_PORT`                   | `9668`                        | Admin listener port                                                                                                                                                                                                                                                    |
+| `SPKY_ADMIN_HOST`                   | `0.0.0.0`                     | Admin listener bind address                                                                                                                                                                                                                                            |
+| `SPKY_ADMIN_DIR`                    | `/usr/share/spooky/dashboard` | Where the built dashboard lives                                                                                                                                                                                                                                        |
+| `SPKY_ADMIN_PASSWORD`               | unset                         | Break-glass password. Unset disables password-only login                                                                                                                                                                                                               |
+| `SPKY_ADMIN_ACCESS`                 | auto                          | Pins the record-access method used for sign-in                                                                                                                                                                                                                         |
+| `SPKY_ADMIN_SESSION_TTL_SECS`       | `28800`                       | Session lifetime (8 hours)                                                                                                                                                                                                                                             |
+| `SPKY_ADMIN_PRESENCE_INTERVAL_SECS` | `15`                          | How often the presence sampler reads `_00_query`. One sampler serves every open dashboard                                                                                                                                                                              |
+| `SPKY_ADMIN_SLOW_VIEW_MS`           | `250`                         | Materialization p99 at which a view counts as slow. `?slow_ms=` overrides it per request                                                                                                                                                                               |
+| `SPKY_ADMIN_LARGE_VIEW_ROWS`        | `1000`                        | Row count from which a view is flagged **large** on the Views tab and the Overview. Every row of an unwindowed live view is republished as an edge on each cold registration, so a few thousand at once can stall the database; `?large=true` filters the list to them |
+| `SPKY_ADMIN_PRESENCE_MAX_ROWS`      | `20000`                       | Ceiling on rows one presence or views query may pull back                                                                                                                                                                                                              |
+| `SPKY_ADMIN_JOB_INTERVAL_SECS`      | `15`                          | How often the job sampler reads the outbox tables while nobody has the Jobs page open. `0` switches the sampler off: the Jobs list still works, the totals and the Overview tile report that they are not measured                                                     |
+| `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | `2`                           | The cadence while at least one dashboard holds `/admin/api/jobs/stream` open. Clamped to no slower than the idle interval                                                                                                                                              |
+| `SPKY_CLOUD_API_URL`                | unset                         | Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane                                                                                                                                                                                  |
+| `SPKY_CLOUD_PROJECT`                | unset                         | The project slug, injected alongside it                                                                                                                                                                                                                                |
+| `SPKY_PROJECT_SLUG`                 | `default`                     | Storage prefix for backups on an unlinked scheduler                                                                                                                                                                                                                    |
 
 Backup storage is configured separately, and those five variables carry no
 `SPKY_` prefix: `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`
@@ -537,71 +589,70 @@ Two routes sit outside that prefix: the built dashboard itself, served from
 `/admin`, and `GET /`, which answers a `301` to `/admin/` so typing the host
 and port with no path lands on the dashboard.
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /admin/api/config` | Scheduler id, version, `breakglass_available`, `cloud_linked`, `supervised`, `sessions_persistent`, `project_slug`. Unauthenticated |
-| `POST /admin/api/session` | Sign in. `{username, password}` or `{password}` for break-glass |
-| `POST /admin/api/logout` | Revoke the current token |
-| `GET /admin/api/me` | Current session's subject, label, mode and scope |
-| `GET /admin/api/overview` | Scheduler, SSP and backend entities plus totals, and the presence rollup |
-| `GET /admin/api/presence` | Live users, sessions and views, the sample ring behind the charts, the heaviest users and the per-SSP split. Served from the sampler's memory |
-| `GET /admin/api/views` | Registered live queries. `?limit=`, `?user=`, `?ssp=`, `?sort=`, `?slow_ms=`, `?q=`, `?shared=`, `?include_expired=` |
-| `GET /admin/api/views/:key` | One view: SurrealQL, params, subscribers, percentiles, its SSP's memory attribution, and the other sessions running the identical query |
-| `GET /admin/api/backends` | Backend list |
-| `GET /admin/api/backends/:name` | One backend with probe history and masked env |
-| `GET /admin/api/logs` | SSE. `?source=scheduler` or `ssp:<id>`, `&tail=`, `&backfill=` |
-| `GET /admin/api/workflows/runs` | Run list. `?name=`, `?schedule=`, `?status=`, `?rerun_of=`, `?limit=` |
-| `GET /admin/api/workflows/runs/:id` | One run with its steps and DAG |
-| `GET /admin/api/workflows/stream` | SSE. Run list, pushed on change |
-| `GET /admin/api/jobs` | Outbox jobs across every table, newest activity first, with the queue totals and a per-table breakdown. `?status=`, `?table=`, `?origin=schedule\|workflow\|app`, `?q=`, `?limit=`. Unfiltered it is served from the sampler's memory and costs the database nothing |
-| `GET /admin/api/jobs/stream` | SSE. Event `jobs`, the list and totals pushed on change. Holding it open is what puts the sampler on its live cadence. `501` when the sampler is disabled |
-| `GET /admin/api/jobs/:id` | One outbox job: status, path, payload, result, every attempt in `errors`, retry budget, assignee, lease, and the `origin` block naming the schedule fire or workflow step it came from. `404` unless the id's table is in `_00_retention.job_tables` |
-| `GET /admin/api/schedules` | Schedule definitions with next/last fire |
-| `GET /admin/api/schedules/:name` | One schedule, its recent fires, and its `_00_run_rollup` tally |
-| `GET /admin/api/operations` | Recent operations, newest first |
-| `GET /admin/api/operations/stream` | SSE. Event `operations`, the whole list on every change |
-| `POST /admin/api/ssps/:id/restart` | `{mode: "restart" \| "clean" \| "reload"}`. `202` with the operation |
-| `POST /admin/api/ssps/restart-all` | `{mode: "restart" \| "clean", rolling: true}`. `409` while a roll is running |
-| `POST /admin/api/scheduler/restart` | `{mode: "restart" \| "reclone" \| "rehash"}` |
-| `POST /admin/api/cloud/restart` | `{roles, upgrade, clean, surreal}`, forwarded to Sp00ky Cloud. `409` when unlinked |
-| `GET /admin/api/cloud/deployment` | The deployment as Sp00ky Cloud sees it. `409` when unlinked |
-| `GET /admin/api/backups` | Catalog, local registry, restores, schedule config, storage status |
-| `POST /admin/api/backups` | `{name}`. `202` with the operation and `backup_id`. `503` without S3 storage |
-| `PUT /admin/api/backups/config` | `{enabled, schedule, retention}`. `409` when unlinked |
-| `DELETE /admin/api/backups/:id` | Soft-delete in the catalog. `409` when unlinked |
-| `POST /admin/api/backups/:id/restore` | `202` with the operation and `restore_id`. `503` unless the scheduler is `Ready` |
-| `GET /admin/api/backups/:id/restore` | `{cloud, local, stage}` for the latest restore of that backup |
-| `POST /admin/api/workflows/runs/:id/cancel` | `202` `{run, status: "killed" \| "kill_requested"}` |
-| `POST /admin/api/workflows/runs/:id/rerun` | `201` `{run, rerun_of}` |
-| `POST /admin/api/workflows/runs/:id/retry` | `200` `{run, retry_count, reset, kept}` |
-| `POST /admin/api/schedules/:name/pause` | `{name, paused: true}` |
-| `POST /admin/api/schedules/:name/resume` | `{name, paused: false}` |
-| `POST /admin/api/schedules/:name/trigger` | `{name, triggered_at}`. `409` when paused or config-disabled |
-| `POST /admin/api/jobs/:id/kill` | The cluster kill, relaying the SSPs' answer |
-| `POST /admin/api/jobs/:id/retry` | The cluster retry, relaying the SSP's answer |
-| `POST /admin/api/jobs/clear` | `{table, all}`. Batch-deletes terminal rows, never `processing` ones. `200` `{cleared, total, more}` |
-| `POST /admin/api/tokens` | `{label, scope: "read" \| "full", ttl_days}`. `201` with the token, shown once. `403` for an MCP or read-only session |
-| `DELETE /admin/api/tokens` | `{token}`. Revokes it. `204` |
-| `POST /admin/api/mcp` | The scheduler admin MCP server: JSON-RPC over Streamable HTTP, stateless. `GET` and `DELETE` answer `405` |
+| Endpoint                                    | Purpose                                                                                                                                                                                                                                                              |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /admin/api/config`                     | Scheduler id, version, `breakglass_available`, `cloud_linked`, `supervised`, `sessions_persistent`, `project_slug`. Unauthenticated                                                                                                                                  |
+| `POST /admin/api/session`                   | Sign in. `{username, password}` or `{password}` for break-glass                                                                                                                                                                                                      |
+| `POST /admin/api/logout`                    | Revoke the current token                                                                                                                                                                                                                                             |
+| `GET /admin/api/me`                         | Current session's subject, label, mode and scope                                                                                                                                                                                                                     |
+| `GET /admin/api/overview`                   | Scheduler, SSP and backend entities plus totals, and the presence rollup                                                                                                                                                                                             |
+| `GET /admin/api/presence`                   | Live users, sessions and views, the sample ring behind the charts, the heaviest users and the per-SSP split. Served from the sampler's memory                                                                                                                        |
+| `GET /admin/api/views`                      | Registered live queries. `?limit=`, `?user=`, `?ssp=`, `?sort=`, `?slow_ms=`, `?q=`, `?shared=`, `?include_expired=`                                                                                                                                                 |
+| `GET /admin/api/views/:key`                 | One view: SurrealQL, params, subscribers, percentiles, its SSP's memory attribution, and the other sessions running the identical query                                                                                                                              |
+| `GET /admin/api/backends`                   | Backend list                                                                                                                                                                                                                                                         |
+| `GET /admin/api/backends/:name`             | One backend with probe history and masked env                                                                                                                                                                                                                        |
+| `GET /admin/api/logs`                       | SSE. `?source=scheduler` or `ssp:<id>`, `&tail=`, `&backfill=`                                                                                                                                                                                                       |
+| `GET /admin/api/workflows/runs`             | Run list. `?name=`, `?schedule=`, `?status=`, `?rerun_of=`, `?limit=`                                                                                                                                                                                                |
+| `GET /admin/api/workflows/runs/:id`         | One run with its steps and DAG                                                                                                                                                                                                                                       |
+| `GET /admin/api/workflows/stream`           | SSE. Run list, pushed on change                                                                                                                                                                                                                                      |
+| `GET /admin/api/jobs`                       | Outbox jobs across every table, newest activity first, with the queue totals and a per-table breakdown. `?status=`, `?table=`, `?origin=schedule\|workflow\|app`, `?q=`, `?limit=`. Unfiltered it is served from the sampler's memory and costs the database nothing |
+| `GET /admin/api/jobs/stream`                | SSE. Event `jobs`, the list and totals pushed on change. Holding it open is what puts the sampler on its live cadence. `501` when the sampler is disabled                                                                                                            |
+| `GET /admin/api/jobs/:id`                   | One outbox job: status, path, payload, result, every attempt in `errors`, retry budget, assignee, lease, and the `origin` block naming the schedule fire or workflow step it came from. `404` unless the id's table is in `_00_retention.job_tables`                 |
+| `GET /admin/api/schedules`                  | Schedule definitions with next/last fire                                                                                                                                                                                                                             |
+| `GET /admin/api/schedules/:name`            | One schedule, its recent fires, and its `_00_run_rollup` tally                                                                                                                                                                                                       |
+| `GET /admin/api/operations`                 | Recent operations, newest first                                                                                                                                                                                                                                      |
+| `GET /admin/api/operations/stream`          | SSE. Event `operations`, the whole list on every change                                                                                                                                                                                                              |
+| `POST /admin/api/ssps/:id/restart`          | `{mode: "restart" \| "clean" \| "reload"}`. `202` with the operation                                                                                                                                                                                                 |
+| `POST /admin/api/ssps/restart-all`          | `{mode: "restart" \| "clean", rolling: true}`. `409` while a roll is running                                                                                                                                                                                         |
+| `POST /admin/api/scheduler/restart`         | `{mode: "restart" \| "reclone" \| "rehash"}`                                                                                                                                                                                                                         |
+| `POST /admin/api/cloud/restart`             | `{roles, upgrade, clean, surreal}`, forwarded to Sp00ky Cloud. `409` when unlinked                                                                                                                                                                                   |
+| `GET /admin/api/cloud/deployment`           | The deployment as Sp00ky Cloud sees it. `409` when unlinked                                                                                                                                                                                                          |
+| `GET /admin/api/backups`                    | Catalog, local registry, restores, schedule config, storage status                                                                                                                                                                                                   |
+| `POST /admin/api/backups`                   | `{name}`. `202` with the operation and `backup_id`. `503` without S3 storage                                                                                                                                                                                         |
+| `PUT /admin/api/backups/config`             | `{enabled, schedule, retention}`. `409` when unlinked                                                                                                                                                                                                                |
+| `DELETE /admin/api/backups/:id`             | Soft-delete in the catalog. `409` when unlinked                                                                                                                                                                                                                      |
+| `POST /admin/api/backups/:id/restore`       | `202` with the operation and `restore_id`. `503` unless the scheduler is `Ready`                                                                                                                                                                                     |
+| `GET /admin/api/backups/:id/restore`        | `{cloud, local, stage}` for the latest restore of that backup                                                                                                                                                                                                        |
+| `POST /admin/api/workflows/runs/:id/cancel` | `202` `{run, status: "killed" \| "kill_requested"}`                                                                                                                                                                                                                  |
+| `POST /admin/api/workflows/runs/:id/rerun`  | `201` `{run, rerun_of}`                                                                                                                                                                                                                                              |
+| `POST /admin/api/workflows/runs/:id/retry`  | `200` `{run, retry_count, reset, kept}`                                                                                                                                                                                                                              |
+| `POST /admin/api/schedules/:name/pause`     | `{name, paused: true}`                                                                                                                                                                                                                                               |
+| `POST /admin/api/schedules/:name/resume`    | `{name, paused: false}`                                                                                                                                                                                                                                              |
+| `POST /admin/api/schedules/:name/trigger`   | `{name, triggered_at}`. `409` when paused or config-disabled                                                                                                                                                                                                         |
+| `POST /admin/api/jobs/:id/kill`             | The cluster kill, relaying the SSPs' answer                                                                                                                                                                                                                          |
+| `POST /admin/api/jobs/:id/retry`            | The cluster retry, relaying the SSP's answer                                                                                                                                                                                                                         |
+| `POST /admin/api/jobs/clear`                | `{table, all}`. Batch-deletes terminal rows, never `processing` ones. `200` `{cleared, total, more}`                                                                                                                                                                 |
+| `POST /admin/api/tokens`                    | `{label, scope: "read" \| "full", ttl_days}`. `201` with the token, shown once. `403` for an MCP or read-only session                                                                                                                                                |
+| `DELETE /admin/api/tokens`                  | `{token}`. Revokes it. `204`                                                                                                                                                                                                                                         |
+| `POST /admin/api/mcp`                       | The scheduler admin MCP server: JSON-RPC over Streamable HTTP, stateless. `GET` and `DELETE` answer `405`                                                                                                                                                            |
 
 <Note title="When sign-in says the database is unreachable">
-  A <code>503</code> on the login screen — <em>"Cannot reach the tenant database,
-  so no sign-in can be checked"</em> — is not a credential problem and no password
-  will fix it. The roster path signs in <em>through</em> your database, so it needs
-  that database reachable; when it is not, the scheduler says so instead of
-  answering <code>401</code>. Check the scheduler's log for the reason and the
-  database container's health. A tenant database can reach a state where it keeps
-  answering existing connections and its REST endpoints while refusing new
-  SDK sessions, so "the app still works" does not rule this out; restarting the
-  database container clears it.
+  A <code>503</code> on the login screen —{' '}
+  <em>"Cannot reach the tenant database, so no sign-in can be checked"</em> — is not a credential
+  problem and no password will fix it. The roster path signs in <em>through</em> your database, so
+  it needs that database reachable; when it is not, the scheduler says so instead of answering{' '}
+  <code>401</code>. Check the scheduler's log for the reason and the database container's health. A
+  tenant database can reach a state where it keeps answering existing connections and its REST
+  endpoints while refusing new SDK sessions, so "the app still works" does not rule this out;
+  restarting the database container clears it.
 </Note>
 
 <Note title="Upgrading to canary.212">
   <code>retry_count</code> on <code>_00_workflow_run</code> became
-  <code>option&lt;int&gt;</code>: as a plain <code>int</code> every update to a run created
-  before the field existed failed validation, which blocked cancel and the engine's own
-  finalize on those rows. <code>spky migrate</code> applies the new definition and a one-time
-  backfill; run it once after upgrading.
+  <code>option&lt;int&gt;</code>: as a plain <code>int</code> every update to a run created before
+  the field existed failed validation, which blocked cancel and the engine's own finalize on those
+  rows. <code>spky migrate</code> applies the new definition and a one-time backfill; run it once
+  after upgrading.
 </Note>
 
 The workflow endpoints are served by the scheduler rather than read from the
@@ -617,35 +668,34 @@ row's `error` field — a stable `code`, a sentence, and whatever ids make the
 sentence actionable — and the dashboard renders that rather than a JSON payload.
 The ones worth knowing by name:
 
-| `code` | On | Means |
-| --- | --- | --- |
-| `concurrency_skip` | `_00_schedule_run` | The fire was suppressed by `concurrency: skip`. `blocked_by` is the run holding the key and `since` is when it started. A run wedged in `running` suppresses that key's fires for as long as it stays there, so the blocking run is what needs acting on — not the skipped rows |
-| `upstream_failed` | `_00_step_run` | The step is below a failure under `on_failure: continue-independent`. `blocked_by` names the dependency one hop up, so the chain can be walked a step at a time |
-| `run_halted` | `_00_step_run` | The step had not started when the run halted under `on_failure: halt`. `failed_steps` names what actually broke, which is elsewhere in the DAG |
-| `not_started` | `_00_step_run` | The run was killed or reaped before this step started. `run_error` carries the run's own reason |
-| `never_dispatched` | `_00_step_run` | The step was promoted but its job row was never created, and the run stopped before recovery re-dispatched it |
-| `lost_dispatch` | `_00_step_run` | The step exhausted its dispatch attempts without ever getting a job |
-| `job_failed` | `_00_step_run`, `_00_schedule_run` | The step's job failed. Normally the job's last `errors` entry verbatim; synthesized, and saying so, when the job recorded none |
-| `job_missing` | `_00_step_run`, `_00_schedule_run` | The job row is gone — deleted, or pruned by retention while the step still pointed at it |
-| `step_failed` | `_00_workflow_run` | A step failed and the run failed with it. The step's own row carries the real reason |
-| `deadline_exceeded` | `_00_workflow_run`, `_00_schedule_run` | The reaper stopped a run that passed its `deadline:` (or the project's `run_deadline_secs`) without finishing, and killed its jobs |
-| `killed` | `_00_workflow_run`, `_00_schedule_run` | An operator cancelled the run |
-| `spawn_failed` | `_00_workflow_run`, `_00_schedule_run` | The fire could not create what it needed — the job row, or the run's steps |
-| `bad_dag` | `_00_workflow_run` | The frozen DAG on the run does not validate. A redeploy cannot fix a run already in flight; its DAG is frozen at spawn |
-| `no_target_table` | `_00_step_run` | The step names no outbox table and its schedule has no `target_table` |
+| `code`              | On                                     | Means                                                                                                                                                                                                                                                                           |
+| ------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `concurrency_skip`  | `_00_schedule_run`                     | The fire was suppressed by `concurrency: skip`. `blocked_by` is the run holding the key and `since` is when it started. A run wedged in `running` suppresses that key's fires for as long as it stays there, so the blocking run is what needs acting on — not the skipped rows |
+| `upstream_failed`   | `_00_step_run`                         | The step is below a failure under `on_failure: continue-independent`. `blocked_by` names the dependency one hop up, so the chain can be walked a step at a time                                                                                                                 |
+| `run_halted`        | `_00_step_run`                         | The step had not started when the run halted under `on_failure: halt`. `failed_steps` names what actually broke, which is elsewhere in the DAG                                                                                                                                  |
+| `not_started`       | `_00_step_run`                         | The run was killed or reaped before this step started. `run_error` carries the run's own reason                                                                                                                                                                                 |
+| `never_dispatched`  | `_00_step_run`                         | The step was promoted but its job row was never created, and the run stopped before recovery re-dispatched it                                                                                                                                                                   |
+| `lost_dispatch`     | `_00_step_run`                         | The step exhausted its dispatch attempts without ever getting a job                                                                                                                                                                                                             |
+| `job_failed`        | `_00_step_run`, `_00_schedule_run`     | The step's job failed. Normally the job's last `errors` entry verbatim; synthesized, and saying so, when the job recorded none                                                                                                                                                  |
+| `job_missing`       | `_00_step_run`, `_00_schedule_run`     | The job row is gone — deleted, or pruned by retention while the step still pointed at it                                                                                                                                                                                        |
+| `step_failed`       | `_00_workflow_run`                     | A step failed and the run failed with it. The step's own row carries the real reason                                                                                                                                                                                            |
+| `deadline_exceeded` | `_00_workflow_run`, `_00_schedule_run` | The reaper stopped a run that passed its `deadline:` (or the project's `run_deadline_secs`) without finishing, and killed its jobs                                                                                                                                              |
+| `killed`            | `_00_workflow_run`, `_00_schedule_run` | An operator cancelled the run                                                                                                                                                                                                                                                   |
+| `spawn_failed`      | `_00_workflow_run`, `_00_schedule_run` | The fire could not create what it needed — the job row, or the run's steps                                                                                                                                                                                                      |
+| `bad_dag`           | `_00_workflow_run`                     | The frozen DAG on the run does not validate. A redeploy cannot fix a run already in flight; its DAG is frozen at spawn                                                                                                                                                          |
+| `no_target_table`   | `_00_step_run`                         | The step names no outbox table and its schedule has no `target_table`                                                                                                                                                                                                           |
 
 `_00_schedule.last_error` is the exception: it is a bare string, because it is why
-a schedule could not be *planned or fanned out at all* (a bad cron, a failing
+a schedule could not be _planned or fanned out at all_ (a bad cron, a failing
 `forEach`) — which happens before any run row exists to carry a cause.
 
 Each step in `GET /admin/api/workflows/runs/:id` carries both `created_at` and
 `started_at`, and the distinction matters: the engine creates every step row when
-the run is spawned, so `created_at` on a step deep in a DAG is the *run's* start,
+the run is spawned, so `created_at` on a step deep in a DAG is the _run's_ start,
 not the step's. `started_at` is stamped when the step's job is created and is the
 only honest answer to "when did this begin". The Timeline draws from it, and
 falls back to the moment the step's last dependency finished — marked as an
 estimate — for runs recorded before the engine stamped it.
-
 
 Incident details show publication backlog when an SSP heartbeat sample was
 available: peak queued operations and bytes, longest observed wait, parked
@@ -653,3 +703,15 @@ batches, last successful publication, and related view links. Bulk database
 session generation and reconnect timing distinguish database recovery from
 circuit evaluation. The SSP page also shows its current publication backlog.
 These are sampled measurements; a spike between samples can be missed.
+
+## Regenerating these screenshots
+
+They are captured from the real dashboard driven by a fixed fixture, not by
+hand:
+
+<CodeBlock code={screenshotsCode} lang="bash" />
+
+See `apps/dashboard/screenshots/README.md` for what to update when a route is
+added or a response shape changes.
+
+export const screenshotsCode = `pnpm --filter @spooky-sync/dashboard screenshots`;

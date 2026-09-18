@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "screenshots": "node screenshots/capture.mjs"
   },
   "dependencies": {
     "@solidjs/router": "^0.15.3",

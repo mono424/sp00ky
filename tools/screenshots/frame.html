@@ -1,13 +1,19 @@
 <!doctype html>
 <!--
-  The browser window drawn around every captured panel.
+  The browser window drawn around every capture.
 
-  `capture.mjs` captures the panel on its own, then loads this page with the raw
+  `engine.mjs` captures a screen on its own, then loads this page with the raw
   capture as `{{IMG}}` and screenshots the `.window` element. Keeping the chrome
-  in HTML means it can be restyled without recapturing a single panel, and the
-  panel capture stays a plain picture of the panel.
+  in HTML means it can be restyled without recapturing a single screen, and each
+  capture stays a plain picture of the app.
 
-  Placeholders: {{IMG}} {{IMG_HEIGHT}} {{SITE_HEIGHT}} {{TITLE}} {{URL}}
+  Two modes. `page` is a browser window around a whole page, which is what the
+  admin dashboard is. `devtools` additionally shows a sliver of the page being
+  inspected and the DevTools tab strip, which is where the extension's panel
+  actually lives.
+
+  Placeholders: {{MODE}} {{IMG}} {{IMG_HEIGHT}} {{SITE_HEIGHT}} {{TITLE}}
+                {{URL}} {{ICON}}
 -->
 <html lang="en">
   <head>
@@ -46,6 +52,11 @@
         border-radius: 10px;
         overflow: hidden;
         background: var(--chrome-body);
+      }
+
+      .window.page .site,
+      .window.page .dt-bar {
+        display: none;
       }
 
       /* ---- Browser chrome ------------------------------------------------ */
@@ -228,9 +239,12 @@
 
       /* ---- DevTools ------------------------------------------------------ */
 
-      .devtools {
-        border-top: 1px solid var(--chrome-line);
+      .body {
         background: var(--chrome-body);
+      }
+
+      .window.devtools .body {
+        border-top: 1px solid var(--chrome-line);
       }
 
       .dt-bar {
@@ -280,7 +294,7 @@
         background: var(--chrome-dim);
       }
 
-      .panel {
+      .capture {
         display: block;
         width: 1280px;
         height: var(--img-height);
@@ -288,14 +302,17 @@
     </style>
   </head>
   <body>
-    <div class="window" style="--site-height: {{SITE_HEIGHT}}px; --img-height: {{IMG_HEIGHT}}px">
+    <div
+      class="window {{MODE}}"
+      style="--site-height: {{SITE_HEIGHT}}px; --img-height: {{IMG_HEIGHT}}px"
+    >
       <div class="titlebar">
         <div class="lights">
           <div class="light red"></div>
           <div class="light yellow"></div>
           <div class="light green"></div>
         </div>
-        <div class="tab"><span class="favicon"></span>{{TITLE}}</div>
+        <div class="tab"><span class="favicon">{{ICON}}</span>{{TITLE}}</div>
       </div>
 
       <div class="toolbar">
@@ -341,7 +358,7 @@
         </div>
       </div>
 
-      <div class="devtools">
+      <div class="body">
         <div class="dt-bar">
           <span class="dt-tab">Elements</span>
           <span class="dt-tab">Console</span>
@@ -355,7 +372,7 @@
             <i class="dt-dot"></i><i class="dt-dot"></i><i class="dt-dot"></i>
           </span>
         </div>
-        <img class="panel" src="{{IMG}}" alt="" />
+        <img class="capture" src="{{IMG}}" alt="" />
       </div>
     </div>
   </body>

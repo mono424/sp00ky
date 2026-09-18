@@ -4,74 +4,68 @@
   "deviceScaleFactor": 2,
   "theme": "dark",
   "frame": {
-    "chrome": "frame.html",
+    "chrome": "tools/screenshots/frame.html",
+    "devtools": true,
+    "title": "Acme Chat",
+    "url": "chat.acme.test",
+    "chromeHeight": 78,
+    "barHeight": 31,
     "siteShare": 0.05,
-    "site": "Acme Chat"
+    "siteMin": 44
   },
   "shots": [
     {
       "name": "queries",
-      "tab": "Queries",
       "caption": "Every live query with its status, update count and payload size.",
       "file": "queries.png"
     },
     {
       "name": "queries-detail",
-      "tab": "Queries",
       "caption": "The detail panel for one query: text, variables, rows and timings.",
       "file": "queries-detail.png"
     },
     {
       "name": "timing",
-      "tab": "Timing",
       "caption": "Per-phase p90 for every query, slowest first.",
       "file": "timing.png"
     },
     {
       "name": "database",
-      "tab": "Database",
       "caption": "Browse and edit the local cache or the remote database.",
       "file": "database.png"
     },
     {
       "name": "storage",
-      "tab": "Storage",
       "caption": "Which local engine is running, whether it is really persistent, and who owns the store.",
       "file": "storage.png"
     },
     {
       "name": "storage-files",
-      "tab": "Storage",
       "caption": "The bucket file cache and what the store actually holds on disk, down to the file.",
       "file": "storage-files.png"
     },
     {
       "name": "access",
-      "tab": "Access",
       "caption": "Who the page is signed in as, and impersonating another user from the panel.",
       "file": "access.png"
     },
     {
       "name": "access-flags",
-      "tab": "Access",
       "caption": "Every feature flag the client has seen, with a browser-local override.",
       "file": "access-flags.png"
     },
     {
       "name": "stack",
-      "tab": "Stack",
       "caption": "Frontend versus backend versions, live entities and the e2e heartbeat.",
       "file": "stack.png"
     },
     {
       "name": "mcp",
-      "tab": "MCP",
       "caption": "The MCP bridge that lets an AI assistant read the same state.",
       "file": "mcp.png"
     },
     {
       "name": "events",
-      "tab": "Events",
       "caption": "The client event log, filtered by type.",
       "file": "events.png"
     }

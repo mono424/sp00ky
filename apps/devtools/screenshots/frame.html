@@ -1,0 +1,362 @@
+<!doctype html>
+<!--
+  The browser window drawn around every captured panel.
+
+  `capture.mjs` captures the panel on its own, then loads this page with the raw
+  capture as `{{IMG}}` and screenshots the `.window` element. Keeping the chrome
+  in HTML means it can be restyled without recapturing a single panel, and the
+  panel capture stays a plain picture of the panel.
+
+  Placeholders: {{IMG}} {{IMG_HEIGHT}} {{SITE_HEIGHT}} {{TITLE}} {{URL}}
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        --chrome: #35363a;
+        --chrome-body: #202124;
+        --chrome-line: #3c4043;
+        --chrome-text: #e8eaed;
+        --chrome-dim: #9aa0a6;
+        --chrome-active: #8ab4f8;
+        --site-bg: #0d1017;
+        --site-panel: #141925;
+        --site-line: #222a3a;
+        --site-text: #e6e9ef;
+        --site-dim: #7d8699;
+        --site-accent: #7c5cff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .window {
+        width: 1280px;
+        border-radius: 10px;
+        overflow: hidden;
+        background: var(--chrome-body);
+      }
+
+      /* ---- Browser chrome ------------------------------------------------ */
+
+      .titlebar {
+        height: 38px;
+        background: var(--chrome);
+        display: flex;
+        align-items: flex-end;
+        gap: 14px;
+        padding: 0 12px;
+      }
+
+      .lights {
+        display: flex;
+        gap: 8px;
+        padding-bottom: 12px;
+      }
+
+      .light {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+      }
+      .light.red {
+        background: #ff5f57;
+      }
+      .light.yellow {
+        background: #febc2e;
+      }
+      .light.green {
+        background: #28c840;
+      }
+
+      .tab {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 30px;
+        padding: 0 16px;
+        min-width: 220px;
+        background: var(--chrome-body);
+        border-radius: 8px 8px 0 0;
+        font-size: 12px;
+        color: var(--chrome-text);
+      }
+
+      .favicon {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        background: var(--site-accent);
+      }
+
+      .toolbar {
+        height: 40px;
+        background: var(--chrome-body);
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 14px;
+      }
+
+      .toolbar svg {
+        width: 16px;
+        height: 16px;
+        fill: none;
+        stroke: var(--chrome-dim);
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        flex: none;
+      }
+
+      .omnibox {
+        flex: 1;
+        height: 26px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        border-radius: 13px;
+        background: #2f3033;
+        font-size: 12px;
+        color: #bdc1c6;
+      }
+
+      .omnibox .host {
+        color: var(--chrome-text);
+      }
+
+      /* ---- The page being inspected -------------------------------------- */
+
+      /* Only the top sliver is visible: DevTools is docked under it, exactly as
+         it is when the panel is this tall in a real window. */
+      .site {
+        height: var(--site-height);
+        overflow: hidden;
+        background: var(--site-bg);
+        display: flex;
+        color: var(--site-text);
+        font-size: 12px;
+      }
+
+      .site-rail {
+        width: 200px;
+        flex: none;
+        background: var(--site-panel);
+        border-right: 1px solid var(--site-line);
+        padding: 12px 14px;
+      }
+
+      .site-workspace {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      .site-mark {
+        width: 18px;
+        height: 18px;
+        border-radius: 5px;
+        background: var(--site-accent);
+      }
+
+      .site-channels {
+        margin-top: 14px;
+        display: grid;
+        gap: 8px;
+        color: var(--site-dim);
+      }
+
+      .site-main {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .site-head {
+        height: 44px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--site-line);
+      }
+
+      .site-title {
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      .site-topic {
+        color: var(--site-dim);
+        margin-left: 10px;
+        font-weight: 400;
+      }
+
+      .site-avatars {
+        display: flex;
+        gap: -4px;
+      }
+
+      .site-avatar {
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: #2b3346;
+        margin-left: -6px;
+        border: 2px solid var(--site-bg);
+      }
+
+      .site-messages {
+        padding: 14px 18px;
+        display: grid;
+        gap: 12px;
+        color: var(--site-dim);
+      }
+
+      /* ---- DevTools ------------------------------------------------------ */
+
+      .devtools {
+        border-top: 1px solid var(--chrome-line);
+        background: var(--chrome-body);
+      }
+
+      .dt-bar {
+        height: 30px;
+        display: flex;
+        align-items: stretch;
+        padding: 0 8px;
+        border-bottom: 1px solid var(--chrome-line);
+        font-size: 11px;
+        color: var(--chrome-dim);
+      }
+
+      .dt-tab {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 0 9px;
+        white-space: nowrap;
+      }
+
+      .dt-tab.active {
+        color: var(--chrome-active);
+        box-shadow: inset 0 -2px 0 var(--chrome-active);
+      }
+
+      .dt-tab img {
+        width: 13px;
+        height: 13px;
+        display: block;
+      }
+
+      .dt-spacer {
+        flex: 1;
+      }
+
+      .dt-dots {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        padding: 0 10px;
+      }
+
+      .dt-dot {
+        width: 3px;
+        height: 3px;
+        border-radius: 50%;
+        background: var(--chrome-dim);
+      }
+
+      .panel {
+        display: block;
+        width: 1280px;
+        height: var(--img-height);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="window" style="--site-height: {{SITE_HEIGHT}}px; --img-height: {{IMG_HEIGHT}}px">
+      <div class="titlebar">
+        <div class="lights">
+          <div class="light red"></div>
+          <div class="light yellow"></div>
+          <div class="light green"></div>
+        </div>
+        <div class="tab"><span class="favicon"></span>{{TITLE}}</div>
+      </div>
+
+      <div class="toolbar">
+        <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6" /></svg>
+        <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" /></svg>
+        <svg viewBox="0 0 24 24">
+          <path d="M20 11A8 8 0 1 0 18 16" />
+          <path d="M20 5v6h-6" />
+        </svg>
+        <div class="omnibox">
+          <svg viewBox="0 0 24 24" style="width: 12px; height: 12px">
+            <rect x="4" y="10" width="16" height="10" rx="2" />
+            <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+          </svg>
+          <span><span class="host">{{URL}}</span></span>
+        </div>
+      </div>
+
+      <div class="site">
+        <div class="site-rail">
+          <div class="site-workspace"><span class="site-mark"></span>Acme</div>
+          <div class="site-channels">
+            <div># general</div>
+            <div># design</div>
+            <div># random</div>
+          </div>
+        </div>
+        <div class="site-main">
+          <div class="site-head">
+            <div class="site-title">
+              # general<span class="site-topic">Everything that matters</span>
+            </div>
+            <div class="site-avatars">
+              <span class="site-avatar"></span>
+              <span class="site-avatar"></span>
+              <span class="site-avatar"></span>
+            </div>
+          </div>
+          <div class="site-messages">
+            <div>Mira Shipping the migration behind the flag tonight.</div>
+            <div>Tomas Replica caught up, drift is back to zero.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="devtools">
+        <div class="dt-bar">
+          <span class="dt-tab">Elements</span>
+          <span class="dt-tab">Console</span>
+          <span class="dt-tab">Sources</span>
+          <span class="dt-tab">Network</span>
+          <span class="dt-tab">Performance</span>
+          <span class="dt-tab">Application</span>
+          <span class="dt-tab active"><img src="/icons/icon16.png" alt="" />00</span>
+          <span class="dt-spacer"></span>
+          <span class="dt-dots">
+            <i class="dt-dot"></i><i class="dt-dot"></i><i class="dt-dot"></i>
+          </span>
+        </div>
+        <img class="panel" src="{{IMG}}" alt="" />
+      </div>
+    </div>
+  </body>
+</html>

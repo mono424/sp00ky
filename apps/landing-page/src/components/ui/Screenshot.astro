@@ -1,0 +1,25 @@
+---
+import { basePath } from '../../config/nav';
+
+interface Props {
+  /** Path under `public/`, e.g. `/docs/devtools/queries.png`. */
+  src: string;
+  /** What the image shows. Used as the alt text and printed under it. */
+  caption: string;
+}
+
+const { src, caption } = Astro.props;
+---
+
+<figure class="my-6">
+  {/* No border or radius here: these images are captured as a browser window
+      and already carry their own rounded corners, which are transparent. */}
+  <img
+    src={`${basePath}${src}`}
+    alt={caption}
+    loading="lazy"
+    decoding="async"
+    class="w-full drop-shadow-2xl"
+  />
+  <figcaption class="mt-2 text-sm text-zinc-500">{caption}</figcaption>
+</figure>

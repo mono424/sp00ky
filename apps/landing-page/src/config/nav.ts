@@ -71,6 +71,7 @@ export const docsNav = [
       { text: 'Dev servers & sidecars', href: `${basePath}/docs/dev/servers` },
       { text: 'Environment variables', href: `${basePath}/docs/dev/env` },
       { text: 'Doctor & troubleshooting', href: `${basePath}/docs/dev/doctor` },
+      { text: 'DevTools extension', href: `${basePath}/docs/reference/devtools` },
     ],
   },
   {

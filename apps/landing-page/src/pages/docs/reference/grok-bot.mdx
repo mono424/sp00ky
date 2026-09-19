@@ -1,0 +1,97 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Grok Bot template recipe
+description: Create a public Sp00ky Grok Bot template using source material in apps/grok-bot.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const mcpInstall = `{
+  "mcpServers": {
+    "spooky-devtools": {
+      "command": "npx",
+      "args": ["-y", "@spooky-sync/devtools-mcp"]
+    }
+  }
+}`;
+
+export const verifyTree = `find apps/grok-bot -type f | sort`;
+
+The monorepo keeps **Grok Bot template source material** under [`apps/grok-bot`](https://github.com/mono424/sp00ky/tree/main/apps/grok-bot). Use it to create a public Bot template that helps people build and operate Sp00ky (`@spooky-sync`) apps.
+
+This folder is not a runtime npm library or an automatically importable bundle. It holds a profile draft, reference facts, and skills to add to a Bot. Learned memory is not part of the shared template configuration.
+
+## Who it is for
+
+- **App builders** starting a Sp00ky project (schema → codegen → Solid clients → SSP)
+- **Operators** running Sp00ky in production (doctor/verify, allowlists, SSP/scheduler health, incident triage)
+- **Contributors** working in this monorepo
+
+## What ships in the recipe
+
+Skills live under `apps/grok-bot/skills/*/SKILL.md`:
+
+| Skill folder | Use when |
+| :--- | :--- |
+| `sp00ky-onboarding` | First import, explain Sp00ky, pick app vs prod vs monorepo track |
+| `sp00ky-schema-codegen` | Schema edits, `spky generate`, `spky doctor`, allowlists, `@crdt` / `@parent` |
+| `sp00ky-solid-app` | Solid providers, queries/mutations, Solid 2 bindings |
+| `sp00ky-debug-mcp` | Stale queries, sync stalls, live schema/data via DevTools MCP |
+| `sp00ky-prod-ops` | Production health, deploys, drift, backups — diagnose before changing anything |
+| `sp00ky-monorepo` | Contributing here: docs-sync, version bumps, PR hygiene |
+
+Profile copy and sharing notes live in [`apps/grok-bot/BOT.md`](https://github.com/mono424/sp00ky/blob/main/apps/grok-bot/BOT.md).
+
+## Share as a public Grok Bot template
+
+1. Keep the drafts aligned with real CLI behavior (`spky generate`, `spky doctor`, `spky recipe`, `spky agents init`, `sp00ky.yml`).
+2. Create a Bot in Grok Bot. Use `BOT.md` for its profile, save and enable the relevant skills, and put essential facts from `memories/profile.md` in the description or skills.
+3. Open **Share → Create template**, choose **Public link**, then check **View template details**. Remove secrets, private paths, and customer data before copying the link.
+
+See [Grok Bot's sharing guide](https://docs.x.ai/grok-bot/bots#share-a-bot) for the current controls and what the recipient receives.
+
+<Note title="DevTools MCP needs separate setup">
+  A shared Bot template does not provision Sp00ky's local DevTools MCP server. Developers using a compatible MCP client can configure it separately:
+</Note>
+
+<CodeBlock code={mcpInstall} lang="json" />
+
+Or from an app: `spky mcp`. See [AI coding agents](/docs/reference/ai-agents) and [MCP server](/docs/reference/mcp) for how DevTools MCP relates to cloud and scheduler admin MCP.
+
+## Verify in the monorepo
+
+<CodeBlock code={verifyTree} lang="bash" />
+
+After docs edits, build the site:
+
+```bash
+cd apps/landing-page && pnpm build
+```
+
+## Next steps
+
+<CardGrid>
+  <LinkCard
+    href="/docs/reference/ai-agents"
+    title="AI coding agents"
+    description="AGENTS.md, recipes, doctor loop, and DevTools MCP."
+  />
+  <LinkCard
+    href="/docs/reference/mcp"
+    title="MCP server"
+    description="Cloud and scheduler admin MCP for deployed projects."
+  />
+  <LinkCard
+    href="/docs/reference/cli"
+    title="CLI"
+    description="spky generate, doctor, recipe, agents, and deploy commands."
+  />
+  <LinkCard
+    href="/docs/reference/devtools"
+    title="DevTools extension"
+    description="Chrome panel for live queries, cache, and client events."
+  />
+</CardGrid>

@@ -62,6 +62,14 @@ Re-run after schema changes to refresh the table list:
 
 <CodeBlock code={codeAgentsForce} lang="bash" />
 
+## Grok Bot template recipe
+
+The monorepo keeps source material for a public Grok Bot template under [`apps/grok-bot`](https://github.com/mono424/sp00ky/tree/main/apps/grok-bot): onboarding, schema/codegen, Solid clients, DevTools MCP debugging, production ops, and monorepo contribution skills.
+
+Create a Bot, enable its skills, then share it using a **public template link**. The template does not provision DevTools MCP; developers can configure `npx -y @spooky-sync/devtools-mcp` (or `spky mcp`) in a compatible MCP client.
+
+Full sharing flow, skill map, and verification steps: [Grok Bot template recipe](/docs/reference/grok-bot).
+
 ## Per-package guides
 
 Every `@spooky-sync/*` package ships an `AGENTS.md` documenting its public API surface. Once installed, an agent can enumerate them:

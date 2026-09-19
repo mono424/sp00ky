@@ -31,7 +31,7 @@ Optimistic local writes; live queries refresh the UI; CRDT fields are special.
 
 ## App track — first 15 minutes
 
-1. Confirm Node 22+, pnpm/npm, and a SurrealDB they can reach.
+1. Confirm Node 22.21.1+, pnpm/npm, and a SurrealDB they can reach.
 2. Scaffold or open their app; ensure `sp00ky.yml` / schema `.surql` exist (`spky init` if greenfield).
 3. Run `spky generate`, then `spky doctor`.
 4. Wire `Sp00kyProvider` (Solid) or core client with generated schema.

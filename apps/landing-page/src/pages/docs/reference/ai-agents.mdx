@@ -62,14 +62,13 @@ Re-run after schema changes to refresh the table list:
 
 <CodeBlock code={codeAgentsForce} lang="bash" />
 
-## Grok Bot marketplace recipe
+## Grok Bot template recipe
 
-The monorepo keeps a scrubbed Grok Bot template under [`apps/grok-bot`](https://github.com/mono424/sp00ky/tree/main/apps/grok-bot): onboarding, schema/codegen, Solid clients, DevTools MCP debugging, production ops, and monorepo contribution skills.
+The monorepo keeps source material for a public Grok Bot template under [`apps/grok-bot`](https://github.com/mono424/sp00ky/tree/main/apps/grok-bot): onboarding, schema/codegen, Solid clients, DevTools MCP debugging, production ops, and monorepo contribution skills.
 
-Pack it as a **public** Grok Bot template. DevTools MCP is **not** a marketplace plugin — importers wire `npx -y @spooky-sync/devtools-mcp` (or `spky mcp`) themselves.
+Create a Bot, enable its skills, then share it using a **public template link**. The template does not provision DevTools MCP; developers can configure `npx -y @spooky-sync/devtools-mcp` (or `spky mcp`) in a compatible MCP client.
 
-Full publish flow, skill map, and verification steps: [Grok Bot marketplace recipe](/docs/reference/grok-bot).
-
+Full sharing flow, skill map, and verification steps: [Grok Bot template recipe](/docs/reference/grok-bot).
 
 ## Per-package guides
 

@@ -1,19 +1,18 @@
-# Sp00ky Grok Bot (marketplace)
+# Sp00ky Grok Bot template
 
-Published docs: [/docs/reference/grok-bot](../../landing-page/src/pages/docs/reference/grok-bot.mdx) (site path `/docs/reference/grok-bot`).
+Published docs: [Grok Bot template recipe](../landing-page/src/pages/docs/reference/grok-bot.mdx) (site path `/docs/reference/grok-bot`).
 
-Source of truth for the public **Sp00ky** Grok Bot marketplace template.
+Source material for a public **Sp00ky** Grok Bot template.
 
-This is not a runtime npm library. It holds the scrubbed profile, memories, and skills that should be packed into a public Grok Bot template for people building and running Sp00ky (`@spooky-sync`) apps — including production ops.
+This is not a runtime npm library. It holds a profile draft, reference facts, and skill drafts for people building and running Sp00ky (`@spooky-sync`) apps. Grok Bot shares a Bot through a public template link; these files are not an automatically importable bundle.
 
 ## Layout
 
 ```
 apps/grok-bot/
   README.md
-  BOT.md                 # storefront profile + publish notes
-  package.json           # private workspace marker only
-  memories/              # scrubbed profile/log facts for templates
+  BOT.md                 # Bot profile draft + sharing notes
+  memories/              # reference facts to incorporate into shared copy
   skills/
     sp00ky-onboarding/
     sp00ky-schema-codegen/
@@ -30,12 +29,14 @@ apps/grok-bot/
 - Docs: [`/docs/reference/ai-agents`](../landing-page/src/pages/docs/reference/ai-agents.mdx)
 - Live introspection: `@spooky-sync/devtools-mcp` (`spky mcp`)
 
-## Publish flow (Grok Bot)
+## Share flow (Grok Bot)
 
-1. Keep skills/memories aligned with package `AGENTS.md` / CLI reality (`spky generate`, `spky doctor`, `spky recipe`, `sp00ky.yml`).
-2. In Grok Bot, stage a **public** template from these recipes (profile + skills + memories).
-3. Marketplace plugins only pack if they are marketplace connectors. **DevTools MCP does not pack** — keep setup instructions in `sp00ky-debug-mcp` so importers wire `npx -y @spooky-sync/devtools-mcp` themselves.
-4. Review the publish card (no secrets, no private paths), then publish.
+1. Keep the drafts aligned with package `AGENTS.md` and CLI behavior (`spky generate`, `spky doctor`, `spky recipe`, `sp00ky.yml`).
+2. Create a Bot in Grok Bot. Use `BOT.md` for its profile, save and enable the relevant skills, and put essential facts from `memories/profile.md` in the description or skills. Learned memory is not part of the shared configuration.
+3. Open **Share → Create template**, choose **Public link**, and review **View template details** before copying the link. Remove secrets, private paths, and customer data.
+4. The template does not provision Sp00ky DevTools MCP. Developers using a compatible MCP client can configure `npx -y @spooky-sync/devtools-mcp` or run `spky mcp` in their app.
+
+See [Grok Bot's sharing guide](https://docs.x.ai/grok-bot/bots#share-a-bot) for the current sharing controls.
 
 ## Verify
 

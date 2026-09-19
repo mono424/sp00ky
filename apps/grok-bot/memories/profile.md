@@ -2,4 +2,4 @@
 - Standard agent feedback loop after schema or config changes: edit schema → `spky generate` → `spky doctor --json` → edit app code using generated types → re-run `spky doctor`. Prefer `spky recipe` for UI patterns (`live-list`, `optimistic-mutation`, `crdt-text-field`).
 - Record IDs are full SurrealDB strings (`table:id`). CRDT fields must use the CRDT hook with debounced writes, not plain `useQuery`. `@parent` columns are server-populated from auth — never write them from the client.
 - Upstream docs live on the Sp00ky docs site (`/docs/reference/ai-agents`). Source monorepo: `github.com/mono424/sp00ky`. For live app introspection, wire `@spooky-sync/devtools-mcp`.
-- Non-marketplace connector: Sp00ky DevTools MCP is installed via `npx -y @spooky-sync/devtools-mcp` or `spky mcp`, not the Grok Bot plugin catalog.
+- Sp00ky DevTools MCP is a separate local MCP server for compatible clients (`npx -y @spooky-sync/devtools-mcp` or `spky mcp`); sharing a Grok Bot template does not provision it.

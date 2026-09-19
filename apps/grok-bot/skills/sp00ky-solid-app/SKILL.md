@@ -15,7 +15,7 @@ Wrap the app in the Solid provider with database endpoint/namespace/database/sto
 
 ## Queries
 
-Prefer `useDb()` then `useQuery(() => db.query('table').….build())` so the factory ends with `.build()`. Function form re-runs when signals/props change.
+Prefer `useDb<typeof schema>()` then `useQuery(() => db.query('table').….build())` so the factory ends with `.build()`. Function form re-runs when signals/props change.
 
 For Solid 2 bindings, follow `client-solid2` AGENTS.md (`createQuery`, `<Loading>`, `createSubmission`).
 

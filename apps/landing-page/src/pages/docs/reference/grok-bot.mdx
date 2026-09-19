@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
-title: Grok Bot marketplace recipe
-description: Pack Sp00ky's scrubbed Grok Bot template from apps/grok-bot — skills for app builders and production operators.
+title: Grok Bot template recipe
+description: Create a public Sp00ky Grok Bot template using source material in apps/grok-bot.
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -20,9 +20,9 @@ export const mcpInstall = `{
 
 export const verifyTree = `find apps/grok-bot -type f | sort`;
 
-The monorepo ships a **Grok Bot marketplace recipe** under [`apps/grok-bot`](https://github.com/mono424/sp00ky/tree/main/apps/grok-bot). It is the source of truth for a **public** Grok Bot template that helps people build and operate Sp00ky (`@spooky-sync`) apps.
+The monorepo keeps **Grok Bot template source material** under [`apps/grok-bot`](https://github.com/mono424/sp00ky/tree/main/apps/grok-bot). Use it to create a public Bot template that helps people build and operate Sp00ky (`@spooky-sync`) apps.
 
-This folder is not a runtime npm library. It holds scrubbed profile copy, memories, and skills you pack into Grok Bot.
+This folder is not a runtime npm library or an automatically importable bundle. It holds a profile draft, reference facts, and skills to add to a Bot. Learned memory is not part of the shared template configuration.
 
 ## Who it is for
 
@@ -43,17 +43,18 @@ Skills live under `apps/grok-bot/skills/*/SKILL.md`:
 | `sp00ky-prod-ops` | Production health, deploys, drift, backups — diagnose before changing anything |
 | `sp00ky-monorepo` | Contributing here: docs-sync, version bumps, PR hygiene |
 
-Storefront copy and publish notes live in [`apps/grok-bot/BOT.md`](https://github.com/mono424/sp00ky/blob/main/apps/grok-bot/BOT.md).
+Profile copy and sharing notes live in [`apps/grok-bot/BOT.md`](https://github.com/mono424/sp00ky/blob/main/apps/grok-bot/BOT.md).
 
-## Pack as a public Grok Bot template
+## Share as a public Grok Bot template
 
-1. Keep skills and memories aligned with real CLI behaviour (`spky generate`, `spky doctor`, `spky recipe`, `spky agents init`, `sp00ky.yml`).
-2. In Grok Bot, stage a **public** template from these recipes (profile + skills + memories).
-3. Attach `sp00ky-onboarding` as the getting-started skill only if that skill already exists on the bot before packing.
-4. Review the publish card: no secrets, no private machine paths, no customer data.
+1. Keep the drafts aligned with real CLI behavior (`spky generate`, `spky doctor`, `spky recipe`, `spky agents init`, `sp00ky.yml`).
+2. Create a Bot in Grok Bot. Use `BOT.md` for its profile, save and enable the relevant skills, and put essential facts from `memories/profile.md` in the description or skills.
+3. Open **Share → Create template**, choose **Public link**, then check **View template details**. Remove secrets, private paths, and customer data before copying the link.
 
-<Note title="DevTools MCP is not a marketplace plugin">
-  Grok Bot public templates only pack marketplace connectors. Importers wire Sp00ky DevTools MCP themselves:
+See [Grok Bot's sharing guide](https://docs.x.ai/grok-bot/bots#share-a-bot) for the current controls and what the recipient receives.
+
+<Note title="DevTools MCP needs separate setup">
+  A shared Bot template does not provision Sp00ky's local DevTools MCP server. Developers using a compatible MCP client can configure it separately:
 </Note>
 
 <CodeBlock code={mcpInstall} lang="json" />

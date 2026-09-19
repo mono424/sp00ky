@@ -7,7 +7,7 @@ description: >-
 
 # Debug with Sp00ky DevTools MCP
 
-## Wire-up
+## Wire-up in a compatible MCP client
 
 ```json
 {
@@ -22,7 +22,7 @@ description: >-
 
 Or from an app: `spky mcp`. Prefer the browser DevTools extension bridge when a tab is open; otherwise configure SurrealDB env vars for direct DB fallback (see `@spooky-sync/devtools-mcp` AGENTS.md).
 
-**Marketplace note:** this MCP is **not** a Grok Bot marketplace plugin. Importers must wire it themselves.
+**Sharing note:** a Grok Bot template does not provision this local MCP server. The recipient needs to configure it in an MCP client that supports local stdio servers.
 
 ## Investigation order
 

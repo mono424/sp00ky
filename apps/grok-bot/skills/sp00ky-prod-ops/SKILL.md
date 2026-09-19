@@ -24,7 +24,7 @@ Help operators keep a Sp00ky deployment healthy. Prefer read-only diagnosis firs
 | Schema change rollout | migrate create/apply → generate → doctor → redeploy SSP/clients |
 | Allowlist miss (403 / not allowlisted) | regenerate allowlist from `q*` modules; redeploy |
 | Scheduler drift | `spky verify`; only `--fix` with operator approval |
-| Backup / restore | follow cloud/deploy docs for snapshots; never invent a backup tool |
+| Backup / restore | follow `/docs/cloud/backups` for `spky backup` and restore steps |
 
 ## Safety
 

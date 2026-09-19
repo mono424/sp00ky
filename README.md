@@ -86,7 +86,7 @@ cd example/app-solid && pnpm install && pnpm dev
 
 ## Documentation
 
-- [Grok Bot marketplace recipe](https://mono424.github.io/sp00ky/docs/reference/grok-bot) — public Grok Bot template source under `apps/grok-bot`
+- [Grok Bot template recipe](https://mono424.github.io/sp00ky/docs/reference/grok-bot) — source material for a public Bot template under `apps/grok-bot`
 
 Full documentation is available at **[mono424.github.io/sp00ky](https://mono424.github.io/sp00ky/)**.
 

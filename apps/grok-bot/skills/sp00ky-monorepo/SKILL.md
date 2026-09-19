@@ -12,7 +12,7 @@ Repo: https://github.com/mono424/sp00ky (pnpm workspace + Rust crates for CLI/SS
 ## Layout
 
 - `packages/*` — publishable `@spooky-sync` libraries (core, clients, query-builder, …)
-- `apps/*` — cli, landing-page/docs, ssp, scheduler, dashboard, devtools-mcp, **grok-bot** (marketplace recipe), …
+- `apps/*` — cli, landing-page/docs, ssp, scheduler, dashboard, devtools-mcp, **grok-bot** (template source material), …
 - `example/` — reference apps
 - Per-package `AGENTS.md` and `skills/<name>/SKILL.md` are part of the public agent surface
 - Repo skills: `.agents/skills/docs-sync`, `.agents/skills/bump-version`

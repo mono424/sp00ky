@@ -1,0 +1,6 @@
+{
+  "name": "@spooky-sync/grok-bot",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Source of truth for the public Sp00ky Grok Bot marketplace template (skills + memories). Not a runtime package."
+}

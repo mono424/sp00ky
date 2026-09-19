@@ -101,6 +101,7 @@ export const docsNav = [
       { text: 'sp00ky.yml', href: `${basePath}/docs/reference/config` },
       { text: 'Client config', href: `${basePath}/docs/reference/client-config` },
       { text: 'AI coding agents', href: `${basePath}/docs/reference/ai-agents` },
+      { text: 'Grok Bot recipe', href: `${basePath}/docs/reference/grok-bot` },
       { text: 'Architecture', href: `${basePath}/docs/reference/architecture` },
       { text: 'Performance', href: `${basePath}/docs/reference/performance` },
       { text: 'Vault architecture', href: `${basePath}/docs/reference/vault` },

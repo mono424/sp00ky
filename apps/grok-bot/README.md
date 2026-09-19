@@ -1,5 +1,7 @@
 # Sp00ky Grok Bot (marketplace)
 
+Published docs: [/docs/reference/grok-bot](../../landing-page/src/pages/docs/reference/grok-bot.mdx) (site path `/docs/reference/grok-bot`).
+
 Source of truth for the public **Sp00ky** Grok Bot marketplace template.
 
 This is not a runtime npm library. It holds the scrubbed profile, memories, and skills that should be packed into a public Grok Bot template for people building and running Sp00ky (`@spooky-sync`) apps — including production ops.

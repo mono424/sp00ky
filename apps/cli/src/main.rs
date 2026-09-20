@@ -1477,13 +1477,6 @@ impl ConnectionArgs {
     }
 }
 
-/// A `-- @name` / `-- @name value` annotation comment line. Matches the pattern
-/// `annotations::extract_field_annotations` recognizes, so the two agree on what
-/// counts as an annotation attached to the following statement.
-static ANNOTATION_COMMENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^--\s*@([a-z][a-z0-9_]*)(?:\s+(.+?))?\s*$").expect("static regex")
-});
-
 /// Filter schema content to remove field definitions with FOR select WHERE false
 /// and make all fields (except 'id') nullable by wrapping their types in option<>
 fn filter_schema_for_client(content: &str, parser: &SchemaParser) -> Result<String> {
@@ -1521,7 +1514,7 @@ fn filter_schema_for_client(content: &str, parser: &SchemaParser) -> Result<Stri
             .unwrap_or(0);
         let has_annotation = result[block_start..]
             .iter()
-            .any(|l| ANNOTATION_COMMENT_RE.is_match(l.trim()));
+            .any(|l| annotations::is_annotation_comment(l));
         if has_annotation {
             result.truncate(block_start);
         }

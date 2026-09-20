@@ -23,6 +23,66 @@ pub fn has_annotation(annotations: &[FieldAnnotation], name: &str) -> bool {
     annotations.iter().any(|a| a.name == name)
 }
 
+/// Annotations that carry a value (`-- @crdt text`). Every other annotation is a
+/// bare marker.
+const VALUED_ANNOTATIONS: &[&str] = &["crdt"];
+
+/// Parse one comment as an annotation, or `None` when it is an ordinary comment.
+///
+/// The one reader for the `-- @name [value]` syntax. There used to be six copies
+/// of the regex, and all six accepted ANY trailing text as the value - so a
+/// sentence that merely begins with an annotation name was an annotation:
+///
+/// ```text
+/// -- @nosync would break the client here, so this table stays synced.
+/// DEFINE TABLE foo SCHEMAFULL;
+/// ```
+///
+/// silently made `foo` server-only. That is the dangerous direction: the author
+/// wrote the opposite of what happened, and nothing said so. It was found the
+/// harmless way round, as two "attaches to nothing" warnings on prose lines in a
+/// comment block that a blank line happened to orphan.
+///
+/// An annotation is therefore a marker and at most ONE token. More than one token
+/// is a sentence. A single token on a marker that takes no value is not silently
+/// dropped either - that is the typo case (`-- @nosync true`), and silence there
+/// would mean a table the author believes is server-only is fully synced.
+pub fn parse_annotation(comment: &str) -> Option<FieldAnnotation> {
+    let (name, value) = annotation_parts(comment)?;
+    if !KNOWN_ANNOTATIONS.contains(&name.as_str()) {
+        eprintln!(
+            "  ⚠ Unknown annotation @{} — known annotations: {}",
+            name,
+            KNOWN_ANNOTATIONS.join(", ")
+        );
+    }
+    if value.is_some() && !VALUED_ANNOTATIONS.contains(&name.as_str()) {
+        eprintln!(
+            "  ⚠ Annotation @{name} takes no value, so `{}` is not read as one and \
+             is being ignored. Write `-- @{name}` alone on the line.",
+            comment.trim()
+        );
+        return None;
+    }
+    Some(FieldAnnotation { name, value })
+}
+
+/// Whether a line is an annotation comment, by exactly the rule
+/// [`parse_annotation`] applies but without its warnings. For callers that ask
+/// the question repeatedly about lines extraction has already reported on.
+pub fn is_annotation_comment(line: &str) -> bool {
+    annotation_parts(line)
+        .is_some_and(|(name, value)| value.is_none() || VALUED_ANNOTATIONS.contains(&name.as_str()))
+}
+
+/// The syntax itself: `-- @name` and at most one value token.
+fn annotation_parts(comment: &str) -> Option<(String, Option<String>)> {
+    // `\S+`, not `.+?`: a value is one token, and a second token fails the match.
+    let re = Regex::new(r"^--\s*@([a-z][a-z0-9_]*)(?:\s+(\S+))?\s*$").unwrap();
+    let caps = re.captures(comment.trim())?;
+    Some((caps[1].to_string(), caps.get(2).map(|m| m.as_str().to_string())))
+}
+
 /// Rewrite a `DEFINE FIELD` line to use `option<object> FLEXIBLE` when the
 /// field carries both `@crdt` and `@cursor` annotations. The CRDT field
 /// then stores `{ state, cursors }` as a structured object (the editor
@@ -71,7 +131,6 @@ pub fn rewrite_crdt_cursor_type(line: &str, annotations: &[FieldAnnotation]) -> 
 pub fn extract_field_annotations(
     content: &str,
 ) -> BTreeMap<(String, String), Vec<FieldAnnotation>> {
-    let annotation_re = Regex::new(r"^--\s*@([a-z][a-z0-9_]*)(?:\s+(.+?))?\s*$").unwrap();
     let define_field_re = Regex::new(&format!(
         r"(?i)DEFINE\s+FIELD\s+(?:OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?({FIELD_NAME_PATTERN})\s+ON\s+(?:TABLE\s+)?(\w+)"
     ))
@@ -87,19 +146,7 @@ pub fn extract_field_annotations(
 
         // === Try to parse as standalone annotation comment ===
         if trimmed.starts_with("--") {
-            if let Some(caps) = annotation_re.captures(trimmed) {
-                let name = caps[1].to_string();
-                let value = caps.get(2).map(|m| m.as_str().trim().to_string());
-
-                if !KNOWN_ANNOTATIONS.contains(&name.as_str()) {
-                    eprintln!(
-                        "  ⚠ Unknown annotation @{} — known annotations: {}",
-                        name,
-                        KNOWN_ANNOTATIONS.join(", ")
-                    );
-                }
-
-                let ann = FieldAnnotation { name, value };
+            if let Some(ann) = parse_annotation(trimmed) {
                 if !in_define_field {
                     pending.push(ann);
                 }
@@ -132,13 +179,8 @@ pub fn extract_field_annotations(
             // Check for trailing annotation after ';' on this line
             if let Some(semi_pos) = trimmed.rfind(';') {
                 let after = trimmed[semi_pos + 1..].trim();
-                if let Some(caps) = annotation_re.captures(after) {
-                    let name = caps[1].to_string();
-                    let value = caps.get(2).map(|m| m.as_str().trim().to_string());
-                    result
-                        .entry(key.clone())
-                        .or_default()
-                        .push(FieldAnnotation { name, value });
+                if let Some(ann) = parse_annotation(after) {
+                    result.entry(key.clone()).or_default().push(ann);
                 }
                 in_define_field = false;
                 current_key = None;
@@ -155,14 +197,9 @@ pub fn extract_field_annotations(
             if let Some(semi_pos) = trimmed.rfind(';') {
                 // Check for trailing annotation on the closing line
                 let after = trimmed[semi_pos + 1..].trim();
-                if let Some(caps) = annotation_re.captures(after) {
+                if let Some(ann) = parse_annotation(after) {
                     if let Some(key) = &current_key {
-                        let name = caps[1].to_string();
-                        let value = caps.get(2).map(|m| m.as_str().trim().to_string());
-                        result
-                            .entry(key.clone())
-                            .or_default()
-                            .push(FieldAnnotation { name, value });
+                        result.entry(key.clone()).or_default().push(ann);
                     }
                 }
                 in_define_field = false;
@@ -187,7 +224,6 @@ pub fn extract_field_annotations(
 /// field is server-only, while the generated code syncs it. Callers surface
 /// these as warnings.
 pub fn unattached_annotations(content: &str) -> Vec<(usize, String)> {
-    let annotation_re = Regex::new(r"^--\s*@([a-z][a-z0-9_]*)(?:\s+(.+?))?\s*$").unwrap();
     let define_re = Regex::new(r"(?i)^DEFINE\s+(FIELD|TABLE)\s+").unwrap();
 
     let mut out = Vec::new();
@@ -198,8 +234,8 @@ pub fn unattached_annotations(content: &str) -> Vec<(usize, String)> {
         let trimmed = line.trim();
 
         if trimmed.starts_with("--") {
-            if let Some(caps) = annotation_re.captures(trimmed) {
-                pending.push((idx + 1, caps[1].to_string()));
+            if let Some(ann) = parse_annotation(trimmed) {
+                pending.push((idx + 1, ann.name));
             }
             continue;
         }
@@ -243,7 +279,6 @@ pub fn warn_unattached_annotations(content: &str) {
 /// - Non-annotation comments do NOT clear pending
 /// - Trailing `; -- @name` after the statement is also supported
 pub fn extract_table_annotations(content: &str) -> BTreeMap<String, Vec<FieldAnnotation>> {
-    let annotation_re = Regex::new(r"^--\s*@([a-z][a-z0-9_]*)(?:\s+(.+?))?\s*$").unwrap();
     let define_table_re =
         Regex::new(r"(?i)^DEFINE\s+TABLE\s+(?:OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?(\w+)").unwrap();
 
@@ -255,19 +290,8 @@ pub fn extract_table_annotations(content: &str) -> BTreeMap<String, Vec<FieldAnn
 
         // === Standalone annotation comment ===
         if trimmed.starts_with("--") {
-            if let Some(caps) = annotation_re.captures(trimmed) {
-                let name = caps[1].to_string();
-                let value = caps.get(2).map(|m| m.as_str().trim().to_string());
-
-                if !KNOWN_ANNOTATIONS.contains(&name.as_str()) {
-                    eprintln!(
-                        "  ⚠ Unknown annotation @{} — known annotations: {}",
-                        name,
-                        KNOWN_ANNOTATIONS.join(", ")
-                    );
-                }
-
-                pending.push(FieldAnnotation { name, value });
+            if let Some(ann) = parse_annotation(trimmed) {
+                pending.push(ann);
             }
             // Non-annotation comments don't clear pending
             continue;
@@ -293,13 +317,8 @@ pub fn extract_table_annotations(content: &str) -> BTreeMap<String, Vec<FieldAnn
             // Trailing annotation after the closing ';' on the same line
             if let Some(semi_pos) = trimmed.rfind(';') {
                 let after = trimmed[semi_pos + 1..].trim();
-                if let Some(caps) = annotation_re.captures(after) {
-                    let name = caps[1].to_string();
-                    let value = caps.get(2).map(|m| m.as_str().trim().to_string());
-                    result
-                        .entry(table)
-                        .or_default()
-                        .push(FieldAnnotation { name, value });
+                if let Some(ann) = parse_annotation(after) {
+                    result.entry(table).or_default().push(ann);
                 }
             }
             continue;
@@ -399,6 +418,49 @@ DEFINE FIELD content ON TABLE thread TYPE string;
             got,
             "DEFINE FIELD content ON TABLE thread TYPE option<object> FLEXIBLE DEFAULT {} PERMISSIONS FOR update WHERE true"
         );
+    }
+
+    #[test]
+    fn a_sentence_that_begins_with_an_annotation_name_is_not_one() {
+        // The dangerous direction: the author wrote that the table STAYS synced,
+        // and the old any-trailing-text regex silently made it server-only.
+        let content = "-- @nosync would break the client here, so this stays synced.\n\
+                       DEFINE TABLE foo SCHEMAFULL;\n";
+        assert!(
+            extract_table_annotations(content).is_empty(),
+            "prose must not mark a table nosync"
+        );
+        // And it is a comment, so it is not reported as an orphaned annotation.
+        assert!(unattached_annotations(content).is_empty());
+    }
+
+    #[test]
+    fn prose_in_a_comment_block_does_not_warn_as_unattached() {
+        // The whitepawn shape that surfaced this: doc sentences about @nosync in
+        // the block above the real annotation, orphaned by a blank line.
+        let content = "-- @nosync (server-only, since 2026-09-07): this table is big.\n\
+                       -- @nosync means no ingest events and no circuit rows.\n\
+                       \n\
+                       -- @nosync\n\
+                       DEFINE TABLE analysis SCHEMAFULL;\n";
+        assert!(unattached_annotations(content).is_empty(), "prose is not an annotation");
+        let anns = extract_table_annotations(content);
+        assert!(has_annotation(&anns["analysis"], "nosync"), "the real one still attaches");
+    }
+
+    #[test]
+    fn a_value_on_a_marker_annotation_is_refused_not_silently_kept() {
+        // `-- @nosync true` is the typo case. Reading it as nosync would be a
+        // guess; dropping it silently would leave a table the author believes is
+        // server-only fully synced. It is refused (with a warning on stderr).
+        assert!(parse_annotation("-- @nosync true").is_none());
+        assert!(parse_annotation("-- @opaque yes").is_none());
+        // A bare marker and a valued annotation both still parse.
+        assert_eq!(parse_annotation("-- @nosync").unwrap().name, "nosync");
+        let crdt = parse_annotation("-- @crdt text").unwrap();
+        assert_eq!((crdt.name.as_str(), crdt.value.as_deref()), ("crdt", Some("text")));
+        // A valued annotation followed by a sentence is a sentence.
+        assert!(parse_annotation("-- @crdt text is what we use here").is_none());
     }
 
     #[test]

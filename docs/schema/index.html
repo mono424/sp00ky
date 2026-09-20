@@ -95,6 +95,11 @@ DEFINE TABLE audit_log SCHEMALESS;"> <svg class="copy-icon w-4 h-4" fill="none" 
 <span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">DEFINE </span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">TABLE</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> audit_log SCHEMALESS;</span></span></code></pre> </div> </div> </div> 
 <p>A descriptor must sit <strong>directly above</strong> its statement, with no blank line between. A marker that
 attaches to nothing is reported as a warning by <code>spky generate</code> rather than silently ignored.</p>
+<p>A descriptor is the marker alone on its comment line, plus one value for the markers that take
+one (<code>-- @crdt text</code>). Anything longer is read as an ordinary comment, so you can write <em>about</em>
+a marker without applying it: <code>-- @nosync would break the client here</code> does not make the next
+table server-only. A single stray word on a marker that takes no value (<code>-- @nosync true</code>) is
+refused with a warning rather than guessed at.</p>
 <h3 id="keeping-a-table-or-field-off-the-client-nosync">Keeping a table or field off the client (<code>@nosync</code>)</h3>
 <p>Put <code>-- @nosync</code> on the line above a <code>DEFINE TABLE</code> or <code>DEFINE FIELD</code> to make it <strong>server-only</strong>. This is useful for audit
 logs, bookkeeping, and internal data that should live in your database but not in your client’s cache.</p>

@@ -23,6 +23,9 @@ pub struct LegacyEngine {
     /// substitute and FAIL on any unresolved placeholder, even when the vault load
     /// came back empty — so a missing secret never silently writes a literal key.
     secrets: Option<Vec<(String, String)>>,
+    /// Completes each migration's tables with their sync identity as they apply.
+    /// `None` = verbatim (no manifest found). See [`migrate::SyncIdentity`].
+    identity: Option<migrate::SyncIdentity>,
 }
 
 impl LegacyEngine {
@@ -43,7 +46,13 @@ impl LegacyEngine {
             password,
             migrations_dir,
             secrets,
+            identity: None,
         }
+    }
+
+    pub fn with_sync_identity(mut self, identity: Option<migrate::SyncIdentity>) -> Self {
+        self.identity = identity;
+        self
     }
 
     fn make_client(&self) -> SurrealClient {
@@ -60,16 +69,16 @@ impl LegacyEngine {
 impl MigrationEngine for LegacyEngine {
     fn apply(&self) -> Result<()> {
         let client = self.make_client();
-        match self.secrets.as_ref() {
-            // Injection requested (prod / cloud apply): always take the checked
-            // path so unresolved `{{KEY}}` placeholders error loudly — even if the
-            // vault load returned an empty set — instead of writing a literal
-            // `{{...}}` (e.g. a broken JWT signing key).
-            Some(secrets) => migrate::apply_with_secrets(&client, &self.migrations_dir, secrets),
-            // No injection (ephemeral schema-diff replay): apply verbatim, leaving
-            // `{{...}}` literal so the placeholder never reads as schema drift.
-            None => migrate::apply(&client, &self.migrations_dir),
-        }
+        // `secrets: Some(_)` = injection requested (prod / cloud apply): the checked
+        // path, so an unresolved `{{KEY}}` errors loudly - even if the vault load
+        // came back empty - instead of writing a literal `{{...}}` (e.g. a broken
+        // JWT signing key). `None` leaves `{{...}}` literal.
+        migrate::apply_completing(
+            &client,
+            &self.migrations_dir,
+            self.secrets.as_deref(),
+            self.identity.as_ref(),
+        )
     }
 
     fn status(&self) -> Result<Vec<MigrationInfo>> {

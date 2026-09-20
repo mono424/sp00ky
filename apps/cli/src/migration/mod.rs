@@ -64,7 +64,8 @@ pub fn create_engine(ctx: MigrationContext) -> Result<Box<dyn MigrationEngine>> 
             ctx.password.clone(),
             ctx.migrations_dir.clone(),
             ctx.secrets.clone(),
-        ))
+        )
+        .with_sync_identity(crate::migrate::SyncIdentity::discover(&ctx.project_dir)))
     };
 
     Ok(Box::new(sp00ky_engine::Sp00kyEngine::new(

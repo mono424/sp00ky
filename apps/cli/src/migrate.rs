@@ -275,9 +275,80 @@ pub fn create(
     Ok(())
 }
 
+/// What a migration's `DEFINE TABLE` statements are completed with as they apply:
+/// the `sp00ky:nosync` marker and, under the changefeed transport, the CHANGEFEED
+/// clause.
+///
+/// A user migration defines a table bare. Both halves of its sync identity were
+/// only added LATER, by the internal-schema pass - and only if that pass ran.
+/// Every row written in between was committed to a table with no feed, so the
+/// changefeed tail never saw it: the replica stayed short until drift repair
+/// noticed, minutes later, and logged a `drift_repair` incident for what was a
+/// perfectly ordinary deploy. When the internal pass did not run at all (a
+/// migration applied on its own), the table had no feed indefinitely and drifted
+/// in both directions, which is what `camera_ingest` did on whitepawn.
+///
+/// Completing the statement as it is applied closes the window instead of
+/// shortening it: the table is born with its feed. The internal-schema pass still
+/// re-asserts both afterwards, so this is belt and braces, not a replacement.
+///
+/// The CURRENT annotated schema decides what a table is, not the migration's own
+/// comments: a migration is history, and a table that was `@nosync` when it was
+/// written may not be today. Whatever this gets wrong for a since-changed table,
+/// the later migration and the internal pass put right.
+pub struct SyncIdentity {
+    /// The annotated schema source (`-- @nosync`).
+    pub source: String,
+    /// `Some(retention)` under `sync.transport: changefeed`.
+    pub changefeed_retention: Option<String>,
+}
+
+impl SyncIdentity {
+    /// Read it off the project's `sp00ky.yml`. `None` when there is no manifest or
+    /// no readable schema - the migrations then apply verbatim, as they always did.
+    pub fn discover(project_dir: &Path) -> Option<Self> {
+        let config_path = project_dir.join("sp00ky.yml");
+        if !config_path.exists() {
+            return None;
+        }
+        let config = crate::backend::load_config(&config_path);
+        let source = fs::read_to_string(project_dir.join(&config.resolved_schema().schema)).ok()?;
+        let sync = config.sync();
+        Some(Self {
+            source,
+            changefeed_retention: sync.is_changefeed().then(|| sync.retention().to_string()),
+        })
+    }
+
+    pub fn complete(&self, sql: &str) -> String {
+        let marked = crate::schema_builder::add_nosync_markers(sql, &self.source);
+        match &self.changefeed_retention {
+            Some(retention) => {
+                crate::schema_builder::add_changefeed_clauses(&marked, &self.source, retention)
+            }
+            None => marked,
+        }
+    }
+}
+
 /// Apply all pending migrations in order.
 pub fn apply(client: &dyn MigrationDB, migrations_dir: &Path) -> Result<()> {
-    apply_impl(client, migrations_dir, None)
+    apply_impl(client, migrations_dir, None, None)
+}
+
+/// The real apply path: [`apply_with_secrets`] semantics when `secrets` is given,
+/// plus each migration's tables completed with their [`SyncIdentity`].
+///
+/// Deliberately NOT what the ephemeral schema-diff replay uses. That replay calls
+/// [`apply`], verbatim, so the "old" schema it reconstructs is exactly what the
+/// migrations say and a completed clause can never read as drift.
+pub fn apply_completing(
+    client: &dyn MigrationDB,
+    migrations_dir: &Path,
+    secrets: Option<&[(String, String)]>,
+    identity: Option<&SyncIdentity>,
+) -> Result<()> {
+    apply_impl(client, migrations_dir, secrets, identity)
 }
 
 /// Like [`apply`], but substitutes `{{VAULT_KEY}}` placeholders in each migration
@@ -294,13 +365,14 @@ pub fn apply_with_secrets(
     migrations_dir: &Path,
     secrets: &[(String, String)],
 ) -> Result<()> {
-    apply_impl(client, migrations_dir, Some(secrets))
+    apply_impl(client, migrations_dir, Some(secrets), None)
 }
 
 fn apply_impl(
     client: &dyn MigrationDB,
     migrations_dir: &Path,
     secrets: Option<&[(String, String)]>,
+    identity: Option<&SyncIdentity>,
 ) -> Result<()> {
     client
         .ensure_ns_db()
@@ -354,6 +426,12 @@ fn apply_impl(
                 migration.version, migration.name
             ))?,
             None => raw,
+        };
+        // After the checksum and after substitution: the recorded checksum stays
+        // that of the committed file, and a secret can never be mistaken for SQL.
+        let sql = match identity {
+            Some(identity) => identity.complete(&sql),
+            None => sql,
         };
 
         let step = ui::step(format!("  {}_{}", migration.version, migration.name));
@@ -1718,6 +1796,89 @@ mod tests {
         assert_eq!(recorded[0].0, "20240101120000");
         assert_eq!(recorded[0].1, "initial");
         assert_eq!(recorded[0].2, checksum_str(up_sql));
+    }
+
+    /// whitepawn's real shape: a hand-written migration defines tables bare, and
+    /// the clause and the marker only arrived with a later pass. Rows written in
+    /// between never entered the feed.
+    #[test]
+    fn a_table_is_born_with_its_sync_identity() {
+        let dir = TempDir::new().unwrap();
+        create_migration_file(
+            dir.path(),
+            "20260919073412",
+            "mcp_authorization",
+            "DEFINE TABLE OVERWRITE camera_ingest SCHEMAFULL PERMISSIONS FULL;\n\
+             DEFINE TABLE OVERWRITE mcp_token SCHEMAFULL PERMISSIONS NONE;\n\
+             DEFINE TABLE OVERWRITE likes TYPE RELATION IN user OUT post;\n",
+        );
+        let identity = SyncIdentity {
+            source: "DEFINE TABLE camera_ingest SCHEMAFULL PERMISSIONS FULL;\n\
+                     -- @nosync\nDEFINE TABLE mcp_token SCHEMAFULL PERMISSIONS NONE;\n\
+                     DEFINE TABLE likes TYPE RELATION IN user OUT post;\n"
+                .into(),
+            changefeed_retention: Some("1d".into()),
+        };
+
+        let mock = MockDB::new();
+        apply_completing(&mock, dir.path(), None, Some(&identity)).unwrap();
+        let queries = mock.executed_queries.borrow();
+        let sql = &queries[0];
+
+        assert!(
+            sql.contains("DEFINE TABLE OVERWRITE camera_ingest SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FULL;"),
+            "a synced table is born with its feed: {sql}"
+        );
+        assert!(
+            sql.contains("DEFINE TABLE OVERWRITE mcp_token SCHEMAFULL COMMENT 'sp00ky:nosync' PERMISSIONS NONE;"),
+            "a server-only table is born marked, and takes no feed: {sql}"
+        );
+        assert!(!sql.contains("mcp_token SCHEMAFULL CHANGEFEED"), "{sql}");
+        assert!(
+            sql.contains("likes TYPE RELATION IN user OUT post CHANGEFEED 1d INCLUDE ORIGINAL;"),
+            "relations sync too: {sql}"
+        );
+
+        // The recorded checksum is the committed file's, not the completed SQL's:
+        // completing a migration must never make it read as modified afterwards.
+        let recorded = mock.recorded.borrow();
+        let on_disk = checksum(&dir.path().join("20260919073412_mcp_authorization.surql")).unwrap();
+        assert_eq!(recorded[0].2, on_disk);
+    }
+
+    /// Under the http transport there is no feed to be born with, but the marker
+    /// still matters: it is what keeps a server-only table out of the replica.
+    #[test]
+    fn without_the_changefeed_transport_only_the_marker_is_added() {
+        let dir = TempDir::new().unwrap();
+        create_migration_file(
+            dir.path(),
+            "20260101000000",
+            "t",
+            "DEFINE TABLE a SCHEMALESS;\nDEFINE TABLE secrets SCHEMALESS;\n",
+        );
+        let identity = SyncIdentity {
+            source: "DEFINE TABLE a SCHEMALESS;\n-- @nosync\nDEFINE TABLE secrets SCHEMALESS;\n".into(),
+            changefeed_retention: None,
+        };
+        let mock = MockDB::new();
+        apply_completing(&mock, dir.path(), None, Some(&identity)).unwrap();
+        let queries = mock.executed_queries.borrow();
+        assert!(!queries[0].contains("CHANGEFEED"), "{}", queries[0]);
+        assert!(queries[0].contains("DEFINE TABLE secrets SCHEMALESS COMMENT 'sp00ky:nosync';"));
+        assert!(queries[0].contains("DEFINE TABLE a SCHEMALESS;"), "a plain table is untouched");
+    }
+
+    /// The ephemeral schema-diff replay goes through `apply`, and must reconstruct
+    /// exactly what the migrations say - a completed clause there would read as
+    /// drift on every `spky migrate create`.
+    #[test]
+    fn the_verbatim_path_stays_verbatim() {
+        let dir = TempDir::new().unwrap();
+        create_migration_file(dir.path(), "20260101000000", "t", "DEFINE TABLE a SCHEMALESS;");
+        let mock = MockDB::new();
+        apply(&mock, dir.path()).unwrap();
+        assert_eq!(mock.executed_queries.borrow()[0], "DEFINE TABLE a SCHEMALESS;");
     }
 
     #[test]

@@ -189,6 +189,14 @@ in `table.fields`), so `sp00ky::relation_endpoints` adds them to the ingest payl
 The same marker is re-asserted next to the changefeed ALTER
 (`schema_builder::nosync_alter_statements`), for the same reason.
 
+Both halves are also applied at the moment a migration defines a table, not only by the
+pass after it: `migrate::SyncIdentity::complete` rewrites each migration's `DEFINE TABLE`
+with the clause and the marker as `LegacyEngine` applies it (`migrate::apply_completing`).
+Without that, rows written between a migration and the internal-schema pass landed in a
+table with no feed. The ephemeral schema-diff replay still uses the verbatim
+`migrate::apply`, so a completed clause never reads as drift, and the recorded checksum
+is always the committed file's.
+
 ## Common gotchas
 
 - **`schema.gen.ts` must be regenerated after every `.surql` change.** `spky generate`. CI typically asserts no drift.

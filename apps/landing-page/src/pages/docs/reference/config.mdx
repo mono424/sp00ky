@@ -134,6 +134,10 @@ Why `changefeed`: the feed is written by the same commit as the row, so it is po
 
 What a deploy does with it: `spky deploy` / `spky migrate` add `CHANGEFEED <retention> INCLUDE ORIGINAL` to every synced table (`ALTER TABLE IF EXISTS`, so your own table definitions are kept and a migration that redefined a table gets the clause back), remove the `_00_dbsp_cleanup` event, and generate events that do not post. The scheduler and SSP containers receive `SPKY_INGEST_TRANSPORT` and `SPKY_CHANGEFEED_RETENTION` automatically (cloud: merged into `deployment.env`; `spky dev`: injected into the containers). Switching back to `http` regenerates the posting events; the `CHANGEFEED` clauses stay and are harmless.
 
+"Synced" means every table that is not `@nosync`, **`TYPE RELATION` tables included**: an edge table is queryable from a client like any other, so it has to be in the feed like any other.
+
+A table is also born with its feed. Your migrations define tables bare, and the clause used to arrive only with the pass that follows them, so rows written in between were committed to a table with no feed and surfaced minutes later as a `drift_repair` incident. Each migration's `DEFINE TABLE` is now completed as it is applied (the clause, and the `sp00ky:nosync` marker for a `@nosync` table), decided by your current annotated schema. The file on disk and its recorded checksum are untouched, and `spky migrate create` still diffs against exactly what your migrations say.
+
 <Note>
 Set `sync.transport` before the first deploy of a database or plan a short window: the scheduler must run with `SPKY_INGEST_TRANSPORT=changefeed` from the moment the schema stops posting, or nothing arrives. Deploy the schema, then restart the scheduler with the new env. The changefeed tail starts one second before the restart's clone, so the window is replayed rather than lost.
 </Note>

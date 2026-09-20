@@ -47,6 +47,12 @@ table or field is generated and synced.
 A descriptor must sit **directly above** its statement, with no blank line between. A marker that
 attaches to nothing is reported as a warning by `spky generate` rather than silently ignored.
 
+A descriptor is the marker alone on its comment line, plus one value for the markers that take
+one (`-- @crdt text`). Anything longer is read as an ordinary comment, so you can write *about*
+a marker without applying it: `-- @nosync would break the client here` does not make the next
+table server-only. A single stray word on a marker that takes no value (`-- @nosync true`) is
+refused with a warning rather than guessed at.
+
 ### Keeping a table or field off the client (`@nosync`)
 
 Put `-- @nosync` on the line above a `DEFINE TABLE` or `DEFINE FIELD` to make it **server-only**. This is useful for audit

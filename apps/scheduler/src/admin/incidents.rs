@@ -80,6 +80,10 @@ pub struct Incidents {
     history: Mutex<History>,
     path: PathBuf,
     persistence: tokio::sync::Mutex<()>,
+    /// When this recorder first saw each backend failing, in its current streak.
+    /// In memory on purpose: it is the debounce for `backend_down`, and a streak
+    /// must restart with the process - see [`Self::backend_transitions`].
+    failing_since: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl Incidents {
@@ -124,6 +128,7 @@ impl Incidents {
             history: Mutex::new(history),
             path,
             persistence: tokio::sync::Mutex::new(()),
+            failing_since: Mutex::new(Default::default()),
         })
     }
 
@@ -288,9 +293,22 @@ impl Incidents {
     /// every 15s under a target the recorder does not read.
     ///
     /// Derive it here instead, from the entity list this tick already builds
-    /// for `sample_entities`. `last_healthy` is the debounce: it is the state
-    /// that already knows how long the outage has run, so no new counter is
-    /// needed on either side.
+    /// for `sample_entities`.
+    ///
+    /// The debounce is how long THIS recorder has watched the backend fail, not
+    /// anything the backend reports about itself. The first version measured
+    /// from `last_healthy`, falling back to the recorder's start for a backend
+    /// that had never answered - and opened nine incidents, one per backend, on
+    /// every scheduler restart. The control plane pushes the backend list about
+    /// a hundred seconds after the scheduler boots, each entry `unknown` with no
+    /// `last_healthy`, so every one of them had "been down" since boot the
+    /// instant it appeared, and recovered at its first probe 13 seconds later.
+    /// Two things follow:
+    ///
+    /// - `unknown` means not probed yet. It is not evidence of an outage.
+    /// - a streak starts when it is first OBSERVED. A backend that really has
+    ///   been down for hours still opens its incident, a minute after this
+    ///   process starts watching it; `last_healthy` only says how long for.
     ///
     /// Returns the transitions to emit. The caller emits them after dropping
     /// the history guard, so every incident still enters through the one
@@ -298,23 +316,28 @@ impl Incidents {
     fn backend_transitions(
         &self,
         entities: &[Value],
-        floor: u64,
         now: u64,
         after_ms: u64,
     ) -> Vec<(String, bool, String)> {
         let h = self.history.lock().unwrap();
+        let mut failing = self.failing_since.lock().unwrap();
         let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
         for entity in entities.iter().filter(|v| v["entity"] == "backend") {
             let Some(id) = entity["id"].as_str() else {
                 continue;
             };
+            seen.insert(id.to_string());
             let open = h
                 .rows
                 .iter()
                 .any(|r| r.state == "open" && r.kind == "backend_down" && r.component == id);
             let status = entity["status"].as_str().unwrap_or("unknown");
-            if status == "healthy" {
-                if open {
+
+            if !matches!(status, "unhealthy" | "unreachable") {
+                failing.remove(id);
+                if status == "healthy" && open {
                     out.push((
                         id.to_string(),
                         false,
@@ -323,31 +346,29 @@ impl Incidents {
                 }
                 continue;
             }
-            if open {
+
+            let since = *failing.entry(id.to_string()).or_insert(now);
+            if open || now.saturating_sub(since) < after_ms {
                 continue;
             }
-            // A backend that has never answered since this recorder started
-            // has no `last_healthy` to measure from; the recorder's own start
-            // is the honest floor, and "down since boot" is exactly the case
-            // worth reporting.
-            let since = entity["last_healthy"]
+            // How long it has REALLY been down, when the backend can say; how
+            // long it has been watched failing otherwise.
+            let down_for = entity["last_healthy"]
                 .as_str()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.timestamp_millis().max(0) as u64)
-                .filter(|&t| t >= floor)
-                .unwrap_or(floor);
-            if now.saturating_sub(since) < after_ms {
-                continue;
-            }
+                .map(|t| now.saturating_sub(t.timestamp_millis().max(0) as u64))
+                .unwrap_or_else(|| now.saturating_sub(since));
             out.push((
                 id.to_string(),
                 true,
                 format!(
                     "Backend {id} is {status}; no successful health check for {}",
-                    approx_duration(now.saturating_sub(since))
+                    approx_duration(down_for)
                 ),
             ));
         }
+        // A backend removed from the deployment takes its streak with it.
+        failing.retain(|id, _| seen.contains(id));
         out
     }
 
@@ -423,12 +444,9 @@ impl Incidents {
                         this.sample_entities(&entities);
                         // Emitted outside `backend_transitions`, which holds
                         // the history guard while it reads the open rows.
-                        for (backend, down, summary) in this.backend_transitions(
-                            &entities,
-                            started_at,
-                            now,
-                            Self::BACKEND_DOWN_AFTER_MS,
-                        ) {
+                        for (backend, down, summary) in
+                            this.backend_transitions(&entities, now, Self::BACKEND_DOWN_AFTER_MS)
+                        {
                             emit(
                                 &backend,
                                 "backend_down",
@@ -688,100 +706,114 @@ mod tests {
             .to_rfc3339()
     }
 
-    #[test]
-    fn a_single_slow_probe_does_not_open_a_backend_incident() {
+    const AFTER: u64 = Incidents::BACKEND_DOWN_AFTER_MS;
+
+    fn recorder() -> (tempfile::TempDir, Arc<Incidents>) {
         let dir = tempfile::tempdir().unwrap();
         let history = Incidents::open(dir.path().join("incidents.json"));
-        let now = 1_000_000_000;
-        // Unreachable, but healthy 15s ago: one missed probe.
-        let out = history.backend_transitions(
-            &[backend("relay", "unreachable", Some(&rfc3339(now - 15_000)))],
-            0,
-            now,
-            Incidents::BACKEND_DOWN_AFTER_MS,
+        (dir, history)
+    }
+
+    fn open_backend_down(history: &Incidents, id: &str, at: u64) {
+        history.observe(Event {
+            at,
+            component: id.into(),
+            kind: "backend_down".into(),
+            state: "open".into(),
+            summary: "down".into(),
+            operation_id: None,
+            version: "test".into(),
+        });
+    }
+
+    /// The regression: a scheduler restart. The control plane pushes the backend
+    /// list ~100s after boot, every entry `unknown` with no `last_healthy`, and
+    /// the first probe lands up to 15s later. The first version of this timed a
+    /// never-healthy backend from the RECORDER's start, so all nine backends had
+    /// "been down" for 100s the instant they appeared: nine incidents opened and
+    /// closed 13 seconds apart, on every restart.
+    #[test]
+    fn a_restart_does_not_report_every_backend_as_down() {
+        let (_dir, history) = recorder();
+        let boot = 1_000_000_000;
+        let pushed = boot + 107_000;
+        let nine: Vec<Value> = (0..9).map(|i| backend(&format!("b{i}"), "unknown", None)).collect();
+        assert!(
+            history.backend_transitions(&nine, pushed, AFTER).is_empty(),
+            "`unknown` is not-probed-yet, not an outage"
         );
-        assert!(out.is_empty(), "got: {out:?}");
+        // The first probe fails for one still-starting container. One failed
+        // probe is not an outage either, however long ago the process booted.
+        let mut starting = nine.clone();
+        starting[0] = backend("b0", "unreachable", None);
+        assert!(history.backend_transitions(&starting, pushed + 15_000, AFTER).is_empty());
+        // It comes up on the next probe: never reported at all.
+        let up: Vec<Value> = (0..9)
+            .map(|i| backend(&format!("b{i}"), "healthy", Some(&rfc3339(pushed + 30_000))))
+            .collect();
+        assert!(history.backend_transitions(&up, pushed + 30_000, AFTER).is_empty());
+    }
+
+    #[test]
+    fn a_single_slow_probe_does_not_open_a_backend_incident() {
+        let (_dir, history) = recorder();
+        let now = 1_000_000_000;
+        let down = [backend("relay", "unreachable", Some(&rfc3339(now - 15_000)))];
+        assert!(history.backend_transitions(&down, now, AFTER).is_empty());
+        // It recovers before the threshold, and the streak is forgotten: a later
+        // blip starts counting from zero, not from this one.
+        let up = [backend("relay", "healthy", Some(&rfc3339(now + 15_000)))];
+        assert!(history.backend_transitions(&up, now + 15_000, AFTER).is_empty());
+        assert!(history.backend_transitions(&down, now + 120_000, AFTER).is_empty());
     }
 
     #[test]
     fn a_sustained_outage_opens_once_and_recovers_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let history = Incidents::open(dir.path().join("incidents.json"));
+        let (_dir, history) = recorder();
         let now = 1_000_000_000;
-        let down = [backend("relay", "unreachable", Some(&rfc3339(now - 8 * 3600_000)))];
+        // Down for eight hours already when this recorder starts watching.
+        let down = [backend("relay", "unreachable", Some(&rfc3339(now - 8 * 3_600_000)))];
 
-        let opened = history.backend_transitions(&down, 0, now, Incidents::BACKEND_DOWN_AFTER_MS);
+        assert!(history.backend_transitions(&down, now, AFTER).is_empty(), "watched for 0s");
+        let opened = history.backend_transitions(&down, now + AFTER, AFTER);
         assert_eq!(opened.len(), 1);
         assert!(opened[0].1, "opens as down");
-        assert!(opened[0].2.contains("8h0m"), "carries the age: {}", opened[0].2);
-
-        history.observe(Event {
-            at: now,
-            component: "relay".into(),
-            kind: "backend_down".into(),
-            state: "open".into(),
-            summary: opened[0].2.clone(),
-            operation_id: None,
-            version: "test".into(),
-        });
+        assert!(
+            opened[0].2.contains("8h1m"),
+            "the summary says how long it has REALLY been down: {}",
+            opened[0].2
+        );
+        open_backend_down(&history, "relay", now + AFTER);
 
         // While it stays open the tick must not re-report it.
-        assert!(history
-            .backend_transitions(&down, 0, now + 1000, Incidents::BACKEND_DOWN_AFTER_MS)
-            .is_empty());
+        assert!(history.backend_transitions(&down, now + AFTER + 1000, AFTER).is_empty());
 
-        let healthy = [backend("relay", "healthy", Some(&rfc3339(now)))];
-        let recovered =
-            history.backend_transitions(&healthy, 0, now, Incidents::BACKEND_DOWN_AFTER_MS);
+        let healthy = [backend("relay", "healthy", Some(&rfc3339(now + AFTER + 2000)))];
+        let recovered = history.backend_transitions(&healthy, now + AFTER + 2000, AFTER);
         assert_eq!(recovered.len(), 1);
         assert!(!recovered[0].1, "recovers");
-
-        // And a healthy backend with nothing open is silent.
-        history.observe(Event {
-            at: now,
-            component: "relay".into(),
-            kind: "backend_down".into(),
-            state: "recovered".into(),
-            summary: "back".into(),
-            operation_id: None,
-            version: "test".into(),
-        });
-        assert!(history
-            .backend_transitions(&healthy, 0, now, Incidents::BACKEND_DOWN_AFTER_MS)
-            .is_empty());
     }
 
     #[test]
-    fn a_backend_down_since_boot_is_measured_from_the_recorder_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let history = Incidents::open(dir.path().join("incidents.json"));
-        let started = 1_000_000_000;
-        // Never answered: no `last_healthy` to measure from.
-        let never = [backend("relay", "unknown", None)];
-        assert!(history
-            .backend_transitions(&never, started, started + 30_000, Incidents::BACKEND_DOWN_AFTER_MS)
-            .is_empty());
-        let out = history.backend_transitions(
-            &never,
-            started,
-            started + 120_000,
-            Incidents::BACKEND_DOWN_AFTER_MS,
-        );
-        assert_eq!(out.len(), 1, "opens once past the threshold: {out:?}");
+    fn a_backend_that_never_answers_is_still_reported() {
+        let (_dir, history) = recorder();
+        let t = 1_000_000_000;
+        let never = [backend("relay", "unreachable", None)];
+        assert!(history.backend_transitions(&never, t, AFTER).is_empty());
+        assert!(history.backend_transitions(&never, t + 30_000, AFTER).is_empty());
+        let out = history.backend_transitions(&never, t + AFTER, AFTER);
+        assert_eq!(out.len(), 1, "a minute of watching it fail is enough: {out:?}");
     }
 
     #[test]
-    fn a_last_healthy_from_before_this_process_does_not_backdate_the_floor() {
-        // `last_healthy` survives a live reconfigure but the history does not,
-        // so a stale timestamp must not open an incident the instant the
-        // recorder starts.
-        let dir = tempfile::tempdir().unwrap();
-        let history = Incidents::open(dir.path().join("incidents.json"));
-        let started = 1_000_000_000;
-        let stale = [backend("relay", "unreachable", Some(&rfc3339(started - 86_400_000)))];
-        assert!(history
-            .backend_transitions(&stale, started, started + 30_000, Incidents::BACKEND_DOWN_AFTER_MS)
-            .is_empty());
+    fn a_backend_removed_from_the_deployment_takes_its_streak_with_it() {
+        let (_dir, history) = recorder();
+        let t = 1_000_000_000;
+        let down = [backend("old", "unreachable", None)];
+        assert!(history.backend_transitions(&down, t, AFTER).is_empty());
+        assert!(history.backend_transitions(&[], t + 30_000, AFTER).is_empty());
+        // Re-added later: the clock starts again, it does not resume.
+        assert!(history.backend_transitions(&down, t + AFTER + 5_000, AFTER).is_empty());
     }
 
     #[test]

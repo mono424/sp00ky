@@ -259,11 +259,18 @@ fn get(client: &SurrealClient, name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Lifetime totals for a schedule, summed from the retention rollup.
+/// Lifetime totals for a schedule: the retention rollup plus the runs that have
+/// not been pruned yet.
 ///
-/// The rollup is written as history is pruned, so these totals cover runs whose rows
-/// are long gone — which is the point of keeping short retention windows. They are a
-/// LOWER bound, not an audit trail: rows removed by `spky jobs clear`, by an
+/// The rollup is written as history is pruned, so on its own it covers runs whose
+/// rows are long gone — which is the point of keeping short retention windows — but
+/// says nothing about a bucket retention has not swept. Retention is routinely
+/// asymmetric (successes for 30m, failures for the 30d default), so the rollup alone
+/// reads `0 failed` for a month on a schedule that is visibly failing. Adding the
+/// survivors is exact, not approximate: a run row is either still present or it was
+/// folded when pruned, never both.
+///
+/// Still a LOWER bound, not an audit trail: rows removed by `spky jobs clear`, by an
 /// application's own DELETE, or before the rollup existed were never counted.
 fn print_rollup_totals(client: &SurrealClient, name: &str) -> Result<()> {
     let rows = query_rows(
@@ -276,8 +283,26 @@ fn print_rollup_totals(client: &SurrealClient, name: &str) -> Result<()> {
             esc(name)
         ),
     )?;
-    let Some(row) = rows.first() else { return Ok(()) };
-    let n = |key: &str| row.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let live = query_rows(
+        client,
+        &format!(
+            "SELECT status, count() AS n FROM _00_schedule_run \
+             WHERE schedule_name = '{}' \
+             AND status IN ['success', 'failed', 'skipped', 'replaced', 'killed'] \
+             GROUP BY status;",
+            esc(name)
+        ),
+    )?;
+    let surviving = |status: &str| -> i64 {
+        live.iter()
+            .find(|r| r.get("status").and_then(Value::as_str) == Some(status))
+            .and_then(|r| r.get("n").and_then(Value::as_i64))
+            .unwrap_or(0)
+    };
+    let row = rows.first().cloned().unwrap_or_default();
+    let n = |key: &str| {
+        row.get(key).and_then(Value::as_i64).unwrap_or(0) + surviving(key)
+    };
     let (success, failed) = (n("success"), n("failed"));
     let (skipped, replaced, killed) = (n("skipped"), n("replaced"), n("killed"));
     if success + failed + skipped + replaced + killed == 0 {

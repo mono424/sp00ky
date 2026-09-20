@@ -215,21 +215,107 @@ pub async fn schedule_detail(
     )
     .await?;
 
-    let rollup = rows(
-        &db,
-        &format!(
-            "SELECT type::string(bucket) AS bucket, success, failed, skipped, replaced, killed \
-             FROM _00_run_rollup WHERE name = '{}' ORDER BY bucket DESC LIMIT 48;",
-            esc(&name)
-        ),
-    )
-    .await?;
+    let rollup = schedule_tally(&db, &name, 48).await?;
 
     Ok(Json(json!({
         "schedule": schedule,
         "runs": runs,
         "rollup": rollup,
     })))
+}
+
+/// The outcome counters a run can land in, in the order the rollup and the
+/// dashboard render them.
+pub const RUN_OUTCOMES: [&str; 5] = ["success", "failed", "skipped", "replaced", "killed"];
+
+/// The hourly outcome tally for a schedule: the rollup plus the runs that have
+/// not been pruned yet.
+///
+/// `_00_run_rollup` is folded by the prune pass alone - deliberately, so the
+/// counts are a by-product of work already being done. The cost is that a
+/// bucket only becomes true once retention has swept it, and retention is
+/// routinely asymmetric: an app that keeps successes for 30m and failures for
+/// the 30d default has every bucket reading `failed: 0` for a month while the
+/// schedule is visibly failing. That is the most misleading direction the
+/// number could be wrong in, and both `spky schedules get` and the dashboard
+/// read it.
+///
+/// Counting the survivors and adding them is exact rather than approximate: a
+/// run row is either still present or it was folded when pruned, never both.
+async fn schedule_tally(
+    db: &Arc<ReconnectingDb>,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<Value>, ApiError> {
+    let statuses = RUN_OUTCOMES
+        .map(|s| format!("'{s}'"))
+        .join(", ");
+    let pruned = rows(
+        db,
+        &format!(
+            "SELECT type::string(bucket) AS bucket, success, failed, skipped, replaced, killed \
+             FROM _00_run_rollup WHERE scope = 'schedule' AND name = '{}';",
+            esc(name)
+        ),
+    )
+    .await?;
+    // `time::floor` to the same hour the prune pass buckets by, so a bucket
+    // that is half pruned and half live adds up instead of splitting in two.
+    let live = rows(
+        db,
+        &format!(
+            "SELECT type::string(time::floor(fire_at, 1h)) AS bucket, status, count() AS n \
+             FROM _00_schedule_run \
+             WHERE schedule_name = '{}' AND status IN [{statuses}] \
+             GROUP BY bucket, status;",
+            esc(name)
+        ),
+    )
+    .await?;
+
+    Ok(merge_tally(&pruned, &live, limit))
+}
+
+/// Fold the pruned counters and the surviving rows into one set of hourly
+/// buckets. Split out from [`schedule_tally`] so the arithmetic that decides
+/// what an operator reads is testable without a database.
+fn merge_tally(pruned: &[Value], live: &[Value], limit: usize) -> Vec<Value> {
+    let mut buckets: std::collections::BTreeMap<String, [i64; 5]> =
+        std::collections::BTreeMap::new();
+    for row in pruned {
+        let Some(bucket) = row["bucket"].as_str() else {
+            continue;
+        };
+        let slot = buckets.entry(bucket.to_string()).or_default();
+        for (i, outcome) in RUN_OUTCOMES.iter().enumerate() {
+            slot[i] += row[*outcome].as_i64().unwrap_or(0);
+        }
+    }
+    for row in live {
+        let (Some(bucket), Some(status)) = (row["bucket"].as_str(), row["status"].as_str()) else {
+            continue;
+        };
+        let Some(i) = RUN_OUTCOMES.iter().position(|o| *o == status) else {
+            continue;
+        };
+        buckets.entry(bucket.to_string()).or_default()[i] += row["n"].as_i64().unwrap_or(0);
+    }
+
+    buckets
+        .into_iter()
+        .rev()
+        .take(limit)
+        .map(|(bucket, c)| {
+            json!({
+                "bucket": bucket,
+                "success": c[0],
+                "failed": c[1],
+                "skipped": c[2],
+                "replaced": c[3],
+                "killed": c[4],
+            })
+        })
+        .collect()
 }
 
 // =============================================================
@@ -652,5 +738,55 @@ mod tests {
             ..Default::default()
         });
         assert!(!sql.contains("WHERE"), "{sql}");
+    }
+
+    #[test]
+    fn a_half_pruned_bucket_adds_up_instead_of_splitting() {
+        // Asymmetric retention is the whole point: this hour's successes are
+        // already pruned and folded, its failures are not. Neither source
+        // alone is the truth; their sum is.
+        let pruned = vec![json!({
+            "bucket": "2026-09-20T06:00:00Z",
+            "success": 140, "failed": 0, "skipped": 30, "replaced": 0, "killed": 0
+        })];
+        let live = vec![
+            json!({"bucket": "2026-09-20T06:00:00Z", "status": "failed", "n": 20}),
+            json!({"bucket": "2026-09-20T06:00:00Z", "status": "success", "n": 2}),
+        ];
+        let out = merge_tally(&pruned, &live, 48);
+        assert_eq!(out.len(), 1, "one bucket, not two: {out:?}");
+        assert_eq!(out[0]["failed"], 20, "the failures an operator never saw");
+        assert_eq!(out[0]["success"], 142);
+        assert_eq!(out[0]["skipped"], 30);
+    }
+
+    #[test]
+    fn buckets_come_back_newest_first_and_capped() {
+        let pruned: Vec<Value> = (0..4)
+            .map(|h| json!({
+                "bucket": format!("2026-09-20T0{h}:00:00Z"),
+                "success": 1, "failed": 0, "skipped": 0, "replaced": 0, "killed": 0
+            }))
+            .collect();
+        let out = merge_tally(&pruned, &[], 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["bucket"], "2026-09-20T03:00:00Z");
+        assert_eq!(out[1]["bucket"], "2026-09-20T02:00:00Z");
+    }
+
+    #[test]
+    fn a_bucket_with_only_live_rows_still_appears() {
+        // The hour a schedule started failing has nothing pruned yet.
+        let live = vec![json!({"bucket": "2026-09-20T07:00:00Z", "status": "failed", "n": 3})];
+        let out = merge_tally(&[], &live, 48);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["failed"], 3);
+        assert_eq!(out[0]["success"], 0);
+    }
+
+    #[test]
+    fn a_running_run_is_not_an_outcome() {
+        let live = vec![json!({"bucket": "2026-09-20T07:00:00Z", "status": "running", "n": 9})];
+        assert!(merge_tally(&[], &live, 48).is_empty());
     }
 }

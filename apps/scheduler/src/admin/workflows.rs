@@ -217,10 +217,23 @@ pub async fn schedule_detail(
 
     let rollup = schedule_tally(&db, &name, 48).await?;
 
+    // The keys this schedule has stopped firing. Empty for a schedule that
+    // never set `quarantineAfter`, since nothing writes the row without it.
+    let quarantined = rows(
+        &db,
+        &format!(
+            "SELECT key, consecutive_failures, type::string(quarantined_at) AS quarantined_at \
+             FROM _00_schedule_key WHERE schedule_name = '{}' AND quarantined_at != NONE;",
+            esc(&name)
+        ),
+    )
+    .await?;
+
     Ok(Json(json!({
         "schedule": schedule,
         "runs": runs,
         "rollup": rollup,
+        "quarantined": quarantined,
     })))
 }
 
@@ -618,6 +631,37 @@ pub async fn schedule_resume(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     set_paused(&state, &session, &name, false).await
+}
+
+/// `POST /admin/api/schedules/:name/release` with `{ "key": "..." }`
+///
+/// Release one quarantined forEach key. Forgetting the failure streak IS the
+/// release: the gate derives quarantine from the count against the schedule's
+/// current budget, so a key with no row is simply a key that has not failed.
+pub async fn schedule_release(
+    State(state): State<AdminState>,
+    Extension(session): Extension<CurrentSession>,
+    Path(name): Path<String>,
+    Json(body): Json<ReleaseBody>,
+) -> Result<Json<Value>, ApiError> {
+    let db = state.db().ok_or_else(db_unavailable)?;
+    load_schedule(&db, &name).await?;
+    let row = schedule_core::ids::schedule_key(&name, &body.key);
+    rows(
+        &db,
+        &format!("DELETE {}:⟨{}⟩;", row.table, row.key.replace('⟩', "")),
+    )
+    .await?;
+    tracing::info!(
+        schedule = %name, key = %body.key, by = %session.0.subject,
+        "Schedule key released from the dashboard"
+    );
+    Ok(Json(json!({ "name": name, "key": body.key, "released": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ReleaseBody {
+    pub key: String,
 }
 
 /// `POST /admin/api/schedules/:name/trigger`

@@ -190,6 +190,40 @@ pub fn start_schedule_sweep(
 
             match engine.as_ref().unwrap().tick_pass().await {
                 Ok(report) => {
+                    // The engine is a library beneath this crate and cannot
+                    // reach the incident recorder; it reports key transitions
+                    // and the host turns them into incidents, which is how
+                    // every other operator-facing surface here works.
+                    for t in &report.quarantined {
+                        let (state, summary) = if t.suppressed {
+                            (
+                                "open",
+                                format!(
+                                    "Schedule '{}' stopped firing key {} after {} consecutive failures",
+                                    t.schedule, t.key, t.failures
+                                ),
+                            )
+                        } else {
+                            (
+                                "recovered",
+                                format!(
+                                    "Schedule '{}' is firing key {} again",
+                                    t.schedule, t.key
+                                ),
+                            )
+                        };
+                        // Component is the key, not "scheduler": the
+                        // recorder correlates an open episode by component, so
+                        // two quarantined keys must not collapse into one
+                        // incident that either recovery then closes.
+                        crate::admin::incidents::emit(
+                            &format!("schedule:{}/{}", t.schedule, t.key),
+                            "schedule_quarantined",
+                            state,
+                            &summary,
+                            None,
+                        );
+                    }
                     if report != Default::default() {
                         debug!(?report, "schedule sweep");
                     }

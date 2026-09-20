@@ -43,7 +43,7 @@ somewhere else, and `spky <command> --help` for the flags of any single command.
 | Command | What it does |
 | --- | --- |
 | `spky jobs` | Background jobs: `list`, `get`, `kill`, `retry`, `clear`. `clear -A/--all` also drops queued jobs; running ones are never deleted. No subcommand opens the interactive dashboard. [Docs](/docs/jobs) |
-| `spky schedules` | Server-side schedules: `list`, `get`, `pause`, `resume`, `trigger`, `runs`, `sync`. [Docs](/docs/jobs/schedules) |
+| `spky schedules` | Server-side schedules: `list`, `get`, `pause`, `resume`, `trigger`, `release`, `runs`, `sync`. `release <name> <key>` lets a quarantined `forEach` key fire again. [Docs](/docs/jobs/schedules) |
 | `spky workflows` | Workflow DAGs: `list`, `show`, `watch`, `runs`, `kill`. `show` renders the graph, `watch` follows a run live. [Docs](/docs/jobs/workflows) |
 | `spky logs` | Tail or browse logs. `--filter`, `--split`, `--since`, `--until`, `--grep`, `-i/--interactive` (TUI), `-F/--follow`. [Docs](/docs/cloud/logs) |
 | `spky stats` | Live CPU, memory, disk and network graphs. `--window 1h`, `--filter backend,surrealdb`. |

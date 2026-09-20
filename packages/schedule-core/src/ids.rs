@@ -27,6 +27,7 @@ pub const SCHEDULE_RUN: &str = "_00_schedule_run";
 pub const WORKFLOW_RUN: &str = "_00_workflow_run";
 pub const STEP_RUN: &str = "_00_step_run";
 pub const RUN_ROLLUP: &str = "_00_run_rollup";
+pub const SCHEDULE_KEY: &str = "_00_schedule_key";
 
 /// Longest raw name/key fragment kept verbatim before it is hashed away. Keeps
 /// ids readable (`_00_schedule_run:game-sync_1769337000000_9f2a1c4d8b30`)
@@ -134,6 +135,19 @@ pub fn run_key(schedule_name: &str, fire_at_ms: i64, fan_out_key: &str) -> Strin
 
 pub fn schedule(name: &str) -> Ref {
     Ref::new(SCHEDULE, sanitize(name))
+}
+
+/// The per-key failure budget row: `<schedule>_<hash(key)>`.
+///
+/// The same shape as [`run_key`] minus the fire timestamp, and for the same
+/// reason — the fan-out key is user data, so it is hashed rather than inlined.
+/// Deterministic, so the gate and the finalize path address the row without a
+/// lookup.
+pub fn schedule_key(schedule_name: &str, fan_out_key: &str) -> Ref {
+    Ref::new(
+        SCHEDULE_KEY,
+        format!("{}_{}", sanitize(schedule_name), short_hash(fan_out_key)),
+    )
 }
 
 pub fn schedule_run(run_key: &str) -> Ref {

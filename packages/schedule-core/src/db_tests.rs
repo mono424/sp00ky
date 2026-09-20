@@ -3359,3 +3359,171 @@ async fn a_workflow_dispatches_against_a_schema_that_predates_the_engine() {
     h.engine.tick_pass().await.unwrap();
     assert_eq!(h.run_status(&run).await.as_deref(), Some("success"));
 }
+
+// ---------------------------------------------------------------------------
+// Per-key failure budget
+// ---------------------------------------------------------------------------
+
+/// A fan-out where alice's backend always 500s — the poison-row shape.
+async fn quarantine_harness(budget: Option<i64>) -> Harness {
+    let h = harness().await;
+    h.set("CREATE connection:alice SET active = true; CREATE connection:bob SET active = true")
+        .await;
+    let mut spec = json!({
+        "kind": "job",
+        "every_ms": 300_000,
+        "target_table": "job",
+        "path": "/syncGames",
+        "for_each": "SELECT id FROM connection WHERE active = true",
+        "for_each_key": "id",
+        "concurrency": "skip",
+    });
+    if let Some(n) = budget {
+        spec["quarantine_after"] = json!(n);
+    }
+    h.define_schedule("game-sync", spec).await;
+    h.engine.tick_pass().await.unwrap();
+    h.rearm().await;
+    h
+}
+
+impl Harness {
+    async fn rearm(&self) {
+        self.set("UPDATE _00_schedule:`game-sync` SET next_fire_at = time::now() - 1s").await;
+    }
+
+    /// The job spawned for one key by the most recent fire, if the gate let it
+    /// through at all.
+    async fn job_for(&self, key: &str) -> Option<String> {
+        self.raw
+            .query(
+                "SELECT VALUE job_id FROM ONLY _00_schedule_run \
+                 WHERE key = $key AND status = 'running' LIMIT 1",
+            )
+            .bind(("key", key.to_string()))
+            .await
+            .expect("query")
+            .take(0)
+            .expect("take")
+    }
+
+    /// One full cycle: fire, then settle alice's run with `outcome`.
+    async fn cycle(&self, outcome: &str) -> crate::TickReport {
+        let report = self.engine.tick_pass().await.unwrap();
+        if let Some(job) = self.job_for("connection:alice").await {
+            match outcome {
+                "success" => self.finish_job(&job, "success", json!({})).await,
+                _ => self.fail_job(&job, "Chess.com user not found").await,
+            }
+            self.engine.tick_pass().await.unwrap();
+        }
+        if let Some(job) = self.job_for("connection:bob").await {
+            self.finish_job(&job, "success", json!({})).await;
+            self.engine.tick_pass().await.unwrap();
+        }
+        self.rearm().await;
+        report
+    }
+
+    async fn key_failures(&self, key: &str) -> i64 {
+        self.count(&format!(
+            "SELECT VALUE consecutive_failures FROM ONLY _00_schedule_key \
+             WHERE key = '{key}' LIMIT 1"
+        ))
+        .await
+    }
+}
+
+#[tokio::test]
+async fn a_key_that_always_fails_stops_firing_while_the_others_carry_on() {
+    let h = quarantine_harness(Some(2)).await;
+
+    h.cycle("failed").await;
+    assert_eq!(h.key_failures("connection:alice").await, 1);
+    h.cycle("failed").await;
+    assert_eq!(h.key_failures("connection:alice").await, 2, "at budget");
+
+    // The next fire is the one the gate suppresses.
+    let report = h.engine.tick_pass().await.unwrap();
+    assert_eq!(report.spawned, 1, "bob still runs; alice does not");
+    assert_eq!(report.quarantined.len(), 1, "reported once, to become an incident");
+    assert_eq!(report.quarantined[0].key, "connection:alice");
+    assert!(report.quarantined[0].suppressed);
+
+    let code = h
+        .one_string(
+            "SELECT VALUE error.code FROM ONLY _00_schedule_run \
+             WHERE key = 'connection:alice' AND status = 'skipped' \
+             ORDER BY fire_at DESC LIMIT 1",
+        )
+        .await;
+    assert_eq!(code.as_deref(), Some("quarantine"), "recorded with its cause");
+
+    // And it stays quiet rather than re-reporting every tick.
+    h.rearm().await;
+    let again = h.engine.tick_pass().await.unwrap();
+    assert!(again.quarantined.is_empty(), "an operator is told once, not every 5s");
+}
+
+#[tokio::test]
+async fn one_success_forgets_the_streak() {
+    let h = quarantine_harness(Some(2)).await;
+    h.cycle("failed").await;
+    h.cycle("success").await;
+    assert_eq!(
+        h.count("SELECT VALUE count() FROM _00_schedule_key WHERE key = 'connection:alice' GROUP ALL")
+            .await,
+        0,
+        "a healthy key keeps no row at all, so the table is bounded by failures"
+    );
+    h.cycle("failed").await;
+    let report = h.engine.tick_pass().await.unwrap();
+    assert_eq!(report.spawned, 2, "one failure since the success is under budget");
+}
+
+#[tokio::test]
+async fn a_suppressed_fire_is_evidence_of_nothing() {
+    // `concurrency: skip` suppresses most ticks of exactly the key that is
+    // failing, so counting a skip either way would break the mechanism.
+    let h = quarantine_harness(Some(2)).await;
+    h.engine.tick_pass().await.unwrap();
+    h.rearm().await;
+    let report = h.engine.tick_pass().await.unwrap();
+    assert!(report.skipped >= 1, "the first runs are still in flight");
+    assert_eq!(h.key_failures("connection:alice").await, 0);
+}
+
+#[tokio::test]
+async fn releasing_a_key_lets_it_fire_again_and_says_so() {
+    let h = quarantine_harness(Some(2)).await;
+    h.cycle("failed").await;
+    h.cycle("failed").await;
+    h.engine.tick_pass().await.unwrap();
+    h.rearm().await;
+
+    // The operator release: forgetting the streak IS the release.
+    h.set("DELETE _00_schedule_key").await;
+    let report = h.engine.tick_pass().await.unwrap();
+    // Alice specifically: bob may still be held by `skip` from the tick above,
+    // so the total says nothing about the key under test.
+    assert!(
+        h.job_for("connection:alice").await.is_some(),
+        "alice fires again after the release"
+    );
+    assert!(
+        report.quarantined.iter().all(|t| !t.suppressed),
+        "nothing is suppressed after a release: {:?}",
+        report.quarantined
+    );
+}
+
+#[tokio::test]
+async fn a_schedule_without_a_budget_never_quarantines() {
+    let h = quarantine_harness(None).await;
+    for _ in 0..4 {
+        h.cycle("failed").await;
+    }
+    let report = h.engine.tick_pass().await.unwrap();
+    assert_eq!(report.spawned, 2, "opt-in only: an upgrade changes no firing behaviour");
+    assert!(report.quarantined.is_empty());
+}

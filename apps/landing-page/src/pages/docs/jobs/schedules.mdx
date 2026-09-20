@@ -237,6 +237,56 @@ every job-level retry, and every gap in between.
   retuning or deleting a schedule never changes the ceiling of work already in flight.
 </Note>
 
+## Failing keys
+
+A `forEach` query is re-run from scratch on every fire, so a row that **always** fails is
+re-selected forever. Nothing else in the chain notices: `concurrency: skip` only suppresses
+a fire while the previous run is still going, and a query that returns a bad row is a
+perfectly successful query. One dead row then costs a job every tick indefinitely, and keeps
+the outbox's `failed` bucket permanently non-empty — which is exactly where a *real* failure
+would have shown.
+
+`quarantineAfter` is the escape hatch.
+
+```yaml
+schedules:
+  game-sync:
+    every: 1m
+    forEach:
+      query: SELECT id FROM connection WHERE last_synced_at < time::now() - 15m
+      key: id
+    quarantineAfter: 5    # stop firing a key after 5 consecutive failures
+```
+
+Past the budget the key stops firing. Each suppressed fire is recorded as a `skipped` run
+carrying `{ code: "quarantine" }`, and the first one opens a `schedule_quarantined` incident
+naming the schedule and the key. Every other key of the same schedule is untouched.
+
+Only runs that **actually executed** move the counter. A `skipped` fire is evidence of
+nothing — under `concurrency: skip` most of the ticks of a failing key are suppressed, so
+counting those either way would defeat the mechanism. One success forgets the streak
+entirely.
+
+<Note>
+  It is opt-in, and unset means never. Turning a firing behaviour on implicitly at upgrade
+  is not a change anyone asked for, so a schedule that wants the budget states it.
+
+  The budget is read at the gate rather than frozen onto a key, unlike `deadline` and
+  `history`. Those bound a run already in flight, where a config change must not move the
+  goalposts; this decides whether to *start* one at all. Raising or lowering it therefore
+  takes effect on the next fire — which is what an operator releasing a stuck key expects.
+</Note>
+
+Release a key by hand once the underlying problem is fixed:
+
+```bash
+spky schedules release game-sync 'connection:CONN_abc123'
+```
+
+Forgetting the streak **is** the release: the next fire goes through, and if the key is
+still broken it quarantines again. `spky schedules get <name>` lists the currently
+quarantined keys, as does the admin dashboard.
+
 ## Definitions in their own files
 
 Once you have more than a handful, `schedules:` can live in separate files, per entry or wholesale. Paths are relative to the manifest that names them.
@@ -339,6 +389,7 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
   { name: 'forEach.query', type: 'string', default: '-', desc: 'SurrealQL SELECT run each fire; one job per row, passed as payload.row.' },
   { name: 'forEach.key', type: 'string', default: 'id', desc: 'Row field whose value keys the per-row concurrency check.' },
   { name: 'concurrency', type: 'skip | allow | replace', default: 'skip', desc: 'What a fire does when the previous run for that key is still going.' },
+  { name: 'quarantineAfter', type: 'number', default: '-', desc: 'Consecutive failures of ONE forEach key before it stops firing. Unset means never.' },
   { name: 'retry.max', type: 'integer', default: '3', desc: 'Retries per run, before the run counts as failed.' },
   { name: 'retry.strategy', type: 'linear | exponential', default: 'linear', desc: 'Backoff shape between retries.' },
   { name: 'timeout', type: 'duration', default: '(backend default)', desc: 'Per-job HTTP timeout. Honoured only when the backend sets deploy.timeoutOverridable.' },
@@ -351,7 +402,7 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
   { name: 'running', type: 'status', default: '-', desc: 'In flight.' },
   { name: 'success', type: 'status', default: '-', desc: 'The job succeeded.' },
   { name: 'failed', type: 'status', default: '-', desc: 'The job exhausted its retries.' },
-  { name: 'skipped', type: 'status', default: '-', desc: 'concurrency: skip suppressed this tick. The previous run for that key was still going.' },
+  { name: 'skipped', type: 'status', default: '-', desc: 'This tick was suppressed. error.code says why: concurrency_skip (the previous run for that key was still going) or quarantine (the key is past its quarantineAfter budget).' },
   { name: 'replaced', type: 'status', default: '-', desc: 'concurrency: replace killed this run in favour of a newer fire.' },
   { name: 'killed', type: 'status', default: '-', desc: 'An operator stopped it.' },
 ]} />

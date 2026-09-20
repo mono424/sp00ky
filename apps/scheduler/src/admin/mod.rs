@@ -358,6 +358,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/schedules/:name/pause", post(workflows::schedule_pause))
         .route("/schedules/:name/resume", post(workflows::schedule_resume))
         .route("/schedules/:name/trigger", post(workflows::schedule_trigger))
+        .route("/schedules/:name/release", post(workflows::schedule_release))
         // Jobs. `/jobs/clear` is registered before `/jobs/:id` so the literal
         // segment wins the match rather than being read as a job named "clear".
         .route("/jobs", get(jobs::list_jobs))

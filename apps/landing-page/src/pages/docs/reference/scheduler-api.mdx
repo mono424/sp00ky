@@ -763,6 +763,14 @@ These authenticated, read-only endpoints are on the admin listener:
 - `GET /admin/api/overview` includes `incidents` with `open`, `total`,
   `retention_days`, and `storage_error`.
 
+`kind` names what happened. Besides the SSP and scheduler lifecycle kinds, two
+are worth knowing because nothing else reports them: `backend_down` opens when a
+backend has failed its health check for longer than a minute and recovers when it
+answers again (its `component` is the backend name), and `schedule_quarantined`
+opens when a schedule's per-key failure budget stops firing one `forEach` key
+(its `component` is `schedule:<name>/<key>`). See
+[Failing keys](/docs/jobs/schedules#failing-keys).
+
 An incident carries `id`, `component`, `kind`, `severity`, `state`, `started_at`,
 `ended_at`, `max_buffered_events`, `event_count`, and `events`. Each event has
 `at`, `component`, `kind`, `state`, `summary`, `operation_id`, and `version`.

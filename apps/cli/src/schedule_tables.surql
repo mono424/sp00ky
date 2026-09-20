@@ -86,6 +86,14 @@ DEFINE FIELD OVERWRITE history_failed_secs ON TABLE _00_schedule TYPE option<int
 DEFINE FIELD OVERWRITE history_mode ON TABLE _00_schedule TYPE option<string>
     ASSERT $value INSIDE ['all', 'failures-only'];
 
+-- Consecutive failures of one forEach key before the gate stops firing it.
+-- NONE (the default) means never: a schedule opts in, because turning a firing
+-- behaviour on implicitly at upgrade is not a change anyone asked for. The
+-- budget is read at the gate, never frozen onto a key, so retuning it applies
+-- on the next fire.
+DEFINE FIELD OVERWRITE quarantine_after ON TABLE _00_schedule TYPE option<int>
+    ASSERT $value = NONE OR $value > 0;
+
 -- Operator: written by the CLI only.
 DEFINE FIELD OVERWRITE paused ON TABLE _00_schedule TYPE bool DEFAULT false;
 DEFINE FIELD OVERWRITE trigger_requested_at ON TABLE _00_schedule TYPE option<datetime>;
@@ -399,6 +407,46 @@ DEFINE FIELD OVERWRITE updated_at ON TABLE _00_run_rollup TYPE datetime VALUE ti
 
 DEFINE INDEX OVERWRITE idx_rollup_lookup ON TABLE _00_run_rollup
     COLUMNS scope, name, bucket;
+
+-- ==================================================
+-- SPOOKY SCHEDULE KEY (per-forEach-key failure budget)
+-- One row per (schedule, forEach key), id
+-- `_00_schedule_key:<schedule>_<hash(key)>`.
+--
+-- The engine holds no state across fires, which is usually the right call: a
+-- fire is decided entirely from the schedule row and the forEach query. But it
+-- means a forEach row that ALWAYS fails is re-selected forever. Nothing in the
+-- chain accumulates evidence: `concurrency: skip` only blocks on a run still
+-- `running`, `last_error` is only written when the fan-out query itself errors,
+-- and a query returning a poison row is a perfectly successful query. So one
+-- dead row costs a job every tick, indefinitely, and keeps the outbox's failed
+-- bucket permanently non-empty, which is where a real failure would have shown.
+--
+-- This is the one piece of per-key memory, and it holds exactly one number.
+-- Whether that number means "quarantined" is DERIVED at the gate from the
+-- schedule's current `quarantine_after`, so raising or lowering the budget in
+-- `sp00ky.yml` takes effect on the next fire with nothing to migrate.
+--
+-- `skipped` and `replaced` touch neither counter: a suppressed fire is evidence
+-- of nothing. Only a run that actually executed moves it.
+-- ==================================================
+DEFINE TABLE OVERWRITE _00_schedule_key SCHEMAFULL PERMISSIONS NONE;
+
+DEFINE FIELD OVERWRITE schedule_name ON TABLE _00_schedule_key TYPE string;
+DEFINE FIELD OVERWRITE key ON TABLE _00_schedule_key TYPE string DEFAULT '';
+DEFINE FIELD OVERWRITE consecutive_failures ON TABLE _00_schedule_key TYPE int DEFAULT 0;
+-- 'success' | 'failed' — the last outcome that actually executed.
+DEFINE FIELD OVERWRITE last_status ON TABLE _00_schedule_key TYPE option<string>;
+-- Set when the gate first suppresses this key, cleared when it lets it through
+-- again. It is not what makes a key quarantined (the count and the budget are);
+-- it is the record that an operator has already been told, so the incident
+-- opens and closes once rather than on every tick.
+DEFINE FIELD OVERWRITE quarantined_at ON TABLE _00_schedule_key TYPE option<datetime>;
+DEFINE FIELD OVERWRITE updated_at ON TABLE _00_schedule_key TYPE datetime VALUE time::now();
+
+-- `spky schedules get` lists a schedule's quarantined keys.
+DEFINE INDEX OVERWRITE idx_skey_schedule ON TABLE _00_schedule_key
+    COLUMNS schedule_name, quarantined_at;
 
 -- ==================================================
 -- SPOOKY JOB POLICY (per-outbox-table execution limits)

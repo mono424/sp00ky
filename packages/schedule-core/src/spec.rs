@@ -97,6 +97,18 @@ pub struct ScheduleSpec {
     /// run, including every step and every job-level retry inside it.
     #[serde(default)]
     pub deadline_secs: Option<i64>,
+
+    /// Consecutive failures of ONE forEach key before the gate stops firing it.
+    /// Unset (the default) means never.
+    ///
+    /// The budget is read at the gate rather than frozen onto a key, unlike
+    /// `history_mode` and `deadline_secs`: those bound a run already in flight,
+    /// where a config change must not move the goalposts, while this decides
+    /// whether to start one at all. Raising or lowering it therefore takes
+    /// effect on the next fire, which is what an operator releasing a stuck key
+    /// expects.
+    #[serde(default)]
+    pub quarantine_after: Option<i64>,
 }
 
 /// `history_mode` value that suppresses successful run rows entirely.

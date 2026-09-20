@@ -181,6 +181,33 @@ pub struct TickReport {
     /// Schedules whose plan or fan-out failed. Recorded on the row's
     /// `last_error`; one bad schedule never aborts the sweep.
     pub errored: usize,
+    /// Keys the failure budget suppressed this pass, and keys it let through
+    /// again. Reported rather than logged here because the engine is a library
+    /// beneath the scheduler: the host turns these into incidents, the same way
+    /// it owns every other operator-facing surface.
+    pub quarantined: Vec<KeyTransition>,
+}
+
+/// One forEach key crossing the failure budget, in either direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyTransition {
+    pub schedule: String,
+    pub key: String,
+    /// The streak that suppressed it, or 0 for a release.
+    pub failures: i64,
+    pub suppressed: bool,
+}
+
+/// Where one forEach key stands against its schedule's failure budget, as the
+/// gate sees it on a fire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyGate {
+    /// Fire it: no streak, or still under budget.
+    Clear,
+    /// Fire it, and report that a previously suppressed key is running again.
+    Released,
+    /// Suppress it. `announced` is whether an operator has already been told.
+    Quarantined { failures: i64, announced: bool },
 }
 
 pub struct ScheduleEngine {
@@ -435,6 +462,61 @@ impl ScheduleEngine {
         let run_key = ids::run_key(&spec.name, fire_at.timestamp_millis(), key);
         let run_ref = ids::schedule_run(&run_key);
 
+        // Before the concurrency gate, because a quarantined key must not even
+        // consult it: `skip` answers "is a run in flight", which for a key that
+        // is failing fast is usually "no", and that is precisely how a dead row
+        // re-fires forever.
+        match self.key_gate(spec, key).await? {
+            KeyGate::Clear => {}
+            KeyGate::Released => report.quarantined.push(KeyTransition {
+                schedule: spec.name.clone(),
+                key: key.to_string(),
+                failures: 0,
+                suppressed: false,
+            }),
+            KeyGate::Quarantined { failures, announced } => {
+                // Recorded with its cause, like a `skip`: an operator seeing a
+                // key stop firing needs the reason in the run history, not only
+                // in an incident that retention will eventually drop.
+                self.create_schedule_run(
+                    schedule_id,
+                    spec,
+                    &run_key,
+                    key,
+                    fire_at,
+                    trigger,
+                    // `skipped`, not a status of its own: a quarantined fire
+                    // IS a suppressed fire, and the existing `skip` already
+                    // records its cause in `error`. A new status would have to
+                    // earn its own prune window, its own rollup counter and its
+                    // own colour in the dashboard to say the same thing the
+                    // code below already says.
+                    "skipped",
+                    Some(json!({
+                        "code": "quarantine",
+                        "reason": format!(
+                            "{failures} consecutive failures for this key; \
+                             release it or raise quarantineAfter to fire it again"
+                        ),
+                        "consecutive_failures": failures,
+                    })),
+                    None,
+                    None,
+                )
+                .await?;
+                if !announced {
+                    report.quarantined.push(KeyTransition {
+                        schedule: spec.name.clone(),
+                        key: key.to_string(),
+                        failures,
+                        suppressed: true,
+                    });
+                }
+                report.skipped += 1;
+                return Ok(());
+            }
+        }
+
         match spec.concurrency {
             Concurrency::Allow => {}
             Concurrency::Skip => {
@@ -545,6 +627,67 @@ impl ScheduleEngine {
             .query(sql::SELECT_BLOCKING_RUN, &[("name", json!(name)), ("key", json!(key))])
             .await?;
         Ok(first_row(results))
+    }
+
+    /// Where one forEach key stands against its schedule's failure budget.
+    async fn key_gate(&self, spec: &ScheduleSpec, key: &str) -> Result<KeyGate, ScheduleDbError> {
+        // A schedule that did not opt in pays nothing: no read, no row, no
+        // behaviour change.
+        let Some(budget) = spec.quarantine_after.filter(|n| *n > 0) else {
+            return Ok(KeyGate::Clear);
+        };
+        let row_ref = ids::schedule_key(&spec.name, key);
+        let binds = bind_ref("", &row_ref);
+        let Some(row) = first_row(self.db.query(sql::SELECT_SCHEDULE_KEY, &binds).await?) else {
+            // No row means no failure streak. The success path deletes, so
+            // "absent" and "healthy" are the same state.
+            return Ok(KeyGate::Clear);
+        };
+        let failures = row.get("consecutive_failures").and_then(Value::as_i64).unwrap_or(0);
+        let announced = row.get("announced").and_then(Value::as_bool).unwrap_or(false);
+
+        if failures >= budget {
+            if !announced {
+                // Guarded on the field being unset, so suppressing the key on
+                // every tick does not keep moving the timestamp.
+                let _ = self.db.query(sql::MARK_KEY_QUARANTINED, &binds).await;
+            }
+            return Ok(KeyGate::Quarantined { failures, announced });
+        }
+        if announced {
+            // Under budget again — an operator released it, or the budget was
+            // raised. Clear the marker and say so once.
+            let cleared = self.db.query(sql::CLEAR_KEY_QUARANTINE, &binds).await?;
+            if first_row(cleared).is_some() {
+                return Ok(KeyGate::Released);
+            }
+        }
+        Ok(KeyGate::Clear)
+    }
+
+    /// Fold a run's outcome into its key's failure streak.
+    ///
+    /// Best-effort, like [`Self::record_last_run`] beside it: this decides
+    /// future fires, never the one that just finished, so a write failure here
+    /// must not turn a completed run into a failed sweep. A lost increment
+    /// costs one extra fire before the gate catches up.
+    ///
+    /// Only an outcome that actually EXECUTED moves the streak. A `skipped` or
+    /// `replaced` run is evidence of nothing — and counting `skipped` as health
+    /// would defeat the whole mechanism, because `concurrency: skip` suppresses
+    /// most of the ticks of exactly the key that is failing.
+    async fn note_key_outcome(&self, name: &str, key: &str, status: &str) {
+        let stmt = match status {
+            "failed" => sql::NOTE_KEY_FAILURE,
+            "success" => sql::NOTE_KEY_SUCCESS,
+            _ => return,
+        };
+        let row_ref = ids::schedule_key(name, key);
+        let mut binds = bind_ref("", &row_ref).to_vec();
+        binds.extend([("name", json!(name)), ("fan_out_key", json!(key))]);
+        if let Err(e) = self.db.query(stmt, &binds).await {
+            tracing::warn!(schedule = name, error = %e, "could not record key outcome");
+        }
     }
 
     /// Kill whatever is in flight for this key and mark those runs `replaced`.
@@ -767,6 +910,13 @@ impl ScheduleEngine {
         let Some(name) = run_row.get("schedule_name").and_then(Value::as_str) else {
             return;
         };
+        // Folded here because this is the one place every terminal outcome
+        // passes through. A run born terminal reports itself from a synthetic
+        // row with no `key`, which is exactly right: those are the suppressed
+        // fires, and a suppressed fire is evidence of nothing.
+        if let Some(key) = run_row.get("key").and_then(Value::as_str) {
+            self.note_key_outcome(name, key, status).await;
+        }
         let Some(fire_at) = run_row.get("fire_at").and_then(Value::as_str) else {
             return;
         };

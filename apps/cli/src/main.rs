@@ -664,6 +664,12 @@ enum SchedulesCommands {
     Trigger {
         name: String,
     },
+    /// Let a quarantined forEach key fire again
+    Release {
+        name: String,
+        /// The key, exactly as `spky schedules get` reports it
+        key: String,
+    },
     /// Run history, newest first
     Runs {
         /// Limit to one schedule

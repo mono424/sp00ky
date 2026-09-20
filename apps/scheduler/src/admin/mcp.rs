@@ -185,7 +185,7 @@ pub const TOOLS: &[ToolDef] = &[
     tool!("workflow_run_retry", "Retry a failed or killed run from its failed steps; successful steps keep their output.", "POST", "/workflows/runs/{id}/retry",
         path_params = &[req("id", "string", "Run id")]),
     tool!("schedules_list", "Every schedule with cadence, pause state, next and last fire.", "GET", "/schedules", read_only = true),
-    tool!("schedule_get", "One schedule with its recent fires and hourly outcome tally.", "GET", "/schedules/{name}",
+    tool!("schedule_get", "One schedule with its recent fires, its hourly outcome tally (the retention rollup plus the runs not pruned yet) and any forEach keys the failure budget has quarantined.", "GET", "/schedules/{name}",
         path_params = &[req("name", "string", "Schedule name")], read_only = true),
     tool!("schedule_pause", "Pause a schedule: no fires and no queued triggers until resumed.", "POST", "/schedules/{name}/pause",
         path_params = &[req("name", "string", "Schedule name")]),
@@ -193,6 +193,9 @@ pub const TOOLS: &[ToolDef] = &[
         path_params = &[req("name", "string", "Schedule name")]),
     tool!("schedule_trigger", "Fire a schedule once now (refused while paused or config-disabled).", "POST", "/schedules/{name}/trigger",
         path_params = &[req("name", "string", "Schedule name")]),
+    tool!("schedule_release", "Release one quarantined forEach key so the schedule fires it again. A key is quarantined after `quarantineAfter` consecutive failures; releasing forgets the streak, so the next fire goes through and the key quarantines again if it keeps failing. schedule_get lists the quarantined keys.", "POST", "/schedules/{name}/release",
+        path_params = &[req("name", "string", "Schedule name")],
+        body = &[req("key", "string", "The forEach key, exactly as schedule_get reports it")]),
     // ---- Jobs ----
     tool!("jobs_list", "Outbox jobs across every table, newest activity first, with the queue totals. Filter by origin to separate a schedule's fires from a workflow's steps and from jobs the application created itself, which have no other surface. Unfiltered it is served from the scheduler's sampler and costs the database nothing.", "GET", "/jobs",
         query = &[

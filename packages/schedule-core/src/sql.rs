@@ -105,6 +105,63 @@ type::string(created_at) AS created_at FROM _00_schedule_run \
 WHERE schedule_name = $name AND key = $key AND status = 'running' LIMIT 1";
 
 // ---------------------------------------------------------------------------
+// Per-key failure budget
+// ---------------------------------------------------------------------------
+
+/// The one point read the gate adds per fanned-out key, and only for a schedule
+/// that set `quarantine_after`. The id is deterministic, so this is a key
+/// lookup, not a scan.
+/// `announced` is computed in the query rather than cast: `type::string(NONE)`
+/// renders the STRING "NONE", which is truthy on the way back and would make
+/// every key look as though an operator had already been told.
+pub const SELECT_SCHEDULE_KEY: &str = "\
+SELECT consecutive_failures, quarantined_at != NONE AS announced \
+FROM type::record($tb, $key)";
+
+/// Accumulate a failure. `UPSERT` with `+=` for the same reason as
+/// [`UPSERT_ROLLUP`]: a first touch and an accumulate are one statement, so two
+/// finalizers racing the same key cannot lose a count to a read-modify-write.
+pub const NOTE_KEY_FAILURE: &str = "\
+UPSERT type::record($tb, $key) SET schedule_name = $name, key = $fan_out_key, \
+consecutive_failures += 1, last_status = 'failed'";
+
+/// A run that actually executed and succeeded DELETES the row: a healthy key
+/// has nothing to remember.
+///
+/// This is what keeps the table self-pruning and bounded by the number of
+/// currently-failing keys rather than by fan-out width. It is also why the
+/// success path needs no `UPSERT` and no config gate — a key that has never
+/// failed has no row, so this is a key miss, not a write, and the common case
+/// of a wide fan-out where everything works costs nothing at all.
+pub const NOTE_KEY_SUCCESS: &str = "DELETE type::record($tb, $key)";
+
+/// Stamp the moment the gate first suppressed this key. Guarded on the field
+/// being unset so re-suppressing every tick does not keep moving the timestamp,
+/// which is what makes the incident open once instead of once a tick.
+pub const MARK_KEY_QUARANTINED: &str = "\
+UPDATE type::record($tb, $key) SET quarantined_at = time::now() \
+WHERE quarantined_at = NONE";
+
+/// Clear the marker once the key is under budget again — an operator release,
+/// or a raised budget. Returns the rows it changed, so the caller reports a
+/// recovery exactly once.
+pub const CLEAR_KEY_QUARANTINE: &str = "\
+UPDATE type::record($tb, $key) SET quarantined_at = NONE \
+WHERE quarantined_at != NONE RETURN BEFORE";
+
+/// Release a key by hand, the operator surface for a quarantine nobody wants to
+/// wait out. Same statement as the success path, for the same reason: forgetting
+/// the streak IS the release.
+pub const RELEASE_SCHEDULE_KEY: &str = NOTE_KEY_SUCCESS;
+
+/// Every currently quarantined key of one schedule, for `spky schedules get`
+/// and the dashboard. Served by `idx_skey_schedule`.
+pub const SELECT_QUARANTINED_KEYS: &str = "\
+SELECT key, consecutive_failures, type::string(quarantined_at) AS quarantined_at \
+FROM _00_schedule_key \
+WHERE schedule_name = $name AND quarantined_at != NONE";
+
+// ---------------------------------------------------------------------------
 // Spawning
 // ---------------------------------------------------------------------------
 

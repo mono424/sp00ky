@@ -56,6 +56,10 @@ pub fn run(
             let client = client_from(&conn, &config)?;
             trigger(&client, &name)
         }
+        SchedulesCommands::Release { name, key } => {
+            let client = client_from(&conn, &config)?;
+            release(&client, &name, &key)
+        }
         SchedulesCommands::Runs { name, status, limit, json } => {
             let client = client_from(&conn, &config)?;
             runs(&client, name.as_deref(), status.as_deref(), limit, json)
@@ -230,6 +234,7 @@ fn get(client: &SurrealClient, name: &str, json: bool) -> Result<()> {
     }
 
     print_rollup_totals(client, name)?;
+    print_quarantined_keys(client, name)?;
 
     let recent = query_rows(
         client,
@@ -375,6 +380,56 @@ fn trigger(client: &SurrealClient, name: &str) -> Result<()> {
         .with_context(|| format!("failed to trigger '{name}'"))?;
     println!("{CYAN}Triggered{RESET} {BOLD}{name}{RESET} — it fires within a few seconds.");
     println!("{DIM}The cron clock is untouched: this run is extra, not instead.{RESET}");
+    Ok(())
+}
+
+/// Keys this schedule has stopped firing, and how to start them again.
+///
+/// Printed right under the totals because a quarantined key is the one state
+/// where the numbers look calm and the schedule is not doing its job: the fires
+/// are recorded `skipped`, so nothing turns red.
+fn print_quarantined_keys(client: &SurrealClient, name: &str) -> Result<()> {
+    let rows = query_rows(
+        client,
+        &format!(
+            "SELECT key, consecutive_failures FROM _00_schedule_key \
+             WHERE schedule_name = '{}' AND quarantined_at != NONE;",
+            esc(name)
+        ),
+    )?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    println!();
+    println!("  {YELLOW}quarantined{RESET} ({} key(s) no longer firing)", rows.len());
+    for row in &rows {
+        let key = row.get("key").and_then(Value::as_str).unwrap_or("-");
+        let n = row.get("consecutive_failures").and_then(Value::as_i64).unwrap_or(0);
+        println!("    {key}  {DIM}{n} consecutive failures{RESET}");
+    }
+    println!("  {DIM}spky schedules release {name} '<key>'{RESET}");
+    Ok(())
+}
+
+/// Let one quarantined forEach key fire again.
+///
+/// Forgetting the streak IS the release: the gate derives quarantine from the
+/// count against the schedule's current `quarantineAfter`, so a key with no row
+/// is simply a key that has not failed. If the key is still broken it will
+/// quarantine again, which is the point — this clears the block, it does not
+/// grant an exemption.
+fn release(client: &SurrealClient, name: &str, key: &str) -> Result<()> {
+    load_schedule(client, name)?;
+    let row = schedule_core::ids::schedule_key(name, key);
+    client
+        .execute(&format!(
+            "DELETE {}:⟨{}⟩;",
+            row.table,
+            row.key.replace('⟩', "")
+        ))
+        .with_context(|| format!("failed to release '{key}' on '{name}'"))?;
+    println!("{CYAN}Released{RESET} {BOLD}{key}{RESET} on {BOLD}{name}{RESET} — it fires on the next tick.");
+    println!("{DIM}The failure streak is forgotten, not exempted: if it still fails it quarantines again.{RESET}");
     Ok(())
 }
 

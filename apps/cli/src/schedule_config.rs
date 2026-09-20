@@ -66,6 +66,25 @@ pub struct ScheduleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
 
+    /// Consecutive failures of ONE `forEach` key before the schedule stops
+    /// firing that key. Unset (the default) means never.
+    ///
+    /// The escape hatch for a poison row. A `forEach` query is re-run from
+    /// scratch every fire, so a row that always fails is re-selected forever:
+    /// `concurrency: skip` only suppresses a fire while the previous run is
+    /// still going, and a query that returns a bad row is a perfectly
+    /// successful query, so nothing else in the chain notices. One dead row
+    /// then costs a job every tick indefinitely and keeps the outbox's failed
+    /// bucket permanently non-empty, which is where a real failure would have
+    /// shown.
+    ///
+    /// Only runs that actually executed count: a `skipped` fire moves nothing,
+    /// and one success forgets the streak. A quarantined key raises an incident
+    /// and records a `quarantined` run carrying the reason; release it with
+    /// `spky schedules release <name> <key>` or by raising this number.
+    #[serde(default, rename = "quarantineAfter", skip_serializing_if = "Option::is_none")]
+    pub quarantine_after: Option<i64>,
+
     /// `false` deploys the schedule but leaves it inert. Distinct from an
     /// operator `spky schedules pause`, which config never overwrites.
     #[serde(default = "default_true")]
@@ -234,6 +253,25 @@ pub struct WorkflowConfig {
     /// key under `concurrency: skip` indefinitely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
+
+    /// Consecutive failures of ONE `forEach` key before the schedule stops
+    /// firing that key. Unset (the default) means never.
+    ///
+    /// The escape hatch for a poison row. A `forEach` query is re-run from
+    /// scratch every fire, so a row that always fails is re-selected forever:
+    /// `concurrency: skip` only suppresses a fire while the previous run is
+    /// still going, and a query that returns a bad row is a perfectly
+    /// successful query, so nothing else in the chain notices. One dead row
+    /// then costs a job every tick indefinitely and keeps the outbox's failed
+    /// bucket permanently non-empty, which is where a real failure would have
+    /// shown.
+    ///
+    /// Only runs that actually executed count: a `skipped` fire moves nothing,
+    /// and one success forgets the streak. A quarantined key raises an incident
+    /// and records a `quarantined` run carrying the reason; release it with
+    /// `spky schedules release <name> <key>` or by raising this number.
+    #[serde(default, rename = "quarantineAfter", skip_serializing_if = "Option::is_none")]
+    pub quarantine_after: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -512,9 +550,18 @@ pub fn normalize_schedule(
         row.insert("timeout".into(), serde_json::json!(parse_duration_ms(timeout)? / 1000));
     }
     insert_deadline(&mut row, cfg.deadline.as_deref())?;
+    insert_quarantine(&mut row, cfg.quarantine_after);
     row.insert("config_disabled".into(), serde_json::json!(!cfg.enabled));
     insert_history(&mut row, cfg.history.as_ref(), default_mode)?;
     Ok(serde_json::Value::Object(row))
+}
+
+/// The per-key failure budget, omitted rather than nulled when unset so the
+/// engine reads NONE and the gate stays off. `option<int>` rejects NULL.
+fn insert_quarantine(row: &mut serde_json::Map<String, serde_json::Value>, after: Option<i64>) {
+    if let Some(n) = after.filter(|n| *n > 0) {
+        row.insert("quarantine_after".into(), serde_json::json!(n));
+    }
 }
 
 /// Flatten `history:` to the seconds the engine reads. Absent windows are left out
@@ -611,6 +658,7 @@ pub fn normalize_workflow(
         }),
     );
     insert_deadline(&mut row, cfg.deadline.as_deref())?;
+    insert_quarantine(&mut row, cfg.quarantine_after);
     row.insert("config_disabled".into(), serde_json::json!(false));
     Ok(serde_json::Value::Object(row))
 }

@@ -189,6 +189,8 @@ Whatever retention deletes is first folded into permanent hourly counters (`_00_
 
 A schedule sets exactly one of `cron` (a 5-field expression, evaluated in `timezone`, default UTC) or `every` (a fixed interval, minimum 10s). `forEach` fans one schedule out into one job per row, and `concurrency` decides what a fire does when that row's previous run is still going: `skip` (default) records the suppressed tick, `allow` permits overlap, `replace` kills the in-flight run first.
 
+`quarantineAfter` sets a per-key consecutive-failure budget: past it the schedule stops firing that key and opens an incident, so one permanently broken `forEach` row cannot burn a job every tick forever. Opt-in, and one success forgets the streak. See [Failing keys](/docs/jobs/schedules#failing-keys).
+
 A schedule may also set `history:` to override the project's [retention](#retention) for its own run history — worth doing for a wide fan-out, which writes one run row per item per fire. It takes either the shorthand `history: failures-only` (a successful run then never persists at all), or an object with `mode`, `success` and `failed`.
 
 <Warning>

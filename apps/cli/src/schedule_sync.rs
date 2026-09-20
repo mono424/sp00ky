@@ -230,10 +230,15 @@ pub fn sync(
         // MERGE, not CONTENT: engine and operator fields on this row must
         // survive. And `next_fire_at = NONE` only here, on a real spec change,
         // so the engine replans the new cadence instead of firing on the old one.
+        //
+        // MERGE alone is not enough for the fields deploy DOES own, though: it
+        // only writes the keys it is given, so an optional one removed from
+        // `sp00ky.yml` kept its old value forever. `cleared_fields` names those.
         let sql = format!(
-            "UPSERT {id} MERGE {patch}; UPDATE {id} SET next_fire_at = NONE;",
+            "UPSERT {id} MERGE {patch}; UPDATE {id} SET next_fire_at = NONE{cleared};",
             id = record_literal(name),
             patch = merge_patch(spec, &hash)?,
+            cleared = cleared_fields(spec),
         );
         client
             .execute(&sql)
@@ -423,6 +428,51 @@ fn read_stored_hashes(client: &dyn MigrationDB) -> Result<BTreeMap<String, Strin
     Ok(out)
 }
 
+/// Every OPTIONAL spec field deploy owns on `_00_schedule`.
+///
+/// Deploy is the only writer of these, so it has to be authoritative over them in
+/// both directions. `MERGE` handles "set"; nothing handled "unset", so a field
+/// dropped from `sp00ky.yml` lingered on the row. Two of the ways that bit:
+///
+/// - switching a schedule from `cron:` to `every:` (or back) left BOTH on the
+///   row, which the engine rejects as `AmbiguousSyntax` - the schedule stopped
+///   firing entirely, from a config change that was perfectly valid;
+/// - removing `quarantineAfter`, `deadline` or `history:` changed nothing, so the
+///   operator saw the config they wrote and the engine ran the one they deleted.
+///
+/// Required fields (`name`, `kind`, `target_table`, `concurrency`,
+/// `config_disabled`, `spec_hash`) are always in the patch and never listed here.
+/// Operator and engine fields are never listed here either: not clearing them is
+/// the entire point of using `MERGE`.
+const SPEC_OPTIONAL_FIELDS: &[&str] = &[
+    "cron",
+    "every_ms",
+    "timezone",
+    "path",
+    "payload",
+    "workflow",
+    "for_each",
+    "for_each_key",
+    "max_retries",
+    "retry_strategy",
+    "timeout",
+    "deadline_secs",
+    "quarantine_after",
+    "history_mode",
+    "history_success_secs",
+    "history_failed_secs",
+];
+
+/// `, field = NONE` for every optional spec field this spec does not carry.
+/// `NONE`, not `NULL`: every one of them is `option<T>`, which rejects NULL.
+fn cleared_fields(spec: &Value) -> String {
+    SPEC_OPTIONAL_FIELDS
+        .iter()
+        .filter(|field| spec.get(**field).is_none())
+        .map(|field| format!(", {field} = NONE"))
+        .collect()
+}
+
 /// The `MERGE` object: spec fields plus the hash, and nothing else.
 fn merge_patch(spec: &Value, hash: &str) -> Result<String> {
     let mut patch = spec.as_object().cloned().unwrap_or_default();
@@ -450,6 +500,93 @@ mod tests {
     #[test]
     fn record_literals_quote_hyphenated_names() {
         assert_eq!(record_literal("game-sync"), "_00_schedule:⟨game-sync⟩");
+    }
+
+    /// The bug this guards: `cron:` -> `every:` is a valid edit, and MERGE left
+    /// both on the row, which the engine rejects as AmbiguousSyntax. The schedule
+    /// then never fired again.
+    #[test]
+    fn switching_cadence_clears_the_one_it_replaced() {
+        let every = serde_json::json!({
+            "name": "digest", "kind": "job", "target_table": "job",
+            "path": "/digest", "every_ms": 43_200_000, "concurrency": "skip",
+            "config_disabled": false,
+        });
+        let cleared = cleared_fields(&every);
+        assert!(cleared.contains(", cron = NONE"), "the old cron must go: {cleared}");
+        assert!(!cleared.contains("every_ms"), "the new cadence must stay: {cleared}");
+        // And a removed budget is actually removed, not just absent from the yml.
+        assert!(cleared.contains(", quarantine_after = NONE"), "{cleared}");
+    }
+
+    /// Clearing must never reach a field deploy does not own - that would undo
+    /// the reason the row is MERGEd at all.
+    #[test]
+    fn clearing_never_touches_operator_or_engine_state() {
+        let cleared = cleared_fields(&serde_json::json!({}));
+        for forbidden in [
+            "paused", "trigger_requested_at", "last_fire_at", "last_error",
+            "last_run_status", "last_run_at", "spec_hash", "name", "kind",
+        ] {
+            assert!(
+                !cleared.contains(&format!(", {forbidden} = ")),
+                "`{forbidden}` is not deploy's to clear: {cleared}"
+            );
+        }
+    }
+
+    /// NONE only clears an `option<T>`. Listing a required field here would make
+    /// every deploy of a schedule that omits it fail its ASSERT.
+    #[test]
+    fn every_clearable_field_is_optional_in_the_ddl() {
+        const SCHEDULE_TABLES: &str = include_str!("schedule_tables.surql");
+        for field in SPEC_OPTIONAL_FIELDS {
+            assert!(
+                SCHEDULE_TABLES
+                    .contains(&format!("{field} ON TABLE _00_schedule TYPE option<")),
+                "`{field}` is cleared with NONE but is not option<T> on _00_schedule"
+            );
+        }
+    }
+
+    /// The guard that would have caught `quarantine_after`: a new optional spec
+    /// field that normalize can emit but that is not clearable lingers forever
+    /// once removed from the yml. Every key normalize produces must be accounted
+    /// for, one way or the other.
+    #[test]
+    fn every_key_normalize_emits_is_required_or_clearable() {
+        const REQUIRED: &[&str] = &["name", "kind", "target_table", "concurrency", "config_disabled"];
+        let job: crate::schedule_config::ScheduleConfig = serde_yaml::from_str(
+            "cron: '0 3 * * *'\ntimezone: Europe/Berlin\nbackend: api\nroute: /run\n\
+             payload: { a: 1 }\nforEach: { query: 'SELECT id FROM t', key: id }\n\
+             concurrency: replace\nretry: { max: 2, strategy: linear }\ntimeout: 120s\n\
+             deadline: 30m\nquarantineAfter: 5\n\
+             history: { mode: failures-only, success: 1h, failed: 7d }\n",
+        )
+        .expect("a schedule using every optional key");
+        let mut spec = crate::schedule_config::normalize_schedule("s", &job, "job", None)
+            .expect("normalizes");
+        // `every` and `cron` are exclusive in the yml, so add the other by hand.
+        spec["every_ms"] = serde_json::json!(60_000);
+
+        let wf: crate::schedule_config::WorkflowConfig = serde_yaml::from_str(
+            "schedule: { every: 5m }\nsteps:\n  a: { backend: api, route: /a }\n",
+        )
+        .expect("a workflow");
+        let wf_spec = crate::schedule_config::normalize_workflow(
+            "w", &wf, "job", &std::collections::BTreeMap::new(),
+        )
+        .expect("normalizes");
+
+        for spec in [&spec, &wf_spec] {
+            for key in spec.as_object().unwrap().keys() {
+                assert!(
+                    REQUIRED.contains(&key.as_str()) || SPEC_OPTIONAL_FIELDS.contains(&key.as_str()),
+                    "normalize emits `{key}`, which is neither required nor in \
+                     SPEC_OPTIONAL_FIELDS - removing it from sp00ky.yml would never clear it"
+                );
+            }
+        }
     }
 
     /// The whole point of MERGE: a deploy must not touch operator or engine state.

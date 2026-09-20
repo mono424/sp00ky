@@ -659,6 +659,13 @@ Returns <code>incidents</code>, <code>total</code>, <code>offset</code>, <code>l
 <li><code>GET /admin/api/overview</code> includes <code>incidents</code> with <code>open</code>, <code>total</code>,
 <code>retention_days</code>, and <code>storage_error</code>.</li>
 </ul>
+<p><code>kind</code> names what happened. Besides the SSP and scheduler lifecycle kinds, two
+are worth knowing because nothing else reports them: <code>backend_down</code> opens when a
+backend has failed its health check for longer than a minute and recovers when it
+answers again (its <code>component</code> is the backend name), and <code>schedule_quarantined</code>
+opens when a schedule’s per-key failure budget stops firing one <code>forEach</code> key
+(its <code>component</code> is <code>schedule:&lt;name&gt;/&lt;key&gt;</code>). See
+<a href="/docs/jobs/schedules#failing-keys">Failing keys</a>.</p>
 <p>An incident carries <code>id</code>, <code>component</code>, <code>kind</code>, <code>severity</code>, <code>state</code>, <code>started_at</code>,
 <code>ended_at</code>, <code>max_buffered_events</code>, <code>event_count</code>, and <code>events</code>. Each event has
 <code>at</code>, <code>component</code>, <code>kind</code>, <code>state</code>, <code>summary</code>, <code>operation_id</code>, and <code>version</code>.

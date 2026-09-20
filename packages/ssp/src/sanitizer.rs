@@ -294,6 +294,44 @@ pub fn fix_surql_json(s: &str) -> String {
     sanitize_query(s).unwrap_or_else(|_| String::new())
 }
 
+/// Whether a string is worth trying to parse as a JSON container.
+fn looks_like_json_container(s: &str) -> bool {
+    (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))
+}
+
+/// Normalize an incoming record for the circuit: collapse `{tb, id}` objects to
+/// the `"tb:id"` record-id string at any depth.
+///
+/// A record that arrives as a JSON STRING is parsed, because the legacy bridge
+/// hands the whole record over that way - but only at the TOP level. This used
+/// to apply to every nested value too, so a user field of `TYPE string` that
+/// happened to hold JSON (whitepawn's `broadcast.scene`, "a built-in id or
+/// inline JSON") was silently retyped into an object on its way into the circuit.
+///
+/// Nothing else in the system does that. The SSP's own bootstrap reads the row
+/// straight from SurrealDB and keeps the string; so does the scheduler's replica.
+/// So the moment a row carrying such a field was UPDATED during a bootstrap, the
+/// replayed event made it an object while both other copies said string, the
+/// catch-up hash could never match, and the SSP was re-bootstrapped - into the
+/// same disagreement. A livestream updates its `broadcast` row every few
+/// seconds, so every restart failed five times, re-cloned the replica, and left
+/// the tenant with no ready SSP for about nine minutes until the breaker gave
+/// up and admitted it anyway.
+///
+/// A value's type is the database's to decide, not something to infer from what
+/// the text looks like.
+pub fn normalize_record(record: Value) -> Value {
+    match record {
+        Value::String(s) if looks_like_json_container(&s) => {
+            match serde_json::from_str::<Value>(&s) {
+                Ok(parsed) => normalize_fields(parsed),
+                Err(_) => Value::String(s),
+            }
+        }
+        other => normalize_fields(other),
+    }
+}
+
 /// Borrowing counterpart to [`normalize_record`], for callers that still need
 /// the original afterwards.
 ///
@@ -304,75 +342,56 @@ pub fn fix_surql_json(s: &str) -> String {
 /// clone.
 ///
 /// The owned version is kept rather than forwarded to this one, because it
-/// genuinely benefits from ownership on the leaf paths — a scalar or a
-/// non-record string is moved through untouched instead of being copied.
+/// genuinely benefits from ownership on the leaf paths - a scalar or a string is
+/// moved through untouched instead of being copied.
 pub fn normalize_record_ref(record: &Value) -> Value {
     match record {
-        Value::String(s) => {
-            if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))
-            {
-                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    return normalize_record(parsed);
-                }
+        Value::String(s) if looks_like_json_container(s) => {
+            match serde_json::from_str::<Value>(s) {
+                Ok(parsed) => normalize_fields(parsed),
+                Err(_) => Value::String(s.clone()),
             }
-            Value::String(s.clone())
         }
-        Value::Object(map) => {
-            if map.len() == 2 && map.contains_key("tb") && map.contains_key("id") {
-                let tb = map.get("tb").and_then(|v| v.as_str());
-                let id = map.get("id");
-                if let (Some(tb_str), Some(id_val)) = (tb, id) {
-                    let id_str = match id_val {
-                        Value::String(s) => s.clone(),
-                        Value::Number(n) => n.to_string(),
-                        _ => id_val.to_string(),
-                    };
-                    return Value::String(format!("{}:{}", tb_str, id_str));
-                }
-            }
-            let mut new_map = serde_json::Map::new();
-            for (k, v) in map {
-                new_map.insert(k.clone(), normalize_record_ref(v));
-            }
-            Value::Object(new_map)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(normalize_record_ref).collect()),
-        other => (*other).clone(),
+        other => normalize_fields_ref(other),
     }
 }
 
-pub fn normalize_record(record: Value) -> Value {
-    match record {
-        Value::String(s) => {
-            if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))
-            {
-                if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
-                    return normalize_record(parsed);
-                }
-            }
-            Value::String(s)
-        }
-        Value::Object(map) => {
-            if map.len() == 2 && map.contains_key("tb") && map.contains_key("id") {
-                let tb = map.get("tb").and_then(|v| v.as_str());
-                let id = map.get("id");
-                if let (Some(tb_str), Some(id_val)) = (tb, id) {
-                    let id_str = match id_val {
-                        Value::String(s) => s.clone(),
-                        Value::Number(n) => n.to_string(),
-                        _ => id_val.to_string(),
-                    };
-                    return Value::String(format!("{}:{}", tb_str, id_str));
-                }
-            }
-            let mut new_map = serde_json::Map::new();
-            for (k, v) in map {
-                new_map.insert(k, normalize_record(v));
-            }
-            Value::Object(new_map)
-        }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_record).collect()),
-        _ => record,
+/// `{tb, id}` -> `"tb:id"`, or `None` when the object is not a record id.
+fn collapse_record_id(map: &serde_json::Map<String, Value>) -> Option<Value> {
+    if map.len() != 2 {
+        return None;
+    }
+    let tb = map.get("tb")?.as_str()?;
+    let id = match map.get("id")? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    };
+    Some(Value::String(format!("{tb}:{id}")))
+}
+
+/// Everything below the top level. Strings are left exactly as they are.
+fn normalize_fields(value: Value) -> Value {
+    match value {
+        Value::Object(map) => match collapse_record_id(&map) {
+            Some(id) => id,
+            None => Value::Object(map.into_iter().map(|(k, v)| (k, normalize_fields(v))).collect()),
+        },
+        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_fields).collect()),
+        other => other,
+    }
+}
+
+fn normalize_fields_ref(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => match collapse_record_id(map) {
+            Some(id) => id,
+            None => Value::Object(
+                map.iter().map(|(k, v)| (k.clone(), normalize_fields_ref(v))).collect(),
+            ),
+        },
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_fields_ref).collect()),
+        other => other.clone(),
     }
 }
 
@@ -424,6 +443,39 @@ mod normalize_ref_tests {
         assert_same(json!([{ "tb": "user", "id": "abc" }]));
         // A three-key object is NOT a record id.
         assert_same(json!({ "tb": "user", "id": "abc", "extra": 1 }));
+    }
+
+    /// whitepawn's `broadcast.scene` is `TYPE option<string>` holding inline JSON.
+    /// Retyping it into an object here, while the bootstrap and the scheduler
+    /// both keep the string, made every catch-up hash mismatch and took the
+    /// tenant's only SSP out for nine minutes on every restart.
+    #[test]
+    fn a_string_field_holding_json_stays_a_string() {
+        let scene = r#"{"id":"big-board","name":"Board Focus","canvas":{"width":1920,"height":1080}}"#;
+        let row = json!({
+            "id": "broadcast:abc",
+            "scene": scene,
+            "tags": "[1,2,3]",
+            "nested": { "blob": "{\"a\":1}" },
+            "list": ["{\"b\":2}"],
+        });
+        for out in [normalize_record(row.clone()), normalize_record_ref(&row)] {
+            assert_eq!(out["scene"], json!(scene), "a string is the database's to type");
+            assert_eq!(out["tags"], json!("[1,2,3]"));
+            assert_eq!(out["nested"]["blob"], json!("{\"a\":1}"), "at any depth");
+            assert_eq!(out["list"][0], json!("{\"b\":2}"), "and inside arrays");
+        }
+    }
+
+    /// The one place a JSON string IS a record: the legacy bridge hands the whole
+    /// thing over stringified. Record ids inside it still collapse.
+    #[test]
+    fn a_whole_record_arriving_as_a_string_is_still_parsed() {
+        let whole = r#"{"id":"t:1","owner":{"tb":"user","id":"abc"},"scene":"{\"x\":1}"}"#;
+        let out = normalize_record(json!(whole));
+        assert_eq!(out["owner"], json!("user:abc"));
+        assert_eq!(out["scene"], json!("{\"x\":1}"), "but its string fields are not");
+        assert_eq!(out, normalize_record_ref(&json!(whole)));
     }
 
     #[test]

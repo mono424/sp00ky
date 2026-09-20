@@ -233,6 +233,11 @@ describe('readMembership', () => {
     });
     expect(rereadFail.result.failed).toBe(true);
     expect(n).toBe(3);
+    const rereadUnusable = await runPure(readMembership(env, ['a', 'b']), {
+      state: s,
+      handlers: { 'remote.query': (e: any) => (e.sql.includes('IN $ins') ? [ok([]), ok([])] : [ok('x'), ok(null), ok(null)]) },
+    });
+    expect(rereadUnusable.result).toEqual({ changed: false, failed: true });
     const single = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1]] })]);
     const notArray = await runPure(readMembership(env, ['a']), { state: single, handlers: { 'remote.query': () => [ok('x'), ok(null), ok(null)] } });
     expect(notArray.result).toEqual({ changed: false, failed: true });

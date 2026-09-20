@@ -111,6 +111,9 @@ describe('query reducers', () => {
     const reset = R.resetRegisterAttempts('a')(s);
     expect(reset.queries.get('a')!.registerAttempts).toBe(0);
     expect(R.resetRegisterAttempts('a')(reset)).toBe(reset);
+    const lost = R.setViewLost('a', 2, 900)(reset);
+    expect(lost.queries.get('a')).toMatchObject({ viewLostCount: 2, viewLostRetryAt: 900 });
+    expect(R.setViewLost('a', 2, 900)(lost)).toBe(lost);
   });
 
   it('subscribe / unsubscribe track the eviction clock', () => {

@@ -182,7 +182,7 @@ export function* readMembership(
     }
     const batch = snapshotsFromBatch(edges, counts as never, hashById);
     const held = new Map(chunk.map((h) => [h, byHash.get(h)!.remoteArray.length]));
-    const suspect = new Set(suspectHashes(batch, held, Array.isArray(edges) ? edges.length : 0));
+    const suspect = new Set(suspectHashes(batch, held, edges.length));
     for (const [h, snap] of batch) {
       if (suspect.has(h)) rereads.push(byHash.get(h)!);
       else snapshots.set(h, snap);

@@ -53,6 +53,28 @@ pub(crate) const EVENT_HTTP_TIMEOUT_SECS: u64 = 10;
 
 
 /// Generate Sp00ky events for data hashing and graph synchronization
+/// The `in` / `out` lines of a relation table's ingest payload.
+///
+/// An edge's endpoints are implicit: `DEFINE TABLE likes TYPE RELATION IN user
+/// OUT post` declares no `in` or `out` field, so they are not in `table.fields`
+/// and the payload loop below would build an edge with no endpoints. The SSP
+/// bootstrap reads the row whole, endpoints included, so without these the
+/// circuit and the ingest stream would disagree about the row's key set - the
+/// same disagreement the excluded-field skip below is careful to avoid.
+///
+/// Stringified like every other record link. Skipped when the schema declares
+/// the field itself, which the field loop then emits with its own typing.
+fn relation_endpoints(table: &TableSchema, row: &str) -> String {
+    if !table.is_relation {
+        return String::new();
+    }
+    ["in", "out"]
+        .iter()
+        .filter(|end| !table.fields.contains_key(**end))
+        .map(|end| format!("        {end}: <string>({row}.{end} OR \"\"),\n"))
+        .collect()
+}
+
 pub fn generate_sp00ky_events(
     tables: &BTreeMap<String, TableSchema>,
     _raw_content: &str,
@@ -143,11 +165,11 @@ pub fn generate_sp00ky_events(
 
         let table = tables.get(*table_name).unwrap();
 
-        // Skip relation tables that are explicitly marked as such (if we had that metadata easily available)
-        // In the parser, we store is_relation.
-        if table.is_relation {
-            continue;
-        }
+        // `TYPE RELATION` tables get events like any other table. They were
+        // skipped here for years with no stated reason, while the replica clone,
+        // the drift check and the SSP bootstrap all kept carrying them - see
+        // `schema_builder::table_takes_changefeed` for what that did to a live
+        // query over an edge table.
 
         // @nosync tables never sync: emit no events for them, so SurrealDB
         // posts no ingest to the scheduler/SSP.
@@ -184,6 +206,8 @@ pub fn generate_sp00ky_events(
         // --- Ingestion Logic ---
         events.push_str("    LET $plain_after = {\n");
         events.push_str("        id: <string>($after.id OR \"\"),\n");
+
+        events.push_str(&relation_endpoints(table, "$after"));
 
         let mut all_fields: Vec<_> = table.fields.keys().collect();
         all_fields.sort();
@@ -266,6 +290,8 @@ pub fn generate_sp00ky_events(
         // --- Ingestion Logic ---
         events.push_str("    LET $plain_before = {\n");
         events.push_str("        id: <string>($before.id OR \"\"),\n");
+
+        events.push_str(&relation_endpoints(table, "$before"));
 
         let mut all_fields_del: Vec<_> = table.fields.keys().collect();
         all_fields_del.sort();
@@ -641,6 +667,75 @@ DEFINE FIELD body ON TABLE doc TYPE string;
             !out.contains("_00_user_feature_mutation"),
             "client schema must not emit _00_user_feature ingest events"
         );
+    }
+
+    /// A relation table is cloned, drift-checked, bootstrapped into circuits and
+    /// exposed to clients as queryable. It has to be in the ingest stream too, or
+    /// a live query over it returns the bootstrap-time edges and never updates.
+    #[test]
+    fn a_relation_table_gets_events_with_its_endpoints() {
+        use crate::parser::SchemaParser;
+        let schema = r#"
+DEFINE TABLE user SCHEMALESS;
+DEFINE TABLE post SCHEMALESS;
+DEFINE TABLE likes TYPE RELATION IN user OUT post SCHEMAFULL;
+DEFINE FIELD weight ON TABLE likes TYPE int;
+"#;
+        let mut parser = SchemaParser::new();
+        parser.parse_file(schema).unwrap();
+        assert!(parser.tables["likes"].is_relation);
+
+        let out = generate_sp00ky_events(
+            &parser.tables,
+            schema,
+            false,
+            &DeployMode::Singlenode,
+            None,
+            None,
+            SyncTransport::Http,
+        );
+        assert!(out.contains("DEFINE EVENT OVERWRITE _00_likes_mutation ON TABLE likes"), "{out}");
+        assert!(out.contains("DEFINE EVENT OVERWRITE _00_likes_delete ON TABLE likes"), "{out}");
+
+        // `in`/`out` are implicit on an edge, so they are not in `table.fields`;
+        // without them the payload is an edge with no endpoints, and the circuit
+        // (which bootstraps the row whole) disagrees with the stream about it.
+        let mutation = out.split("_00_likes_mutation").nth(1).unwrap();
+        let mutation = mutation.split("_00_likes_delete").next().unwrap();
+        assert!(mutation.contains(r#"in: <string>($after.in OR ""),"#), "{mutation}");
+        assert!(mutation.contains(r#"out: <string>($after.out OR ""),"#), "{mutation}");
+        assert!(mutation.contains("weight: $after.weight,"), "declared fields still ride along");
+
+        let delete = out.split("_00_likes_delete").nth(1).unwrap();
+        assert!(delete.contains(r#"in: <string>($before.in OR ""),"#), "{delete}");
+
+        // A plain table gets no invented endpoints.
+        let user = out.split("_00_user_mutation").nth(1).unwrap();
+        let user = user.split("_00_user_delete").next().unwrap();
+        assert!(!user.contains("$after.in"), "{user}");
+
+        // And what is generated has to be SurrealQL the server will accept: one
+        // bad statement fails the whole internal-schema batch.
+        if let Err(e) = surrealdb_core::syn::parse_with_capabilities(
+            &out,
+            &surrealdb_core::dbs::Capabilities::all(),
+        ) {
+            panic!("generated relation events do not parse: {e}");
+        }
+    }
+
+    #[test]
+    fn a_nosync_relation_table_still_emits_nothing() {
+        use crate::parser::SchemaParser;
+        let schema = "DEFINE TABLE a SCHEMALESS;\nDEFINE TABLE b SCHEMALESS;\n-- @nosync\nDEFINE TABLE audit_edge TYPE RELATION IN a OUT b;\n";
+        let mut parser = SchemaParser::new();
+        parser.parse_file(schema).unwrap();
+        let out = generate_sp00ky_events(
+            &parser.tables, schema, false, &DeployMode::Singlenode, None, None, SyncTransport::Http,
+        );
+        assert!(!out.contains("ON TABLE audit_edge"), "@nosync wins over being a relation: {out}");
+        assert!(!crate::schema_builder::table_takes_changefeed("audit_edge", true, true));
+        assert!(crate::schema_builder::table_takes_changefeed("likes", true, false));
     }
 
     #[test]

@@ -631,12 +631,27 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
 ];
 
 /// Whether a table takes a `CHANGEFEED` clause: every user table that syncs
-/// (not `@nosync`, not a relation) plus the meta tables above.
-pub fn table_takes_changefeed(table: &str, is_relation: bool, no_sync: bool) -> bool {
+/// (not `@nosync`) plus the meta tables above.
+///
+/// `TYPE RELATION` tables are included. They used to be excluded here, and from
+/// the ingest events, by a rule nobody wrote a reason for - while the OTHER half
+/// of the system kept including them: `Replica::discover_sync_tables` clones and
+/// drift-checks every table that is not `@nosync`, the SSP bootstrap loads them
+/// into its circuits, and the generated client schema exposes them as queryable
+/// tables. So a live query over a relation table registered fine, returned the
+/// edges that existed at bootstrap, and then never updated: a new edge reached
+/// the replica only when drift repair noticed the count was off, minutes later,
+/// and was logged as an incident each time. Same asymmetry as the `@nosync`
+/// marker bug, from the other side.
+///
+/// `_is_relation` stays in the signature because the question "does this kind of
+/// table sync?" is asked in three places that must agree, and a reader at any of
+/// them should see that relations were considered, not forgotten.
+pub fn table_takes_changefeed(table: &str, _is_relation: bool, no_sync: bool) -> bool {
     if table.starts_with("_00_") {
         return CHANGEFEED_META_TABLES.contains(&table);
     }
-    !is_relation && !no_sync
+    !no_sync
 }
 
 /// Is `s` a duration in the form SurrealDB renders (`1d`, `12h`, `1d12h`,
@@ -1482,7 +1497,10 @@ mod changefeed_clause_tests {
         assert!(out.contains("DEFINE TABLE secrets SCHEMALESS;"), "nosync untouched");
         assert!(out.contains("DEFINE TABLE game SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FOR select WHERE true;"), "{out}");
         assert!(out.contains("DEFINE TABLE plain SCHEMALESS COMMENT 'x' CHANGEFEED 1d INCLUDE ORIGINAL;"), "{out}");
-        assert!(out.contains("DEFINE TABLE edge TYPE RELATION IN a OUT b;"), "relations untouched");
+        assert!(
+            out.contains("DEFINE TABLE edge TYPE RELATION IN a OUT b CHANGEFEED 1d INCLUDE ORIGINAL;"),
+            "a relation table syncs, so it takes the clause like any other: {out}"
+        );
         assert!(out.contains("DEFINE TABLE _00_list_ref SCHEMALESS;"), "edges tables untouched");
         assert!(out.contains("DEFINE TABLE OVERWRITE _00_version SCHEMALESS CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FULL;"), "{out}");
         // Idempotent.

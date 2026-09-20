@@ -179,6 +179,16 @@ reader of the setting. The scheduler/SSP get `SPKY_INGEST_TRANSPORT` through
 `deployment.env` (cloud) or the dev launch specs. Retention must be in
 SurrealDB's rendered form (`1d`, not `24h`): `valid_changefeed_retention`.
 
+"Synced" means every user table that is not `@nosync`, **including `TYPE RELATION`
+tables**: `schema_builder::table_takes_changefeed` is the one predicate, and it has
+to agree with `Replica::discover_sync_tables`, which clones and drift-checks every
+table that does not carry the `sp00ky:nosync` marker. Relations used to be left out
+of the events and the feed while staying in the replica and the SSP bootstrap, so a
+live query over an edge table never updated. An edge's `in`/`out` are implicit (not
+in `table.fields`), so `sp00ky::relation_endpoints` adds them to the ingest payload.
+The same marker is re-asserted next to the changefeed ALTER
+(`schema_builder::nosync_alter_statements`), for the same reason.
+
 ## Common gotchas
 
 - **`schema.gen.ts` must be regenerated after every `.surql` change.** `spky generate`. CI typically asserts no drift.

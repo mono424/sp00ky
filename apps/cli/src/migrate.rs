@@ -986,6 +986,27 @@ pub fn apply_internal_schema(
         ));
     }
 
+    // 3b". The `sp00ky:nosync` marker on every server-only table, for the
+    // same reason as the CHANGEFEED clause above and by the same means: a
+    // user migration's `DEFINE TABLE OVERWRITE` drops a COMMENT exactly as it
+    // drops a CHANGEFEED clause. The clause and the marker are the two halves
+    // of `@nosync` and different sides read them - the tail skips a table
+    // that has no changefeed, while the drift detector and the replica clone
+    // skip a table that carries the marker. Re-assert only one of them and a
+    // server-only table rejoins the replica set with no feed that could ever
+    // converge it, so drift repairs its rows back in through the ingest
+    // pipeline every cycle, forever. Runs under both transports: the marker
+    // governs snapshot/bootstrap, not the feed.
+    let nosync_alters = crate::schema_builder::nosync_alter_statements(&content);
+    if !nosync_alters.is_empty() {
+        ui::detail(format!(
+            "@nosync marker on {} table(s)",
+            nosync_alters.lines().filter(|l| !l.trim().is_empty()).count()
+        ));
+        internal_sql.push('\n');
+        internal_sql.push_str(&nosync_alters);
+    }
+
     // 3c. Platform job fields on outbox tables. The SSP stamps `assignee`
     // when it claims a job on pickup/recover; a SCHEMAFULL user outbox table
     // without the field rejects the stamp and the recovery sweep can then

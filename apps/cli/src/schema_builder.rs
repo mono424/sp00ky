@@ -573,11 +573,7 @@ pub fn rewrite_crdt_cursor_fields(content: &str) -> String {
 /// If a table already carries a `COMMENT`, the marker token is merged into the
 /// existing comment text rather than emitting a second (invalid) COMMENT clause.
 pub fn add_nosync_markers(content: &str, source: &str) -> String {
-    let nosync: std::collections::HashSet<String> = annotations::extract_table_annotations(source)
-        .into_iter()
-        .filter(|(_, anns)| anns.iter().any(|a| a.name == "nosync"))
-        .map(|(t, _)| t)
-        .collect();
+    let nosync = nosync_tables(source);
     if nosync.is_empty() {
         return content.to_string();
     }
@@ -660,11 +656,7 @@ pub fn valid_changefeed_retention(s: &str) -> bool {
 /// else before the terminating `;`. A statement that already carries a
 /// CHANGEFEED clause is left alone.
 pub fn add_changefeed_clauses(content: &str, source: &str, retention: &str) -> String {
-    let nosync: std::collections::HashSet<String> = annotations::extract_table_annotations(source)
-        .into_iter()
-        .filter(|(_, anns)| anns.iter().any(|a| a.name == "nosync"))
-        .map(|(t, _)| t)
-        .collect();
+    let nosync = nosync_tables(source);
     let define_table_re =
         Regex::new(r"(?i)^\s*DEFINE\s+TABLE\s+(?:OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?(\w+)")
             .expect("static regex");
@@ -731,6 +723,86 @@ pub fn changefeed_alter_statements<'a>(tables: impl Iterator<Item = &'a str>, re
             "ALTER TABLE IF EXISTS {} CHANGEFEED {} INCLUDE ORIGINAL;\n",
             table,
             retention.trim()
+        ));
+    }
+    out
+}
+
+/// The set of tables marked `-- @nosync` in `source`. One reader for the
+/// annotation, so the deploy-time decisions that depend on it (the CHANGEFEED
+/// clause, the `sp00ky:nosync` marker, and the ALTER that re-asserts it) can
+/// never drift apart.
+pub fn nosync_tables(source: &str) -> std::collections::HashSet<String> {
+    annotations::extract_table_annotations(source)
+        .into_iter()
+        .filter(|(_, anns)| anns.iter().any(|a| a.name == "nosync"))
+        .map(|(t, _)| t)
+        .collect()
+}
+
+/// `ALTER TABLE IF EXISTS <t> COMMENT '...'` for every `-- @nosync` table in
+/// `source`. The mirror of [`changefeed_alter_statements`], and for the same
+/// reason: `DEFINE TABLE OVERWRITE` in a user migration drops a COMMENT just
+/// as it drops a CHANGEFEED clause, so both need re-asserting after every
+/// migration batch.
+///
+/// Without this the two halves of `@nosync` disagree. The CHANGEFEED clause is
+/// decided from the source annotation, so the tail correctly skips the table;
+/// but `Replica::discover_sync_tables` filters on the marker read back from
+/// `INFO FOR DB`, so a table that lost its marker rejoins the replica set with
+/// no feed that could ever converge it. Drift then sees `replica=0,
+/// upstream>0`, repairs the rows in through the ingest pipeline, and repeats
+/// forever — which is how server-only tables ended up fanned out to the SSPs.
+///
+/// The comment text comes from [`add_nosync_markers`] rather than being
+/// written here, so an ALTER can never disagree with the desired schema: a
+/// table carrying its own COMMENT keeps it with the marker merged in, and
+/// `schema_diff` stays quiet instead of reporting a phantom change forever.
+pub fn nosync_alter_statements(source: &str) -> String {
+    let nosync = nosync_tables(source);
+    if nosync.is_empty() {
+        return String::new();
+    }
+    let marked = add_nosync_markers(source, source);
+    let define_table_re =
+        Regex::new(r"(?i)^\s*DEFINE\s+TABLE\s+(?:OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?(\w+)")
+            .expect("static regex");
+    let comment_re = Regex::new(r#"(?is)COMMENT\s+(['"])(.*?)['"]"#).expect("static regex");
+
+    let lines: Vec<&str> = marked.lines().collect();
+    let mut out = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(caps) = define_table_re.captures(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let table = caps[1].to_string();
+        // Accumulate the (possibly multi-line) statement up to its `;`.
+        let mut stmt = String::new();
+        while i < lines.len() {
+            stmt.push_str(lines[i]);
+            stmt.push('\n');
+            let done = lines[i].contains(';');
+            i += 1;
+            if done {
+                break;
+            }
+        }
+        if !nosync.contains(&table) || !seen.insert(table.clone()) {
+            continue;
+        }
+        // `add_nosync_markers` guarantees a COMMENT on every nosync table; the
+        // fallback keeps this total rather than silently dropping a table.
+        let comment = comment_re
+            .captures(&stmt)
+            .map(|c| c[2].to_string())
+            .unwrap_or_else(|| ssp_protocol::NOSYNC_TABLE_COMMENT.to_string());
+        out.push_str(&format!(
+            "ALTER TABLE IF EXISTS {} COMMENT '{}';\n",
+            table,
+            comment.replace('\'', "\\'")
         ));
     }
     out
@@ -980,6 +1052,53 @@ mod tests {
         let twice = add_nosync_markers(&once, src);
         assert_eq!(once, twice);
         assert_eq!(once.matches("sp00ky:nosync").count(), 1);
+    }
+
+    #[test]
+    fn nosync_alter_reasserts_only_marked_tables() {
+        let src = "-- @nosync\nDEFINE TABLE secrets SCHEMALESS PERMISSIONS NONE;\nDEFINE TABLE public SCHEMALESS;\n";
+        let out = nosync_alter_statements(src);
+        assert_eq!(
+            out, "ALTER TABLE IF EXISTS secrets COMMENT 'sp00ky:nosync';\n",
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn nosync_alter_preserves_a_user_comment() {
+        // An ALTER SETS the comment, so it must carry the merged text the
+        // desired schema has. Anything else clobbers the user's comment and
+        // makes schema_diff report a phantom change on every deploy.
+        let src = "-- @nosync\nDEFINE TABLE secrets SCHEMALESS COMMENT 'sensitive';\n";
+        let alter = nosync_alter_statements(src);
+        let marked = add_nosync_markers(src, src);
+        let want = marked
+            .split("COMMENT '")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        assert!(want.contains("sensitive") && want.contains("sp00ky:nosync"));
+        assert_eq!(
+            alter,
+            format!("ALTER TABLE IF EXISTS secrets COMMENT '{want}';\n")
+        );
+    }
+
+    #[test]
+    fn nosync_alter_survives_a_multiline_define() {
+        let src = "-- @nosync\nDEFINE TABLE secrets SCHEMAFULL\n  PERMISSIONS\n    FOR select WHERE false\n;\n";
+        assert_eq!(
+            nosync_alter_statements(src),
+            "ALTER TABLE IF EXISTS secrets COMMENT 'sp00ky:nosync';\n"
+        );
+    }
+
+    #[test]
+    fn nosync_alter_is_empty_when_nothing_marked() {
+        let src = "DEFINE TABLE a SCHEMALESS;\nDEFINE TABLE b SCHEMALESS;\n";
+        assert_eq!(nosync_alter_statements(src), "");
     }
 
     #[test]

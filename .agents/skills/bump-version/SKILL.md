@@ -30,8 +30,10 @@ Bump the canary version number across all `package.json`, `Cargo.toml`, and mani
    for manifest in apps/ssp/Cargo.toml apps/scheduler/Cargo.toml; do
      grep -q "^version = \"$V\"$" "$manifest" || { echo "BAD: $manifest not at $V"; exit 1; }
    done
+   # A plain pipe, not `grep -q ... <(grep ...)`: process substitution
+   # false-negatives where `grep` is aliased to ugrep, which reads as a bad lock.
    for crate in ssp-server scheduler; do
-     grep -q "^version = \"$V\"$" <(grep -A1 "^name = \"$crate\"\$" Cargo.lock) \
+     grep -A1 "^name = \"$crate\"\$" Cargo.lock | grep -q "^version = \"$V\"$" \
        || { echo "BAD: root Cargo.lock has $crate at another version — re-run cargo check"; exit 1; }
    done
    echo "OK: ssp-server + scheduler pinned to $V in Cargo.toml and the root Cargo.lock"

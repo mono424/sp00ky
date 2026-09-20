@@ -56,10 +56,9 @@ pub fn run(action: FlagCommands) -> Result<()> {
             for_user,
             rollout,
             sql,
-            yes,
             conn,
             config,
-        } => set_rule(key, variant, for_user, rollout, sql, yes, conn, config),
+        } => set_rule(key, variant, for_user, rollout, sql, conn, config),
         FlagCommands::Unset {
             key,
             for_user,
@@ -330,7 +329,6 @@ fn set_rule(
     for_user: Option<String>,
     rollout: Option<u32>,
     sql: Option<String>,
-    yes: bool,
     conn: ConnectionArgs,
     config: Option<PathBuf>,
 ) -> Result<()> {
@@ -397,7 +395,7 @@ fn set_rule(
             return Ok(());
         }
         preview_ids(&ids, &variant, &key);
-        if !yes && !confirm_apply(ids.len())? {
+        if !crate::ui::consent(&format!("Apply to all {} user(s)?", ids.len()))? {
             println!("{}Aborted; no changes written.{}", YELLOW, RESET);
             return Ok(());
         }
@@ -480,23 +478,6 @@ fn preview_ids(ids: &[String], variant: &str, key: &str) {
     if ids.len() > MAX {
         println!("  {}... and {} more{}", DIM, ids.len() - MAX, RESET);
     }
-}
-
-/// Confirm a bulk apply. In non-interactive runs there is no prompt to answer,
-/// so require `--yes` rather than silently applying to everyone.
-fn confirm_apply(n: usize) -> Result<bool> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        bail!(
-            "Refusing to assign {} user(s) without confirmation; pass --yes to apply in a non-interactive run.",
-            n
-        );
-    }
-    Ok(
-        inquire::Confirm::new(&format!("Apply to all {} user(s)?", n))
-            .with_default(false)
-            .prompt()
-            .unwrap_or(false),
-    )
 }
 
 fn unset_rule(

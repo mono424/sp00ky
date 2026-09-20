@@ -482,9 +482,7 @@ pub fn create_project() -> Result<()> {
     // --- Create root directory ---
     let root_path = Path::new(&project_name);
     if root_path.exists() {
-        if !inquire::Confirm::new("Directory already exists. Overwrite?")
-            .with_default(false)
-            .prompt()?
+        if !crate::ui::consent("Directory already exists. Overwrite?")?
         {
             println!("Aborting.");
             return Ok(());
@@ -510,10 +508,7 @@ pub fn create_project() -> Result<()> {
     );
 
     // --- Optional: git init ---
-    let do_git = inquire::Confirm::new("Initialize git repository?")
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
+    let do_git = crate::ui::prefer("Initialize git repository?", true).unwrap_or(false);
 
     if do_git {
         let git_result = Command::new("git")
@@ -542,10 +537,7 @@ pub fn create_project() -> Result<()> {
 
     // --- Optional: install dependencies ---
     let pm_cmd = pm.cmd();
-    let do_install = inquire::Confirm::new(&format!("Install dependencies with {}?", pm_cmd))
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
+    let do_install = crate::ui::prefer(&format!("Install dependencies with {}?", pm_cmd), true).unwrap_or(false);
 
     let mut installed_ok = false;
     if do_install {

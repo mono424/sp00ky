@@ -548,8 +548,14 @@ fn resolve_project_slug() -> Result<String> {
 // Flow helpers — composable building blocks for guided CLI flows
 // ---------------------------------------------------------------------------
 
+/// Whether there is a person to talk to. `--yes` says there is not, even on a
+/// terminal: the guided flows below lead into project pickers, passphrase
+/// prompts and browser logins that no flag can answer, and each already has an
+/// unattended branch that fails with the exact command or env var to use
+/// instead. Without this an agent on a pseudo-terminal walked into a picker and
+/// hung there.
 fn is_interactive() -> bool {
-    std::io::stdin().is_terminal()
+    std::io::stdin().is_terminal() && !crate::ui::assume_yes()
 }
 
 /// Fetch a project by slug. Returns None if not found.
@@ -597,10 +603,7 @@ fn ensure_login() -> Result<Credentials> {
     }
 
     println!("You're not logged in to Sp00ky Cloud.");
-    let do_login = inquire::Confirm::new("Log in now?")
-        .with_default(true)
-        .prompt()
-        .context("Failed to read confirmation")?;
+    let do_login = crate::ui::prefer("Log in now?", true)?;
 
     if !do_login {
         bail!("Login required. Run `spky login` to authenticate.");
@@ -642,10 +645,7 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
                     "Project '{}' (from sp00ky.yml) not found in Sp00ky Cloud.",
                     slug
                 );
-                let do_create = inquire::Confirm::new(&format!("Create project '{}'?", slug))
-                    .with_default(true)
-                    .prompt()
-                    .context("Failed to read confirmation")?;
+                let do_create = crate::ui::prefer(&format!("Create project '{}'?", slug), true)?;
                 if do_create {
                     return create_project_inline(client, Some(slug));
                 }
@@ -667,10 +667,7 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
 
     if active_projects.is_empty() {
         println!("No cloud projects found.");
-        let do_create = inquire::Confirm::new("Create a new project?")
-            .with_default(true)
-            .prompt()
-            .context("Failed to read confirmation")?;
+        let do_create = crate::ui::prefer("Create a new project?", true)?;
         if do_create {
             return create_project_inline(client, None);
         }
@@ -795,10 +792,7 @@ fn ensure_billing_active(
 
             println!();
             println!("  Billing is not set up for '{}'.", slug);
-            let do_billing = inquire::Confirm::new("Set up billing now?")
-                .with_default(true)
-                .prompt()
-                .context("Failed to read confirmation")?;
+            let do_billing = crate::ui::prefer("Set up billing now?", true)?;
 
             if !do_billing {
                 bail!("Billing required before deploying. Run `spky billing` when ready.");
@@ -1128,10 +1122,7 @@ pub fn create(slug: Option<String>, plan: String) -> Result<()> {
 
     if is_interactive() {
         println!();
-        let setup_billing = inquire::Confirm::new("Set up billing now?")
-            .with_default(true)
-            .prompt()
-            .context("Failed to read confirmation")?;
+        let setup_billing = crate::ui::prefer("Set up billing now?", true)?;
         if setup_billing {
             wait_for_billing(&mut client, &slug)?;
             println!();
@@ -5163,7 +5154,6 @@ fn cloud_supports_restart_targets(client: &mut CloudClient) -> bool {
 pub fn restart(
     targets: Vec<String>,
     all_backends: bool,
-    yes: bool,
     clean: bool,
     upgrade: bool,
     surreal: bool,
@@ -5248,19 +5238,14 @@ pub fn restart(
     // Restarting SurrealDB takes the whole deployment offline for a few
     // seconds, so confirm before pulling the trigger. A single backend does
     // not warrant a prompt — that is the whole point of naming one.
-    if roles.contains("surrealdb") && !yes {
-        let confirmed = inquire::Confirm::new(&format!(
+    if roles.contains("surrealdb")
+        && !crate::ui::consent(&format!(
             "Restart SurrealDB for '{}'? The deployment will be briefly unavailable (data is preserved).",
             slug
-        ))
-        .with_default(false)
-        .prompt()
-        .context("Failed to read confirmation")?;
-
-        if !confirmed {
-            println!("Cancelled.");
-            return Ok(());
-        }
+        ))?
+    {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     // Roles and apps are additive, so the summary is simply both lists. Empty
@@ -5306,18 +5291,16 @@ pub fn restart(
     Ok(())
 }
 
-pub fn destroy() -> Result<()> {
+pub fn destroy(confirm: Option<String>) -> Result<()> {
     let creds = require_credentials()?;
     let mut client = CloudClient::new(&creds);
     let (slug, pid) = resolve_project_id(&mut client)?;
 
-    let confirmed = inquire::Confirm::new(&format!(
-        "Are you sure you want to destroy project '{}'? This cannot be undone.",
-        slug
-    ))
-    .with_default(false)
-    .prompt()
-    .context("Failed to read confirmation")?;
+    let confirmed = crate::ui::consent_naming(
+        &format!("Destroy project '{slug}'? This cannot be undone."),
+        &slug,
+        confirm.as_deref(),
+    )?;
 
     if !confirmed {
         println!("Cancelled.");
@@ -5437,7 +5420,7 @@ fn is_uuid(s: &str) -> bool {
 pub fn backup(action: CloudBackupCommands) -> Result<()> {
     let creds = require_credentials()?;
     let mut client = CloudClient::new(&creds);
-    let (_slug, pid) = resolve_project_id(&mut client)?;
+    let (slug, pid) = resolve_project_id(&mut client)?;
 
     match action {
         CloudBackupCommands::List => {
@@ -5660,7 +5643,7 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
             client.post(&format!("/v1/projects/{}/backups/configure", pid), &body)?;
             println!("  Backup configuration updated.");
         }
-        CloudBackupCommands::Reset { no_backup } => {
+        CloudBackupCommands::Reset { no_backup, confirm } => {
             println!();
             println!("  ╔══════════════════════════════════════════════════════╗");
             println!("  ║  ⚠️  WARNING: DATABASE RESET                        ║");
@@ -5673,23 +5656,22 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
             println!("  ╚══════════════════════════════════════════════════════╝");
             println!();
 
-            let confirmed =
-                inquire::Confirm::new("Are you absolutely sure you want to reset the database?")
-                    .with_default(false)
-                    .prompt()
-                    .context("Failed to read confirmation")?;
+            let confirmed = crate::ui::consent_naming(
+                &format!("Reset the database of '{slug}'? Every record will be deleted."),
+                &slug,
+                confirm.as_deref(),
+            )?;
 
             if !confirmed {
                 println!("  Cancelled.");
                 return Ok(());
             }
 
-            // Offer to create a backup first
+            // Offer to create a backup first. A preference, and its default is
+            // yes: an unattended reset still takes its backup unless told
+            // `--no-backup` in so many words.
             if !no_backup {
-                let backup_first = inquire::Confirm::new("Create a backup before resetting?")
-                    .with_default(true)
-                    .prompt()
-                    .context("Failed to read confirmation")?;
+                let backup_first = crate::ui::prefer("Create a backup before resetting?", true)?;
 
                 if backup_first {
                     println!("  Creating backup before reset...");
@@ -5889,13 +5871,8 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
                     println!("  Already on the free plan.");
                     return Ok(());
                 }
-                let confirm = inquire::Confirm::new(
-                    "Downgrade to Free? This cancels your subscription and tears down \
-                     the current deployment. You then run `spky deploy` to publish on Cloudflare.",
-                )
-                .with_default(false)
-                .prompt()
-                .context("Failed to read confirmation")?;
+                let confirm = crate::ui::consent("Downgrade to Free? This cancels your subscription and tears down \
+                     the current deployment. You then run `spky deploy` to publish on Cloudflare.")?;
                 if !confirm {
                     println!("  Cancelled.");
                     return Ok(());
@@ -5938,13 +5915,10 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
                 return Ok(());
             }
 
-            let confirm = inquire::Confirm::new(&format!(
+            let confirm = crate::ui::consent(&format!(
                 "Switch to {} ({})? Stripe will handle proration.",
                 new_plan, new_interval,
-            ))
-            .with_default(true)
-            .prompt()
-            .context("Failed to read confirmation")?;
+            ))?;
 
             if !confirm {
                 println!("  Cancelled.");
@@ -6150,13 +6124,10 @@ pub fn team(action: CloudTeamCommands) -> Result<()> {
             let member_id = member["id"].as_str().context("No member ID")?;
 
             if is_interactive() {
-                let confirm = inquire::Confirm::new(&format!(
+                let confirm = crate::ui::consent(&format!(
                     "Remove {} from the team? This revokes all access immediately.",
                     email,
-                ))
-                .with_default(false)
-                .prompt()
-                .context("Failed to read confirmation")?;
+                ))?;
 
                 if !confirm {
                     println!("  Cancelled.");
@@ -6310,10 +6281,7 @@ fn vault(action: CloudVaultCommands) -> Result<()> {
                 save_cached_derived_key(&dk)?;
                 println!("  Cached derived key updated.");
             } else if is_interactive() {
-                let cache = inquire::Confirm::new("Cache derived key locally in ~/.sp00ky/?")
-                    .with_default(true)
-                    .prompt()
-                    .unwrap_or(false);
+                let cache = crate::ui::prefer("Cache derived key locally in ~/.sp00ky/?", true).unwrap_or(false);
                 if cache {
                     save_cached_derived_key(&dk)?;
                 }
@@ -7034,10 +7002,7 @@ fn link_setup() -> Result<()> {
 
                 // Offer to deploy now
                 if is_interactive() {
-                    let deploy_now = inquire::Confirm::new("Deploy now?")
-                        .with_default(true)
-                        .prompt()
-                        .unwrap_or(false);
+                    let deploy_now = crate::ui::prefer("Deploy now?", true).unwrap_or(false);
 
                     if deploy_now {
                         let resp = client.post(
@@ -7095,10 +7060,7 @@ fn link_setup() -> Result<()> {
 
                     // Offer to deploy
                     if is_interactive() {
-                        let deploy_now = inquire::Confirm::new("Deploy now?")
-                            .with_default(true)
-                            .prompt()
-                            .unwrap_or(false);
+                        let deploy_now = crate::ui::prefer("Deploy now?", true).unwrap_or(false);
 
                         if deploy_now {
                             let resp = client.post(
@@ -7233,10 +7195,7 @@ fn link_settings(
                 .prompt()
                 .context("Failed to read manifest path")?;
 
-            let new_auto = inquire::Confirm::new("Auto-deploy on push?")
-                .with_default(current_auto)
-                .prompt()
-                .context("Failed to read auto-deploy setting")?;
+            let new_auto = crate::ui::prefer("Auto-deploy on push?", current_auto)?;
 
             (Some(new_branch), Some(new_auto), Some(new_config))
         } else {
@@ -7281,19 +7240,14 @@ fn link_unlink() -> Result<()> {
     let mut client = CloudClient::new(&creds);
     let (slug, pid) = resolve_project_id(&mut client)?;
 
-    if is_interactive() {
-        let confirm = inquire::Confirm::new(&format!(
-            "Unlink project '{}'? This will stop automated deployments.",
-            slug
-        ))
-        .with_default(false)
-        .prompt()
-        .context("Failed to read confirmation")?;
-
-        if !confirm {
-            println!("Cancelled.");
-            return Ok(());
-        }
+    // No `is_interactive()` guard: it made a script unlink with no confirmation
+    // at all. `consent` asks a person, takes --yes, and refuses otherwise.
+    if !crate::ui::consent(&format!(
+        "Unlink project '{}'? This will stop automated deployments.",
+        slug
+    ))? {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     client.delete(&format!("/v1/projects/{}/link", pid))?;
@@ -7468,11 +7422,7 @@ fn get_derived_key(client: &mut CloudClient) -> Result<String> {
     let dk = derive_key(&pp, &salt)?;
 
     if is_interactive() {
-        let cache = inquire::Confirm::new("Cache derived key locally in ~/.sp00ky/?")
-            .with_default(true)
-            .with_help_message("Saves to ~/.sp00ky/vault-derived-key so you don't need to enter your passphrase every time")
-            .prompt()
-            .unwrap_or(false);
+        let cache = crate::ui::prefer("Cache derived key locally in ~/.sp00ky/?", true).unwrap_or(false);
         if cache {
             save_cached_derived_key(&dk)?;
         }
@@ -7524,10 +7474,7 @@ fn ensure_vault(client: &mut CloudClient) -> Result<()> {
     )?;
     println!("Vault initialized.");
 
-    let cache = inquire::Confirm::new("Cache derived key locally in ~/.sp00ky/?")
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
+    let cache = crate::ui::prefer("Cache derived key locally in ~/.sp00ky/?", true).unwrap_or(false);
     if cache {
         save_cached_derived_key(&dk)?;
     }
@@ -7579,11 +7526,7 @@ fn env_init() -> Result<()> {
     )?;
     println!("Vault initialized successfully.");
 
-    let cache = inquire::Confirm::new("Cache derived key locally in ~/.sp00ky/?")
-        .with_default(true)
-        .with_help_message("So you don't need to enter it every time you load env variables")
-        .prompt()
-        .unwrap_or(false);
+    let cache = crate::ui::prefer("Cache derived key locally in ~/.sp00ky/?", true).unwrap_or(false);
     if cache {
         save_cached_derived_key(&dk)?;
         println!("Derived key cached at ~/.sp00ky/vault-derived-key");
@@ -7778,14 +7721,11 @@ fn env_import(file: String) -> Result<()> {
     .prompt()
     .context("Failed to read environment choice")?;
 
-    let confirm = inquire::Confirm::new(&format!(
+    let confirm = crate::ui::consent(&format!(
         "Import {} variables to project '{}'?",
         pairs.len(),
         slug
-    ))
-    .with_default(true)
-    .prompt()
-    .unwrap_or(false);
+    ))?;
 
     if !confirm {
         println!("Import cancelled.");

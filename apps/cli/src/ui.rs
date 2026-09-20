@@ -93,6 +93,136 @@ fn is_silenced() -> bool {
     SILENCE_DEPTH.with(|d| d.get() > 0)
 }
 
+// ── Confirmation ────────────────────────────────────────────────────────────
+//
+// Every yes/no question the CLI asks goes through here, so that one flag
+// (`-y/--yes`, or `SPKY_YES=1`) answers all of them the same way.
+//
+// There used to be 32 separate `inquire::Confirm` calls and four per-command
+// `--yes` flags, each with its own idea of what to do without a terminal: some
+// hung, some failed with "Failed to read confirmation", and two - the PRODUCTION
+// migration gate among them - silently skipped the question and proceeded. An
+// agent driving the CLI hit the worst of both: a pseudo-terminal makes
+// `is_terminal()` true, so the prompt renders and then waits forever for a
+// keypress nothing can send.
+//
+// The two kinds of question need different answers, which is why there are two
+// functions rather than one flag meaning "yes to everything":
+//
+// - [`consent`]: "may I do this consequential thing?" `--yes` means yes.
+// - [`prefer`]: "which way do you want it?" `--yes` means the DEFAULT, because
+//   answering yes to "Set up billing now?" is a decision, not a confirmation.
+//
+// Two operations are NOT covered by `--yes` at all: see [`consent_naming`].
+
+static ASSUME_YES: AtomicBool = AtomicBool::new(false);
+
+/// Record the global `-y/--yes` flag. Called once from `main`.
+pub fn set_assume_yes(yes: bool) {
+    ASSUME_YES.store(yes, Ordering::Relaxed);
+}
+
+/// Whether confirmations are pre-answered: `-y/--yes`, or `SPKY_YES` set to
+/// anything but `0`/`false`/empty (so CI can turn it on without editing commands).
+pub fn assume_yes() -> bool {
+    ASSUME_YES.load(Ordering::Relaxed)
+        || std::env::var("SPKY_YES")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"))
+            .unwrap_or(false)
+}
+
+fn stdin_is_terminal() -> bool {
+    std::io::stdin().is_terminal()
+}
+
+/// Whether nobody is there to answer: no terminal on stdin, or `--yes`.
+///
+/// For the prompts that offer a CHOICE rather than a yes/no (`spky dev` asking
+/// what to do about schema drift or pending migrations). Each of those already
+/// has an unattended path for a piped stdin; `--yes` takes the same one, so a
+/// pseudo-terminal - which makes `is_terminal()` true - no longer lands an agent
+/// on a menu it cannot operate.
+pub fn is_unattended() -> bool {
+    !stdin_is_terminal() || assume_yes()
+}
+
+/// Ask permission for something consequential. Defaults to No.
+///
+/// - `--yes`: answers yes, and says so, so a log shows what was agreed to.
+/// - a terminal: asks.
+/// - neither: **refuses**, naming the flag. Proceeding unasked is how a
+///   production migration ran without anyone approving it; hanging or a bare
+///   "Failed to read confirmation" is how everything else failed.
+pub fn consent(prompt: &str) -> anyhow::Result<bool> {
+    decide(prompt, false, true, assume_yes(), stdin_is_terminal())
+}
+
+/// Ask a yes/no preference that has a sensible default.
+///
+/// `--yes` and a missing terminal both take `default`: neither is a reason to
+/// stop, and neither is licence to pick the non-default on the user's behalf.
+pub fn prefer(prompt: &str, default: bool) -> anyhow::Result<bool> {
+    decide(prompt, default, false, assume_yes(), stdin_is_terminal())
+}
+
+/// Ask permission for something IRREVERSIBLE, by making the caller name it.
+///
+/// `--yes` deliberately does not cover these. It is the flag an agent adds to
+/// every command so nothing blocks, which makes it exactly the wrong thing to
+/// arm "destroy this project" or "wipe this database" with. The caller has to
+/// pass `--confirm <name>` and get the name right, which cannot happen by reflex.
+/// A person at a terminal is still simply asked.
+pub fn consent_naming(prompt: &str, target: &str, confirmed: Option<&str>) -> anyhow::Result<bool> {
+    match confirmed {
+        Some(named) if named == target => {
+            note_auto_answer(prompt, &format!("yes (--confirm {target})"));
+            Ok(true)
+        }
+        Some(named) => anyhow::bail!(
+            "--confirm {named} does not match '{target}'. Nothing was changed."
+        ),
+        None if stdin_is_terminal() && !assume_yes() => decide(prompt, false, true, false, true),
+        None => anyhow::bail!(
+            "{prompt}\n  This cannot be undone, so --yes does not cover it. \
+             Re-run with `--confirm {target}` to go ahead."
+        ),
+    }
+}
+
+/// The decision table, split from the prompt so it can be tested without a terminal.
+fn decide(
+    prompt: &str,
+    default: bool,
+    is_consent: bool,
+    yes: bool,
+    terminal: bool,
+) -> anyhow::Result<bool> {
+    if yes {
+        let answer = if is_consent { true } else { default };
+        note_auto_answer(prompt, if answer { "yes (--yes)" } else { "no (--yes, default)" });
+        return Ok(answer);
+    }
+    if !terminal {
+        if is_consent {
+            anyhow::bail!(
+                "{prompt}\n  No terminal to ask on. Re-run with `-y/--yes` (or SPKY_YES=1) to confirm."
+            );
+        }
+        note_auto_answer(prompt, if default { "yes (default)" } else { "no (default)" });
+        return Ok(default);
+    }
+    suspend(|| {
+        inquire::Confirm::new(prompt)
+            .with_default(default)
+            .prompt()
+            .map_err(|e| anyhow::anyhow!("Failed to read confirmation: {e}"))
+    })
+}
+
+fn note_auto_answer(prompt: &str, answer: &str) {
+    println(format!("{INDENT}{prompt} {answer}"));
+}
+
 /// Mark startup as finished: clears any live spinner region and lets infra log
 /// sinks start printing (quiet mode buffers them until now).
 pub fn done_startup() {
@@ -1199,5 +1329,47 @@ mod live_format_tests {
         assert_eq!(s.render(sched_warn, false, true), None);
         assert_eq!(s.render(surreal_warn, false, true), None);
         assert!(s.render(sched_warn, true, true).is_some());
+    }
+
+    // ── confirmation decision table ─────────────────────────────────────────
+
+    #[test]
+    fn yes_answers_consent_with_yes_and_a_preference_with_its_default() {
+        // (prompt, default, is_consent, yes, terminal)
+        assert!(decide("apply to PRODUCTION?", false, true, true, false).unwrap());
+        // "Set up billing now?" under --yes is a decision nobody made: default wins.
+        assert!(!decide("set up billing now?", false, false, true, true).unwrap());
+        assert!(decide("initialize git?", true, false, true, true).unwrap());
+    }
+
+    #[test]
+    fn consent_without_a_terminal_or_yes_refuses_instead_of_proceeding() {
+        // The production-migration gate used to be skipped entirely here.
+        let err = decide("apply to PRODUCTION?", false, true, false, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--yes"), "the refusal must name the way out: {msg}");
+    }
+
+    #[test]
+    fn a_preference_without_a_terminal_takes_its_default_and_carries_on() {
+        assert!(decide("initialize git?", true, false, false, false).unwrap());
+        assert!(!decide("needs auth?", false, false, false, false).unwrap());
+    }
+
+    #[test]
+    fn irreversible_consent_is_not_covered_by_yes() {
+        set_assume_yes(true);
+        let err = consent_naming("Destroy project 'acme'?", "acme", None).unwrap_err();
+        set_assume_yes(false);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--confirm acme"), "{msg}");
+        assert!(msg.contains("--yes does not cover"), "{msg}");
+    }
+
+    #[test]
+    fn irreversible_consent_needs_the_name_spelled_right() {
+        assert!(consent_naming("Destroy?", "acme", Some("acme")).unwrap());
+        let err = consent_naming("Destroy?", "acme", Some("acme-staging")).unwrap_err();
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
     }
 }

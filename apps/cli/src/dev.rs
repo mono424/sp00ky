@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::io::{BufRead, BufReader, IsTerminal};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -304,9 +304,10 @@ fn check_schema_drift(config: &Sp00kyConfig, step: ui::Step) -> Result<()> {
     ));
     diff.print_colored();
 
-    // Non-TTY: warn and continue (matches existing pattern in apply_migrations)
-    if !std::io::stdin().is_terminal() {
-        ui::hint("Non-TTY: continuing with schema drift. Run `spky migrate create` to generate a migration.");
+    // Unattended (no terminal, or --yes): warn and continue (matches
+    // apply_migrations below).
+    if ui::is_unattended() {
+        ui::hint("Unattended: continuing with schema drift. Run `spky migrate create` to generate a migration.");
         return Ok(());
     }
 
@@ -1237,8 +1238,8 @@ fn apply_migrations(
 
     if auto_apply {
         ui::info("auto-applying (--apply-migrations)");
-    } else if !std::io::stdin().is_terminal() {
-        ui::info("non-TTY: auto-applying pending migrations");
+    } else if ui::is_unattended() {
+        ui::info("unattended: auto-applying pending migrations");
     } else {
         let options = vec![
             "Apply migrations",
@@ -1281,7 +1282,7 @@ fn apply_migrations(
                 "root",
             );
 
-            if auto_apply || !std::io::stdin().is_terminal() {
+            if auto_apply || ui::is_unattended() {
                 ui::info("auto-resetting database and retrying migrations");
                 client.reset_database()?;
                 engine.apply().map(|_| ())

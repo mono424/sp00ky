@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use inquire::{Confirm, Text};
+use inquire::Text;
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -310,9 +310,7 @@ pub fn add_api(
             token: auth_token,
         })
     } else {
-        let needs_auth = Confirm::new("Does this API require authentication?")
-            .with_default(false)
-            .prompt()?;
+        let needs_auth = crate::ui::prefer("Does this API require authentication?", false)?;
 
         if needs_auth {
             let token = Text::new("Auth token:")
@@ -355,12 +353,10 @@ pub fn add_api(
 
     // Sanity check: schema file doesn't already exist (or confirm overwrite)
     if resolved_schema_output.exists() {
-        let overwrite = Confirm::new(&format!(
+        let overwrite = crate::ui::consent(&format!(
             "{} already exists. Overwrite?",
             resolved_schema_output.display()
-        ))
-        .with_default(false)
-        .prompt()?;
+        ))?;
 
         if !overwrite {
             println!("  Aborted.");

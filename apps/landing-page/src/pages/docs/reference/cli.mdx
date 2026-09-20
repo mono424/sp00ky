@@ -38,6 +38,40 @@ somewhere else, and `spky <command> --help` for the flags of any single command.
 | `spky agents init` | Generate `AGENTS.md`, parameterized by your schema. [Docs](/docs/reference/ai-agents) |
 | `spky mcp` | MCP server for editors and agents: `serve`, `token`, `tokens`, `revoke`, `install`. [Docs](/docs/reference/mcp) |
 
+## Running unattended: `-y` / `--yes`
+
+Every subcommand accepts `-y` / `--yes`, and `SPKY_YES=1` does the same from the environment.
+It answers confirmation prompts without asking, so a command never sits waiting for a keypress.
+
+This is the flag a CI job or a coding agent should pass. A pipe is easy for the CLI to detect, but
+an agent usually runs commands on a **pseudo-terminal**, where the prompt renders normally and then
+waits forever for input nothing can send.
+
+The two kinds of question get different answers, because "yes to everything" is not what anyone
+means:
+
+| Question | Example | With `--yes` | No terminal, no `--yes` |
+| --- | --- | --- | --- |
+| **Consent** to something consequential | Apply to PRODUCTION? Restart SurrealDB? Overwrite this directory? | Yes, and the log says so | **Refuses**, naming the flag |
+| **Preference** with a default | Initialize git? Cache the vault key? Create a backup first? | The default | The default |
+| **Irreversible** | Destroy the project. Reset its database. | Not covered | Refuses |
+
+The last row is deliberate. `--yes` is the flag that gets added to every command by reflex, which
+makes it the wrong thing to arm "delete everything" with. Those two take the project's name instead:
+
+<CodeBlock code={confirmCode} lang="bash" />
+
+`--yes` also switches the guided flows (`spky login`, picking or creating a project, billing setup)
+to their unattended path. They lead into pickers and browser logins that no flag can answer, so
+instead of opening one they stop with the exact command or environment variable to use.
+
+<Note>
+  Consent without a terminal used to be inconsistent: some commands hung, some failed with a bare
+  "Failed to read confirmation", and `spky migrate prod` and `spky link disconnect` skipped the
+  question and **went ahead**. They now refuse like everything else. If a script relied on that,
+  add `--yes` to it.
+</Note>
+
 ## Operating a running system
 
 | Command | What it does |
@@ -81,7 +115,7 @@ SSPs, leaving backends, frontends and SurrealDB running.
 | `--upgrade` | Pull the latest scheduler and SSP base images before restarting. |
 | `--clean` | Also wipe the scheduler's persistent volume, its replica and write-ahead log. SurrealDB data is untouched. |
 | `--surreal` (`--db`) | Also restart SurrealDB. A process restart rather than a wipe, so data on the volume survives, but the whole deployment is briefly unavailable. Equivalent to adding `db` to the targets. |
-| `-y`, `--yes` | Skip the confirmation prompt that a SurrealDB target triggers. Required in CI and any other non-interactive shell, where the prompt cannot be answered at all. |
+| `-y`, `--yes` | The [global flag](#running-unattended--y----yes): confirms the prompt a SurrealDB target triggers. Without it, and without a terminal, the restart is refused. |
 
 <CodeBlock code={restartCode} lang="bash" />
 
@@ -98,7 +132,7 @@ your login and the `slug` in `sp00ky.yml`, and reads the mode, namespace and dat
 
 | Flag | What it does |
 | --- | --- |
-| `--yes` | Skip the production confirmation prompt. |
+| `-y`, `--yes` | The [global flag](#running-unattended--y----yes): confirms applying to production. Without it, and without a terminal, the migration is refused rather than run unasked. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when unchanged, bypassing the schema-hash skip. Also accepted by `spky migrate apply`. Use it for drift recovery. |
 | `--migrations-dir <dir>` | Override the migrations directory from `sp00ky.yml`. |
 | `--endpoint <url>`, `--secret <s>` | Override the SSP or scheduler endpoint and auth secret used for the internal schema. |
@@ -136,3 +170,7 @@ spky restart --all-backends  # every backend app
 spky restart --upgrade       # pull new scheduler/SSP images first
 spky restart --clean         # also wipe the scheduler's replica + WAL
 spky restart db -y           # CI: skip the SurrealDB prompt`;
+
+export const confirmCode = `spky project destroy --confirm my-project
+spky backup reset --confirm my-project          # still takes its backup first
+spky backup reset --confirm my-project --no-backup`;

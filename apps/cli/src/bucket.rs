@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use inquire::{Confirm, Select, Text};
+use inquire::{Select, Text};
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -489,10 +489,10 @@ pub fn add(
         auth
     } else {
         let default = selected_preset.path_prefix_auth;
-        Confirm::new("Enable per-user path isolation (path_prefix_auth)?")
-            .with_default(default)
-            .with_help_message("Isolates uploads by user path prefix for access control")
-            .prompt()?
+        crate::ui::prefer(
+            "Enable per-user path isolation (path_prefix_auth)? Isolates uploads by user path prefix for access control.",
+            default,
+        )?
     };
 
     // Step 6: Confirmation summary
@@ -530,9 +530,7 @@ pub fn add(
 
     // Only prompt for confirmation in interactive mode (if we got here via prompts)
     if preset.is_none() {
-        let confirmed = Confirm::new("Create this bucket?")
-            .with_default(true)
-            .prompt()?;
+        let confirmed = crate::ui::consent("Create this bucket?")?;
         if !confirmed {
             println!("  Aborted.");
             return Ok(());

@@ -26,6 +26,28 @@ your-app/
 
 `spky` finds `sp00ky.yml` in the current directory by default; pass `--config <path>` to override.
 
+## Running it as an agent: always pass `-y`
+
+You are almost certainly running on a **pseudo-terminal**. The CLI sees a terminal, renders its
+prompt, and waits forever for a keypress you cannot send. Pass `-y` / `--yes` (any subcommand, any
+position; `SPKY_YES=1` also works) and nothing blocks:
+
+- **Consent prompts** ("Apply pending migrations to this PRODUCTION database?", "Restart SurrealDB?",
+  "Overwrite?") are answered **yes**, and the answer is printed so your log shows what you agreed to.
+- **Preference prompts** ("Initialize git?", "Create a backup before resetting?") take their
+  **default**, never a blanket yes.
+- **Menus** in `spky dev` (schema drift, pending migrations) take their unattended path: continue
+  with drift, auto-apply pending migrations.
+- **Guided flows** (login, project picker, billing) do not open. They stop and print the exact
+  command or env var to use instead, e.g. `SP00KY_CLOUD_PROJECT` or `slug:` in `sp00ky.yml`.
+
+Two operations are **not** covered by `-y`, on purpose, because they cannot be undone:
+`spky project destroy` and `spky backup reset`. They need `--confirm <project-slug>`, spelled
+correctly. Do not reach for these unless the user asked for exactly that, by name.
+
+Without `-y` and without a terminal, a consent prompt **refuses** rather than proceeding, and the
+error names the flag. If you see "No terminal to ask on", that is this.
+
 ## Subcommands an app developer/agent uses most
 
 - **`spky generate` / `spky gen`** — read `sp00ky.yml`, parse all `.surql`, emit `schema.gen.ts` (and Dart equivalents per config). **Run this after every schema edit.**
@@ -55,11 +77,11 @@ Two that come up when a deployment misbehaves:
   recreate containers. Targets are roles (`db`, `scheduler`, `ssp`, `frontend`) or an app
   name; with none it restarts the scheduler and SSPs. `--upgrade` pulls the latest scheduler
   and SSP images, `--clean` wipes the scheduler's volume (replica and WAL, not SurrealDB
-  data). `-y` is required in CI because the SurrealDB prompt cannot be answered
-  non-interactively.
-- **`spky migrate prod`** — apply pending migrations plus the internal Sp00ky schema to the
-  deployment, without a full deploy. Set `SPKY_DB_HTTP_TIMEOUT_SECS` if the internal schema
-  step times out.
+  data). `-y` (the global flag, see above) confirms the SurrealDB prompt; without it and without
+  a terminal the restart is refused.
+- **`spky migrate prod -y`** — apply pending migrations plus the internal Sp00ky schema to the
+  deployment, without a full deploy. `-y` confirms the production gate, which otherwise refuses
+  when there is no terminal. Set `SPKY_DB_HTTP_TIMEOUT_SECS` if the internal schema step times out.
 
 ## Schema annotations the parser recognizes
 
@@ -89,7 +111,7 @@ DEFINE FIELD preview_png ON TABLE thread TYPE option<bytes>;
 DEFINE TABLE audit_log SCHEMALESS;
 ```
 
-A descriptor must sit directly above its statement (no blank line between). One that attaches to nothing is warned about, not silently dropped (`annotations::warn_unattached_annotations`).
+A descriptor must sit directly above its statement (no blank line between). One that attaches to nothing is warned about, not silently dropped (`annotations::warn_unattached_annotations`). A descriptor is the marker alone plus at most one value token (`-- @crdt text`); a longer comment that merely starts with a marker name is prose, not an annotation, and `-- @nosync true` is refused with a warning.
 
 ## Docker dev apps (`type: docker`)
 

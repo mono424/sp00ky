@@ -98,10 +98,7 @@ pub fn token(
     let should_install = install_flag
         || client.is_some()
         || (!yes
-            && inquire::Confirm::new("Add this MCP server to an editor now?")
-                .with_default(true)
-                .prompt()
-                .unwrap_or(false));
+            && crate::ui::prefer("Add this MCP server to an editor now?", true).unwrap_or(false));
 
     if should_install {
         install_to(client, &key, &url)?;

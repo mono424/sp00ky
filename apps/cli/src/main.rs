@@ -59,6 +59,19 @@ struct Args {
     #[arg(long, global = true)]
     path: Option<PathBuf>,
 
+    /// Answer confirmation prompts without asking, so the command never waits on
+    /// a keypress. Consent questions ("apply to PRODUCTION?") are answered yes;
+    /// preference questions ("set up billing now?") take their default. Works on
+    /// every subcommand, and `SPKY_YES=1` does the same from the environment.
+    ///
+    /// Does NOT cover the two irreversible operations - destroying a project and
+    /// resetting its database - which take `--confirm <project>` instead.
+    ///
+    /// This is what an agent or a CI job should pass: a pseudo-terminal makes a
+    /// prompt render and then wait forever for input nothing can send.
+    #[arg(long = "yes", short = 'y', alias = "y", global = true)]
+    yes: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -292,11 +305,6 @@ enum Commands {
         /// Restart every backend app.
         #[arg(long)]
         all_backends: bool,
-        /// Skip the confirmation prompt shown when the target includes
-        /// SurrealDB. Required in CI and any non-interactive shell, where the
-        /// prompt cannot be answered at all.
-        #[arg(long, short = 'y')]
-        yes: bool,
         /// Also wipe the scheduler's persistent volume. Use after
         /// scheduler state corruption. Does NOT touch SurrealDB data.
         #[arg(long)]
@@ -599,9 +607,6 @@ enum FlagCommands {
         /// the total count before applying (e.g. "SELECT id FROM user WHERE age > 18")
         #[arg(long)]
         sql: Option<String>,
-        /// Skip the preview confirmation prompt (required in non-interactive runs)
-        #[arg(long, short = 'y')]
-        yes: bool,
         #[command(flatten)]
         conn: ConnectionArgs,
         /// Path to sp00ky.yml config file
@@ -840,7 +845,13 @@ enum ProjectCommands {
         raw: bool,
     },
     /// Destroy the cloud project and all its VMs
-    Destroy,
+    Destroy {
+        /// The project's slug, typed out. Required wherever there is no terminal
+        /// to ask on: this cannot be undone, so `--yes` deliberately does not
+        /// cover it.
+        #[arg(long, value_name = "PROJECT")]
+        confirm: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1018,6 +1029,11 @@ pub enum CloudBackupCommands {
         /// Skip the backup before reset
         #[arg(long)]
         no_backup: bool,
+        /// The project's slug, typed out. Required wherever there is no terminal
+        /// to ask on: this deletes every record, so `--yes` deliberately does
+        /// not cover it.
+        #[arg(long, value_name = "PROJECT")]
+        confirm: Option<String>,
     },
 }
 
@@ -1108,9 +1124,6 @@ enum McpCommands {
         /// Editor to register with: claude | cursor | vscode
         #[arg(long)]
         client: Option<String>,
-        /// Skip all interactive prompts (uses read-only scopes unless --scopes given)
-        #[arg(long)]
-        yes: bool,
     },
     /// List your cloud MCP tokens
     Tokens,
@@ -1314,9 +1327,6 @@ enum MigrateCommands {
         /// SSP/Scheduler auth secret
         #[arg(long)]
         secret: Option<String>,
-        /// Skip the production confirmation prompt
-        #[arg(long)]
-        yes: bool,
         /// Force re-applying the internal schema + remote functions even when
         /// unchanged (bypasses the schema-hash skip). Use for drift recovery.
         #[arg(long)]
@@ -1929,7 +1939,6 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
             migrations_dir,
             endpoint,
             secret,
-            yes,
             force_schema,
         } => {
             if force_schema {
@@ -1956,16 +1965,12 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 cloud.url, resolved_surreal.namespace, resolved_surreal.database, deploy_mode
             );
 
-            if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                let confirmed =
-                    inquire::Confirm::new("Apply pending migrations to this PRODUCTION database?")
-                        .with_default(false)
-                        .prompt()
-                        .unwrap_or(false);
-                if !confirmed {
-                    println!("Aborted.");
-                    return Ok(());
-                }
+            // `consent`, not a bare prompt: this gate used to be skipped whenever
+            // stdin was not a terminal, so the one caller that most needs to be
+            // asked - a script or an agent - applied to production unasked.
+            if !ui::consent("Apply pending migrations to this PRODUCTION database?")? {
+                println!("Aborted.");
+                return Ok(());
             }
 
             let config_path_opt = if config_file.exists() {
@@ -3022,6 +3027,7 @@ fn moved_cloud_hint(rest: &[String]) -> ! {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    ui::set_assume_yes(args.yes);
 
     if let Some(ref project_path) = args.path {
         std::env::set_current_dir(project_path).context(format!(
@@ -3085,8 +3091,7 @@ fn main() -> Result<()> {
                 read_only,
                 install,
                 client,
-                yes,
-            }) => mcp_cloud::token(name, scopes, read_only, install, client, yes),
+            }) => mcp_cloud::token(name, scopes, read_only, install, client, ui::assume_yes()),
             Some(McpCommands::Tokens) => mcp_cloud::list_tokens(),
             Some(McpCommands::Revoke { id }) => mcp_cloud::revoke(id),
             Some(McpCommands::Install { token, client }) => mcp_cloud::install(token, client),
@@ -3136,11 +3141,10 @@ fn main() -> Result<()> {
         Some(Commands::Restart {
             targets,
             all_backends,
-            yes,
             clean,
             upgrade,
             surreal,
-        }) => cloud::restart(targets, all_backends, yes, clean, upgrade, surreal),
+        }) => cloud::restart(targets, all_backends, clean, upgrade, surreal),
         Some(Commands::Push) => cloud::push(),
         Some(Commands::Scale { action }) => match action {
             ScaleCommands::Ssp { count } => cloud::scale(count),
@@ -3185,7 +3189,7 @@ fn main() -> Result<()> {
             ProjectCommands::Create { slug, plan } => cloud::create(slug, plan),
             ProjectCommands::List => cloud::list(),
             ProjectCommands::Credentials { raw } => cloud::credentials(raw),
-            ProjectCommands::Destroy => cloud::destroy(),
+            ProjectCommands::Destroy { confirm } => cloud::destroy(confirm),
         },
         Some(Commands::Team { action }) => cloud::team(action),
         Some(Commands::Billing { action }) => cloud::billing(action),

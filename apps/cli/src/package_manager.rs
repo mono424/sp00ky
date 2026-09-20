@@ -66,10 +66,7 @@ pub fn detect_preferred() -> PackageManager {
         return PackageManager::Pnpm;
     }
     if pnpm {
-        let use_pnpm = inquire::Confirm::new("pnpm detected — use it instead of npm?")
-            .with_default(true)
-            .prompt()
-            .unwrap_or(true);
+        let use_pnpm = crate::ui::prefer("pnpm detected — use it instead of npm?", true).unwrap_or(true);
         if use_pnpm {
             return PackageManager::Pnpm;
         }

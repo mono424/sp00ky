@@ -1736,20 +1736,19 @@ mod tests {
         assert_eq!(recorded[1].0, "20240102120000");
         assert_eq!(recorded[2].0, "20240103120000");
 
-        // Verify the SQL was actually executed (wrapped in transactions)
+        // The SQL is executed AS WRITTEN, not wrapped in a transaction. That was
+        // deliberate (SurrealDB DDL does not run inside one, so the wrap made a
+        // DEFINE-only migration fail), and it is pinned here because these
+        // assertions kept expecting the wrap for months after it was removed,
+        // leaving two permanently red tests that taught everyone to ignore red.
         let queries = mock.executed_queries.borrow();
         assert_eq!(queries.len(), 3);
-        assert_eq!(
-            queries[0],
-            "BEGIN TRANSACTION;\nCREATE first;\nCOMMIT TRANSACTION;"
-        );
-        assert_eq!(
-            queries[1],
-            "BEGIN TRANSACTION;\nCREATE second;\nCOMMIT TRANSACTION;"
-        );
-        assert_eq!(
-            queries[2],
-            "BEGIN TRANSACTION;\nCREATE third;\nCOMMIT TRANSACTION;"
+        assert_eq!(queries[0], "CREATE first;");
+        assert_eq!(queries[1], "CREATE second;");
+        assert_eq!(queries[2], "CREATE third;");
+        assert!(
+            queries.iter().all(|q| !q.contains("TRANSACTION")),
+            "a migration must not be wrapped: {queries:?}"
         );
     }
 
@@ -1852,10 +1851,8 @@ mod tests {
         assert_eq!(recorded[0].1, "add_users");
 
         let queries = mock.executed_queries.borrow();
-        assert_eq!(
-            queries[0],
-            format!("BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;", up_sql)
-        );
+        // As written, no transaction wrap (see test_apply_applies_multiple_in_order).
+        assert_eq!(queries[0], up_sql);
         drop(recorded);
         drop(queries);
 

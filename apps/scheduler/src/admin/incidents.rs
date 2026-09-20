@@ -273,6 +273,84 @@ impl Incidents {
         self.persist().await;
     }
 
+    /// How long a backend must be failing before it becomes an incident.
+    /// `backend_health` probes every 15s with a 3s timeout and no hysteresis
+    /// of its own, so a single slow probe flips the cached status; four
+    /// missed probes is a real outage.
+    const BACKEND_DOWN_AFTER_MS: u64 = 60_000;
+
+    /// Backend outages are the one cluster fault with no incident of its own.
+    /// `maintenance::backend_health` assigns the probe result straight into
+    /// its cache with no previous-status comparison and no failure counter,
+    /// so there is no transition for it to report - and it lives in a crate
+    /// beneath this one, so it could not call [`emit`] without a dependency
+    /// cycle. The result was an eight-hour outage whose only trace was a WARN
+    /// every 15s under a target the recorder does not read.
+    ///
+    /// Derive it here instead, from the entity list this tick already builds
+    /// for `sample_entities`. `last_healthy` is the debounce: it is the state
+    /// that already knows how long the outage has run, so no new counter is
+    /// needed on either side.
+    ///
+    /// Returns the transitions to emit. The caller emits them after dropping
+    /// the history guard, so every incident still enters through the one
+    /// path - [`emit`] to the log ring, [`Self::observe_line`] back out.
+    fn backend_transitions(
+        &self,
+        entities: &[Value],
+        floor: u64,
+        now: u64,
+        after_ms: u64,
+    ) -> Vec<(String, bool, String)> {
+        let h = self.history.lock().unwrap();
+        let mut out = Vec::new();
+        for entity in entities.iter().filter(|v| v["entity"] == "backend") {
+            let Some(id) = entity["id"].as_str() else {
+                continue;
+            };
+            let open = h
+                .rows
+                .iter()
+                .any(|r| r.state == "open" && r.kind == "backend_down" && r.component == id);
+            let status = entity["status"].as_str().unwrap_or("unknown");
+            if status == "healthy" {
+                if open {
+                    out.push((
+                        id.to_string(),
+                        false,
+                        format!("Backend {id} is answering its health check again"),
+                    ));
+                }
+                continue;
+            }
+            if open {
+                continue;
+            }
+            // A backend that has never answered since this recorder started
+            // has no `last_healthy` to measure from; the recorder's own start
+            // is the honest floor, and "down since boot" is exactly the case
+            // worth reporting.
+            let since = entity["last_healthy"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.timestamp_millis().max(0) as u64)
+                .filter(|&t| t >= floor)
+                .unwrap_or(floor);
+            if now.saturating_sub(since) < after_ms {
+                continue;
+            }
+            out.push((
+                id.to_string(),
+                true,
+                format!(
+                    "Backend {id} is {status}; no successful health check for {}",
+                    approx_duration(now.saturating_sub(since))
+                ),
+            ));
+        }
+        out
+    }
+
     fn sample_entities(&self, entities: &[Value]) {
         let mut h = self.history.lock().unwrap();
         let mut changed = false;
@@ -316,9 +394,10 @@ impl Incidents {
         // Subscribe before the first await; no polling gap on short incidents.
         let mut rx = state.logs.subscribe();
         let this = self.clone();
+        let started_at = super::ops::now_ms();
         tokio::spawn(async move {
             this.observe(Event {
-                at: super::ops::now_ms(),
+                at: started_at,
                 component: "scheduler".into(),
                 kind: "scheduler_start".into(),
                 state: "recorded".into(),
@@ -338,15 +417,46 @@ impl Incidents {
                         Err(_) => break,
                     },
                     _ = tick.tick() => {
-                        this.expire(super::ops::now_ms());
+                        let now = super::ops::now_ms();
+                        this.expire(now);
                         let entities = crate::metrics::build_entities(&state.metrics).await;
                         this.sample_entities(&entities);
+                        // Emitted outside `backend_transitions`, which holds
+                        // the history guard while it reads the open rows.
+                        for (backend, down, summary) in this.backend_transitions(
+                            &entities,
+                            started_at,
+                            now,
+                            Self::BACKEND_DOWN_AFTER_MS,
+                        ) {
+                            emit(
+                                &backend,
+                                "backend_down",
+                                if down { "open" } else { "recovered" },
+                                &summary,
+                                None,
+                            );
+                        }
                         let revision = this.history.lock().unwrap().revision;
                         if revision != saved { this.persist().await; saved = revision; }
                     }
                 }
             }
         });
+    }
+}
+
+/// Coarse, operator-readable age for an incident summary ("8h12m"). Only ever
+/// rendered into prose, never parsed back.
+fn approx_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -563,6 +673,117 @@ mod tests {
             version: "test".into(),
         }
     }
+    fn backend(id: &str, status: &str, last_healthy: Option<&str>) -> Value {
+        json!({
+            "entity": "backend",
+            "id": id,
+            "status": status,
+            "last_healthy": last_healthy,
+        })
+    }
+
+    fn rfc3339(ms: u64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms as i64)
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    #[test]
+    fn a_single_slow_probe_does_not_open_a_backend_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let now = 1_000_000_000;
+        // Unreachable, but healthy 15s ago: one missed probe.
+        let out = history.backend_transitions(
+            &[backend("relay", "unreachable", Some(&rfc3339(now - 15_000)))],
+            0,
+            now,
+            Incidents::BACKEND_DOWN_AFTER_MS,
+        );
+        assert!(out.is_empty(), "got: {out:?}");
+    }
+
+    #[test]
+    fn a_sustained_outage_opens_once_and_recovers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let now = 1_000_000_000;
+        let down = [backend("relay", "unreachable", Some(&rfc3339(now - 8 * 3600_000)))];
+
+        let opened = history.backend_transitions(&down, 0, now, Incidents::BACKEND_DOWN_AFTER_MS);
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].1, "opens as down");
+        assert!(opened[0].2.contains("8h0m"), "carries the age: {}", opened[0].2);
+
+        history.observe(Event {
+            at: now,
+            component: "relay".into(),
+            kind: "backend_down".into(),
+            state: "open".into(),
+            summary: opened[0].2.clone(),
+            operation_id: None,
+            version: "test".into(),
+        });
+
+        // While it stays open the tick must not re-report it.
+        assert!(history
+            .backend_transitions(&down, 0, now + 1000, Incidents::BACKEND_DOWN_AFTER_MS)
+            .is_empty());
+
+        let healthy = [backend("relay", "healthy", Some(&rfc3339(now)))];
+        let recovered =
+            history.backend_transitions(&healthy, 0, now, Incidents::BACKEND_DOWN_AFTER_MS);
+        assert_eq!(recovered.len(), 1);
+        assert!(!recovered[0].1, "recovers");
+
+        // And a healthy backend with nothing open is silent.
+        history.observe(Event {
+            at: now,
+            component: "relay".into(),
+            kind: "backend_down".into(),
+            state: "recovered".into(),
+            summary: "back".into(),
+            operation_id: None,
+            version: "test".into(),
+        });
+        assert!(history
+            .backend_transitions(&healthy, 0, now, Incidents::BACKEND_DOWN_AFTER_MS)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_backend_down_since_boot_is_measured_from_the_recorder_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let started = 1_000_000_000;
+        // Never answered: no `last_healthy` to measure from.
+        let never = [backend("relay", "unknown", None)];
+        assert!(history
+            .backend_transitions(&never, started, started + 30_000, Incidents::BACKEND_DOWN_AFTER_MS)
+            .is_empty());
+        let out = history.backend_transitions(
+            &never,
+            started,
+            started + 120_000,
+            Incidents::BACKEND_DOWN_AFTER_MS,
+        );
+        assert_eq!(out.len(), 1, "opens once past the threshold: {out:?}");
+    }
+
+    #[test]
+    fn a_last_healthy_from_before_this_process_does_not_backdate_the_floor() {
+        // `last_healthy` survives a live reconfigure but the history does not,
+        // so a stale timestamp must not open an incident the instant the
+        // recorder starts.
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let started = 1_000_000_000;
+        let stale = [backend("relay", "unreachable", Some(&rfc3339(started - 86_400_000)))];
+        assert!(history
+            .backend_transitions(&stale, started, started + 30_000, Incidents::BACKEND_DOWN_AFTER_MS)
+            .is_empty());
+    }
+
     #[test]
     fn episodes_coalesce_recover_and_survive_restart() {
         let dir = tempfile::tempdir().unwrap();

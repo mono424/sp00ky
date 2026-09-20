@@ -531,7 +531,9 @@ pub async fn cloud_restart(
 /// `GET /admin/api/cloud/deployment`
 pub async fn cloud_deployment(State(state): State<AdminState>) -> Result<Json<Value>, ApiError> {
     let link = state.cloud.as_ref().ok_or_else(not_linked)?;
-    Ok(Json(link.get("/deployment").await?))
+    // Masked: the control plane's answer carries the database root password and
+    // every backend's environment, and this endpoint is also an MCP tool.
+    Ok(Json(crate::metrics::mask_cloud_secrets(link.get("/deployment").await?)))
 }
 
 /// `GET /admin/api/operations`

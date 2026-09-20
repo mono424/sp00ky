@@ -484,6 +484,120 @@ pub fn mask_sensitive_env(
         .collect()
 }
 
+/// Field names that hold a credential in a Sp00ky Cloud API response.
+/// Narrower than [`SENSITIVE_PATTERNS`]: these run against arbitrary API field
+/// names, where a bare `key` is an env var's name and `auth` starts `author`.
+const CREDENTIAL_FIELD_FRAGMENTS: &[&str] = &[
+    "password", "passwd", "secret", "token", "credential", "passphrase",
+    "private_key", "access_key", "secret_key", "api_key", "apikey", "authorization",
+];
+
+fn is_credential_field(key: &str) -> bool {
+    let k = key.to_lowercase();
+    k == "auth" || k.ends_with("_auth") || CREDENTIAL_FIELD_FRAGMENTS.iter().any(|f| k.contains(f))
+}
+
+/// Mask every credential in a document relayed from Sp00ky Cloud.
+///
+/// `GET /admin/api/cloud/deployment` passed the control plane's answer straight
+/// through, and the control plane answers with everything the CLI needs to apply
+/// a schema: the database root password, the sp00ky auth secret, and each
+/// container's full environment - JWT private key, S3 keys, every third-party
+/// API key a backend holds. That endpoint is also the `cloud_deployment` MCP
+/// tool, so all of it went to any model that asked what was deployed. The
+/// overview right beside it has masked backend env since day one; this one was
+/// simply never routed through the same rule.
+///
+/// Three shapes, because that is how they arrive: a field NAMED like a
+/// credential, a `["NAME=value"]` environment list (same name rule as
+/// [`mask_sensitive_env`], so both surfaces agree), and a password passed as a
+/// flag in a command string, which is how the SurrealDB container is started.
+pub fn mask_cloud_secrets(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    const MASK: &str = "****";
+
+    fn mask_env_entry(entry: &str) -> String {
+        match entry.split_once('=') {
+            Some((name, value)) if !value.is_empty() => {
+                let lower = name.to_lowercase();
+                if SENSITIVE_PATTERNS.iter().any(|pat| lower.contains(pat)) {
+                    return format!("{name}={MASK}");
+                }
+                // A value that is itself JSON (SPKY_JOB_CONFIG carries
+                // `auth_token`) is walked, so nothing hides one level down.
+                match serde_json::from_str::<Value>(value) {
+                    Ok(nested @ (Value::Object(_) | Value::Array(_))) => {
+                        format!("{name}={}", walk(nested, false))
+                    }
+                    _ => entry.to_string(),
+                }
+            }
+            _ => entry.to_string(),
+        }
+    }
+
+    fn mask_inline_password(cmd: &str) -> String {
+        let mut out = Vec::new();
+        let mut mask_next = false;
+        for word in cmd.split(' ') {
+            if mask_next && !word.is_empty() {
+                out.push(MASK.to_string());
+                mask_next = false;
+            } else if word == "--pass" || word == "--password" {
+                out.push(word.to_string());
+                mask_next = true;
+            } else if let Some((flag, _)) = word.split_once('=').filter(|(f, _)| matches!(*f, "--pass" | "--password")) {
+                out.push(format!("{flag}={MASK}"));
+            } else {
+                out.push(word.to_string());
+            }
+        }
+        out.join(" ")
+    }
+
+    fn walk(value: Value, under_secret: bool) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(k, v)| {
+                        let lower = k.to_lowercase();
+                        let secret = under_secret || is_credential_field(&k);
+                        let v = match v {
+                            Value::String(s) if secret && !s.is_empty() => Value::String(MASK.into()),
+                            Value::String(s) if lower == "cmd" || lower == "command" => {
+                                Value::String(mask_inline_password(&s))
+                            }
+                            Value::Array(items) if lower == "env" || lower == "environment" => Value::Array(
+                                items
+                                    .into_iter()
+                                    .map(|e| match e {
+                                        Value::String(s) => Value::String(mask_env_entry(&s)),
+                                        other => walk(other, false),
+                                    })
+                                    .collect(),
+                            ),
+                            other => walk(other, secret),
+                        };
+                        (k, v)
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::String(s) if under_secret && !s.is_empty() => Value::String(MASK.into()),
+                        other => walk(other, under_secret),
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    walk(value, false)
+}
+
 /// Convert `["KEY=value", ...]` to a `serde_json::Map`.
 pub fn vec_env_to_map(entries: &[String]) -> serde_json::Map<String, serde_json::Value> {
     entries
@@ -776,4 +890,66 @@ pub async fn start_query_reassignment_monitor(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod cloud_secret_mask_tests {
+    use super::mask_cloud_secrets;
+    use serde_json::json;
+
+    /// The real shape of the control plane's `/deployment` answer, with fake
+    /// values. Every `LEAK-` string is a credential in one of the three shapes
+    /// it arrives in.
+    #[test]
+    fn no_credential_survives_and_nothing_else_is_lost() {
+        let raw = json!({
+            "deployment": { "id": "d1", "version": 457, "status": "running" },
+            "sp00ky_auth_secret": "LEAK-auth",
+            "surrealdb_password": "LEAK-dbpass",
+            "urls": { "web": "https://app.example.com" },
+            "vms": [{
+                "name": "surrealdb", "status": "running",
+                "metadata": {
+                    "cmd": "start --bind 0.0.0.0:8000 --user root --pass LEAK-cmd --allow-all rocksdb:/data",
+                    "env": ["SURREAL_LOG=info", "SPKY_DB_NS=main"],
+                    "port": 8000
+                }
+            }, {
+                "name": "email", "status": "running",
+                "metadata": {
+                    "cmd": "/email-api",
+                    "env": [
+                        "PORT=3673",
+                        "SPKY_DB_PASS=LEAK-envpass",
+                        "JWT_PRIVATE_KEY=LEAK-jwt",
+                        "GH_RELEASE_TOKEN=LEAK-pat",
+                        "SPKY_JOB_CONFIG=[{\"name\":\"api\",\"auth_token\":\"LEAK-nested\"}]"
+                    ]
+                }
+            }]
+        });
+        let text = mask_cloud_secrets(raw).to_string();
+        assert!(!text.contains("LEAK-"), "a credential leaked: {text}");
+        for keep in [
+            "\"version\":457", "https://app.example.com", "PORT=3673", "SURREAL_LOG=info",
+            "--user root", "rocksdb:/data", "SPKY_DB_PASS=****", "JWT_PRIVATE_KEY=****",
+            "\\\"name\\\":\\\"api\\\"",
+        ] {
+            assert!(text.contains(keep), "masking dropped non-secret content {keep}: {text}");
+        }
+    }
+
+    /// The name rule runs against arbitrary API field names, so it must leave
+    /// ordinary ones alone.
+    #[test]
+    fn ordinary_fields_are_left_alone() {
+        let raw = json!({ "key": "API_URL", "author": "sam", "auth_mode": "oauth", "token_count": 3 });
+        assert_eq!(mask_cloud_secrets(raw.clone()), raw);
+    }
+
+    #[test]
+    fn an_equals_style_password_flag_is_masked_too() {
+        let out = mask_cloud_secrets(json!({ "cmd": "start --password=LEAK-x --user root" }));
+        assert_eq!(out["cmd"], json!("start --password=**** --user root"));
+    }
 }

@@ -37,7 +37,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `schema` | path | (none) | Directory containing your `.surql` schema sources. See [Schema](/docs/schema). |
 | `buckets` | path[] | `[]` | Bucket definition files referenced from your schema. See [Buckets](/docs/client/buckets). |
 | `clientTypes` | array | `[]` | Codegen targets. Each entry has `format` (`typescript` or `dart`), an `output` path, (dart only) an optional `workdir`, and (typescript only) optional `queries`, `allowlistOutput` and `app` for the [query allowlist](#query-allowlist). See [Client types](#client-types). |
-| `version` | string \| object | latest stable | Pin SSP and scheduler image tags. Accepts a single tag, a `{dev, cloud}` split, or a `path:` override pointing at a local binary. |
+| `version` | string \| object | `any` | Which SSP and scheduler build runs, enforced: an exact version, `newest` or `any`. Accepts a single value, a `{ssp, scheduler}` split, a `{dev, cloud}` split, or a `path:` override pointing at a local binary. See [Versions](#versions). |
 | `logLevel` | string \| object | `info` | Log verbosity for the SSP and scheduler. Accepts `trace`, `debug`, `info`, `warn`, `error`, `off`, target=level directives, or a `{dev, cloud}` split. Under `spky dev` a bare level applies to the sp00ky crates only (third-party crates stay at `warn`); pass a full directive list such as `ssp=debug,hyper=info,warn` to control those too. |
 | `refMode` | `dedicated` \| `single` | `dedicated` | Storage layout for the SSP's `_00_list_ref` table. `dedicated` gives each user their own table and works around a SurrealDB v3 LIVE-permission gap. |
 | `sync` | object | `{ transport: http, queryAllowlist: off }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`, see [Sync transport](#sync-transport); and whether the SSP refuses query shapes the app does not ship: `queryAllowlist`, see [Query allowlist](#query-allowlist). |
@@ -233,6 +233,24 @@ A pool is fixed (`autoscale: false`, exactly `min` machines), scales on demand u
 
 A project can list several outputs, e.g. a TypeScript web client plus one or more Dart clients (a Flutter app, a renderer), and keep them all in sync from one command.
 
+## Versions
+
+`version` decides which SSP and scheduler build your project runs, and Sp00ky Cloud enforces it on every deploy, from the CLI and from a git push alike. Each value is one of three policies:
+
+| Value | Policy | What a deploy does | What `--upgrade` does |
+| --- | --- | --- | --- |
+| an exact version, e.g. `0.0.1-canary.270` | **Pinned** | Runs exactly that version. A stack on anything else is moved to it, up or down. | Nothing. The file wins: change `version` and deploy. |
+| `newest` | **Tracked** | Rolls the stack to the newest published build whenever there is one. | The same as any deploy. |
+| `any`, or no `version` at all | **Manual** | Leaves the stack alone. | Moves the stack to the newest published build. |
+
+<CodeBlock code={ymlVersions} lang="yaml" />
+
+Whatever the policy, Sp00ky Cloud records the concrete version it resolved, so a container that is recreated later for an unrelated reason (a changed env var, a crash) comes back on the version it had, not on whatever is newest by then. `spky status` prints the policy next to the running versions and warns when a pinned stack is not running its pin.
+
+A pinned version that was never published fails the deploy before anything is built. A roll restarts the scheduler and the SSPs (about a minute of sync downtime), so with `newest` every deploy can include one: pin a version when you want rolls to happen only on purpose.
+
+Under `spky dev`, an exact version is the image tag to run, `any` runs the local `canary` image (pulling it once if missing), and `newest` re-pulls `canary` on every start.
+
 ## Per-environment overrides
 
 `version`, `logLevel`, and `apps.<name>.env` each accept a `{dev, cloud}` split so your local stack can differ from what runs in Sp00ky Cloud. A common pattern is to run host-built binaries during `spky dev` and a pinned image tag in the cloud:
@@ -370,13 +388,29 @@ apps:
     runOn: { pool: render }
     # ...spec, baseUrl, method (an outbox table) and deploy as usual`;
 
+export const ymlVersions = `# Pinned: the cloud runs exactly this, and --upgrade cannot move it.
+version: 0.0.1-canary.270
+
+# Tracked: every deploy (and every git push) rolls to the newest build.
+version: newest
+
+# Manual: deploys never touch it, only --upgrade does. Same as leaving it out.
+version: any
+
+# Per service and per environment, in any combination.
+version:
+  dev: newest
+  cloud:
+    ssp: 0.0.1-canary.270
+    scheduler: 0.0.1-canary.270`;
+
 export const ymlPerEnv = `version:
   dev:
     ssp:
       path: ../target/debug/ssp-server
     scheduler:
       path: ../target/debug/scheduler
-  cloud: canary
+  cloud: 0.0.1-canary.270
 
 logLevel:
   dev: trace

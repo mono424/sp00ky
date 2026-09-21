@@ -184,7 +184,8 @@ enum Commands {
     // ── Deploy & operate (act on the current project) ──────────────────────
     /// Deploy the current project to Sp00ky Cloud
     Deploy {
-        /// Also upgrade SSP and scheduler to latest version
+        /// Also move the SSP and scheduler to the newest published build.
+        /// Does not move a role that sp00ky.yml pins with `version:`.
         #[arg(long)]
         upgrade: bool,
         /// Wipe the scheduler's persistent volume before redeploy. Use
@@ -311,7 +312,9 @@ enum Commands {
         /// scheduler state corruption. Does NOT touch SurrealDB data.
         #[arg(long)]
         clean: bool,
-        /// Pull the latest scheduler/SSP base images before restarting.
+        /// Move the scheduler/SSP to the newest published build before
+        /// restarting. A role that sp00ky.yml pins with `version:` restarts
+        /// on its pin instead.
         #[arg(long)]
         upgrade: bool,
         /// Also restart the SurrealDB container. This is a process restart,

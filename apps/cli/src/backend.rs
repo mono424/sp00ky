@@ -522,6 +522,53 @@ pub struct Sp00kyConfig {
 }
 
 impl Sp00kyConfig {
+    /// The `version:` spec that applies to `env`, if any.
+    pub fn version_spec(&self, env: DeployEnv) -> Option<&VersionSpec> {
+        match &self.version {
+            None => None,
+            Some(VersionConfig::Single(s)) => Some(s),
+            Some(VersionConfig::PerEnvironment { dev, cloud }) => match env {
+                DeployEnv::Dev => dev.as_ref(),
+                DeployEnv::Cloud => cloud.as_ref(),
+            },
+        }
+    }
+
+    /// The raw `(ssp, scheduler)` version strings for `env`. `None` where the
+    /// file says nothing, or names a host binary (`{ path }`), which only means
+    /// something to `spky dev`.
+    pub fn component_version_specs(&self, env: DeployEnv) -> (Option<String>, Option<String>) {
+        let tag = |cv: &Option<ComponentVersion>| match cv {
+            Some(ComponentVersion::Tag(t)) => Some(t.clone()),
+            _ => None,
+        };
+        match self.version_spec(env) {
+            None => (None, None),
+            Some(VersionSpec::All(v)) => (Some(v.clone()), Some(v.clone())),
+            Some(VersionSpec::Individual { ssp, scheduler }) => (tag(ssp), tag(scheduler)),
+        }
+    }
+
+    /// The scheduler/SSP version policy a cloud deploy sends as `infra_version`:
+    /// role -> the string from the file. The control plane enforces an exact
+    /// version, rolls a `newest` role whenever a newer build exists, and leaves
+    /// an `any` (or absent) role to a manual `--upgrade`. Always sent, even
+    /// empty: an absent key is how a CLI that predates the policy looks, and the
+    /// control plane then keeps whatever policy the project had.
+    pub fn cloud_version_policy(&self) -> Result<BTreeMap<String, String>> {
+        let (ssp, scheduler) = self.component_version_specs(DeployEnv::Cloud);
+        let mut out = BTreeMap::new();
+        for (role, spec) in [("ssp", ssp), ("scheduler", scheduler)] {
+            if let Some(spec) = spec {
+                classify_version(&spec).with_context(|| format!("sp00ky.yml version ({role})"))?;
+                out.insert(role.to_string(), spec);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Sp00kyConfig {
     /// `sync:` with defaults filled in.
     pub fn sync(&self) -> SyncConfig {
         self.sync.clone().unwrap_or_default()
@@ -1698,9 +1745,70 @@ fn validate_rust_log(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// What one `version:` string asks for. The cloud control plane reads the same
+/// three cases (spooky-cloud `internal/infraversion`), so the file means the
+/// same thing to `spky deploy`, to a git push and to `spky dev`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionPolicy {
+    /// `any`, or nothing at all: whatever is there stays. On the cloud only a
+    /// manual `--upgrade` moves the role; `spky dev` pulls an image it lacks
+    /// and otherwise uses the local one.
+    Any,
+    /// `newest` (or a channel name: `canary`, `latest`, `alpha`): follow the
+    /// channel. The cloud rolls the role on every deploy once a newer build
+    /// exists.
+    Track(String),
+    /// An exact image tag. Enforced: the cloud runs exactly this on every
+    /// deploy, and `--upgrade` does not move it.
+    Pinned(String),
+}
+
+/// The keyword for [`VersionPolicy::Any`].
+pub const VERSION_ANY: &str = "any";
+/// The keyword that tracks [`DEFAULT_VERSION_CHANNEL`].
+pub const VERSION_NEWEST: &str = "newest";
+/// There is no stable release line yet, so the newest build is the newest canary.
+pub const DEFAULT_VERSION_CHANNEL: &str = "canary";
+const VERSION_CHANNELS: [&str; 3] = ["canary", "latest", "alpha"];
+
+/// Classify one `version:` string. Errors on anything that is not a keyword,
+/// a channel or a valid image tag, since the value ends up in an image reference.
+pub fn classify_version(spec: &str) -> Result<VersionPolicy> {
+    let s = spec.trim();
+    let lower = s.to_ascii_lowercase();
+    if lower.is_empty() || lower == VERSION_ANY {
+        return Ok(VersionPolicy::Any);
+    }
+    if lower == VERSION_NEWEST {
+        return Ok(VersionPolicy::Track(DEFAULT_VERSION_CHANNEL.to_string()));
+    }
+    if VERSION_CHANNELS.contains(&lower.as_str()) {
+        return Ok(VersionPolicy::Track(lower));
+    }
+    // "v0.0.1-canary.270" is the git tag spelling; the image tag has no "v".
+    let mut chars = s.chars();
+    let tag = match (chars.next(), chars.next()) {
+        (Some('v'), Some(d)) if d.is_ascii_digit() => &s[1..],
+        _ => s,
+    };
+    let valid = tag.len() <= 128
+        && tag
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        bail!(
+            "version `{spec}` is not a valid image tag (use an exact version, `{VERSION_NEWEST}` or `{VERSION_ANY}`)"
+        );
+    }
+    Ok(VersionPolicy::Pinned(tag.to_string()))
+}
+
 /// Which environment a `from_config` call is resolving versions for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Cloud` is reserved; cloud.rs does not yet read versions.
 pub enum DeployEnv {
     Dev,
     Cloud,
@@ -1745,6 +1853,19 @@ impl Default for ResolvedVersions {
     }
 }
 
+/// The Docker tag a `version:` string means locally. `any` and `newest` are
+/// policies, not tags: both run the default channel's image, and `newest`
+/// additionally refreshes it (see `ResolvedVersions::images_to_refresh`). A
+/// string `classify_version` rejects is passed through so `docker run` reports it.
+fn image_tag_for(spec: &str, default_tag: &str) -> String {
+    match classify_version(spec) {
+        Ok(VersionPolicy::Any) => default_tag.to_string(),
+        Ok(VersionPolicy::Track(channel)) => channel,
+        Ok(VersionPolicy::Pinned(tag)) => tag,
+        Err(_) => spec.to_string(),
+    }
+}
+
 /// Resolve a `ComponentVersion` (or absent value with default tag) into a
 /// `RuntimeSource`. Relative paths are anchored at `project_dir` so users
 /// can write `../../target/debug/ssp-server` from inside `example/` without
@@ -1756,7 +1877,7 @@ fn resolve_component(
 ) -> RuntimeSource {
     match cv {
         None => RuntimeSource::Image(default_tag.to_string()),
-        Some(ComponentVersion::Tag(t)) => RuntimeSource::Image(t.clone()),
+        Some(ComponentVersion::Tag(t)) => RuntimeSource::Image(image_tag_for(t, default_tag)),
         Some(ComponentVersion::Path { path }) => {
             let resolved = if path.is_absolute() {
                 path.clone()
@@ -1790,19 +1911,12 @@ impl ResolvedVersions {
     pub fn from_config_with_dir(config: &Sp00kyConfig, env: DeployEnv, project_dir: &Path) -> Self {
         let surrealdb = config.resolved_surrealdb().version;
 
-        let spec: Option<&VersionSpec> = match &config.version {
-            None => None,
-            Some(VersionConfig::Single(s)) => Some(s),
-            Some(VersionConfig::PerEnvironment { dev, cloud }) => match env {
-                DeployEnv::Dev => dev.as_ref(),
-                DeployEnv::Cloud => cloud.as_ref(),
-            },
-        };
+        let spec = config.version_spec(env);
 
         let (ssp, scheduler) = match spec {
             Some(VersionSpec::All(v)) => (
-                RuntimeSource::Image(v.clone()),
-                RuntimeSource::Image(v.clone()),
+                RuntimeSource::Image(image_tag_for(v, DEFAULT_SSP_VERSION)),
+                RuntimeSource::Image(image_tag_for(v, DEFAULT_SCHEDULER_VERSION)),
             ),
             Some(VersionSpec::Individual { ssp, scheduler }) => (
                 resolve_component(ssp.as_ref(), DEFAULT_SSP_VERSION, project_dir),
@@ -1823,6 +1937,25 @@ impl ResolvedVersions {
 
     pub fn surrealdb_image(&self) -> String {
         format!("surrealdb/surrealdb:{}", self.surrealdb)
+    }
+
+    /// Images `spky dev` should re-pull before starting: the components whose
+    /// `version:` says `newest`. Everything else keeps the pull-if-missing
+    /// behaviour, a channel name included, so a plain `version: canary` does not
+    /// spend a registry request on every dev start.
+    pub fn images_to_refresh(&self, config: &Sp00kyConfig) -> Vec<String> {
+        let is_newest = |spec: Option<&str>| {
+            spec.is_some_and(|s| s.trim().eq_ignore_ascii_case(VERSION_NEWEST))
+        };
+        let (ssp, scheduler) = config.component_version_specs(DeployEnv::Dev);
+        let mut out = Vec::new();
+        if is_newest(ssp.as_deref()) {
+            out.extend(self.ssp_image());
+        }
+        if is_newest(scheduler.as_deref()) {
+            out.extend(self.scheduler_image());
+        }
+        out
     }
 
     /// Image reference for the SSP, if it is launched from Docker.
@@ -2863,6 +2996,102 @@ mod version_tests {
             resolve(yaml, DeployEnv::Cloud),
             ("canary".into(), "canary".into())
         );
+    }
+
+    fn policy(yaml: &str) -> BTreeMap<String, String> {
+        let cfg: Sp00kyConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.cloud_version_policy().unwrap()
+    }
+
+    #[test]
+    fn classify_version_reads_the_three_policies() {
+        assert_eq!(classify_version("any").unwrap(), VersionPolicy::Any);
+        assert_eq!(classify_version(" ").unwrap(), VersionPolicy::Any);
+        assert_eq!(
+            classify_version("newest").unwrap(),
+            VersionPolicy::Track("canary".into())
+        );
+        assert_eq!(
+            classify_version("latest").unwrap(),
+            VersionPolicy::Track("latest".into())
+        );
+        assert_eq!(
+            classify_version("0.0.1-canary.270").unwrap(),
+            VersionPolicy::Pinned("0.0.1-canary.270".into())
+        );
+        // The git tag spelling of a release names the same image.
+        assert_eq!(
+            classify_version("v0.0.1-canary.270").unwrap(),
+            VersionPolicy::Pinned("0.0.1-canary.270".into())
+        );
+        assert!(classify_version("not a tag").is_err());
+        assert!(classify_version("repo/image:tag").is_err());
+    }
+
+    #[test]
+    fn cloud_policy_is_the_cloud_half_verbatim() {
+        // The whitepawn shape. `dev` must not leak into what the cloud enforces.
+        let yaml = "version:\n  cloud: 0.0.1-canary.270\n  dev:\n    ssp: canary\n    scheduler: canary\n";
+        let p = policy(yaml);
+        assert_eq!(p.get("ssp").unwrap(), "0.0.1-canary.270");
+        assert_eq!(p.get("scheduler").unwrap(), "0.0.1-canary.270");
+
+        let p = policy("version:\n  cloud: { ssp: newest, scheduler: any }\n");
+        assert_eq!(p.get("ssp").unwrap(), "newest");
+        assert_eq!(p.get("scheduler").unwrap(), "any");
+    }
+
+    #[test]
+    fn cloud_policy_is_empty_when_the_file_says_nothing_for_the_cloud() {
+        assert!(policy("mode: cluster\n").is_empty());
+        assert!(policy("version:\n  dev: canary\n").is_empty());
+        // A host binary is a `spky dev` concept; the cloud has no such thing.
+        let p = policy("version:\n  ssp: { path: ../target/debug/ssp }\n  scheduler: newest\n");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.get("scheduler").unwrap(), "newest");
+    }
+
+    #[test]
+    fn cloud_policy_rejects_a_version_that_cannot_be_a_tag() {
+        let cfg: Sp00kyConfig = serde_yaml::from_str("version:\n  cloud: \"not a tag\"\n").unwrap();
+        assert!(cfg.cloud_version_policy().is_err());
+    }
+
+    #[test]
+    fn keywords_run_the_default_channel_image_in_dev() {
+        // `any` and `newest` are policies, not Docker tags.
+        assert_eq!(
+            resolve("version: any\n", DeployEnv::Dev),
+            ("canary".into(), "canary".into())
+        );
+        assert_eq!(
+            resolve("version: newest\n", DeployEnv::Dev),
+            ("canary".into(), "canary".into())
+        );
+        assert_eq!(
+            resolve("version: v0.0.1-canary.270\n", DeployEnv::Dev),
+            ("0.0.1-canary.270".into(), "0.0.1-canary.270".into())
+        );
+    }
+
+    #[test]
+    fn only_newest_refreshes_dev_images() {
+        let refresh = |yaml: &str| {
+            let cfg: Sp00kyConfig = serde_yaml::from_str(yaml).unwrap();
+            ResolvedVersions::from_config(&cfg, DeployEnv::Dev).images_to_refresh(&cfg)
+        };
+        assert_eq!(
+            refresh("version: newest\n"),
+            vec!["mono424/spooky-ssp:canary", "mono424/spooky-scheduler:canary"]
+        );
+        assert_eq!(
+            refresh("version:\n  dev: { ssp: newest, scheduler: 0.0.1-canary.270 }\n"),
+            vec!["mono424/spooky-ssp:canary"]
+        );
+        // A channel name keeps pull-if-missing; so does a cloud-only `newest`.
+        assert!(refresh("version: canary\n").is_empty());
+        assert!(refresh("version:\n  cloud: newest\n").is_empty());
+        assert!(refresh("mode: cluster\n").is_empty());
     }
 
     #[test]

@@ -112,7 +112,7 @@ SSPs, leaving backends, frontends and SurrealDB running.
 | --- | --- |
 | `TARGET...` | Roles (`db` or `surrealdb`, `scheduler`, `ssp`, `frontend`) or the name of a single app from `sp00ky.yml`. Several may be given at once. |
 | `--all-backends` | Restart every backend app. |
-| `--upgrade` | Pull the latest scheduler and SSP base images before restarting. |
+| `--upgrade` | Move the scheduler and SSP to the newest published build before restarting. A role that `sp00ky.yml` pins to an exact [`version`](/docs/reference/config#versions) restarts on its pin instead, with a warning. |
 | `--clean` | Also wipe the scheduler's persistent volume, its replica and write-ahead log. SurrealDB data is untouched. |
 | `--surreal` (`--db`) | Also restart SurrealDB. A process restart rather than a wipe, so data on the volume survives, but the whole deployment is briefly unavailable. Equivalent to adding `db` to the targets. |
 | `-y`, `--yes` | The [global flag](#running-unattended--y----yes): confirms the prompt a SurrealDB target triggers. Without it, and without a terminal, the restart is refused. |
@@ -157,7 +157,7 @@ export const flagsCode = `spky dev --clean            # rebuild SSP/scheduler st
 spky dev --clean-db         # also wipe the database
 spky dev --verbose          # stream all SurrealDB/SSP/scheduler logs
 spky deploy --only api,web  # deploy a subset of apps
-spky deploy --upgrade       # also pull new SSP/scheduler images
+spky deploy --upgrade       # also move SSP/scheduler to the newest build (unless version: pins them)
 spky doctor --json          # machine-readable health check
 spky query --cloud '…'      # run SurrealQL against production
 spky logs --since 1h --grep 'error'`;
@@ -167,7 +167,7 @@ spky restart db              # SurrealDB only (prompts first)
 spky restart ssp scheduler   # several roles at once
 spky restart gameanalysis    # one backend, by app name
 spky restart --all-backends  # every backend app
-spky restart --upgrade       # pull new scheduler/SSP images first
+spky restart --upgrade       # newest scheduler/SSP build first (unless version: pins them)
 spky restart --clean         # also wipe the scheduler's replica + WAL
 spky restart db -y           # CI: skip the SurrealDB prompt`;
 

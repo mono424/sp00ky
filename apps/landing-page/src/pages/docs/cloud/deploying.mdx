@@ -66,7 +66,7 @@ You'll see real-time progress as each step completes.
 
 | Flag | Effect |
 | --- | --- |
-| `--upgrade` | Also pull the latest SSP and Scheduler images. |
+| `--upgrade` | Also move the SSP and Scheduler to the newest published build. Only for a project whose [`version`](/docs/reference/config#versions) is `any` or unset: a pinned version stays where `sp00ky.yml` put it, and `newest` already rolls on every deploy. |
 | `--only api,web` | Build and deploy just these apps. Everything else keeps running untouched. |
 | `--clean` | Wipe the scheduler's persistent volume first. Last resort: the scheduler self-heals stale snapshot state on startup, and `spky verify --fix` (or `POST /admin/resync` on the scheduler) repairs it without a wipe. Your SurrealDB data is not touched either way. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when the hash says nothing changed. Drift recovery. |
@@ -187,7 +187,7 @@ The value is forwarded to `tracing-subscriber`, so target-specific directives wo
 
 <CodeBlock code={codeLogLevelTargets} lang="yaml" />
 
-Each `spky deploy` sends the resolved `cloud` value to Sp00ky Cloud, which restarts the Scheduler and SSP containers with the new `RUST_LOG`. Use `--upgrade` if you also want fresh base images at the same time.
+Each `spky deploy` sends the resolved `cloud` value to Sp00ky Cloud, which restarts the Scheduler and SSP containers with the new `RUST_LOG`. Use `--upgrade` if you also want the newest SSP and Scheduler build at the same time (it does not move a [pinned `version`](/docs/reference/config#versions)).
 
 <Note>
   At <code>trace</code>, the Scheduler logs every replica query and every record it ingests during bootstrap. Useful for diagnosing "why isn't this row showing up?" See <a href="/docs/cloud/logs">Logs & Monitoring</a>.

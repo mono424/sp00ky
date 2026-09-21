@@ -2169,6 +2169,11 @@ pub fn deploy(
     let config = backend::load_config(&config_path);
     config.validate()?;
 
+    // The scheduler/SSP version policy from `version:`. Read here, before any
+    // image is built: a typo in it should cost seconds, not a full build.
+    let infra_version = config.cloud_version_policy()?;
+    print_version_policy(&infra_version, upgrade);
+
     // --only: restrict this deploy to a subset of apps. The selected apps are
     // built/uploaded and sent with `partial: true`; the control plane merges them
     // over the previous deployment so every other running service is left alone.
@@ -3124,6 +3129,10 @@ pub fn deploy(
         "ssp_count": ssp_count,
         "log_level": cloud_log_level,
         "upgrade_infra": upgrade,
+        // `version:` as the control plane should enforce it: role -> exact tag,
+        // `newest` or `any`. A control plane that predates the key ignores it
+        // and keeps running the floating channel tag.
+        "infra_version": infra_version,
         "clean": clean,
         "ssp_job_config": ssp_job_config,
         // Free plan: the app's refMode must reach the SSP Worker so its ref mode
@@ -3153,6 +3162,7 @@ pub fn deploy(
         "  Deployment v{} created. Waiting for provisioning...",
         version
     );
+    print_version_outcome(&deployment["infra_version"], !infra_version.is_empty());
     println!();
 
     // Phase 1: Stream events until infra is ready (migrating state)
@@ -3432,6 +3442,47 @@ pub fn deploy(
     Ok(())
 }
 
+/// Say up front what `version:` will do to the scheduler and SSP, so a roll (or
+/// the absence of one under `--upgrade`) is announced rather than discovered.
+fn print_version_policy(policy: &std::collections::BTreeMap<String, String>, upgrade: bool) {
+    use crate::backend::{classify_version, VersionPolicy};
+    for role in ["scheduler", "ssp"] {
+        let spec = policy.get(role).map(String::as_str).unwrap_or("");
+        let line = match classify_version(spec) {
+            Ok(VersionPolicy::Pinned(tag)) if upgrade => format!(
+                "pinned to {tag} by sp00ky.yml (--upgrade does not move it; change `version:` instead)"
+            ),
+            Ok(VersionPolicy::Pinned(tag)) => format!("pinned to {tag}"),
+            Ok(VersionPolicy::Track(channel)) => {
+                format!("newest {channel} build (rolls when a newer one exists)")
+            }
+            Ok(VersionPolicy::Any) if upgrade => "upgrading to the newest build".to_string(),
+            Ok(VersionPolicy::Any) => "unchanged (manual: `spky deploy --upgrade`)".to_string(),
+            Err(_) => continue, // cloud_version_policy already rejected it
+        };
+        println!("  ▸ {role} version: {line}");
+    }
+}
+
+/// Print what the control plane decided. `sent_policy` is whether the manifest
+/// declared a `version:` at all: only then is a silent control plane worth a
+/// warning, because only then is something being ignored.
+fn print_version_outcome(report: &serde_json::Value, sent_policy: bool) {
+    if report.is_null() {
+        if sent_policy {
+            println!(
+                "  ▸ Warning: this control plane does not enforce `version:` yet; the scheduler and SSP keep their current images."
+            );
+        }
+        return;
+    }
+    for note in report["notes"].as_array().into_iter().flatten() {
+        if let Some(note) = note.as_str() {
+            println!("  ▸ {note}");
+        }
+    }
+}
+
 /// Name the case where the deployed components do not all run the same release.
 ///
 /// The table already prints every version, but reading skew off three columns is
@@ -3453,13 +3504,38 @@ pub(crate) struct VersionSkew {
     pub reported: Vec<(String, String)>,
     /// Core roles that did not report a version at all.
     pub unknown: Vec<String>,
-    /// True when the reported versions and the CLI's own are not all equal.
+    /// True when an UNPINNED role's version differs from the CLI's own. A role
+    /// that sp00ky.yml pins is supposed to differ from the CLI, so it is judged
+    /// against its pin instead (see `off_pin`).
     pub skewed: bool,
+    /// Pinned roles not running their pin: (role, running, pinned).
+    pub off_pin: Vec<(String, String, String)>,
+}
+
+/// Roles that sp00ky.yml pins to an exact release, role -> tag, read from the
+/// deployment status (`infra_version.policy`). Only release-shaped pins are
+/// kept: a one-off build tag ("pools-rc3") is not what the binary reports as
+/// its version, so comparing the two would always cry wolf.
+pub(crate) fn pinned_release_roles(
+    status: &serde_json::Value,
+) -> std::collections::HashMap<String, String> {
+    use crate::backend::{classify_version, VersionPolicy};
+    let mut out = std::collections::HashMap::new();
+    for role in CORE_ROLES {
+        let spec = status["infra_version"]["policy"][role].as_str().unwrap_or("");
+        if let Ok(VersionPolicy::Pinned(tag)) = classify_version(spec) {
+            if tag.starts_with(|c: char| c.is_ascii_digit()) {
+                out.insert(role.to_string(), tag);
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn detect_version_skew(
     component_versions: &std::collections::HashMap<String, (String, String)>,
     cli_version: &str,
+    pinned: &std::collections::HashMap<String, String>,
 ) -> VersionSkew {
     let mut reported: Vec<(String, String)> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
@@ -3474,27 +3550,62 @@ pub(crate) fn detect_version_skew(
 
     // Only compare what actually answered: an unreported role is called out
     // separately rather than counted as agreeing.
-    let skewed = reported.iter().any(|(_, v)| v != cli_version);
+    let skewed = reported
+        .iter()
+        .any(|(role, v)| !pinned.contains_key(role) && v != cli_version);
+    let off_pin = reported
+        .iter()
+        .filter_map(|(role, v)| {
+            let pin = pinned.get(role)?;
+            (v != pin).then(|| (role.clone(), v.clone(), pin.clone()))
+        })
+        .collect();
 
-    VersionSkew { reported, unknown, skewed }
+    VersionSkew { reported, unknown, skewed, off_pin }
 }
 
 fn report_version_skew(
     component_versions: &std::collections::HashMap<String, (String, String)>,
+    pinned: &std::collections::HashMap<String, String>,
 ) {
     let cli_version = env!("CARGO_PKG_VERSION");
-    let skew = detect_version_skew(component_versions, cli_version);
+    let skew = detect_version_skew(component_versions, cli_version, pinned);
 
     if skew.skewed {
         println!();
         println!("  \x1b[33m▲ Version skew:\x1b[0m components are not on the same release.");
         println!("      {:<26} {}", "cli (this deploy's target)", cli_version);
         for (role, v) in &skew.reported {
-            let marker = if v == cli_version { "" } else { "  ← does not match" };
+            let marker = match pinned.get(role) {
+                Some(_) => "  (pinned by sp00ky.yml)",
+                None if v == cli_version => "",
+                None => "  ← does not match",
+            };
             println!("      {role:<26} {v}{marker}");
         }
         println!("    A server-side fix is only live once ssp + scheduler move too.");
         println!("    Run `spky deploy --upgrade` to bring them to {cli_version}.");
+    }
+
+    if !skew.off_pin.is_empty() {
+        println!();
+        println!("  \x1b[33m▲ Pinned version not running:\x1b[0m sp00ky.yml and the stack disagree.");
+        for (role, running, pin) in &skew.off_pin {
+            println!("      {role:<26} runs {running}, `version:` pins {pin}");
+        }
+        println!("    Run `spky deploy` (or push) to enforce the pin.");
+    } else if !pinned.is_empty() && pinned.values().any(|pin| pin != cli_version) {
+        // Not a problem, but worth one line: a pinned stack does not follow the
+        // CLI, which is exactly what reads as "my upgrade did nothing".
+        let mut pins: Vec<&String> = pinned.values().collect();
+        pins.sort();
+        pins.dedup();
+        let pins: Vec<&str> = pins.into_iter().map(String::as_str).collect();
+        println!();
+        println!(
+            "  ▸ Pinned to {} by sp00ky.yml (cli is {cli_version}). Change `version:` and deploy to move it.",
+            pins.join(" / ")
+        );
     }
 
     if !skew.unknown.is_empty() {
@@ -3522,7 +3633,7 @@ mod version_skew_tests {
     #[test]
     fn no_skew_when_everything_matches() {
         let v = versions(&[("ssp", "1.2.3"), ("scheduler", "1.2.3")]);
-        let skew = detect_version_skew(&v, "1.2.3");
+        let skew = detect_version_skew(&v, "1.2.3", &HashMap::new());
         assert!(!skew.skewed);
         assert!(skew.unknown.is_empty());
     }
@@ -3532,7 +3643,7 @@ mod version_skew_tests {
         // The whitepawn case: client moved, the SSP that evaluates permissions
         // did not, so a server-side fix was never actually live.
         let v = versions(&[("ssp", "0.0.1-canary.168"), ("scheduler", "0.0.1-canary.168")]);
-        let skew = detect_version_skew(&v, "0.0.1-canary.178");
+        let skew = detect_version_skew(&v, "0.0.1-canary.178", &HashMap::new());
         assert!(skew.skewed);
         assert_eq!(skew.reported.len(), 2);
     }
@@ -3540,16 +3651,63 @@ mod version_skew_tests {
     #[test]
     fn flags_a_partial_upgrade() {
         let v = versions(&[("ssp", "1.2.3"), ("scheduler", "1.2.2")]);
-        let skew = detect_version_skew(&v, "1.2.3");
+        let skew = detect_version_skew(&v, "1.2.3", &HashMap::new());
         assert!(skew.skewed);
     }
 
     #[test]
     fn unknown_is_reported_but_is_not_skew_on_its_own() {
         let v = versions(&[("ssp", "1.2.3")]);
-        let skew = detect_version_skew(&v, "1.2.3");
+        let skew = detect_version_skew(&v, "1.2.3", &HashMap::new());
         assert!(!skew.skewed);
         assert_eq!(skew.unknown, vec!["scheduler".to_string()]);
+    }
+
+    fn pins(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_pinned_stack_behind_the_cli_is_not_skew() {
+        // sp00ky.yml says .266 and the stack runs .266: that is the file being
+        // enforced, not an upgrade someone forgot.
+        let v = versions(&[("ssp", "0.0.1-canary.266"), ("scheduler", "0.0.1-canary.266")]);
+        let p = pins(&[("ssp", "0.0.1-canary.266"), ("scheduler", "0.0.1-canary.266")]);
+        let skew = detect_version_skew(&v, "0.0.1-canary.270", &p);
+        assert!(!skew.skewed);
+        assert!(skew.off_pin.is_empty());
+    }
+
+    #[test]
+    fn flags_a_stack_that_left_its_pin() {
+        // The case this exists for: upgraded by hand past what the repo declares.
+        let v = versions(&[("ssp", "0.0.1-canary.270"), ("scheduler", "0.0.1-canary.266")]);
+        let p = pins(&[("ssp", "0.0.1-canary.266"), ("scheduler", "0.0.1-canary.266")]);
+        let skew = detect_version_skew(&v, "0.0.1-canary.270", &p);
+        assert!(!skew.skewed);
+        assert_eq!(
+            skew.off_pin,
+            vec![("ssp".to_string(), "0.0.1-canary.270".to_string(), "0.0.1-canary.266".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_unpinned_role_is_still_judged_against_the_cli() {
+        let v = versions(&[("ssp", "1.2.2"), ("scheduler", "1.2.2")]);
+        let skew = detect_version_skew(&v, "1.2.3", &pins(&[("ssp", "1.2.2")]));
+        assert!(skew.skewed);
+        assert!(skew.off_pin.is_empty());
+    }
+
+    #[test]
+    fn only_release_shaped_pins_are_compared() {
+        let status = serde_json::json!({ "infra_version": { "policy": {
+            "ssp": "pools-rc3", "scheduler": "v0.0.1-canary.270" } } });
+        let p = pinned_release_roles(&status);
+        assert_eq!(p, pins(&[("scheduler", "0.0.1-canary.270")]));
+        let newest = serde_json::json!({ "infra_version": { "policy": { "ssp": "newest" } } });
+        assert!(pinned_release_roles(&newest).is_empty());
+        assert!(pinned_release_roles(&serde_json::json!({})).is_empty());
     }
 
     #[test]
@@ -3557,7 +3715,7 @@ mod version_skew_tests {
         // The control plane reports "-" for a component it cannot read; that
         // must not be compared as if it were a real release.
         let v = versions(&[("ssp", "-"), ("scheduler", "")]);
-        let skew = detect_version_skew(&v, "1.2.3");
+        let skew = detect_version_skew(&v, "1.2.3", &HashMap::new());
         assert!(!skew.skewed);
         assert_eq!(skew.unknown.len(), 2);
     }
@@ -5315,7 +5473,11 @@ pub fn restart(
     }
 
     let resp = client.post(&format!("/v1/projects/{}/restart", pid), &body)?;
-    let _: serde_json::Value = resp.into_json().context("Failed to parse response")?;
+    let queued: serde_json::Value = resp.into_json().context("Failed to parse response")?;
+    // --upgrade against a role that sp00ky.yml pins restarts it on the pin.
+    if let Some(warning) = queued["warning"].as_str() {
+        println!("  ▸ Warning: {warning}");
+    }
 
     // The API only queues the request; the worker stops and recreates the
     // containers itself so there is a single writer of container lifecycle.
@@ -6568,7 +6730,7 @@ fn print_deployment_details(data: &serde_json::Value) {
                 );
             }
 
-            report_version_skew(&component_versions);
+            report_version_skew(&component_versions, &pinned_release_roles(&data));
         }
     }
 

@@ -33,11 +33,11 @@
       ]
     },
     "version": {
-      "description": "Sp00ky service versions. A string sets both SSP and Scheduler everywhere. A `{ssp, scheduler}` object splits per service. A `{dev, cloud}` object splits per environment (currently only `dev` is consumed by `spky dev`; `cloud` is reserved). Each service entry may be an image version tag or a `{ path }` object pointing at a host-built binary.",
+      "description": "Sp00ky service versions, enforced. An exact version (e.g. \"0.0.1-canary.270\") is pinned: Sp00ky Cloud runs exactly that on every deploy, CLI or git push, and `--upgrade` does not move it. `newest` rolls the stack to the newest build on every deploy. `any` (or no `version` at all) changes nothing on deploy and leaves upgrades to a manual `spky deploy --upgrade` / `spky restart --upgrade`. A string sets both SSP and Scheduler everywhere. A `{ssp, scheduler}` object splits per service. A `{dev, cloud}` object splits per environment: `dev` selects the images `spky dev` runs, `cloud` is what Sp00ky Cloud enforces. Each service entry may also be a `{ path }` object pointing at a host-built binary (`spky dev` only).",
       "oneOf": [
         {
           "type": "string",
-          "description": "Version tag applied to both SSP and Scheduler (e.g. \"canary\", \"v1.0.0\")."
+          "description": "Applied to both SSP and Scheduler: an exact version (pinned, e.g. \"0.0.1-canary.270\"), `newest` (always roll to the newest build) or `any` (manual upgrades only)."
         },
         {
           "type": "object",
@@ -54,7 +54,7 @@
         },
         {
           "type": "object",
-          "description": "Per-environment versions. Currently only `dev` is consumed; `cloud` is reserved.",
+          "description": "Per-environment versions. `dev` selects the images `spky dev` runs; `cloud` is the policy Sp00ky Cloud enforces on every deploy.",
           "properties": {
             "dev": {
               "$ref": "#/$defs/versionSpec"
@@ -240,7 +240,7 @@
       "oneOf": [
         {
           "type": "string",
-          "description": "Image version tag (e.g. \"canary\", \"v1.0.0\")."
+          "description": "An exact version (pinned, e.g. \"0.0.1-canary.270\"), `newest` (always roll to the newest build) or `any` (manual upgrades only)."
         },
         {
           "type": "object",

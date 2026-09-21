@@ -133,6 +133,19 @@ pub fn run(
     // would only work when invoked from that exact dir.
     let project_dir = std::env::current_dir().context("Failed to get current directory")?;
     let versions = ResolvedVersions::from_config_with_dir(&config, DeployEnv::Dev, &project_dir);
+    // `version: newest` means the newest build, not the newest one this machine
+    // happens to have: re-pull before anything starts. Best effort, so working
+    // offline still starts the stack on the image that is already here.
+    for image in versions.images_to_refresh(&config) {
+        match Command::new("docker").args(["pull", "--quiet", &image]).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => ui::detail(&format!(
+                "could not refresh {image} ({}); using the local copy",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => ui::detail(&format!("could not refresh {image} ({e}); using the local copy")),
+        }
+    }
     let resolved = config.resolved_schema();
     let resolved_surreal = config.resolved_surrealdb();
     let migrations_path = resolved.migrations.to_string_lossy().to_string();

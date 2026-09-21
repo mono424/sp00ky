@@ -295,6 +295,21 @@ The dashboard and its MCP server, on their own port. See
 | `SPKY_ADMIN_JOB_INTERVAL_SECS` | How often the job sampler reads your outbox tables, feeding the Jobs page, its totals and the Overview tile. Every job aggregate is a scan of one of your own tables, so one sampler takes them for every open dashboard. Set it to `0` to switch the sampler off entirely: the Jobs list and its filters still work, and the totals then report that they are not being measured rather than showing zeros. | `15` |
 | `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | The cadence while at least one dashboard holds the Jobs stream open, so a backlog can be watched draining. Clamped to no slower than the idle interval. | `2` |
 
+#### Machine pools
+
+The listener [machine pool](/docs/jobs/machine-pools) agents connect to, and the `docker` provider a self-hosted scheduler can create machines with.
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SPKY_POOL_ENABLED` | Serve pools at all. `0` or `false` turns the listener and the pool sweep off. | `true` |
+| `SPKY_POOL_PORT` | Port of the pool listener | `9669` |
+| `SPKY_POOL_HOST` | Bind address of the pool listener | `0.0.0.0` |
+| `SPKY_POOL_PUBLIC_URL` | The listener's URL **as a machine reaches it**. Handed to every machine the scheduler creates. | `http://scheduler:<port>` |
+| `SPKY_POOL_SECRET` | Key that signs each machine's token. Must survive restarts, or running machines are locked out and their jobs fail over. Falls back to `SPKY_AUTH_SECRET`. | *(SPKY_AUTH_SECRET)* |
+| `SPKY_POOL_DOCKER` | Enable the `docker` provider: machines are containers on this scheduler's Docker host. Needs the Docker socket mounted. | *(off)* |
+| `SPKY_POOL_DOCKER_NETWORK` | Docker network machine containers join, so they can reach `SPKY_POOL_PUBLIC_URL` | *(default bridge)* |
+| `SPKY_POOL_AGENT_IMAGE` | Image carrying the `spky-agent` binary each machine runs. Defaults to the agent released with this scheduler, which is the one that speaks its protocol. | `mono424/spooky-agent:<release>` |
+
 #### Backup storage
 
 These carry **no `SPKY_` prefix**. The backup plane is enabled as soon as any of

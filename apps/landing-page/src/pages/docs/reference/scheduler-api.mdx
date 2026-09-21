@@ -27,13 +27,14 @@ The bind host/port are YAML-only.
 
 ## Ports
 
-The scheduler listens on **two** ports, and the distinction matters for how you
+The scheduler listens on **three** ports, and the distinction matters for how you
 expose it:
 
 | Port | Env | Serves | Exposure |
 | --- | --- | --- | --- |
 | `9667` | `ingest_port` (YAML) | `/ingest`, `/proxy/*`, `/view/*`, `/ssp/*`, `/job/*`, `/metrics`, `/health*`, `/info`, `/backup/*` | **Private network only** |
 | `9668` | `SPKY_ADMIN_PORT` | `/admin` (dashboard) and `/admin/api/*` | Safe to publish |
+| `9669` | `SPKY_POOL_PORT` | `/pool/v1/*`, the [machine pool](/docs/jobs/machine-pools) agents' connection | Publish when pool machines live outside the scheduler's network |
 
 ## Authentication
 

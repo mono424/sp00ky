@@ -54,6 +54,8 @@ Each entry under `apps` is a service `spky` knows how to run locally and deploy 
 
 <CodeBlock code={ymlApps} lang="yaml" />
 
+A backend may also set `runOn: { pool: <name> }` to run its jobs on a [machine pool](#machine-pools) instead of an always-on container.
+
 `method` describes the outbox the SSP delivers jobs through: `type: outbox`, the `table` the rows live in, the `schema` file defining it, and an optional `concurrency` bounding how many of that table's jobs run at once (default `1`; extra rows wait as `pending` and are admitted oldest-first). See [Jobs → Concurrency](/docs/jobs#concurrency).
 
 `dev` accepts either a raw command string or a typed form: `{type: npm, script, workdir?}`, `{type: docker, file, workdir?, port?}` (builds a Dockerfile for this app's dev server), or `{type: uv, script, workdir?}`. `deploy` accepts `dockerfile`, `context`, `port`, `healthcheck`, `resources` (`vcpus`, `memory`, `disk`), a `timeout`, a `cmd` (override the image's ENTRYPOINT/CMD), `build_args` (build-time-only args, same shape as `env`), and `static` (`{build, dir}`, for Cloudflare static-asset frontends).
@@ -211,6 +213,14 @@ Either section can also live in its own file, per entry or wholesale, useful onc
   `spky lint` parses every cron expression, checks each interval, resolves each `backend` and `route` against that app's OpenAPI spec, and rejects a workflow whose `dependsOn` edges form a cycle, so a definition that lints is one the scheduler can actually run.
 </Note>
 
+## Machine pools
+
+`pools` declares machines that exist only while a backend has work: a pool is sized by the scheduler and its machines are created and destroyed on demand. A backend opts in with `runOn: { pool: <name> }`, and its outbox jobs then run on the pool's machines instead of on an always-on container.
+
+<CodeBlock code={ymlPools} lang="yaml" />
+
+A pool is fixed (`autoscale: false`, exactly `min` machines), scales on demand up to `max`, or keeps a warm `buffer` of ready machines above what is in use. `provider` is `hetzner` for VMs on Sp00ky Cloud; `spky dev` always runs pools as local containers (`docker`). Each pool serves exactly one backend, and pools need `mode: cluster`. The full behaviour, every field with its default, and how to operate a pool are in [Machine pools](/docs/jobs/machine-pools).
+
 ## Client types
 
 `clientTypes` is a list of codegen targets; `spky generate` (run with no args) regenerates every entry from your schema. Each entry has a `format` and an `output` path (relative to `sp00ky.yml`):
@@ -335,6 +345,30 @@ export const ymlScheduleFiles = `schedules: ./schedules.yml            # the who
 workflows:
   monthly-report: ./workflows/monthly-report.yml   # one definition per file
   quick-one: { steps: { ping: { backend: api, route: /ping } } }   # mixing is fine`;
+
+export const ymlPools = `mode: cluster
+
+pools:
+  render:
+    provider: hetzner                 # hetzner (Sp00ky Cloud) | docker (local, self-hosted)
+    machine: { type: cx33, locations: [fsn1, nbg1] }
+    slots: 1                          # jobs per machine at once
+    min: 0                            # machines that always run
+    autoscale: true
+    max: 2                            # required with autoscale
+    buffer: 0                         # ready machines kept above what is in use
+    idleTimeout: 10m
+    recycle: job                      # restart the backend between jobs (or: never)
+    maxJobDuration: 8h
+    maxLifetime: 24h
+    lease: 90s
+    bootTimeout: 5m
+
+apps:
+  renderer:
+    type: backend
+    runOn: { pool: render }
+    # ...spec, baseUrl, method (an outbox table) and deploy as usual`;
 
 export const ymlPerEnv = `version:
   dev:

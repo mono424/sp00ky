@@ -270,6 +270,10 @@ The job runner is built into the SSP. There is nothing to install or implement:
 
    `lease_epoch` is what makes reclaiming safe. Each of the runner's writes is guarded on the token it claimed under, so if a slow attempt wakes up after its row was reclaimed and re-run, its write matches nothing instead of overwriting the attempt that replaced it. Without that, reclaiming a stuck job would trade it for a corrupted one.
 
+<Note>
+  One exception to "the runner is built into the SSP": a backend with [`runOn`](/docs/jobs/machine-pools) has its jobs run by the scheduler, on machines of their own. The job rows, retries, `spky jobs` and the kill and retry commands work the same way.
+</Note>
+
 <Warning>
   A SCHEMAFULL job table must define the platform's own fields, or those writes are rejected at the statement level and quietly lost. `spky deploy` injects `assignee`, `lease_until`, `lease_epoch`, `result`, `errors[*]`, and `timeout` with `IF NOT EXISTS` (plus the retention index below), so re-deploying an older project fixes it.
 

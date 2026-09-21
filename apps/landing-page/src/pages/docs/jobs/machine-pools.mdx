@@ -1,0 +1,390 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Machine pools
+description: Run a backend's jobs on machines that exist only while there is work. Autoscaling, warm buffers, one machine per job if you want it, and nothing left running when the queue is empty.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const quickstartCode = `# sp00ky.yml
+mode: cluster                     # pools are run by the scheduler
+
+pools:
+  render:
+    provider: hetzner             # a VM per machine on Sp00ky Cloud (spky dev uses containers)
+    machine: { type: cx33, locations: [fsn1, nbg1] }
+    min: 0                        # nothing runs while there is no work
+    autoscale: true
+    max: 2                        # the ceiling, and so the bill
+    idleTimeout: 5m               # an idle machine goes after five minutes
+
+apps:
+  renderer:
+    type: backend
+    runOn: { pool: render }       # this backend's jobs run on the pool
+    spec: ./renderer/openapi.yml
+    baseUrl: http://127.0.0.1:8080
+    method:
+      type: outbox
+      table: render_job
+      schema: ./src/outbox/render.surql
+    deploy:
+      dockerfile: ./renderer/Dockerfile
+      port: 8080
+      healthcheck: /health`;
+
+export const handlerCode = `// renderer: an ordinary backend. On each machine an agent POSTs every job
+// to it over loopback and waits for the answer, however long it takes.
+app.get('/health', (_req, res) => res.send('ok'));
+
+app.post('/render', async (req, res) => {
+  const { gameId, format } = req.body;
+  const file = await renderGame(gameId, format);   // minutes of CPU
+  res.json({ url: await upload(file) });            // stored on the job row as \`result\`
+});`;
+
+export const enqueueCode = `// From your app, exactly like any other job:
+await db.run('renderer', '/render', { gameId, format: 'mp4' });`;
+
+export const sizingModesCode = `pools:
+  # Fixed: always two machines. Jobs beyond the free slots wait for one.
+  steady:
+    min: 2
+
+  # Baseline plus on demand: one machine always, more while jobs queue up,
+  # never more than eight. A job that finds no free slot waits one boot.
+  elastic:
+    min: 1
+    autoscale: true
+    max: 8
+
+  # Warm buffer: two ready machines always wait ON TOP of the busy ones,
+  # so a job starts at once and the buffer refills behind it.
+  instant:
+    min: 0
+    autoscale: true
+    max: 10
+    buffer: 2
+
+  # Scale to zero: no machine at all until a job arrives.
+  on-demand:
+    min: 0
+    autoscale: true
+    max: 3`;
+
+export const sizingFormulaCode = `capacity = busy slots + queued jobs + buffer x slots
+needed   = ceil(capacity / slots)
+desired  = autoscale ? clamp(max(min, needed), min, max) : min`;
+
+export const machineCode = `pools:
+  render:
+    provider: hetzner
+    machine:
+      type: cpx42                 # any Hetzner Cloud x86 server type
+      locations: [fsn1, nbg1, hel1]   # tried in order; empty = Hetzner decides
+    slots: 2                      # two jobs at once on each machine`;
+
+export const operateCode = `# Jobs on a pool are ordinary jobs:
+spky jobs                          # dashboard, pool tables included
+spky jobs get render_job:abc       # payload, result, every attempt
+spky jobs kill render_job:abc      # stops it on the machine
+spky jobs retry render_job:abc`;
+
+export const selfHostEnvCode = `# The scheduler's pool listener, which pool machines dial:
+SPKY_POOL_PORT=9669
+SPKY_POOL_PUBLIC_URL=https://pool.example.com   # as a MACHINE reaches it
+SPKY_POOL_SECRET=<long random string>           # signs machine tokens; keep it stable
+
+# The docker provider: machines are containers on the scheduler's docker host.
+SPKY_POOL_DOCKER=1
+SPKY_POOL_DOCKER_NETWORK=my-network`;
+
+<Experimental>
+  Machine pools are experimental. They need a CLI and a scheduler that ship them (the first release after `0.0.1-canary.269`) and a project deployed with `spky deploy`; see [Limitations](#limitations). Expect the configuration to settle and the operator tooling to grow.
+</Experimental>
+
+## Overview
+
+Every backend normally runs as one always-on container next to your database, and the SSPs hand it one job after another. That is right for most work. It is wrong for work that needs a machine of its own: a render that pins every core for twenty minutes, a transcode, a headless browser, a model run, anything whose CPU, memory or bandwidth would starve the rest of the project.
+
+A **machine pool** gives a backend's jobs their own machines, created when there is work and destroyed when there is not. You declare the pool in `sp00ky.yml` and point a backend at it with `runOn`. Nothing about the backend changes: it still answers a POST per job, and your app still creates jobs with `db.run()` or a schedule.
+
+<CodeBlock code={quickstartCode} lang="yaml" />
+
+<CodeBlock code={handlerCode} lang="typescript" />
+
+<CodeBlock code={enqueueCode} lang="typescript" />
+
+With that configuration nothing runs while the queue is empty. The first job makes the scheduler ask for a machine; about a minute later the machine is up, runs the job, and after five idle minutes it is gone again. Two jobs at once get two machines. A third waits for one of them.
+
+## How a job runs
+
+1. Your app (or a schedule) writes a `pending` row into the backend's outbox table, as for any job.
+2. The scheduler sizes the pool against what is queued and asks the provider for machines it lacks.
+3. On each machine, a small agent starts your backend's container, waits for its `healthcheck` to answer, and reports the machine ready.
+4. The scheduler binds the oldest queued job to a free slot. The agent picks it up on its next poll and sends it to your backend as `POST http://127.0.0.1:<port><path>` with the job's payload as the JSON body, and holds the request open until the backend answers.
+5. The answer goes back to the scheduler, which records it on the job row exactly as it would for any other job.
+
+The agent **dials out**: it polls the scheduler every few seconds and nothing ever connects to the machine. Every poll also renews the lease of the jobs it is running, so a job may run for hours without anyone tuning a timeout for it.
+
+## Sizing
+
+A pool sizes itself one of three ways, decided by `min`, `autoscale`, `max` and `buffer`:
+
+<CodeBlock code={sizingModesCode} lang="yaml" />
+
+<PropTable props={[
+  { name: 'Fixed', type: 'autoscale: false', default: '-', desc: 'Exactly min machines, always. More jobs than free slots wait in the queue. Predictable cost, no boot waits once the pool is up.' },
+  { name: 'Baseline + on demand', type: 'autoscale: true, buffer: 0', default: '-', desc: 'min machines always, plus one per job that finds no free slot, up to max. A job that needs a new machine waits one boot.' },
+  { name: 'Warm buffer', type: 'autoscale: true, buffer: N', default: '-', desc: 'N whole machines stay ready above what is in use, so jobs start at once and the buffer refills behind them. You pay for the idle buffer.' },
+]} />
+
+The rule behind all three, evaluated every two seconds:
+
+<CodeBlock code={sizingFormulaCode} lang="text" />
+
+A pool with `min: 0` and `buffer: 0` **scales to zero**: no machine runs until a job arrives, and each burst of work waits one boot. Surplus machines are only ever taken away once they have been idle for `idleTimeout`, the longest-idle first, and never a machine that is running a job.
+
+<Note>
+  `max` is required with `autoscale: true`. It is the number that bounds the bill, so the config makes you state it. A fixed pool's size is `min`, so `max` and `buffer` are rejected there rather than silently ignored.
+</Note>
+
+## Machines
+
+### Providers
+
+<PropTable props={[
+  { name: 'hetzner', type: 'provider', default: '-', desc: 'One Hetzner Cloud VM per machine, created by Sp00ky Cloud. Use it in production.' },
+  { name: 'docker', type: 'provider', default: 'default', desc: 'One container per machine on the scheduler\'s own docker host. What spky dev always uses, and what a self-hosted scheduler with a docker socket can use.' },
+]} />
+
+`spky dev` runs every pool on `docker`, whatever the file says, so the same `sp00ky.yml` works locally and in the cloud. A deployed pool that should create VMs sets `provider: hetzner`.
+
+### Machine shape
+
+<CodeBlock code={machineCode} lang="yaml" />
+
+`machine.type` is a [Hetzner Cloud server type](https://www.hetzner.com/cloud) name. It defaults to `cx33`. Use an x86 type (the CX, CPX and CCX lines): your backend image is built for `linux/amd64`, so the Arm types (CAX) cannot run it.
+
+`machine.locations` lists Hetzner locations (`fsn1`, `nbg1`, `hel1`, `ash`, `hil`, `sin`) in order of preference. A location that is out of capacity, or does not offer the server type, is skipped for the next one. Capacity in single locations does run out now and then, so list more than one. Leave it empty and Hetzner picks.
+
+`slots` is how many jobs one machine runs at the same time (default `1`). Your backend must be able to serve that many concurrent requests; the machine's cores are what they share.
+
+### Boot time
+
+About a minute on Sp00ky Cloud from the scheduler asking to the machine being ready (the VM boots, installs the agent, downloads and starts your backend's image), and a couple of seconds under `spky dev`. Keep images small, and use `buffer` when jobs must not wait for a boot.
+
+## Writing a pool backend
+
+A pool backend is an ordinary [backend](/docs/backend) with an outbox method. `spky lint` checks what a pool needs from it:
+
+- an outbox `method` with a `table`: pool machines run outbox jobs;
+- `deploy.port`: the port the agent sends jobs to;
+- `deploy.dockerfile`: the image each machine runs (also what `spky dev` builds);
+- `deploy.healthcheck` (recommended): a path that answers `2xx` once the backend can take work. Without it, the backend counts as ready as soon as its port accepts connections.
+
+### The contract
+
+<PropTable props={[
+  { name: '2xx', type: 'answer', default: '-', desc: 'Success. The response body is stored on the job row as result.' },
+  { name: 'any other status', type: 'answer', default: '-', desc: 'A failed attempt: errors gets { code: <status>, reason: <the first 2 KB of the body> }, and the job is retried until it has used max_retries attempts (default 3), then failed.' },
+  { name: 'no answer', type: 'answer', default: '-', desc: 'Connection refused or dropped: a failed attempt with code 0, retried the same way.' },
+  { name: 'too slow', type: 'answer', default: '-', desc: 'Past the job\'s deadline the request is dropped and the job is failed with code deadline, without a retry.' },
+]} />
+
+A job's deadline is `maxJobDuration` (default 8 hours). A job's own `timeout`, when it has one ([Jobs](/docs/jobs)), shortens it but never extends it. The backend's `deploy.timeout` is the core-host job runner's setting and plays no part here.
+
+<Note>
+  A job created by a [schedule](/docs/jobs/schedules) also runs under the schedule's run deadline, one hour by default. A schedule whose pool jobs run longer needs its own [`deadline:`](/docs/jobs/schedules#run-deadlines).
+</Note>
+
+### Environment
+
+Each machine runs your backend with:
+
+- the backend's own [`env:`](/docs/dev/env), resolved at deploy exactly as for any backend: inline values, env files and `vault` references;
+- the image's own `ENV`;
+- on Sp00ky Cloud, `SPKY_ENV`, `SPKY_DB_NS` and `SPKY_DB_NAME`.
+
+The environment reaches the machine through the agent's authenticated connection to your scheduler, never through the cloud provider's metadata, which anything on a VM can read back.
+
+<Warning>
+  A pool machine is **not** on your project's private network. The connection variables the platform injects into backends on the core host (`SPKY_DB_URL`, `SPKY_DB_WS`, `SPKY_DB_USER`, `SPKY_DB_PASS`, `SPKY_SCHEDULER_URL`, `SPKY_SSP_ADDR`) are not set there, and would not resolve if they were. Prefer returning results as the job's response. A pool backend that must reach the database needs its public endpoint and credentials of its own through `env:`.
+</Warning>
+
+### Networking
+
+On Sp00ky Cloud, machines accept **no** inbound connections: every pool machine sits behind a firewall with no inbound rules, and your backend's port is never published, only the agent inside the machine talks to it. Outbound traffic is open, so a job can fetch its input from and upload its output to anywhere. Each machine has its own network interface, which is the point for bandwidth-heavy work.
+
+## Machine lifecycle
+
+A machine moves through these states, left to right; a machine that never becomes ready or stops answering is `failed` instead, and is destroyed all the same.
+
+<PropTable props={[
+  { name: 'requested', type: 'state', default: '-', desc: 'The scheduler has asked the provider for it.' },
+  { name: 'booting', type: 'state', default: '-', desc: 'It exists and is starting the agent and your backend.' },
+  { name: 'ready', type: 'state', default: '-', desc: 'Healthy and polling. Takes jobs up to its slots.' },
+  { name: 'draining', type: 'state', default: '-', desc: 'Takes no new jobs, finishes the ones it has.' },
+  { name: 'terminating', type: 'state', default: '-', desc: 'Being destroyed at the provider; retried until it sticks.' },
+  { name: 'gone', type: 'state', default: '-', desc: 'Destroyed.' },
+  { name: 'failed', type: 'state', default: '-', desc: 'Taken away because it never became ready or stopped answering. It still passes through terminating, so it is destroyed too.' },
+]} />
+
+A machine starts draining when:
+
+- it has been idle for `idleTimeout` and the pool has more machines than it needs;
+- it has lived `maxLifetime` (default 24 hours), so a long-lived pool is renewed piece by piece;
+- a deploy changed what it runs: a new image, command, environment or setting. Old machines finish their jobs and are replaced; a deploy never interrupts a running job;
+- an operator drained it by hand.
+
+`recycle` decides what happens between jobs on one machine. `job` (the default) restarts your backend's process once the machine has no job running, so every job starts from a fresh process and nothing leaks from one job into the next. `never` keeps the process up, for backends that keep a useful cache in memory. Either way the machine itself stays until one of the reasons above.
+
+## When things go wrong
+
+Worth knowing, because it is what makes a pool safe to leave alone:
+
+- **A machine dies or loses its network.** Each job attempt holds a lease (default 90 seconds) that the machine's polls renew. When the polls stop, the attempt goes back to the queue once the lease runs out and runs again on another machine; that counts as an attempt against `max_retries`. The agent keeps its own clock too and stops its jobs a safety margin **before** the lease can run out, so the same attempt never runs on two machines at once. A machine out of contact for long enough shuts itself down.
+- **The scheduler restarts.** Nothing is lost. Which job runs where is recorded on the job rows, and the machines keep working and reconnect.
+- **A job is killed.** `spky jobs kill` sends the cancel to the machine: the agent drops the request and, when it was the machine's only job, restarts your backend so the work really stops. The job is failed with code `cancelled`.
+- **Machines keep failing to boot.** After three failed boots in a row the pool stops creating machines for a minute, doubling up to fifteen, and opens a `pool_breaker_open` incident on the admin dashboard. A machine that boots fine closes it again. Typical causes: an image that does not start, a healthcheck that never answers, a server type the provider does not have.
+- **A limit is reached.** Sp00ky Cloud caps how many machines a project may have (see [below](#on-sp00ky-cloud)). A machine asked for beyond it is refused, and a refusal counts as a failed boot, so a pool whose `max` is above your plan's limit opens its breaker whenever it tries to grow past the limit. Keep `max` within your plan.
+
+Sp00ky Cloud also watches from its side, whatever your scheduler does: a pool never gets more than twice its size limit plus one machines (`max`, or `min` for a fixed pool; the headroom covers a deploy's old machines draining while new ones start), machines of a scheduler that has been silent for half an hour are destroyed, no machine lives longer than 72 hours, and destroying a project destroys its machines first.
+
+## Local development
+
+`spky dev` runs every pool as containers next to your dev stack, with the same scheduler logic as production. It builds each pool backend's image from `deploy.dockerfile` (as `sp00ky-dev-pool-<backend>`), gives the scheduler the Docker socket so it can start and stop machine containers, and removes machine containers left over from a previous session.
+
+A machine is ready in a couple of seconds, so scale-up, idle timeouts and a killed job are all easy to watch with `docker ps`. The agent and your backend log to the container, `docker logs <container>`.
+
+## On Sp00ky Cloud
+
+Deploy with `spky deploy`. It sends the pool definitions along, keeps pool backends off the core host (their image only runs on pool machines), and publishes the scheduler's pool listener at `<slug>-pool.<domain>` for machines to dial.
+
+<PropTable props={[
+  { name: 'Free', type: 'plan', default: '-', desc: 'No pool machines. (Free projects have no scheduler.)' },
+  { name: 'Starter', type: 'plan', default: '-', desc: 'Up to 2 pool machines per project at a time.' },
+  { name: 'Pro', type: 'plan', default: '-', desc: 'Up to 10 pool machines per project at a time.' },
+]} />
+
+The limit counts machines in every pool of the project together, including ones still booting or draining.
+
+Machine time is recorded per machine from creation to destruction and shows up in your project's usage as `pool_machine_hours`. A pool with `min: 0` costs nothing while it has no work.
+
+## Operating pools
+
+<CodeBlock code={operateCode} lang="bash" />
+
+For the pools themselves, the scheduler's [admin API](/docs/reference/admin-dashboard#api) and [admin MCP server](/docs/reference/mcp#scheduler-admin-mcp) have five operations:
+
+<PropTable props={[
+  { name: 'pools_list', type: 'GET /admin/api/pools', default: '-', desc: 'Every pool with its sizing, pause and breaker state, machines by state, busy slots, and how many jobs are waiting for a machine.' },
+  { name: 'pool_machines', type: 'GET /admin/api/pools/:name/machines', default: '-', desc: 'One pool\'s machines, newest first: state, slots in use, last contact, and why a machine was taken away.' },
+  { name: 'pool_pause', type: 'POST /admin/api/pools/:name/pause', default: '-', desc: 'No new jobs are assigned and no machines are created. Running jobs finish. Survives redeploys.' },
+  { name: 'pool_resume', type: 'POST /admin/api/pools/:name/resume', default: '-', desc: 'Resume a paused pool.' },
+  { name: 'machine_drain', type: 'POST /admin/api/machines/:id/drain', default: '-', desc: 'One machine takes no new jobs, finishes what it runs, and is destroyed. The pool replaces it if it still needs the capacity.' },
+]} />
+
+Pausing is the big red button: a deploy never un-pauses a pool, just as it never un-pauses a schedule.
+
+## Self-hosting
+
+A self-hosted scheduler serves pools with the `docker` provider. It needs the Docker socket and a pool listener its machine containers can reach:
+
+<CodeBlock code={selfHostEnvCode} lang="bash" />
+
+The full list is in [Self-hosting → Machine pools](/docs/self-hosting#machine-pools). The `hetzner` provider needs Sp00ky Cloud, which holds the cloud credentials and enforces the limits on its side.
+
+## Limitations
+
+- **One backend per pool.** A machine runs exactly one backend's image. Give each backend its own pool.
+- **Deploy with `spky deploy`.** Git-linked deploys do not carry pools yet.
+- **x86 only.** See [Machine shape](#machine-shape).
+- **No database connection variables on the machine.** See [Environment](#environment).
+- **Hetzner is the only cloud provider.**
+- **Cluster mode only.** Pools are run by the scheduler, so the project needs `mode: cluster`.
+
+## Validation
+
+`spky lint` checks pools with the rest of the config:
+
+- every `runOn.pool` names a declared pool, and every pool is used by exactly one backend;
+- a pool backend has an outbox `method` with a `table`, and a `deploy.port`;
+- `autoscale: true` has a `max` of at least 1, `min` is not above `max`, and `buffer` is not above `max`;
+- a fixed pool has `min` of at least 1 and no `max` or `buffer`;
+- `slots` is at least 1, `lease` at least 30 seconds, and `maxLifetime` not shorter than `maxJobDuration`;
+- every duration parses.
+
+## Reference
+
+### Pool fields
+
+<PropTable props={[
+  { name: 'provider', type: 'hetzner | docker', default: 'docker', desc: 'Where machines come from. spky dev always uses docker.' },
+  { name: 'machine.type', type: 'string', default: 'cx33', desc: 'Hetzner Cloud server type. x86 types only.' },
+  { name: 'machine.locations', type: 'string[]', default: '[]', desc: 'Hetzner locations in order of preference. Empty lets Hetzner choose.' },
+  { name: 'slots', type: 'integer', default: '1', desc: 'Jobs one machine runs at the same time.' },
+  { name: 'min', type: 'integer', default: '0', desc: 'Machines that always run. The whole size of a fixed pool.' },
+  { name: 'autoscale', type: 'boolean', default: 'false', desc: 'Add machines while jobs wait, up to max.' },
+  { name: 'max', type: 'integer', default: '(required with autoscale)', desc: 'Most machines the pool may have.' },
+  { name: 'buffer', type: 'integer', default: '0', desc: 'Ready machines kept above what is in use. Autoscaling pools only.' },
+  { name: 'idleTimeout', type: 'duration', default: '10m', desc: 'How long a surplus machine may sit idle before it goes.' },
+  { name: 'recycle', type: 'job | never', default: 'job', desc: 'Restart the backend process between jobs, or keep it running.' },
+  { name: 'maxJobDuration', type: 'duration', default: '8h', desc: 'Longest a job may run. A job\'s own timeout can only shorten it.' },
+  { name: 'maxLifetime', type: 'duration', default: '24h', desc: 'Oldest a machine gets before it is drained and replaced.' },
+  { name: 'lease', type: 'duration', default: '90s', desc: 'How long a job attempt survives without a word from its machine. Minimum 30s.' },
+  { name: 'bootTimeout', type: 'duration', default: '5m', desc: 'How long a machine may take to become ready before it is given up on.' },
+]} />
+
+Durations take the same form as elsewhere in `sp00ky.yml`: `90s`, `10m`, `1h30m`, `8h`.
+
+### On a backend
+
+<PropTable props={[
+  { name: 'runOn.pool', type: 'string', default: '-', desc: 'Name of the pool this backend\'s jobs run on. The backend then gets no always-on container.' },
+]} />
+
+### Job errors written by a pool
+
+<PropTable props={[
+  { name: '<HTTP status>', type: 'code', default: '-', desc: 'The backend answered with a non-2xx status. Retried.' },
+  { name: '0', type: 'code', default: '-', desc: 'The request to the backend failed. Retried.' },
+  { name: 'lease_expired', type: 'code', default: '-', desc: 'The machine running the attempt went silent. Retried on another machine.' },
+  { name: 'deadline', type: 'code', default: '-', desc: 'The job ran past its deadline or past maxJobDuration. Not retried.' },
+  { name: 'cancelled', type: 'code', default: '-', desc: 'The job was killed. Not retried.' },
+]} />
+
+## See also
+
+<CardGrid>
+  <LinkCard
+    href="/docs/jobs"
+    title="Jobs"
+    icon="jobs"
+    description="db.run(), retries, and the job lifecycle a pool job shares."
+  />
+  <LinkCard
+    href="/docs/jobs/schedules"
+    title="Schedules"
+    icon="clock"
+    description="Run a pool backend on a clock, including run deadlines for long jobs."
+  />
+  <LinkCard
+    href="/docs/backend/options"
+    title="Backend options"
+    icon="server"
+    description="deploy, healthcheck and env: the settings a pool backend reads."
+  />
+  <LinkCard
+    href="/docs/reference/config#machine-pools"
+    title="sp00ky.yml"
+    icon="config"
+    description="Where the pools: block sits in your project config."
+  />
+</CardGrid>

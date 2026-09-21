@@ -62,6 +62,7 @@ export const docsNav = [
       { text: 'Jobs', href: `${basePath}/docs/jobs` },
       { text: 'Schedules', href: `${basePath}/docs/jobs/schedules` },
       { text: 'Workflows', href: `${basePath}/docs/jobs/workflows` },
+      { text: 'Machine pools', href: `${basePath}/docs/jobs/machine-pools`, experimental: true },
     ],
   },
   {

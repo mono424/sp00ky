@@ -161,6 +161,13 @@
         }
       ]
     },
+    "pools": {
+      "type": "object",
+      "description": "Machine pools, keyed by name. See https://sp00ky.cloud/docs/jobs/machine-pools",
+      "additionalProperties": {
+        "$ref": "#/$defs/poolEntry"
+      }
+    },
     "buckets": {
       "type": "array",
       "description": "List of SurrealQL bucket definition files.",
@@ -446,6 +453,20 @@
             },
             "method": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/backendMethod"
+            },
+            "runOn": {
+              "type": "object",
+              "description": "Run this backend's outbox jobs on the machines of a pool declared under `pools:` in sp00ky.yml, instead of on an always-on container. See https://sp00ky.cloud/docs/jobs/machine-pools",
+              "required": [
+                "pool"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "pool": {
+                  "type": "string",
+                  "description": "Name of the pool."
+                }
+              }
             },
             "dev": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/devConfig"
@@ -897,6 +918,101 @@
           ],
           "default": "off",
           "description": "Query allowlist enforcement on the SSP. 'off': any parseable query registers. 'warn': a registration whose shape is not in the allowlist generated from clientTypes[].queries is logged and counted but admitted. 'enforce': it is refused with 403 not_allowlisted. Also gates useRemote/remoteQuery/queryRaw in the client SDK (allowRawRemote: true opts back in)."
+        }
+      }
+    },
+    "poolEntry": {
+      "type": "object",
+      "description": "A machine pool: machines created while its backend has jobs and destroyed when it has none. Exactly one backend uses it, through `runOn: { pool: <name> }`. Fixed (autoscale false, exactly `min` machines), on demand up to `max`, or with a warm `buffer`.",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": [
+            "hetzner",
+            "docker"
+          ],
+          "default": "docker",
+          "description": "Where machines come from. `hetzner`: a Hetzner Cloud VM per machine, created by Sp00ky Cloud. `docker`: a container per machine on the scheduler's Docker host. `spky dev` always uses `docker`."
+        },
+        "machine": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The machine to create (hetzner).",
+          "properties": {
+            "type": {
+              "type": "string",
+              "default": "cx33",
+              "description": "Hetzner Cloud server type, e.g. `cx33`, `cpx42`. x86 types only: backend images are built for linux/amd64."
+            },
+            "locations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Hetzner locations in order of preference, e.g. `[fsn1, nbg1]`. A full location, or one without the server type, is skipped. Empty lets Hetzner choose."
+            }
+          }
+        },
+        "slots": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Jobs one machine runs at the same time."
+        },
+        "min": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Machines that always run. The whole size of a fixed pool, which needs at least 1."
+        },
+        "autoscale": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add machines while jobs wait, up to `max`."
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Most machines the pool may have. Required with `autoscale: true`, rejected without it."
+        },
+        "buffer": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Ready machines kept above what is in use, so jobs start without waiting for a boot. Autoscaling pools only."
+        },
+        "idleTimeout": {
+          "type": "string",
+          "default": "10m",
+          "description": "How long a surplus machine may sit idle before it is destroyed, e.g. `10m`."
+        },
+        "recycle": {
+          "enum": [
+            "job",
+            "never"
+          ],
+          "default": "job",
+          "description": "`job`: restart the backend process between jobs. `never`: keep it running."
+        },
+        "maxJobDuration": {
+          "type": "string",
+          "default": "8h",
+          "description": "Longest a job may run, e.g. `8h`. A job's own timeout can only shorten it."
+        },
+        "maxLifetime": {
+          "type": "string",
+          "default": "24h",
+          "description": "Oldest a machine gets before it is drained and replaced, e.g. `24h`. Not shorter than `maxJobDuration`."
+        },
+        "lease": {
+          "type": "string",
+          "default": "90s",
+          "description": "How long a job attempt survives without a word from its machine, e.g. `90s`. Minimum 30s."
+        },
+        "bootTimeout": {
+          "type": "string",
+          "default": "5m",
+          "description": "How long a machine may take to become ready, e.g. `5m`."
         }
       }
     }

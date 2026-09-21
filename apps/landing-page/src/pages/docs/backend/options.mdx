@@ -99,6 +99,19 @@ own network.
 
 <CodeBlock fileName="sp00ky.yml" code={externalCode} lang="yaml" />
 
+## Running on a machine pool
+
+`runOn` moves a backend's jobs off the core host onto machines of their own, created while there is work and destroyed when there is not. The backend then gets no always-on container.
+
+```yaml
+apps:
+  renderer:
+    type: backend
+    runOn: { pool: render }   # a pool declared under pools: in sp00ky.yml
+```
+
+The backend itself is unchanged: it still answers a POST per job. What a pool needs from it (`deploy.port`, `deploy.dockerfile`, ideally `deploy.healthcheck`) and what changes on the machine (no private network, so no injected database variables) is in [Machine pools](/docs/jobs/machine-pools#writing-a-pool-backend).
+
 ## Limiting where an app runs
 
 `scope` keeps an app out of an environment where it doesn't belong.

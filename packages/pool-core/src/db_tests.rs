@@ -761,6 +761,48 @@ async fn an_operator_kill_fences_the_attempt_and_the_agent_is_told_to_cancel() {
     assert_eq!(h.job_row(&job).await["errors"][0]["code"], "killed");
 }
 
+/// `spky jobs retry` / the dashboard's retry on a pool job. The SSPs cannot do
+/// it (pool tables are not in their job config), so the pool engine resets the
+/// row the same way they would, and the next sweep hands it to a machine.
+#[tokio::test]
+async fn an_operator_retry_brings_a_finished_job_back_and_the_pool_runs_it_again() {
+    let h = harness().await;
+    h.pool(json!({ "min": 1 })).await;
+    h.tick().await;
+    let m = h.boot_all().await.remove(0);
+    h.poll(&m, &[]).await;
+    let job = h.job("a").await;
+    h.tick().await;
+
+    // Refused while the job is queued or running: that would race its attempt.
+    assert!(!h.engine.retry_job(&job).await.unwrap(), "pending");
+    let first = assigns(&h.poll(&m, &[]).await).remove(0);
+    assert!(!h.engine.retry_job(&job).await.unwrap(), "processing");
+
+    assert!(h.result(&m, &first, Outcome::Cancelled).await);
+    assert_eq!(h.job_row(&job).await["status"], "failed");
+
+    assert!(h.engine.retry_job(&job).await.unwrap());
+    let row = h.job_row(&job).await;
+    assert_eq!(
+        (row["status"].clone(), row["retries"].clone(), row["errors"].clone()),
+        (json!("pending"), json!(0), json!([])),
+        "a fresh budget and a clean history, like an SSP retry"
+    );
+    assert!(row.get("assignee").is_none_or(Value::is_null), "the old machine lets go: {row}");
+
+    h.tick().await;
+    let second = assigns(&h.poll(&m, &[]).await).remove(0);
+    assert_eq!(second.job, first.job);
+    assert!(second.epoch > first.epoch, "a new attempt, fenced from the old one");
+    assert!(h.result(&m, &second, ok()).await);
+    assert_eq!(h.job_row(&job).await["status"], "success");
+
+    // A success can be run again too, as with any job.
+    assert!(h.engine.retry_job(&job).await.unwrap());
+    assert_eq!(h.job_row(&job).await["status"], "pending");
+}
+
 #[tokio::test]
 async fn the_engine_fails_an_attempt_the_agent_let_run_past_the_hard_limit() {
     let h = harness().await;

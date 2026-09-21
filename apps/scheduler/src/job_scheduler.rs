@@ -159,6 +159,13 @@ pub async fn kill_job(
     transport: &HttpTransport,
     id: &str,
 ) -> (StatusCode, serde_json::Value) {
+    // A pool job runs on a pool machine, which no SSP knows about: broadcasting
+    // would get "not in-flight on this ssp" from every SSP while the machine ran
+    // on. The pool host fences the attempt, and the machine's agent cancels it
+    // on its next poll.
+    if let Some(verdict) = pool_job_action(id, PoolAction::Kill).await {
+        return verdict;
+    }
     let ready: Vec<SspInfo> = {
         let pool = ssp_pool.read().await;
         pool.all()
@@ -202,6 +209,11 @@ pub async fn retry_job(
     transport: &HttpTransport,
     id: &str,
 ) -> (StatusCode, serde_json::Value) {
+    // An SSP cannot retry a pool job (its table is not in the SSP's job config,
+    // by design), so the pool host resets it and the pool picks it up.
+    if let Some(verdict) = pool_job_action(id, PoolAction::Retry).await {
+        return verdict;
+    }
     let ssp = {
         let mut pool = ssp_pool.write().await;
         match pool.select_for_query() {
@@ -631,4 +643,40 @@ mod tests {
         assert!(job_tables_from_json("not json").is_empty());
         assert!(job_tables_from_json("\"job\"").is_empty());
     }
+}
+
+#[derive(Clone, Copy)]
+enum PoolAction {
+    Kill,
+    Retry,
+}
+
+/// Kill or retry `id` through the pool host when it is a pool job. None when it
+/// is not one (or pools are off), and the caller goes to the SSPs as before.
+async fn pool_job_action(id: &str, action: PoolAction) -> Option<(StatusCode, serde_json::Value)> {
+    let pools = crate::pool_engine::global()?;
+    let table = id.split_once(':').map(|(t, _)| t)?;
+    if !pools.owns_table(table).await {
+        return None;
+    }
+    let outcome = match action {
+        PoolAction::Kill => pools.kill_job(id).await,
+        PoolAction::Retry => pools.retry_job(id).await,
+    };
+    Some(match (action, outcome) {
+        (PoolAction::Kill, Ok(true)) => (StatusCode::OK, json!({ "id": id, "status": "killed" })),
+        (PoolAction::Kill, Ok(false)) => (
+            StatusCode::CONFLICT,
+            json!({ "code": "not_active", "message": "job is not pending or running, so there is nothing to kill" }),
+        ),
+        (PoolAction::Retry, Ok(true)) => (StatusCode::OK, json!({ "id": id, "status": "pending" })),
+        (PoolAction::Retry, Ok(false)) => (
+            StatusCode::CONFLICT,
+            json!({ "code": "not_terminal", "message": "only a 'failed' or 'success' job can be retried" }),
+        ),
+        (_, Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            json!({ "code": "pool_error", "message": format!("{e:#}") }),
+        ),
+    })
 }

@@ -1019,6 +1019,16 @@ impl PoolEngine {
 
     /// Operator kill for a pool job (pending or running). The running attempt is
     /// fenced at once; its agent is told to cancel on the next poll.
+    /// Operator retry: true when the job was finished and is pending again.
+    pub async fn retry_job(&self, job_id: &str) -> anyhow::Result<bool> {
+        Ok(first_row(
+            self.db
+                .query(sql::RETRY_JOB, &[("id", json!(job_id))])
+                .await?,
+        )
+        .is_some())
+    }
+
     pub async fn kill_job(&self, job_id: &str) -> anyhow::Result<bool> {
         Ok(first_row(
             self.db

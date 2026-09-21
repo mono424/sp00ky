@@ -264,6 +264,17 @@ impl PoolHost {
         Ok(killed)
     }
 
+    /// Operator retry for a pool job. The SSPs cannot retry one: pool tables are
+    /// deliberately missing from their job config, so they answer `unknown_table`.
+    pub async fn retry_job(&self, job_id: &str) -> anyhow::Result<bool> {
+        let Some(engine) = self.engine().await else {
+            anyhow::bail!("database session not ready")
+        };
+        let retried = engine.retry_job(job_id).await?;
+        self.changed.notify_waiters();
+        Ok(retried)
+    }
+
     /// Start the cluster pool sweep. One task, one ticker.
     pub fn start_sweep(&self) {
         let host = self.clone();

@@ -274,6 +274,16 @@ pub fn complete_terminal_failure() -> String {
 
 /// Operator kill. Bumping the epoch fences the running attempt; the agent finds
 /// the job no longer bound to it on its next poll and is told to cancel.
+/// Operator retry of a finished pool job. The same reset the SSPs apply to their
+/// own jobs (`reset_for_retry_helper`): back to `pending` with a fresh retry
+/// budget and an empty error history. It also lets go of the machine the last
+/// attempt ran on; the next sweep assigns the job like any other pending one.
+/// Only a terminal job: retrying one that is still queued or running would race
+/// the attempt that owns it.
+pub const RETRY_JOB: &str = "UPDATE type::record($id) SET status = 'pending', retries = 0, \
+     errors = [], assignee = NONE, lease_until = NONE, updated_at = time::now() \
+     WHERE status INSIDE ['failed', 'success'] RETURN id";
+
 pub const KILL_JOB: &str = "UPDATE type::record($id) SET status = 'failed', lease_until = NONE, \
      lease_epoch = (lease_epoch ?? 0) + 1, \
      errors = array::append(errors ?? [], { code: 'killed', reason: 'killed by operator' }), \

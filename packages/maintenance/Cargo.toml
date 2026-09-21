@@ -1,6 +1,6 @@
 [package]
 name = "maintenance"
-version = "0.0.1-canary.270"
+version = "0.0.1-canary.271"
 edition = "2021"
 
 [dependencies]

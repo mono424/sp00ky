@@ -14,6 +14,16 @@ fn is_excluded_field(field_def: &FieldDefinition) -> bool {
         .any(|name| has_annotation(&field_def.annotations, name))
 }
 
+/// A `DEFINE FIELD` on a sub-path (`errors[*]`, `settings.theme`) types part of
+/// a value its parent field already carries whole. It is not a key of the
+/// record, so it has no place in the `$plain_after` / `$plain_before` objects:
+/// `errors[*]: $after.errors[*]` is not even valid SurrealQL, and one such line
+/// fails the whole internal schema. The stock outbox template of `spky api add`
+/// defines `errors[*]`, so every project scaffolded from it hit this on deploy.
+fn is_sub_path(field_name: &str) -> bool {
+    field_name.contains('[') || field_name.contains('.')
+}
+
 /// Generate Sp00ky events for data hashing and graph synchronization
 // ... imports ...
 
@@ -233,7 +243,7 @@ pub fn generate_sp00ky_events(
             // scan omit them too. Both halves are required: skipping here while
             // the bootstrap still loads the column leaves the circuit and the
             // replica permanently disagreeing about the row's key set.
-            if is_excluded_field(field_def) {
+            if is_excluded_field(field_def) || is_sub_path(field_name) {
                 continue;
             }
             match field_def.field_type {
@@ -299,7 +309,7 @@ pub fn generate_sp00ky_events(
         for field_name in all_fields_del {
             let field_def = table.fields.get(field_name).unwrap();
             // See the matching skip in the mutation event above.
-            if is_excluded_field(field_def) {
+            if is_excluded_field(field_def) || is_sub_path(field_name) {
                 continue;
             }
             match field_def.field_type {
@@ -672,6 +682,41 @@ DEFINE FIELD body ON TABLE doc TYPE string;
     /// A relation table is cloned, drift-checked, bootstrapped into circuits and
     /// exposed to clients as queryable. It has to be in the ingest stream too, or
     /// a live query over it returns the bootstrap-time edges and never updates.
+    /// The stock outbox template defines `errors[*]` (FLEXIBLE elements). A
+    /// sub-path is not a record key: emitting it produced
+    /// `errors[*]: $after.errors[*]`, a parse error that took the whole internal
+    /// schema down with it on the first deploy of a freshly scaffolded project.
+    #[test]
+    fn a_sub_path_field_definition_never_becomes_an_event_object_key() {
+        use crate::parser::SchemaParser;
+        let schema = r#"
+DEFINE TABLE job SCHEMAFULL;
+DEFINE FIELD path ON TABLE job TYPE string;
+DEFINE FIELD errors ON TABLE job TYPE array<object> DEFAULT ALWAYS [];
+DEFINE FIELD errors[*] ON TABLE job TYPE object FLEXIBLE;
+DEFINE FIELD settings ON TABLE job TYPE object;
+DEFINE FIELD settings.theme ON TABLE job TYPE string;
+"#;
+        let mut parser = SchemaParser::new();
+        parser.parse_file(schema).unwrap();
+
+        let out = generate_sp00ky_events(
+            &parser.tables,
+            schema,
+            false,
+            &DeployMode::Cluster,
+            None,
+            None,
+            SyncTransport::Http,
+        );
+        assert!(out.contains("errors: $after.errors,"), "the parent field carries the value: {out}");
+        assert!(out.contains("settings: $after.settings,"), "{out}");
+        assert!(out.contains("path: $after.path,"), "{out}");
+        for bad in ["errors[*]:", "$after.errors[*]", "$before.errors[*]", "settings.theme:"] {
+            assert!(!out.contains(bad), "`{bad}` must not be generated: {out}");
+        }
+    }
+
     #[test]
     fn a_relation_table_gets_events_with_its_endpoints() {
         use crate::parser::SchemaParser;

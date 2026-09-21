@@ -69,5 +69,11 @@ ENV RUST_LOG=info \
     SPKY_ADMIN_DIR=/usr/share/spooky/dashboard
 # 9667 = ingest/proxy/ssp/metrics, private network only.
 # 9668 = the admin dashboard and its API, safe to publish.
-EXPOSE 9667 9668
+# 9669 = the machine pool listener (pool machines dial in), safe to publish.
+EXPOSE 9667 9668 9669
+# The tag this image is published under. The scheduler names the pool agent
+# image by it (mono424/spooky-agent:<same tag>), so the two always speak the
+# same pool protocol. Last, so a new version never invalidates a layer above.
+ARG SPKY_VERSION=""
+ENV SPKY_RELEASE_VERSION=${SPKY_VERSION}
 CMD ["scheduler"]

@@ -57,19 +57,49 @@ jobs:
       matrix:
         include:
           - image: mono424/spooky-ssp
+            short: ssp
+            dockerfile: Dockerfile
             target: ssp
+            cache_scope: spooky-rust
             platform: linux/amd64
             runner: ubuntu-latest
           - image: mono424/spooky-ssp
+            short: ssp
+            dockerfile: Dockerfile
             target: ssp
+            cache_scope: spooky-rust
             platform: linux/arm64
             runner: ubuntu-24.04-arm
           - image: mono424/spooky-scheduler
+            short: scheduler
+            dockerfile: Dockerfile
             target: scheduler
+            cache_scope: spooky-rust
             platform: linux/amd64
             runner: ubuntu-latest
           - image: mono424/spooky-scheduler
+            short: scheduler
+            dockerfile: Dockerfile
             target: scheduler
+            cache_scope: spooky-rust
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          # The machine pool agent: one static binary, published under the same
+          # tag as the scheduler that speaks its protocol. Its own Dockerfile and
+          # its own cache scope: writing the shared Rust scope from here would
+          # evict the ssp/scheduler dependency cache.
+          - image: mono424/spooky-agent
+            short: agent
+            dockerfile: apps/agent/Dockerfile
+            target: ""
+            cache_scope: spooky-agent
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: mono424/spooky-agent
+            short: agent
+            dockerfile: apps/agent/Dockerfile
+            target: ""
+            cache_scope: spooky-agent
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -90,14 +120,18 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
+          # Stamped into the scheduler image so it names the agent image of the
+          # same tag. Stages that do not declare the arg ignore it.
+          build-args: |
+            SPKY_VERSION=${{ needs.prepare.outputs.version }}
           outputs: type=image,name=${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
-            type=gha,scope=spooky-rust-${{ matrix.platform }}
+            type=gha,scope=${{ matrix.cache_scope }}-${{ matrix.platform }}
             type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}
-          cache-to: type=gha,scope=spooky-rust-${{ matrix.platform }},mode=max
+          cache-to: type=gha,scope=${{ matrix.cache_scope }}-${{ matrix.platform }},mode=max
 
       - name: Export digest
         run: |
@@ -108,7 +142,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.image == 'mono424/spooky-ssp' && 'ssp' || 'scheduler' }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          name: digests-${{ matrix.short }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -123,6 +157,8 @@ jobs:
             artifact_prefix: ssp
           - image: mono424/spooky-scheduler
             artifact_prefix: scheduler
+          - image: mono424/spooky-agent
+            artifact_prefix: agent
     steps:
       - name: Download amd64 digest
         uses: actions/download-artifact@v4

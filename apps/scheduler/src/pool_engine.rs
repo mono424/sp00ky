@@ -48,6 +48,23 @@ const POOL_SWEEP_INTERVAL_SECS: u64 = 2;
 /// Longest a poll is held open. Well under any proxy's idle timeout.
 const MAX_POLL_HOLD_SECS: u64 = 10;
 
+/// How often a scheduler whose database has no pool tables looks again.
+const POOL_DORMANT_RECHECK_SECS: u64 = 60;
+
+/// Did a sweep fail because this database has no pool tables?
+///
+/// `_00_pool` and `_00_machine` are installed by a deploy with a CLI that ships
+/// them. A scheduler image is usually upgraded ahead of that (and a git-linked
+/// deploy never installs new internal tables), so for every existing project
+/// this is the normal state, not a fault: the sweep goes dormant instead of
+/// logging an error every two seconds. Matched on the server's wording
+/// ("The table '_00_pool' does not exist", SurrealDB 3.x), which is all the
+/// error carries by the time it gets here.
+fn is_missing_pool_tables(error: &str) -> bool {
+    error.contains("does not exist")
+        && (error.contains("'_00_pool'") || error.contains("'_00_machine'"))
+}
+
 #[derive(Clone)]
 pub struct PoolHostConfig {
     pub enabled: bool,
@@ -255,8 +272,13 @@ impl PoolHost {
             let mut engine: Option<PoolEngine> = None;
             let mut interval = tokio::time::interval(Duration::from_secs(POOL_SWEEP_INTERVAL_SECS));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Set while the database has no pool tables: sweep again only then.
+            let mut dormant_until: Option<tokio::time::Instant> = None;
             loop {
                 interval.tick().await;
+                if dormant_until.is_some_and(|until| tokio::time::Instant::now() < until) {
+                    continue;
+                }
                 if engine.is_none() {
                     engine = host.engine().await;
                     if engine.is_none() {
@@ -266,6 +288,9 @@ impl PoolHost {
                 }
                 match engine.as_ref().unwrap().tick_pass().await {
                     Ok(report) => {
+                        if dormant_until.take().is_some() {
+                            info!("Pool tables found: pool sweep active");
+                        }
                         for t in &report.transitions {
                             let summary = format!(
                                 "Pool '{}' stopped creating machines after {} failed boots: {}",
@@ -293,6 +318,19 @@ impl PoolHost {
                         if report != Default::default() {
                             debug!(?report, "pool sweep");
                         }
+                    }
+                    Err(e) if is_missing_pool_tables(&format!("{e:#}")) => {
+                        if dormant_until.is_none() {
+                            info!(
+                                recheck_secs = POOL_DORMANT_RECHECK_SECS,
+                                "This database has no pool tables, so pools are idle. They arrive \
+                                 with the next deploy from a CLI that ships machine pools"
+                            );
+                        }
+                        dormant_until = Some(
+                            tokio::time::Instant::now()
+                                + Duration::from_secs(POOL_DORMANT_RECHECK_SECS),
+                        );
                     }
                     // The shared handle heals itself; the next tick runs against
                     // the refreshed session.
@@ -483,6 +521,25 @@ mod tests {
             "registry.local/agent:dev",
             "an explicit image always wins"
         );
+    }
+
+    #[test]
+    fn a_database_without_pool_tables_is_recognised_and_nothing_else_is() {
+        // Verbatim from SurrealDB 3.1.5, wrapped the way the db port wraps it.
+        assert!(is_missing_pool_tables(
+            "query failed: The table '_00_pool' does not exist"
+        ));
+        assert!(is_missing_pool_tables(
+            "The table '_00_machine' does not exist"
+        ));
+        // Another table missing is a real fault (a pool's outbox table, say).
+        assert!(!is_missing_pool_tables(
+            "The table 'render_job' does not exist"
+        ));
+        assert!(!is_missing_pool_tables(
+            "connection reset while reading _00_pool"
+        ));
+        assert!(!is_missing_pool_tables(""));
     }
 
     #[test]

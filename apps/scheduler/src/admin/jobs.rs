@@ -1105,6 +1105,22 @@ pub async fn job_kill(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     tracing::info!(job = %id, by = %session.subject, "Job kill from the dashboard");
+    // A pool job runs on a pool machine, not on an SSP: broadcasting `/job/kill`
+    // to the SSPs would reach nobody. The pool host fences the attempt and wakes
+    // the machine's poll so its agent cancels at once.
+    if let Some(pools) = state.pools.as_ref() {
+        let table = id.split(':').next().unwrap_or_default();
+        if pools.owns_table(table).await {
+            return match pools.kill_job(&id).await {
+                Ok(true) => Ok((StatusCode::OK, Json(json!({ "id": id, "status": "killed" })))),
+                Ok(false) => Err(api_error(
+                    StatusCode::CONFLICT,
+                    "Job is not pending or running, so there is nothing to kill",
+                )),
+                Err(e) => Err(api_error(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+            };
+        }
+    }
     let (status, body) =
         crate::job_scheduler::kill_job(&state.metrics.ssp_pool, &state.transport, &id).await;
     relay(status, body)

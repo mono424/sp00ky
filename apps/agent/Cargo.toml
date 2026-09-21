@@ -1,0 +1,27 @@
+[package]
+name = "spky-agent"
+version = "0.0.1-canary.1"
+edition = "2021"
+description = "Runs on every machine of a sp00ky pool: supervises the backend process, dials out to the scheduler, and runs the jobs it is assigned against the backend on loopback"
+
+[lib]
+name = "spky_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spky-agent"
+path = "src/main.rs"
+
+[dependencies]
+pool-protocol = { path = "../../packages/pool-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "sync", "net"] }
+# rustls, not native-tls: the agent ships as one static musl binary that is
+# dropped into arbitrary backend images, so it cannot depend on a system OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = "1"
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }

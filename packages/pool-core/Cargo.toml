@@ -1,0 +1,24 @@
+[package]
+name = "pool-core"
+version = "0.0.1-canary.1"
+edition = "2021"
+description = "Machine pool engine core: sizing, machine lifecycle, job-to-machine assignment and the SQL it runs. Pure logic over two ports (database, machine provider), so every failure mode is testable without a cloud"
+
+[dependencies]
+pool-protocol = { path = "../pool-protocol" }
+# For the shared `ScheduleDb` port (the scheduler already implements it) and the
+# shared lease predicates, so pool jobs and ordinary jobs cannot disagree about
+# when a lease has expired.
+schedule-core = { path = "../schedule-core", default-features = false }
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# Embedded in-memory SurrealDB so the engine tests run the real SQL against the
+# real shipped DDL (same approach as schedule-core).
+surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+tokio = { version = "1", features = ["full"] }

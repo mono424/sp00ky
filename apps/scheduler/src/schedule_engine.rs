@@ -83,6 +83,18 @@ struct ClusterJobKill {
 #[async_trait::async_trait]
 impl JobKill for ClusterJobKill {
     async fn kill(&self, job_id: &str) -> Result<()> {
+        // A pool job runs on a pool machine, which no SSP knows about: the
+        // broadcast below would reach nobody and the job would run on under a run
+        // the engine has already closed (`concurrency: replace`, a cancelled
+        // workflow, a reaped deadline).
+        if let Some(pools) = crate::pool_engine::global() {
+            let table = job_id.split(':').next().unwrap_or_default();
+            if pools.owns_table(table).await {
+                let killed = pools.kill_job(job_id).await?;
+                debug!(job_id, killed, "schedule engine killed a pool job");
+                return Ok(());
+            }
+        }
         let ready: Vec<SspInfo> = {
             let pool = self.ssp_pool.read().await;
             pool.all().into_iter().filter(|s| pool.is_ready(&s.id)).cloned().collect()

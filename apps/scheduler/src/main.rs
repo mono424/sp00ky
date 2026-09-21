@@ -191,6 +191,19 @@ async fn run() -> Result<()> {
     // unauthenticated on the assumption that the ingest port is private; the
     // dashboard is the first surface meant for a browser, so it gets a port an
     // operator can publish without publishing `/proxy/query` alongside it.
+    // Machine pools: built before the admin plane, which routes pool job kills
+    // through it; started further down with the other background work.
+    let pool_config = scheduler::pool_engine::PoolHostConfig::from_env();
+    let pool_host = pool_config.enabled.then(|| {
+        let host = scheduler::pool_engine::PoolHost::new(
+            pool_config.clone(),
+            std::sync::Arc::clone(&scheduler.db_slot),
+        );
+        // So the schedule engine's job kill reaches pool jobs too.
+        host.install_global();
+        host
+    });
+
     let admin_config = scheduler::admin::AdminConfig::from_env();
     let admin_server = if admin_config.enabled {
         let admin_addr = admin_config.bind_addr();
@@ -227,6 +240,7 @@ async fn run() -> Result<()> {
                 // The control plane runs containers under `unless-stopped`;
                 // anything else (a checkout, a bare host) is on its own.
                 supervised: std::env::var("SPKY_ENV").map(|v| v == "cloud").unwrap_or(false),
+                pools: pool_host.clone(),
             },
         );
         // No global TimeoutLayer here, unlike the ingest app: `/admin/api/logs`
@@ -262,6 +276,20 @@ async fn run() -> Result<()> {
         std::sync::Arc::clone(&transport),
         std::sync::Arc::clone(&scheduler.db_slot),
     );
+
+    // Machine pools: jobs that run on their own, autoscaled machines. Same shape
+    // as the schedule engine above (the scheduler is the single ticker), plus a
+    // dedicated, token-authenticated listener for the machines to dial into.
+    let pool_server = match pool_host {
+        Some(host) => {
+            host.start_sweep();
+            Some((pool_config.bind_addr(), host.router()))
+        }
+        None => {
+            info!("Machine pools disabled (SPKY_POOL_ENABLED)");
+            None
+        }
+    };
 
     // Spawn the single-consumer backup worker
     {
@@ -337,6 +365,22 @@ async fn run() -> Result<()> {
         std::future::pending::<()>().await;
     });
     
+    // Spawn the pool listener. Like the admin port, failing to bind it is loud
+    // but not fatal: sync must not go down because pool machines cannot dial in.
+    // No request deadline on this listener: a poll is SUPPOSED to be held open.
+    tokio::spawn(async move {
+        let Some((addr, router)) = pool_server else { return };
+        info!("Starting pool listener on {}...", addr);
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, router).await {
+                    error!(error = %e, "Pool listener failed");
+                }
+            }
+            Err(e) => error!(addr = %addr, error = %e, "Failed to bind the pool port; pool machines cannot connect"),
+        }
+    });
+
     // Handle graceful shutdown
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     

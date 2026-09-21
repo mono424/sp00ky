@@ -31,6 +31,7 @@ pub mod logs;
 pub mod mcp;
 pub mod ops;
 pub mod overview;
+pub mod pools;
 pub mod presence;
 pub mod session;
 pub mod tokens;
@@ -107,6 +108,8 @@ pub struct AdminState {
     pub backup: Arc<maintenance::BackupState>,
     /// What a reclone or rehash needs, shared with `POST /admin/resync`.
     pub resync: crate::ssp_management::ResyncArgs,
+    /// See [`AdminDeps::pools`].
+    pub pools: Option<crate::pool_engine::PoolHost>,
     /// Whether something relaunches this process when it exits.
     pub supervised: bool,
     /// The slug backups are stored under.
@@ -355,6 +358,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/workflows/runs/:id/cancel", post(workflows::cancel_run))
         .route("/workflows/runs/:id/rerun", post(workflows::rerun_run))
         .route("/workflows/runs/:id/retry", post(workflows::retry_run))
+        .route("/pools", get(pools::list_pools))
+        .route("/pools/:name/machines", get(pools::list_machines))
+        .route("/pools/:name/pause", post(pools::pool_pause))
+        .route("/pools/:name/resume", post(pools::pool_resume))
+        .route("/machines/:id/drain", post(pools::machine_drain))
         .route("/schedules/:name/pause", post(workflows::schedule_pause))
         .route("/schedules/:name/resume", post(workflows::schedule_resume))
         .route("/schedules/:name/trigger", post(workflows::schedule_trigger))
@@ -430,6 +438,9 @@ pub struct AdminDeps {
     /// The cluster secret, which selects restart-surviving sessions.
     pub auth_secret: Option<String>,
     pub supervised: bool,
+    /// The machine pool host, when pools are enabled: a pool job is killed
+    /// through it (the SSPs never see pool jobs, so broadcasting would do nothing).
+    pub pools: Option<crate::pool_engine::PoolHost>,
 }
 
 /// Assemble the admin state and its router.
@@ -460,6 +471,7 @@ pub fn build(config: AdminConfig, deps: AdminDeps) -> (AdminState, Router) {
         cloud: deps.cloud,
         backup: deps.backup,
         resync: deps.resync,
+        pools: deps.pools,
         supervised: deps.supervised,
         project_slug,
         router_slot: mcp::router_slot(),

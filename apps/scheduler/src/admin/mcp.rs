@@ -196,6 +196,16 @@ pub const TOOLS: &[ToolDef] = &[
     tool!("schedule_release", "Release one quarantined forEach key so the schedule fires it again. A key is quarantined after `quarantineAfter` consecutive failures; releasing forgets the streak, so the next fire goes through and the key quarantines again if it keeps failing. schedule_get lists the quarantined keys.", "POST", "/schedules/{name}/release",
         path_params = &[req("name", "string", "Schedule name")],
         body = &[req("key", "string", "The forEach key, exactly as schedule_get reports it")]),
+    // ---- Machine pools ----
+    tool!("pools_list", "Every machine pool with its sizing (min, max, buffer, autoscale), pause and breaker state, live machines by state, busy slots and how many jobs are waiting for a machine.", "GET", "/pools", read_only = true),
+    tool!("pool_machines", "One pool's machines, newest first, terminal ones included: state, slots in use, heartbeat, and the reason a machine was taken away.", "GET", "/pools/{name}/machines",
+        path_params = &[req("name", "string", "Pool name")], read_only = true),
+    tool!("pool_pause", "Pause a pool: no new jobs are assigned and no machines are created. Jobs already running finish.", "POST", "/pools/{name}/pause",
+        path_params = &[req("name", "string", "Pool name")]),
+    tool!("pool_resume", "Resume a paused pool.", "POST", "/pools/{name}/resume",
+        path_params = &[req("name", "string", "Pool name")]),
+    tool!("machine_drain", "Drain one ready machine: it takes no new jobs, finishes what it is running and is then destroyed. The pool replaces it if it still needs the capacity.", "POST", "/machines/{id}/drain",
+        path_params = &[req("id", "string", "Machine id, e.g. _00_machine:abc")]),
     // ---- Jobs ----
     tool!("jobs_list", "Outbox jobs across every table, newest activity first, with the queue totals. Filter by origin to separate a schedule's fires from a workflow's steps and from jobs the application created itself, which have no other surface. Unfiltered it is served from the scheduler's sampler and costs the database nothing.", "GET", "/jobs",
         query = &[

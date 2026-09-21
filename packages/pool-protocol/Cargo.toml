@@ -1,0 +1,9 @@
+[package]
+name = "pool-protocol"
+version = "0.0.1-canary.1"
+edition = "2021"
+description = "Wire types between the pool agent on a machine and the cluster scheduler. Serde only, so the agent binary stays tiny and the two ends cannot drift"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -258,6 +258,7 @@ impl TestHarness {
             }),
             auth_secret: auth_secret.map(str::to_string),
             supervised: false,
+            pools: None,
         }
     }
 

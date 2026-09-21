@@ -5,6 +5,14 @@ edition = "2021"
 
 [dependencies]
 schedule-core = { path = "../../packages/schedule-core" }
+# Machine pools: the engine, its agent wire types, the docker provider (Docker
+# Engine API over the local socket, so the scheduler image needs no docker CLI)
+# and the HMAC behind per-machine bearer tokens.
+pool-core = { path = "../../packages/pool-core" }
+pool-protocol = { path = "../../packages/pool-protocol" }
+bollard = "0.18"
+hmac = "0.12"
+hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 surrealdb = { version = "3.1.2", default-features = false, features = ["kv-rocksdb", "protocol-http", "rustls"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }

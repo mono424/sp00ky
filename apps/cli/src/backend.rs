@@ -446,6 +446,10 @@ pub struct Sp00kyConfig {
     /// Server-side workflow DAGs. Same file-linking rule as `schedules`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workflows: BTreeMap<String, crate::schedule_config::WorkflowConfig>,
+    /// Machine pools: autoscaled machines that run one backend's outbox jobs,
+    /// keyed by pool name. A backend opts in with `runOn: { pool: <name> }`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pools: BTreeMap<String, crate::pool_config::PoolConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buckets: Vec<String>,
     #[serde(default, rename = "clientTypes", skip_serializing_if = "Vec::is_empty")]
@@ -1372,6 +1376,7 @@ impl Sp00kyConfig {
         }
         self.validate_docker_depends_on()?;
         crate::schedule_config::validate_all(&self.schedules, &self.workflows)?;
+        crate::pool_config::validate_all(self)?;
         // logLevel: walk every directive string and confirm it parses.
         if let Some(cfg) = &self.log_level {
             match cfg {
@@ -2048,6 +2053,10 @@ pub struct AppConfig {
     /// Trigger method (required for backends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<BackendMethod>,
+    /// Run this backend's jobs on machines from a pool (see `pools:`) instead of
+    /// on one always-on container the SSPs POST to.
+    #[serde(default, rename = "runOn", skip_serializing_if = "Option::is_none")]
+    pub run_on: Option<crate::pool_config::RunOnConfig>,
 
     // ── Docker-app fields (type: docker) ────────────────────────────────
     /// Prebuilt image to run (required for `type: docker`).

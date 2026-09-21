@@ -20,6 +20,8 @@ mod migration;
 mod modules;
 mod package_manager;
 mod parser;
+mod pool_config;
+mod pool_sync;
 mod port_check;
 mod query;
 mod scaffold;

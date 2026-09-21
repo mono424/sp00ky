@@ -87,8 +87,8 @@ fn collect_dev_ports(
         }
     }
     for (name, app) in config.backends() {
-        if !app.runs_in_dev() {
-            continue; // cloudOnly: not started in dev, don't reserve its port
+        if !app.runs_in_dev() || app.run_on.is_some() {
+            continue; // cloudOnly, or a pool backend: nothing of it listens on the host
         }
         collect_app("app", name, &app.dev);
     }
@@ -438,6 +438,7 @@ fn run_direct_mode(
     let urls = RuntimeUrls::new(versions.ssp.is_local(), versions.scheduler.is_local());
 
     // Clean up any stale resources from a previous run
+    remove_pool_machines();
     let _ = docker(&["rm", "-f", SURREAL_CONTAINER]);
     let _ = docker(&["rm", "-f", SSP_CONTAINER]);
     let _ = docker(&["rm", "-f", SCHEDULER_CONTAINER]);
@@ -647,7 +648,12 @@ fn run_direct_mode(
             db_name: resolved_surreal.database.clone(),
             db_user: resolved_surreal.username_literal(),
             db_pass: resolved_surreal.password_literal(),
-            sync_env: dev_infra_env(&config),
+            sync_env: {
+                let mut env = dev_infra_env(&config);
+                env.extend(pool_dev_env(&config, versions.scheduler.is_local()));
+                env
+            },
+            mount_docker_sock: !config.pools.is_empty(),
         };
 
         let step = ui::step("Scheduler");
@@ -844,6 +850,9 @@ fn cleanup_direct(_stop: &Arc<AtomicBool>) -> Result<()> {
         let _ = docker(&["rm", "-f", SSP_CONTAINER]);
         let _ = docker(&["rm", "-f", SURREAL_CONTAINER]);
     }
+
+    // Pool machines hold the network open, so they go before it does.
+    remove_pool_machines();
 
     // Remove network
     let _ = docker(&["network", "rm", NETWORK_NAME]);
@@ -1706,8 +1715,12 @@ struct SchedulerLaunchSpec {
     db_name: String,
     db_user: String,
     db_pass: String,
-    /// `SPKY_INGEST_TRANSPORT` and friends, from `sync:` in the manifest.
+    /// `SPKY_INGEST_TRANSPORT` and friends, from `sync:` in the manifest, plus
+    /// the machine pool settings when the manifest declares pools.
     sync_env: Vec<(String, String)>,
+    /// A containerized scheduler creates pool machines through the host's docker
+    /// socket. Only mounted when the manifest actually declares a pool.
+    mount_docker_sock: bool,
 }
 
 impl SchedulerLaunchSpec {
@@ -1804,6 +1817,10 @@ fn start_scheduler(spec: &SchedulerLaunchSpec, step: Option<&ui::Step>) -> Resul
             for e in &sync_env {
                 args.push("-e");
                 args.push(e);
+            }
+            if spec.mount_docker_sock {
+                args.push("-v");
+                args.push("/var/run/docker.sock:/var/run/docker.sock");
             }
             args.push(image.as_str());
             docker(&args)?;
@@ -2384,6 +2401,12 @@ fn build_job_config_json(config: &Sp00kyConfig, ssp_in_docker: bool) -> String {
         if !app.runs_in_dev() {
             continue; // cloudOnly backend isn't running in dev; don't route jobs to it
         }
+        // A pool backend's jobs run on pool machines, driven by the scheduler's
+        // pool engine. Routing its table to the SSP runner as well would have two
+        // executors claiming the same rows.
+        if app.run_on.is_some() {
+            continue;
+        }
         let method = match &app.method {
             Some(m) => m,
             None => continue,
@@ -2417,6 +2440,79 @@ fn build_job_config_json(config: &Sp00kyConfig, ssp_in_docker: bool) -> String {
         }));
     }
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Scheduler environment for machine pools under `spky dev`.
+///
+/// Every pool runs on the `docker` provider in dev, whatever the manifest says
+/// (`pool_sync` writes the rows that way too): machines are containers on the dev
+/// network. They reach the scheduler by its network alias when it is a container,
+/// and through the host gateway when it is a locally built host process.
+///
+/// `SPKY_DEV_AGENT_IMAGE` overrides the agent image, for working on the agent.
+fn pool_dev_env(config: &Sp00kyConfig, scheduler_on_host: bool) -> Vec<(String, String)> {
+    if config.pools.is_empty() {
+        return vec![("SPKY_POOL_ENABLED".into(), "false".into())];
+    }
+    let public_url = if scheduler_on_host {
+        "http://host.docker.internal:9669"
+    } else {
+        "http://scheduler:9669"
+    };
+    let mut env = vec![
+        ("SPKY_POOL_DOCKER".to_string(), "1".to_string()),
+        ("SPKY_POOL_DOCKER_NETWORK".to_string(), NETWORK_NAME.to_string()),
+        ("SPKY_POOL_PUBLIC_URL".to_string(), public_url.to_string()),
+    ];
+    if let Ok(image) = std::env::var("SPKY_DEV_AGENT_IMAGE") {
+        if !image.trim().is_empty() {
+            env.push(("SPKY_POOL_AGENT_IMAGE".to_string(), image));
+        }
+    }
+    env
+}
+
+/// Build the image pool machines run for `name`, tagged the way `pool_sync`
+/// names it in the pool row. Needs `deploy.dockerfile`: there is no other
+/// description of how to run this backend inside a container.
+fn build_pool_image(name: &str, app: &backend::AppConfig, project_dir: &Path) {
+    let Some(dockerfile) = app.deploy.as_ref().and_then(|d| d.dockerfile.as_deref()) else {
+        ui::warn(format!(
+            "'{name}' runs on a pool but has no `deploy.dockerfile`, so there is no image to run it from"
+        ));
+        return;
+    };
+    let context = app.deploy.as_ref().and_then(|d| d.context.as_deref()).unwrap_or(".");
+    let tag = crate::pool_sync::dev_image_tag(name);
+    let built = Command::new("docker")
+        .args(["build", "-q", "-f", dockerfile, "-t", &tag, context])
+        .current_dir(project_dir)
+        .output();
+    match built {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => ui::warn(format!(
+            "docker build for pool backend '{name}' failed:\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => ui::warn(format!("could not run docker build for pool backend '{name}': {e}")),
+    }
+}
+
+/// Remove every pool machine container. They are created by the scheduler, so
+/// the CLI only knows them by the label the docker provider stamps on them.
+fn remove_pool_machines() {
+    let Ok(out) = Command::new("docker").args(["ps", "-aq", "--filter", "label=spky.pool"]).output()
+    else {
+        return;
+    };
+    let ids: Vec<String> =
+        String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string).collect();
+    if ids.is_empty() {
+        return;
+    }
+    let mut args = vec!["rm".to_string(), "-f".to_string()];
+    args.extend(ids);
+    let _ = Command::new("docker").args(&args).output();
 }
 
 /// Build the auto-injected SPKY_* environment variables for dev mode.
@@ -2610,6 +2706,17 @@ fn apply_internal_sp00ky_schema(
         Some(secret),
     )?;
 
+    // Machine pools: after the internal schema (the tables must exist), with the
+    // dev image tags and dev environment.
+    if !config.pools.is_empty() {
+        let project_dir = config_path.parent().unwrap_or(Path::new("."));
+        crate::pool_sync::sync_and_report(
+            &client,
+            &config,
+            &crate::pool_sync::PoolEnv::Dev { project_dir },
+        );
+    }
+
     // Publish the query allowlist so a `warn`/`enforce` dev SSP has something to
     // compare against. Version "dev": one row, overwritten on every start.
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
@@ -2639,6 +2746,14 @@ fn spawn_backend_dev_commands(
     for (name, app) in config.backends() {
         if !app.runs_in_dev() {
             continue; // cloudOnly: deployed but not started by `spky dev`
+        }
+        // A pool backend never runs as one always-on dev process: the scheduler
+        // starts it on pool machines (containers, in dev), on demand. What dev
+        // owes it is the image those machines run.
+        if app.run_on.is_some() {
+            step.set_message(format!("building pool image for {}…", name));
+            build_pool_image(name, app, project_dir);
+            continue;
         }
         let dev_config = match &app.dev {
             Some(cfg) => cfg,

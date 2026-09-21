@@ -344,6 +344,10 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
     content.push('\n');
     content.push_str(include_str!("schedule_tables.surql"));
 
+    // Machine pool tables (`_00_pool`, `_00_machine`)
+    content.push('\n');
+    content.push_str(include_str!("pool_tables.surql"));
+
     // Migration tracking table
     content.push('\n');
     content.push_str(include_str!("migration_tables.surql"));
@@ -1472,6 +1476,15 @@ mod outbox_platform_field_tests {
             {
                 panic!("outbox platform fields do not parse for {mode:?}:\n{sql}\n→ {e}");
             }
+        }
+    }
+
+    /// Same for the machine pool DDL: it ships in the same all-or-nothing batch.
+    #[test]
+    fn the_shipped_pool_ddl_parses() {
+        let ddl = include_str!("pool_tables.surql");
+        if let Err(e) = parse_with_capabilities(ddl, &Capabilities::all()) {
+            panic!("pool_tables.surql does not parse: {e}");
         }
     }
 

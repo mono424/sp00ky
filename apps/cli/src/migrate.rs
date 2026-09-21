@@ -1015,6 +1015,11 @@ pub fn apply_internal_schema(
     internal_sql.push_str(include_str!("schedule_tables.surql"));
     internal_sql.push('\n');
 
+    // Machine pool tables (`_00_pool`, `_00_machine`). Same arrangement: its own
+    // file so `packages/pool-core` tests run against exactly what ships.
+    internal_sql.push_str(include_str!("pool_tables.surql"));
+    internal_sql.push('\n');
+
     // 3b. Per-table sp00ky events (mutation + delete for versioning & ingest)
     let sp00ky_events = generate_sp00ky_events(
         &parser.tables,

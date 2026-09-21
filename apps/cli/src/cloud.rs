@@ -1464,6 +1464,7 @@ impl SchemaApplyFailures {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_remote_fns_and_internal_schema(
     db_url: &str,
     db_password: &str,
@@ -1472,6 +1473,9 @@ fn apply_remote_fns_and_internal_schema(
     config_path: &std::path::Path,
     client: &mut CloudClient,
     pid: &str,
+    // The backend manifests of THIS deploy, for the machine pool rows. Empty when
+    // there are none at hand (a restore), which leaves every pool row untouched.
+    pool_manifests: &[serde_json::Value],
 ) -> SchemaApplyFailures {
     let mut failures = SchemaApplyFailures::default();
     let resolved = config.resolved_surrealdb();
@@ -1547,6 +1551,14 @@ fn apply_remote_fns_and_internal_schema(
                 println!("  ▸ Warning: failed to apply internal schema: {:?}", e);
                 failures.record("internal schema", &e);
             }
+        }
+        // Machine pools, once their tables exist.
+        if !config.pools.is_empty() {
+            crate::pool_sync::sync_and_report(
+                &surreal_client,
+                config,
+                &crate::pool_sync::PoolEnv::Cloud { manifests: pool_manifests },
+            );
         }
     }
     failures
@@ -1947,6 +1959,13 @@ fn build_backend_manifest(
                 "table": table,
             });
         }
+    }
+    // A pool backend is not an always-on container the SSPs POST to: the control
+    // plane must keep it out of `SPKY_JOB_CONFIG` and run its image on pool
+    // machines instead. Absent for every ordinary backend, so an older control
+    // plane sees exactly the manifest it always has.
+    if let Some(ref run_on) = app_config.run_on {
+        manifest["run_on"] = serde_json::json!({ "pool": run_on.pool });
     }
     manifest
 }
@@ -3085,7 +3104,18 @@ pub fn deploy(
         Some(serde_json::json!(infra_env_map))
     };
 
+    // Kept for the machine pool rows written after the infra phase: the manifests
+    // themselves are moved into the request body below.
+    let pool_manifests: Vec<serde_json::Value> = backend_manifests
+        .iter()
+        .filter(|m| m.get("run_on").is_some())
+        .cloned()
+        .collect();
+
     let deploy_body = serde_json::json!({
+        // Machine pools: ceilings and machine shapes, enforced control-plane side.
+        // An older control plane simply ignores the key.
+        "pools": crate::pool_config::cloud_pool_manifests(&config),
         "infra_env": infra_env,
         "surrealdb": surrealdb_manifest,
         "backends": backend_manifests,
@@ -3226,6 +3256,7 @@ pub fn deploy(
                                 config_path.as_path(),
                                 &mut client,
                                 &pid,
+                                &pool_manifests,
                             );
                         }
                     }
@@ -3285,6 +3316,7 @@ pub fn deploy(
                                         config_path.as_path(),
                                         &mut client,
                                         &pid,
+                                        &pool_manifests,
                                     );
                                     if !reapply.is_empty() {
                                         schema_failures = reapply;
@@ -5605,6 +5637,7 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                     config_path.as_path(),
                     &mut client,
                     &pid,
+                    &[],
                 );
                 if !restore_schema.is_empty() {
                     // The dump carries user-table data only. Without the meta

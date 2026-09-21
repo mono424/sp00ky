@@ -394,6 +394,7 @@ pub fn add_api(
             // parallelism is a deliberate act, not a starter-template value.
             concurrency: None,
         }),
+        run_on: None,
         image: None,
         ports: Vec::new(),
         args: Vec::new(),

@@ -320,7 +320,7 @@ fn default_true() -> bool {
 // ── Validation ──────────────────────────────────────────────────────────────
 
 /// Names must be safe to embed in a record id and readable in CLI output.
-fn validate_name(kind: &str, name: &str) -> Result<()> {
+pub(crate) fn validate_name(kind: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');

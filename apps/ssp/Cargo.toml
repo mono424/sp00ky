@@ -1,6 +1,6 @@
 [package]
 name = "ssp-server"
-version = "0.0.1-canary.269"
+version = "0.0.1-canary.270"
 edition = "2024"
 
 [dependencies]

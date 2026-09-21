@@ -99,6 +99,20 @@
     "method": {
       "$ref": "#/$defs/backendMethod"
     },
+    "runOn": {
+      "type": "object",
+      "description": "Run this backend's outbox jobs on the machines of a pool declared under `pools:` in sp00ky.yml, instead of on an always-on container. See https://sp00ky.cloud/docs/jobs/machine-pools",
+      "required": [
+        "pool"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pool": {
+          "type": "string",
+          "description": "Name of the pool."
+        }
+      }
+    },
     "dev": {
       "$ref": "#/$defs/devConfig"
     },

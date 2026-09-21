@@ -106,10 +106,38 @@ dispatched build carries a tag of its own). Dispatching that workflow by hand
 pushes an immutable tag and moves neither `canary` nor `latest`, which is the way
 to put an unreleased scheduler on one test project without rolling every cluster.
 
-Still open for Phase 2: the live run itself against Hetzner (token is stored;
-needs the staging deploy of the control plane, the dispatched images, a test
-project on a plan that includes pools, and real money), git-linked deploys (they
-do not send `pools` / `run_on` or write `_00_pool` rows yet).
+First live run (staging, 2026-09-21, scheduler and agent images `pools-rc1`): a
+throwaway project with one `hetzner` pool (`cx33`, min 0, max 1, idle timeout 2m)
+and one hand-triggered 20 second job. VM requested 07:45:55 UTC, agent ready
+07:47:00 (about 65s), job assigned 07:47:12 under lease epoch 1, success 07:47:23
+with the backend's result, machine gone after the idle timeout, machine-hours
+billed once. Then a project destroyed under a second machine mid-job: the control
+plane took the VM down before it deleted the project. Before the first success
+the safety net got a real workout: four creates rejected by Hetzner over a missing
+SSH key came back as `409 rejected`, the machine rows failed with the reason, and
+the breaker opened after three, with nothing created.
+
+What the live run found on this side, all fixed:
+- The sync event generator emitted sub-path field definitions as object keys
+  (`errors[*]: $after.errors[*]`), a parse error that fails the WHOLE internal
+  schema, so `_00_pool` never installed and the pool sync had nowhere to write.
+  The stock outbox template of `spky api add` defines `errors[*]`, so every
+  freshly scaffolded backend hit it on its first deploy.
+- The same template's plain `DEFINE FIELD errors[*]` fails on SurrealDB 3.1 with
+  "The field 'errors.*' already exists" (3.1 defines the element of an
+  `array<object>` by itself), which killed `spky migrate create`. OVERWRITE now.
+- A scheduler whose database has no pool tables (every existing project right
+  after an image upgrade, and any git-linked project, since that path never
+  installs new internal tables) logged a sweep error every two seconds. The sweep
+  goes dormant instead: one info line, a look every 60s, back the moment the
+  tables appear. `pools-rc1` does NOT have this; build an rc2 before promoting.
+- A fresh project needs `spky migrate create init` before its first deploy, or its
+  own tables never exist SCHEMAFULL. `spky init` and `spky api add` both need a
+  TTY even with `--yes`, so an agent has to write the project by hand.
+
+Still open for Phase 2: git-linked deploys (they do not send `pools` / `run_on`
+or write `_00_pool` rows yet), and a pool backend's env lacks the runtime-injected
+database credentials a core-host backend gets.
 
 Not built yet: `spky pools` / `spky machines` CLI commands (the admin API and MCP
 tools exist), machine stats beyond a version string, and everything in Phases 3

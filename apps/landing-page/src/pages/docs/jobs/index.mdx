@@ -83,7 +83,7 @@ DEFINE FIELD errors ON TABLE job TYPE array<object> DEFAULT ALWAYS []
   PERMISSIONS FOR create WHERE true FOR select, update WHERE false;
 -- The element must be FLEXIBLE, or a SCHEMAFULL table rejects the runner's
 -- { code, reason } entries as unknown fields.
-DEFINE FIELD errors[*] ON TABLE job TYPE object FLEXIBLE;
+DEFINE FIELD OVERWRITE errors[*] ON TABLE job TYPE object FLEXIBLE;
 DEFINE FIELD result ON TABLE job TYPE any
   PERMISSIONS FOR select WHERE true FOR create, update WHERE false;
 DEFINE FIELD assignee ON TABLE job TYPE option<string>

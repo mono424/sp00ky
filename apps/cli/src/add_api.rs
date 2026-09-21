@@ -66,7 +66,11 @@ PERMISSIONS
 
 -- The element must be FLEXIBLE or a SCHEMAFULL table rejects the runner's
 -- `{{ code, reason }}` entries as unknown fields (`errors[0].code`).
-DEFINE FIELD errors[*] ON TABLE {table} TYPE object FLEXIBLE;
+-- OVERWRITE because SurrealDB 3.1 defines the element (`errors.*`, without
+-- FLEXIBLE) by itself the moment `errors` is declared `array<object>`: a plain
+-- DEFINE then fails with "The field 'errors.*' already exists", which is how
+-- `spky migrate create` died on every freshly scaffolded backend.
+DEFINE FIELD OVERWRITE errors[*] ON TABLE {table} TYPE object FLEXIBLE;
 
 -- Set on create, and thereafter only when a writer sets it explicitly. Every
 -- platform write does (`UPDATE ... SET status = ..., updated_at = time::now()`),
@@ -521,7 +525,7 @@ mod tests {
     #[test]
     fn error_entries_are_flexible_objects() {
         let ddl = outbox_template("job");
-        assert!(ddl.contains("DEFINE FIELD errors[*] ON TABLE job TYPE object FLEXIBLE"));
+        assert!(ddl.contains("DEFINE FIELD OVERWRITE errors[*] ON TABLE job TYPE object FLEXIBLE"));
     }
 
     /// The template documents the full shape of the table, so it must carry the lease

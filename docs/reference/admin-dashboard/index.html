@@ -125,7 +125,14 @@ against the scheduler’s bootstrap budget.</p>
 <p><strong>Backends</strong> — status and response time for everything in <code>SPKY_BACKENDS</code>, with
 a detail page carrying a ~30-minute response-time history and the resolved
 healthcheck URL. Environment values are masked by the scheduler before they
-leave it.</p>
+leave it. A backend that runs on a machine pool (<code>run_on: { pool: ... }</code>) is
+not probed: between jobs there may be no machine to answer, and that is not an
+outage. Its status is what the pool sweep last saw: <code>idle</code> at zero machines with
+nothing queued, <code>starting</code> while a machine boots or a job waits for one,
+<code>healthy</code> with a ready machine, <code>unhealthy</code> only when the pool’s boot-failure
+breaker is open or its last pass failed. No <code>backend_down</code> incident is ever
+opened for it; the pool’s own <code>pool_breaker_open</code> incident carries the reason
+when it cannot get a machine.</p>
 <figure class="my-6">  <img src="/docs/admin/backends.png" alt="Your own services, their resolved health-check URLs and response times." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">Your own services, their resolved health-check URLs and response times.</figcaption> </figure>
 <p><strong>Workflows</strong> — runs updating in real time, and a run page built around a
 timeline: every step plotted on one shared axis, so where the time went is

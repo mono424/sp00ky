@@ -25,7 +25,7 @@ pub mod sql;
 #[cfg(test)]
 mod db_tests;
 
-pub use engine::{PoolEngine, PoolEngineConfig, PoolTransition, TickReport};
+pub use engine::{PoolEngine, PoolEngineConfig, PoolObservation, PoolTransition, TickReport};
 pub use provider::{CreateMachine, MachineProvider, ProviderError, ProviderMachine};
 pub use sizing::{desired_machines, Demand};
 pub use spec::{MachineRow, MachineState, PoolSpec, SpecError};

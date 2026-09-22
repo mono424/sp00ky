@@ -401,23 +401,28 @@ async fn fixed_size_pool_keeps_min_machines_and_queues_the_rest() {
 async fn baseline_with_no_buffer_spawns_for_a_waiting_job_and_shrinks_back() {
     let h = harness().await;
     h.pool(json!({ "min": 0, "buffer": 0, "max": 3 })).await;
-    assert_eq!(
-        h.tick().await.created,
-        0,
-        "scale to zero: nothing to do, nothing running"
-    );
+    // Every pass also reports what it saw of the pool, for the backend's
+    // status: at zero machines that is "nothing running, nothing waiting",
+    // which the scheduler shows as idle rather than unreachable.
+    let observed = |r: &crate::TickReport| (r.pools.len(), r.pools[0].ready, r.pools[0].starting, r.pools[0].queued);
+    let report = h.tick().await;
+    assert_eq!(report.created, 0, "scale to zero: nothing to do, nothing running");
+    assert_eq!(observed(&report), (1, 0, 0, 0));
+    assert_eq!(report.pools[0].backend, "renderer");
 
     let job = h.job("a").await;
-    assert_eq!(h.tick().await.created, 1, "the waiting job is the demand");
-    assert_eq!(
-        h.tick().await.created,
-        0,
-        "a booting machine already counts as supply"
-    );
+    let report = h.tick().await;
+    assert_eq!(report.created, 1, "the waiting job is the demand");
+    assert_eq!(observed(&report), (1, 0, 1, 1), "the machine just created is starting");
+    let report = h.tick().await;
+    assert_eq!(report.created, 0, "a booting machine already counts as supply");
+    assert_eq!(observed(&report), (1, 0, 1, 1));
 
     let m = h.boot_all().await.remove(0);
     h.poll(&m, &[]).await;
-    assert_eq!(h.tick().await.assigned, 1);
+    let report = h.tick().await;
+    assert_eq!(report.assigned, 1);
+    assert_eq!(observed(&report), (1, 1, 0, 0), "ready, and the job is off the queue");
 
     let attempt = assigns(&h.poll(&m, &[]).await).remove(0);
     assert_eq!(attempt.job, job);

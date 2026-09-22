@@ -150,7 +150,29 @@ export interface SspEntity {
   env: Record<string, string> | null;
 }
 
-export type BackendStatus = 'healthy' | 'unhealthy' | 'unreachable' | 'unknown';
+/**
+ * `idle` and `starting` only ever describe a backend that runs on a machine
+ * pool: at zero machines there is nothing to probe and nothing wrong.
+ */
+export type BackendStatus =
+  | 'healthy'
+  | 'unhealthy'
+  | 'unreachable'
+  | 'unknown'
+  | 'idle'
+  | 'starting';
+
+/** What the pool sweep last saw of the pool that runs a backend. */
+export interface PoolBacking {
+  pool: string;
+  ready: number;
+  starting: number;
+  busy_slots: number;
+  queued: number;
+  paused: boolean;
+  breaker_open: boolean;
+  error: string | null;
+}
 
 export interface BackendSummary {
   /**
@@ -168,6 +190,8 @@ export interface BackendSummary {
   response_time_ms: number | null;
   last_checked: string | null;
   last_healthy: string | null;
+  /** Present exactly when a machine pool runs this backend. */
+  pool?: PoolBacking | null;
 }
 
 export interface HealthSample {

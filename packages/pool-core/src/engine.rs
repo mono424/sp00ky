@@ -87,6 +87,42 @@ pub struct PoolTransition {
     pub detail: String,
 }
 
+/// What a pass saw of one pool, for whoever reports the pool's backend: at zero
+/// machines there is no container to health-check, so the pool's own state is
+/// the only honest answer about the backend it runs. One per `_00_pool` row
+/// the pass could read, including a pool whose pass failed (`error` set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolObservation {
+    pub pool: String,
+    pub backend: String,
+    /// Machines ready to take a job, busy or free.
+    pub ready: u32,
+    /// Machines requested or booting, including the ones this pass created.
+    pub starting: u32,
+    pub busy_slots: u32,
+    /// Jobs still waiting for a machine after this pass assigned what it could.
+    pub queued: u32,
+    pub paused: bool,
+    pub breaker_open: bool,
+    pub error: Option<String>,
+}
+
+impl PoolObservation {
+    fn failed(spec: &PoolSpec, error: String) -> Self {
+        Self {
+            pool: spec.name.clone(),
+            backend: spec.backend.clone(),
+            ready: 0,
+            starting: 0,
+            busy_slots: 0,
+            queued: 0,
+            paused: spec.paused,
+            breaker_open: spec.breaker_open,
+            error: Some(error),
+        }
+    }
+}
+
 /// What one `tick_pass` did. Returned for logging and asserted on in tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -108,6 +144,8 @@ pub struct TickReport {
     /// pool never aborts the sweep.
     pub errored: usize,
     pub transitions: Vec<PoolTransition>,
+    /// One per pool row read this pass, in `_00_pool` order.
+    pub pools: Vec<PoolObservation>,
 }
 
 /// Seconds between agent polls for a pool with this lease. Six polls per lease,
@@ -173,17 +211,16 @@ impl PoolEngine {
             };
             if let Err(e) = self.tick_pool(&spec, pass, &mut report).await {
                 report.errored += 1;
-                tracing::warn!(pool = %spec.name, error = format!("{e:#}"), "pool pass failed");
+                let error = format!("{e:#}");
+                tracing::warn!(pool = %spec.name, error = %error, "pool pass failed");
                 let _ = self
                     .db
                     .query(
                         sql::RECORD_POOL_ERROR,
-                        &[
-                            ("name", json!(spec.name)),
-                            ("error", json!(format!("{e:#}"))),
-                        ],
+                        &[("name", json!(spec.name)), ("error", json!(error.clone()))],
                     )
                     .await;
+                report.pools.push(PoolObservation::failed(&spec, error));
             }
         }
 
@@ -352,6 +389,7 @@ impl PoolEngine {
             },
         );
 
+        let mut created = 0u32;
         if desired > supply && !spec.paused && !breaker_open {
             // Draining and terminating machines are on their way out and do not
             // count against the ceiling (that is the surge a roll needs). But if
@@ -371,7 +409,10 @@ impl PoolEngine {
                 Some(provider) => {
                     for _ in 0..want {
                         match self.create_machine(spec, provider.as_ref()).await {
-                            Ok(()) => report.created += 1,
+                            Ok(()) => {
+                                report.created += 1;
+                                created += 1;
+                            }
                             Err(e) => {
                                 report.create_failed += 1;
                                 boot_failures += 1;
@@ -458,6 +499,29 @@ impl PoolEngine {
                 report.orphans_destroyed += self.destroy_orphans(spec, provider.as_ref()).await;
             }
         }
+
+        // -- what this pass leaves behind, for the backend's status. Machines
+        //    created above are not in `machines`; they are counted from the report.
+        let ready = machines
+            .iter()
+            .filter(|m| matches!(m.state, MachineState::Ready | MachineState::Draining))
+            .count() as u32;
+        let starting = machines
+            .iter()
+            .filter(|m| matches!(m.state, MachineState::Requested | MachineState::Booting))
+            .count() as u32
+            + created;
+        report.pools.push(PoolObservation {
+            pool: spec.name.clone(),
+            backend: spec.backend.clone(),
+            ready,
+            starting,
+            busy_slots: occupancy.values().sum(),
+            queued,
+            paused: spec.paused,
+            breaker_open,
+            error: None,
+        });
 
         Ok(())
     }

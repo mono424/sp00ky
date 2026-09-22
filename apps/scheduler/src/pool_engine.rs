@@ -65,6 +65,20 @@ fn is_missing_pool_tables(error: &str) -> bool {
         && (error.contains("'_00_pool'") || error.contains("'_00_machine'"))
 }
 
+/// The pool sweep's view of a backend, in the health cache's vocabulary.
+fn pool_backing(p: &pool_core::PoolObservation) -> maintenance::backend_health::PoolBacking {
+    maintenance::backend_health::PoolBacking {
+        pool: p.pool.clone(),
+        ready: p.ready,
+        starting: p.starting,
+        busy_slots: p.busy_slots,
+        queued: p.queued,
+        paused: p.paused,
+        breaker_open: p.breaker_open,
+        error: p.error.clone(),
+    }
+}
+
 #[derive(Clone)]
 pub struct PoolHostConfig {
     pub enabled: bool,
@@ -276,7 +290,11 @@ impl PoolHost {
     }
 
     /// Start the cluster pool sweep. One task, one ticker.
-    pub fn start_sweep(&self) {
+    ///
+    /// `backends` is the backend health cache: a pool backend has no always-on
+    /// container to probe, so every pass writes what the pool knows about it
+    /// there instead (idle at zero machines, not unreachable).
+    pub fn start_sweep(&self, backends: maintenance::BackendHealthCache) {
         let host = self.clone();
         tokio::spawn(async move {
             // The SWEEP engine is kept: its pass counter paces the orphan sweep.
@@ -302,6 +320,12 @@ impl PoolHost {
                         if dormant_until.take().is_some() {
                             info!("Pool tables found: pool sweep active");
                         }
+                        let backings: Vec<_> = report
+                            .pools
+                            .iter()
+                            .map(|p| (p.backend.clone(), pool_backing(p)))
+                            .collect();
+                        maintenance::set_pool_backing(&backends, &backings).await;
                         for t in &report.transitions {
                             let summary = format!(
                                 "Pool '{}' stopped creating machines after {} failed boots: {}",

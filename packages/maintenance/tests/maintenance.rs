@@ -282,6 +282,89 @@ async fn backup_failure_marks_registry() {
 // Backend health monitor (wiremock)
 // ---------------------------------------------------------------------------
 
+/// A pool backend at zero machines is `idle`, not down: there is no container
+/// to probe and nothing wrong. The whole mapping, since it is what decides
+/// whether a scaled-to-zero backend reads as an outage.
+#[test]
+fn pool_backing_status_is_idle_at_zero_machines() {
+    use backend_health::PoolBacking;
+    let rest = PoolBacking {
+        pool: "render".into(),
+        ready: 0,
+        starting: 0,
+        busy_slots: 0,
+        queued: 0,
+        paused: false,
+        breaker_open: false,
+        error: None,
+    };
+    assert_eq!(rest.status(), BackendStatus::Idle);
+    assert_eq!(PoolBacking { queued: 2, ..rest.clone() }.status(), BackendStatus::Starting);
+    assert_eq!(PoolBacking { starting: 1, ..rest.clone() }.status(), BackendStatus::Starting);
+    // Paused with work queued: nothing is coming, so nothing is starting.
+    assert_eq!(
+        PoolBacking { queued: 2, paused: true, ..rest.clone() }.status(),
+        BackendStatus::Idle
+    );
+    assert_eq!(PoolBacking { ready: 1, ..rest.clone() }.status(), BackendStatus::Healthy);
+    assert_eq!(
+        PoolBacking { ready: 1, breaker_open: true, ..rest.clone() }.status(),
+        BackendStatus::Unhealthy
+    );
+    assert_eq!(
+        PoolBacking { error: Some("no provider".into()), ..rest }.status(),
+        BackendStatus::Unhealthy
+    );
+    assert!(!BackendStatus::Idle.is_failing() && !BackendStatus::Starting.is_failing());
+}
+
+/// The regression: a pool backend is pushed to the scheduler with a URL nothing
+/// listens on (its machines come and go). The prober must leave it alone once
+/// the pool sweep has claimed it, and the sweep's word must survive the
+/// prober's sweeps. Un-claiming hands it back to the prober.
+#[tokio::test]
+async fn pool_backed_backend_is_not_probed() {
+    use backend_health::PoolBacking;
+    let renderer = backend_health::BackendHealthConfig {
+        name: "renderer".into(),
+        url: "http://127.0.0.1:1".into(),
+        healthcheck: "/health".into(),
+        port: None,
+        env: None,
+    };
+    let cache = backend_health::create_health_cache(&[renderer.clone()]);
+    let configs = backend_health::create_shared_configs(&[renderer]);
+    let client = backend_health::health_http_client();
+
+    let idle = PoolBacking {
+        pool: "render".into(),
+        ready: 0,
+        starting: 0,
+        busy_slots: 0,
+        queued: 0,
+        paused: false,
+        breaker_open: false,
+        error: None,
+    };
+    backend_health::set_pool_backing(&cache, &[("renderer".into(), idle.clone())]).await;
+    backend_health::check_backends_once(&configs, &cache, &client).await;
+    {
+        let e = &cache.read().await[0];
+        assert_eq!(e.status, BackendStatus::Idle, "the prober did not touch it");
+        assert!(e.history.is_empty(), "no probe ran");
+        assert_eq!(e.pool.as_ref(), Some(&idle));
+        assert!(e.last_checked.is_some());
+    }
+
+    // The pool list without it: back to the prober, which finds it unreachable.
+    backend_health::set_pool_backing(&cache, &[]).await;
+    assert_eq!(cache.read().await[0].status, BackendStatus::Unknown);
+    backend_health::check_backends_once(&configs, &cache, &client).await;
+    let e = &cache.read().await[0];
+    assert_eq!(e.status, BackendStatus::Unreachable);
+    assert!(e.pool.is_none());
+}
+
 #[tokio::test]
 async fn health_monitor_tracks_backend_status_and_live_updates() {
     use wiremock::matchers::{method, path};

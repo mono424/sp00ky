@@ -138,7 +138,7 @@ pub const TOOLS: &[ToolDef] = &[
     // ---- Cluster ----
     tool!("admin_config", "Scheduler identity and version, whether it is linked to Sp00ky Cloud and supervised.", "GET", "/config", read_only = true),
     tool!("overview", "The whole cluster at a glance: scheduler status and end-to-end latency, every SSP with its phase and bootstrap progress, backends, running operations.", "GET", "/overview", read_only = true),
-    tool!("backends_list", "Health-checked application backends with status and response time.", "GET", "/backends", read_only = true),
+    tool!("backends_list", "Health-checked application backends with status and response time. A backend on a machine pool is not probed: its status is the pool's (idle at zero machines, starting, healthy, unhealthy).", "GET", "/backends", read_only = true),
     tool!("backend_get", "One backend with its probe history and masked environment.", "GET", "/backends/{name}",
         path_params = &[req("name", "string", "Backend name as listed by backends_list")], read_only = true),
     // ---- Views (who is connected, and what they are watching) ----

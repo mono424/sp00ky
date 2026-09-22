@@ -3,7 +3,9 @@
 //! Backends are the user's own deployed services, health-checked from
 //! `SPKY_BACKENDS`. The scheduler has no container handle for them, so what it
 //! can honestly report is reachability: status, how long the probe took, when
-//! it last succeeded, and the recent history of both.
+//! it last succeeded, and the recent history of both. A backend that runs on a
+//! machine pool is the exception: it is not probed at all (there may be no
+//! machine to probe), and its status is what the pool sweep last saw.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -37,6 +39,9 @@ fn entry_json(e: &BackendHealthEntry, with_history: bool) -> serde_json::Value {
         "response_time_ms": e.response_time_ms,
         "last_checked": e.last_checked.and_then(rfc3339),
         "last_healthy": e.last_healthy.and_then(rfc3339),
+        // A pool backend has no container at `url` between jobs: its status
+        // is the pool's (machines ready, booting, or none and nothing queued).
+        "pool": e.pool,
     });
 
     if with_history {

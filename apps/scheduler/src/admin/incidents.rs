@@ -335,6 +335,23 @@ impl Incidents {
                 .any(|r| r.state == "open" && r.kind == "backend_down" && r.component == id);
             let status = entity["status"].as_str().unwrap_or("unknown");
 
+            // A pool backend is never probed: between jobs there is no machine
+            // to answer, and that is not an outage. Its pool has its own
+            // incident (`pool_breaker_open`) for the case where it cannot get
+            // one, so nothing is reported here; an incident opened before the
+            // backend moved onto a pool is closed rather than left open forever.
+            if let Some(pool) = entity["pool"]["pool"].as_str() {
+                failing.remove(id);
+                if open {
+                    out.push((
+                        id.to_string(),
+                        false,
+                        format!("Backend {id} runs on pool '{pool}'; its health is the pool's"),
+                    ));
+                }
+                continue;
+            }
+
             if !matches!(status, "unhealthy" | "unreachable") {
                 failing.remove(id);
                 if status == "healthy" && open {
@@ -752,6 +769,47 @@ mod tests {
             .map(|i| backend(&format!("b{i}"), "healthy", Some(&rfc3339(pushed + 30_000))))
             .collect();
         assert!(history.backend_transitions(&up, pushed + 30_000, AFTER).is_empty());
+    }
+
+    fn pool_backend(id: &str, status: &str) -> Value {
+        json!({
+            "entity": "backend",
+            "id": id,
+            "status": status,
+            "last_healthy": null,
+            "pool": { "pool": "render", "ready": 0, "starting": 0, "queued": 0 },
+        })
+    }
+
+    /// A pool backend at zero machines is `idle` and, while the breaker is
+    /// open, `unhealthy`: neither opens `backend_down`, however long it lasts.
+    /// The pool's own breaker incident is the one that carries the reason.
+    #[test]
+    fn a_pool_backend_never_opens_a_backend_incident() {
+        let (_dir, history) = recorder();
+        let now = 1_000_000_000;
+        for status in ["idle", "starting", "unhealthy"] {
+            let entities = vec![pool_backend("renderer", status)];
+            assert!(history.backend_transitions(&entities, now, AFTER).is_empty());
+            assert!(
+                history.backend_transitions(&entities, now + AFTER * 10, AFTER).is_empty(),
+                "`{status}` on a pool backend is not an outage"
+            );
+        }
+    }
+
+    /// The upgrade path: an incident opened while the backend was still probed
+    /// (unreachable at zero machines) is closed the first time the backend is
+    /// seen pool-backed, whatever the pool's state.
+    #[test]
+    fn an_open_incident_recovers_once_the_backend_is_pool_backed() {
+        let (_dir, history) = recorder();
+        let now = 1_000_000_000;
+        open_backend_down(&history, "renderer", now);
+        let out = history.backend_transitions(&[pool_backend("renderer", "idle")], now + 1, AFTER);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].1, "recovered, not opened");
+        assert!(out[0].2.contains("pool 'render'"));
     }
 
     #[test]

@@ -135,6 +135,17 @@ What the live run found on this side, all fixed:
   own tables never exist SCHEMAFULL. `spky init` and `spky api add` both need a
   TTY even with `--yes`, so an agent has to write the project by hand.
 
+Second finding (2026-09-22): the control plane pushes a pool backend to the
+scheduler's `/backends` list like any other (`http://{name}:{port}`), and at zero
+machines nothing listens there, so the prober said `unreachable` and opened a
+`backend_down` incident for a backend that was resting exactly as designed.
+Fixed scheduler-side, so no control plane change is needed: every pool sweep pass
+reports what it saw of each pool (`TickReport.pools`), the sweep writes that into
+the backend health cache (`maintenance::set_pool_backing`), the prober skips a
+backend a pool has claimed, and the incident recorder never opens `backend_down`
+for one. Statuses: `idle` (zero machines, nothing queued), `starting`, `healthy`,
+`unhealthy` (breaker open or pass failed; the pool's own incident says why).
+
 Still open for Phase 2: git-linked deploys (they do not send `pools` / `run_on`
 or write `_00_pool` rows yet), and a pool backend's env lacks the runtime-injected
 database credentials a core-host backend gets.

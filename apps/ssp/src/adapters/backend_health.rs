@@ -17,7 +17,11 @@ impl BackendHealth for MaintenanceBackendHealth {
                 maintenance::BackendStatus::Healthy => c.healthy += 1,
                 maintenance::BackendStatus::Unhealthy => c.unhealthy += 1,
                 maintenance::BackendStatus::Unreachable => c.unreachable += 1,
-                maintenance::BackendStatus::Unknown => {}
+                // Pool-backed statuses never occur here: the standalone SSP
+                // has no pool sweep to write them.
+                maintenance::BackendStatus::Unknown
+                | maintenance::BackendStatus::Idle
+                | maintenance::BackendStatus::Starting => {}
             }
         }
         c

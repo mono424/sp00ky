@@ -127,6 +127,8 @@ async fn run() -> Result<()> {
     // dashboard and `/info` can never disagree about backend health.
     let backend_health_cache_for_admin = backend_health_cache.clone();
     let shared_backend_configs_for_admin = shared_backend_configs.clone();
+    // And the pool sweep writes pool backends' status into the same cache.
+    let backend_health_cache_for_pools = backend_health_cache.clone();
 
     let metrics_router = scheduler::metrics::create_metrics_router(
         scheduler.metrics_state(
@@ -282,7 +284,7 @@ async fn run() -> Result<()> {
     // dedicated, token-authenticated listener for the machines to dial into.
     let pool_server = match pool_host {
         Some(host) => {
-            host.start_sweep();
+            host.start_sweep(backend_health_cache_for_pools);
             Some((pool_config.bind_addr(), host.router()))
         }
         None => {

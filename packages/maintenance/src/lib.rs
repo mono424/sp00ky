@@ -19,7 +19,8 @@ pub mod routes;
 pub mod s3;
 
 pub use backend_health::{
-    create_health_cache, create_shared_configs, start_backend_health_monitor, update_backends,
+    create_health_cache, create_shared_configs, set_pool_backing, start_backend_health_monitor,
+    update_backends,
     BackendHealthCache, BackendHealthConfig, BackendHealthEntry, BackendStatus,
     SharedBackendConfigs,
 };

@@ -14,7 +14,18 @@ import {
 import { Sparkline } from '../components/Sparkline';
 import { decodeParam, formatMs, formatStamp, relativeStamp } from '../lib/format';
 import { backendTone } from '../lib/status';
-import type { BackendDetail, BackendSummary } from '../api/types';
+import type { BackendDetail, BackendSummary, PoolBacking } from '../api/types';
+
+/** One line on a pool backend's machines, in place of a probe time. */
+function poolSummary(p: PoolBacking): string {
+  const machines = p.ready + p.starting;
+  const parts = [`${machines} ${machines === 1 ? 'machine' : 'machines'}`];
+  if (p.starting > 0) parts.push(`${p.starting} booting`);
+  if (p.queued > 0) parts.push(`${p.queued} queued`);
+  if (p.paused) parts.push('paused');
+  if (p.breaker_open) parts.push('breaker open');
+  return parts.join(' · ');
+}
 
 export function Backends() {
   const [data, { refetch }] = createResource(() =>
@@ -71,7 +82,11 @@ export function Backends() {
                           <td data-label="Status">
                             <Pill tone={backendTone(b.status)}>{b.status}</Pill>
                           </td>
-                          <td class="dim" data-label="Response">{formatMs(b.response_time_ms)}</td>
+                          <td class="dim" data-label="Response">
+                            <Show when={b.pool} fallback={formatMs(b.response_time_ms)}>
+                              {(p) => <>pool {p().pool} · {poolSummary(p())}</>}
+                            </Show>
+                          </td>
                           <td class="dim" data-label="Last healthy">{relativeStamp(b.last_healthy)}</td>
                           <td class="ghost truncate" data-label="Healthcheck">{b.healthcheck_url}</td>
                         </tr>
@@ -155,10 +170,23 @@ export function BackendDetailView() {
                     tone={backendTone(b().status)}
                     value={b().status}
                   />
-                  <Cell
-                    label="Last response"
-                    value={formatMs(b().response_time_ms)}
-                  />
+                  <Show
+                    when={b().pool}
+                    fallback={
+                      <Cell
+                        label="Last response"
+                        value={formatMs(b().response_time_ms)}
+                      />
+                    }
+                  >
+                    {(p) => (
+                      <Cell
+                        label="Machines"
+                        value={`${p().ready + p().starting}`}
+                        foot={`pool ${p().pool}`}
+                      />
+                    )}
+                  </Show>
                   <Cell
                     label="Last healthy"
                     value={relativeStamp(b().last_healthy)}
@@ -172,6 +200,29 @@ export function BackendDetailView() {
                   />
                 </Rail>
 
+                <Show when={b().pool}>
+                  {(p) => (
+                    <Panel
+                      title="Machine pool"
+                      sub="This backend runs on pool machines, created on demand; there is no container to probe between jobs"
+                    >
+                      <KeyValue
+                        rows={[
+                          ['Pool', p().pool],
+                          ['Ready machines', `${p().ready}`],
+                          ['Booting machines', `${p().starting}`],
+                          ['Busy slots', `${p().busy_slots}`],
+                          ['Queued jobs', `${p().queued}`],
+                          ['Paused', p().paused ? 'yes' : 'no'],
+                          ['Breaker', p().breaker_open ? 'open' : 'closed'],
+                          ...(p().error ? [['Last error', p().error] as [string, string]] : []),
+                        ]}
+                      />
+                    </Panel>
+                  )}
+                </Show>
+
+                <Show when={!b().pool}>
                 <Panel
                   title="Response time"
                   sub={
@@ -187,6 +238,7 @@ export function BackendDetailView() {
                 >
                   <Sparkline points={points()} height={90} />
                 </Panel>
+                </Show>
 
                 <div class="grid grid-2">
                   <Panel title="Target">

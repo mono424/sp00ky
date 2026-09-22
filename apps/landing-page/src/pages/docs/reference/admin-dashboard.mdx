@@ -192,7 +192,14 @@ against the scheduler's bootstrap budget.
 **Backends** — status and response time for everything in `SPKY_BACKENDS`, with
 a detail page carrying a ~30-minute response-time history and the resolved
 healthcheck URL. Environment values are masked by the scheduler before they
-leave it.
+leave it. A backend that runs on a machine pool (`run_on: { pool: ... }`) is
+not probed: between jobs there may be no machine to answer, and that is not an
+outage. Its status is what the pool sweep last saw: `idle` at zero machines with
+nothing queued, `starting` while a machine boots or a job waits for one,
+`healthy` with a ready machine, `unhealthy` only when the pool's boot-failure
+breaker is open or its last pass failed. No `backend_down` incident is ever
+opened for it; the pool's own `pool_breaker_open` incident carries the reason
+when it cannot get a machine.
 
 <Screenshot
   src="/docs/admin/backends.png"

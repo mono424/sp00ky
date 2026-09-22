@@ -29,9 +29,17 @@ pub async fn overview(State(state): State<AdminState>) -> Json<serde_json::Value
         .iter()
         .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("ready"))
         .count();
+    // "Healthy" for the tile means not failing: a pool backend resting at zero
+    // machines, or booting one for a queued job, is doing exactly what it
+    // should and must not read as an outage.
     let healthy_backends = backends
         .iter()
-        .filter(|b| b.get("status").and_then(|v| v.as_str()) == Some("healthy"))
+        .filter(|b| {
+            matches!(
+                b.get("status").and_then(|v| v.as_str()),
+                Some("healthy" | "idle" | "starting")
+            )
+        })
         .count();
 
     Json(json!({

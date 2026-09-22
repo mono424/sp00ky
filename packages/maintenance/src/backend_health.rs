@@ -61,13 +61,22 @@ pub async fn update_backends(
     }
 }
 
-/// Backend health status
+/// Backend health status.
+///
+/// `Healthy`, `Unhealthy` and `Unreachable` are what an HTTP probe can say.
+/// `Idle` and `Starting` only ever describe a backend that runs on a machine
+/// pool (see [`PoolBacking`]): at zero machines there is nothing to probe and
+/// nothing wrong, so neither is an outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
     Healthy,
     Unhealthy,
     Unreachable,
     Unknown,
+    /// Pool backend scaled to zero with no work waiting.
+    Idle,
+    /// Pool backend with machines booting, or work waiting for one.
+    Starting,
 }
 
 impl BackendStatus {
@@ -77,6 +86,50 @@ impl BackendStatus {
             BackendStatus::Unhealthy => "unhealthy",
             BackendStatus::Unreachable => "unreachable",
             BackendStatus::Unknown => "unknown",
+            BackendStatus::Idle => "idle",
+            BackendStatus::Starting => "starting",
+        }
+    }
+
+    /// A probe or a pool said this backend cannot do its work right now.
+    pub fn is_failing(&self) -> bool {
+        matches!(self, BackendStatus::Unhealthy | BackendStatus::Unreachable)
+    }
+}
+
+/// What a machine pool knows about the backend it runs, sampled by the pool
+/// sweep. A pool backend has no always-on container: its health IS the pool's
+/// state, and the HTTP prober leaves it alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolBacking {
+    pub pool: String,
+    /// Machines ready to take a job (busy or free).
+    pub ready: u32,
+    /// Machines requested or booting.
+    pub starting: u32,
+    pub busy_slots: u32,
+    /// Jobs waiting for a machine.
+    pub queued: u32,
+    pub paused: bool,
+    /// The boot-failure breaker is open: no machines are being created.
+    pub breaker_open: bool,
+    /// The pool's last sweep pass failed (no provider, unreadable spec, ...).
+    pub error: Option<String>,
+}
+
+impl PoolBacking {
+    /// The backend status this pool state amounts to. Pure, so the mapping is
+    /// asserted in one place: a pool at zero machines with nothing queued is
+    /// `Idle`, not down.
+    pub fn status(&self) -> BackendStatus {
+        if self.error.is_some() || self.breaker_open {
+            BackendStatus::Unhealthy
+        } else if self.ready > 0 {
+            BackendStatus::Healthy
+        } else if self.starting > 0 || (self.queued > 0 && !self.paused) {
+            BackendStatus::Starting
+        } else {
+            BackendStatus::Idle
         }
     }
 }
@@ -113,6 +166,9 @@ pub struct BackendHealthEntry {
     /// Ephemeral like the rest of this struct: a scheduler restart starts the
     /// window over.
     pub history: std::collections::VecDeque<HealthSample>,
+    /// Set while a machine pool runs this backend. The pool sweep writes
+    /// `status` then (see [`set_pool_backing`]); the prober skips it.
+    pub pool: Option<PoolBacking>,
 }
 
 impl BackendHealthEntry {
@@ -128,6 +184,7 @@ impl BackendHealthEntry {
             last_healthy: None,
             response_time_ms: None,
             history: std::collections::VecDeque::with_capacity(HISTORY_LEN),
+            pool: None,
         }
     }
 
@@ -150,6 +207,39 @@ pub fn create_health_cache(backends: &[BackendHealthConfig]) -> BackendHealthCac
     Arc::new(RwLock::new(entries))
 }
 
+/// Record what the machine pools know, one entry per pool, keyed by the backend
+/// each runs. Authoritative for the whole cache: a backend named here takes its
+/// status from its pool and stops being probed; a backend that was pool-backed
+/// and is not named any more goes back to `Unknown` and the prober picks it up
+/// on its next sweep. A backend the pools do not know is left alone.
+pub async fn set_pool_backing(cache: &BackendHealthCache, backings: &[(String, PoolBacking)]) {
+    let now = SystemTime::now();
+    let mut entries = cache.write().await;
+    for entry in entries.iter_mut() {
+        match backings.iter().find(|(backend, _)| *backend == entry.name) {
+            Some((_, backing)) => {
+                let status = backing.status();
+                entry.status = status;
+                entry.last_checked = Some(now);
+                if status == BackendStatus::Healthy {
+                    entry.last_healthy = Some(now);
+                }
+                // No probe ran, so no probe time to report or to chart.
+                entry.response_time_ms = None;
+                if entry.pool.as_ref() != Some(backing) {
+                    entry.pool = Some(backing.clone());
+                }
+            }
+            None if entry.pool.is_some() => {
+                entry.pool = None;
+                entry.status = BackendStatus::Unknown;
+                entry.response_time_ms = None;
+            }
+            None => {}
+        }
+    }
+}
+
 /// Build the short-timeout client the health checks use.
 pub fn health_http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -168,8 +258,17 @@ pub async fn check_backends_once(
     http_client: &reqwest::Client,
 ) {
     let backends = configs.read().await.clone();
+    // A pool backend's status is written by the pool sweep; there is no
+    // container at its URL to ask, and asking would only log a failure.
+    let pooled: Vec<String> = cache
+        .read()
+        .await
+        .iter()
+        .filter(|e| e.pool.is_some())
+        .map(|e| e.name.clone())
+        .collect();
 
-    for backend in &backends {
+    for backend in backends.iter().filter(|b| !pooled.contains(&b.name)) {
         let health_url = format!(
             "{}{}",
             backend.url.trim_end_matches('/'),

@@ -285,18 +285,25 @@ async fn health_check(
     };
 
     // Counts only — the guard must not live past this block (see get_metrics).
-    let (total_backends, healthy_backends, unhealthy_backends, unreachable_backends) = {
+    let (total_backends, healthy_backends, unhealthy_backends, unreachable_backends, resting_backends) = {
         let backends = state.backend_health.read().await;
         (
             backends.len(),
             backends.iter().filter(|b| b.status == BackendStatus::Healthy).count(),
             backends.iter().filter(|b| b.status == BackendStatus::Unhealthy).count(),
             backends.iter().filter(|b| b.status == BackendStatus::Unreachable).count(),
+            // Pool backends at zero machines, or booting one: doing what they
+            // should, so they must not degrade the cluster's health verdict.
+            backends
+                .iter()
+                .filter(|b| matches!(b.status, BackendStatus::Idle | BackendStatus::Starting))
+                .count(),
         )
     };
 
     let ssps_ok = ready_ssps > 0;
-    let all_backends_ok = total_backends == 0 || healthy_backends == total_backends;
+    let all_backends_ok =
+        total_backends == 0 || healthy_backends + resting_backends == total_backends;
     let all_backends_down = total_backends > 0 && (unreachable_backends + unhealthy_backends) == total_backends;
 
     // Snapshot-pipeline visibility: `stalled` is the exact latch predicate —
@@ -765,6 +772,9 @@ pub async fn build_entities(state: &MetricsState) -> Vec<serde_json::Value> {
                 }),
                 "response_time_ms": entry.response_time_ms,
                 "env": backend_env,
+                // Present exactly when a machine pool runs this backend; the
+                // status above is then the pool's, not a probe's.
+                "pool": entry.pool,
             }));
         }
     }

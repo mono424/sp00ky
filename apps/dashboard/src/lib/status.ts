@@ -37,11 +37,16 @@ export function sspTone(status: string | undefined): Tone {
   }
 }
 
+/**
+ * `idle` (a pool backend at zero machines, nothing queued) is a resting state,
+ * not a fault; `starting` is a machine on its way.
+ */
 export function backendTone(status: string | undefined): Tone {
   switch (status) {
     case 'healthy':
       return 'ok';
     case 'unhealthy':
+    case 'starting':
       return 'warn';
     case 'unreachable':
       return 'bad';

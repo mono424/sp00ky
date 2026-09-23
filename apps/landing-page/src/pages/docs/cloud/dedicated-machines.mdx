@@ -1,0 +1,173 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Dedicated machines
+description: Give an always-on backend a Hetzner VM of its own. Sp00ky Cloud creates it, keeps it healthy, rolls it on every deploy, and proxies traffic to it, so exposure and custom domains work as for any backend.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const declareCode = `# sp00ky.yml
+machines:
+  api-box:
+    provider: hetzner             # the only provider
+    type: cx33                    # Hetzner server type
+    locations: [fsn1, nbg1]       # tried in order
+
+apps:
+  api:
+    type: backend
+    runOn: { machine: api-box }   # this backend, and only this one, lives on api-box
+    spec: ./api/openapi.yml
+    baseUrl: http://127.0.0.1:8080
+    deploy:
+      dockerfile: ./api/Dockerfile
+      port: 8080
+      healthcheck: /health        # required: the machine takes traffic only once this answers
+      expose: true                # https://<slug>-api.<domain>
+    method: { type: outbox, table: api_job, schema: ./schema/api.surql }`;
+
+export const deployOutput = `  SERVICE        IP                 STATUS
+  ● surrealdb    172.18.0.4         running
+  ● scheduler    172.18.0.5         running
+  ● ssp          172.18.0.6         running
+  ◐ machine/api-box  65.21.4.17     starting (booting)
+  ...
+  ● machine/api-box  65.21.4.17     running (serving)
+  ● backend      172.18.0.9         running`;
+
+export const statusOutput = `  MACHINE        IP                 TYPE       STATUS         BACKEND
+  ──────────────────────────────────────────────────────────────────────────────
+  ● api-box g3   65.21.4.17         cx33 fsn1  serving        api`;
+
+<Experimental>
+  Dedicated machines are new. The shape of <code>machines:</code> is settled; what
+  <code>spky deploy</code> prints for them may still change.
+</Experimental>
+
+A backend normally runs as a container on the shared host of your deployment, next to the
+database, the scheduler and the SSPs. A **dedicated machine** gives one always-on backend a
+Hetzner VM of its own instead: its own CPU and memory, nothing else on the box, and a fixed
+address. Sp00ky Cloud owns the machine from start to finish: it creates it, probes it, replaces it
+with a fresh one on every deploy and whenever it stops answering, and proxies traffic to it, so
+`deploy.expose`, `spky domain add --app`, outbox jobs and the operator dashboard all work exactly
+as for any other backend.
+
+This is not a [machine pool](/docs/jobs/machine-pools). A pool runs a backend for its jobs and takes
+the machines away when the queue is empty. A dedicated machine runs a backend as a service, always,
+on one VM.
+
+## Declaring one
+
+<CodeBlock fileName="sp00ky.yml" code={declareCode} lang="yaml" />
+
+`machines.<name>` is the VM; `runOn: { machine: <name> }` on a backend puts it there. Each machine
+runs exactly one backend, and `runOn` takes either `pool` or `machine`, never both. `spky lint`
+checks all of it, and `spky deploy` refuses a control plane that does not offer dedicated machines
+before building anything.
+
+## What the backend needs
+
+- **`deploy.port`**: the port the service listens on. Sp00ky Cloud forwards it (and `deploy.grpc_port`,
+  if set) to the machine; `deploy.ports` is not supported here.
+- **`deploy.healthcheck`**: an HTTP path answering 2xx when the service is ready. A new machine takes
+  traffic only after this answers, and the running one is probed on it every 30 seconds.
+- **`hosting: cloud`** (the default): Sp00ky Cloud runs it there. A `hosting: external` backend has
+  its own host already.
+- An image with a command: like a pool machine, the VM imports the exported image, so `deploy.cmd`
+  is needed when the Dockerfile has no `CMD`.
+
+The backend's environment reaches the machine the same way as on the core host, with the usual
+`SPKY_*` variables, except that `SPKY_DB_URL` and `SPKY_DB_WS` point at the published database
+host (`https://<slug>-db.<domain>`) rather than the internal one, and `SPKY_SCHEDULER_URL` and
+`SPKY_SSP_ADDR` are not set: those addresses have no public twin. `deploy.resources` is ignored;
+the machine type is the size.
+
+## What a deploy does
+
+The VM is started as soon as the deploy is accepted, so it boots while your migrations run. In the
+apps phase Sp00ky Cloud waits for it to answer its healthcheck, then routes to it. Every deploy that
+changes the backend (image, env, command, port, machine type or locations) boots a **fresh** VM
+beside the running one and only switches over once the newcomer answers; the old one is retired
+after that. A machine that never answers is destroyed, the deploy fails, and the previous machine
+keeps serving.
+
+<CodeBlock code={deployOutput} />
+
+The `backend` row is the backend's presence on the core host: a small forwarder that carries the
+backend's name and points at the machine. That is what keeps job routing, health probes and
+custom domains unchanged.
+
+<Note>
+  A deploy of a dedicated backend takes a few minutes longer than a container deploy: a VM has to
+  boot and import the image. Expect the deploy to sit on <code>booting</code> for one to three
+  minutes.
+</Note>
+
+## What `spky status` shows
+
+<CodeBlock code={statusOutput} />
+
+`g3` is the generation: the third VM this machine name has had. The IP is the machine's public
+address. `serving` means traffic goes there; `booting` and `healthy` mark a newcomer that has not
+taken over yet; `unhealthy` means the serving machine is failing probes and a replacement is on its
+way.
+
+## Failure and replacement
+
+Sp00ky Cloud probes the serving machine every 30 seconds. Three failures in a row, or the VM being
+gone at the provider, start a replacement: a fresh machine with the same spec, promoted the moment
+it answers. The one that failed is retired afterwards. This happens at most three times per hour per
+machine; past that the backend is reported down and you get the uptime alert email. The serving
+machine is never touched before its replacement answered, so a wrong probe costs a machine-hour,
+not an outage.
+
+`spky restart <app>` on a dedicated backend rolls a fresh VM the same way. There is no way to
+restart the process on the box, and none is needed: docker's restart policy on the machine brings a
+crashed process back on its own.
+
+## Local development
+
+`spky dev` ignores `runOn.machine`. The backend is started like any other app, from its `dev:`
+command, and the local SSP dispatches its jobs to its `baseUrl`.
+
+## Limitations
+
+- **One backend per machine**, and one machine per backend.
+- **Hetzner only.** `provider` must be `hetzner`; the machine type must be an x86 type the account
+  can order.
+- **Deploy with `spky deploy`.** Git-linked deploys refuse a `runOn.machine` backend for now.
+- **No logs from the machine yet.** `spky logs <app>` shows the forwarder's log, not the backend's.
+- **`deploy.ports` is not forwarded**, only `port` and `grpc_port`. `deploy.resources` is ignored.
+- **A backend that calls the scheduler** (`SPKY_SCHEDULER_URL`) does not work from the machine, as on
+  pool machines.
+- **Machines count against your plan's machine allowance**, together with pool machines, and bill
+  per machine-hour.
+
+## Reference
+
+### Machine fields
+
+<PropTable props={[
+  { name: 'provider', type: 'hetzner', default: 'hetzner', desc: 'Where the VM comes from. Only hetzner.' },
+  { name: 'type', type: 'string', default: 'cx33', desc: 'Hetzner Cloud server type. x86 types only.' },
+  { name: 'locations', type: 'string[]', default: '[]', desc: 'Hetzner locations in order of preference. Empty lets Hetzner choose.' },
+]} />
+
+### On a backend
+
+<PropTable props={[
+  { name: 'runOn.machine', type: 'string', default: '-', desc: 'Name of the dedicated machine this backend runs on. Needs deploy.port and deploy.healthcheck.' },
+]} />
+
+<CardGrid>
+  <LinkCard title="Deploying" href="/docs/cloud/deploying" description="What a deploy does, flags, and checking status." />
+  <LinkCard title="Machine pools" href="/docs/jobs/machine-pools" description="Machines that exist only while a backend has jobs." />
+  <LinkCard title="Backend options" href="/docs/backend/options" description="deploy, env, resources, hosting and scope on a backend." />
+  <LinkCard title="Config reference" href="/docs/reference/config#dedicated-machines" description="Every sp00ky.yml key." />
+</CardGrid>

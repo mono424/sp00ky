@@ -43,6 +43,8 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `sync` | object | `{ transport: http, queryAllowlist: off }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`, see [Sync transport](#sync-transport); and whether the SSP refuses query shapes the app does not ship: `queryAllowlist`, see [Query allowlist](#query-allowlist). |
 | `impersonation` | object | `{ enabled: false }` | Lets admins act as other users from the DevTools. See [Impersonation](#impersonation). |
 | `apps` | map | `{}` | Your frontend and backend services. See [Apps](#apps) below. |
+| `pools` | map | `{}` | Machine pools: machines that run one backend's jobs while there is work. See [Machine pools](#machine-pools). |
+| `machines` | map | `{}` | Dedicated machines: one Hetzner VM of its own per always-on backend. See [Dedicated machines](#dedicated-machines). |
 | `schedules` | map \| path | `{}` | Server-side cron/interval jobs. See [Schedules](/docs/jobs/schedules). |
 | `workflows` | map \| path | `{}` | Server-side workflow DAGs. See [Workflows](/docs/jobs/workflows). |
 | `deployment` | object | (none) | Cloud deployment knobs: `sspCount`, `backup`, `env` (per-role infra environment variables). See [Cloud Deployment](/docs/cloud/deploying). |
@@ -54,11 +56,11 @@ Each entry under `apps` is a service `spky` knows how to run locally and deploy 
 
 <CodeBlock code={ymlApps} lang="yaml" />
 
-A backend may also set `runOn: { pool: <name> }` to run its jobs on a [machine pool](#machine-pools) instead of an always-on container.
+A backend may also set `runOn: { pool: <name> }` to run its jobs on a [machine pool](#machine-pools) instead of an always-on container, or `runOn: { machine: <name> }` to run, always on, on a [dedicated machine](#dedicated-machines) of its own.
 
 `method` describes the outbox the SSP delivers jobs through: `type: outbox`, the `table` the rows live in, the `schema` file defining it, and an optional `concurrency` bounding how many of that table's jobs run at once (default `1`; extra rows wait as `pending` and are admitted oldest-first). See [Jobs → Concurrency](/docs/jobs#concurrency).
 
-`dev` accepts either a raw command string or a typed form: `{type: npm, script, workdir?}`, `{type: docker, file, workdir?, port?}` (builds a Dockerfile for this app's dev server), or `{type: uv, script, workdir?}`. `deploy` accepts `dockerfile`, `context`, `port`, `healthcheck`, `resources` (`vcpus`, `memory`, `disk`), a `timeout`, a `cmd` (override the image's ENTRYPOINT/CMD), `build_args` (build-time-only args, same shape as `env`), and `static` (`{build, dir}`, for Cloudflare static-asset frontends).
+`dev` accepts either a raw command string or a typed form: `{type: npm, script, workdir?}`, `{type: docker, file, workdir?, port?}` (builds a Dockerfile for this app's dev server), or `{type: uv, script, workdir?}`. `deploy` accepts `dockerfile`, `context`, `port`, `healthcheck`, `resources` (`vcpus`, `memory`, `disk`), a `timeout`, a `cmd` (override the image's ENTRYPOINT/CMD), `build_args` (build-time-only args, same shape as `env`), `expose` (backends only: publish it at `<slug>-<name>.<domain>`, which is also what a [custom domain](/docs/reference/cli) can point at), `grpc_port` (a second, h2c port at `<slug>-<name>-grpc.<domain>`), and `static` (`{build, dir}`, for Cloudflare static-asset frontends).
 
 #### `scope`: where an app runs
 
@@ -220,6 +222,14 @@ Either section can also live in its own file, per entry or wholesale, useful onc
 <CodeBlock code={ymlPools} lang="yaml" />
 
 A pool is fixed (`autoscale: false`, exactly `min` machines), scales on demand up to `max`, or keeps a warm `buffer` of ready machines above what is in use. `provider` is `hetzner` for VMs on Sp00ky Cloud; `spky dev` always runs pools as local containers (`docker`). Each pool serves exactly one backend, and pools need `mode: cluster`. The full behaviour, every field with its default, and how to operate a pool are in [Machine pools](/docs/jobs/machine-pools).
+
+## Dedicated machines
+
+`machines` declares Hetzner VMs that each run one always-on backend, fixed. A backend opts in with `runOn: { machine: <name> }`; Sp00ky Cloud then creates the VM, keeps it healthy, replaces it with a fresh one on every deploy and on failure, and proxies traffic to it, so `deploy.expose` and `spky domain add --app` work exactly as for any backend.
+
+<CodeBlock code={ymlMachines} lang="yaml" />
+
+Each machine runs exactly one backend, which needs `deploy.port` and `deploy.healthcheck` and must be `hosting: cloud`. `spky dev` ignores the placement and runs the backend as an ordinary app. Everything else, from what `spky deploy` shows to how a redeploy rolls the VM, is in [Dedicated machines](/docs/cloud/dedicated-machines).
 
 ## Client types
 
@@ -387,6 +397,23 @@ apps:
     type: backend
     runOn: { pool: render }
     # ...spec, baseUrl, method (an outbox table) and deploy as usual`;
+
+export const ymlMachines = `machines:
+  api-box:
+    provider: hetzner                 # the only provider
+    type: cx33                        # Hetzner server type
+    locations: [fsn1, nbg1]           # tried in order
+
+apps:
+  api:
+    type: backend
+    runOn: { machine: api-box }
+    deploy:
+      dockerfile: ./api/Dockerfile
+      port: 8080
+      healthcheck: /health            # required: probed before traffic is sent
+      expose: true                    # https://<slug>-api.<domain>
+    # ...spec, baseUrl and method (if it takes jobs) as usual`;
 
 export const ymlVersions = `# Pinned: the cloud runs exactly this, and --upgrade cannot move it.
 version: 0.0.1-canary.270

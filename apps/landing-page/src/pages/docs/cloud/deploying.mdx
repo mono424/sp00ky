@@ -81,6 +81,11 @@ You'll see real-time progress as each step completes.
 `--only` is the one to reach for during normal iteration: a frontend-only change doesn't need the
 backend rebuilt.
 
+A backend on a [dedicated machine](/docs/cloud/dedicated-machines) shows up in the deploy table as
+`machine/<name>` with its public address, moving through `creating`, `booting` and `serving`. A
+deploy of such a backend takes a few minutes longer: a fresh VM boots beside the old one and only
+takes over once it answers its healthcheck.
+
 ## Checking Status
 
 <CodeBlock

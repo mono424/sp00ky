@@ -168,6 +168,13 @@
         "$ref": "#/$defs/poolEntry"
       }
     },
+    "machines": {
+      "type": "object",
+      "description": "Dedicated machines, keyed by name: one Hetzner VM of its own per always-on backend. A backend opts in with `runOn: { machine: <name> }`. See https://sp00ky.cloud/docs/cloud/dedicated-machines",
+      "additionalProperties": {
+        "$ref": "#/$defs/machineEntry"
+      }
+    },
     "buckets": {
       "type": "array",
       "description": "List of SurrealQL bucket definition files.",
@@ -455,18 +462,20 @@
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/backendMethod"
             },
             "runOn": {
+              "description": "Where this backend runs instead of an always-on container on the core host. Exactly one of `pool` (its outbox jobs run on the machines of a pool declared under `pools:`, see https://sp00ky.cloud/docs/jobs/machine-pools) or `machine` (the whole backend runs, always on, on a dedicated machine declared under `machines:`, see https://sp00ky.cloud/docs/cloud/dedicated-machines).",
               "type": "object",
-              "description": "Run this backend's outbox jobs on the machines of a pool declared under `pools:` in sp00ky.yml, instead of on an always-on container. See https://sp00ky.cloud/docs/jobs/machine-pools",
-              "required": [
-                "pool"
-              ],
-              "additionalProperties": false,
-              "properties": {
-                "pool": {
-                  "type": "string",
-                  "description": "Name of the pool."
+              "oneOf": [
+                {
+                  "required": ["pool"],
+                  "additionalProperties": false,
+                  "properties": { "pool": { "type": "string", "description": "Name of the pool." } }
+                },
+                {
+                  "required": ["machine"],
+                  "additionalProperties": false,
+                  "properties": { "machine": { "type": "string", "description": "Name of the dedicated machine." } }
                 }
-              }
+              ]
             },
             "dev": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/devConfig"
@@ -918,6 +927,29 @@
           ],
           "default": "off",
           "description": "Query allowlist enforcement on the SSP. 'off': any parseable query registers. 'warn': a registration whose shape is not in the allowlist generated from clientTypes[].queries is logged and counted but admitted. 'enforce': it is refused with 403 not_allowlisted. Also gates useRemote/remoteQuery/queryRaw in the client SDK (allowRawRemote: true opts back in)."
+        }
+      }
+    },
+    "machineEntry": {
+      "type": "object",
+      "description": "A dedicated machine: one Hetzner Cloud VM that runs exactly one always-on backend, through `runOn: { machine: <name> }`. Sp00ky Cloud creates it, replaces it with a fresh one on every deploy and on failure, and proxies traffic to it.",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": ["hetzner"],
+          "default": "hetzner",
+          "description": "Where the VM comes from. Only `hetzner`; under `spky dev` the backend runs as an ordinary app."
+        },
+        "type": {
+          "type": "string",
+          "default": "cx33",
+          "description": "Hetzner Cloud server type. x86 types only."
+        },
+        "locations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Hetzner locations in order of preference. Empty lets Hetzner choose."
         }
       }
     },

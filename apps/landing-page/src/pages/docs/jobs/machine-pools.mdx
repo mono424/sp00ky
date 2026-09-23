@@ -309,6 +309,7 @@ The full list is in [Self-hosting → Machine pools](/docs/self-hosting#machine-
 - **No database connection variables on the machine.** See [Environment](#environment).
 - **Hetzner is the only cloud provider.**
 - **Cluster mode only.** Pools are run by the scheduler, so the project needs `mode: cluster`.
+- **Jobs, not services.** A pool runs a backend for its jobs and takes the machines away when there are none. For one always-on backend on a VM of its own, use a [dedicated machine](/docs/cloud/dedicated-machines).
 
 ## Validation
 
@@ -348,6 +349,7 @@ Durations take the same form as elsewhere in `sp00ky.yml`: `90s`, `10m`, `1h30m`
 
 <PropTable props={[
   { name: 'runOn.pool', type: 'string', default: '-', desc: 'Name of the pool this backend\'s jobs run on. The backend then gets no always-on container.' },
+  { name: 'runOn.machine', type: 'string', default: '-', desc: 'Instead of a pool: the dedicated machine this backend runs on, always on. See Dedicated machines.' },
 ]} />
 
 ### Job errors written by a pool

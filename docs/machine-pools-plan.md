@@ -5,6 +5,17 @@ end to end (Phase 2 offline only, never against real cloud). Phases 3 and 4 are
 still plan. See "As built" right below;
 where it differs from the original design further down, "As built" wins.
 
+## Related: dedicated machines (2026-09-22)
+
+`machines:` + `runOn: { machine }` is a separate feature that shares only the
+deploy body's placement keys and the CLI's `PoolProvider`: one always-on backend
+on one fixed Hetzner VM, owned by the control plane end to end (no scheduler, no
+pool engine, no agent), reached through a forwarder container on the core host
+that carries the backend's name. CLI side: `apps/cli/src/pool_config.rs`
+(`MachineConfig`, `RunOnConfig` as `pool` XOR `machine`, `cloud_machine_manifests`).
+Control plane side: `spooky-cloud` `docs/17-dedicated-machines.md`. User docs:
+`docs/cloud/dedicated-machines`.
+
 ## As built (Phase 1)
 
 What exists, all with tests:

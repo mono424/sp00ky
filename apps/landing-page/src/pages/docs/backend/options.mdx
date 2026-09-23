@@ -61,8 +61,13 @@ Full syntax, layering rules and the auto-injected variables are on
 
 | Field | Purpose |
 | --- | --- |
-| `dockerfile` | Build context for the image. |
+| `dockerfile` | Dockerfile to build the image from. |
+| `context` | Build context directory (default: the directory of `sp00ky.yml`). |
 | `port` | Port your service listens on inside the container. |
+| `healthcheck` | HTTP path that answers 2xx when the service is ready. Probed by the uptime monitor, and required for a backend on a [dedicated machine](#running-on-a-dedicated-machine). |
+| `expose` | Publish the backend at `https://<slug>-<name>.<domain>`. Off by default: an unexposed backend is reachable only by the SSP (and a custom domain can only point at an exposed one). |
+| `grpc_port` | A second, gRPC (h2c) port, published at `<slug>-<name>-grpc.<domain>`. |
+| `cmd` | Override the image's ENTRYPOINT/CMD. |
 | `timeout` | Per-request timeout in seconds (default `10`). |
 | `timeoutOverridable` | Let the client override `timeout` per call. |
 | `resources` | CPU, memory and disk for the container (see below). |
@@ -111,6 +116,23 @@ apps:
 ```
 
 The backend itself is unchanged: it still answers a POST per job. What a pool needs from it (`deploy.port`, `deploy.dockerfile`, ideally `deploy.healthcheck`) and what changes on the machine (no private network, so no injected database variables) is in [Machine pools](/docs/jobs/machine-pools#writing-a-pool-backend).
+
+## Running on a dedicated machine
+
+`runOn: { machine: <name> }` gives an always-on backend a Hetzner VM of its own instead of a container on the shared host. It stays reachable exactly as before (`expose`, custom domains, outbox jobs); only where it runs changes.
+
+```yaml
+machines:
+  api-box: { type: cx33, locations: [fsn1] }
+
+apps:
+  api:
+    type: backend
+    runOn: { machine: api-box }
+    deploy: { dockerfile: ./api/Dockerfile, port: 8080, healthcheck: /health, expose: true }
+```
+
+A dedicated backend needs `deploy.port` and `deploy.healthcheck`; `deploy.resources` is ignored (the machine type is the size). The lifecycle, what `spky deploy` shows, and the limits are in [Dedicated machines](/docs/cloud/dedicated-machines).
 
 ## Limiting where an app runs
 
@@ -173,6 +195,8 @@ export const deployCode = `apps:
     deploy:
       dockerfile: ../api/Dockerfile
       port: 3660
+      healthcheck: /health
+      expose: true
       timeout: 30`;
 
 export const resourcesCode = `apps:

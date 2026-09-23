@@ -95,7 +95,7 @@ instead of opening one they stop with the exact command or environment variable 
 | `spky push` | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. |
 | `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. Also publishes the app's allowlist JSON under the announced version, so a regenerated [query allowlist](/docs/guide/query-allowlist) goes live without a restart. |
 | `spky env` | Encrypted variables and the vault: `set`, `list`, `rm`, `pull`, `import`, `unlock`, `passphrase`, `share-ci`, `reset`. `set --file <path>` reads a multi-line value (a PEM key) from disk, scoped with `--dev` or `--prod`. `reset` takes `request`, `approve <email>`, `complete`, `list`. [Docs](/docs/cloud/env-variables) |
-| `spky domain` | Custom domains: `add`, `list`, `remove`. `add --app <name>` picks which app serves it, `add --status` attaches it to the public uptime page. |
+| `spky domain` | Custom domains: `add`, `list`, `remove`. `add --app <name>` picks which app serves it (a frontend, an exposed backend, or a backend on a [dedicated machine](/docs/cloud/dedicated-machines)), `add --status` attaches it to the public uptime page. |
 | `spky backup` | Database backups: `list`, `create`, `restore`, `delete`, `configure`, `reset`. [Docs](/docs/cloud/backups) |
 | `spky link` | GitHub push-to-deploy: `connect`, `status`, `settings`, `disconnect`, `trigger`, `runs`. [Docs](/docs/cloud/ci-cd) |
 | `spky token` | API tokens for CI: `create`, `list`, `revoke`. |

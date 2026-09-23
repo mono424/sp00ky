@@ -1,6 +1,6 @@
 [package]
 name = "ssp-protocol"
-version = "0.0.1-canary.272"
+version = "0.0.1-canary.273"
 edition = "2021"
 
 [dependencies]

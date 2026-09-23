@@ -3941,12 +3941,16 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 /// One row of the deploy table: a container of the deployment, or a dedicated
 /// machine (`role == "machine"`, named, whose address is its public IP).
 struct VmRow {
+    /// The control plane's row id (a container's VM row, a machine's row):
+    /// the identity that survives an address change. Empty from older
+    /// control planes.
+    id: String,
     role: String,
     name: String,
     ip: String,
     status: String,
     /// The finer word the control plane adds for a machine (creating, booting,
-    /// healthy, serving); empty for a container.
+    /// healthy, serving, replaced); empty for a container.
     detail: String,
 }
 
@@ -3969,14 +3973,17 @@ impl VmRow {
         }
     }
 
-    /// A machine is one row across its life (its address changes on a swap and
-    /// is empty while creating); a container is keyed by role and address.
+    /// One row per control-plane id: a machine keeps its row while its
+    /// address goes from empty (creating) to set (booting), and two
+    /// generations of the same machine show as two rows during a roll.
+    /// Without ids (an older control plane) a container is keyed by role and
+    /// address.
     fn same(&self, other: &VmRow) -> bool {
         if self.role != other.role {
             return false;
         }
-        if !self.name.is_empty() || !other.name.is_empty() {
-            return self.name == other.name;
+        if !self.id.is_empty() && !other.id.is_empty() {
+            return self.id == other.id;
         }
         self.ip == other.ip
     }
@@ -4261,6 +4268,7 @@ fn stream_deployment_events(
                 match event_type {
                     "vm" => {
                         let row = VmRow {
+                            id: event["vm_id"].as_str().unwrap_or("").to_string(),
                             role: event["role"].as_str().unwrap_or("?").to_string(),
                             name: event["name"].as_str().unwrap_or("").to_string(),
                             ip: event["ip"].as_str().unwrap_or("?").to_string(),
@@ -6843,6 +6851,10 @@ fn print_deployment_details(data: &serde_json::Value) {
                     ("stopped", _) => "\x1b[90m○\x1b[0m",
                     _ => "\x1b[90m·\x1b[0m",
                 };
+                // Retired generations are noise once the swap is done.
+                if phase == "replaced" {
+                    continue;
+                }
                 let name = format!(
                     "{} g{}",
                     m["name"].as_str().unwrap_or("-"),

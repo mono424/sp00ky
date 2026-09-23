@@ -127,6 +127,11 @@ machine; past that the backend is reported down and you get the uptime alert ema
 machine is never touched before its replacement answered, so a wrong probe costs a machine-hour,
 not an outage.
 
+When Hetzner has no capacity for the machine type in any of the listed `locations`, the replacement
+cannot be made and the backend is reported down; Sp00ky Cloud keeps trying every 30 seconds until
+capacity is back, and those attempts do not count against the three per hour. Listing more than one
+location is the cheapest insurance against this.
+
 `spky restart <app>` on a dedicated backend rolls a fresh VM the same way. There is no way to
 restart the process on the box, and none is needed: docker's restart policy on the machine brings a
 crashed process back on its own.

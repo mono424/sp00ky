@@ -96,7 +96,7 @@ pub fn resolve_rows(config: &Sp00kyConfig, env: &PoolEnv) -> Result<Vec<(String,
     for name in config.pools.keys() {
         let backend = config
             .backends()
-            .find(|(_, app)| app.run_on.as_ref().is_some_and(|r| &r.pool == name));
+            .find(|(_, app)| app.pool() == Some(name.as_str()));
         let mut manifest: Option<&Value> = None;
         let (image, vars) = match (env, backend) {
             (PoolEnv::Dev { project_dir }, Some((backend, app))) => (

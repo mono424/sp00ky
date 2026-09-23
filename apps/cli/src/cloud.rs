@@ -1964,8 +1964,15 @@ fn build_backend_manifest(
     // plane must keep it out of `SPKY_JOB_CONFIG` and run its image on pool
     // machines instead. Absent for every ordinary backend, so an older control
     // plane sees exactly the manifest it always has.
+    // Placement. A pool backend is kept off the core host by the control
+    // plane; a dedicated machine backend is placed on its VM and proxied, so
+    // `expose`, `grpc_port` and `healthcheck` in this manifest apply unchanged.
     if let Some(ref run_on) = app_config.run_on {
-        manifest["run_on"] = serde_json::json!({ "pool": run_on.pool });
+        manifest["run_on"] = match (run_on.pool(), run_on.machine()) {
+            (Some(pool), _) => serde_json::json!({ "pool": pool }),
+            (_, Some(machine)) => serde_json::json!({ "machine": machine }),
+            _ => serde_json::Value::Null, // unreachable after validate()
+        };
     }
     manifest
 }
@@ -2173,6 +2180,15 @@ pub fn deploy(
     // image is built: a typo in it should cost seconds, not a full build.
     let infra_version = config.cloud_version_policy()?;
     print_version_policy(&infra_version, upgrade);
+
+    // A control plane that does not know `machines` would take a backend with
+    // `runOn: { machine }` for a pool backend and run nothing for it, quietly.
+    if !config.machines.is_empty() && !cloud_has_feature(&mut client, "dedicated_machines") {
+        bail!(
+            "sp00ky.yml declares `machines:` ({}), but this control plane does not offer dedicated machines",
+            config.machines.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // --only: restrict this deploy to a subset of apps. The selected apps are
     // built/uploaded and sent with `partial: true`; the control plane merges them
@@ -3113,7 +3129,7 @@ pub fn deploy(
     // themselves are moved into the request body below.
     let pool_manifests: Vec<serde_json::Value> = backend_manifests
         .iter()
-        .filter(|m| m.get("run_on").is_some())
+        .filter(|m| m.get("run_on").and_then(|r| r.get("pool")).is_some())
         .cloned()
         .collect();
 
@@ -3121,6 +3137,9 @@ pub fn deploy(
         // Machine pools: ceilings and machine shapes, enforced control-plane side.
         // An older control plane simply ignores the key.
         "pools": crate::pool_config::cloud_pool_manifests(&config),
+        // Dedicated machines: shape and the backend on each. Sent on every
+        // deploy; a partial one leaves what the last full deploy stored.
+        "machines": crate::pool_config::cloud_machine_manifests(&config),
         "infra_env": infra_env,
         "surrealdb": surrealdb_manifest,
         "backends": backend_manifests,
@@ -3919,10 +3938,54 @@ impl<'a> std::io::Read for ProgressReader<'a> {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// One row of the deploy table: a container of the deployment, or a dedicated
+/// machine (`role == "machine"`, named, whose address is its public IP).
+struct VmRow {
+    role: String,
+    name: String,
+    ip: String,
+    status: String,
+    /// The finer word the control plane adds for a machine (creating, booting,
+    /// healthy, serving); empty for a container.
+    detail: String,
+}
+
+impl VmRow {
+    /// SERVICE column: the role, or `machine/<name>` for a dedicated machine.
+    fn service(&self) -> String {
+        if self.role == "machine" && !self.name.is_empty() {
+            format!("machine/{}", self.name)
+        } else {
+            self.role.clone()
+        }
+    }
+
+    /// STATUS column: `starting (booting)` when the control plane said more.
+    fn status_text(&self) -> String {
+        if self.detail.is_empty() || self.detail == self.status {
+            self.status.clone()
+        } else {
+            format!("{} ({})", self.status, self.detail)
+        }
+    }
+
+    /// A machine is one row across its life (its address changes on a swap and
+    /// is empty while creating); a container is keyed by role and address.
+    fn same(&self, other: &VmRow) -> bool {
+        if self.role != other.role {
+            return false;
+        }
+        if !self.name.is_empty() || !other.name.is_empty() {
+            return self.name == other.name;
+        }
+        self.ip == other.ip
+    }
+}
+
 /// Shared state between the SSE reader and the render thread.
 struct DeployState {
     phase: String,
-    vms: Vec<(String, String, String)>, // (role, ip, status)
+    vms: Vec<VmRow>,
     done: bool,
 }
 
@@ -3947,12 +4010,7 @@ fn vm_style(status: &str) -> &str {
 }
 
 /// Render the full VM table in-place by moving the cursor up and overwriting.
-fn render_vm_table(
-    vms: &[(String, String, String)],
-    phase: &str,
-    spinner_frame: usize,
-    first_render: bool,
-) {
+fn render_vm_table(vms: &[VmRow], phase: &str, spinner_frame: usize, first_render: bool) {
     use std::io::Write;
     let mut out = std::io::stdout();
 
@@ -4014,13 +4072,19 @@ fn render_vm_table(
     .ok();
 
     // VM rows
-    for (role, ip, status) in vms {
-        let icon = vm_icon(status, spinner_frame);
-        let style = vm_style(status);
+    for row in vms {
+        let icon = vm_icon(&row.status, spinner_frame);
+        let style = vm_style(&row.status);
         write!(
             out,
             "\r\x1b[2K   {}{}\x1b[0m {}{:<14}\x1b[0m \x1b[90m{:<18}\x1b[0m {}{}\x1b[0m\n",
-            style, icon, style, role, ip, style, status,
+            style,
+            icon,
+            style,
+            row.service(),
+            row.ip,
+            style,
+            row.status_text(),
         )
         .ok();
     }
@@ -4196,26 +4260,38 @@ fn stream_deployment_events(
                 let event_type = event["type"].as_str().unwrap_or("");
                 match event_type {
                     "vm" => {
-                        let role = event["role"].as_str().unwrap_or("?").to_string();
-                        let ip = event["ip"].as_str().unwrap_or("?").to_string();
-                        let status = event["status"].as_str().unwrap_or("?").to_string();
+                        let row = VmRow {
+                            role: event["role"].as_str().unwrap_or("?").to_string(),
+                            name: event["name"].as_str().unwrap_or("").to_string(),
+                            ip: event["ip"].as_str().unwrap_or("?").to_string(),
+                            status: event["status"].as_str().unwrap_or("?").to_string(),
+                            detail: event["detail"].as_str().unwrap_or("").to_string(),
+                        };
 
                         if is_tty {
                             let mut s = state.lock().unwrap();
-                            if let Some(vm) = s.vms.iter_mut().find(|v| v.0 == role && v.1 == ip) {
-                                vm.2 = status;
+                            if let Some(vm) = s.vms.iter_mut().find(|v| v.same(&row)) {
+                                vm.ip = row.ip;
+                                vm.status = row.status;
+                                vm.detail = row.detail;
                             } else {
-                                s.vms.push((role, ip, status));
+                                s.vms.push(row);
                             }
                         } else {
-                            let icon = match status.as_str() {
+                            let icon = match row.status.as_str() {
                                 "running" => "●",
                                 "starting" => "◐",
                                 "failed" => "✗",
                                 "stopped" => "○",
                                 _ => "·",
                             };
-                            println!("  {} {:14} {:18} {}", icon, role, ip, status);
+                            println!(
+                                "  {} {:14} {:18} {}",
+                                icon,
+                                row.service(),
+                                row.ip,
+                                row.status_text()
+                            );
                         }
                     }
                     "deployment" => {
@@ -4473,6 +4549,7 @@ pub fn service_color(service: &str) -> crossterm::style::Color {
         "scheduler" => Color::Yellow,
         "ssp" => Color::Green,
         "backend" => Color::Magenta,
+        "machine" => Color::Magenta,
         "frontend" => Color::Blue,
         _ => Color::White,
     }
@@ -5322,28 +5399,33 @@ fn deployed_apps(data: &serde_json::Value) -> std::collections::BTreeMap<String,
     apps
 }
 
-/// Whether the control plane can act on per-role / per-app restart targets.
+/// Whether the control plane advertises `feature` in `/health`'s `features`
+/// list. Probed there rather than inferred from a response, because by the
+/// time a response comes back the action is already queued, and an older
+/// control plane would have queued the wrong one (or silently done something
+/// else with a key it does not know).
 ///
-/// Probed from `/health`'s `features` list rather than inferred from the
-/// restart response, because by the time a response comes back the restart is
-/// already queued — and an older control plane would have queued the wrong one.
-fn cloud_supports_restart_targets(client: &mut CloudClient) -> bool {
+/// Unreachable or unparseable `/health` reads as "yes": it is not evidence of
+/// an old control plane, and failing closed would block exactly the kind of
+/// incident some of these actions exist for. The real request surfaces a real
+/// outage. A `/health` WITHOUT a `features` key is a build older than
+/// capability reporting, and reads as "no".
+fn cloud_has_feature(client: &mut CloudClient, feature: &str) -> bool {
     let Ok(resp) = client.get("/health") else {
-        // Unreachable /health is not evidence of an old control plane, and
-        // failing closed here would block restarts during exactly the kind of
-        // incident they exist for. The POST below surfaces a real outage.
         return true;
     };
     let Ok(body) = resp.into_json::<serde_json::Value>() else {
         return true;
     };
     match body.get("features").and_then(|f| f.as_array()) {
-        Some(features) => features
-            .iter()
-            .any(|f| f.as_str() == Some("restart_targets")),
-        // No `features` key at all ⇒ a build older than capability reporting.
+        Some(features) => features.iter().any(|f| f.as_str() == Some(feature)),
         None => false,
     }
+}
+
+/// Whether the control plane can act on per-role / per-app restart targets.
+fn cloud_supports_restart_targets(client: &mut CloudClient) -> bool {
+    cloud_has_feature(client, "restart_targets")
 }
 
 pub fn restart(
@@ -6736,6 +6818,55 @@ fn print_deployment_details(data: &serde_json::Value) {
             }
 
             report_version_skew(&component_versions, &pinned_release_roles(&data));
+        }
+    }
+
+    // Dedicated machines: not containers of the deployment, so a table of their
+    // own. The IP is the machine's public address (the forwarder on the core
+    // host proxies to it); `serving` marks the generation traffic goes to.
+    if let Some(machines) = data.get("machines").and_then(|v| v.as_array()) {
+        if !machines.is_empty() {
+            println!();
+            println!(
+                "  {:<14} {:<18} {:<10} {:<14} {}",
+                "MACHINE", "IP", "TYPE", "STATUS", "BACKEND"
+            );
+            println!("  {}", "─".repeat(78));
+            for m in machines {
+                let status = m["status"].as_str().unwrap_or("-");
+                let phase = m["phase"].as_str().unwrap_or(status);
+                let icon = match (status, phase) {
+                    ("running", "serving") => "\x1b[32m●\x1b[0m",
+                    ("running", _) => "\x1b[33m▲\x1b[0m",
+                    ("starting", _) => "\x1b[33m◐\x1b[0m",
+                    ("failed", _) => "\x1b[31m✗\x1b[0m",
+                    ("stopped", _) => "\x1b[90m○\x1b[0m",
+                    _ => "\x1b[90m·\x1b[0m",
+                };
+                let name = format!(
+                    "{} g{}",
+                    m["name"].as_str().unwrap_or("-"),
+                    m["generation"].as_u64().unwrap_or(0)
+                );
+                let machine_type = format!(
+                    "{} {}",
+                    m["server_type"].as_str().unwrap_or("-"),
+                    m["location"].as_str().unwrap_or("")
+                );
+                let ip = m["ip"].as_str().filter(|s| !s.is_empty()).unwrap_or("-");
+                println!(
+                    "  {} {:<13} {:<18} {:<10} {:<14} {}",
+                    icon,
+                    name,
+                    ip,
+                    machine_type.trim(),
+                    phase,
+                    m["backend"].as_str().unwrap_or("-"),
+                );
+                if let Some(err) = m["last_error"].as_str().filter(|e| !e.is_empty()) {
+                    println!("    \x1b[31m{}\x1b[0m", err);
+                }
+            }
         }
     }
 
@@ -8151,6 +8282,38 @@ fn env_change_passphrase() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    fn manifest(run_on: &str) -> serde_json::Value {
+        let app: backend::AppConfig = serde_yaml::from_str(&format!(
+            "type: backend\n{run_on}deploy: {{ port: 8080, healthcheck: /health, expose: true }}\n"
+        ))
+        .unwrap();
+        let deploy = app.deploy.clone().unwrap();
+        build_backend_manifest("api", "slug", &None, 8080, &deploy, &[], &None, &None, &app)
+    }
+
+    /// The control plane reads `run_on` to place the backend: a pool keeps it
+    /// off the core host, a machine puts a forwarder there. Absent otherwise.
+    #[test]
+    fn run_on_reaches_the_control_plane_in_its_two_shapes() {
+        assert_eq!(
+            manifest("runOn: { machine: box }\n")["run_on"],
+            serde_json::json!({ "machine": "box" })
+        );
+        assert_eq!(
+            manifest("runOn: { pool: render }\n")["run_on"],
+            serde_json::json!({ "pool": "render" })
+        );
+        let plain = manifest("");
+        assert!(plain.get("run_on").is_none(), "{plain}");
+        assert_eq!(plain["expose"], true);
+        assert_eq!(plain["healthcheck"], "/health");
+    }
 }
 
 #[cfg(test)]

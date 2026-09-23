@@ -87,7 +87,7 @@ fn collect_dev_ports(
         }
     }
     for (name, app) in config.backends() {
-        if !app.runs_in_dev() || app.run_on.is_some() {
+        if !app.runs_in_dev() || app.pool().is_some() {
             continue; // cloudOnly, or a pool backend: nothing of it listens on the host
         }
         collect_app("app", name, &app.dev);
@@ -2416,8 +2416,10 @@ fn build_job_config_json(config: &Sp00kyConfig, ssp_in_docker: bool) -> String {
         }
         // A pool backend's jobs run on pool machines, driven by the scheduler's
         // pool engine. Routing its table to the SSP runner as well would have two
-        // executors claiming the same rows.
-        if app.run_on.is_some() {
+        // executors claiming the same rows. A dedicated machine backend is an
+        // ordinary backend here: in dev it runs on the host like any other, and
+        // in the cloud the SSPs POST to it through its forwarder.
+        if app.pool().is_some() {
             continue;
         }
         let method = match &app.method {
@@ -2763,7 +2765,7 @@ fn spawn_backend_dev_commands(
         // A pool backend never runs as one always-on dev process: the scheduler
         // starts it on pool machines (containers, in dev), on demand. What dev
         // owes it is the image those machines run.
-        if app.run_on.is_some() {
+        if app.pool().is_some() {
             step.set_message(format!("building pool image for {}…", name));
             build_pool_image(name, app, project_dir);
             continue;
@@ -3292,3 +3294,41 @@ fn spawn_log_tail(container: &str, label: &str) -> LogTailGuard {
     )
 }
 
+
+#[cfg(test)]
+mod job_config_tests {
+    use super::*;
+
+    fn cfg(run_on: &str) -> Sp00kyConfig {
+        serde_yaml::from_str(&format!(
+            "
+pools:
+  render: {{ min: 1 }}
+machines:
+  api-box: {{}}
+apps:
+  api:
+    type: backend
+    runOn: {run_on}
+    baseUrl: http://127.0.0.1:8080
+    deploy: {{ port: 8080, healthcheck: /health, cmd: /api }}
+    method: {{ type: outbox, table: job, schema: ./x.surql }}
+"
+        ))
+        .unwrap()
+    }
+
+    /// A dedicated machine backend is an ordinary backend to the dev SSP: its
+    /// jobs are dispatched to its base URL. A pool backend's are not (the
+    /// scheduler's pool engine runs them).
+    #[test]
+    fn a_machine_backend_stays_in_the_dev_job_config() {
+        let on_machine = build_job_config_json(&cfg("{ machine: api-box }"), true);
+        assert!(
+            on_machine.contains("host.docker.internal:8080"),
+            "{on_machine}"
+        );
+        let on_pool = build_job_config_json(&cfg("{ pool: render }"), true);
+        assert_eq!(on_pool, "[]");
+    }
+}

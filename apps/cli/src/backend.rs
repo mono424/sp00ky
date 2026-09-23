@@ -450,6 +450,10 @@ pub struct Sp00kyConfig {
     /// keyed by pool name. A backend opts in with `runOn: { pool: <name> }`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pools: BTreeMap<String, crate::pool_config::PoolConfig>,
+    /// Dedicated machines: one always-on backend on one Hetzner VM of its own,
+    /// keyed by machine name. A backend opts in with `runOn: { machine: <name> }`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub machines: BTreeMap<String, crate::pool_config::MachineConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buckets: Vec<String>,
     #[serde(default, rename = "clientTypes", skip_serializing_if = "Vec::is_empty")]
@@ -2186,8 +2190,10 @@ pub struct AppConfig {
     /// Trigger method (required for backends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<BackendMethod>,
-    /// Run this backend's jobs on machines from a pool (see `pools:`) instead of
-    /// on one always-on container the SSPs POST to.
+    /// Where this backend runs instead of one always-on container on the core
+    /// host: `{ pool: <name> }` sends its jobs to machines from a pool (see
+    /// `pools:`); `{ machine: <name> }` places it on a dedicated machine (see
+    /// `machines:`). See `pool_config::RunOnConfig`.
     #[serde(default, rename = "runOn", skip_serializing_if = "Option::is_none")]
     pub run_on: Option<crate::pool_config::RunOnConfig>,
 
@@ -2233,6 +2239,16 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn resolved_hosting(&self) -> HostingMode {
         self.hosting.clone().unwrap_or_default()
+    }
+
+    /// The pool this backend's jobs run on, if `runOn: { pool }`.
+    pub fn pool(&self) -> Option<&str> {
+        self.run_on.as_ref().and_then(|r| r.pool())
+    }
+
+    /// The dedicated machine this backend runs on, if `runOn: { machine }`.
+    pub fn machine(&self) -> Option<&str> {
+        self.run_on.as_ref().and_then(|r| r.machine())
     }
 
     /// Resolve the deploy port, falling back to type-specific defaults.
@@ -2665,6 +2681,17 @@ fn resolve_app_includes(root: &mut serde_yaml::Value, base_dir: &Path) -> Result
                 "app include {} must be a mapping (a bare single-app config)",
                 include_path.display()
             );
+        }
+        // Root-only sections. An include is one app, so these would be merged
+        // INTO the app entry and dropped without a word (AppConfig ignores
+        // unknown keys); lint would then say "no such machine" with no hint why.
+        for root_only in ["pools", "machines"] {
+            if sub.get(root_only).is_some() {
+                bail!(
+                    "app include {} declares `{root_only}:`, which is root-only: move it to sp00ky.yml",
+                    include_path.display()
+                );
+            }
         }
 
         rebase_app_paths(&mut sub, &service_rel);
@@ -3439,6 +3466,49 @@ apps:
     }
 
     /// A missing sub-file surfaces a clear error rather than a silent default.
+    /// `machines:` (and `pools:`) belong to the root file. In an include they
+    /// would be merged into the app entry and dropped without a word.
+    #[test]
+    fn machines_in_an_app_include_are_refused() {
+        let dir = TempDir::new().unwrap();
+        let svc = dir.path().join("api");
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(
+            svc.join("sp00ky.app.yml"),
+            "type: backend\nrunOn: { machine: box }\nmachines:\n  box: {}\ndeploy: { port: 1, healthcheck: /h }\n",
+        )
+        .unwrap();
+        let err =
+            parse_config_with_includes("apps:\n  api:\n    path: ./api\n", dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("`machines:`") && err.to_string().contains("root-only"),
+            "{err}"
+        );
+    }
+
+    /// A root override merges keys into the include's `runOn`, so `pool` from
+    /// the include plus `machine` from the root is caught by validation, by app.
+    #[test]
+    fn root_run_on_override_conflicts_are_caught() {
+        let dir = TempDir::new().unwrap();
+        let svc = dir.path().join("api");
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(
+            svc.join("sp00ky.app.yml"),
+            "type: backend\nrunOn: { pool: render }\ndeploy: { port: 1, healthcheck: /h }\nmethod: { type: outbox, table: job, schema: ./x.surql }\n",
+        )
+        .unwrap();
+        let cfg = parse_config_with_includes(
+            "pools:\n  render: { min: 1 }\nmachines:\n  box: {}\napps:\n  api:\n    path: ./api\n    runOn: { machine: box }\n",
+            dir.path(),
+        )
+        .unwrap();
+        let err = crate::pool_config::validate_all(&cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("api") && err.contains("not both"), "{err}");
+    }
+
     #[test]
     fn missing_include_errors() {
         let dir = TempDir::new().unwrap();

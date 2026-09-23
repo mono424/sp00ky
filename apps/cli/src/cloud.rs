@@ -2189,6 +2189,24 @@ pub fn deploy(
             config.machines.keys().cloned().collect::<Vec<_>>().join(", ")
         );
     }
+    // A control plane that predates public ports on dedicated machines would
+    // accept `deploy.ports` and never publish or open them: the backend would
+    // come up with its raw ports silently closed.
+    let ported: Vec<&str> = config
+        .apps
+        .iter()
+        .filter(|(_, app)| {
+            app.machine().is_some()
+                && app.deploy.as_ref().is_some_and(|d| d.ports.as_ref().is_some_and(|p| !p.is_empty()))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !ported.is_empty() && !cloud_has_feature(&mut client, "dedicated_ports") {
+        bail!(
+            "{} declare `deploy.ports` on a dedicated machine, but this control plane cannot open ports on one",
+            ported.join(", ")
+        );
+    }
 
     // --only: restrict this deploy to a subset of apps. The selected apps are
     // built/uploaded and sent with `partial: true`; the control plane merges them

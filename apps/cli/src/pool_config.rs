@@ -256,8 +256,15 @@ pub fn validate_all(config: &Sp00kyConfig) -> Result<()> {
                 if deploy.and_then(|d| d.healthcheck.as_ref()).is_none() {
                     bail!("app '{name}' runs on a dedicated machine, so it needs `deploy.healthcheck` (the control plane probes it before sending traffic)");
                 }
-                if deploy.is_some_and(|d| d.ports.as_ref().is_some_and(|p| !p.is_empty())) {
-                    bail!("app '{name}' runs on a dedicated machine, which forwards `deploy.port` and `deploy.grpc_port` only; drop `deploy.ports`");
+                // `deploy.ports` on a dedicated machine are raw TCP/UDP ports
+                // published on the VM's public address and opened in its
+                // firewall to everyone (the core host forwards `port` and
+                // `grpc_port` only). Each entry opens a firewall, so its shape
+                // is checked here, not guessed at by the control plane.
+                for spec in deploy.and_then(|d| d.ports.as_deref()).unwrap_or_default() {
+                    validate_public_port(spec).map_err(|e| {
+                        anyhow::anyhow!("app '{name}': deploy.ports entry {spec:?}: {e} (a dedicated machine publishes these on its public address: `7881`, `7882/udp` or `host:container[/udp]`)")
+                    })?;
                 }
             }
         }
@@ -485,6 +492,34 @@ pub fn normalize_pool(
     Ok(row)
 }
 
+/// One `deploy.ports` entry of a dedicated backend: `7881`, `7882/udp` or
+/// `host:container[/proto]` with tcp or udp, every port 1..=65535. The same
+/// syntax `spky dev` publishes with; the control plane parses it again.
+pub fn validate_public_port(spec: &str) -> Result<()> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("empty");
+    }
+    let (ports, proto) = match spec.split_once('/') {
+        Some((ports, proto)) => (ports, proto),
+        None => (spec, "tcp"),
+    };
+    if !matches!(proto.to_ascii_lowercase().as_str(), "tcp" | "udp") {
+        bail!("protocol must be tcp or udp, not `{proto}`");
+    }
+    let parts: Vec<&str> = ports.split(':').collect();
+    if parts.len() > 2 {
+        bail!("at most one `:` (host:container)");
+    }
+    for part in parts {
+        match part.trim().parse::<u32>() {
+            Ok(n) if (1..=65535).contains(&n) => {}
+            _ => bail!("`{part}` is not a port"),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,10 +689,24 @@ apps:
             &MACHINE_APP.replace("type: backend", "type: backend\n    scope: devOnly")
         ))
         .contains("devOnly"));
-        assert!(machine_err(&with(
-            &MACHINE_APP.replace("expose: true }", "expose: true, ports: [\"9000:9000\"] }")
-        ))
-        .contains("drop `deploy.ports`"));
+    }
+
+    /// `deploy.ports` on a machine are raw ports opened on the VM's public
+    /// address: well-formed entries pass, anything else names the entry.
+    #[test]
+    fn a_machine_backend_may_publish_raw_ports() {
+        let with = |ports: &str| {
+            format!(
+                "machines:\n  api-box: {{}}\n{}",
+                MACHINE_APP.replace("expose: true }", &format!("expose: true, ports: [{ports}] }}"))
+            )
+        };
+        validate_all(&config(&with("\"7881\", \"7882/udp\", \"3000:8080\", \"1935/tcp\"")))
+            .unwrap_or_else(|e| panic!("well-formed ports refused: {e}"));
+        for bad in ["\"0\"", "\"70000\"", "\"7882/sctp\"", "\"a:b\"", "\"1:2:3\"", "\"\""] {
+            let err = machine_err(&with(bad));
+            assert!(err.contains("deploy.ports entry"), "{bad}: {err}");
+        }
     }
 
     #[test]

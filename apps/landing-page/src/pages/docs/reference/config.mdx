@@ -77,7 +77,7 @@ Every app accepts an optional `scope` controlling where it runs:
 A `docker` app runs a prebuilt image directly (no Dockerfile build), useful for local infra like a LiveKit SFU, a mock service, or a cache. Fields:
 
 - `image` (required): the image to run, e.g. `livekit/livekit-server:latest`.
-- `ports`: published ports. A bare port (`7880`) maps host→container 1:1 (`7880:7880`); use `"host:container"` to remap and a `/proto` suffix for UDP (`"7882/udp"`).
+- `ports`: published ports. A bare port (`7880`) maps host→container 1:1 (`7880:7880`); use `"host:container"` to remap and a `/proto` suffix for UDP (`"7882/udp"`). On a [dedicated machine](#dedicated-machines) they are published on the VM's public address and opened in its firewall to everyone; the core host only proxies `port` and `grpc_port`.
 - `args`: appended after the image as the container command (e.g. `["--dev"]`, or `["go", "run", "."]` to run a service from source).
 - `volumes`: bind/volume mounts (`docker run -v`), e.g. `["/var/run/docker.sock:/var/run/docker.sock", "${PROJECT_DIR}/../..:/src", "gomod:/go"]`. `${PROJECT_DIR}` (the absolute directory of `sp00ky.yml`) is expanded in the host portion.
 - `workdir`: working directory inside the container (`docker run -w`).
@@ -229,7 +229,7 @@ A pool is fixed (`autoscale: false`, exactly `min` machines), scales on demand u
 
 <CodeBlock code={ymlMachines} lang="yaml" />
 
-Each machine runs exactly one backend, which needs `deploy.port` and `deploy.healthcheck` and must be `hosting: cloud`. `spky dev` ignores the placement and runs the backend as an ordinary app. Everything else, from what `spky deploy` shows to how a redeploy rolls the VM, is in [Dedicated machines](/docs/cloud/dedicated-machines).
+Each machine runs exactly one backend, which needs `deploy.port` and `deploy.healthcheck` and must be `hosting: cloud`. Its `deploy.ports`, if any, are raw TCP/UDP ports opened on the VM's public address to everyone (WebRTC media, RTMP); they are not proxied. `spky dev` ignores the placement and runs the backend as an ordinary app. Everything else, from what `spky deploy` shows to how a redeploy rolls the VM, is in [Dedicated machines](/docs/cloud/dedicated-machines).
 
 ## Client types
 

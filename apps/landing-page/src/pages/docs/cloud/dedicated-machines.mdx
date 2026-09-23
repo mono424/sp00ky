@@ -74,7 +74,14 @@ before building anything.
 ## What the backend needs
 
 - **`deploy.port`**: the port the service listens on. Sp00ky Cloud forwards it (and `deploy.grpc_port`,
-  if set) to the machine; `deploy.ports` is not supported here.
+  if set) to the machine through the core host.
+- **`deploy.ports`** (optional): raw ports the machine opens to the internet on its own public
+  address, for traffic the HTTP forwarder cannot carry: WebRTC media, RTMP, anything UDP. Each entry
+  is published by docker on the VM and allowed in the machine's firewall from anywhere
+  (`"7882/udp"`, `"7881"`, `"3000:8080"`, same syntax as in `spky dev`). They are not proxied by the
+  core host, so clients need the machine's public IP, which changes with every generation: a
+  service on them must discover its own address (a WebRTC SFU does, via STUN) and hand it out over
+  the forwarded port. Changing the list rolls a fresh VM.
 - **`deploy.healthcheck`**: an HTTP path answering 2xx when the service is ready. A new machine takes
   traffic only after this answers, and the running one is probed on it every 30 seconds.
 - **`hosting: cloud`** (the default): Sp00ky Cloud runs it there. A `hosting: external` backend has
@@ -151,9 +158,11 @@ command, and the local SSP dispatches its jobs to its `baseUrl`.
 - **One backend per machine**, and one machine per backend.
 - **Hetzner only.** `provider` must be `hetzner`; the machine type must be an x86 type the account
   can order.
-- **Deploy with `spky deploy`.** Git-linked deploys refuse a `runOn.machine` backend for now.
+- **Git-linked deploys** place the backend and carry `deploy.ports` like `spky deploy` does; `spky
+  restart <app>` (the forced roll) remains a CLI action.
 - **No logs from the machine yet.** `spky logs <app>` shows the forwarder's log, not the backend's.
-- **`deploy.ports` is not forwarded**, only `port` and `grpc_port`. `deploy.resources` is ignored.
+- **`deploy.ports` are not forwarded**, only `port` and `grpc_port` reach the machine through the core
+  host; the others are open on the VM's own public address. `deploy.resources` is ignored.
 - **A backend that calls the scheduler** (`SPKY_SCHEDULER_URL`) does not work from the machine, as on
   pool machines.
 - **Machines count against your plan's machine allowance**, together with pool machines, and bill
@@ -173,6 +182,7 @@ command, and the local SSP dispatches its jobs to its `baseUrl`.
 
 <PropTable props={[
   { name: 'runOn.machine', type: 'string', default: '-', desc: 'Name of the dedicated machine this backend runs on. Needs deploy.port and deploy.healthcheck.' },
+  { name: 'deploy.ports', type: 'string[]', default: '[]', desc: 'Raw TCP/UDP ports published on the machine\'s public address and opened in its firewall to everyone. Not proxied by the core host.' },
 ]} />
 
 <CardGrid>

@@ -136,6 +136,11 @@ location is the cheapest insurance against this.
 restart the process on the box, and none is needed: docker's restart policy on the machine brings a
 crashed process back on its own.
 
+Every switch to a new machine recreates the small forwarder container on the core host, which costs
+about three seconds of `404` at the platform hostname (measured on staging), the same as any other
+backend's container restart. The machine itself is never the reason for a gap: the old one serves
+until the new one has answered.
+
 ## Local development
 
 `spky dev` ignores `runOn.machine`. The backend is started like any other app, from its `dev:`

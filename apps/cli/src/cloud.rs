@@ -3152,7 +3152,12 @@ pub fn deploy(
         "partial": is_partial,
     });
 
-    println!("PAYLOAD: {}", deploy_body);
+    // The body carries every backend's env with vault values resolved, so it
+    // never goes to stdout (terminal scrollback, CI logs). A debugging dump is
+    // opt-in and goes to stderr.
+    if std::env::var_os("SPKY_DEBUG_DEPLOY_BODY").is_some() {
+        eprintln!("deploy body: {}", deploy_body);
+    }
     let resp = client.post(&format!("/v1/projects/{}/deploy", pid), &deploy_body)?;
 
     let deployment: serde_json::Value = resp.into_json().context("Failed to parse response")?;

@@ -100,18 +100,20 @@
       "$ref": "#/$defs/backendMethod"
     },
     "runOn": {
+      "description": "Where this backend runs instead of an always-on container on the core host. Exactly one of `pool` (its outbox jobs run on the machines of a pool declared under `pools:`, see https://sp00ky.cloud/docs/jobs/machine-pools) or `machine` (the whole backend runs, always on, on a dedicated machine declared under `machines:`, see https://sp00ky.cloud/docs/cloud/dedicated-machines).",
       "type": "object",
-      "description": "Run this backend's outbox jobs on the machines of a pool declared under `pools:` in sp00ky.yml, instead of on an always-on container. See https://sp00ky.cloud/docs/jobs/machine-pools",
-      "required": [
-        "pool"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "pool": {
-          "type": "string",
-          "description": "Name of the pool."
+      "oneOf": [
+        {
+          "required": ["pool"],
+          "additionalProperties": false,
+          "properties": { "pool": { "type": "string", "description": "Name of the pool." } }
+        },
+        {
+          "required": ["machine"],
+          "additionalProperties": false,
+          "properties": { "machine": { "type": "string", "description": "Name of the dedicated machine." } }
         }
-      }
+      ]
     },
     "dev": {
       "$ref": "#/$defs/devConfig"

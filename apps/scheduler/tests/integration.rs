@@ -273,6 +273,7 @@ impl TestHarness {
             status: Arc::clone(&self.status),
             backend_health: scheduler::backend_health::create_health_cache(&[]),
             shared_backend_configs: scheduler::backend_health::create_shared_configs(&[]),
+            backend_registry: None,
             ingest: IngestState {
                 replica: Arc::clone(&self.replica),
                 transport: Arc::clone(&self.transport),
@@ -2593,6 +2594,7 @@ mod drift_tests {
             status: Arc::clone(&h.status),
             backend_health: scheduler::backend_health::create_health_cache(&[]),
             shared_backend_configs: scheduler::backend_health::create_shared_configs(&[]),
+            backend_registry: None,
             ingest: IngestState {
                 replica: Arc::clone(&h.replica),
                 transport: Arc::clone(&h.transport),

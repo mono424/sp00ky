@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod backend_registry;
 pub mod config;
 pub mod maintenance_host;
 pub mod replica;
@@ -322,6 +323,10 @@ pub struct Scheduler {
     /// The query router's state, attached by `main` before `start()`, so the
     /// tail can tear down views for the `_00_query` deletes it reads.
     query_state_slot: std::sync::OnceLock<crate::query::QueryState>,
+    /// The health-checked backend list, attached by `main` before `start()`,
+    /// so a restart reads back what the last deploy pushed (see
+    /// `crate::backend_registry`).
+    backend_registry_slot: std::sync::OnceLock<Arc<crate::backend_registry::BackendRegistry>>,
 }
 
 impl Scheduler {
@@ -366,6 +371,7 @@ impl Scheduler {
             changefeed: maintenance::changefeed::TailerStats::new(),
             changefeed_notify: Arc::new(tokio::sync::Notify::new()),
             query_state_slot: std::sync::OnceLock::new(),
+            backend_registry_slot: std::sync::OnceLock::new(),
         })
     }
 
@@ -373,6 +379,12 @@ impl Scheduler {
     /// when the transport is `changefeed`; a second call is ignored.
     pub fn attach_query_state(&self, state: crate::query::QueryState) {
         let _ = self.query_state_slot.set(state);
+    }
+
+    /// Hand over the backend registry. Must run before `metrics_state()` and
+    /// `start()`; a second call is ignored.
+    pub fn attach_backend_registry(&self, registry: Arc<crate::backend_registry::BackendRegistry>) {
+        let _ = self.backend_registry_slot.set(registry);
     }
 
     /// Get ingest state for HTTP handlers
@@ -437,6 +449,7 @@ impl Scheduler {
             drift: Arc::clone(&self.drift),
             drift_config: self.drift_config.clone(),
             changefeed: Arc::clone(&self.changefeed),
+            backend_registry: self.backend_registry_slot.get().cloned(),
         }
     }
 
@@ -794,6 +807,11 @@ impl Scheduler {
         // previous `db.clone()` per consumer meant several independent sessions
         // to lose and several to re-establish.
         let shared_db = maintenance::db::ReconnectingDb::new(db, self.config.db.clone());
+        // Store a list pushed before this point, or restore the one the last
+        // deploy pushed (the control plane does not push it after a restart).
+        if let Some(registry) = self.backend_registry_slot.get() {
+            registry.attach_db(Arc::clone(&shared_db));
+        }
         // The admin plane (presence and job samplers, dashboard reads) gets
         // its own session: its scans are the slow readers on this process,
         // and a slow read plus the periodic re-signin's write lock is what

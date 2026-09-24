@@ -618,7 +618,17 @@ pub fn fix(client: &dyn MigrationDB, migrations_dir: &Path, fix_checksums: bool)
 /// Extract the full schema from a live DB via the MigrationDB trait.
 ///
 /// Queries INFO FOR DB and INFO FOR TABLE for each discovered table,
-/// collecting all DEFINE statements (excluding internal `_00_migrations`).
+/// collecting all DEFINE statements (excluding the runtime state tables, see
+/// [`is_runtime_state_table`]).
+/// Tables a running project writes for its own bookkeeping, which no schema or
+/// migration declares: `_00_migrations` (this module) and
+/// `_00_scheduler_state` (the scheduler stores the deploy's backend list there
+/// so a restart keeps it). A schema diff against a live database must not see
+/// them, or it proposes `REMOVE TABLE` for live runtime state.
+pub(crate) fn is_runtime_state_table(name: &str) -> bool {
+    matches!(name, "_00_migrations" | "_00_scheduler_state")
+}
+
 fn extract_live_schema(client: &dyn MigrationDB) -> Result<String> {
     let db_info_responses = client.execute("INFO FOR DB;")?;
     let db_info = db_info_responses
@@ -634,7 +644,7 @@ fn extract_live_schema(client: &dyn MigrationDB) -> Result<String> {
         for (section, values) in obj {
             if let Some(inner_obj) = values.as_object() {
                 for (name, define_stmt) in inner_obj {
-                    if section == "tables" && name == "_00_migrations" {
+                    if section == "tables" && is_runtime_state_table(name) {
                         continue;
                     }
                     if let Some(stmt_str) = define_stmt.as_str() {
@@ -1204,6 +1214,15 @@ fn sync_schedules(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn runtime_state_tables_stay_out_of_schema_diffs() {
+        assert!(super::is_runtime_state_table("_00_migrations"));
+        assert!(super::is_runtime_state_table("_00_scheduler_state"));
+        assert!(!super::is_runtime_state_table("_00_query"));
+        assert!(!super::is_runtime_state_table("user"));
+    }
+
     use super::*;
     use crate::surreal_client::{AppliedMigration, MigrationDB, SurrealResponse};
     use std::cell::RefCell;

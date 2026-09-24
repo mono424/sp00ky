@@ -117,6 +117,12 @@ async fn run() -> Result<()> {
     // Create backend health cache and shared configs for live updates
     let backend_health_cache = scheduler::backend_health::create_health_cache(&config.backends);
     let shared_backend_configs = scheduler::backend_health::create_shared_configs(&config.backends);
+    // Keeps the pushed list across restarts; before the first metrics_state().
+    scheduler.attach_backend_registry(scheduler::backend_registry::BackendRegistry::new(
+        shared_backend_configs.clone(),
+        backend_health_cache.clone(),
+        !config.backends.is_empty(),
+    ));
     scheduler::backend_health::start_backend_health_monitor(
         shared_backend_configs.clone(),
         backend_health_cache.clone(),

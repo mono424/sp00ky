@@ -192,7 +192,10 @@ against the scheduler's bootstrap budget.
 **Backends** — status and response time for everything in `SPKY_BACKENDS`, with
 a detail page carrying a ~30-minute response-time history and the resolved
 healthcheck URL. Environment values are masked by the scheduler before they
-leave it. A backend that runs on a machine pool (`run_on: { pool: ... }`) is
+leave it. On Sp00ky Cloud each deploy pushes the list; the scheduler stores the
+last pushed list (env values masked) in `_00_scheduler_state` and reads it back
+when it starts, so a restart or reclone between deploys keeps its backends. A
+list in `SPKY_BACKENDS` always takes precedence. A backend that runs on a machine pool (`run_on: { pool: ... }`) is
 not probed: between jobs there may be no machine to answer, and that is not an
 outage. Its status is what the pool sweep last saw: `idle` at zero machines with
 nothing queued, `starting` while a machine boots or a job waits for one,

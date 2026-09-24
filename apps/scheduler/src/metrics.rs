@@ -116,6 +116,9 @@ pub struct MetricsState {
     pub status: Arc<RwLock<SchedulerStatus>>,
     pub backend_health: BackendHealthCache,
     pub shared_backend_configs: SharedBackendConfigs,
+    /// Stores every pushed backend list for the next start. `None` = the list
+    /// stays in memory only (tests).
+    pub backend_registry: Option<Arc<crate::backend_registry::BackendRegistry>>,
     pub ingest: IngestState,
     pub replica: Arc<RwLock<Replica>>,
     pub surrealdb_version: Arc<RwLock<String>>,
@@ -788,11 +791,17 @@ async fn update_backends_handler(
     Json(new_backends): Json<Vec<crate::config::BackendHealthConfig>>,
 ) -> StatusCode {
     info!(count = new_backends.len(), "Updating backend configs via PUT /backends");
-    crate::backend_health::update_backends(
-        &state.shared_backend_configs,
-        &state.backend_health,
-        new_backends,
-    ).await;
+    match &state.backend_registry {
+        Some(registry) => registry.replace(new_backends).await,
+        None => {
+            crate::backend_health::update_backends(
+                &state.shared_backend_configs,
+                &state.backend_health,
+                new_backends,
+            )
+            .await
+        }
+    }
     StatusCode::OK
 }
 

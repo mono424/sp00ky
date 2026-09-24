@@ -27,8 +27,9 @@ pub fn extract_schema_from_db(client: &SurrealClient) -> Result<String> {
         for (section, values) in obj {
             if let Some(inner_obj) = values.as_object() {
                 for (name, define_stmt) in inner_obj {
-                    // Skip internal migration tracking table
-                    if section == "tables" && name == "_00_migrations" {
+                    // Skip runtime bookkeeping tables that no schema declares:
+                    // migration tracking, and the scheduler's own state.
+                    if section == "tables" && crate::migrate::is_runtime_state_table(name) {
                         continue;
                     }
                     if let Some(stmt_str) = define_stmt.as_str() {

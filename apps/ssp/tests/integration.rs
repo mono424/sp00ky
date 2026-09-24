@@ -200,6 +200,8 @@ impl TestHarness {
                     bootstrap_warnings: Arc::new(tokio::sync::RwLock::new(Vec::new())),
                     view_metrics_flush_ms: 2000,
                     ttl_cleanup_interval_secs: 60,
+                    schema_poll_secs: 0,
+                    schema_watch: Default::default(),
                     bootstrap_page_size: 200,
                     checkpoint_interval_secs: None,
                     max_snapshot_age_secs: 3600,

@@ -99,6 +99,11 @@ pub struct SspNode {
     pub checkpoint_interval_secs: Option<u64>,
     /// Max age of a restored snapshot before `bootstrap()` rebuilds instead.
     pub max_snapshot_age_secs: u64,
+    /// `SchemaPoll` cadence (seconds); 0 leaves schema changes to the
+    /// registration-triggered refresh alone. See [`crate::schema`].
+    pub schema_poll_secs: u64,
+    /// State of following upstream's table set (see [`crate::schema`]).
+    pub schema_watch: crate::schema::SchemaWatch,
     /// Last `_00_heartbeat` probe this node ingested: `(hb_seq, epoch_ms
     /// received)`. Written at the end of `ingest_handler`, read by
     /// `GET /debug/heartbeat` — the scheduler's e2e probe polls it to measure
@@ -164,7 +169,7 @@ fn err_json(status: u16, code: &str, message: impl Into<String>) -> ApiResponse 
 }
 
 impl SspNode {
-    fn publication_admission(&self, bytes: usize) -> Option<crate::edges::PublicationPermit> {
+    pub(crate) fn publication_admission(&self, bytes: usize) -> Option<crate::edges::PublicationPermit> {
         self.edge_update_tx.start(&self.platform, self.platform.db.clone(), self.processor.clone(),
             self.publication_gate.clone(), self.ref_mode, std::time::Duration::ZERO);
         self.edge_update_tx.try_reserve(bytes)
@@ -1236,13 +1241,25 @@ impl SspNode {
         self.platform.telemetry.counter("stranded_view_repaired", 1);
     }
 
+    /// Parse a registration and inject each scanned table's permission,
+    /// against the circuit's current schema.
+    async fn prepare_registration(&self, payload: Value) -> anyhow::Result<ssp::service::view::DbspRegistrationData> {
+        let circuit = self.processor.read().await;
+        ssp::service::view::prepare_registration_dbsp(
+            payload,
+            circuit.permissions(),
+            circuit.link_targets(),
+            circuit.opaque_fields(),
+        )
+    }
+
     async fn register_view_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
         use ssp::circuit::view::OutputFormat;
 
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
         }
-        let Some(permit) = self.publication_admission(req.body.len()) else {
+        let Some(mut permit) = self.publication_admission(req.body.len()) else {
             return Some(err_json(503, "publication_backlog", "Publication backlog is full; retry this request"));
         };
         let Ok(payload) = serde_json::from_slice::<Value>(&req.body) else {
@@ -1251,19 +1268,32 @@ impl SspNode {
 
         // Parse + validate under the read lock (permission injection). Failures
         // are 400 with the offending table named.
-        let data = {
-            let circuit = self.processor.read().await;
-            match ssp::service::view::prepare_registration_dbsp(
-                payload,
-                circuit.permissions(),
-                circuit.link_targets(),
-                circuit.opaque_fields(),
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    error!(target: "ssp::policy", error = %e, "Rejected view registration");
-                    return Some(err_json(400, "rejected", e.to_string()));
-                }
+        let mut prepared = self.prepare_registration(payload.clone()).await;
+        // A table this circuit holds no schema for is, right after a deploy,
+        // most likely one the deploy just added and the schema poll has not
+        // seen yet: a root scan on it was default-denied, a subquery on it
+        // degraded to empty for the life of the view. Refresh the schema and
+        // prepare once more if that changed anything. The publication place is
+        // released meanwhile; a refresh must never wait behind our own permit.
+        let unknown = match &prepared {
+            Ok(d) => !self.unknown_tables(&d.plan.root).await.is_empty(),
+            Err(_) => true,
+        };
+        if unknown {
+            drop(permit);
+            if self.refresh_schema_on_miss().await {
+                prepared = self.prepare_registration(payload).await;
+            }
+            permit = match self.publication_admission(req.body.len()) {
+                Some(p) => p,
+                None => return Some(err_json(503, "publication_backlog", "Publication backlog is full; retry this request")),
+            };
+        }
+        let data = match prepared {
+            Ok(d) => d,
+            Err(e) => {
+                error!(target: "ssp::policy", error = %e, "Rejected view registration");
+                return Some(err_json(400, "rejected", e.to_string()));
             }
         };
         // A live client's id arrives as `_00_query:<hash>` (SurrealDB
@@ -1671,19 +1701,8 @@ impl SspNode {
             let source = payload.record.get("_00_rv").and_then(|v| v.as_i64()).filter(|v| *v > 0 && op != Operation::Delete)
                 .map(|v| (payload.id.clone(), v));
             let mut cleanup = Vec::new();
-            if op == Operation::Delete && valid_record_id(&payload.id) {
-                if let Some(owner) = payload.record.get("owner").and_then(|v| v.as_str()) {
-                    cleanup.push(crate::edges::PublicationCleanup::DropEdgesTo {
-                        table: crate::tables::list_ref_table(self.ref_mode, owner),
-                        record: payload.id.clone(),
-                    });
-                }
-                if self.anonymous_live_queries {
-                    cleanup.push(crate::edges::PublicationCleanup::DropEdgesTo {
-                        table: "_00_list_ref_anon".to_string(),
-                        record: payload.id.clone(),
-                    });
-                }
+            if op == Operation::Delete {
+                cleanup = delete_cleanup(self.ref_mode, self.anonymous_live_queries, &payload.id, &payload.record);
             }
             if payload.table == "user" {
                 if op == Operation::Create {
@@ -2252,6 +2271,35 @@ pub async fn flush_view_metrics(
 
 fn valid_record_id(id: &str) -> bool {
     matches!(id.split_once(':'), Some((t, k)) if !t.is_empty() && !k.is_empty())
+}
+
+/// Edge cleanup a deleted row owes beyond its own view deltas: every edge to
+/// it in its owner's `_00_list_ref*` table (and the anon table), including
+/// edges from views this circuit no longer holds. `row` is the row as it was
+/// before the delete; `id` is `table:id`.
+pub(crate) fn delete_cleanup(
+    ref_mode: ssp_protocol::RefMode,
+    anonymous_live_queries: bool,
+    id: &str,
+    row: &Value,
+) -> Vec<crate::edges::PublicationCleanup> {
+    let mut cleanup = Vec::new();
+    if !valid_record_id(id) {
+        return cleanup;
+    }
+    if let Some(owner) = row.get("owner").and_then(|v| v.as_str()) {
+        cleanup.push(crate::edges::PublicationCleanup::DropEdgesTo {
+            table: crate::tables::list_ref_table(ref_mode, owner),
+            record: id.to_string(),
+        });
+    }
+    if anonymous_live_queries {
+        cleanup.push(crate::edges::PublicationCleanup::DropEdgesTo {
+            table: "_00_list_ref_anon".to_string(),
+            record: id.to_string(),
+        });
+    }
+    cleanup
 }
 
 /// Wipe the in-memory circuit and every view edge in the database. Used by

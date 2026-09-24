@@ -441,6 +441,10 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         // is VM/singlenode + cluster only until that changes.
         schedule_engine: None,
         ttl_cleanup_interval_secs: 60,
+        // Off: a 15 s alarm would keep the Durable Object from ever
+        // hibernating. Registrations naming an unknown table still refresh.
+        schema_poll_secs: 0,
+        schema_watch: Default::default(),
         view_metrics_flush_ms: 2000,
         bootstrap_page_size: 200,
         checkpoint_interval_secs: Some(300),

@@ -293,6 +293,8 @@ async fn build(opts: HarnessOpts) -> Harness {
             .expect("standalone builds an engine")
         }),
         ttl_cleanup_interval_secs: 60,
+        schema_poll_secs: 0,
+        schema_watch: Default::default(),
         view_metrics_flush_ms: 2000,
         bootstrap_page_size: 200,
         checkpoint_interval_secs: None,
@@ -1267,6 +1269,98 @@ async fn admin_reload_picks_up_schema_defined_after_bootstrap() {
     assert_eq!(r.status, 200, "registers after reload: {:?}", json_of(&r));
     let dbg = h.node.route(authed(Method::Get, "/debug/view/v1", Value::Null)).await.unwrap();
     assert_eq!(json_of(&dbg)["cache_size"].as_u64(), Some(1), "reloaded row visible");
+}
+
+#[tokio::test]
+async fn a_view_on_a_table_defined_after_bootstrap_registers_without_a_reload() {
+    // What a deploy that adds a table looks like from a running node: the
+    // client on the new app version registers a view on it before the schema
+    // poll has run. The registration itself refreshes the schema.
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db
+        .query("DEFINE TABLE late SCHEMALESS PERMISSIONS FOR select FULL; CREATE late:1 SET x = 1;")
+        .await
+        .unwrap();
+
+    let reg = json!({ "id": "v1", "surql": "SELECT * FROM late", "clientId": "c", "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z" });
+    let r = h.node.route(authed(Method::Post, "/view/register", reg)).await.unwrap();
+    assert_eq!(r.status, 200, "a table added after bootstrap registers: {:?}", json_of(&r));
+    assert_eq!(h.node.processor.read().await.permissions()["late"], "true");
+
+    // Its rows arrive through ingest, as any table's do.
+    let ingest = json!({ "table": "late", "op": "CREATE", "id": "late:2", "record": { "x": 2 } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest)).await.unwrap().status, 200);
+    let dbg = h.node.route(authed(Method::Get, "/debug/view/v1", Value::Null)).await.unwrap();
+    assert_eq!(json_of(&dbg)["cache_size"].as_u64(), Some(1));
+}
+
+#[tokio::test]
+async fn a_subquery_on_a_table_defined_after_bootstrap_is_not_left_empty() {
+    // Without the refresh the subquery registers "fine" but degraded to an
+    // always-empty filter, for the life of the view.
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db
+        .query("DEFINE TABLE post SCHEMALESS PERMISSIONS FOR select FULL;")
+        .await
+        .unwrap();
+    h.node.refresh_schema(true).await.unwrap();
+    assert!(h.node.processor.read().await.permissions().contains_key("post"));
+
+    h.raw_db
+        .query("DEFINE TABLE note SCHEMALESS PERMISSIONS FOR select FULL;")
+        .await
+        .unwrap();
+    let reg = json!({
+        "id": "v1",
+        "surql": "SELECT *, (SELECT * FROM note WHERE post=$parent.id) AS notes FROM post",
+        "clientId": "c", "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z"
+    });
+    let r = h.node.route(authed(Method::Post, "/view/register", reg)).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    assert!(
+        h.node.processor.read().await.permissions().contains_key("note"),
+        "the subquery's table was picked up before the view was built"
+    );
+}
+
+#[tokio::test]
+async fn a_table_removed_upstream_is_dropped_from_a_running_node() {
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db
+        .query(
+            "DEFINE TABLE keep SCHEMALESS PERMISSIONS FOR select FULL; CREATE keep:1 SET x = 1;
+             DEFINE TABLE gone SCHEMALESS PERMISSIONS FOR select FULL; CREATE gone:1 SET x = 1; CREATE gone:2 SET x = 2;",
+        )
+        .await
+        .unwrap();
+    let r = h.node.route(authed(Method::Post, "/admin/reload", Value::Null)).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    let reg = json!({ "id": "v1", "surql": "SELECT * FROM gone", "clientId": "c", "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z" });
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", reg.clone())).await.unwrap().status, 200);
+    let dbg = h.node.route(authed(Method::Get, "/debug/view/v1", Value::Null)).await.unwrap();
+    assert_eq!(json_of(&dbg)["cache_size"].as_u64(), Some(2));
+    // A runtime table the schema never lists must survive every poll.
+    let hb = json!({ "table": "_00_heartbeat", "op": "CREATE", "id": "_00_heartbeat:1", "record": { "hb_seq": 1 } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", hb)).await.unwrap().status, 200);
+
+    h.raw_db.query("REMOVE TABLE gone;").await.unwrap();
+    // One probe is not evidence enough; the second confirms it.
+    h.node.refresh_schema(true).await.unwrap();
+    assert!(h.node.processor.read().await.store.get_collection("gone").is_some());
+    assert!(h.node.refresh_schema(true).await.unwrap());
+
+    let circuit = h.node.processor.read().await;
+    assert!(circuit.store.get_collection("gone").is_none(), "rows dropped");
+    assert!(!circuit.permissions().contains_key("gone"), "schema forgotten");
+    assert!(circuit.store.get_collection("keep").is_some());
+    assert!(circuit.store.get_collection("_00_heartbeat").is_some());
+    drop(circuit);
+    let dbg = h.node.route(authed(Method::Get, "/debug/view/v1", Value::Null)).await.unwrap();
+    assert_eq!(json_of(&dbg)["cache_size"].as_u64(), Some(0), "the view retracted the rows");
+
+    // And a new registration on it is refused, as on a node that never had it.
+    let reg2 = json!({ "id": "v2", "surql": "SELECT * FROM gone", "clientId": "c", "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z" });
+    assert_ne!(h.node.route(authed(Method::Post, "/view/register", reg2)).await.unwrap().status, 200);
 }
 
 #[tokio::test]

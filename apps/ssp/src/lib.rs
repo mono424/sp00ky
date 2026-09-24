@@ -182,6 +182,10 @@ pub fn load_config() -> Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(60),
+        schema_poll_secs: std::env::var("SPKY_SCHEMA_POLL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(15),
         view_metrics_flush_ms: std::env::var("SPKY_SSP_VIEW_METRICS_FLUSH_MS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1023,6 +1027,8 @@ pub async fn run_server() -> anyhow::Result<()> {
         bootstrap_page_size: config.bootstrap_page_size,
         checkpoint_interval_secs: config.checkpoint_interval_secs,
         max_snapshot_age_secs: config.max_snapshot_age_secs,
+        schema_poll_secs: config.schema_poll_secs,
+        schema_watch: Default::default(),
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
     });
     let runtime = ssp_node::Runtime::new(node.clone());
@@ -1590,6 +1596,19 @@ pub async fn run_server() -> anyhow::Result<()> {
         )
         .await;
     info!(interval_secs = config.ttl_cleanup_interval_secs, "TTL cleanup timer armed");
+
+    // Schema poll: added, changed and removed tables are applied in place
+    // (TimerKind::SchemaPoll, re-armed by the dispatcher). 0 turns it off.
+    if config.schema_poll_secs > 0 {
+        platform
+            .scheduler
+            .schedule(
+                ssp_node::TimerKind::SchemaPoll,
+                ssp_node::now_epoch_ms() + config.schema_poll_secs * 1000,
+            )
+            .await;
+        info!(interval_secs = config.schema_poll_secs, "Schema poll timer armed");
+    }
 
     // Per-view metrics: noted in memory on ingest, flushed to `_00_query` here
     // (TimerKind::ViewMetricsFlush), re-armed by the dispatcher.

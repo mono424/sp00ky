@@ -516,6 +516,21 @@ impl Circuit {
         self.columns.insert(table.to_string(), meta.columns);
     }
 
+    /// What [`Self::set_table_meta`] last stored for `table`, or `None` for a
+    /// table without a registered permission (one the circuit does not sync).
+    pub fn table_meta(&self, table: &str) -> Option<TableMeta> {
+        Some(TableMeta {
+            permission: self.permissions.get(table)?.clone(),
+            link_targets: self
+                .link_targets
+                .get(table)
+                .map(|m| m.iter().map(|(f, t)| (f.clone(), t.clone())).collect())
+                .unwrap_or_default(),
+            opaque: self.opaque_fields.get(table).cloned().unwrap_or_default(),
+            columns: self.columns.get(table).cloned().unwrap_or_default(),
+        })
+    }
+
     /// Drop a table this circuit no longer syncs: its rows and its schema.
     /// Rows are removed as they are, without retracting them from views, so
     /// step them out first ([`Self::reconcile`] with an empty list) when views

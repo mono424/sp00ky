@@ -240,6 +240,9 @@ fn build_node(
         // dropped), so a fired schedule would spawn rows nothing executes.
         schedule_engine: None,
         ttl_cleanup_interval_secs: 60,
+        // No timers are armed here; registrations still refresh on a miss.
+        schema_poll_secs: 0,
+        schema_watch: Default::default(),
         view_metrics_flush_ms: 2000,
         bootstrap_page_size: 200,
         checkpoint_interval_secs,

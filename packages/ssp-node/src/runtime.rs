@@ -119,6 +119,17 @@ impl Runtime {
                     )
                     .await;
             }
+            TimerKind::SchemaPoll => {
+                if node.schema_poll_secs == 0 {
+                    return;
+                }
+                if let Err(e) = node.refresh_schema(true).await {
+                    tracing::warn!(error = %e, "Schema poll failed; retrying at the next one");
+                }
+                sched
+                    .schedule(TimerKind::SchemaPoll, now_epoch_ms() + node.schema_poll_secs * 1000)
+                    .await;
+            }
             TimerKind::CircuitCheckpoint => {
                 // Filled in step 4 (checkpoint triggers). Re-arm only if enabled.
                 if let Some(secs) = node.checkpoint_interval_secs {

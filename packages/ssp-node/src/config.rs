@@ -26,6 +26,11 @@ pub struct NodeConfig {
     pub heartbeat_interval_ms: u64,
     pub advertise_addr: Option<String>,
     pub ttl_cleanup_interval_secs: u64,
+    /// How often (seconds) the node probes upstream's schema to pick up added,
+    /// changed and removed tables in place (`SspNode::refresh_schema`). 0 turns
+    /// the poll off; a registration naming an unknown table still refreshes.
+    /// Env: `SPKY_SCHEMA_POLL_SECS`, default 15.
+    pub schema_poll_secs: u64,
     /// Total wall-clock budget (seconds) for retrying scheduler registration
     /// before the process exits to let the supervisor restart it. Must comfortably
     /// exceed a cold `--clean` re-clone window (scheduler returns 503 while

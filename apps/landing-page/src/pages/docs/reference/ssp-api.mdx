@@ -267,10 +267,12 @@ Rebuild the circuit from the database, in process. The SSP re-scans the schema,
 reloads rows and re-registers the views recorded in `_00_query`, then returns to
 `ready`. It does **not** exit, and it does not re-run the scheduler handshake.
 
-This is how a schema change becomes visible without a restart: view registration
-captures table permissions at bootstrap, so a table or permission defined
-afterwards is invisible until a reload. Ingest is gated for the duration, exactly
-as during a cold start.
+You do not need it for a schema change: a running SSP probes upstream's schema
+every `SPKY_SCHEMA_POLL_SECS` (and whenever a view registration names a table it
+does not know yet) and applies added, changed and removed tables in place. A
+removed table's rows are retracted from every view it fed. Reload is the full,
+explicit rebuild, for when the circuit itself is suspect. Ingest is gated for the
+duration, exactly as during a cold start.
 
 **Authentication:** Required
 
@@ -676,6 +678,10 @@ SPKY_SSP_REF_MODE=dedicated   # or 'single'
 
 # TTL cleanup interval (seconds, default: 60)
 TTL_CLEANUP_INTERVAL_SECS=60
+
+# Schema poll: added, changed and removed tables applied in place
+# (seconds, default: 15, 0 = off)
+SPKY_SCHEMA_POLL_SECS=15
 
 # Job-table runner config, JSON-encoded. Read once at startup.
 SPKY_JOB_CONFIG='{"job_tables": {…}}'

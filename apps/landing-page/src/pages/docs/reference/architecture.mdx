@@ -277,6 +277,24 @@ How a committed row change leaves SurrealDB is chosen per project
   poll is the safety net. A cursor older than the retention triggers a
   replica re-clone, the same remediation the drift check uses.
 
+### Schema changes
+
+Adding, changing or removing a table needs no restart and no re-clone. The
+scheduler and every SSP follow upstream's table set with the same rules: they
+probe `INFO FOR DB` plus the CLI's `_00_schema_state` hashes (which move
+whenever a field does), re-read per-table metadata when that fingerprint moves,
+and drop a table only once two consecutive probes no longer list it.
+
+- **SSP**: polls every `SPKY_SCHEMA_POLL_SECS` (15 s by default) and also
+  refreshes when a view registration names a table it does not know yet, which
+  covers clients on the new app version registering right after a deploy. A
+  removed table's rows are retracted from every view they fed.
+- **Scheduler**: checks on the snapshot updater's tick. A dropped table leaves
+  the replica with its hash, so no bootstrapping SSP disputes it; a table new to
+  the replica whose rows never went through ingest is backfilled in place,
+  uncapped. Under the `changefeed` transport the scheduler strips opaque fields
+  from feed rows, so both transports hold the same columns.
+
 ### Edge-Update Batching
 
 The SSP does not write one transaction per record. View deltas, from

@@ -211,6 +211,7 @@ All `SPKY_*` vars below are read directly from the process environment.
 | `SPKY_SSP_ADVERTISE_ADDR` | Externally reachable `host:port` for this SSP | *(unset)* |
 | `HEARTBEAT_INTERVAL_MS` | Heartbeat interval in ms | `5000` |
 | `TTL_CLEANUP_INTERVAL_SECS` | View TTL cleanup interval | `60` |
+| `SPKY_SCHEMA_POLL_SECS` | How often (seconds) the SSP probes upstream's schema and applies added, changed and removed tables in place, with no restart or rebuild. `0` turns the poll off; a view registration naming a table the SSP does not know yet still refreshes. | `15` |
 | `SPKY_INGEST_TRANSPORT` | Standalone mode only (no `SPKY_SCHEDULER_URL`): `changefeed` makes the SSP tail SurrealDB's `CHANGEFEED` itself instead of receiving `/ingest` posts from the DB events. Takes the same `SPKY_CHANGEFEED_*` knobs as the scheduler. In cluster mode the scheduler tails. | `http` |
 | `SPKY_SSP_REF_MODE` | `_00_list_ref` storage layout: `dedicated` (per-user tables; works around the SurrealDB v3 LIVE permission gap) or `single` (legacy shared table). Mirrors `refMode` in `sp00ky.yml`. | `dedicated` |
 | `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS` | Window (ms) over which the SSP coalesces query edge-update writes to `_00_list_ref` into one batched transaction, so a burst of view updates lands as a few batched `LIVE` deliveries instead of one transaction per record. `0` disables batching (flush each update immediately). See [Architecture](/docs/reference/architecture#edge-update-batching). | `100` |
@@ -267,8 +268,8 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | `SPKY_DRIFT_AUTO_RECLONE` | Act when the check confirms a mismatch: repair the table in place by sending the rows that differ through the ingest pipeline, and re-clone the replica (re-bootstrapping every SSP) only when a repair cannot fix it (`false` = report only) | `true` |
 | `SPKY_DRIFT_CONFIRM_TICKS` | Consecutive checks a non-zero count mismatch must persist before acting (an empty table upstream has rows for is acted on immediately) | `2` |
 | `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` | Minimum seconds between automatic re-clones | `3600` |
-| `SPKY_DRIFT_REPAIR_MAX_ROWS` | Most rows one in-place table repair may send; a bigger difference falls back to a re-clone | `2000` |
-| `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` | Deadline for one table repair; past it the repair is abandoned, the upstream connection replaced, and the repair retried on the next check | `300` |
+| `SPKY_DRIFT_REPAIR_MAX_ROWS` | Most rows one in-place repair of a table the replica already held may send; a bigger difference falls back to a re-clone. A table new to the replica (added upstream, or with `@nosync` removed) is backfilled with no cap, in the background, and never re-cloned for | `2000` |
+| `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` | Deadline for one table repair, and the longest any repair (a backfill included) may go without finishing a page; past it the repair is abandoned, the upstream connection replaced, and the repair retried on the next check | `300` |
 | `SPKY_DRIFT_CHECK_TIMEOUT_SECS` | Deadline for one drift check; past it the check is abandoned and the upstream connection replaced, so a wedged query cannot stop the replica draining | `120` |
 | `SPKY_BOOTSTRAP_PAGE_SIZE` | Rows read per bootstrap page from the replica | `500` |
 | `SPKY_AUTH_SECRET` | Optional shared secret; when set, callers to `/proxy/*` must send `Authorization: Bearer <secret>`. Also signs admin dashboard sessions, so setting it is what makes them survive a restart. | *(empty)* |

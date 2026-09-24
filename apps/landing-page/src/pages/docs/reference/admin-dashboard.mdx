@@ -325,7 +325,7 @@ from the dashboard is indistinguishable from one by Docker.
 | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `restart` | Flag, `409`, exit, relaunch. The SSP restores its circuit snapshot and catches up the delta.                                                                                                                      |
 | `clean`   | The directive carries `clean: true`, so before exiting the SSP deletes its `snapshot.json` and its arena directory. The relaunch is a cold rebuild from the database. Use it when the snapshot itself is suspect. |
-| `reload`  | No exit. The scheduler calls the SSP's `POST /admin/reload`, which rebuilds the circuit in-process from the database. Picks up tables and permissions defined after the last bootstrap.                           |
+| `reload`  | No exit. The scheduler calls the SSP's `POST /admin/reload`, which rebuilds the circuit in-process from the database. Schema changes do not need it (they are applied live), but it is there for a suspect circuit. |
 
 Nothing happens until the next heartbeat (5 s by default). An operation is
 marked **done** when the SSP has re-registered and reached `ready`, and

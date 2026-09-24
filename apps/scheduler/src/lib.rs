@@ -34,6 +34,7 @@ pub mod pool_cloud;
 pub mod pool_docker;
 pub mod pool_engine;
 pub mod drift;
+pub mod schema;
 pub mod changefeed;
 pub mod impersonation;
 
@@ -327,6 +328,8 @@ pub struct Scheduler {
     /// so a restart reads back what the last deploy pushed (see
     /// `crate::backend_registry`).
     backend_registry_slot: std::sync::OnceLock<Arc<crate::backend_registry::BackendRegistry>>,
+    /// Upstream's table set as the replica follows it (see `crate::schema`).
+    pub schema: Arc<crate::schema::SchemaWatch>,
 }
 
 impl Scheduler {
@@ -372,6 +375,7 @@ impl Scheduler {
             changefeed_notify: Arc::new(tokio::sync::Notify::new()),
             query_state_slot: std::sync::OnceLock::new(),
             backend_registry_slot: std::sync::OnceLock::new(),
+            schema: Arc::new(crate::schema::SchemaWatch::new()),
         })
     }
 
@@ -403,6 +407,7 @@ impl Scheduler {
             observer_permits: Arc::clone(&self.observer_permits),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
+            schema: Arc::clone(&self.schema.cell),
         }
     }
 
@@ -484,6 +489,7 @@ impl Scheduler {
                 },
             }),
             reclone: self.recloner(),
+            schema: Some(Arc::clone(&self.schema)),
         })
     }
 
@@ -746,28 +752,6 @@ impl Scheduler {
             );
             info!("Snapshot clone complete");
         } else {
-            // A table the upstream stopped syncing since this snapshot was
-            // written (`-- @nosync` added, or dropped) must not reach the
-            // SSPs: they leave it out of their own load and dispute its hash
-            // on every bootstrap, so the cluster never comes up until the
-            // volume is wiped. Trim to what a fresh clone would load. A failed
-            // discovery keeps the persisted set: the drift check below needs
-            // the upstream anyway and reports it properly.
-            match Replica::discover_sync_tables(&db).await {
-                Ok(tables) => {
-                    let current: BTreeSet<String> = tables.into_iter().collect();
-                    let mut replica = self.replica.write().await;
-                    match replica.forget_tables_not_in(&current).await {
-                        Ok(gone) if !gone.is_empty() => warn!(
-                            tables = ?gone,
-                            "Dropped persisted tables the upstream no longer syncs (@nosync or removed)"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => warn!(error = %e, "Could not trim persisted tables; SSP bootstraps may dispute them"),
-                    }
-                }
-                Err(e) => warn!(error = %e, "Could not discover upstream tables at boot; keeping the persisted set"),
-            }
             let replica = self.replica.read().await;
             info!(
                 snapshot_seq = replica.snapshot_seq(),
@@ -832,6 +816,15 @@ impl Scheduler {
         // Publish it for the admin plane, which came up with the HTTP servers
         // (before this point) and answers 503 until this lands.
         *self.db_slot.write().await = Some(admin_db);
+        // Bring the replica in line with upstream's schema before anything
+        // reads it: tables added or dropped (or turned `@nosync`) while the
+        // scheduler was down, and the opaque fields a persisted snapshot does
+        // not carry. From here on the snapshot updater's tick keeps it so.
+        self.schema.attach(Arc::clone(&shared_db));
+        let schema_step = self.schema.boot(&self.replica).await;
+        if !schema_step.is_empty() {
+            info!(added = ?schema_step.added, reloaded = schema_step.reload, "Schema reconciled at boot");
+        }
         let drift_hook = self.drift_hook(Arc::clone(&shared_db));
 
         // The check the integrity check above cannot do: compare the replica
@@ -1159,6 +1152,13 @@ pub async fn snapshot_updater_tick(
         }
     }
 
+    // Upstream's schema, read before the lock: it is network, and on a moved
+    // fingerprint one `INFO FOR TABLE` per table. Applied after the drain.
+    let schema_read = match drift.and_then(|h| h.schema.as_ref()) {
+        Some(watch) => watch.read().await,
+        None => None,
+    };
+
     // Everything below runs under `drain_lock`. Registration freezes the
     // status AND inserts the SSP into the pool inside the same lock, so a
     // lock-holder here sees a consistent world: either the registration
@@ -1247,6 +1247,14 @@ pub async fn snapshot_updater_tick(
         if *st == SchedulerStatus::SnapshotUpdating {
             *st = SchedulerStatus::Ready;
         }
+    }
+
+    // Step 5b: follow upstream's table set. Under the lock and after the
+    // drain, so a removed table's buffered events are applied before the table
+    // is dropped, and never while an SSP bootstraps (checked above): the hashes
+    // it was handed must not change underneath it.
+    if let (Some(read), Some(watch)) = (schema_read, drift.and_then(|h| h.schema.as_ref())) {
+        watch.apply(read, replica).await;
     }
 
     // Step 6: replica-vs-upstream drift check, skipping the tables that still

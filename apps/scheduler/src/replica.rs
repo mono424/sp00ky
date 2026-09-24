@@ -205,6 +205,10 @@ pub struct Replica {
     /// authority. A fresh process with an empty map hashes as it always did
     /// until the first discover repopulates it.
     opaque_fields: BTreeMap<String, BTreeSet<String>>,
+    /// Whether `opaque_fields` was ever read from upstream in this process. A
+    /// persisted snapshot boots with an empty map that is not knowledge, so the
+    /// first read after it is not a change of anyone's opaque set.
+    opaque_known: bool,
     /// Tables whose last hash attempt failed. Re-tried on the next
     /// `set_snapshot_state` so a transient error can't strand a table with a
     /// stale (or absent) hash indefinitely. Not persisted: a fresh process
@@ -298,6 +302,7 @@ impl Replica {
             // Re-derived from upstream DDL on the first clone/rediscover; a
             // fresh process starts with no exclusions.
             opaque_fields: BTreeMap::new(),
+            opaque_known: false,
             seq_cell: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(snapshot_seq)),
         })
     }
@@ -389,23 +394,66 @@ impl Replica {
         &self.known_tables
     }
 
-    /// Forget tables the upstream no longer syncs: marked `-- @nosync` since
-    /// this snapshot was persisted, or dropped outright. `current` is what a
-    /// fresh clone would load ([`Self::discover_sync_tables`]).
-    ///
-    /// Their hashes used to be handed to every bootstrapping SSP, which leaves
-    /// such a table out of its own load and so disputed it on every attempt:
-    /// whitepawn after `analysis` went @nosync logged "Bootstrap integrity
-    /// mismatch table=analysis expected=x3:f731… actual=x3:000…" per bootstrap
-    /// until a clean restart threw the snapshot away. The rows stay in the
-    /// store as dead weight; a clone never pages them again. Persists the
-    /// trimmed lists. Returns the tables dropped, sorted.
-    pub async fn forget_tables_not_in(&mut self, current: &BTreeSet<String>) -> Result<Vec<String>> {
-        let gone: Vec<String> = self
-            .known_tables
+    /// Tables this replica holds state for: every table it has written to or
+    /// holds a hash for. What a schema reconcile compares upstream against.
+    pub fn held_tables(&self) -> BTreeSet<String> {
+        self.known_tables
             .iter()
             .chain(self.snapshot_hashes.keys())
-            .filter(|t| !current.contains(*t))
+            .cloned()
+            .collect()
+    }
+
+    /// Opaque fields per table, as the replica currently omits them.
+    pub fn opaque_fields(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.opaque_fields
+    }
+
+    /// Bring the replica in line with upstream's schema (see `crate::schema`).
+    ///
+    /// `opaque`, when given, replaces the opaque-field sets. A table whose set
+    /// moved is rehashed from content at the next drain: its persisted `x3`
+    /// accumulator was folded with the old set, and every SSP that bootstraps
+    /// omits by the new one.
+    ///
+    /// `removed` are tables upstream no longer syncs (`-- @nosync` added, or
+    /// dropped outright), as confirmed by the schema tracker. Each is dropped
+    /// here: its rows (so `/proxy` stops serving them and a later re-add starts
+    /// clean), its known-table entry and its hash, and the trimmed lists are
+    /// persisted. Their hashes used to be handed to every bootstrapping SSP,
+    /// which leaves such a table out of its own load and so disputed it on
+    /// every attempt: whitepawn after `analysis` went @nosync logged "Bootstrap
+    /// integrity mismatch table=analysis expected=x3:f731… actual=x3:000…" per
+    /// bootstrap until the breaker re-cloned the whole replica. Returns the
+    /// tables dropped, sorted.
+    pub async fn reconcile_schema(
+        &mut self,
+        removed: &[String],
+        opaque: Option<BTreeMap<String, BTreeSet<String>>>,
+    ) -> Result<Vec<String>> {
+        if let Some(opaque) = opaque {
+            if self.opaque_known {
+                let moved: BTreeSet<String> = self
+                    .opaque_fields
+                    .keys()
+                    .chain(opaque.keys())
+                    .filter(|t| self.opaque_fields.get(*t) != opaque.get(*t))
+                    .filter(|t| self.snapshot_hashes.contains_key(*t))
+                    .cloned()
+                    .collect();
+                if !moved.is_empty() {
+                    info!(tables = ?moved, "Opaque fields changed upstream; rehashing those tables from content at the next drain");
+                    self.dirty_hashes.extend(moved);
+                }
+            }
+            self.opaque_fields = opaque;
+            self.opaque_known = true;
+        }
+
+        let held = self.held_tables();
+        let gone: Vec<String> = removed
+            .iter()
+            .filter(|t| held.contains(*t))
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -414,6 +462,11 @@ impl Replica {
             return Ok(gone);
         }
         for t in &gone {
+            self.db
+                .query(format!("REMOVE TABLE IF EXISTS {t}"))
+                .await
+                .and_then(|r| r.check())
+                .with_context(|| format!("Drop table {t} from the replica"))?;
             self.known_tables.remove(t);
             self.snapshot_hashes.remove(t);
             self.dirty_hashes.remove(t);
@@ -421,7 +474,7 @@ impl Replica {
         let seq = self.snapshot_seq;
         self.commit_snapshot_state(seq, BTreeMap::new(), BTreeSet::new())
             .await
-            .context("Persist snapshot state after forgetting unsynced tables")?;
+            .context("Persist snapshot state after dropping unsynced tables")?;
         Ok(gone)
     }
 
@@ -841,6 +894,7 @@ impl Replica {
         // Refresh field-level exclusions before the clone reads a single row —
         // the whole point is that these values never enter the replica.
         self.opaque_fields = Self::discover_opaque_fields(remote_db, &tables).await;
+        self.opaque_known = true;
 
         // Track which tables we are about to populate so the integrity-check
         // path can rediscover them after a restart (INFO FOR DB on the
@@ -956,37 +1010,52 @@ impl Replica {
     where
         C: surrealdb::Connection,
     {
+        let info = Self::info_for_db(remote_db).await?;
+        let Some((synced, nosync)) = ssp_protocol::schema::sync_table_defs(&info) else {
+            return Ok(Vec::new());
+        };
+        for name in &nosync {
+            info!(table = %name, "Excluding @nosync table from snapshot");
+        }
+        Ok(synced.into_keys().collect())
+    }
+
+    /// `INFO FOR DB` on the remote, "database doesn't exist yet" read as
+    /// `Null` (no table list at all).
+    async fn info_for_db<C>(remote_db: &surrealdb::Surreal<C>) -> Result<Value>
+    where
+        C: surrealdb::Connection,
+    {
         trace!("remote query: INFO FOR DB");
-        let info: Value = match remote_db.query("INFO FOR DB").await {
+        match remote_db.query(ssp_protocol::schema::INFO_FOR_DB).await {
             Ok(mut response) => {
                 let v: Vec<Value> = response.take(0).unwrap_or_default();
-                v.into_iter().next().unwrap_or_default()
+                Ok(v.into_iter().next().unwrap_or_default())
             }
             Err(e) if is_missing_error(&e) => {
                 debug!("INFO FOR DB on missing database — treating as empty");
-                Value::Null
+                Ok(Value::Null)
             }
-            Err(e) => return Err(anyhow::Error::from(e).context("Failed to query INFO FOR DB on remote")),
-        };
+            Err(e) => Err(anyhow::Error::from(e).context("Failed to query INFO FOR DB on remote")),
+        }
+    }
 
-        Ok(match info.get("tables") {
-            Some(Value::Object(tables_map)) => tables_map
-                .iter()
-                .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
-                .filter(|(name, def)| {
-                    let nosync = def
-                        .as_str()
-                        .map(ssp_protocol::define_str_is_nosync)
-                        .unwrap_or(false);
-                    if nosync {
-                        info!(table = %name, "Excluding @nosync table from snapshot");
-                    }
-                    !nosync
-                })
-                .map(|(name, _)| name.clone())
-                .collect(),
-            _ => Vec::new(),
-        })
+    /// Read upstream's schema probe (see `ssp_protocol::schema`). `None` when
+    /// upstream has no table list at all (a database no migration touched).
+    pub async fn probe_schema<C>(remote_db: &surrealdb::Surreal<C>) -> Result<Option<ssp_protocol::schema::SchemaProbe>>
+    where
+        C: surrealdb::Connection,
+    {
+        let info = Self::info_for_db(remote_db).await?;
+        // Absent until the CLI first applies its schema: that is "no rows".
+        let state: Value = match remote_db.query(ssp_protocol::schema::SCHEMA_STATE_QUERY).await {
+            Ok(mut response) => response
+                .take::<surrealdb::types::Value>(0)
+                .map(|v| v.into_json_value())
+                .unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        Ok(ssp_protocol::schema::SchemaProbe::parse(&info, &state))
     }
 
     /// Per-table opaque-field sets, read from upstream `INFO FOR TABLE`.
@@ -995,7 +1064,7 @@ impl Replica {
     /// that table rather than aborting the clone. The cost of missing one is a
     /// hash mismatch that the existing verify/re-clone machinery already
     /// handles; the cost of aborting is no replica at all.
-    async fn discover_opaque_fields<C>(
+    pub(crate) async fn discover_opaque_fields<C>(
         remote_db: &surrealdb::Surreal<C>,
         tables: &[String],
     ) -> BTreeMap<String, BTreeSet<String>>
@@ -1465,6 +1534,7 @@ impl Replica {
         // Adopt phase 1's exclusions before any hash is computed off this data,
         // so `hash_one_table` and the SSP's circuit agree on the key set.
         self.opaque_fields = manifest.opaque_fields.clone();
+        self.opaque_known = true;
         for spooled in &manifest.tables {
             let path = spooled.path.clone();
             let records = tokio::task::spawn_blocking(move || -> Result<Vec<Value>> {
@@ -1702,6 +1772,7 @@ impl Replica {
         self.interrupted_apply = false;
         self.changefeed_vs = 0;
         self.opaque_fields.clear();
+        self.opaque_known = false;
         info!(path = ?self.db_path, "Replica reset (REMOVE DATABASE)");
         Ok(())
     }
@@ -1725,19 +1796,9 @@ impl Replica {
             }
         };
 
-        let tables: Vec<String> = match info.get("tables") {
-            Some(Value::Object(tables_map)) => tables_map
-                .iter()
-                .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
-                .filter(|(_, def)| {
-                    !def.as_str()
-                        .map(ssp_protocol::define_str_is_nosync)
-                        .unwrap_or(false)
-                })
-                .map(|(name, _)| name.clone())
-                .collect(),
-            _ => Vec::new(),
-        };
+        let tables: Vec<String> = ssp_protocol::schema::sync_table_defs(&info)
+            .map(|(synced, _)| synced.into_keys().collect())
+            .unwrap_or_default();
 
         for t in &tables {
             self.known_tables.insert(t.clone());
@@ -1749,6 +1810,7 @@ impl Replica {
         // path where the replica is schemaless.
         let discovered = Self::discover_opaque_fields(&self.db, &tables).await;
         self.opaque_fields = discovered;
+        self.opaque_known = true;
 
         Ok(tables.len())
     }
@@ -2071,11 +2133,11 @@ mod tests {
         Ok(())
     }
 
-    /// A table that turned `@nosync` (or was dropped) after the snapshot was
-    /// persisted must lose its hash and its known-table entry: the SSP leaves
-    /// it out of its bootstrap and would dispute the hash forever.
+    /// A table that turned `@nosync` (or was dropped) must lose its rows, its
+    /// hash and its known-table entry: the SSP leaves it out of its bootstrap
+    /// and would dispute the hash forever.
     #[tokio::test]
-    async fn forget_tables_not_in_drops_hashes_and_persists() -> Result<()> {
+    async fn reconcile_drops_removed_tables_and_persists() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut replica = Replica::new(tmp.path().join("replica")).await?;
         replica
@@ -2088,9 +2150,10 @@ mod tests {
         assert!(replica.snapshot_hashes().contains_key("analysis"));
         assert!(replica.known_tables().contains("analysis"));
 
-        let current: BTreeSet<String> = ["user".to_string()].into_iter().collect();
-        let gone = replica.forget_tables_not_in(&current).await?;
+        let removed = vec!["analysis".to_string(), "never_held".to_string()];
+        let gone = replica.reconcile_schema(&removed, None).await?;
         assert_eq!(gone, vec!["analysis".to_string()]);
+        assert_eq!(replica.count_table("analysis").await?, 0, "rows dropped");
         assert!(!replica.snapshot_hashes().contains_key("analysis"));
         assert!(!replica.known_tables().contains("analysis"));
         assert!(replica.snapshot_hashes().contains_key("user"), "synced tables keep their hash");
@@ -2108,7 +2171,31 @@ mod tests {
         assert!(!hashes.contains_key("analysis"));
 
         // Idempotent.
-        assert!(replica.forget_tables_not_in(&current).await?.is_empty());
+        assert!(replica.reconcile_schema(&removed, None).await?.is_empty());
+        Ok(())
+    }
+
+    /// A table whose opaque set moved at runtime is rehashed from content; the
+    /// first read after a restart is not a move.
+    #[tokio::test]
+    async fn a_moved_opaque_set_marks_the_table_dirty() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut replica = Replica::new(tmp.path().join("replica")).await?;
+        replica
+            .apply("game", RecordOp::Create, "game:g1", Some(serde_json::json!({"pgn": "x", "_00_rv": 1})))
+            .await?;
+        replica.set_snapshot_state(3, None).await?;
+        let set = |fields: &[&str]| -> BTreeMap<String, BTreeSet<String>> {
+            [("game".to_string(), fields.iter().map(|f| f.to_string()).collect())].into_iter().collect()
+        };
+
+        replica.reconcile_schema(&[], Some(set(&["crdt"]))).await?;
+        assert!(replica.dirty_tables().is_empty(), "first read after boot");
+        replica.reconcile_schema(&[], Some(set(&["crdt"]))).await?;
+        assert!(replica.dirty_tables().is_empty(), "unchanged");
+        replica.reconcile_schema(&[], Some(set(&["crdt", "notes"]))).await?;
+        assert!(replica.dirty_tables().contains("game"));
+        assert_eq!(replica.omit_for("game").len(), 2);
         Ok(())
     }
 

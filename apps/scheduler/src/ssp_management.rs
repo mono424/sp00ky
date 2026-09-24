@@ -46,6 +46,8 @@ pub struct SspManagementState {
     /// mid-drain. Lock order is always `drain_lock` → replica; never combine
     /// with `reclone_lock` in one path.
     pub drain_lock: Arc<Mutex<()>>,
+    /// Upstream's table set as the replica follows it (see `crate::schema`).
+    pub schema: Arc<crate::schema::SchemaWatch>,
 }
 
 /// Create SSP management router
@@ -273,12 +275,24 @@ async fn handle_bootstrap_verify(
     // either side as the empty-table hash, so appearing/disappearing tables
     // are disputed too.
     let cached = { state.replica.read().await.snapshot_hashes().clone() };
-    let disputed: BTreeSet<String> =
+    let mut disputed: BTreeSet<String> =
         ssp_protocol::snapshot_hash::diff_table_hashes(&cached, &request.table_hashes)
             .into_iter()
             .map(|d| d.table)
             .filter(|t| !ssp_protocol::SYNCED_META_TABLES.contains(&t.as_str()))
             .collect();
+
+    // A table upstream no longer syncs (dropped, or turned `@nosync`) that
+    // the replica has not let go of yet: the SSP was right to leave it out.
+    // It is dropped from the replica on the next tick; counting it here
+    // instead would walk the breaker to a full re-clone.
+    if !disputed.is_empty() {
+        let gone = state.schema.not_synced_upstream(&disputed).await;
+        if !gone.is_empty() {
+            info!(ssp_id = %ssp_id, tables = ?gone, "Bootstrap dispute over tables upstream no longer syncs; not counted");
+            disputed.retain(|t| !gone.contains(t));
+        }
+    }
 
     if disputed.is_empty() {
         // Nothing to settle (the SSP retried against hashes that already

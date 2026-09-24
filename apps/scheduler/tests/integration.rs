@@ -144,6 +144,7 @@ impl TestHarness {
             observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
+            schema: Default::default(),
         }
     }
 
@@ -160,6 +161,7 @@ impl TestHarness {
             reclone_lock: Arc::clone(&self.reclone_lock),
             wal: Arc::clone(&self.wal),
             drain_lock: Arc::clone(&self.drain_lock),
+            schema: Default::default(),
         };
         ssp_management::create_ssp_router(state)
     }
@@ -220,6 +222,7 @@ impl TestHarness {
                     observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                     snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
+            schema: Default::default(),
                 },
             });
         let (backup_tx, _backup_rx) = maintenance::backup::create_backup_channel();
@@ -288,6 +291,7 @@ impl TestHarness {
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
+            schema: Default::default(),
             },
             replica: Arc::clone(&self.replica),
             surrealdb_version: Arc::new(RwLock::new("unknown".to_string())),
@@ -1518,6 +1522,7 @@ mod bootstrap_protocol_tests {
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
                 fanout: Arc::clone(&h.fanout),
+                schema: Default::default(),
             };
             let app = ingest::create_ingest_router(ingest_state);
 
@@ -2084,6 +2089,7 @@ mod bootstrap_protocol_tests {
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
                 fanout: Arc::clone(&h.fanout),
+                schema: Default::default(),
             },
         };
         let seq = host.pre_backup().await.unwrap();
@@ -2549,6 +2555,7 @@ mod drift_tests {
             state: Arc::new(RwLock::new(DriftState::default())),
             repair: Arc::new(TooLarge),
             reclone: recloner.clone(),
+            schema: Default::default(),
         });
         (hook, recloner)
     }
@@ -2609,6 +2616,7 @@ mod drift_tests {
                 observer_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
                 fanout: Arc::clone(&h.fanout),
+                schema: Default::default(),
             },
             replica: Arc::clone(&h.replica),
             surrealdb_version: Arc::new(RwLock::new("unknown".to_string())),

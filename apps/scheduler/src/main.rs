@@ -109,6 +109,7 @@ async fn run() -> Result<()> {
         wal: scheduler.wal.clone(),
         drain_lock: scheduler.drain_lock.clone(),
         changefeed: std::sync::Arc::clone(&scheduler.changefeed),
+        schema: std::sync::Arc::clone(&scheduler.schema),
     };
     let ssp_router = scheduler::ssp_management::create_ssp_router(ssp_mgmt_state);
 

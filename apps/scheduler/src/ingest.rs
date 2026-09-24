@@ -48,6 +48,8 @@ pub struct IngestState {
     /// Serialised SSP fan-out. `/ingest` hands the event over here once it is
     /// durable instead of delivering it inline; see [`Fanout`].
     pub fanout: Arc<Fanout>,
+    /// What upstream syncs, lock-free (see `crate::schema`).
+    pub schema: crate::schema::SchemaCell,
 }
 
 /// The SSP fan-out, moved off the `/ingest` request path.
@@ -228,6 +230,17 @@ pub async fn ingest_event(
         "Received ingest: {} {} on {}",
         request.op, request.id, request.table
     );
+
+    // A table upstream marks `-- @nosync` can still fire an event it was
+    // generated before the marker, or keep a changefeed it was defined with.
+    // Applying one would put the table straight back into the replica (and
+    // its hash back into every bootstrap) right after the schema reconcile
+    // dropped it. Only positive knowledge: a table the last probe did not list
+    // at all is one a deploy just added, and its events are the point.
+    if crate::schema::SchemaWatch::is_nosync(&state.schema, &request.table) {
+        tracing::debug!(table = %request.table, id = %request.id, "Ingest for a @nosync table dropped");
+        return Ok(0);
+    }
 
     // Parse operation
     let operation = match request.op.to_uppercase().as_str() {

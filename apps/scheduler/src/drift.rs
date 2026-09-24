@@ -439,6 +439,9 @@ pub struct DriftHook {
     pub state: Arc<RwLock<DriftState>>,
     pub repair: Arc<dyn TableRepairer>,
     pub reclone: Arc<dyn Recloner>,
+    /// Upstream's table set, followed on the same tick (see `crate::schema`).
+    /// `None` in tests that exercise the drift rules alone.
+    pub schema: Option<Arc<crate::schema::SchemaWatch>>,
 }
 
 /// The remediation, abstracted so tests can observe it without an upstream.
@@ -1050,6 +1053,7 @@ mod tests {
             state: Arc::new(RwLock::new(DriftState::default())),
             repair: Arc::new(NeverReclones),
             reclone: Arc::new(NeverReclones),
+            schema: None,
         };
 
         assert_eq!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Clean);
@@ -1367,6 +1371,7 @@ mod tests {
             state: Arc::new(RwLock::new(DriftState::default())),
             repair: script.clone(),
             reclone: script,
+            schema: None,
         };
         (hook, replica, tmp)
     }

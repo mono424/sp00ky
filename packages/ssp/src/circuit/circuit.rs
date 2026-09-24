@@ -194,6 +194,22 @@ pub struct Circuit {
     missing_fields: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
+/// One table's schema as the circuit uses it, read from upstream DDL: the
+/// select permission from `DEFINE TABLE`, the rest from `INFO FOR TABLE`.
+/// Applied with [`Circuit::set_table_meta`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableMeta {
+    /// Raw `PERMISSIONS FOR select WHERE` text (`"true"` / `"false"` for
+    /// FULL / NONE), see `permissions`.
+    pub permission: String,
+    /// Record-link fields: `field -> target table`, see `link_targets`.
+    pub link_targets: BTreeMap<String, String>,
+    /// Fields this circuit never holds, see `opaque_fields`.
+    pub opaque: std::collections::BTreeSet<String>,
+    /// Root column names, see `columns`.
+    pub columns: std::collections::BTreeSet<String>,
+}
+
 /// What [`Circuit::reconcile`] found when a table's rows were compared against
 /// the caller's authoritative `(id, _00_rv)` list.
 #[derive(Debug, Default)]
@@ -478,6 +494,40 @@ impl Circuit {
         columns: std::collections::BTreeSet<String>,
     ) {
         self.columns.insert(table.into(), columns);
+    }
+
+    /// Replace everything this circuit knows about `table`'s schema at once.
+    /// Unlike [`Self::set_link_target`], which adds one field at a time, a
+    /// link field the new schema no longer has is gone afterwards, so a
+    /// schema read at runtime leaves nothing stale behind.
+    pub fn set_table_meta(&mut self, table: &str, meta: TableMeta) {
+        self.permissions.insert(table.to_string(), meta.permission);
+        if meta.link_targets.is_empty() {
+            self.link_targets.remove(table);
+        } else {
+            self.link_targets
+                .insert(table.to_string(), meta.link_targets.into_iter().collect());
+        }
+        if meta.opaque.is_empty() {
+            self.opaque_fields.remove(table);
+        } else {
+            self.opaque_fields.insert(table.to_string(), meta.opaque);
+        }
+        self.columns.insert(table.to_string(), meta.columns);
+    }
+
+    /// Drop a table this circuit no longer syncs: its rows and its schema.
+    /// Rows are removed as they are, without retracting them from views, so
+    /// step them out first ([`Self::reconcile`] with an empty list) when views
+    /// may hold them. A registration on the table is default-denied afterwards,
+    /// exactly as on a circuit that never loaded it.
+    pub fn forget_table(&mut self, table: &str) {
+        self.store.collections.remove(table);
+        self.permissions.remove(table);
+        self.link_targets.remove(table);
+        self.opaque_fields.remove(table);
+        self.columns.remove(table);
+        self.missing_fields.remove(table);
     }
 
     /// Bulk-load initial data into base collections.
@@ -4158,6 +4208,42 @@ mod snapshot_and_projection_tests {
         let result = c.reconcile("nope", &entries);
         assert_eq!(result.fetch.len(), 3);
         assert_eq!(result.deleted, 0);
+    }
+
+    #[test]
+    fn table_meta_is_replaced_whole_and_a_forgotten_table_leaves_nothing() {
+        let mut c = seeded(2);
+        c.set_table_meta(
+            "thread",
+            TableMeta {
+                permission: "owner = $auth.id".into(),
+                link_targets: [("author".to_string(), "user".to_string()), ("board".to_string(), "board".to_string())]
+                    .into_iter()
+                    .collect(),
+                opaque: ["draft".to_string()].into_iter().collect(),
+                columns: ["title".to_string(), "author".to_string()].into_iter().collect(),
+            },
+        );
+        assert_eq!(c.link_targets()["thread"].len(), 2);
+
+        // The schema dropped a link field and the opaque marker.
+        c.set_table_meta(
+            "thread",
+            TableMeta {
+                permission: "true".into(),
+                link_targets: [("author".to_string(), "user".to_string())].into_iter().collect(),
+                ..TableMeta::default()
+            },
+        );
+        assert_eq!(c.permissions()["thread"], "true");
+        assert_eq!(c.link_targets()["thread"].len(), 1, "a dropped link field does not linger");
+        assert!(!c.opaque_fields().contains_key("thread"));
+
+        c.forget_table("thread");
+        assert!(!c.permissions().contains_key("thread"));
+        assert!(!c.link_targets().contains_key("thread"));
+        assert!(!c.columns().contains_key("thread"));
+        assert!(c.store.get_collection("thread").is_none());
     }
 
     #[test]

@@ -14,7 +14,8 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use ssp::circuit::view::OutputFormat;
-use ssp::circuit::{Change, ChangeSet, Circuit, Record};
+use ssp::circuit::{Change, ChangeSet, Circuit, Record, TableMeta};
+use ssp_protocol::schema::{SchemaProbe, INFO_FOR_DB, SCHEMA_STATE_QUERY};
 
 use crate::ports::Db;
 
@@ -43,23 +44,45 @@ pub fn bootstrap_page_query(
     }
 }
 
-/// Per-table metadata read out of `INFO FOR TABLE` in one pass: record-link
-/// targets (`field` → target table) and the opaque-field `OMIT` set.
-#[derive(Default)]
-struct TableFieldMeta {
-    link_targets: Vec<(String, String)>,
-    opaque: BTreeSet<String>,
-    columns: BTreeSet<String>,
+/// Upstream's schema as the circuit needs it.
+pub struct LoadedSchema {
+    /// The probe the metadata was read under. `None` when upstream answered
+    /// without a `tables` object: a database no migration has touched yet.
+    pub probe: Option<SchemaProbe>,
+    /// Every synced table's metadata.
+    pub tables: BTreeMap<String, TableMeta>,
+    /// `_00_version` exists upstream, so row versions are durable.
+    pub has_versions: bool,
 }
 
-/// Read `INFO FOR TABLE <table>` and split it into link targets + opaque fields.
-/// A failed read yields empty metadata rather than aborting the bootstrap; the
-/// caller logs it (a missing link map degrades reverse-link edges, it does not
-/// corrupt row content).
-async fn table_field_meta(db: &dyn Db, table: &str) -> anyhow::Result<TableFieldMeta> {
-    let info = q1(db, &format!("INFO FOR TABLE {}", table)).await?;
-    let opaque = ssp_protocol::opaque_fields_from_info(&info);
-    let columns = ssp_protocol::columns_from_info(&info);
+/// Read upstream's schema probe ([`INFO_FOR_DB`] plus the CLI's
+/// `_00_schema_state` rows). Cheap: two small reads, no `INFO FOR TABLE`.
+pub async fn probe_schema(db: &dyn Db) -> anyhow::Result<Option<SchemaProbe>> {
+    Ok(read_probe(db).await?.0)
+}
+
+async fn read_probe(db: &dyn Db) -> anyhow::Result<(Option<SchemaProbe>, bool)> {
+    let info = q1(db, INFO_FOR_DB).await.context("INFO FOR DB")?;
+    let has_versions = info.get("tables").and_then(|v| v.get("_00_version")).is_some();
+    // Absent until the CLI first applies its schema: that is "no rows".
+    let state = q1(db, SCHEMA_STATE_QUERY).await.unwrap_or(Value::Null);
+    Ok((SchemaProbe::parse(&info, &state), has_versions))
+}
+
+/// One table's metadata: the select permission out of its `DEFINE TABLE`
+/// string, link targets, opaque fields and columns out of `INFO FOR TABLE`.
+/// A failed `INFO FOR TABLE` keeps the permission and leaves the rest empty
+/// rather than failing the load: a missing link map degrades reverse-link
+/// edges, it does not corrupt row content.
+pub async fn load_table_meta(db: &dyn Db, table: &str, define: &str) -> TableMeta {
+    let permission = extract_select_permission_text(define);
+    let info = match q1(db, &format!("INFO FOR TABLE {}", table)).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(target: "ssp::policy", table = %table, error = %e, "INFO FOR TABLE failed; skipping link map");
+            return TableMeta { permission, ..TableMeta::default() };
+        }
+    };
     let link_targets = info
         .get("fields")
         .and_then(|f| f.as_object())
@@ -74,11 +97,44 @@ async fn table_field_meta(db: &dyn Db, table: &str) -> anyhow::Result<TableField
                 .collect()
         })
         .unwrap_or_default();
-    Ok(TableFieldMeta {
+    TableMeta {
+        permission,
         link_targets,
-        opaque,
-        columns,
+        opaque: ssp_protocol::opaque_fields_from_info(&info),
+        columns: ssp_protocol::columns_from_info(&info),
+    }
+}
+
+/// Probe upstream and read every synced table's metadata. The one loader
+/// behind the cold rebuild, the snapshot catch-up, the cluster bootstrap and
+/// the live schema refresh, so all four hold the same view of a table.
+pub async fn load_schema(db: &dyn Db) -> anyhow::Result<LoadedSchema> {
+    let (probe, has_versions) = read_probe(db).await?;
+    let mut tables = BTreeMap::new();
+    if let Some(probe) = &probe {
+        for (table, define) in &probe.synced {
+            tables.insert(table.clone(), load_table_meta(db, table, define).await);
+        }
+    }
+    Ok(LoadedSchema {
+        probe,
+        tables,
+        has_versions,
     })
+}
+
+/// Hand every table's metadata to the circuit, replacing what it held.
+pub fn apply_schema(circuit: &mut Circuit, tables: &BTreeMap<String, TableMeta>) {
+    for (table, meta) in tables {
+        info!(target: "ssp::policy", table = %table, permission = %meta.permission, "registered table permission");
+        for (field, target) in &meta.link_targets {
+            info!(target: "ssp::policy", table = %table, field = %field, link_target = %target, "registered record-link target");
+        }
+        if !meta.opaque.is_empty() {
+            info!(target: "ssp::policy", table = %table, fields = ?meta.opaque, "omitting opaque fields from row scans");
+        }
+        circuit.set_table_meta(table, meta.clone());
+    }
 }
 
 /// Target table of a `DEFINE FIELD … TYPE record<X>` link (single, simple X).
@@ -177,82 +233,16 @@ pub async fn rebuild_from_db(
 ) -> anyhow::Result<()> {
     info!("Starting circuit rebuild from DB");
 
-    // 1. Tables + their DEFINE strings (skip _00_* and @nosync tables).
-    let info_json = q1(db, "INFO FOR DB").await.context("INFO FOR DB")?;
-    let has_versions = info_json.get("tables").and_then(|v| v.get("_00_version")).is_some();
-    let table_defs: Vec<(String, String)> = match info_json.get("tables") {
-        Some(Value::Object(tables_map)) => tables_map
-            .iter()
-            .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
-            .filter(|(name, def)| {
-                let nosync =
-                    def.as_str().map(ssp_protocol::define_str_is_nosync).unwrap_or(false);
-                if nosync {
-                    info!(table = %name, "Excluding @nosync table from rebuild");
-                }
-                !nosync
-            })
-            .map(|(name, def)| (name.clone(), def.as_str().unwrap_or("").to_string()))
-            .collect(),
-        _ => vec![],
-    };
-    let tables: Vec<String> = table_defs.iter().map(|(n, _)| n.clone()).collect();
-    info!(count = tables.len(), "Discovered tables: {:?}", tables);
-
-    // 1b. Per-table select-permission text → circuit.
-    {
-        let mut circuit = processor.write().await;
-        for (name, def) in &table_defs {
-            let permission = extract_select_permission_text(def);
-            info!(target: "ssp::policy", table = %name, permission = %permission, "registered table permission");
-            circuit.set_permission(name, permission);
-        }
-    }
-
-    // 1c. Record-link map (field -> target table) and the per-table opaque-field
-    //     OMIT set, both from INFO FOR TABLE.
-    let mut opaque_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut columns_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    {
-        let mut resolved: Vec<(String, String, String)> = Vec::new();
-        for table in &tables {
-            let meta = match table_field_meta(db, table).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(target: "ssp::policy", table = %table, error = %e, "INFO FOR TABLE failed; skipping link map");
-                    continue;
-                }
-            };
-            if !meta.opaque.is_empty() {
-                info!(table = %table, fields = ?meta.opaque, "Omitting opaque fields from bootstrap scan");
-                opaque_by_table.insert(table.clone(), meta.opaque);
-            }
-            columns_by_table.insert(table.clone(), meta.columns);
-            for (field_name, target) in meta.link_targets {
-                resolved.push((table.clone(), field_name, target));
-            }
-        }
-        {
-            let mut circuit = processor.write().await;
-            for (table, field, target) in &resolved {
-                circuit.set_link_target(table.clone(), field.clone(), target.clone());
-            }
-            // Also give the circuit the set, so a registration that tries to
-            // filter/order on one of these fields is rejected rather than
-            // silently matching nothing.
-            for (table, fields) in &opaque_by_table {
-                circuit.set_opaque_fields(table.clone(), fields.clone());
-            }
-            for (table, cols) in &columns_by_table {
-                circuit.set_columns(table.clone(), cols.clone());
-            }
-        }
-    }
+    // 1. Synced tables and their metadata (permissions, link targets, opaque
+    //    fields, columns). Skips `_00_*` runtime tables and `@nosync` tables.
+    let schema = load_schema(db).await?;
+    let has_versions = schema.has_versions;
+    info!(count = schema.tables.len(), "Discovered tables: {:?}", schema.tables.keys().collect::<Vec<_>>());
+    apply_schema(&mut *processor.write().await, &schema.tables);
 
     // 2. Page each table's rows into the circuit store.
-    let no_omit = BTreeSet::new();
-    for table in &tables {
-        let omit = opaque_by_table.get(table).unwrap_or(&no_omit);
+    for (table, meta) in &schema.tables {
+        let omit = &meta.opaque;
         let mut record_count = 0usize;
         let mut after_id: Option<String> = None;
         loop {
@@ -399,47 +389,32 @@ pub async fn catch_up_from_db(
     processor: &Arc<RwLock<Circuit>>,
     point: &crate::ports::ResumePoint,
 ) -> anyhow::Result<()> {
-    // Discover current syncable tables (metadata may have changed since the
-    // snapshot; refresh permissions/links cheaply too).
-    let info_json = q1(db, "INFO FOR DB").await.context("INFO FOR DB (catch-up)")?;
-    let table_defs: Vec<(String, String)> = match info_json.get("tables") {
-        Some(Value::Object(m)) => m
-            .iter()
-            .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
-            .filter(|(_, def)| !def.as_str().map(ssp_protocol::define_str_is_nosync).unwrap_or(false))
-            .map(|(n, d)| (n.clone(), d.as_str().unwrap_or("").to_string()))
-            .collect(),
-        _ => vec![],
-    };
+    // Re-read the schema: `Circuit::restore` drops all table metadata, and
+    // the schema may have changed since the snapshot was written. A table
+    // upstream no longer syncs is stepped out of the restored views and
+    // forgotten, exactly as a cold rebuild would never have loaded it.
+    let schema = load_schema(db).await.context("schema (catch-up)")?;
     {
         let mut circuit = processor.write().await;
-        for (name, def) in &table_defs {
-            circuit.set_permission(name, extract_select_permission_text(def));
-        }
-    }
-    // Link targets are also dropped by `Circuit::restore` — re-seed them. Same
-    // pass collects the opaque-field OMIT set for the catch-up scan below.
-    let mut opaque_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (table, _) in &table_defs {
-        if let Ok(meta) = table_field_meta(db, table).await {
-            let mut circuit = processor.write().await;
-            if !meta.opaque.is_empty() {
-                circuit.set_opaque_fields(table.clone(), meta.opaque.clone());
-                opaque_by_table.insert(table.clone(), meta.opaque);
-            }
-            for (field_name, target) in meta.link_targets {
-                circuit.set_link_target(table.clone(), field_name, target);
-            }
+        apply_schema(&mut circuit, &schema.tables);
+        let gone: Vec<String> = circuit
+            .table_names()
+            .into_iter()
+            .filter(|t| !ssp_protocol::table_excluded_from_sync(t) && !schema.tables.contains_key(t))
+            .collect();
+        for table in gone {
+            let dropped = circuit.reconcile(&table, &[]).deleted;
+            circuit.forget_table(&table);
+            info!(table = %table, rows = dropped, "Catch-up: table no longer synced upstream; dropped");
         }
     }
 
-    let no_omit = BTreeSet::new();
-    for (table, _) in &table_defs {
+    for (table, meta) in &schema.tables {
         let since = point.max_row_version.get(table).copied().unwrap_or(-1);
         // Must match `bootstrap_page_query`'s projection exactly: a row that
         // arrives via catch-up and the same row via a full rebuild have to carry
         // the same keys or the two produce different content hashes.
-        let omit = ssp_protocol::omit_clause(opaque_by_table.get(table).unwrap_or(&no_omit));
+        let omit = ssp_protocol::omit_clause(&meta.opaque);
         let q = format!("SELECT *{omit} FROM {table} WHERE _00_rv > {since}");
         let rows: Vec<Value> = match q1(db, &q).await? {
             Value::Array(arr) => arr,

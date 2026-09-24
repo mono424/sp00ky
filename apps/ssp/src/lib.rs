@@ -8,7 +8,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1925,141 +1925,30 @@ async fn self_bootstrap_with_metadata(
     }
     let mut warnings: Vec<String> = Vec::new();
 
-    use ssp_node::bootstrap::{
-        bootstrap_page_query, extract_select_permission_text, parse_link_target,
-    };
+    use ssp_node::bootstrap::bootstrap_page_query;
     let source = data_source;
 
-    // Step 1: Discover tables via INFO FOR DB (against upstream so we get
-    // the real DEFINE TABLE strings with PERMISSIONS clauses).
-    let info_json = metadata_source.query("INFO FOR DB").await
-        .context("Failed to query INFO FOR DB")?;
-
-    // INFO FOR DB returns `tables: { name: "DEFINE TABLE ... PERMISSIONS ...;" }`.
-    // Keep both the table list (for data-loading) and the raw DEFINE strings
-    // (for permission extraction below).
-    // Tables marked `-- @nosync` carry a `COMMENT 'sp00ky:nosync'` marker in
-    // their `DEFINE TABLE` string. Skip them entirely: no permission is
-    // registered and no data is loaded into the circuit, so the table never
-    // participates in sync. It stays in the upstream DB (still backed up).
-    let table_defs: Vec<(String, String)> = match info_json.get("tables") {
-        Some(Value::Object(tables_map)) => tables_map
-            .iter()
-            .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
-            .filter(|(name, def)| {
-                let nosync = def
-                    .as_str()
-                    .map(ssp_protocol::define_str_is_nosync)
-                    .unwrap_or(false);
-                if nosync {
-                    info!(table = %name, "Excluding @nosync table from bootstrap");
-                }
-                !nosync
-            })
-            .map(|(name, def)| {
-                (name.clone(), def.as_str().unwrap_or("").to_string())
-            })
-            .collect(),
-        _ => {
-            info!("No tables found in database");
-            vec![]
-        }
+    // Step 1: the schema, always from upstream: the scheduler's replica is
+    // records-only and carries no DEFINE TABLE / DEFINE FIELD strings. One
+    // loader for every path (`ssp_node::bootstrap::load_schema`): synced tables
+    // (no `_00_*`, no `@nosync`), each with its select permission, record-link
+    // targets (so a link-traversal permission lowers to a SemiJoin), columns,
+    // and opaque fields. The opaque set is applied as an `OMIT` to the row
+    // scan below: the replica should already lack those fields, but one cloned
+    // before they were marked still holds them, and loading them would put the
+    // circuit permanently out of step with the ingest payload's key set.
+    let BootstrapSource::Direct(upstream) = metadata_source else {
+        anyhow::bail!("bootstrap metadata must come from upstream SurrealDB");
     };
-    let tables: Vec<String> = table_defs.iter().map(|(n, _)| n.clone()).collect();
-
+    let schema = ssp_node::bootstrap::load_schema(&crate::adapters::SurrealSdkDb::new(upstream.clone()))
+        .await
+        .context("Failed to read the upstream schema")?;
+    let tables: Vec<String> = schema.tables.keys().cloned().collect();
     info!(count = tables.len(), "Discovered tables: {:?}", tables);
     if let Some(r) = reporter {
         r.set_total(tables.len()).await;
     }
-
-    // Step 1b: Pull `PERMISSIONS FOR select WHERE <expr>` text out of each
-    // DEFINE TABLE string and stash it on the circuit. Stored as raw text so
-    // `prepare_registration_dbsp` can route it through the same converter that
-    // handles user queries (see permission_inject.rs).
-    {
-        let mut circuit = processor.write().await;
-        for (name, def) in &table_defs {
-            let permission = extract_select_permission_text(def);
-            info!(
-                target: "ssp::policy",
-                table = %name,
-                permission = %permission,
-                "registered table permission"
-            );
-            circuit.set_permission(name, permission);
-        }
-    }
-
-    // Step 1c: Per-table record-link map. `INFO FOR TABLE` exposes each field's
-    // `DEFINE FIELD ... TYPE record<X>`; capture `field -> X` so the
-    // registration pipeline can lower a link-traversal permission
-    // (`assigned_to.owner.id = $auth.id`) into a SemiJoin against `X`. The
-    // target table isn't derivable from the field name (`assigned_to` links to
-    // `connection`), and a flat Filter can't dereference a link across rows, so
-    // without this every live query on an outbox table matches zero rows.
-    // Best-effort: a failed INFO or an unparseable field just leaves that link
-    // unresolved (its permission stays flat, i.e. today's behavior).
-    // The same pass collects each table's opaque-field set (fields marked
-    // `@nosync`/`@crdt`/`@opaque` on a DEFINE FIELD, which the CLI stamps with
-    // `COMMENT 'sp00ky:opaque'`). Read from `metadata_source` — always the
-    // upstream DB, which is the only side that carries the DDL — and applied as
-    // an `OMIT` to the row scan below. On this path `source` is the scheduler
-    // proxy, whose replica should already lack these fields; the OMIT still
-    // matters because a replica cloned before this change does hold them, and
-    // loading them here would put the circuit permanently out of step with the
-    // ingest payload's key set.
-    let mut opaque_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut columns_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    {
-        let mut resolved: Vec<(String, String, String)> = Vec::new();
-        for table in &tables {
-            let info = match metadata_source.query(&format!("INFO FOR TABLE {}", table)).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(target: "ssp::policy", table = %table, error = %e, "INFO FOR TABLE failed; skipping link map");
-                    continue;
-                }
-            };
-            let opaque = ssp_protocol::opaque_fields_from_info(&info);
-            if !opaque.is_empty() {
-                info!(
-                    target: "ssp::policy",
-                    table = %table, fields = ?opaque,
-                    "omitting opaque fields from bootstrap scan"
-                );
-                opaque_by_table.insert(table.clone(), opaque);
-            }
-            columns_by_table.insert(table.clone(), ssp_protocol::columns_from_info(&info));
-            let Some(fields) = info.get("fields").and_then(|f| f.as_object()) else {
-                continue;
-            };
-            for (field_name, def) in fields {
-                if let Some(target) = def.as_str().and_then(parse_link_target) {
-                    resolved.push((table.clone(), field_name.clone(), target));
-                }
-            }
-        }
-        {
-            let mut circuit = processor.write().await;
-            for (table, field, target) in &resolved {
-                info!(
-                    target: "ssp::policy",
-                    table = %table, field = %field, link_target = %target,
-                    "registered record-link target"
-                );
-                circuit.set_link_target(table.clone(), field.clone(), target.clone());
-            }
-            // Also give the circuit the set, so a registration that tries to
-            // filter/order on one of these fields is rejected rather than
-            // silently matching nothing.
-            for (table, fields) in &opaque_by_table {
-                circuit.set_opaque_fields(table.clone(), fields.clone());
-            }
-            for (table, cols) in &columns_by_table {
-                circuit.set_columns(table.clone(), cols.clone());
-            }
-        }
-    }
+    ssp_node::bootstrap::apply_schema(&mut *processor.write().await, &schema.tables);
 
     // Step 2: Load all table data, paged. Pulling the entire table in one
     // request blew up at multi-GB DBs because the SurrealDB engine or the
@@ -2067,12 +1956,11 @@ async fn self_bootstrap_with_metadata(
     // body. Paging keeps each round-trip bounded; the SSP still loads
     // everything into the circuit store but does so a chunk at a time.
     // `page_size` comes from NodeConfig (env: SPKY_SSP_BOOTSTRAP_PAGE_SIZE).
-    let no_omit = BTreeSet::new();
-    for table in &tables {
+    for (table, meta) in &schema.tables {
         if let Some(r) = reporter {
             r.start_table(table).await;
         }
-        let omit = opaque_by_table.get(table).unwrap_or(&no_omit);
+        let omit = &meta.opaque;
         let mut record_count: usize = 0;
         // Keyset cursor: the highest `id` loaded so far. `None` = first page.
         let mut after_id: Option<String> = None;

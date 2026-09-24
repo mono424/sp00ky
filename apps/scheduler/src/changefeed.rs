@@ -35,6 +35,47 @@ pub struct IngestSink {
     pub query: QueryState,
     pub recloner: Arc<dyn crate::drift::Recloner>,
     pub stats: Arc<TailerStats>,
+    /// Upstream, for the opaque fields of a table the schema reconcile has
+    /// not seen yet (see [`IngestSink::opaque_for`]). `None` skips the lookup.
+    pub db: Option<Arc<ReconnectingDb>>,
+    /// Those lookups, once per table.
+    pub first_sight: tokio::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeSet<String>>>,
+}
+
+impl IngestSink {
+    /// Opaque fields to strip from a `table` row. The schema reconcile's view
+    /// when it has one; for a table it has not seen yet (one a deploy just
+    /// added, whose first rows can beat the next tick) a one-off
+    /// `INFO FOR TABLE`, never a wait on the reconcile.
+    async fn opaque_for(&self, table: &str) -> std::collections::BTreeSet<String> {
+        if ssp_protocol::table_excluded_from_sync(table) {
+            return Default::default();
+        }
+        if let Some(fields) = crate::schema::SchemaWatch::opaque_of(&self.ingest.schema, table) {
+            return fields;
+        }
+        let mut cache = self.first_sight.lock().await;
+        if let Some(fields) = cache.get(table) {
+            return fields.clone();
+        }
+        let Some(db) = &self.db else {
+            return Default::default();
+        };
+        let handle = db.handle();
+        let tables = [table.to_string()];
+        let read = crate::replica::Replica::discover_opaque_fields(&*handle, &tables);
+        match tokio::time::timeout(std::time::Duration::from_secs(10), read).await {
+            Ok(map) => {
+                let fields = map.get(table).cloned().unwrap_or_default();
+                cache.insert(table.to_string(), fields.clone());
+                fields
+            }
+            Err(_) => {
+                warn!(table, "Reading a new table's opaque fields timed out; forwarding its row as is");
+                Default::default()
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -90,13 +131,20 @@ impl ChangeSink for IngestSink {
             }
             return Ok(());
         }
+        // The feed carries the whole row, opaque fields included; the http
+        // transport's event payload never did. Strip them here, so the WAL,
+        // the replica and every SSP circuit hold what the clone and the SSP
+        // bootstrap (`SELECT * OMIT <opaque>`) hold, whichever transport ran.
+        let mut row = record
+            .record
+            .unwrap_or_else(|| Value::Object(Default::default()));
+        let opaque = self.opaque_for(&record.table).await;
+        crate::schema::strip_opaque(&mut row, &opaque);
         let request = IngestRequest {
             table: record.table,
             op: record.op.as_str().to_string(),
             id: record.id,
-            record: record
-                .record
-                .unwrap_or_else(|| Value::Object(Default::default())),
+            record: row,
             job_assignee: None,
         };
         match crate::ingest::ingest_event(&self.ingest, request, record.versionstamp).await {
@@ -166,13 +214,15 @@ pub fn spawn(
             settings.fallback_ms
         );
     }
-    let source: Arc<dyn ChangeSource> = Arc::new(ReconnectingSource { db });
     let sink: Arc<dyn ChangeSink> = Arc::new(IngestSink {
         ingest,
         query,
         recloner,
         stats: Arc::clone(&stats),
+        db: Some(Arc::clone(&db)),
+        first_sight: Default::default(),
     });
+    let source: Arc<dyn ChangeSource> = Arc::new(ReconnectingSource { db });
     tokio::spawn(maintenance::changefeed::run_tailer(
         source, sink, cfg, stats, notify,
     ));

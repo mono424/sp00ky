@@ -4318,6 +4318,8 @@ async fn changefeed_delete_does_not_wait_for_a_recloning_replica() {
         },
         recloner: Arc::new(Recloning),
         stats: maintenance::changefeed::TailerStats::new(),
+        db: None,
+        first_sight: Default::default(),
     };
     // What the re-clone holds for its whole reset and load.
     let _reset = h.replica.write().await;

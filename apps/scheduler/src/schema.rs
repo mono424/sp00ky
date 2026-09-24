@@ -38,6 +38,8 @@ const VERIFY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// re-clone holds for a long time): the ingest path checks it per event.
 #[derive(Debug, Default)]
 pub struct SyncedSchema {
+    /// Tables upstream syncs, as of the last probe.
+    pub synced: BTreeSet<String>,
     /// Tables upstream positively marks `-- @nosync`.
     pub nosync: BTreeSet<String>,
     /// Opaque fields per table, as the replica holds them.
@@ -184,11 +186,22 @@ impl SchemaWatch {
         let opaque = replica.read().await.opaque_fields().clone();
         if let Ok(mut cell) = self.cell.write() {
             *cell = Arc::new(SyncedSchema {
+                synced: read.probe.tables(),
                 nosync: read.probe.nosync.clone(),
                 opaque,
             });
         }
         step
+    }
+
+    /// The opaque fields of `table` if the last probe listed it, `None` for a
+    /// table it has not seen yet.
+    pub fn opaque_of(cell: &SchemaCell, table: &str) -> Option<BTreeSet<String>> {
+        let schema = cell.read().ok()?;
+        schema
+            .synced
+            .contains(table)
+            .then(|| schema.opaque.get(table).cloned().unwrap_or_default())
     }
 
     /// The tables among `tables` that upstream does not sync, by a fresh
@@ -210,6 +223,30 @@ impl SchemaWatch {
             .filter(|t| !probe.synced.contains_key(*t))
             .cloned()
             .collect()
+    }
+}
+
+/// Remove `fields` (names, or dotted paths into nested objects) from a row, so
+/// it carries exactly what `SELECT * OMIT <fields>` would: what the clone, the
+/// SSP bootstrap and the http transport's event payload all hold.
+pub fn strip_opaque(record: &mut serde_json::Value, fields: &BTreeSet<String>) {
+    fn strip(value: &mut serde_json::Value, path: &[&str]) {
+        match path {
+            [] => {}
+            [leaf] => {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove(*leaf);
+                }
+            }
+            [head, rest @ ..] => {
+                if let Some(next) = value.get_mut(*head) {
+                    strip(next, rest);
+                }
+            }
+        }
+    }
+    for path in fields {
+        strip(record, &path.split('.').collect::<Vec<_>>());
     }
 }
 
@@ -274,6 +311,14 @@ mod tests {
         let step = watch.apply(read(&["game", "comment"], &[]), &replica).await;
         assert_eq!(step.added, vec!["comment".to_string()]);
         assert!(step.removed.is_empty());
+    }
+
+    #[test]
+    fn stripping_matches_an_omit_projection() {
+        let mut row = json!({ "id": "doc:1", "title": "t", "body": "crdt", "meta": { "secret": 1, "kept": 2 } });
+        let fields: BTreeSet<String> = ["body".to_string(), "meta.secret".to_string(), "absent.path".to_string()].into_iter().collect();
+        strip_opaque(&mut row, &fields);
+        assert_eq!(row, json!({ "id": "doc:1", "title": "t", "meta": { "kept": 2 } }));
     }
 
     #[tokio::test]

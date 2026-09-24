@@ -212,10 +212,12 @@ below when you want the SSP to come back with data.</p>
 <p>Rebuild the circuit from the database, in process. The SSP re-scans the schema,
 reloads rows and re-registers the views recorded in <code>_00_query</code>, then returns to
 <code>ready</code>. It does <strong>not</strong> exit, and it does not re-run the scheduler handshake.</p>
-<p>This is how a schema change becomes visible without a restart: view registration
-captures table permissions at bootstrap, so a table or permission defined
-afterwards is invisible until a reload. Ingest is gated for the duration, exactly
-as during a cold start.</p>
+<p>You do not need it for a schema change: a running SSP probes upstream’s schema
+every <code>SPKY_SCHEMA_POLL_SECS</code> (and whenever a view registration names a table it
+does not know yet) and applies added, changed and removed tables in place. A
+removed table’s rows are retracted from every view it fed. Reload is the full,
+explicit rebuild, for when the circuit itself is suspect. Ingest is gated for the
+duration, exactly as during a cold start.</p>
 <p><strong>Authentication:</strong> Required</p>
 <p><strong>Response:</strong></p>
 <ul>
@@ -565,6 +567,10 @@ again.</p>
 <span class="line"></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># TTL cleanup interval (seconds, default: 60)</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">TTL_CLEANUP_INTERVAL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">60</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Schema poll: added, changed and removed tables applied in place</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># (seconds, default: 15, 0 = off)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SCHEMA_POLL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">15</span></span>
 <span class="line"></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Job-table runner config, JSON-encoded. Read once at startup.</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_JOB_CONFIG</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&#39;{&quot;job_tables&quot;: {…}}&#39;</span></span>

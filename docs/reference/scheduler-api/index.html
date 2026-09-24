@@ -467,10 +467,19 @@ own replica-vs-upstream verdict. <code>spky verify</code> reads this.</p>
 ingest events, so rows written while nothing was listening (a bulk migration
 with the stack down) never reach it, and every SSP that bootstraps from it
 inherits the gap. The scheduler compares row counts against upstream at
-startup and after every snapshot drain that leaves nothing buffered, and by
-default re-clones the replica and re-bootstraps every SSP when a table is
-empty in the replica but not upstream, or when any other count mismatch
-persists across consecutive checks.</p>
+startup and after every snapshot drain that leaves nothing buffered. A table
+that is empty in the replica but not upstream is acted on at once, any other
+mismatch once it persists across consecutive checks. The table is repaired in
+place (the rows that differ go through the ingest pipeline); only a repair
+that cannot fix it re-clones the replica and re-bootstraps every SSP. A table
+new to the replica (added upstream while the scheduler ran, or with <code>@nosync</code>
+removed) is backfilled instead: uncapped, in the background, never re-cloned
+for.</p>
+<p>The replica also follows upstream’s table set on the same tick: a table
+dropped upstream, or marked <code>@nosync</code>, is dropped from the replica (rows and
+hash) once two consecutive probes agree, and a table’s opaque fields are
+re-read whenever the schema changes. Both are recorded as <code>schema_change</code>
+incidents.</p>
 <p><strong>Response:</strong></p>
 <ul>
 <li><code>200 OK</code>
@@ -493,6 +502,7 @@ persists across consecutive checks.</p>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;last_auto_repair&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;auto_repairs&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;repair_max_rows&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">2000</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;backfilling&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [],</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;last_error&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
@@ -501,8 +511,9 @@ persists across consecutive checks.</p>
 <p><code>drift.mismatched</code> lists tables whose counts differed on the last check.
 <code>drift.stuck</code> lists tables an automatic repair or re-clone did not fix; those
 need an operator (a row the replica schema rejects, typically).
-<code>drift.auto_repairs</code> counts in-place table repairs, <code>drift.auto_reclones</code> the
-full re-clones a repair escalated to. <code>drift.upstream</code> is
+<code>drift.auto_repairs</code> counts in-place table repairs (backfills included),
+<code>drift.auto_reclones</code> the full re-clones a repair escalated to.
+<code>drift.backfilling</code> lists the new tables being backfilled right now. <code>drift.upstream</code> is
 <code>null</code> for a table whose upstream count could not be read.</p>
 <p><strong>Example:</strong></p>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:9667/health/snapshot</span></span></code></pre>
@@ -619,8 +630,8 @@ full re-clones a repair escalated to. <code>drift.upstream</code> is
 <li><code>SPKY_DRIFT_AUTO_RECLONE</code> - Act on a confirmed mismatch (default: <code>true</code>; <code>false</code> reports only, via <code>/health/snapshot</code>, <code>/metrics</code> and <code>spky verify</code>). The table is repaired in place: its ids and <code>_00_rv</code>s are compared with upstream, and the rows that are missing, stale or deleted go through the ingest pipeline as ordinary events, so the replica and every SSP converge without a bootstrap. Only a repair that finds no difference, would exceed <code>SPKY_DRIFT_REPAIR_MAX_ROWS</code>, or fails falls back to re-cloning the replica and re-bootstrapping every SSP. A table still off after either is reported as stuck until its counts change</li>
 <li><code>SPKY_DRIFT_CONFIRM_TICKS</code> - Consecutive checks a non-zero count mismatch must persist before it is acted on; an empty replica table upstream has rows for is acted on at first sight (default: <code>2</code>)</li>
 <li><code>SPKY_DRIFT_RECLONE_COOLDOWN_SECS</code> - Minimum spacing between automatic re-clones (default: <code>3600</code>)</li>
-<li><code>SPKY_DRIFT_REPAIR_MAX_ROWS</code> - Most rows one in-place table repair may send through the ingest pipeline (default: <code>2000</code>)</li>
-<li><code>SPKY_DRIFT_REPAIR_TIMEOUT_SECS</code> - Deadline for one table repair; on the deadline it is abandoned, the upstream connection is replaced and the repair is retried on the next check (default: <code>300</code>)</li>
+<li><code>SPKY_DRIFT_REPAIR_MAX_ROWS</code> - Most rows one in-place repair of a table the replica already held may send through the ingest pipeline (default: <code>2000</code>). A table new to the replica is backfilled with no cap</li>
+<li><code>SPKY_DRIFT_REPAIR_TIMEOUT_SECS</code> - Deadline for one table repair, and the longest any repair (a backfill included) may go without finishing a page; on the deadline it is abandoned, the upstream connection is replaced and the repair is retried on the next check (default: <code>300</code>)</li>
 <li><code>SPKY_DRIFT_CHECK_TIMEOUT_SECS</code> - Deadline for one drift check. The check is the last step of the snapshot updater’s tick, so a check that never answers would stop the replica draining; on the deadline it is abandoned, the upstream connection is replaced and the tick finishes (default: <code>120</code>)</li>
 <li><code>SPKY_BACKENDS</code> - JSON-encoded backend health-check list (<code>SPKY_SCHEDULER_BACKENDS</code> accepted as legacy fallback)</li>
 <li><code>SPKY_BOOTSTRAP_PAGE_SIZE</code> - Rows read per bootstrap page from the replica (default: <code>500</code>)</li>

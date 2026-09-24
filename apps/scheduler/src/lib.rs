@@ -481,6 +481,7 @@ impl Scheduler {
             state: Arc::clone(&self.drift),
             repair: Arc::new(SchedulerRepairer {
                 db,
+                stall: self.drift_config.repair_timeout,
                 replica: Arc::clone(&self.replica),
                 feed: crate::drift::IngestRepairFeed {
                     ingest: self.ingest_state(),
@@ -825,6 +826,7 @@ impl Scheduler {
         if !schema_step.is_empty() {
             info!(added = ?schema_step.added, reloaded = schema_step.reload, "Schema reconciled at boot");
         }
+        self.drift.write().await.new_tables.extend(schema_step.added);
         let drift_hook = self.drift_hook(Arc::clone(&shared_db));
 
         // The check the integrity check above cannot do: compare the replica
@@ -1053,15 +1055,17 @@ impl crate::drift::Recloner for SchedulerRecloner {
 /// handle and its own ingest pipeline.
 struct SchedulerRepairer {
     db: Arc<maintenance::db::ReconnectingDb>,
+    /// How long a repair may go without finishing a page (`repair_timeout`).
+    stall: std::time::Duration,
     replica: Arc<RwLock<Replica>>,
     feed: crate::drift::IngestRepairFeed,
 }
 
 #[async_trait::async_trait]
 impl crate::drift::TableRepairer for SchedulerRepairer {
-    async fn repair(&self, table: &str, max_rows: usize) -> Result<crate::drift::RepairOutcome> {
+    async fn repair(&self, table: &str, max_rows: Option<usize>) -> Result<crate::drift::RepairOutcome> {
         let handle = self.db.handle();
-        crate::drift::repair_table(&*handle, &self.replica, &self.feed, table, max_rows).await
+        crate::drift::repair_table(&*handle, &self.replica, &self.feed, table, max_rows, self.stall).await
     }
 
     fn note_stalled(&self) {
@@ -1253,8 +1257,13 @@ pub async fn snapshot_updater_tick(
     // drain, so a removed table's buffered events are applied before the table
     // is dropped, and never while an SSP bootstraps (checked above): the hashes
     // it was handed must not change underneath it.
-    if let (Some(read), Some(watch)) = (schema_read, drift.and_then(|h| h.schema.as_ref())) {
-        watch.apply(read, replica).await;
+    if let (Some(read), Some(hook)) = (schema_read, drift) {
+        if let Some(watch) = hook.schema.as_ref() {
+            let step = watch.apply(read, replica).await;
+            if !step.added.is_empty() {
+                hook.state.write().await.new_tables.extend(step.added);
+            }
+        }
     }
 
     // Step 6: replica-vs-upstream drift check, skipping the tables that still

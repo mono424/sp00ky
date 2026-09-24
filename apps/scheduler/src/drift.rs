@@ -37,7 +37,9 @@
 //! repair that cannot explain the mismatch, or would be too large, falls back
 //! to re-cloning the whole replica and re-bootstrapping every SSP, which is
 //! what every mismatch used to cost (whitepawn 2026-09-17: one missing
-//! `puzzle` row re-cloned 196k rows and restarted the SSP).
+//! `puzzle` row re-cloned 196k rows and restarted the SSP). A table new to the
+//! replica (see [`DriftState::new_tables`]) is never re-cloned for: its repair
+//! is an uncapped backfill in a task of its own.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -68,12 +70,15 @@ pub struct DriftConfig {
     /// between two automatic re-clones. Repairs have none: each needs a
     /// fresh confirmed mismatch, and one that does not fix its table latches.
     pub reclone_cooldown: Duration,
-    /// `SPKY_DRIFT_REPAIR_MAX_ROWS` (default 2000): the most rows one table
-    /// repair may push through the ingest pipeline. A bigger difference is
-    /// cheaper as a re-clone and a bootstrap than as that many events.
+    /// `SPKY_DRIFT_REPAIR_MAX_ROWS` (default 2000): the most rows one repair
+    /// of a table the replica already held may push through the ingest
+    /// pipeline. A bigger difference is cheaper as a re-clone and a bootstrap
+    /// than as that many events. A table new to the replica has no cap: a
+    /// re-clone would cost at least its rows plus every other table's.
     pub repair_max_rows: usize,
-    /// `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` (default 300): deadline for one table
-    /// repair, for the same reason as `check_timeout`.
+    /// `SPKY_DRIFT_REPAIR_TIMEOUT_SECS` (default 300): deadline for one capped
+    /// table repair, for the same reason as `check_timeout`, and the longest
+    /// any repair (a backfill included) may go without finishing a page.
     pub repair_timeout: Duration,
     /// `SPKY_DRIFT_CHECK_TIMEOUT_SECS` (default 120): deadline for one whole
     /// check. The check is the last step of the snapshot updater's tick, and
@@ -340,6 +345,18 @@ pub struct DriftState {
     /// latches it as stuck if it is still off.
     #[serde(skip)]
     pub verify_tables: BTreeSet<String>,
+    /// Tables new to the replica since its clone: added upstream while the
+    /// scheduler ran (the schema reconcile's `added`), or not in the persisted
+    /// hashes at boot. Rows such a table had before its ingest hook existed (a
+    /// migration seeding the table it creates, `@nosync` taken off a populated
+    /// table) never reached the replica. Its repair is a backfill: uncapped,
+    /// because the re-clone a cap escalates to would cost every row of every
+    /// table plus a bootstrap of every SSP, and in a task of its own, so the
+    /// tick keeps draining what it emits. Forgotten once the table compares
+    /// clean or its backfill is done.
+    pub new_tables: BTreeSet<String>,
+    /// Backfills running now; their tables sit every check out.
+    pub backfilling: BTreeSet<String>,
 }
 
 /// Fold a report into the state and decide. Pure, so the escalation rules are
@@ -349,6 +366,10 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig) -
     let mut mismatched: Vec<String> = Vec::new();
 
     for (table, counts) in &report.tables {
+        if state.backfilling.contains(table) {
+            // Its counts move with every page the backfill sends.
+            continue;
+        }
         let verifying = state.verify_tables.remove(table);
         if let Some(stuck) = state.stuck.get(table) {
             if *stuck == *counts {
@@ -360,6 +381,7 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig) -
         }
         if !counts.mismatched() {
             state.streaks.remove(table);
+            state.new_tables.remove(table);
             continue;
         }
         mismatched.push(table.clone());
@@ -462,7 +484,9 @@ pub trait Recloner: Send + Sync {
 /// scheduler's upstream handle; tests substitute an outcome.
 #[async_trait]
 pub trait TableRepairer: Send + Sync {
-    async fn repair(&self, table: &str, max_rows: usize) -> Result<RepairOutcome>;
+    /// `max_rows: None` is uncapped: the backfill of a table new to the
+    /// replica.
+    async fn repair(&self, table: &str, max_rows: Option<usize>) -> Result<RepairOutcome>;
 
     /// Called when a repair was abandoned on its deadline, like
     /// [`UpstreamCounts::note_stalled`].
@@ -493,6 +517,19 @@ pub struct RepairStats {
     pub deleted: usize,
     /// Rows re-sent because upstream changed them while the repair ran.
     pub corrected: usize,
+}
+
+impl RepairStats {
+    fn add(&mut self, other: &RepairStats) {
+        self.created += other.created;
+        self.updated += other.updated;
+        self.deleted += other.deleted;
+        self.corrected += other.corrected;
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == RepairStats::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -688,82 +725,164 @@ pub fn plan_corrections(
 /// stale, or holds but upstream deleted, through the ingest pipeline, so the
 /// replica AND every SSP receive them as ordinary events.
 ///
-/// Every step is ordered against the live pipeline:
-/// 1. read the replica's ids;
-/// 2. page upstream (keeping full rows only for candidates, capped);
-/// 3. wait until everything committed before the end of that read has been
-///    ingested, so a row still in flight is not mistaken for a lost one;
-/// 4. read the pending changes, then the replica again (in that order, so a
-///    drain in between shows up in the second read), and plan;
-/// 5. emit the plan;
-/// 6. re-read the planned rows upstream and emit corrections. A change
-///    committed before this re-read is caught by it; one committed after is
-///    ingested after the repair's events and overrides them. That matters
-///    because an SSP applies a repeated or stale row as new, and a CREATE that
-///    raced a DELETE would resurrect the row.
+/// Page by page, so a table of any size costs one page of memory: `max_rows`
+/// caps a repair of a table the replica already held (a big difference there
+/// is cheaper as a re-clone), `None` is the backfill of a table new to the
+/// replica, which a re-clone could only ever cost more (see
+/// [`DriftState::new_tables`]). Every step is ordered against the live
+/// pipeline:
+/// 1. read the replica's ids, once;
+/// 2. per upstream page: wait until everything committed before that page was
+///    read has been ingested, so a row still in flight is not mistaken for a
+///    lost one; read the page's pending changes, then the replica's versions
+///    for the page's ids (in that order, so a drain in between shows up in
+///    the second read); plan creates and updates; emit; then re-read the
+///    planned rows upstream and emit corrections;
+/// 3. after the last page, the same for deletes: rows the replica held that
+///    no page had.
+///
+/// The corrections are what make it safe to emit at all: a change committed
+/// before a re-read is caught by it; one committed after is ingested after
+/// the repair's events and overrides them. That matters because an SSP
+/// applies a repeated or stale row as new, and a CREATE that raced a DELETE
+/// would resurrect the row.
 pub async fn repair_table<C: surrealdb::Connection>(
     upstream: &surrealdb::Surreal<C>,
     replica: &Arc<RwLock<Replica>>,
     feed: &dyn RepairFeed,
     table: &str,
-    max_rows: usize,
+    max_rows: Option<usize>,
+    stall: Duration,
 ) -> Result<RepairOutcome> {
     let (omit, before) = {
         let rep = replica.read().await;
         (rep.omit_for(table).clone(), rep.row_versions(table).await?)
     };
 
-    let mut up: HashMap<String, Option<i64>> = HashMap::new();
-    let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
-    let mut too_large = false;
-    Replica::page_table(upstream, table, &omit, |page| {
-        for row in page {
-            let Some(id) = row.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
-                continue;
-            };
-            let rv = row.get("_00_rv").and_then(|v| v.as_i64());
-            let candidate = before.get(&id).map_or(true, |local| upstream_newer(rv, *local));
-            up.insert(id.clone(), rv);
-            if candidate {
-                if rows.len() >= max_rows {
-                    too_large = true;
-                } else {
+    /// What the pages have done so far.
+    #[derive(Default)]
+    struct Pass {
+        up: HashMap<String, Option<i64>>,
+        planned: usize,
+        stats: RepairStats,
+        stop: Option<RepairOutcome>,
+    }
+    let pass = tokio::sync::Mutex::new(Pass::default());
+    // No deadline for the whole repair (a backfill takes as long as its table
+    // does), but one for progress: a page that never comes back is a session
+    // the server forgot, which answers nothing rather than erroring.
+    let progress = std::sync::atomic::AtomicU64::new(now_epoch_ms());
+    let paging = Replica::page_table(upstream, table, &omit, |page| {
+        let (pass, before, omit, progress) = (&pass, &before, &omit, &progress);
+        async move {
+            let mut pass = pass.lock().await;
+            let mut page_up: HashMap<String, Option<i64>> = HashMap::new();
+            let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+            for row in page {
+                let Some(id) = row.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+                    continue;
+                };
+                let rv = row.get("_00_rv").and_then(|v| v.as_i64());
+                pass.up.insert(id.clone(), rv);
+                page_up.insert(id.clone(), rv);
+                if before.get(&id).map_or(true, |local| upstream_newer(rv, *local)) {
                     rows.insert(id, row);
                 }
             }
-        }
-        std::future::ready(if too_large {
-            Err(anyhow::anyhow!("repair too large"))
-        } else {
+            if rows.is_empty() {
+                return Ok(());
+            }
+            pass.planned += rows.len();
+            if max_rows.is_some_and(|max| pass.planned > max) {
+                pass.stop = Some(RepairOutcome::TooLarge);
+                anyhow::bail!("repair too large");
+            }
+            let read_at = now_epoch_ms();
+            if !feed.wait_ingested(read_at).await {
+                pass.stop = Some(RepairOutcome::Deferred);
+                anyhow::bail!("repair deferred");
+            }
+            let ids: Vec<String> = page_up.keys().cloned().collect();
+            let pending: Vec<PendingChange> = feed
+                .pending(table)
+                .await
+                .into_iter()
+                .filter(|c| page_up.contains_key(&c.id))
+                .collect();
+            let local = replica.read().await.row_versions_for(table, &ids).await?;
+            let after = overlay_pending(local, &pending);
+            let touched: HashSet<String> = pending.iter().map(|c| c.id.clone()).collect();
+            let page_before: HashMap<String, Option<i64>> = before
+                .iter()
+                .filter(|(id, _)| page_up.contains_key(*id))
+                .map(|(id, rv)| (id.clone(), *rv))
+                .collect();
+            let plan = plan_repair(&page_before, &page_up, &after, &touched);
+            let stats = emit_plan(upstream, replica, feed, table, omit, &plan, &mut rows).await?;
+            pass.stats.add(&stats);
+            progress.store(now_epoch_ms(), std::sync::atomic::Ordering::Relaxed);
             Ok(())
-        })
-    })
-    .await
-    .or_else(|e| if too_large { Ok(0) } else { Err(e) })
-    .with_context(|| format!("repair: page upstream {table}"))?;
-    if too_large {
-        return Ok(RepairOutcome::TooLarge);
+        }
+    });
+    let watchdog = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1).min(stall)).await;
+            let idle = now_epoch_ms().saturating_sub(progress.load(std::sync::atomic::Ordering::Relaxed));
+            if idle >= stall.as_millis() as u64 {
+                return;
+            }
+        }
+    };
+    let paged = tokio::select! {
+        paged = paging => paged,
+        () = watchdog => Err(anyhow::anyhow!("repair of {table} made no progress for {}s", stall.as_secs())),
+    };
+    let mut pass = pass.into_inner();
+    if let Some(outcome) = pass.stop.take() {
+        return Ok(outcome);
     }
-    let read_at = now_epoch_ms();
+    paged.with_context(|| format!("repair: page upstream {table}"))?;
 
-    if !feed.wait_ingested(read_at).await {
-        return Ok(RepairOutcome::Deferred);
+    // Deletes: rows the replica held before the repair that no page had.
+    if !feed.wait_ingested(now_epoch_ms()).await {
+        return Ok(if pass.stats.is_empty() { RepairOutcome::Deferred } else { RepairOutcome::Applied(pass.stats) });
     }
     let pending = feed.pending(table).await;
     let after = overlay_pending(replica.read().await.row_versions(table).await?, &pending);
     let touched: HashSet<String> = pending.iter().map(|c| c.id.clone()).collect();
-
-    let plan = plan_repair(&before, &up, &after, &touched);
-    if plan.is_empty() {
-        return Ok(RepairOutcome::NothingToDo);
-    }
-    if plan.len() > max_rows {
+    let deletes: Vec<(RepairOp, String)> = plan_repair(&before, &pass.up, &after, &touched)
+        .into_iter()
+        .filter(|(op, _)| *op == RepairOp::Delete)
+        .collect();
+    if max_rows.is_some_and(|max| pass.planned + deletes.len() > max) {
         return Ok(RepairOutcome::TooLarge);
     }
+    let stats = tokio::time::timeout(stall, emit_plan(upstream, replica, feed, table, &omit, &deletes, &mut HashMap::new()))
+        .await
+        .map_err(|_| anyhow::anyhow!("repair of {table}: the delete pass made no progress for {}s", stall.as_secs()))??;
+    pass.stats.add(&stats);
 
+    if pass.stats.is_empty() {
+        Ok(RepairOutcome::NothingToDo)
+    } else {
+        Ok(RepairOutcome::Applied(pass.stats))
+    }
+}
+
+/// Emit one repair plan and then its corrections (see [`repair_table`]).
+/// `rows` holds the upstream bodies of the planned CREATEs and UPDATEs.
+async fn emit_plan<C: surrealdb::Connection>(
+    upstream: &surrealdb::Surreal<C>,
+    replica: &Arc<RwLock<Replica>>,
+    feed: &dyn RepairFeed,
+    table: &str,
+    omit: &BTreeSet<String>,
+    plan: &[(RepairOp, String)],
+    rows: &mut HashMap<String, serde_json::Value>,
+) -> Result<RepairStats> {
     let mut stats = RepairStats::default();
     let mut emitted: Vec<(RepairOp, String, Option<i64>)> = Vec::with_capacity(plan.len());
-    for (op, id) in &plan {
+    for (op, id) in plan {
         let record = match op {
             RepairOp::Delete => {
                 // The SSPs' delete path reads the row's owner from it.
@@ -791,9 +910,12 @@ pub async fn repair_table<C: surrealdb::Connection>(
         }
         emitted.push((*op, id.clone(), if *op == RepairOp::Delete { None } else { rv }));
     }
+    if emitted.is_empty() {
+        return Ok(stats);
+    }
 
     let ids: Vec<String> = emitted.iter().map(|(_, id, _)| id.clone()).collect();
-    let current = Replica::fetch_rows_by_id(upstream, table, &ids, &omit)
+    let current = Replica::fetch_rows_by_id(upstream, table, &ids, omit)
         .await
         .with_context(|| format!("repair: re-read {table}"))?;
     for (op, id) in plan_corrections(&emitted, &current) {
@@ -807,7 +929,7 @@ pub async fn repair_table<C: surrealdb::Connection>(
         feed.emit(table, op, &id, record).await?;
         stats.corrected += 1;
     }
-    Ok(RepairOutcome::Applied(stats))
+    Ok(stats)
 }
 
 /// Run one check + decision + remediation. Returns the action taken.
@@ -875,10 +997,20 @@ pub async fn run_check(
 
     let mut escalate: Vec<String> = Vec::new();
     for table in tables {
+        {
+            let mut st = hook.state.write().await;
+            if st.new_tables.contains(table) {
+                if st.backfilling.insert(table.clone()) {
+                    warn!(table = %detail(table), "Replica drift: table new to the replica; backfilling it in place");
+                    spawn_backfill(hook, table.clone());
+                }
+                continue;
+            }
+        }
         warn!(table = %detail(table), "Replica drift: repairing the table in place");
         let outcome = tokio::time::timeout(
             hook.cfg.repair_timeout,
-            hook.repair.repair(table, hook.cfg.repair_max_rows),
+            hook.repair.repair(table, Some(hook.cfg.repair_max_rows)),
         )
         .await;
         let mut st = hook.state.write().await;
@@ -955,6 +1087,51 @@ pub async fn run_check(
     Action::Reclone { tables: escalate }
 }
 
+/// Backfill a table new to the replica ([`DriftState::new_tables`]) in a task
+/// of its own: uncapped, paced by its own progress deadline rather than by
+/// the check's, and never escalated to a re-clone. A failed or deferred
+/// backfill is retried by the next check that sees the table still off.
+fn spawn_backfill(hook: &DriftHook, table: String) {
+    let repair = Arc::clone(&hook.repair);
+    let state = Arc::clone(&hook.state);
+    tokio::spawn(async move {
+        let outcome = repair.repair(&table, None).await;
+        let mut st = state.write().await;
+        st.backfilling.remove(&table);
+        match outcome {
+            Ok(RepairOutcome::Applied(stats)) => {
+                info!(table = %table, ?stats, "Replica drift: new table backfilled");
+                crate::admin::incidents::emit(
+                    "scheduler",
+                    "drift_repair",
+                    "recorded",
+                    &format!(
+                        "Table `{table}` was new to the replica: backfilled in place ({} created, {} updated, {} deleted, {} corrected)",
+                        stats.created, stats.updated, stats.deleted, stats.corrected
+                    ),
+                    None,
+                );
+                st.new_tables.remove(&table);
+                st.streaks.remove(&table);
+                st.verify_tables.insert(table);
+                st.auto_repairs += 1;
+                st.last_auto_repair_epoch_ms = Some(now_epoch_ms());
+            }
+            Ok(RepairOutcome::NothingToDo) => {
+                st.new_tables.remove(&table);
+            }
+            Ok(RepairOutcome::Deferred) | Ok(RepairOutcome::TooLarge) => {
+                info!(table = %table, "Replica drift: backfill deferred; retrying next check");
+            }
+            Err(e) => {
+                repair.note_stalled();
+                error!(table = %table, error = %e, "Replica drift: backfill failed; retrying next check");
+                st.last_error = Some(format!("backfill of {table}: {e}"));
+            }
+        }
+    });
+}
+
 /// JSON for `/health/snapshot` and friends.
 pub fn state_json(state: &DriftState, cfg: &DriftConfig) -> serde_json::Value {
     let (checked_at, tables, mismatched) = match &state.last_report {
@@ -977,6 +1154,7 @@ pub fn state_json(state: &DriftState, cfg: &DriftConfig) -> serde_json::Value {
         "last_auto_repair": state.last_auto_repair_epoch_ms,
         "auto_repairs": state.auto_repairs,
         "repair_max_rows": cfg.repair_max_rows,
+        "backfilling": state.backfilling.iter().collect::<Vec<_>>(),
         "last_error": state.last_error,
     })
 }
@@ -1034,7 +1212,7 @@ mod tests {
         }
         #[async_trait]
         impl TableRepairer for NeverReclones {
-            async fn repair(&self, _table: &str, _max_rows: usize) -> Result<RepairOutcome> {
+            async fn repair(&self, _table: &str, _max_rows: Option<usize>) -> Result<RepairOutcome> {
                 unreachable!("a timed-out check decides nothing")
             }
         }
@@ -1326,6 +1504,8 @@ mod tests {
         outcome: std::sync::Mutex<Option<Result<RepairOutcome>>>,
         repairs: std::sync::atomic::AtomicUsize,
         reclones: std::sync::atomic::AtomicUsize,
+        /// The cap each repair was called with.
+        caps: std::sync::Mutex<Vec<Option<usize>>>,
     }
 
     impl Scripted {
@@ -1334,13 +1514,15 @@ mod tests {
                 outcome: std::sync::Mutex::new(Some(outcome)),
                 repairs: Default::default(),
                 reclones: Default::default(),
+                caps: Default::default(),
             })
         }
     }
 
     #[async_trait]
     impl TableRepairer for Scripted {
-        async fn repair(&self, _table: &str, _max_rows: usize) -> Result<RepairOutcome> {
+        async fn repair(&self, _table: &str, max_rows: Option<usize>) -> Result<RepairOutcome> {
+            self.caps.lock().unwrap().push(max_rows);
             self.repairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut slot = self.outcome.lock().unwrap();
             match slot.as_ref() {
@@ -1383,10 +1565,46 @@ mod tests {
         let action = run_check(&hook, &replica, &BTreeSet::new()).await;
         assert_eq!(action, Action::Repair { tables: vec!["puzzle".into()] });
         assert_eq!(script.reclones.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(*script.caps.lock().unwrap(), vec![Some(2000)], "a table the replica held stays capped");
         let st = hook.state.read().await;
         assert_eq!(st.auto_repairs, 1);
         assert_eq!(st.auto_reclones, 0);
         assert!(st.verify_tables.contains("puzzle"));
+    }
+
+    #[tokio::test]
+    async fn a_new_table_is_backfilled_uncapped_and_never_recloned() {
+        for outcome in [Ok(RepairOutcome::TooLarge), Err(anyhow::anyhow!("boom")), Ok(RepairOutcome::Applied(RepairStats { created: 48, ..Default::default() }))] {
+            let applied = matches!(outcome, Ok(RepairOutcome::Applied(_)));
+            let script = Scripted::new(outcome);
+            let (hook, replica, _tmp) = drifted_hook(script.clone()).await;
+            hook.state.write().await.new_tables.insert("puzzle".into());
+
+            let action = run_check(&hook, &replica, &BTreeSet::new()).await;
+            assert_eq!(action, Action::Repair { tables: vec!["puzzle".into()] });
+            for _ in 0..200 {
+                if hook.state.read().await.backfilling.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(*script.caps.lock().unwrap(), vec![None], "uncapped");
+            assert_eq!(script.reclones.load(std::sync::atomic::Ordering::SeqCst), 0, "never a re-clone");
+            let st = hook.state.read().await;
+            assert!(st.backfilling.is_empty());
+            assert_eq!(st.new_tables.contains("puzzle"), !applied, "kept for a retry until it lands");
+        }
+    }
+
+    #[test]
+    fn a_table_being_backfilled_sits_the_check_out() {
+        let mut st = DriftState::default();
+        st.backfilling.insert("puzzle".into());
+        assert_eq!(decide(&report(&[("puzzle", Some(48), 3)]), &mut st, &cfg()), Action::Clean);
+        st.backfilling.clear();
+        st.new_tables.insert("puzzle".into());
+        decide(&report(&[("puzzle", Some(48), 48)]), &mut st, &cfg());
+        assert!(st.new_tables.is_empty(), "a new table that compares clean is no longer new");
     }
 
     #[tokio::test]

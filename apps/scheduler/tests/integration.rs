@@ -2537,7 +2537,7 @@ mod drift_tests {
 
     #[async_trait::async_trait]
     impl drift::TableRepairer for TooLarge {
-        async fn repair(&self, _table: &str, _max_rows: usize) -> anyhow::Result<drift::RepairOutcome> {
+        async fn repair(&self, _table: &str, _max_rows: Option<usize>) -> anyhow::Result<drift::RepairOutcome> {
             Ok(drift::RepairOutcome::TooLarge)
         }
     }
@@ -4384,11 +4384,11 @@ async fn drift_repair_pushes_the_difference_through_ingest() {
     };
 
     // More rows differ than allowed: nothing is sent.
-    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 1).await.unwrap();
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", Some(1), std::time::Duration::from_secs(30)).await.unwrap();
     assert_eq!(outcome, RepairOutcome::TooLarge);
     assert!(h.event_buffer.read().await.is_empty());
 
-    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 100).await.unwrap();
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", Some(100), std::time::Duration::from_secs(30)).await.unwrap();
     assert_eq!(
         outcome,
         RepairOutcome::Applied(RepairStats { created: 2, updated: 1, deleted: 1, corrected: 0 })
@@ -4424,7 +4424,51 @@ async fn drift_repair_pushes_the_difference_through_ingest() {
     ]));
 
     // Converged: a second pass finds nothing.
-    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 100).await.unwrap();
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", Some(100), std::time::Duration::from_secs(30)).await.unwrap();
+    assert_eq!(outcome, RepairOutcome::NothingToDo);
+}
+
+/// A table new to the replica whose rows never went through ingest (seeded by
+/// the migration that created it) is backfilled whole, across pages, with no
+/// row cap: the re-clone a cap would escalate to costs strictly more.
+#[tokio::test]
+async fn a_new_table_is_backfilled_uncapped_across_pages() {
+    use scheduler::drift::{self, IngestRepairFeed, RepairOutcome, RepairStats};
+
+    let h = TestHarness::new().await;
+    let upstream_dir = tempfile::tempdir().unwrap();
+    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+        upstream_dir.path().join("upstream").to_str().unwrap()).await.unwrap();
+    upstream.use_ns("test").use_db("test").await.unwrap();
+    upstream.query("DEFINE TABLE puzzle SCHEMALESS PERMISSIONS FULL; CREATE puzzle:a SET t = 1;")
+        .await.unwrap().check().unwrap();
+    h.replica.write().await.ingest_all(&upstream).await.unwrap();
+    // More rows than one page holds (pages are capped at 2000).
+    upstream.query("DEFINE TABLE comment SCHEMALESS PERMISSIONS FULL; \
+        FOR $i IN 0..2500 { CREATE type::record('comment', string::concat('c', <string> $i)) SET n = $i; };")
+        .await.unwrap().check().unwrap();
+
+    let feed = IngestRepairFeed {
+        ingest: h.ingest_state(),
+        changefeed: maintenance::changefeed::TailerStats::new(),
+        changefeed_notify: Arc::new(tokio::sync::Notify::new()),
+    };
+    let stall = std::time::Duration::from_secs(30);
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "comment", Some(2000), stall).await.unwrap();
+    assert_eq!(outcome, RepairOutcome::TooLarge, "a capped repair still refuses");
+    let emitted_before = h.event_buffer.read().await.len();
+
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "comment", None, stall).await.unwrap();
+    let RepairOutcome::Applied(RepairStats { created, updated, deleted, .. }) = outcome else {
+        panic!("backfill applied nothing: {outcome:?}");
+    };
+    assert_eq!((updated, deleted), (0, 0));
+    scheduler::drain_and_apply(&h.event_buffer, &h.replica, &h.wal).await.unwrap();
+    assert_eq!(h.replica.read().await.count_table("comment").await.unwrap(), 2500);
+    // Rows the capped attempt already sent are not sent twice.
+    assert_eq!(created + emitted_before, 2500);
+
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "comment", None, stall).await.unwrap();
     assert_eq!(outcome, RepairOutcome::NothingToDo);
 }
 
@@ -4483,7 +4527,7 @@ async fn drift_repair_corrects_a_row_deleted_while_it_ran() {
         upstream: &upstream,
         fired: Default::default(),
     };
-    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", 100).await.unwrap();
+    let outcome = drift::repair_table(&upstream, &h.replica, &feed, "puzzle", Some(100), std::time::Duration::from_secs(30)).await.unwrap();
     assert_eq!(outcome, RepairOutcome::Applied(RepairStats { created: 1, corrected: 1, ..Default::default() }));
 
     let ops: Vec<(String, String)> = h.event_buffer.read().await.iter()

@@ -1329,6 +1329,33 @@ impl Replica {
             .collect())
     }
 
+    /// [`Self::row_versions`] for just these record ids (`table:id`); ids the
+    /// replica does not hold are absent from the result.
+    pub async fn row_versions_for(
+        &self,
+        table: &str,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Option<i64>>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in ids.chunks(500) {
+            let mut response = self
+                .db
+                .query("SELECT id, _00_rv FROM $ids.map(|$i| <record> $i)")
+                .bind(("ids", chunk.to_vec()))
+                .await
+                .with_context(|| format!("SELECT {} row versions from replica {}", chunk.len(), table))?;
+            let rows: surrealdb::types::Value = response
+                .take(0)
+                .with_context(|| format!("take(0) for row versions of {}", table))?;
+            for row in rows.into_json_value().as_array().into_iter().flatten() {
+                if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+                    out.insert(id.to_string(), row.get("_00_rv").and_then(|v| v.as_i64()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Bulk-insert records into a replica table in bounded batches. The
     /// per-record `CREATE … CONTENT` loop this replaced was O(N) round-trips;
     /// for tables with large records the per-call cost in SurrealDB 3.0 was

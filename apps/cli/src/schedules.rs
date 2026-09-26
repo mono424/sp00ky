@@ -393,7 +393,8 @@ fn print_quarantined_keys(client: &SurrealClient, name: &str) -> Result<()> {
         client,
         &format!(
             "SELECT key, consecutive_failures FROM _00_schedule_key \
-             WHERE schedule_name = '{}' AND quarantined_at != NONE;",
+             WHERE schedule_name = '{}' AND quarantined_at != NONE \
+             AND consecutive_failures > 0;",
             esc(name)
         ),
     )?;
@@ -414,19 +415,17 @@ fn print_quarantined_keys(client: &SurrealClient, name: &str) -> Result<()> {
 /// Let one quarantined forEach key fire again.
 ///
 /// Forgetting the streak IS the release: the gate derives quarantine from the
-/// count against the schedule's current `quarantineAfter`, so a key with no row
-/// is simply a key that has not failed. If the key is still broken it will
+/// count against the schedule's current `quarantineAfter`, so a key with a zero
+/// streak is simply a key that has not failed, and its next fire closes the
+/// incident. Without this the key is still probed on a backoff; release is for
+/// not waiting that out. If the key is still broken it will
 /// quarantine again, which is the point — this clears the block, it does not
 /// grant an exemption.
 fn release(client: &SurrealClient, name: &str, key: &str) -> Result<()> {
     load_schedule(client, name)?;
     let row = schedule_core::ids::schedule_key(name, key);
     client
-        .execute(&format!(
-            "DELETE {}:⟨{}⟩;",
-            row.table,
-            row.key.replace('⟩', "")
-        ))
+        .execute(&schedule_core::sql::release_schedule_key(&row))
         .with_context(|| format!("failed to release '{key}' on '{name}'"))?;
     println!("{CYAN}Released{RESET} {BOLD}{key}{RESET} on {BOLD}{name}{RESET} — it fires on the next tick.");
     println!("{DIM}The failure streak is forgotten, not exempted: if it still fails it quarantines again.{RESET}");

@@ -133,7 +133,35 @@ consecutive_failures += 1, last_status = 'failed'";
 /// success path needs no `UPSERT` and no config gate — a key that has never
 /// failed has no row, so this is a key miss, not a write, and the common case
 /// of a wide fan-out where everything works costs nothing at all.
-pub const NOTE_KEY_SUCCESS: &str = "DELETE type::record($tb, $key)";
+///
+/// Except for a key an operator was told about. Deleting that row would also
+/// delete the only record that an incident is open for it, and the gate could
+/// then never report the recovery: the incident would sit open until a
+/// scheduler restart marked it interrupted. So a quarantined key keeps its row
+/// with the streak zeroed, the gate sees an announced key under budget on its
+/// next fire and says so once ([`CLEAR_KEY_QUARANTINE`]), and the success after
+/// that deletes it.
+pub const NOTE_KEY_SUCCESS: &str = "\
+DELETE type::record($tb, $key) WHERE quarantined_at = NONE; \
+UPDATE type::record($tb, $key) SET consecutive_failures = 0, last_status = 'success' \
+WHERE quarantined_at != NONE";
+
+/// Claim the next probe of a quarantined key: returns the row only when the
+/// quarantine's backoff has elapsed since the key's last write, and moves
+/// `updated_at` (a `VALUE time::now()` field) so the claim restarts the clock.
+///
+/// The row holds no timestamp of its own for this: every write that matters
+/// here already lands in `updated_at` (the quarantine stamp, a claimed probe, a
+/// failed probe's `+= 1`), so "time since the last of those" is exactly the
+/// interval the ladder is measured in, with nothing added to a SCHEMAFULL table
+/// a scheduler may run ahead of.
+///
+/// One statement, so the time check and the claim cannot interleave with a
+/// second engine: whoever's UPDATE matches owns the probe, and the other finds
+/// the clock already restarted.
+pub const CLAIM_KEY_PROBE: &str = "\
+UPDATE type::record($tb, $key) SET last_status = 'probe' \
+WHERE quarantined_at != NONE AND updated_at <= time::now() - <duration>$backoff";
 
 /// Stamp the moment the gate first suppressed this key. Guarded on the field
 /// being unset so re-suppressing every tick does not keep moving the timestamp,
@@ -150,16 +178,29 @@ UPDATE type::record($tb, $key) SET quarantined_at = NONE \
 WHERE quarantined_at != NONE RETURN BEFORE";
 
 /// Release a key by hand, the operator surface for a quarantine nobody wants to
-/// wait out. Same statement as the success path, for the same reason: forgetting
-/// the streak IS the release.
-pub const RELEASE_SCHEDULE_KEY: &str = NOTE_KEY_SUCCESS;
+/// wait out for its next probe. The success path's statement, for the same
+/// reason: forgetting the streak IS the release, and the zeroed row is what lets
+/// the gate close the incident when the key fires again. It leaves
+/// `last_status` alone, since nothing ran.
+///
+/// A literal id rather than binds: both callers (`spky schedules release` and
+/// the dashboard) run plain statement text.
+pub fn release_schedule_key(row: &crate::ids::Ref) -> String {
+    let rec = format!("{}:⟨{}⟩", row.table, row.key.replace('⟩', ""));
+    format!(
+        "DELETE {rec} WHERE quarantined_at = NONE; \
+         UPDATE {rec} SET consecutive_failures = 0 WHERE quarantined_at != NONE;"
+    )
+}
 
 /// Every currently quarantined key of one schedule, for `spky schedules get`
-/// and the dashboard. Served by `idx_skey_schedule`.
+/// and the dashboard. Served by `idx_skey_schedule`. A zero streak is a key
+/// that was released or recovered and has not fired since, so it is no longer
+/// being held back.
 pub const SELECT_QUARANTINED_KEYS: &str = "\
 SELECT key, consecutive_failures, type::string(quarantined_at) AS quarantined_at \
 FROM _00_schedule_key \
-WHERE schedule_name = $name AND quarantined_at != NONE";
+WHERE schedule_name = $name AND quarantined_at != NONE AND consecutive_failures > 0";
 
 // ---------------------------------------------------------------------------
 // Spawning

@@ -262,6 +262,12 @@ Past the budget the key stops firing. Each suppressed fire is recorded as a `ski
 carrying `{ code: "quarantine" }`, and the first one opens a `schedule_quarantined` incident
 naming the schedule and the key. Every other key of the same schedule is untouched.
 
+A quarantined key is not written off for good. An hour after it was quarantined, one fire
+goes through as a **probe**. A probe that fails waits twice as long for the next one (1h, 2h,
+4h, 8h, 16h, then every 24h). A probe that succeeds forgets the streak, and the key's next
+fire closes the incident. So a dead row costs at most one job a day, and a key whose upstream
+only had a bad quarter of an hour recovers without anyone having to notice it first.
+
 Only runs that **actually executed** move the counter. A `skipped` fire is evidence of
 nothing — under `concurrency: skip` most of the ticks of a failing key are suppressed, so
 counting those either way would defeat the mechanism. One success forgets the streak
@@ -277,15 +283,15 @@ entirely.
   takes effect on the next fire — which is what an operator releasing a stuck key expects.
 </Note>
 
-Release a key by hand once the underlying problem is fixed:
+Release a key by hand to skip the wait for its next probe, once the underlying problem is fixed:
 
 ```bash
 spky schedules release game-sync 'connection:CONN_abc123'
 ```
 
-Forgetting the streak **is** the release: the next fire goes through, and if the key is
-still broken it quarantines again. `spky schedules get <name>` lists the currently
-quarantined keys, as does the admin dashboard.
+Forgetting the streak **is** the release: the next fire goes through and closes the
+incident, and if the key is still broken it quarantines again. `spky schedules get <name>`
+lists the currently quarantined keys, as does the admin dashboard.
 
 ## Definitions in their own files
 
@@ -389,7 +395,7 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
   { name: 'forEach.query', type: 'string', default: '-', desc: 'SurrealQL SELECT run each fire; one job per row, passed as payload.row.' },
   { name: 'forEach.key', type: 'string', default: 'id', desc: 'Row field whose value keys the per-row concurrency check.' },
   { name: 'concurrency', type: 'skip | allow | replace', default: 'skip', desc: 'What a fire does when the previous run for that key is still going.' },
-  { name: 'quarantineAfter', type: 'number', default: '-', desc: 'Consecutive failures of ONE forEach key before it stops firing. Unset means never.' },
+  { name: 'quarantineAfter', type: 'number', default: '-', desc: 'Consecutive failures of ONE forEach key before it stops firing. It is then probed on a doubling backoff (1h up to 24h) and heals on the first probe that succeeds. Unset means never.' },
   { name: 'retry.max', type: 'integer', default: '3', desc: 'Retries per run, before the run counts as failed.' },
   { name: 'retry.strategy', type: 'linear | exponential', default: 'linear', desc: 'Backoff shape between retries.' },
   { name: 'timeout', type: 'duration', default: '(backend default)', desc: 'Per-job HTTP timeout. Honoured only when the backend sets deploy.timeoutOverridable.' },

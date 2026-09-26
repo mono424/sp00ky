@@ -193,7 +193,7 @@ pub const TOOLS: &[ToolDef] = &[
         path_params = &[req("name", "string", "Schedule name")]),
     tool!("schedule_trigger", "Fire a schedule once now (refused while paused or config-disabled).", "POST", "/schedules/{name}/trigger",
         path_params = &[req("name", "string", "Schedule name")]),
-    tool!("schedule_release", "Release one quarantined forEach key so the schedule fires it again. A key is quarantined after `quarantineAfter` consecutive failures; releasing forgets the streak, so the next fire goes through and the key quarantines again if it keeps failing. schedule_get lists the quarantined keys.", "POST", "/schedules/{name}/release",
+    tool!("schedule_release", "Release one quarantined forEach key so the schedule fires it again. A key is quarantined after `quarantineAfter` consecutive failures and then probed on a doubling backoff (1h up to 24h) that releases it on its own once a probe succeeds; releasing forgets the streak now, so the next fire goes through and the key quarantines again if it keeps failing. schedule_get lists the quarantined keys.", "POST", "/schedules/{name}/release",
         path_params = &[req("name", "string", "Schedule name")],
         body = &[req("key", "string", "The forEach key, exactly as schedule_get reports it")]),
     // ---- Machine pools ----

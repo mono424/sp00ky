@@ -223,7 +223,8 @@ pub async fn schedule_detail(
         &db,
         &format!(
             "SELECT key, consecutive_failures, type::string(quarantined_at) AS quarantined_at \
-             FROM _00_schedule_key WHERE schedule_name = '{}' AND quarantined_at != NONE;",
+             FROM _00_schedule_key WHERE schedule_name = '{}' AND quarantined_at != NONE \
+             AND consecutive_failures > 0;",
             esc(&name)
         ),
     )
@@ -637,7 +638,8 @@ pub async fn schedule_resume(
 ///
 /// Release one quarantined forEach key. Forgetting the failure streak IS the
 /// release: the gate derives quarantine from the count against the schedule's
-/// current budget, so a key with no row is simply a key that has not failed.
+/// current budget, so a key with a zero streak is simply a key that has not
+/// failed, and its next fire closes the incident.
 pub async fn schedule_release(
     State(state): State<AdminState>,
     Extension(session): Extension<CurrentSession>,
@@ -647,11 +649,7 @@ pub async fn schedule_release(
     let db = state.db().ok_or_else(db_unavailable)?;
     load_schedule(&db, &name).await?;
     let row = schedule_core::ids::schedule_key(&name, &body.key);
-    rows(
-        &db,
-        &format!("DELETE {}:⟨{}⟩;", row.table, row.key.replace('⟩', "")),
-    )
-    .await?;
+    rows(&db, &schedule_core::sql::release_schedule_key(&row)).await?;
     tracing::info!(
         schedule = %name, key = %body.key, by = %session.0.subject,
         "Schedule key released from the dashboard"

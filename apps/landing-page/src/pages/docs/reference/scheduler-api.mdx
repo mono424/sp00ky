@@ -781,7 +781,8 @@ are worth knowing because nothing else reports them: `backend_down` opens when a
 backend has failed its health check for longer than a minute and recovers when it
 answers again (its `component` is the backend name), and `schedule_quarantined`
 opens when a schedule's per-key failure budget stops firing one `forEach` key
-(its `component` is `schedule:<name>/<key>`). See
+(its `component` is `schedule:<name>/<key>`) and recovers when that key fires
+again, after a passing probe or a release. See
 [Failing keys](/docs/jobs/schedules#failing-keys).
 
 An incident carries `id`, `component`, `kind`, `severity`, `state`, `started_at`,

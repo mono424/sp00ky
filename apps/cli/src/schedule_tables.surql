@@ -435,10 +435,13 @@ DEFINE TABLE OVERWRITE _00_schedule_key SCHEMAFULL PERMISSIONS NONE;
 DEFINE FIELD OVERWRITE schedule_name ON TABLE _00_schedule_key TYPE string;
 DEFINE FIELD OVERWRITE key ON TABLE _00_schedule_key TYPE string DEFAULT '';
 DEFINE FIELD OVERWRITE consecutive_failures ON TABLE _00_schedule_key TYPE int DEFAULT 0;
--- 'success' | 'failed' — the last outcome that actually executed.
+-- 'success' | 'failed' — the last outcome that actually executed, or 'probe'
+-- while a quarantined key's probe fire is out. That write also restarts
+-- `updated_at`, which is the clock the probe backoff is measured on.
 DEFINE FIELD OVERWRITE last_status ON TABLE _00_schedule_key TYPE option<string>;
 -- Set when the gate first suppresses this key, cleared when it lets it through
--- again. It is not what makes a key quarantined (the count and the budget are);
+-- again under budget (after a passing probe or a release zeroed the count). It
+-- is not what makes a key quarantined (the count and the budget are);
 -- it is the record that an operator has already been told, so the incident
 -- opens and closes once rather than on every tick.
 DEFINE FIELD OVERWRITE quarantined_at ON TABLE _00_schedule_key TYPE option<datetime>;

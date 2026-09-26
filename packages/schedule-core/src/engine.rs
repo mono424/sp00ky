@@ -38,12 +38,40 @@ pub struct EngineConfig {
     pub fanout_max: usize,
     /// How long finished history is kept.
     pub history_max_age: Duration,
+    /// First wait before a quarantined key gets one probe fire. Each probe that
+    /// fails doubles it, up to [`Self::quarantine_probe_max`].
+    pub quarantine_probe_base: Duration,
+    /// Longest wait between probes: what one dead key costs at most, a job per
+    /// this interval, and how stale a recovered key can be at worst.
+    pub quarantine_probe_max: Duration,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { fanout_max: 10_000, history_max_age: Duration::days(30) }
+        Self {
+            fanout_max: 10_000,
+            history_max_age: Duration::days(30),
+            quarantine_probe_base: Duration::hours(1),
+            quarantine_probe_max: Duration::hours(24),
+        }
     }
+}
+
+/// How long a quarantined key waits before its next probe, given how many
+/// probes have already failed.
+///
+/// Why quarantine probes at all: a key past its budget used to stay quarantined
+/// until an operator released it, and nothing tells a key that is broken
+/// forever from one whose upstream had a bad quarter hour. whitepawn's
+/// `game-sync` quarantined two Chess.com accounts on a short run of 404s from
+/// Chess.com itself, and both stopped syncing for days while every account
+/// answered fine again. A doubling probe keeps what the budget is for, since a
+/// dead key costs one job per `max` instead of one per tick, and lets a
+/// recovered key heal itself.
+pub(crate) fn probe_backoff(cfg: &EngineConfig, failed_probes: i64) -> Duration {
+    // Clamped before the shift: past 2^20 the cap has long won anyway.
+    let factor = 1i32 << failed_probes.clamp(0, 20);
+    (cfg.quarantine_probe_base * factor).min(cfg.quarantine_probe_max)
 }
 
 /// Resolved retention policy for one prune pass.
@@ -495,8 +523,9 @@ impl ScheduleEngine {
                     Some(json!({
                         "code": "quarantine",
                         "reason": format!(
-                            "{failures} consecutive failures for this key; \
-                             release it or raise quarantineAfter to fire it again"
+                            "{failures} consecutive failures for this key; it is \
+                             probed on a backoff, or release it or raise \
+                             quarantineAfter to fire it now"
                         ),
                         "consecutive_failures": failures,
                     })),
@@ -651,6 +680,28 @@ impl ScheduleEngine {
                 // Guarded on the field being unset, so suppressing the key on
                 // every tick does not keep moving the timestamp.
                 let _ = self.db.query(sql::MARK_KEY_QUARANTINED, &binds).await;
+                return Ok(KeyGate::Quarantined { failures, announced });
+            }
+            // Probes that already failed are the streak past the budget: the
+            // first probe finds `failures == budget`, and each failed one adds
+            // one.
+            let backoff = probe_backoff(&self.cfg, failures - budget);
+            let mut claim = binds.to_vec();
+            claim.push(("backoff", json!(format!("{}ms", backoff.num_milliseconds()))));
+            // Best-effort like the mark above: a claim that errors leaves the
+            // key suppressed, which is where it already was.
+            let probe = self.db.query(sql::CLAIM_KEY_PROBE, &claim).await.ok().and_then(first_row);
+            if probe.is_some() {
+                // An ordinary fire from here on. Its outcome is folded like any
+                // other, so a success zeroes the streak and the next fire reports
+                // the recovery, and a failure moves the next probe further out.
+                tracing::info!(
+                    schedule = %spec.name,
+                    key,
+                    failures,
+                    "probing a quarantined key"
+                );
+                return Ok(KeyGate::Clear);
             }
             return Ok(KeyGate::Quarantined { failures, announced });
         }
@@ -1760,6 +1811,15 @@ pub(crate) fn build_job_content(
 mod tests {
     use super::*;
     use crate::cron::parse_datetime;
+
+    #[test]
+    fn quarantine_probes_double_up_to_the_cap() {
+        let cfg = EngineConfig::default();
+        let ladder: Vec<i64> = (0..7).map(|n| probe_backoff(&cfg, n).num_hours()).collect();
+        assert_eq!(ladder, [1, 2, 4, 8, 16, 24, 24]);
+        assert_eq!(probe_backoff(&cfg, i64::MAX), Duration::hours(24), "no overflow");
+        assert_eq!(probe_backoff(&cfg, -3), Duration::hours(1), "a raised budget reads as none");
+    }
 
     #[test]
     fn job_content_never_carries_status() {

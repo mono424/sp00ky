@@ -1400,7 +1400,7 @@ async fn a_fan_out_wider_than_the_cap_is_truncated_and_recorded() {
         engine: ScheduleEngine::new(
             Arc::new(MemDb(Arc::clone(&raw))),
             Arc::clone(&kill) as Arc<dyn JobKill>,
-            EngineConfig { fanout_max: 2, history_max_age: Duration::days(30) },
+            EngineConfig { fanout_max: 2, ..EngineConfig::default() },
         ),
         raw,
         kill,
@@ -3463,6 +3463,10 @@ async fn a_key_that_always_fails_stops_firing_while_the_others_carry_on() {
     h.rearm().await;
     let again = h.engine.tick_pass().await.unwrap();
     assert!(again.quarantined.is_empty(), "an operator is told once, not every 5s");
+    assert!(
+        h.job_for("connection:alice").await.is_none(),
+        "no probe before the first rung of the backoff"
+    );
 }
 
 #[tokio::test]
@@ -3501,8 +3505,10 @@ async fn releasing_a_key_lets_it_fire_again_and_says_so() {
     h.engine.tick_pass().await.unwrap();
     h.rearm().await;
 
-    // The operator release: forgetting the streak IS the release.
-    h.set("DELETE _00_schedule_key").await;
+    // The operator release: forgetting the streak IS the release. The same
+    // statement `spky schedules release` and the dashboard run.
+    let row = ids::schedule_key("game-sync", "connection:alice");
+    h.set(&crate::sql::release_schedule_key(&row)).await;
     let report = h.engine.tick_pass().await.unwrap();
     // Alice specifically: bob may still be held by `skip` from the tick above,
     // so the total says nothing about the key under test.
@@ -3510,11 +3516,93 @@ async fn releasing_a_key_lets_it_fire_again_and_says_so() {
         h.job_for("connection:alice").await.is_some(),
         "alice fires again after the release"
     );
+    // "And says so": the recovery is what closes the incident. A release that
+    // deleted the row left the gate nothing to report it from.
+    assert_eq!(
+        report.quarantined,
+        vec![crate::engine::KeyTransition {
+            schedule: "game-sync".into(),
+            key: "connection:alice".into(),
+            failures: 0,
+            suppressed: false,
+        }],
+        "the release is reported once, as a recovery"
+    );
+}
+
+/// The quarantine fan-out with every probe due at once, so a test can drive
+/// one without waiting out the real ladder.
+async fn probing_harness() -> Harness {
+    let mut h = quarantine_harness(Some(2)).await;
+    h.engine = ScheduleEngine::new(
+        Arc::new(MemDb(Arc::clone(&h.raw))),
+        Arc::clone(&h.kill) as Arc<dyn JobKill>,
+        EngineConfig { quarantine_probe_base: Duration::zero(), ..EngineConfig::default() },
+    );
+    h
+}
+
+#[tokio::test]
+async fn a_passing_probe_heals_a_quarantined_key_on_its_own() {
+    // whitepawn 2026-09-26: five Chess.com 404s in thirteen minutes quarantined
+    // an account that answered fine again right after, and nothing but an
+    // operator could bring it back.
+    let h = probing_harness().await;
+    h.cycle("failed").await;
+    h.cycle("failed").await;
+    let report = h.engine.tick_pass().await.unwrap();
+    assert!(report.quarantined.iter().any(|t| t.suppressed), "quarantined first");
+    assert!(h.job_for("connection:alice").await.is_none());
+    h.rearm().await;
+
+    // The probe is an ordinary fire.
+    h.engine.tick_pass().await.unwrap();
+    let probe = h.job_for("connection:alice").await.expect("the probe fires");
+    h.finish_job(&probe, "success", json!({})).await;
+    h.engine.tick_pass().await.unwrap();
+    assert_eq!(h.key_failures("connection:alice").await, 0, "the streak is forgotten");
+    h.rearm().await;
+
+    // The next fire closes the incident, and the success after it leaves no row.
+    let report = h.engine.tick_pass().await.unwrap();
     assert!(
-        report.quarantined.iter().all(|t| !t.suppressed),
-        "nothing is suppressed after a release: {:?}",
+        report.quarantined.iter().any(|t| t.key == "connection:alice" && !t.suppressed),
+        "the recovery is reported: {:?}",
         report.quarantined
     );
+    let job = h.job_for("connection:alice").await.expect("alice fires on cadence again");
+    h.finish_job(&job, "success", json!({})).await;
+    h.engine.tick_pass().await.unwrap();
+    assert_eq!(
+        h.count("SELECT VALUE count() FROM _00_schedule_key WHERE key = 'connection:alice' GROUP ALL")
+            .await,
+        0,
+        "a healthy key keeps no row"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_probe_stays_quarantined_without_a_second_incident() {
+    let h = probing_harness().await;
+    h.cycle("failed").await;
+    h.cycle("failed").await;
+    h.engine.tick_pass().await.unwrap();
+    h.rearm().await;
+
+    let report = h.cycle("failed").await;
+    assert!(report.quarantined.is_empty(), "no new incident and no recovery: {report:?}");
+    assert_eq!(
+        h.key_failures("connection:alice").await,
+        3,
+        "a failed probe counts, which is what moves the next one further out"
+    );
+    let still = h
+        .count(
+            "SELECT VALUE count() FROM _00_schedule_key \
+             WHERE key = 'connection:alice' AND quarantined_at != NONE GROUP ALL",
+        )
+        .await;
+    assert_eq!(still, 1, "still quarantined");
 }
 
 #[tokio::test]

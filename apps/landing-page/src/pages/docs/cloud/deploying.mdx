@@ -31,6 +31,10 @@ logLevel:
 export const codeLogLevelTargets = `# Tracing-style target=level directives also work
 logLevel: info,ssp=debug,scheduler=trace`;
 
+export const codeStorage = `deployment:
+  storage:
+    sizeGB: 100`;
+
 export const codeInfraEnv = `deployment:
   env:
     ssp:
@@ -127,6 +131,31 @@ You can also set the default SSP count in your `sp00ky.yml`:
   code={code1}
   lang="yaml"
 />
+
+## Bucket Storage
+
+Buckets with a `file:` backend keep their files on a volume of their own,
+mounted at `/buckets` in your SurrealDB container. Size it in `sp00ky.yml`:
+
+<CodeBlock
+  code={codeStorage}
+  lang="yaml"
+/>
+
+- **It is a real disk of that size.** When it is full, uploads fail; nothing
+  else on the host is affected. Raise `sizeGB` and redeploy (or push) to grow it
+  in place, without restarting the database.
+- **It only grows.** A deploy that asks for less than the volume already has is
+  refused with the current size. Removing the key keeps the volume as it is.
+- **The smallest volume is 10 GB.** Asking for less gets 10 GB, and you are
+  billed for what you asked for.
+- **Billing:** Starter includes 5 GB and Pro 20 GB. Above that, storage is
+  $0.10 per GB-month, prorated by the hour, on a separate invoice at the start
+  of each month. `spky cloud billing usage` (and the `billing_usage` MCP tool)
+  shows the month so far.
+
+See [File Buckets](/docs/client/buckets#persistent-storage) for defining a
+bucket on this volume.
 
 ## Infrastructure Environment Variables
 

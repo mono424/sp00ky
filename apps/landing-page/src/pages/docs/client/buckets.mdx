@@ -8,6 +8,15 @@ import CodeBlock from '../../../components/ui/CodeBlock.astro';
 import Experimental from '../../../components/ui/Experimental.astro';
 import Note from '../../../components/ui/Note.astro';
 
+export const codePersistentYml = `buckets:
+  - ./src/buckets/uploads.surql
+deployment:
+  storage:
+    sizeGB: 20`;
+
+export const codePersistentBucket = `DEFINE BUCKET IF NOT EXISTS uploads BACKEND "file:/buckets/uploads"
+  PERMISSIONS WHERE $auth.id != NONE;`;
+
 export const code10 = `DEFINE BUCKET IF NOT EXISTS profile_pictures BACKEND "memory"
   PERMISSIONS WHERE
     $action NOT IN ['put']
@@ -128,7 +137,7 @@ export const code1 = `// With path isolation enabled, uploading to "avatar.jpg"
 await upload('avatar.jpg', file);`;
 
 <Experimental>
-  File Buckets are experimental. The API may change in future releases. Currently only the **memory** backend is supported, so files are not persisted across server restarts.
+  File Buckets are experimental. The API may change in future releases. A bucket on the **memory** backend loses its files when SurrealDB restarts; use a [persistent](#persistent-storage) `file:` backend for anything you want to keep.
 </Experimental>
 
 Buckets provide a type-safe file storage abstraction for uploading, downloading, and managing files in your Sp00ky application. They integrate directly with your SurrealDB schema for permission control and with the Sp00ky CLI for guided setup.
@@ -178,6 +187,32 @@ Reference your bucket files in `sp00ky.yml`:
 />
 
 After adding or modifying a bucket, regenerate your types by running `spky` so the bucket names and config are available in your generated schema.
+
+## Persistent storage
+
+Set `deployment.storage.sizeGB` in `sp00ky.yml` and give the bucket a `file:`
+backend under `/buckets`:
+
+<CodeBlock
+  code={codePersistentYml}
+  lang="yaml"
+/>
+
+<CodeBlock
+  code={codePersistentBucket}
+  lang="sql"
+/>
+
+`spky bucket backend <name> persistent` rewrites an existing bucket's backend
+for you, and `spky` warns when a bucket's backend and the storage setting do not
+match.
+
+- **Locally**, `spky dev` mounts `.sp00ky/bucket_data/` at `/buckets`.
+- **On Sp00ky Cloud**, the files live on a volume of their own of `sizeGB`: a
+  hard cap that only affects this project, and that grows in place when you
+  raise the number. It cannot shrink. Starter includes 5 GB and Pro 20 GB, and
+  storage above that is billed per GB-month. See
+  [Deploying → Bucket Storage](/docs/cloud/deploying#bucket-storage).
 
 ## CLI: Adding a Bucket
 
@@ -305,6 +340,6 @@ await bucket.evict('old.png');  // drop locally, leave the remote file alone`}
 
 ## Current Limitations
 
-- **Memory backend only**: Files are stored in memory and not persisted across restarts. Additional storage backends (S3, filesystem, etc.) are planned.
+- **Memory or disk**: a bucket is either in memory (lost on restart) or on the project's [persistent volume](#persistent-storage). Object-store backends (S3 and the like) are planned.
 - **No streaming**: Files are uploaded and downloaded as complete blobs. No chunked upload or progress tracking yet.
 - **No transactions**: Bucket operations do not participate in database transactions.

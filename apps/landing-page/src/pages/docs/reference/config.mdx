@@ -47,7 +47,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `machines` | map | `{}` | Dedicated machines: one Hetzner VM of its own per always-on backend. See [Dedicated machines](#dedicated-machines). |
 | `schedules` | map \| path | `{}` | Server-side cron/interval jobs. See [Schedules](/docs/jobs/schedules). |
 | `workflows` | map \| path | `{}` | Server-side workflow DAGs. See [Workflows](/docs/jobs/workflows). |
-| `deployment` | object | (none) | Cloud deployment knobs: `sspCount`, `backup`, `env` (per-role infra environment variables). See [Cloud Deployment](/docs/cloud/deploying). |
+| `deployment` | object | (none) | Cloud deployment knobs: `sspCount`, `backup`, `env` (per-role infra environment variables), `storage.sizeGB` (the volume behind `file:` buckets; only grows). See [Cloud Deployment](/docs/cloud/deploying) and [Bucket storage](/docs/cloud/deploying#bucket-storage). |
 | `retention` | object | (see below) | How long finished jobs and run history are kept. See [Retention](#retention). |
 
 ## Apps

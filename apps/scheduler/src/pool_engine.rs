@@ -327,10 +327,14 @@ impl PoolHost {
                             .collect();
                         maintenance::set_pool_backing(&backends, &backings).await;
                         for t in &report.transitions {
-                            let summary = format!(
-                                "Pool '{}' stopped creating machines after {} failed boots: {}",
-                                t.pool, t.failures, t.detail
-                            );
+                            let summary = if t.open {
+                                format!(
+                                    "Pool '{}' stopped creating machines after {} failed boots: {}",
+                                    t.pool, t.failures, t.detail
+                                )
+                            } else {
+                                format!("Pool '{}' got a machine to ready again", t.pool)
+                            };
                             crate::admin::incidents::emit(
                                 &format!("pool:{}", t.pool),
                                 "pool_breaker_open",

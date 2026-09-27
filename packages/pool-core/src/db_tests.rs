@@ -252,6 +252,17 @@ impl Harness {
         self.engine.tick_pass().await.expect("tick")
     }
 
+    /// A second engine on the same database and provider: a restarted scheduler.
+    fn fresh_engine(&self) -> PoolEngine {
+        let mut providers: BTreeMap<String, Arc<dyn MachineProvider>> = BTreeMap::new();
+        providers.insert("docker".into(), self.cloud.clone());
+        PoolEngine::new(
+            Arc::new(MemDb(self.raw.clone())),
+            providers,
+            PoolEngineConfig::default(),
+        )
+    }
+
     async fn machines(&self, state: &str) -> Vec<String> {
         self.rows(&format!(
             "SELECT id, created_at FROM _00_machine WHERE state = '{state}' ORDER BY created_at ASC"
@@ -933,6 +944,37 @@ async fn machines_that_never_boot_open_the_breaker_and_a_good_boot_closes_it() {
         .remove(0);
     assert_eq!(pool["boot_failures"], 0);
     assert!(pool["breaker_until"].is_null());
+
+    // ...and the next pass says so, once: an incident must not stay open after
+    // its pool recovered (the pause running out alone was not a recovery).
+    let closed = h.tick().await.transitions;
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert!(!closed[0].open && closed[0].pool == "render");
+    assert!(h.tick().await.transitions.is_empty(), "reported once");
+}
+
+#[tokio::test]
+async fn a_tripped_pool_is_reported_again_by_a_fresh_engine_and_closed_when_deleted() {
+    let h = harness().await;
+    h.pool(json!({ "min": 0, "max": 5 })).await;
+    for n in 0..5 {
+        h.job(&format!("j{n}")).await;
+    }
+    h.cloud.fail_create.store(true, Ordering::SeqCst);
+    assert_eq!(h.tick().await.transitions.len(), 1);
+
+    // A restarted scheduler has a new engine and a history whose open incidents
+    // were interrupted: the breaker is still tripped, so it says so again, with
+    // the failure it read off the row.
+    let fresh = h.fresh_engine();
+    let again = fresh.tick_pass().await.unwrap().transitions;
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert!(again[0].open && again[0].detail.contains("create failed"));
+
+    h.sql("DELETE _00_pool:render").await;
+    let gone = fresh.tick_pass().await.unwrap().transitions;
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert!(!gone[0].open && gone[0].pool == "render");
 }
 
 #[tokio::test]

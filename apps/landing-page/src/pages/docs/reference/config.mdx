@@ -379,7 +379,7 @@ export const ymlPools = `mode: cluster
 pools:
   render:
     provider: hetzner                 # hetzner (Sp00ky Cloud) | docker (local, self-hosted)
-    machine: { type: cx33, locations: [fsn1, nbg1] }
+    machine: { type: cx33, fallbackTypes: [ccx23], locations: [fsn1, nbg1] }
     slots: 1                          # jobs per machine at once
     min: 0                            # machines that always run
     autoscale: true

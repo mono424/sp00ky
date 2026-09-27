@@ -4,7 +4,7 @@
 //! pools:
 //!   render:
 //!     provider: hetzner            # hetzner | docker (default: docker)
-//!     machine: { type: cpx32, locations: [fsn1, nbg1] }
+//!     machine: { type: cpx32, fallbackTypes: [cx33, ccx23], locations: [fsn1, nbg1] }
 //!     slots: 1                     # concurrent jobs per machine
 //!     min: 1                       # baseline that always runs
 //!     autoscale: true              # false = fixed size (= min), jobs queue
@@ -141,6 +141,17 @@ pub enum PoolRecycle {
 pub struct PoolMachineConfig {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub machine_type: Option<String>,
+    /// Tried in order after `type` when the cloud has none of it to give: no
+    /// capacity in any listed location, or the account at a limit that type
+    /// counts against (Hetzner caps shared and dedicated vCPUs separately, so a
+    /// `ccx` type still boots when the `cx`/`cpx` cores are used up). Only the
+    /// control plane reads it; the scheduler still asks for `type`.
+    #[serde(
+        default,
+        rename = "fallbackTypes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub fallback_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<String>,
 }
@@ -352,6 +363,23 @@ pub fn validate_all(config: &Sp00kyConfig) -> Result<()> {
             bail!("{label}: maxLifetime is shorter than maxJobDuration, so a job could never run to its limit");
         }
 
+        let machine = pool.machine.clone().unwrap_or_default();
+        if !machine.fallback_types.is_empty() {
+            if pool.provider.unwrap_or_default() != PoolProvider::Hetzner {
+                bail!("{label}: machine.fallbackTypes only applies to `provider: hetzner` (a docker pool has no machine types)");
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            seen.extend(machine.machine_type.as_deref());
+            for t in &machine.fallback_types {
+                if t.trim().is_empty() {
+                    bail!("{label}: machine.fallbackTypes has an empty entry");
+                }
+                if !seen.insert(t.as_str()) {
+                    bail!("{label}: machine type `{t}` is listed twice in type/fallbackTypes");
+                }
+            }
+        }
+
         // v1: one backend per pool. A machine runs exactly one backend image, so a
         // shared pool would need per-backend machines, which is a different feature.
         let users = backends_on(config, name);
@@ -390,6 +418,7 @@ pub fn cloud_pool_manifests(config: &Sp00kyConfig) -> Vec<Value> {
                 "name": name,
                 "provider": pool.provider.unwrap_or_default().as_str(),
                 "machine_type": machine.machine_type,
+                "fallback_machine_types": machine.fallback_types,
                 "locations": machine.locations,
                 "slots": pool.slots.unwrap_or(1),
                 "ceiling": ceiling,
@@ -787,6 +816,34 @@ apps:
             3,
             "a fixed pool's ceiling is its size"
         );
+    }
+
+    /// Fallback types go to the control plane only: the `_00_pool` row (and so
+    /// the spec hash that rolls machines) does not change when they do.
+    #[test]
+    fn fallback_types_reach_the_control_plane_not_the_row() {
+        let cfg = config(&format!(
+            "pools:\n  render:\n    provider: hetzner\n    machine: {{ type: cx33, fallbackTypes: [cpx32, ccx23] }}\n    \
+             autoscale: true\n    max: 2\n{APP}"
+        ));
+        validate_all(&cfg).unwrap();
+        assert_eq!(
+            cloud_pool_manifests(&cfg)[0]["fallback_machine_types"],
+            json!(["cpx32", "ccx23"])
+        );
+        let row = normalize_pool(&cfg, "render", None, &BTreeMap::new()).unwrap();
+        assert!(row.get("fallback_machine_types").is_none());
+
+        let err = |yaml: String| validate_all(&config(&yaml)).unwrap_err().to_string();
+        assert!(err(format!(
+            "pools:\n  render:\n    provider: hetzner\n    machine: {{ type: cx33, fallbackTypes: [ccx23, cx33] }}\n    \
+             autoscale: true\n    max: 2\n{APP}"
+        ))
+        .contains("listed twice"));
+        assert!(err(format!(
+            "pools:\n  render:\n    machine: {{ fallbackTypes: [ccx23] }}\n    autoscale: true\n    max: 2\n{APP}"
+        ))
+        .contains("provider: hetzner"));
     }
 
     #[test]

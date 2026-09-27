@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pool_protocol::{
     Command, HelloReply, JobRef, Outcome, PollReply, PollRequest, ResultReply, ResultRequest,
@@ -79,11 +79,17 @@ impl Default for PoolEngineConfig {
 
 /// A pool crossing the boot-failure breaker, either way. Reported, not logged:
 /// the host owns incidents.
+///
+/// `open` means the streak reached the threshold; it stays open through the
+/// breaker's pause and the half-open probe after it, and closes when a machine
+/// makes it to ready (which is what resets the streak). A pool that is deleted
+/// while open closes too, so an incident never outlives its pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolTransition {
     pub pool: String,
     pub open: bool,
     pub failures: i64,
+    /// The failure that opened it; empty on a close.
     pub detail: String,
 }
 
@@ -170,6 +176,11 @@ pub struct PoolEngine {
     providers: BTreeMap<String, Arc<dyn MachineProvider>>,
     cfg: PoolEngineConfig,
     passes: AtomicU64,
+    /// Pools this engine last reported as tripped. Only what has been SAID is
+    /// held here; whether a pool is tripped is read from its row every pass.
+    /// Empty after a restart, so a pool still tripped then is reported again,
+    /// which is right: the host's incidents do not survive a restart open.
+    tripped: Mutex<BTreeSet<String>>,
 }
 
 type Binds<'a> = Vec<(&'a str, Value)>;
@@ -185,6 +196,7 @@ impl PoolEngine {
             providers,
             cfg,
             passes: AtomicU64::new(0),
+            tripped: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -199,8 +211,12 @@ impl PoolEngine {
     pub async fn tick_pass(&self) -> anyhow::Result<TickReport> {
         let pass = self.passes.fetch_add(1, Ordering::Relaxed);
         let mut report = TickReport::default();
+        let mut seen = BTreeSet::new();
 
         for row in rows(self.db.query(sql::SELECT_POOLS, &[]).await?) {
+            if let Some(name) = row.get("name").and_then(Value::as_str) {
+                seen.insert(name.to_string());
+            }
             let spec = match PoolSpec::from_row(&row) {
                 Ok(spec) => spec,
                 Err(e) => {
@@ -223,6 +239,19 @@ impl PoolEngine {
                 report.pools.push(PoolObservation::failed(&spec, error));
             }
         }
+        // A pool deleted while tripped: nothing is failing any more.
+        self.tripped.lock().unwrap().retain(|pool| {
+            let keep = seen.contains(pool);
+            if !keep {
+                report.transitions.push(PoolTransition {
+                    pool: pool.clone(),
+                    open: false,
+                    failures: 0,
+                    detail: String::new(),
+                });
+            }
+            keep
+        });
 
         if pass.checked_rem(20) == Some(0) {
             let keep = [("keep", json!(self.cfg.machine_retention_secs))];
@@ -285,6 +314,7 @@ impl PoolEngine {
         let provider = self.providers.get(&spec.provider).cloned();
         let mut boot_failures = spec.boot_failures;
         let mut breaker_open = spec.breaker_open;
+        let mut last_failure: Option<String> = None;
         for m in machines.iter_mut() {
             let (from, reason): (&[&str], &str) = match m.state {
                 MachineState::Requested | MachineState::Booting if m.boot_overdue => (
@@ -302,9 +332,8 @@ impl PoolEngine {
             if matches!(m.state, MachineState::Requested | MachineState::Booting) {
                 report.boot_timeouts += 1;
                 boot_failures += 1;
-                breaker_open |= self
-                    .record_boot_failure(spec, boot_failures, reason, breaker_open, report)
-                    .await;
+                last_failure = Some(reason.to_string());
+                breaker_open |= self.record_boot_failure(spec, boot_failures, reason).await;
             } else {
                 report.lost += 1;
             }
@@ -417,15 +446,9 @@ impl PoolEngine {
                                 report.create_failed += 1;
                                 boot_failures += 1;
                                 let detail = format!("create failed: {e}");
-                                breaker_open |= self
-                                    .record_boot_failure(
-                                        spec,
-                                        boot_failures,
-                                        &detail,
-                                        breaker_open,
-                                        report,
-                                    )
-                                    .await;
+                                breaker_open |=
+                                    self.record_boot_failure(spec, boot_failures, &detail).await;
+                                last_failure = Some(detail);
                                 if breaker_open {
                                     break;
                                 }
@@ -523,7 +546,41 @@ impl PoolEngine {
             error: None,
         });
 
+        let detail = last_failure.or_else(|| spec.last_error.clone());
+        self.note_breaker(spec, boot_failures, detail, report);
         Ok(())
+    }
+
+    /// Report the pool crossing its breaker threshold, either way. Tripped is
+    /// read off the streak (`on_ready` is what resets it), not off
+    /// `breaker_until`: the pause running out only lets the next create try,
+    /// it is not evidence that anything recovered.
+    fn note_breaker(
+        &self,
+        spec: &PoolSpec,
+        failures: i64,
+        detail: Option<String>,
+        report: &mut TickReport,
+    ) {
+        let tripped = failures >= self.cfg.breaker_threshold;
+        let mut said = self.tripped.lock().unwrap();
+        let crossed = if tripped {
+            said.insert(spec.name.clone())
+        } else {
+            said.remove(&spec.name)
+        };
+        if crossed {
+            report.transitions.push(PoolTransition {
+                pool: spec.name.clone(),
+                open: tripped,
+                failures,
+                detail: if tripped {
+                    detail.unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            });
+        }
     }
 
     async fn live_machines(&self, spec: &PoolSpec) -> anyhow::Result<Vec<MachineRow>> {
@@ -783,14 +840,7 @@ impl PoolEngine {
 
     /// Count a failed boot and, past the threshold, open the breaker with an
     /// exponentially growing pause. Returns whether the breaker is open now.
-    async fn record_boot_failure(
-        &self,
-        spec: &PoolSpec,
-        failures: i64,
-        detail: &str,
-        already_open: bool,
-        report: &mut TickReport,
-    ) -> bool {
+    async fn record_boot_failure(&self, spec: &PoolSpec, failures: i64, detail: &str) -> bool {
         let over = failures - self.cfg.breaker_threshold;
         let until_secs = if over >= 0 {
             let doubled = self
@@ -810,16 +860,7 @@ impl PoolEngine {
         if let Err(e) = self.db.query(sql::RECORD_BOOT_FAILURE, &binds).await {
             tracing::warn!(pool = %spec.name, error = %e, "could not record a boot failure");
         }
-        let open = until_secs > 0;
-        if open && !already_open {
-            report.transitions.push(PoolTransition {
-                pool: spec.name.clone(),
-                open: true,
-                failures,
-                detail: detail.to_string(),
-            });
-        }
-        open
+        until_secs > 0
     }
 
     // -- agent entry points -----------------------------------------------------

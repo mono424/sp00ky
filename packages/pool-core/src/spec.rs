@@ -42,6 +42,8 @@ pub struct PoolSpec {
     pub boot_failures: i64,
     /// `breaker_until` is still in the future (computed by the SELECT).
     pub breaker_open: bool,
+    /// The failure the engine recorded last, if the streak has not been reset.
+    pub last_error: Option<String>,
 }
 
 fn str_field(row: &Value, key: &'static str) -> Result<String, SpecError> {
@@ -111,6 +113,10 @@ impl PoolSpec {
                 .get("breaker_open")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            last_error: row
+                .get("last_error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             name,
             target_table,
         })

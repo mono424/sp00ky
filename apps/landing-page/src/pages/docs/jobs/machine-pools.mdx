@@ -87,6 +87,7 @@ export const machineCode = `pools:
     provider: hetzner
     machine:
       type: cpx42                 # any Hetzner Cloud x86 server type
+      fallbackTypes: [cx43, ccx23]    # when cpx42 cannot be had anywhere
       locations: [fsn1, nbg1, hel1]   # tried in order; empty = Hetzner decides
     slots: 2                      # two jobs at once on each machine`;
 
@@ -173,6 +174,8 @@ A pool with `min: 0` and `buffer: 0` **scales to zero**: no machine runs until a
 `machine.type` is a [Hetzner Cloud server type](https://www.hetzner.com/cloud) name. It defaults to `cx33`. Use an x86 type (the CX, CPX and CCX lines): your backend image is built for `linux/amd64`, so the Arm types (CAX) cannot run it.
 
 `machine.locations` lists Hetzner locations (`fsn1`, `nbg1`, `hel1`, `ash`, `hil`, `sin`) in order of preference. A location that is out of capacity, or does not offer the server type, is skipped for the next one. Capacity in single locations does run out now and then, so list more than one. Leave it empty and Hetzner picks.
+
+`machine.fallbackTypes` lists server types to try, in order, when `type` cannot be had: no capacity for it in any of the locations, or the cloud account at a limit it counts against. Each fallback is tried across every location before the next one. Hetzner caps shared vCPUs (CX, CPX) and dedicated vCPUs (CCX) separately, so ending the list with a CCX type keeps machines booting when the shared cores run out. A fallback should be at least as big as `type`: your backend gets whichever one was created.
 
 `slots` is how many jobs one machine runs at the same time (default `1`). Your backend must be able to serve that many concurrent requests; the machine's cores are what they share.
 
@@ -329,6 +332,7 @@ The full list is in [Self-hosting → Machine pools](/docs/self-hosting#machine-
 <PropTable props={[
   { name: 'provider', type: 'hetzner | docker', default: 'docker', desc: 'Where machines come from. spky dev always uses docker.' },
   { name: 'machine.type', type: 'string', default: 'cx33', desc: 'Hetzner Cloud server type. x86 types only.' },
+  { name: 'machine.fallbackTypes', type: 'string[]', default: '[]', desc: 'Server types tried in order when type has no capacity or is over an account limit.' },
   { name: 'machine.locations', type: 'string[]', default: '[]', desc: 'Hetzner locations in order of preference. Empty lets Hetzner choose.' },
   { name: 'slots', type: 'integer', default: '1', desc: 'Jobs one machine runs at the same time.' },
   { name: 'min', type: 'integer', default: '0', desc: 'Machines that always run. The whole size of a fixed pool.' },

@@ -6,7 +6,7 @@
 <ol>
 <li><strong>Validates</strong> your <code>sp00ky.yml</code> configuration</li>
 <li><strong>Builds</strong> Docker images for each app (linux/amd64)</li>
-<li><strong>Uploads</strong> images to Sp00ky Cloud (skips unchanged images)</li>
+<li><strong>Pushes</strong> images to your team’s private build registry on Sp00ky Cloud: only the layers it does not have yet, so an unchanged image costs seconds. Apps on a <a href="/docs/jobs/machine-pools">machine pool</a> or a <a href="/docs/cloud/dedicated-machines">dedicated machine</a> upload an image archive instead, which their machines download.</li>
 <li><strong>Provisions</strong> infrastructure (SurrealDB, Scheduler, SSP instances)</li>
 <li><strong>Runs migrations</strong> against the cloud database</li>
 <li><strong>Deploys</strong> your backend and frontend containers</li>

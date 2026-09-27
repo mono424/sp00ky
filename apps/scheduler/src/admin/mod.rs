@@ -348,6 +348,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/scheduler/restart", post(actions::scheduler_restart))
         .route("/cloud/restart", post(actions::cloud_restart))
         .route("/cloud/deployment", get(actions::cloud_deployment))
+        .route("/cloud/stats", get(actions::cloud_stats))
         .route("/backups", get(backups::list).post(backups::create))
         .route("/backups/config", put(backups::configure))
         .route("/backups/:id", delete(backups::delete))

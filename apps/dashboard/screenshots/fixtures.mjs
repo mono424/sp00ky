@@ -356,6 +356,7 @@ export const OVERVIEW = {
   presence: PRESENCE,
   jobs: JOB_TOTALS,
   incidents: INCIDENT_SUMMARY,
+  cloud_linked: true,
 };
 
 export const CONFIG = {
@@ -991,6 +992,53 @@ export const MCP_TOOLS_RESULT = {
  * A path not listed here is reported by `capture.mjs` rather than silently
  * 404ing, so a screen that grows a request cannot quietly lose its data.
  */
+/** Resources (`GET /cloud/stats`): the acme stack as Sp00ky Cloud measures it. */
+const statSeries = (base, swing, n = 60) => {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(Math.round((base + swing * Math.sin(i / 5) + (i % 7) * swing * 0.08) * 10) / 10);
+  return out;
+};
+const memSeries = (mb, swing, n = 60) =>
+  statSeries(mb, swing, n).map((v) => Math.round(v * 1024 * 1024));
+const service = (id, name, role, vcpus, memoryMb, cpu, cpuSwing, memMb, extra = {}) => {
+  const cpuS = statSeries(cpu, cpuSwing);
+  const memS = memSeries(memMb, memMb * 0.04);
+  return {
+    id, name, role, status: 'running', vcpus, memory_mb: memoryMb, since: iso(3 * 86_400_000 + id.length * 3_600_000),
+    sample: {
+      ts: iso(9_000), cpu_pct: cpuS[cpuS.length - 1], mem_bytes: memS[memS.length - 1], mem_limit_bytes: memoryMb * 1024 * 1024,
+      disk_read_bps: 0, disk_write_bps: 18_000, net_rx_bps: Math.round(cpu * 2_400), net_tx_bps: Math.round(cpu * 5_100),
+    },
+    cpu_series: cpuS, mem_series: memS, ...extra,
+  };
+};
+const CLOUD_STATS = {
+  deployment: { id: 'dep_7f2c', version: 142, status: 'running', deployed_at: iso(2 * 3_600_000) },
+  services: [
+    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740),
+    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210),
+    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380),
+    service('vm-api', 'api', 'backend', 1, 512, 6, 3, 212, { image: 'acme/api' }),
+    service('vm-mail', 'email', 'backend', 1, 512, 1.2, 0.6, 64, { image: 'acme/email' }),
+    service('vm-render', 'renderer', 'backend', 1, 64, 0.4, 0.2, 9, { image: 'nginx:1.27-alpine', machine: 'media' }),
+    service('vm-web', 'web', 'frontend', 1, 512, 0.3, 0.2, 18, { image: 'acme/web' }),
+  ],
+  metrics_available: true,
+  machines: [
+    { id: 'm1', name: 'media', backend: 'renderer', generation: 3, status: 'running', phase: 'serving', ip: '116.203.20.41',
+      server_type: 'cx33', location: 'fsn1', serving: true, healthy_at: iso(26 * 3_600_000), created_at: iso(26 * 3_600_000) },
+  ],
+  pool_machines: [
+    { pool: 'thumbs', machine_id: 'thumbs-4k2p', status: 'running', server_type: 'cx23', location: 'nbg1', created_at: iso(14 * 60_000) },
+  ],
+  bucket_volume: {
+    size_gb: 100,
+    provisioned_gb: 100,
+    usage: { fs_bytes: 105_089_261_568, used_bytes: 31_457_280_000, free_bytes: 73_631_981_568, measured_at: iso(3 * 60_000) },
+  },
+  server_time: new Date(NOW).toISOString(),
+};
+
 export const ROUTES = {
   'GET /config': CONFIG,
   'GET /me': ME,
@@ -1001,5 +1049,6 @@ export const ROUTES = {
   'GET /backends': { backends: BACKENDS, check_interval_secs: 10 },
   'GET /incidents': INCIDENT_LIST,
   'GET /backups': BACKUPS,
+  'GET /cloud/stats': CLOUD_STATS,
   'POST /mcp': MCP_TOOLS_RESULT,
 };

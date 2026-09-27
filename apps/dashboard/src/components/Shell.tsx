@@ -23,6 +23,7 @@ const NAV_PATHS: Record<string, string> = {
   '/incidents': 'M12 3 2 21h20L12 3z M12 9v5 M12 17v1',
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
   '/access': 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3',
+  '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
 };
 
 function NavIcon(props: { href: string }) {
@@ -100,6 +101,10 @@ export function Shell(props: {
         : undefined,
     },
     { href: '/backups', label: 'Backups' },
+    // Sp00ky Cloud only: the scheduler cannot measure its neighbours or the
+    // database's volume, the control plane can. Hidden, not disabled, when
+    // unlinked: there is nothing on that page a self-hosted cluster could use.
+    ...(props.overview?.cloud_linked ? [{ href: '/resources', label: 'Resources' }] : []),
     { href: '/incidents', label: 'Incidents' },
     { href: '/logs', label: 'Logs' },
     { href: '/access', label: 'Access' },

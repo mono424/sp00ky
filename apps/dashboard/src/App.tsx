@@ -26,6 +26,7 @@ import { Logs } from './routes/Logs';
 import { ViewDetail, Views } from './routes/Views';
 import { Incidents, IncidentDetail } from './routes/Incidents';
 import { Access } from './routes/Access';
+import { Resources } from './routes/Resources';
 
 /** How often the overview is refreshed. Fast enough to feel live, slow enough
  *  that a wall display is not a load source. */
@@ -195,6 +196,7 @@ export function App() {
                 <Route path="/views" component={Views} />
                 <Route path="/views/:key" component={ViewDetail} />
                 <Route path="/logs" component={() => <Logs overview={overview()} />} />
+                <Route path="/resources" component={Resources} />
                 <Route path="/incidents" component={Incidents} />
                 <Route path="/incidents/:id" component={IncidentDetail} />
                 <Route path="/access" component={Access} />

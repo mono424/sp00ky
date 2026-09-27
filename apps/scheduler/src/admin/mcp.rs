@@ -238,6 +238,7 @@ pub const TOOLS: &[ToolDef] = &[
     tool!("scheduler_restart", "Restart the scheduler process ('restart', the supervisor relaunches it), or repair its replica in place ('reclone' refetches everything from upstream, 'rehash' recomputes snapshot hashes).", "POST", "/scheduler/restart",
         body = &[choice(p("mode", "string", "restart (default), reclone or rehash"), SCHED_MODES)], destructive = true),
     tool!("cloud_deployment", "The deployment as Sp00ky Cloud sees it (needs the cloud link).", "GET", "/cloud/deployment", read_only = true),
+    tool!("cloud_stats", "Live resources as Sp00ky Cloud measures them (needs the cloud link): every service's CPU, memory and network with the last 15 minutes of CPU and memory, dedicated and pool machines, and the bucket volume's size, used and free bytes.", "GET", "/cloud/stats", read_only = true),
     tool!("cloud_restart", "Ask Sp00ky Cloud to recreate containers: optionally pull newer images (upgrade), wipe the scheduler volume (clean) or bounce SurrealDB (surreal). Needs the cloud link.", "POST", "/cloud/restart",
         body = &[
             p("roles", "array", "Roles to restart: scheduler, ssp, surrealdb, backend, frontend (default scheduler + ssp)"),

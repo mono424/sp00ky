@@ -209,6 +209,8 @@ export interface BackendDetail extends BackendSummary {
 }
 
 export interface Overview {
+  /** Whether this scheduler can reach Sp00ky Cloud; gates the Resources page. */
+  cloud_linked?: boolean;
   incidents?: IncidentSummary;
   scheduler: SchedulerEntity | null;
   ssps: SspEntity[];
@@ -896,4 +898,90 @@ export interface IncidentSummary {
   retention_days: number;
   storage_error: string | null;
   server_time_ms?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sp00ky Cloud resources (`GET /cloud/stats`)                          */
+/* ------------------------------------------------------------------ */
+
+/** One resource sample of a container, from the control plane's collector. */
+export interface ResourceSample {
+  ts: string;
+  /** 100 = one full core. */
+  cpu_pct: number;
+  mem_bytes: number;
+  mem_limit_bytes?: number;
+  disk_read_bps: number;
+  disk_write_bps: number;
+  net_rx_bps: number;
+  net_tx_bps: number;
+}
+
+export interface CloudService {
+  id: string;
+  name: string;
+  role: 'surrealdb' | 'scheduler' | 'ssp' | 'backend' | 'frontend' | string;
+  status: string;
+  image?: string;
+  /** A backend on a dedicated machine: the container here only forwards to it. */
+  machine?: string;
+  vcpus: number;
+  memory_mb: number;
+  since: string;
+  /** Newest sample; null when there is none from the last minute and a half. */
+  sample: ResourceSample | null;
+  /** The last 15 minutes, one point per 15 s, oldest first. */
+  cpu_series: number[];
+  mem_series: number[];
+}
+
+export interface CloudDedicatedMachine {
+  id: string;
+  name: string;
+  backend?: string;
+  generation: number;
+  status: string;
+  phase?: string;
+  ip?: string;
+  server_type: string;
+  location?: string;
+  serving: boolean;
+  healthy_at?: string | null;
+  last_error?: string;
+  created_at: string;
+}
+
+export interface CloudPoolMachine {
+  pool: string;
+  machine_id: string;
+  status: string;
+  server_type: string;
+  location?: string;
+  created_at: string;
+}
+
+export interface CloudBucketVolume {
+  /** What `deployment.storage.sizeGB` asks for (and is billed). */
+  size_gb: number;
+  /** What exists at the provider, never below its 10 GB minimum. */
+  provisioned_gb: number;
+  /** Null until the first measurement (every 5 minutes). */
+  usage: {
+    fs_bytes: number;
+    used_bytes: number;
+    free_bytes: number;
+    measured_at: string;
+  } | null;
+}
+
+export interface CloudStats {
+  deployment: { id: string; version: number; status: string; deployed_at: string | null } | null;
+  services: CloudService[];
+  /** False when the control plane has no metrics backend (or it failed). */
+  metrics_available: boolean;
+  machines: CloudDedicatedMachine[];
+  pool_machines: CloudPoolMachine[];
+  /** Null when the project has no bucket volume (`deployment.storage` unset). */
+  bucket_volume: CloudBucketVolume | null;
+  server_time: string;
 }

@@ -99,6 +99,12 @@ const SHOTS = [
     caption: 'The backup catalog, its schedule, and restoring from a snapshot.',
   },
   {
+    name: 'resources',
+    route: '/resources',
+    height: 900,
+    caption: 'Sp00ky Cloud only: every service, machine and the bucket volume, with live CPU, memory and free space.',
+  },
+  {
     name: 'logs',
     route: '/logs',
     height: 620,

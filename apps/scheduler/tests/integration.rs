@@ -3772,6 +3772,51 @@ mod admin_plane {
     }
 
     #[tokio::test]
+    async fn cloud_stats_relays_the_control_planes_snapshot() {
+        // Unlinked: the Resources page has nothing to ask, and says so.
+        let h = TestHarness::new().await;
+        let unlinked = admin_app(&h, Some("pw"));
+        let token = breakglass_token(&unlinked, "pw").await;
+        let res = unlinked.oneshot(get_auth("/admin/api/cloud/stats", &token)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fake = Router::new().route(
+            "/v1/internal/projects/test-project/stats",
+            axum::routing::get(|req: Request<axum::body::Body>| async move {
+                let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                if auth != "Bearer cluster-secret" {
+                    return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": "invalid project credentials" })));
+                }
+                (StatusCode::OK, axum::Json(json!({
+                    "deployment": { "id": "d1", "version": 7, "status": "running" },
+                    "services": [{
+                        "id": "v1", "name": "surrealdb", "role": "surrealdb", "status": "running",
+                        "vcpus": 3, "memory_mb": 3072,
+                        "sample": { "ts": "2026-09-27T01:00:00Z", "cpu_pct": 42.5, "mem_bytes": 1073741824 },
+                        "cpu_series": [40.0, 42.5], "mem_series": [1000, 1073741824]
+                    }],
+                    "metrics_available": true,
+                    "machines": [], "pool_machines": [],
+                    "bucket_volume": { "size_gb": 100, "provisioned_gb": 100,
+                        "usage": { "fs_bytes": 105089261568i64, "used_bytes": 220000000, "free_bytes": 104869261568i64, "measured_at": "2026-09-27T01:00:00Z" } }
+                })))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+
+        let app = admin_app_with(&h, Some("pw"), Some(&format!("http://{addr}")), None);
+        let token = breakglass_token(&app, "pw").await;
+        let res = app.oneshot(get_auth("/admin/api/cloud/stats", &token)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["services"][0]["sample"]["cpu_pct"], 42.5);
+        assert_eq!(body["bucket_volume"]["usage"]["free_bytes"], 104869261568i64);
+        assert_eq!(body["bucket_volume"]["size_gb"], 100);
+    }
+
+    #[tokio::test]
     async fn backups_list_works_unlinked_and_says_what_is_missing() {
         let h = TestHarness::new().await;
         let app = admin_app(&h, Some("pw"));

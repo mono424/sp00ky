@@ -307,6 +307,17 @@ than hidden.
 Backends have no log stream: the scheduler reaches them with HTTP health checks
 and has no access to their output.
 
+**Resources** (Sp00ky Cloud only) — what the deployment runs on, as the
+control plane measures it: every container with its CPU, memory (against its
+limit) and network, with the last 15 minutes of CPU and memory as sparklines;
+the [dedicated machines](/docs/cloud/dedicated-machines) and machine pool VMs;
+and the [bucket volume](/docs/cloud/deploying#bucket-storage) with how much of
+it is used and free. The scheduler cannot see its neighbours' containers or the
+database's volume, so all of it comes from Sp00ky Cloud through the
+[cloud link](#configuration): container samples every 15 seconds, the volume
+every 5 minutes. The page is not in the navigation of a scheduler that is not
+linked.
+
 ## Actions
 
 Everything the dashboard can _do_, as opposed to show, goes through the
@@ -627,6 +638,7 @@ and port with no path lands on the dashboard.
 | `POST /admin/api/scheduler/restart`         | `{mode: "restart" \| "reclone" \| "rehash"}`                                                                                                                                                                                                                         |
 | `POST /admin/api/cloud/restart`             | `{roles, upgrade, clean, surreal}`, forwarded to Sp00ky Cloud. `409` when unlinked                                                                                                                                                                                   |
 | `GET /admin/api/cloud/deployment`           | The deployment as Sp00ky Cloud sees it. `409` when unlinked                                                                                                                                                                                                          |
+| `GET /admin/api/cloud/stats`                | The Resources page: `services` (status, allocation, newest `sample`, `cpu_series`, `mem_series`), `machines`, `pool_machines`, `bucket_volume` (`size_gb`, `usage.fs_bytes/used_bytes/free_bytes`). `409` when unlinked                                                |
 | `GET /admin/api/backups`                    | Catalog, local registry, restores, schedule config, storage status                                                                                                                                                                                                   |
 | `POST /admin/api/backups`                   | `{name}`. `202` with the operation and `backup_id`. `503` without S3 storage                                                                                                                                                                                         |
 | `PUT /admin/api/backups/config`             | `{enabled, schedule, retention}`. `409` when unlinked                                                                                                                                                                                                                |

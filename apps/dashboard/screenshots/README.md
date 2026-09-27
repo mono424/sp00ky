@@ -24,6 +24,16 @@ delivered in one go.
 Shapes mirror `src/api/types.ts`. A screen rendering a dash, an empty section or
 `NaN` means this file and the types have drifted, and the types are right.
 
+## `serve.mjs`
+
+The same stand-in cluster for a browser, without Playwright: serves `dist/` at
+`/admin/` and answers `/admin/api/*` from `fixtures.mjs`, signed in with the
+fixture token. `.claude/launch.json` runs it as `dashboard-fixtures`.
+
+```bash
+pnpm --filter @spooky-sync/dashboard build && node apps/dashboard/screenshots/serve.mjs
+```
+
 ## `capture.mjs`
 
 The dashboard reaches its scheduler through exactly one place (`src/api/client.ts`:

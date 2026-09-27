@@ -109,3 +109,31 @@ export function stepTone(status: string | undefined): Tone {
       return 'idle';
   }
 }
+
+/** A Sp00ky Cloud container (`vms.status`) or machine (`pool_machines.status`). */
+export function containerTone(status: string | undefined): Tone {
+  switch (status) {
+    case 'running':
+      return 'ok';
+    case 'pending':
+    case 'starting':
+    case 'creating':
+    case 'destroying':
+      return 'warn';
+    case 'failed':
+      return 'bad';
+    default:
+      return 'idle';
+  }
+}
+
+/**
+ * How full a disk is. A volume filling up is a warning well before it is a
+ * fault: at 90% a burst of uploads can take the rest.
+ */
+export function fillTone(fraction: number | null | undefined): Tone {
+  if (fraction === null || fraction === undefined || !Number.isFinite(fraction)) return 'idle';
+  if (fraction >= 0.9) return 'bad';
+  if (fraction >= 0.75) return 'warn';
+  return 'ok';
+}

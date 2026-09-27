@@ -317,10 +317,10 @@ with an operation, and `operations_list` is how the agent watches it finish.
 - **Workflows**: `workflow_runs_list`, `workflow_run_get`, `workflow_run_cancel`, `workflow_run_rerun`, `workflow_run_retry`, `schedules_list`, `schedule_get`, `schedule_pause`, `schedule_resume`, `schedule_trigger`, `schedule_release`
 - **Pools**: `pools_list` (every [machine pool](/docs/jobs/machine-pools) with its sizing, pause and breaker state, machines by state and the jobs waiting for one), `pool_machines` (one pool's machines, newest first, with why each one was taken away), `pool_pause`, `pool_resume`, `machine_drain`
 - **Jobs**: `jobs_list` (every outbox job with the queue totals; `origin=schedule|workflow|app` separates a schedule's fires from a workflow's steps and from jobs your own code created), `job_get` (one job with every attempt in `errors` and the fire or step it came from), `job_kill`, `job_retry`, **`jobs_clear`**
-- **Restart**: `ssp_restart` (`restart`, `clean` or `reload`), `ssps_restart_all` (rolling by default), **`scheduler_restart`** (`restart`, `reclone` or `rehash`), `cloud_deployment`, **`cloud_restart`** (`upgrade`, `clean`, `surreal`)
+- **Restart**: `ssp_restart` (`restart`, `clean` or `reload`), `ssps_restart_all` (rolling by default), **`scheduler_restart`** (`restart`, `reclone` or `rehash`), `cloud_deployment`, `cloud_stats` (every service's CPU, memory and network, the machines, and the bucket volume's free space), **`cloud_restart`** (`upgrade`, `clean`, `surreal`)
 - **Backups**: `backups_list`, `backup_create`, **`backup_restore`**, `backup_restore_status`, **`backup_delete`**, `backups_configure`
 
-On a scheduler that is not linked to Sp00ky Cloud, `cloud_deployment`, `cloud_restart`,
+On a scheduler that is not linked to Sp00ky Cloud, `cloud_deployment`, `cloud_stats`, `cloud_restart`,
 `backup_delete` and `backups_configure` are refused with `Not linked to Sp00ky Cloud`; the
 server's `initialize` instructions say so up front.
 

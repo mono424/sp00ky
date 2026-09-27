@@ -536,6 +536,18 @@ pub async fn cloud_deployment(State(state): State<AdminState>) -> Result<Json<Va
     Ok(Json(crate::metrics::mask_cloud_secrets(link.get("/deployment").await?)))
 }
 
+/// `GET /admin/api/cloud/stats`: the Resources page. Every service's CPU,
+/// memory and network with the last 15 minutes of CPU and memory, the
+/// dedicated and pool machines, and how full the bucket volume is, as Sp00ky
+/// Cloud measures them (this process cannot see its neighbours' containers or
+/// the database's volume). The control plane builds this answer without
+/// credentials or container env; it is masked anyway, like every cloud answer
+/// that is also an MCP tool.
+pub async fn cloud_stats(State(state): State<AdminState>) -> Result<Json<Value>, ApiError> {
+    let link = state.cloud.as_ref().ok_or_else(not_linked)?;
+    Ok(Json(crate::metrics::mask_cloud_secrets(link.get("/stats").await?)))
+}
+
 /// `GET /admin/api/operations`
 pub async fn list_operations(State(state): State<AdminState>) -> Json<Value> {
     Json(state.ops.snapshot())

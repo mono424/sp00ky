@@ -13,10 +13,19 @@
 //!
 //! A `CHANGEFEED` clause on a table makes SurrealDB write the change into the
 //! same transaction's commit, so `SHOW CHANGES FOR DATABASE SINCE <vs>` is
-//! post-commit only, ordered by commit versionstamp, durable and resumable.
+//! post-commit only, ordered by versionstamp, durable and resumable.
 //! Verified on 3.1.5: cancelled and failed transactions never appear, a
-//! versionstamp is `(commit_unix_ms << 16) | counter` assigned AT commit, and
-//! `SINCE` is inclusive.
+//! versionstamp is `(unix_ms << 16) | counter`, and `SINCE` is inclusive.
+//!
+//! The feed is ordered by versionstamp, but it does not BECOME VISIBLE in that
+//! order. `Transaction::commit` (3.1.5 `kvs/tx.rs`) takes the stamp in
+//! `store_changes` and only then commits the storage transaction, which for a
+//! big write takes a while. A small transaction that starts committing later
+//! gets a later stamp and can be visible first; a tail that moved its cursor
+//! past it never reads the big one. whitepawn lost whole 200-game imports that
+//! way (2026-09-24 and 2026-09-27; drift repair put them back ten minutes
+//! later). The tail's look-back sweep ([`TailerConfig::lookback_ms`]) re-reads
+//! the last few seconds below the cursor and delivers what it had not seen.
 //!
 //! This module is the host-independent half: parsing, cursor arithmetic, gap
 //! detection and the tail loop over two small traits. The scheduler and the
@@ -55,6 +64,18 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
 /// How far past `poll_limit` the tail widens a poll that one transaction
 /// filled on its own.
 const MAX_POLL_LIMIT_FACTOR: usize = 64;
+
+/// SurrealDB clamps a `SHOW CHANGES` `LIMIT` to this (3.1.5 `cf/reader.rs`).
+/// A larger limit comes back with at most this many keys, which `is_full`
+/// would read as the end of the feed, so no poll ever asks for more.
+pub const MAX_SHOW_CHANGES_LIMIT: usize = 1000;
+
+/// The widest poll the tail makes for `poll_limit`.
+fn widest_limit(poll_limit: usize) -> usize {
+    poll_limit
+        .saturating_mul(MAX_POLL_LIMIT_FACTOR)
+        .min(MAX_SHOW_CHANGES_LIMIT)
+}
 
 /// Low 16 bits of a versionstamp are a per-millisecond counter.
 const STAMP_SHIFT: u32 = 16;
@@ -414,6 +435,14 @@ pub struct TailerConfig {
     pub gap_margin_ms: u64,
     /// No successful poll for this long is reported as a stall.
     pub stall_after: Duration,
+    /// How far below the cursor the look-back sweep re-reads, in ms of
+    /// versionstamp time. A transaction that becomes visible later than this
+    /// after its stamp is left to drift repair. 0 turns the sweep off.
+    pub lookback_ms: u64,
+    /// Least time between two look-back sweeps. A sweep only runs while the
+    /// tail delivered something inside the window (nothing delivered, nothing
+    /// jumped over), so an idle feed costs no reads.
+    pub lookback_every: Duration,
 }
 
 impl Default for TailerConfig {
@@ -427,6 +456,8 @@ impl Default for TailerConfig {
             retention_ms: 24 * 3_600_000,
             gap_margin_ms: 5 * 60_000,
             stall_after: Duration::from_secs(60),
+            lookback_ms: 10_000,
+            lookback_every: Duration::from_millis(2_500),
         }
     }
 }
@@ -452,6 +483,13 @@ pub struct TailerStats {
     pub stalled: AtomicBool,
     pub doorbell_connected: AtomicBool,
     pub doorbell_reconnects: AtomicU64,
+    /// Transactions the look-back sweep found below the cursor, their
+    /// records, and how late the last one was (ms between its stamp and the
+    /// sweep that found it).
+    pub late_entries_total: AtomicU64,
+    pub late_records_total: AtomicU64,
+    pub last_late_ms: AtomicU64,
+    pub lookback_polls: AtomicU64,
     /// Local time at which the last poll that drained the feed dry STARTED:
     /// every change committed before it has been delivered. See
     /// [`TailerStats::caught_up_ms`].
@@ -573,6 +611,10 @@ impl TailerStats {
             "stalled": self.stalled.load(Ordering::Relaxed),
             "doorbell": if self.doorbell_connected.load(Ordering::Relaxed) { "connected" } else { "reconnecting" },
             "doorbell_reconnects": self.doorbell_reconnects.load(Ordering::Relaxed),
+            "late_entries_total": self.late_entries_total.load(Ordering::Relaxed),
+            "late_records_total": self.late_records_total.load(Ordering::Relaxed),
+            "last_late_ms": self.last_late_ms.load(Ordering::Relaxed),
+            "lookback_polls": self.lookback_polls.load(Ordering::Relaxed),
             "last_error": self.last_error.lock().ok().and_then(|e| e.clone()),
         })
     }
@@ -638,6 +680,10 @@ pub async fn run_tailer(
         "Changefeed tail started"
     );
     let mut stall_reported = false;
+    // Versionstamps delivered inside the look-back window, and the cursor
+    // generation they belong to.
+    let mut seen = Seen::default();
+    let mut last_sweep = std::time::Instant::now();
     loop {
         let wait = if stats.doorbell_connected.load(Ordering::Relaxed) {
             cfg.fallback
@@ -665,7 +711,7 @@ pub async fn run_tailer(
         }
 
         // Drain: keep polling while a poll comes back full.
-        let mut limit = cfg.poll_limit;
+        let mut limit = cfg.poll_limit.min(MAX_SHOW_CHANGES_LIMIT);
         loop {
             let generation = stats.generation();
             let since = stats.cursor();
@@ -704,9 +750,12 @@ pub async fn run_tailer(
             // only one, it alone filled the limit, so read it again with room.
             let full = batch.is_full(limit);
             if full && !batch.hold_back_last() {
-                if limit < cfg.poll_limit.saturating_mul(MAX_POLL_LIMIT_FACTOR) {
-                    limit = limit.saturating_mul(2);
-                    debug!(limit, "One transaction filled the poll; re-reading it with a larger limit");
+                if limit < widest_limit(cfg.poll_limit) {
+                    limit = limit.saturating_mul(2).min(widest_limit(cfg.poll_limit));
+                    debug!(
+                        limit,
+                        "One transaction filled the poll; re-reading it with a larger limit"
+                    );
                     continue;
                 }
                 warn!(
@@ -754,6 +803,7 @@ pub async fn run_tailer(
                     stats.raise_cursor_in(generation, last_vs + 1);
                     last_vs = record.versionstamp;
                 }
+                seen.insert(generation, record.versionstamp);
                 let mut record = record;
                 if record.op == ChangeOp::Delete && record.record.is_none() {
                     record.record = sink.before_image(&record.table, &record.id).await;
@@ -793,7 +843,12 @@ pub async fn run_tailer(
                 stats.caught_up_ms.fetch_max(started_ms, Ordering::Relaxed);
                 break;
             }
-            limit = cfg.poll_limit;
+            limit = cfg.poll_limit.min(MAX_SHOW_CHANGES_LIMIT);
+        }
+
+        if cfg.lookback_ms > 0 && last_sweep.elapsed() >= cfg.lookback_every {
+            last_sweep = std::time::Instant::now();
+            sweep_late(&*source, &*sink, &cfg, &stats, &mut seen).await;
         }
 
         // Stall detection: no successful poll for a while, with the loop alive.
@@ -809,6 +864,147 @@ pub async fn run_tailer(
                 "Changefeed tail has not completed a poll in a while"
             );
         }
+    }
+}
+
+/// Versionstamps the tail delivered recently, for the look-back sweep to skip.
+/// Tied to a cursor generation: after a reset (a re-clone) nothing delivered
+/// before it counts, and the sweep starts over from what comes next.
+#[derive(Default)]
+struct Seen {
+    generation: u64,
+    stamps: std::collections::BTreeSet<u64>,
+}
+
+impl Seen {
+    fn insert(&mut self, generation: u64, versionstamp: u64) {
+        if generation != self.generation {
+            self.generation = generation;
+            self.stamps.clear();
+        }
+        self.stamps.insert(versionstamp);
+    }
+
+    /// Forget everything below `floor`, and everything from an older generation.
+    fn prune(&mut self, generation: u64, floor: u64) {
+        if generation != self.generation {
+            self.generation = generation;
+            self.stamps.clear();
+        }
+        self.stamps = self.stamps.split_off(&floor);
+    }
+}
+
+/// Deliver what became visible below the cursor after the tail passed it.
+///
+/// Re-reads `[now - lookback, cursor)` and hands the sink every transaction
+/// in it the tail has not delivered: one that took longer to commit than a
+/// later-stamped one the tail already read (see the module docs). Only runs
+/// while something was delivered inside the window, since a transaction can
+/// only have been jumped over by a later one the tail took. Delivery order
+/// is safe: two transactions that wrote the same row cannot both commit, so
+/// a late one never carries an older state of a row the tail already has.
+async fn sweep_late(
+    source: &dyn ChangeSource,
+    sink: &dyn ChangeSink,
+    cfg: &TailerConfig,
+    stats: &TailerStats,
+    seen: &mut Seen,
+) {
+    let now = now_ms();
+    let generation = stats.generation();
+    let floor = stamp_from_ms(now.saturating_sub(cfg.lookback_ms));
+    seen.prune(generation, floor);
+    if seen.stamps.is_empty() || !sink.ready() {
+        return;
+    }
+    // At and above the cursor is the drain's; it has not jumped over any of it.
+    let ceiling = stats.cursor();
+    let mut since = floor;
+    let mut limit = cfg.poll_limit.min(MAX_SHOW_CHANGES_LIMIT);
+    let (mut entries, mut records, mut latest_late) = (0u64, 0u64, 0u64);
+    while since < ceiling {
+        stats.lookback_polls.fetch_add(1, Ordering::Relaxed);
+        let result =
+            match tokio::time::timeout(cfg.poll_timeout, source.show_changes(since, limit)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    debug!(error = %e, "Changefeed look-back poll failed; next sweep retries");
+                    break;
+                }
+                Err(_) => {
+                    warn!("Changefeed look-back poll timed out; reconnecting");
+                    stats.poll_timeouts.fetch_add(1, Ordering::Relaxed);
+                    source.note_stalled();
+                    break;
+                }
+            };
+        let mut batch = parse_show_changes(&result);
+        let full = batch.is_full(limit);
+        if full && !batch.hold_back_last() && limit < widest_limit(cfg.poll_limit) {
+            limit = limit.saturating_mul(2).min(widest_limit(cfg.poll_limit));
+            continue;
+        }
+        let next = batch.next_cursor(since);
+        let mut current: Option<u64> = None;
+        let mut deferred = false;
+        for record in batch.records {
+            let vs = record.versionstamp;
+            if vs >= ceiling || seen.stamps.contains(&vs) {
+                continue;
+            }
+            if stats.generation() != generation {
+                return; // a reset: the rebuild behind it covers this window
+            }
+            if current != Some(vs) {
+                // The previous late transaction landed whole.
+                if let Some(done) = current.replace(vs) {
+                    seen.insert(generation, done);
+                }
+                entries += 1;
+                latest_late = latest_late.max(now.saturating_sub(stamp_ms(vs)));
+            }
+            let mut record = record;
+            if record.op == ChangeOp::Delete && record.record.is_none() {
+                record.record = sink.before_image(&record.table, &record.id).await;
+            }
+            match sink.deliver(record).await {
+                Ok(()) => records += 1,
+                Err(SinkError::Retry(reason)) => {
+                    // Not marked seen: the next sweep delivers it again, whole.
+                    debug!(reason, "Late changefeed delivery deferred");
+                    deferred = true;
+                    break;
+                }
+            }
+        }
+        if deferred {
+            break;
+        }
+        if let Some(done) = current {
+            seen.insert(generation, done);
+        }
+        if !full || next <= since {
+            break;
+        }
+        since = next;
+        limit = cfg.poll_limit.min(MAX_SHOW_CHANGES_LIMIT);
+    }
+    if entries > 0 {
+        stats
+            .late_entries_total
+            .fetch_add(entries, Ordering::Relaxed);
+        stats
+            .late_records_total
+            .fetch_add(records, Ordering::Relaxed);
+        stats.last_late_ms.store(latest_late, Ordering::Relaxed);
+        stats.note_records(records, now);
+        warn!(
+            entries,
+            records,
+            late_ms = latest_late,
+            "Changefeed transactions became visible after the tail had passed their versionstamp; delivered now"
+        );
     }
 }
 
@@ -913,6 +1109,13 @@ pub struct ChangefeedSettings {
     /// milliseconds; a 20k-row transaction entry is ~70 ms.
     /// Env `SPKY_CHANGEFEED_POLL_TIMEOUT_SECS`.
     pub poll_timeout_secs: u64,
+    /// How far below the cursor the look-back sweep re-reads (see
+    /// [`TailerConfig::lookback_ms`]); 0 turns it off.
+    /// Env `SPKY_CHANGEFEED_LOOKBACK_MS`.
+    pub lookback_ms: u64,
+    /// Least time between two look-back sweeps.
+    /// Env `SPKY_CHANGEFEED_LOOKBACK_EVERY_MS`.
+    pub lookback_every_ms: u64,
 }
 
 impl Default for ChangefeedSettings {
@@ -926,6 +1129,8 @@ impl Default for ChangefeedSettings {
             gap_margin_secs: 300,
             poll_limit: 500,
             poll_timeout_secs: 5,
+            lookback_ms: 10_000,
+            lookback_every_ms: 2_500,
         }
     }
 }
@@ -970,6 +1175,12 @@ impl ChangefeedSettings {
         if let Some(n) = env_u64("SPKY_CHANGEFEED_POLL_TIMEOUT_SECS").filter(|n| *n > 0) {
             self.poll_timeout_secs = n;
         }
+        if let Some(n) = env_u64("SPKY_CHANGEFEED_LOOKBACK_MS") {
+            self.lookback_ms = n;
+        }
+        if let Some(n) = env_u64("SPKY_CHANGEFEED_LOOKBACK_EVERY_MS").filter(|n| *n > 0) {
+            self.lookback_every_ms = n;
+        }
     }
 
     pub fn retention_ms(&self) -> u64 {
@@ -989,6 +1200,8 @@ impl ChangefeedSettings {
             stall_after: Duration::from_millis(
                 self.fallback_ms.max(self.fallback_down_ms) * 10 + 30_000,
             ),
+            lookback_ms: self.lookback_ms,
+            lookback_every: Duration::from_millis(self.lookback_every_ms),
         }
     }
 }
@@ -1120,31 +1333,39 @@ mod tests {
     /// (versionstamp, table) keys, so a transaction can be split across polls.
     struct KeyLimitedFeed {
         /// (versionstamp, table, change), in key order.
-        keys: Vec<(u64, String, Vec<Value>)>,
+        keys: std::sync::Mutex<Vec<(u64, String, Vec<Value>)>>,
     }
 
     impl KeyLimitedFeed {
         fn new(txns: &[(u64, Vec<&str>)]) -> Self {
-            let mut keys = Vec::new();
+            let feed = Self {
+                keys: Default::default(),
+            };
             for (vs, ids) in txns {
-                let mut by_table: std::collections::BTreeMap<String, Vec<Value>> =
-                    Default::default();
-                for id in ids.iter() {
-                    let row = if id.starts_with("_00_version:") {
-                        json!({"update": {"id": id, "record_id": "x:y", "version": 1}})
-                    } else {
-                        json!({"update": {"id": id}})
-                    };
-                    by_table
-                        .entry(table_of(id).unwrap().to_string())
-                        .or_default()
-                        .push(row);
-                }
-                for (table, changes) in by_table {
-                    keys.push((*vs, table, changes));
-                }
+                feed.commit(*vs, ids);
             }
-            Self { keys }
+            feed
+        }
+
+        /// A transaction becoming visible, whatever its versionstamp.
+        fn commit(&self, vs: u64, ids: &[&str]) {
+            let mut by_table: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
+            for id in ids.iter() {
+                let row = if id.starts_with("_00_version:") {
+                    json!({"update": {"id": id, "record_id": "x:y", "version": 1}})
+                } else {
+                    json!({"update": {"id": id}})
+                };
+                by_table
+                    .entry(table_of(id).unwrap().to_string())
+                    .or_default()
+                    .push(row);
+            }
+            let mut keys = self.keys.lock().unwrap();
+            for (table, changes) in by_table {
+                keys.push((vs, table, changes));
+            }
+            keys.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         }
     }
 
@@ -1152,7 +1373,8 @@ mod tests {
     impl ChangeSource for KeyLimitedFeed {
         async fn show_changes(&self, since: u64, limit: usize) -> anyhow::Result<Value> {
             let mut entries: Vec<Value> = Vec::new();
-            for (vs, _, changes) in self.keys.iter().filter(|k| k.0 >= since).take(limit) {
+            let keys = self.keys.lock().unwrap();
+            for (vs, _, changes) in keys.iter().filter(|k| k.0 >= since).take(limit) {
                 match entries.last_mut() {
                     Some(e) if e["versionstamp"] == json!(vs) => e["changes"]
                         .as_array_mut()
@@ -1238,6 +1460,65 @@ mod tests {
         let ids = tail_until(KeyLimitedFeed::new(&txns), 3, 7).await;
         let expected: Vec<String> = (1..=7).map(|n| format!("game:g{n}")).collect();
         assert_eq!(ids, expected);
+    }
+
+    /// whitepawn 2026-09-27: SurrealDB stamps a transaction before its storage
+    /// commit, so a 200-game import became visible after a small write with a
+    /// later stamp that the tail had already read. The cursor was past the
+    /// import and its games reached the replica only through drift repair.
+    #[tokio::test]
+    async fn a_transaction_visible_after_a_later_one_is_delivered_once() {
+        let base = stamp_from_ms(now_ms());
+        let feed = Arc::new(KeyLimitedFeed::new(&[(base + 2, vec!["game:small"])]));
+        let sink = Arc::new(RecordingSink::default());
+        let stats = TailerStats::new();
+        stats.set_cursor(base);
+        let cfg = TailerConfig {
+            fallback: Duration::from_millis(5),
+            fallback_down: Duration::from_millis(5),
+            retention_ms: 0,
+            lookback_every: Duration::from_millis(10),
+            ..TailerConfig::default()
+        };
+        let task = tokio::spawn(run_tailer(
+            Arc::clone(&feed) as Arc<dyn ChangeSource>,
+            Arc::clone(&sink) as Arc<dyn ChangeSink>,
+            cfg,
+            Arc::clone(&stats),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let wait_for = |n: usize| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while sink.ids.lock().unwrap().len() < n && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        wait_for(1).await;
+        assert!(
+            stats.cursor() > base + 2,
+            "the tail moved past the small write"
+        );
+
+        feed.commit(base + 1, &["_00_version:v1", "game:big1", "game:big2"]);
+        wait_for(3).await;
+        // Several more sweeps run over the same window: nothing twice.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        assert_eq!(
+            *sink.ids.lock().unwrap(),
+            vec!["game:small", "game:big1", "game:big2"]
+        );
+        assert_eq!(stats.late_entries_total.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.late_records_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn no_poll_asks_surrealdb_for_more_than_it_returns() {
+        assert_eq!(widest_limit(500), MAX_SHOW_CHANGES_LIMIT);
+        assert_eq!(widest_limit(2), 128);
     }
 
     #[tokio::test]

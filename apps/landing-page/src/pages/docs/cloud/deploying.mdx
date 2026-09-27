@@ -54,7 +54,7 @@ The deploy command performs these steps automatically:
 
 1. **Validates** your `sp00ky.yml` configuration
 2. **Builds** Docker images for each app (linux/amd64)
-3. **Uploads** images to Sp00ky Cloud (skips unchanged images)
+3. **Pushes** images to your team's private build registry on Sp00ky Cloud: only the layers it does not have yet, so an unchanged image costs seconds. Apps on a [machine pool](/docs/jobs/machine-pools) or a [dedicated machine](/docs/cloud/dedicated-machines) upload an image archive instead, which their machines download.
 4. **Provisions** infrastructure (SurrealDB, Scheduler, SSP instances)
 5. **Runs migrations** against the cloud database
 6. **Deploys** your backend and frontend containers

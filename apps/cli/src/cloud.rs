@@ -2245,6 +2245,14 @@ pub fn deploy(
 
     let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
     let mut backend_manifests: Vec<serde_json::Value> = Vec::new();
+    // The project's build registry: images are pushed (only their new layers)
+    // and run by digest instead of uploaded as rootfs tarballs. None on a
+    // control plane without one, and for the free plan's static frontend.
+    let registry = if platform == "cloudflare" {
+        None
+    } else {
+        project_registry(&mut client, &pid)
+    };
     let mut external_backends: Vec<serde_json::Value> = Vec::new();
 
     for (name, app_config) in config.backends() {
@@ -2374,6 +2382,38 @@ pub fn deploy(
 
         // Check if image changed since last deploy (skip export+upload if unchanged)
         let image_id = get_docker_image_id(&image_tag);
+
+        // Build registry. Pool and dedicated machine backends keep the tarball:
+        // their VMs download it from the control plane.
+        if let (Some(reg), true) = (&registry, app_config.run_on.is_none()) {
+            match push_to_registry(reg, &image_tag, &slug, name) {
+                Ok((pull_ref, digest)) => {
+                    let cmd = match get_docker_cmd(&image_tag) {
+                        Some(c) => Some(c),
+                        None => deploy.cmd.clone(),
+                    };
+                    let mut manifest = build_backend_manifest(
+                        name,
+                        &slug,
+                        &image_id,
+                        port,
+                        deploy,
+                        &merged_env,
+                        &cmd,
+                        &working_dir,
+                        app_config,
+                    );
+                    use_registry_image(&mut manifest, &pull_ref, &digest);
+                    backend_manifests.push(manifest);
+                    println!("  Backend '{}' ready for deployment.", name);
+                    continue;
+                }
+                Err(e) => println!(
+                    "  Registry push failed for '{}' ({:#}); uploading a tarball instead.",
+                    name, e
+                ),
+            }
+        }
         if let Some(ref id) = image_id {
             if let Some(remote_hash) = get_remote_image_hash(&client, &pid, name) {
                 if remote_hash == *id {
@@ -2556,6 +2596,34 @@ pub fn deploy(
             .collect();
         let working_dir = get_docker_workdir(&image_tag);
         let image_id = get_docker_image_id(&image_tag);
+
+        // Build registry, as for backends (pool and dedicated machine apps keep
+        // the tarball their VMs download).
+        if let (Some(reg), true) = (&registry, app_config.run_on.is_none()) {
+            match push_to_registry(reg, &image_tag, &slug, name) {
+                Ok((pull_ref, digest)) => {
+                    let mut manifest = build_backend_manifest(
+                        name,
+                        &slug,
+                        &image_id,
+                        port,
+                        &docker_app_deploy(app_config, port),
+                        &merged_env,
+                        &docker_app_cmd(app_config, &image_tag),
+                        &working_dir,
+                        app_config,
+                    );
+                    use_registry_image(&mut manifest, &pull_ref, &digest);
+                    backend_manifests.push(manifest);
+                    println!("  Docker app '{}' ready for deployment.", name);
+                    continue;
+                }
+                Err(e) => println!(
+                    "  Registry push failed for '{}' ({:#}); uploading a tarball instead.",
+                    name, e
+                ),
+            }
+        }
 
         if let Some(ref id) = image_id {
             if let Some(remote_hash) = get_remote_image_hash(&client, &pid, name) {
@@ -2967,7 +3035,39 @@ pub fn deploy(
                     disk: 5,
                 });
 
-        if frontend_unchanged {
+        // Build registry: push the frontend image and run it by digest.
+        let mut pushed_frontend = false;
+        if let Some(reg) = &registry {
+            match push_to_registry(reg, &image_tag, &slug, frontend_name) {
+                Ok((pull_ref, digest)) => {
+                    let cmd = match get_docker_cmd(&image_tag) {
+                        Some(c) => Some(c),
+                        None => frontend_deploy.cmd.clone(),
+                    };
+                    let mut manifest = build_frontend_manifest(
+                        frontend_name,
+                        &slug,
+                        &frontend_image_id,
+                        port,
+                        &resources,
+                        &merged_env,
+                        &cmd,
+                        &working_dir,
+                    );
+                    use_registry_image(&mut manifest, &pull_ref, &digest);
+                    frontend_manifest = Some(manifest);
+                    pushed_frontend = true;
+                    println!("  Frontend ready for deployment.");
+                }
+                Err(e) => println!(
+                    "  Registry push failed for the frontend ({:#}); uploading a tarball instead.",
+                    e
+                ),
+            }
+        }
+        if pushed_frontend {
+            // Pushed above; nothing to upload.
+        } else if frontend_unchanged {
             println!("  Frontend image unchanged, skipping upload.");
             let cmd = match get_docker_cmd(&image_tag) {
                 Some(c) => Some(c),
@@ -3890,6 +3990,173 @@ fn upload_landed_despite_error(
 }
 
 /// Get the remote image hash from the API.
+/// A project's build registry on Sp00ky Cloud. Images are pushed there, only
+/// the layers the registry does not have yet, instead of being exported and
+/// uploaded as a whole rootfs tarball on every change.
+struct RegistryTarget {
+    /// Where `docker push` goes, e.g. `reg-d196f3a82077.stg.spky.cloud`.
+    push_host: String,
+    /// How the control plane's runtime names the same registry, e.g.
+    /// `127.0.0.1:5100`; the manifest's image ref starts with it.
+    pull_prefix: String,
+}
+
+/// Asks the control plane for the project's build registry and logs Docker in
+/// to it. `None` when it has none (an older control plane, or a runtime
+/// without registries) or anything about it fails: images then go up as
+/// tarballs, exactly as before.
+fn project_registry(client: &mut CloudClient, pid: &str) -> Option<RegistryTarget> {
+    if !cloud_has_feature(client, "registry_push") {
+        return None;
+    }
+    let body: serde_json::Value = match client
+        .post(&format!("/v1/projects/{}/registry", pid), &serde_json::json!({}))
+    {
+        Ok(resp) => resp.into_json().ok()?,
+        Err(e) => {
+            println!("  No build registry ({}); uploading image tarballs.", e);
+            return None;
+        }
+    };
+    let push_host = body["push_host"].as_str()?.to_string();
+    let pull_prefix = body["pull_prefix"].as_str()?.to_string();
+    let username = body["username"].as_str()?.to_string();
+    let password = body["password"].as_str()?.to_string();
+
+    // A tenant's first registry starts within seconds of that call, so the
+    // login (which is also the readiness check) is retried for a while.
+    let mut last_err = String::new();
+    for _ in 0..30 {
+        use std::io::Write;
+        let child = std::process::Command::new("docker")
+            .args(["login", &push_host, "--username", &username, "--password-stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else {
+            return None;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(password.as_bytes());
+        }
+        match child.wait_with_output() {
+            Ok(out) if out.status.success() => {
+                return Some(RegistryTarget {
+                    push_host,
+                    pull_prefix,
+                });
+            }
+            Ok(out) => last_err = String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => last_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    println!(
+        "  Build registry {} not reachable ({}); uploading image tarballs.",
+        push_host, last_err
+    );
+    None
+}
+
+/// Pushes the local `image_tag` to the build registry as `<slug>/<app>` and
+/// returns the ref the control plane runs it by
+/// (`<pull_prefix>/<slug>/<app>@sha256:...`) and its digest.
+fn push_to_registry(
+    target: &RegistryTarget,
+    image_tag: &str,
+    slug: &str,
+    app: &str,
+) -> Result<(String, String)> {
+    let repo = format!("{}/{}", slug, app);
+    // The builder's tag format, so the registry's retention (newest first, by
+    // tag) orders CLI pushes and git-linked builds together.
+    let tag = format!(
+        "{}/{}:r-{}-cli",
+        target.push_host,
+        repo,
+        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+    );
+    let status = std::process::Command::new("docker")
+        .args(["tag", image_tag, &tag])
+        .status()
+        .context("docker tag")?;
+    if !status.success() {
+        bail!("docker tag {} failed", tag);
+    }
+    println!("  Pushing '{}' to the build registry...", app);
+    let out = std::process::Command::new("docker")
+        .args(["push", &tag])
+        .output()
+        .context("docker push")?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        bail!("docker push failed: {}", text.trim().lines().last().unwrap_or(""));
+    }
+    let digest = registry_digest(&text, &tag, &target.push_host, &repo)
+        .context("docker push printed no digest")?;
+    Ok((format!("{}/{}@{}", target.pull_prefix, repo, digest), digest))
+}
+
+/// The pushed manifest's digest: from `docker push` output
+/// (`<tag>: digest: sha256:... size: ...`), else the image's RepoDigests.
+fn registry_digest(push_output: &str, tag: &str, push_host: &str, repo: &str) -> Option<String> {
+    let from_output = push_output.split_whitespace().skip_while(|w| *w != "digest:").nth(1);
+    if let Some(d) = from_output.filter(|d| d.starts_with("sha256:") && d.len() == 71) {
+        return Some(d.to_string());
+    }
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{range .RepoDigests}}{{println .}}{{end}}", tag])
+        .output()
+        .ok()?;
+    let prefix = format!("{}/{}@", push_host, repo);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(|d| d.to_string()))
+}
+
+/// A docker app's command: its `args`, else the image's own ENTRYPOINT + CMD,
+/// else `deploy.cmd` (the same order as its tarball path).
+fn docker_app_cmd(app_config: &backend::AppConfig, image_tag: &str) -> Option<String> {
+    if app_config.args.is_empty() {
+        get_docker_cmd(image_tag).or_else(|| app_config.deploy.as_ref().and_then(|d| d.cmd.clone()))
+    } else {
+        Some(app_config.args.join(" "))
+    }
+}
+
+/// A docker app's deploy block, defaulted when it has none.
+fn docker_app_deploy(app_config: &backend::AppConfig, port: u16) -> backend::AppDeployConfig {
+    app_config.deploy.clone().unwrap_or(backend::AppDeployConfig {
+        dockerfile: None,
+        context: None,
+        port: Some(port),
+        ports: None,
+        grpc_port: None,
+        resources: None,
+        expose: false,
+        healthcheck: None,
+        timeout: None,
+        timeout_overridable: None,
+        cmd: None,
+        build_args: None,
+        static_site: None,
+    })
+}
+
+/// Points a manifest at a pushed registry image. `flat_semantics`: the
+/// manifest's `cmd` is ENTRYPOINT + CMD (`get_docker_cmd`), written for a
+/// flattened rootfs, so the runtime runs the real image the same way.
+fn use_registry_image(manifest: &mut serde_json::Value, pull_ref: &str, digest: &str) {
+    manifest["image"] = serde_json::json!(pull_ref);
+    manifest["image_hash"] = serde_json::json!(digest);
+    manifest["flat_semantics"] = serde_json::json!(true);
+}
+
 fn get_remote_image_hash(client: &CloudClient, pid: &str, image_name: &str) -> Option<String> {
     let url = format!(
         "{}/v1/projects/{}/images/{}/hash",
@@ -8641,5 +8908,34 @@ mod fn_endpoint_tests {
         assert!(is_stable_endpoint_host("10.100.5.20")); // Firecracker
         assert!(!is_stable_endpoint_host("172.21.0.3")); // Docker bridge IP
         assert!(!is_stable_endpoint_host("")); // empty host
+    }
+}
+
+#[cfg(test)]
+mod registry_push_tests {
+    use super::*;
+
+    #[test]
+    fn registry_digest_reads_docker_push_output() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let out = format!(
+            "The push refers to repository [reg-abc.stg.spky.cloud/wp/api]\n\
+             5f70bf18a086: Pushed\n\
+             r-20260927T080000-cli: digest: {} size: 1573\n",
+            digest
+        );
+        assert_eq!(
+            registry_digest(&out, "unused", "reg-abc.stg.spky.cloud", "wp/api").as_deref(),
+            Some(digest.as_str())
+        );
+    }
+
+    #[test]
+    fn use_registry_image_rewrites_the_manifest() {
+        let mut m = serde_json::json!({"image": "wp/api", "image_hash": "sha256:old"});
+        use_registry_image(&mut m, "127.0.0.1:5100/wp/api@sha256:new", "sha256:new");
+        assert_eq!(m["image"], "127.0.0.1:5100/wp/api@sha256:new");
+        assert_eq!(m["image_hash"], "sha256:new");
+        assert_eq!(m["flat_semantics"], true);
     }
 }

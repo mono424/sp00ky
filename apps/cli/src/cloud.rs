@@ -7163,6 +7163,25 @@ fn print_deployment_details(data: &serde_json::Value) {
                 if let Some(err) = m["last_error"].as_str().filter(|e| !e.is_empty()) {
                     println!("    \x1b[31m{}\x1b[0m", err);
                 }
+                // Each app on the machine as its agent last reported it: they
+                // are updated one by one, in place, so one can be failing
+                // while the others and the machine are fine.
+                for app in m["apps"].as_array().into_iter().flatten() {
+                    let state = app["state"].as_str().unwrap_or("-");
+                    let healthy = app["healthy"].as_bool().unwrap_or(false);
+                    let (icon, word) = match (state, healthy) {
+                        ("running", true) => ("\x1b[32m●\x1b[0m", "running"),
+                        ("running", false) => ("\x1b[33m▲\x1b[0m", "not answering"),
+                        ("starting", _) => ("\x1b[33m◐\x1b[0m", "starting"),
+                        ("failed", _) => ("\x1b[31m✗\x1b[0m", "failed, previous version kept"),
+                        _ => ("\x1b[90m·\x1b[0m", state),
+                    };
+                    println!("      {} {:<20} {}", icon, app["name"].as_str().unwrap_or("-"), word);
+                    if let Some(err) = app["error"].as_str().filter(|e| !e.is_empty()) {
+                        let first = err.lines().next().unwrap_or(err);
+                        println!("        \x1b[31m{}\x1b[0m", first);
+                    }
+                }
             }
         }
     }

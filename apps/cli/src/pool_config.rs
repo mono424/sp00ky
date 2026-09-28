@@ -28,24 +28,30 @@
 //! engine never reads sp00ky.yml: everything it needs is resolved here, at
 //! deploy time, into the row.
 //!
-//! It also owns `machines:`, the other placement a backend can ask for: one
-//! always-on backend on one Hetzner VM of its own, fixed. Nothing of it runs in
-//! the scheduler; the control plane creates the VM, keeps it healthy and proxies
-//! traffic to it, so `deploy.expose` and `spky domain add --app` work as for
+//! It also owns `machines:`, the other placement a backend can ask for: a
+//! Hetzner VM of its own, always on, for one or more backends. Nothing of it
+//! runs in the scheduler; the control plane creates the VM, keeps every app on
+//! it running (an agent on the VM updates each one in place) and proxies
+//! traffic to them, so `deploy.expose` and `spky domain add --app` work as for
 //! any backend. The CLI only declares, validates and sends it.
 //!
 //! ```yaml
 //! machines:
-//!   api-box:
+//!   media:
 //!     provider: hetzner            # the only provider
-//!     type: cx33
+//!     type: cpx32
+//!     fallbackTypes: [cx33]        # when cpx32 cannot be had
 //!     locations: [fsn1, nbg1]      # tried in order
 //!
 //! apps:
-//!   api:
+//!   livekit:
 //!     type: backend
-//!     runOn: { machine: api-box }
-//!     deploy: { port: 8080, healthcheck: /health, expose: true }
+//!     runOn: { machine: media }
+//!     deploy: { port: 7880, healthcheck: /, ports: ["7882/udp"], expose: true }
+//!   recorder:
+//!     type: backend
+//!     runOn: { machine: media }    # same VM; reaches livekit as http://livekit:7880
+//!     deploy: { port: 3676, healthcheck: /health }
 //! ```
 
 use std::collections::BTreeMap;
@@ -156,11 +162,12 @@ pub struct PoolMachineConfig {
     pub locations: Vec<String>,
 }
 
-/// `machines:` in sp00ky.yml: one Hetzner VM of its own, fixed, for exactly one
-/// always-on backend. The control plane owns its lifecycle and proxies traffic
-/// to it; the CLI only declares, validates and sends it. Not flattened into
-/// `PoolMachineConfig` (serde refuses `flatten` next to `deny_unknown_fields`),
-/// and the two fields are cheap to repeat.
+/// `machines:` in sp00ky.yml: one Hetzner VM of its own, always on, for every
+/// backend that says `runOn: { machine: <name> }`. The control plane owns its
+/// lifecycle and proxies traffic to the apps on it; the CLI only declares,
+/// validates and sends it. Not flattened into `PoolMachineConfig` (serde
+/// refuses `flatten` next to `deny_unknown_fields`), and the fields are cheap
+/// to repeat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MachineConfig {
@@ -169,6 +176,15 @@ pub struct MachineConfig {
     pub provider: Option<PoolProvider>,
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub machine_type: Option<String>,
+    /// Tried in order after `type` when it cannot be had (see
+    /// `PoolMachineConfig::fallback_types`). Changing them never replaces the
+    /// VM; they only matter when one is made.
+    #[serde(
+        default,
+        rename = "fallbackTypes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub fallback_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<String>,
 }
@@ -287,14 +303,19 @@ pub fn validate_all(config: &Sp00kyConfig) -> Result<()> {
             bail!("machine '{name}': provider must be `hetzner` (a dedicated machine is a VM; under `spky dev` its backend runs as an ordinary app)");
         }
         let users = backends_on_machine(config, name);
-        match users.len() {
-            0 => bail!("machine '{name}' is not used by any app (add `runOn: {{ machine: {name} }}` to a backend, or remove the machine)"),
-            1 => {}
-            _ => bail!(
-                "machine '{name}' is used by {} apps ({}); a dedicated machine runs exactly one backend",
-                users.len(),
-                users.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
-            ),
+        if users.is_empty() {
+            bail!("machine '{name}' is not used by any app (add `runOn: {{ machine: {name} }}` to a backend, or remove the machine)");
+        }
+        check_machine_ports(name, &users)?;
+        let mut types = std::collections::BTreeSet::new();
+        types.extend(machine.machine_type.as_deref());
+        for t in &machine.fallback_types {
+            if t.trim().is_empty() {
+                bail!("machine '{name}': fallbackTypes has an empty entry");
+            }
+            if !types.insert(t.as_str()) {
+                bail!("machine '{name}': machine type `{t}` is listed twice in type/fallbackTypes");
+            }
         }
     }
 
@@ -430,22 +451,79 @@ pub fn cloud_pool_manifests(config: &Sp00kyConfig) -> Vec<Value> {
 
 /// What the control plane needs about each dedicated machine, sent with every
 /// deploy (a partial one too: the control plane keeps what the last full deploy
-/// stored). The backend name is included so the control plane can bind the VM
-/// without scanning `backends[].run_on`.
+/// stored). The control plane places apps by each backend's own `run_on`;
+/// `backends` is for the record, and `backend` (the first) is what control
+/// planes from before shared machines read.
 pub fn cloud_machine_manifests(config: &Sp00kyConfig) -> Vec<Value> {
     config
         .machines
         .iter()
         .map(|(name, m)| {
+            let users: Vec<&str> = backends_on_machine(config, name)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
             json!({
                 "name": name,
                 "provider": m.provider.unwrap_or(PoolProvider::Hetzner).as_str(),
                 "machine_type": m.machine_type,
+                "fallback_machine_types": m.fallback_types,
                 "locations": m.locations,
-                "backend": backends_on_machine(config, name).first().map(|(n, _)| *n),
+                "backend": users.first(),
+                "backends": users,
             })
         })
         .collect()
+}
+
+/// Apps on one machine share its one address, so no two may bind the same host
+/// port: each app's `deploy.port` and `deploy.grpc_port` (TCP) and every
+/// `deploy.ports` entry. An app repeating its own port in `deploy.ports` is
+/// fine (the control plane publishes it once). The control plane runs the same
+/// check (internal/machines CheckMachinePorts).
+fn check_machine_ports(machine: &str, users: &[(&str, &AppConfig)]) -> Result<()> {
+    let mut owner: BTreeMap<(u32, String), &str> = BTreeMap::new();
+    for (app, config) in users {
+        let deploy = config.deploy.as_ref();
+        let mut claims: Vec<(u32, String)> = Vec::new();
+        claims.extend(
+            deploy
+                .and_then(|d| d.port)
+                .map(|p| (p as u32, "tcp".to_string())),
+        );
+        claims.extend(
+            deploy
+                .and_then(|d| d.grpc_port)
+                .map(|p| (p as u32, "tcp".to_string())),
+        );
+        for spec in deploy.and_then(|d| d.ports.as_deref()).unwrap_or_default() {
+            if let Some(claim) = public_port_host(spec) {
+                claims.push(claim);
+            }
+        }
+        for (port, proto) in claims {
+            match owner.get(&(port, proto.clone())) {
+                Some(other) if other != app => bail!(
+                    "machine '{machine}': port {port}/{proto} is used by both '{other}' and '{app}' \
+                     (apps on one machine share its address)"
+                ),
+                _ => {
+                    owner.insert((port, proto), app);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The host side of a `deploy.ports` entry: `7882/udp` -> (7882, udp),
+/// `443:4433/udp` -> (443, udp). None for an entry `validate_public_port`
+/// refuses anyway.
+fn public_port_host(spec: &str) -> Option<(u32, String)> {
+    let spec = spec.trim();
+    let (ports, proto) = spec.split_once('/').unwrap_or((spec, "tcp"));
+    let host = ports.split(':').next()?.trim().parse::<u32>().ok()?;
+    Some((host, proto.to_ascii_lowercase()))
 }
 
 /// Flatten one pool into the spec fields of its `_00_pool` row. `image` is how
@@ -688,11 +766,45 @@ apps:
     fn a_machine_and_its_backend_must_find_each_other() {
         assert!(machine_err(&MACHINE_APP.replace("api-box", "missing")).contains("no such machine"));
         assert!(machine_err("machines:\n  api-box: {}\napps: {}\n").contains("not used by any app"));
-        assert!(machine_err(&format!(
-            "machines:\n  api-box: {{}}\n{MACHINE_APP}  second:\n    type: backend\n    \
-             runOn: {{ machine: api-box }}\n    deploy: {{ port: 1, healthcheck: /h }}\n"
+    }
+
+    /// Several apps share one machine, as long as no two bind the same port on
+    /// its one address; the control plane hears about all of them.
+    #[test]
+    fn apps_share_a_machine_on_ports_of_their_own() {
+        let second = |deploy: &str| {
+            format!(
+                "machines:\n  api-box: {{ type: cpx32, fallbackTypes: [cx33] }}\n{MACHINE_APP}  second:\n    type: backend\n    \
+                 runOn: {{ machine: api-box }}\n    deploy: {{ {deploy} }}\n"
+            )
+        };
+        let shared = config(&second(
+            "port: 3680, healthcheck: /h, ports: [\"443:4433/udp\"]",
+        ));
+        validate_all(&shared).unwrap_or_else(|e| panic!("two apps on one machine: {e}"));
+        let sent = cloud_machine_manifests(&shared);
+        assert_eq!(sent[0]["backends"], json!(["api", "second"]));
+        assert_eq!(
+            sent[0]["backend"], "api",
+            "what an older control plane reads"
+        );
+        assert_eq!(sent[0]["fallback_machine_types"], json!(["cx33"]));
+
+        for (deploy, clash) in [
+            ("port: 8080, healthcheck: /h", "8080/tcp"),
+            ("port: 3680, grpc_port: 8080, healthcheck: /h", "8080/tcp"),
+        ] {
+            let err = machine_err(&second(deploy));
+            assert!(
+                err.contains(clash) && err.contains("used by both"),
+                "{deploy}: {err}"
+            );
+        }
+        assert!(machine_err(&second("port: 3680, healthcheck: /h").replace(
+            "api-box: { type: cpx32, fallbackTypes: [cx33] }",
+            "api-box: { type: cx33, fallbackTypes: [cx33] }"
         ))
-        .contains("exactly one backend"));
+        .contains("listed twice"));
     }
 
     #[test]

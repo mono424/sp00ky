@@ -56,7 +56,7 @@ Each entry under `apps` is a service `spky` knows how to run locally and deploy 
 
 <CodeBlock code={ymlApps} lang="yaml" />
 
-A backend may also set `runOn: { pool: <name> }` to run its jobs on a [machine pool](#machine-pools) instead of an always-on container, or `runOn: { machine: <name> }` to run, always on, on a [dedicated machine](#dedicated-machines) of its own.
+A backend may also set `runOn: { pool: <name> }` to run its jobs on a [machine pool](#machine-pools) instead of an always-on container, or `runOn: { machine: <name> }` to run, always on, on a [dedicated machine](#dedicated-machines), alone or next to other backends.
 
 `method` describes the outbox the SSP delivers jobs through: `type: outbox`, the `table` the rows live in, the `schema` file defining it, and an optional `concurrency` bounding how many of that table's jobs run at once (default `1`; extra rows wait as `pending` and are admitted oldest-first). See [Jobs → Concurrency](/docs/jobs#concurrency).
 
@@ -225,11 +225,11 @@ A pool is fixed (`autoscale: false`, exactly `min` machines), scales on demand u
 
 ## Dedicated machines
 
-`machines` declares Hetzner VMs that each run one always-on backend, fixed. A backend opts in with `runOn: { machine: <name> }`; Sp00ky Cloud then creates the VM, keeps it healthy, replaces it with a fresh one on every deploy and on failure, and proxies traffic to it, so `deploy.expose` and `spky domain add --app` work exactly as for any backend.
+`machines` declares Hetzner VMs for always-on backends, one or several per machine. A backend opts in with `runOn: { machine: <name> }`; Sp00ky Cloud then creates the VM, updates each backend on it in place when it is deployed (the others and the machine's address stay as they are), replaces the VM when its type or locations change or it dies, and proxies traffic to the backends, so `deploy.expose` and `spky domain add --app` work exactly as for any backend.
 
 <CodeBlock code={ymlMachines} lang="yaml" />
 
-Each machine runs exactly one backend, which needs `deploy.port` and `deploy.healthcheck` and must be `hosting: cloud`. Its `deploy.ports`, if any, are raw TCP/UDP ports opened on the VM's public address to everyone (WebRTC media, RTMP); they are not proxied. `spky dev` ignores the placement and runs the backend as an ordinary app. Everything else, from what `spky deploy` shows to how a redeploy rolls the VM, is in [Dedicated machines](/docs/cloud/dedicated-machines).
+Each backend on a machine needs `deploy.port` and `deploy.healthcheck` and must be `hosting: cloud`, and no two backends on one machine may use the same port. They reach each other as `http://<app>:<port>` and get the machine's public address as `SPKY_MACHINE_IP`. Its `deploy.ports`, if any, are raw TCP/UDP ports opened on the VM's public address to everyone (WebRTC media, RTMP); they are not proxied. `spky dev` ignores the placement and runs the backend as an ordinary app. Everything else, from what `spky deploy` shows to how a redeploy rolls the VM, is in [Dedicated machines](/docs/cloud/dedicated-machines).
 
 ## Client types
 

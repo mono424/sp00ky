@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Dedicated machines
-description: Give an always-on backend a Hetzner VM of its own. Sp00ky Cloud creates it, keeps it healthy, rolls it on every deploy, and proxies traffic to it, so exposure and custom domains work as for any backend.
+description: Give always-on backends a Hetzner VM of their own, one or several per machine. Sp00ky Cloud creates it, keeps it healthy, updates each app on it in place, and proxies traffic to them, so exposure and custom domains work as for any backend.
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -14,36 +14,47 @@ import LinkCard from '../../../components/ui/LinkCard.astro';
 
 export const declareCode = `# sp00ky.yml
 machines:
-  api-box:
+  media:
     provider: hetzner             # the only provider
-    type: cx33                    # Hetzner server type
+    type: cpx32                   # Hetzner server type
+    fallbackTypes: [cx33]         # when cpx32 cannot be had
     locations: [fsn1, nbg1]       # tried in order
 
 apps:
-  api:
+  livekit:
     type: backend
-    runOn: { machine: api-box }   # this backend, and only this one, lives on api-box
-    spec: ./api/openapi.yml
-    baseUrl: http://127.0.0.1:8080
+    runOn: { machine: media }     # lives on the media VM
     deploy:
-      dockerfile: ./api/Dockerfile
-      port: 8080
-      healthcheck: /health        # required: the machine takes traffic only once this answers
-      expose: true                # https://<slug>-api.<domain>
-    method: { type: outbox, table: api_job, schema: ./schema/api.surql }`;
+      dockerfile: ./livekit/Dockerfile
+      port: 7880
+      healthcheck: /              # required: the app takes traffic only once this answers
+      ports: ["7881", "7882/udp"] # raw ports on the VM's own address (WebRTC media)
+      expose: true                # https://<slug>-livekit.<domain>
+  recorder:
+    type: backend
+    runOn: { machine: media }     # same VM, its own container
+    deploy:
+      dockerfile: ./recorder/Dockerfile
+      port: 3676
+      healthcheck: /health
+      expose: true`;
 
 export const deployOutput = `  SERVICE        IP                 STATUS
   ● surrealdb    172.18.0.4         running
   ● scheduler    172.18.0.5         running
   ● ssp          172.18.0.6         running
-  ◐ machine/api-box  65.21.4.17     starting (booting)
+  ◐ machine/media  65.21.4.17       starting (booting)
   ...
-  ● machine/api-box  65.21.4.17     running (serving)
-  ● backend      172.18.0.9         running`;
+  ● machine/media  65.21.4.17       running (serving)
+  ● livekit      172.18.0.9         running
+  ● recorder     172.18.0.10        running`;
 
 export const statusOutput = `  MACHINE        IP                 TYPE       STATUS         BACKEND
   ──────────────────────────────────────────────────────────────────────────────
-  ● api-box g3   65.21.4.17         cx33 fsn1  serving        api`;
+  ● media g3     65.21.4.17         cpx32 fsn1 serving        livekit, recorder
+      ● livekit              running
+      ✗ recorder             failed, previous version kept
+        exited with code 1`;
 
 <Experimental>
   Dedicated machines are new. The shape of <code>machines:</code> is settled; what
@@ -51,69 +62,89 @@ export const statusOutput = `  MACHINE        IP                 TYPE       STAT
 </Experimental>
 
 A backend normally runs as a container on the shared host of your deployment, next to the
-database, the scheduler and the SSPs. A **dedicated machine** gives one always-on backend a
-Hetzner VM of its own instead: its own CPU and memory, nothing else on the box, and a fixed
-address. Sp00ky Cloud owns the machine from start to finish: it creates it, probes it, replaces it
-with a fresh one on every deploy and whenever it stops answering, and proxies traffic to it, so
-`deploy.expose`, `spky domain add --app`, outbox jobs and the operator dashboard all work exactly
-as for any other backend.
+database, the scheduler and the SSPs. A **dedicated machine** gives always-on backends a Hetzner VM
+of their own instead: its own CPU and memory, nothing of the platform on the box, and a fixed
+address. One backend can have a machine to itself, or several can share one.
+
+Sp00ky Cloud owns the machine from start to finish: it creates it, keeps every app on it running,
+updates each app in place when you deploy it, replaces the VM when it dies, and proxies traffic to
+the apps, so `deploy.expose`, `spky domain add --app`, outbox jobs and the operator dashboard all work
+exactly as for any other backend.
 
 This is not a [machine pool](/docs/jobs/machine-pools). A pool runs a backend for its jobs and takes
-the machines away when the queue is empty. A dedicated machine runs a backend as a service, always,
-on one VM.
+the machines away when the queue is empty. A dedicated machine runs backends as services, always.
 
 ## Declaring one
 
 <CodeBlock fileName="sp00ky.yml" code={declareCode} lang="yaml" />
 
-`machines.<name>` is the VM; `runOn: { machine: <name> }` on a backend puts it there. Each machine
-runs exactly one backend, and `runOn` takes either `pool` or `machine`, never both. `spky lint`
+`machines.<name>` is the VM; `runOn: { machine: <name> }` on a backend puts it there. Any number of
+backends may live on one machine, and `runOn` takes either `pool` or `machine`, never both. `spky lint`
 checks all of it, and `spky deploy` refuses a control plane that does not offer dedicated machines
 before building anything.
 
-## What the backend needs
+## What a backend on it needs
 
 - **`deploy.port`**: the port the service listens on. Sp00ky Cloud forwards it (and `deploy.grpc_port`,
   if set) to the machine through the core host.
 - **`deploy.ports`** (optional): raw ports the machine opens to the internet on its own public
   address, for traffic the HTTP forwarder cannot carry: WebRTC media, RTMP, anything UDP. Each entry
   is published by docker on the VM and allowed in the machine's firewall from anywhere
-  (`"7882/udp"`, `"7881"`, `"3000:8080"`, same syntax as in `spky dev`). They are not proxied by the
-  core host, so clients need the machine's public IP, which changes with every generation: a
-  service on them must discover its own address (a WebRTC SFU does, via STUN) and hand it out over
-  the forwarded port. Changing the list rolls a fresh VM.
-- **`deploy.healthcheck`**: an HTTP path answering 2xx when the service is ready. A new machine takes
-  traffic only after this answers, and the running one is probed on it every 30 seconds.
+  (`"7882/udp"`, `"7881"`, `"443:4433/udp"`, same syntax as in `spky dev`). They are not proxied by the
+  core host, so clients need the machine's public address: `SPKY_MACHINE_IP` (below) is it.
+- **`deploy.healthcheck`**: an HTTP path answering 2xx when the service is ready. A new version of the
+  app takes the place of the old one only once this answers.
 - **`hosting: cloud`** (the default): Sp00ky Cloud runs it there. A `hosting: external` backend has
   its own host already.
-- An image with a command: like a pool machine, the VM imports the exported image, so `deploy.cmd`
-  is needed when the Dockerfile has no `CMD`.
+- An image with a command: the VM imports the exported image, so `deploy.cmd` is needed when the
+  Dockerfile has no `CMD`.
+
+Apps on one machine share its one address, so **no two of them may use the same port**: each app's
+`port`, `grpc_port` and `deploy.ports` entries must be distinct from every other app's on that machine.
+`spky lint` says which two collide.
 
 The backend's environment reaches the machine the same way as on the core host, with the usual
 `SPKY_*` variables, except that `SPKY_DB_URL` and `SPKY_DB_WS` point at the published database
 host (`https://<slug>-db.<domain>`) rather than the internal one, and `SPKY_SCHEDULER_URL` and
-`SPKY_SSP_ADDR` are not set: those addresses have no public twin. `deploy.resources` is ignored;
-the machine type is the size.
+`SPKY_SSP_ADDR` are not set: those addresses have no public twin. Two more are added:
+
+- **`SPKY_MACHINE_IP`**: the machine's public IPv4 address, for a service that has to advertise it
+  (a WebRTC SFU, a QUIC server, an RTMP URL).
+- **`SPKY_MACHINE`**: the machine's name.
+
+Apps on the same machine reach each other directly by name: every app is on the machine's own
+network as `http://<app>:<port>` (the recorder above talks to `http://livekit:7880`), without a trip
+through the platform. `deploy.resources` is ignored; the machine type is the size, and the apps on
+it share it.
 
 ## What a deploy does
 
-The VM is started as soon as the deploy is accepted, so it boots while your migrations run. In the
-apps phase Sp00ky Cloud waits for it to answer its healthcheck, then routes to it. Every deploy that
-changes the backend (image, env, command, port, machine type or locations) boots a **fresh** VM
-beside the running one and only switches over once the newcomer answers; the old one is retired
-after that. A machine that never answers is destroyed, the deploy fails, and the previous machine
-keeps serving.
+A machine has two kinds of change, and they are handled differently:
+
+- **An app changes** (image, env, command, ports, healthcheck): only that app's container is
+  replaced, on the running VM. The other apps keep running untouched, and the machine keeps its
+  address. The old container is stopped, the new one started, and the deploy waits until it answers
+  its healthcheck. If it never does, the old version is put back, the deploy fails, and the machine
+  keeps serving what it served before.
+- **The machine changes** (`type`, `locations`): a **fresh** VM boots beside the running one with
+  every app on it, and traffic switches over once all of them answer; the old VM is retired after
+  that. A machine that never gets there is destroyed, the deploy fails, and the previous machine
+  keeps serving. `fallbackTypes` are not part of this: they only matter when a VM is made.
+
+A new VM is started as soon as the deploy is accepted, so it boots while your migrations run. In the
+apps phase Sp00ky Cloud waits for the machine to run everything, then routes to it.
 
 <CodeBlock code={deployOutput} />
 
-The `backend` row is the backend's presence on the core host: a small forwarder that carries the
-backend's name and points at the machine. That is what keeps job routing, health probes and
-custom domains unchanged.
+Each backend row is that backend's presence on the core host: a small forwarder that carries the
+backend's name and points at the machine. That is what keeps job routing, health probes and custom
+domains unchanged.
 
 <Note>
-  A deploy of a dedicated backend takes a few minutes longer than a container deploy: a VM has to
-  boot and import the image. Expect the deploy to sit on <code>booting</code> for one to three
-  minutes.
+  Updating an app in place is stop, then start: two copies of it cannot both hold its ports on one
+  address. Expect a few seconds of that one app being unavailable per deploy. The first deploy of a
+  new machine, or a change of its type, takes a few minutes longer: a VM has to boot and import the
+  images.
 </Note>
 
 ## What `spky status` shows
@@ -122,51 +153,54 @@ custom domains unchanged.
 
 `g3` is the generation: the third VM this machine name has had. The IP is the machine's public
 address. `serving` means traffic goes there; `booting` and `healthy` mark a newcomer that has not
-taken over yet; `unhealthy` means the serving machine is failing probes and a replacement is on its
-way.
+taken over yet; `unhealthy` means the machine has stopped reporting and a replacement is on its way.
+Under each machine is every app on it, as the machine last reported it.
 
 ## Failure and replacement
 
-Sp00ky Cloud probes the serving machine every 30 seconds. Three failures in a row, or the VM being
-gone at the provider, start a replacement: a fresh machine with the same spec, promoted the moment
-it answers. The one that failed is retired afterwards. This happens at most three times per hour per
-machine; past that the backend is reported down and you get the uptime alert email. The serving
-machine is never touched before its replacement answered, so a wrong probe costs a machine-hour,
-not an outage.
+An agent on each machine reports every few seconds what runs and whether it answers. When it stops
+reporting for three checks in a row (30 seconds apart), or the VM is gone at the provider, a
+replacement starts: a fresh machine with the same shape and every app, promoted the moment all of
+them answer. The one that failed is retired afterwards. This happens at most three times per hour per
+machine; past that the machine is reported down and you get the uptime alert email. The serving
+machine is never touched before its replacement is ready, so a false alarm costs a machine-hour, not
+an outage.
 
-When Hetzner has no capacity for the machine type in any of the listed `locations`, the replacement
-cannot be made and the backend is reported down; Sp00ky Cloud keeps trying every 30 seconds until
-capacity is back, and those attempts do not count against the three per hour. Listing more than one
-location is the cheapest insurance against this.
+A crashing app is not a reason to replace the machine: docker's restart policy on the machine brings
+it back, and its healthcheck is watched through the forwarder like any backend's.
 
-`spky restart <app>` on a dedicated backend rolls a fresh VM the same way. There is no way to
-restart the process on the box, and none is needed: docker's restart policy on the machine brings a
-crashed process back on its own.
+When Hetzner has no capacity for the machine type (or its `fallbackTypes`) in any of the listed
+`locations`, a replacement cannot be made and the machine is reported down; Sp00ky Cloud keeps trying
+every 30 seconds until capacity is back, and those attempts do not count against the three per hour.
+Listing more than one location, and a fallback type or two, is the cheapest insurance against this.
 
-Every switch to a new machine recreates the small forwarder container on the core host, which costs
-about three seconds of `404` at the platform hostname (measured on staging), the same as any other
-backend's container restart. The machine itself is never the reason for a gap: the old one serves
-until the new one has answered.
+`spky restart <app>` on a backend on a dedicated machine restarts that app's container, on the same
+machine; the other apps on it are not touched.
+
+Every switch to a new machine recreates the small forwarder containers on the core host, which costs
+about three seconds of `404` at the platform hostnames (measured on staging), the same as any other
+backend's container restart.
 
 ## Local development
 
-`spky dev` ignores `runOn.machine`. The backend is started like any other app, from its `dev:`
-command, and the local SSP dispatches its jobs to its `baseUrl`.
+`spky dev` ignores `runOn.machine`. Each backend is started like any other app, from its `dev:`
+command, and the local SSP dispatches its jobs to its `baseUrl`. There is no machine network in dev:
+an app that talks to another app on its machine by name needs a `dev:` env pointing at that app's
+local address.
 
 ## Limitations
 
-- **One backend per machine**, and one machine per backend.
 - **Hetzner only.** `provider` must be `hetzner`; the machine type must be an x86 type the account
   can order.
-- **Git-linked deploys** place the backend and carry `deploy.ports` like `spky deploy` does; `spky
-  restart <app>` (the forced roll) remains a CLI action.
+- **Git-linked deploys** place the backends and carry `deploy.ports` like `spky deploy` does; `spky
+  restart <app>` remains a CLI action.
 - **No logs from the machine yet.** `spky logs <app>` shows the forwarder's log, not the backend's.
 - **`deploy.ports` are not forwarded**, only `port` and `grpc_port` reach the machine through the core
   host; the others are open on the VM's own public address. `deploy.resources` is ignored.
 - **A backend that calls the scheduler** (`SPKY_SCHEDULER_URL`) does not work from the machine, as on
   pool machines.
 - **Machines count against your plan's machine allowance**, together with pool machines, and bill
-  per machine-hour.
+  per machine-hour. A machine shared by several apps counts once.
 
 ## Reference
 
@@ -175,14 +209,15 @@ command, and the local SSP dispatches its jobs to its `baseUrl`.
 <PropTable props={[
   { name: 'provider', type: 'hetzner', default: 'hetzner', desc: 'Where the VM comes from. Only hetzner.' },
   { name: 'type', type: 'string', default: 'cx33', desc: 'Hetzner Cloud server type. x86 types only.' },
+  { name: 'fallbackTypes', type: 'string[]', default: '[]', desc: 'Server types tried in order when type has no capacity or is over an account limit. Never replaces a running VM.' },
   { name: 'locations', type: 'string[]', default: '[]', desc: 'Hetzner locations in order of preference. Empty lets Hetzner choose.' },
 ]} />
 
 ### On a backend
 
 <PropTable props={[
-  { name: 'runOn.machine', type: 'string', default: '-', desc: 'Name of the dedicated machine this backend runs on. Needs deploy.port and deploy.healthcheck.' },
-  { name: 'deploy.ports', type: 'string[]', default: '[]', desc: 'Raw TCP/UDP ports published on the machine\'s public address and opened in its firewall to everyone. Not proxied by the core host.' },
+  { name: 'runOn.machine', type: 'string', default: '-', desc: 'Name of the dedicated machine this backend runs on. Needs deploy.port and deploy.healthcheck. Several backends may name the same machine.' },
+  { name: 'deploy.ports', type: 'string[]', default: '[]', desc: 'Raw TCP/UDP ports published on the machine\'s public address and opened in its firewall to everyone. Not proxied by the core host. Unique across the machine\'s apps.' },
 ]} />
 
 <CardGrid>

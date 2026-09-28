@@ -170,7 +170,7 @@
     },
     "machines": {
       "type": "object",
-      "description": "Dedicated machines, keyed by name: one Hetzner VM of its own per always-on backend. A backend opts in with `runOn: { machine: <name> }`. See https://sp00ky.cloud/docs/cloud/dedicated-machines",
+      "description": "Dedicated machines, keyed by name: a Hetzner VM of its own for one or more always-on backends. A backend opts in with `runOn: { machine: <name> }`. See https://sp00ky.cloud/docs/cloud/dedicated-machines",
       "additionalProperties": {
         "$ref": "#/$defs/machineEntry"
       }
@@ -932,7 +932,7 @@
     },
     "machineEntry": {
       "type": "object",
-      "description": "A dedicated machine: one Hetzner Cloud VM that runs exactly one always-on backend, through `runOn: { machine: <name> }`. Sp00ky Cloud creates it, replaces it with a fresh one on every deploy and on failure, and proxies traffic to it.",
+      "description": "A dedicated machine: one Hetzner Cloud VM that runs every always-on backend placed on it with `runOn: { machine: <name> }`, each in a container of its own. Sp00ky Cloud creates it, updates each app on it in place, replaces the VM when its type or locations change or it dies, and proxies traffic to the apps. Apps on one machine may not share a port.",
       "additionalProperties": false,
       "properties": {
         "provider": {
@@ -944,6 +944,12 @@
           "type": "string",
           "default": "cx33",
           "description": "Hetzner Cloud server type. x86 types only."
+        },
+        "fallbackTypes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Server types tried in order after `type` when Hetzner has none of it to give (no capacity, or the account over a limit that type counts against). Changing them never replaces a running VM. x86 types only."
         },
         "locations": {
           "type": "array",

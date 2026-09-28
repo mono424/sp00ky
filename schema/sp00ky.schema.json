@@ -976,6 +976,13 @@
               "default": "cx33",
               "description": "Hetzner Cloud server type, e.g. `cx33`, `cpx42`. x86 types only: backend images are built for linux/amd64."
             },
+            "fallbackTypes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Server types tried in order after `type` when Hetzner has none of it to give: no capacity in any listed location, or the account at a limit that type counts against. Shared (CX, CPX) and dedicated (CCX) vCPUs are capped separately, so a CCX fallback still boots when the shared cores are used up. x86 types only."
+            },
             "locations": {
               "type": "array",
               "items": {

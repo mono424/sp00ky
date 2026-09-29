@@ -40,8 +40,11 @@ class AuthService implements Sp00kyAuth {
   /// after the token is cleared is not an option either - the statements would
   /// run unauthenticated and come back as rejections, which roll the writes
   /// back. So the flush has to happen here, first, and it is best-effort: a
-  /// failure must never block signing out.
-  Future<void> Function()? onBeforeSignOut;
+  /// failure must never block signing out. Push unregistration hooks in the
+  /// same way.
+  late final SignOutHooks _signOutHooks = SignOutHooks(_logger);
+  @override
+  void Function() onBeforeSignOut(SignOutHook hook) => _signOutHooks.add(hook);
   Future<void> Function(String?)? onSessionChanged;
   int _generation = 0;
   Future<void>? _checking;
@@ -52,7 +55,7 @@ class AuthService implements Sp00kyAuth {
   void dispose() {
     _generation++;
     onSessionChanged = null;
-    onBeforeSignOut = null;
+    _signOutHooks.clear();
   }
 
   Future<void> publishSession() async {
@@ -238,7 +241,12 @@ class AuthService implements Sp00kyAuth {
     final generation = ++_generation;
     _isLoading = false;
     try {
-      if (flush) await onBeforeSignOut?.call();
+      if (flush) {
+        await _signOutHooks.run(SignOutContext(
+            userId: _currentUser?['id']?.toString(),
+            token: _token,
+            impersonating: isImpersonating));
+      }
     } catch (err) {
       _logger.debug('Outbox flush before signOut failed: $err');
     }

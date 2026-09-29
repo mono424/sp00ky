@@ -71,6 +71,38 @@ void main() {
         await c.delete('thread', 'thread:a');
         expect(await empty, isEmpty);
       });
+      test('module key-value state round-trips and survives a restart',
+          () async {
+        // Push keeps its per-account device record here; on the default
+        // client it lives in the worker, next to the session.
+        final dir = Directory.systemTemp.createTempSync('spooky-kv');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final config = fixture(path: '${dir.path}/store.db');
+        var c = build(config);
+        await c.init();
+        expect(await c.kvRead('sp00ky_push_endpoint'), isNull);
+        await c.kvWrite('sp00ky_push_endpoint', '{"userId":"user:a"}');
+        expect(await c.kvRead('sp00ky_push_endpoint'), '{"userId":"user:a"}');
+        await c.close();
+        c = build(config);
+        addTearDown(c.close);
+        await c.init();
+        expect(await c.kvRead('sp00ky_push_endpoint'), '{"userId":"user:a"}');
+        await c.kvWrite('sp00ky_push_endpoint', null);
+        expect(await c.kvRead('sp00ky_push_endpoint'), isNull);
+      });
+      test('sign-out hooks run before the session goes', () async {
+        final c = build(fixture(endpoint: 'ws://127.0.0.1:1/rpc'));
+        addTearDown(c.close);
+        await c.init();
+        final seen = <SignOutContext>[];
+        final off = c.auth.onBeforeSignOut((ctx) async => seen.add(ctx));
+        await c.auth.signOut();
+        expect(seen, hasLength(1));
+        off();
+        await c.auth.signOut();
+        expect(seen, hasLength(1), reason: 'removed hooks stay removed');
+      });
       test('cold remote request cannot block cached reads', () async {
         final c = build(fixture(endpoint: 'ws://127.0.0.1:1/rpc'));
         addTearDown(c.close);

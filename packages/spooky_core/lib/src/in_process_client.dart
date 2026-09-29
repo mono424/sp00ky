@@ -173,9 +173,9 @@ class InProcessSp00kyClient extends Sp00kyClient {
       // Push what is already queued while the session is still valid. Bounded:
       // an unreachable server must not hold sign-out open. Anything still
       // pending stays in that user's store and drains on their next sign-in.
-      auth.onBeforeSignOut = () => _runtime
+      auth.onBeforeSignOut((_) => _runtime
           .dispatchAsync(const Drain())
-          .timeout(Duration(milliseconds: config.reconnect.connectTimeoutMs));
+          .timeout(Duration(milliseconds: config.reconnect.connectTimeoutMs)));
       _auth = auth;
       _services
         ..remote = remote
@@ -322,6 +322,24 @@ class InProcessSp00kyClient extends Sp00kyClient {
   }
 
   // ==================== QUERIES ====================
+
+  /// One key of this client's persistence (the account's bucket when
+  /// session persistence is on), for modules that keep per-device state.
+  @override
+  Future<Object?> kvRead(String key) async {
+    await init();
+    return _persistence.get<Object>(key);
+  }
+
+  @override
+  Future<void> kvWrite(String key, Object? value) async {
+    await init();
+    if (value == null) {
+      await _persistence.remove(key);
+    } else {
+      await _persistence.set(key, value);
+    }
+  }
 
   /// One-shot direct remote query, bypassing the sync layer (TS
   /// `useRemote(r => r.query(...))`). Results are NOT synced into the local

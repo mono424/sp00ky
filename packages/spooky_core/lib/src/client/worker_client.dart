@@ -5,6 +5,7 @@ import '../in_process_client.dart';
 import '../modules/auth/sp00ky_auth.dart';
 import '../modules/query_builder.dart';
 import '../mutation/rows.dart';
+import '../services/logger/logger.dart';
 import '../state/client_state.dart';
 import '../state/selectors.dart' as selectors;
 import '../types.dart';
@@ -197,6 +198,11 @@ class WorkerSp00kyClient extends Sp00kyClient {
   Future<List<dynamic>> queryRemote(String sql, [Map<String, dynamic>? vars]) =>
       _call(RemoteCommand(sql, vars));
   @override
+  Future<Object?> kvRead(String key) => _call(KvCommand(key));
+  @override
+  Future<void> kvWrite(String key, Object? value) =>
+      _call(KvCommand(key, value, true));
+  @override
   Future<void> preload(String sql, Map<String, dynamic> params,
           {QueryTimeToLive ttl = defaultTtl}) =>
       _call(PreloadCommand(sql, params, ttl));
@@ -315,6 +321,7 @@ class _RemoteAuth implements Sp00kyAuth {
   _RemoteAuth(this.client);
   final WorkerSp00kyClient client;
   final _listeners = <void Function(String?)>{};
+  final _signOutHooks = SignOutHooks(SpookyLogger.root());
   @override
   String? token;
   @override
@@ -354,7 +361,13 @@ class _RemoteAuth implements Sp00kyAuth {
     }
   }
 
-  void clearListeners() => _listeners.clear();
+  void clearListeners() {
+    _listeners.clear();
+    _signOutHooks.clear();
+  }
+
+  @override
+  void Function() onBeforeSignOut(SignOutHook hook) => _signOutHooks.add(hook);
   @override
   void Function() subscribe(void Function(String?) cb) {
     _listeners.add(cb);
@@ -368,8 +381,16 @@ class _RemoteAuth implements Sp00kyAuth {
   @override
   Future<void> signUp(String name, Map<String, dynamic> params) =>
       client._call(SignUpCommand(name, params));
+  /// Main-isolate hooks first, while the worker still holds the session;
+  /// the worker then runs its own (the outbox drain) and signs out.
   @override
-  Future<void> signOut() => client._call(SignOutCommand());
+  Future<void> signOut() async {
+    await _signOutHooks.run(SignOutContext(
+        userId: currentUser?['id']?.toString(),
+        token: token,
+        impersonating: isImpersonating));
+    await client._call(SignOutCommand());
+  }
 }
 
 WorkerFailure _failure(Object e, StackTrace s) => WorkerFailure(
@@ -471,6 +492,12 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
           watchQuery(result);
         case RemoteCommand command:
           result = await client.queryRemote(command.sql, command.vars);
+        case KvCommand command:
+          if (command.write) {
+            await client.kvWrite(command.key, command.value);
+          } else {
+            result = await client.kvRead(command.key);
+          }
         case PreloadCommand command:
           await client.preload(command.sql, command.params, ttl: command.ttl);
         case CreateCommand command:

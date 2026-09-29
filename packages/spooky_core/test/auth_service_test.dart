@@ -267,10 +267,10 @@ void main() {
 
       String? tokenDuringFlush;
       var invalidatedDuringFlush = true;
-      auth.onBeforeSignOut = () async {
+      auth.onBeforeSignOut((_) async {
         tokenDuringFlush = auth.token;
         invalidatedDuringFlush = remoteClient.invalidated;
-      };
+      });
 
       await auth.signOut();
 
@@ -285,12 +285,57 @@ void main() {
       final auth = build();
       remoteClient.authUser = {'id': 'user:a'};
       await auth.check('tok');
-      auth.onBeforeSignOut = () async => throw StateError('server gone');
+      auth.onBeforeSignOut((_) async => throw StateError('server gone'));
 
       await auth.signOut();
 
       expect(auth.token, isNull);
       expect(auth.isAuthenticated, isFalse);
+    });
+
+    test('every hook runs, in parallel, with who is leaving', () async {
+      // The outbox drain and the push unregistration both need the session;
+      // neither may wait for the other, and one failing must not skip the other.
+      final auth = build();
+      remoteClient.authUser = {'id': 'user:a'};
+      await auth.check('tok');
+      final started = <String>[];
+      final gate = Completer<void>();
+      SignOutContext? seen;
+      auth.onBeforeSignOut((ctx) async {
+        started.add('slow');
+        seen = ctx;
+        await gate.future;
+      });
+      auth.onBeforeSignOut((_) async {
+        started.add('failing');
+        throw StateError('nope');
+      });
+      final off = auth.onBeforeSignOut((_) async => started.add('removed'));
+      off();
+
+      final done = auth.signOut();
+      await Future<void>.delayed(Duration.zero);
+      expect(started, ['slow', 'failing']);
+      expect(auth.token, 'tok', reason: 'still signed in while a hook runs');
+      gate.complete();
+      await done;
+
+      expect(seen?.userId, 'user:a');
+      expect(seen?.token, 'tok');
+      expect(seen?.impersonating, isFalse);
+      expect(auth.token, isNull);
+    });
+
+    test('dispose drops the hooks', () async {
+      final auth = build();
+      remoteClient.authUser = {'id': 'user:a'};
+      await auth.check('tok');
+      var ran = false;
+      auth.onBeforeSignOut((_) async => ran = true);
+      auth.dispose();
+      await auth.signOut();
+      expect(ran, isFalse);
     });
   });
 }

@@ -7,6 +7,7 @@ import 'modules/query_host.dart';
 import 'modules/bucket.dart';
 import 'modules/feature_flag/feature_flag.dart';
 import 'modules/app_release/app_release.dart';
+import 'modules/push/push.dart';
 import 'modules/ref_tables.dart' show anonUserId, bucketIdForUser;
 import 'mutation/rows.dart';
 import 'services/blobs/blob_cache.dart';
@@ -91,6 +92,11 @@ abstract class Sp00kyClient {
   Future<dynamic> authenticate(String token);
   Future<void> deauthenticate();
 
+  /// One key of the client's persistence, for modules that keep per-device
+  /// state (the account's bucket under session persistence). `null` removes.
+  Future<Object?> kvRead(String key);
+  Future<void> kvWrite(String key, Object? value);
+
   FeatureFlagModule? _flags;
   AppReleaseModule? _releases;
   FeatureFlagHandle feature(String key,
@@ -108,9 +114,22 @@ abstract class Sp00kyClient {
     return releases.release(app, ttl: ttl);
   }
 
+  PushModule? _push;
+
+  /// Native push registration for this device (APNs / FCM). The token comes
+  /// from the platform (`spooky_push` in Flutter). The sign-out hook is
+  /// installed on first use, so touch it early.
+  PushModule get push => _push ??= PushModule(
+      remote: queryRemote,
+      auth: auth,
+      storage: _KvStorage(this),
+      logger: SpookyLogger.root())
+    ..attach();
+
   void closeModules() {
     _flags?.closeAll();
     _releases?.closeAll();
+    _push?.dispose();
     _blobsAuthUnsubscribe?.call();
     _blobsAuthUnsubscribe = null;
   }
@@ -195,6 +214,17 @@ Stream<T> broadcast<T>(void Function() Function(void Function(T)) attach) {
         off = null;
       });
   return controller.stream;
+}
+
+class _KvStorage implements PersistenceClient {
+  _KvStorage(this.client);
+  final Sp00kyClient client;
+  @override
+  Future<void> set(String key, dynamic value) => client.kvWrite(key, value);
+  @override
+  Future<T?> get<T>(String key) async => await client.kvRead(key) as T?;
+  @override
+  Future<void> remove(String key) => client.kvWrite(key, null);
 }
 
 class _Host implements QueryHost {

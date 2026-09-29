@@ -27,6 +27,7 @@ enum WorkerOp {
   failed,
   retry,
   discard,
+  kv,
   close
 }
 
@@ -112,6 +113,18 @@ final class SignUpCommand extends WorkerCommand {
   final Map<String, dynamic> params;
   @override
   WorkerOp get op => WorkerOp.signUp;
+}
+
+/// Read (`write: false`) or write one key of the client's persistence, from
+/// the main isolate (push keeps its per-account device record there). A
+/// `null` value on write removes the key.
+final class KvCommand extends WorkerCommand {
+  const KvCommand(this.key, [this.value, this.write = false]);
+  final String key;
+  final Object? value;
+  final bool write;
+  @override
+  WorkerOp get op => WorkerOp.kv;
 }
 
 final class SignOutCommand extends WorkerCommand {

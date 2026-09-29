@@ -44,5 +44,38 @@ export 'src/modules/query_builder.dart'
 export 'src/modules/relationships.dart' show SchemaRelationship;
 
 export 'src/modules/auth/sp00ky_auth.dart'
-    show Sp00kyAuth, AuthVerificationError;
+    show
+        Sp00kyAuth,
+        AuthVerificationError,
+        SignOutContext,
+        SignOutHook,
+        SignOutHooks,
+        Sp00kyAuthImpersonation,
+        impersonationAccess;
+export 'src/modules/push/push.dart'
+    show
+        PushModule,
+        PushKind,
+        PushPlatform,
+        ApnsEnvironment,
+        PushPermission,
+        PushToken,
+        PushInfo,
+        FirebaseClientConfig,
+        PushDevice,
+        PushMessageInput,
+        PushMessage,
+        PushPayload,
+        PushError,
+        PushErrorCode,
+        PushSyncStatus,
+        PushRecord,
+        pushEndpointKey,
+        decidePushSync,
+        PushSyncInput,
+        PushSyncDecision,
+        PushSyncDone,
+        PushSyncNeedsServer,
+        PushSyncDropRows,
+        PushSyncRegister;
 export 'src/client/worker_protocol.dart' show WorkerFailure;

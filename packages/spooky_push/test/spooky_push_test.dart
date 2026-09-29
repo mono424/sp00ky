@@ -330,8 +330,9 @@ class _Os {
         return {'ready': true, 'restartRequired': false};
       case 'getToken':
         final t = nextToken ?? token;
-        if (t == null)
+        if (t == null) {
           throw PlatformException(code: 'no-token', message: 'none');
+        }
         return t;
       default:
         return null;

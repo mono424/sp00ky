@@ -13,6 +13,9 @@ pub struct InternalSchemaConfig {
     pub deploy_mode: DeployMode,
     pub endpoint: Option<String>,
     pub secret: Option<String>,
+    /// Vault variables for `{ vault: KEY }` push credentials. `None`: this
+    /// context has no vault (env and file references still resolve).
+    pub vault: Option<Vec<(String, String)>>,
 }
 
 /// Configuration for applying remote functions after user migrations.
@@ -106,6 +109,7 @@ impl MigrationEngine for Sp00kyEngine {
                 &is.deploy_mode,
                 is.endpoint.as_deref(),
                 is.secret.as_deref(),
+                &mut || is.vault.clone().unwrap_or_default(),
             )
             .context("Failed to apply internal Sp00ky schema")?;
         }

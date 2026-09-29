@@ -927,6 +927,8 @@ pub fn apply_remote_functions_if_changed(client: &dyn MigrationDB, sql: &str) ->
 ///
 /// This is idempotent — all statements use `DEFINE ... OVERWRITE` or `DEFINE ... SCHEMALESS`.
 /// Not tracked in `_00_migrations` table.
+/// `vault` resolves `{ vault: KEY }` secret references in `push.apns` /
+/// `push.fcm`; it is only called when such a reference exists.
 pub fn apply_internal_schema(
     client: &dyn MigrationDB,
     schema_input_path: &Path,
@@ -934,6 +936,7 @@ pub fn apply_internal_schema(
     mode: &DeployMode,
     endpoint: Option<&str>,
     secret: Option<&str>,
+    vault: &mut dyn FnMut() -> Vec<(String, String)>,
 ) -> Result<()> {
     let step = ui::step("Internal schema");
 
@@ -1144,7 +1147,7 @@ pub fn apply_internal_schema(
         // sp00ky.yml, which changes independently of the schema this hash
         // covers.
         sync_schedules(client, config_path, &backend_processor);
-        sync_push(client, config_path);
+        sync_push(client, config_path, vault);
         return Ok(());
     }
 
@@ -1183,7 +1186,7 @@ pub fn apply_internal_schema(
         event_count
     ));
     sync_schedules(client, config_path, &backend_processor);
-    sync_push(client, config_path);
+    sync_push(client, config_path, vault);
     Ok(())
 }
 
@@ -1196,7 +1199,11 @@ pub fn apply_internal_schema(
 /// does not validate, leaves the previous row in place (the engine keeps the
 /// last good rules) and says so. `spky lint` catches both before a deploy;
 /// `spky push sync` retries afterwards.
-fn sync_push(client: &dyn MigrationDB, config_path: Option<&Path>) {
+fn sync_push(
+    client: &dyn MigrationDB,
+    config_path: Option<&Path>,
+    vault: &mut dyn FnMut() -> Vec<(String, String)>,
+) {
     // No manifest, nothing to say about push. Writing the default here would
     // wipe the rules a deploy with a manifest stored.
     let Some(config_path) = config_path.filter(|p| p.exists()) else { return };
@@ -1214,7 +1221,26 @@ fn sync_push(client: &dyn MigrationDB, config_path: Option<&Path>) {
         Ok(crate::push_sync::Outcome::Written) => {
             ui::step("Push config").done(crate::push_sync::summary(&cfg));
         }
-        Err(e) => ui::warn(format!("failed to sync push rules: {e:#}")),
+        Err(e) => {
+            ui::warn(format!("failed to sync push rules: {e:#}"));
+            return;
+        }
+    }
+    // Native credentials and `$sp00ky_push_native`, after the rules so a
+    // config that did not validate never gets this far.
+    let base_dir = config_path.parent().unwrap_or(Path::new("."));
+    let mut lazy_vault = crate::push_sync::Vault::new(|| vault());
+    match crate::push_sync::sync_native(client, &cfg, base_dir, &mut lazy_vault) {
+        Ok(report) => {
+            for (warn, line) in report.lines() {
+                if warn {
+                    ui::warn(line);
+                } else {
+                    ui::detail(line);
+                }
+            }
+        }
+        Err(e) => ui::warn(format!("failed to sync native push credentials: {e:#}")),
     }
 }
 
@@ -1935,7 +1961,7 @@ mod tests {
         // Changefeed: `_00_push_message` is born with its feed, no http event.
         fs::write(&config, format!("sync:\n  transport: changefeed\n{push}")).unwrap();
         let mock = MockDB::new();
-        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Cluster, None, None).unwrap();
+        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Cluster, None, None, &mut Vec::new).unwrap();
         let q = mock.executed_queries.borrow().clone();
         let ddl = q
             .iter()
@@ -1961,7 +1987,7 @@ mod tests {
         // Hash-skip path: no DDL, the config is still stored.
         let mock = MockDB::new();
         mock.set_stored_hash(&internal_hash);
-        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Cluster, None, None).unwrap();
+        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Cluster, None, None, &mut Vec::new).unwrap();
         let q = mock.executed_queries.borrow().clone();
         assert!(!q.iter().any(|s| s.contains("DEFINE TABLE OVERWRITE _00_push_config")), "DDL skipped");
         assert_eq!(upserts(&q), 1, "skip path stores the config too: {q:?}");
@@ -1969,7 +1995,7 @@ mod tests {
         // Http: the table has no feed, the CREATE posts to /ingest.
         fs::write(&config, push).unwrap();
         let mock = MockDB::new();
-        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Singlenode, None, None).unwrap();
+        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Singlenode, None, None, &mut Vec::new).unwrap();
         let q = mock.executed_queries.borrow().clone();
         let ddl = q.iter().find(|s| s.contains("DEFINE TABLE OVERWRITE _00_push_config")).unwrap();
         assert!(!ddl.contains("_00_push_message SCHEMAFULL CHANGEFEED"));

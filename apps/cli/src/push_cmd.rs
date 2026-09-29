@@ -151,12 +151,19 @@ RETURN { public_key: $sp00ky_vapid_public_key, kid: $sp00ky_vapid_kid };
 RETURN {
     total: array::len(SELECT VALUE id FROM _00_push_subscription),
     disabled: array::len(SELECT VALUE id FROM _00_push_subscription WHERE disabled_at != NONE),
-    stale: array::len(SELECT VALUE id FROM _00_push_subscription WHERE disabled_at = NONE AND kid != ($sp00ky_vapid_kid ?? '')),
+    stale: array::len(SELECT VALUE id FROM _00_push_subscription WHERE disabled_at = NONE AND (kind ?? 'web') = 'web' AND kid != ($sp00ky_vapid_kid ?? '')),
     users: array::len(array::distinct(SELECT VALUE auth_id FROM _00_push_subscription WHERE disabled_at = NONE))
 };
 SELECT status, count() AS n FROM _00_push_message GROUP BY status;
 RETURN array::len(SELECT VALUE id FROM _00_push_message WHERE status = 'pending' AND send_at != NONE AND send_at > time::now());
 SELECT <string> id AS id, to, error, type::string(created_at) AS created_at FROM _00_push_message WHERE status = 'failed' ORDER BY created_at DESC LIMIT 5;
+RETURN {
+    native: $sp00ky_push_native,
+    credentials: (SELECT VALUE <string> id FROM _00_push_credential),
+    web: array::len(SELECT VALUE id FROM _00_push_subscription WHERE disabled_at = NONE AND (kind ?? 'web') = 'web'),
+    apns: array::len(SELECT VALUE id FROM _00_push_subscription WHERE disabled_at = NONE AND kind = 'apns'),
+    fcm: array::len(SELECT VALUE id FROM _00_push_subscription WHERE disabled_at = NONE AND kind = 'fcm')
+};
 ";
 
 #[derive(Debug, Default, PartialEq)]
@@ -176,6 +183,12 @@ pub(crate) struct Status {
     /// Pending with a future `send_at`.
     pub scheduled: i64,
     pub recent_failures: Vec<Value>,
+    /// `$sp00ky_push_native` as the last migrate wrote it.
+    pub native: Value,
+    /// Provider names with a stored credential (`apns`, `fcm`).
+    pub credentials: Vec<String>,
+    /// Enabled devices per kind: web, apns, fcm.
+    pub by_kind: [i64; 3],
 }
 
 pub(crate) fn parse_status(results: &[Value]) -> Status {
@@ -208,6 +221,24 @@ pub(crate) fn parse_status(results: &[Value]) -> Status {
     }
     s.scheduled = at(4).as_i64().unwrap_or(0);
     s.recent_failures = rows_of(Some(&at(5)));
+
+    let native = at(6);
+    s.native = native.get("native").cloned().unwrap_or(Value::Null);
+    s.credentials = native
+        .get("credentials")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|id| {
+            id.rsplit(':')
+                .next()
+                .unwrap_or(id)
+                .trim_matches(|c| c == '⟨' || c == '⟩' || c == '`')
+                .to_string()
+        })
+        .collect();
+    s.by_kind = [int_of(&native, "web"), int_of(&native, "apns"), int_of(&native, "fcm")];
     s
 }
 
@@ -229,12 +260,18 @@ fn status(client: &SurrealClient, json: bool) -> Result<()> {
             "messages": s.messages,
             "scheduled": s.scheduled,
             "recentFailures": s.recent_failures,
+            "native": {
+                "apns": s.credentials.iter().any(|c| c == "apns"),
+                "fcm": s.credentials.iter().any(|c| c == "fcm"),
+                "clientConfig": s.native,
+                "devices": { "web": s.by_kind[0], "apns": s.by_kind[1], "fcm": s.by_kind[2] },
+            },
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
-    println!("{BOLD}Web Push{RESET}");
+    println!("{BOLD}Push{RESET}");
 
     // Host / key.
     match (&s.public_key, &s.kid) {
@@ -252,6 +289,26 @@ fn status(client: &SurrealClient, json: bool) -> Result<()> {
                  (singlenode) publishes one at boot when SPKY_AUTH_SECRET or\n  \
                  SPKY_VAPID_PRIVATE_KEY is set and SPKY_PUSH is not `off`.{RESET}"
             );
+        }
+    }
+
+    // Native providers.
+    for (i, name, block) in [(1usize, "apns", "push.apns"), (2, "fcm", "push.fcm")] {
+        let configured = s.config.as_ref().is_some_and(|c| {
+            if name == "apns" { c.apns.is_some() } else { c.fcm.is_some() }
+        });
+        let stored = s.credentials.iter().any(|c| c == name);
+        let label = format!("{name:<12}");
+        match (configured, stored) {
+            (true, true) => println!(
+                "  {label}: {GREEN}configured{RESET} {DIM}(credential stored; {}){RESET}",
+                plural(s.by_kind[i].max(0) as usize, "device", "devices")
+            ),
+            (true, false) => println!(
+                "  {label}: {RED}no credential stored{RESET} {DIM}({block} did not resolve at the last sync; `spky push sync`){RESET}"
+            ),
+            (false, true) => println!("  {label}: {YELLOW}credential stored but {block} is gone{RESET}"),
+            (false, false) => println!("  {label}: {DIM}not configured ({block}){RESET}"),
         }
     }
 
@@ -670,14 +727,33 @@ fn send(client: &SurrealClient, msg: &Message, wait: bool, json: bool) -> Result
 /// `type::string(NONE)` is the string "NONE", hence the guards.
 pub(crate) fn devices_sql(user: &str) -> String {
     format!(
-        "SELECT <string> id AS id, endpoint, kid, label, user_agent, rules, meta, failures, last_error, \
+        "SELECT <string> id AS id, endpoint, (kind ?? 'web') AS kind, platform, app_id, environment, \
+         kid, label, user_agent, rules, meta, failures, last_error, \
          disabled_reason, type::string(created_at) AS created_at, type::string(updated_at) AS updated_at, \
          IF last_ok_at = NONE {{ NONE }} ELSE {{ type::string(last_ok_at) }} AS last_ok_at, \
          IF disabled_at = NONE {{ NONE }} ELSE {{ type::string(disabled_at) }} AS disabled_at, \
-         (kid = ($sp00ky_vapid_kid ?? '')) AS current \
+         ((kind ?? 'web') != 'web' OR kid = ($sp00ky_vapid_kid ?? '')) AS current \
          FROM _00_push_subscription WHERE auth_id = {} ORDER BY updated_at DESC;",
         surql_string(user)
     )
+}
+
+/// Where a device row is reached: `APNs sandbox · im.app`, `FCM · android`,
+/// or a browser push service's host.
+fn device_route(row: &Value) -> String {
+    match str_of(row, "kind") {
+        Some("apns") => format!(
+            "APNs {} · {}",
+            str_of(row, "environment").unwrap_or("production"),
+            str_of(row, "app_id").unwrap_or("-")
+        ),
+        Some("fcm") => format!(
+            "FCM · {} · {}",
+            str_of(row, "platform").unwrap_or("android"),
+            str_of(row, "app_id").unwrap_or("-")
+        ),
+        _ => push_service(str_of(row, "endpoint").unwrap_or("")).to_string(),
+    }
 }
 
 /// `https://fcm.googleapis.com/fcm/send/abc...` -> `fcm.googleapis.com`.
@@ -723,7 +799,7 @@ fn devices(client: &SurrealClient, user: &str, json: bool) -> Result<()> {
         println!("  {color}{state:<9}{RESET} {BOLD}{label}{RESET}");
         println!(
             "            {DIM}{} · updated {} · last ok {}{RESET}",
-            push_service(str_of(row, "endpoint").unwrap_or("")),
+            device_route(row),
             str_of(row, "updated_at")
                 .map(|t| &t[..t.len().min(19)])
                 .unwrap_or("-"),
@@ -769,6 +845,25 @@ fn sync(conn: &ConnectionArgs, config: &Option<PathBuf>) -> Result<()> {
             "{GREEN}Synced push config{RESET}: {}",
             crate::push_sync::summary(&cfg)
         ),
+    }
+    // `--cloud` talks to the deployment: its credentials come from the
+    // production vault; anything else is a dev database.
+    let prod = conn.cloud;
+    let mut vault = crate::push_sync::Vault::new(move || {
+        if prod {
+            crate::cloud::load_vault_secrets_for_prod()
+        } else {
+            crate::cloud::load_vault_envs_for_dev()
+        }
+    });
+    let base_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let report = crate::push_sync::sync_native(&client, &cfg, base_dir, &mut vault)?;
+    for (warn, line) in report.lines() {
+        if warn {
+            println!("{YELLOW}{line}{RESET}");
+        } else {
+            println!("{DIM}{line}{RESET}");
+        }
     }
     Ok(())
 }

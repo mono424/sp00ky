@@ -2040,6 +2040,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                     deploy_mode,
                     endpoint: endpoint.clone(),
                     secret: secret.clone(),
+                    vault: None,
                 }),
                 remote_functions: None,
                 secrets: None,
@@ -2094,6 +2095,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 None
             };
 
+            let vault = cloud::load_vault_secrets_for_prod();
             let ctx = migration::MigrationContext {
                 environment: migration::MigrationEnvironment::Production,
                 project_dir: std::env::current_dir()?,
@@ -2110,6 +2112,8 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                     deploy_mode,
                     endpoint: endpoint.clone(),
                     secret: secret.clone(),
+                    // Push credentials (`push.apns.key: { vault: .. }`).
+                    vault: Some(vault.clone()),
                 }),
                 remote_functions: None,
                 // Inject vault secrets so `{{KEY}}` placeholders in user migrations
@@ -2117,7 +2121,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 // to real values on prod. `Some(_)` forces the checked apply path:
                 // an unresolved placeholder fails loudly rather than writing a
                 // literal `{{...}}`. (Previously `None` → verbatim → broke auth.)
-                secrets: Some(cloud::load_vault_secrets_for_prod()),
+                secrets: Some(vault),
             };
 
             let engine = migration::create_engine(ctx)?;

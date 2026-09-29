@@ -2719,6 +2719,7 @@ fn apply_internal_sp00ky_schema(
         mode,
         Some(&endpoint),
         Some(secret),
+        &mut crate::cloud::load_vault_envs_for_dev,
     )?;
 
     // Machine pools: after the internal schema (the tables must exist), with the

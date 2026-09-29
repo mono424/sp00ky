@@ -10,13 +10,19 @@
 //! A missing `push:` block writes `PushConfig::default()` (enabled, no rules):
 //! removing the block has to stop the rules it used to declare, and direct
 //! messages (`_00_push_message`) keep working without any configuration.
+//!
+//! Native push (`push.apns`, `push.fcm`) adds two writes ([`sync_native`]):
+//! the resolved secrets go to `_00_push_credential` (root only; the config
+//! row only ever holds the redacted form), and the non-secret client facts
+//! (which providers exist, the bundle-id allowlist, the Android Firebase
+//! client config) to the `$sp00ky_push_native` param `fn::push::*` reads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use push_core::{DataSpec, Issue, PushConfig, Severity, Target};
-use serde_json::Value;
+use anyhow::{anyhow, bail, Context, Result};
+use push_core::{DataSpec, Issue, PushConfig, SecretRef, Severity, Target};
+use serde_json::{json, Value};
 
 use crate::backend::{DeployMode, Sp00kyConfig};
 use crate::parser::{SchemaParser, TableSchema};
@@ -32,8 +38,9 @@ pub struct Spec {
     pub hash: String,
 }
 
+/// What the engine reads: the config with every secret reference redacted.
 pub fn spec_of(cfg: &PushConfig) -> Result<Spec> {
-    let json = serde_json::to_string(cfg).context("could not serialize the push config")?;
+    let json = serde_json::to_string(&cfg.redacted()).context("could not serialize the push config")?;
     let hash = crate::migrate::checksum_str(&json);
     Ok(Spec { json, hash })
 }
@@ -118,6 +125,254 @@ pub fn sync(client: &dyn MigrationDB, cfg: &PushConfig) -> Result<Outcome> {
     Ok(Outcome::Written)
 }
 
+// ── Native credentials ──────────────────────────────────────────────────
+
+pub const CREDENTIAL_TABLE: &str = "_00_push_credential";
+
+/// The project vault, loaded the first time a `{ vault: KEY }` reference
+/// needs it (most projects have none, and loading it is a Cloud round trip).
+pub struct Vault<'a> {
+    load: Option<Box<dyn FnMut() -> Vec<(String, String)> + 'a>>,
+    loaded: Option<Vec<(String, String)>>,
+}
+
+impl<'a> Vault<'a> {
+    pub fn new(load: impl FnMut() -> Vec<(String, String)> + 'a) -> Vault<'a> {
+        Vault { load: Some(Box::new(load)), loaded: None }
+    }
+
+    /// No vault in this context: `{ vault: .. }` references do not resolve.
+    pub fn none() -> Vault<'static> {
+        Vault { load: None, loaded: None }
+    }
+
+    fn get(&mut self, key: &str) -> Option<String> {
+        if self.loaded.is_none() {
+            self.loaded = Some(self.load.as_mut().map(|f| f()).unwrap_or_default());
+        }
+        let vars = self.loaded.as_ref()?;
+        vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+}
+
+/// The value a secret reference points at.
+pub fn resolve_secret(r: &SecretRef, base_dir: &Path, vault: &mut Vault<'_>) -> Result<String> {
+    let value = match r {
+        SecretRef::Vault { vault: key } => vault
+            .get(key)
+            .ok_or_else(|| anyhow!("vault key `{key}` is not set here (spky env set {key} ...)"))?,
+        SecretRef::Env { env } => {
+            std::env::var(env).map_err(|_| anyhow!("environment variable `{env}` is not set"))?
+        }
+        SecretRef::File { file } => {
+            let path = base_dir.join(file);
+            std::fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?
+        }
+        SecretRef::Literal(s) if s == push_core::REDACTED => {
+            bail!("`{}` is the stored placeholder, not a secret", push_core::REDACTED)
+        }
+        SecretRef::Literal(s) => s.clone(),
+    };
+    if value.trim().is_empty() {
+        bail!("the secret is empty");
+    }
+    Ok(value)
+}
+
+/// What happened to one provider's credential row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Credential {
+    Unchanged,
+    Written,
+    /// The block was removed from the manifest.
+    Removed,
+    /// The secret did not resolve or parse; the stored one stays in use.
+    Kept(String),
+    /// The secret did not resolve or parse and nothing is stored.
+    Missing(String),
+}
+
+impl Credential {
+    /// Devices of this kind can be reached after the sync.
+    pub fn usable(&self) -> bool {
+        matches!(self, Credential::Unchanged | Credential::Written | Credential::Kept(_))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeReport {
+    pub apns: Option<Credential>,
+    pub fcm: Option<Credential>,
+    pub warnings: Vec<String>,
+}
+
+impl NativeReport {
+    /// One line per configured provider and warning, for step output;
+    /// `true` marks the ones to show as warnings.
+    pub fn lines(&self) -> Vec<(bool, String)> {
+        let mut out = Vec::new();
+        for (name, c) in [("apns", &self.apns), ("fcm", &self.fcm)] {
+            let Some(c) = c else { continue };
+            out.push(match c {
+                Credential::Unchanged => (false, format!("push.{name} credential unchanged")),
+                Credential::Written => (false, format!("push.{name} credential stored")),
+                Credential::Removed => (false, format!("push.{name} credential removed")),
+                Credential::Kept(e) => (true, format!("push.{name} credential NOT updated ({e}); the stored one stays in use")),
+                Credential::Missing(e) => (true, format!("push.{name} has no credential ({e}); these devices get nothing")),
+            });
+        }
+        out.extend(self.warnings.iter().map(|w| (true, w.clone())));
+        out
+    }
+}
+
+/// Stored credential hashes by provider name.
+fn stored_credentials(client: &dyn MigrationDB) -> HashMap<String, String> {
+    let Ok(responses) = client.execute(&format!("SELECT id, hash FROM {CREDENTIAL_TABLE};")) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for r in responses.into_iter().filter(|r| r.status == "OK") {
+        let rows = match r.result {
+            Some(Value::Array(rows)) => rows,
+            _ => continue,
+        };
+        for row in rows {
+            let (Some(id), Some(hash)) = (
+                row.get("id").and_then(Value::as_str),
+                row.get("hash").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let name = id.rsplit(':').next().unwrap_or(id).trim_matches(|c| c == '⟨' || c == '⟩' || c == '`');
+            out.insert(name.to_string(), hash.to_string());
+        }
+    }
+    out
+}
+
+fn put_credential(
+    client: &dyn MigrationDB,
+    name: &str,
+    secret: Result<String>,
+    stored: &HashMap<String, String>,
+) -> Result<Credential> {
+    let secret = match secret {
+        Ok(s) => s,
+        Err(e) => {
+            let why = format!("{e:#}");
+            return Ok(if stored.contains_key(name) {
+                Credential::Kept(why)
+            } else {
+                Credential::Missing(why)
+            });
+        }
+    };
+    let hash = crate::migrate::checksum_str(&secret);
+    if stored.get(name) == Some(&hash) {
+        return Ok(Credential::Unchanged);
+    }
+    // The error must not echo the statement: it carries the secret.
+    client
+        .execute(&format!(
+            "UPSERT {CREDENTIAL_TABLE}:{name} SET secret = {}, hash = {}, updated_at = time::now();",
+            surql_string(&secret),
+            surql_string(&hash)
+        ))
+        .map_err(|_| anyhow!("failed to write {CREDENTIAL_TABLE}:{name}"))?;
+    Ok(Credential::Written)
+}
+
+/// The APNs credential row: team, key id and the .p8, checked by the same
+/// parser the engine uses.
+fn apns_secret(a: &push_core::ApnsConfig, base_dir: &Path, vault: &mut Vault<'_>) -> Result<String> {
+    let key = resolve_secret(&a.key, base_dir, vault)?;
+    let secret = json!({ "teamId": a.team_id, "keyId": a.key_id, "key": key.trim() }).to_string();
+    push_core::native::Apns::from_secret(&secret).map_err(|e| anyhow!(e))?;
+    Ok(secret)
+}
+
+fn fcm_secret(
+    f: &push_core::FcmConfig,
+    base_dir: &Path,
+    vault: &mut Vault<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<String> {
+    let sa = resolve_secret(&f.service_account, base_dir, vault)?;
+    let fcm = push_core::native::Fcm::from_secret(&sa).map_err(|e| anyhow!(e))?;
+    if let Some(android) = &f.android {
+        if android.project_id != fcm.project_id() {
+            warnings.push(format!(
+                "push.fcm.android.projectId is `{}` but the service account belongs to `{}`: Android tokens will be refused",
+                android.project_id,
+                fcm.project_id()
+            ));
+        }
+    }
+    Ok(sa.trim().to_string())
+}
+
+/// `$sp00ky_push_native`: what `fn::push::info()` / `fn::push::register`
+/// tell apps. Built from validated values only, and quoted anyway.
+pub fn native_param_sql(cfg: &PushConfig, apns: bool, fcm: bool) -> String {
+    let mut fields = vec![format!("apns: {apns}"), format!("fcm: {fcm}")];
+    if let Some(a) = cfg.apns.as_ref().filter(|a| !a.bundle_ids.is_empty()) {
+        let ids: Vec<String> = a.bundle_ids.iter().map(|b| surql_string(b)).collect();
+        fields.push(format!("bundleIds: [{}]", ids.join(", ")));
+    }
+    if let Some(a) = cfg.fcm.as_ref().and_then(|f| f.android.as_ref()) {
+        fields.push(format!(
+            "android: {{ projectId: {}, appId: {}, apiKey: {}, senderId: {} }}",
+            surql_string(&a.project_id),
+            surql_string(&a.app_id),
+            surql_string(&a.api_key),
+            surql_string(&a.sender_id)
+        ));
+    }
+    format!(
+        "DEFINE PARAM OVERWRITE $sp00ky_push_native VALUE {{ {} }} PERMISSIONS FULL;",
+        fields.join(", ")
+    )
+}
+
+/// Store the native credentials and `$sp00ky_push_native`. A secret that
+/// does not resolve never wipes a stored one (a deploy from a machine without
+/// the key file must not take push down); removing the block removes the row.
+pub fn sync_native(
+    client: &dyn MigrationDB,
+    cfg: &PushConfig,
+    base_dir: &Path,
+    vault: &mut Vault<'_>,
+) -> Result<NativeReport> {
+    let stored = stored_credentials(client);
+    let mut report = NativeReport::default();
+    let remove = |name: &str| -> Result<Option<Credential>> {
+        if !stored.contains_key(name) {
+            return Ok(None);
+        }
+        client
+            .execute(&format!("DELETE {CREDENTIAL_TABLE}:{name};"))
+            .with_context(|| format!("failed to delete {CREDENTIAL_TABLE}:{name}"))?;
+        Ok(Some(Credential::Removed))
+    };
+    report.apns = match &cfg.apns {
+        Some(a) => Some(put_credential(client, "apns", apns_secret(a, base_dir, vault), &stored)?),
+        None => remove("apns")?,
+    };
+    report.fcm = match &cfg.fcm {
+        Some(f) => {
+            let secret = fcm_secret(f, base_dir, vault, &mut report.warnings);
+            Some(put_credential(client, "fcm", secret, &stored)?)
+        }
+        None => remove("fcm")?,
+    };
+    let usable = |c: &Option<Credential>| c.as_ref().is_some_and(Credential::usable);
+    client
+        .execute(&native_param_sql(cfg, usable(&report.apns), usable(&report.fcm)))
+        .context("failed to write $sp00ky_push_native")?;
+    Ok(report)
+}
+
 /// The `push:` block of the manifest at `config_path`, strictly parsed.
 ///
 /// Unlike `backend::load_config` this never falls back to a default config on
@@ -157,6 +412,21 @@ pub fn lint_issues(config: &Sp00kyConfig, config_path: &Path) -> Vec<Issue> {
             "push",
             "`mode: surrealism` has no push host (the scheduler or a standalone SSP runs the engine): the rules are stored, but nothing delivers them",
         ));
+    }
+    let base_dir = config_path.parent().unwrap_or(Path::new("."));
+    let files = [
+        push.apns.as_ref().map(|a| ("push.apns.key", &a.key)),
+        push.fcm.as_ref().map(|f| ("push.fcm.serviceAccount", &f.service_account)),
+    ];
+    for (at, secret) in files.into_iter().flatten() {
+        if let SecretRef::File { file } = secret {
+            if !base_dir.join(file).exists() {
+                issues.push(Issue::warning(
+                    at,
+                    format!("`{file}` does not exist here; a migrate from this machine keeps the stored credential"),
+                ));
+            }
+        }
     }
     if push.rules.is_empty() {
         return issues;
@@ -615,5 +885,156 @@ rules:
         assert_eq!(summary(&PushConfig::default()), "no rules");
         assert_eq!(summary(&cfg("rules: { r: { table: t, to: u } }")), "1 rule");
         assert_eq!(summary(&cfg("enabled: false")), "disabled");
+    }
+
+    // ── native credentials ──────────────────────────────────────────────
+
+    const TEST_P8: &str = include_str!("../../../packages/push-core/testdata/apns_test_key.p8");
+    const TEST_RSA: &str = include_str!("../../../packages/push-core/testdata/fcm_test_key.pem");
+
+    fn service_account(project: &str) -> String {
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": project,
+            "private_key": TEST_RSA,
+            "client_email": "push@x.iam.gserviceaccount.com",
+        })
+        .to_string()
+    }
+
+    /// Answers the credential read with `stored`, records every statement.
+    struct CredDb {
+        stored: Vec<(&'static str, String)>,
+        executed: RefCell<Vec<String>>,
+    }
+
+    impl CredDb {
+        fn new(stored: Vec<(&'static str, String)>) -> CredDb {
+            CredDb { stored, executed: RefCell::new(Vec::new()) }
+        }
+        fn writes(&self) -> Vec<String> {
+            self.executed.borrow().iter().filter(|q| !q.starts_with("SELECT")).cloned().collect()
+        }
+    }
+
+    impl MigrationDB for CredDb {
+        fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_ns_db(&self) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_migration_table(&self) -> Result<()> {
+            Ok(())
+        }
+        fn execute(&self, query: &str) -> Result<Vec<SurrealResponse>> {
+            self.executed.borrow_mut().push(query.to_string());
+            let result = query.starts_with("SELECT id, hash FROM _00_push_credential").then(|| {
+                Value::Array(
+                    self.stored
+                        .iter()
+                        .map(|(n, h)| serde_json::json!({ "id": format!("_00_push_credential:{n}"), "hash": h }))
+                        .collect(),
+                )
+            });
+            Ok(vec![SurrealResponse { status: "OK".into(), result }])
+        }
+        fn get_applied_migrations(&self) -> Result<Vec<AppliedMigration>> {
+            Ok(vec![])
+        }
+        fn record_migration(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn update_migration_checksum(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    const NATIVE: &str = r#"
+apns: { teamId: ABCDE12345, keyId: XYZ987WVUT, key: { file: AuthKey.p8 }, bundleIds: [im.app] }
+fcm:
+  serviceAccount: { vault: FCM_SA }
+  android: { projectId: sp00ky-test, appId: "1:42:android:ab", apiKey: AIzaX, senderId: "42" }
+"#;
+
+    #[test]
+    fn native_credentials_are_resolved_stored_and_left_alone_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AuthKey.p8"), TEST_P8).unwrap();
+        let cfg = cfg(NATIVE);
+        let loads = std::cell::Cell::new(0);
+        let mut vault = Vault::new(|| {
+            loads.set(loads.get() + 1);
+            vec![("FCM_SA".to_string(), service_account("sp00ky-test"))]
+        });
+
+        let db = CredDb::new(vec![]);
+        let report = sync_native(&db, &cfg, dir.path(), &mut vault).unwrap();
+        assert_eq!(report.apns, Some(Credential::Written));
+        assert_eq!(report.fcm, Some(Credential::Written));
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(loads.get(), 1, "the vault is loaded once, lazily");
+        let writes = db.writes();
+        assert_eq!(writes.len(), 3, "{writes:#?}");
+        assert!(writes[0].starts_with("UPSERT _00_push_credential:apns SET secret = '{"));
+        assert!(writes[0].contains("ABCDE12345") && writes[0].contains("BEGIN PRIVATE KEY"));
+        assert!(writes[1].starts_with("UPSERT _00_push_credential:fcm"));
+        assert_eq!(
+            writes[2],
+            "DEFINE PARAM OVERWRITE $sp00ky_push_native VALUE { apns: true, fcm: true, bundleIds: ['im.app'], \
+             android: { projectId: 'sp00ky-test', appId: '1:42:android:ab', apiKey: 'AIzaX', senderId: '42' } } PERMISSIONS FULL;"
+        );
+
+        // Same secrets stored: only the param is written.
+        let hash_of = |q: &str| q.rsplit("hash = '").next().unwrap().split('\'').next().unwrap().to_string();
+        let db2 = CredDb::new(vec![("apns", hash_of(&writes[0])), ("fcm", hash_of(&writes[1]))]);
+        let report = sync_native(&db2, &cfg, dir.path(), &mut vault).unwrap();
+        assert_eq!((report.apns, report.fcm), (Some(Credential::Unchanged), Some(Credential::Unchanged)));
+        assert_eq!(db2.writes().len(), 1);
+
+        // The spec the engine reads never holds the references.
+        let spec = spec_of(&cfg).unwrap();
+        assert!(!spec.json.contains("AuthKey.p8") && !spec.json.contains("FCM_SA"), "{}", spec.json);
+    }
+
+    #[test]
+    fn an_unresolvable_secret_never_wipes_the_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(NATIVE);
+        // No key file, no vault: stored rows stay, missing ones are reported.
+        let db = CredDb::new(vec![("apns", "old".into())]);
+        let report = sync_native(&db, &cfg, dir.path(), &mut Vault::none()).unwrap();
+        assert!(matches!(&report.apns, Some(Credential::Kept(e)) if e.contains("AuthKey.p8")), "{report:?}");
+        assert!(matches!(&report.fcm, Some(Credential::Missing(e)) if e.contains("FCM_SA")), "{report:?}");
+        let writes = db.writes();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains("apns: true, fcm: false"), "{}", writes[0]);
+
+        // A key that is not a .p8 is refused before it is stored.
+        std::fs::write(dir.path().join("AuthKey.p8"), "not a key").unwrap();
+        let report = sync_native(&CredDb::new(vec![]), &cfg, dir.path(), &mut Vault::none()).unwrap();
+        assert!(matches!(&report.apns, Some(Credential::Missing(e)) if e.contains("P-256")), "{report:?}");
+    }
+
+    #[test]
+    fn removing_a_block_removes_its_credential_and_a_mismatched_project_warns() {
+        let db = CredDb::new(vec![("apns", "a".into()), ("fcm", "f".into())]);
+        let report = sync_native(&db, &PushConfig::default(), Path::new("."), &mut Vault::none()).unwrap();
+        assert_eq!((report.apns, report.fcm), (Some(Credential::Removed), Some(Credential::Removed)));
+        assert_eq!(
+            db.writes(),
+            vec![
+                "DELETE _00_push_credential:apns;".to_string(),
+                "DELETE _00_push_credential:fcm;".to_string(),
+                "DEFINE PARAM OVERWRITE $sp00ky_push_native VALUE { apns: false, fcm: false } PERMISSIONS FULL;".to_string(),
+            ]
+        );
+
+        let mut vault = Vault::new(|| vec![("FCM_SA".to_string(), service_account("another-project"))]);
+        let only_fcm = cfg("fcm: { serviceAccount: { vault: FCM_SA }, android: { projectId: sp00ky-test, appId: a, apiKey: b, senderId: '1' } }");
+        let report = sync_native(&CredDb::new(vec![]), &only_fcm, Path::new("."), &mut vault).unwrap();
+        assert_eq!(report.fcm, Some(Credential::Written));
+        assert!(report.warnings[0].contains("another-project"), "{:?}", report.warnings);
+        assert!(report.lines().iter().any(|(warn, l)| *warn && l.contains("another-project")));
     }
 }

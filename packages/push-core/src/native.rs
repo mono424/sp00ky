@@ -1021,11 +1021,7 @@ pub(crate) mod tests {
 
     // A throwaway key made for these tests (`openssl genpkey -algorithm EC
     // -pkeyopt ec_paramgen_curve:P-256`), in Apple's .p8 layout.
-    pub(crate) const TEST_P8: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDj6koxo5KtMn6QIs
-mrvkvEiFcippdURoL9yWat4LgbmhRANCAASK73+cisqPRLJ6m0WyjceaF5+C+VfX
-LOqVeDEOSxeUqCOJg7HdC08v+atq9wk5Fu0JdcHCuFAb76lQMm4Kq8BS
------END PRIVATE KEY-----";
+    pub(crate) const TEST_P8: &str = include_str!("../testdata/apns_test_key.p8");
 
     // Same, RSA 2048 (`openssl genpkey -algorithm RSA`), as a service
     // account's `private_key`.

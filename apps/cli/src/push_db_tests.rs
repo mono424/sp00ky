@@ -315,3 +315,66 @@ async fn status_devices_and_send_read_the_real_tables() {
     let state = run(&db, &push_cmd::message_state_sql(&pending).unwrap()).await;
     assert_eq!(state[0][0]["status"], json!("pending"));
 }
+
+/// What `sync_native` writes, run for real: the credential survives the
+/// quoting byte for byte, `fn::push::info()` reads the param, and `spky push
+/// status` / `devices` see the native rows.
+#[tokio::test]
+async fn native_sync_output_runs_and_reads_back() {
+    let db = db().await;
+    run(&db, &push_sync_ddl(SyncTransport::Http)).await;
+    let cfg: push_core::PushConfig = serde_yaml::from_str(
+        r#"
+apns: { teamId: ABCDE12345, keyId: XYZ987WVUT, key: { vault: K }, bundleIds: [im.app] }
+fcm:
+  serviceAccount: { vault: S }
+  android: { projectId: sp00ky-test, appId: "1:42:android:ab", apiKey: "AIza'x", senderId: "42" }
+"#,
+    )
+    .unwrap();
+    run(&db, &push_sync::native_param_sql(&cfg, true, false)).await;
+    let secret = "{\"key\":\"-----BEGIN PRIVATE KEY-----\\nab'c\\\\d\\n-----END PRIVATE KEY-----\"}";
+    run(
+        &db,
+        &format!(
+            "UPSERT _00_push_credential:apns SET secret = {}, hash = 'h';",
+            push_sync::surql_string(secret)
+        ),
+    )
+    .await;
+    let stored = run(&db, "SELECT VALUE secret FROM ONLY _00_push_credential:apns").await;
+    assert_eq!(stored[0], json!(secret));
+
+    let info = run(&db, "RETURN fn::push::info()").await;
+    assert_eq!(info[0]["providers"], json!(["apns"]));
+    assert_eq!(info[0]["android"], Value::Null, "fcm is not usable, so no client config");
+    run(&db, &push_sync::native_param_sql(&cfg, true, true)).await;
+    let info = run(&db, "RETURN fn::push::info()").await;
+    assert_eq!(info[0]["providers"], json!(["apns", "fcm"]));
+    assert_eq!(info[0]["android"]["apiKey"], json!("AIza'x"));
+
+    run(
+        &db,
+        "CREATE _00_push_subscription:n SET auth_id = 'user:u1', kind = 'apns', endpoint = 'apns:ab', token = 'ab', app_id = 'im.app', environment = 'sandbox'; \
+         CREATE _00_push_subscription:w SET auth_id = 'user:u1', endpoint = 'https://p.example/x', p256dh = 'p', auth = 'a', kid = 'old';",
+    )
+    .await;
+    let s = push_cmd::parse_status(&run(&db, push_cmd::STATUS_SQL).await);
+    assert_eq!(s.credentials, vec!["apns".to_string()]);
+    assert_eq!(s.by_kind, [1, 1, 0]);
+    assert_eq!(s.stale, 1, "only the web row can be on an old key");
+    assert_eq!(s.native["bundleIds"], json!(["im.app"]));
+
+    let rows = run(&db, &push_cmd::devices_sql("user:u1")).await[0].clone();
+    let native = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == json!("apns"))
+        .unwrap()
+        .clone();
+    assert_eq!(native["current"], json!(true));
+    assert_eq!(native["environment"], json!("sandbox"));
+    let web = rows.as_array().unwrap().iter().find(|r| r["kind"] == json!("web")).unwrap().clone();
+    assert_eq!(web["current"], json!(false));
+}

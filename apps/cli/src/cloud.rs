@@ -1545,6 +1545,7 @@ fn apply_remote_fns_and_internal_schema(
             &mode,
             Some(&fn_endpoint),
             Some(&auth_secret),
+            &mut || load_vault_map_for_deploy(client, pid, true).into_iter().collect(),
         ) {
             Ok(()) => {}
             Err(e) => {

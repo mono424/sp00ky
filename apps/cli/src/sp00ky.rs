@@ -97,6 +97,7 @@ pub(crate) fn push_message_events(post_ingest: bool) -> String {
     out.push_str("            id: <string>($after.id OR \"\"),\n");
     out.push_str("            to: $after.to,\n");
     out.push_str("            notification: $after.notification,\n");
+    out.push_str("            native: $after.native,\n");
     out.push_str("            data: $after.data,\n");
     out.push_str("            topic: $after.topic,\n");
     out.push_str("            urgency: $after.urgency,\n");

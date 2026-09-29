@@ -1,0 +1,36 @@
+mode: cluster
+slug: pushe2e
+schema: ./schema
+version:
+  dev:
+    ssp:
+      path: ../../../target/debug/ssp-server
+    scheduler:
+      path: ../../../target/debug/scheduler
+  cloud: canary
+push:
+  subject: mailto:push-e2e@example.com
+  rules:
+    new-message:
+      table: message
+      on: [create]
+      to: recipient
+      except: sender
+      topic: "dm:{{sender | key}}"
+      throttle: 5s
+      with:
+        author: SELECT username FROM ONLY $row.sender
+      notification:
+        title: "{{author.username}} wrote"
+        body: "{{text | truncate(80)}}"
+        url: "/m/{{id | key}}"
+      data: [sender]
+    alert-nudge:
+      table: alert
+      on: [create, update]
+      to: owner
+      topic: alerts
+logLevel:
+  dev: "info,push=debug"
+sync:
+  transport: changefeed

@@ -10,6 +10,7 @@ export * from './events/index';
 import { AuthEventTypes, createAuthEventSystem } from './events/index';
 import type { PersistenceClient } from '../../types';
 import { classifySyncError } from '../../utils/error-classification';
+import { encodeRecordId } from '../../utils/index';
 import {
   decodeTokenClaims,
   impersonationFromToken,
@@ -36,6 +37,20 @@ export interface ActiveImpersonation {
   started_at: unknown;
   expires_at: unknown;
 }
+
+/** What a sign-out hook sees: the session that is about to end. */
+export interface SignOutContext {
+  /** `table:id` of the signed-in record, or null. */
+  userId: string | null;
+  token: string | null;
+  /** The session is an admin impersonation (its token is the target's). */
+  impersonating: boolean;
+}
+
+export type SignOutHook = (ctx: SignOutContext) => Promise<void> | void;
+
+/** Upper bound on the before-sign-out hooks, so a dead socket never holds a sign-out. */
+export const SIGN_OUT_HOOK_TIMEOUT_MS = 2_000;
 
 // Helper to pretty print types
 type Prettify<T> = {
@@ -81,6 +96,7 @@ export class AuthService<S extends SchemaStructure> {
   public isLoading: boolean = true;
 
   private events = createAuthEventSystem();
+  private signOutHooks = new Set<SignOutHook>();
 
   /** The impersonation last announced, for change detection. */
   private announcedImpersonation: ImpersonationInfo | null = null;
@@ -138,6 +154,40 @@ export class AuthService<S extends SchemaStructure> {
     return () => {
       this.events.unsubscribe(id);
     };
+  }
+
+  /**
+   * Run `hook` at the start of every sign-out, while the token and the socket
+   * still belong to the leaving user (Web Push removes this device's
+   * subscription here). Hooks are best-effort: they run in parallel, errors
+   * are swallowed, and the sign-out goes on after
+   * {@link SIGN_OUT_HOOK_TIMEOUT_MS} whatever they are doing. Returns a disposer.
+   */
+  onBeforeSignOut(hook: SignOutHook): () => void {
+    this.signOutHooks.add(hook);
+    return () => {
+      this.signOutHooks.delete(hook);
+    };
+  }
+
+  private async runSignOutHooks(): Promise<void> {
+    if (this.signOutHooks.size === 0 || !this.isAuthenticated) return;
+    const id = this.currentUser?.id;
+    const ctx: SignOutContext = {
+      userId: id ? (typeof id === 'string' ? id : encodeRecordId(id)) : null,
+      token: this.token,
+      impersonating: this.impersonation !== null,
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SIGN_OUT_HOOK_TIMEOUT_MS);
+    });
+    const hooks = Promise.allSettled([...this.signOutHooks].map(async (hook) => hook(ctx)));
+    try {
+      await Promise.race([hooks, deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private notifyListeners() {
@@ -457,6 +507,8 @@ export class AuthService<S extends SchemaStructure> {
    * impersonation and signs the admin out too.
    */
   async signOut() {
+    // Before anything is dropped: hooks still act as the leaving user.
+    await this.runSignOutHooks();
     const impersonating = this.impersonation;
     this.impersonationTimers.clear();
     if (impersonating) {

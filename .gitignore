@@ -24,3 +24,8 @@ blob-report/
 # Benchmark data
 .bench-*/
 coverage/
+
+# Web Push browser checks (scripts/push-e2e): runtime links, bundles and dev state
+scripts/push-e2e/web/core
+scripts/push-e2e/web/live/sw.bundle.js
+scripts/push-e2e/project/.sp00ky/

@@ -37,6 +37,7 @@ pub mod drift;
 pub mod schema;
 pub mod changefeed;
 pub mod impersonation;
+pub mod push;
 
 use anyhow::{Context, Result};
 
@@ -330,6 +331,11 @@ pub struct Scheduler {
     backend_registry_slot: std::sync::OnceLock<Arc<crate::backend_registry::BackendRegistry>>,
     /// Upstream's table set as the replica follows it (see `crate::schema`).
     pub schema: Arc<crate::schema::SchemaWatch>,
+    /// The Web Push engine, published by `start()` once the root handle
+    /// exists (see `crate::push`).
+    pub push: crate::push::PushSlot,
+    /// Caps concurrent push observers (see `crate::push::observe`).
+    push_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl Scheduler {
@@ -376,6 +382,8 @@ impl Scheduler {
             query_state_slot: std::sync::OnceLock::new(),
             backend_registry_slot: std::sync::OnceLock::new(),
             schema: Arc::new(crate::schema::SchemaWatch::new()),
+            push: crate::push::new_slot(),
+            push_permits: Arc::new(tokio::sync::Semaphore::new(crate::push::OBSERVE_PERMITS)),
         })
     }
 
@@ -408,6 +416,8 @@ impl Scheduler {
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
             schema: Arc::clone(&self.schema.cell),
+            push: Arc::clone(&self.push),
+            push_permits: Arc::clone(&self.push_permits),
         }
     }
 
@@ -817,6 +827,11 @@ impl Scheduler {
         // Publish it for the admin plane, which came up with the HTTP servers
         // (before this point) and answers 503 until this lands.
         *self.db_slot.write().await = Some(admin_db);
+        // Web Push rides the shared handle: its reads are small and keyed.
+        // Built before the tail starts so the first changes it reads can push.
+        if let Some(engine) = crate::push::start(Arc::clone(&shared_db)) {
+            let _ = self.push.set(engine);
+        }
         // Bring the replica in line with upstream's schema before anything
         // reads it: tables added or dropped (or turned `@nosync`) while the
         // scheduler was down, and the opaque fields a persisted snapshot does

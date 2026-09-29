@@ -70,7 +70,8 @@ const workerUrlPlugin = {
   },
 };
 
-export default defineConfig({
+export default defineConfig([
+  {
   // `sqlite-worker` is emitted at `dist/sqlite-worker.js` (top level, NOT under
   // services/database) so the `new URL('./sqlite-worker.js', import.meta.url)`
   // in `SqliteCacheEngine` — which gets bundled into the flat `dist/index.js` —
@@ -91,4 +92,32 @@ export default defineConfig({
   clean: true,
   hash: false,
   plugins: [versionDefinePlugin, workerUrlPlugin],
-});
+  },
+  // The wasm-free entries a service worker, a dedicated worker or Node can
+  // import: `/pure` (protocol builders), `/live` (the live feed over the
+  // pure-JS `surrealdb` SDK) and `/sw` (push handlers). Built separately so
+  // they never share a chunk with `index` (whose graph holds the wasm engines)
+  // and so `dist/index.js` stays one flat file. They may share chunks among
+  // themselves; scripts/check-worker-entries.mjs walks those too and fails
+  // the build on any wasm/pino import or top-level window/document access.
+  {
+    entry: {
+      pure: 'src/pure.ts',
+      live: 'src/live/index.ts',
+      sw: 'src/sw/index.ts',
+    },
+    format: ['esm'],
+    dts: true,
+    clean: false,
+    hash: false,
+    // Own prefix so a chunk of this build never overwrites one of the first
+    // (both write `dist/`; `types.d.ts` collided).
+    // The entries' own declaration files arrive as chunks named `<entry>.d`
+    // and must keep their plain name.
+    outputOptions: {
+      chunkFileNames: (chunk: { name: string }) =>
+        ['pure.d', 'live.d', 'sw.d'].includes(chunk.name) ? '[name].js' : 'worker-[name].js',
+    },
+    plugins: [versionDefinePlugin],
+  },
+]);

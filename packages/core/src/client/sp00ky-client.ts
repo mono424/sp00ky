@@ -34,6 +34,7 @@ import { FeatureFlagModule, FeatureFlagHandle } from '../modules/feature-flag/in
 import type { FeatureFlagOptions, FeatureFlagOverride } from '../modules/feature-flag/index';
 import { AppReleaseModule, AppReleaseHandle } from '../modules/app-release/index';
 import type { AppReleaseOptions } from '../modules/app-release/index';
+import { WebPushModule } from '../modules/web-push/index';
 import { DevToolsService } from '../modules/devtools/index';
 import type { DevToolsQuerySource } from '../modules/devtools/index';
 import { parseQueryParams, generateId } from '../utils/index';
@@ -73,6 +74,8 @@ export interface Sp00kyClientDeps<S extends SchemaStructure> {
 export class Sp00kyClient<S extends SchemaStructure> {
   public readonly auth: AuthService<S>;
   public readonly streamProcessor: StreamProcessorService;
+  /** Web Push for this browser: subscribe, devices, self-pushes, service worker bridge. */
+  public readonly webPush: WebPushModule;
 
   private readonly services: Services<S>;
   private readonly env: SagaEnv;
@@ -139,6 +142,16 @@ export class Sp00kyClient<S extends SchemaStructure> {
     const remoteRegisterPort = { enqueueDownEvent: () => void this.runtime.dispatch({ type: 'EnsureRegistered' }) };
     this.featureFlags = new FeatureFlagModule<S>({ dataModule: liveQueryPort, sync: remoteRegisterPort, auth: s.auth, logger: s.logger });
     this.appReleases = new AppReleaseModule<S>({ dataModule: liveQueryPort, sync: remoteRegisterPort, auth: s.auth, logger: s.logger });
+    this.webPush = new WebPushModule({
+      remote: s.remote,
+      auth: s.auth,
+      persistence: s.persistence,
+      logger: s.logger,
+      database: config.database,
+      connection: s.connectionSupervisor,
+      config: config.webPush,
+    });
+    this.disposers.push(this.webPush.attach());
 
     const querySource: DevToolsQuerySource = {
       getActiveQueries: () => [...this.runtime.state.queries.values()].map(toQueryState),

@@ -18,6 +18,9 @@ humantime = "2"
 # Shared with the runtime engine so a cron/DAG that lints is one the engine can
 # actually plan — no second parser to drift.
 schedule-core = { path = "../../packages/schedule-core" }
+# The `push:` block types and their validation, shared with the push engine
+# (scheduler / standalone SSP) so what lints is exactly what the engine loads.
+push-core = { path = "../../packages/push-core" }
 regex = "1.12.2"
 tar = "0.4"
 zstd = "0.13"
@@ -45,4 +48,9 @@ ssp-protocol = { path = "../../packages/ssp-protocol" }
 [dev-dependencies]
 # Used by the docker-gated e2e tests to talk to the throwaway SurrealDB over HTTP.
 ureq = { version = "2.9", features = ["json"] }
+# In-process SurrealDB v3 (the engine and parser the server runs) for the Web
+# Push SQL tests (`push_db_tests.rs`): the CLI itself only speaks HTTP, and the
+# CLI's own `surrealdb-core` is the 2.x parser.
+surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+tokio = { version = "1", features = ["rt", "macros"] }
 

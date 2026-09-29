@@ -348,6 +348,11 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
     content.push('\n');
     content.push_str(include_str!("pool_tables.surql"));
 
+    // Web Push tables (`_00_push_*`) and `fn::push::*`, with the CHANGEFEED
+    // clause on `_00_push_message` under the changefeed transport.
+    content.push('\n');
+    content.push_str(&push_tables_sql(&sync));
+
     // Migration tracking table
     content.push('\n');
     content.push_str(include_str!("migration_tables.surql"));
@@ -632,7 +637,26 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
     "_00_app_release",
     "_00_heartbeat",
     "_00_query_allowlist",
+    // Direct pushes: the push host (scheduler / standalone SSP) intercepts
+    // them on the ingest path, before the WAL and the circuit. Still excluded
+    // from sync (`ssp_protocol::table_excluded_from_sync`).
+    "_00_push_message",
 ];
+
+/// `push_tables.surql` as it ships for `sync`: verbatim under the http
+/// transport, with `_00_push_message` carrying its CHANGEFEED clause under the
+/// changefeed transport. In the DEFINE itself rather than an ALTER after it,
+/// because the file is all `DEFINE TABLE OVERWRITE`: every re-apply would
+/// otherwise drop the feed and re-add it, and the desired schema that
+/// `schema diff` compares against would disagree with the live one.
+pub fn push_tables_sql(sync: &crate::backend::SyncConfig) -> String {
+    let ddl = include_str!("push_tables.surql");
+    if sync.is_changefeed() {
+        add_changefeed_clauses(ddl, "", sync.retention())
+    } else {
+        ddl.to_string()
+    }
+}
 
 /// Whether a table takes a `CHANGEFEED` clause: every user table that syncs
 /// (not `@nosync`) plus the meta tables above.
@@ -1296,6 +1320,16 @@ DEFINE FIELD meta.secret ON TABLE user
                 && sql.contains("http::post($sp00ky_endpoint + '/ingest'"),
             "pushed free-plan schema is missing the /ingest events → realtime would be broken"
         );
+        // Web Push: the tables, the record-user API and the direct-push event,
+        // the event after the table it hangs on.
+        let table = sql
+            .find("DEFINE TABLE OVERWRITE _00_push_message")
+            .expect("push tables in the free-plan schema");
+        assert!(sql.contains("DEFINE FUNCTION OVERWRITE fn::push::subscribe"));
+        let event = sql
+            .find("DEFINE EVENT OVERWRITE _00_push_message_ingest ON TABLE _00_push_message")
+            .expect("direct-push ingest event in the free-plan schema");
+        assert!(table < event);
     }
 }
 
@@ -1497,6 +1531,19 @@ mod outbox_platform_field_tests {
             panic!("schedule_tables.surql does not parse: {e}");
         }
     }
+
+    /// And the Web Push DDL, in both of the forms it ships in.
+    #[test]
+    fn the_shipped_push_ddl_parses() {
+        use crate::backend::{SyncConfig, SyncTransport};
+        for transport in [SyncTransport::Http, SyncTransport::Changefeed] {
+            let sync = SyncConfig { transport: Some(transport), ..Default::default() };
+            let ddl = super::push_tables_sql(&sync);
+            if let Err(e) = parse_with_capabilities(&ddl, &Capabilities::all()) {
+                panic!("push_tables.surql ({transport:?}) does not parse: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1518,6 +1565,33 @@ mod changefeed_clause_tests {
         assert!(out.contains("DEFINE TABLE OVERWRITE _00_version SCHEMALESS CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FULL;"), "{out}");
         // Idempotent.
         assert_eq!(add_changefeed_clauses(&out, src, "1d"), out);
+    }
+
+    /// `_00_push_message` is born with the feed under the changefeed transport
+    /// (the scheduler learns about a direct push from it) and without it under
+    /// http; the config and subscription tables never take it.
+    #[test]
+    fn only_the_push_message_table_takes_the_feed() {
+        use crate::backend::{SyncConfig, SyncTransport};
+        assert!(table_takes_changefeed("_00_push_message", false, false));
+        assert!(!table_takes_changefeed("_00_push_config", false, false));
+        assert!(!table_takes_changefeed("_00_push_subscription", false, false));
+
+        let cf = push_tables_sql(&SyncConfig {
+            transport: Some(SyncTransport::Changefeed),
+            changefeed_retention: Some("12h".into()),
+            ..Default::default()
+        });
+        assert!(
+            cf.contains("DEFINE TABLE OVERWRITE _00_push_message SCHEMAFULL CHANGEFEED 12h INCLUDE ORIGINAL PERMISSIONS"),
+            "{cf}"
+        );
+        assert_eq!(cf.matches("CHANGEFEED 12h INCLUDE ORIGINAL").count(), 1, "only _00_push_message: {cf}");
+        assert!(cf.contains("DEFINE TABLE OVERWRITE _00_push_config SCHEMAFULL PERMISSIONS NONE;"));
+
+        let http = push_tables_sql(&SyncConfig::default());
+        assert!(!http.contains("INCLUDE ORIGINAL"));
+        assert_eq!(http, include_str!("push_tables.surql"), "http ships the file verbatim");
     }
 
     #[test]

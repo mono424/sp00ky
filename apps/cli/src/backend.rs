@@ -523,9 +523,21 @@ pub struct Sp00kyConfig {
     /// when off, every deploy removes the access method and functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impersonation: Option<ImpersonationConfig>,
+    /// Web Push rules (`push:`): which row changes notify which users. The
+    /// types and their validation live in `push-core`, shared with the engine
+    /// that reads them back from `_00_push_config:default`. May be a path to a
+    /// YAML file holding the whole block (`push: ./push.yml`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<push_core::PushConfig>,
 }
 
 impl Sp00kyConfig {
+    /// `push:` with defaults filled in. A missing block is the default config:
+    /// push enabled, no rules, so direct messages (`_00_push_message`) work.
+    pub fn push(&self) -> push_core::PushConfig {
+        self.push.clone().unwrap_or_default()
+    }
+
     /// The `version:` spec that applies to `env`, if any.
     pub fn version_spec(&self, env: DeployEnv) -> Option<&VersionSpec> {
         match &self.version {
@@ -1416,8 +1428,33 @@ impl Sp00kyConfig {
         Ok(())
     }
 
-    /// Validate hosting configuration for SurrealDB and all apps.
+    /// Validate hosting configuration for SurrealDB and all apps, and the
+    /// `push:` block.
     pub fn validate(&self) -> Result<()> {
+        self.validate_manifest()?;
+        self.validate_push()
+    }
+
+    /// Errors in `push:`, all of them in one message. Warnings are left to
+    /// `spky lint`, which prints every issue on its own line.
+    pub fn validate_push(&self) -> Result<()> {
+        let errors: Vec<String> = self
+            .push()
+            .validate()
+            .into_iter()
+            .filter(|i| i.severity == push_core::Severity::Error)
+            .map(|i| i.to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("invalid `push:` config:\n  {}", errors.join("\n  "))
+        }
+    }
+
+    /// Everything [`Sp00kyConfig::validate`] checks except `push:`, which
+    /// `spky lint` reports issue by issue instead.
+    pub fn validate_manifest(&self) -> Result<()> {
         if let Some(cfg) = &self.surrealdb {
             cfg.validate_raw()?;
         }
@@ -2454,6 +2491,20 @@ const LINKABLE_SECTIONS: &[&str] = &["schedules", "workflows"];
 /// effective config depend on a traversal order nobody can see. If that is ever
 /// wanted, it should be an explicit feature rather than a fallout of recursion.
 fn resolve_linked_definitions(root: &mut serde_yaml::Value, base_dir: &Path) -> Result<()> {
+    // `push: ./push.yml`: the whole block in its own file. Whole-section only:
+    // unlike `schedules`, the block's own keys are not names of definitions,
+    // and `subject: mailto:..` is a string that must stay a string.
+    let push_key = serde_yaml::Value::String("push".to_string());
+    if let Some(serde_yaml::Value::String(path)) = root.get(&push_key).cloned() {
+        let loaded = load_linked_yaml(base_dir, &path, "push")?;
+        if !matches!(loaded, serde_yaml::Value::Mapping(_)) {
+            bail!("push file '{}' must contain the push block as a mapping", path);
+        }
+        if let serde_yaml::Value::Mapping(root_map) = root {
+            root_map.insert(push_key, loaded);
+        }
+    }
+
     for section in LINKABLE_SECTIONS {
         let key = serde_yaml::Value::String((*section).to_string());
         let Some(value) = root.get(&key).cloned() else { continue };
@@ -2685,7 +2736,7 @@ fn resolve_app_includes(root: &mut serde_yaml::Value, base_dir: &Path) -> Result
         // Root-only sections. An include is one app, so these would be merged
         // INTO the app entry and dropped without a word (AppConfig ignores
         // unknown keys); lint would then say "no such machine" with no hint why.
-        for root_only in ["pools", "machines"] {
+        for root_only in ["pools", "machines", "push"] {
             if sub.get(root_only).is_some() {
                 bail!(
                     "app include {} declares `{root_only}:`, which is root-only: move it to sp00ky.yml",

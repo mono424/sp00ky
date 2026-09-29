@@ -54,6 +54,69 @@ fn ingest_post() -> String {
     )
 }
 
+/// Name of the ingest-notify event on `_00_push_message`.
+pub(crate) const PUSH_MESSAGE_EVENT: &str = "_00_push_message_ingest";
+
+/// The ingest-notify event for direct pushes (`_00_push_message`).
+///
+/// Only the http transport posts: the row goes to `/ingest` like any other,
+/// and the push host (scheduler, or the standalone SSP in singlenode)
+/// intercepts `_00_push_message` there, before the WAL, the replica and the
+/// circuit. The table stays excluded from sync. CREATE only: the engine is the
+/// one writer of every later change (claim, delivery result, prune), and a
+/// scheduled row is picked up by its sweep, not by an UPDATE.
+///
+/// Every other case REMOVEs the event: under the changefeed transport the row
+/// reaches the host through the feed (`_00_push_message` carries a CHANGEFEED
+/// clause), so a leftover http event from before the switch would deliver it
+/// twice; surrealism mode has no push host at all, and `mod::dbsp::ingest`
+/// would only load the row into the module's circuit, which is exactly where
+/// it must never be.
+///
+/// The payload mirrors what the changefeed delivers: the stored row, record
+/// ids and datetimes as strings, unset optional fields NONE (absent / null in
+/// the posted JSON).
+pub(crate) fn push_message_events(post_ingest: bool) -> String {
+    if !post_ingest {
+        return format!(
+            "-- Table: _00_push_message (no in-transaction post: changefeed transport or no push host)\n\
+             REMOVE EVENT IF EXISTS {PUSH_MESSAGE_EVENT} ON TABLE _00_push_message;\n\n"
+        );
+    }
+    let mut out = String::new();
+    out.push_str("-- Table: _00_push_message Creation (direct push; push host trigger)\n");
+    out.push_str(&format!(
+        "DEFINE EVENT OVERWRITE {PUSH_MESSAGE_EVENT} ON TABLE _00_push_message\n"
+    ));
+    out.push_str("WHEN $event = \"CREATE\"\nTHEN {\n");
+    out.push_str("    LET $payload = {\n");
+    out.push_str("        table: '_00_push_message',\n");
+    out.push_str("        op: $event,\n");
+    out.push_str("        id: <string>($after.id OR \"\"),\n");
+    out.push_str("        record: {\n");
+    out.push_str("            id: <string>($after.id OR \"\"),\n");
+    out.push_str("            to: $after.to,\n");
+    out.push_str("            notification: $after.notification,\n");
+    out.push_str("            data: $after.data,\n");
+    out.push_str("            topic: $after.topic,\n");
+    out.push_str("            urgency: $after.urgency,\n");
+    out.push_str("            ttl: $after.ttl,\n");
+    out.push_str("            send_at: IF $after.send_at = NONE { NONE } ELSE { <string>$after.send_at },\n");
+    out.push_str("            status: $after.status,\n");
+    out.push_str("            claimed_at: IF $after.claimed_at = NONE { NONE } ELSE { <string>$after.claimed_at },\n");
+    out.push_str("            sent_at: IF $after.sent_at = NONE { NONE } ELSE { <string>$after.sent_at },\n");
+    out.push_str("            delivered: $after.delivered,\n");
+    out.push_str("            error: $after.error,\n");
+    out.push_str("            created_by: $after.created_by,\n");
+    out.push_str("            created_at: <string>($after.created_at OR \"\")\n");
+    out.push_str("        },\n");
+    out.push_str("        hash: \"\"\n");
+    out.push_str("    };\n");
+    out.push_str(&ingest_post());
+    out.push_str("};\n\n");
+    out
+}
+
 /// Bound for the HTTP calls a DB event makes inside the user's transaction
 /// (`/ingest` here, `/view/unregister` in `migrate.rs`). The scheduler
 /// acknowledges as soon as the event is durable (WAL flush + buffer) and no
@@ -500,6 +563,8 @@ pub fn generate_sp00ky_events(
         }
     }
 
+    events.push_str(&push_message_events(post_ingest));
+
     events.push_str("-- Table: _00_app_release Deletion (ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_app_release_delete ON TABLE _00_app_release\n");
     events.push_str("WHEN $event = \"DELETE\"\nTHEN {\n");
@@ -874,5 +939,76 @@ DEFINE FIELD body ON TABLE doc TYPE string;
             out.contains("_00_rv: (SELECT VALUE version FROM ONLY _00_version"),
             "the record version must still be stamped:\n{out}"
         );
+    }
+
+    /// Direct pushes reach the push host over `/ingest` under the http
+    /// transport: CREATE only, inside the bounded post, the whole stored row.
+    #[test]
+    fn push_message_create_posts_to_ingest_under_http() {
+        for mode in [DeployMode::Singlenode, DeployMode::Cluster] {
+            let out = gen(false, mode);
+            let start = out
+                .find(&format!("DEFINE EVENT OVERWRITE {PUSH_MESSAGE_EVENT} ON TABLE _00_push_message"))
+                .unwrap_or_else(|| panic!("missing push message event:\n{out}"));
+            let event = &out[start..start + out[start..].find("\n};\n").unwrap() + 4];
+            assert!(event.contains("WHEN $event = \"CREATE\"\n"), "{event}");
+            assert!(event.contains("table: '_00_push_message'"), "{event}");
+            assert!(
+                event.contains(&format!(
+                    "SELECT * FROM http::post($sp00ky_endpoint + '/ingest', $payload, {{ \"Authorization\": \"Bearer \" + $sp00ky_secret }}) TIMEOUT {EVENT_HTTP_TIMEOUT_SECS}s;"
+                )),
+                "the post is bounded like every other ingest event: {event}"
+            );
+            assert!(!event.contains("_00_version"), "never synced, so no version row: {event}");
+            // Every field the DDL defines travels in the payload.
+            let ddl = include_str!("push_tables.surql");
+            for line in ddl.lines() {
+                let Some(rest) = line.strip_prefix("DEFINE FIELD OVERWRITE ") else { continue };
+                let Some((field, tail)) = rest.split_once(' ') else { continue };
+                if !tail.starts_with("ON TABLE _00_push_message ") {
+                    continue;
+                }
+                assert!(
+                    event.contains(&format!("            {field}: ")),
+                    "`{field}` of _00_push_message is missing from the ingest payload: {event}"
+                );
+            }
+        }
+    }
+
+    /// Changefeed: the feed delivers the row, so the event must go (a leftover
+    /// one from an http deploy would deliver it twice). Surrealism: no host.
+    #[test]
+    fn push_message_event_is_removed_without_the_http_post() {
+        let cf = generate_sp00ky_events(
+            &BTreeMap::new(),
+            "",
+            false,
+            &DeployMode::Cluster,
+            None,
+            None,
+            SyncTransport::Changefeed,
+        );
+        let surrealism = gen(false, DeployMode::Surrealism);
+        for out in [cf, surrealism] {
+            assert!(
+                out.contains(&format!("REMOVE EVENT IF EXISTS {PUSH_MESSAGE_EVENT} ON TABLE _00_push_message;")),
+                "{out}"
+            );
+            assert!(!out.contains(&format!("DEFINE EVENT OVERWRITE {PUSH_MESSAGE_EVENT}")), "{out}");
+            assert!(!out.contains("mod::dbsp::ingest('_00_push_message'"), "never into a circuit: {out}");
+        }
+        assert!(!gen(true, DeployMode::Singlenode).contains("_00_push_message"), "not in the client schema");
+    }
+
+    #[test]
+    fn push_message_events_parse() {
+        use surrealdb_core::dbs::Capabilities;
+        for post in [true, false] {
+            let sql = format!("DEFINE TABLE _00_push_message SCHEMALESS;\n{}", push_message_events(post));
+            if let Err(e) = surrealdb_core::syn::parse_with_capabilities(&sql, &Capabilities::all()) {
+                panic!("push message event (post={post}) does not parse:\n{sql}\n-> {e}");
+            }
+        }
     }
 }

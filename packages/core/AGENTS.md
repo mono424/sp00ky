@@ -41,6 +41,8 @@ re-materialized from state, never patched in place.
 - `CrdtManager`, `CrdtField`, `cursorColorFromName`, `CURSOR_COLORS` — Loro-CRDT integration.
 - Types: `Sp00kyConfig` (client-solid wraps it as `SyncedDbConfig`), `QueryTimeToLive`, `PersistenceClient`, `StoreType`, `UpdateOptions`, `RunOptions`, `PreloadOptions`.
 - Subpath: `@spooky-sync/core/otel` — `createOtelTransmit(endpoint)` for piping pino logs to OpenTelemetry.
+- `client.webPush` (`WebPushModule`, `db.webPush` in the Solid bindings) - Web Push on the page: `support()`, `info()`, `subscribe(opts)` (call from a click), `unsubscribe(opts)`, `sync()`, `isSubscribed()`, `update(opts)`, `devices()`, `notify(msg)`, `cancel(id)`, `test()`, `bridge()`, `onMessage(cb)`. Server calls are `fn::push::*`; typed `WebPushError`; config `webPush` in `types.ts`. Sign-out runs through `AuthService.onBeforeSignOut`.
+- Subpaths for service workers, workers and Node (no wasm, no pino, no DOM; `scripts/check-worker-entries.mjs` enforces it in `build`): `@spooky-sync/core/pure` (protocol builders), `@spooky-sync/core/live` (`createLiveFeed`, the live subscriber over the pure-JS SDK), `@spooky-sync/core/sw` (`installPushHandlers`, `getBridgedToken`). Built by the second tsdown config; chunks are prefixed `worker-`. See `docs/web-push-design.md` at the repo root.
 
 ## Common gotchas
 

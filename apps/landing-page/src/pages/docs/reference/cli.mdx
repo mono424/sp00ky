@@ -79,6 +79,7 @@ instead of opening one they stop with the exact command or environment variable 
 | `spky jobs` | Background jobs: `list`, `get`, `kill`, `retry`, `clear`. `clear -A/--all` also drops queued jobs; running ones are never deleted. No subcommand opens the interactive dashboard. [Docs](/docs/jobs) |
 | `spky schedules` | Server-side schedules: `list`, `get`, `pause`, `resume`, `trigger`, `release`, `runs`, `sync`. `release <name> <key>` lets a quarantined `forEach` key fire again. [Docs](/docs/jobs/schedules) |
 | `spky workflows` | Workflow DAGs: `list`, `show`, `watch`, `runs`, `kill`. `show` renders the graph, `watch` follows a run live. [Docs](/docs/jobs/workflows) |
+| `spky push` | Web Push: `status`, `send`, `devices`, `sync`. `send` pushes to users directly and waits for the delivery result. [Flags](#web-push) |
 | `spky logs` | Tail or browse logs. `--filter`, `--split`, `--since`, `--until`, `--grep`, `-i/--interactive` (TUI), `-F/--follow`. [Docs](/docs/cloud/logs) |
 | `spky stats` | Live CPU, memory, disk and network graphs. `--window 1h`, `--filter backend,surrealdb`. |
 | `spky status` | Deployment version, status and running VMs. |
@@ -92,7 +93,7 @@ instead of opening one they stop with the exact command or environment variable 
 | `spky login`, `spky logout` | Authenticate with Sp00ky Cloud. |
 | `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. [Docs](/docs/cloud/getting-started) |
 | `spky deploy` | Build, upload, provision, migrate, deploy. With `sync.queryAllowlist` on, also publishes the committed allowlist JSON as `_00_query_allowlist:<app>__<version>` (the frontend's `package.json` version) and keeps the previous version's row; under `enforce`, a missing or stale JSON (`sourceHash` no longer matches the query module) fails the deploy, under `warn` it warns. [Docs](/docs/cloud/deploying) |
-| `spky push` | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. |
+| `spky push` (no subcommand) | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. With a subcommand it is the [Web Push](#web-push) tool. |
 | `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. Also publishes the app's allowlist JSON under the announced version, so a regenerated [query allowlist](/docs/guide/query-allowlist) goes live without a restart. |
 | `spky env` | Encrypted variables and the vault: `set`, `list`, `rm`, `pull`, `import`, `unlock`, `passphrase`, `share-ci`, `reset`. `set --file <path>` reads a multi-line value (a PEM key) from disk, scoped with `--dev` or `--prod`. `reset` takes `request`, `approve <email>`, `complete`, `list`. [Docs](/docs/cloud/env-variables) |
 | `spky domain` | Custom domains: `add`, `list`, `remove`. `add --app <name>` picks which app serves it (a frontend, an exposed backend, or a backend on a [dedicated machine](/docs/cloud/dedicated-machines)), `add --status` attaches it to the public uptime page. |
@@ -122,6 +123,37 @@ SSPs, leaving backends, frontends and SurrealDB running.
 What `--upgrade`, `--clean` and `--surreal` do at the container level is spelled out in
 [Admin dashboard](/docs/reference/admin-dashboard), which offers the same three actions from a
 browser.
+
+## Web Push
+
+`spky push` inspects and drives [Web Push](/docs/reference/config#web-push) as root, against the
+local dev database by default or the cloud deployment with `--cloud` (or any database with `--url`,
+`--namespace`, `--database`, `--username`, `--password`), like `spky schedules`.
+
+| Command | What it does |
+| --- | --- |
+| `spky push status [--json]` | Whether a host has published its VAPID key (and its `kid`), the rules stored in `_00_push_config`, devices per user (disabled ones, and ones subscribed under an older key), and direct messages by status with the most recent failures. |
+| `spky push send --to <user> ...` | Creates a `_00_push_message` for the given users and waits up to 40 s for the delivery result: how many devices accepted it, or why it failed. With no notification flags it sends a nudge. On `--cloud` it asks first (`-y` answers). |
+| `spky push devices <user> [--json]` | A user's subscriptions, newest first: label or user agent, push service, last success, failures, disabled reason, rule filter. Never the encryption keys; `--json` includes the full endpoint. |
+| `spky push sync` | Store `push:` from `sp00ky.yml` without a deploy (`spky deploy` and `spky migrate` do it anyway). |
+
+`send` takes:
+
+| Flag | What it does |
+| --- | --- |
+| `--to <user>` | Recipient, as `$auth.id` reads (`user:abc`). Repeat it or comma-separate. Required. |
+| `--title`, `--body` | The visible notification. A notification needs a `--title`. |
+| `--link <url>` | Opened when the notification is clicked (`notification.url`). Not `--url`: that one picks the database. |
+| `--icon`, `--tag` | Notification icon, and a tag that replaces an earlier notification with the same tag on screen. |
+| `--topic <key>` | Collapse key: an undelivered push with the same topic is replaced at the push service. |
+| `--at <when>` | Send later: an RFC 3339 time (`2026-10-01T09:00:00Z`) or a delay (`10m`, `2h`, `1d`). |
+| `--ttl <duration>` | How long the push service keeps it for a device that is offline (`30s`, `1h`, `1d`). |
+| `--urgency <u>` | `very-low`, `low`, `normal` or `high`. |
+| `--data <json>` | A JSON object handed to the service worker as `payload.data`. |
+| `--no-wait` | Return once the message is queued. |
+| `--json` | Print the outcome as JSON (`id`, `status`, `delivered`, `error`). |
+
+<CodeBlock code={pushCode} lang="bash" />
 
 ## Migrating a deployment
 
@@ -170,6 +202,14 @@ spky restart --all-backends  # every backend app
 spky restart --upgrade       # newest scheduler/SSP build first (unless version: pins them)
 spky restart --clean         # also wipe the scheduler's replica + WAL
 spky restart db -y           # CI: skip the SurrealDB prompt`;
+
+export const pushCode = `spky push status                                    # local dev stack
+spky push status --cloud                            # the deployment
+spky push send --to user:abc --title "Hello" --body "Push works"
+spky push send --to user:abc,user:def --title "Maintenance at 22:00" --at 2h
+spky push send --to user:abc --data '{"conversation":"c1"}'   # a nudge
+spky push devices user:abc
+spky push sync --cloud                              # store push: without a deploy`;
 
 export const confirmCode = `spky project destroy --confirm my-project
 spky backup reset --confirm my-project          # still takes its backup first

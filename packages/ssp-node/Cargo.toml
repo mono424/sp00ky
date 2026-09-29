@@ -21,6 +21,7 @@ tracing = "0.1"
 web-time = "1"
 
 schedule-core = { path = "../schedule-core" }
+push-core = { path = "../push-core" }
 ssp = { path = "../ssp" }
 ssp-protocol = { path = "../ssp-protocol" }
 

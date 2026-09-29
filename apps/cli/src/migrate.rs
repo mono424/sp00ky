@@ -1030,6 +1030,16 @@ pub fn apply_internal_schema(
     internal_sql.push_str(include_str!("pool_tables.surql"));
     internal_sql.push('\n');
 
+    // Web Push tables (`_00_push_*`) and the `fn::push::*` record-user API.
+    // Same arrangement again (push-core's tests include this file). Applied in
+    // every mode, surrealism included: the tables and functions are harmless
+    // there, `fn::push::info()` just reports `enabled: false` because no host
+    // publishes a VAPID key. Under the changefeed transport `_00_push_message`
+    // is born with its CHANGEFEED clause (it is in CHANGEFEED_META_TABLES), so
+    // a direct push reaches the host through the feed.
+    internal_sql.push_str(&crate::schema_builder::push_tables_sql(&sync));
+    internal_sql.push('\n');
+
     // 3b. Per-table sp00ky events (mutation + delete for versioning & ingest)
     let sp00ky_events = generate_sp00ky_events(
         &parser.tables,
@@ -1130,9 +1140,11 @@ pub fn apply_internal_schema(
         && read_stored_schema_hash(client, "internal").as_deref() == Some(&hash)
     {
         step.skip("unchanged");
-        // Schedules still sync: their definitions live in sp00ky.yml, which
-        // changes independently of the schema this hash covers.
+        // Schedules and push rules still sync: their definitions live in
+        // sp00ky.yml, which changes independently of the schema this hash
+        // covers.
         sync_schedules(client, config_path, &backend_processor);
+        sync_push(client, config_path);
         return Ok(());
     }
 
@@ -1171,7 +1183,39 @@ pub fn apply_internal_schema(
         event_count
     ));
     sync_schedules(client, config_path, &backend_processor);
+    sync_push(client, config_path);
     Ok(())
+}
+
+/// Store the `push:` block in `_00_push_config:default` (a missing block
+/// stores the default config), skipping the write when the stored hash
+/// matches.
+///
+/// Non-fatal like `sync_schedules`: a deploy that otherwise succeeded is not
+/// failed over push rules. A manifest that does not parse, or a block that
+/// does not validate, leaves the previous row in place (the engine keeps the
+/// last good rules) and says so. `spky lint` catches both before a deploy;
+/// `spky push sync` retries afterwards.
+fn sync_push(client: &dyn MigrationDB, config_path: Option<&Path>) {
+    // No manifest, nothing to say about push. Writing the default here would
+    // wipe the rules a deploy with a manifest stored.
+    let Some(config_path) = config_path.filter(|p| p.exists()) else { return };
+    let cfg = match crate::push_sync::load(config_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            ui::warn(format!("push rules not synced, sp00ky.yml did not parse: {e:#}"));
+            return;
+        }
+    };
+    match crate::push_sync::sync(client, &cfg) {
+        Ok(crate::push_sync::Outcome::Unchanged) => {
+            ui::detail(format!("push config unchanged ({})", crate::push_sync::summary(&cfg)));
+        }
+        Ok(crate::push_sync::Outcome::Written) => {
+            ui::step("Push config").done(crate::push_sync::summary(&cfg));
+        }
+        Err(e) => ui::warn(format!("failed to sync push rules: {e:#}")),
+    }
 }
 
 /// Push declarative `schedules:` / `workflows:` into `_00_schedule`.
@@ -1868,6 +1912,68 @@ mod tests {
         let recorded = mock.recorded.borrow();
         let on_disk = checksum(&dir.path().join("20260919073412_mcp_authorization.surql")).unwrap();
         assert_eq!(recorded[0].2, on_disk);
+    }
+
+    /// The internal schema carries the Web Push tables, the direct-push ingest
+    /// path that matches the transport, and stores `push:` on BOTH paths: a
+    /// manifest edit that leaves the schema alone must still reach
+    /// `_00_push_config`.
+    #[test]
+    fn internal_schema_ships_push_and_stores_its_config_on_both_paths() {
+        let dir = TempDir::new().unwrap();
+        let schema = dir.path().join("schema.surql");
+        fs::write(
+            &schema,
+            "DEFINE TABLE message SCHEMAFULL;\nDEFINE FIELD recipient ON TABLE message TYPE string;\n",
+        )
+        .unwrap();
+        let push = "push:\n  subject: mailto:ops@example.com\n  rules:\n    r:\n      table: message\n      to: recipient\n";
+        let config = dir.path().join("sp00ky.yml");
+        let config_ref: Option<&Path> = Some(&config);
+        let upserts = |q: &[String]| q.iter().filter(|s| s.starts_with("UPSERT _00_push_config:default SET spec_json = ")).count();
+
+        // Changefeed: `_00_push_message` is born with its feed, no http event.
+        fs::write(&config, format!("sync:\n  transport: changefeed\n{push}")).unwrap();
+        let mock = MockDB::new();
+        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Cluster, None, None).unwrap();
+        let q = mock.executed_queries.borrow().clone();
+        let ddl = q
+            .iter()
+            .find(|s| s.contains("DEFINE TABLE OVERWRITE _00_push_config"))
+            .expect("push tables in the internal schema");
+        assert!(ddl.contains(
+            "DEFINE TABLE OVERWRITE _00_push_message SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS"
+        ));
+        assert!(ddl.contains("REMOVE EVENT IF EXISTS _00_push_message_ingest ON TABLE _00_push_message;"));
+        assert!(!ddl.contains("DEFINE EVENT OVERWRITE _00_push_message_ingest"));
+        assert!(
+            ddl.find("DEFINE TABLE OVERWRITE _00_push_message").unwrap()
+                < ddl.find("REMOVE EVENT IF EXISTS _00_push_message_ingest").unwrap(),
+            "the event statement comes after its table"
+        );
+        assert_eq!(upserts(&q), 1, "normal path stores the config: {q:?}");
+        let internal_hash = q
+            .iter()
+            .find_map(|s| s.strip_prefix("UPSERT _00_schema_state:internal SET hash = '"))
+            .map(|rest| rest.split('\'').next().unwrap().to_string())
+            .expect("internal hash recorded");
+
+        // Hash-skip path: no DDL, the config is still stored.
+        let mock = MockDB::new();
+        mock.set_stored_hash(&internal_hash);
+        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Cluster, None, None).unwrap();
+        let q = mock.executed_queries.borrow().clone();
+        assert!(!q.iter().any(|s| s.contains("DEFINE TABLE OVERWRITE _00_push_config")), "DDL skipped");
+        assert_eq!(upserts(&q), 1, "skip path stores the config too: {q:?}");
+
+        // Http: the table has no feed, the CREATE posts to /ingest.
+        fs::write(&config, push).unwrap();
+        let mock = MockDB::new();
+        apply_internal_schema(&mock, &schema, config_ref, &DeployMode::Singlenode, None, None).unwrap();
+        let q = mock.executed_queries.borrow().clone();
+        let ddl = q.iter().find(|s| s.contains("DEFINE TABLE OVERWRITE _00_push_config")).unwrap();
+        assert!(!ddl.contains("_00_push_message SCHEMAFULL CHANGEFEED"));
+        assert!(ddl.contains("DEFINE EVENT OVERWRITE _00_push_message_ingest ON TABLE _00_push_message"));
     }
 
     /// Under the http transport there is no feed to be born with, but the marker

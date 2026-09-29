@@ -1,0 +1,43 @@
+[package]
+name = "push-core"
+version = "0.0.1-canary.280"
+edition = "2021"
+description = "Portable Web Push engine: push rules over ingested rows, VAPID keys derived from the auth secret, RFC 8291 payload encryption, subscription bookkeeping - shared by the cluster scheduler and the singlenode SSP"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+# Parsing and formatting only (maxAge, the `date` filter, updated_at ordering).
+# The clock is web-time's, so no chrono clock backend is needed on wasm32.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+hkdf = "0.12"
+lru = "0.12"
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+web-time = "1"
+
+schedule-core = { path = "../schedule-core", default-features = false }
+
+# Native hosts only: the reqwest `PushHttp` with a public-address resolver.
+reqwest = { version = "0.12", optional = true }
+tokio = { version = "1", optional = true, features = ["net"] }
+
+[features]
+reqwest = ["dep:reqwest", "dep:tokio"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rand_core's OsRng -> getrandom 0.2, which needs its JS backend on wasm32.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_yaml = "0.9"
+surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+tokio = { version = "1", features = ["full"] }

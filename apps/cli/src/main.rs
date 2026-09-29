@@ -23,6 +23,10 @@ mod parser;
 mod pool_config;
 mod pool_sync;
 mod port_check;
+mod push_cmd;
+#[cfg(test)]
+mod push_db_tests;
+mod push_sync;
 mod query;
 mod scaffold;
 mod dag_render;
@@ -324,11 +328,20 @@ enum Commands {
         #[arg(long, visible_alias = "db")]
         surreal: bool,
     },
-    /// Push the current schema to a free (Cloudflare) project's SSP node.
-    /// Builds the server schema locally and sends it to the control plane,
-    /// which applies it to the project's database and reloads the node. For
-    /// paid plans, schema is applied during `deploy` instead.
-    Push,
+    /// Web Push: status, test sends and a user's devices (`push:` in sp00ky.yml).
+    ///
+    /// Subcommands: `status`, `send`, `devices`, `sync`. Each takes `--cloud`
+    /// (or `--url`) to pick the database, like `spky schedules`.
+    ///
+    /// Without a subcommand, `spky push` keeps its older meaning: push the
+    /// current schema to a free (Cloudflare) project's SSP node. It builds the
+    /// server schema locally and sends it to the control plane, which applies
+    /// it to the project's database and reloads the node. For paid plans,
+    /// schema is applied during `deploy` instead.
+    Push {
+        #[command(subcommand)]
+        action: Option<PushCommands>,
+    },
     /// Scale a deployment component (e.g. `spky scale ssp 3`)
     Scale {
         #[command(subcommand)]
@@ -638,6 +651,103 @@ enum FlagCommands {
         /// Username (or user record id) to evaluate as
         #[arg(long = "as-user")]
         as_user: String,
+        #[command(flatten)]
+        conn: ConnectionArgs,
+        /// Path to sp00ky.yml config file
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PushCommands {
+    /// Show the stored push rules, whether a host has published its VAPID
+    /// key, subscription counts and queued/failed direct messages
+    Status {
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        conn: ConnectionArgs,
+        /// Path to sp00ky.yml config file
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Send a direct push: creates a `_00_push_message` as root and waits for
+    /// the delivery result. With no notification flags it is a content-free
+    /// nudge the app's service worker renders itself.
+    ///
+    ///   spky push send --to user:abc --title "Hello" --body "It works"
+    ///   spky push send --to user:abc --to user:def --title "Maintenance" --at 30m
+    ///   spky push send --to user:abc --data '{"conversation":"c1"}'
+    #[command(
+        verbatim_doc_comment,
+        about = "Send a direct push to users and wait for the delivery result"
+    )]
+    Send {
+        /// Recipient user id as `$auth.id` reads (`user:abc`). Repeat or
+        /// comma-separate for several
+        #[arg(long, required = true, value_delimiter = ',', value_name = "USER_ID")]
+        to: Vec<String>,
+        /// Notification title (required for a visible notification)
+        #[arg(long)]
+        title: Option<String>,
+        /// Notification body
+        #[arg(long)]
+        body: Option<String>,
+        /// URL opened when the notification is clicked (`notification.url`).
+        /// `--url` is taken: it selects the database
+        #[arg(long, value_name = "URL")]
+        link: Option<String>,
+        /// Notification icon URL
+        #[arg(long)]
+        icon: Option<String>,
+        /// Notification tag (a later push with the same tag replaces it on screen)
+        #[arg(long)]
+        tag: Option<String>,
+        /// Collapse key: an undelivered push with the same topic is replaced
+        /// at the push service
+        #[arg(long)]
+        topic: Option<String>,
+        /// Send later: an RFC 3339 time (2026-10-01T09:00:00Z) or a delay (10m, 2h, 1d)
+        #[arg(long, value_name = "WHEN")]
+        at: Option<String>,
+        /// How long the push service keeps it for an offline device (30s, 1h, 1d)
+        #[arg(long)]
+        ttl: Option<String>,
+        /// very-low, low, normal or high
+        #[arg(long)]
+        urgency: Option<String>,
+        /// JSON object handed to the service worker as `payload.data`
+        #[arg(long, value_name = "JSON")]
+        data: Option<String>,
+        /// Return once queued instead of waiting for the delivery result
+        #[arg(long)]
+        no_wait: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        conn: ConnectionArgs,
+        /// Path to sp00ky.yml config file
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// List a user's push subscriptions (devices), newest first, without their keys
+    Devices {
+        /// User id as `$auth.id` reads (`user:abc`)
+        user: String,
+        /// Emit JSON instead of text (includes the full endpoint)
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        conn: ConnectionArgs,
+        /// Path to sp00ky.yml config file
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Store `push:` from sp00ky.yml in `_00_push_config` without a full deploy
+    Sync {
         #[command(flatten)]
         conn: ConnectionArgs,
         /// Path to sp00ky.yml config file
@@ -2536,8 +2646,8 @@ fn handle_lint(config_path: &Path) -> Result<()> {
         .context(format!("Failed to parse {}", config_path.display()))?;
     println!("  Parsed {} successfully.", config_path.display());
 
-    // 3. Structural validation
-    if let Err(e) = config.validate() {
+    // 3. Structural validation. `push:` is reported below, issue by issue.
+    if let Err(e) = config.validate_manifest() {
         errors.push(format!("{}", e));
     }
 
@@ -2715,6 +2825,19 @@ fn handle_lint(config_path: &Path) -> Result<()> {
                 "could not resolve backends to validate schedules: {e:#}"
             )),
         }
+    }
+
+    // 4c. Web Push rules: the block's own validation plus the checks that need
+    // the schema (does the rule's table exist and sync, do its field paths
+    // name fields the ingested row carries).
+    if config.push.is_some() {
+        for issue in push_sync::lint_issues(&config, config_path) {
+            match issue.severity {
+                push_core::Severity::Error => errors.push(issue.to_string()),
+                push_core::Severity::Warning => warnings.push(issue.to_string()),
+            }
+        }
+        println!("  Validated push config ({}).", push_sync::summary(&config.push()));
     }
 
     // 5. Print results
@@ -3150,7 +3273,8 @@ fn main() -> Result<()> {
             upgrade,
             surreal,
         }) => cloud::restart(targets, all_backends, clean, upgrade, surreal),
-        Some(Commands::Push) => cloud::push(),
+        Some(Commands::Push { action: None }) => cloud::push(),
+        Some(Commands::Push { action: Some(action) }) => push_cmd::run(action),
         Some(Commands::Scale { action }) => match action {
             ScaleCommands::Ssp { count } => cloud::scale(count),
         },

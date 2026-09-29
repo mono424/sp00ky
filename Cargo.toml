@@ -12,6 +12,7 @@ members = [
     "packages/ssp-ffi",
     "packages/maintenance",
     "packages/schedule-core",
+    "packages/push-core",
     "packages/pool-protocol",
     "packages/pool-core",
     "packages/ssp-node",

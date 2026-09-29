@@ -50,6 +50,9 @@ pub struct IngestState {
     pub fanout: Arc<Fanout>,
     /// What upstream syncs, lock-free (see `crate::schema`).
     pub schema: crate::schema::SchemaCell,
+    /// The Web Push engine once `start()` has built it (see `crate::push`).
+    pub push: crate::push::PushSlot,
+    pub push_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// The SSP fan-out, moved off the `/ingest` request path.
@@ -200,6 +203,35 @@ pub async fn ingest_event(
     request: IngestRequest,
     versionstamp: u64,
 ) -> Result<u64, (StatusCode, String)> {
+    ingest_event_from(state, request, versionstamp, push_core::Origin::Live).await
+}
+
+/// [`ingest_event`] for a caller that is not a live change: drift repair
+/// re-emits rows that changed long ago, and those must never push.
+pub async fn ingest_event_from(
+    state: &IngestState,
+    request: IngestRequest,
+    versionstamp: u64,
+    origin: push_core::Origin,
+) -> Result<u64, (StatusCode, String)> {
+    // A direct push. Never a synced row: it goes to the push engine and
+    // nowhere else (no WAL, no replica, no SSP), so it is taken before the
+    // clone gate below, which would otherwise refuse (under the http
+    // transport: abort) the write that created it. Left `pending` when the
+    // engine is not up yet; the engine's sweep sends missed messages.
+    if request.table == push_core::engine::MESSAGE_TABLE {
+        crate::push::observe(
+            &state.push,
+            &state.push_permits,
+            &request.table,
+            &request.op,
+            &request.id,
+            &request.record,
+            origin,
+        );
+        return Ok(0);
+    }
+
     // Gate. A 503 here is not a soft failure upstream: the `_00_<table>_*`
     // DB events `http::post` to this endpoint inside the user's transaction,
     // so a refused ingest ABORTS the user's write. That is acceptable only
@@ -354,6 +386,18 @@ pub async fn ingest_event(
             );
         }
     }
+
+    // Push rules watch synced rows. Spawned and bounded: the tail and the
+    // user's transaction never wait on a push service.
+    crate::push::observe(
+        &state.push,
+        &state.push_permits,
+        &request.table,
+        &request.op,
+        &request.id,
+        &request.record,
+        origin,
+    );
 
     // Durable now (WAL flushed, buffered). Hand the SSP fan-out to the queue
     // and answer, so the user's transaction is not held open for it.

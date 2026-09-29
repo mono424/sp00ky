@@ -96,16 +96,27 @@ async fn session(
         (id, frame)
     };
 
-    // The handshake: three requests whose replies must come back in order.
-    let steps = [
-        call(
-            "signin",
-            json!([{ "user": config.username, "pass": config.password }]),
+    // The handshake: requests whose replies must come back in order. The
+    // extra tables are best effort: a refused live query on one of them (an
+    // older schema without the table) leaves it on the fallback interval
+    // instead of failing the doorbell for everything.
+    let mut steps = vec![
+        (
+            call(
+                "signin",
+                json!([{ "user": config.username, "pass": config.password }]),
+            ),
+            true,
         ),
-        call("use", json!([config.namespace, config.database])),
-        call("query", json!([format!("LIVE SELECT id FROM {table};")])),
+        (call("use", json!([config.namespace, config.database])), true),
+        (call("query", json!([format!("LIVE SELECT id FROM {table};")])), true),
     ];
-    for (id, frame) in steps {
+    for extra in crate::changefeed::DOORBELL_EXTRA_TABLES {
+        if *extra != table {
+            steps.push((call("query", json!([format!("LIVE SELECT id FROM {extra};")])), false));
+        }
+    }
+    for ((id, frame), required) in steps {
         tx.send(Message::text(frame)).await?;
         let reply = tokio::time::timeout(RPC_TIMEOUT, async {
             loop {
@@ -127,20 +138,24 @@ async fn session(
         })
         .await
         .map_err(|_| anyhow::anyhow!("rpc {id} timed out"))??;
-        if let Some(err) = reply.get("error") {
-            anyhow::bail!("rpc {id} failed: {err}");
-        }
-        // The live query's reply is `[{status: OK, result: <uuid>}]`.
-        if let Some(status) = reply
-            .get("result")
-            .and_then(|r| r.as_array())
-            .and_then(|a| a.first())
-            .and_then(|s| s.get("status"))
-            .and_then(|s| s.as_str())
-        {
-            if status != "OK" {
-                anyhow::bail!("live query refused: {reply}");
+        let refused = if let Some(err) = reply.get("error") {
+            Some(format!("rpc {id} failed: {err}"))
+        } else {
+            // The live query's reply is `[{status: OK, result: <uuid>}]`.
+            reply
+                .get("result")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.first())
+                .and_then(|s| s.get("status"))
+                .and_then(|s| s.as_str())
+                .filter(|status| *status != "OK")
+                .map(|_| format!("live query refused: {reply}"))
+        };
+        if let Some(why) = refused {
+            if required {
+                anyhow::bail!(why);
             }
+            warn!(error = %why, "Changefeed doorbell: an extra table stays on the fallback interval");
         }
     }
 

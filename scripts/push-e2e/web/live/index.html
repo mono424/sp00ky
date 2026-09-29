@@ -1,0 +1,22 @@
+<!doctype html><meta charset="utf-8"><title>push live e2e</title>
+<script type="module">
+window.__reg = navigator.serviceWorker.register('/live/sw.bundle.js', { type: 'module', scope: '/live/' }).then(async (r) => {
+  await navigator.serviceWorker.ready;
+  return r;
+});
+window.subscribeWith = async (publicKey) => {
+  const reg = await window.__reg;
+  const b = atob(publicKey.replace(/-/g, '+').replace(/_/g, '/'));
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: Uint8Array.from(b, (c) => c.charCodeAt(0)) });
+  return sub.toJSON();
+};
+window.bridge = async (msg) => {
+  const reg = await window.__reg;
+  (reg.active || reg.waiting || reg.installing).postMessage(msg);
+  await new Promise((r) => setTimeout(r, 300));
+};
+window.shown = async () => {
+  const reg = await window.__reg;
+  return (await reg.getNotifications()).map((n) => ({ title: n.title, body: n.body, tag: n.tag }));
+};
+</script>

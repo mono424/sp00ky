@@ -15,6 +15,38 @@ export {
   type AppReleaseOptions,
   type AppReleaseSnapshot,
 } from './modules/app-release/index';
+export {
+  WebPushModule,
+  WebPushError,
+  detectWebPushSupport,
+  PUSH_ENDPOINT_KEY,
+  type WebPushConfig,
+  type WebPushSupport,
+  type WebPushUnsupportedReason,
+  type WebPushInfo,
+  type WebPushDevice,
+  type WebPushSubscribeOptions,
+  type WebPushUnsubscribeOptions,
+  type WebPushSyncOptions,
+  type WebPushSyncStatus,
+  type WebPushUpdateOptions,
+  type WebPushMessageInput,
+  type WebPushMessage,
+  type WebPushErrorCode,
+} from './modules/web-push/index';
+export {
+  PUSH_PAYLOAD_VERSION,
+  isPushPayload,
+  type PushPayload,
+  type PushPayloadKind,
+  type PushOp,
+  type PushUrgency,
+  type PushNotification,
+  type PushNotificationAction,
+  type BridgeTokenMessage,
+  type BridgeSignOutMessage,
+  type WebPushClientMessage,
+} from './push/types';
 export type {
   BlobCacheStats,
   BlobEntry,

@@ -623,7 +623,7 @@ impl RepairFeed for IngestRepairFeed {
             record,
             job_assignee: None,
         };
-        crate::ingest::ingest_event(&self.ingest, request, 0)
+        crate::ingest::ingest_event_from(&self.ingest, request, 0, push_core::Origin::Repair)
             .await
             .map(|_| ())
             .map_err(|(status, reason)| anyhow::anyhow!("ingest refused the repair ({status}): {reason}"))

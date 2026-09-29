@@ -197,6 +197,7 @@ impl TestHarness {
                     standalone: true,
                     // These tests drive the HTTP surface, not the schedule sweep.
                     schedule_engine: None,
+                    push_engine: None,
                     bootstrap_warnings: Arc::new(tokio::sync::RwLock::new(Vec::new())),
                     view_metrics_flush_ms: 2000,
                     ttl_cleanup_interval_secs: 60,

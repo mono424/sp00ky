@@ -15,6 +15,7 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync", "tim
 ssp = { path = "../../packages/ssp" }
 ssp-protocol = { path = "../../packages/ssp-protocol" }
 ssp-node = { path = "../../packages/ssp-node" }
+push-core = { path = "../../packages/push-core", features = ["reqwest"] }
 maintenance = { path = "../../packages/maintenance" }
 
 tracing = "0.1"

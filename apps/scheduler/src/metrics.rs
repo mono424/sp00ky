@@ -392,7 +392,9 @@ async fn health_check(
             "stalled": stalled,
         },
         "heartbeat": heartbeat,
-        "changefeed": changefeed
+        "changefeed": changefeed,
+        // Informational only: push never decides the scheduler's health.
+        "push": crate::push::status_json(&state.ingest.push)
     })))
 }
 
@@ -748,6 +750,7 @@ pub async fn build_entities(state: &MetricsState) -> Vec<serde_json::Value> {
         "lag": pending.lag,
         "heartbeat": heartbeat,
         "changefeed": state.changefeed.json(now_ms),
+        "push": crate::push::status_json(&state.ingest.push),
         "env": mask_sensitive_env(env_vars),
     })];
 

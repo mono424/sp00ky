@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 schedule-core = { path = "../../packages/schedule-core" }
+push-core = { path = "../../packages/push-core", features = ["reqwest"] }
 # Machine pools: the engine, its agent wire types, the docker provider (Docker
 # Engine API over the local socket, so the scheduler image needs no docker CLI)
 # and the HMAC behind per-machine bearer tokens.

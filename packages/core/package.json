@@ -13,12 +13,24 @@
     "./otel": {
       "types": "./dist/otel/index.d.ts",
       "import": "./dist/otel/index.js"
+    },
+    "./pure": {
+      "types": "./dist/pure.d.ts",
+      "import": "./dist/pure.js"
+    },
+    "./live": {
+      "types": "./dist/live.d.ts",
+      "import": "./dist/live.js"
+    },
+    "./sw": {
+      "types": "./dist/sw.d.ts",
+      "import": "./dist/sw.js"
     }
   },
   "scripts": {
     "dev": "tsdown --watch",
     "dev:example": "pnpm dev",
-    "build": "tsdown && node scripts/check-broker-bundle.mjs",
+    "build": "tsdown && node scripts/check-broker-bundle.mjs && node scripts/check-worker-entries.mjs",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",

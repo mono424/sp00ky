@@ -3,6 +3,7 @@ import type { RecordId, SchemaStructure, QueryPlan } from '@spooky-sync/query-bu
 import type { Level, LoggerOptions } from 'pino';
 import type { PushEventOptions } from './events/index';
 import type { LocalEngineChoice } from './services/database/cache-engine';
+import type { WebPushConfig } from './modules/web-push/index';
 
 export type { Level };
 
@@ -384,6 +385,16 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    * Defaults to 30000; `0` disables the timeout.
    */
   downTimeoutMs?: number;
+  /**
+   * Web Push on this page (`client.webPush`, `db.webPush`). Everything is
+   * optional and the defaults need no service worker configuration here:
+   * `autoSync` (repair this browser's subscription after sign-in),
+   * `unsubscribeOnSignOut` (drop this device's subscription on `signOut()`),
+   * `bridge` (post the session to the service worker for live rendering) are
+   * on; `serviceWorkerUrl` registers a worker when the app does not.
+   * See the `push-notifications` docs page.
+   */
+  webPush?: WebPushConfig;
 }
 
 /** Tunables for sync-health reporting. See {@link Sp00kyConfig.syncHealth}. */

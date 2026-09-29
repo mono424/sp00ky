@@ -440,6 +440,7 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         // no runner to execute anything a fired schedule would spawn. Scheduling
         // is VM/singlenode + cluster only until that changes.
         schedule_engine: None,
+        push_engine: None,
         ttl_cleanup_interval_secs: 60,
         // Off: a 15 s alarm would keep the Durable Object from ever
         // hibernating. Registrations naming an unknown table still refresh.

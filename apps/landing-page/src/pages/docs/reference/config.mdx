@@ -49,6 +49,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `workflows` | map \| path | `{}` | Server-side workflow DAGs. See [Workflows](/docs/jobs/workflows). |
 | `deployment` | object | (none) | Cloud deployment knobs: `sspCount`, `backup`, `env` (per-role infra environment variables), `storage.sizeGB` (the volume behind `file:` buckets; only grows). See [Cloud Deployment](/docs/cloud/deploying) and [Bucket storage](/docs/cloud/deploying#bucket-storage). |
 | `retention` | object | (see below) | How long finished jobs and run history are kept. See [Retention](#retention). |
+| `push` | object \| path | enabled, no rules | Web Push rules: which row changes notify which users. See [Web Push](#web-push). |
 
 ## Apps
 
@@ -215,6 +216,70 @@ Either section can also live in its own file, per entry or wholesale, useful onc
   `spky lint` parses every cron expression, checks each interval, resolves each `backend` and `route` against that app's OpenAPI spec, and rejects a workflow whose `dependsOn` edges form a cycle, so a definition that lints is one the scheduler can actually run.
 </Note>
 
+## Web Push
+
+`push` declares rules of the form "when a row of this table looks like this, push to the users in that field". Browsers subscribe through `db.webPush` in the client, and the platform delivers: no app backend, no push library, no key management. The VAPID key is derived from `SPKY_AUTH_SECRET` (or taken from `SPKY_VAPID_PRIVATE_KEY`); `SPKY_PUSH=off` turns push off. The scheduler runs the engine in `cluster` mode, the SSP in `singlenode`; `surrealism` has no push host. Subscribing and the service worker side are in [Push notifications](/docs/client/push-notifications).
+
+<CodeBlock code={ymlPush} lang="yaml" />
+
+Without a `push` block, push is on with no rules: direct pushes (a `_00_push_message` row, `db.webPush.notify()`, `spky push send`) still work. The block may also be a path to a YAML file holding it, `push: ./push.yml`.
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | Master switch. `false` stops every rule and every direct push; subscriptions are kept. |
+| `subject` | `mailto:` or `https:` URI | `https://sp00ky.cloud` | The VAPID contact the push services can reach about your pushes. Apple and Mozilla want one of yours. |
+| `defaults` | object | (none) | `ttl`, `urgency`, `throttle` and `notification`, applied to every rule unless it sets its own. `defaults.notification` (an `icon`, a `badge`, a `lang`) is merged under each rule's notification, the rule's keys winning. |
+| `limits.perUserPerMinute` | integer | `60` | Pushes one user may receive per minute, counted once per matched recipient, not per device. |
+| `limits.perMinute` | integer | `6000` | Pushes the whole project may send per minute, one per subscription. |
+| `limits.maxRecipients` | integer | `10000` | Recipients one matched row may fan out to. |
+| `rules` | map | `{}` | Rules keyed by name (letters, digits, `-`, `_`, `.`). The name travels in every push and is what a device filters on. |
+
+Over a limit a push is dropped and counted, and the engine warns at most once a minute.
+
+### Rules
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `table` | table name | (required) | The synced table whose rows the rule watches. A `-- @nosync` table never reaches the engine, and `_00_` platform tables cannot be watched. |
+| `on` | `create` \| `update` \| `delete` list | `[create]` | Which operations. A `delete` sees the row as it was before the delete. |
+| `when` | map | (none) | Conditions on the row after the change, keyed by field path (`data.kind`). All must hold. See [Conditions](#conditions). |
+| `to` | field path(s) \| `{ query }` | (required) | Who receives it: one field (`recipient`), several (`[owner, assignee]`), or a root SurrealQL query with `$row` bound. A value may be a record id, its string form, an array of either, or rows with an `id`. |
+| `except` | field path(s) | (none) | Users removed from the recipients, typically the author of the change. |
+| `once` | field path list | once per record version | Push at most once per record for each distinct combination of these fields' values: `once: [state]` pushes when a row reaches `ready`, not on every later update while it stays `ready`. |
+| `topic` | template | the record id | Collapse key. An undelivered push is replaced at the push service by a newer one with the same topic, the service worker uses it as the notification `tag`, and throttling is per rule, recipient and topic. |
+| `throttle` | duration | (none) | Minimum gap between two pushes of this rule to one recipient under one topic. Changes inside the gap collapse into one trailing push carrying the latest row, sent when the gap ends. |
+| `maxAge` | `{ field, within }` | (none) | Ignore rows older than `within`, judged by `field` (a datetime, or epoch milliseconds or seconds). Keeps a backfill or an import from paging everyone. |
+| `with` | map of SurrealQL | (none) | Extra template context: one root query per name, with `$row` and `$rule` bound, run only when the rule matched. A name wins over a row field of the same name. |
+| `notification` | object | (none: a nudge) | What the device shows: `title`, `body`, `icon`, `badge`, `image`, `tag`, `url` (opened on click), `lang`, `dir`, `requireInteraction`, `renotify`, `silent`, `actions` (`{ action, title, icon }`), `data`. Any other key passes through to `showNotification`. Every string is a template. |
+| `data` | field list \| map of templates | (none) | `payload.data` for the service worker: row fields to copy, or named templates. Sent with nudges too. |
+| `urgency` | `very-low` \| `low` \| `normal` \| `high` | (push service default) | How eagerly a sleeping device is woken for it. |
+| `ttl` | duration | `1d` | How long the push service keeps a push for a device that is offline. |
+| `enabled` | boolean | `true` | Switch one rule off without deleting it. |
+
+Durations are `500ms`, `30s`, `10m`, `1h30m`, `2d`, `1w`, or a plain number of seconds.
+
+A rule without `notification` sends a **nudge**: a push with no visible content that wakes the app's service worker, which renders the notification from its own live data (and the client decides what to show). A matching row pushes to every enabled subscription of every recipient; whether the user is currently looking at the app is the service worker's call (it can suppress the notification when a visible window exists), because the server cannot know.
+
+#### Conditions
+
+A key of `when` is a field path, its value one of:
+
+| Form | Meaning |
+| --- | --- |
+| `state: ready`, `count: 3`, `muted: false`, `deleted_at: null` | Equal to. |
+| `state: [ready, urgent]` | One of. |
+| `count: { gte: 2, lt: 10 }` | Operators, all of which must hold: `eq`, `ne`, `in`, `nin`, `gt`, `gte`, `lt`, `lte` (numbers, or strings compared as strings), `exists` (`true`: present and not null), `contains` (array element or substring), `startsWith`. |
+
+#### Templates
+
+`topic`, every string in `notification` and the values of a `data` map are templates: `{{ path | filter }}` over the row's fields (also under `row`), `id`, `table`, `op`, `rule`, each `with` name, `recipient` (the user being rendered for) and `now`. A missing path renders empty. Filters: `default(x)`, `truncate(n)`, `upper`, `lower`, `trim`, `key` (`user:abc` to `abc`), `table`, `json`, `len`, `join(sep)`, `first`, `last`, `date(format)`. In `data`, a value that is exactly one `{{ expr }}` keeps its JSON type.
+
+#### More rules
+
+<CodeBlock code={ymlPushMore} lang="yaml" />
+
+What a deploy does with it: `spky migrate` and `spky deploy` store the block, normalized, in `_00_push_config:default` (unchanged blocks are not rewritten), and the engine picks it up within 30 seconds, no restart. A block that fails validation is not stored and the previous rules stay. `spky lint` checks every rule, including against your schema: a table that does not exist or is `@nosync`, a field path the table does not define, and a field that is `@opaque`, `@crdt` or `@nosync` (stripped from what the engine sees) are reported. `spky push sync` stores the block without a deploy, and `spky push status` shows what is stored. See [`spky push`](/docs/reference/cli#web-push).
+
 ## Machine pools
 
 `pools` declares machines that exist only while a backend has work: a pool is sized by the scheduler and its machines are created and destroyed on demand. A backend opts in with `runOn: { pool: <name> }`, and its outbox jobs then run on the pool's machines instead of on an always-on container.
@@ -373,6 +438,71 @@ export const ymlScheduleFiles = `schedules: ./schedules.yml            # the who
 workflows:
   monthly-report: ./workflows/monthly-report.yml   # one definition per file
   quick-one: { steps: { ping: { backend: api, route: /ping } } }   # mixing is fine`;
+
+export const ymlPush = `push:
+  subject: mailto:ops@example.com
+  defaults:
+    ttl: 1d
+    notification: { icon: /icon-192.png, badge: /badge-72.png }
+  rules:
+    # A content push: the notification is rendered on the server.
+    new-message:
+      table: message
+      on: [create]
+      when: { kind: text }
+      to: recipient                    # a record<user> field
+      except: sender
+      topic: "dm:{{conversation | key}}"
+      throttle: 30s                    # a burst becomes one push, then a trailing one
+      with:
+        sender: SELECT username FROM ONLY $row.sender
+      notification:
+        title: "{{sender.username}}"
+        body: "{{text | truncate(120)}}"
+        url: "/messages/{{conversation | key}}"
+      data: [conversation]`;
+
+export const ymlPushMore = `push:
+  limits: { perUserPerMinute: 30 }
+  rules:
+    # A nudge: no notification, the app's service worker renders from its own data.
+    inbox-changed:
+      table: message
+      to: recipient
+      topic: inbox
+      urgency: high
+
+    # Fan-out: every member of the club, except the author.
+    club-post:
+      table: post
+      to:
+        query: SELECT VALUE user FROM member WHERE club = $row.club
+      except: author
+      notification:
+        title: "New post in {{club_name}}"
+        body: "{{title}}"
+        url: "/clubs/{{club | key}}"
+      with:
+        club_name: SELECT VALUE name FROM ONLY $row.club
+
+    # Once per state transition, only for fresh rows.
+    order-ready:
+      table: order
+      on: [create, update]
+      when:
+        state: ready
+        total: { gt: 0 }
+      once: [state]                    # not again while it stays ready
+      maxAge: { field: updated_at, within: 10m }
+      to: customer
+      notification:
+        title: Your order is ready
+        tag: "order-{{id | key}}"
+        requireInteraction: true
+        actions: [{ action: open, title: Open }]
+
+# Or keep the whole block in its own file:
+# push: ./push.yml`;
 
 export const ymlPools = `mode: cluster
 

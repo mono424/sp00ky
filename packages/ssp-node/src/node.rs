@@ -88,6 +88,9 @@ pub struct SspNode {
     /// Declarative-schedule engine — standalone mode only (`None` in cluster
     /// mode, where the scheduler service is the single ticker).
     pub schedule_engine: Option<Arc<schedule_core::ScheduleEngine>>,
+    /// Web Push engine: standalone mode only (`None` in cluster mode, where the
+    /// scheduler hosts it). Built by the shell, which also drives its `tick`.
+    pub push_engine: Option<Arc<push_core::PushEngine>>,
     /// View TTL cleanup cadence (seconds) — the `TtlCleanup` timer re-arm.
     pub ttl_cleanup_interval_secs: u64,
     /// Flush cadence for the per-view metrics on `_00_query` (see
@@ -768,6 +771,7 @@ impl SspNode {
                 "env": env_vars,
                 "bootstrap_warnings": bootstrap_warnings,
                 "query_allowlist": query_allowlist,
+                "push": self.push_engine.as_ref().map(|e| serde_json::to_value(e.status()).unwrap_or(Value::Null)),
             }
         ])
     }
@@ -1651,6 +1655,15 @@ impl SspNode {
             return Some(ok_json(json!({ "status": "ok" })));
         }
 
+        // A direct push (`_00_push_message`) is the push engine's alone and
+        // never a synced row: same interception as the allowlist, before the
+        // circuit could give it a collection.
+        if payload.table == push_core::engine::MESSAGE_TABLE {
+            drop(permit);
+            self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
+            return Some(ok_json(json!({ "status": "ok" })));
+        }
+
         let start = crate::now_epoch_ms();
         // Borrowed: `payload.record` is read again further down (job routing,
         // heartbeat seq, owner, job timing), so it has to survive. Cloning it
@@ -1678,6 +1691,10 @@ impl SspNode {
                 self.observe_job_terminal(&payload.id, &payload.record).await;
             }
         }
+
+        // Push rules watch synced rows. Spawned: the ingest answer never
+        // waits on a push service.
+        self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
 
         // Step the circuit.
         let change = match op {
@@ -1874,6 +1891,27 @@ impl SspNode {
             if let Err(e) = engine.observe_job_terminal(&job_id, &status).await {
                 warn!(job_id = %job_id, error = %e, "schedule engine could not observe job completion");
             }
+        }));
+    }
+
+    /// Hand an ingested row to the push engine when it wants it.
+    fn observe_push(&self, table: &str, op: &str, id: &str, record: &Value) {
+        let Some(engine) = self.push_engine.clone() else { return };
+        let Some(op) = push_core::Op::parse(op) else { return };
+        if !engine.wants(table, op) {
+            return;
+        }
+        let change = push_core::ObservedChange {
+            table: table.to_string(),
+            op,
+            id: id.to_string(),
+            record: record.clone(),
+            origin: push_core::Origin::Live,
+            // Taken here, in ingest order, not inside the spawned task.
+            seq: engine.next_seq(),
+        };
+        self.platform.spawner.spawn(Box::pin(async move {
+            engine.observe(change).await;
         }));
     }
 

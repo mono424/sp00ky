@@ -5633,6 +5633,15 @@ pub(crate) fn push_schema_inner(client: &mut CloudClient, slug: &str, pid: &str)
     sql.push('\n');
     sql.push_str(&events);
 
+    // The `push:` block, stored the way `apply_internal_schema` stores it on
+    // the VM path (`_00_push_config:default`). Not part of
+    // `build_server_schema`, which also feeds `schema diff`: a data write has
+    // no place in a generated migration. `config.validate()` above already
+    // refused an invalid block.
+    let push_spec = crate::push_sync::spec_of(&config.push())?;
+    sql.push('\n');
+    sql.push_str(&crate::push_sync::upsert_sql(&push_spec));
+
     println!("Pushing schema for '{}' ({} bytes)...", slug, sql.len());
     client
         .post(

@@ -292,6 +292,7 @@ async fn build(opts: HarnessOpts) -> Harness {
             )
             .expect("standalone builds an engine")
         }),
+        push_engine: None,
         ttl_cleanup_interval_secs: 60,
         schema_poll_secs: 0,
         schema_watch: Default::default(),

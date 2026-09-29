@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>push e2e</title>
+<script type="module">
+window.__pushes = [];
+navigator.serviceWorker.addEventListener('message', (e) => window.__pushes.push(e.data));
+window.__reg = navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready);
+window.subscribeWith = async (publicKey) => {
+  const reg = await window.__reg;
+  const b = atob(publicKey.replace(/-/g, '+').replace(/_/g, '/'));
+  const key = Uint8Array.from(b, (c) => c.charCodeAt(0));
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  return sub.toJSON();
+};
+window.shown = async () => {
+  const reg = await window.__reg;
+  return (await reg.getNotifications()).map((n) => ({ title: n.title, body: n.body, tag: n.tag, data: n.data, actions: n.actions }));
+};
+</script>

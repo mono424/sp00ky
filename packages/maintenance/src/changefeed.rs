@@ -49,9 +49,17 @@ use crate::db::ReconnectingDb;
 /// write and no hot row.
 pub const DOORBELL_TABLE: &str = "_00_version";
 
+/// Tables the doorbell also watches, best effort: they carry a changefeed but
+/// their writes never touch `_00_version`, and their changes are wanted in
+/// milliseconds rather than on the fallback interval. `_00_push_message` is a
+/// direct push somebody is waiting to see on their screen.
+pub const DOORBELL_EXTRA_TABLES: &[&str] = &["_00_push_message"];
+
 /// Meta tables that carry a `CHANGEFEED` clause besides the user's synced
 /// tables. `_00_version` rides along only to stamp `_00_rv`; `_00_query`
-/// only for its DELETE (view teardown); `_00_heartbeat` for the probe.
+/// only for its DELETE (view teardown); `_00_heartbeat` for the probe;
+/// `_00_push_message` for direct pushes, which the push host intercepts on the
+/// ingest path (the table stays excluded from sync).
 pub const CHANGEFEED_META_TABLES: &[&str] = &[
     "_00_version",
     "_00_query",
@@ -59,6 +67,7 @@ pub const CHANGEFEED_META_TABLES: &[&str] = &[
     "_00_app_release",
     "_00_heartbeat",
     "_00_query_allowlist",
+    "_00_push_message",
 ];
 
 /// How far past `poll_limit` the tail widens a poll that one transaction

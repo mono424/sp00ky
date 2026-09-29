@@ -921,6 +921,14 @@ pub async fn run_server() -> anyhow::Result<()> {
         info!("Schedule sweep disabled (cluster mode — the scheduler service owns ticking)");
     }
 
+    // Web Push (`push:` in sp00ky.yml, `_00_push_message`). Standalone only,
+    // like the schedule engine: in cluster mode the scheduler hosts it.
+    let push_engine = if config.scheduler_url.is_none() {
+        build_push_engine(Arc::clone(&platform.db))
+    } else {
+        None
+    };
+
     // Clone for scheduler integration
     let processor_for_scheduler = processor_arc.clone();
 
@@ -1022,6 +1030,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(config.query_allowlist)),
         standalone: config.scheduler_url.is_none(),
         schedule_engine,
+        push_engine,
         ttl_cleanup_interval_secs: config.ttl_cleanup_interval_secs,
         view_metrics_flush_ms: config.view_metrics_flush_ms,
         bootstrap_page_size: config.bootstrap_page_size,
@@ -2304,3 +2313,39 @@ pub async fn ttl_cleanup_sweep(
 
 
 
+
+/// The standalone push engine over the node's `Db` port, ticked every second
+/// on the runtime. `None` only when its HTTP client cannot be built; a missing
+/// key still yields an engine whose status says why push is off.
+fn build_push_engine(db: Arc<dyn ssp_node::ports::Db>) -> Option<Arc<push_core::PushEngine>> {
+    let env = |k: &str| std::env::var(k).ok();
+    let mut opts = push_core::EngineOptions::from_env(env);
+    opts.sleep = Some(Arc::new(|ms| Box::pin(tokio::time::sleep(std::time::Duration::from_millis(ms)))));
+    let http = match push_core::ReqwestPushHttp::new(opts.allow_private_endpoints) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(error = %e, "web push disabled: could not build the HTTP client");
+            return None;
+        }
+    };
+    let keys = push_core::PushEngine::keys_from_env(env);
+    if let Some(k) = &keys {
+        info!(kid = %k.kid(), "web push engine starting");
+    }
+    let engine = Arc::new(push_core::PushEngine::new(
+        Arc::new(ssp_node::schedules::PortDb(db)),
+        Arc::new(http),
+        keys,
+        opts,
+    ));
+    let ticker = Arc::clone(&engine);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            ticker.tick().await;
+        }
+    });
+    Some(engine)
+}

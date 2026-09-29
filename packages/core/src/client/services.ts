@@ -1,6 +1,6 @@
-import { RecordId, type Uuid } from 'surrealdb';
+import type { Uuid } from 'surrealdb';
 import type { SchemaStructure } from '@spooky-sync/query-builder';
-import type { InlineRow, Sp00kyConfig, PersistenceClient } from '../types';
+import type { Sp00kyConfig, PersistenceClient } from '../types';
 import type { Logger } from '../services/logger/index';
 import { createLogger } from '../services/logger/index';
 import { ConnectionSupervisor, LocalMigrator, RemoteDatabaseService, createLocalEngine } from '../services/database/index';
@@ -27,6 +27,8 @@ import type { Adapters } from '../kernel/interpreter';
 import type { RuntimeEvent } from '../kernel/events';
 import type { ServiceCalls } from '../kernel/effects';
 import { encodeRecordId } from '../utils/index';
+import { sha256Hex } from '../utils/sha256';
+import { hashOfEdge, rowOfEdge } from '../utils/edges';
 import { mintMutationId } from '../mutation/mutation-id';
 import { BucketHandle, bucketContentToBlob } from './bucket-handle';
 
@@ -48,13 +50,9 @@ export function writeBootBucketHint(bucketId: string): void {
   }
 }
 
-export async function sha256Hex(input: string): Promise<string> {
-  const bytes = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
+// Moved to a pure module so `@spooky-sync/core/pure` and the live feed share
+// it; re-exported here for existing imports.
+export { sha256Hex };
 
 export function mintSalt(): string {
   const c = (globalThis as { crypto?: Crypto }).crypto;
@@ -208,35 +206,9 @@ export function leaderToRuntime(msg: { type: string; [k: string]: unknown }): un
   }
 }
 
-/** The hash a `_00_list_ref` edge belongs to: the id part of its `in` (`_00_query:<hash>`). */
-export function hashOfEdge(value: unknown): string | null {
-  const inId = (value as { in?: unknown } | null)?.in;
-  if (!inId) return null;
-  const str = inId instanceof RecordId ? String(inId.id) : String(inId).replace(/^_00_query:/, '');
-  return str.length > 0 ? str : null;
-}
-
-/**
- * The row an edge notification carries, when the subscription joined it on.
- *
- * Without `FETCH out` the edge's `out` is a record id and there is nothing to
- * land, so this returns null and the caller falls back to fetching the body.
- * It also returns null for a row the session may not read (the join yields
- * `out: null`) and for an edge whose target has been deleted.
- */
-export function rowOfEdge(value: unknown): InlineRow | null {
-  const edge = value as { out?: unknown; version?: unknown } | null;
-  const out = edge?.out;
-  if (!out || typeof out !== 'object' || Array.isArray(out) || out instanceof RecordId) return null;
-  // Must be a real RecordId: the landing path keys off `row.id` being one, and
-  // would otherwise record the version for a body it never wrote.
-  const rid = (out as { id?: unknown }).id;
-  if (!(rid instanceof RecordId)) return null;
-  const id = encodeRecordId(rid);
-  const version = typeof edge?.version === 'number' ? edge.version : null;
-  if (version === null) return null;
-  return { id, version, record: out as Record<string, unknown> };
-}
+// Edge decoding lives in a pure module (the wasm-free live feed uses it too);
+// re-exported here for existing imports.
+export { hashOfEdge, rowOfEdge };
 
 /** Build the adapters the interpreter drives from the services. */
 export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S>, s: Services<S>, host: ServiceHost, lateModules: () => { init(): void }[]): Adapters {

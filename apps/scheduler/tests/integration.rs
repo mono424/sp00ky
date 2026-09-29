@@ -145,6 +145,8 @@ impl TestHarness {
             snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
             schema: Default::default(),
+            push: scheduler::push::new_slot(),
+            push_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 
@@ -223,6 +225,8 @@ impl TestHarness {
                     snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
             schema: Default::default(),
+            push: scheduler::push::new_slot(),
+            push_permits: Arc::new(tokio::sync::Semaphore::new(8)),
                 },
             });
         let (backup_tx, _backup_rx) = maintenance::backup::create_backup_channel();
@@ -292,6 +296,8 @@ impl TestHarness {
                 snapshot_seq: Arc::clone(&self.snapshot_seq_cell),
             fanout: Arc::clone(&self.fanout),
             schema: Default::default(),
+            push: scheduler::push::new_slot(),
+            push_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             },
             replica: Arc::clone(&self.replica),
             surrealdb_version: Arc::new(RwLock::new("unknown".to_string())),
@@ -1523,6 +1529,8 @@ mod bootstrap_protocol_tests {
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
                 fanout: Arc::clone(&h.fanout),
                 schema: Default::default(),
+                push: scheduler::push::new_slot(),
+                push_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             };
             let app = ingest::create_ingest_router(ingest_state);
 
@@ -2090,6 +2098,8 @@ mod bootstrap_protocol_tests {
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
                 fanout: Arc::clone(&h.fanout),
                 schema: Default::default(),
+                push: scheduler::push::new_slot(),
+                push_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             },
         };
         let seq = host.pre_backup().await.unwrap();
@@ -2617,6 +2627,8 @@ mod drift_tests {
                 snapshot_seq: Arc::clone(&h.snapshot_seq_cell),
                 fanout: Arc::clone(&h.fanout),
                 schema: Default::default(),
+                push: scheduler::push::new_slot(),
+                push_permits: Arc::new(tokio::sync::Semaphore::new(8)),
             },
             replica: Arc::clone(&h.replica),
             surrealdb_version: Arc::new(RwLock::new("unknown".to_string())),

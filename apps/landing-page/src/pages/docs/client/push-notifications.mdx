@@ -1,0 +1,393 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Push notifications
+description: Declare push rules in sp00ky.yml, subscribe browsers with db.webPush, and show notifications from your service worker. No push server, no keys to manage.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+
+export const ruleCode = `push:
+  subject: mailto:ops@example.com        # who the push services can contact
+  defaults:
+    notification: { icon: /icon-192.png, badge: /badge-72.png }
+  rules:
+    new-message:
+      table: message
+      on: [create]                       # default: [create]
+      to: recipient                      # a field holding user:abc (or a list)
+      except: sender
+      topic: "dm:{{conversation | key}}" # collapses at the push service, tag on screen
+      throttle: 30s                      # one push per 30 s per recipient + topic
+      with:
+        sender: SELECT username FROM ONLY $row.sender
+      notification:
+        title: "{{sender.username}}"
+        body: "{{text | truncate(120)}}"
+        url: "/messages/{{conversation | key}}"`;
+
+export const swCode = `// src/sw.ts, bundled into /sw.js (see "Bundling the worker" below)
+import { installPushHandlers } from '@spooky-sync/core/sw';
+
+installPushHandlers({
+  // Shown when a push cannot be rendered. Browsers require a visible
+  // notification for every push that arrives while the app is not open.
+  placeholder: { title: 'My App', body: 'You have new activity', icon: '/icon-192.png' },
+});`;
+
+export const buttonCode = `import { createSignal, onMount, Show } from 'solid-js';
+import { useDb, WebPushError } from '@spooky-sync/client-solid';
+
+export function NotificationsToggle() {
+  const db = useDb();
+  const support = db.webPush.support();
+  const [on, setOn] = createSignal(false);
+  const [error, setError] = createSignal('');
+
+  onMount(async () => setOn(await db.webPush.isSubscribed()));
+
+  // Call subscribe() straight from the click: the permission prompt needs
+  // the user gesture.
+  const enable = async () => {
+    try {
+      await db.webPush.subscribe({ label: 'This browser' });
+      setOn(true);
+    } catch (e) {
+      if (e instanceof WebPushError && e.code === 'permission-denied') {
+        setError('Notifications are blocked in your browser settings.');
+      } else throw e;
+    }
+  };
+
+  return (
+    <Show when={support.supported} fallback={<p>Not available here ({support.reason})</p>}>
+      <Show when={on()} fallback={<button onClick={enable}>Turn on notifications</button>}>
+        <button onClick={() => db.webPush.test()}>Send me a test</button>
+        <button onClick={async () => { await db.webPush.unsubscribe(); setOn(false); }}>Turn off</button>
+      </Show>
+      <p>{error()}</p>
+    </Show>
+  );
+}`;
+
+export const pwaCode = `// vite.config.ts
+import { defineConfig } from 'vite';
+import { VitePWA } from 'vite-plugin-pwa';
+
+export default defineConfig({
+  plugins: [
+    VitePWA({
+      strategies: 'injectManifest',
+      srcDir: 'src',
+      filename: 'sw.ts',            // emitted as /sw.js and registered for you
+      registerType: 'autoUpdate',
+      injectRegister: 'auto',
+      // No Workbox precache in this worker: skip the manifest injection point.
+      injectManifest: { injectionPoint: undefined },
+      manifest: {
+        name: 'My App',
+        short_name: 'My App',
+        display: 'standalone',      // required for push on iOS / iPadOS
+        start_url: '/',
+        icons: [{ src: '/icon-192.png', sizes: '192x192', type: 'image/png' }],
+      },
+      devOptions: { enabled: true, type: 'module' },
+    }),
+  ],
+});`;
+
+export const nudgeRuleCode = `push:
+  rules:
+    activity:
+      table: notification
+      to: user
+      topic: activity                    # every activity push replaces the last
+      data: [kind]                       # payload.data, sent with nudges too
+      # no \`notification:\` block: a content-free nudge`;
+
+export const liveSwCode = `// src/sw.ts
+import { installPushHandlers } from '@spooky-sync/core/sw';
+import { createLiveFeed } from '@spooky-sync/core/live';
+import { QueryBuilder } from '@spooky-sync/query-builder';
+import { schema } from './schema.gen';
+
+installPushHandlers({
+  placeholder: { title: 'My App', body: 'You have new activity' },
+  live: {
+    // The session the page bridged over. It has exactly the fields
+    // createLiveFeed wants: endpoint, namespace, database, token.
+    feed: (session) => createLiveFeed(session),
+    query: (userId) =>
+      new QueryBuilder(schema, 'notification')
+        .where({ user: userId, read: false })
+        .limit(20)
+        .build(),
+    visible: (row) => !row.read,
+    render: (row) => ({
+      tag: String(row.id),                 // one notification per row
+      title: row.title,
+      body: row.body,
+      url: '/notifications/' + row.id.id,
+    }),
+  },
+});`;
+
+export const rulesFilterCode = `// Only direct messages and mentions on this device:
+await db.webPush.subscribe({ label: 'Work laptop', rules: ['new-message', 'mention'] });
+
+// Later, from a settings screen:
+await db.webPush.update({ rules: ['new-message'] });
+await db.webPush.update({ rules: null });  // back to every rule
+
+const devices = await db.webPush.devices();
+// [{ id, label, userAgent, rules, lastOkAt, failures, disabledReason, current, thisDevice }, ...]`;
+
+export const selfPushCode = `// A reminder in 25 minutes, to every device of the signed-in user.
+const reminder = await db.webPush.notify({
+  notification: { title: 'Break time', body: 'Stand up and stretch', url: '/focus' },
+  topic: 'focus-timer',
+  sendAt: new Date(Date.now() + 25 * 60_000),
+});
+
+// Changed your mind:
+await db.webPush.cancel(reminder.id);
+
+// "Is this working?" button:
+await db.webPush.test({ title: 'Hello from My App' });`;
+
+export const backendCode = `-- Root only (a backend, a DEFINE EVENT, an operator). Record users may only
+-- push to themselves, through fn::push::notify.
+CREATE _00_push_message CONTENT {
+  to: ['user:abc', 'user:def'],
+  notification: { title: 'Maintenance', body: 'Back in 10 minutes', url: '/status' },
+  topic: 'maintenance',
+  send_at: time::now() + 30m,
+};`;
+
+export const foregroundCode = `// While a page of the app is visible, the worker posts the push here
+// instead of showing it. Render an in-app toast, bump a badge, ...
+const stop = db.webPush.onMessage((msg) => {
+  if (msg.type === 'sp00ky:push') showToast(msg.payload.notification?.title ?? 'New activity');
+  if (msg.type === 'sp00ky:navigate') router.navigate(new URL(msg.url).pathname);
+});`;
+
+export const configCode = `export const dbConfig: SyncedDbConfig<typeof schema> = {
+  // ...
+  webPush: {
+    autoSync: true,               // repair this browser's subscription after sign-in
+    autoResubscribe: false,       // true: subscribe any granted browser on sign-in
+    unsubscribeOnSignOut: true,   // drop this device's subscription on signOut()
+    bridge: true,                 // post the session to the worker for live rendering
+    serviceWorkerUrl: undefined,  // set when nothing else registers your worker
+  },
+};`;
+
+Push notifications that reach a closed tab, an installed app, or a phone in a pocket. You declare **rules** in `sp00ky.yml` ("when a row of `message` is created, push to the user in its `recipient` field"), browsers subscribe through `db.webPush`, and the platform encrypts and delivers. There is no push server to run, no Web Push library to wire up, and no key pair to manage: the deployment derives its VAPID key from the project's auth secret.
+
+## Concepts
+
+There are three ways a push gets sent, and two shapes it can have.
+
+| Kind | Sent by | Typical use |
+|---|---|---|
+| **Rule** | the platform, when a synced row matches a `push:` rule | new message, mention, job finished |
+| **Direct message** | root SurrealQL (a backend, a `DEFINE EVENT`, `spky push send`) | maintenance notice, digest |
+| **Self-push** | the signed-in user, through `db.webPush.notify()` / `test()` | reminders, "send me a test" |
+
+| Shape | What it carries | Who renders it |
+|---|---|---|
+| **Content push** | a rendered `notification` (title, body, url, actions, ...) | the service worker shows it as is |
+| **Nudge** | no notification, only the row id, rule and optional `data` | your service worker, typically from its own live data |
+
+A rule with a `notification:` block sends content pushes. Leave the block out and it sends nudges. Content pushes are simple and work with any service worker; nudges keep the payload free of user content and let the notification always show the latest state.
+
+<Note title="Who decides whether to show it">
+  The server cannot know whether a user has the app open: a matching row
+  pushes to **every** subscribed device of the recipient. The service worker
+  decides on the device: while a page of the app is visible it hands the push
+  to that page instead of showing a notification.
+</Note>
+
+## 5-minute setup
+
+### 1. Add a rule
+
+<CodeBlock code={ruleCode} lang="yaml" fileName="sp00ky.yml" />
+
+`spky lint` validates the block; `spky dev` and `spky deploy` store it (`spky push sync` stores it without a deploy). Every string under `notification`, `topic` and `data` is a template: `{{ field }}` reads the row, `with:` queries run as root with `$row` bound, and filters (`truncate(n)`, `key`, `default(x)`, `upper`, `date(format)`, ...) shape the output.
+
+Recipients come from row fields (`to: recipient`, `to: [owner, assignee]`) or from a root query (`to: { query: "SELECT VALUE user FROM member WHERE club = $row.club" }`). Conditions (`when:`), `once:` per state change, `maxAge:` and `urgency:` / `ttl:` are available on every rule; see [Web Push in the sp00ky.yml reference](/docs/reference/config#web-push) for every option.
+
+### 2. Add a service worker
+
+<CodeBlock code={swCode} lang="typescript" fileName="src/sw.ts" />
+
+That is the whole worker for content pushes: it shows each notification with its tag, icon and actions, opens (or focuses) the notification's `url` on click, suppresses pushes while the app is visible, and keeps the session the page bridges over.
+
+### 3. Subscribe from a button
+
+<CodeBlock code={buttonCode} lang="tsx" />
+
+`subscribe()` asks for permission (when it is still `default`), creates the browser's push subscription with the deployment's key, and registers it for the signed-in user. Outside Solid, the same object is `client.webPush` on a `Sp00kyClient`.
+
+### 4. Send a test push
+
+Click the "Send me a test" button, or send one from the terminal:
+
+<CodeBlock code={`spky push status                                   # rules, key published, subscriptions
+spky push devices user:abc                          # a user's devices
+spky push send --to user:abc --title "Hello" --body "It works"`} lang="bash" />
+
+## Bundling the worker
+
+The worker imports from npm, so it has to be bundled into one file served from your origin (a worker only controls pages at or below its own path, so serve it from `/`). With Vite, [vite-plugin-pwa](https://vite-pwa-org.netlify.app/guide/inject-manifest)'s `injectManifest` strategy builds `src/sw.ts` for you and registers it:
+
+<CodeBlock code={pwaCode} lang="typescript" fileName="vite.config.ts" />
+
+If the app registers its worker some other way, nothing else is needed: `db.webPush` finds the page's registration. If nothing registers one, set `webPush.serviceWorkerUrl` and the client registers it when it first needs it.
+
+<Note>
+  `@spooky-sync/core/sw` and `@spooky-sync/core/live` contain no WebAssembly,
+  no logger and no DOM access. The build checks that on every release. `/sw` on
+  its own is about 3.6 kB gzipped; with `/live` (which brings the pure-JS
+  `surrealdb` SDK) the worker is about 30 kB gzipped.
+</Note>
+
+## Rendering from live data
+
+A nudge carries no text, so the worker decides what to show. The `live` option does it for you: on each nudge it opens a live feed with the bridged session, reads your query, shows one notification per visible row under its own tag, closes the notifications of rows that are no longer visible (read on another device, deleted), and closes the feed.
+
+<CodeBlock code={nudgeRuleCode} lang="yaml" fileName="sp00ky.yml" />
+
+<CodeBlock code={liveSwCode} lang="typescript" fileName="src/sw.ts" />
+
+The feed speaks the same protocol as the full client (it registers the query, reads its membership, then follows the user's `_00_list_ref` table with `LIVE ... FETCH out`), so permissions apply exactly as they do in the app. It needs the session: the page posts it to the worker whenever the token changes while notifications are allowed (`webPush.bridge`, on by default). An impersonation token is never posted.
+
+When the feed cannot load in time (no session yet, offline, 8 s budget by default via `live.timeoutMs`) the worker shows the placeholder, since the browser requires something on screen.
+
+A nudge whose only effect is closing notifications (the row was read on another device) shows nothing, which is what the user expects. Chrome tolerates occasional pushes that show nothing; if your origin sends many of them and Chrome starts showing its own "updated in the background" notice, set `live.silentClose: false` (the placeholder is shown instead), or narrow the rule with `when:` so only the changes worth a notification push.
+
+`createLiveFeed` works anywhere with a WebSocket, including a dedicated worker or Node:
+
+<CodeBlock code={`import { createLiveFeed } from '@spooky-sync/core/live';
+
+const feed = createLiveFeed({ endpoint, namespace, database, token: () => getToken() });
+const sub = feed.subscribe(query, {
+  onSet: (rows) => render(rows),                          // whole set, after every change
+  onChange: ({ added, updated, removed }) => log(added),  // the diff
+});
+await feed.idle({ timeoutMs: 5000 });                     // first set loaded, quiet for 300 ms
+await feed.close();                                       // releases the views`} lang="typescript" />
+
+<Note title="Query allowlist">
+  With `sync.queryAllowlist` on, the worker's query goes through the same
+  allowlist as the app's: write it with the query builder, in a file the
+  generator scans, so its shape is collected.
+</Note>
+
+If you would rather render nudges yourself, pass `onNudge(payload, ctx)` (call `ctx.show(...)` at least once) or `render(payload)` (return a notification spec). `onPush` sees every push first and can take over completely by returning `true`.
+
+## Per-device rule filters
+
+A user may want direct messages on their phone but not every mention on the work laptop. Each device carries an optional list of rule names; direct messages and self-pushes always pass.
+
+<CodeBlock code={rulesFilterCode} lang="typescript" />
+
+## Self-pushes and scheduled reminders
+
+A signed-in user can push to their own devices, now or later. Messages with a future `sendAt` wait on the server until they are due, so the reminder arrives even if every tab is closed.
+
+<CodeBlock code={selfPushCode} lang="typescript" />
+
+Backends push to anyone by creating a `_00_push_message` as root:
+
+<CodeBlock code={backendCode} lang="sql" />
+
+## When the app is open
+
+With `suppressWhenVisible` (the default) a push that arrives while a page of the app is visible is not shown; the worker posts `{ type: 'sp00ky:push', payload }` to the visible pages instead:
+
+<CodeBlock code={foregroundCode} lang="typescript" />
+
+A notification click focuses an open window and loads the notification's `url` in it, or opens a new window. Pass `clickMode: 'message'` to `installPushHandlers` to route in-app instead (the page receives `sp00ky:navigate`), or `onClick` to handle clicks entirely yourself.
+
+## Sign-out and shared devices
+
+On `signOut()`, before the token is dropped, the client removes this device's subscription for the user and tells the worker to forget the session and close every notification it shows. Both are best-effort with a short timeout, so sign-out never waits on the network. The next user who enables notifications on the same browser gets their own subscription; the platform delivers an endpoint only to its most recent owner.
+
+While impersonating, `db.webPush` refuses to subscribe or push, and an operator's browser is never attached to someone else's notifications.
+
+After sign-in, `webPush.autoSync` (on by default) runs `db.webPush.sync()`: when the user subscribed on this browser before and permission is still granted, it repairs a browser subscription that went away, one made with a rotated key, or a server row that was removed. It never prompts. Set `autoResubscribe: true` to also subscribe users who never subscribed here but whose browser already allows notifications.
+
+<CodeBlock code={configCode} lang="typescript" />
+
+## iOS and iPadOS
+
+Safari on iOS and iPadOS 16.4+ supports Web Push **only for web apps added to the Home Screen** (your manifest needs `display: "standalone"`). In a Safari tab, `db.webPush.support()` returns `{ supported: false, reason: 'ios-not-installed' }`: show a short "Add to Home Screen" hint instead of the button. Once installed and opened from the Home Screen, the same `subscribe()` works.
+
+## Asking for permission
+
+- **Ask in context, from a click.** Browsers block or quietly deny prompts that are not triggered by a user gesture, and Chrome shows a muted prompt to sites that ask on page load. `subscribe()` requests permission first thing, so call it directly from the click handler.
+- **Explain first.** Show why notifications are useful ("Get a message when someone replies") before the browser prompt appears.
+- **A denial is final** until the user changes it in the browser settings (`permission-denied`). Do not keep asking; show how to re-enable instead.
+- **Offer granular control.** Rule filters and a device list are cheaper than losing the permission entirely.
+
+## API reference
+
+<PropTable props={[
+  { name: 'support()', type: 'WebPushSupport', default: '-', desc: '{ supported, permission, reason? }. Reasons: no-window, insecure-context, no-service-worker, no-push-manager, no-notification, ios-not-installed.' },
+  { name: 'info()', type: 'Promise<WebPushInfo>', default: '-', desc: 'Whether push is enabled on the deployment, its public key and key id. Cached.' },
+  { name: 'subscribe(opts?)', type: 'Promise<WebPushDevice>', default: '-', desc: 'Permission, browser subscription and server registration. opts: registration, label, rules, meta, requestPermission.' },
+  { name: 'unsubscribe(opts?)', type: 'Promise<number>', default: '-', desc: 'Remove this device (all: every device of the user). keepBrowserSubscription keeps the browser side.' },
+  { name: 'sync(opts?)', type: 'Promise<WebPushSyncStatus>', default: '-', desc: 'Reconcile after sign-in. ok, resubscribed, registered, or why nothing happened. Never throws.' },
+  { name: 'isSubscribed()', type: 'Promise<boolean>', default: '-', desc: 'This browser holds a subscription registered for the signed-in user. No network.' },
+  { name: 'update(opts)', type: 'Promise<WebPushDevice | null>', default: '-', desc: 'Change label, rules (null resets to every rule) or meta of this device.' },
+  { name: 'devices()', type: 'Promise<WebPushDevice[]>', default: '-', desc: 'The user\'s devices, this one marked with thisDevice.' },
+  { name: 'notify(msg)', type: 'Promise<WebPushMessage>', default: '-', desc: 'Push to yourself: notification, data, topic, urgency, ttl, sendAt.' },
+  { name: 'cancel(id)', type: 'Promise<boolean>', default: '-', desc: 'Cancel a scheduled self-push that is still pending.' },
+  { name: 'test(opts?)', type: 'Promise<WebPushMessage>', default: '-', desc: 'A visible test notification to every device of the user.' },
+  { name: 'bridge(registration?)', type: '() => void', default: '-', desc: 'Post the session to the worker now and on every token change. Automatic with webPush.bridge.' },
+  { name: 'onMessage(cb)', type: '() => void', default: '-', desc: 'Messages from the worker: sp00ky:push, sp00ky:navigate, sp00ky:subscriptionchange.' },
+]} />
+
+Errors are `WebPushError` with a `code`: `unsupported`, `signed-out`, `impersonating`, `disabled`, `permission-denied`, `permission-default`, `no-registration`, `not-subscribed`, `subscribe-failed`, `server`.
+
+`installPushHandlers(options)` from `@spooky-sync/core/sw`:
+
+<PropTable props={[
+  { name: 'placeholder', type: '{ title, body?, icon? }', default: 'generic text', desc: 'Shown when a push cannot be rendered (unknown payload version, nudge without a renderer, feed failure).' },
+  { name: 'suppressWhenVisible', type: 'boolean', default: 'true', desc: 'Post to visible pages instead of showing.' },
+  { name: 'onPush(payload, ctx)', type: 'Promise<boolean | void>', default: '-', desc: 'Sees every push first; return true when you handled it.' },
+  { name: 'onNudge(payload, ctx)', type: 'Promise<void>', default: '-', desc: 'Render content-free pushes yourself (ctx.show, ctx.bridged, ctx.visibleClients).' },
+  { name: 'render(payload)', type: 'NotificationSpec | null', default: '-', desc: 'Custom rendering for content pushes and nudges; null keeps the default.' },
+  { name: 'live', type: '{ feed, query, visible, render, timeoutMs? }', default: '-', desc: 'Render nudges from live data (see above).' },
+  { name: 'onClick(event, payload, action)', type: 'Promise<boolean | void>', default: '-', desc: 'Return true to replace the default focus / open behaviour.' },
+  { name: 'clickMode', type: "'navigate' | 'message'", default: "'navigate'", desc: 'How a click reaches an open window.' },
+  { name: 'resolveUrl(url, payload)', type: 'string', default: 'relative to the scope', desc: 'Map a notification url to the one to open.' },
+  { name: 'feed(session)', type: 'LiveFeed', default: '-', desc: 'Used on pushsubscriptionchange to register the new endpoint when live is not configured.' },
+]} />
+
+`getBridgedToken()` returns the bridged session (`{ token, userId, endpoint, namespace, database }`) or `null`, for your own worker code.
+
+The payload every push carries:
+
+<CodeBlock code={`{ "v": 1, "kind": "rule", "rule": "new-message", "table": "message",
+  "id": "message:abc", "op": "create", "topic": "dm:xyz",
+  "notification": { "title": "...", "body": "...", "tag": "dm:xyz", "url": "/m/xyz" },
+  "data": { "conversation": "conversation:xyz" }, "ts": 1727000000000 }`} lang="json" />
+
+`kind: "message"` (direct and self-pushes) carries `message` (the `_00_push_message` id) instead of `rule`, `table`, `id` and `op`.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `subscribe()` throws `disabled` | No host with push enabled has started yet, or the deployment has no auth secret. `spky push status` shows whether the key is published. `SPKY_PUSH=off` turns push off. |
+| `support()` says `insecure-context` | Push needs HTTPS (or `localhost`). |
+| `no-registration` | No service worker is active for the page. Check the Application tab in DevTools, or set `webPush.serviceWorkerUrl`. |
+| Nothing arrives | `spky push devices user:abc` lists the user's devices with their last error. A device disabled with `http_403` was made for an old key: the next `sync()` (on sign-in) replaces it. Rule filters on the device may exclude the rule. |
+| Chrome shows "This site has been updated in the background" | The worker did not show a notification for a push. Keep a `placeholder`, and make sure `onNudge` always calls `ctx.show()`. |
+| Notifications keep coming after sign-out | Only when sign-out could not reach the server (offline, or while impersonating). The row goes the next time the push service reports the endpoint gone, or on the next user's subscribe on that browser. |
+| Live rendering always shows the placeholder | The worker has no session (sign in once with notifications allowed, `webPush.bridge` on), or the query takes longer than `live.timeoutMs`. |

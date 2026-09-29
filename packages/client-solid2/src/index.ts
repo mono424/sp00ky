@@ -10,6 +10,7 @@ import {
   type StorageHealth,
   type PreloadOptions,
   type PreloadRefresh,
+  type WebPushModule,
 } from '@spooky-sync/core';
 
 import type {
@@ -66,6 +67,26 @@ export type {
 } from '@spooky-sync/core';
 export { useStorageStatus, type UseStorageStatus } from './lib/use-storage-status';
 export type { StorageHealth, StorageHealthStatus } from '@spooky-sync/core';
+export {
+  WebPushError,
+  type WebPushModule,
+  type WebPushConfig,
+  type WebPushSupport,
+  type WebPushUnsupportedReason,
+  type WebPushInfo,
+  type WebPushDevice,
+  type WebPushSubscribeOptions,
+  type WebPushUnsubscribeOptions,
+  type WebPushSyncOptions,
+  type WebPushSyncStatus,
+  type WebPushUpdateOptions,
+  type WebPushMessageInput,
+  type WebPushMessage,
+  type WebPushErrorCode,
+  type WebPushClientMessage,
+  type PushPayload,
+  type PushNotification,
+} from '@spooky-sync/core';
 export { useCrdtField } from './lib/use-crdt-field';
 export { useFeatureFlag, type UseFeatureFlag } from './lib/use-feature-flag';
 export {
@@ -436,6 +457,16 @@ export class SyncedDb<S extends SchemaStructure> {
   subscribeToStorageHealth(cb: (health: StorageHealth) => void): () => void {
     if (!this.sp00ky) throw new Error('SyncedDb not initialized');
     return this.sp00ky.subscribeToStorageHealth(cb);
+  }
+
+  /**
+   * Web Push for this browser: `support()`, `subscribe()` (from a click),
+   * `devices()`, `notify()` / `test()` (push to yourself), `bridge()` for the
+   * service worker. See the push-notifications docs page.
+   */
+  get webPush(): WebPushModule {
+    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
+    return this.sp00ky.webPush;
   }
 
   bucket<B extends BucketNames<S>>(name: B): BucketHandle {

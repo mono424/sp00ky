@@ -67,6 +67,8 @@ pub async fn overview(State(state): State<AdminState>) -> Json<serde_json::Value
         // tile and the sidebar count ride the poll the dashboard already makes
         // rather than scanning a user table per open tab.
         "jobs": state.jobs.overview_block(),
+        // The push engine keeps its counters in memory; free with the poll.
+        "push": crate::push::status_json(&state.metrics.ingest.push),
         "cloud_linked": state.cloud.is_some(),
         "server_time_ms": now_ms(),
     }))

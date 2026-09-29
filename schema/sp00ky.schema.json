@@ -220,7 +220,7 @@
       "$ref": "#/$defs/syncConfig"
     },
     "push": {
-      "description": "Web Push rules: when a row of a table looks like `when`, push to the users named by `to`. Browsers subscribe through `db.webPush`, the platform delivers (VAPID keys derived from SPKY_AUTH_SECRET, or SPKY_VAPID_PRIVATE_KEY). Stored in `_00_push_config` at every migrate/deploy; a missing block means enabled with no rules, so direct pushes (`_00_push_message`) still work. May instead be a path to a YAML file holding the whole block.",
+      "description": "Push rules: when a row of a table looks like `when`, push to the users named by `to`. Browsers subscribe through `db.webPush` (VAPID keys derived from SPKY_AUTH_SECRET, or SPKY_VAPID_PRIVATE_KEY); iOS and Android apps register through `fn::push::register` once `apns` / `fcm` are configured. The platform delivers. Stored in `_00_push_config` at every migrate/deploy; a missing block means enabled with no rules, so direct pushes (`_00_push_message`) still work. May instead be a path to a YAML file holding the whole block.",
       "oneOf": [
         {
           "type": "string",
@@ -1136,6 +1136,12 @@
           "additionalProperties": {
             "$ref": "#/$defs/pushRule"
           }
+        },
+        "apns": {
+          "$ref": "#/$defs/pushApns"
+        },
+        "fcm": {
+          "$ref": "#/$defs/pushFcm"
         }
       }
     },
@@ -1158,6 +1164,10 @@
         "notification": {
           "$ref": "#/$defs/pushNotification",
           "description": "Merged under every rule's `notification` (icon, badge, lang, ...); a rule's own keys win. Not applied to nudge-only rules."
+        },
+        "native": {
+          "$ref": "#/$defs/pushNative",
+          "description": "Merged under every rule's `native` block (sound, channel, ...)."
         }
       }
     },
@@ -1310,6 +1320,24 @@
               "type": "object"
             }
           ]
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "web",
+              "ios",
+              "android"
+            ]
+          },
+          "description": "Which kinds of device receive it. Default: every kind."
+        },
+        "native": {
+          "$ref": "#/$defs/pushNative",
+          "description": "What iOS and Android devices show, over `notification`. With no notification anywhere a native device gets a silent data push."
         }
       }
     },
@@ -1469,6 +1497,211 @@
         },
         "data": {
           "description": "Merged into the notification's `data` next to the bridge's own keys."
+        }
+      }
+    },
+    "pushSecret": {
+      "description": "A secret the CLI resolves at migrate/deploy and stores in `_00_push_credential` (root only). Never stored in `_00_push_config`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Inline. Works, but it is committed with sp00ky.yml; `spky lint` warns."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "vault"
+          ],
+          "properties": {
+            "vault": {
+              "type": "string",
+              "description": "Project vault key (`spky env set`)."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "env"
+          ],
+          "properties": {
+            "env": {
+              "type": "string",
+              "description": "Environment variable of the machine running the CLI."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ],
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "File relative to sp00ky.yml. Never commit it."
+            }
+          }
+        }
+      ]
+    },
+    "pushApns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "teamId",
+        "keyId",
+        "key"
+      ],
+      "description": "Native iOS delivery through the Apple Push Notification service with a token-auth key (.p8). Devices register with `fn::push::register` (`spooky_push` in Flutter).",
+      "properties": {
+        "teamId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{10}$",
+          "description": "Apple Developer team id."
+        },
+        "keyId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{10}$",
+          "description": "Id of the APNs auth key."
+        },
+        "key": {
+          "$ref": "#/$defs/pushSecret",
+          "description": "The .p8 key (PEM)."
+        },
+        "bundleIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "description": "Bundle ids devices may register with (the APNs topic). Empty: any."
+        }
+      }
+    },
+    "pushFcm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceAccount"
+      ],
+      "description": "Native Android (and FCM-registered iOS) delivery through FCM HTTP v1.",
+      "properties": {
+        "serviceAccount": {
+          "$ref": "#/$defs/pushSecret",
+          "description": "The Firebase service account JSON."
+        },
+        "android": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "projectId",
+            "appId",
+            "apiKey",
+            "senderId"
+          ],
+          "description": "The Android app's Firebase client config (from google-services.json). Not secret: served to the app through `fn::push::info()`, so the app ships no google-services.json.",
+          "properties": {
+            "projectId": {
+              "type": "string"
+            },
+            "appId": {
+              "type": "string",
+              "description": "`mobilesdk_app_id`, `1:<sender>:android:<hex>`."
+            },
+            "apiKey": {
+              "type": "string"
+            },
+            "senderId": {
+              "type": "string",
+              "pattern": "^[0-9]+$",
+              "description": "`project_number`."
+            }
+          }
+        }
+      }
+    },
+    "pushNative": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What iOS and Android show.",
+      "properties": {
+        "notification": {
+          "$ref": "#/$defs/pushNotification",
+          "description": "Over the rule's `notification`, key by key. Only title, body, image, tag, url and data mean anything on a phone."
+        },
+        "apns": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "APNs `aps` keys. Strings are templates; unknown keys go into `aps` verbatim.",
+          "properties": {
+            "sound": {
+              "type": "string",
+              "description": "A sound in the app bundle, or `default` (the default for alerts); `none` for silence."
+            },
+            "badge": {
+              "description": "App icon badge; a template that is exactly one `{{expr}}` keeps its number type.",
+              "type": [
+                "integer",
+                "string"
+              ]
+            },
+            "category": {
+              "type": "string",
+              "description": "A `UNNotificationCategory` the app registered."
+            },
+            "threadId": {
+              "type": "string",
+              "description": "Groups notifications. Default: the notification tag."
+            },
+            "interruptionLevel": {
+              "type": "string",
+              "description": "passive, active, time-sensitive or critical."
+            },
+            "relevanceScore": {
+              "type": [
+                "number",
+                "string"
+              ]
+            },
+            "mutableContent": {
+              "type": "boolean",
+              "description": "Lets a notification service extension rewrite the push."
+            }
+          }
+        },
+        "android": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "FCM `android.notification` keys. Strings are templates; unknown keys go into `android.notification` verbatim (FCM spelling).",
+          "properties": {
+            "channelId": {
+              "type": "string",
+              "description": "Notification channel the app created."
+            },
+            "sound": {
+              "type": "string"
+            },
+            "icon": {
+              "type": "string",
+              "description": "A drawable resource name."
+            },
+            "color": {
+              "type": "string",
+              "pattern": "^#[0-9a-fA-F]{6}$"
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "high",
+                "normal"
+              ],
+              "description": "Message priority. Default: high for anything shown or `urgency: high`, normal for silent pushes."
+            }
+          }
         }
       }
     }

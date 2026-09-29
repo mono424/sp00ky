@@ -37,6 +37,10 @@ interface Row {
   failures?: number;
   current?: boolean;
   disabled_at?: Date;
+  kind?: string;
+  platform?: string;
+  app_id?: string;
+  environment?: string;
 }
 
 function harness(
@@ -778,6 +782,29 @@ describe('WebPushModule devices and direct messages', () => {
     });
     h.server.fail = true;
     await expect(h.mod.test()).rejects.toMatchObject({ code: 'server' });
+  });
+
+  it('lists native devices (APNs / FCM) with their kind, never as this browser', async () => {
+    const h = harness({ permission: 'granted' });
+    h.server.info = { enabled: true, publicKey: KEY, kid: 'kid1', providers: ['web', 'apns', 'bogus'] };
+    h.server.rows.push({
+      id: new RecordId('_00_push_subscription', 'phone'),
+      endpoint: 'apns:ab12',
+      kind: 'apns',
+      platform: 'ios',
+      app_id: 'im.app',
+      environment: 'sandbox',
+      kid: '',
+      current: true,
+    });
+    expect((await h.mod.info({ refresh: true })).providers).toEqual(['web', 'apns']);
+    await h.mod.subscribe({ label: 'Laptop' });
+    const devices = await h.mod.devices();
+    const phone = devices.find((d) => d.endpoint === 'apns:ab12')!;
+    expect(phone).toMatchObject({ kind: 'apns', platform: 'ios', appId: 'im.app', environment: 'sandbox', thisDevice: false });
+    expect(devices.find((d) => d.thisDevice)?.kind).toBe('web');
+    // A native row never makes the browser resubscribe.
+    expect(await h.mod.sync()).toBe('ok');
   });
 
   it('caches info until refreshed; a failed read is not cached', async () => {

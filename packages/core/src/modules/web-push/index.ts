@@ -77,13 +77,30 @@ export interface WebPushInfo {
   publicKey?: string;
   /** Id of that key. */
   kid?: string;
+  /**
+   * Every kind of device the project reaches: `web` once a VAPID key is
+   * published, `apns` / `fcm` when `push.apns` / `push.fcm` are configured.
+   */
+  providers?: PushDeviceKind[];
 }
+
+/** How a device is reached: a browser (Web Push), APNs or FCM. */
+export type PushDeviceKind = 'web' | 'apns' | 'fcm';
 
 export interface WebPushDevice {
   /** `_00_push_subscription:<id>` */
   id: string;
+  /** Web: the push service URL. Native: `<kind>:<token>`. */
   endpoint: string;
-  /** Key id the device subscribed under. */
+  /** Rows the Flutter / native side registered are `apns` or `fcm`. */
+  kind: PushDeviceKind;
+  /** `web`, `ios`, `android` or `macos`. */
+  platform?: string;
+  /** Native: bundle id / package name. */
+  appId?: string;
+  /** APNs: `sandbox` or `production`. */
+  environment?: string;
+  /** Key id a web device subscribed under (empty for native ones). */
   kid: string;
   label?: string;
   userAgent?: string;
@@ -260,6 +277,10 @@ interface StoredEndpoint {
 interface DeviceRow {
   id?: unknown;
   endpoint?: string;
+  kind?: string | null;
+  platform?: string | null;
+  app_id?: string | null;
+  environment?: string | null;
   kid?: string;
   label?: string | null;
   user_agent?: string | null;
@@ -309,6 +330,10 @@ function toDevice(row: DeviceRow, thisEndpoint: string | null): WebPushDevice {
   return {
     id: recordIdString(row.id),
     endpoint: String(row.endpoint ?? ''),
+    kind: row.kind === 'apns' || row.kind === 'fcm' ? row.kind : 'web',
+    platform: row.platform ?? undefined,
+    appId: row.app_id ?? undefined,
+    environment: row.environment ?? undefined,
     kid: typeof row.kid === 'string' ? row.kid : '',
     label: row.label ?? undefined,
     userAgent: row.user_agent ?? undefined,
@@ -489,11 +514,16 @@ export class WebPushModule {
         enabled?: boolean;
         publicKey?: string | null;
         kid?: string | null;
+        providers?: unknown;
       } | null>('RETURN fn::push::info()').then((r) => {
+        const providers = Array.isArray(r?.providers)
+          ? (r.providers.filter((p) => p === 'web' || p === 'apns' || p === 'fcm') as PushDeviceKind[])
+          : undefined;
         const info: WebPushInfo = dropUndefined({
           enabled: r?.enabled === true && typeof r.publicKey === 'string',
           publicKey: typeof r?.publicKey === 'string' ? r.publicKey : undefined,
           kid: typeof r?.kid === 'string' ? r.kid : undefined,
+          providers,
         });
         this.lastInfo = info;
         return info;

@@ -69,6 +69,7 @@ export {
   type WebPushUnsupportedReason,
   type WebPushInfo,
   type WebPushDevice,
+  type PushDeviceKind,
   type WebPushSubscribeOptions,
   type WebPushUnsubscribeOptions,
   type WebPushSyncOptions,

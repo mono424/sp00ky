@@ -20,6 +20,13 @@ const CARGO_TOML_PACKAGES = [
   "packages/ssp-wasm/Cargo.toml",
 ];
 
+// Dart packages versioned with the release (same list as bump-version.mjs).
+const PUBSPEC_PACKAGES = [
+  "packages/spooky_core/pubspec.yaml",
+  "packages/spooky_flutter/pubspec.yaml",
+  "packages/spooky_push/pubspec.yaml",
+];
+
 const CLI_PLATFORM_PACKAGES = [
   "cli-linux-x64",
   "cli-linux-arm64",
@@ -99,6 +106,17 @@ for (const rel of CARGO_TOML_PACKAGES) {
   }
 }
 
+// Check pubspec.yaml files
+for (const rel of PUBSPEC_PACKAGES) {
+  const content = readFileSync(join(ROOT, rel), "utf-8");
+  const match = content.match(/^version:\s*(\S+)\s*$/m);
+  if (!match) {
+    mismatches.push({ file: rel, actual: "not found" });
+  } else if (match[1] !== expected) {
+    mismatches.push({ file: rel, actual: match[1] });
+  }
+}
+
 if (mismatches.length > 0) {
   console.error(`Version mismatch! Expected ${expected} but found:\n`);
   for (const m of mismatches) {
@@ -108,4 +126,4 @@ if (mismatches.length > 0) {
   process.exit(1);
 }
 
-console.log(`All ${dirs.length} workspace packages + ${CLI_PLATFORM_PACKAGES.length} platform packages + ${CARGO_TOML_PACKAGES.length} Cargo packages are at ${expected}`);
+console.log(`All ${dirs.length} workspace packages + ${CLI_PLATFORM_PACKAGES.length} platform packages + ${CARGO_TOML_PACKAGES.length} Cargo packages + ${PUBSPEC_PACKAGES.length} Dart packages are at ${expected}`);

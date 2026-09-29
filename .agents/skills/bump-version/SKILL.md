@@ -14,7 +14,7 @@ Bump the canary version number across all `package.json`, `Cargo.toml`, and mani
 
 2. **Calculate next version**: Increment the canary number by 1 (e.g. `0.0.1-canary.50` → `0.0.1-canary.51`).
 
-3. **Run the bump script**: Run `node scripts/bump-version.mjs NEW_VERSION` from the repo root. This updates all workspace `package.json` files, CLI platform packages, Chrome manifest, and all `Cargo.toml` files in one go.
+3. **Run the bump script**: Run `node scripts/bump-version.mjs NEW_VERSION` from the repo root. This updates all workspace `package.json` files, CLI platform packages, Chrome manifest, all `Cargo.toml` files and the Dart `pubspec.yaml` files (`spooky_core`, `spooky_flutter`, `spooky_push`) in one go.
 
 4. **Regenerate the Cargo.lock**: Run `cargo check` once from the **repo root**. `apps/cli`, `apps/scheduler` and `apps/ssp` are all members of the root workspace, so the root `Cargo.lock` is the only lockfile any of them reads — cargo ignores a `Cargo.lock` inside a workspace member. (There used to be one in each of those directories, frozen at whatever version they held when the crates joined the workspace. They were inert, but this skill verified against them and so failed every release; they have been deleted.)
 

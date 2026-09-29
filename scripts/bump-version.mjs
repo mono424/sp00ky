@@ -25,6 +25,7 @@ const CARGO_TOML_PACKAGES = [
 const PUBSPEC_PACKAGES = [
   "packages/spooky_core/pubspec.yaml",
   "packages/spooky_flutter/pubspec.yaml",
+  "packages/spooky_push/pubspec.yaml",
 ];
 
 const CLI_PLATFORM_PACKAGES = [

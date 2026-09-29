@@ -1,0 +1,22 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application>
+        <!-- FCM hands messages to ONE MESSAGING_EVENT service per app. If the
+             app (or another plugin) declares one too, remove one of them with
+             tools:node="remove" and forward to Sp00kyPushPlugin.handleMessage. -->
+        <service
+            android:name="dev.sp00ky.push.Sp00kyMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <!-- Applies the Firebase options sp00ky served before any service of
+             the process runs (after FirebaseInitProvider, initOrder 100). -->
+        <provider
+            android:name="dev.sp00ky.push.Sp00kyPushInitProvider"
+            android:authorities="${applicationId}.sp00kypush"
+            android:exported="false"
+            android:initOrder="99" />
+    </application>
+</manifest>

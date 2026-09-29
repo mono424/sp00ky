@@ -1,0 +1,30 @@
+name: spooky_push
+description: Native push for sp00ky apps (APNs on iOS, FCM on Android) - permission, device token, taps - registered through spooky_core's db.push.
+version: 0.0.1-canary.281
+publish_to: none
+
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+  # FlutterPluginRegistrar.addSceneDelegate (cold-start taps in UIScene apps).
+  flutter: '>=3.38.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  spooky_core:
+    path: ../spooky_core
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  fake_async: ^1.3.1
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.sp00ky.push
+        pluginClass: Sp00kyPushPlugin
+      ios:
+        pluginClass: Sp00kyPushPlugin

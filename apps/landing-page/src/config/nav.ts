@@ -35,6 +35,7 @@ export const docsNav = [
       { text: 'Query allowlist', href: `${basePath}/docs/guide/query-allowlist` },
       { text: 'Feature flags', href: `${basePath}/docs/client/feature-flags` },
       { text: 'Push notifications', href: `${basePath}/docs/client/push-notifications`, experimental: true },
+      { text: 'Native push (iOS, Android)', href: `${basePath}/docs/client/native-push`, experimental: true },
       { text: 'Admin impersonation', href: `${basePath}/docs/client/impersonation` },
       { text: 'File buckets', href: `${basePath}/docs/client/buckets`, experimental: true },
       { text: 'CRDT fields', href: `${basePath}/docs/client/crdt`, experimental: true },

@@ -323,7 +323,11 @@ After sign-in, `webPush.autoSync` (on by default) runs `db.webPush.sync()`: when
 
 <CodeBlock code={configCode} lang="typescript" />
 
-## iOS and iPadOS
+## Phones (iOS, Android)
+
+The same rules reach native apps: configure `push.apns` / `push.fcm` and add the `spooky_push` Flutter plugin. A rule's `notification` shows on phones too, a `native:` block overrides it there, and `platforms:` limits a rule to some kinds of device. See [Native push](/docs/client/native-push).
+
+## iOS and iPadOS (web apps)
 
 Safari on iOS and iPadOS 16.4+ supports Web Push **only for web apps added to the Home Screen** (your manifest needs `display: "standalone"`). In a Safari tab, `db.webPush.support()` returns `{ supported: false, reason: 'ios-not-installed' }`: show a short "Add to Home Screen" hint instead of the button. Once installed and opened from the Home Screen, the same `subscribe()` works.
 
@@ -338,13 +342,13 @@ Safari on iOS and iPadOS 16.4+ supports Web Push **only for web apps added to th
 
 <PropTable props={[
   { name: 'support()', type: 'WebPushSupport', default: '-', desc: '{ supported, permission, reason? }. Reasons: no-window, insecure-context, no-service-worker, no-push-manager, no-notification, ios-not-installed.' },
-  { name: 'info()', type: 'Promise<WebPushInfo>', default: '-', desc: 'Whether push is enabled on the deployment, its public key and key id. Cached.' },
+  { name: 'info()', type: 'Promise<WebPushInfo>', default: '-', desc: 'Whether web push is enabled on the deployment, its public key and key id, and the providers it reaches (web, apns, fcm). Cached.' },
   { name: 'subscribe(opts?)', type: 'Promise<WebPushDevice>', default: '-', desc: 'Permission, browser subscription and server registration. opts: registration, label, rules, meta, requestPermission.' },
   { name: 'unsubscribe(opts?)', type: 'Promise<number>', default: '-', desc: 'Remove this device (all: every device of the user). keepBrowserSubscription keeps the browser side.' },
   { name: 'sync(opts?)', type: 'Promise<WebPushSyncStatus>', default: '-', desc: 'Reconcile after sign-in. ok, resubscribed, registered, or why nothing happened. Never throws.' },
   { name: 'isSubscribed()', type: 'Promise<boolean>', default: '-', desc: 'This browser holds a subscription registered for the signed-in user. No network.' },
   { name: 'update(opts)', type: 'Promise<WebPushDevice | null>', default: '-', desc: 'Change label, rules (null resets to every rule) or meta of this device.' },
-  { name: 'devices()', type: 'Promise<WebPushDevice[]>', default: '-', desc: 'The user\'s devices, this one marked with thisDevice.' },
+  { name: 'devices()', type: 'Promise<WebPushDevice[]>', default: '-', desc: 'The user\'s devices, native ones included (kind: web | apns | fcm, platform, appId, environment), this one marked with thisDevice.' },
   { name: 'notify(msg)', type: 'Promise<WebPushMessage>', default: '-', desc: 'Push to yourself: notification, data, topic, urgency, ttl, sendAt.' },
   { name: 'cancel(id)', type: 'Promise<boolean>', default: '-', desc: 'Cancel a scheduled self-push that is still pending.' },
   { name: 'test(opts?)', type: 'Promise<WebPushMessage>', default: '-', desc: 'A visible test notification to every device of the user.' },

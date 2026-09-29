@@ -376,9 +376,15 @@ variables in both. It needs no configuration: its VAPID key is derived from
 `SPKY_AUTH_SECRET`, and the rules come from `push:` in `sp00ky.yml`. See
 [Push notifications](/docs/client/push-notifications).
 
+Native push needs no variable either: the APNs and FCM credentials come from
+`push.apns` / `push.fcm`, which `spky migrate` stores in the database
+(`_00_push_credential`). The host needs outbound HTTPS (HTTP/2 for Apple) to
+`api.push.apple.com`, `api.sandbox.push.apple.com`, `fcm.googleapis.com` and
+`oauth2.googleapis.com`. See [Native push](/docs/client/native-push).
+
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `SPKY_PUSH` | `off` (or `0`, `false`, `no`, `disabled`) switches the engine off. Subscriptions and queued messages are kept. | *(on)* |
+| `SPKY_PUSH` | `off` (or `0`, `false`, `no`, `disabled`) switches the engine off, web and native. Subscriptions and queued messages are kept. | *(on)* |
 | `SPKY_VAPID_PRIVATE_KEY` | A VAPID private key (base64url raw P-256 scalar, the form web-push libraries print) to use instead of the one derived from `SPKY_AUTH_SECRET`. Set it on every host that runs the engine. Changing the key (or the secret it is derived from) invalidates every browser subscription: clients re-subscribe on their next boot through `db.webPush.sync()`. With neither this nor `SPKY_AUTH_SECRET`, push is off. | *(derived)* |
 | `SPKY_PUSH_ALLOW_PRIVATE_ENDPOINTS` | Accept `http://` endpoints and private or local addresses, for a mock push service in development. Never in production: endpoints are chosen by your users and the engine posts to them from inside your network. | `false` |
 | `SPKY_PUSH_SEND_CONCURRENCY` | Concurrent HTTP sends per matched row or tick | `8` |

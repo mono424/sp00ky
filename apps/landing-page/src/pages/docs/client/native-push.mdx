@@ -1,0 +1,277 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Native push (iOS, Android)
+description: The same push rules deliver to iOS through APNs and to Android through FCM, with the spooky_push Flutter plugin on the device and no Firebase setup in the app.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+import Steps from '../../../components/ui/Steps.astro';
+import Step from '../../../components/ui/Step.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const configCode = `push:
+  subject: mailto:ops@example.com
+  apns:
+    teamId: ABCDE12345                 # Membership details in the Apple Developer account
+    keyId: XYZ987WVUT                  # Certificates, IDs & Profiles > Keys (APNs enabled)
+    key: { vault: APNS_KEY }           # the .p8 file's contents
+    bundleIds: [com.example.app]       # optional: the only apps devices may register for
+  fcm:
+    serviceAccount: { vault: FCM_SERVICE_ACCOUNT }   # the service account JSON
+    android:                           # from the app's google-services.json
+      projectId: example
+      appId: "1:1234567890:android:0a1b2c3d4e5f"     # mobilesdk_app_id
+      apiKey: AIzaSyExample                          # current_key
+      senderId: "1234567890"                         # project_number
+  defaults:
+    native:
+      android: { channelId: sp00ky_default }`;
+
+export const vaultCode = `spky env set APNS_KEY "$(cat AuthKey_XYZ987WVUT.p8)"
+spky env set FCM_SERVICE_ACCOUNT "$(cat example-firebase-adminsdk.json)"
+spky deploy            # resolves both and stores them, root only
+spky push status       # apns / fcm: configured`;
+
+export const ruleCode = `push:
+  rules:
+    new-message:
+      table: message
+      to: recipient
+      except: sender
+      topic: "dm:{{conversation | key}}"
+      throttle: 30s
+      with:
+        sender: SELECT username FROM ONLY $row.sender
+      notification:                    # web: shown by the service worker
+        title: "{{sender.username}}"
+        body: "{{text | truncate(120)}}"
+        url: "/messages/{{conversation | key}}"
+      native:                          # phones: over the notification above
+        apns: { sound: message.caf, badge: "{{unread}}" }
+        android: { channelId: messages }
+
+    incoming-call:
+      table: call
+      when: { state: ringing }
+      to: callee
+      platforms: [ios, android]        # phones only
+      urgency: high
+      ttl: 45s
+      native:
+        notification: { title: "Incoming call", body: "{{caller_name}}", url: "/calls/{{id | key}}" }
+        apns: { interruptionLevel: time-sensitive, category: CALL }
+        android: { channelId: calls, priority: high }`;
+
+export const pubspecCode = `dependencies:
+  spooky_core:
+    git: { url: https://github.com/mono424/sp00ky.git, path: packages/spooky_core }
+  spooky_push:
+    git: { url: https://github.com/mono424/sp00ky.git, path: packages/spooky_push }`;
+
+export const dartCode = `final push = Sp00kyPush(db);
+
+Future<void> main() async {
+  runApp(const App());
+  await push.start();                         // keeps the device registered from now on
+  final launch = await push.initialMessage(); // the tap that started the app
+  if (launch?.url != null) router.go(launch!.url!);
+  push.onOpened.listen((e) => router.go(e.url ?? '/'));
+}
+
+// A settings switch: enable() asks for permission, so call it from the tap.
+Future<void> onToggle(bool on) async {
+  try {
+    if (on) {
+      await push.enable(label: 'My phone');
+    } else {
+      await push.disable();
+    }
+  } on PushError catch (e) {
+    if (e.code == PushErrorCode.permissionDenied) await push.openSettings();
+  }
+}`;
+
+export const removeServiceCode = `<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+  <application>
+    <!-- live_activities declares one too; only one gets FCM messages. -->
+    <service android:name="com.istornz.live_activities.LiveActivityFirebaseMessagingService"
+             tools:node="remove" />
+  </application>
+</manifest>`;
+
+export const coreCode = `// Any Dart app, with a token from wherever you get it:
+await db.push.register(PushToken(
+  kind: PushKind.fcm,
+  token: fcmToken,
+  appId: 'com.example.app',
+  platform: PushPlatform.android,
+));
+final status = await db.push.sync(token, permission: PushPermission.granted);
+final devices = await db.push.devices();   // web and native, this one marked
+await db.push.test();`;
+
+<Experimental>
+  Native push is experimental. The rule format is shared with web push and stable; the plugin API may still change.
+</Experimental>
+
+The [push rules](/docs/client/push-notifications) that reach browsers also reach phones. Configure Apple's and Google's credentials once in `sp00ky.yml`, add the `spooky_push` Flutter plugin, and every rule and direct message is delivered to iOS through APNs and to Android through FCM, with the same throttling, limits, device list and sign-out handling.
+
+There is no Firebase setup in the app: iOS talks to APNs with its raw device token, and the Android plugin initialises Firebase at runtime from a client config the server hands out. No `google-services.json`, no Google services Gradle plugin, no FlutterFire.
+
+## How it fits together
+
+| | Web | iOS | Android |
+|---|---|---|---|
+| Device registers with | `db.webPush.subscribe()` | `spooky_push` → `fn::push::register` | `spooky_push` → `fn::push::register` |
+| Delivered through | the browser's push service (VAPID) | APNs (token auth, HTTP/2) | FCM HTTP v1 |
+| Server credential | derived from the auth secret | `push.apns` (.p8 key) | `push.fcm` (service account) |
+| Content push | service worker shows it | iOS shows the alert | Android shows the notification |
+| Nudge (no notification) | service worker renders it | silent push (`content-available`) | data message |
+
+Every device is a row of `_00_push_subscription` with a `kind` (`web`, `apns`, `fcm`); `db.webPush.devices()` and `db.push.devices()` list all of them.
+
+## Setup
+
+<Steps>
+  <Step title="Configure the providers">
+    Add `apns`, `fcm` or both to the `push:` block. The keys are secret references: `{ vault: KEY }` (recommended), `{ env: KEY }` or `{ file: ./AuthKey.p8 }`. The CLI resolves them at every `spky migrate` / `spky deploy`, checks them, and stores them in the root-only `_00_push_credential` table; `_00_push_config` only ever holds the redacted block.
+    <CodeBlock code={configCode} lang="yaml" fileName="sp00ky.yml" />
+    <CodeBlock code={vaultCode} lang="bash" />
+  </Step>
+  <Step title="Add the plugin">
+    <CodeBlock code={pubspecCode} lang="yaml" fileName="pubspec.yaml" />
+    **iOS:** in Xcode, *Signing & Capabilities*, add **Push Notifications** and **Background Modes → Remote notifications**.
+    **Android:** nothing to add, unless the app already has a `com.google.firebase.MESSAGING_EVENT` service (see below).
+  </Step>
+  <Step title="Start it and give users a switch">
+    <CodeBlock code={dartCode} lang="dart" />
+  </Step>
+  <Step title="Send a test">
+    `await db.push.test()` from the app, or `spky push send --to user:abc --title Hello` from a terminal. `spky push devices user:abc` lists the user's devices with kind, app, APNs environment and last error.
+  </Step>
+</Steps>
+
+## Rules for phones
+
+A rule's `notification` is what phones show too. Add a `native:` block to change it for phones only, or to show something on phones for a rule that is a nudge on the web:
+
+<CodeBlock code={ruleCode} lang="yaml" fileName="sp00ky.yml" />
+
+- `native.notification` overrides the rule's `notification` key by key. On a phone only `title`, `body`, `image`, `tag` and `url` mean something.
+- `native.apns` sets `aps` keys: `sound` (alerts default to `default`, `none` is silent), `badge`, `category`, `threadId` (defaults to the tag), `interruptionLevel`, `relevanceScore`, `mutableContent`; anything else goes into `aps` as written.
+- `native.android` sets `android.notification` keys: `channelId`, `sound`, `icon`, `color`, and `priority` (the message priority, `high` or `normal`); anything else goes in as written, in FCM's snake_case.
+- `platforms: [web, ios, android]` limits a rule to some kinds of device.
+- `defaults.native` applies under every rule.
+- Strings are templates like everywhere else in `push:`, with the same context.
+
+A rule with no `notification` and no `native.notification` is a **nudge**: iOS gets a silent push (`content-available`, low priority, may be delayed or dropped by iOS), Android a data message. The plugin wakes the client so it syncs, then lets the OS suspend the app again.
+
+Direct messages (`_00_push_message`, `spky push send`, `db.push.notify()`) take a `native` object with the same keys, taken as written.
+
+## Devices, sign-in and sign-out
+
+`push.start()` keeps the registration right without any further code: after a sign-in, when the connection comes back, when the app returns with a changed permission, and when the OS hands out a new token. The rules it follows:
+
+- Nothing is registered until the user enables push on this device (`enable()`), unless you pass `autoRegister: true`. An app that asks for notification permission for something else must not opt users in silently.
+- `disable()` is remembered per account: no automatic sync turns it back on.
+- On **sign-out** the device's row is removed while the session is still valid, and the choice is kept for that account's next sign-in. On Android the FCM token is also dropped, so the old token dies even if the server could not be reached.
+- The same phone signed in as another user: the newest owner of a token gets its pushes and the previous owner's row is deleted.
+- A signed-out phone never shows pushes in the foreground.
+- While impersonating, nothing is registered or removed.
+
+Development builds get **sandbox** APNs tokens, TestFlight and App Store builds **production** ones. The plugin reads the build's provisioning profile to tell which, and the server retries the other APNs host once on `BadDeviceToken` and corrects the row.
+
+## Android and other Firebase users
+
+FCM delivers every message of an app to **one** `MESSAGING_EVENT` service. `spooky_push` declares one; if the app or another plugin declares one too (the `live_activities` plugin does), only one of them receives anything. Remove the one you do not need:
+
+<CodeBlock code={removeServiceCode} lang="xml" fileName="android/app/src/main/AndroidManifest.xml" />
+
+Or keep your own service and forward from it: `Sp00kyPushPlugin.handleMessage(context, message)` and `Sp00kyPushPlugin.handleNewToken(context, token)`.
+
+If the app ships its own `google-services.json`, it must be for the same Firebase project as `push.fcm`; tokens of another project are refused by sp00ky's service account, and `configureFirebase` reports the conflict.
+
+<Warning title="Pushes are readable by Apple and Google">
+  Web Push payloads are end-to-end encrypted to the browser. APNs and FCM
+  payloads are not: Apple and Google can read what a content push says. When
+  that matters, keep the notification text short and neutral, or send a nudge
+  and let the app fetch the details.
+</Warning>
+
+## Without Flutter
+
+`db.push` in `spooky_core` is the whole server side in plain Dart; the plugin only adds the OS half. Any Dart app that gets a token another way can use it:
+
+<CodeBlock code={coreCode} lang="dart" />
+
+<PropTable props={[
+  { name: 'info({refresh})', type: 'Future<PushInfo>', default: '-', desc: 'providers (web, apns, fcm) and the Android Firebase client config. Cached.' },
+  { name: 'register(token, {label, rules, meta, userAgent})', type: 'Future<PushDevice>', default: '-', desc: 'Register this device for the signed-in user and remember the choice.' },
+  { name: 'sync(token, {permission, autoRegister})', type: 'Future<PushSyncStatus>', default: '-', desc: 'Reconcile after sign-in, a token rotation, an environment switch or a permission change. Never throws.' },
+  { name: 'unsubscribe({all})', type: 'Future<int>', default: '-', desc: 'Remove this device (or all) and remember the opt-out.' },
+  { name: 'update({label, rules, meta})', type: 'Future<PushDevice?>', default: '-', desc: 'Change this device; rules: [] means every rule again.' },
+  { name: 'devices()', type: 'Future<List<PushDevice>>', default: '-', desc: 'Every device of the user, web and native.' },
+  { name: 'notify(message) / cancel(id) / test()', type: 'Future<...>', default: '-', desc: 'Self-pushes, as db.webPush.' },
+]} />
+
+## Plugin reference
+
+<PropTable props={[
+  { name: 'Sp00kyPush(db, {...})', type: 'constructor', default: '-', desc: 'autoRegister (false), foreground (hide | show), apnsEnvironment (from the profile), androidChannel, rotateTokenOnSignOut (true), onNudge, label.' },
+  { name: 'start()', type: 'Future<void>', default: '-', desc: 'Hand-shake with the OS side and keep the device registered. Idempotent.' },
+  { name: 'enable({label, rules, meta})', type: 'Future<PushDevice>', default: '-', desc: 'Permission, token, registration. Throws PushError permissionDenied / noRegistration.' },
+  { name: 'disable({all})', type: 'Future<int>', default: '-', desc: 'Stop pushes to this device.' },
+  { name: 'sync()', type: 'Future<PushSyncStatus>', default: '-', desc: 'Reconcile now; start() already calls it when needed.' },
+  { name: 'permission() / requestPermission({provisional})', type: 'Future<PushPermission>', default: '-', desc: 'granted, provisional (iOS quiet delivery), denied, notDetermined.' },
+  { name: 'token()', type: 'Future<PushToken?>', default: '-', desc: 'The device token, or null.' },
+  { name: 'onMessage / onOpened', type: 'Stream<PushEvent>', default: '-', desc: 'Pushes received while the app runs; notifications tapped. PushEvent: payload, url, title, body, action, isNudge.' },
+  { name: 'initialMessage()', type: 'Future<PushEvent?>', default: '-', desc: 'The tap that launched the app, once.' },
+  { name: 'setBadge(n) / openSettings() / createChannel(c)', type: 'Future', default: '-', desc: 'iOS badge, the notification settings screen, an extra Android channel.' },
+]} />
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `enable()` throws `disabled` | The project has no usable `push.apns` / `push.fcm`. `spky push status` shows each provider; a credential that did not resolve at the last deploy is reported there. |
+| `noRegistration` on iOS | The app lacks the Push Notifications capability, or the simulator is not on Apple silicon / a recent Xcode. |
+| `noRegistration` on Android | No Google Play services on the device, or `push.fcm.android` is missing (`info().android` is null). |
+| iOS devices end up disabled | `spky push devices user:abc` shows the reason: `bad_app_id` (the bundle id is not in `push.apns.bundleIds`), `apns_400: DeviceTokenNotForTopic` (the key or bundle id belongs to another app or team). A refused key (`apns_403`) leaves devices alone and shows in `spky push status`. |
+| Android: `configureFirebase` reports a conflict | The app ships a `google-services.json` for another Firebase project. Use the same project in `push.fcm`, or remove the file. |
+| Android: nothing arrives, FCM accepts the push | Another `MESSAGING_EVENT` service took the message. See "Android and other Firebase users". |
+| Silent pushes do nothing on iOS | Background Modes → Remote notifications is missing, the user force-quit the app, or iOS throttled it (they are low priority by design). |
+
+## Next steps
+
+<CardGrid>
+  <LinkCard
+    href="/docs/client/push-notifications"
+    title="Push notifications"
+    icon="live"
+    description="Rules, templates, throttling, direct messages and the web side."
+  />
+  <LinkCard
+    href="/docs/guide/flutter"
+    title="Flutter guide"
+    icon="mobile"
+    description="Set up spooky_core in a Flutter app."
+  />
+  <LinkCard
+    href="/docs/reference/config"
+    title="Config reference"
+    icon="config"
+    description="Every key of the push block, apns and fcm included."
+  />
+  <LinkCard
+    href="/docs/reference/cli"
+    title="CLI reference"
+    icon="terminal"
+    description="spky push status, devices, send and sync."
+  />
+</CardGrid>

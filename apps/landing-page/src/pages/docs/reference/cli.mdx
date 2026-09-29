@@ -132,10 +132,10 @@ local dev database by default or the cloud deployment with `--cloud` (or any dat
 
 | Command | What it does |
 | --- | --- |
-| `spky push status [--json]` | Whether a host has published its VAPID key (and its `kid`), the rules stored in `_00_push_config`, devices per user (disabled ones, and ones subscribed under an older key), and direct messages by status with the most recent failures. |
+| `spky push status [--json]` | Whether a host has published its VAPID key (and its `kid`), whether `push.apns` / `push.fcm` have a stored credential and how many devices each reaches, the rules stored in `_00_push_config`, devices per user (disabled ones, and web ones subscribed under an older key), and direct messages by status with the most recent failures. |
 | `spky push send --to <user> ...` | Creates a `_00_push_message` for the given users and waits up to 40 s for the delivery result: how many devices accepted it, or why it failed. With no notification flags it sends a nudge. On `--cloud` it asks first (`-y` answers). |
-| `spky push devices <user> [--json]` | A user's subscriptions, newest first: label or user agent, push service, last success, failures, disabled reason, rule filter. Never the encryption keys; `--json` includes the full endpoint. |
-| `spky push sync` | Store `push:` from `sp00ky.yml` without a deploy (`spky deploy` and `spky migrate` do it anyway). |
+| `spky push devices <user> [--json]` | A user's devices, newest first: label or user agent, where it is reached (a browser push service, `APNs sandbox · <bundle id>`, `FCM · android · <package>`), last success, failures, disabled reason, rule filter. Never the encryption keys; `--json` includes the full endpoint. |
+| `spky push sync` | Store `push:` from `sp00ky.yml` without a deploy (`spky deploy` and `spky migrate` do it anyway), and the native credentials it references: `{ vault: .. }` resolves against the production vault with `--cloud`, the dev vault otherwise. |
 
 `send` takes:
 

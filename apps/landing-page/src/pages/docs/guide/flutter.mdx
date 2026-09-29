@@ -364,6 +364,12 @@ To have a screen's first frame already hold its rows, keep that query open
 from startup (subscribe once, share the latest rows) rather than subscribing
 when the screen mounts.
 
+## Push notifications
+
+The `spooky_push` plugin adds native push: APNs on iOS, FCM on Android, from the
+same `push:` rules as the web, with no Firebase setup in the app. `db.push` in
+`spooky_core` is the Dart side of it. See [Native push](/docs/client/native-push).
+
 ## Next steps
 
 <CardGrid>

@@ -218,7 +218,7 @@ Either section can also live in its own file, per entry or wholesale, useful onc
 
 ## Web Push
 
-`push` declares rules of the form "when a row of this table looks like this, push to the users in that field". Browsers subscribe through `db.webPush` in the client, and the platform delivers: no app backend, no push library, no key management. The VAPID key is derived from `SPKY_AUTH_SECRET` (or taken from `SPKY_VAPID_PRIVATE_KEY`); `SPKY_PUSH=off` turns push off. The scheduler runs the engine in `cluster` mode, the SSP in `singlenode`; `surrealism` has no push host. Subscribing and the service worker side are in [Push notifications](/docs/client/push-notifications).
+`push` declares rules of the form "when a row of this table looks like this, push to the users in that field". Browsers subscribe through `db.webPush` in the client, iOS and Android apps through the `spooky_push` Flutter plugin once `apns` / `fcm` are set ([Native push](/docs/client/native-push)), and the platform delivers: no app backend, no push library, no key management. The VAPID key is derived from `SPKY_AUTH_SECRET` (or taken from `SPKY_VAPID_PRIVATE_KEY`); `SPKY_PUSH=off` turns push off. The scheduler runs the engine in `cluster` mode, the SSP in `singlenode`; `surrealism` has no push host. Subscribing and the service worker side are in [Push notifications](/docs/client/push-notifications).
 
 <CodeBlock code={ymlPush} lang="yaml" />
 
@@ -233,6 +233,10 @@ Without a `push` block, push is on with no rules: direct pushes (a `_00_push_mes
 | `limits.perMinute` | integer | `6000` | Pushes the whole project may send per minute, one per subscription. |
 | `limits.maxRecipients` | integer | `10000` | Recipients one matched row may fan out to. |
 | `rules` | map | `{}` | Rules keyed by name (letters, digits, `-`, `_`, `.`). The name travels in every push and is what a device filters on. |
+| `apns` | object | (none) | iOS delivery through APNs, see [Native providers](#native-providers). |
+| `fcm` | object | (none) | Android (and FCM-registered iOS) delivery through FCM, see [Native providers](#native-providers). |
+
+`defaults` also takes `native` (merged under every rule's `native` block).
 
 Over a limit a push is dropped and counted, and the engine warns at most once a minute.
 
@@ -255,6 +259,8 @@ Over a limit a push is dropped and counted, and the engine warns at most once a 
 | `urgency` | `very-low` \| `low` \| `normal` \| `high` | (push service default) | How eagerly a sleeping device is woken for it. |
 | `ttl` | duration | `1d` | How long the push service keeps a push for a device that is offline. |
 | `enabled` | boolean | `true` | Switch one rule off without deleting it. |
+| `platforms` | `web` \| `ios` \| `android` list | every kind | Which kinds of device receive it. |
+| `native` | `{ notification, apns, android }` | (none) | What iOS and Android show. `notification` overrides the rule's `notification` key by key; `apns` sets `aps` keys (`sound`, `badge`, `category`, `threadId`, `interruptionLevel`, `relevanceScore`, `mutableContent`, anything else as written); `android` sets `android.notification` keys (`channelId`, `sound`, `icon`, `color`, anything else as written) and `priority` (`high` \| `normal`). A rule with no notification anywhere is a silent push on phones. |
 
 Durations are `500ms`, `30s`, `10m`, `1h30m`, `2d`, `1w`, or a plain number of seconds.
 
@@ -274,11 +280,24 @@ A key of `when` is a field path, its value one of:
 
 `topic`, every string in `notification` and the values of a `data` map are templates: `{{ path | filter }}` over the row's fields (also under `row`), `id`, `table`, `op`, `rule`, each `with` name, `recipient` (the user being rendered for) and `now`. A missing path renders empty. Filters: `default(x)`, `truncate(n)`, `upper`, `lower`, `trim`, `key` (`user:abc` to `abc`), `table`, `json`, `len`, `join(sep)`, `first`, `last`, `date(format)`. In `data`, a value that is exactly one `{{ expr }}` keeps its JSON type.
 
+#### Native providers
+
+`apns` and `fcm` turn on delivery to native apps. Their secrets are references the CLI resolves at every migrate and deploy: `{ vault: KEY }` (the project vault, recommended), `{ env: KEY }`, `{ file: path }` (relative to `sp00ky.yml`), or an inline string (`spky lint` warns: it is committed). The resolved secret is checked and stored in the root-only `_00_push_credential` table; `_00_push_config` holds the block with the secrets redacted. A reference that does not resolve on the machine running the deploy keeps the stored credential; removing the block removes it. The engine reloads credentials with the config, so a rotated key needs no restart.
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `apns.teamId` | 10 characters | Apple Developer team id. |
+| `apns.keyId` | 10 characters | Id of the APNs auth key. |
+| `apns.key` | secret | The `.p8` key (PEM). |
+| `apns.bundleIds` | list | Bundle ids devices may register with (the APNs topic). Empty: any. |
+| `fcm.serviceAccount` | secret | The Firebase service account JSON. |
+| `fcm.android` | `{ projectId, appId, apiKey, senderId }` | The Android app's Firebase client config (from `google-services.json`: `project_id`, `mobilesdk_app_id`, `current_key`, `project_number`). Not secret: apps read it through `fn::push::info()` and ship no `google-services.json`. |
+
 #### More rules
 
 <CodeBlock code={ymlPushMore} lang="yaml" />
 
-What a deploy does with it: `spky migrate` and `spky deploy` store the block, normalized, in `_00_push_config:default` (unchanged blocks are not rewritten), and the engine picks it up within 30 seconds, no restart. A block that fails validation is not stored and the previous rules stay. `spky lint` checks every rule, including against your schema: a table that does not exist or is `@nosync`, a field path the table does not define, and a field that is `@opaque`, `@crdt` or `@nosync` (stripped from what the engine sees) are reported. `spky push sync` stores the block without a deploy, and `spky push status` shows what is stored. See [`spky push`](/docs/reference/cli#web-push).
+What a deploy does with it: `spky migrate` and `spky deploy` store the block, normalized, in `_00_push_config:default` (unchanged blocks are not rewritten), and the engine picks it up within 30 seconds, no restart. A block that fails validation is not stored and the previous rules stay. `spky lint` checks every rule, including against your schema: a table that does not exist or is `@nosync`, a field path the table does not define, and a field that is `@opaque`, `@crdt` or `@nosync` (stripped from what the engine sees) are reported. `spky push sync` stores the block (and the native credentials) without a deploy, and `spky push status` shows what is stored, each native provider included. See [`spky push`](/docs/reference/cli#web-push).
 
 ## Machine pools
 

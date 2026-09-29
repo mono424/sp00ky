@@ -510,6 +510,54 @@ imported in Node):
 `kind: "message"` carries `message` (the `_00_push_message` id) instead of
 rule/table/id/op.
 
+## Native (APNs, FCM)
+
+Same engine, same rules, two more device kinds (`_00_push_subscription.kind`:
+`web` | `apns` | `fcm`, NONE = web for rows from before). User docs:
+`apps/landing-page/src/pages/docs/client/native-push.mdx`.
+
+- Rows: `fn::push::register($device, $opts)` writes `kind`, `token`,
+  `app_id` (APNs topic), `platform`, `environment` (APNs sandbox |
+  production) and a synthesized `endpoint = '<kind>:<token>'`, so id,
+  update / unsubscribe by endpoint and "newest owner of an endpoint wins" are
+  unchanged. `p256dh` / `auth` are web only; `kid` is web only.
+- Credentials: `push.apns` / `push.fcm` hold secret references
+  (`SecretRef`: vault / env / file / inline). The CLI resolves them at
+  migrate (`push_sync::sync_native`), validates them with the engine's own
+  parsers, writes `_00_push_credential:{apns,fcm}` (`secret`, `hash`) only on
+  change, keeps the stored row when a reference does not resolve, deletes it
+  when the block goes. `_00_push_config` stores `PushConfig::redacted()`.
+  `$sp00ky_push_native` (CLI-written, PERMISSIONS FULL) carries
+  `{ apns, fcm, bundleIds?, android? }` for `fn::push::info()` (`providers`,
+  `android`) and `fn::push::register` (provider on, bundle allowlist).
+- Engine (`native.rs`): providers are rebuilt from the credential rows when
+  their fingerprint changes (separate query, so a schema without the table
+  still loads the config). `can_send` = not `SPKY_PUSH=off` and (VAPID key or
+  a ready provider). A delivery carries `Rendered { web, native }`; native
+  content is rendered per rule from `native.notification` over `notification`
+  over `defaults.native.notification` over `defaults.notification` (only when
+  the rule has a notification somewhere), plus `native.apns` / `.android`
+  option maps. The app's `sp00ky` payload keeps `url`, `tag`, `image`, `data`
+  of the notification. 4096-byte cap, degrading data, notification data,
+  body, then everything but `url`.
+- APNs: token-auth ES256 JWT cached 50 min, HTTP/2 (the reqwest client uses
+  rustls so ALPN offers h2), `apns-push-type` alert | background, priority
+  10 | 5, collapse id = topic (hashed past 64 bytes). `BadDeviceToken` retries
+  the other host once and rewrites `environment` (`Outcome::OkMoved`).
+- FCM: RS256 service-account grant to the fixed Google token URL (the JSON's
+  `token_uri` is ignored), one exchange at a time, cached until 5 min before
+  expiry. `android` block for Android rows, `apns` block for FCM rows with
+  `platform: ios`. Content = notification message, nudge = data message.
+- Answers: provider auth refused (APNs 403, FCM 401 / 403 other than
+  SENDER_ID_MISMATCH) = `Outcome::Provider`: forget the token, retry through
+  the backoff, never touch the row. Dead tokens (APNs 410, FCM UNREGISTERED /
+  404 / invalid token) delete the row; wrong topic / sender disables it.
+- Clients: `db.push` (spooky_core, pure Dart, `decidePushSync` decides) and
+  the `spooky_push` Flutter plugin (token, permission, taps; Android
+  initialises Firebase from `info().android` at runtime, no
+  google-services.json). Sign-out removes the row through
+  `auth.onBeforeSignOut` hooks while the session is valid.
+
 ## Verified end to end (2026-09-29)
 
 A real Chrome (Playwright, system Chrome channel, persistent profile, since

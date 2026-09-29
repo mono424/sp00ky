@@ -540,14 +540,24 @@ scheduler hosts. It is informational and never changes `status`:
     "totals": { "matched": 12, "messages": 4, "sent": 16, "failed": 0, "dropped": 0, "throttled": 6, "retried": 3, "deduped": 0, "skipped_repair": 0 },
     "last_minute": { "matched": 3, "messages": 1, "sent": 4, "failed": 0, "dropped": 0, "throttled": 1, "retried": 0, "deduped": 0, "skipped_repair": 0 },
     "queues": { "retry": 0, "trailing": 1, "throttle_slots": 2, "messages_in_flight": 0, "dedupe_entries": 12, "cached_users": 2 },
-    "last_error": null
+    "last_error": null,
+    "providers": {
+      "web": true,
+      "apns": { "configured": true, "ready": true },
+      "fcm": { "configured": true, "ready": false, "error": "fcm service account has no `private_key`" }
+    }
   }
 }
 ```
 
-`enabled` is `false` with a `reason` when there is no key
-(`SPKY_AUTH_SECRET` and `SPKY_VAPID_PRIVATE_KEY` unset), `SPKY_PUSH=off`, or
-`push.enabled: false`. `matched` counts rule matches, `messages` direct
+`enabled` is `false` with a `reason` when nothing can be delivered (no VAPID
+key because `SPKY_AUTH_SECRET` and `SPKY_VAPID_PRIVATE_KEY` are unset, and no
+usable `push.apns` / `push.fcm` credential), `SPKY_PUSH=off`, or
+`push.enabled: false`. `providers` says what each delivery path can do:
+`web` a VAPID key is loaded, `apns` / `fcm` a credential is stored
+(`configured`) and parses (`ready`), with the parse `error` otherwise; the
+counters also include `no_provider` (native devices skipped because their
+provider is not ready). `matched` counts rule matches, `messages` direct
 pushes, `sent`/`failed` HTTP sends to push services, `dropped` pushes over a
 limit, `throttled` pushes folded into a trailing one, `retried` sends put on
 the retry queue, `skipped_repair` rows drift repair re-emitted (those never

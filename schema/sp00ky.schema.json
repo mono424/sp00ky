@@ -218,6 +218,18 @@
     },
     "sync": {
       "$ref": "#/$defs/syncConfig"
+    },
+    "push": {
+      "description": "Web Push rules: when a row of a table looks like `when`, push to the users named by `to`. Browsers subscribe through `db.webPush`, the platform delivers (VAPID keys derived from SPKY_AUTH_SECRET, or SPKY_VAPID_PRIVATE_KEY). Stored in `_00_push_config` at every migrate/deploy; a missing block means enabled with no rules, so direct pushes (`_00_push_message`) still work. May instead be a path to a YAML file holding the whole block.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Path to a YAML file holding the whole push block, relative to the manifest."
+        },
+        {
+          "$ref": "#/$defs/pushConfig"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -1058,6 +1070,405 @@
           "type": "string",
           "default": "5m",
           "description": "How long a machine may take to become ready, e.g. `5m`."
+        }
+      }
+    },
+    "pushDuration": {
+      "description": "A duration: `30s`, `10m`, `1h30m`, `2d`, `500ms` (units ms, s, m, h, d, w), or a plain number of seconds.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\s*(\\d+|(\\d+(ms|s|m|h|d|w))+)\\s*$",
+          "examples": [
+            "30s",
+            "10m",
+            "1h30m",
+            "1d"
+          ]
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds."
+        }
+      ]
+    },
+    "pushUrgency": {
+      "type": "string",
+      "enum": [
+        "very-low",
+        "low",
+        "normal",
+        "high"
+      ],
+      "description": "RFC 8030 `Urgency`: how eagerly a battery-saving device is woken up for it."
+    },
+    "pushConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The `push:` block.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch. `false` stops every rule and every direct message; subscriptions are kept."
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^(mailto:|https:)",
+          "examples": [
+            "mailto:ops@example.com"
+          ],
+          "description": "VAPID `sub` claim: a `mailto:` or `https:` contact the push services can reach about this sender. Defaults to `https://sp00ky.cloud`; Apple and Mozilla want one of yours."
+        },
+        "defaults": {
+          "$ref": "#/$defs/pushRuleDefaults"
+        },
+        "limits": {
+          "$ref": "#/$defs/pushLimits"
+        },
+        "rules": {
+          "type": "object",
+          "description": "Push rules keyed by name. The name travels in every push (`payload.rule`) and is what a device filters on.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/pushRule"
+          }
+        }
+      }
+    },
+    "pushRuleDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Applied to every rule (and to direct messages) unless the rule says otherwise.",
+      "properties": {
+        "ttl": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "How long the push service keeps an undelivered push. Default `1d`."
+        },
+        "urgency": {
+          "$ref": "#/$defs/pushUrgency"
+        },
+        "throttle": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "Default minimum gap between two pushes of a rule to one recipient under one topic."
+        },
+        "notification": {
+          "$ref": "#/$defs/pushNotification",
+          "description": "Merged under every rule's `notification` (icon, badge, lang, ...); a rule's own keys win. Not applied to nudge-only rules."
+        }
+      }
+    },
+    "pushLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Built-in ceilings. Over a limit a push is dropped and counted.",
+      "properties": {
+        "perUserPerMinute": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60,
+          "description": "Pushes one user may receive per minute, across rules, counted once per matched recipient (not per device)."
+        },
+        "perMinute": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6000,
+          "description": "Pushes the whole project may send per minute (one per subscription)."
+        },
+        "maxRecipients": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000,
+          "description": "Recipients one matched row may fan out to."
+        }
+      }
+    },
+    "pushRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "to"
+      ],
+      "description": "When a row of `table` looks like `when`, push to `to`.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "table": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_]+$",
+          "not": {
+            "pattern": "^_00_"
+          },
+          "description": "Synced table whose rows this rule watches. A `-- @nosync` table never reaches the push engine; `_00_` platform tables cannot be watched (use `_00_push_message` for direct pushes)."
+        },
+        "on": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update",
+              "delete"
+            ]
+          },
+          "default": [
+            "create"
+          ],
+          "description": "Which operations. A `delete` sees the row as it was before the delete."
+        },
+        "when": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/pushCondition"
+          },
+          "description": "Conditions on the row after the change, keyed by field path (`data.kind`); all must hold."
+        },
+        "once": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Fire at most once per record for each distinct combination of these fields' values: `once: [state]` pushes when a row reaches `ready`, not on every later update while it stays `ready`. Unset: once per record version."
+        },
+        "to": {
+          "$ref": "#/$defs/pushTarget"
+        },
+        "except": {
+          "description": "Users removed from the recipients, as field paths (the author of a message, the actor of an event).",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "topic": {
+          "type": "string",
+          "description": "Collapse key (template). Undelivered pushes with the same topic replace each other at the push service, the service worker uses it as the notification `tag`, and throttling is per (rule, recipient, topic). Default: the record id."
+        },
+        "throttle": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "Minimum gap between two pushes of this rule to one recipient under one topic. Pushes inside the gap collapse into one trailing push carrying the latest row."
+        },
+        "urgency": {
+          "$ref": "#/$defs/pushUrgency"
+        },
+        "ttl": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "How long the push service keeps an undelivered push. Default `1d`."
+        },
+        "maxAge": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "field",
+            "within"
+          ],
+          "description": "Ignore rows older than this, e.g. `{ field: created_at, within: 45s }`. The field may hold a datetime or epoch milliseconds / seconds.",
+          "properties": {
+            "field": {
+              "type": "string"
+            },
+            "within": {
+              "$ref": "#/$defs/pushDuration"
+            }
+          }
+        },
+        "with": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra template context: one root SurrealQL query per name, with `$row` (the changed row) and `$rule` bound, e.g. `sender: SELECT username FROM ONLY $row.sender`. Evaluated only when the rule matched."
+        },
+        "notification": {
+          "$ref": "#/$defs/pushNotification",
+          "description": "What the device shows. Absent: a content-free nudge, and the app's service worker renders it from its own data."
+        },
+        "data": {
+          "description": "`payload.data`: row field paths to copy, or a map of name to template. Sent with nudges too.",
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "object"
+            }
+          ]
+        }
+      }
+    },
+    "pushTarget": {
+      "description": "Recipients. Field paths on the row (a value may be a record id `user:abc`, its string form, or an array of either), or a root SurrealQL query with `$row` bound that returns ids, strings or rows with an `id`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "One field path, e.g. `recipient`."
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Several field paths, e.g. `[owner, assignee]`."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "query"
+          ],
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "e.g. `SELECT VALUE user FROM member WHERE club = $row.club`."
+            }
+          }
+        }
+      ]
+    },
+    "pushCondition": {
+      "description": "A condition on one field: a scalar is equality (`null` included), a list is membership, a map is operators that must all hold.",
+      "oneOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "eq": {
+              "description": "Equal to."
+            },
+            "ne": {
+              "description": "Not equal to."
+            },
+            "in": {
+              "type": "array",
+              "description": "One of."
+            },
+            "nin": {
+              "type": "array",
+              "description": "None of."
+            },
+            "gt": {
+              "description": "Greater than (numbers, or strings compared as strings)."
+            },
+            "gte": {
+              "description": "Greater than or equal."
+            },
+            "lt": {
+              "description": "Less than."
+            },
+            "lte": {
+              "description": "Less than or equal."
+            },
+            "exists": {
+              "type": "boolean",
+              "description": "Present and not null (`true`), or absent or null (`false`)."
+            },
+            "contains": {
+              "description": "Array element or substring."
+            },
+            "startsWith": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "pushNotification": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Passed to `showNotification` by the service worker bridge. Every string is a `{{ path | filter }}` template over the row, `with` results and `recipient`. Keys not listed here (`vibrate`, `timestamp`, ...) pass through, templated too.",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "badge": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "lang": {
+          "type": "string"
+        },
+        "dir": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "description": "Defaults to the rule's topic."
+        },
+        "url": {
+          "type": "string",
+          "description": "Opened (or focused) on click."
+        },
+        "requireInteraction": {
+          "type": "boolean"
+        },
+        "renotify": {
+          "type": "boolean"
+        },
+        "silent": {
+          "type": "boolean"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "action",
+              "title"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "icon": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "data": {
+          "description": "Merged into the notification's `data` next to the bridge's own keys."
         }
       }
     }

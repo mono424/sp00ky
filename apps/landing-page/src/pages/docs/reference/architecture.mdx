@@ -52,6 +52,10 @@ It runs backend jobs declared in `sp00ky.yml` (e.g. AI agent steps, scheduled ta
 
 The SSP also computes per-table content hashes that the scheduler can compare against its persisted replica during bootstrap and through `spky verify`, so cluster nodes detect drift before serving stale data.
 
+### 4. Web Push
+
+Every ingested row also passes the push engine (`push:` rules in `sp00ky.yml`, direct pushes in `_00_push_message`). It runs where rows are ingested: in the scheduler in cluster mode, in the SSP in singlenode mode. A matching row is encrypted per browser subscription (RFC 8291) and posted to that browser's push service, signed with a VAPID key derived from `SPKY_AUTH_SECRET`. The hook is spawned after the event is durable, so neither the ingest path nor the user's transaction ever waits on a push service, and rows re-emitted by drift repair never push. See [Push notifications](/docs/client/push-notifications).
+
 ---
 
 ## Distributed Architecture
@@ -273,8 +277,9 @@ How a committed row change leaves SurrealDB is chosen per project
   never announces anything and the tail resumes from its last stamp after a
   restart. `_00_version` is written by the same transaction, so `_00_rv`
   comes from the same feed entry. A `LIVE SELECT` on `_00_version` over
-  WebSocket wakes the tail about half a millisecond after a commit; a 2 s
-  poll is the safety net. A cursor older than the retention triggers a
+  WebSocket wakes the tail about half a millisecond after a commit (a second
+  one on `_00_push_message` does the same for direct pushes, whose writes do
+  not touch `_00_version`); a 2 s poll is the safety net. A cursor older than the retention triggers a
   replica re-clone, the same remediation the drift check uses.
 
 ### Schema changes

@@ -523,6 +523,36 @@ most. `gap` means the cursor fell out of the feed's retention and the
 replica is being re-cloned; `stalled` means no poll has completed for a
 while. Either one reports the stack `degraded`.
 
+`push` is the [Web Push](/docs/client/push-notifications) engine this
+scheduler hosts. It is informational and never changes `status`:
+
+```json
+{
+  "push": {
+    "enabled": true,
+    "kid": "0995a9a91bc5dcc9",
+    "public_key": "BMeKUJgMb9oF...",
+    "subject": "mailto:ops@example.com",
+    "rules": 2,
+    "rule_names": ["new-message", "alert-nudge"],
+    "config_loaded": true,
+    "vapid_published": true,
+    "totals": { "matched": 12, "messages": 4, "sent": 16, "failed": 0, "dropped": 0, "throttled": 6, "retried": 3, "deduped": 0, "skipped_repair": 0 },
+    "last_minute": { "matched": 3, "messages": 1, "sent": 4, "failed": 0, "dropped": 0, "throttled": 1, "retried": 0, "deduped": 0, "skipped_repair": 0 },
+    "queues": { "retry": 0, "trailing": 1, "throttle_slots": 2, "messages_in_flight": 0, "dedupe_entries": 12, "cached_users": 2 },
+    "last_error": null
+  }
+}
+```
+
+`enabled` is `false` with a `reason` when there is no key
+(`SPKY_AUTH_SECRET` and `SPKY_VAPID_PRIVATE_KEY` unset), `SPKY_PUSH=off`, or
+`push.enabled: false`. `matched` counts rule matches, `messages` direct
+pushes, `sent`/`failed` HTTP sends to push services, `dropped` pushes over a
+limit, `throttled` pushes folded into a trailing one, `retried` sends put on
+the retry queue, `skipped_repair` rows drift repair re-emitted (those never
+push). The same block is in `/info` and the admin overview.
+
 **Example:**
 
 ```bash

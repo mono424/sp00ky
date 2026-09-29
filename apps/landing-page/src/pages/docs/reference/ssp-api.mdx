@@ -397,6 +397,11 @@ whose SurrealQL did not compile, the decision `counters` since start
 every Ready transition, whenever a `_00_query_allowlist` row changes, and at
 most once per 5 s after a miss.
 
+`push` is the [Web Push](/docs/client/push-notifications) engine's status
+(same shape as the scheduler's `/health` `push` block) on a standalone SSP,
+which hosts the engine in singlenode mode. It is `null` behind a scheduler,
+which runs the engine instead.
+
 `bootstrap_warnings` is non-empty when the last bootstrap loaded zero rows
 for a table that upstream SurrealDB has rows in. That is the scheduler's
 replica missing data (see the scheduler's `/health/snapshot` `drift`

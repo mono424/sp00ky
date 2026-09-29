@@ -356,7 +356,7 @@ staleness flag are built on.
 | `SPKY_CLEAR_VIEWS_ON_START` | Wipe every registered view (`_00_query`) when the scheduler starts. `false` keeps them: the replica clones them, the SSPs re-register them at bootstrap, and clients keep their views across a scheduler restart with no re-registration; the SSP TTL sweep retires rows nobody heartbeats. Leave `true` on tenants with more than one SSP for now (every SSP would compute every view). | `true` |
 | `SPKY_INGEST_TRANSPORT` | `http` (the generated DB events post to `/ingest`) or `changefeed` (the scheduler tails SurrealDB's `CHANGEFEED`; must match the schema deployed with `sync.transport`). See [Sync transport](/docs/reference/config#sync-transport). | `http` |
 | `SPKY_CHANGEFEED_RETENTION` | The schema's `CHANGEFEED` retention, rendered form (`1d`). A cursor older than this minus the margin is a gap: the replica is re-cloned. | `1d` |
-| `SPKY_CHANGEFEED_DOORBELL` | `LIVE SELECT id FROM _00_version` over WebSocket as the wake-up for the tail; `false` = poll only. | `true` |
+| `SPKY_CHANGEFEED_DOORBELL` | `LIVE SELECT id FROM _00_version` over WebSocket as the wake-up for the tail (plus a best-effort one on `_00_push_message`, so direct pushes do not wait for the fallback poll); `false` = poll only. | `true` |
 | `SPKY_CHANGEFEED_DEBOUNCE_MS` | Wait after a doorbell wake before polling, so a bulk transaction costs one poll. | `5` |
 | `SPKY_CHANGEFEED_FALLBACK_MS` | Safety-net poll interval while the doorbell is connected. | `2000` |
 | `SPKY_CHANGEFEED_FALLBACK_DOWN_MS` | Poll interval while the doorbell is reconnecting. | `250` |
@@ -367,6 +367,24 @@ staleness flag are built on.
 | `SPKY_BOOTSTRAP_ADMIT_AFTER` | Consecutive bootstrap integrity failures before the SSP is admitted to broadcast anyway, restoring sync. Floored at the re-clone threshold, so admit never precedes a re-clone attempt. | `5` |
 | `SPKY_CATCHUP_RECLONE_AFTER` | Same escalation for the catch-up gate | `3` |
 | `SPKY_CATCHUP_ADMIT_AFTER` | Same escalation for the catch-up gate | `5` |
+
+#### Web Push
+
+The push engine runs in the scheduler in cluster mode and in the SSP in
+singlenode mode (an SSP behind a scheduler never runs it), and reads the same
+variables in both. It needs no configuration: its VAPID key is derived from
+`SPKY_AUTH_SECRET`, and the rules come from `push:` in `sp00ky.yml`. See
+[Push notifications](/docs/client/push-notifications).
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SPKY_PUSH` | `off` (or `0`, `false`, `no`, `disabled`) switches the engine off. Subscriptions and queued messages are kept. | *(on)* |
+| `SPKY_VAPID_PRIVATE_KEY` | A VAPID private key (base64url raw P-256 scalar, the form web-push libraries print) to use instead of the one derived from `SPKY_AUTH_SECRET`. Set it on every host that runs the engine. Changing the key (or the secret it is derived from) invalidates every browser subscription: clients re-subscribe on their next boot through `db.webPush.sync()`. With neither this nor `SPKY_AUTH_SECRET`, push is off. | *(derived)* |
+| `SPKY_PUSH_ALLOW_PRIVATE_ENDPOINTS` | Accept `http://` endpoints and private or local addresses, for a mock push service in development. Never in production: endpoints are chosen by your users and the engine posts to them from inside your network. | `false` |
+| `SPKY_PUSH_SEND_CONCURRENCY` | Concurrent HTTP sends per matched row or tick | `8` |
+| `SPKY_PUSH_DEDUPE_CAPACITY` | Rule matches remembered to drop duplicates (a row re-delivered by the changefeed look-back or a restart) | `100000` |
+| `SPKY_PUSH_CONFIG_RELOAD_SECS` | How often the stored `push:` block is re-read, so a deploy's rule change is live within this | `30` |
+| `SPKY_PUSH_DEFAULT_TTL_SECS` | Push-service TTL when neither the rule nor `push.defaults.ttl` sets one | `86400` |
 
 <Note title="Injected by Sp00ky Cloud, not by you">
 A managed deployment also receives `SPKY_CLOUD_API_URL` and

@@ -23,8 +23,9 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tracing::{debug, info, warn};
 
-use crate::config::{Op, PushConfig, Rule, Target, Urgency};
+use crate::config::{valid_app_id, Op, Platform, PushConfig, Rule, Target, Urgency};
 use crate::ece;
+use crate::native::{self, Answer, DeviceKind, Providers};
 use crate::rules::{self, RowRef};
 use crate::util::{canonical_record_id, epoch_millis, now_ms, record_binding, split_record_id};
 use crate::vapid::VapidKeys;
@@ -131,6 +132,8 @@ pub struct EngineOptions {
     /// A 404/410 for a subscription (re)made this recently is retried, not
     /// taken as "gone" (see `send_one`).
     pub fresh_subscription_grace_ms: u64,
+    /// `SPKY_PUSH=off`: nothing is sent, web or native.
+    pub off: bool,
 }
 
 const MINUTE: u64 = 60_000;
@@ -162,6 +165,7 @@ impl Default for EngineOptions {
             sleep: None,
             claim_visible_budget_ms: 5_000,
             fresh_subscription_grace_ms: 2 * MINUTE,
+            off: false,
         }
     }
 }
@@ -202,6 +206,7 @@ impl EngineOptions {
         if let Some(n) = num("SPKY_PUSH_DEFAULT_TTL_SECS") {
             o.default_ttl_secs = n;
         }
+        o.off = get("SPKY_PUSH").is_some_and(|v| truthy_off(&v));
         // Local development against a mock push service only.
         o.allow_private_endpoints = get("SPKY_PUSH_ALLOW_PRIVATE_ENDPOINTS")
             .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
@@ -232,6 +237,9 @@ pub struct PushCounters {
     pub deduped: u64,
     /// Rows from drift repair.
     pub skipped_repair: u64,
+    /// Native devices skipped because their provider (push.apns / push.fcm)
+    /// has no usable credential.
+    pub no_provider: u64,
 }
 
 impl PushCounters {
@@ -245,6 +253,7 @@ impl PushCounters {
         self.retried += o.retried;
         self.deduped += o.deduped;
         self.skipped_repair += o.skipped_repair;
+        self.no_provider += o.no_provider;
     }
 }
 
@@ -278,6 +287,36 @@ pub struct PushStatus {
     pub last_minute: PushCounters,
     pub queues: PushQueues,
     pub last_error: Option<String>,
+    pub providers: ProviderStatus,
+}
+
+/// What each delivery path can do right now.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderStatus {
+    /// A VAPID key is loaded.
+    pub web: bool,
+    pub apns: ProviderState,
+    pub fcm: ProviderState,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProviderState {
+    /// A credential row exists.
+    pub configured: bool,
+    /// It parsed; devices of this kind get pushes.
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ProviderState {
+    fn of<T>(p: &Option<Result<T, String>>) -> ProviderState {
+        match p {
+            None => ProviderState::default(),
+            Some(Ok(_)) => ProviderState { configured: true, ready: true, error: None },
+            Some(Err(e)) => ProviderState { configured: true, ready: false, error: Some(e.clone()) },
+        }
+    }
 }
 
 // ── Internals ────────────────────────────────────────────────────────────
@@ -288,6 +327,10 @@ struct Loaded {
     hash: Option<String>,
     /// table -> bitmask of watched ops. Empty while disabled.
     watch: HashMap<String, u8>,
+    /// Native providers from `_00_push_credential`, rebuilt only when
+    /// `credentials` (their fingerprint) changes.
+    providers: Arc<Providers>,
+    credentials: String,
 }
 
 fn op_bit(op: Op) -> u8 {
@@ -299,7 +342,12 @@ fn op_bit(op: Op) -> u8 {
 }
 
 impl Loaded {
-    fn new(config: PushConfig, hash: Option<String>) -> Loaded {
+    fn new(
+        config: PushConfig,
+        hash: Option<String>,
+        providers: Arc<Providers>,
+        credentials: String,
+    ) -> Loaded {
         let mut watch: HashMap<String, u8> = HashMap::new();
         if config.enabled {
             for rule in config.rules.values().filter(|r| r.enabled) {
@@ -311,6 +359,8 @@ impl Loaded {
             config: Arc::new(config),
             hash,
             watch,
+            providers,
+            credentials,
         }
     }
 }
@@ -322,9 +372,18 @@ struct Subscription {
     /// Bound for `type::record('_00_push_subscription', $k)`.
     key: Value,
     user: String,
+    kind: DeviceKind,
+    platform: Platform,
+    /// Web: the push service URL. Native: `<kind>:<token>`, never contacted.
     endpoint: String,
     p256dh: String,
     auth: String,
+    /// Native device token.
+    token: Option<String>,
+    /// Bundle id / package name (APNs topic).
+    app_id: Option<String>,
+    /// APNs `sandbox` or `production`.
+    environment: Option<String>,
     kid: String,
     rules: Option<Vec<String>>,
     failures: i64,
@@ -335,12 +394,19 @@ struct Subscription {
 fn parse_subscription(v: &Value) -> Option<Subscription> {
     let id = v.get("id")?.as_str()?.to_string();
     let (_, key) = record_binding(&id)?;
+    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let kind = DeviceKind::parse(v.get("kind").and_then(Value::as_str))?;
     Some(Subscription {
         key,
         user: canonical_record_id(v.get("auth_id")?.as_str()?)?,
+        kind,
+        platform: kind.platform(v.get("platform").and_then(Value::as_str)),
         endpoint: v.get("endpoint")?.as_str()?.to_string(),
-        p256dh: v.get("p256dh")?.as_str()?.to_string(),
-        auth: v.get("auth")?.as_str()?.to_string(),
+        p256dh: text("p256dh").unwrap_or_default(),
+        auth: text("auth").unwrap_or_default(),
+        token: text("token"),
+        app_id: text("app_id"),
+        environment: text("environment"),
         kid: v
             .get("kid")
             .and_then(Value::as_str)
@@ -358,19 +424,30 @@ fn parse_subscription(v: &Value) -> Option<Subscription> {
     })
 }
 
+/// One push rendered for every kind of device.
+#[derive(Debug)]
+struct Rendered {
+    /// The Web Push plaintext; `None` when it could not be encoded (web
+    /// devices then get nothing, native ones still do).
+    web: Option<Vec<u8>>,
+    native: native::NativePush,
+}
+
 /// One push for one user, ready to encrypt per subscription.
 #[derive(Debug, Clone)]
 struct Delivery {
     user: String,
     /// `ObservedChange::seq` of the row it renders.
     seq: u64,
-    plaintext: Arc<Vec<u8>>,
+    push: Arc<Rendered>,
     ttl: u64,
     urgency: Urgency,
-    /// The `Topic` header (already hashed).
+    /// The readable topic; each transport derives its collapse header.
     topic: Option<String>,
     /// Rule name, for the per-device rule filter. `None` for messages.
     rule: Option<String>,
+    /// The rule's `platforms`; `None` = every kind of device.
+    platforms: Option<Arc<Vec<Platform>>>,
     /// Canonical `_00_push_message` id this delivery reports to.
     message: Option<String>,
 }
@@ -385,6 +462,11 @@ struct SendJob {
 #[derive(Debug, Clone, PartialEq)]
 enum Outcome {
     Ok,
+    /// Delivered after switching the APNs environment; store the new one.
+    OkMoved(String),
+    /// The provider refused OUR credentials (APNs provider token, FCM
+    /// access token): retry with a fresh token, the device is fine.
+    Provider(String),
     /// 404/410: the subscription no longer exists.
     Gone(String),
     /// The push service refused the subscription (400/401/403) or its keys
@@ -459,6 +541,9 @@ struct MsgTally {
     delivered: u32,
     retrying: u32,
     error: Option<String>,
+    /// Why devices were left out (no provider); reported only when nothing
+    /// was delivered.
+    skipped: Option<String>,
 }
 
 /// Subscription writes collected from a batch of sends, written in one
@@ -469,6 +554,8 @@ struct Book {
     gone: Vec<Value>,
     disable: Vec<Value>,
     fail: Vec<Value>,
+    /// `{ k, environment }`: APNs rows registered under the wrong one.
+    moved: Vec<Value>,
 }
 
 impl Book {
@@ -477,6 +564,7 @@ impl Book {
             && self.gone.is_empty()
             && self.disable.is_empty()
             && self.fail.is_empty()
+            && self.moved.is_empty()
     }
 }
 
@@ -582,6 +670,9 @@ UPDATE type::record('_00_push_message', $k) SET status = $status, sent_at = time
 delivered = $delivered, error = $error ?? NONE RETURN NONE;";
 
 const SELECT_CONFIG: &str = "SELECT spec_json, hash FROM ONLY _00_push_config:default;";
+/// Its own query: a database migrated before native push has no such table,
+/// which must not break loading the config.
+const SELECT_CREDENTIALS: &str = "SELECT id, secret, hash FROM _00_push_credential;";
 
 // ── The engine ───────────────────────────────────────────────────────────
 
@@ -624,7 +715,12 @@ impl PushEngine {
             db,
             http,
             keys,
-            loaded: RwLock::new(Arc::new(Loaded::new(PushConfig::default(), None))),
+            loaded: RwLock::new(Arc::new(Loaded::new(
+                PushConfig::default(),
+                None,
+                Arc::new(Providers::default()),
+                String::new(),
+            ))),
             state: Mutex::new(State {
                 dedupe: LruCache::new(capacity),
                 throttles: HashMap::new(),
@@ -710,6 +806,12 @@ impl PushEngine {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Something can be delivered: not switched off, and a VAPID key or a
+    /// native provider is loaded. (`push.enabled` is checked separately.)
+    fn can_send(&self) -> bool {
+        !self.opts.off && (self.keys.is_some() || self.loaded().providers.any())
+    }
+
     fn set_error(&self, msg: impl Into<String>) {
         self.state().last_error = Some(msg.into());
     }
@@ -726,7 +828,7 @@ impl PushEngine {
         if table == MESSAGE_TABLE {
             return true;
         }
-        if self.keys.is_none() {
+        if !self.can_send() {
             return false;
         }
         let loaded = self.loaded();
@@ -751,7 +853,7 @@ impl PushEngine {
     // ── Rules ────────────────────────────────────────────────────────────
 
     async fn observe_rule_row(&self, change: ObservedChange) {
-        if self.keys.is_none() {
+        if !self.can_send() {
             return;
         }
         let loaded = self.loaded();
@@ -900,35 +1002,32 @@ impl PushEngine {
             .map(|d| d.as_millis())
             .filter(|ms| *ms > 0);
 
-        let build = |ctx: &Value| -> Option<(String, Arc<Vec<u8>>)> {
+        let build = |ctx: &Value| -> (String, Arc<Rendered>) {
             let topic = rules::render_topic(rule, ctx, id);
             let payload = rules::rule_payload(name, rule, &cfg.defaults, row, ctx, &topic, now);
-            match rules::encode_payload(&payload) {
+            let web = match rules::encode_payload(&payload) {
                 Ok(enc) => {
                     if !enc.degraded.is_empty() {
                         info!(target: "push", rule = %name, id = %id, dropped = ?enc.degraded, "payload over 3993 bytes; trimmed");
                     }
-                    Some((topic, Arc::new(enc.bytes)))
+                    Some(enc.bytes)
                 }
                 Err(e) => {
-                    warn!(target: "push", rule = %name, id = %id, error = %e, "payload cannot be encoded");
+                    warn!(target: "push", rule = %name, id = %id, error = %e, "payload cannot be encoded for web push");
                     None
                 }
-            }
+            };
+            let native = native::rule_native(rule, &cfg.defaults, ctx, &topic, &payload);
+            (topic, Arc::new(Rendered { web, native }))
         };
-        let shared = if per_recipient { None } else { build(&ctx) };
-        if !per_recipient && shared.is_none() {
-            return;
-        }
+        let shared = (!per_recipient).then(|| build(&ctx));
+        let platforms = rule.platforms.clone().map(Arc::new);
 
         let mut items = Vec::with_capacity(recipients.len());
         for user in recipients {
-            let built = match &shared {
-                Some(s) => Some(s.clone()),
+            let (topic, push) = match &shared {
+                Some(s) => s.clone(),
                 None => build(&rules::with_recipient(&ctx, &user)),
-            };
-            let Some((topic, plaintext)) = built else {
-                continue;
             };
             let throttle_key = gap_ms.map(|gap| (format!("{name}\u{1f}{user}\u{1f}{topic}"), gap));
             items.push((
@@ -936,11 +1035,12 @@ impl PushEngine {
                 Delivery {
                     user,
                     seq: change.seq,
-                    plaintext,
+                    push,
                     ttl,
                     urgency,
-                    topic: Some(rules::topic_header(&topic)),
+                    topic: Some(topic),
                     rule: Some(name.to_string()),
+                    platforms: platforms.clone(),
                     message: None,
                 },
             ));
@@ -1134,9 +1234,6 @@ impl PushEngine {
         if deliveries.is_empty() {
             return tallies;
         }
-        let Some(keys) = &self.keys else {
-            return tallies;
-        };
         let mut users: Vec<String> = deliveries.iter().map(|d| d.user.clone()).collect();
         users.sort();
         users.dedup();
@@ -1156,14 +1253,33 @@ impl PushEngine {
                 return tallies;
             }
         };
-        let kid = keys.kid();
+        let kid = self.keys.as_ref().map(|k| k.kid());
+        let providers = Arc::clone(&self.loaded().providers);
         let mut jobs = Vec::new();
+        let mut no_provider = 0u64;
         for d in deliveries {
             let Some(list) = subs.get(&d.user) else {
                 continue;
             };
             for s in list.iter() {
-                if s.kid != kid {
+                if d.platforms.as_ref().is_some_and(|p| !p.contains(&s.platform)) {
+                    continue;
+                }
+                let usable = match s.kind {
+                    // A row made under another VAPID key is rejected by the
+                    // push service; the browser re-subscribes on its next boot.
+                    DeviceKind::Web => kid == Some(s.kid.as_str()) && d.push.web.is_some(),
+                    DeviceKind::Apns => providers.apns().is_some(),
+                    DeviceKind::Fcm => providers.fcm().is_some(),
+                };
+                if !usable {
+                    if s.kind != DeviceKind::Web {
+                        no_provider += 1;
+                        if let Some(m) = &d.message {
+                            let why = format!("push.{} is not configured", if s.kind == DeviceKind::Apns { "apns" } else { "fcm" });
+                            tallies.entry(m.clone()).or_default().skipped.get_or_insert(why);
+                        }
+                    }
                     continue;
                 }
                 if let (Some(rule), Some(allowed)) = (&d.rule, &s.rules) {
@@ -1177,6 +1293,9 @@ impl PushEngine {
                     attempt: 0,
                 });
             }
+        }
+        if no_provider > 0 {
+            self.count(|c| c.no_provider += no_provider);
         }
         self.run_jobs(jobs, &mut tallies).await;
         tallies
@@ -1200,26 +1319,45 @@ impl PushEngine {
     }
 
     async fn send(&self, job: &SendJob) -> Outcome {
+        match job.sub.kind {
+            DeviceKind::Web => self.send_web(job).await,
+            DeviceKind::Apns => self.send_apns(job).await,
+            DeviceKind::Fcm => self.send_fcm(job).await,
+        }
+    }
+
+    /// One token of the project-wide `limits.perMinute` bucket.
+    fn take_global(&self) -> bool {
+        let now = self.now();
+        let cap = self.loaded().config.limits.per_minute();
+        let mut st = self.state();
+        let bucket = st
+            .global_bucket
+            .get_or_insert_with(|| Bucket::full(cap, now));
+        if bucket.take(cap, now) {
+            true
+        } else {
+            st.limit_warn(now, "limits.perMinute");
+            false
+        }
+    }
+
+    async fn send_web(&self, job: &SendJob) -> Outcome {
         let Some(keys) = &self.keys else {
             return Outcome::Dropped("push is off".into());
+        };
+        let Some(plaintext) = job.delivery.push.web.as_deref() else {
+            return Outcome::GiveUp("payload cannot be encoded for web push".into());
         };
         if let Err(why) = endpoint_allowed(&job.sub.endpoint, self.opts.allow_private_endpoints) {
             return Outcome::Rejected(format!("bad_endpoint: {why}"));
         }
+        if !self.take_global() {
+            return Outcome::Dropped("rate_limited".into());
+        }
         let now = self.now();
         let cfg = self.loaded().config.clone();
-        {
-            let mut st = self.state();
-            let cap = cfg.limits.per_minute();
-            let bucket = st
-                .global_bucket
-                .get_or_insert_with(|| Bucket::full(cap, now));
-            if !bucket.take(cap, now) {
-                st.limit_warn(now, "limits.perMinute");
-                return Outcome::Dropped("rate_limited".into());
-            }
-        }
-        let body = match ece::encrypt(&job.delivery.plaintext, &job.sub.p256dh, &job.sub.auth) {
+        let body = match ece::encrypt(plaintext, &job.sub.p256dh, &job.sub.auth) {
             Ok(b) => b,
             Err(e) => return Outcome::Rejected(format!("bad_keys: {e}")),
         };
@@ -1239,7 +1377,7 @@ impl PushEngine {
             ("Authorization".to_string(), authorization),
         ];
         if let Some(topic) = &d.topic {
-            headers.push(("Topic".to_string(), topic.clone()));
+            headers.push(("Topic".to_string(), rules::topic_header(topic)));
         }
         match self.http.post(&job.sub.endpoint, headers, body).await {
             Ok((status, text)) => match classify(status, &text) {
@@ -1258,6 +1396,142 @@ impl PushEngine {
                 other => other,
             },
             Err(e) => Outcome::Retry(format!("transport: {}", prefix(&e))),
+        }
+    }
+
+    fn native_send<'a>(&self, d: &'a Delivery) -> native::Send<'a> {
+        native::Send {
+            push: &d.push.native,
+            ttl_secs: d.ttl,
+            urgency: d.urgency,
+            topic: d.topic.as_deref(),
+            now_ms: self.now(),
+        }
+    }
+
+    async fn post_native(&self, req: native::Request) -> Result<(u16, String), Outcome> {
+        self.http
+            .post(&req.url, req.headers, req.body)
+            .await
+            .map_err(|e| Outcome::Retry(format!("transport: {}", prefix(&e))))
+    }
+
+    async fn send_apns(&self, job: &SendJob) -> Outcome {
+        let loaded = self.loaded();
+        let Some(apns) = loaded.providers.apns().cloned() else {
+            return Outcome::Dropped("push.apns is not configured".into());
+        };
+        let sub = &job.sub;
+        let Some(token) = sub.token.as_deref().filter(|t| native::valid_apns_token(t)) else {
+            return Outcome::Rejected("bad_token: not an APNs device token".into());
+        };
+        let Some(topic) = sub.app_id.as_deref().filter(|a| valid_app_id(a)) else {
+            return Outcome::Rejected("bad_app_id: an APNs device needs its bundle id".into());
+        };
+        // `fn::push::register` checks this too, but a record user can write
+        // their row directly.
+        if let Some(cfg) = &loaded.config.apns {
+            if !cfg.bundle_ids.is_empty() && !cfg.bundle_ids.iter().any(|b| b == topic) {
+                return Outcome::Rejected(format!("bad_app_id: `{topic}` is not in push.apns.bundleIds"));
+            }
+        }
+        if !self.take_global() {
+            return Outcome::Dropped("rate_limited".into());
+        }
+        let send = self.native_send(&job.delivery);
+        let bearer = apns.bearer(send.now_ms);
+        let sandbox = sub.environment.as_deref() == Some("sandbox");
+        let request = |sandbox: bool| native::apns_request(&send, token, topic, sandbox, &bearer);
+        let req = match request(sandbox) {
+            Ok(r) => r,
+            Err(e) => return Outcome::GiveUp(format!("payload: {e}")),
+        };
+        let answer = match self.post_native(req).await {
+            Ok((status, body)) => native::classify_apns(status, &body),
+            Err(o) => return o,
+        };
+        match answer {
+            // Almost always a development build's token sent to production or
+            // the reverse. Try the other host once and remember the answer.
+            Answer::BadDeviceToken(reason) => {
+                let Ok(req) = request(!sandbox) else {
+                    return Outcome::Gone(reason);
+                };
+                match self.post_native(req).await {
+                    Ok((status, body)) => match native::classify_apns(status, &body) {
+                        Answer::Ok => Outcome::OkMoved(if sandbox { "production" } else { "sandbox" }.into()),
+                        Answer::BadDeviceToken(_) => Outcome::Gone(reason),
+                        other => self.native_outcome(other, || apns.forget_token()),
+                    },
+                    Err(o) => o,
+                }
+            }
+            other => self.native_outcome(other, || apns.forget_token()),
+        }
+    }
+
+    async fn send_fcm(&self, job: &SendJob) -> Outcome {
+        let Some(fcm) = self.loaded().providers.fcm().cloned() else {
+            return Outcome::Dropped("push.fcm is not configured".into());
+        };
+        let sub = &job.sub;
+        let Some(token) = sub.token.as_deref().filter(|t| native::valid_fcm_token(t)) else {
+            return Outcome::Rejected("bad_token: not an FCM registration token".into());
+        };
+        if !self.take_global() {
+            return Outcome::Dropped("rate_limited".into());
+        }
+        let access = match self.fcm_access_token(&fcm).await {
+            Ok(t) => t,
+            Err(o) => return o,
+        };
+        let send = self.native_send(&job.delivery);
+        let req = match native::fcm_request(&send, fcm.project_id(), token, sub.platform, &access) {
+            Ok(r) => r,
+            Err(e) => return Outcome::GiveUp(format!("payload: {e}")),
+        };
+        match self.post_native(req).await {
+            Ok((status, body)) => self.native_outcome(native::classify_fcm(status, &body), || fcm.forget_token()),
+            Err(o) => o,
+        }
+    }
+
+    /// The cached FCM access token, or a fresh one. One exchange at a time;
+    /// concurrent sends wait for it instead of each asking Google.
+    async fn fcm_access_token(&self, fcm: &native::Fcm) -> Result<String, Outcome> {
+        if let Some(t) = fcm.cached_token(self.now()) {
+            return Ok(t);
+        }
+        let _one = fcm.refresh.lock().await;
+        let now = self.now();
+        if let Some(t) = fcm.cached_token(now) {
+            return Ok(t);
+        }
+        let req = fcm.token_request(now / 1000);
+        let (status, body) = self.post_native(req).await?;
+        let fail = |why: String| {
+            let msg = format!("fcm: access token: {why}");
+            self.set_error(msg.clone());
+            Outcome::Provider(msg)
+        };
+        if !(200..300).contains(&status) {
+            return Err(fail(format!("http_{status}: {}", prefix(&body))));
+        }
+        fcm.accept_token(&body, now).map_err(fail)
+    }
+
+    fn native_outcome(&self, answer: Answer, forget_token: impl FnOnce()) -> Outcome {
+        match answer {
+            Answer::Ok => Outcome::Ok,
+            Answer::Gone(r) | Answer::BadDeviceToken(r) => Outcome::Gone(r),
+            Answer::Rejected(r) => Outcome::Rejected(r),
+            Answer::GiveUp(r) => Outcome::GiveUp(r),
+            Answer::Retry(r) => Outcome::Retry(r),
+            Answer::Provider(r) => {
+                forget_token();
+                self.set_error(r.clone());
+                Outcome::Provider(r)
+            }
         }
     }
 
@@ -1302,6 +1576,21 @@ impl PushEngine {
                 t.jobs += 1;
             }
             let sub = &job.sub;
+            let outcome = match outcome {
+                Outcome::OkMoved(environment) => {
+                    info!(target: "push", sub = %sub.id, environment = %environment, "APNs token belongs to the other environment; row updated");
+                    book.moved.push(json!({ "k": sub.key, "environment": environment }));
+                    st.sub_cache.remove(&sub.user);
+                    Outcome::Ok
+                }
+                other => other,
+            };
+            // A refused provider credential is retried like a transport error,
+            // but it is not the device's fault: its row is left alone.
+            let (outcome, device_fault) = match outcome {
+                Outcome::Provider(reason) => (Outcome::Retry(reason), false),
+                other => (other, true),
+            };
             match outcome {
                 Outcome::Ok => {
                     st.count(now, |c| c.sent += 1);
@@ -1348,8 +1637,11 @@ impl PushEngine {
                         t.error = Some(reason);
                     }
                 }
+                Outcome::OkMoved(_) | Outcome::Provider(_) => unreachable!("mapped above"),
                 Outcome::Retry(reason) => {
-                    book.fail.push(json!({ "k": sub.key, "error": reason }));
+                    if device_fault {
+                        book.fail.push(json!({ "k": sub.key, "error": reason }));
+                    }
                     let backoff = self.opts.retry_backoff_ms.get(job.attempt).copied();
                     match backoff {
                         Some(delay) if st.retries.len() < self.opts.retry_queue_cap => {
@@ -1409,6 +1701,10 @@ impl PushEngine {
             sql.push_str("FOR $f IN $fail { UPDATE type::record('_00_push_subscription', $f.k) SET failures += 1, last_error = $f.error RETURN NONE };\n");
             binds.push(("fail", Value::Array(book.fail)));
         }
+        if !book.moved.is_empty() {
+            sql.push_str("FOR $m IN $moved { UPDATE type::record('_00_push_subscription', $m.k) SET environment = $m.environment RETURN NONE };\n");
+            binds.push(("moved", Value::Array(book.moved)));
+        }
         if let Err(e) = self.db.query(&sql, &binds).await {
             warn!(target: "push", error = %e, "subscription bookkeeping failed");
             self.set_error(format!("subscription bookkeeping: {e}"));
@@ -1421,7 +1717,7 @@ impl PushEngine {
         if change.op != Op::Create || change.origin == Origin::Repair {
             return;
         }
-        if self.keys.is_none() || !self.loaded().config.enabled {
+        if !self.can_send() || !self.loaded().config.enabled {
             return;
         }
         let status = change.record.get("status").and_then(Value::as_str);
@@ -1497,17 +1793,17 @@ impl PushEngine {
         self.count(|c| c.messages += 1);
 
         let payload = rules::message_payload(&id, &row, &cfg.defaults, now);
-        let encoded = match rules::encode_payload(&payload) {
-            Ok(enc) => enc,
-            Err(e) => {
-                self.finish_message(&key, 0, Some(format!("payload: {e}")))
-                    .await;
-                return Claim::Skipped;
+        let (web, web_error) = match rules::encode_payload(&payload) {
+            Ok(enc) => {
+                if !enc.degraded.is_empty() {
+                    info!(target: "push", id = %id, dropped = ?enc.degraded, "message payload over 3993 bytes; trimmed");
+                }
+                (Some(enc.bytes), None)
             }
+            Err(e) => (None, Some(format!("payload: {e}"))),
         };
-        if !encoded.degraded.is_empty() {
-            info!(target: "push", id = %id, dropped = ?encoded.degraded, "message payload over 3993 bytes; trimmed");
-        }
+        let native = native::message_native(&row, &cfg.defaults, &payload, now);
+        let push = Arc::new(Rendered { web, native });
         let ttl = row
             .get("ttl")
             .and_then(Value::as_u64)
@@ -1519,7 +1815,7 @@ impl PushEngine {
             .and_then(Urgency::parse)
             .or(cfg.defaults.urgency)
             .unwrap_or(Urgency::Normal);
-        let topic = payload.topic.as_deref().map(rules::topic_header);
+        let topic = payload.topic.clone();
         let mut ids = Vec::new();
         if let Some(to) = row.get("to") {
             rules::collect_ids(to, &mut ids);
@@ -1532,7 +1828,6 @@ impl PushEngine {
             return Claim::Skipped;
         }
 
-        let plaintext = Arc::new(encoded.bytes);
         let per_user = cfg.limits.per_user_per_minute();
         let mut admitted = Vec::new();
         let mut limited = 0;
@@ -1543,11 +1838,12 @@ impl PushEngine {
                     admitted.push(Delivery {
                         user,
                         seq: 0,
-                        plaintext: Arc::clone(&plaintext),
+                        push: Arc::clone(&push),
                         ttl,
                         urgency,
                         topic: topic.clone(),
                         rule: None,
+                        platforms: None,
                         message: Some(id.clone()),
                     });
                 } else {
@@ -1565,7 +1861,7 @@ impl PushEngine {
             } else if limited > 0 {
                 Some("rate_limited".into())
             } else if t.jobs == 0 {
-                Some("no subscriptions".into())
+                Some(t.skipped.clone().or(web_error).unwrap_or_else(|| "no subscriptions".into()))
             } else {
                 None
             }
@@ -1644,7 +1940,7 @@ impl PushEngine {
         if vapid_due {
             self.publish_vapid().await;
         }
-        let active = self.keys.is_some() && self.loaded().config.enabled;
+        let active = self.can_send() && self.loaded().config.enabled;
         if active {
             self.flush_trailing(now).await;
             self.run_retries(now).await;
@@ -1660,8 +1956,10 @@ impl PushEngine {
         self.gc(now);
     }
 
-    /// Re-read `_00_push_config:default`. `Ok(true)` when a different config
-    /// is now active. A row that does not parse keeps the previous config.
+    /// Re-read `_00_push_config:default` and `_00_push_credential`. `Ok(true)`
+    /// when a different config or credential set is now active. A config row
+    /// that does not parse keeps the previous config; a credential that does
+    /// not parse turns only its provider off.
     pub async fn reload_config(&self) -> Result<bool, String> {
         let row = match self.db.query(SELECT_CONFIG, &[]).await {
             Ok(r) => first_row(r),
@@ -1672,6 +1970,15 @@ impl PushEngine {
                 return Err(msg);
             }
         };
+        let credential_rows = match self.db.query(SELECT_CREDENTIALS, &[]).await {
+            Ok(r) => rows(r),
+            Err(e) => {
+                // Older schema without the table: no native providers.
+                debug!(target: "push", error = %e, "reading _00_push_credential failed; no native providers");
+                Vec::new()
+            }
+        };
+        let credentials = Providers::fingerprint(&credential_rows);
         let (spec, hash) = match &row {
             Some(r) => (
                 r.get("spec_json")
@@ -1685,26 +1992,48 @@ impl PushEngine {
             None => (None, String::new()),
         };
         let current = self.loaded();
-        if current.hash.as_deref() == Some(hash.as_str()) {
+        let same_config = current.hash.as_deref() == Some(hash.as_str());
+        let same_credentials = current.hash.is_some() && current.credentials == credentials;
+        if same_config && same_credentials {
             return Ok(false);
         }
-        let config = match spec {
-            None => PushConfig::default(),
-            Some(spec) => match serde_json::from_str::<PushConfig>(&spec) {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = format!("_00_push_config (hash {hash}) does not parse: {e}; keeping the previous config");
-                    let mut st = self.state();
-                    if st.bad_config_hash.as_deref() != Some(hash.as_str()) {
-                        warn!(target: "push", "{msg}");
-                        st.bad_config_hash = Some(hash);
+        let config = if same_config {
+            (*current.config).clone()
+        } else {
+            match spec {
+                None => PushConfig::default(),
+                Some(spec) => match serde_json::from_str::<PushConfig>(&spec) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let msg = format!("_00_push_config (hash {hash}) does not parse: {e}; keeping the previous config");
+                        let mut st = self.state();
+                        if st.bad_config_hash.as_deref() != Some(hash.as_str()) {
+                            warn!(target: "push", "{msg}");
+                            st.bad_config_hash = Some(hash);
+                        }
+                        st.last_error = Some(msg.clone());
+                        return Err(msg);
                     }
-                    st.last_error = Some(msg.clone());
-                    return Err(msg);
-                }
-            },
+                },
+            }
         };
-        let loaded = Arc::new(Loaded::new(config, Some(hash.clone())));
+        let providers = if same_credentials {
+            Arc::clone(&current.providers)
+        } else {
+            let p = Providers::from_rows(&credential_rows);
+            for (name, state) in [("apns", ProviderState::of(&p.apns)), ("fcm", ProviderState::of(&p.fcm))] {
+                match (state.ready, &state.error) {
+                    (true, _) => info!(target: "push", provider = name, "native push credential loaded"),
+                    (false, Some(e)) => {
+                        warn!(target: "push", provider = name, error = %e, "native push credential unusable");
+                        self.set_error(format!("push.{name}: {e}"));
+                    }
+                    _ => {}
+                }
+            }
+            Arc::new(p)
+        };
+        let loaded = Arc::new(Loaded::new(config, Some(hash.clone()), providers, credentials));
         let (rules_count, enabled) = (loaded.config.rules.len(), loaded.config.enabled);
         match self.loaded.write() {
             Ok(mut guard) => *guard = loaded,
@@ -1929,8 +2258,11 @@ impl PushEngine {
         let cfg = &loaded.config;
         let now = self.now();
         let st = self.state();
-        let reason = if self.keys.is_none() {
-            Some("no VAPID key (set SPKY_AUTH_SECRET or SPKY_VAPID_PRIVATE_KEY; SPKY_PUSH=off disables)".to_string())
+        let providers = &loaded.providers;
+        let reason = if self.opts.off {
+            Some("switched off (SPKY_PUSH=off)".to_string())
+        } else if self.keys.is_none() && !providers.any() {
+            Some("no VAPID key (set SPKY_AUTH_SECRET or SPKY_VAPID_PRIVATE_KEY) and no usable push.apns / push.fcm credential".to_string())
         } else if !cfg.enabled {
             Some("disabled by push.enabled: false".to_string())
         } else {
@@ -1965,6 +2297,11 @@ impl PushEngine {
                 cached_users: st.sub_cache.len(),
             },
             last_error: st.last_error.clone(),
+            providers: ProviderStatus {
+                web: self.keys.is_some(),
+                apns: ProviderState::of(&providers.apns),
+                fcm: ProviderState::of(&providers.fcm),
+            },
         }
     }
 }

@@ -383,7 +383,7 @@ async fn record_users_see_and_change_only_their_own_rows() {
     let info = one(&alice, "RETURN fn::push::info()", vec![]).await;
     assert_eq!(
         info,
-        json!({ "enabled": true, "publicKey": "BPUB", "kid": "k1" })
+        json!({ "enabled": true, "publicKey": "BPUB", "kid": "k1", "providers": ["web"], "android": null })
     );
 
     let a1 = Device::new("https://push.example/a1");
@@ -1460,6 +1460,348 @@ async fn config_reload_picks_up_a_changed_rule() {
     assert!(h.engine.reload_config().await.unwrap());
     assert!(!h.engine.wants("message", Op::Create));
     assert!(h.engine.status().enabled);
+}
+
+// --- native devices (APNs, FCM) ---------------------------------------------
+
+const NATIVE_PARAM: &str = "DEFINE PARAM OVERWRITE $sp00ky_push_native VALUE { apns: true, fcm: true, bundleIds: ['im.app'], android: { projectId: 'sp00ky-test', appId: '1:42:android:ab', apiKey: 'AIzaX', senderId: '42' } } PERMISSIONS FULL;";
+
+const APNS_TOKEN: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+const FCM_TOKEN: &str = "fcm-token_0123456789:abcdefghij";
+
+#[tokio::test]
+async fn native_devices_register_through_fn_push_register() {
+    let root = fresh_db().await;
+    let (alice, alice_id) = sign_up(&root, "alice").await;
+    let device = json!({ "kind": "apns", "token": APNS_TOKEN.to_uppercase(), "appId": "im.app", "environment": "sandbox" });
+
+    // Nothing configured: refused, and info says so.
+    let refused = try_run(&alice, "RETURN fn::push::register($d, NONE)", vec![("d", device.clone())]).await;
+    assert!(refused.unwrap_err().contains("push.apns is not configured"));
+    assert_eq!(one(&alice, "RETURN fn::push::info().providers", vec![]).await, json!([]));
+
+    run(&root, NATIVE_PARAM, vec![]).await;
+    let info = one(&alice, "RETURN fn::push::info()", vec![]).await;
+    assert_eq!(info["enabled"], json!(false), "web push is still off");
+    assert_eq!(info["providers"], json!(["apns", "fcm"]));
+    assert_eq!(info["android"]["senderId"], json!("42"));
+
+    let row = one(&alice, "RETURN fn::push::register($d, { label: 'iPhone', rules: ['dm'] })", vec![("d", device)]).await;
+    assert_eq!(row["endpoint"], json!(format!("apns:{APNS_TOKEN}")), "token lowercased");
+    assert_eq!(row["kind"], json!("apns"));
+    assert_eq!(row["platform"], json!("ios"));
+    assert_eq!(row["environment"], json!("sandbox"));
+    assert_eq!(row["label"], json!("iPhone"));
+    let fcm = one(
+        &alice,
+        "RETURN fn::push::register({ kind: 'fcm', token: $t, appId: 'im.app.android' }, NONE)",
+        vec![("t", json!(FCM_TOKEN))],
+    )
+    .await;
+    assert_eq!(fcm["platform"], json!("android"));
+    assert_eq!(fcm["environment"], Value::Null);
+
+    let list = one(&alice, "RETURN fn::push::list()", vec![]).await;
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|d| d["current"] == json!(true)), "native rows are always current");
+    assert!(list.iter().all(|d| d.get("token").is_none()));
+
+    // The same token again is the same row; update / unsubscribe work by endpoint.
+    one(&alice, "RETURN fn::push::register({ kind: 'apns', token: $t, appId: 'im.app' }, NONE)", vec![("t", json!(APNS_TOKEN))]).await;
+    let stored = one(&root, "SELECT VALUE environment FROM _00_push_subscription WHERE kind = 'apns'", vec![]).await;
+    assert_eq!(stored, json!(["production"]), "re-registering takes the new environment");
+    one(&alice, "RETURN fn::push::update($e, { label: 'Phone' })", vec![("e", json!(format!("fcm:{FCM_TOKEN}")))]).await;
+    assert_eq!(
+        one(&root, "SELECT VALUE label FROM _00_push_subscription WHERE kind = 'fcm'", vec![]).await,
+        json!(["Phone"])
+    );
+    assert_eq!(one(&alice, "RETURN fn::push::unsubscribe($e)", vec![("e", json!(format!("fcm:{FCM_TOKEN}")))]).await, json!(1));
+
+    for (bad, why) in [
+        (json!({ "kind": "web", "token": APNS_TOKEN, "appId": "im.app" }), "kind"),
+        (json!({ "kind": "apns", "token": "not-hex", "appId": "im.app" }), "hex"),
+        (json!({ "kind": "apns", "token": "ab", "appId": "im.app" }), "hex"),
+        (json!({ "kind": "apns", "token": APNS_TOKEN, "appId": "com.other" }), "bundleIds"),
+        (json!({ "kind": "apns", "token": APNS_TOKEN, "appId": "a/b" }), "appId"),
+        (json!({ "kind": "apns", "token": APNS_TOKEN, "appId": "im.app", "environment": "dev" }), "environment"),
+        (json!({ "kind": "fcm", "token": "short", "appId": "im.app" }), "FCM"),
+        (json!({ "kind": "fcm", "token": format!("{FCM_TOKEN}/../x"), "appId": "im.app" }), "FCM"),
+        (json!({ "kind": "fcm", "token": FCM_TOKEN, "appId": "im.app", "platform": "tv" }), "platform"),
+    ] {
+        let err = try_run(&alice, "RETURN fn::push::register($d, NONE)", vec![("d", bad.clone())])
+            .await
+            .expect_err(&format!("{bad} must be refused"));
+        assert!(err.contains(why), "{bad}: {err}");
+    }
+
+    let anon = try_run(&root, "RETURN fn::push::register({ kind: 'fcm', token: $t, appId: 'x' }, NONE)", vec![("t", json!(FCM_TOKEN))]).await;
+    assert!(anon.unwrap_err().contains("sign in"));
+    let imp = root.clone();
+    imp.signin(Record {
+        namespace: "test".into(),
+        database: "test".into(),
+        access: "_00_impersonate".into(),
+        params: json!({ "username": "alice" }),
+    })
+    .await
+    .expect("impersonation signin");
+    let refused = try_run(&imp, "RETURN fn::push::register({ kind: 'fcm', token: $t, appId: 'x' }, NONE)", vec![("t", json!(FCM_TOKEN))]).await;
+    assert!(refused.unwrap_err().contains("impersonating"));
+    assert_eq!(
+        one(&root, "SELECT VALUE auth_id FROM _00_push_subscription", vec![]).await,
+        json!([alice_id])
+    );
+}
+
+const NATIVE_RULES: &str = r#"
+subject: mailto:ops@example.com
+apns: { teamId: TEAM123456, keyId: KEY1234567, key: "<stored>", bundleIds: [im.app] }
+fcm: { serviceAccount: "<stored>" }
+defaults:
+  native: { android: { channelId: general } }
+rules:
+  dm:
+    table: message
+    when: { kind: text }
+    to: recipient
+    topic: "dm:{{conversation | key}}"
+    notification: { title: "Web {{text}}", url: "/m/{{conversation | key}}" }
+    native:
+      notification: { title: "Phone {{text}}" }
+      apns: { badge: "{{unread}}" }
+  ios-only:
+    table: message
+    when: { kind: ping }
+    to: recipient
+    platforms: [ios]
+"#;
+
+const TOKEN_ANSWER: &str = r#"{"access_token":"ya29.test","expires_in":3600,"token_type":"Bearer"}"#;
+
+impl Harness {
+    async fn native_harness() -> Harness {
+        let h = harness(NATIVE_RULES).await;
+        let apns = json!({ "teamId": "TEAM123456", "keyId": "KEY1234567", "key": crate::native::tests::TEST_P8 }).to_string();
+        run(
+            &h.root,
+            "UPSERT _00_push_credential:apns SET secret = $a, hash = 'a1'; UPSERT _00_push_credential:fcm SET secret = $f, hash = 'f1';",
+            vec![("a", json!(apns)), ("f", json!(crate::native::tests::service_account()))],
+        )
+        .await;
+        assert_eq!(h.engine.reload_config().await, Ok(true));
+        let st = h.engine.status();
+        assert!(st.providers.apns.ready && st.providers.fcm.ready, "{:?}", st.providers);
+        h
+    }
+
+    /// A native row as `fn::push::register` would leave it.
+    async fn native(&self, user: &str, kind: &str, token: &str, extra: &str) -> String {
+        let endpoint = format!("{kind}:{token}");
+        let key = hex(&sha256(format!("{user}|{endpoint}").as_bytes()));
+        let sql = format!(
+            "CREATE type::record('_00_push_subscription', $k) CONTENT {{ auth_id: $u, kind: $kind, endpoint: $e, token: $t, app_id: 'im.app', platform: IF $kind = 'apns' {{ 'ios' }} ELSE {{ 'android' }}, environment: IF $kind = 'apns' {{ 'production' }} ELSE {{ NONE }} }}; \
+             UPDATE type::record('_00_push_subscription', $k) SET {} RETURN NONE;",
+            if extra.is_empty() { "failures = 0" } else { extra }
+        );
+        run(
+            &self.root,
+            &sql,
+            vec![("k", json!(key)), ("u", json!(user)), ("kind", json!(kind)), ("e", json!(endpoint)), ("t", json!(token))],
+        )
+        .await;
+        endpoint
+    }
+}
+
+fn apns_url(sandbox: bool) -> String {
+    let host = if sandbox { crate::native::APNS_SANDBOX_HOST } else { crate::native::APNS_HOST };
+    format!("{host}/3/device/{APNS_TOKEN}")
+}
+
+const FCM_SEND: &str = "https://fcm.googleapis.com/v1/projects/sp00ky-test/messages:send";
+
+#[tokio::test]
+async fn one_rule_reaches_web_apns_and_fcm_devices() {
+    let h = Harness::native_harness().await;
+    let web = h.device("user:bob", "https://push.example/bob", "").await;
+    h.native("user:bob", "apns", APNS_TOKEN, "").await;
+    h.native("user:bob", "fcm", FCM_TOKEN, "").await;
+    h.http.script(crate::native::GOOGLE_TOKEN_URL, vec![Ok((200, TOKEN_ANSWER.into()))]);
+
+    h.write_and_observe(
+        "CREATE message:n1 SET kind = 'text', recipient = user:bob, conversation = conversation:c1, text = 'hi', unread = 4",
+        Op::Create,
+    )
+    .await;
+    let reqs = h.http.take();
+    let urls: Vec<&str> = reqs.iter().map(|r| r.url.as_str()).collect();
+    assert_eq!(reqs.len(), 4, "{urls:?}");
+
+    let w = reqs.iter().find(|r| r.url == web.endpoint).unwrap();
+    assert_eq!(web.open(&w.body).notification.unwrap()["title"], json!("Web hi"));
+
+    let a = reqs.iter().find(|r| r.url == apns_url(false)).unwrap();
+    assert_eq!(a.header("apns-topic"), Some("im.app"));
+    assert!(a.header("authorization").unwrap().starts_with("bearer "));
+    assert_eq!(a.header("apns-collapse-id"), Some("dm:c1"));
+    let body: Value = serde_json::from_slice(&a.body).unwrap();
+    assert_eq!(body["aps"]["alert"]["title"], json!("Phone hi"));
+    assert_eq!(body["aps"]["badge"], json!(4));
+    assert_eq!(body["sp00ky"]["notification"]["url"], json!("/m/c1"));
+    assert_eq!(body["sp00ky"]["id"], json!("message:n1"));
+
+    let t = reqs.iter().find(|r| r.url == crate::native::GOOGLE_TOKEN_URL).unwrap();
+    assert!(String::from_utf8_lossy(&t.body).contains("assertion="));
+    let f = reqs.iter().find(|r| r.url == FCM_SEND).unwrap();
+    assert_eq!(f.header("Authorization"), Some("Bearer ya29.test"));
+    let m: Value = serde_json::from_slice(&f.body).unwrap();
+    assert_eq!(m["message"]["token"], json!(FCM_TOKEN));
+    assert_eq!(m["message"]["notification"]["title"], json!("Phone hi"));
+    assert_eq!(m["message"]["android"]["notification"]["channel_id"], json!("general"));
+
+    // The access token is reused; the ios-only nudge skips web and Android.
+    h.write_and_observe("CREATE message:n2 SET kind = 'ping', recipient = user:bob", Op::Create).await;
+    let reqs = h.http.take();
+    assert_eq!(reqs.len(), 1, "{:?}", reqs.iter().map(|r| &r.url).collect::<Vec<_>>());
+    assert_eq!(reqs[0].url, apns_url(false));
+    assert_eq!(reqs[0].header("apns-push-type"), Some("background"));
+    let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(body["aps"], json!({ "content-available": 1 }));
+    assert!(h.sub("user:bob", &format!("fcm:{FCM_TOKEN}")).await["last_ok_at"].is_string());
+}
+
+#[tokio::test]
+async fn provider_answers_keep_the_device_table_right() {
+    let h = Harness::native_harness().await;
+    let apns = h.native("user:bob", "apns", APNS_TOKEN, "").await;
+    let fcm = h.native("user:bob", "fcm", FCM_TOKEN, "").await;
+    h.http.script(crate::native::GOOGLE_TOKEN_URL, vec![Ok((200, TOKEN_ANSWER.into()))]);
+
+    // A development build's token sent to production: moved to sandbox.
+    h.http.script(&apns_url(false), vec![Ok((400, r#"{"reason":"BadDeviceToken"}"#.into()))]);
+    h.http.script(&apns_url(true), vec![Ok((200, String::new()))]);
+    // Our credentials refused: retried later, the device untouched.
+    h.http.script(FCM_SEND, vec![Ok((401, r#"{"error":{"status":"UNAUTHENTICATED","message":"bad token"}}"#.into()))]);
+    h.write_and_observe("CREATE message:p1 SET kind = 'text', recipient = user:bob, conversation = conversation:c, text = 'a'", Op::Create).await;
+    assert_eq!(h.sub("user:bob", &apns).await["environment"], json!("sandbox"));
+    let f = h.sub("user:bob", &fcm).await;
+    assert_eq!(f["failures"], json!(0), "a provider refusal is not the device's fault");
+    assert!(f["disabled_at"].is_null());
+    assert!(h.engine.status().last_error.unwrap().contains("fcm_401"));
+    h.http.take();
+
+    // The retry asks for a new access token first.
+    h.http.script(crate::native::GOOGLE_TOKEN_URL, vec![Ok((200, TOKEN_ANSWER.into()))]);
+    h.advance(2_500);
+    h.engine.tick().await;
+    let urls: Vec<String> = h.http.take().into_iter().map(|r| r.url).collect();
+    assert_eq!(urls, vec![crate::native::GOOGLE_TOKEN_URL.to_string(), FCM_SEND.to_string()]);
+
+    // Dead tokens are deleted.
+    h.http.script(&apns_url(true), vec![Ok((410, r#"{"reason":"Unregistered"}"#.into()))]);
+    h.http.script(
+        FCM_SEND,
+        vec![Ok((404, r#"{"error":{"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}"#.into()))],
+    );
+    h.write_and_observe("CREATE message:p2 SET kind = 'text', recipient = user:bob, conversation = conversation:c, text = 'b'", Op::Create).await;
+    assert!(h.sub("user:bob", &apns).await.is_null());
+    assert!(h.sub("user:bob", &fcm).await.is_null());
+
+    // A row a record user pointed at another app is disabled, never sent.
+    let other = h.native("user:bob", "apns", &"cd".repeat(32), "app_id = 'com.other'").await;
+    h.http.take();
+    h.write_and_observe("CREATE message:p3 SET kind = 'text', recipient = user:bob, conversation = conversation:c, text = 'c'", Op::Create).await;
+    assert!(h.http.take().is_empty());
+    let o = h.sub("user:bob", &other).await;
+    assert!(o["disabled_reason"].as_str().unwrap().starts_with("bad_app_id:"));
+}
+
+#[tokio::test]
+async fn credentials_hot_reload_and_a_bad_one_only_stops_its_provider() {
+    let h = Harness::native_harness().await;
+    h.native("user:bob", "apns", APNS_TOKEN, "").await;
+    h.native("user:bob", "fcm", FCM_TOKEN, "").await;
+    run(&h.root, "UPDATE _00_push_credential:fcm SET secret = '{}', hash = 'f2'", vec![]).await;
+    assert_eq!(h.engine.reload_config().await, Ok(true));
+    let st = h.engine.status();
+    assert!(st.providers.apns.ready);
+    assert!(!st.providers.fcm.ready && st.providers.fcm.error.is_some());
+    assert!(st.enabled);
+
+    h.write_and_observe("CREATE message:c1 SET kind = 'text', recipient = user:bob, conversation = conversation:c, text = 'a'", Op::Create).await;
+    let reqs = h.http.take();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].url, apns_url(false));
+    assert_eq!(h.engine.status().totals.no_provider, 1);
+    assert_eq!(h.engine.reload_config().await, Ok(false), "unchanged rows are not reloaded");
+
+    run(&h.root, "DELETE _00_push_credential", vec![]).await;
+    assert_eq!(h.engine.reload_config().await, Ok(true));
+    assert!(!h.engine.status().providers.apns.configured);
+}
+
+#[tokio::test]
+async fn native_only_engine_and_direct_messages_with_a_native_block() {
+    // No VAPID key at all: native push still works.
+    let root = fresh_db().await;
+    write_config(&root, NATIVE_RULES).await;
+    let apns = json!({ "teamId": "TEAM123456", "keyId": "KEY1234567", "key": crate::native::tests::TEST_P8 }).to_string();
+    run(&root, "UPSERT _00_push_credential:apns SET secret = $a, hash = 'a1'", vec![("a", json!(apns))]).await;
+    run(&root, "CREATE user:bob SET username = 'bob', pass = 'x'", vec![]).await;
+    let http = Arc::new(MockHttp::default());
+    let engine = PushEngine::new(
+        Arc::new(MemDb(root.clone())),
+        Arc::clone(&http) as Arc<dyn PushHttp>,
+        None,
+        EngineOptions::default(),
+    );
+    engine.tick().await;
+    let st = engine.status();
+    assert!(st.enabled, "{:?}", st.reason);
+    assert!(!st.providers.web);
+    let key = hex(&sha256(format!("user:bob|apns:{APNS_TOKEN}").as_bytes()));
+    run(
+        &root,
+        "CREATE type::record('_00_push_subscription', $k) CONTENT { auth_id: 'user:bob', kind: 'apns', endpoint: $e, token: $t, app_id: 'im.app' }",
+        vec![("k", json!(key)), ("e", json!(format!("apns:{APNS_TOKEN}"))), ("t", json!(APNS_TOKEN))],
+    )
+    .await;
+    let row = one(
+        &root,
+        "CREATE ONLY _00_push_message:m1 CONTENT { to: ['user:bob'], native: { notification: { title: 'Reminder', body: '{{raw}}' }, apns: { sound: 'bell.caf' } }, topic: 'r1' }",
+        vec![],
+    )
+    .await;
+    engine
+        .observe(ObservedChange {
+            table: "_00_push_message".into(),
+            op: Op::Create,
+            id: "_00_push_message:m1".into(),
+            record: row,
+            origin: Origin::Live,
+            seq: 0,
+        })
+        .await;
+    let reqs = http.take();
+    assert_eq!(reqs.len(), 1);
+    let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(body["aps"]["alert"], json!({ "title": "Reminder", "body": "{{raw}}" }));
+    assert_eq!(body["aps"]["sound"], json!("bell.caf"));
+    assert_eq!(body["sp00ky"]["kind"], json!("message"));
+    let m = one(&root, "SELECT status, delivered FROM ONLY _00_push_message:m1", vec![]).await;
+    assert_eq!(m, json!({ "status": "sent", "delivered": 1 }));
+
+    // SPKY_PUSH=off stops native too.
+    let off = PushEngine::new(
+        Arc::new(MemDb(root.clone())),
+        Arc::clone(&http) as Arc<dyn PushHttp>,
+        None,
+        EngineOptions { off: true, ..EngineOptions::default() },
+    );
+    off.tick().await;
+    assert!(!off.status().enabled);
+    assert!(!off.wants("message", Op::Create));
 }
 
 #[test]

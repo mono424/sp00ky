@@ -24,7 +24,10 @@ impl ReqwestPushHttp {
     /// `allow_private`: skip the address filter (local development against a
     /// mock push service). Mirrors `EngineOptions::allow_private_endpoints`.
     pub fn new(allow_private: bool) -> Result<Self, String> {
+        // rustls, so ALPN offers h2: APNs refuses HTTP/1.1, and FCM and the
+        // browser push services take either.
         let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
@@ -51,10 +54,10 @@ impl PushHttp for ReqwestPushHttp {
         }
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
-        // The push services answer with a short JSON or text reason; the
-        // engine keeps a prefix of it, so never read an unbounded body.
+        // The push services answer with a short JSON or text reason, the
+        // OAuth token endpoint with a small JSON; never read an unbounded body.
         let text = match resp.bytes().await {
-            Ok(b) => String::from_utf8_lossy(&b[..b.len().min(1024)]).into_owned(),
+            Ok(b) => String::from_utf8_lossy(&b[..b.len().min(8192)]).into_owned(),
             Err(_) => String::new(),
         };
         Ok((status, text))

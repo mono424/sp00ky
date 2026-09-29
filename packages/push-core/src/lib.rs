@@ -8,13 +8,15 @@
 //! outbound HTTP port ([`PushHttp`]); everything else lives here: the `push:`
 //! rules of sp00ky.yml ([`config`]), VAPID keys derived from the auth secret,
 //! RFC 8291 payload encryption, delivery with throttling and rate limits, and
-//! the `_00_push_subscription` / `_00_push_message` bookkeeping.
+//! the `_00_push_subscription` / `_00_push_message` bookkeeping, and native
+//! delivery to iOS (APNs) and Android (FCM) from the same rules ([`native`]).
 
 pub mod config;
 pub mod ece;
 pub mod engine;
 #[cfg(feature = "reqwest")]
 pub mod http_reqwest;
+pub mod native;
 pub mod rules;
 pub mod template;
 pub mod util;

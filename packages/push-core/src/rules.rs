@@ -357,6 +357,9 @@ pub fn rule_references_recipient(rule: &Rule, defaults: &RuleDefaults) -> bool {
             return true;
         }
     }
+    if crate::native::native_references(rule, defaults, root) {
+        return true;
+    }
     match &rule.data {
         Some(DataSpec::Map(map)) => map.values().any(|v| template::value_references(v, root)),
         Some(DataSpec::Fields(paths)) => paths

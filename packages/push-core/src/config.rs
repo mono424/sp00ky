@@ -60,6 +60,12 @@ pub struct PushConfig {
     /// is what a device filters on (`_00_push_subscription.rules`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rules: BTreeMap<String, Rule>,
+    /// Native iOS delivery through Apple's push service (token auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apns: Option<ApnsConfig>,
+    /// Native Android (and FCM-registered iOS) delivery through FCM HTTP v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fcm: Option<FcmConfig>,
 }
 
 impl Default for PushConfig {
@@ -70,6 +76,8 @@ impl Default for PushConfig {
             defaults: RuleDefaults::default(),
             limits: Limits::default(),
             rules: BTreeMap::new(),
+            apns: None,
+            fcm: None,
         }
     }
 }
@@ -125,8 +133,47 @@ impl PushConfig {
                 ));
             }
             rule.validate(&at, &mut issues);
+            let native_targets: Vec<&str> = rule
+                .targets()
+                .iter()
+                .filter(|p| **p != Platform::Web)
+                .map(|p| p.as_str())
+                .collect();
+            if !native_targets.is_empty()
+                && rule.platforms.is_some()
+                && self.apns.is_none()
+                && self.fcm.is_none()
+            {
+                issues.push(Issue::warning(
+                    format!("{at}.platforms"),
+                    format!(
+                        "targets {} but neither push.apns nor push.fcm is configured",
+                        native_targets.join(", ")
+                    ),
+                ));
+            }
+        }
+        if let Some(apns) = &self.apns {
+            apns.validate("push.apns", &mut issues);
+        }
+        if let Some(fcm) = &self.fcm {
+            fcm.validate("push.fcm", &mut issues);
         }
         issues
+    }
+
+    /// The config as stored in `_00_push_config`: every secret reference
+    /// replaced, so neither a secret nor where it lives reaches the table.
+    /// The resolved secrets travel separately (`_00_push_credential`).
+    pub fn redacted(&self) -> PushConfig {
+        let mut out = self.clone();
+        if let Some(apns) = out.apns.as_mut() {
+            apns.key = SecretRef::Literal(REDACTED.into());
+        }
+        if let Some(fcm) = out.fcm.as_mut() {
+            fcm.service_account = SecretRef::Literal(REDACTED.into());
+        }
+        out
     }
 
     /// `true` when [`PushConfig::validate`] reports no error.
@@ -202,6 +249,9 @@ pub struct RuleDefaults {
     /// rule's own keys win. Not applied to nudge-only rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<NotificationTemplate>,
+    /// Merged under every rule's `native` block (sound, channel, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeTemplate>,
 }
 
 impl RuleDefaults {
@@ -212,6 +262,9 @@ impl RuleDefaults {
     fn validate(&self, at: &str, issues: &mut Vec<Issue>) {
         if let Some(n) = &self.notification {
             n.validate(&format!("{at}.notification"), issues);
+        }
+        if let Some(n) = &self.native {
+            n.validate(&format!("{at}.native"), issues);
         }
     }
 }
@@ -328,6 +381,13 @@ pub struct Rule {
     /// or a map of name -> template. Sent with nudges too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<DataSpec>,
+    /// Which kinds of device receive it. Default: every kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<Platform>>,
+    /// What iOS and Android devices show, over `notification`. With no
+    /// notification anywhere a native device gets a silent data push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeTemplate>,
 }
 
 impl Rule {
@@ -337,6 +397,14 @@ impl Rule {
             vec![Op::Create]
         } else {
             self.on.clone()
+        }
+    }
+
+    /// Platforms after defaulting.
+    pub fn targets(&self) -> Vec<Platform> {
+        match &self.platforms {
+            Some(p) => p.clone(),
+            None => Platform::ALL.to_vec(),
         }
     }
 
@@ -393,6 +461,12 @@ impl Rule {
         }
         if let Some(data) = &self.data {
             data.validate(&format!("{at}.data"), issues);
+        }
+        if self.platforms.as_ref().is_some_and(Vec::is_empty) {
+            issues.push(Issue::error(format!("{at}.platforms"), "list at least one platform (web, ios, android)"));
+        }
+        if let Some(native) = &self.native {
+            native.validate(&format!("{at}.native"), issues);
         }
         if self.ops() == vec![Op::Delete] && self.once.is_some() {
             issues.push(Issue::warning(format!("{at}.once"), "a deleted record never changes again; `once` has no effect"));
@@ -757,6 +831,318 @@ fn value_templates(at: &str, v: &Value, issues: &mut Vec<Issue>) {
     }
 }
 
+// ── Native (APNs / FCM) ──────────────────────────────────────────────────
+
+/// A kind of device a rule can target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    Web,
+    Ios,
+    Android,
+}
+
+impl Platform {
+    pub const ALL: [Platform; 3] = [Platform::Web, Platform::Ios, Platform::Android];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Platform::Web => "web",
+            Platform::Ios => "ios",
+            Platform::Android => "android",
+        }
+    }
+}
+
+/// What [`PushConfig::redacted`] puts where a secret was.
+pub const REDACTED: &str = "<stored>";
+
+/// A secret in the manifest. The CLI resolves it at migrate / deploy and
+/// stores the value in `_00_push_credential`; the engine never sees the
+/// reference.
+///
+/// ```yaml
+/// key: { vault: APNS_AUTH_KEY }    # the project vault (recommended)
+/// key: { env: APNS_AUTH_KEY }      # the CLI's environment
+/// key: { file: ./AuthKey.p8 }      # relative to sp00ky.yml, never commit it
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SecretRef {
+    Vault { vault: String },
+    Env { env: String },
+    File { file: String },
+    /// Inline. Allowed, but it ends up in git; lint warns.
+    Literal(String),
+}
+
+impl SecretRef {
+    fn validate(&self, at: &str, issues: &mut Vec<Issue>) {
+        match self {
+            SecretRef::Vault { vault: k } | SecretRef::Env { env: k } | SecretRef::File { file: k }
+                if k.trim().is_empty() =>
+            {
+                issues.push(Issue::error(at, "empty secret reference"));
+            }
+            SecretRef::Literal(s) if s.trim().is_empty() => {
+                issues.push(Issue::error(at, "empty secret"));
+            }
+            SecretRef::Literal(s) if s != REDACTED => {
+                issues.push(Issue::warning(
+                    at,
+                    "an inline secret is committed with sp00ky.yml; use { vault: KEY }, { env: KEY } or { file: path }",
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `push.apns`: Apple Push Notification service with a token-auth key (.p8).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApnsConfig {
+    /// Apple Developer team id (10 characters).
+    pub team_id: String,
+    /// Id of the APNs auth key (10 characters).
+    pub key_id: String,
+    /// The .p8 key (PEM).
+    pub key: SecretRef,
+    /// Bundle ids devices may register with (`apns-topic`). Empty: any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundle_ids: Vec<String>,
+}
+
+impl ApnsConfig {
+    fn validate(&self, at: &str, issues: &mut Vec<Issue>) {
+        for (key, v) in [("teamId", &self.team_id), ("keyId", &self.key_id)] {
+            if v.len() != 10 || !v.chars().all(|c| c.is_ascii_alphanumeric()) {
+                issues.push(Issue::error(format!("{at}.{key}"), "must be the 10-character id from the Apple Developer account"));
+            }
+        }
+        self.key.validate(&format!("{at}.key"), issues);
+        for (i, b) in self.bundle_ids.iter().enumerate() {
+            if !valid_app_id(b) {
+                issues.push(Issue::error(format!("{at}.bundleIds.{i}"), format!("`{b}` is not a bundle id")));
+            }
+        }
+    }
+}
+
+/// `push.fcm`: Firebase Cloud Messaging HTTP v1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FcmConfig {
+    /// The service account JSON (Firebase console, Project settings, Service
+    /// accounts, Generate new private key).
+    pub service_account: SecretRef,
+    /// The Android app's Firebase client config. Not secret: the app reads it
+    /// through `fn::push::info()` and needs no google-services.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<AndroidClientConfig>,
+}
+
+impl FcmConfig {
+    fn validate(&self, at: &str, issues: &mut Vec<Issue>) {
+        self.service_account.validate(&format!("{at}.serviceAccount"), issues);
+        if let Some(a) = &self.android {
+            a.validate(&format!("{at}.android"), issues);
+        }
+    }
+}
+
+/// The four values of an Android app's `google-services.json` that
+/// `FirebaseOptions` needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AndroidClientConfig {
+    pub project_id: String,
+    /// `mobilesdk_app_id`, `1:<sender>:android:<hex>`.
+    pub app_id: String,
+    pub api_key: String,
+    /// `project_number`.
+    pub sender_id: String,
+}
+
+impl AndroidClientConfig {
+    fn validate(&self, at: &str, issues: &mut Vec<Issue>) {
+        let token = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-'))
+        };
+        for (key, v) in [
+            ("projectId", &self.project_id),
+            ("appId", &self.app_id),
+            ("apiKey", &self.api_key),
+            ("senderId", &self.sender_id),
+        ] {
+            if !token(v) {
+                issues.push(Issue::error(format!("{at}.{key}"), "letters, digits, `:`, `.`, `_` and `-` only"));
+            }
+        }
+        if !self.sender_id.chars().all(|c| c.is_ascii_digit()) {
+            issues.push(Issue::error(format!("{at}.senderId"), "the project number (digits)"));
+        }
+    }
+}
+
+/// A bundle id / Android package name.
+pub fn valid_app_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 255
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// `native:` on a rule or in `defaults`: what iOS and Android show.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeTemplate {
+    /// Over the rule's `notification`, key by key. Only `title`, `body`,
+    /// `image`, `tag`, `url` and `data` mean anything on a phone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<NotificationTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apns: Option<ApnsOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<AndroidOptions>,
+}
+
+impl NativeTemplate {
+    pub fn over(&self, base: &NativeTemplate) -> NativeTemplate {
+        NativeTemplate {
+            notification: match (&self.notification, &base.notification) {
+                (Some(a), Some(b)) => Some(a.over(b)),
+                (a, b) => a.clone().or_else(|| b.clone()),
+            },
+            apns: match (&self.apns, &base.apns) {
+                (Some(a), Some(b)) => Some(a.over(b)),
+                (a, b) => a.clone().or_else(|| b.clone()),
+            },
+            android: match (&self.android, &base.android) {
+                (Some(a), Some(b)) => Some(a.over(b)),
+                (a, b) => a.clone().or_else(|| b.clone()),
+            },
+        }
+    }
+
+    fn validate(&self, at: &str, issues: &mut Vec<Issue>) {
+        if let Some(n) = &self.notification {
+            n.validate(&format!("{at}.notification"), issues);
+        }
+        if let Some(a) = &self.apns {
+            let v = serde_json::to_value(a).unwrap_or(Value::Null);
+            value_templates(&format!("{at}.apns"), &v, issues);
+            if let Some(level) = &a.interruption_level {
+                if !level.contains("{{")
+                    && !["passive", "active", "time-sensitive", "critical"].contains(&level.as_str())
+                {
+                    issues.push(Issue::error(
+                        format!("{at}.apns.interruptionLevel"),
+                        "passive, active, time-sensitive or critical",
+                    ));
+                }
+            }
+        }
+        if let Some(a) = &self.android {
+            let v = serde_json::to_value(a).unwrap_or(Value::Null);
+            value_templates(&format!("{at}.android"), &v, issues);
+            if let Some(p) = &a.priority {
+                if !["high", "normal"].contains(&p.as_str()) {
+                    issues.push(Issue::error(format!("{at}.android.priority"), "high or normal"));
+                }
+            }
+        }
+    }
+}
+
+/// APNs `aps` keys. Strings are templates; `badge` and `relevanceScore` keep
+/// their JSON type when they are exactly one `{{expr}}`. Unknown keys go into
+/// `aps` verbatim (templated).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApnsOptions {
+    /// A sound file in the app bundle, or `default`. Alerts default to
+    /// `default`; `none` sends no sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<Value>,
+    /// A `UNNotificationCategory` the app registered (actions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Groups notifications; defaults to the notification tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance_score: Option<Value>,
+    /// Lets a notification service extension rewrite the push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutable_content: Option<bool>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl ApnsOptions {
+    pub fn over(&self, base: &ApnsOptions) -> ApnsOptions {
+        let mut extra = base.extra.clone();
+        extra.extend(self.extra.clone());
+        ApnsOptions {
+            sound: self.sound.clone().or_else(|| base.sound.clone()),
+            badge: self.badge.clone().or_else(|| base.badge.clone()),
+            category: self.category.clone().or_else(|| base.category.clone()),
+            thread_id: self.thread_id.clone().or_else(|| base.thread_id.clone()),
+            interruption_level: self.interruption_level.clone().or_else(|| base.interruption_level.clone()),
+            relevance_score: self.relevance_score.clone().or_else(|| base.relevance_score.clone()),
+            mutable_content: self.mutable_content.or(base.mutable_content),
+            extra,
+        }
+    }
+}
+
+/// FCM `android.notification` keys (and the message priority). Strings are
+/// templates. Unknown keys go into `android.notification` verbatim, in FCM's
+/// own snake_case spelling (`notification_priority`, `visibility`, ...).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidOptions {
+    /// Notification channel; the app must have created it (Android 8+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// A raw resource name, or `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
+    /// A drawable resource name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// `#rrggbb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Message priority: `high` or `normal`. Default: high for anything shown
+    /// or `urgency: high`, normal for silent pushes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl AndroidOptions {
+    pub fn over(&self, base: &AndroidOptions) -> AndroidOptions {
+        let mut extra = base.extra.clone();
+        extra.extend(self.extra.clone());
+        AndroidOptions {
+            channel_id: self.channel_id.clone().or_else(|| base.channel_id.clone()),
+            sound: self.sound.clone().or_else(|| base.sound.clone()),
+            icon: self.icon.clone().or_else(|| base.icon.clone()),
+            color: self.color.clone().or_else(|| base.color.clone()),
+            priority: self.priority.clone().or_else(|| base.priority.clone()),
+            extra,
+        }
+    }
+}
+
 // ── Durations ────────────────────────────────────────────────────────────
 
 /// `30s`, `10m`, `1h30m`, `2d`, `500ms`, or a plain number of seconds.
@@ -998,6 +1384,73 @@ rules:
         assert!(serde_yaml::from_str::<PushConfig>("rules: { r: { table: t, to: u, bogus: 1 } }").is_err());
         let cfg = parse("rules: { r: { table: t, to: u, notification: { title: x, timestamp: 5 } } }");
         assert_eq!(cfg.rules["r"].notification.as_ref().unwrap().extra["timestamp"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn native_blocks_parse_validate_and_redact() {
+        let cfg = parse(
+            r#"
+subject: mailto:ops@example.com
+apns: { teamId: ABCDE12345, keyId: XYZ987WVUT, key: { vault: APNS_KEY }, bundleIds: [im.khad.whitepawn] }
+fcm:
+  serviceAccount: { file: ./fcm.json }
+  android: { projectId: whitepawn, appId: "1:42:android:ab12", apiKey: AIzaSy-x_y, senderId: "42" }
+defaults:
+  native: { apns: { sound: default }, android: { channelId: general } }
+rules:
+  call:
+    table: call
+    to: callee
+    platforms: [ios, android]
+    native:
+      notification: { title: "{{caller}}" }
+      apns: { category: CALL, interruptionLevel: time-sensitive, badge: "{{unread}}", target-content-id: x }
+      android: { channelId: calls, priority: high, visibility: PUBLIC }
+"#,
+        );
+        assert!(cfg.is_valid(), "{:?}", cfg.validate());
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        let back: PushConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
+        let rule = &cfg.rules["call"];
+        assert_eq!(rule.targets(), vec![Platform::Ios, Platform::Android]);
+        let apns = rule.native.as_ref().unwrap().apns.as_ref().unwrap();
+        assert_eq!(apns.extra["target-content-id"], serde_json::json!("x"));
+
+        let stored = serde_json::to_string(&cfg.redacted()).unwrap();
+        assert!(!stored.contains("APNS_KEY") && !stored.contains("fcm.json"), "{stored}");
+        assert!(cfg.redacted().is_valid());
+        assert!(cfg.redacted().validate().is_empty(), "the stored form lints clean");
+
+        let bad = parse(
+            r#"
+apns: { teamId: short, keyId: XYZ987WVUT, key: "-----BEGIN PRIVATE KEY-----", bundleIds: ["a b"] }
+fcm: { serviceAccount: { vault: "" }, android: { projectId: "x/y", appId: a, apiKey: b, senderId: abc } }
+rules:
+  r:
+    table: t
+    to: u
+    platforms: []
+    native: { apns: { interruptionLevel: loud }, android: { priority: urgent } }
+"#,
+        );
+        let issues = bad.validate();
+        let at = |p: &str, sev: Severity| issues.iter().any(|i| i.path == p && i.severity == sev);
+        assert!(at("push.apns.teamId", Severity::Error));
+        assert!(at("push.apns.key", Severity::Warning), "inline secrets warn");
+        assert!(at("push.apns.bundleIds.0", Severity::Error));
+        assert!(at("push.fcm.serviceAccount", Severity::Error));
+        assert!(at("push.fcm.android.projectId", Severity::Error));
+        assert!(at("push.fcm.android.senderId", Severity::Error));
+        assert!(at("push.rules.r.platforms", Severity::Error));
+        assert!(at("push.rules.r.native.apns.interruptionLevel", Severity::Error));
+        assert!(at("push.rules.r.native.android.priority", Severity::Error));
+
+        let unreachable = parse("rules: { r: { table: t, to: u, platforms: [ios] } }");
+        assert!(unreachable
+            .validate()
+            .iter()
+            .any(|i| i.path == "push.rules.r.platforms" && i.severity == Severity::Warning));
     }
 
     #[test]

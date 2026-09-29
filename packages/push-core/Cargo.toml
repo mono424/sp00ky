@@ -15,11 +15,14 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hkdf = "0.12"
 lru = "0.12"
-p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# FCM service-account JWTs (RS256). Pure Rust, so the crate still builds for
+# wasm32; signing is deterministic (PKCS#1 v1.5), no RNG involved.
+rsa = { version = "0.9", features = ["sha2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 thiserror = "2"
 tracing = "0.1"
 web-time = "1"
@@ -27,7 +30,9 @@ web-time = "1"
 schedule-core = { path = "../schedule-core", default-features = false }
 
 # Native hosts only: the reqwest `PushHttp` with a public-address resolver.
-reqwest = { version = "0.12", optional = true }
+# rustls + http2: APNs only speaks HTTP/2, negotiated through ALPN, which the
+# default native-tls backend does not offer.
+reqwest = { version = "0.12", optional = true, features = ["rustls-tls", "http2"] }
 tokio = { version = "1", optional = true, features = ["net"] }
 
 [features]

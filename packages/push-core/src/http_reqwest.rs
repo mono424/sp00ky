@@ -134,4 +134,32 @@ mod tests {
             assert!(is_public(ip.parse().unwrap()), "{ip} must pass");
         }
     }
+    /// APNs refuses anything but HTTP/2. Unauthenticated, Apple answers 403
+    /// with a JSON reason only once h2 was negotiated (network: `--ignored`).
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn apns_is_reached_over_http2() {
+        let http = ReqwestPushHttp::new(false).unwrap();
+        let url = format!("{}/3/device/{}", crate::native::APNS_SANDBOX_HOST, "ab".repeat(32));
+        let (status, body) = http
+            .post(&url, vec![("apns-topic".into(), "dev.sp00ky.test".into())], b"{}".to_vec())
+            .await
+            .expect("APNs reachable");
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("ProviderToken"), "{body}");
+    }
+    /// FCM without a valid access token: 401, which the engine reads as "our
+    /// credentials", not "this device".
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn fcm_answers_are_classified_as_the_engine_expects() {
+        let http = ReqwestPushHttp::new(false).unwrap();
+        let url = format!("{}/v1/projects/sp00ky-smoke/messages:send", crate::native::FCM_HOST);
+        let (status, body) = http
+            .post(&url, vec![("Authorization".into(), "Bearer nope".into())], b"{}".to_vec())
+            .await
+            .expect("FCM reachable");
+        assert_eq!(status, 401, "{body}");
+        assert!(matches!(crate::native::classify_fcm(status, &body), crate::native::Answer::Provider(_)));
+    }
 }

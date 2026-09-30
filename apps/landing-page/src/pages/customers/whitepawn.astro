@@ -1,0 +1,1299 @@
+---
+// oxlint-disable-next-line no-unassigned-import
+import '../../styles/global.css';
+import '../../styles/case-study.css';
+import { Image } from 'astro:assets';
+import SiteNav from '../../components/SiteNav.astro';
+import SiteFooter from '../../components/SiteFooter.astro';
+import CodeCard from '../../components/case-study/CodeCard.astro';
+import SyncDemo from '../../components/case-study/SyncDemo';
+import { basePath } from '../../config/nav';
+import heroArt from '../../assets/case-studies/whitepawn/hero.webp';
+import studioArt from '../../assets/case-studies/whitepawn/studio.webp';
+import togetherArt from '../../assets/case-studies/whitepawn/analyze-together-sketch.webp';
+import portalShot from '../../assets/case-studies/whitepawn/web-portal.png';
+
+// Every number on this page comes from WhitePawn's repository or its production
+// admin API, as of 2026-09-30. Where a number is a count of call sites, it was
+// taken with grep over apps/solid-app/src (generated files and tests excluded).
+
+const title = 'WhitePawn case study';
+const description =
+  'How one developer ships a real-time chess platform to web, iOS and Android on sp00ky: 79 tables, 178 live queries, 16 services and no hand-written API layer.';
+
+// ---------------------------------------------------------------------------
+// The build, in the order a feature is built. Code is copied from WhitePawn,
+// trimmed (marked with ...) but not rewritten.
+// ---------------------------------------------------------------------------
+
+type Snippet = { file: string; lang: string; code: string };
+type Step = { title: string; body: string[]; saved: string; code: Snippet[] };
+
+const steps: Step[] = [
+  {
+    title: 'Describe the data once, with its rules',
+    body: [
+      'Every WhitePawn feature starts in one SurrealQL schema: 79 tables, each with its permissions next to its fields. Direct messages are a good example. Only the two people in a conversation can read a message, only the sender can write or delete it, and nobody can edit it.',
+      'Those same rules decide what each user\'s live queries return. There is no second copy of them in an API handler.',
+      'One config line per platform turns the schema into typed models for the web app and the Flutter app.',
+    ],
+    saved: 'No REST or GraphQL layer, no permission checks repeated in handlers, no models kept in step by hand across TypeScript and Dart.',
+    code: [
+      {
+        file: 'packages/schema/src/schema.surql',
+        lang: 'surrealql',
+        code: `DEFINE TABLE message SCHEMAFULL
+  PERMISSIONS
+    FOR select WHERE $access IN ["account", "_00_impersonate"] AND ( sender = $auth.id OR recipient = $auth.id )
+    FOR create WHERE $access IN ["account", "_00_impersonate"] AND sender = $auth.id AND recipient != $auth.id
+    FOR update WHERE false
+    FOR delete WHERE $access IN ["account", "_00_impersonate"] AND sender = $auth.id
+;
+
+DEFINE FIELD conversation ON TABLE message TYPE record<conversation>;
+DEFINE FIELD sender ON TABLE message TYPE record<user>;
+DEFINE FIELD recipient ON TABLE message TYPE record<user>;
+DEFINE FIELD text ON TABLE message TYPE string ASSERT string::len($value) > 0 AND string::len($value) <= 2000;`,
+      },
+      {
+        file: 'packages/schema/sp00ky.yml',
+        lang: 'yaml',
+        code: `clientTypes:
+  - format: typescript
+    output: ../../apps/solid-app/src/schema.gen.ts
+  - format: dart
+    output: ../../apps/flutter_app/lib/sync/app_db.g.dart`,
+      },
+    ],
+  },
+  {
+    title: 'Read with a live query',
+    body: [
+      'The inbox is one query builder and one hook. The conversation rows arrive with both participants already joined, from the local cache first and then live.',
+      'When a message lands on any device, the conversation\'s <code>last_message_ms</code> changes and the inbox re-sorts itself. The component has no idea a network exists.',
+      'The web app has 178 of these <code>createQuery</code> call sites. Not one of them is paired with a refetch.',
+    ],
+    saved: 'No fetch calls, no cache keys, no invalidation after a write, no WebSocket client, no polling.',
+    code: [
+      {
+        file: 'apps/solid-app/src/lib/query.ts',
+        lang: 'ts',
+        code: `export const qConversations = (db: Db) =>
+  db
+    .query("conversation")
+    .related("user_a", (q: any) => q.select("id", "username", "email"))
+    .related("user_b", (q: any) => q.select("id", "username", "email"))
+    .build();`,
+      },
+      {
+        file: 'apps/solid-app/src/components/messages/MessagesPage.jsx',
+        lang: 'jsx',
+        code: `const convQuery = createQuery(() => qConversations(db), {
+  enabled: () => !!auth.userId(),
+  deregisterOnCleanup: true,
+});
+const conversations = createMemo(() =>
+  [...(convQuery.data() || [])].sort(
+    (a, b) => (Number(b.last_message_ms) || 0) - (Number(a.last_message_ms) || 0),
+  ),
+);`,
+      },
+    ],
+  },
+  {
+    title: 'Write locally, sync after',
+    body: [
+      'Sending a message is two writes: create the message, bump the conversation. Both land in the local store at once, so the bubble and the inbox preview appear before any network round trip.',
+      'sp00ky sends the writes up in the background, retries them if the connection drops, and holds them in an outbox while the device is offline.',
+    ],
+    saved: 'No optimistic-update reducers, no rollback code, no offline queue, no "sending..." state machine.',
+    code: [
+      {
+        file: 'apps/solid-app/src/lib/dm.js',
+        lang: 'js',
+        code: `await db.create(draft.id, {
+  conversation: toRecordId(String(convId)),
+  sender: toRecordId(String(myId)),
+  recipient: toRecordId(String(peerId)),
+  text: t,
+  kind,
+  created_ms: now,
+  created_at: new Date(now).toISOString(),
+  ...(opts.linkCount > 0 ? { link_count: opts.linkCount } : {}),
+});
+await db.update("conversation", String(convId), {
+  last_message_text: String(opts.preview || t).slice(0, 120),
+  last_message_ms: now,
+  last_message_sender: toRecordId(String(myId)),
+  last_message_kind: kind,
+  [readField]: now,
+});`,
+      },
+    ],
+  },
+  {
+    title: 'Use the same data on iOS and Android',
+    body: [
+      'The Flutter app reads the same tables through sp00ky\'s Dart client. The conversation query is a line-for-line twin of the web one, and the models are generated from the same schema.',
+      'Writes work the same way too: a typed <code>create</code> that shows up on the phone at once and on every other device a moment later.',
+    ],
+    saved: 'No second API client, no hand-written JSON mapping, no drift between what the web and the phone think a row looks like.',
+    code: [
+      {
+        file: 'apps/flutter_app/lib/sync/MessagingService.dart',
+        lang: 'dart',
+        code: `static QueryBuilder conversationQuery(Sp00kyClient client) => client
+    .query('conversation')
+    .related(
+      'user_a',
+      (q) => q.select(const ['id', 'username', 'lichess_username']),
+    )
+    .related(
+      'user_b',
+      (q) => q.select(const ['id', 'username', 'lichess_username']),
+    );`,
+      },
+      {
+        file: 'apps/flutter_app/lib/sync/FriendshipService.dart',
+        lang: 'dart',
+        code: `await _spooky.db.friendship.create(Friendship(
+  id: 'friendship:FS_\${customAlphabet(_idAlphabet, 7)}',
+  requester: me,
+  addressee: _fullUserId(otherId),
+  status: statusPending,
+  created_at: DateTime.now().toUtc(),
+  created_ms: DateTime.now().millisecondsSinceEpoch,
+));`,
+      },
+    ],
+  },
+  {
+    title: 'Store files next to the rows that use them',
+    body: [
+      'Club crests, puzzle covers, broadcast art and stream recordings live in eight buckets, defined in the schema with their own permissions.',
+      'Uploading is a hook and rendering is a component. The row only stores a key.',
+    ],
+    saved: 'No upload service, no signed-URL endpoint, no separate storage permissions to keep in line with the database.',
+    code: [
+      {
+        file: 'packages/schema/src/buckets/puzzle_covers.surql',
+        lang: 'surrealql',
+        code: `DEFINE BUCKET IF NOT EXISTS puzzle_covers BACKEND "file:/buckets/puzzle_covers"
+  PERMISSIONS WHERE $action IN ['get', 'head', 'exists']
+    OR ($auth != NONE AND $action IN ['put', 'delete']);`,
+      },
+      {
+        file: 'apps/solid-app/src/components/clubs/ClubSettingsDialog.jsx',
+        lang: 'jsx',
+        code: `const upload = useFileUpload("club_covers");
+...
+for (const [path, blob] of [
+  [paths.full, full],
+  [paths.thumb, thumb],
+]) {
+  await upload.upload(path, blob);
+  const err = upload.error();
+  if (err) throw err;
+}
+await updateClub(db, club().id, { [field]: key });
+
+// ClubCrest.jsx
+<BucketImage bucket="club_covers" path={path()} class="absolute inset-0" alt="" />`,
+      },
+    ],
+  },
+  {
+    title: 'Describe background work instead of running it',
+    body: [
+      'WhitePawn imports every user\'s games from Lichess and Chess.com. That is one schedule: every minute, pick the connections that are due, call the sync backend once per connection, retry twice, and park a connection that keeps failing.',
+      'The "Sync now" button enqueues the same job from the client. Engine analysis runs as a two-step workflow the same way, analyze first and then compute insights.',
+      'The backend that does the importing is 1,138 lines of TypeScript. It does not schedule, queue or retry anything itself.',
+    ],
+    saved: 'No cron server, no queue, no worker fleet, no retry bookkeeping, no dashboard to find stuck jobs.',
+    code: [
+      {
+        file: 'packages/schema/sp00ky.yml',
+        lang: 'yaml',
+        code: `schedules:
+  game-sync:
+    every: 1m
+    backend: gamesync
+    route: /syncGames
+    forEach:
+      query: >
+        SELECT id FROM connection
+        WHERE provider IN ['lichess', 'chesscom']
+        AND sync_error = NONE
+        AND (last_synced_at = NONE OR last_synced_at < time::now() - 15m)
+        AND (sync_failed_at = NONE OR sync_failed_at < time::now() - 15m)
+      key: id
+    concurrency: skip
+    retry:
+      max: 2
+      strategy: linear
+    quarantineAfter: 5`,
+      },
+      {
+        file: 'apps/solid-app/src/lib/gameSync.js',
+        lang: 'js',
+        code: `export async function pokeSync(db, connId) {
+  await db.run(
+    BACKEND,
+    PATH,
+    { connection: connId },
+    { assignedTo: connId, delay: MANUAL_SYNC_DELAY_MS }
+  );
+}`,
+      },
+    ],
+  },
+  {
+    title: 'Ship sixteen services with one command',
+    body: [
+      'Each service keeps a small <code>sp00ky.app.yml</code> next to its code. The root config pulls them together: the web app, thirteen backends in Go, TypeScript and Rust, a LiveKit server, and a pool of render machines that scales from zero to five while a livestream is on air.',
+      '<code>spky deploy</code> builds the images, applies schema migrations and rolls the whole thing out to sp00ky cloud. Backups, logs and the admin dashboard come with it.',
+    ],
+    saved: 'No Kubernetes, no Terraform, no deploy scripts per service, no autoscaler of their own.',
+    code: [
+      {
+        file: 'packages/schema/sp00ky.yml',
+        lang: 'yaml',
+        code: `apps:
+  web:
+    path: ../../apps/solid-app
+  gamesync:
+    path: ../../apps/gamesync-api
+  gameanalysis:
+    path: ../../apps/gameanalysis-api
+  ...
+
+pools:
+  render:
+    provider: hetzner
+    machine: { type: cx33, fallbackTypes: [cx43, cpx32], locations: [fsn1, nbg1, hel1] }
+    slots: 1
+    min: 0
+    autoscale: true
+    max: 5
+    idleTimeout: 1m
+    recycle: job`,
+      },
+      {
+        file: 'terminal',
+        lang: 'bash',
+        code: `spky deploy`,
+      },
+    ],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// What a chess platform usually needs on the server, and what WhitePawn wrote.
+// ---------------------------------------------------------------------------
+
+const ledger: { would: string; got: string }[] = [
+  { would: 'REST or GraphQL endpoints for every table', got: 'A <code>DEFINE TABLE</code> per table' },
+  { would: 'Permission checks inside each handler', got: 'One <code>PERMISSIONS</code> clause, also applied to live queries' },
+  { would: 'TypeScript and Dart models kept in step by hand', got: 'Two generated clients, 22,924 lines they never typed' },
+  { would: 'A WebSocket server with reconnects and fan-out', got: '<code>createQuery</code> on the web, <code>.watch()</code> in Flutter' },
+  { would: 'Client caching, refetching and invalidation', got: 'Nothing. Live queries do not go stale' },
+  { would: 'An offline queue with retries', got: 'Local-first writes and a sync badge from <code>useSyncActivity</code>' },
+  { would: 'A cron server and job queue for game imports', got: 'The <code>game-sync</code> schedule, 17 lines of YAML' },
+  { would: 'Orchestration for multi-step engine analysis', got: 'The <code>game-cloud-analysis</code> workflow' },
+  { would: 'An upload service with signed URLs', got: '<code>DEFINE BUCKET</code>, <code>useFileUpload</code>, <code>BucketImage</code>' },
+  { would: 'A signaling server for voice and video calls', got: 'Rows in the <code>call</code> table' },
+  { would: 'Deploy pipelines, an autoscaler and backups', got: '<code>spky deploy</code> and one <code>sp00ky.yml</code>' },
+  { would: 'A secrets manager and an <code>.env</code> file per service', got: 'One shared vault, referenced by key name in each app' },
+  { would: 'Runbooks, SSH sessions and log greps during incidents', got: 'The admin dashboard, and an MCP server agents can read' },
+];
+
+// ---------------------------------------------------------------------------
+// The hub: secrets and agents. Key names only; no value appears anywhere here.
+// Parsed from every apps/*/sp00ky.app.yml in WhitePawn (vault entries).
+// ---------------------------------------------------------------------------
+
+const vaultServices = ['relay', 'email', 'game server', 'MCP', 'analysis', 'commentator', 'recorder'];
+const sharedSecrets: { key: string; note?: string; used: string[] }[] = [
+  { key: 'SPKY_JWT_PUBLIC_KEY', used: ['relay', 'email', 'game server', 'MCP'] },
+  { key: 'JWT_PRIVATE_KEY', used: ['email', 'MCP'] },
+  { key: 'CEC_ANALYSIS_*', note: '4 keys', used: ['relay', 'analysis'] },
+  { key: 'COMMENTATOR_SECRET', used: ['relay', 'commentator'] },
+  { key: 'RECORDER_SECRET', used: ['relay', 'recorder'] },
+  { key: 'BCAST_RENDER_SECRET', used: ['relay', 'recorder'] },
+];
+
+const onboarding = [
+  {
+    title: 'Invite',
+    who: 'An admin',
+    cmd: 'spky team invite dev@example.com',
+    text: 'The admin\'s passphrase unlocks the vault key, and a re-encrypted copy travels with the invite. No value is sent to anyone.',
+  },
+  {
+    title: 'Accept',
+    who: 'The new developer',
+    cmd: 'spky login',
+    text: 'Sign in with GitHub, accept the invite and pick a personal passphrase. It never leaves the laptop.',
+  },
+  {
+    title: 'Run',
+    who: 'The new developer',
+    cmd: 'spky dev',
+    text: 'The whole stack starts from the dev values in each sp00ky.app.yml. Production secrets live in the cloud half of the config, so a laptop never holds one.',
+  },
+];
+
+const mcpServers = [
+  {
+    name: 'Devtools',
+    sees: 'The running app',
+    what: 'Live queries, the local cache, auth state and the schema of an open tab. Runs SurrealQL locally or remotely.',
+    tools: ['get_active_queries', 'describe_schema', 'run_query'],
+  },
+  {
+    name: 'Cloud',
+    sees: 'The account',
+    what: 'Deployments, logs, environment variables, vault status, backups and domains. Secret values come back masked.',
+    tools: ['deployment_status', 'logs_recent', 'env_list'],
+  },
+  {
+    name: 'Admin',
+    sees: 'The live cluster',
+    what: 'Incidents, jobs with every attempt, schedules, workflow runs, live views and who is online. Restarts and backups with a write token.',
+    tools: ['incidents_list', 'job_get', 'schedule_release'],
+  },
+];
+
+// Reconstructed from the agent session on 2026-09-26 (whitepawn 20a0e285).
+// Tool names are real; outputs are summarized, and player names are left out.
+const transcript: { kind: 'event' | 'call' | 'out' | 'agent' | 'ship'; text: string }[] = [
+  { kind: 'event', text: 'Incident open: schedule_quarantined on game-sync, 2 keys' },
+  { kind: 'call', text: 'schedule_get("game-sync")' },
+  { kind: 'out', text: '2 connections quarantined after 5 failures, since 09-24 and 09-26' },
+  { kind: 'call', text: 'job_get(<last failed game-sync job>)' },
+  { kind: 'out', text: 'last_error: Chess.com month fetch failed (404) for the current month' },
+  { kind: 'agent', text: 'Chess.com\'s current-month archive answered 404 for a few minutes, then 200 again. A failed sync is re-selected on the next one-minute tick, so five failures took five minutes, and quarantine only ends with a release.' },
+  { kind: 'call', text: 'schedule_release("game-sync", both keys)' },
+  { kind: 'out', text: 'released, both connections synced on the next tick' },
+  { kind: 'agent', text: 'Fix: stamp sync_failed_at on a transient failure and wait 15 minutes before the next try. The quarantine budget now spans more than an hour.' },
+  { kind: 'ship', text: 'fix(gamesync): wait 15 minutes after a failed sync (20a0e285), deployed' },
+];
+
+const incidents = [
+  {
+    date: '3 Sep',
+    read: ['workflow_run_get', 'logs_recent'],
+    found: 'Every cloud-analysis run had failed at the insights step for days. The step showed no error; the reason was only in the sync processor\'s log: short games ending in mate could never reach the 90% coverage gate.',
+    fix: 'Mate and stalemate positions are scored from the rules. The loop ends.',
+  },
+  {
+    date: '14 Sep',
+    read: ['overview', 'views_list', 'view_get', 'operations_list'],
+    found: 'Short sync stalls traced to one table change republishing a whole window of a joined view: a 300-update transaction timing out.',
+    fix: 'Fixes shipped upstream in sp00ky, plus a persistent incident history in the admin dashboard.',
+  },
+  {
+    date: '20 Sep',
+    read: ['incidents_list', 'jobs_list'],
+    found: 'A deleted Chess.com account had cost a job every minute for 20 hours, hidden behind a failure counter that read zero.',
+    fix: 'Four quiet faults fixed in sp00ky canary.267; quarantine switched on for game-sync.',
+  },
+  {
+    date: '26 Sep',
+    read: ['schedule_get', 'job_get', 'schedule_release'],
+    found: 'Two accounts quarantined by a few minutes of 404s from Chess.com. One stayed stuck for two days.',
+    fix: 'Released at once. Failed syncs now wait 15 minutes, and sp00ky re-probes quarantined keys on its own.',
+  },
+  {
+    date: '27 Sep',
+    read: ['incidents_list', 'job_get'],
+    found: 'Six Lichess accounts quarantined for about 77 minutes each. Lichess allows two exports per account across every app a player uses.',
+    fix: 'A 429 is now "busy, try in 15 minutes", never a failure.',
+  },
+];
+
+// Commits per month to the WhitePawn monorepo (`git log`, HEAD and branches).
+const months = [
+  { label: 'Nov', commits: 14, milestone: true },
+  { label: 'Dec', commits: 0 },
+  { label: 'Jan', commits: 0 },
+  { label: 'Feb', commits: 28 },
+  { label: 'Mar', commits: 3, milestone: true },
+  { label: 'Apr', commits: 5 },
+  { label: 'May', commits: 50 },
+  { label: 'Jun', commits: 113, milestone: true },
+  { label: 'Jul', commits: 160, milestone: true },
+  { label: 'Aug', commits: 98, milestone: true },
+  { label: 'Sep', commits: 384, milestone: true },
+];
+const maxCommits = Math.max(...months.map((m) => m.commits));
+
+const milestones = [
+  {
+    when: 'November 2025',
+    what: 'The web app starts on sp00ky',
+    detail: 'The first commit of the web app already reads its games through sp00ky. The games database and PGN import come first.',
+  },
+  {
+    when: 'March 2026',
+    what: 'One schema, one config file',
+    detail: 'The schema and the backends move into sp00ky.yml, the one file that migrations and deploys run from.',
+  },
+  {
+    when: 'June 2026',
+    what: 'The Flutter app joins the same schema',
+    detail: 'iOS, Android and macOS switch to sp00ky\'s Dart client. Landing the same month: puzzle builder, game comments, collection sharing, the livestream studio and analytics.',
+  },
+  {
+    when: 'July 2026',
+    what: 'Social, and background work',
+    detail: 'Lichess and Chess.com sync, direct messages, friends, voice and video calls, and cloud game analysis with insights.',
+  },
+  {
+    when: 'August 2026',
+    what: 'Local-first boot',
+    detail: 'Contacts ship, and the web app starts painting from its local cache before the network answers.',
+  },
+  {
+    when: 'September 2026',
+    what: 'The busiest month yet',
+    detail: 'A puzzle store with ratings, paid plans, clubs with events, AI connectors for ChatGPT and Claude, and live play.',
+  },
+];
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="description" content={description} />
+    <!-- Unlisted while it is being proofread: no nav or footer link, kept out of
+         search engines here and out of the site search by data-pagefind-ignore
+         on <body>. Remove both, and add the links, to publish it. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      media="print"
+      onload="this.media='all'"
+    />
+    <noscript>
+      <link
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      />
+    </noscript>
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content={new URL('customers/whitepawn', Astro.site)} />
+    <meta property="og:title" content={`${title} | sp00ky`} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={new URL('/social-card.png', Astro.site)} />
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:title" content={`${title} | sp00ky`} />
+    <meta property="twitter:description" content={description} />
+    <meta property="twitter:image" content={new URL('/social-card.png', Astro.site)} />
+    <title>{title} | sp00ky</title>
+  </head>
+
+  <body class="cs-page min-h-screen flex flex-col" data-pagefind-ignore="all">
+    <SiteNav activePath="/customers" />
+
+    <main class="cs flex-1">
+      <!-- Hero -->
+      <header class="cs-hero">
+        <div class="cs-wrap">
+          <nav class="cs-crumb" aria-label="Breadcrumb">
+            <span>Customer story</span>
+            <span aria-hidden="true">/</span>
+            <a href="https://whitepawn.app" target="_blank" rel="noopener">WhitePawn</a>
+          </nav>
+          <h1>
+            One developer runs a real-time chess platform.
+            <span class="serif"><em>Without writing the plumbing.</em></span>
+          </h1>
+          <p class="cs-lede">
+            WhitePawn gives people who own real chessboards one place to play, analyze, stream and
+            meet: games, puzzles, clubs, messages, calls and live play on the web, iOS and Android.
+            It is built by a single developer on sp00ky, with no API layer, no sync code and no
+            ops team. sp00ky also keeps every secret and shows the running system to the AI agents
+            that help build and operate it. Here is how.
+          </p>
+        </div>
+
+        <figure class="cs-postcard">
+          <Image
+            src={heroArt}
+            alt="Watercolor of a sunny terrace above a bay, with pairs of people playing chess at wooden tables."
+            class="cs-postcard-art"
+            widths={[768, 1280, 1536]}
+            sizes="100vw"
+            format="webp"
+            quality={82}
+            loading="eager"
+            fetchpriority="high"
+          />
+          <aside class="cs-facts" aria-label="WhitePawn at a glance">
+            <div class="cs-facts-head">
+              <svg viewBox="0 0 512 512" fill="currentColor" aria-hidden="true"
+                ><path
+                  d="M299,92c-6.9-1.4-36.9-15.2-41.3-8.5c-7.6,11.5-5.5,31.4-9.5,44.5c-7.4,24.1-26.2,48.9-38.3,71 c-6.2,11.2-11,26.6-20.1,35.8c-26.7,26.9-80.5,23.1-107.2,49.7c-7.2,7.2-8.2,20.3-16.1,26.7c-7.6,6.1-20.8,2.8-29.2,7.4 c-6.3,3.5-9.4,14.3-12.4,20.4c-1.9,3.7-6.7,10.2-4.4,14.5c2.9,5.5,13.4,8.6,18.6,11.2c15.4,7.7,31,15.3,46,23.7 c50.7,28.2,103.1,53.9,155,79.8c17.1,8.6,44,29.3,63,30.8c7.6,0.6,24.2-19.8,27.3-26.1c5.7-11.7-12.3-22.3-10.2-34 c1.9-10.4,15.7-17.2,16.2-28c1.2-28.2-21-58.9-24.9-87c-4.9-34.7,10.7-61.9,24.1-93c5.6-12.9,11-36,21.8-45.2 c8.2-7,37.4-16.7,40.1-27.1c3-11.6-29.1-21.4-26.2-33.3c3.2-13.1,22.5-25.4,29.3-37.4c5.9-10.4-1.3-38.2-6.4-48.8 c-3.4-7.1-17.2-10.3-24-13.2c-8.1-3.4-19-12.2-28-11.9c-9.7,0.3-44.3,26.6-48.5,35.4C289.2,58.5,297.2,82.2,299,92z"
+                ></path></svg
+              >
+              WhitePawn
+            </div>
+            <dl>
+              <dt>Product</dt>
+              <dd>Chess platform for real boards, since 2022</dd>
+              <dt>Team</dt>
+              <dd>One developer, working with AI coding agents</dd>
+              <dt>Platforms</dt>
+              <dd>Web (SolidJS), iOS, Android and macOS (Flutter)</dd>
+              <dt>On sp00ky</dt>
+              <dd>Web since November 2025, mobile since June 2026</dd>
+              <dt>Uses</dt>
+              <dd>Live queries, local-first writes, file buckets, schedules, workflows, machine pools, shared vault, MCP servers, sp00ky cloud</dd>
+            </dl>
+            <p class="cs-disclosure">
+              Full disclosure: WhitePawn is built by sp00ky's creator. It is sp00ky's largest
+              production app, and every release runs there first.
+            </p>
+          </aside>
+        </figure>
+
+        <div class="cs-wrap">
+          <ul class="cs-numbers" aria-label="WhitePawn by the numbers">
+            <li>
+              <span class="cs-num">79</span>
+              <span class="cs-num-label">tables in one SurrealQL schema, shared by every platform</span>
+            </li>
+            <li>
+              <span class="cs-num">178</span>
+              <span class="cs-num-label">live queries in the web app, none with a refetch</span>
+            </li>
+            <li>
+              <span class="cs-num">0</span>
+              <span class="cs-num-label">hand-written API endpoints for reading or writing app data</span>
+            </li>
+            <li>
+              <span class="cs-num">16</span>
+              <span class="cs-num-label">services deployed from a single <code>sp00ky.yml</code></span>
+            </li>
+          </ul>
+
+          <div class="cs-summary">
+            <section>
+              <h2>The challenge</h2>
+              <p>
+                WhitePawn began in 2022 as an app that connected one electronic board to one phone.
+                Its users wanted more: their Lichess and Chess.com games in one place, clubs,
+                messages, calls, puzzles and live play, on every device they own. A platform like
+                that normally needs a backend team.
+              </p>
+            </section>
+            <section>
+              <h2>The approach</h2>
+              <p>
+                Put everything into a schema and a config file. Tables and permissions in
+                SurrealQL, screens as live queries, writes straight to the local store, background
+                work as schedules and workflows, and the whole stack deployed with
+                <code>spky deploy</code>.
+              </p>
+            </section>
+            <section>
+              <h2>The result</h2>
+              <p>
+                In ten months, one developer took the web app from a first commit to a platform with
+                sixteen services, then brought the Flutter apps onto the same schema. September
+                2026 alone added a puzzle store, clubs, paid plans, AI connectors and live play.
+              </p>
+            </section>
+          </div>
+
+          <figure class="cs-shot">
+            <div class="cs-shot-frame">
+              <div class="cs-shot-bar" aria-hidden="true">
+                <i></i><i></i><i></i><span>web.whitepawn.app</span>
+              </div>
+              <Image
+                src={portalShot}
+                alt="WhitePawn's games database in the browser: collections from Lichess, Chess.com and imported databases, each listing recent games with players, ratings, results and dates."
+                widths={[768, 1280, 1920, 2520]}
+                sizes="(min-width: 1200px) 1180px, 100vw"
+                format="webp"
+                quality={85}
+              />
+            </div>
+            <figcaption>
+              The games database. Nearly 11,000 games from Lichess, Chess.com and imported
+              collections, every list a live query. Import a PGN on your phone and it shows up here
+              without a reload.
+            </figcaption>
+          </figure>
+        </div>
+      </header>
+
+      <!-- What they did not build -->
+      <section class="cs-section" aria-labelledby="ledger-title">
+        <div class="cs-panel">
+          <div class="cs-wrap">
+            <div class="cs-section-head">
+              <p class="cs-kicker">What WhitePawn did not build</p>
+              <h2 id="ledger-title">
+                The backend a chess platform usually needs, <span class="serif"><em>and what replaced it.</em></span>
+              </h2>
+            </div>
+            <div class="cs-ledger">
+              <div>
+                <div class="cs-ledger-cols" aria-hidden="true">
+                  <span>Usually built by hand</span>
+                  <span>What WhitePawn wrote instead</span>
+                </div>
+                <ul class="cs-ledger-list">
+                  {
+                    ledger.map((row) => (
+                      <li>
+                        <span class="would">{row.would}</span>
+                        <span class="got" set:html={row.got} />
+                      </li>
+                    ))
+                  }
+                </ul>
+              </div>
+              <aside class="cs-ledger-aside">
+                <div class="cs-bignum">0</div>
+                <p>
+                  hand-written endpoints for WhitePawn's own data. The web app does make 26
+                  <code>fetch</code> calls, and none of them reads or writes app data. They go to
+                  Lichess sign-in, LiveKit tokens, password resets, Stripe, Twitch and the
+                  livestream relay.
+                </p>
+                <p>
+                  The backends that do exist are small and single-minded. The Lichess and Chess.com
+                  importer is 1,138 lines. Each one does its job and leaves the data plumbing to
+                  sp00ky.
+                </p>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Build walkthrough -->
+      <section class="cs-section" aria-labelledby="build-title">
+        <div class="cs-wrap">
+          <div class="cs-section-head">
+            <p class="cs-kicker">How it is built</p>
+            <h2 id="build-title">
+              Seven steps, <span class="serif"><em>straight from the repository.</em></span>
+            </h2>
+            <p>
+              This is the path every WhitePawn feature takes, from table to production. The code is
+              copied from WhitePawn's source, trimmed where marked with <code>...</code> but not
+              rewritten for this page.
+            </p>
+          </div>
+
+          <div class="cs-steps" data-steps>
+            <div>
+              {
+                steps.map((step, i) => (
+                  <article class={`cs-step${i === 0 ? ' is-active' : ''}`} data-step={i}>
+                    <span class="cs-step-n">{i + 1}</span>
+                    <h3>{step.title}</h3>
+                    {step.body.map((p) => (
+                      <p set:html={p} />
+                    ))}
+                    <p class="cs-saved">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                      <span>{step.saved}</span>
+                    </p>
+                    <div class="cs-step-code-inline">
+                      {step.code.map((c) => (
+                        <CodeCard {...c} />
+                      ))}
+                    </div>
+                  </article>
+                ))
+              }
+            </div>
+            <div class="cs-codes" aria-hidden="true">
+              {
+                steps.map((step, i) => (
+                  <div class={`cs-code${i === 0 ? ' is-active' : ''}`} data-code={i}>
+                    {step.code.map((c) => (
+                      <CodeCard {...c} />
+                    ))}
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Interactive demo -->
+      <section class="cs-section" aria-labelledby="demo-title">
+        <div class="cs-panel">
+          <div class="cs-wrap">
+            <div class="cs-section-head">
+              <p class="cs-kicker">See the flow</p>
+              <h2 id="demo-title">
+                Two players, two platforms, <span class="serif"><em>one row.</em></span>
+              </h2>
+              <p>
+                Alice plays white in the web app. Bob plays black on his phone. Each move is a
+                local write: it is on the mover's board at once, goes up to SurrealDB, and comes
+                down to the other device through its live query. Take Bob's phone offline halfway
+                through and watch his move wait in the outbox until he is back.
+              </p>
+            </div>
+            <SyncDemo client:visible />
+            <p class="cs-tl-note">
+              A re-enactment, slowed down so the round trip is visible. In production, a write takes
+              a median of 29 ms to pass through WhitePawn's whole sync engine.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- The hub: vault, onboarding, agents -->
+      <section class="cs-section" aria-labelledby="hub-title">
+        <div class="cs-wrap">
+          <div class="cs-section-head">
+            <p class="cs-kicker">Beyond sync</p>
+            <h2 id="hub-title">
+              sp00ky became the hub, <span class="serif"><em>for people and for agents.</em></span>
+            </h2>
+            <p>
+              Once the schema, the services and the deploys lived in sp00ky, two more things moved
+              in: every secret the platform needs, and the AI agents that build and operate it.
+              Both now read from the same place, and that is what made WhitePawn AI native rather
+              than AI assisted.
+            </p>
+          </div>
+
+          <ul class="cs-hubnums" aria-label="The hub in numbers">
+            <li>
+              <span class="cs-num">40</span>
+              <span class="cs-num-label">secrets in one shared vault, used by 11 of the 16 services</span>
+            </li>
+            <li>
+              <span class="cs-num">1</span>
+              <span class="cs-num-label">encrypted value per secret and environment, however many services read it</span>
+            </li>
+            <li>
+              <span class="cs-num">605</span>
+              <span class="cs-num-label">of 839 commits written together with AI agents; 355 of 370 since September</span>
+            </li>
+          </ul>
+
+          <!-- Vault -->
+          <div class="cs-hub-block">
+            <div class="cs-hub-text">
+              <h3>One vault, and no secret drifts</h3>
+              <p>
+                WhitePawn's services need Stripe, RevenueCat, LiveKit, Resend, Google sign-in and a
+                set of signing keys between them. None of those values is in the repository. Each
+                <code>sp00ky.app.yml</code> lists the <strong>names</strong> of the secrets it needs,
+                and <code>spky deploy</code> fills them in from the team's shared vault, server side.
+              </p>
+              <p>
+                There is exactly one encrypted copy of each value per environment. When four services
+                verify the same token signature, they read the same key. Rotating it is one
+                <code>spky env set</code>, and the next deploy hands the new value to every service
+                that names it. For every service sp00ky deploys, there is no second <code>.env</code> to
+                forget, no stale copy on a laptop, and no CI variable that quietly disagrees with
+                production.
+              </p>
+              <p>
+                Everyone who can decrypt holds their own passphrase, which never leaves their
+                machine. Removing someone deletes their copy of the vault key and revokes their API
+                keys, without re-encrypting a single secret.
+              </p>
+            </div>
+            <div class="cs-hub-visual">
+              <CodeCard
+                file="apps/commentator/sp00ky.app.yml"
+                lang="yaml"
+                code={`env:
+  - dev:
+      PORT: "3674"
+      ...
+  - cloud:
+      vault:
+        [
+          # Shared with the relay: authenticates its session PUT/DELETE calls.
+          "COMMENTATOR_SECRET",
+          ...
+          "DASHSCOPE_API_KEY",
+        ]`}
+              />
+              <figure class="cs-matrix">
+                <figcaption>Secrets several services share. One stored value each.</figcaption>
+                <div class="cs-matrix-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th scope="col"><span class="sr-only">Secret</span></th>
+                        {vaultServices.map((svc) => <th scope="col">{svc}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {
+                        sharedSecrets.map((row) => (
+                          <tr>
+                            <th scope="row">
+                              <code>{row.key}</code>
+                              {row.note && <span class="note">{row.note}</span>}
+                            </th>
+                            {vaultServices.map((svc) =>
+                              row.used.includes(svc) ? (
+                                <td>
+                                  <span class="dot" aria-label="reads this secret" />
+                                </td>
+                              ) : (
+                                <td>
+                                  <span class="sr-only">no</span>
+                                </td>
+                              ),
+                            )}
+                          </tr>
+                        ))
+                      }
+                    </tbody>
+                  </table>
+                </div>
+              </figure>
+            </div>
+          </div>
+
+          <!-- Onboarding -->
+          <div class="cs-onboard">
+            <div class="cs-onboard-head">
+              <h3>Onboarding is three commands</h3>
+              <p>
+                WhitePawn has no onboarding document, and does not need one. There is no list of
+                forty variables to request, no password-manager folder to share, no afternoon spent
+                finding out which <code>.env</code> is current. The config file is the guide, and
+                the vault travels with the invite.
+              </p>
+            </div>
+            <ol class="cs-onboard-steps">
+              {
+                onboarding.map((step, i) => (
+                  <li>
+                    <span class="cs-step-n">{i + 1}</span>
+                    <h4>{step.title}</h4>
+                    <p class="who">{step.who}</p>
+                    <pre class="cs-term"><span aria-hidden="true">$ </span>{step.cmd}</pre>
+                    <p>{step.text}</p>
+                  </li>
+                ))
+              }
+            </ol>
+            <p class="cs-onboard-foot">
+              Agents onboard the same way. An MCP token is read-only unless you grant more, and
+              secret values stay masked unless the token carries <code>secrets:reveal</code>. You can
+              hand an agent the whole operating surface without handing it a single secret.
+            </p>
+          </div>
+        </div>
+
+        <!-- Agents -->
+        <div class="cs-panel cs-agents">
+          <div class="cs-wrap">
+            <div class="cs-section-head">
+              <p class="cs-kicker">Agents that can see the system</p>
+              <h3 class="cs-h2">
+                Three MCP servers, <span class="serif"><em>one picture of what is really happening.</em></span>
+              </h3>
+              <p>
+                An AI agent that can only read code has to guess what production is doing. sp00ky
+                gives WhitePawn's agents the same view the admin dashboard has, over the Model Context
+                Protocol: the running app, the cloud account and the live cluster. The agent reads
+                incidents, job attempts, logs and view statistics itself, finds the cause, and comes
+                back with a fix instead of a question.
+              </p>
+            </div>
+
+            <ul class="cs-mcp">
+              {
+                mcpServers.map((m) => (
+                  <li>
+                    <p class="sees">{m.sees}</p>
+                    <h4>{m.name} MCP</h4>
+                    <p>{m.what}</p>
+                    <p class="tools">
+                      {m.tools.map((t) => (
+                        <code>{t}</code>
+                      ))}
+                    </p>
+                  </li>
+                ))
+              }
+            </ul>
+
+            <div class="cs-session">
+              <div class="cs-session-text">
+                <h4>One incident, start to finish</h4>
+                <p>
+                  On 26 September two players' game imports stopped. This is the agent session that
+                  handled it, reconstructed and trimmed. The tool names are real; the output is
+                  summarized.
+                </p>
+                <p>
+                  The whole investigation ran through MCP: no dashboard, no SSH session, no log
+                  grep. The developer's part was reading the conclusion and deciding.
+                </p>
+              </div>
+              <ol class="cs-transcript" aria-label="Agent session, 26 September 2026">
+                {
+                  transcript.map((line) => (
+                    <li class={`t-${line.kind}`}>
+                      <span class="t-tag">
+                        {line.kind === 'event'
+                          ? 'incident'
+                          : line.kind === 'call'
+                            ? 'tool'
+                            : line.kind === 'out'
+                              ? 'result'
+                              : line.kind === 'agent'
+                                ? 'agent'
+                                : 'shipped'}
+                      </span>
+                      <span class="t-text">{line.text}</span>
+                    </li>
+                  ))
+                }
+              </ol>
+            </div>
+
+            <div class="cs-incidents-head">
+              <h4>September, as the agents saw it</h4>
+              <p>
+                Five production problems, each diagnosed by an agent reading sp00ky's state and fixed
+                with its help. Several were silent: nothing on screen looked wrong.
+              </p>
+            </div>
+            <ol class="cs-incidents">
+              {
+                incidents.map((inc) => (
+                  <li>
+                    <time>{inc.date}</time>
+                    <p class="read">
+                      {inc.read.map((t) => (
+                        <code>{t}</code>
+                      ))}
+                    </p>
+                    <p class="found">{inc.found}</p>
+                    <p class="fix">{inc.fix}</p>
+                  </li>
+                ))
+              }
+            </ol>
+            <p class="cs-tl-note">
+              Every write an agent makes goes through the same admin router as the dashboard's
+              buttons, and the audit log records the label of the token that made it. The live
+              numbers on this page were read through the same admin MCP server.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Results -->
+      <section class="cs-section" aria-labelledby="results-title">
+        <div class="cs-wrap">
+          <div class="cs-section-head">
+            <p class="cs-kicker">Results</p>
+            <h2 id="results-title">
+              Ten months of shipping, <span class="serif"><em>by one person.</em></span>
+            </h2>
+            <p>
+              Commits per month to the WhitePawn repository, with what shipped along the way. The
+              quiet winter went into sp00ky itself, with 347 commits there in December and January.
+              From June on, the web and Flutter apps share one schema.
+            </p>
+          </div>
+
+          <ol class="cs-tl" aria-label="Commits per month, November 2025 to September 2026">
+            {
+              months.map((m) => (
+                <li class={m.milestone ? 'is-milestone' : ''} style={`--v: ${m.commits / maxCommits}`}>
+                  <span class="cs-tl-bar">
+                    <span class="cs-tl-n">{m.commits}</span>
+                  </span>
+                </li>
+              ))
+            }
+          </ol>
+          <ol class="cs-tl-months" aria-hidden="true">
+            {months.map((m) => <li class={m.milestone ? 'is-milestone' : ''}>{m.label}</li>)}
+          </ol>
+
+          <ol class="cs-milestones">
+            {
+              milestones.map((m) => (
+                <li>
+                  <time>{m.when}</time>
+                  <strong>{m.what}</strong>
+                  <p>{m.detail}</p>
+                </li>
+              ))
+            }
+          </ol>
+
+          <div class="cs-proof">
+            <div>
+              <span class="cs-num">~38k</span>
+              <p>chess games in WhitePawn's synced database, as of September 2026.</p>
+            </div>
+            <div>
+              <span class="cs-num">~100</span>
+              <p>live queries held open by a single signed-in session, all kept current by one sync channel.</p>
+            </div>
+            <div>
+              <span class="cs-num">29 ms</span>
+              <p>median time for a write to pass through the whole sync engine, measured by the production heartbeat.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Quote -->
+      <section class="cs-section" aria-label="In WhitePawn's words">
+        <figure class="cs-quote">
+          <blockquote>
+            <p>
+              I stopped writing the parts every app has. A new feature in WhitePawn is a table, a
+              query in a component and sometimes a small backend. There is no API to keep in step
+              with two apps, so the time goes into chess.
+            </p>
+            <footer>
+              <strong>Khadim Fall</strong>
+              Developer of WhitePawn and creator of sp00ky
+            </footer>
+          </blockquote>
+          <Image
+            src={studioArt}
+            alt="Watercolor of a bright studio with open glass doors, where people sit at a long table with chessboards and laptops."
+            widths={[640, 960, 1180]}
+            sizes="(min-width: 860px) 50vw, 100vw"
+            format="webp"
+            quality={70}
+          />
+        </figure>
+      </section>
+
+      <!-- Honest limits -->
+      <section class="cs-section" aria-labelledby="limits-title">
+        <div class="cs-wrap">
+          <div class="cs-section-head">
+            <p class="cs-kicker">Where it still takes work</p>
+            <h2 id="limits-title">
+              Not everything is a live query, <span class="serif"><em>yet.</em></span>
+            </h2>
+            <p>
+              A case study that only lists the wins is not much use to you. These are the places
+              where WhitePawn still steps outside the happy path.
+            </p>
+          </div>
+          <ul class="cs-caveats">
+            <li>
+              <h3>Aggregates are read once, not live</h3>
+              <p>
+                Live queries cannot run <code>count()</code> or similar aggregates yet. Eighteen
+                screens, mostly totals and statistics, still use one-shot remote reads, each marked
+                in the code with what it is waiting for.
+              </p>
+            </li>
+            <li>
+              <h3>Very large tables stay on the server</h3>
+              <p>
+                Engine analysis alone was 636k of the database's 738k rows. Syncing it to every
+                device would not help anyone, so the table is marked <code>@nosync</code> and read on demand. Deciding what
+                lives on the device is still a design decision.
+              </p>
+            </li>
+            <li>
+              <h3>One secret still lives twice</h3>
+              <p>
+                The livestream renderer is built by a GitHub Actions workflow outside sp00ky, so its
+                upload password is mirrored into GitHub secrets by hand. It is the one value in
+                WhitePawn that can drift, and the workflow file says so.
+              </p>
+            </li>
+            <li>
+              <h3>Being first means finding the edges</h3>
+              <p>
+                WhitePawn runs every sp00ky release before anyone else does, so it has met the rough
+                spots first. Many sp00ky fixes and features, from local-first boot to machine pools,
+                started as a WhitePawn problem.
+              </p>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Lessons -->
+      <section class="cs-section" aria-labelledby="lessons-title">
+        <div class="cs-wrap">
+          <div class="cs-section-head">
+            <p class="cs-kicker">For your team</p>
+            <h2 id="lessons-title">
+              What a small team can take <span class="serif"><em>from WhitePawn.</em></span>
+            </h2>
+          </div>
+          <ul class="cs-lessons">
+            <li>
+              <h3>Put the rules in the schema</h3>
+              <p>
+                Write each permission once, next to the table. The database enforces it for writes
+                and sp00ky applies it to every live query, so there is no second copy to forget.
+              </p>
+            </li>
+            <li>
+              <h3>Make every screen a live query</h3>
+              <p>
+                Once nothing is fetched by hand, nothing can go stale. Multi-tab, multi-device and
+                offline stop being features you build and become things you get.
+              </p>
+            </li>
+            <li>
+              <h3>Keep background work in config</h3>
+              <p>
+                Schedules and workflows in <code>sp00ky.yml</code> keep backends down to one job each.
+                WhitePawn's importer, email and link-preview services are each a few thousand lines
+                or less.
+              </p>
+            </li>
+            <li>
+              <h3>Share one schema across platforms</h3>
+              <p>
+                Web and Flutter read the same tables with generated types. A new column is one
+                migration and one <code>spky generate</code>, not three pull requests.
+              </p>
+            </li>
+            <li>
+              <h3>Let agents read the real state</h3>
+              <p>
+                Most of WhitePawn's commits were written together with AI agents. Give yours a
+                read-only MCP token for the cluster and the account, and they debug from what
+                production is doing instead of guessing from the code.
+              </p>
+            </li>
+            <li>
+              <h3>Keep one copy of every secret</h3>
+              <p>
+                Put secret names in the config and values in the vault. Onboarding becomes an invite,
+                offboarding deletes one key, and a rotated secret reaches every service on the next
+                deploy.
+              </p>
+            </li>
+            <li>
+              <h3>Ship the stack with the app</h3>
+              <p>
+                When the database, sync engine, backends and machines deploy from the same file as
+                the schema, a feature is done when it is merged, not when someone has updated the
+                infrastructure.
+              </p>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- Fit -->
+      <section class="cs-section" aria-labelledby="fit-title">
+        <div class="cs-wrap">
+          <div class="cs-section-head">
+            <p class="cs-kicker">Is it a fit</p>
+            <h2 id="fit-title">
+              When sp00ky is the right call, <span class="serif"><em>and when it is not.</em></span>
+            </h2>
+          </div>
+          <div class="cs-fit">
+            <div>
+              <h3>A good fit if you are building</h3>
+              <ul>
+                <li>An app where several people or devices see the same data change</li>
+                <li>Something that should keep working on a train or in a basement club</li>
+                <li>Web and mobile clients on one data model</li>
+                <li>With a team too small to own an API, a cache and a job queue</li>
+              </ul>
+            </div>
+            <div>
+              <h3>Probably not the right tool if</h3>
+              <ul>
+                <li>Your screens are mostly analytics over millions of rows</li>
+                <li>You need to stay on Postgres or another existing database</li>
+                <li>You want a stable 1.0 today; sp00ky ships on a canary channel</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CTA -->
+      <section class="cs-cta" aria-labelledby="cta-title">
+        <div class="cs-narrow">
+          <Image
+            src={togetherArt}
+            alt=""
+            widths={[320, 480]}
+            sizes="240px"
+            format="webp"
+            quality={80}
+            style="width: 240px; height: auto; margin: 0 auto 40px; border-radius: 18px;"
+          />
+          <h2 id="cta-title">Build the part only you can build.</h2>
+          <p>
+            Start with a schema and a live query. The quickstart gets you from an empty folder to an
+            app syncing between two tabs in about five minutes.
+          </p>
+          <div class="cs-cta-row">
+            <a class="cs-btn cs-btn-primary" href={`${basePath}/docs/quickstart`}>Open the quickstart</a>
+            <a class="cs-btn cs-btn-ghost" href={`${basePath}/docs/how-it-works`}>See how sp00ky works</a>
+          </div>
+          <p class="cs-install"><span>$ </span>npx @spooky-sync/cli@canary create</p>
+        </div>
+      </section>
+    </main>
+
+    <SiteFooter />
+
+    <script>
+      // Scroll-linked walkthrough: the step nearest the middle of the viewport is
+      // active, and its code shows in the sticky column. Narrow screens show the
+      // code inline under each step instead, so they skip this.
+      const root = document.querySelector<HTMLElement>('[data-steps]');
+      const wide = window.matchMedia('(min-width: 901px)');
+      if (root) {
+        const steps = [...root.querySelectorAll<HTMLElement>('[data-step]')];
+        const codes = [...root.querySelectorAll<HTMLElement>('[data-code]')];
+        const activate = (i: number) => {
+          steps.forEach((s, j) => s.classList.toggle('is-active', i === j));
+          codes.forEach((c, j) => c.classList.toggle('is-active', i === j));
+        };
+        const observer = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) activate(Number((entry.target as HTMLElement).dataset.step));
+            }
+          },
+          { rootMargin: '-45% 0px -50% 0px' },
+        );
+        const sync = () => {
+          root.classList.toggle('is-enhanced', wide.matches);
+          steps.forEach((s) => (wide.matches ? observer.observe(s) : observer.unobserve(s)));
+        };
+        sync();
+        wide.addEventListener('change', sync);
+      }
+    </script>
+  </body>
+</html>

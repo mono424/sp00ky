@@ -1,0 +1,29 @@
+---
+import { Code } from 'astro:components';
+
+export interface Props {
+  /** Path in the customer's repository, shown as the card's title. */
+  file: string;
+  lang: string;
+  code: string;
+}
+
+const { file, lang, code } = Astro.props;
+const LANG_LABEL: Record<string, string> = {
+  surrealql: 'SurrealQL',
+  yaml: 'YAML',
+  ts: 'TypeScript',
+  jsx: 'SolidJS',
+  js: 'JavaScript',
+  dart: 'Dart',
+  bash: 'Shell',
+};
+---
+
+<div class="cs-codecard">
+  <div class="cs-codecard-head">
+    <span class="file">{file}</span>
+    <span class="lang">{LANG_LABEL[lang] ?? lang}</span>
+  </div>
+  <Code code={code} lang={lang as any} theme="vitesse-dark" />
+</div>

@@ -31,7 +31,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `mode` | `singlenode` \| `cluster` \| `surrealism` | `singlenode` | Deployment topology. `singlenode` runs one SSP, `cluster` runs multiple, `surrealism` is for embedded setups. |
+| `mode` | `singlenode` \| `cluster` \| `surrealism` | `singlenode` | Deployment topology. `singlenode` is one SSP with no scheduler, `cluster` puts a scheduler in front of one or more SSPs, `surrealism` is for embedded setups. See [Self-hosting](/docs/self-hosting). |
 | `slug` | string | (none) | Project slug used by `spky deploy` and the other cloud commands. |
 | `surrealdb` | object | (none) | DB connection. Sub-fields: `namespace`, `database`, `username`, `password`, `hosting` (`cloud` or `external`), `endpoint` (required when `hosting: external`). |
 | `schema` | path | (none) | Directory containing your `.surql` schema sources. See [Schema](/docs/schema). |

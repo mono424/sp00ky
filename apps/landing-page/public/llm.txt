@@ -68,7 +68,7 @@ one-command deploys.
 - [Backups](https://sp00ky.cloud/docs/cloud/backups): Create, list and restore database snapshots, and schedule them to run automatically.
 - [CI/CD](https://sp00ky.cloud/docs/cloud/ci-cd): API keys for automated deploys, and GitHub push-to-deploy.
 - [Teams](https://sp00ky.cloud/docs/cloud/team): Invite members, manage roles, and handle vault passphrase resets.
-- [Self-hosting](https://sp00ky.cloud/docs/self-hosting): Run the scheduler and SSP yourself, single node or distributed, with the environment variables each needs.
+- [Self-hosting](https://sp00ky.cloud/docs/self-hosting): Run sp00ky on your own server with Docker Compose. SurrealDB and one SSP is a complete setup; add the scheduler for the dashboard. Every SSP and scheduler environment variable.
 
 ### Reference
 

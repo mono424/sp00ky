@@ -1,142 +1,331 @@
 ---
 layout: ../../layouts/DocsLayout.astro
 title: Self-hosting
-description: Run the scheduler and SSP yourself, single node or distributed, with the environment variables each needs.
+description: Run sp00ky on your own server with Docker Compose. SurrealDB and one SSP is a complete setup, big projects included.
 ---
 
 import CodeBlock from '../../components/ui/CodeBlock.astro';
 import Note from '../../components/ui/Note.astro';
 import Warning from '../../components/ui/Warning.astro';
+import Steps from '../../components/ui/Steps.astro';
+import Step from '../../components/ui/Step.astro';
 import CardGrid from '../../components/ui/CardGrid.astro';
 import LinkCard from '../../components/ui/LinkCard.astro';
 
-export const code2 = `services:
+export const envFile = `# Your images and your CLI must be the same version (spky --version)
+SPOOKY_VERSION=0.0.1-canary.283
+
+# The domain your app connects to. Point its DNS at this server.
+DB_DOMAIN=db.example.com
+
+# Long random values, e.g. from: openssl rand -hex 32
+SURREAL_PASS=change-me
+SPKY_AUTH_SECRET=change-me`;
+
+export const caddyFile = `{$DB_DOMAIN} {
+	reverse_proxy surrealdb:8000
+}`;
+
+export const composeSingle = `services:
   surrealdb:
     image: surrealdb/surrealdb:v3.1.0-beta.3
-    command: start --user root --pass root rocksdb:/data/db
-    ports:
-      - "8666:8000"
+    user: root
+    command: start --allow-all rocksdb:/data/db
+    environment:
+      SURREAL_USER: root
+      SURREAL_PASS: \${SURREAL_PASS}
+      SURREAL_CAPS_ALLOW_EXPERIMENTAL: files,surrealism
     volumes:
-      - ./data:/data
+      - surrealdb:/data
+    restart: unless-stopped
 
   ssp:
-    image: ghcr.io/sp00ky-org/ssp-server:canary
+    image: mono424/spooky-ssp:\${SPOOKY_VERSION}
     environment:
-      - SPKY_DB_WS=ws://surrealdb:8000
-      - SPKY_DB_USER=root
-      - SPKY_DB_PASS=root
-      - SPKY_DB_NS=main
-      - SPKY_DB_NAME=app
-      - SPKY_SSP_LISTEN_ADDR=0.0.0.0:8667
-      - SPKY_AUTH_SECRET=your-secret-token
-      - SPKY_SSP_REF_MODE=dedicated
+      SPKY_DB_URL: http://surrealdb:8000
+      SPKY_DB_NS: main
+      SPKY_DB_NAME: main
+      SPKY_DB_USER: root
+      SPKY_DB_PASS: \${SURREAL_PASS}
+      SPKY_AUTH_SECRET: \${SPKY_AUTH_SECRET}
+      # Restart from a snapshot instead of re-reading the whole database
+      SPKY_SSP_SNAPSHOT_DIR: /data/snapshot
+      SPKY_SSP_ARENA_DIR: /data/arena
+    volumes:
+      - ssp:/data
     ports:
-      - "8667:8667"
+      - "127.0.0.1:8667:8667" # health checks from the server only
     depends_on:
-      - surrealdb`;
+      - surrealdb
+    restart: unless-stopped
 
-export const code1 = `services:
+  caddy:
+    image: caddy:2
+    environment:
+      DB_DOMAIN: \${DB_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+    restart: unless-stopped
+
+volumes:
   surrealdb:
-    image: surrealdb/surrealdb:v3.1.0-beta.3
-    command: start --user root --pass root rocksdb:/data/db
-    ports:
-      - "8666:8000"
+  ssp:
+  caddy:`;
+
+export const upCmd = `docker compose up -d
+curl localhost:8667/health`;
+
+export const applyCmd = `export SURREAL_URL=https://db.example.com
+export SURREAL_PASS=<SURREAL_PASS from .env>
+
+spky migrate apply --endpoint http://ssp:8667 --secret <SPKY_AUTH_SECRET from .env>`;
+
+export const clientCfg = `const dbConfig: SyncedDbConfig<typeof schema> = {
+  // ...
+  database: {
+    endpoint: 'wss://db.example.com/rpc',
+    namespace: 'main',
+    database: 'main',
+  },
+};`;
+
+export const schemaChange = `spky migrate create add_due_date
+spky migrate apply --endpoint http://ssp:8667 --secret <SPKY_AUTH_SECRET>`;
+
+export const upgradeCmd = `docker compose pull
+docker compose up -d
+spky migrate apply --endpoint http://ssp:8667 --secret <SPKY_AUTH_SECRET>`;
+
+export const jobCfg = `  ssp:
+    environment:
+      # ...
+      SPKY_JOB_CONFIG: '[{"name":"api","base_url":"http://api:3000","table":"job"}]'
+
+  api:
+    image: registry.example.com/my-api:latest
+    environment:
+      SPKY_DB_URL: http://surrealdb:8000
+      SPKY_DB_NS: main
+      SPKY_DB_NAME: main
+      SPKY_DB_USER: root
+      SPKY_DB_PASS: \${SURREAL_PASS}
+    restart: unless-stopped`;
+
+export const composeScheduler = `  scheduler:
+    image: mono424/spooky-scheduler:\${SPOOKY_VERSION}
+    environment:
+      SPKY_DB_URL: http://surrealdb:8000
+      SPKY_DB_NS: main
+      SPKY_DB_NAME: main
+      SPKY_DB_USER: root
+      SPKY_DB_PASS: \${SURREAL_PASS}
+      SPKY_AUTH_SECRET: \${SPKY_AUTH_SECRET}
+      SPKY_ADMIN_PASSWORD: \${SPKY_ADMIN_PASSWORD}
     volumes:
-      - surreal-data:/data
-
-  scheduler:
-    image: ghcr.io/sp00ky-org/scheduler:canary
-    environment:
-      - SPKY_DB_WS=ws://surrealdb:8000
-      - SPKY_DB_NS=main
-      - SPKY_DB_NAME=app
-      - SPKY_DB_USER=root
-      - SPKY_DB_PASS=root
-      - SPKY_SCHEDULER_ID=scheduler-01
-      - SPKY_AUTH_SECRET=your-secret-token
-    # Bind host/port and storage paths come from the scheduler's
-    # sp00ky.yml (ingest_host, ingest_port, replica_db_path, wal_path).
+      - scheduler:/data # replica and write-ahead log
     ports:
-      # 9668 is the admin plane: the operator dashboard and its MCP server.
-      # This is the only scheduler port you publish. 9667 stays internal.
-      - "127.0.0.1:9668:9668"
-    volumes:
-      - scheduler-data:/app/data
+      - "127.0.0.1:9668:9668" # dashboard. Never publish 9667.
     depends_on:
       - surrealdb
+    restart: unless-stopped
 
-  ssp-1:
-    image: ghcr.io/sp00ky-org/ssp-server:canary
+  ssp:
+    image: mono424/spooky-ssp:\${SPOOKY_VERSION}
     environment:
-      - SPKY_SSP_ID=ssp-01
-      - SPKY_DB_WS=ws://surrealdb:8000
-      - SPKY_DB_USER=root
-      - SPKY_DB_PASS=root
-      - SPKY_DB_NS=main
-      - SPKY_DB_NAME=app
-      - SPKY_SSP_LISTEN_ADDR=0.0.0.0:8667
-      - SPKY_AUTH_SECRET=your-secret-token
-      - SPKY_SCHEDULER_URL=http://scheduler:9667
-      - SPKY_SSP_ADVERTISE_ADDR=ssp-1:8667
-      - SPKY_SSP_REF_MODE=dedicated
-      - HEARTBEAT_INTERVAL_MS=5000
-    ports:
-      - "8667:8667"
+      # ...everything from before, plus:
+      SPKY_SCHEDULER_URL: http://scheduler:9667
+      SPKY_SSP_ID: ssp-0
+      SPKY_SSP_ADVERTISE_ADDR: ssp:8667
     depends_on:
-      - surrealdb
-      - scheduler
-
-  ssp-2:
-    image: ghcr.io/sp00ky-org/ssp-server:canary
-    environment:
-      - SPKY_SSP_ID=ssp-02
-      - SPKY_DB_WS=ws://surrealdb:8000
-      - SPKY_DB_USER=root
-      - SPKY_DB_PASS=root
-      - SPKY_DB_NS=main
-      - SPKY_DB_NAME=app
-      - SPKY_SSP_LISTEN_ADDR=0.0.0.0:8667
-      - SPKY_AUTH_SECRET=your-secret-token
-      - SPKY_SCHEDULER_URL=http://scheduler:9667
-      - SPKY_SSP_ADVERTISE_ADDR=ssp-2:8667
-      - SPKY_SSP_REF_MODE=dedicated
-      - HEARTBEAT_INTERVAL_MS=5000
-    ports:
-      - "8668:8667"
-    depends_on:
-      - surrealdb
       - scheduler
 
 volumes:
-  surreal-data:
-  scheduler-data:`;
+  # ...
+  scheduler:`;
 
-Deploying Sp00ky requires running the **Sp00ky Sidecar (SSP)** alongside your SurrealDB instance. For production deployments, the **Scheduler** coordinates multiple SSP instances.
+export const applyCluster = `spky migrate apply --endpoint http://scheduler:9667 --secret <SPKY_AUTH_SECRET>`;
 
-## Architecture
+export const tunnelCmd = `ssh -L 9668:localhost:9668 you@your-server
+# then open http://localhost:9668/admin`;
 
-1.  **SurrealDB**: Your persistent data store.
-2.  **Sp00ky SSP (Sidecar)**: A backend service that monitors SurrealDB for changes and maintains materialized views.
-3.  **Scheduler** *(optional)*: Central coordinator for distributed deployments with multiple SSPs. Maintains a RocksDB snapshot replica and WAL.
-4.  **Client**: Connects directly to SurrealDB.
+export const caddyAdmin = `{$DB_DOMAIN} {
+	reverse_proxy surrealdb:8000
+}
 
-## Single Node (Development)
+admin.example.com {
+	reverse_proxy scheduler:9668
+}`;
 
-The simplest setup for development and testing. No scheduler needed.
+export const composeSecondSsp = `  ssp-1:
+    image: mono424/spooky-ssp:\${SPOOKY_VERSION}
+    environment:
+      # ...same as ssp, except:
+      SPKY_SSP_ID: ssp-1
+      SPKY_SSP_ADVERTISE_ADDR: ssp-1:8667
+    volumes:
+      - ssp-1:/data
+    depends_on:
+      - scheduler
+    restart: unless-stopped
 
-<CodeBlock
-  code={code2}
-  lang="yaml"
-/>
+volumes:
+  # ...
+  ssp-1:`;
 
-## Distributed (Production)
+A self-hosted sp00ky is two containers. **SurrealDB** holds your data, and the
+**SSP** keeps every live query up to date. Your app connects to SurrealDB
+directly, so the SSP never has to be reachable from the internet.
 
-For production with high availability and horizontal scaling, use a Scheduler with multiple SSP instances.
+```mermaid
+sequenceDiagram
+    participant App as Your app
+    participant DB as SurrealDB
+    participant SSP
+    App->>DB: reads and writes over wss://db.example.com
+    DB->>SSP: every change, through the sync events
+    SSP->>DB: updated query results
+    DB-->>App: live update
+```
 
-<CodeBlock
-  code={code1}
-  lang="yaml"
-/>
+<Note title="One SSP is enough">
+A single SSP serves every live query for every connected user, and also runs
+your jobs, schedules, workflows, backend health checks and backups. It carries
+large projects on its own. Add a [scheduler](#add-the-scheduler) when you want
+the operator dashboard, and a second SSP only when one machine runs out of
+memory or CPU.
+</Note>
+
+## What you need
+
+- A Linux server with Docker and Docker Compose, ports 80 and 443 open.
+- A domain for the database, for example `db.example.com`, with its DNS pointing
+  at the server. Caddy uses it to get a TLS certificate automatically.
+- Your sp00ky project and the `spky` CLI on your own machine.
+
+## Set it up
+
+<Steps>
+  <Step title="Write the .env file">
+    On the server, create an empty directory with a `.env` file in it. Compose
+    reads it automatically, and every value below is used in the next steps.
+
+    <CodeBlock code={envFile} lang="bash" fileName=".env" />
+  </Step>
+
+  <Step title="Add the Caddyfile and docker-compose.yml">
+    Caddy terminates TLS for your domain and forwards it to SurrealDB,
+    WebSockets included. If you already run a reverse proxy, drop the `caddy`
+    service and point your proxy at `surrealdb:8000` instead.
+
+    <CodeBlock code={caddyFile} lang="text" fileName="Caddyfile" />
+
+    <CodeBlock code={composeSingle} lang="yaml" fileName="docker-compose.yml" />
+
+    `SPKY_DB_NS` and `SPKY_DB_NAME` must match `surrealdb.namespace` and
+    `surrealdb.database` in your `sp00ky.yml`. Both default to `main`.
+  </Step>
+
+  <Step title="Start it">
+    <CodeBlock code={upCmd} lang="bash" />
+
+    The SSP answers with a short JSON status. Once it contains
+    `"status":"ready"`, it is up.
+  </Step>
+
+  <Step title="Apply your schema">
+    From your project directory on your own machine, apply your migrations
+    together with the sync events sp00ky adds to every table:
+
+    <CodeBlock code={applyCmd} lang="bash" />
+
+    - `SURREAL_URL` is how **your machine** reaches SurrealDB.
+    - `--endpoint` is how **SurrealDB** reaches the SSP. The sync events call
+      it on every write, from inside the Docker network, so it is the service
+      name `ssp` and not your domain.
+    - `--secret` must be the exact `SPKY_AUTH_SECRET` from `.env`, or the SSP
+      rejects every change.
+  </Step>
+
+  <Step title="Point your app at it">
+    Set the client's endpoint to your domain. Namespace and database are the
+    same as above.
+
+    <CodeBlock code={clientCfg} lang="typescript" />
+
+    If your client sets `enableAnonymousLiveQueries: true`, add
+    `SPKY_SSP_ANON_LIVE_QUERIES: "true"` to the SSP as well. The two must agree,
+    or signed-out users get no live updates.
+  </Step>
+</Steps>
+
+That is a complete production setup. Everything below is optional.
+
+## Everyday tasks
+
+### Change the schema
+
+Create a migration as usual, then apply it with the same command as the first
+time:
+
+<CodeBlock code={schemaChange} lang="bash" />
+
+The SSP notices new and changed tables on its own within 15 seconds. No restart
+needed.
+
+### Upgrade
+
+Update the CLI, set `SPOOKY_VERSION` in `.env` to the version it prints, then
+pull the new images and re-apply so the sync events match the new version:
+
+<CodeBlock code={upgradeCmd} lang="bash" />
+
+### Back up
+
+Add the `S3_*` variables from [Backup storage](#backup-storage) to the SSP and
+it can export SurrealDB to any S3-compatible bucket and restore from it,
+through the [backup routes](/docs/reference/ssp-api#standalone-maintenance). With
+the [scheduler](#add-the-scheduler), the dashboard does this for you.
+
+## Backends and jobs
+
+If your `sp00ky.yml` has [backends](/docs/backend) that take jobs from an
+outbox table, run each one as another service in the same compose file and tell
+the SSP where to send the jobs:
+
+<CodeBlock code={jobCfg} lang="yaml" fileName="docker-compose.yml" />
+
+`table` is the backend's outbox table (`method.table` in `sp00ky.yml`) and
+`base_url` is how the SSP reaches the backend on the Docker network. With no
+backends, leave `SPKY_JOB_CONFIG` out.
+
+## Add the scheduler
+
+The scheduler sits between SurrealDB and your SSPs. You still run one SSP. What
+you get:
+
+- The [operator dashboard](#operator-dashboard) and its [MCP server](/docs/reference/mcp).
+- A replica of your database, so an SSP restart loads from the replica instead
+  of reading everything from SurrealDB again.
+- An end-to-end heartbeat that can page you through a webhook, and drift checks
+  that repair the replica on their own.
+- The option to [run more SSPs](#run-more-than-one-ssp) later.
+
+To switch:
+
+1. Set `mode: cluster` in your `sp00ky.yml`.
+2. Add `SPKY_ADMIN_PASSWORD` (another long random value) to `.env`.
+3. Add the `scheduler` service and point the SSP at it:
+
+<CodeBlock code={composeScheduler} lang="yaml" fileName="docker-compose.yml" />
+
+4. Run `docker compose up -d`, then apply again with the scheduler as the
+   endpoint, since the sync events now go to the scheduler instead of the SSP:
+
+<CodeBlock code={applyCluster} lang="bash" />
 
 <Warning title="Never publish port 9667">
 The scheduler listens on two ports and they are not equivalent. Port **9667**
@@ -146,55 +335,58 @@ includes `POST /proxy/query`, which runs **arbitrary SurrealQL against the
 replica** for any caller that can open a socket to it. Publishing 9667 hands
 your database to the internet.
 
-Port **9668** is the admin plane. It is authenticated, and it is the one you
-publish, behind TLS. The example above binds it to `127.0.0.1` so you can put a
-reverse proxy in front of it rather than exposing it directly.
+Port **9668** is the admin plane. It is authenticated, and it is the only
+scheduler port you ever expose.
 </Warning>
 
-## Operator dashboard
+### Operator dashboard
 
-The scheduler image bundles a dashboard and serves it on the admin port at
-`/admin`. It shows the health of the scheduler and every SSP, the end-to-end
-sync latency, backend health, live logs, and workflow runs, and it can restart
-SSPs, cancel and retry workflow runs, pause schedules and take backups.
+The dashboard shows the health of the scheduler and every SSP, end-to-end sync
+latency, backend health, live logs and workflow runs. It can restart SSPs,
+cancel and retry workflow runs, pause schedules and take backups.
 
-Point a browser at `http://your-scheduler:9668/admin` and sign in one of two
-ways:
+The compose file above binds it to the server itself. Reach it over an SSH
+tunnel:
 
-- **An admin account.** `spky admin add <user>` puts an existing app user on
-  the `_00_admin` roster; they then sign in with their normal app credentials.
-  The roster starts empty, so until you add someone nobody can sign in this way.
-- **The break-glass password.** Set `SPKY_ADMIN_PASSWORD` on the scheduler and
-  sign in with that alone. It bypasses the roster, which is what makes it
-  useful when the database itself is the thing that is down, so the dashboard
-  shows a persistent banner while a session is using it.
+<CodeBlock code={tunnelCmd} lang="bash" />
 
-The same port also serves an **MCP server** at `/admin/api/mcp`, so an AI
-assistant can read the cluster and run the same actions. Tokens are minted from
+Or give it its own domain by adding a second block to the Caddyfile:
+
+<CodeBlock code={caddyAdmin} lang="text" fileName="Caddyfile" />
+
+Sign in with `SPKY_ADMIN_PASSWORD`, the break-glass login that works even when
+the database is down, or with a normal app account after `spky admin add <user>`
+puts it on the admin roster.
+
+The same port serves the [MCP server](/docs/reference/mcp) at `/admin/api/mcp`,
+so an AI assistant can read and operate the deployment with tokens minted on
 the dashboard's Access page.
 
-Everything works self-hosted except the actions that only Sp00ky Cloud can
-perform, because they act on containers rather than on processes: pulling newer
-images, wiping the scheduler volume, bouncing SurrealDB, and the backup
-catalog, schedule, retention and delete. Those answer `409` with `Not linked to
-Sp00ky Cloud`, and the dashboard shows them greyed out with that reason rather
-than hiding them. Backups themselves still work: configure the `S3_*` variables
-below and the dashboard lists the bucket directly.
+A few actions only work on Sp00ky Cloud, because they manage containers rather
+than processes: pulling newer images, wiping the scheduler volume, restarting
+SurrealDB, and the managed backup catalog, schedule and retention. The
+dashboard shows them greyed out with the reason `Not linked to Sp00ky Cloud`.
+See [Admin dashboard](/docs/reference/admin-dashboard) for the full surface.
 
-<Note>
-Sessions are signed with `SPKY_AUTH_SECRET` when you set one, which means they
-survive a scheduler restart. Without it they live in memory and every restart
-signs you out. See [Admin dashboard](/docs/reference/admin-dashboard) for the
-full surface and [MCP server](/docs/reference/mcp) for the agent side.
-</Note>
+### Run more than one SSP
+
+Only when one SSP runs out of memory or CPU. Each extra SSP needs its own id,
+address and volume:
+
+<CodeBlock code={composeSecondSsp} lang="yaml" fileName="docker-compose.yml" />
+
+The scheduler spreads views across the SSPs by load. Keep
+`SPKY_CLEAR_VIEWS_ON_START` at its default (`true`) while you run more than one.
 
 ---
 
-## Environment Variables
+## Environment variables
+
+Every variable the SSP and the scheduler read, with its default. The setups above only need the handful they show; reach for these when you tune or debug.
 
 ### SSP (Sidecar)
 
-All `SPKY_*` vars below are read directly from the process environment.
+Read straight from the process environment.
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
@@ -215,7 +407,7 @@ All `SPKY_*` vars below are read directly from the process environment.
 | `SPKY_INGEST_TRANSPORT` | Standalone mode only (no `SPKY_SCHEDULER_URL`): `changefeed` makes the SSP tail SurrealDB's `CHANGEFEED` itself instead of receiving `/ingest` posts from the DB events. Takes the same `SPKY_CHANGEFEED_*` knobs as the scheduler. In cluster mode the scheduler tails. | `http` |
 | `SPKY_SSP_REF_MODE` | `_00_list_ref` storage layout: `dedicated` (per-user tables; works around the SurrealDB v3 LIVE permission gap) or `single` (legacy shared table). Mirrors `refMode` in `sp00ky.yml`. | `dedicated` |
 | `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS` | Window (ms) over which the SSP coalesces query edge-update writes to `_00_list_ref` into one batched transaction, so a burst of view updates lands as a few batched `LIVE` deliveries instead of one transaction per record. `0` disables batching (flush each update immediately). See [Architecture](/docs/reference/architecture#edge-update-batching). | `100` |
-| `SPKY_JOB_CONFIG` | JSON-encoded `{ "job_tables": { … } }` describing backends the SSP can dispatch to. | *(unset)* |
+| `SPKY_JOB_CONFIG` | JSON array of the backends the SSP dispatches jobs to: `[{"name":"api","base_url":"http://api:3000","table":"job"}]`, with optional `auth_token` and `timeout` per entry. See [Backends and jobs](#backends-and-jobs). The literal `null` disables the job runner, so pass `[]` for none. | *(unset)* |
 | `SPKY_CRDT_CACHE_SIZE` | In-memory CRDT cache capacity | `10000` |
 | `SPKY_CRDT_FIELDS` | JSON override for `@crdt` field detection, e.g. `{"thread":["content"]}` | *(auto)* |
 | `SPKY_SSP_BOOTSTRAP_PAGE_SIZE` | Rows pulled per `/proxy/query` page | `500` |
@@ -274,6 +466,7 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | `SPKY_BOOTSTRAP_PAGE_SIZE` | Rows read per bootstrap page from the replica | `500` |
 | `SPKY_AUTH_SECRET` | Optional shared secret; when set, callers to `/proxy/*` must send `Authorization: Bearer <secret>`. Also signs admin dashboard sessions, so setting it is what makes them survive a restart. | *(empty)* |
 | `SPKY_BACKENDS` | JSON-encoded backend health-check list (`SPKY_SCHEDULER_BACKENDS` accepted as legacy fallback) | *(unset)* |
+| `SPKY_JOB_CONFIG` | The outbox tables whose jobs the scheduler recovers and re-dispatches. Takes the SSP's array as is (only each `table` is read) or an object keyed by table. Without it, recurring and delayed jobs are never re-dispatched after their first run. | *(unset)* |
 
 #### Admin plane
 

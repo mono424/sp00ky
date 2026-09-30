@@ -1408,13 +1408,17 @@ enum MigrateCommands {
         /// Path to sp00ky.yml config file
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Generation mode: singlenode, cluster, surrealism
-        #[arg(long, default_value = "singlenode")]
-        mode: String,
-        /// SSP/Scheduler endpoint URL
+        /// Generation mode: singlenode, cluster, surrealism. Defaults to `mode`
+        /// in sp00ky.yml, then singlenode.
+        #[arg(long)]
+        mode: Option<String>,
+        /// SSP (singlenode) or scheduler (cluster) URL as SurrealDB reaches it,
+        /// e.g. http://ssp:8667. When set, the sync params and remote functions
+        /// the DB events call are installed too, which a self-hosted database
+        /// needs and `spky dev` / `spky deploy` otherwise do for you.
         #[arg(long)]
         endpoint: Option<String>,
-        /// SSP/Scheduler auth secret
+        /// Must equal SPKY_AUTH_SECRET on the SSP / scheduler
         #[arg(long)]
         secret: Option<String>,
         /// Force re-applying the internal schema + remote functions even when
@@ -2012,11 +2016,27 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
 
             let conn_resolved = conn.resolve(&Some(config_file.clone()))?;
 
-            let deploy_mode = match mode.as_str() {
-                "cluster" => DeployMode::Cluster,
-                "surrealism" => DeployMode::Surrealism,
-                _ => DeployMode::Singlenode,
+            // An explicit --mode wins; otherwise the project's own topology, so a
+            // cluster project is not handed the singlenode internal schema.
+            let deploy_mode = match mode.as_deref() {
+                Some("cluster") => DeployMode::Cluster,
+                Some("surrealism") => DeployMode::Surrealism,
+                Some(_) => DeployMode::Singlenode,
+                None => sp00ky_config.mode.clone().unwrap_or_default(),
             };
+            // The DB events post to `$sp00ky_endpoint`. Without these params the
+            // first write to a synced table fails with "Cannot perform addition
+            // with 'none' and 'string'". Only with an explicit --endpoint, so a
+            // plain `migrate apply` against the dev stack keeps the Docker-internal
+            // endpoint `spky dev` installed.
+            let remote_functions =
+                endpoint
+                    .as_ref()
+                    .map(|endpoint| migration::RemoteFunctionsConfig {
+                        deploy_mode: deploy_mode.clone(),
+                        endpoint: endpoint.clone(),
+                        secret: secret.clone().unwrap_or_default(),
+                    });
 
             let config_path_opt = if config_file.exists() {
                 Some(config_file.clone())
@@ -2042,7 +2062,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                     secret: secret.clone(),
                     vault: None,
                 }),
-                remote_functions: None,
+                remote_functions,
                 secrets: None,
             };
 

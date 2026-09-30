@@ -1,56 +1,36 @@
 ---
 import { docsNav as nav, resolveActive } from '../config/nav';
 
-const { group: activeGroup, link: activeLink } = resolveActive(Astro.url.pathname);
+const { link: activeLink } = resolveActive(Astro.url.pathname);
 ---
 
-<nav class="space-y-6">
+<nav class="docs-sidebar" aria-label="Documentation">
   {
-    nav.map((group) => {
-      const isOpen = group === activeGroup;
-      return (
-      <details open={isOpen} name="docs-sidebar" class="group">
-        <summary class="flex items-center justify-between cursor-pointer list-none text-sm font-medium text-text-primary mb-2 px-2 hover:opacity-80 select-none">
-          {group.title}
-          <svg
-            class="w-4 h-4 transition-transform group-open:rotate-180 text-text-muted"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M19 9l-7 7-7-7"
-            />
-          </svg>
-        </summary>
-        <ul class="space-y-0.5 relative ml-2 pl-2">
+    nav.map((group) => (
+      <section class="docs-sidebar-group">
+        <p class="docs-sidebar-title">{group.title}</p>
+        <ul>
           {group.links.map((link) => {
             const isActive = link === activeLink;
             return (
               <li>
                 <a
                   href={link.href}
-                  class:list={[
-                    'flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-lg transition-colors border border-transparent',
-                    isActive
-                      ? 'text-white bg-white/[0.06] font-medium border-white/[0.08] shadow-glass-inset'
-                      : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]',
-                  ]}
+                  class="docs-sidebar-link"
+                  aria-current={isActive ? 'page' : undefined}
+                  data-sidebar-active={isActive ? '' : undefined}
                 >
-                  {isActive && <span class="w-1.5 h-1.5 bg-brand-400 rounded-full" />}
-                  <span>{link.text}</span>
+                  <span class="truncate">{link.text}</span>
                   {link.experimental && (
                     <svg
-                      class="ml-auto w-3.5 h-3.5 text-amber-300 shrink-0"
+                      class="docs-sidebar-experimental"
                       fill="none"
                       stroke="currentColor"
                       stroke-width="2"
                       stroke-linecap="round"
                       stroke-linejoin="round"
                       viewBox="0 0 24 24"
+                      role="img"
                       aria-label="Experimental"
                     >
                       <title>Experimental</title>
@@ -64,30 +44,7 @@ const { group: activeGroup, link: activeLink } = resolveActive(Astro.url.pathnam
             );
           })}
         </ul>
-      </details>
-    );})
+      </section>
+    ))
   }
 </nav>
-
-<script>
-  // Accordion fallback for browsers without <details name=""> support
-  document.querySelectorAll('details[name="docs-sidebar"]').forEach((details) => {
-    details.addEventListener('toggle', () => {
-      if (details.open) {
-        document.querySelectorAll('details[name="docs-sidebar"]').forEach((other) => {
-          if (other !== details) other.open = false;
-        });
-      }
-    });
-  });
-</script>
-
-<style>
-  /* Remove default details marker */
-  details > summary {
-    list-style: none;
-  }
-  details > summary::-webkit-details-marker {
-    display: none;
-  }
-</style>

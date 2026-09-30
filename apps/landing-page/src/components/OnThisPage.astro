@@ -10,63 +10,179 @@ interface Props {
 }
 
 const { headings = [] } = Astro.props;
+// h2 and h3 only: deeper levels turn a long reference page into a wall of links.
+const items = headings.filter((h) => h.depth === 2 || h.depth === 3);
 ---
 
-<div class="text-sm">
-  <h4 class="font-medium text-text-primary mb-4 pl-4">On this page</h4>
-  <ul class="space-y-2">
-    {
-      headings.map((h) => (
-        <li>
-          <a
-            href={`#${h.slug}`}
-            class:list={[
-              'block text-text-tertiary hover:text-text-primary transition-colors truncate',
-              {
-                'pl-4': h.depth === 2,
-                'pl-6': h.depth === 3,
-                'pl-8': h.depth > 3,
-              },
-            ]}
-            data-heading-link={h.slug}
-          >
-            {h.text}
-          </a>
-        </li>
-      ))
-    }
-  </ul>
-</div>
+{
+  items.length > 0 && (
+    <nav class="docs-toc" aria-labelledby="docs-toc-title" data-toc>
+      <p id="docs-toc-title" class="docs-toc-title">
+        On this page
+      </p>
+      <div class="docs-toc-track">
+        <span class="docs-toc-indicator" data-toc-indicator aria-hidden="true" />
+        <ul>
+          {items.map((h) => (
+            <li>
+              <a
+                href={`#${h.slug}`}
+                class:list={['docs-toc-link', h.depth === 3 && 'docs-toc-link-nested']}
+                data-toc-link={h.slug}
+              >
+                {h.text}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <button type="button" class="docs-toc-top" data-toc-top hidden>
+        <svg
+          class="h-3.5 w-3.5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+        >
+          <path d="M12 19V5M5 12l7-7 7 7" />
+        </svg>
+        Back to top
+      </button>
+    </nav>
+  )
+}
 
 <script>
-  function updateActiveHeading() {
-    const headings = document.querySelectorAll('h2, h3, h4');
-    const links = document.querySelectorAll('[data-heading-link]');
+  // A heading counts as "current" once its top edge passes this line: the 64px
+  // sticky header plus the same breathing room `scroll-margin-top` leaves when
+  // a TOC link is clicked, so a clicked heading is always the active one.
+  const ACTIVE_LINE = 96;
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            const id = entry.target.id;
-            links.forEach((link) => {
-              if (link.getAttribute('data-heading-link') === id) {
-                link.classList.add('text-brand-400', 'font-medium');
-                link.classList.remove('text-text-tertiary');
-              } else {
-                link.classList.remove('text-brand-400', 'font-medium');
-                link.classList.add('text-text-tertiary');
-              }
-            });
-          }
-        });
-      },
-      { rootMargin: '-100px 0px -66% 0px' }
-    );
+  let teardown: (() => void) | undefined;
 
-    headings.forEach((h) => observer.observe(h));
+  function setup() {
+    teardown?.();
+    teardown = undefined;
+
+    const toc = document.querySelector<HTMLElement>('[data-toc]');
+    if (!toc) return;
+
+    const indicator = toc.querySelector<HTMLElement>('[data-toc-indicator]');
+    const topButton = toc.querySelector<HTMLButtonElement>('[data-toc-top]');
+    const scroller = toc.closest<HTMLElement>('[data-toc-scroller]');
+    const links = [...toc.querySelectorAll<HTMLAnchorElement>('[data-toc-link]')];
+    const entries = links
+      .map((link) => ({ link, heading: document.getElementById(link.dataset.tocLink ?? '') }))
+      .filter((entry): entry is { link: HTMLAnchorElement; heading: HTMLElement } =>
+        Boolean(entry.heading)
+      );
+    if (entries.length === 0) return;
+
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let current: HTMLAnchorElement | null = null;
+    // While a click-triggered smooth scroll runs, keep the clicked link active
+    // instead of flickering through every heading the page passes on the way.
+    let pinned: HTMLAnchorElement | null = null;
+    let unpinTimer: number | undefined;
+    let frame = 0;
+
+    function activate(link: HTMLAnchorElement | null) {
+      if (link === current) return;
+      current?.removeAttribute('aria-current');
+      current = link;
+      if (!indicator) return;
+      if (!link) {
+        indicator.style.opacity = '0';
+        return;
+      }
+      link.setAttribute('aria-current', 'location');
+      indicator.style.opacity = '1';
+      indicator.style.transform = `translateY(${link.offsetTop}px)`;
+      indicator.style.height = `${link.offsetHeight}px`;
+      keepInView(link);
+    }
+
+    // Long reference pages have more entries than fit; follow the active one
+    // without scrolling the page itself (which scrollIntoView would do).
+    function keepInView(link: HTMLAnchorElement) {
+      if (!scroller) return;
+      const linkBox = link.getBoundingClientRect();
+      const box = scroller.getBoundingClientRect();
+      const margin = 64;
+      if (linkBox.top >= box.top + margin && linkBox.bottom <= box.bottom - margin) return;
+      scroller.scrollBy({
+        top: linkBox.top - box.top - box.height / 3,
+        behavior: reduceMotion ? 'auto' : 'smooth',
+      });
+    }
+
+    function compute() {
+      frame = 0;
+      if (topButton) topButton.hidden = window.scrollY < window.innerHeight * 0.6;
+      if (pinned) return;
+
+      const atBottom =
+        window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4;
+      if (atBottom) {
+        activate(entries[entries.length - 1].link);
+        return;
+      }
+
+      let next: HTMLAnchorElement | null = null;
+      for (const { link, heading } of entries) {
+        if (heading.getBoundingClientRect().top - ACTIVE_LINE > 1) break;
+        next = link;
+      }
+      activate(next);
+    }
+
+    function onScroll() {
+      if (pinned) {
+        window.clearTimeout(unpinTimer);
+        unpinTimer = window.setTimeout(() => {
+          pinned = null;
+        }, 150);
+      }
+      if (!frame) frame = requestAnimationFrame(compute);
+    }
+
+    function onClick(event: MouseEvent) {
+      const link = (event.target as Element).closest<HTMLAnchorElement>('[data-toc-link]');
+      const heading = link && document.getElementById(link.dataset.tocLink ?? '');
+      if (!link || !heading) return;
+      event.preventDefault();
+      pinned = link;
+      activate(link);
+      history.pushState(history.state, '', `#${heading.id}`);
+      heading.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+      // A heading already in place never fires a scroll event to unpin it.
+      window.clearTimeout(unpinTimer);
+      unpinTimer = window.setTimeout(() => {
+        pinned = null;
+      }, 1000);
+    }
+
+    function onTop() {
+      window.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
+      history.replaceState(history.state, '', location.pathname + location.search);
+    }
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    toc.addEventListener('click', onClick);
+    topButton?.addEventListener('click', onTop);
+    compute();
+
+    teardown = () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onScroll);
+      window.clearTimeout(unpinTimer);
+      if (frame) cancelAnimationFrame(frame);
+    };
   }
 
-  // Run on load and View Transitions
-  document.addEventListener('astro:page-load', updateActiveHeading);
-  updateActiveHeading();
+  document.addEventListener('astro:page-load', setup);
 </script>

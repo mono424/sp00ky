@@ -42,7 +42,7 @@ export const docsNav = [
     ],
   },
   {
-    title: 'Framework Guides',
+    title: 'Framework guides',
     links: [
       { text: 'SolidJS', href: `${basePath}/docs/guide/solid` },
       { text: 'Solid 2 (RC)', href: `${basePath}/docs/guide/solid2` },
@@ -59,7 +59,7 @@ export const docsNav = [
     ],
   },
   {
-    title: 'Background Jobs',
+    title: 'Background jobs',
     links: [
       { text: 'Jobs', href: `${basePath}/docs/jobs` },
       { text: 'Schedules', href: `${basePath}/docs/jobs/schedules` },
@@ -68,7 +68,7 @@ export const docsNav = [
     ],
   },
   {
-    title: 'Local Development',
+    title: 'Local development',
     links: [
       { text: 'spky dev', href: `${basePath}/docs/dev` },
       { text: 'Dev servers & sidecars', href: `${basePath}/docs/dev/servers` },

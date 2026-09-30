@@ -199,3 +199,143 @@ body {
 ::-webkit-scrollbar-thumb {
   @apply rounded-full bg-white/10 hover:bg-white/20;
 }
+
+/* Clicked TOC entries and #hash loads land below the 64px sticky header. */
+.prose-docs :is(h2, h3, h4)[id] {
+  scroll-margin-top: 6rem;
+}
+
+/* Side rails: sticky columns that scroll on their own. The scrollbar only shows
+   while the pointer is over the rail, and the edges fade so a clipped list
+   reads as "more below" instead of a hard cut. */
+.docs-rail {
+  position: sticky;
+  top: 4rem;
+  height: calc(100vh - 4rem);
+}
+.docs-rail-scroll {
+  height: 100%;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  mask-image: linear-gradient(to bottom, transparent, #000 1.5rem, #000 calc(100% - 3rem), transparent);
+}
+.docs-rail-scroll:hover {
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+.docs-rail-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+.docs-rail-scroll:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Sidebar: every group stays expanded so the whole map is scannable. Group
+   labels carry the structure; links sit quieter and share the label's left
+   edge, with the pill bleeding into the gutter. */
+.docs-sidebar-group + .docs-sidebar-group {
+  margin-top: 1.75rem;
+}
+.docs-sidebar-title {
+  margin-bottom: 0.375rem;
+  color: #f4f4f5;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25rem;
+  letter-spacing: -0.005em;
+}
+.docs-sidebar-link {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 -0.625rem;
+  padding: 0.3125rem 0.625rem;
+  border-radius: 0.5rem;
+  color: #a1a1aa;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  transition:
+    color 150ms,
+    background-color 150ms;
+}
+.docs-sidebar-link:hover {
+  color: #f4f4f5;
+  background-color: rgba(255, 255, 255, 0.035);
+}
+.docs-sidebar-link[aria-current='page'] {
+  color: #fff;
+  font-weight: 500;
+  background-color: rgba(255, 255, 255, 0.07);
+}
+.docs-sidebar-experimental {
+  flex-shrink: 0;
+  width: 0.8125rem;
+  height: 0.8125rem;
+  margin-left: auto;
+  color: #52525b;
+}
+.docs-sidebar-link:hover .docs-sidebar-experimental,
+.docs-sidebar-link[aria-current='page'] .docs-sidebar-experimental {
+  color: #a1a1aa;
+}
+
+/* On this page: entries hang off a hairline track. One indicator slides along
+   it to the section being read, so position on the track mirrors position in
+   the article. */
+.docs-toc {
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+}
+.docs-toc-title {
+  margin-bottom: 0.75rem;
+  color: #f4f4f5;
+  font-weight: 600;
+}
+.docs-toc-track {
+  position: relative;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+.docs-toc-indicator {
+  position: absolute;
+  top: 0;
+  left: -1px;
+  width: 2px;
+  height: 0;
+  border-radius: 1px;
+  background: #f4f4f5;
+  opacity: 0;
+  transition:
+    transform 220ms cubic-bezier(0.2, 0, 0, 1),
+    height 220ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 150ms;
+}
+.docs-toc-link {
+  display: block;
+  padding: 0.3125rem 0 0.3125rem 0.875rem;
+  color: #71717a;
+  text-wrap: pretty;
+  transition: color 150ms;
+}
+.docs-toc-link-nested {
+  padding-left: 1.625rem;
+}
+.docs-toc-link:hover {
+  color: #d4d4d8;
+}
+.docs-toc-link[aria-current] {
+  color: #fafafa;
+}
+.docs-toc-top {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 1.25rem;
+  color: #71717a;
+  transition: color 150ms;
+}
+.docs-toc-top:hover {
+  color: #f4f4f5;
+}
+.docs-toc-top[hidden] {
+  display: none;
+}

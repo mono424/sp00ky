@@ -50,6 +50,12 @@ abstract interface class Sp00kyAuth {
   void Function() subscribe(void Function(String?) callback);
   Future<void> signIn(String accessName, Map<String, dynamic> params);
   Future<void> signUp(String accessName, Map<String, dynamic> params);
+
+  /// Validate a token with the server and open the session as its account
+  /// (TS `auth.check(token)`). Without [token] it re-verifies the stored one.
+  /// Use it for a token minted outside the client, such as an OAuth exchange:
+  /// unlike a raw `authenticate`, the session is persisted and listeners fire.
+  Future<void> check([String? token]);
   Future<void> signOut();
 
   /// Register work that must happen before the session is dropped (drain

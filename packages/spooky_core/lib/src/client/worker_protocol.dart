@@ -14,6 +14,7 @@ enum WorkerOp {
   signIn,
   signUp,
   signOut,
+  check,
   authenticate,
   deauthenticate,
   subscribe,
@@ -131,6 +132,16 @@ final class SignOutCommand extends WorkerCommand {
   const SignOutCommand();
   @override
   WorkerOp get op => WorkerOp.signOut;
+}
+
+/// Open (or re-verify) the session from a token, the way a restart does. With
+/// a token, it is one minted outside the client (an OAuth exchange) and the
+/// session becomes that account's, persisted like a sign-in.
+final class CheckCommand extends WorkerCommand {
+  const CheckCommand([this.token]);
+  final String? token;
+  @override
+  WorkerOp get op => WorkerOp.check;
 }
 
 final class AuthenticateCommand extends WorkerCommand {

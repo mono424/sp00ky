@@ -103,6 +103,16 @@ void main() {
         await c.auth.signOut();
         expect(seen, hasLength(1), reason: 'removed hooks stay removed');
       });
+      test('check with a supplied token never succeeds offline', () async {
+        // The OAuth path: a token minted outside the client must be verified
+        // by the server before it becomes the session.
+        final c = build(fixture(endpoint: 'ws://127.0.0.1:1/rpc'));
+        addTearDown(c.close);
+        await c.init();
+        await expectLater(c.auth.check('header.e30.sig'), throwsA(anything));
+        expect(c.auth.isAuthenticated, false);
+        expect(c.auth.token, isNull);
+      });
       test('cold remote request cannot block cached reads', () async {
         final c = build(fixture(endpoint: 'ws://127.0.0.1:1/rpc'));
         addTearDown(c.close);

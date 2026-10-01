@@ -167,6 +167,7 @@ class AuthService implements Sp00kyAuth {
   }
 
   /// Validate an existing or supplied token and hydrate the user.
+  @override
   Future<void> check([String? accessToken]) {
     if (accessToken != null) return _check(accessToken);
     return _checking ??= _check(null).whenComplete(() => _checking = null);

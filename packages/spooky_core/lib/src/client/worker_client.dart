@@ -381,6 +381,8 @@ class _RemoteAuth implements Sp00kyAuth {
   @override
   Future<void> signUp(String name, Map<String, dynamic> params) =>
       client._call(SignUpCommand(name, params));
+  @override
+  Future<void> check([String? token]) => client._call(CheckCommand(token));
   /// Main-isolate hooks first, while the worker still holds the session;
   /// the worker then runs its own (the outbox drain) and signs out.
   @override
@@ -517,6 +519,8 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
           await client.auth.signUp(command.access, command.params);
         case SignOutCommand():
           await client.auth.signOut();
+        case CheckCommand command:
+          await client.auth.check(command.token);
         case AuthenticateCommand command:
           result = await client.authenticate(command.token);
         case DeauthenticateCommand():
@@ -586,6 +590,7 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
             ![
               WorkerOp.signIn,
               WorkerOp.signUp,
+              WorkerOp.check,
               WorkerOp.signOut,
               WorkerOp.close
             ].contains(request.op)) {

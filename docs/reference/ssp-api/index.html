@@ -123,7 +123,10 @@ logged (<code>allowlist miss (warn mode): admitted</code>, target <code>ssp::pol
 view registers. The scheduler relays this status and body to the client
 unchanged. Shapes over <code>_00_app_release</code> / <code>_00_user_feature</code> are always
 admitted. See the <a href="/docs/guide/query-allowlist">Query allowlist guide</a>.</li>
-<li><code>503 Service Unavailable</code> - SSP is not in Ready state (<code>SSP_NOT_READY</code>)</li>
+<li><code>503 Service Unavailable</code> - SSP is not in Ready state (<code>SSP_NOT_READY</code>), or
+registrations already fill their half of the publication queue
+(<code>publication_backlog</code>, see <a href="#publication-admission-and-backlog">Publication admission and backlog</a>).
+Retry later.</li>
 </ul>
 <p><strong>What the SSP writes:</strong> the <code>_00_query</code> row for the view (<code>UPSERT</code>) with
 <code>rowCount</code> (the size of the initial set) and <code>state</code>. A view with rows is
@@ -798,6 +801,13 @@ is exhausted, ingest returns HTTP 503 before accepting the event; the scheduler
 retains it in its WAL and delivers it again. A prolonged overload can therefore
 show as lagging while memory use is protected, with explicit bootstrap recovery
 if the scheduler’s replay buffer overflows.</p>
+<p>A view registration may only take half of the queue: once half the slots, half
+the bytes or half the operations are reserved, <code>/view/register</code> answers 503
+<code>publication_backlog</code> while ingest keeps using the rest. A cold registration
+publishes its whole result as edges, so without this a burst of them (a client
+reloading many tabs at once) took every slot, ingest was refused, and the
+scheduler marked the SSP lagging and refused every other registration until the
+queue drained.</p>
 <p>New admission also stops at measured pending-delta thresholds of 64 MiB or
 100,000 operations. These are admission thresholds, not a strict RSS or total
 byte cap: deltas are sized after evaluation, so already reserved slots can

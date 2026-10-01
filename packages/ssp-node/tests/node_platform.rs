@@ -2236,6 +2236,19 @@ async fn publication_saturation_rejects_ingest_before_circuit_and_job_side_effec
     assert!(h.job_rx.lock().await.try_recv().is_ok(), "scheduler replay can retry after capacity returns");
 }
 
+#[tokio::test]
+async fn a_registration_burst_is_refused_before_it_can_refuse_ingest() {
+    let h = build(HarnessOpts::default()).await;
+    let mut held = Vec::new();
+    while let Some(permit) = h.node.edge_update_tx.try_reserve_registration(0) { held.push(permit); }
+    let register = json!({ "id": "v1", "surql": "SELECT * FROM thread" });
+    let r = h.node.route(authed(Method::Post, "/view/register", register)).await.unwrap();
+    assert_eq!(r.status, 503, "registrations stop at their share of the queue");
+    let body = json!({ "table": "thread", "op": "CREATE", "id": "thread:1", "record": {} });
+    let r = h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap();
+    assert_eq!(r.status, 200, "live changes keep the rest");
+}
+
 // --- Query allowlist ---------------------------------------------------------
 //
 // The gate sits in `register_view_handler` right after the id is canonicalised

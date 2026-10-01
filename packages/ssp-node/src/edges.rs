@@ -112,6 +112,18 @@ pub struct PublicationLimits {
 impl Default for PublicationLimits {
     fn default() -> Self { Self { slots: 256, bytes: 64 * 1024 * 1024, operations: 100_000 } }
 }
+impl PublicationLimits {
+    /// The part of every limit a view registration may fill: half. A cold
+    /// registration publishes its whole result as edges, so a burst of them
+    /// used to take every slot. `/ingest` then answered 503, the scheduler
+    /// marked the SSP lagging, and it refused every user's registrations until
+    /// the queue drained (whitepawn 2026-10-01: one client reloading its open
+    /// tabs registered ~316 views in 25 s). The other half is only ever used
+    /// by live changes, so the burst is refused instead of them.
+    fn registration_share(self) -> Self {
+        Self { slots: self.slots / 2, bytes: self.bytes / 2, operations: self.operations / 2 }
+    }
+}
 
 #[derive(Clone)]
 pub struct EdgePublisher(Arc<PublicationQueue>);
@@ -340,13 +352,24 @@ impl EdgePublisher {
     }
     /// The estimate covers request-owned input before evaluation. Oversize input
     /// is refused immediately. Delta sizes replace this estimate when enqueued.
+    /// For live changes, which may use the whole queue; a view registration
+    /// reserves with [`Self::try_reserve_registration`].
     pub fn try_reserve(&self, input_bytes: usize) -> Option<PublicationPermit> {
+        self.reserve(input_bytes, self.0.limits)
+    }
+    /// [`Self::try_reserve`] for a view registration, which is refused once the
+    /// queue holds [`PublicationLimits::registration_share`] of any limit, so
+    /// live changes always find room.
+    pub fn try_reserve_registration(&self, input_bytes: usize) -> Option<PublicationPermit> {
+        self.reserve(input_bytes, self.0.limits.registration_share())
+    }
+    fn reserve(&self, input_bytes: usize, limits: PublicationLimits) -> Option<PublicationPermit> {
         let mut state = self.0.state.lock().unwrap();
         let bytes = state.leases.values().map(|s| s.bytes).sum::<u64>();
         let operations = state.leases.values().map(|s| s.operations).sum::<u64>();
-        if state.leases.len() >= self.0.limits.slots
-            || bytes.saturating_add(input_bytes as u64) > self.0.limits.bytes
-            || operations >= self.0.limits.operations {
+        if state.leases.len() >= limits.slots
+            || bytes.saturating_add(input_bytes as u64) > limits.bytes
+            || operations >= limits.operations {
             state.overloaded += 1;
             return None;
         }
@@ -2337,6 +2360,19 @@ mod publication_tests {
         assert_eq!(p.snapshot().overload_total, 2);
         drop(permit);
         assert!(p.try_reserve(0).is_some());
+    }
+    #[test]
+    fn registrations_fill_half_the_queue_and_live_changes_keep_the_rest() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 4, bytes: 1024, operations: 100 });
+        let regs: Vec<_> = (0..2).map(|_| p.try_reserve_registration(0).unwrap()).collect();
+        assert!(p.try_reserve_registration(0).is_none(), "a burst stops at half the slots");
+        let live: Vec<_> = (0..2).map(|_| p.try_reserve(0).unwrap()).collect();
+        assert!(p.try_reserve(0).is_none(), "live changes still stop at the full limit");
+        drop(regs);
+        assert!(p.try_reserve_registration(0).is_none(), "live work counts against the registration share too");
+        drop(live);
+        assert!(p.try_reserve_registration(0).is_some());
+        assert!(p.try_reserve_registration(513).is_none(), "and half the bytes");
     }
     #[tokio::test]
     async fn publication_measured_operations_stop_further_admission() {

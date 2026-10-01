@@ -173,9 +173,20 @@ fn err_json(status: u16, code: &str, message: impl Into<String>) -> ApiResponse 
 
 impl SspNode {
     pub(crate) fn publication_admission(&self, bytes: usize) -> Option<crate::edges::PublicationPermit> {
+        self.start_publisher();
+        self.edge_update_tx.try_reserve(bytes)
+    }
+
+    /// [`Self::publication_admission`] for a view registration: refused while
+    /// the queue is half full, so a registration burst can never refuse ingest.
+    fn registration_admission(&self, bytes: usize) -> Option<crate::edges::PublicationPermit> {
+        self.start_publisher();
+        self.edge_update_tx.try_reserve_registration(bytes)
+    }
+
+    fn start_publisher(&self) {
         self.edge_update_tx.start(&self.platform, self.platform.db.clone(), self.processor.clone(),
             self.publication_gate.clone(), self.ref_mode, std::time::Duration::ZERO);
-        self.edge_update_tx.try_reserve(bytes)
     }
 
 
@@ -1263,7 +1274,7 @@ impl SspNode {
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
         }
-        let Some(mut permit) = self.publication_admission(req.body.len()) else {
+        let Some(mut permit) = self.registration_admission(req.body.len()) else {
             return Some(err_json(503, "publication_backlog", "Publication backlog is full; retry this request"));
         };
         let Ok(payload) = serde_json::from_slice::<Value>(&req.body) else {
@@ -1288,7 +1299,7 @@ impl SspNode {
             if self.refresh_schema_on_miss().await {
                 prepared = self.prepare_registration(payload).await;
             }
-            permit = match self.publication_admission(req.body.len()) {
+            permit = match self.registration_admission(req.body.len()) {
                 Some(p) => p,
                 None => return Some(err_json(503, "publication_backlog", "Publication backlog is full; retry this request")),
             };

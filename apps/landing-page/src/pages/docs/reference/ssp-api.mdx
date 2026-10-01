@@ -163,7 +163,10 @@ Register a new view (live query) with the SSP.
   view registers. The scheduler relays this status and body to the client
   unchanged. Shapes over `_00_app_release` / `_00_user_feature` are always
   admitted. See the [Query allowlist guide](/docs/guide/query-allowlist).
-- `503 Service Unavailable` - SSP is not in Ready state (`SSP_NOT_READY`)
+- `503 Service Unavailable` - SSP is not in Ready state (`SSP_NOT_READY`), or
+  registrations already fill their half of the publication queue
+  (`publication_backlog`, see [Publication admission and backlog](#publication-admission-and-backlog)).
+  Retry later.
 
 **What the SSP writes:** the `_00_query` row for the view (`UPSERT`) with
 `rowCount` (the size of the initial set) and `state`. A view with rows is
@@ -906,6 +909,14 @@ is exhausted, ingest returns HTTP 503 before accepting the event; the scheduler
 retains it in its WAL and delivers it again. A prolonged overload can therefore
 show as lagging while memory use is protected, with explicit bootstrap recovery
 if the scheduler's replay buffer overflows.
+
+A view registration may only take half of the queue: once half the slots, half
+the bytes or half the operations are reserved, `/view/register` answers 503
+`publication_backlog` while ingest keeps using the rest. A cold registration
+publishes its whole result as edges, so without this a burst of them (a client
+reloading many tabs at once) took every slot, ingest was refused, and the
+scheduler marked the SSP lagging and refused every other registration until the
+queue drained.
 
 New admission also stops at measured pending-delta thresholds of 64 MiB or
 100,000 operations. These are admission thresholds, not a strict RSS or total

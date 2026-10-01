@@ -89,19 +89,22 @@ impl SchemaWatch {
         cell.read().map(|s| s.nosync.contains(table)).unwrap_or(false)
     }
 
-    /// Boot: start the tracker from the tables the persisted snapshot hashes,
-    /// so a table added while the scheduler was down reads as added, and load
-    /// the opaque fields a restart would otherwise leave empty. Runs before
-    /// the scheduler is Ready, so nothing else touches the replica.
+    /// Boot: start the tracker from the tables the persisted snapshot holds
+    /// (hashed or known, so an empty table counts too), so a table added while
+    /// the scheduler was down reads as added, and load the opaque fields a
+    /// restart would otherwise leave empty. Runs before the scheduler is Ready,
+    /// so nothing else touches the replica.
     pub async fn boot(&self, replica: &Arc<RwLock<Replica>>) -> SchemaStep {
-        {
-            let hashed = replica.read().await.snapshot_hashes().keys().cloned().collect::<Vec<_>>();
-            *self.tracker.lock().await = SchemaTracker::seeded(None, hashed);
-        }
+        self.seed(replica).await;
         match self.read().await {
             Some(read) => self.apply(read, replica).await,
             None => SchemaStep::default(),
         }
+    }
+
+    async fn seed(&self, replica: &Arc<RwLock<Replica>>) {
+        let held = replica.read().await.held_tables();
+        *self.tracker.lock().await = SchemaTracker::seeded(None, held);
     }
 
     /// Probe upstream and, when the fingerprint moved since the last load,
@@ -311,6 +314,30 @@ mod tests {
         let step = watch.apply(read(&["game", "comment"], &[]), &replica).await;
         assert_eq!(step.added, vec!["comment".to_string()]);
         assert!(step.removed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_table_once_backfilled_is_not_added_again_at_boot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut replica = Replica::new(tmp.path().join("replica")).await.unwrap();
+        replica
+            .apply("game", RecordOp::Create, "game:1", Some(json!({ "x": 1, "_00_rv": 1 })))
+            .await
+            .unwrap();
+        // The new-table backfill found no rows: held, but a snapshot advance
+        // only hashes the tables it touched, so it has no hash.
+        replica.hold_table("stream_video");
+        let touched = ["game".to_string()].into_iter().collect();
+        replica.set_snapshot_state(1, Some(&touched)).await.unwrap();
+        assert!(!replica.snapshot_hashes().contains_key("stream_video"));
+
+        // Boot seeds from what the replica holds (persisted with the snapshot
+        // state, see `hold_table_is_persisted`), not from the hashes alone.
+        let replica = Arc::new(RwLock::new(replica));
+        let watch = SchemaWatch::new();
+        watch.seed(&replica).await;
+        let step = watch.apply(read(&["game", "stream_video", "comment"], &[]), &replica).await;
+        assert_eq!(step.added, vec!["comment".to_string()], "only the table that is really new");
     }
 
     #[test]

@@ -862,6 +862,9 @@ pub async fn repair_table<C: surrealdb::Connection>(
         .map_err(|_| anyhow::anyhow!("repair of {table}: the delete pass made no progress for {}s", stall.as_secs()))??;
     pass.stats.add(&stats);
 
+    // Every page and the delete pass are in: the replica now matches upstream
+    // for this table, however few rows that is.
+    replica.write().await.hold_table(table);
     if pass.stats.is_empty() {
         Ok(RepairOutcome::NothingToDo)
     } else {

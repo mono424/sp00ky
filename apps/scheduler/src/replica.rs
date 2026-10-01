@@ -404,6 +404,15 @@ impl Replica {
             .collect()
     }
 
+    /// Record that the replica holds all of `table`, also when that is no rows
+    /// at all. A table added upstream while empty is never written to, so it
+    /// had no hash and no `known_tables` entry, and every boot reported it as
+    /// newly added again (whitepawn's `stream_video`). Persisted with the next
+    /// snapshot advance.
+    pub fn hold_table(&mut self, table: &str) {
+        self.known_tables.insert(table.to_string());
+    }
+
     /// Opaque fields per table, as the replica currently omits them.
     pub fn opaque_fields(&self) -> &BTreeMap<String, BTreeSet<String>> {
         &self.opaque_fields
@@ -2199,6 +2208,20 @@ mod tests {
 
         // Idempotent.
         assert!(replica.reconcile_schema(&removed, None).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hold_table_is_persisted() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut replica = Replica::new(tmp.path().join("replica")).await?;
+        replica.hold_table("stream_video");
+        replica.set_snapshot_state(1, Some(&BTreeSet::new())).await?;
+        let mut resp = replica.db.query("SELECT tables FROM _00_metadata:snapshot").await?;
+        let rows: Vec<Value> = resp.take(0)?;
+        let tables: Vec<String> = serde_json::from_value(rows[0]["tables"].clone())?;
+        assert_eq!(tables, vec!["stream_video".to_string()], "a boot restores it as held");
+        assert!(!replica.snapshot_hashes().contains_key("stream_video"));
         Ok(())
     }
 

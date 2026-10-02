@@ -343,6 +343,38 @@ const onboarding = [
   },
 ];
 
+// WhitePawn's scripts/copy-prod-account-to-local.mjs, trimmed. The account id
+// and the production URL are left out.
+const prodCopyCmd = `PROD_PASS=$(cd packages/schema && spky project credentials --raw) \\
+  node scripts/copy-prod-account-to-local.mjs`;
+const prodCopyCode = `const TABLES = [
+  ['player_name', 'author'],
+  ['game_database', 'owner'],
+  ['game', 'owner'],
+  ...
+  ['analysis', 'owner'],
+  ['collection_share', 'user'],
+  ['puzzle_rating', 'user'],
+];
+...
+for (const [table, field] of TABLES) {
+  ...
+  // Idempotent re-runs: drop what a previous pass wrote for THIS account only.
+  await local.query(\`DELETE FROM \${table} WHERE \${field} = $u\`, { u: USER_ID }).collect();
+
+  for (let start = 0; start < total; start += PAGE) {
+    const [rows] = await prod
+      .query(
+        \`SELECT * FROM \${table} WHERE \${field} = $u ORDER BY id LIMIT \${PAGE} START \${start}\`,
+        { u: USER_ID },
+      )
+      .collect();
+    if (!rows?.length) break;
+    await local.query(\`INSERT INTO \${table} $data\`, { data: rows }).collect();
+    ...
+  }
+}`;
+
 const mcpServers = [
   {
     name: 'Devtools',
@@ -902,6 +934,47 @@ const milestones = [
               secret values stay masked unless the token carries <code>secrets:reveal</code>. You can
               hand an agent the whole operating surface without handing it a single secret.
             </p>
+          </div>
+
+          <!-- Production data, locally -->
+          <div class="cs-hub-block cs-prodlocal">
+            <div class="cs-hub-text">
+              <h3>Run it locally, on production data</h3>
+              <p>
+                Some bugs only show up on real data: an account with years of imported games, or a
+                contact stacked from several player identities. WhitePawn reproduces them on the
+                laptop, on the real rows, in one of two ways.
+              </p>
+              <p>
+                <strong>Local code, production database.</strong> There is nothing to set up.
+                <code>spky dev</code> fills <code>VITE_DB_ENDPOINT</code> from the vault like any
+                other value, so the web app on localhost opens against the production database. It
+                still needs no production secret: the developer signs in with their own account, and
+                the schema's permissions decide what every live query returns, exactly as they do in
+                production. To see a bug report through someone else's eyes, an admin impersonates
+                that user from DevTools, and every session and every write is audited. Writes are
+                real too, so this mode is for looking and reproducing.
+              </p>
+              <p>
+                <strong>Production rows, local database.</strong> For work that rewrites data, like
+                a migration, a schema change or a bulk delete, WhitePawn copies an account into the
+                stack <code>spky dev</code> runs instead. One 141-line script reads the user row and
+                18 tables of games, databases, puzzles, analysis and comments, and inserts them
+                locally. Production is only ever read. The root password is fetched for that one
+                process by <code>spky project credentials</code>, so it is never written down, and
+                only someone already on the project can fetch it.
+              </p>
+              <p>
+                Rows keep their types because both ends speak the SDK's CBOR: a record link stays a
+                record link and a datetime stays a datetime, so the SCHEMAFULL tables accept every
+                row as it is. The password hash comes along with the user, so the production
+                password works on localhost. A re-run replaces only that account's rows.
+              </p>
+            </div>
+            <div class="cs-hub-visual">
+              <pre class="cs-term"><span aria-hidden="true">$ </span>{prodCopyCmd}</pre>
+              <CodeCard file="scripts/copy-prod-account-to-local.mjs" lang="js" code={prodCopyCode} />
+            </div>
           </div>
         </div>
 

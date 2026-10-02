@@ -150,6 +150,25 @@ void main() {
       expect(cleaned.containsKey('serverOnly'), isFalse);
     });
 
+    test('absentOptionalColumns names only optional columns the row lacks', () {
+      final columns = {
+        'title': const ColumnSchema(type: 'string'),
+        'club': const ColumnSchema(recordId: true, optional: true),
+        'note': const ColumnSchema(type: 'string', optional: true),
+        'cover': const ColumnSchema(type: 'string', optional: true),
+        '_00_local': const ColumnSchema(optional: true),
+      };
+      final cleared = absentOptionalColumns(columns, {
+        'id': 'broadcast:1',
+        'note': 'kept',
+        'cover': null,
+      });
+      // `club` is absent, `cover` present but null: both cleared. `title` is
+      // required (absent means unreadable, not cleared) and `_00_*` is local.
+      expect(cleared, unorderedEquals(['club', 'cover']));
+      expect(absentOptionalColumns(null, {'id': 'x:1'}), isEmpty);
+    });
+
     test('parseParams coerces recordId and dateTime', () {
       final parsed = parseParams(schema, {
         'author': 'user:42',

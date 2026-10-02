@@ -74,11 +74,17 @@ sealed class LocalOp {
 }
 
 class PutOp extends LocalOp {
-  const PutOp(this.table, this.id, this.data, {this.mode = WriteMode.replace});
+  const PutOp(this.table, this.id, this.data,
+      {this.mode = WriteMode.replace, this.clear = const []});
   final String table;
   final String id;
   final Map<String, dynamic> data;
   final WriteMode mode;
+
+  /// Keys a [WriteMode.merge] removes from the stored document after merging
+  /// [data]: fields the server cleared, which a merge alone would keep. Ignored
+  /// by [WriteMode.replace], which drops every key [data] lacks anyway.
+  final List<String> clear;
 }
 
 class DeleteOp extends LocalOp {

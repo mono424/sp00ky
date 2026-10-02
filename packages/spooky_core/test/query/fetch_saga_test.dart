@@ -5,7 +5,9 @@ import 'package:spooky_core/src/state/client_state.dart';
 import 'package:spooky_core/src/state/lifecycle.dart';
 import 'package:spooky_core/src/state/reducers.dart' as r;
 import 'package:spooky_core/src/testing/build.dart';
+import 'package:spooky_core/src/testing/fake_adapters.dart' show FakeLocal;
 import 'package:spooky_core/src/testing/run_pure.dart';
+import 'package:spooky_core/src/utils/parser.dart' show ColumnSchema;
 import 'package:test/test.dart';
 
 import '../saga_helpers.dart';
@@ -163,5 +165,78 @@ void main() {
     );
     expect(round, 1, reason: 'one chunk covers both ids');
     expect(out.state.versions.length, 2);
+  });
+
+  group('landChunk clears optional fields the server no longer sends', () {
+    const schema = <String, dynamic>{
+      'thing': {
+        'columns': <String, ColumnSchema>{
+          'title': ColumnSchema(type: 'string'),
+          'club': ColumnSchema(recordId: true, optional: true),
+          'note': ColumnSchema(type: 'string', optional: true),
+        }
+      },
+    };
+
+    test('names absent optional columns on the merge op, not in the body',
+        () async {
+      final out = await runPure<void>(
+        (ctx) => fetchRows(ctx, env(schema: schema)),
+        state: primed([
+          liveQuery('a', [('thing:1', 2)])
+        ]),
+        handlers: defaults(over: {
+          'remote.query': (_, __) => [
+                StatementResult.ok([
+                  {'id': 'thing:1', 'title': 't', 'note': 'n'}
+                ])
+              ],
+        }),
+      );
+      final put =
+          (out.ofKind('local.tx').single as LocalTx).ops.single as PutOp;
+      expect(put.mode, WriteMode.merge);
+      expect(put.clear, ['club']);
+      expect(put.data.containsKey('club'), isFalse,
+          reason:
+              'the body doubles as the circuit record: no null placeholders');
+      final ingest =
+          (out.ofKind('ssp.ingest').single as SspIngest).records.single;
+      expect(ingest.record.containsKey('club'), isFalse);
+    });
+
+    test('a landed body removes a field cleared upstream from the store',
+        () async {
+      final local = FakeLocal((_, __) {}, rows: {
+        'thing': {
+          'thing:1': {
+            'id': 'thing:1',
+            'title': 'old',
+            'club': 'club:9',
+            '_00_rv': 1,
+            '_00_crdt': 'blob',
+          }
+        }
+      });
+      final out = await runPure<void>(
+        (ctx) => fetchRows(ctx, env(schema: schema)),
+        state: primed([
+          liveQuery('a', [('thing:1', 2)])
+        ]),
+        handlers: defaults(over: {
+          'remote.query': (_, __) => [
+                StatementResult.ok([
+                  {'id': 'thing:1', 'title': 'new'}
+                ])
+              ],
+        }),
+      );
+      local.tx((out.ofKind('local.tx').single as LocalTx).ops);
+      final row = local.tables['thing']!['thing:1']!;
+      expect(row.containsKey('club'), isFalse);
+      expect(row['title'], 'new');
+      expect(row['_00_rv'], 2);
+      expect(row['_00_crdt'], 'blob', reason: 'local bookkeeping survives');
+    });
   });
 }

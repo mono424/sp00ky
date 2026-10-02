@@ -96,8 +96,15 @@ class LocalStoreAdapter implements LocalPort {
     db.tx(() {
       for (final op in ops) {
         switch (op) {
-          case PutOp(:final table, :final id, :final data, :final mode):
-            db.putDoc(table, id, data, merge: mode == WriteMode.merge);
+          case PutOp(
+              :final table,
+              :final id,
+              :final data,
+              :final mode,
+              :final clear
+            ):
+            db.putDoc(table, id, data,
+                merge: mode == WriteMode.merge, clear: clear);
           case DeleteOp(:final table, :final id):
             db.deleteDoc(table, id);
           case BumpRvOp(:final table, :final id):

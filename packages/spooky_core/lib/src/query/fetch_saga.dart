@@ -107,7 +107,12 @@ Future<bool> landChunk(
         ? row
         : cleanRecord(columns, row);
     final body = {...cleaned, 'id': id, '_00_rv': version};
-    ops.add(PutOp(table, id, body, mode: WriteMode.merge));
+    // The row is the server's whole body, so an optional column it lacks was
+    // cleared upstream: the merge removes the local copy instead of keeping
+    // it. Named on the op, not as nulls in `body`, which doubles as the
+    // circuit record (CREATE/UPDATE replace the circuit's row outright).
+    ops.add(PutOp(table, id, body,
+        mode: WriteMode.merge, clear: absentOptionalColumns(columns, row)));
     ingest.add(IngestRecord(
       table: table,
       op: state.versions.containsKey(id) ? IngestOp.update : IngestOp.create,

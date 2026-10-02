@@ -44,6 +44,33 @@ Map<String, dynamic> cleanRecord(
   return cleaned;
 }
 
+/// The OPTIONAL schema columns a full server row does not carry, for clearing
+/// when that row is landed with MERGE (TS `absentOptionalColumns`).
+///
+/// The server omits an optional field that is unset (`UPDATE t UNSET club`
+/// leaves no `club` key in `SELECT *` or a LIVE body), and MERGE keeps every
+/// key the patch does not mention, so without this the local store held on to
+/// a cleared value forever. A key that is present but null counts as absent.
+///
+/// Required columns are left alone: a SCHEMAFULL server cannot hold NONE in
+/// one, so its absence means the row was not readable in full (a field
+/// permission), not that it was cleared. `id` and the local-only `_00_*`
+/// bookkeeping are never touched.
+List<String> absentOptionalColumns(
+  Map<String, ColumnSchema>? tableSchema,
+  Map<String, dynamic> record,
+) {
+  if (tableSchema == null) return const [];
+  return [
+    for (final entry in tableSchema.entries)
+      if (entry.key != 'id' &&
+          !entry.key.startsWith('_00_') &&
+          entry.value.optional &&
+          record[entry.key] == null)
+        entry.key,
+  ];
+}
+
 /// Coerce params to their schema column types (TS `parseParams`).
 Map<String, dynamic> parseParams(
   Map<String, ColumnSchema> tableSchema,

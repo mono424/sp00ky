@@ -88,9 +88,17 @@ class FakeLocal implements LocalPort {
     _log('local.tx', [ops]);
     for (final op in ops) {
       switch (op) {
-        case PutOp(:final table, :final id, :final data, :final mode):
+        case PutOp(
+            :final table,
+            :final id,
+            :final data,
+            :final mode,
+            :final clear
+          ):
           final t = tables.putIfAbsent(table, () => {});
-          t[id] = mode == WriteMode.merge ? {...?t[id], ...data} : {...data};
+          t[id] = mode == WriteMode.merge
+              ? ({...?t[id], ...data}..removeWhere((k, _) => clear.contains(k)))
+              : {...data};
         case DeleteOp(:final table, :final id):
           tables[table]?.remove(id);
         case BumpRvOp(:final table, :final id):

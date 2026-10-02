@@ -114,10 +114,16 @@ class LocalDatabaseService {
   }
 
   /// `UPSERT ONLY $id MERGE $patch`: deep-merge into the existing doc (creating
-  /// it if absent), preserving keys the patch omits (e.g. `_00_crdt`).
-  void upsertMerge(String id, Map<String, dynamic> patch) {
+  /// it if absent), preserving keys the patch omits (e.g. `_00_crdt`). The
+  /// top-level keys in [clear] are then removed: fields cleared upstream, which
+  /// SurrealDB's MERGE removes when the patch holds NONE for them.
+  void upsertMerge(String id, Map<String, dynamic> patch,
+      {List<String> clear = const []}) {
     final existing = getById(id) ?? <String, dynamic>{'id': id};
     final merged = _deepMerge(existing, patch);
+    for (final key in clear) {
+      if (key != 'id') merged.remove(key);
+    }
     merged['id'] = id;
     _writeDoc(id, merged);
   }
@@ -226,7 +232,7 @@ class LocalDatabaseService {
   }
 
   void putDoc(String table, String id, Map<String, dynamic> data,
-      {bool merge = false}) {
+      {bool merge = false, List<String> clear = const []}) {
     if (_isQueryRegistry(table)) {
       if (merge) {
         patchQueryConfig(id, data);
@@ -240,7 +246,7 @@ class LocalDatabaseService {
       return;
     }
     if (merge) {
-      upsertMerge(id, data);
+      upsertMerge(id, data, clear: clear);
     } else {
       replace(id, data);
     }

@@ -76,6 +76,32 @@ void main() {
       expect(got['_00_crdt'], 'blob'); // preserved
     });
 
+    test('upsertMerge removes cleared keys and keeps local-only fields', () {
+      db.create('thread:a', {
+        'title': 'hello',
+        'club': 'club:1',
+        '_00_crdt': 'blob',
+        '_00_rv': 1,
+      });
+      db.upsertMerge('thread:a', {'title': 'updated', '_00_rv': 2},
+          clear: ['club', 'id']);
+      final got = db.getById('thread:a')!;
+      expect(got.containsKey('club'), isFalse, reason: 'cleared upstream');
+      expect(got['title'], 'updated');
+      expect(got['_00_crdt'], 'blob');
+      expect(got['id'], 'thread:a', reason: 'id is never cleared');
+    });
+
+    test('putDoc merge forwards clear; replace ignores it', () {
+      db.create('thread:a', {'title': 'x', 'club': 'club:1', '_00_rv': 1});
+      db.putDoc('thread', 'thread:a', {'title': 'y'},
+          merge: true, clear: ['club']);
+      expect(db.getById('thread:a')!.containsKey('club'), isFalse);
+      db.putDoc('thread', 'thread:a', {'title': 'z', 'club': 'club:2'},
+          clear: ['club']);
+      expect(db.getById('thread:a')!['club'], 'club:2');
+    });
+
     test('incrementRv and delete', () {
       db.create('thread:a', {'title': 'x', '_00_rv': 1});
       db.incrementRv('thread:a');

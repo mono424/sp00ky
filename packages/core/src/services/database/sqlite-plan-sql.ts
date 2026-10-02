@@ -70,6 +70,32 @@ export function serializeRow(row: Row): string {
   });
 }
 
+/**
+ * Serialize a MERGE row ONCE for both halves of the merge upsert: the row a
+ * fresh INSERT stores and the RFC 7396 delta `json_patch` applies on conflict.
+ *
+ * A top-level own key holding `undefined` means "clear this field", which is
+ * what SurrealDB's MERGE does with it (the SDK sends it as NONE). JSON drops
+ * such a key, so a patch built by {@link serializeRow} alone never mentioned
+ * it and the stored value survived every merge: a field cleared on the server
+ * stayed set locally. The patch therefore carries each one as a `null` member,
+ * which `json_patch` removes; the insert row simply lacks it, exactly as
+ * before. Appended to the already-serialized text, so the common case costs no
+ * second stringify. Nested `undefined` stays dropped (never a clear here).
+ */
+export function serializeMergeRow(row: Row): { insert: string; patch: string } {
+  const insert = serializeRow(row);
+  const cleared: string[] = [];
+  for (const key of Object.keys(row)) {
+    if (row[key] === undefined) cleared.push(`${JSON.stringify(key)}:null`);
+  }
+  // Not an object text (the replacer collapsed the root): nothing to append to.
+  if (cleared.length === 0 || insert[0] !== '{') return { insert, patch: insert };
+  const members = cleared.join(',');
+  const patch = insert === '{}' ? `{${members}}` : `${insert.slice(0, -1)},${members}}`;
+  return { insert, patch };
+}
+
 export function reviveRow(json: string): Row {
   // Fast path: the per-key reviver is only needed to rebuild `Uint8Array`s from
   // `{__u8}` tags. Most rows (e.g. game bodies) have none — a plain parse avoids

@@ -6,6 +6,7 @@ import {
   renderOrderSql,
   scalar,
   serializeRow,
+  serializeMergeRow,
   reviveRow,
   project,
 } from './sqlite-plan-sql';
@@ -100,5 +101,39 @@ describe('serializeRow / reviveRow round-trip', () => {
 describe('project', () => {
   it('keeps id plus the listed fields only, skipping absent ones', () => {
     expect(project({ id: 'a', x: 1, y: 2 }, ['x', 'missing'])).toEqual({ id: 'a', x: 1 });
+  });
+});
+
+describe('serializeMergeRow', () => {
+  it('reuses one string for insert and patch when nothing is cleared', () => {
+    const row = { id: 't:1', a: 1, b: null };
+    const { insert, patch } = serializeMergeRow(row);
+    expect(insert).toBe(serializeRow(row));
+    expect(patch).toBe(insert);
+  });
+
+  // json_patch (RFC 7396) removes a member whose patch value is null; JSON drops
+  // an undefined one, which is how a cleared field used to survive the MERGE.
+  it('carries a top-level undefined as a null member in the patch only', () => {
+    const { insert, patch } = serializeMergeRow({ id: 't:1', a: 1, club: undefined, 'we"ird': undefined });
+    expect(JSON.parse(insert)).toStrictEqual({ id: 't:1', a: 1 });
+    expect(JSON.parse(patch)).toStrictEqual({ id: 't:1', a: 1, club: null, 'we"ird': null });
+  });
+
+  it('handles a row with nothing but cleared keys', () => {
+    const { insert, patch } = serializeMergeRow({ club: undefined });
+    expect(insert).toBe('{}');
+    expect(JSON.parse(patch)).toStrictEqual({ club: null });
+  });
+
+  it('leaves nested undefined dropped (only top-level keys clear)', () => {
+    const { patch } = serializeMergeRow({ id: 't:1', meta: { x: undefined, y: 1 } });
+    expect(JSON.parse(patch)).toStrictEqual({ id: 't:1', meta: { y: 1 } });
+  });
+
+  it('does not append to a root the replacer collapsed to a scalar', () => {
+    const { insert, patch } = serializeMergeRow({ tb: 'user', id: 'u1', gone: undefined });
+    expect(insert).toBe('"user:u1"');
+    expect(patch).toBe(insert);
   });
 });

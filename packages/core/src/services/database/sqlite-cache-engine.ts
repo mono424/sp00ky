@@ -6,6 +6,7 @@ import {
   renderOrderSql,
   renderWhereSql,
   reviveRow,
+  serializeMergeRow,
   serializeRow,
   project,
   projectedDataSql,
@@ -947,11 +948,12 @@ export class SqliteCacheEngine implements LocalStore {
     if (mode === 'merge') {
       // Merge in-SQL via json_patch (RFC7396 = MERGE semantics): on insert store
       // the row, on conflict shallow-merge. Serialize once, reuse for VALUES and
-      // the patch. No read-modify-write round-trip. (RFC7396: null deletes key.)
-      const full = serializeRow({ ...data, id: key });
+      // the patch. No read-modify-write round-trip. (RFC7396: null deletes key,
+      // which is how a key holding `undefined` clears the stored field.)
+      const { insert, patch } = serializeMergeRow({ ...data, id: key });
       await this.call('run', {
         sql: `INSERT INTO "${table}"(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = json_patch(data, ?)`,
-        bind: [key, full, full],
+        bind: [key, insert, patch],
       });
       return;
     }
@@ -1191,10 +1193,12 @@ export class SqliteCacheEngine implements LocalStore {
           // Serialize ONCE and reuse for both VALUES (fresh insert) and the
           // json_patch (merge). Patching with `id` is a harmless no-op set, so
           // the full row doubles as the delta — halves per-row stringify cost.
-          const full = serializeRow({ ...op.data, id: key });
+          // A key holding `undefined` (a field cleared upstream) rides in the
+          // delta as a `null` member, which json_patch removes.
+          const { insert, patch } = serializeMergeRow({ ...op.data, id: key });
           stmts.push({
             sql: `INSERT INTO "${t}"(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = json_patch(data, ?)`,
-            bind: [key, full, full],
+            bind: [key, insert, patch],
           });
         } else {
           stmts.push({

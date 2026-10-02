@@ -17,6 +17,38 @@ export function cleanRecord(
 }
 
 /**
+ * The OPTIONAL schema columns a full server row does not carry, each mapped to
+ * `undefined`, for spreading into a body that is landed with MERGE.
+ *
+ * The server omits an optional field that is unset (`UPDATE t UNSET club`
+ * leaves no `club` key in `SELECT *` or the SSP body), and MERGE keeps every
+ * key the patch does not mention, so without this the local store held on to
+ * a cleared value forever. `undefined` is the one representation both engines
+ * read as "remove": the SurrealDB SDK encodes it as NONE, which MERGE removes
+ * (NULL would be a type error on an `option<record<...>>` field), and the
+ * SQLite engine turns it into the `null` member that `json_patch` removes (see
+ * `serializeMergeRow`).
+ *
+ * Required columns are left alone. A SCHEMAFULL server cannot hold NONE in
+ * one, so its absence means the row was not readable in full (a field
+ * permission), not that it was cleared, and NONE in a typed local store is a
+ * coercion error that would fail the whole chunk's transaction. `id` and the
+ * local-only `_00_*` bookkeeping are never touched.
+ */
+export function absentOptionalColumns(
+  tableSchema: Record<string, ColumnSchema> | undefined,
+  record: Record<string, unknown>
+): Record<string, undefined> {
+  const cleared: Record<string, undefined> = {};
+  if (!tableSchema) return cleared;
+  for (const [key, column] of Object.entries(tableSchema)) {
+    if (key === 'id' || key.startsWith('_00_') || column?.optional !== true) continue;
+    if (record[key] === undefined) cleared[key] = undefined;
+  }
+  return cleared;
+}
+
+/**
  * Parse a RECORD's fields against the table schema. Anything the schema does not
  * know is dropped, which is what keeps a stray field out of a write.
  */

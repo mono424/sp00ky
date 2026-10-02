@@ -8,7 +8,7 @@ import type { ClientState } from '../state/client-state';
 import * as R from '../state/reducers';
 import { planFetch } from '../state/selectors';
 import { encodeRecordId, parseRecordIdString } from '../utils/index';
-import { cleanRecord } from '../utils/parser';
+import { absentOptionalColumns, cleanRecord } from '../utils/parser';
 import type { SagaEnv } from './env';
 import * as sql from './sql';
 
@@ -87,7 +87,12 @@ export function* landChunk(
     const columns = env.schema.tables.find((t) => t.name === table)?.columns;
     const cleaned = columns ? cleanRecord(columns, row) : row;
     const { id: _id, ...content } = cleaned;
-    bodies.push({ id: rid, content: { ...content, _00_rv: version } });
+    // The row is the server's whole body, so an optional column it lacks was
+    // cleared upstream: name it (as `undefined`) so the MERGE removes the local
+    // copy instead of keeping it. `_00_*` local bookkeeping is never named, so
+    // MERGE (not REPLACE) still preserves it. The circuit record below needs no
+    // such key: CREATE/UPDATE replace the circuit's row outright.
+    bodies.push({ id: rid, content: { ...absentOptionalColumns(columns, row), ...content, _00_rv: version } });
     ingest.push({ table, op: state.versions.has(id) ? 'UPDATE' : 'CREATE', id, record: { ...cleaned, _00_rv: version } });
     seen.add(id);
   }

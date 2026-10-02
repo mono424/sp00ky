@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { RecordId } from '@spooky-sync/query-builder';
-import { parseParams, parseQueryParams } from './parser';
+import { absentOptionalColumns, parseParams, parseQueryParams } from './parser';
 
 const columns = {
   white: { recordId: true },
@@ -50,5 +50,41 @@ describe('parseParams', () => {
   it('drops a field that is not a column', () => {
     const parsed = parseParams(columns, { result: '1-0', nonsense: 'x', white__or0: 'y' });
     expect(parsed).toEqual({ result: '1-0' });
+  });
+});
+
+describe('absentOptionalColumns', () => {
+  const schema = {
+    title: { type: 'string', optional: false },
+    club: { type: 'string', recordId: true, optional: true },
+    note: { type: 'string', optional: true },
+    _00_local: { type: 'string', optional: true },
+    id: { type: 'string', optional: true },
+  } as any;
+
+  // The bug: `UPDATE broadcast:x UNSET club` leaves no `club` key in the body,
+  // and a MERGE that does not name it keeps the stale local value.
+  it('names every optional column the row lacks, as undefined', () => {
+    const cleared = absentOptionalColumns(schema, { id: 'broadcast:x', title: 't', note: 'n' });
+    expect(cleared).toStrictEqual({ club: undefined });
+    expect(Object.prototype.hasOwnProperty.call(cleared, 'club')).toBe(true);
+  });
+
+  it('treats an explicit undefined (a decoded NONE) as absent', () => {
+    expect(absentOptionalColumns(schema, { title: 't', club: undefined, note: 'n' })).toStrictEqual(
+      { club: undefined }
+    );
+  });
+
+  it('never names a required column, id, or _00_* bookkeeping', () => {
+    expect(absentOptionalColumns(schema, {})).toStrictEqual({ club: undefined, note: undefined });
+  });
+
+  it('keeps a present value, even a falsy one', () => {
+    expect(absentOptionalColumns(schema, { club: null, note: '' })).toStrictEqual({});
+  });
+
+  it('is empty without a schema', () => {
+    expect(absentOptionalColumns(undefined, { a: 1 })).toStrictEqual({});
   });
 });

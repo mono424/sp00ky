@@ -4,7 +4,7 @@ import { runPure } from '../testing/run-pure';
 import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import * as R from '../state/reducers';
 import { defaultEnv } from './env';
-import { fetchRows } from './fetch.saga';
+import { fetchRows, landChunk } from './fetch.saga';
 import type { StatementResult } from '../kernel/effects';
 
 const env = defaultEnv({ tables: [{ name: 'thing', columns: { a: {} } }] } as any);
@@ -152,5 +152,48 @@ describe('fetchRows', () => {
     });
     expect(calls).toBe(2);
     expect(out.state.versions.get('thing:2')).toBe(1);
+  });
+});
+
+describe('landChunk', () => {
+  const typed = defaultEnv({
+    tables: [
+      {
+        name: 'broadcast',
+        columns: {
+          title: { type: 'string', optional: false },
+          owner: { type: 'string', recordId: true, optional: false },
+          club: { type: 'string', recordId: true, optional: true },
+          note: { type: 'string', optional: true },
+        },
+      },
+    ],
+  } as any);
+
+  // `UPDATE broadcast:x UNSET club` leaves no `club` key in the body the server
+  // returns, and a MERGE that does not name it kept the stale local club.
+  it('names each optional column the body lacks as undefined so the MERGE clears it', async () => {
+    const rid = new RecordId('broadcast', 'x');
+    const out = await runPure(landChunk(typed, ['broadcast:x'], [{ id: rid, title: 't', note: 'n', _00_extra: 1 }], new Map([['broadcast:x', 4]]), buildState(), 3), {
+      handlers: { 'local.execute': () => undefined, 'ssp.ingest': () => undefined },
+    });
+    expect(out.result).toBe(true);
+    const exec = out.log.find((e) => e.kind === 'local.execute') as any;
+    expect(exec.query.sql).toContain('UPSERT ONLY $id0 MERGE $content0');
+    expect(exec.vars.content0).toStrictEqual({ club: undefined, title: 't', note: 'n', _00_extra: 1, _00_rv: 4 });
+    expect(Object.prototype.hasOwnProperty.call(exec.vars.content0, 'club')).toBe(true);
+    // A required column (`owner`) is never cleared: its absence means hidden, not unset.
+    expect(Object.prototype.hasOwnProperty.call(exec.vars.content0, 'owner')).toBe(false);
+    // The circuit record carries no clear: CREATE/UPDATE replace the circuit row.
+    const ingest = out.log.find((e) => e.kind === 'ssp.ingest') as any;
+    expect(ingest.records[0].record).toStrictEqual({ id: rid, title: 't', note: 'n', _00_extra: 1, _00_rv: 4 });
+  });
+
+  it('names nothing for a table without a schema', async () => {
+    const out = await runPure(landChunk(typed, ['other:1'], [{ id: new RecordId('other', '1'), z: 1 }], new Map([['other:1', 1]]), buildState(), 0), {
+      handlers: { 'local.execute': () => undefined, 'ssp.ingest': () => undefined },
+    });
+    const exec = out.log.find((e) => e.kind === 'local.execute') as any;
+    expect(exec.vars.content0).toStrictEqual({ z: 1, _00_rv: 1 });
   });
 });

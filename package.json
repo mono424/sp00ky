@@ -20,7 +20,7 @@
     "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,yml,yaml}\"",
     "version:bump": "node scripts/bump-version.mjs",
     "version:check": "node scripts/check-version.mjs",
-    "skills:validate": "pnpm --filter @spooky-sync/query-builder exec npx @tanstack/intent validate skills && pnpm --filter @spooky-sync/core exec npx @tanstack/intent validate skills && pnpm --filter @spooky-sync/client-solid exec npx @tanstack/intent validate skills && pnpm --filter @spooky-sync/client-solid2 exec npx @tanstack/intent validate skills"
+    "skills:validate": "pnpm --filter @spooky-sync/query-builder exec npx @tanstack/intent@0.4.0 validate skills && pnpm --filter @spooky-sync/core exec npx @tanstack/intent@0.4.0 validate skills && pnpm --filter @spooky-sync/client-solid exec npx @tanstack/intent@0.4.0 validate skills && pnpm --filter @spooky-sync/client-solid2 exec npx @tanstack/intent@0.4.0 validate skills"
   },
   "keywords": [],
   "author": "",

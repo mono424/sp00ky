@@ -182,12 +182,15 @@ Backend runs let you trigger server-side HTTP operations via an **outbox pattern
 ### `db.run()` Signature
 
 ```typescript
-db.run<B extends BackendNames<S>, R extends BackendRoutes<S, B>>(
-  backend: B,        // Backend name from sp00ky.yml (e.g., 'api')
-  route: R,          // Route path from OpenAPI spec (e.g., '/spookify')
-  payload: RoutePayload<S, B, R>,  // Typed args for the route
-  options?: RunOptions
-): Promise<void>
+// A method of the client: called as `db.run(backend, route, payload, options)`.
+interface Sp00kyClient<S> {
+  run<B extends BackendNames<S>, R extends BackendRoutes<S, B>>(
+    backend: B, // Backend name from sp00ky.yml (e.g., 'api')
+    route: R, // Route path from OpenAPI spec (e.g., '/spookify')
+    payload: RoutePayload<S, B, R>, // Typed args for the route
+    options?: RunOptions
+  ): Promise<void>;
+}
 ```
 
 All parameters are type-safe — `backend`, `route`, and `payload` are inferred from the generated schema.

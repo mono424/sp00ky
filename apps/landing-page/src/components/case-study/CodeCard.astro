@@ -35,12 +35,15 @@ const where = (file: string) => {
   return parts.length > 3 ? `…/${parts.slice(-3, -1).join('/')}/` : parts.slice(0, -1).join('/') + '/';
 };
 const tabbed = snippets.length > 1;
+// Rendered height estimate (13px x 1.7 per line plus a pill and padding per
+// file), so the script can stack the files when they fit on screen.
+const estimate = snippets.reduce((h, s) => h + s.code.split('\n').length * 22 + 64, 0);
 // The page renders each step twice (sticky column and inline on phones), so
 // ids only need to be unique per render, not stable.
 const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
 ---
 
-<div class="cs-codecard" data-codecard>
+<div class="cs-codecard" data-codecard data-estimate={tabbed ? estimate : undefined}>
   <div class="cs-codetabs" role={tabbed ? 'tablist' : undefined} aria-label={tabbed ? 'Files' : undefined}>
     {
       tabbed ? (
@@ -70,6 +73,7 @@ const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
         aria-labelledby={tabbed ? `${uid}-t${i}` : undefined}
         hidden={i !== 0}
       >
+        {tabbed && <span class="cs-codetab-static cs-codepanel-tab">{base(s.file)}</span>}
         <span class="cs-codemeta" title={s.file === 'terminal' ? undefined : s.file}>
           {where(s.file) && <span class="path">{where(s.file)}</span>}
           <span class="lang">{LANG_LABEL[s.lang] ?? s.lang}</span>
@@ -81,6 +85,19 @@ const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
 </div>
 
 <script>
+  // Several files show stacked when they fit: always inline on phones (the page
+  // scrolls), and in the sticky column when the card fits under the header.
+  // Otherwise they stay behind pills.
+  const layout = () => {
+    for (const card of document.querySelectorAll<HTMLElement>('[data-codecard][data-estimate]')) {
+      const inline = !!card.closest('.cs-step-code-inline');
+      const fits = Number(card.dataset.estimate) <= window.innerHeight - 150;
+      card.classList.toggle('is-stacked', inline || fits);
+    }
+  };
+  layout();
+  window.addEventListener('resize', layout);
+
   // Pills: click or arrow keys move between a card's files.
   for (const list of document.querySelectorAll<HTMLElement>('.cs-codetabs[role="tablist"]')) {
     const tabs = [...list.querySelectorAll<HTMLButtonElement>('[role="tab"]')];

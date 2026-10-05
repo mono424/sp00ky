@@ -1407,24 +1407,40 @@ const milestones = [
       if (root) {
         const steps = [...root.querySelectorAll<HTMLElement>('[data-step]')];
         const codes = [...root.querySelectorAll<HTMLElement>('[data-code]')];
+        let current = -1;
         const activate = (i: number) => {
+          if (i === current) return;
+          current = i;
           steps.forEach((s, j) => s.classList.toggle('is-active', i === j));
           codes.forEach((c, j) => c.classList.toggle('is-active', i === j));
         };
-        const observer = new IntersectionObserver(
-          (entries) => {
-            for (const entry of entries) {
-              if (entry.isIntersecting) activate(Number((entry.target as HTMLElement).dataset.step));
-            }
-          },
-          { rootMargin: '-45% 0px -50% 0px' },
-        );
+        // The step crossing the middle of the screen is active. Read on every
+        // scroll frame, so a jump (an anchor link, a restored scroll position)
+        // lands on the right code at once.
+        let queued = false;
         const sync = () => {
-          root.classList.toggle('is-enhanced', wide.matches);
-          steps.forEach((s) => (wide.matches ? observer.observe(s) : observer.unobserve(s)));
+          queued = false;
+          if (!wide.matches) return;
+          const mid = window.innerHeight * 0.47;
+          let pick = 0;
+          steps.forEach((s, i) => {
+            if (s.getBoundingClientRect().top <= mid) pick = i;
+          });
+          activate(pick);
         };
-        sync();
-        wide.addEventListener('change', sync);
+        const onScroll = () => {
+          if (queued) return;
+          queued = true;
+          requestAnimationFrame(sync);
+        };
+        const mode = () => {
+          root.classList.toggle('is-enhanced', wide.matches);
+          sync();
+        };
+        mode();
+        wide.addEventListener('change', mode);
+        window.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('resize', onScroll);
       }
     </script>
   </body>

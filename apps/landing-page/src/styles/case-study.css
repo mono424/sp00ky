@@ -536,6 +536,25 @@ body.cs-page {
 .cs-codepanel[hidden] {
   display: none;
 }
+/* Stacked: every file shows, each under its own pill; the tab row goes away. */
+.cs-codepanel-tab {
+  display: none;
+}
+.cs-codecard.is-stacked .cs-codetabs {
+  display: none;
+}
+.cs-codecard.is-stacked .cs-codepanel,
+.cs-codecard.is-stacked .cs-codepanel[hidden] {
+  display: block;
+  position: relative;
+}
+.cs-codecard.is-stacked .cs-codepanel-tab {
+  display: inline-block;
+  margin: 12px 0 0 12px;
+}
+.cs-codecard.is-stacked .cs-codepanel + .cs-codepanel {
+  margin-top: 4px;
+}
 .cs-codemeta {
   position: absolute;
   top: 18px;

@@ -813,10 +813,9 @@ const milestones = [
                 Two players, two platforms, <span class="serif"><em>one row.</em></span>
               </h2>
               <p>
-                Alice plays white in the web app. Bob plays black on his phone. Each move is a
-                local write: it is on the mover's board at once, goes up to SurrealDB, and comes
-                down to the other device through its live query. Take Bob's phone offline halfway
-                through and watch his move wait in the outbox until he is back.
+                Alice plays white in the web app, Bob plays black on his phone, and both boards
+                read the same row in SurrealDB. The four steps under the boards show where each move
+                is. Take Bob's phone offline to see what a lost connection does.
               </p>
             </div>
             <SyncDemo client:visible />

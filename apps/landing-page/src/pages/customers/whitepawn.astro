@@ -10,7 +10,6 @@ import SyncDemo from '../../components/case-study/SyncDemo';
 import { basePath } from '../../config/nav';
 import heroArt from '../../assets/case-studies/whitepawn/hero.webp';
 import studioArt from '../../assets/case-studies/whitepawn/studio.webp';
-import togetherArt from '../../assets/case-studies/whitepawn/analyze-together-sketch.webp';
 import portalShot from '../../assets/case-studies/whitepawn/web-portal.png';
 
 // Every number on this page comes from WhitePawn's repository or its production
@@ -785,9 +784,7 @@ const milestones = [
                       <span>{step.saved}</span>
                     </p>
                     <div class="cs-step-code-inline">
-                      {step.code.map((c) => (
-                        <CodeCard {...c} />
-                      ))}
+                      <CodeCard snippets={step.code} />
                     </div>
                   </article>
                 ))
@@ -797,9 +794,7 @@ const milestones = [
               {
                 steps.map((step, i) => (
                   <div class={`cs-code${i === 0 ? ' is-active' : ''}`} data-code={i}>
-                    {step.code.map((c) => (
-                      <CodeCard {...c} />
-                    ))}
+                    <CodeCard snippets={step.code} />
                   </div>
                 ))
               }
@@ -1351,15 +1346,7 @@ const milestones = [
       <!-- CTA -->
       <section class="cs-cta" aria-labelledby="cta-title">
         <div class="cs-narrow">
-          <Image
-            src={togetherArt}
-            alt=""
-            widths={[320, 480]}
-            sizes="240px"
-            format="webp"
-            quality={80}
-            style="width: 240px; height: auto; margin: 0 auto 40px; border-radius: 18px;"
-          />
+          <img class="cs-cta-mark" src="/footer-mark-00.svg" alt="" width="78" height="51" />
           <h2 id="cta-title">Build the part only you can build.</h2>
           <p>
             Start with a schema and a live query. The quickstart gets you from an empty folder to an
@@ -1369,7 +1356,24 @@ const milestones = [
             <a class="cs-btn cs-btn-primary" href={`${basePath}/docs/quickstart`}>Open the quickstart</a>
             <a class="cs-btn cs-btn-ghost" href={`${basePath}/docs/how-it-works`}>See how sp00ky works</a>
           </div>
-          <p class="cs-install"><span>$ </span>npx @spooky-sync/cli@canary create</p>
+          <div class="cs-install">
+            <span class="prompt" aria-hidden="true">$</span>
+            <code class="cmd">npx @spooky-sync/cli@canary create</code>
+            <button
+              type="button"
+              class="cs-copy"
+              data-copy="npx @spooky-sync/cli@canary create"
+              aria-label="Copy the create command"
+            >
+              <svg class="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+              <svg class="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5"></path>
+              </svg>
+            </button>
+          </div>
         </div>
       </section>
     </main>
@@ -1380,6 +1384,23 @@ const milestones = [
       // Scroll-linked walkthrough: the step nearest the middle of the viewport is
       // active, and its code shows in the sticky column. Narrow screens show the
       // code inline under each step instead, so they skip this.
+      // Copy button on the create command.
+      for (const btn of document.querySelectorAll<HTMLButtonElement>('.cs-copy')) {
+        btn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(btn.dataset.copy ?? '');
+          } catch {
+            return;
+          }
+          btn.classList.add('is-copied');
+          btn.setAttribute('aria-label', 'Copied');
+          setTimeout(() => {
+            btn.classList.remove('is-copied');
+            btn.setAttribute('aria-label', 'Copy the create command');
+          }, 1600);
+        });
+      }
+
       const root = document.querySelector<HTMLElement>('[data-steps]');
       const wide = window.matchMedia('(min-width: 901px)');
       if (root) {

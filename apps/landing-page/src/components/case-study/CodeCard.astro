@@ -1,14 +1,22 @@
 ---
 import { Code } from 'astro:components';
 
-export interface Props {
+interface Snippet {
   /** Path in the customer's repository, shown as the card's title. */
   file: string;
   lang: string;
   code: string;
 }
 
-const { file, lang, code } = Astro.props;
+/**
+ * One code card. Pass a single snippet (`file`, `lang`, `code`) or several
+ * (`snippets`): several share one card with a tab per file, so a step's code
+ * never grows taller than the sticky column it sits in.
+ */
+export type Props = Snippet | { snippets: Snippet[] };
+
+const props = Astro.props;
+const snippets: Snippet[] = 'snippets' in props ? props.snippets : [props];
 const LANG_LABEL: Record<string, string> = {
   surrealql: 'SurrealQL',
   yaml: 'YAML',
@@ -18,12 +26,73 @@ const LANG_LABEL: Record<string, string> = {
   dart: 'Dart',
   bash: 'Shell',
 };
+const base = (file: string) => file.split('/').pop() ?? file;
+// The page renders each step twice (sticky column and inline on phones), so
+// ids only need to be unique per render, not stable.
+const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
 ---
 
-<div class="cs-codecard">
-  <div class="cs-codecard-head">
-    <span class="file">{file}</span>
-    <span class="lang">{LANG_LABEL[lang] ?? lang}</span>
-  </div>
-  <Code code={code} lang={lang as any} theme="vitesse-dark" wrap />
+<div class="cs-codecard" data-codecard>
+  {
+    snippets.length > 1 && (
+      <div class="cs-codetabs" role="tablist" aria-label="Files">
+        {snippets.map((s, i) => (
+          <button
+            type="button"
+            role="tab"
+            id={`${uid}-t${i}`}
+            aria-controls={`${uid}-p${i}`}
+            aria-selected={i === 0 ? 'true' : 'false'}
+            tabindex={i === 0 ? 0 : -1}
+          >
+            {base(s.file)}
+          </button>
+        ))}
+      </div>
+    )
+  }
+  {
+    snippets.map((s, i) => (
+      <div
+        class="cs-codepanel"
+        role={snippets.length > 1 ? 'tabpanel' : undefined}
+        id={`${uid}-p${i}`}
+        aria-labelledby={snippets.length > 1 ? `${uid}-t${i}` : undefined}
+        hidden={i !== 0}
+      >
+        <div class="cs-codecard-head">
+          <span class="file">{s.file}</span>
+          <span class="lang">{LANG_LABEL[s.lang] ?? s.lang}</span>
+        </div>
+        <Code code={s.code} lang={s.lang as any} theme="vitesse-dark" wrap />
+      </div>
+    ))
+  }
 </div>
+
+<script>
+  // Tabs: click or arrow keys move between a card's files.
+  for (const list of document.querySelectorAll<HTMLElement>('.cs-codetabs')) {
+    const tabs = [...list.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    const card = list.closest<HTMLElement>('[data-codecard]');
+    const select = (index: number, focus = false) => {
+      tabs.forEach((tab, i) => {
+        const on = i === index;
+        tab.setAttribute('aria-selected', String(on));
+        tab.tabIndex = on ? 0 : -1;
+        const panel = card?.querySelector<HTMLElement>(`#${tab.getAttribute('aria-controls')}`);
+        if (panel) panel.hidden = !on;
+      });
+      if (focus) tabs[index].focus();
+    };
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => select(i));
+      tab.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+        e.preventDefault();
+        const step = e.key === 'ArrowRight' ? 1 : -1;
+        select((i + step + tabs.length) % tabs.length, true);
+      });
+    });
+  }
+</script>

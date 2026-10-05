@@ -25,5 +25,5 @@ const LANG_LABEL: Record<string, string> = {
     <span class="file">{file}</span>
     <span class="lang">{LANG_LABEL[lang] ?? lang}</span>
   </div>
-  <Code code={code} lang={lang as any} theme="vitesse-dark" />
+  <Code code={code} lang={lang as any} theme="vitesse-dark" wrap />
 </div>

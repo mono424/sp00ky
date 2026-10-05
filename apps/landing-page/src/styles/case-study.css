@@ -388,7 +388,7 @@ body.cs-page {
 
 .cs-steps {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
   gap: clamp(28px, 5vw, 72px);
 }
 /* Grid children default to min-width: auto, so one long code line would widen

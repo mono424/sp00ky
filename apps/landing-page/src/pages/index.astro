@@ -209,7 +209,7 @@ const mobileHeroSources = await Promise.all(
             class="story-card group relative block rounded-2xl border border-white/[0.08] bg-[#111318] overflow-hidden transition-all duration-300 hover:border-white/[0.14]"
           >
             <div class="flex flex-col md:flex-row items-stretch min-h-[240px]">
-              <div class="relative z-10 flex flex-col justify-between gap-8 p-8 md:p-10 md:w-[50%]">
+              <div class="relative z-10 flex flex-col justify-between gap-8 p-8 md:p-10 md:w-[46%]">
                 <div>
                   <p class="flex items-center gap-2 text-[13px] text-white/45 mb-4">
                     <svg class="w-4 h-4 text-white/60" viewBox="0 0 512 512" fill="currentColor" aria-hidden="true">
@@ -218,7 +218,7 @@ const mobileHeroSources = await Promise.all(
                     Customer story, WhitePawn
                   </p>
                   <h3 class="text-xl md:text-2xl font-semibold text-white/90 leading-snug mb-3 max-w-[440px] text-balance">
-                    One developer runs a real-time chess platform on sp00ky.
+                    One developer runs a real&#8209;time chess platform on sp00ky.
                   </h3>
                   <p class="text-sm text-white/45 leading-relaxed max-w-[400px]">
                     Web, iOS and Android, with no API layer, no sync code and no ops team. See the
@@ -239,7 +239,7 @@ const mobileHeroSources = await Promise.all(
                   <div>
                     <dt class="sr-only">API endpoints</dt>
                     <dd class="text-xl font-medium text-white/85 tabular-nums">0</dd>
-                    <dd class="text-[12px] text-white/40 mt-1">hand-written API endpoints</dd>
+                    <dd class="text-[12px] text-white/40 mt-1">API endpoints written</dd>
                   </div>
                 </dl>
                 <div>
@@ -258,17 +258,18 @@ const mobileHeroSources = await Promise.all(
                   </span>
                 </div>
               </div>
-              <div class="relative flex-1 min-h-[220px] md:min-h-0">
-                <Image
-                  src={whitepawnArt}
-                  alt="Watercolor of a sunny terrace above a bay, with pairs of people playing chess at wooden tables."
-                  class="absolute inset-0 h-full w-full object-cover object-[50%_70%] transition-transform duration-700 group-hover:scale-[1.03]"
-                  widths={[640, 960, 1280]}
-                  sizes="(min-width: 768px) 50vw, 100vw"
-                  format="webp"
-                  quality={80}
-                />
-                <div class="story-fade absolute inset-0" aria-hidden="true"></div>
+              <div class="relative flex-1 p-3 pt-0 md:p-4 md:pl-0">
+                <div class="relative h-full min-h-[220px] overflow-hidden rounded-xl border border-white/[0.06]">
+                  <Image
+                    src={whitepawnArt}
+                    alt="Watercolor of a sunny terrace above a bay, with pairs of people playing chess at wooden tables."
+                    class="absolute inset-0 h-full w-full object-cover object-[50%_72%] transition-transform duration-700 ease-out group-hover:scale-[1.04]"
+                    widths={[640, 960, 1280]}
+                    sizes="(min-width: 768px) 50vw, 100vw"
+                    format="webp"
+                    quality={80}
+                  />
+                </div>
               </div>
             </div>
           </a>
@@ -545,17 +546,6 @@ const mobileHeroSources = await Promise.all(
 
   <style>
     /* Try Out Now, grid pattern */
-    /* The art fades into the card on the side that meets the text. */
-    .story-fade {
-      inset: -1px 0 0 0;
-      background: linear-gradient(to bottom, #111318 0%, #111318 3%, rgba(17, 19, 24, 0) 32%);
-    }
-    @media (min-width: 768px) {
-      .story-fade {
-        inset: 0 0 0 -1px;
-        background: linear-gradient(to right, #111318 0%, #111318 4%, rgba(17, 19, 24, 0) 38%);
-      }
-    }
     .tryout-grid {
       background-image:
         linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px),

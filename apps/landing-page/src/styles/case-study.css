@@ -552,8 +552,24 @@ body.cs-page {
   display: inline-block;
   margin: 12px 0 0 12px;
 }
-.cs-codecard.is-stacked .cs-codepanel + .cs-codepanel {
-  margin-top: 4px;
+/* Each stacked file is its own card: the outer frame steps back. */
+.cs-codecard.is-stacked {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: none;
+  border: 0;
+  box-shadow: none;
+  overflow: visible;
+}
+.cs-codecard.is-stacked .cs-codepanel {
+  border-radius: 18px;
+  background: #0b0d11;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 30px 80px -30px rgba(0, 0, 0, 0.8);
+  overflow: hidden;
 }
 .cs-codemeta {
   position: absolute;

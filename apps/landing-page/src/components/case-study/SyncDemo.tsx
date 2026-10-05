@@ -1,24 +1,30 @@
+import type React from 'react';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 
 /**
- * Two players, two platforms, one row. Alice plays white in the web app, Bob
- * plays black on his phone, and both boards read the same `game` row.
+ * One analysis board, two devices. Alice works through a line on WhitePawn's
+ * analysis screen, a move on her laptop, the next on her phone, and both read
+ * the same `analysis_board` row in SurrealDB.
  *
- * Every move takes the same four steps, shown under the devices as it happens:
- *   1. local write  - the mover's board updates from its own local store
- *   2. upload       - the write goes up and SurrealDB commits it to the row
- *   3. sync engine  - sp00ky finds the live queries that row feeds
+ * The devices only ever talk to SurrealDB. sp00ky's sync engine runs behind the
+ * database: it takes in the change, works out which live queries the row
+ * feeds, and writes that back, so SurrealDB can push the row to the other
+ * device. Every move takes four steps, shown under the devices as it happens:
+ *   1. local write  - the device's board updates from its own local store
+ *   2. SurrealDB    - the write goes up and is stored in the row
+ *   3. sp00ky       - the engine behind the database routes the change
  *   4. live query   - the other device receives the row and re-renders
- * Taking Bob's phone offline stops a move at step 2 (his write waits in the
- * outbox) or step 4 (Alice's move waits for him), and reconnecting resumes it.
+ * Taking the phone offline parks a move at step 2 (the phone's own write waits
+ * in its outbox) or step 4 (a laptop move waits for the phone), and
+ * reconnecting resumes it.
  *
  * Nothing here talks to a server. It is a re-enactment of the flow, timed
  * slower than the real thing so the eye can follow it.
  */
 
-type Device = 'web' | 'phone';
+type Device = 'laptop' | 'phone';
 type Board = Record<string, string>;
-type Stage = 'local' | 'upload' | 'commit' | 'route' | 'deliver' | 'done';
+type Stage = 'local' | 'upload' | 'stored' | 'ingest' | 'route' | 'publish' | 'deliver' | 'done';
 
 interface Move {
   from: string;
@@ -66,50 +72,51 @@ function boardAfter(count: number): Board {
   return b;
 }
 
-/** White (even plies) is played on the web, black (odd plies) on the phone. */
-const owner = (ply: number): Device => (ply % 2 === 0 ? 'web' : 'phone');
-const other = (d: Device): Device => (d === 'web' ? 'phone' : 'web');
-const PLAYER: Record<Device, string> = { web: 'Alice', phone: 'Bob' };
+/** Moves alternate: even plies are added on the laptop, odd plies on the phone. */
+const owner = (ply: number): Device => (ply % 2 === 0 ? 'laptop' : 'phone');
+const other = (d: Device): Device => (d === 'laptop' ? 'phone' : 'laptop');
+const NAME: Record<Device, string> = { laptop: 'laptop', phone: 'phone' };
 
 interface Flight {
   ply: number;
   from: Device;
   stage: Stage;
-  /** Why the move is parked: Bob's own write is offline, or Bob cannot receive. */
+  /** Why the move is parked: the phone's own write is offline, or the phone cannot receive. */
   wait: 'outbox' | 'offline' | null;
   doneAt: number;
 }
 
 interface State {
-  /** Plies committed to the row in SurrealDB. */
+  /** Plies stored in the row. */
   server: number;
   /** Plies each board shows. */
   seen: Record<Device, number>;
   phoneOnline: boolean;
   flight: Flight | null;
-  /** Bumps on every commit so the row can flash. */
-  commits: number;
+  /** Bumps on every store so the row can flash. */
+  writes: number;
 }
 
 const initialState = (): State => ({
   server: 0,
-  seen: { web: 0, phone: 0 },
+  seen: { laptop: 0, phone: 0 },
   phoneOnline: true,
   flight: null,
-  commits: 0,
+  writes: 0,
 });
 
 // Slower than reality on purpose, so each step can be read.
-const STEP_MS = 750;
-const HOP_MS = 600;
-const TURN_GAP_MS = 1100;
+const STEP_MS = 700;
+const HOP_MS = 550;
+const TURN_GAP_MS = 1200;
 
 export default function SyncDemo() {
   const state = useRef<State>(initialState());
   const [, render] = useReducer((n: number) => n + 1, 0);
   const timers = useRef<number[]>([]);
+  const root = useRef<HTMLDivElement>(null);
+  // Autoplays while on screen; the plug on the phone's wire is the only control.
   const [playing, setPlaying] = useState(false);
-  const [reducedMotion, setReducedMotion] = useState(false);
 
   const commit = useCallback((mutate: (s: State) => void) => {
     mutate(state.current);
@@ -118,7 +125,6 @@ export default function SyncDemo() {
   const later = useCallback((ms: number, fn: () => void) => {
     timers.current.push(window.setTimeout(fn, ms));
   }, []);
-
   const setStage = useCallback(
     (stage: Stage, wait: Flight['wait'] = null) =>
       commit((s) => {
@@ -128,54 +134,62 @@ export default function SyncDemo() {
     [commit],
   );
 
-  // Steps 3 and 4: the row is committed; route it and deliver it.
-  const routeAndDeliver = useCallback(() => {
-    setStage('route');
-    later(STEP_MS, () => {
-      const s = state.current;
-      const f = s.flight;
-      if (!f) return;
-      const to = other(f.from);
-      if (to === 'phone' && !s.phoneOnline) {
-        setStage('deliver', 'offline');
-        return;
-      }
-      setStage('deliver');
-      later(HOP_MS, () => {
-        commit((st) => {
-          st.seen[to] = st.server;
-        });
-        setStage('done');
+  const deliver = useCallback(() => {
+    const f = state.current.flight;
+    if (!f) return;
+    const to = other(f.from);
+    if (to === 'phone' && !state.current.phoneOnline) {
+      setStage('deliver', 'offline');
+      return;
+    }
+    setStage('deliver');
+    later(HOP_MS, () => {
+      commit((st) => {
+        st.seen[to] = st.server;
       });
+      setStage('done');
     });
   }, [commit, later, setStage]);
 
-  // Step 2: upload, then SurrealDB commits.
+  // Step 3: the engine behind the database takes the change in, routes it and
+  // writes the result back to SurrealDB.
+  const route = useCallback(() => {
+    setStage('ingest');
+    later(HOP_MS, () => {
+      setStage('route');
+      later(STEP_MS, () => {
+        setStage('publish');
+        later(HOP_MS, deliver);
+      });
+    });
+  }, [deliver, later, setStage]);
+
+  // Step 2: upload, and SurrealDB stores the row.
   const upload = useCallback(() => {
     setStage('upload');
     later(HOP_MS, () => {
       commit((s) => {
         if (!s.flight) return;
         s.server = Math.max(s.server, s.flight.ply + 1);
-        s.commits += 1;
+        s.writes += 1;
       });
-      setStage('commit');
-      later(STEP_MS, routeAndDeliver);
+      setStage('stored');
+      later(STEP_MS, route);
     });
-  }, [commit, later, routeAndDeliver, setStage]);
+  }, [commit, later, route, setStage]);
 
-  /** The device whose turn it is and whose board is caught up, if no move is in flight. */
+  /** The device that adds the next move, if its board is caught up and nothing is in flight. */
   const nextMover = (): Device | null => {
     const s = state.current;
     if (s.flight && s.flight.stage !== 'done') return null;
-    for (const d of ['web', 'phone'] as Device[]) {
+    for (const d of ['laptop', 'phone'] as Device[]) {
       const ply = s.seen[d];
       if (ply < MOVES.length && owner(ply) === d) return d;
     }
     return null;
   };
 
-  // Step 1: the mover's local write.
+  // Step 1: the local write.
   const play = useCallback(() => {
     const device = nextMover();
     if (!device) return;
@@ -201,15 +215,7 @@ export default function SyncDemo() {
     const f = state.current.flight;
     if (!online || !f) return;
     if (f.wait === 'outbox') upload();
-    else if (f.wait === 'offline') {
-      setStage('deliver');
-      later(HOP_MS, () => {
-        commit((st) => {
-          st.seen.phone = st.server;
-        });
-        setStage('done');
-      });
-    }
+    else if (f.wait === 'offline') deliver();
   };
 
   const reset = useCallback(() => {
@@ -220,19 +226,21 @@ export default function SyncDemo() {
   }, []);
 
   useEffect(() => {
-    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-    setReducedMotion(mq.matches);
-    setPlaying(!mq.matches);
+    const el = root.current;
+    if (!el) return;
+    const io = new IntersectionObserver(([entry]) => setPlaying(entry.isIntersecting), { threshold: 0.25 });
+    io.observe(el);
+    return () => io.disconnect();
   }, []);
 
-  // Autoplay: the next move a beat after the last one settled; restart a finished game.
+  // Autoplay: the next move a beat after the last one settled; restart a finished line.
   useEffect(() => {
     if (!playing) return;
     const id = window.setInterval(() => {
       const s = state.current;
       const f = s.flight;
       if (f && (f.stage !== 'done' || Date.now() - f.doneAt < TURN_GAP_MS)) return;
-      if (s.seen.web === MOVES.length && s.seen.phone === MOVES.length) {
+      if (s.seen.laptop === MOVES.length && s.seen.phone === MOVES.length) {
         if (f && Date.now() - f.doneAt > TURN_GAP_MS * 2.5) reset();
         return;
       }
@@ -245,40 +253,75 @@ export default function SyncDemo() {
 
   const s = state.current;
   const f = s.flight;
-  const mover = nextMover();
-  const committed = MOVES.slice(0, s.server);
+  const stored = MOVES.slice(0, s.server);
+  const stamp = f ? `${f.ply}-${f.stage}` : '';
+  const moving = f && !f.wait ? f.stage : null;
+  const sideOf = (d: Device) => (d === 'laptop' ? 'left' : 'right');
 
-  // Which wire carries a dot right now, and which way.
-  const leg: { side: 'left' | 'right'; dir: 'in' | 'out' } | null =
-    f && !f.wait
-      ? f.stage === 'upload'
-        ? { side: f.from === 'web' ? 'left' : 'right', dir: 'in' }
-        : f.stage === 'deliver'
-          ? { side: other(f.from) === 'web' ? 'left' : 'right', dir: 'out' }
-          : null
-      : null;
+  const plug = (
+    <button
+      type="button"
+      className={`sd-plug${s.phoneOnline ? '' : ' is-off'}`}
+      onClick={() => setPhoneOnline(!s.phoneOnline)}
+      aria-pressed={!s.phoneOnline}
+      aria-label={s.phoneOnline ? 'Disconnect the phone' : 'Reconnect the phone'}
+      title={s.phoneOnline ? 'Disconnect the phone' : 'Reconnect the phone'}
+    >
+      {s.phoneOnline ? (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M9 17H7A5 5 0 0 1 7 7h2" />
+          <path d="M15 7h2a5 5 0 1 1 0 10h-2" />
+          <line x1="8" x2="16" y1="12" y2="12" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M9 17H7A5 5 0 0 1 7 7" />
+          <path d="M15 7h2a5 5 0 0 1 4 8" />
+          <line x1="8" x2="12" y1="12" y2="12" />
+          <line x1="2" x2="22" y1="2" y2="22" />
+        </svg>
+      )}
+      <span className="sd-plug-label">{s.phoneOnline ? 'disconnect' : 'reconnect'}</span>
+    </button>
+  );
+
+  // Which wire carries a dot right now, and which way it travels.
+  const dot = (wire: 'left' | 'right' | 'down'): 'toward' | 'away' | null => {
+    if (!f || !moving) return null;
+    if (moving === 'upload' && sideOf(f.from) === wire) return 'toward';
+    if (moving === 'deliver' && sideOf(other(f.from)) === wire) return 'away';
+    if (wire === 'down' && moving === 'ingest') return 'away';
+    if (wire === 'down' && moving === 'publish') return 'toward';
+    return null;
+  };
+
+  const dbActive = moving === 'stored' || moving === 'ingest' || moving === 'publish';
+  const engineActive = moving === 'ingest' || moving === 'route' || moving === 'publish';
 
   return (
-    <div className="sd">
+    <div className="sd" ref={root}>
       <div className="sd-stage">
-        <DeviceFrame kind="web" ply={s.seen.web} status={statusFor('web', s, mover)} />
-        <Wire side="left" leg={leg} stamp={f ? `${f.ply}-${f.stage}` : ''} />
-        <div className={`sd-db${f?.stage === 'commit' ? ' is-commit' : ''}${f?.stage === 'route' ? ' is-route' : ''}`}>
-          <div className="sd-db-head">
+        <DeviceFrame kind="laptop" ply={s.seen.laptop} status={statusFor('laptop', s)} />
+        <div className="sd-middle">
+        <Wire wire="left" dir={dot('left')} stamp={stamp} />
+
+        <div className="sd-stack">
+        <div className={`sd-db${dbActive ? ' is-active' : ''}${moving === 'stored' ? ' is-write' : ''}`}>
+          <div className="sd-card-head">
             <img src="/surrealdb-logo.png" alt="" width="14" height="16" />
-            SurrealDB
+            <span>SurrealDB</span>
           </div>
-          <div className="sd-row" key={s.commits}>
-            <span className="sd-rid">game:alice_bob</span>
+          <div className="sd-row" key={s.writes}>
+            <span className="sd-rid">analysis_board:AB_x7Kq</span>
             <dl>
               <dt>moves</dt>
               <dd>
-                {committed.length === 0 ? (
-                  <span className="sd-muted">none yet</span>
+                {stored.length === 0 ? (
+                  <span className="sd-muted">empty</span>
                 ) : (
                   <>
-                    {committed.length > 3 && <span className="sd-muted">{committed.length - 3} more, </span>}
-                    {committed.slice(-3).map((m, i, arr) => (
+                    {stored.length > 3 && <span className="sd-muted">… </span>}
+                    {stored.slice(-3).map((m, i, arr) => (
                       <span key={m.san + i} className={i === arr.length - 1 ? 'sd-newest' : ''}>
                         {m.san}
                         {i < arr.length - 1 ? ' ' : ''}
@@ -287,25 +330,37 @@ export default function SyncDemo() {
                   </>
                 )}
               </dd>
-              <dt>to move</dt>
-              <dd>{s.server >= MOVES.length ? 'game saved' : owner(s.server) === 'web' ? 'white' : 'black'}</dd>
+              <dt>ply</dt>
+              <dd>{s.server}</dd>
             </dl>
           </div>
-          <div className="sd-engine">
-            <img src="/footer-mark-00.svg" alt="" width="18" height="12" />
+        </div>
+
+        <div className="sd-behind">
+          <Wire wire="down" dir={dot('down')} stamp={stamp} />
+          <div className={`sd-engine${engineActive ? ' is-active' : ''}`}>
+            <img src="/footer-mark-00.svg" alt="" width="20" height="13" />
             <span>
               <strong>sp00ky sync engine</strong>
               <em>{engineText(f)}</em>
             </span>
           </div>
+          <span className="sd-behind-label">runs behind your database</span>
         </div>
-        <Wire side="right" leg={leg} stamp={f ? `${f.ply}-${f.stage}` : ''} dim={!s.phoneOnline} />
+        </div>
+
+        <Wire wire="right" dir={dot('right')} stamp={stamp} dim={!s.phoneOnline}>
+          {plug}
+        </Wire>
+        </div>
+
         <DeviceFrame
           kind="phone"
           ply={s.seen.phone}
-          status={statusFor('phone', s, mover)}
+          status={statusFor('phone', s)}
           offline={!s.phoneOnline}
-          outbox={f?.wait === 'outbox' ? 1 : 0}
+          outbox={f?.wait === 'outbox'}
+          plug={plug}
         />
       </div>
 
@@ -321,28 +376,6 @@ export default function SyncDemo() {
         ))}
       </ol>
 
-      <div className="sd-controls">
-        <button type="button" className="sd-btn" onClick={() => setPlaying((p) => !p)} aria-pressed={playing}>
-          {playing ? 'Pause' : 'Play'}
-        </button>
-        <button type="button" className="sd-btn" onClick={() => play()} disabled={!mover}>
-          Next move
-        </button>
-        <button
-          type="button"
-          className={`sd-btn sd-btn-signal${s.phoneOnline ? '' : ' is-off'}`}
-          onClick={() => setPhoneOnline(!s.phoneOnline)}
-          aria-pressed={!s.phoneOnline}
-        >
-          {s.phoneOnline ? "Take Bob's phone offline" : "Bring Bob's phone back online"}
-        </button>
-        <button type="button" className="sd-btn sd-btn-quiet" onClick={reset}>
-          Restart
-        </button>
-        {reducedMotion && !playing && (
-          <span className="sd-hint">Autoplay is off because your system asks for reduced motion.</span>
-        )}
-      </div>
     </div>
   );
 }
@@ -350,14 +383,21 @@ export default function SyncDemo() {
 type StepState = 'idle' | 'active' | 'done' | 'wait';
 
 function stepsFor(f: Flight | null): { title: string; text: string; state: StepState }[] {
-  const from = f ? PLAYER[f.from] : 'The mover';
-  const to = f ? PLAYER[other(f.from)] : 'the other player';
-  const san = f ? MOVES[f.ply].san : 'a move';
-  const order: Stage[] = ['local', 'upload', 'commit', 'route', 'deliver', 'done'];
-  const at = f ? order.indexOf(f.stage) : -1;
-  // Stage index -> step index: upload and commit are both step 2.
-  const stepOf = (stage: number) => [0, 1, 1, 2, 3, 4][stage];
-  const current = at < 0 ? -1 : stepOf(at);
+  const from = f ? NAME[f.from] : 'device';
+  const to = f ? NAME[other(f.from)] : 'other device';
+  const san = f ? MOVES[f.ply].san : 'the move';
+  // Stage -> step: upload and stored are step 2, ingest/route/publish step 3.
+  const STEP: Record<Stage, number> = {
+    local: 0,
+    upload: 1,
+    stored: 1,
+    ingest: 2,
+    route: 2,
+    publish: 2,
+    deliver: 3,
+    done: 4,
+  };
+  const current = f ? STEP[f.stage] : -1;
   const stateOf = (i: number): StepState => {
     if (current < 0) return 'idle';
     if (i < current || current === 4) return 'done';
@@ -367,68 +407,81 @@ function stepsFor(f: Flight | null): { title: string; text: string; state: StepS
   return [
     {
       title: 'Local write',
-      text: `${from}'s board shows ${san} at once, from the local store.`,
+      text: `The ${from} shows ${san} at once, from its local store.`,
       state: stateOf(0),
     },
     {
-      title: 'Upload',
+      title: 'SurrealDB',
       text:
         f?.wait === 'outbox'
-          ? `No signal: the write waits in ${from}'s outbox.`
-          : at >= 2
-            ? 'SurrealDB committed it to the game row.'
-            : 'The write goes up to SurrealDB.',
+          ? 'No signal: the write waits in the phone’s outbox.'
+          : 'The write is stored in the analysis_board row.',
       state: stateOf(1),
     },
     {
-      title: 'Sync engine',
-      text: `sp00ky finds the live queries this row feeds: ${to}'s game screen.`,
+      title: 'sp00ky, behind it',
+      text: `Finds the screens this row feeds, here the ${to}, and hands them back to SurrealDB.`,
       state: stateOf(2),
     },
     {
       title: 'Live query',
       text:
         f?.wait === 'offline'
-          ? `${to}'s phone is offline. It catches up when it reconnects.`
-          : `${f ? to : 'The other player'}'s board re-renders with ${san}.`,
+          ? 'The phone is offline. It catches up when it reconnects.'
+          : `SurrealDB pushes the row and the ${to} shows ${san}.`,
       state: stateOf(3),
     },
   ];
 }
 
 function engineText(f: Flight | null): string {
-  if (!f) return 'waiting for a change';
-  const to = PLAYER[other(f.from)];
+  if (!f) return 'idle';
+  if (f.stage === 'ingest') return 'reading the change';
   if (f.stage === 'route') return 'matching live queries';
-  if (f.stage === 'deliver') return f.wait ? `${to} offline, holding` : `pushing to ${to}`;
-  if (f.stage === 'done') return `${to} is up to date`;
-  return 'waiting for a change';
+  if (f.stage === 'publish') return `routing it to the ${NAME[other(f.from)]}`;
+  return 'idle';
 }
 
-function statusFor(device: Device, s: State, mover: Device | null): string {
-  if (s.seen[device] >= MOVES.length && s.server >= MOVES.length) return 'Game saved';
+function statusFor(device: Device, s: State): string {
   if (device === 'phone' && !s.phoneOnline) return 'Offline';
-  if (mover === device) return 'Your move';
-  return `${PLAYER[other(device)]}'s move`;
+  const f = s.flight;
+  if (f && f.from === device && f.stage !== 'done' && !(f.stage === 'deliver')) return 'Saving';
+  if (s.seen[device] < s.server || (f && other(f.from) === device && f.stage !== 'done')) return 'Updating';
+  return 'Up to date';
 }
 
 function Wire({
-  side,
-  leg,
+  wire,
+  dir,
   stamp,
   dim = false,
+  children,
 }: {
-  side: 'left' | 'right';
-  leg: { side: 'left' | 'right'; dir: 'in' | 'out' } | null;
+  wire: 'left' | 'right' | 'down';
+  dir: 'toward' | 'away' | null;
   stamp: string;
   dim?: boolean;
+  children?: React.ReactNode;
 }) {
-  // "in" travels toward the database in the middle, "out" away from it.
-  const active = leg && leg.side === side ? leg : null;
-  const forward = active ? (side === 'left' ? active.dir === 'in' : active.dir === 'out') : false;
+  // "toward" travels to the database card, "away" from it.
+  const cls =
+    dir === null
+      ? ''
+      : wire === 'left'
+        ? dir === 'toward'
+          ? 'fwd'
+          : 'rev'
+        : wire === 'right'
+          ? dir === 'toward'
+            ? 'rev'
+            : 'fwd'
+          : dir === 'away'
+            ? 'down'
+            : 'up';
   return (
-    <div className={`sd-wire${dim ? ' is-dim' : ''}`} aria-hidden="true">
-      {active && <span key={stamp} className={`sd-dot ${forward ? 'fwd' : 'rev'}`} />}
+    <div className={`sd-wire sd-wire-${wire}${dim ? ' is-dim' : ''}`}>
+      {dir && <span key={stamp} className={`sd-dot ${cls}`} aria-hidden="true" />}
+      {children}
     </div>
   );
 }
@@ -438,69 +491,104 @@ function DeviceFrame({
   ply,
   status,
   offline = false,
-  outbox = 0,
+  outbox = false,
+  plug,
 }: {
   kind: Device;
   ply: number;
   status: string;
   offline?: boolean;
-  outbox?: number;
+  outbox?: boolean;
+  /** Phones only: the connection plug, shown here when the wires are hidden. */
+  plug?: React.ReactNode;
 }) {
   const board = boardAfter(ply);
   const last = ply > 0 ? MOVES[ply - 1] : null;
-  const flipped = kind === 'phone';
-  const ranks = flipped ? [1, 2, 3, 4, 5, 6, 7, 8] : [8, 7, 6, 5, 4, 3, 2, 1];
-  const files = flipped ? [...FILES].reverse() : [...FILES];
-  const pairs: string[] = [];
-  for (let i = 0; i < ply; i += 2) {
-    pairs.push(`${i / 2 + 1}. ${MOVES[i].san}${MOVES[i + 1] && i + 1 < ply ? ` ${MOVES[i + 1].san}` : ''}`);
-  }
+  const shown = MOVES.slice(0, ply);
+  const tone = status === 'Offline' ? 'off' : status === 'Up to date' ? 'ok' : 'busy';
+  const bar = (
+    <div className="sd-bar">
+      <span className="sd-title">Analysis</span>
+      <span className={`sd-status is-${tone}`}>{status}</span>
+    </div>
+  );
+  const grid = (
+    <div
+      className="sd-board"
+      role="img"
+      aria-label={`The ${kind}'s board after ${ply} moves${last ? `, last move ${last.san}` : ''}`}
+    >
+      {[8, 7, 6, 5, 4, 3, 2, 1].map((r) =>
+        [...FILES].map((f) => {
+          const sq = `${f}${r}`;
+          const piece = board[sq];
+          // a1 is a dark square: file index 0 + rank 1 is odd.
+          const dark = (FILES.indexOf(f) + r) % 2 === 1;
+          const hl = last && (last.from === sq || last.to === sq);
+          return (
+            <span key={sq} className={`sd-sq${dark ? ' dark' : ''}${hl ? ' hl' : ''}`}>
+              {piece && (
+                <span className={`sd-pc ${piece[0] === 'w' ? 'white' : 'black'}`}>
+                  {GLYPH[piece[1]]}
+                  {'\uFE0E'}
+                </span>
+              )}
+            </span>
+          );
+        }),
+      )}
+    </div>
+  );
+
+  // The laptop is landscape: board left, the analysis panel with the line right.
+  // The phone is portrait: board on top, the newest moves under it.
+  const pairs: { n: number; w: string; b?: string }[] = [];
+  for (let i = 0; i < shown.length; i += 2) pairs.push({ n: i / 2 + 1, w: shown[i].san, b: shown[i + 1]?.san });
 
   return (
     <figure className={`sd-device sd-${kind}${offline ? ' is-offline' : ''}`}>
       <div className="sd-screen">
-        <div className="sd-bar">
-          <span className="sd-players">{kind === 'web' ? 'Alice vs Bob' : 'Bob vs Alice'}</span>
-          <span className={`sd-status${offline ? ' is-off' : ''}`}>{status}</span>
-        </div>
-        <div className="sd-body">
-          <div
-            className="sd-board"
-            role="img"
-            aria-label={`${kind === 'web' ? "Alice's" : "Bob's"} board after ${ply} moves${last ? `, last move ${last.san}` : ''}`}
-          >
-            {ranks.map((r) =>
-              files.map((f) => {
-                const sq = `${f}${r}`;
-                const piece = board[sq];
-                // a1 is a dark square: file index 0 + rank 1 is odd.
-                const dark = (FILES.indexOf(f) + r) % 2 === 1;
-                const hl = last && (last.from === sq || last.to === sq);
-                return (
-                  <span key={sq} className={`sd-sq${dark ? ' dark' : ''}${hl ? ' hl' : ''}`}>
-                    {piece && (
-                      <span className={`sd-pc ${piece[0] === 'w' ? 'white' : 'black'}`}>
-                        {GLYPH[piece[1]]}
-                        {'︎'}
-                      </span>
-                    )}
+        {kind === 'laptop' ? (
+          <>
+            {grid}
+            <div className="sd-side">
+              {bar}
+              <ol className="sd-moves" aria-hidden="true">
+                {pairs.length === 0 && <li className="sd-moves-empty">Start position</li>}
+                {pairs.slice(-6).map((p) => (
+                  <li key={p.n}>
+                    <span className="n">{p.n}.</span>
+                    <span className={!p.b ? 'is-new' : ''}>{p.w}</span>
+                    {p.b && <span className="is-new">{p.b}</span>}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          </>
+        ) : (
+          <>
+            {bar}
+            {grid}
+            <div className="sd-line" aria-hidden="true">
+              {shown.length === 0 ? (
+                <span className="sd-line-empty">Start position</span>
+              ) : (
+                shown.slice(-3).map((m, i, arr) => (
+                  <span key={`${ply}-${i}`} className={i === arr.length - 1 ? 'is-new' : ''}>
+                    {m.san}
                   </span>
-                );
-              }),
-            )}
-          </div>
-          {kind === 'web' && (
-            <ol className="sd-movelist" aria-hidden="true">
-              {pairs.slice(-6).map((p) => (
-                <li key={p}>{p}</li>
-              ))}
-            </ol>
-          )}
-        </div>
-        {outbox > 0 && <span className="sd-outbox">{outbox} write in outbox</span>}
+                ))
+              )}
+            </div>
+          </>
+        )}
+        {outbox && <span className="sd-outbox">1 write in outbox</span>}
       </div>
-      {kind === 'web' && <div className="sd-laptop-base" aria-hidden="true" />}
-      <figcaption>{kind === 'web' ? 'Alice, web app' : 'Bob, iPhone app'}</figcaption>
+      {kind === 'laptop' && <div className="sd-laptop-base" aria-hidden="true" />}
+      <figcaption>
+        Alice&rsquo;s {kind}
+        {plug && <span className="sd-plug-mobile">{plug}</span>}
+      </figcaption>
     </figure>
   );
 }

@@ -2,7 +2,7 @@
 import { Code } from 'astro:components';
 
 interface Snippet {
-  /** Path in the customer's repository, shown as the card's title. */
+  /** Path in the customer's repository; 'terminal' for a shell command. */
   file: string;
   lang: string;
   code: string;
@@ -10,8 +10,9 @@ interface Snippet {
 
 /**
  * One code card. Pass a single snippet (`file`, `lang`, `code`) or several
- * (`snippets`): several share one card with a tab per file, so a step's code
- * never grows taller than the sticky column it sits in.
+ * (`snippets`): several share one card with a pill per file, so a step's code
+ * never grows taller than the sticky column it sits in. The file's path and
+ * language sit top right and follow the selected pill.
  */
 export type Props = Snippet | { snippets: Snippet[] };
 
@@ -27,16 +28,23 @@ const LANG_LABEL: Record<string, string> = {
   bash: 'Shell',
 };
 const base = (file: string) => file.split('/').pop() ?? file;
+// The pill already names the file, so a long path keeps only its tail.
+const where = (file: string) => {
+  if (file === 'terminal') return '';
+  const parts = file.split('/');
+  return parts.length > 3 ? `…/${parts.slice(-3, -1).join('/')}/` : parts.slice(0, -1).join('/') + '/';
+};
+const tabbed = snippets.length > 1;
 // The page renders each step twice (sticky column and inline on phones), so
 // ids only need to be unique per render, not stable.
 const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
 ---
 
 <div class="cs-codecard" data-codecard>
-  {
-    snippets.length > 1 && (
-      <div class="cs-codetabs" role="tablist" aria-label="Files">
-        {snippets.map((s, i) => (
+  <div class="cs-codetabs" role={tabbed ? 'tablist' : undefined} aria-label={tabbed ? 'Files' : undefined}>
+    {
+      tabbed ? (
+        snippets.map((s, i) => (
           <button
             type="button"
             role="tab"
@@ -47,23 +55,25 @@ const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
           >
             {base(s.file)}
           </button>
-        ))}
-      </div>
-    )
-  }
+        ))
+      ) : (
+        <span class="cs-codetab-static">{base(snippets[0].file)}</span>
+      )
+    }
+  </div>
   {
     snippets.map((s, i) => (
       <div
         class="cs-codepanel"
-        role={snippets.length > 1 ? 'tabpanel' : undefined}
+        role={tabbed ? 'tabpanel' : undefined}
         id={`${uid}-p${i}`}
-        aria-labelledby={snippets.length > 1 ? `${uid}-t${i}` : undefined}
+        aria-labelledby={tabbed ? `${uid}-t${i}` : undefined}
         hidden={i !== 0}
       >
-        <div class="cs-codecard-head">
-          <span class="file">{s.file}</span>
+        <span class="cs-codemeta" title={s.file === 'terminal' ? undefined : s.file}>
+          {where(s.file) && <span class="path">{where(s.file)}</span>}
           <span class="lang">{LANG_LABEL[s.lang] ?? s.lang}</span>
-        </div>
+        </span>
         <Code code={s.code} lang={s.lang as any} theme="vitesse-dark" wrap />
       </div>
     ))
@@ -71,8 +81,8 @@ const uid = `cc${Math.random().toString(36).slice(2, 8)}`;
 </div>
 
 <script>
-  // Tabs: click or arrow keys move between a card's files.
-  for (const list of document.querySelectorAll<HTMLElement>('.cs-codetabs')) {
+  // Pills: click or arrow keys move between a card's files.
+  for (const list of document.querySelectorAll<HTMLElement>('.cs-codetabs[role="tablist"]')) {
     const tabs = [...list.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
     const card = list.closest<HTMLElement>('[data-codecard]');
     const select = (index: number, focus = false) => {

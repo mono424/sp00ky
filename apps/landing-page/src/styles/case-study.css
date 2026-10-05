@@ -488,6 +488,7 @@ body.cs-page {
 }
 
 .cs-codecard {
+  position: relative;
   border-radius: 18px;
   background: #0b0d11;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -499,57 +500,65 @@ body.cs-page {
 .cs-codecard + .cs-codecard {
   margin-top: 14px;
 }
+/* Pills for the files, left; the selected file's path and language, right. */
 .cs-codetabs {
   display: flex;
-  gap: 4px;
-  padding: 8px 8px 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 12px 0;
+  max-width: 62%;
 }
-.cs-codetabs button {
+.cs-codetabs button,
+.cs-codetab-static {
   flex: none;
   appearance: none;
   border: 0;
-  border-radius: 8px 8px 0 0;
-  padding: 8px 14px 9px;
+  border-radius: 999px;
+  padding: 6px 13px;
   background: transparent;
   color: var(--cs-mist);
   font-family: 'JetBrains Mono', ui-monospace, monospace;
-  font-size: 12.5px;
+  font-size: 12px;
+  line-height: 1.2;
   cursor: pointer;
-  box-shadow: inset 0 -2px 0 transparent;
   transition: color 150ms ease, background 150ms ease;
 }
 .cs-codetabs button:hover {
   color: var(--cs-white);
-}
-.cs-codetabs button[aria-selected='true'] {
-  color: var(--cs-white);
   background: rgba(255, 255, 255, 0.05);
-  box-shadow: inset 0 -2px 0 var(--cs-fog);
+}
+.cs-codetabs button[aria-selected='true'],
+.cs-codetab-static {
+  color: var(--cs-white);
+  background: rgba(255, 255, 255, 0.09);
+  cursor: default;
 }
 .cs-codepanel[hidden] {
   display: none;
 }
-.cs-codecard-head {
+.cs-codemeta {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  max-width: 38%;
   display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 18px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  font-size: 12.5px;
+  gap: 10px;
+  justify-content: flex-end;
+  font-size: 11.5px;
+  line-height: 1.2;
   color: var(--cs-mist);
-}
-.cs-codecard-head .file {
-  font-family: 'JetBrains Mono', ui-monospace, monospace;
-  color: var(--cs-fog);
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.cs-codecard-head .lang {
+.cs-codemeta .path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  opacity: 0.8;
+}
+.cs-codemeta .lang {
   flex: none;
+  color: var(--cs-fog);
 }
 .cs-codecard pre.astro-code code {
   padding: 0;
@@ -561,7 +570,7 @@ body.cs-page {
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   font-variant-ligatures: none;
   margin: 0;
-  padding: 18px 20px 20px;
+  padding: 14px 20px 20px;
   background: transparent !important;
   font-size: 13px;
   line-height: 1.7;
@@ -593,14 +602,31 @@ body.cs-page {
 .sd {
   margin-top: 8px;
 }
+/* Laptop and phone on the sides, SurrealDB between them, and sp00ky's engine
+   under the database: the devices never talk to it directly. The middle block
+   is its own grid so the side wires always meet the database card's center. */
 .sd-stage {
   display: grid;
-  grid-template-columns:
-    minmax(0, 360px) minmax(28px, 1fr) minmax(210px, 236px) minmax(28px, 1fr)
-    minmax(0, 172px);
+  grid-template-columns: minmax(0, 420px) minmax(330px, 1fr) minmax(0, 164px);
   justify-content: center;
   align-items: center;
 }
+.sd-middle {
+  display: grid;
+  grid-template-columns: minmax(52px, 1fr) minmax(220px, 250px) minmax(52px, 1fr);
+  align-items: start;
+}
+.sd-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.sd-behind {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
 .sd-device {
   margin: 0;
   min-width: 0;
@@ -623,9 +649,57 @@ body.cs-page {
     0 24px 48px -20px rgba(0, 0, 0, 0.8);
   transition: filter 300ms ease;
 }
-.sd-web .sd-screen {
+.sd-laptop .sd-screen {
   border-radius: 12px 12px 3px 3px;
   padding: 10px;
+  /* Landscape, like a laptop: the board fills the height on the left. */
+  aspect-ratio: 16 / 10;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 12px;
+}
+.sd-laptop .sd-board {
+  height: 100%;
+  width: auto;
+}
+.sd-side {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.sd-side .sd-bar {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+.sd-moves {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  font-size: 11.5px;
+  line-height: 1.75;
+  font-variant-numeric: tabular-nums;
+  color: var(--cs-ink-2);
+  overflow: hidden;
+}
+.sd-moves li {
+  display: grid;
+  grid-template-columns: 18px 1fr 1fr;
+  gap: 4px;
+  white-space: nowrap;
+}
+.sd-moves .n {
+  color: var(--cs-sage-2);
+}
+.sd-moves li:last-child .is-new {
+  color: var(--cs-ink);
+  font-weight: 600;
+}
+.sd-moves .sd-moves-empty {
+  display: block;
+  color: var(--cs-sage-2);
 }
 .sd-laptop-base {
   height: 10px;
@@ -636,7 +710,7 @@ body.cs-page {
 .sd-phone .sd-screen {
   border-width: 7px;
   border-radius: 26px;
-  padding: 24px 8px 12px;
+  padding: 24px 9px 12px;
 }
 .sd-phone .sd-screen::before {
   content: '';
@@ -655,32 +729,37 @@ body.cs-page {
 .sd-bar {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   margin-bottom: 8px;
-  font-size: 11.5px;
-  line-height: 1.3;
 }
-.sd-phone .sd-bar {
-  flex-direction: column;
-  gap: 1px;
-}
-.sd-players {
+.sd-title {
+  font-size: 12px;
   font-weight: 600;
 }
 .sd-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.sd-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.sd-status.is-ok {
   color: var(--cs-sage);
+}
+.sd-status.is-busy {
+  color: #5d6e89;
 }
 .sd-status.is-off {
   color: #9a6a12;
-}
-.sd-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
-}
-.sd-web .sd-body {
-  grid-template-columns: minmax(0, 1fr) 72px;
 }
 .sd-board {
   container-type: inline-size;
@@ -722,20 +801,31 @@ body.cs-page {
 .sd-pc.black {
   color: #1f2623;
 }
-.sd-movelist {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  font-size: 11.5px;
-  line-height: 1.7;
-  color: var(--cs-ink-2);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+.sd-line {
+  display: flex;
+  gap: 5px;
+  margin-top: 8px;
+  min-height: 21px;
   overflow: hidden;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
-.sd-movelist li:last-child {
+.sd-line span {
+  flex: none;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(42, 50, 47, 0.07);
+  color: var(--cs-ink-2);
+}
+.sd-line span.is-new {
+  background: rgba(227, 194, 126, 0.45);
   color: var(--cs-ink);
   font-weight: 600;
+}
+.sd-line .sd-line-empty {
+  background: none;
+  padding-left: 0;
+  color: var(--cs-sage-2);
 }
 .sd-outbox {
   position: absolute;
@@ -754,30 +844,102 @@ body.cs-page {
 
 .sd-wire {
   position: relative;
-  height: 2px;
-  margin: 0 8px 26px;
-  background: repeating-linear-gradient(90deg, var(--cs-line-strong) 0 6px, transparent 6px 12px);
   transition: opacity 300ms ease;
 }
-.sd-wire.is-dim {
-  opacity: 0.2;
+.sd-wire-left,
+.sd-wire-right {
+  height: 2px;
+  margin: 65px 8px 0;
+  background: repeating-linear-gradient(90deg, var(--cs-line-strong) 0 6px, transparent 6px 12px);
+}
+.sd-wire-down {
+  width: 2px;
+  height: 30px;
+  background: repeating-linear-gradient(180deg, var(--cs-line-strong) 0 5px, transparent 5px 10px);
+}
+.sd-wire-right.is-dim {
+  background: repeating-linear-gradient(90deg, rgba(227, 194, 126, 0.35) 0 4px, transparent 4px 14px);
+}
+
+/* The phone's connection: a plug sitting on its wire. */
+.sd-plug {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--cs-line-strong);
+  background: var(--cs-panel-2);
+  color: var(--cs-fog);
+  cursor: pointer;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.7);
+  transition: border-color 150ms ease, color 150ms ease, background 150ms ease;
+}
+.sd-plug:hover {
+  border-color: var(--cs-fog);
+  color: var(--cs-white);
+}
+.sd-plug svg {
+  width: 16px;
+  height: 16px;
+}
+.sd-plug.is-off {
+  border-color: rgba(227, 194, 126, 0.7);
+  background: #241d10;
+  color: var(--cs-amber);
+}
+.sd-plug-label {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10.5px;
+  color: var(--cs-mist);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.sd-plug.is-off .sd-plug-label {
+  color: var(--cs-amber);
+}
+.sd-plug-mobile {
+  display: none;
 }
 .sd-dot {
   position: absolute;
-  top: 50%;
   width: 10px;
   height: 10px;
   border-radius: 50%;
   background: #e7eef8;
   box-shadow: 0 0 14px 4px rgba(160, 196, 255, 0.45);
   transform: translate(-50%, -50%);
-  animation: 600ms ease-in-out forwards;
+  animation: 550ms ease-in-out forwards;
+}
+.sd-dot.fwd,
+.sd-dot.rev {
+  top: 50%;
 }
 .sd-dot.fwd {
   animation-name: sd-fwd;
 }
 .sd-dot.rev {
   animation-name: sd-rev;
+}
+.sd-dot.down,
+.sd-dot.up {
+  left: 50%;
+}
+.sd-dot.down {
+  animation-name: sd-down;
+}
+.sd-dot.up {
+  animation-name: sd-up;
 }
 @keyframes sd-fwd {
   from { left: 0; }
@@ -787,26 +949,39 @@ body.cs-page {
   from { left: 100%; }
   to { left: 0; }
 }
+@keyframes sd-down {
+  from { top: 0; }
+  to { top: 100%; }
+}
+@keyframes sd-up {
+  from { top: 100%; }
+  to { top: 0; }
+}
 
-/* The database in the middle: the one row both boards read, and the engine
-   that routes its changes. */
-.sd-db {
-  margin-bottom: 26px;
-  padding: 14px;
+.sd-db,
+.sd-engine {
   border-radius: 16px;
+  transition: border-color 250ms ease, background 250ms ease, box-shadow 250ms ease;
+}
+.sd-db {
+  min-height: 132px;
+  padding: 14px;
   background: var(--cs-panel-2);
   border: 1px solid var(--cs-line-strong);
   box-shadow: 0 24px 48px -24px rgba(0, 0, 0, 0.8);
 }
-.sd-db-head {
+.sd-db.is-active {
+  border-color: rgba(169, 200, 229, 0.5);
+}
+.sd-card-head {
   display: flex;
   align-items: center;
-  gap: 7px;
-  font-size: 12.5px;
+  gap: 8px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--cs-white);
 }
-.sd-db-head img {
+.sd-card-head img {
   display: block;
   width: 14px;
   height: auto;
@@ -819,14 +994,14 @@ body.cs-page {
   border: 1px solid var(--cs-line);
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   font-size: 11.5px;
-  line-height: 1.6;
+  line-height: 1.65;
 }
-.sd-db.is-commit .sd-row {
+.sd-db.is-write .sd-row {
   animation: sd-flash 900ms ease-out;
 }
 @keyframes sd-flash {
   from {
-    border-color: rgba(227, 194, 126, 0.8);
+    border-color: rgba(227, 194, 126, 0.85);
     box-shadow: 0 0 22px -4px rgba(227, 194, 126, 0.45);
   }
   to {
@@ -838,11 +1013,14 @@ body.cs-page {
   display: block;
   margin-bottom: 4px;
   color: var(--cs-fog);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sd-row dl {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  column-gap: 10px;
+  column-gap: 12px;
   margin: 0;
 }
 .sd-row dt {
@@ -861,15 +1039,21 @@ body.cs-page {
 .sd-muted {
   color: var(--cs-mist);
 }
+
 .sd-engine {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  padding: 9px 12px;
-  border-radius: 10px;
-  border: 1px solid transparent;
-  transition: background 250ms ease, border-color 250ms ease;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  background: rgba(11, 13, 17, 0.7);
+  border: 1px dashed var(--cs-line-strong);
+}
+.sd-engine.is-active {
+  border-style: solid;
+  border-color: rgba(169, 200, 229, 0.5);
+  background: rgba(169, 200, 229, 0.08);
+  box-shadow: 0 0 28px -8px rgba(160, 196, 255, 0.35);
 }
 .sd-engine img {
   flex: none;
@@ -879,10 +1063,11 @@ body.cs-page {
 .sd-engine span {
   display: flex;
   flex-direction: column;
+  gap: 2px;
   min-width: 0;
 }
 .sd-engine strong {
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 500;
   color: var(--cs-white);
 }
@@ -894,18 +1079,19 @@ body.cs-page {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sd-db.is-route .sd-engine {
-  background: rgba(169, 200, 229, 0.08);
-  border-color: rgba(169, 200, 229, 0.3);
-}
-.sd-db.is-route .sd-engine em {
+.sd-engine.is-active em {
   color: var(--cs-fog);
+}
+.sd-behind-label {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--cs-mist);
 }
 
 /* The four steps of the move in flight. */
 .sd-steps {
   list-style: none;
-  margin: 28px 0 0;
+  margin: 32px 0 0;
   padding: 0;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -980,47 +1166,6 @@ body.cs-page {
   color: var(--cs-amber);
 }
 
-.sd-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  margin-top: 20px;
-}
-.sd-btn {
-  appearance: none;
-  border: 1px solid var(--cs-line-strong);
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--cs-white);
-  font: inherit;
-  font-size: 14px;
-  padding: 9px 16px;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: background 150ms ease, border-color 150ms ease;
-}
-.sd-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.09);
-  border-color: rgba(169, 200, 229, 0.32);
-}
-.sd-btn:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.sd-btn-signal.is-off {
-  border-color: rgba(227, 194, 126, 0.5);
-  color: var(--cs-amber);
-}
-.sd-btn-quiet {
-  border-color: transparent;
-  background: transparent;
-  color: var(--cs-mist);
-}
-.sd-hint {
-  font-size: 13.5px;
-  color: var(--cs-amber);
-}
-
 @media (max-width: 900px) {
   .sd-steps {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1028,33 +1173,54 @@ body.cs-page {
 }
 @media (max-width: 760px) {
   .sd-stage {
-    grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
-    grid-template-areas:
-      'web phone'
-      'db db';
-    gap: 16px 14px;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+    gap: 18px 14px;
     align-items: end;
   }
-  .sd-web {
-    grid-area: web;
+  .sd-phone {
+    width: 100%;
+    max-width: 150px;
+    justify-self: center;
+  }
+  .sd-phone .sd-bar,
+  .sd-side .sd-bar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .sd-title {
+    font-size: 11px;
+  }
+  .sd-status {
+    font-size: 9.5px;
+  }
+  .sd-laptop {
+    grid-column: 1;
+    grid-row: 1;
   }
   .sd-phone {
-    grid-area: phone;
+    grid-column: 2;
+    grid-row: 1;
   }
-  .sd-db {
-    grid-area: db;
-    margin-bottom: 0;
-  }
-  .sd-wire {
-    display: none;
-  }
-  .sd-web .sd-body {
+  .sd-middle {
+    grid-column: 1 / -1;
+    grid-row: 2;
     grid-template-columns: minmax(0, 1fr);
   }
-  .sd-movelist {
+  .sd-plug-mobile {
+    display: block;
+    position: relative;
+    height: 34px;
+    margin: 10px auto 18px;
+  }
+  .sd-plug-mobile .sd-plug {
+    top: 17px;
+  }
+  .sd-wire-left,
+  .sd-wire-right {
     display: none;
   }
-  .sd-web .sd-screen {
+  .sd-laptop .sd-screen {
     border-width: 6px;
     padding: 7px;
   }
@@ -1063,14 +1229,14 @@ body.cs-page {
     border-radius: 20px;
     padding: 20px 6px 10px;
   }
-  .sd-bar {
-    font-size: 10.5px;
+  .sd-line {
+    display: none;
   }
 }
 @media (max-width: 480px) {
   .sd-steps {
     gap: 8px;
-    margin-top: 20px;
+    margin-top: 22px;
   }
   .sd-steps li {
     flex-direction: column;
@@ -1086,7 +1252,7 @@ body.cs-page {
 }
 @media (prefers-reduced-motion: reduce) {
   .sd-dot,
-  .sd-db.is-commit .sd-row {
+  .sd-db.is-write .sd-row {
     animation: none;
   }
 }

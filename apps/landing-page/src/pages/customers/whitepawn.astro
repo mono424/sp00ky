@@ -216,6 +216,9 @@ DEFINE BUCKET club_covers
         lang: 'jsx',
         code: `const upload = useFileUpload("club_covers");
 ...
+// One key names both renditions: <key>_f.webp and <key>_t.webp.
+const key = coverKeyFor(club().id);
+const paths = coverPaths(key);
 for (const [path, blob] of [
   [paths.full, full],
   [paths.thumb, thumb],
@@ -223,10 +226,15 @@ for (const [path, blob] of [
   await upload.upload(path, blob);
   if (upload.error()) throw upload.error();
 }
-await updateClub(db, club().id, { [field]: key });
+// The club row stores only the key.
+await updateClub(db, club().id, { cover_key: key });
 
-// ClubCrest.jsx renders it from the stored key
-<BucketImage bucket="club_covers" path={path()} alt="" />`,
+// ClubCrest.jsx renders the thumbnail from that key
+<BucketImage
+  bucket="club_covers"
+  path={coverThumbPath(club.cover_key)}
+  alt=""
+/>`,
       },
     ],
   },

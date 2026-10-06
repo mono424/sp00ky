@@ -147,3 +147,21 @@ describe('phaseTimings', () => {
     expect(t.registration.parseMs).toBeNull();
   });
 });
+
+describe('view index selectors', () => {
+  it('vouched is the union of every view row, memoized on the index', () => {
+    const s = R.reloadViews(new Map([['v1', ['t:1', 't:2']], ['v2', ['t:2', 'c:1']]]))(buildState());
+    expect([...S.vouched(s)]).toEqual(['t:1', 't:2', 'c:1']);
+    expect(S.vouched({ ...s, dirty: new Set(['x']) })).toBe(S.vouched(s));
+  });
+  it('retained: vouched, held in memory (members, children), in the outbox or a debounced write, or bookkeeping', () => {
+    const s = R.compose(
+      R.reloadViews(new Map([['v', ['t:vouched']]])),
+      R.outboxReplace([buildOutboxItem({ recordId: 't:outbox' })]),
+      (st) => ({ ...st, pendingWrites: new Map([['k', { key: 'k', table: 't', recordId: 't:debounced', data: {}, before: null, firstAt: 0 }]]) })
+    )(buildState([e('a', { remoteArray: [['t:member', 1]], subqueryRemoteArray: [['t:child', 1]] })]));
+    const keep = S.retained(s);
+    for (const id of ['t:vouched', 't:member', 't:child', 't:outbox', 't:debounced', '_00_view:x']) expect(keep(id)).toBe(true);
+    expect(keep('t:orphan')).toBe(false);
+  });
+});

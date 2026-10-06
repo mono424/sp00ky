@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildRenderIds, resolveMembership } from './render-set';
+import { buildRenderIds, paintsCold, resolveMembership } from './render-set';
 
 const ov = (writes: string[] = [], deletes: string[] = []) => ({ writes: new Set(writes), deletes: new Set(deletes) });
 
@@ -32,5 +32,16 @@ describe('buildRenderIds', () => {
     const m: [string, number][] = [['t:b', 1], ['t:a', 1], ['t:b', 1]];
     expect(buildRenderIds(m, [], ov(), { hasExplicitOrder: true, isWindow: false })).toEqual(['t:b', 't:a']);
     expect(buildRenderIds(m, [], ov(), { hasExplicitOrder: false, isWindow: true })).toEqual(['t:b', 't:a']);
+  });
+});
+
+describe('paintsCold', () => {
+  it('only vouched bodies, optimistic writes and bookkeeping paint before the server answers', () => {
+    const vouched = new Set(['t:1']);
+    expect(paintsCold('t:1', vouched, ov())).toBe(true);
+    expect(paintsCold('t:2', vouched, ov(['t:2']))).toBe(true);
+    expect(paintsCold('_00_user_feature:f', vouched, ov())).toBe(true);
+    expect(paintsCold('t:3', vouched, ov([], ['t:3']))).toBe(false);
+    expect(paintsCold('t:3', vouched, ov())).toBe(false);
   });
 });

@@ -6,6 +6,8 @@ import { ANON_USER_ID } from '../modules/ref-tables';
 import type { SagaEnv } from '../query/env';
 import * as sql from '../query/sql';
 import { loadOutbox } from '../mutation/push.saga';
+import { loadViews } from '../query/lifecycle.saga';
+import { GC_BOOT_DELAY_MS } from '../kernel/constants';
 
 export interface BootOptions {
   /** A shared-tabs coordinator is available: ask it for a role instead of opening the store alone. */
@@ -34,6 +36,7 @@ export function* boot(env: SagaEnv, opts: BootOptions): Saga<void> {
   yield fx.state.update(R.setIdentity({ bucketId: bucket }));
   if ((yield fx.service('local.usesSurqlSchema')) as boolean) yield fx.service('migrator.provision');
   yield* migrateWindowToView();
+  yield* loadViews();
   yield fx.dispatch({ type: 'WarmBlobs' });
   yield fx.service('ssp.init');
   yield fx.service('ssp.setPermissions');
@@ -51,7 +54,7 @@ export function* boot(env: SagaEnv, opts: BootOptions): Saga<void> {
   yield fx.service('features.init');
   yield fx.service('releases.init');
   yield fx.dispatch({ type: 'LifecycleTick' });
-  yield fx.dispatch({ type: 'GcTick' });
+  yield fx.timer.set('gc', GC_BOOT_DELAY_MS, { type: 'GcTick' });
   yield fx.state.update(R.setIdentity({ localReady: true }));
   yield fx.dispatch({ type: 'StartRemote' });
 }

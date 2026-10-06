@@ -16,6 +16,36 @@ export function parseViewRow(row: unknown): DurableView | null {
   return { ids: ids as RecordVersionArray, confirmed: (row as { confirmed?: unknown }).confirmed === true };
 }
 
+/** One `_00_view` row as the view index and the GC see it. */
+export interface ViewIndexRow {
+  key: string;
+  /** Members and subquery children: what the row vouches for. */
+  ids: string[];
+  /** Last time a session resolved the query (0 when the row predates the field). */
+  updatedAt: number;
+}
+
+const pairIds = (pairs: unknown): string[] =>
+  Array.isArray(pairs) ? pairs.filter((p): p is [string, number] => Array.isArray(p) && typeof p[0] === 'string').map((p) => p[0]) : [];
+
+/** `SELECT * FROM _00_view` rows, keyed by view key; junk rows are skipped. */
+export function parseViewIndex(rows: unknown): ViewIndexRow[] {
+  if (!Array.isArray(rows)) return [];
+  const out: ViewIndexRow[] = [];
+  for (const row of rows as Array<Record<string, unknown> | null>) {
+    if (!row || typeof row !== 'object' || !Array.isArray(row.ids)) continue;
+    const id = row.id;
+    const key = typeof id === 'string' ? id.slice(id.indexOf(':') + 1) : String((id as { id?: unknown } | undefined)?.id ?? '');
+    if (!key) continue;
+    out.push({
+      key,
+      ids: [...new Set([...pairIds(row.ids), ...pairIds(row.children)])],
+      updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
+    });
+  }
+  return out;
+}
+
 /**
  * "Resolved before": the server answered this query on this device at some
  * point. An unconfirmed empty row cannot be told apart from one written before

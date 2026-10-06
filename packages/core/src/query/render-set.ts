@@ -21,6 +21,17 @@ export function resolveMembership(input: RenderInput): RecordVersionArray | null
   return null;
 }
 
+/**
+ * Whether a body may paint before the server has answered (`cold`). One no
+ * durable view vouches for and no optimistic write touches is an orphan:
+ * deleted upstream while no view watched it, or dropped from every view since.
+ * The predicate scan would otherwise resurrect it until the server answers,
+ * and indefinitely offline.
+ */
+export function paintsCold(id: string, vouched: ReadonlySet<string>, overlay: Overlay): boolean {
+  return id.startsWith('_00_') || vouched.has(id) || overlay.writes.has(id);
+}
+
 export interface RenderOptions {
   hasExplicitOrder: boolean;
   isWindow: boolean;

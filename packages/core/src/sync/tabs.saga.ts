@@ -60,6 +60,9 @@ export function* tabMessage(env: SagaEnv, raw: unknown): Saga<void> {
           ...[...new Set(msg.records.map((r) => r.table))].map((t) => R.markTableDirty(t))
         )
       );
+      // A body another tab deleted (its orphan GC) may still be one this tab
+      // names: with the version gone, the fetch plan pulls it back.
+      if (msg.records.some((r) => r.op === 'DELETE')) yield fx.dispatch({ type: 'FetchRows' });
       return;
     }
     case 'membership-dirty':

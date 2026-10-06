@@ -73,7 +73,10 @@ describe('Runtime lanes', () => {
 
 describe('Runtime state hooks', () => {
   it('dirty queries are materialized after the debounce, once per burst', async () => {
-    const { a, rt } = make({ local: { select: async () => [{ id: 'thing:1' }] } }, buildState([buildEntry({ def: { hash: 'q', plan: { table: 'thing' } as any } })]));
+    const { a, rt } = make(
+      { local: { select: async () => [{ id: 'thing:1' }] } },
+      buildState([buildEntry({ def: { hash: 'q', plan: { table: 'thing' } as any } })], R.reloadViews(new Map([['v', ['thing:1']]])))
+    );
     const seen: unknown[] = [];
     rt.subscribe('q', (rows) => seen.push(rows));
     rt.update(R.markDirty(['q']));

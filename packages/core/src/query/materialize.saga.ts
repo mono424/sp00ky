@@ -4,26 +4,34 @@ import type { Saga } from '../kernel/saga';
 import { fx } from '../kernel/effects';
 import type { QueryEntry } from '../state/client-state';
 import * as R from '../state/reducers';
-import { overlay } from '../state/selectors';
+import { overlay, vouched } from '../state/selectors';
 import type { Overlay } from '../state/selectors';
-import { isWindowed, materializeEffect, rowsEqual, rowsFromResult } from './materialize';
-import { buildRenderIds, resolveMembership } from './render-set';
+import { isWindowed, materializeEffect, rowKey, rowsEqual, rowsFromResult } from './materialize';
+import { buildRenderIds, paintsCold, resolveMembership } from './render-set';
+
+const NONE: ReadonlySet<string> = new Set();
 
 /**
  * Render one query from state: membership (or a cold scan), the outbox
  * overlay, one local read, then notify subscribers if the rows changed. The
  * only writer of `records`. Runs on the `mat:<hash>` dedupe lane whenever the
- * query is dirty.
+ * query is dirty. Before the server has answered (`cold`) only bodies some
+ * durable view vouches for paint (see `paintsCold`).
  */
 export function* materialize(hash: QueryHash): Saga<void> {
-  const [entry, ov] = (yield fx.state.read((s) => [s.queries.get(hash), overlay(s)])) as [QueryEntry | undefined, Overlay];
+  const [entry, ov, known] = (yield fx.state.read((s) => {
+    const e = s.queries.get(hash);
+    return [e, overlay(s), e?.lifecycle.phase === 'cold' ? vouched(s) : NONE];
+  })) as [QueryEntry | undefined, Overlay, ReadonlySet<string>];
   if (!entry) return;
   const t0 = (yield fx.now()) as number;
   const isWindow = isWindowed(entry.def.surql);
+  const paints = (id: string | null) => id === null || paintsCold(id, known, ov);
+  const coldWindow = entry.lifecycle.phase === 'cold' && isWindow;
   const membership = resolveMembership({
     phase: entry.lifecycle.phase,
     remoteArray: entry.remoteArray,
-    localArray: entry.localArray,
+    localArray: coldWindow ? entry.localArray.filter(([id]) => paints(id)) : entry.localArray,
     isWindow,
   });
   const ids = membership
@@ -36,6 +44,7 @@ export function* materialize(hash: QueryHash): Saga<void> {
   let rows: Record<string, unknown>[];
   try {
     rows = rowsFromResult(effect, yield effect);
+    if (ids === null) rows = rows.filter((row) => paints(rowKey(row)));
   } catch (error) {
     yield fx.state.update(R.compose(R.recordError(hash), R.clearDirty(hash)));
     yield fx.emit({ type: 'log', level: 'warn', message: 'materialize failed', data: { hash, error } });

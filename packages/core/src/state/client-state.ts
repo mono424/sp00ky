@@ -126,6 +126,12 @@ export interface ClientState {
   readonly membershipReread: ReadonlyMap<QueryHash, number>;
   /** Local body versions (`_00_rv`) by encoded record id. */
   readonly versions: ReadonlyMap<string, number>;
+  /**
+   * What each durable `_00_view` row vouches for, by view key: its members
+   * and subquery children. A body no row names is an orphan: it never paints
+   * before the server answers and the GC deletes it.
+   */
+  readonly views: ReadonlyMap<string, ReadonlyArray<string>>;
   readonly outbox: ReadonlyArray<OutboxItem>;
   readonly pendingWrites: ReadonlyMap<string, PendingWrite>;
   readonly failedCount: number;
@@ -169,6 +175,7 @@ export function emptyState(init: { tabId: string }): ClientState {
     registering: new Set(),
     membershipReread: new Map(),
     versions: new Map(),
+    views: new Map(),
     outbox: [],
     pendingWrites: new Map(),
     failedCount: 0,

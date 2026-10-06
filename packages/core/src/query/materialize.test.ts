@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { RecordId } from 'surrealdb';
-import { isWindowed, materializeEffect, rowsEqual, rowsFromResult } from './materialize';
+import { isWindowed, materializeEffect, rowKey, rowsEqual, rowsFromResult } from './materialize';
 
 describe('materializeEffect', () => {
   const plan = { table: 'thing', where: [{ field: 'a', op: '=', value: 1 }] } as any;
@@ -46,5 +46,13 @@ describe('materializeEffect', () => {
   it('isWindowed', () => {
     expect(isWindowed('SELECT * FROM t LIMIT 10 START 10')).toBe(true);
     expect(isWindowed('SELECT * FROM t LIMIT 10')).toBe(false);
+  });
+});
+
+describe('rowKey', () => {
+  it('reads a string id (SQLite) or a RecordId (SurrealDB); null when the row carries none', () => {
+    expect(rowKey({ id: 'thing:1' })).toBe('thing:1');
+    expect(rowKey({ id: new RecordId('thing', '2') })).toBe('thing:2');
+    for (const row of [{ name: 'x' }, { id: null }, { id: { other: 1 } }, null, 5]) expect(rowKey(row)).toBeNull();
   });
 });

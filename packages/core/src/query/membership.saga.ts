@@ -89,7 +89,12 @@ export function* applyMembership(
   if (!wasAuthoritative) yield fx.emit({ type: 'query:authority', hash, known: true });
   const now = (yield fx.now()) as number;
   try {
-    yield fx.local.upsert(sql.VIEW_TABLE, sql.viewRecordId(entry.def.viewKey), sql.viewRow(remoteArray, true, now), 'replace');
+    yield fx.local.upsert(
+      sql.VIEW_TABLE,
+      sql.viewRecordId(entry.def.viewKey),
+      sql.viewRow(remoteArray, entry.subqueryRemoteArray, true, now),
+      'replace'
+    );
   } catch (err) {
     yield fx.emit({ type: 'log', level: 'debug', message: 'view row write failed', data: { hash, err } });
   }
@@ -112,11 +117,22 @@ export function* recoverLostView(hash: QueryHash): Saga<void> {
   yield fx.dispatch({ type: 'RegisterRemote', hash });
 }
 
-/** Replace the subquery child set; bodies follow through the fetch plan. */
+/**
+ * Replace the subquery child set; bodies follow through the fetch plan. A
+ * query with a `_00_view` row (past `cold`) records the children there too,
+ * so the GC keeps their bodies and a cold scan may paint them.
+ */
 export function* applySubqueryChildren(hash: QueryHash, children: RecordVersionArray): Saga<void> {
   const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
   if (!entry || recordVersionArraysEqual(entry.subqueryRemoteArray, children)) return;
   yield fx.state.update(R.setSubqueryRemoteArray(hash, children));
+  if (entry.lifecycle.phase !== 'cold') {
+    try {
+      yield fx.local.upsert(sql.VIEW_TABLE, sql.viewRecordId(entry.def.viewKey), { children }, 'merge');
+    } catch (err) {
+      yield fx.emit({ type: 'log', level: 'debug', message: 'view row write failed', data: { hash, err } });
+    }
+  }
   yield fx.dispatch({ type: 'FetchRows' });
 }
 

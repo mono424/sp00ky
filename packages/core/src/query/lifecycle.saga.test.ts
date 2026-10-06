@@ -4,7 +4,7 @@ import { runPure } from '../testing/run-pure';
 import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import * as R from '../state/reducers';
 import { defaultEnv } from './env';
-import { ackPrune, evictQuery, gcTick, lifecycleTick } from './lifecycle.saga';
+import { ackPrune, evictQuery, gcTick, lifecycleTick, loadViews } from './lifecycle.saga';
 import type { StatementResult } from '../kernel/effects';
 
 const env = defaultEnv({ tables: [] } as any);
@@ -75,31 +75,158 @@ describe('ackPrune', () => {
   });
 });
 
+describe('loadViews', () => {
+  it('fills the index from every _00_view row (members and children); a failed read leaves it empty', async () => {
+    const rows = [
+      { id: '_00_view:a', ids: [['t:1', 1]], children: [['c:1', 1], 'junk'] },
+      { id: new RecordId('_00_view', 'b'), ids: [] },
+      { id: '', ids: [] },
+      { ids: [['t:no-key', 1]] },
+      null,
+    ];
+    const out = await runPure(loadViews(), { state: buildState(), handlers: { 'local.query': () => [rows] } });
+    expect(out.state.views).toEqual(new Map([['a', ['t:1', 'c:1']], ['b', []]]));
+    const odd = await runPure(loadViews(), { state: buildState(), handlers: { 'local.query': () => undefined } });
+    expect(odd.state.views.size).toBe(0);
+    const failed = await runPure(loadViews(), {
+      state: buildState(),
+      handlers: {
+        'local.query': () => {
+          throw new Error('no table');
+        },
+      },
+    });
+    expect(failed.state.views.size).toBe(0);
+    expect(failed.emitted).toEqual([expect.objectContaining({ level: 'warn', message: 'view index read failed' })]);
+  });
+});
+
 describe('gcTick', () => {
-  it('deletes bodies no view names and no outbox item touches; keeps _00_ rows; reschedules', async () => {
+  const day = 24 * 60 * 60 * 1000;
+  const now = 100 * day;
+  const ready = R.setIdentity({ primed: true, bucketId: 'u1' });
+  const deletedIds = (log: Array<{ kind: string }>) =>
+    log.filter((e: any) => e.kind === 'local.delete').map((e: any) => (e.table === '_00_view' ? `view:${e.id.id}` : e.id));
+
+  it('retires stale view rows, deletes the bodies nothing retains from the store and the circuit, re-fetches, reschedules', async () => {
     const s = buildState(
-      [],
-      R.setVersions([['thing:keep', 1], ['thing:gone', 1], ['thing:pending', 1], ['_00_view:x', 1], ['thing:failed', 1]]),
+      [buildEntry({ def: { hash: 'h', viewKey: 'held' }, lifecycle: { phase: 'cached' }, remoteArray: [['thing:mem', 1]] })],
+      ready,
+      R.setVersions(
+        ['thing:keep', 'child:1', 'thing:stale', 'thing:held', 'thing:stuck', 'thing:mem', 'thing:gone', 'thing:pending', '_00_view:x', 'thing:failed'].map(
+          (id) => [id, 1] as const
+        )
+      ),
       R.outboxReplace([buildOutboxItem({ recordId: 'thing:pending' })])
     );
-    const deleted: string[] = [];
+    const rows = [
+      { id: '_00_view:fresh', ids: [['thing:keep', 1]], children: [['child:1', 1]], updatedAt: now - day },
+      // Nobody resolved this query for 15 days: the row is retired and stops vouching.
+      { id: new RecordId('_00_view', 'old'), ids: [['thing:stale', 1]], updatedAt: now - 15 * day },
+      // As old, but a query in state holds it.
+      { id: '_00_view:held', ids: [['thing:held', 1]] },
+      // As old, but its delete fails: it keeps vouching.
+      { id: '_00_view:stuck', ids: [['thing:stuck', 1]], updatedAt: 0 },
+      { ids: 'bad' },
+    ];
     const out = await runPure(gcTick(), {
       state: s,
+      now,
       handlers: {
-        'local.query': () => [[{ ids: [['thing:keep', 1]] }, { ids: 'bad' }]],
+        'local.query': (e: any) => {
+          expect(e.sql).toBe('SELECT * FROM _00_view');
+          return [rows];
+        },
         'local.delete': (e: any) => {
-          deleted.push(e.id);
-          if (e.id === 'thing:failed') throw new Error('busy');
+          if (e.id === 'thing:failed' || e.id?.id === 'stuck') throw new Error('busy');
         },
         'ssp.ingest': () => undefined,
       },
     });
-    expect(deleted).toEqual(['thing:gone', 'thing:failed']);
-    expect([...out.state.versions.keys()]).toEqual(['thing:keep', 'thing:pending', '_00_view:x', 'thing:failed']);
+    expect(deletedIds(out.log)).toEqual(['view:old', 'view:stuck', 'thing:stale', 'thing:gone', 'thing:failed']);
+    expect(out.state.views).toEqual(
+      new Map([
+        ['fresh', ['thing:keep', 'child:1']],
+        ['held', ['thing:held']],
+        ['stuck', ['thing:stuck']],
+      ])
+    );
+    expect([...out.state.versions.keys()]).toEqual(['thing:keep', 'child:1', 'thing:held', 'thing:stuck', 'thing:mem', 'thing:pending', '_00_view:x', 'thing:failed']);
     const ingest = out.log.find((e) => e.kind === 'ssp.ingest') as any;
-    expect(ingest.records).toEqual([{ table: 'thing', op: 'DELETE', id: 'thing:gone', record: {} }]);
-    expect(out.timers.get('gc')!.event).toEqual({ type: 'GcTick' });
-    const failing = await runPure(gcTick(), {
+    expect(ingest.records).toEqual([
+      { table: 'thing', op: 'DELETE', id: 'thing:stale', record: {} },
+      { table: 'thing', op: 'DELETE', id: 'thing:gone', record: {} },
+    ]);
+    // Solo: nobody to relay to.
+    expect(out.emitted.filter((e) => e.type === 'tabs:broadcast')).toEqual([]);
+    expect(out.emitted).toContainEqual(expect.objectContaining({ message: 'orphan gc done', data: { removed: 2, retiredViews: 1 } }));
+    expect(out.dispatched).toEqual([{ type: 'FetchRows' }]);
+    expect(out.timers.get('gc')).toEqual({ ms: 60 * 60 * 1000, event: { type: 'GcTick' } });
+  });
+
+  it('waits for the circuit prime (the versions); a leader relays its deletes to the other tabs', async () => {
+    const s = buildState([], R.setIdentity({ bucketId: 'u1' }), R.setTabRole('leader'), R.setVersions([['thing:gone', 1]]));
+    const out = await runPure(gcTick(), {
+      state: s,
+      handlers: {
+        'state.wait': (e: any, ctx) => {
+          expect(e.until(ctx.state)).toBe(false);
+          ctx.state = R.setIdentity({ primed: true })(ctx.state);
+        },
+        'local.query': () => [[]],
+        'local.delete': () => undefined,
+        'ssp.ingest': () => undefined,
+      },
+    });
+    expect(out.emitted).toContainEqual({
+      type: 'tabs:broadcast',
+      message: { type: 'ingest', records: [{ table: 'thing', op: 'DELETE', id: 'thing:gone', record: {} }] },
+    });
+  });
+
+  it('a follower only refreshes its index: no view row or body is deleted', async () => {
+    const s = buildState([], ready, R.setTabRole('follower'), R.setVersions([['thing:gone', 1]]));
+    const out = await runPure(gcTick(), {
+      state: s,
+      now,
+      handlers: { 'local.query': () => [[{ id: '_00_view:old', ids: [['thing:x', 1]], updatedAt: 0 }]] },
+    });
+    expect(out.state.views).toEqual(new Map([['old', ['thing:x']]]));
+    expect(deletedIds(out.log)).toEqual([]);
+    expect(out.state.versions.has('thing:gone')).toBe(true);
+    expect(out.timers.has('gc')).toBe(true);
+  });
+
+  it('each chunk is re-checked against fresh state, and the sweep stops when the bucket moves', async () => {
+    const ids = Array.from({ length: 250 }, (_, i) => `thing:o${i}`);
+    const s = buildState([], ready, R.setVersions(ids.map((id) => [id, 1] as const)));
+    const handlers = (onFirst: (ctx: any) => void) => ({
+      'local.query': () => [[]],
+      'local.delete': (e: any, ctx: any) => {
+        if (e.id === 'thing:o0') onFirst(ctx);
+      },
+      'ssp.ingest': () => undefined,
+    });
+    // Meanwhile a query commits o210 and o220's body goes another way: neither is deleted.
+    const recheck = await runPure(gcTick(), {
+      state: s,
+      handlers: handlers((ctx) => {
+        ctx.state = R.compose(R.putQuery(buildEntry({ def: { hash: 'q' }, remoteArray: [['thing:o210', 1]] })), R.deleteVersions(['thing:o220']))(ctx.state);
+      }),
+    });
+    const removed = deletedIds(recheck.log);
+    expect(removed).toHaveLength(248);
+    expect(removed).not.toContain('thing:o210');
+    expect(removed).not.toContain('thing:o220');
+    expect(recheck.log.filter((e) => e.kind === 'ssp.ingest')).toHaveLength(2);
+    const moved = await runPure(gcTick(), { state: s, handlers: handlers((ctx) => (ctx.state = R.setIdentity({ bucketId: 'u2' })(ctx.state))) });
+    expect(deletedIds(moved.log)).toHaveLength(200);
+    expect(moved.timers.has('gc')).toBe(true);
+  });
+
+  it('failures are logged and the tick still reschedules; a sweep that removes nothing asks for nothing', async () => {
+    const s = buildState([], ready, R.setVersions([['thing:gone', 1]]));
+    const readFails = await runPure(gcTick(), {
       state: s,
       handlers: {
         'local.query': () => {
@@ -107,10 +234,35 @@ describe('gcTick', () => {
         },
       },
     });
-    expect(failing.emitted).toEqual([expect.objectContaining({ message: 'orphan gc failed' })]);
-    expect(failing.timers.has('gc')).toBe(true);
-    const nothing = await runPure(gcTick(), { state: buildState(), handlers: { 'local.query': () => [] } });
-    expect(nothing.log.filter((e) => e.kind === 'ssp.ingest')).toHaveLength(0);
+    expect(readFails.emitted).toEqual([expect.objectContaining({ message: 'orphan gc failed' })]);
+    expect(readFails.timers.has('gc')).toBe(true);
+    const ingestFails = await runPure(gcTick(), {
+      state: s,
+      handlers: {
+        'local.query': () => [[]],
+        'local.delete': () => undefined,
+        'ssp.ingest': () => {
+          throw new Error('wasm');
+        },
+      },
+    });
+    expect(ingestFails.emitted).toEqual([expect.objectContaining({ message: 'orphan gc failed' })]);
+    expect(ingestFails.timers.has('gc')).toBe(true);
+    const deleteFails = await runPure(gcTick(), {
+      state: s,
+      handlers: {
+        'local.query': () => [[]],
+        'local.delete': () => {
+          throw new Error('busy');
+        },
+      },
+    });
+    expect(deleteFails.log.filter((e) => e.kind === 'ssp.ingest')).toHaveLength(0);
+    expect(deleteFails.dispatched).toEqual([]);
+    expect(deleteFails.emitted).toContainEqual(expect.objectContaining({ message: 'orphan gc done', data: { removed: 0, retiredViews: 0 } }));
+    const nothing = await runPure(gcTick(), { state: buildState([], ready), handlers: { 'local.query': () => [] } });
+    expect(nothing.log.filter((e) => e.kind === 'local.delete')).toHaveLength(0);
+    expect(nothing.dispatched).toEqual([]);
   });
 });
 

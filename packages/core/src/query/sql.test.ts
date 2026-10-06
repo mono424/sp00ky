@@ -33,7 +33,8 @@ describe('query sql builders (golden against the previous builders)', () => {
   });
   it('view rows and ids', () => {
     expect(sql.viewRecordId('k')).toEqual(new RecordId('_00_view', 'k'));
-    expect(sql.viewRow([['t:1', 1]], true, 5)).toEqual({ ids: [['t:1', 1]], confirmed: true, updatedAt: 5 });
+    expect(sql.viewRow([['t:1', 1]], [['c:1', 2]], true, 5)).toEqual({ ids: [['t:1', 1]], children: [['c:1', 2]], confirmed: true, updatedAt: 5 });
+    expect(sql.readViewRows()).toBe('SELECT * FROM _00_view');
     expect(sql.readLegacyViewRows()).toBe('SELECT * FROM _00_window');
     expect(sql.countViewRows()).toContain('_00_view');
     expect(sql.bodySelect()).toBe('SELECT * FROM $ids');

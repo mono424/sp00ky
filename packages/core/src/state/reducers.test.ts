@@ -281,3 +281,22 @@ describe('identity / connection / compose', () => {
     expect(s6.failedCount).toBe(3);
   });
 });
+
+describe('durable view index', () => {
+  it('commit and children keep a view key in step with its `_00_view` row; cold children are not indexed', () => {
+    let s = buildState([e('a', { def: { viewKey: 'va' }, lifecycle: { phase: 'cold' }, subqueryRemoteArray: [['c:1', 1]] })]);
+    s = R.setSubqueryRemoteArray('a', [['c:1', 1], ['c:2', 1]])(s);
+    expect(s.views.size).toBe(0);
+    s = R.commitMembership('a', [['t:1', 1], ['c:1', 1]], true)(s);
+    expect(s.views.get('va')).toEqual(['t:1', 'c:1', 'c:2']);
+    s = R.setSubqueryRemoteArray('a', [['c:3', 1]])(s);
+    expect(s.views.get('va')).toEqual(['t:1', 'c:1', 'c:3']);
+    expect(R.setSubqueryRemoteArray('zz', [['c:9', 1]])(s)).toBe(s);
+    expect(R.clearBucketState()(s).views.size).toBe(0);
+  });
+  it('a reload takes the store, except entries of queries in state', () => {
+    const s = R.compose(R.commitMembership('a', [['t:new', 1]], true))(buildState([e('a', { def: { viewKey: 'va' } }), e('b', { def: { viewKey: 'vb' } })]));
+    const reloaded = R.reloadViews(new Map([['va', ['t:old']], ['vb', ['t:b']], ['vc', ['t:c']]]))(s);
+    expect(reloaded.views).toEqual(new Map([['va', ['t:new']], ['vb', ['t:b']], ['vc', ['t:c']]]));
+  });
+});

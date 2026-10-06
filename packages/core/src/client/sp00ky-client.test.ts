@@ -49,7 +49,14 @@ describe('Sp00kyClient facade', () => {
   });
 
   it('queryRaw registers locally and returns the hash before any remote work; subscribers paint from the local store', async () => {
-    const { client, a } = makeClient({ local: { query: (async (sql: string) => (sql.startsWith('SELECT * FROM thing') ? [[{ id: 'thing:1' }]] : [])) as any } });
+    // Boot loads the view index: `thing:1` is vouched for, `thing:2` is an orphan and stays hidden.
+    const stored = (sql: string) =>
+      sql.startsWith('SELECT * FROM thing')
+        ? [[{ id: 'thing:1' }, { id: 'thing:2' }]]
+        : sql === 'SELECT * FROM _00_view'
+          ? [[{ id: '_00_view:k', ids: [['thing:1', 1]] }]]
+          : [];
+    const { client, a } = makeClient({ local: { query: (async (sql: string) => stored(sql)) as any } });
     await client.init();
     const hash = await client.queryRaw('SELECT * FROM thing', {}, '10m');
     expect(client.state.queries.get(hash)!.lifecycle.phase).toBe('cold');

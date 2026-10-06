@@ -90,6 +90,33 @@ export const setServerState =
  * set names: membership has caught up with the write, the overlay's job is
  * done (invariant I7).
  */
+/** What a `_00_view` row holding these arrays vouches for. */
+const vouchedIds = (members: RecordVersionArray, children: RecordVersionArray): string[] => [
+  ...new Set([...members.map(([id]) => id), ...children.map(([id]) => id)]),
+];
+
+const withView = (s: ClientState, viewKey: string, ids: ReadonlyArray<string>): ClientState => {
+  const views = new Map(s.views);
+  views.set(viewKey, ids);
+  return { ...s, views };
+};
+
+/**
+ * Replace the durable view index with a fresh `_00_view` read (boot, bucket
+ * switch, GC). An entry of a query in state is kept: its commits update the
+ * index as they write the row, so it is never older than the read.
+ */
+export const reloadViews =
+  (fromStore: ReadonlyMap<string, ReadonlyArray<string>>): Reducer =>
+  (s) => {
+    const views = new Map(fromStore);
+    for (const e of s.queries.values()) {
+      const held = s.views.get(e.def.viewKey);
+      if (held) views.set(e.def.viewKey, held);
+    }
+    return { ...s, views };
+  };
+
 export const commitMembership =
   (hash: QueryHash, remoteArray: RecordVersionArray, present: boolean): Reducer =>
   (s) => {
@@ -99,9 +126,11 @@ export const commitMembership =
       lifecycle: transition(e.lifecycle, { type: 'membership-applied', present }),
     }));
     if (withArray === s) return s;
+    const entry = withArray.queries.get(hash)!;
     const named = new Set(remoteArray.map(([id]) => id));
     const outbox = withArray.outbox.filter((item) => !(item.status === 'acked' && named.has(item.recordId)));
-    return { ...withArray, outbox, dirty: addAll(withArray.dirty, [hash]) };
+    const indexed = withView(withArray, entry.def.viewKey, vouchedIds(remoteArray, entry.subqueryRemoteArray));
+    return { ...indexed, outbox, dirty: addAll(withArray.dirty, [hash]) };
   };
 
 export const setLocalArray =
@@ -111,10 +140,18 @@ export const setLocalArray =
     return next === s ? s : { ...next, dirty: addAll(next.dirty, [hash]) };
   };
 
+/**
+ * Replace a query's subquery child set. A query past `cold` has a `_00_view`
+ * row, which records the children too (see `applySubqueryChildren`).
+ */
 export const setSubqueryRemoteArray =
   (hash: QueryHash, subqueryRemoteArray: RecordVersionArray): Reducer =>
-  (s) =>
-    withEntry(s, hash, (e) => ({ ...e, subqueryRemoteArray }));
+  (s) => {
+    const next = withEntry(s, hash, (e) => ({ ...e, subqueryRemoteArray }));
+    const entry = next.queries.get(hash);
+    if (!entry || entry.lifecycle.phase === 'cold') return next;
+    return withView(next, entry.def.viewKey, vouchedIds(entry.remoteArray, subqueryRemoteArray));
+  };
 
 export const setRecords =
   (hash: QueryHash, records: ReadonlyArray<Row>, changed: boolean, materializeMs: number | null): Reducer =>
@@ -441,6 +478,7 @@ export const rebindQuery =
 export const clearBucketState = (): Reducer => (s) => ({
   ...s,
   versions: new Map(),
+  views: new Map(),
   outbox: [],
   pendingWrites: new Map(),
   dirty: new Set(),

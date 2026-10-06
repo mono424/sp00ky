@@ -35,6 +35,38 @@ export function overlay(s: ClientState): Overlay {
   return { writes, deletes };
 }
 
+const vouchedCache = new WeakMap<ClientState['views'], ReadonlySet<string>>();
+
+/**
+ * Every id some durable `_00_view` row vouches for. Memoized on the index,
+ * which only changes when a view row does.
+ */
+export function vouched(s: ClientState): ReadonlySet<string> {
+  const hit = vouchedCache.get(s.views);
+  if (hit) return hit;
+  const out = new Set<string>();
+  for (const ids of s.views.values()) for (const id of ids) out.add(id);
+  vouchedCache.set(s.views, out);
+  return out;
+}
+
+/**
+ * Bodies the GC must keep: `_00_` bookkeeping, anything a durable view
+ * vouches for, anything a query in memory names (members or children), and
+ * anything a write is still in flight for.
+ */
+export function retained(s: ClientState): (id: string) => boolean {
+  const held = new Set<string>();
+  for (const e of s.queries.values()) {
+    for (const [id] of e.remoteArray) held.add(id);
+    for (const [id] of e.subqueryRemoteArray) held.add(id);
+  }
+  for (const item of s.outbox) held.add(item.recordId);
+  for (const write of s.pendingWrites.values()) held.add(write.recordId);
+  const known = vouched(s);
+  return (id) => id.startsWith('_00_') || known.has(id) || held.has(id);
+}
+
 export const pendingDeleteIds = (s: ClientState): ReadonlySet<string> =>
   new Set(s.outbox.filter((i) => i.type === 'delete').map((i) => i.recordId));
 

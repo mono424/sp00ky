@@ -19,7 +19,11 @@ describe('boot', () => {
       'auth.access': () => 'account',
     });
     const out = await runPure(boot(env, { sharedTabs: false }), {
-      handlers: { service: svc.handler, 'local.query': (e: any) => (e.sql.startsWith('SELECT count()') ? [[{ count: 1 }]] : []) },
+      handlers: {
+        service: svc.handler,
+        'local.query': (e: any) =>
+          e.sql.startsWith('SELECT count()') ? [[{ count: 1 }]] : e.sql === 'SELECT * FROM _00_view' ? [[{ id: '_00_view:k', ids: [['t:1', 1]] }]] : [],
+      },
     });
     expect(svc.names()).toEqual([
       'hint.read',
@@ -39,7 +43,10 @@ describe('boot', () => {
     ]);
     expect(svc.calls[1]).toEqual(['local.connect', ['u1']]);
     expect(out.state).toMatchObject({ bucketId: 'u1', userId: 'user:u1', saltUserId: 'user:u1', sessionId: 'salt-1', localReady: true });
-    expect(out.dispatched.map((d) => d.type)).toEqual(['WarmBlobs', 'PrimeCircuit', 'LifecycleTick', 'GcTick', 'StartRemote']);
+    expect(out.dispatched.map((d) => d.type)).toEqual(['WarmBlobs', 'PrimeCircuit', 'LifecycleTick', 'StartRemote']);
+    // The view index is loaded before anything can paint; the first GC waits out the boot.
+    expect(out.state.views).toEqual(new Map([['k', ['t:1']]]));
+    expect(out.timers.get('gc')).toEqual({ ms: 30_000, event: { type: 'GcTick' } });
     expect(svc.names()).not.toContain('remote.connect');
   });
   it('shared tabs: takes the role from the coordinator, or falls back to solo; schemaless engines skip provisioning; anonymous skips session auth', async () => {

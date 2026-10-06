@@ -11,11 +11,25 @@ export const LEGACY_VIEW_TABLE = '_00_window';
 
 export const viewRecordId = (viewKey: string): RecordId<string> => new RecordId(VIEW_TABLE, viewKey);
 
-export const viewRow = (ids: RecordVersionArray, confirmed: boolean, now: number): Record<string, unknown> => ({
+/**
+ * The durable `_00_view` row: the confirmed membership plus the subquery
+ * children, which the GC must keep and a cold scan may paint as much as the
+ * members.
+ */
+export const viewRow = (
+  ids: RecordVersionArray,
+  children: RecordVersionArray,
+  confirmed: boolean,
+  now: number
+): Record<string, unknown> => ({
   ids,
+  children,
   confirmed,
   updatedAt: now,
 });
+
+/** Every `_00_view` row: the durable view index and the GC read it. */
+export const readViewRows = (): string => `SELECT * FROM ${VIEW_TABLE}`;
 
 /** Copy every legacy `_00_window` row into `_00_view` once. */
 export const readLegacyViewRows = (): string => `SELECT * FROM ${LEGACY_VIEW_TABLE}`;

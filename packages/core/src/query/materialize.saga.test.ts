@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { RecordId } from 'surrealdb';
 import { runPure } from '../testing/run-pure';
 import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import * as R from '../state/reducers';
@@ -10,8 +11,9 @@ describe('materialize', () => {
     const out = await runPure(materialize('zz'), { state: buildState() });
     expect(out.log.filter((e) => e.kind !== 'state.read')).toHaveLength(0);
   });
+  const vouch = (...ids: string[]) => R.reloadViews(new Map([['other-view', ids]]));
   it('cold: predicate scan through the plan; rows land, dirt clears, subscribers hear once', async () => {
-    const s = R.markDirty(['a'])(buildState([buildEntry({ def: { hash: 'a', plan } })]));
+    const s = R.markDirty(['a'])(buildState([buildEntry({ def: { hash: 'a', plan } })], vouch('thing:1')));
     const out = await runPure(materialize('a'), { state: s, handlers: { 'local.select': (e: any) => (e.plan.ids ? [] : [{ id: 'thing:1' }]) } });
     const en = out.state.queries.get('a')!;
     expect(en.records).toEqual([{ id: 'thing:1' }]);
@@ -24,8 +26,39 @@ describe('materialize', () => {
     expect(again.emitted).toEqual([]);
     expect(again.state.queries.get('a')!.telemetry.updateCount).toBe(1);
   });
-  it('cold window renders the SSP local window; live renders membership with the overlay', async () => {
-    const win = buildState([buildEntry({ def: { hash: 'w', plan: { ...plan, offset: 5 }, surql: 'SELECT * FROM thing LIMIT 5 START 5' }, localArray: [['thing:7', 1]] })]);
+  it('cold: a body no view vouches for (an orphan) does not paint; vouched, optimistic, _00_ and id-less rows do', async () => {
+    const s = buildState(
+      [buildEntry({ def: { hash: 'a', plan } })],
+      vouch('thing:1', 'thing:4'),
+      R.outboxReplace([buildOutboxItem({ id: 'c', type: 'create', recordId: 'thing:3' })])
+    );
+    const scanned = [
+      { id: 'thing:1' },
+      { id: 'thing:2' },
+      { id: 'thing:3' },
+      { id: '_00_user_feature:f' },
+      { name: 'no id' },
+      { id: new RecordId('thing', '4') },
+      { id: new RecordId('thing', '5') },
+    ];
+    const out = await runPure(materialize('a'), { state: s, handlers: { 'local.select': () => scanned } });
+    expect(out.state.queries.get('a')!.records).toEqual([
+      { id: 'thing:1' },
+      { id: 'thing:3' },
+      { id: '_00_user_feature:f' },
+      { name: 'no id' },
+      { id: new RecordId('thing', '4') },
+    ]);
+    // Once the server has answered, membership decides and the index is not consulted.
+    const live = buildState([buildEntry({ def: { hash: 'a', plan }, lifecycle: { phase: 'live' }, remoteArray: [['thing:2', 1]] })]);
+    const l = await runPure(materialize('a'), { state: live, handlers: { 'local.select': (e: any) => e.plan.ids.map((id: any) => ({ id: `${id.table}:${id.id}` })) } });
+    expect(l.state.queries.get('a')!.records).toEqual([{ id: 'thing:2' }]);
+  });
+  it('cold window renders the SSP local window (orphans dropped); live renders membership with the overlay', async () => {
+    const win = buildState(
+      [buildEntry({ def: { hash: 'w', plan: { ...plan, offset: 5 }, surql: 'SELECT * FROM thing LIMIT 5 START 5' }, localArray: [['thing:7', 1], ['thing:8', 1]] })],
+      vouch('thing:7')
+    );
     const w = await runPure(materialize('w'), { state: win, handlers: { 'local.select': (e: any) => e.plan.ids.map((id: any) => ({ id: `${id.table}:${id.id}` })) } });
     expect(w.state.queries.get('w')!.records).toEqual([{ id: 'thing:7' }]);
     const live = buildState(

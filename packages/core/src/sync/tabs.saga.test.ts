@@ -43,6 +43,10 @@ describe('tabMessage', () => {
     expect(out.state.versions.get('other:1')).toBe(0);
     expect(out.state.versions.has('thing:1')).toBe(false);
     expect(out.state.dirty.has('a')).toBe(true);
+    // A relayed delete (another tab's GC) may drop a body this tab names: the fetch plan decides.
+    expect(out.dispatched).toEqual([{ type: 'FetchRows' }]);
+    const writesOnly = await runPure(tabMessage(env, { ...msg, records: msg.records.filter((r) => r.op !== 'DELETE') }), { state: s(), handlers: { 'ssp.ingest': () => undefined } });
+    expect(writesOnly.dispatched).toEqual([]);
     const failing = await runPure(tabMessage(env, msg), {
       state: s(),
       handlers: {

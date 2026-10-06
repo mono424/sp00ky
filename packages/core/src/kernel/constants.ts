@@ -48,8 +48,21 @@ export const AUTH_READY_RETRY_MS = 500;
 export const AUTH_READY_MAX_ATTEMPTS = 10;
 /** Heartbeat at this fraction of the shortest ttl in state. */
 export const TTL_HEARTBEAT_FRACTION = 0.5;
-/** Orphan body garbage collection cadence. */
-export const GC_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * Orphan body garbage collection: the first sweep waits this long after boot
+ * (off the first paint and the first sync round), then repeats on the interval.
+ */
+export const GC_BOOT_DELAY_MS = 30_000;
+export const GC_INTERVAL_MS = 60 * 60 * 1000;
+/** Ids deleted per GC step. */
+export const GC_CHUNK = 200;
+/**
+ * A `_00_view` row no query has resolved for this long stops vouching for its
+ * ids (the sweep deletes it, so its bodies can be collected). Each session
+ * that resolves a query rewrites its row, so this only retires query shapes
+ * the app no longer runs.
+ */
+export const VIEW_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 /** Remote adapter slot limit. */
 export const REMOTE_CONCURRENCY = 16;
 /** Rolling telemetry sample window per query. */

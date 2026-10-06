@@ -10,6 +10,7 @@ import type { SagaEnv } from '../query/env';
 import { queryHashInput } from '../query/hash';
 import { isResolvedBefore, parseViewRow } from '../query/membership';
 import * as sql from '../query/sql';
+import { loadViews } from '../query/lifecycle.saga';
 import { loadOutbox } from '../mutation/push.saga';
 
 export interface BucketSwitchOptions {
@@ -71,6 +72,7 @@ export function* bucketSwitch(env: SagaEnv, target: string, release: (() => void
       yield fx.emit({ type: 'log', level: 'warn', message: 'failed to re-persist the auth token', data: { error } });
     }
   }
+  yield* loadViews();
   yield* rebindQueries();
   yield* loadOutbox(env);
   yield fx.dispatch({ type: 'EnsureRegistered' });

@@ -74,7 +74,7 @@ describe('applyMembership', () => {
   });
   it('applied: commits, writes the view row, flips authority once, releases acked items, asks for bodies', async () => {
     const s = buildState(
-      [buildEntry({ def: { hash: 'a', viewKey: 'vk' }, lifecycle: { phase: 'cold' } })],
+      [buildEntry({ def: { hash: 'a', viewKey: 'vk' }, lifecycle: { phase: 'cold' }, subqueryRemoteArray: [['c:1', 1]] })],
       R.outboxReplace([buildOutboxItem({ id: 'm', recordId: 't:1', status: 'acked', ackedAt: 1 })])
     );
     const out = await runPure(applyMembership('a', [['t:1', 1]], ready(1)), { state: s, now: 42, handlers: { 'local.upsert': () => undefined } });
@@ -86,9 +86,11 @@ describe('applyMembership', () => {
       kind: 'local.upsert',
       table: '_00_view',
       id: new RecordId('_00_view', 'vk'),
-      data: { ids: [['t:1', 1]], confirmed: true, updatedAt: 42 },
+      data: { ids: [['t:1', 1]], children: [['c:1', 1]], confirmed: true, updatedAt: 42 },
       mode: 'replace',
     });
+    // The index vouches for what the row now holds: members and children.
+    expect(out.state.views.get('vk')).toEqual(['t:1', 'c:1']);
     expect(out.dispatched).toEqual([{ type: 'FetchRows' }]);
     const second = await runPure(applyMembership('a', [['t:1', 2]], ready(1)), {
       state: out.state,
@@ -116,6 +118,32 @@ describe('applySubqueryChildren', () => {
     const out = await runPure(applySubqueryChildren('a', [['c:2', 1]]), { state: s });
     expect(out.state.queries.get('a')!.subqueryRemoteArray).toEqual([['c:2', 1]]);
     expect(out.dispatched).toEqual([{ type: 'FetchRows' }]);
+    // Cold: no `_00_view` row to record them in, and the index is untouched.
+    expect(out.log.filter((e) => e.kind === 'local.upsert')).toEqual([]);
+    expect(out.state.views.size).toBe(0);
+  });
+  it('a query with a view row records the children there and in the index; a failed write is logged', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', viewKey: 'vk' }, lifecycle: { phase: 'live' }, remoteArray: [['t:1', 1]] })]);
+    const out = await runPure(applySubqueryChildren('a', [['c:2', 1]]), { state: s, handlers: { 'local.upsert': () => undefined } });
+    expect(out.log.find((e) => e.kind === 'local.upsert')).toEqual({
+      kind: 'local.upsert',
+      table: '_00_view',
+      id: new RecordId('_00_view', 'vk'),
+      data: { children: [['c:2', 1]] },
+      mode: 'merge',
+    });
+    expect(out.state.views.get('vk')).toEqual(['t:1', 'c:2']);
+    expect(out.dispatched).toEqual([{ type: 'FetchRows' }]);
+    const failed = await runPure(applySubqueryChildren('a', [['c:3', 1]]), {
+      state: s,
+      handlers: {
+        'local.upsert': () => {
+          throw new Error('disk');
+        },
+      },
+    });
+    expect(failed.emitted).toEqual([expect.objectContaining({ level: 'debug', message: 'view row write failed' })]);
+    expect(failed.dispatched).toEqual([{ type: 'FetchRows' }]);
   });
 });
 

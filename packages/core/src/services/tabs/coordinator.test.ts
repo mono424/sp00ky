@@ -362,4 +362,25 @@ describe('TabsCoordinator integration', () => {
     await b.coordinator.stop();
     await a.coordinator.stop();
   });
+
+  it('signs in from an anonymous leader into a user bucket another tab already leads', async () => {
+    const signedIn = makeCoordinator('signed-in', {
+      // The real hook awaits a worker RPC. FakePort does not buffer messages
+      // before onmessage is set, so let the joining tab bind its sync port.
+      async exposeClientPort() { await flush(20); },
+    });
+    const signingIn = makeCoordinator('signing-in');
+    try {
+      await signedIn.coordinator.start('user1');
+      await signingIn.coordinator.start('anon');
+
+      await expect(signingIn.coordinator.moveToBucket('user1')).resolves.toBe('follower');
+      expect(signingIn.log.adoptAttached.map((s) => s.bucketId)).toEqual(['user1']);
+      expect(signingIn.log.released).toBe(1);
+      expect(signingIn.coordinator.leaderTabId).toBe('signed-in');
+    } finally {
+      await signingIn.coordinator.stop();
+      await signedIn.coordinator.stop();
+    }
+  }, 20_000);
 });

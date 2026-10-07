@@ -369,6 +369,11 @@ export class TabsCoordinator {
         // us from the old namespace and re-elects there.
         if (this.role === 'leader') await this.teardownLeader();
         else if (this.role === 'follower') this.teardownFollower('bucket switch');
+        // Ownership ended with the old bucket. Keeping `leader` here makes
+        // attachToLeader reject the new bucket's follower ports when another
+        // tab already owns it, leaving sign-in waiting until a reload.
+        this.setRole('solo');
+        this.leaderTabId = null;
         this.bucketId = bucketId;
         const timeout = setTimeout(() => {
           this.startResolve = null;

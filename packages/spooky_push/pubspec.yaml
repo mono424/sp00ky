@@ -1,6 +1,6 @@
 name: spooky_push
 description: Native push for sp00ky apps (APNs on iOS, FCM on Android) - permission, device token, taps - registered through spooky_core's db.push.
-version: 0.0.1-canary.287
+version: 0.0.1-canary.288
 publish_to: none
 
 environment:

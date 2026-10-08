@@ -107,6 +107,11 @@ Every write the client made, from the moment it is queued until the server
 answers. A write is applied locally at once and drained to the server in the
 background; this tab is where you watch the second half.
 
+<Screenshot
+  src="/docs/devtools/mutations.png"
+  caption="Every write this session: queued, retrying, synced or rolled back, and how long the server took."
+/>
+
 The chips along the top switch the view:
 
 | View        | Shows                                                                                         |
@@ -123,6 +128,11 @@ server's error for a rejected one, and the payload with the row it reverts to.
 A queued write's payload is read from the outbox only when you open it; a synced
 one's is gone, so look at the record itself on the Database tab.
 
+<Screenshot
+  src="/docs/devtools/mutations-tray.png"
+  caption="A rejected write in the failed tray: the server's error, the revert, Retry and Discard."
+/>
+
 The status bar says first whether anything can drain at all: a **follower** tab
 never pushes (the leader tab does it for every tab), and a disconnected or
 degraded socket holds the queue until it recovers.
@@ -137,6 +147,11 @@ exposes to your app.
 What the client's own logger wrote, oldest first. Each line shows its time,
 level, category and message; click it for the structured fields it was logged
 with (an error keeps its message and stack).
+
+<Screenshot
+  src="/docs/devtools/logs.png"
+  caption="The client's own log lines, recorded at debug while the console stays at info."
+/>
 
 The page keeps its last 500 lines whether or not the panel is open, so opening
 DevTools after a failed boot still shows the boot. Filter by level with the

@@ -25,6 +25,21 @@
       "file": "queries-detail.png"
     },
     {
+      "name": "mutations",
+      "caption": "Every write this session: queued, retrying, synced or rolled back, and how long the server took.",
+      "file": "mutations.png"
+    },
+    {
+      "name": "mutations-tray",
+      "caption": "The failed-writes tray, with the rejection and the row it reverted to. Retry or discard from here.",
+      "file": "mutations-tray.png"
+    },
+    {
+      "name": "logs",
+      "caption": "The client's own log lines, recorded at debug while the console stays at info.",
+      "file": "logs.png"
+    },
+    {
       "name": "timing",
       "caption": "Per-phase p90 for every query, slowest first.",
       "file": "timing.png"

@@ -78,7 +78,7 @@ const SHOTS = [
   {
     name: 'logs',
     tab: 'Logs',
-    height: 420,
+    height: 480,
     caption: "The client's own log lines, recorded at debug while the console stays at info.",
     async setup(page) {
       await page.click('.log-row.log-error .log-line');

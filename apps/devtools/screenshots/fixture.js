@@ -215,69 +215,6 @@
   };
 
   // ---------------------------------------------------------------------------
-  // Events
-  // ---------------------------------------------------------------------------
-
-  // Event names and payload shapes mirror what `DevToolsService` actually
-  // records (`QUERY_UPDATED`, `STREAM_UPDATE`, `MUTATION_REQUEST_EXECUTION`,
-  // `LOCAL_QUERY`, `QUERY_STATUS_CHANGED`, `QUERY_REQUEST_INIT`).
-  const EVENTS = [
-    {
-      eventType: 'QUERY_UPDATED',
-      at: 3_100,
-      payload: { queryHash: 814233901, recordCount: 50 },
-    },
-    {
-      eventType: 'STREAM_UPDATE',
-      at: 3_140,
-      payload: {
-        queryHash: 814233901,
-        op: 'insert',
-        localCount: 50,
-        materializationTimeMs: 4.2,
-        storeApplyMs: 1.7,
-        circuitStepMs: 1.9,
-        transformMs: 0.6,
-      },
-    },
-    {
-      eventType: 'MUTATION_REQUEST_EXECUTION',
-      at: 12_600,
-      payload: {
-        mutation: { type: 'update', fields: ['done', 'updated_at'], selector: 'task:44cd1' },
-      },
-    },
-    {
-      eventType: 'LOCAL_QUERY',
-      at: 12_640,
-      payload: {
-        query: 'SELECT * FROM task WHERE assigned_to = $auth LIMIT 50',
-        duration: 31.4,
-        success: true,
-      },
-    },
-    {
-      eventType: 'QUERY_STATUS_CHANGED',
-      at: 1_700,
-      payload: { queryHash: 205913664, status: 'initializing' },
-    },
-    {
-      eventType: 'QUERY_REQUEST_INIT',
-      at: 1_800,
-      payload: {
-        queryHash: 205913664,
-        query: 'SELECT * FROM membership WHERE channel = $channel FETCH user',
-        variables: {},
-      },
-    },
-  ].map((e, i) => ({
-    id: i + 1,
-    timestamp: ago(e.at),
-    eventType: e.eventType,
-    payload: e.payload,
-  }));
-
-  // ---------------------------------------------------------------------------
   // Stack / versions
   // ---------------------------------------------------------------------------
 
@@ -730,6 +667,8 @@
     [180_900, 30, 'sp00ky-client::RemoteDatabaseService::connect', 'Connected to remote database'],
     [180_850, 30, 'sp00ky-client::ConnectionSupervisor::state', 'Connection state changed', { state: 'connected' }],
     [96_400, 20, 'sp00ky-client::saga', 'membership read', { hashes: 3, rows: 41, ms: 38 }],
+    [96_300, 20, 'sp00ky-client::local', 'SELECT * FROM message WHERE thread = $thread ORDER BY created_at LIMIT 50', { store: 'local', vars: { thread: 'thread:standup-0917' }, ms: 2.4, ok: true }],
+    [96_200, 20, 'sp00ky-client::query', 'Query membership known', { hash: 'a91f03c2', known: true }],
     [95_100, 20, 'sp00ky-client::DevToolsService::onStreamUpdate', 'StreamUpdate', { queryHash: 814233901 }],
     [47_700, 50, 'sp00ky-client::saga', 'push rejected a mutation', { id: MUTATION_ENTRIES[3].id, error: MUTATION_ENTRIES[3].error }],
     [47_690, 40, 'sp00ky-client::saga', 'circuit revert applied', { recordId: 'channel_member:ops-tomas', revert: 'full' }],
@@ -753,7 +692,6 @@
   // ---------------------------------------------------------------------------
 
   const STATE = {
-    eventsHistory: EVENTS,
     activeQueries: QUERIES,
     auth: { authenticated: true, userId: 'user:mira', timestamp: ago(402_000) },
     version: '0.0.1-canary.265',
@@ -814,9 +752,6 @@
     updateTableRow: async () => ({ success: true }),
     deleteTableRow: async () => ({ success: true }),
     refreshVersions: async () => VERSIONS,
-    clearHistory: () => {
-      STATE.eventsHistory = [];
-    },
   };
 
   // The page-script half: every async op is dispatched into the page as a

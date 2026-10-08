@@ -134,25 +134,6 @@ export function useRunInHostPage(
   };
 
   /**
-   * Clear events history in the host page
-   */
-  const clearHistory = (
-    onSuccess?: (result: { success: boolean }) => void,
-    onError?: (error: any) => void
-  ): void => {
-    run(
-      `(function() {
-        if (window.__00__ && window.__00__.clearHistory) {
-          window.__00__.clearHistory();
-          return { success: true };
-        }
-        return { success: false };
-      })()`,
-      { onSuccess, onError }
-    );
-  };
-
-  /**
    * Check if Sp00ky is available on the page
    */
   const checkSp00kyAvailable = (onSuccess: (available: boolean) => void): void => {
@@ -359,7 +340,6 @@ export function useRunInHostPage(
     devtoolsOp,
     updateTableRow,
     deleteTableRow,
-    clearHistory,
     checkSp00kyAvailable,
     isRunning,
     error,

@@ -219,14 +219,5 @@ describe('createServer', () => {
         'requires the Sp00ky DevTools browser extension'
       );
     });
-
-    it('clear_history throws (bridge-only)', async () => {
-      const bridge = mockBridge(false);
-      const server = createServer(bridge, mockSurreal());
-
-      await expect(callTool(server, 'clear_history', {})).rejects.toThrow(
-        'requires the Sp00ky DevTools browser extension'
-      );
-    });
   });
 });

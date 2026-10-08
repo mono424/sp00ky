@@ -152,12 +152,6 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
         detail: message.payload,
       })
     );
-  } else if (message.type === 'CLEAR_HISTORY') {
-    window.dispatchEvent(
-      new CustomEvent('SP00KY_CLEAR_HISTORY', {
-        detail: message.payload,
-      })
-    );
   } else if (message.type === 'STORAGE_OP') {
     window.dispatchEvent(new CustomEvent('SP00KY_STORAGE_OP', { detail: message.payload }));
   } else if (message.type === 'FLAG_OP') {

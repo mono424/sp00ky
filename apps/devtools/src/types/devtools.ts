@@ -1,7 +1,6 @@
 // Core DevTools Types - matches the backend DevToolsService structure
 
 export interface BackendDevToolsState {
-  eventsHistory: BackendEvent[];
   activeQueries: Record<number, ActiveQuery>;
   auth: BackendAuthState;
   version: string;
@@ -72,13 +71,6 @@ export interface VersionsState {
   entities: BackendEntity[];
 }
 
-export interface BackendEvent {
-  id: number;
-  timestamp: number;
-  eventType: string;
-  payload: any;
-}
-
 export interface BackendAuthState {
   authenticated: boolean;
   userId?: string;
@@ -87,7 +79,6 @@ export interface BackendAuthState {
 
 // Frontend DevTools State - normalized for UI
 export interface DevToolsState {
-  events: Sp00kyEvent[];
   activeQueries: ActiveQuery[];
   auth: AuthState;
   database: DatabaseState;
@@ -199,12 +190,6 @@ export interface LogsMeta {
 export interface LogRead extends LogsMeta {
   entries: LogEntry[];
   dropped: number;
-}
-
-export interface Sp00kyEvent {
-  type: string;
-  timestamp: number;
-  data: unknown;
 }
 
 // Per-query processing-time breakdown (mirrors core's QueryTimings). Each phase
@@ -352,7 +337,6 @@ export interface Sp00kyTableDataResponse {
 // UI State Types
 
 export type TabType =
-  | 'events'
   | 'queries'
   // The outbox, debounced writes, the failed tray and recent outcomes.
   | 'mutations'

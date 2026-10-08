@@ -4,8 +4,8 @@ import { FrameSelect } from './FrameSelect';
 import { formatMs, formatRelativeTime } from '../utils/formatters';
 import type { HeartbeatInfo, TabType } from '../types/devtools';
 
-// Events moved to the end (was first); Queries is now the default landing tab.
-// Reads, writes, then the log: the three things you watch while reproducing.
+// Queries is the default landing tab. Reads, writes, then the log: the three
+// things you watch while reproducing.
 const tabs: { id: TabType; label: string }[] = [
   { id: 'queries', label: 'Queries' },
   { id: 'mutations', label: 'Mutations' },
@@ -16,15 +16,14 @@ const tabs: { id: TabType; label: string }[] = [
   { id: 'access', label: 'Access' },
   { id: 'versions', label: 'Stack' },
   { id: 'mcp', label: 'MCP' },
-  { id: 'events', label: 'Events' },
 ];
 
 // Reserve for the » overflow button when it has to be shown.
 const CHEVRON_W = 30;
 
 // What a plain Refresh click actually refetches, per tab — every tab also gets
-// a `getState()` resync, which is what covers Queries/Timing/Events (and the
-// session half of Access).
+// a `getState()` resync, which is what covers Queries/Timing (and the session
+// half of Access).
 //
 // Typed as a full Record so adding a TabType member is a compile error here as
 // well as in `refreshScoped` (context/DevToolsContext.tsx). The copy and the
@@ -34,7 +33,6 @@ const REFRESH_SCOPE: Record<TabType, string> = {
   mutations: 'the outbox and the failed-writes tray',
   logs: 'the log backlog',
   timing: 'page state',
-  events: 'page state',
   access: 'feature flags',
   database: 'the table list and rows',
   storage: 'storage diagnostics',
@@ -42,9 +40,12 @@ const REFRESH_SCOPE: Record<TabType, string> = {
   mcp: 'MCP bridge status',
 };
 
-// What the toolbar Clear empties, per tab (see `clearActive` in the context).
-const clearLabel = (tab: TabType): string =>
-  tab === 'logs' ? 'Clear logs' : tab === 'mutations' ? 'Clear mutation history' : 'Clear events';
+// What the toolbar Clear empties (see `clearActive` in the context). The other
+// tabs show live state, which has nothing to clear, so the button is hidden.
+const CLEAR_LABEL: Partial<Record<TabType, string>> = {
+  logs: 'Clear logs',
+  mutations: 'Clear mutation history',
+};
 
 function RefreshIcon() {
   return (
@@ -317,14 +318,13 @@ export function Tabs() {
         >
           <RefreshIcon />
         </button>
-        <button
-          class="icon-btn"
-          title={clearLabel(activeTab())}
-          aria-label={clearLabel(activeTab())}
-          onClick={clearActive}
-        >
-          <ClearIcon />
-        </button>
+        <Show when={CLEAR_LABEL[activeTab()]}>
+          {(label) => (
+            <button class="icon-btn" title={label()} aria-label={label()} onClick={clearActive}>
+              <ClearIcon />
+            </button>
+          )}
+        </Show>
       </div>
     </div>
   );

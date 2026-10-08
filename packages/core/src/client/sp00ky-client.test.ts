@@ -44,6 +44,26 @@ describe('Sp00kyClient facade', () => {
     expect(await source.discardFailed('_00_pending_mutations:gone')).toBe(false);
   });
 
+  it('logs each finished statement at debug, and nothing below it', () => {
+    const { services } = makeClient();
+    const lines: unknown[] = [];
+    const log = services.logger as any;
+    log.debug = (fields: unknown, msg: string) => lines.push([fields, msg]);
+    log.isLevelEnabled = () => true;
+    const long = `SELECT * FROM thing WHERE ${'a = 1 AND '.repeat(30)}b = 2`;
+    services.emitStoreEvent('DATABASE_LOCAL_QUERY', { query: 'SELECT\n  1', vars: {}, duration: 1.234, success: true });
+    services.emitStoreEvent('DATABASE_REMOTE_QUERY', { query: long, duration: 3, success: false, error: 'boom' });
+    services.emitStoreEvent('DATABASE_LOCAL_QUERY', undefined);
+    log.isLevelEnabled = () => false;
+    services.emitStoreEvent('DATABASE_LOCAL_QUERY', { query: 'SELECT 3' });
+    expect(lines).toEqual([
+      [expect.objectContaining({ store: 'local', ms: 1.2, ok: true }), 'SELECT 1'],
+      [expect.objectContaining({ store: 'remote', query: long, ok: false, error: 'boom' }), `${long.slice(0, 160)}…`],
+      [expect.objectContaining({ store: 'local', ms: 0, ok: true }), ''],
+    ]);
+    expect((lines[0] as any[])[0].query).toBeUndefined();
+  });
+
   it('init resolves from the local store while the remote connect never does', async () => {
     const { client, a } = makeClient();
     expect(client.isLocalReady()).toBe(false);
@@ -188,7 +208,9 @@ describe('Sp00kyClient facade', () => {
     runtime.emit({ type: 'query:authority', hash: 'h', known: true });
     runtime.emit({ type: 'query:view-lost', hash: 'h' });
     runtime.emit({ type: 'mutation:event', event: { type: 'create', record_id: new RecordId('thing', '1'), data: {} } });
-    runtime.emit({ type: 'devtools', name: 'X', data: 1 });
+    runtime.emit({ type: 'mutation:settled', mutationId: 'm', recordId: 'thing:1', eventType: 'create' });
+    runtime.emit({ type: 'mutation:rolled-back', mutationId: 'm2', recordId: 'thing:1', eventType: 'update', error: 'denied' });
+    runtime.emit({ type: 'tray:changed', count: 1 });
     expect(await client.authenticate('tok')).toBe('tok');
     await client.deauthenticate();
     expect(await client.useRemote(async () => 'r')).toBe('r');

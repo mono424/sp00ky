@@ -19,10 +19,10 @@ User-facing documentation, with screenshots of every tab, lives at
 | Access | The session, admin impersonation, and every feature flag with browser-local overrides and server-wide controls. |
 | Stack | Frontend versus backend versions with drift detection, every SSP / scheduler / backend entity, and the end-to-end sync heartbeat. |
 | MCP | The bridge that hands the same state to an AI assistant via `@spooky-sync/devtools-mcp`. |
-| Events | The client event log, filterable by type. |
 
 The toolbar carries the connection dot (and the frame picker, when a tab runs
-more than one client), the heartbeat badge, a scoped Refresh and a scoped Clear.
+more than one client), the heartbeat badge, a scoped Refresh, and Clear on the
+Mutations and Logs tabs.
 
 ## Development
 

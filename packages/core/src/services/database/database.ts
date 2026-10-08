@@ -133,7 +133,9 @@ export abstract class AbstractDatabaseService {
       await this.beforeQuery();
       const startTime = performance.now();
       try {
-        this.logger.debug(
+        // Trace: the finished statement is logged at debug by the client,
+        // from the query event below. This line is for a statement that hangs.
+        this.logger.trace(
           { query, vars, Category: 'sp00ky-client::Database::query' },
           'Executing query'
         );

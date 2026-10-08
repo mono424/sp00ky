@@ -54,5 +54,4 @@ export type OutEvent =
   | { type: 'activity:changed'; fetching: number; pending: number }
   | { type: 'tabs:broadcast'; message: unknown }
   | { type: 'tabs:sendTo'; tabId: string; message: unknown }
-  | { type: 'devtools'; name: string; data?: unknown }
   | { type: 'log'; level: 'debug' | 'info' | 'warn' | 'error'; message: string; data?: unknown };

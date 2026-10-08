@@ -427,50 +427,6 @@
     }
   });
 
-  // Listen for CLEAR_HISTORY requests from content script
-  window.addEventListener('SP00KY_CLEAR_HISTORY', (event: any) => {
-    const { requestId } = event.detail;
-    const sp00ky = (window as any).__00__;
-
-    if (!sp00ky?.clearHistory) {
-      window.postMessage(
-        {
-          type: 'SP00KY_BRIDGE_RESPONSE',
-          source: 'sp00ky-devtools-page',
-          requestId,
-          success: false,
-          error: 'Sp00ky not found or clearHistory not supported',
-        },
-        '*'
-      );
-      return;
-    }
-
-    try {
-      sp00ky.clearHistory();
-      window.postMessage(
-        {
-          type: 'SP00KY_BRIDGE_RESPONSE',
-          source: 'sp00ky-devtools-page',
-          requestId,
-          success: true,
-        },
-        '*'
-      );
-    } catch (err: any) {
-      window.postMessage(
-        {
-          type: 'SP00KY_BRIDGE_RESPONSE',
-          source: 'sp00ky-devtools-page',
-          requestId,
-          success: false,
-          error: err.message || String(err),
-        },
-        '*'
-      );
-    }
-  });
-
   // Backend version discovery. The panel drives this by eval in the main
   // document, but an out-of-process (cross-origin) iframe cannot be evaluated
   // in at all — `inspectedWindow.eval` addresses frames by URL and only reaches

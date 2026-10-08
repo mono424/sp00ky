@@ -6,14 +6,6 @@ import { RecordId } from 'surrealdb';
 import type { StreamUpdate, StreamUpdateReceiver } from '../../services/stream-processor/index';
 import { encodeRecordId } from '../../utils/index';
 
-// DevTools interfaces (matching extension expectations)
-export interface DevToolsEvent {
-  id: number;
-  timestamp: number;
-  eventType: string;
-  payload: any;
-}
-
 import type { MutationEventType, QueryState, QueryTimings } from '../../types';
 import type { ClientState } from '../../state/client-state';
 import {
@@ -101,26 +93,25 @@ export interface ImpersonationOpResult {
 }
 
 export class DevToolsService implements StreamUpdateReceiver {
-  private eventsHistory: DevToolsEvent[] = [];
-  private eventIdCounter = 0;
   // Real bundled frontend version (injected at build time via tsdown `define`).
   private version = CORE_VERSION;
   // Backend stack info (versions + per-entity status), read via the
   // `fn::spooky::info()` SurrealQL function; empty/'unavailable' until resolved.
   private backendInfo: BackendInfo = emptyBackendInfo();
   // Dormant until a devtools consumer (extension panel or MCP) handshakes via
-  // `SP00KY_DEVTOOLS_CONNECT`. While false, `notifyDevTools()`/`addEvent()` do no
-  // work, so prod pays zero serialization/postMessage cost for an unwatched panel.
+  // `SP00KY_DEVTOOLS_CONNECT`. While false, `notifyDevTools()` and the mutation
+  // history do no work, so prod pays zero serialization/postMessage cost for an
+  // unwatched panel.
   // `window.__00__.getState()` stays live regardless, so the panel's first paint
   // (the on-demand GET_STATE pull) still works before the push channel turns on.
   private enabled = false;
 
   // A state push serializes EVERY active query's full record set (see
   // `getActiveQueries`) and postMessage clones it again, so its cost scales with
-  // the whole client dataset — and it is triggered per event, including one per
-  // local DB query (`DATABASE_LOCAL_QUERY` → `logEvent`). Unthrottled, a single
-  // page load's few hundred local queries turn a handful of MB of rows into GBs
-  // of short-lived large-object garbage and OOM the renderer (V8
+  // the whole client dataset — and it is requested on every sync event (it used
+  // to be one per local DB query, when those were recorded as events).
+  // Unthrottled, a page load's burst of requests turned a handful of MB of rows
+  // into GBs of short-lived large-object garbage and OOMed the renderer (V8
   // "young object promotion failed"). Coalesce instead: push immediately when
   // idle, then at most once per window, always serializing the LATEST state.
   private static readonly NOTIFY_MIN_INTERVAL_MS = 250;
@@ -339,73 +330,29 @@ export class DevToolsService implements StreamUpdateReceiver {
     return result;
   }
 
-  public onQueryInitialized(payload: any) {
-    this.logger.debug(
-      { payload, Category: 'sp00ky-client::DevToolsService::onQueryInitialized' },
-      'QueryInitialized'
-    );
-    const queryHash = this.hashString(payload.queryId.toString());
-
-    this.addEvent('QUERY_REQUEST_INIT', {
-      queryHash,
-      query: payload.sql,
-      variables: {},
-    });
-    this.notifyDevTools();
-  }
-
-  public onQueryUpdated(payload: any) {
-    this.logger.debug(
-      {
-        id: payload.queryId?.toString(),
-        Category: 'sp00ky-client::DevToolsService::onQueryUpdated',
-      },
-      'QueryUpdated'
-    );
-    const queryHash = this.hashString(payload.queryId.toString());
-
-    this.addEvent('QUERY_UPDATED', {
-      queryHash,
-      recordCount: Array.isArray(payload.records) ? payload.records.length : 0,
-    });
-    this.notifyDevTools();
-  }
-
   public onStreamUpdate(update: StreamUpdate) {
     // A synthetic re-materialize is not an ingest (DataModule.scheduleRematerialize).
     if (update.synthetic) return;
+    // Counts and timings, not the `localArray` itself: that is one [id, version]
+    // pair per row of the view. The Logs tab shows this line at debug.
     this.logger.debug(
-      { queryHash: update.queryHash, Category: 'sp00ky-client::DevToolsService::onStreamUpdate' },
+      {
+        queryHash: update.queryHash,
+        op: update.op,
+        localCount: update.localArray?.length ?? 0,
+        materializationTimeMs: update.materializationTimeMs,
+        storeApplyMs: update.storeApplyMs,
+        circuitStepMs: update.circuitStepMs,
+        transformMs: update.transformMs,
+        Category: 'sp00ky-client::DevToolsService::onStreamUpdate',
+      },
       'StreamUpdate'
     );
-    // Counts and timings, not the `localArray` itself: that is one [id, version]
-    // pair per row of the view, serialized on every single update.
-    this.addEvent('STREAM_UPDATE', {
-      queryHash: update.queryHash,
-      op: update.op,
-      localCount: update.localArray?.length ?? 0,
-      materializationTimeMs: update.materializationTimeMs,
-      storeApplyMs: update.storeApplyMs,
-      circuitStepMs: update.circuitStepMs,
-      transformMs: update.transformMs,
-    });
     this.notifyDevTools();
   }
 
   public onMutation(payload: any[]) {
-    const payloads = payload;
-    payloads.forEach((p) => {
-      this.recordQueued(p);
-      this.addEvent('MUTATION_REQUEST_EXECUTION', {
-        mutation: {
-          type: p.type ?? 'create',
-          // Field names only; a payload body (a PGN, a document) is not
-          // something to clone on every write.
-          fields: 'data' in p && p.data && typeof p.data === 'object' ? Object.keys(p.data) : [],
-          selector: encodeRecordId(p.record_id),
-        },
-      });
-    });
+    for (const p of payload) this.recordQueued(p);
     this.notifyDevTools();
   }
 
@@ -446,17 +393,11 @@ export class DevToolsService implements StreamUpdateReceiver {
       outcome: { status: e.status, at: Date.now(), error: e.error },
     });
     trimHistory(this.mutationHistory, DevToolsService.MUTATIONS_CAP);
-    this.addEvent(e.status === 'synced' ? 'MUTATION_SYNCED' : 'MUTATION_ROLLED_BACK', {
-      mutationId: e.mutationId,
-      recordId: e.recordId,
-      type: e.eventType,
-      error: e.error,
-    });
     this.notifyDevTools();
   }
 
-  /** Outbox, tray or sync health moved: re-push so the Mutations tab follows. */
-  public onMutationsChanged(): void {
+  /** Something the panel shows moved (a query's status, the outbox, sync health): re-push. */
+  public onStateChanged(): void {
     this.notifyDevTools();
   }
 
@@ -580,23 +521,6 @@ export class DevToolsService implements StreamUpdateReceiver {
     return hash;
   }
 
-  public logEvent(eventType: string, payload: any) {
-    this.addEvent(eventType, payload);
-    this.notifyDevTools();
-  }
-
-  private addEvent(eventType: string, payload: any) {
-    // No consumer attached → skip recording (and the recursive serialize it does).
-    if (!this.enabled) return;
-    this.eventsHistory.push({
-      id: this.eventIdCounter++,
-      timestamp: Date.now(),
-      eventType,
-      payload: this.serializeForDevTools(payload),
-    });
-    if (this.eventsHistory.length > 100) this.eventsHistory.shift();
-  }
-
   /** Unwrap a SurrealDB `INFO FOR DB` result to its `{ tables, ... }` object. */
   private unwrapInfo(res: any): any {
     if (!Array.isArray(res) || !res[0]) return null;
@@ -647,7 +571,10 @@ export class DevToolsService implements StreamUpdateReceiver {
     // the single local op queue.
     if (opts.refreshTables) this.refreshLocalTables();
     return this.serializeForDevTools({
-      eventsHistory: [...this.eventsHistory],
+      // The event log is gone (the Logs and Mutations tabs carry what it did);
+      // still sent empty because panels before canary.291 read it to tell this
+      // state shape apart from their own.
+      eventsHistory: [],
       activeQueries: Object.fromEntries(this.getActiveQueries()),
       auth: {
         authenticated: this.authService.isAuthenticated,
@@ -957,10 +884,6 @@ export class DevToolsService implements StreamUpdateReceiver {
         setLocalFlagOverride: (key: string, variant: string | null, payload?: unknown) =>
           this.flagsAdmin.setLocalFlagOverride(key, variant, payload),
         clearLocalFlagOverrides: () => this.flagsAdmin.clearLocalFlagOverrides(),
-        clearHistory: () => {
-          this.eventsHistory = [];
-          this.notifyDevTools();
-        },
         refreshVersions: () => this.refreshBackendVersions(),
         getStorageInfo: (opts?: { tableCounts?: boolean }) => this.getStorageInfo(opts),
         requestPersistentStorage: () => this.requestPersistentStorage(),

@@ -49,7 +49,7 @@ export function createServer(bridge: Bridge, surreal?: SurrealClient | null): Mc
 
   server.tool(
     'get_state',
-    'Get the full Sp00ky DevTools state (events, queries, auth, database)',
+    'Get the full Sp00ky DevTools state (queries, mutations, auth, database, versions)',
     { tabId: z.number().optional().describe('Browser tab ID (uses first connected tab if omitted)') },
     async ({ tabId }) => {
       if (!bridge.isConnected) {
@@ -248,36 +248,6 @@ export function createServer(bridge: Bridge, surreal?: SurrealClient | null): Mc
   );
 
   server.tool(
-    'get_events',
-    'Get event history, optionally filtered by type',
-    {
-      eventType: z.string().optional().describe('Filter by event type'),
-      limit: z.number().optional().default(50).describe('Max number of events to return'),
-      tabId: z.number().optional().describe('Browser tab ID'),
-    },
-    async ({ eventType, limit, tabId }) => {
-      if (bridge.isConnected) {
-        const state = (await bridge.request(BRIDGE_METHODS.GET_STATE, {}, tabId)) as any;
-        let events = state?.eventsHistory ?? [];
-        if (eventType) {
-          events = events.filter((e: any) => e.eventType === eventType);
-        }
-        if (limit) {
-          events = events.slice(-limit);
-        }
-        return json(events);
-      }
-      if (surreal) {
-        const result = await surreal.query(
-          `SELECT * FROM _00_events ORDER BY timestamp DESC LIMIT ${limit};`
-        );
-        return json(result);
-      }
-      throw new Error('No extension connected and no direct database configured.');
-    }
-  );
-
-  server.tool(
     'get_mutations',
     "The client's writes: the outbox (pending / retrying with attempt counts), what left it since DevTools " +
       'attached (synced with the server latency, or rolled back with the server error), debounced updates, ' +
@@ -371,19 +341,6 @@ export function createServer(bridge: Bridge, surreal?: SurrealClient | null): Mc
       }
       const state = (await bridge.request(BRIDGE_METHODS.GET_STATE, {}, tabId)) as any;
       return json(state?.auth ?? null);
-    }
-  );
-
-  server.tool(
-    'clear_history',
-    'Clear the event history',
-    { tabId: z.number().optional().describe('Browser tab ID') },
-    async ({ tabId }) => {
-      if (!bridge.isConnected) {
-        throw new Error('No extension connected. clear_history requires the Sp00ky DevTools browser extension.');
-      }
-      await bridge.request(BRIDGE_METHODS.CLEAR_HISTORY, {}, tabId);
-      return { content: [{ type: 'text' as const, text: 'History cleared.' }] };
     }
   );
 
@@ -544,19 +501,6 @@ export function createServer(bridge: Bridge, surreal?: SurrealClient | null): Mc
     }
     if (surreal) {
       const result = await surreal.query('SELECT * FROM _00_query;');
-      return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(result, null, 2) }] };
-    }
-    throw new Error('No extension connected and no direct database configured.');
-  });
-
-  server.resource('events', 'sp00ky://events', { description: 'Event history' }, async (uri) => {
-    if (bridge.isConnected) {
-      const state = (await bridge.request(BRIDGE_METHODS.GET_STATE)) as any;
-      const events = state?.eventsHistory ?? [];
-      return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(events, null, 2) }] };
-    }
-    if (surreal) {
-      const result = await surreal.query('SELECT * FROM _00_events ORDER BY timestamp DESC LIMIT 50;');
       return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(result, null, 2) }] };
     }
     throw new Error('No extension connected and no direct database configured.');

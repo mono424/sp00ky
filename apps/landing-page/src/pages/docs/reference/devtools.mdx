@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: DevTools extension
-description: 'The Chrome DevTools panel for Sp00ky apps: live queries and their timings, the mutation queue and failed writes, the client logs, the local cache, storage health, sessions, feature flags, impersonation, stack versions and the event log.'
+description: 'The Chrome DevTools panel for Sp00ky apps: live queries and their timings, the mutation queue and failed writes, the client logs, the local cache, storage health, sessions, feature flags, impersonation and stack versions.'
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -71,8 +71,8 @@ Every tab shares one toolbar.
 - **Refresh** re-reads what the tab you are on actually shows: the table list
   on Database, the flags on Access, version discovery on Stack. Shift-click
   refreshes everything.
-- **Clear** empties the log on Logs, the mutation history on Mutations, and
-  the event log everywhere else.
+- **Clear** empties the log on Logs and the mutation history on Mutations. The
+  other tabs show live state, so it is not there.
 
 ## Queries
 
@@ -156,6 +156,13 @@ with (an error keeps its message and stack).
 The page keeps its last 500 lines whether or not the panel is open, so opening
 DevTools after a failed boot still shows the boot. Filter by level with the
 chips, by category with the dropdown, or by any text in the line.
+
+At `debug` the log is also the client's trace: every statement each store ran
+(the SurrealQL is the message; the category says `local` or `remote`, and the
+fields hold its variables, how long it took and whether it failed), each
+query's status and membership changes, and the
+per-phase timings of every ingest (`StreamUpdate`). A view the server lost is
+logged at `info`.
 
 **Record** sets what the page captures. The console keeps printing at the
 `logLevel` from your client config; lowering **Record** to `debug` captures the
@@ -297,26 +304,14 @@ The panel can hand the same state to an AI assistant.
 With the bridge enabled, [`@spooky-sync/devtools-mcp`](/docs/reference/mcp)
 connects over a local WebSocket and exposes the tab's state as MCP tools:
 `get_state`, `run_query`, `list_tables`, `get_table_data`, `get_active_queries`,
-`get_mutations`, `get_logs`, `get_events`, `get_auth_state`,
-`update_table_row`, `delete_table_row`, `clear_history` and `list_connections`. The assistant then sees the _exact_
+`get_mutations`, `get_logs`, `get_auth_state`, `update_table_row`,
+`delete_table_row` and `list_connections`. The assistant then sees the _exact_
 state your tab has, the same local cache, the same live queries, the same auth,
 rather than a fresh connection to the database.
 
 <CodeBlock code={mcpCode} lang="bash" />
 
 The toggle is off by default; nothing listens until you turn it on.
-
-## Events
-
-The client's event log, newest first, with each payload expanded.
-
-<Screenshot src="/docs/devtools/events.png" caption="The event log, filtered by type." />
-
-The chips along the top are the event types present in the log; click them to
-filter. `QUERY_REQUEST_INIT` and `QUERY_UPDATED` bracket a query's life,
-`STREAM_UPDATE` carries the per-phase materialization timings of a single
-ingest, `MUTATION_REQUEST_EXECUTION` records a write leaving the client, and
-`LOCAL_QUERY` / `REMOTE_QUERY` are the statements each store actually ran.
 
 ## What it changes
 

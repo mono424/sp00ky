@@ -76,8 +76,12 @@ export function McpTab() {
               <div class="mcp-tool-desc">Inspect live queries and their data</div>
             </div>
             <div class="mcp-tool">
-              <div class="mcp-tool-name">get_events</div>
-              <div class="mcp-tool-desc">Browse event history with filtering</div>
+              <div class="mcp-tool-name">get_mutations</div>
+              <div class="mcp-tool-desc">Outbox, write outcomes and the failed tray</div>
+            </div>
+            <div class="mcp-tool">
+              <div class="mcp-tool-name">get_logs</div>
+              <div class="mcp-tool-desc">The client's log lines, with a capture level</div>
             </div>
             <div class="mcp-tool">
               <div class="mcp-tool-name">get_auth_state</div>
@@ -90,10 +94,6 @@ export function McpTab() {
             <div class="mcp-tool">
               <div class="mcp-tool-name">delete_table_row</div>
               <div class="mcp-tool-desc">Remove a record from the database</div>
-            </div>
-            <div class="mcp-tool">
-              <div class="mcp-tool-name">clear_history</div>
-              <div class="mcp-tool-desc">Clear the event history log</div>
             </div>
             <div class="mcp-tool">
               <div class="mcp-tool-name">list_connections</div>

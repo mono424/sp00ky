@@ -65,7 +65,7 @@ function harness(recordCount = 500) {
   const service = new DevToolsService(local, remote, logger, { tables: [] } as any, auth, dataManager);
   for (const cb of listeners) cb({ source: fakeWindow, data: { type: 'SP00KY_DEVTOOLS_CONNECT' } });
   const statePushes = () => posted.filter((m) => m.type === 'SP00KY_STATE_CHANGED');
-  return { service, statePushes, posted, fakeWindow, infoQueries };
+  return { service, statePushes, posted, fakeWindow, infoQueries, logger };
 }
 
 describe('DevTools pushed state shape', () => {
@@ -77,7 +77,7 @@ describe('DevTools pushed state shape', () => {
   it('carries counts and capped ids, never the rows', async () => {
     vi.useFakeTimers();
     const { service, statePushes } = harness(500);
-    service.onQueryUpdated({ queryId: 'x', records: [] });
+    service.onStateChanged();
     await vi.advanceTimersByTimeAsync(300);
     const push = statePushes().at(-1);
     expect(push).toBeDefined();
@@ -115,19 +115,20 @@ describe('DevTools pushed state shape', () => {
     expect(fakeWindow.__00__.getQueryRows(12345)).toBeNull();
   });
 
-  // Flaky under full-suite load only (the push that carries the event
-  // occasionally lands before the event is recorded); passes in isolation.
-  // DevTools moves to state-derived reads in a later commit; retried until then.
-  it('records a stream update as counts, not the membership array', { retry: 3 }, async () => {
-    vi.useFakeTimers();
-    const { service, statePushes } = harness(2);
-    service.onStreamUpdate({ queryHash: 'q1', localArray: [['a', 1], ['b', 1]], op: 'UPDATE' });
-    await vi.advanceTimersByTimeAsync(300);
-    const push = statePushes().at(-1);
-    const ev = push.state.eventsHistory.find((e: any) => e.eventType === 'STREAM_UPDATE');
-    expect(ev.payload.localCount).toBe(2);
-    expect(ev.payload.updates).toBeUndefined();
-    expect(ev.payload.localArray).toBeUndefined();
+  it('logs a stream update as counts and timings, never the membership array', () => {
+    const { service, logger } = harness(2);
+    const debug = vi.spyOn(logger, 'debug');
+    service.onStreamUpdate({ queryHash: 'q1', localArray: [['a', 1], ['b', 1]], op: 'UPDATE', storeApplyMs: 1.5 });
+    const [fields, msg] = debug.mock.calls.at(-1) as [any, string];
+    expect(msg).toBe('StreamUpdate');
+    expect(fields).toMatchObject({ queryHash: 'q1', op: 'UPDATE', localCount: 2, storeApplyMs: 1.5 });
+    expect(fields.localArray).toBeUndefined();
+  });
+
+  it('no longer keeps an event log, but still sends the field older panels key on', () => {
+    const { fakeWindow } = harness(1);
+    expect(fakeWindow.__00__.getState().eventsHistory).toEqual([]);
+    expect(fakeWindow.__00__.clearHistory).toBeUndefined();
   });
 
   it('ignores a synthetic re-materialize', async () => {

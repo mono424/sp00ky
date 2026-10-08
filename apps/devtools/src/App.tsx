@@ -2,7 +2,6 @@ import { Show } from 'solid-js';
 import { DevToolsProvider, useDevTools } from './context/DevToolsContext';
 import { useTheme } from './hooks/useTheme';
 import { Tabs } from './components/Tabs';
-import { EventsTab } from './components/events/EventsTab';
 import { QueriesTab } from './components/queries/QueriesTab';
 import { TimingTab } from './components/timing/TimingTab';
 import { DatabaseTab } from './components/database/DatabaseTab';
@@ -22,12 +21,6 @@ function AppContent() {
     <>
       <Tabs />
       <div class="content">
-        <div class="tab-content" classList={{ active: activeTab() === 'events' }}>
-          <Show when={activeTab() === 'events'}>
-            <EventsTab />
-          </Show>
-        </div>
-
         <div class="tab-content" classList={{ active: activeTab() === 'queries' }}>
           <Show when={activeTab() === 'queries'}>
             <QueriesTab />

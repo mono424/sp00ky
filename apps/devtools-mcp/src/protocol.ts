@@ -31,7 +31,6 @@ export const BRIDGE_METHODS = {
   GET_QUERY_ROWS: 'getQueryRows',
   UPDATE_TABLE_ROW: 'updateTableRow',
   DELETE_TABLE_ROW: 'deleteTableRow',
-  CLEAR_HISTORY: 'clearHistory',
   /** `{ method: 'mutationOp' | 'logOp', op, args }`: the Mutations / Logs dispatchers. */
   PAGE_OP: 'pageOp',
 } as const;

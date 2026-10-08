@@ -8,7 +8,7 @@ import { DevToolsService } from './index';
  * requested per event — including one per local DB query — so without
  * coalescing a page load's few hundred local queries turn a few MB of rows into
  * GBs of short-lived large-object garbage and OOM the renderer. These tests pin
- * the coalescing, not the payload.
+ * the coalescing, not the payload. `onStateChanged` stands in for any trigger.
  */
 
 function harness(recordCount = 500) {
@@ -60,12 +60,26 @@ function harness(recordCount = 500) {
   };
 
   const service = new DevToolsService(local, remote, logger, { tables: [] } as any, auth, dataManager);
+  // Whatever the next push should carry; tests move it between requests.
+  const mutations: any = {
+    outbox: [],
+    pendingWrites: new Map(),
+    failedCount: 0,
+    tabRole: 'solo',
+    sync: { health: { status: 'healthy', consecutiveFailures: 0, everConnected: true, connection: 'connected' } },
+  };
+  service.setMutationSource({
+    state: () => mutations,
+    listFailed: async () => [],
+    retryFailed: async () => false,
+    discardFailed: async () => false,
+  });
   // Announce a consumer, exactly like the extension's page-script does.
   for (const cb of listeners) {
     cb({ source: fakeWindow, data: { type: 'SP00KY_DEVTOOLS_CONNECT' } });
   }
   const statePushes = () => posted.filter((m) => m.type === 'SP00KY_STATE_CHANGED');
-  return { service, statePushes, posted };
+  return { service, statePushes, posted, mutations };
 }
 
 afterEach(() => {
@@ -84,16 +98,14 @@ describe('DevToolsService state-push coalescing', () => {
     expect(statePushes().length).toBe(1);
   });
 
-  it('collapses a burst of per-query events into ONE trailing push', () => {
+  it('collapses a burst of change requests into ONE trailing push', () => {
     vi.useFakeTimers();
     const { service, statePushes } = harness();
     const before = statePushes().length;
 
-    // What a page load looks like: hundreds of LOCAL_QUERY events, each of which
-    // used to serialize the entire query state.
-    for (let i = 0; i < 400; i++) {
-      (service as any).logEvent('LOCAL_QUERY', { query: 'SELECT * FROM game', vars: {} });
-    }
+    // What a page load looks like: hundreds of requests, each of which used to
+    // serialize the entire query state.
+    for (let i = 0; i < 400; i++) service.onStateChanged();
     // Nothing extra yet — the burst is queued, not serialized 400 times.
     expect(statePushes().length).toBe(before);
 
@@ -106,21 +118,21 @@ describe('DevToolsService state-push coalescing', () => {
     const { service, statePushes } = harness();
     const before = statePushes().length;
 
-    (service as any).logEvent('A', {});
+    service.onStateChanged();
     vi.advanceTimersByTime(300);
     expect(statePushes().length).toBe(before + 1);
 
-    // An event arriving right after that flush is still inside the window, so it
+    // A request arriving right after that flush is still inside the window, so it
     // queues rather than pushing again...
-    (service as any).logEvent('B', {});
+    service.onStateChanged();
     expect(statePushes().length).toBe(before + 1);
     vi.advanceTimersByTime(300);
     expect(statePushes().length).toBe(before + 2);
 
-    // ...but once the tab has been idle past the window, the next event pushes
+    // ...but once the tab has been idle past the window, the next request pushes
     // straight away, so the panel never waits on a quiet app.
     vi.advanceTimersByTime(1000);
-    (service as any).logEvent('C', {});
+    service.onStateChanged();
     vi.advanceTimersByTime(0);
     expect(statePushes().length).toBe(before + 3);
   });
@@ -130,7 +142,7 @@ describe('DevToolsService state-push coalescing', () => {
     const { service, statePushes, posted } = harness();
     const before = statePushes().length;
 
-    (service as any).logEvent('A', {});
+    service.onStateChanged();
     (service as any).enabled = false; // panel closed while the push was queued
     vi.advanceTimersByTime(300);
     expect(statePushes().length).toBe(before);
@@ -139,16 +151,16 @@ describe('DevToolsService state-push coalescing', () => {
 
   it('serializes the LATEST state at flush time, not at request time', () => {
     vi.useFakeTimers();
-    const { service, statePushes } = harness();
-
-    (service as any).logEvent('FIRST', {});
-    (service as any).logEvent('SECOND', {});
+    const { service, statePushes, mutations } = harness();
     vi.advanceTimersByTime(300);
 
-    const last = statePushes().at(-1);
-    const types = last.state.eventsHistory.map((e: any) => e.eventType);
-    // Both events of the coalesced window are present in the single push.
-    expect(types).toContain('FIRST');
-    expect(types).toContain('SECOND');
+    service.onStateChanged();
+    mutations.failedCount = 1;
+    service.onStateChanged();
+    mutations.failedCount = 2;
+    vi.advanceTimersByTime(300);
+
+    // One push for the window, carrying what was true when it flushed.
+    expect(statePushes().at(-1).state.mutations.counts.failed).toBe(2);
   });
 });

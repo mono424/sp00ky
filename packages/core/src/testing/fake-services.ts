@@ -8,12 +8,26 @@ const noop = () => {};
  * members the facade touches at construction / close time exist; sagas never
  * see these (they go through the adapters' `service` calls).
  */
-export function fakeServiceBundle<S extends SchemaStructure>(over: Partial<Services<S>> = {}): Services<S> & { authListeners: Array<(u: string | null) => void>; connectionListeners: Array<(s: string) => void>; receivers: unknown[] } {
+export function fakeServiceBundle<S extends SchemaStructure>(over: Partial<Services<S>> = {}): Services<S> & {
+  authListeners: Array<(u: string | null) => void>;
+  connectionListeners: Array<(s: string) => void>;
+  receivers: unknown[];
+  /** Fire a store event (`DATABASE_LOCAL_QUERY`, ...) at whoever subscribed. */
+  emitStoreEvent: (type: string, payload: unknown) => void;
+} {
   const logger: any = { debug: noop, info: noop, warn: noop, error: noop, trace: noop, child: () => logger };
   const authListeners: Array<(u: string | null) => void> = [];
   const connectionListeners: Array<(s: string) => void> = [];
   const receivers: unknown[] = [];
-  const events = { subscribe: noop };
+  const storeListeners = new Map<string, Array<(e: { payload: unknown }) => void>>();
+  const events = {
+    subscribe: (type: string, cb: (e: { payload: unknown }) => void) => {
+      storeListeners.set(type, [...(storeListeners.get(type) ?? []), cb]);
+    },
+  };
+  const emitStoreEvent = (type: string, payload: unknown) => {
+    for (const cb of storeListeners.get(type) ?? []) cb({ payload });
+  };
   const bundle = {
     logger,
     local: { getEvents: () => events, getClient: () => 'local-client', storageHealth: undefined, subscribeToStorageHealth: undefined, close: async () => undefined } as any,
@@ -30,5 +44,5 @@ export function fakeServiceBundle<S extends SchemaStructure>(over: Partial<Servi
     tabId: 'tab-test',
     ...over,
   } as Services<S>;
-  return Object.assign(bundle, { authListeners, connectionListeners, receivers });
+  return Object.assign(bundle, { authListeners, connectionListeners, receivers, emitStoreEvent });
 }

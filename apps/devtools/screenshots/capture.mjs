@@ -78,7 +78,7 @@ const SHOTS = [
   {
     name: 'logs',
     tab: 'Logs',
-    height: 480,
+    height: 520,
     caption: "The client's own log lines, recorded at debug while the console stays at info.",
     async setup(page) {
       await page.click('.log-row.log-error .log-line');
@@ -140,12 +140,6 @@ const SHOTS = [
     autoHeight: true,
     caption: 'The MCP bridge that lets an AI assistant read the same state.',
   },
-  {
-    name: 'events',
-    tab: 'Events',
-    height: 440,
-    caption: 'The client event log, filtered by type.',
-  },
 ];
 
 run({
@@ -156,7 +150,7 @@ run({
   distEntry: 'panel.html',
   out: join(EXT, '../landing-page/public/docs/devtools'),
 
-  // Wide enough that all ten tabs fit on the toolbar without the overflow
+  // Wide enough that all nine tabs fit on the toolbar without the overflow
   // chevron.
   width: 1280,
   scale: 2,

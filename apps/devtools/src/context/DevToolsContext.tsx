@@ -61,8 +61,7 @@ interface DevToolsContextValue {
   setActiveTab: (tab: TabType) => void;
   setSelectedQueryHash: (hash: number | null) => void;
   setSelectedTable: (table: string | null) => void;
-  clearEvents: () => void;
-  /** The toolbar Clear: logs on Logs, mutation history on Mutations, events elsewhere. */
+  /** The toolbar Clear: logs on Logs, mutation history on Mutations. */
   clearActive: () => void;
   /**
    * Toolbar Refresh. Scoped to the active tab; `{ full: true }` (Shift+click)
@@ -150,7 +149,6 @@ export const DevToolsProvider: ParentComponent = (props) => {
   // Store for DevTools state
   // oxlint-disable-next-line no-shadow -- intentionally matching interface field name
   const [state, setState] = createStore<DevToolsState>({
-    events: [],
     activeQueries: [],
     auth: {
       isAuthenticated: false,
@@ -560,7 +558,7 @@ export const DevToolsProvider: ParentComponent = (props) => {
   /**
    * Point the whole panel at another Sp00ky client.
    *
-   * Everything on screen — events, queries, tables, flags, storage, versions —
+   * Everything on screen — queries, mutations, logs, tables, flags, storage, versions —
    * belongs to ONE client, so switching wipes it rather than blending two
    * clients' state into one view. The new frame's data arrives from the
    * re-check + state request below.
@@ -574,7 +572,6 @@ export const DevToolsProvider: ParentComponent = (props) => {
     lostFrameUrl = null;
 
     setIsSp00kyAvailable(false);
-    setState('events', []);
     setState('activeQueries', []);
     setState('auth', { isAuthenticated: false, user: null, lastAuthCheck: Date.now() });
     setState('database', { tables: [], remoteTables: [], tableData: {} });
@@ -607,18 +604,13 @@ export const DevToolsProvider: ParentComponent = (props) => {
   function updateState(backendState: BackendDevToolsState | DevToolsState) {
     console.log('[DevTools] Received state:', backendState);
 
-    // Check if it's backend format (has eventsHistory) or frontend format (has events)
-    const frontendState =
-      'eventsHistory' in backendState
-        ? adaptBackendState(backendState as BackendDevToolsState)
-        : (backendState as DevToolsState);
+    // The page sends activeQueries keyed by hash; the panel's own shape is an
+    // array. (This used to key on `eventsHistory`, which core no longer keeps.)
+    const frontendState = !Array.isArray(backendState.activeQueries)
+      ? adaptBackendState(backendState as BackendDevToolsState)
+      : (backendState as DevToolsState);
 
     console.log('[DevTools] Adapted state:', frontendState);
-
-    // Update events
-    if (frontendState.events) {
-      setState('events', frontendState.events);
-    }
 
     // Update active queries
     if (frontendState.activeQueries) {
@@ -771,27 +763,6 @@ export const DevToolsProvider: ParentComponent = (props) => {
     });
   }
 
-  /**
-   * Clear all events - clears both local state and backend history
-   */
-  function clearEvents() {
-    // Clear backend history first
-    if (isMainFrame()) {
-      hostPage.clearHistory(
-        (result) => {
-          console.log('[DevTools] Clear history result:', result);
-        },
-        (error) => {
-          console.error('[DevTools] Error clearing history:', error);
-        }
-      );
-    } else {
-      sendMessage({ type: 'CLEAR_HISTORY', payload: { requestId: `clear-${Date.now()}` } } as any);
-    }
-    // Clear local state immediately for responsive UI
-    setState('events', []);
-  }
-
   function clearActive() {
     switch (activeTab()) {
       case 'logs':
@@ -803,7 +774,8 @@ export const DevToolsProvider: ParentComponent = (props) => {
         );
         break;
       default:
-        clearEvents();
+        // The toolbar hides Clear on every other tab.
+        break;
     }
   }
 
@@ -847,12 +819,12 @@ export const DevToolsProvider: ParentComponent = (props) => {
    * `checkSp00ky()` is the baseline for every tab, not just the cheap ones: it
    * is a single `window.__00__.getState()` eval (no network, no DB), it is the
    * only writer of `isSp00kyAvailable()` — which renders the connected dot in
-   * the very toolbar this button lives in — and one call feeds events,
-   * activeQueries, auth, the table list and storage health at once. There is no
+   * the very toolbar this button lives in — and one call feeds activeQueries,
+   * mutations, auth, the table list and storage health at once. There is no
    * tab where skipping it buys anything.
    *
    * `refreshVersions()` is deliberately NOT baseline: it is a remote fetch and
-   * irrelevant to seven of the eight tabs.
+   * irrelevant to all tabs but Stack.
    *
    * Keep in sync with REFRESH_SCOPE in components/Tabs.tsx, which is the
    * user-facing description of exactly this mapping.
@@ -861,10 +833,9 @@ export const DevToolsProvider: ParentComponent = (props) => {
     checkSp00ky(beginOp());
 
     switch (tab) {
-      case 'events':
       case 'queries':
       case 'timing':
-        // Fully covered by the baseline — all three render slices of getState().
+        // Fully covered by the baseline — both render slices of getState().
         break;
       case 'database':
         // Table list (DatabaseTab's effect) and rows (TableView's effect).
@@ -1749,7 +1720,6 @@ export const DevToolsProvider: ParentComponent = (props) => {
     setActiveTab,
     setSelectedQueryHash,
     setSelectedTable,
-    clearEvents,
     clearActive,
     refresh,
     isRefreshing,

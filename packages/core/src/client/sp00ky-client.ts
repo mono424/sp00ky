@@ -59,6 +59,8 @@ import { ImpersonationBanner } from '../modules/auth/impersonation-banner';
 import type { LeaderSyncHub, SyncForwarder } from '../services/tabs/coordinator';
 
 const UNKNOWN_STORAGE_HEALTH: StorageHealth = Object.freeze({ status: 'unknown', fallback: false });
+/** Longest SurrealQL a statement log line shows as its message. */
+const STATEMENT_MSG_MAX = 160;
 
 export interface Sp00kyClientDeps<S extends SchemaStructure> {
   services?: Services<S>;
@@ -226,20 +228,48 @@ export class Sp00kyClient<S extends SchemaStructure> {
       if (e.type === 'tabs:sendTo' && this.hub) this.hub.sendTo(e.tabId, e.message as never);
     });
     this.runtime.on('*', (e) => this.forwardToDevTools(e));
-    s.local.getEvents().subscribe('DATABASE_LOCAL_QUERY', (event: any) => this.devTools.logEvent('LOCAL_QUERY', event.payload));
-    s.remote.getEvents().subscribe('DATABASE_REMOTE_QUERY', (event: any) => this.devTools.logEvent('REMOTE_QUERY', event.payload));
+    // One debug line per finished statement, for both stores and every engine
+    // (the SQLite engine logs none of its own). Guarded: this is the hottest
+    // path there is, and at the default `info` the line is never written.
+    // The message is the SurrealQL itself, so the Logs tab reads like a query
+    // trail; a long statement is cut there and kept whole in `query`.
+    const logStatement = (store: 'local' | 'remote') => (event: any) => {
+      if (!s.logger.isLevelEnabled('debug')) return;
+      const q = event.payload ?? {};
+      const sql = String(q.query ?? '').replace(/\s+/g, ' ').trim();
+      const cut = sql.length > STATEMENT_MSG_MAX;
+      s.logger.debug(
+        {
+          store,
+          ...(cut ? { query: q.query } : {}),
+          vars: q.vars,
+          ms: Math.round((q.duration ?? 0) * 10) / 10,
+          ok: q.success !== false,
+          error: q.error,
+          Category: `sp00ky-client::${store}`,
+        },
+        cut ? `${sql.slice(0, STATEMENT_MSG_MAX)}…` : sql
+      );
+    };
+    s.local.getEvents().subscribe('DATABASE_LOCAL_QUERY', logStatement('local'));
+    s.remote.getEvents().subscribe('DATABASE_REMOTE_QUERY', logStatement('remote'));
   }
 
+  /** Runtime events the DevTools panel follows; query transitions also go to the log. */
   private forwardToDevTools(e: OutEvent): void {
+    const log = this.services.logger;
     switch (e.type) {
       case 'query:status':
-        this.devTools.logEvent('QUERY_STATUS_CHANGED', { queryHash: e.hash, status: e.status });
+        log.debug({ hash: e.hash, status: e.status, Category: 'sp00ky-client::query' }, 'Query status');
+        this.devTools.onStateChanged();
         break;
       case 'query:authority':
-        this.devTools.logEvent('QUERY_AUTHORITY_CHANGED', { queryHash: e.hash, known: e.known });
+        log.debug({ hash: e.hash, known: e.known, Category: 'sp00ky-client::query' }, e.known ? 'Query membership known' : 'Query membership unknown');
+        this.devTools.onStateChanged();
         break;
       case 'query:view-lost':
-        this.devTools.logEvent('QUERY_VIEW_LOST', { queryHash: e.hash });
+        log.info({ hash: e.hash, Category: 'sp00ky-client::query' }, 'Query view lost on the server; re-registering');
+        this.devTools.onStateChanged();
         break;
       case 'mutation:event':
         this.devTools.onMutation([e.event]);
@@ -253,10 +283,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
       case 'tray:changed':
       case 'health:changed':
       case 'activity:changed':
-        this.devTools.onMutationsChanged();
-        break;
-      case 'devtools':
-        this.devTools.logEvent(e.name, e.data);
+        this.devTools.onStateChanged();
         break;
       default:
         break;

@@ -341,15 +341,8 @@ const DEVTOOLS_CSS = `
   display: flex;
 }
 
-/* Events tab */
-.devtools-root .events-container {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  overflow: hidden;
-}
-
-.devtools-root .events-header {
+/* Pane header (Database table list) */
+.devtools-root .pane-header {
   padding: 6px 8px;
   border-bottom: 1px solid var(--sys-color-divider);
   flex-shrink: 0;
@@ -358,7 +351,7 @@ const DEVTOOLS_CSS = `
   align-items: center;
 }
 
-.devtools-root .events-header h2 {
+.devtools-root .pane-header h2 {
   font-family: var(--sys-typescale-label-font);
   font-size: var(--sys-typescale-label-size);
   font-weight: var(--sys-typescale-label-weight);
@@ -369,63 +362,165 @@ const DEVTOOLS_CSS = `
   letter-spacing: 0.5px;
 }
 
-.devtools-root .events-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px;
-}
-
-.devtools-root .event-item {
-  background: var(--sys-color-surface);
-  border-radius: var(--sys-radius-xs);
-  padding: 6px 8px;
-  margin-bottom: 4px;
-  border-left: 2px solid var(--sys-color-divider);
-  transition: background-color var(--sys-transition-fast), border-color var(--sys-transition-fast);
-}
-
-.devtools-root .event-item:hover {
-  background: var(--sys-color-state-hover-on-subtle);
-}
-
-.devtools-root .event-header {
-  display: flex;
-  justify-content: space-between;
+/* Toolbar icon buttons and heartbeat badge */
+.devtools-root .icon-btn {
+  display: inline-flex;
   align-items: center;
-  margin-bottom: var(--sys-spacing-1);
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  color: var(--sys-color-on-surface-subtle);
+  cursor: pointer;
 }
-
-.devtools-root .event-type {
-  font-family: var(--sys-typescale-label-font);
-  font-size: var(--sys-typescale-label-size);
-  font-weight: var(--sys-typescale-label-weight);
+.devtools-root .icon-btn:hover {
+  background: var(--sys-color-state-hover);
   color: var(--sys-color-on-surface);
 }
-
-.devtools-root .event-time {
+.devtools-root .hb-badge {
   font-family: var(--sys-typescale-monospace-font);
-  font-size: var(--sys-typescale-monospace-size);
-  color: var(--sys-color-on-surface-subtle);
+  font-size: 10px;
+  color: var(--sys-color-primary);
+  padding: 0 4px;
 }
 
-.devtools-root .event-payload {
-  background: var(--sys-color-cdt-base-container);
-  border-radius: var(--sys-radius-xs);
-  padding: var(--sys-spacing-2);
-  margin-top: var(--sys-spacing-1);
-  border: 1px solid var(--sys-color-divider);
+/* Filter row (Mutations / Logs) */
+.devtools-root .sim-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--sys-color-divider);
+  background: var(--sys-color-surface);
   overflow-x: auto;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.devtools-root .filter-chip {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 1px 8px;
+  border-radius: 12px;
+  background: var(--sys-color-cdt-base-container);
+  border: 1px solid var(--sys-color-divider);
+  font-family: var(--sys-typescale-label-font);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--sys-color-on-surface-subtle);
+  cursor: pointer;
+}
+.devtools-root .filter-chip.active {
+  background: var(--sys-color-primary-container);
+  border-color: var(--sys-color-primary);
+  color: var(--sys-color-primary);
+}
+.devtools-root .filter-chip.danger {
+  color: var(--sys-color-error);
+}
+.devtools-root .filter-chip.danger.active {
+  background: rgba(244, 143, 177, 0.18);
+  border-color: var(--sys-color-error);
+}
+.devtools-root .filter-chip.warn.active {
+  background: rgba(255, 183, 77, 0.12);
+  border-color: var(--sys-color-warning);
+  color: var(--sys-color-warning);
+}
+.devtools-root .chip-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
 }
 
-.devtools-root .event-payload pre {
-  margin: 0;
-  white-space: pre-wrap;
-  word-wrap: break-word;
+/* Mutations */
+.devtools-root .op-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.devtools-root .op-create { color: var(--sys-color-state-on); }
+.devtools-root .op-update { color: var(--sys-color-info); }
+.devtools-root .op-delete { color: var(--sys-color-error); }
+.devtools-root .status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px 1px 6px;
+  border-radius: 999px;
+  font-family: var(--sys-typescale-label-font);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 15px;
+  text-transform: capitalize;
+}
+.devtools-root .status-pill svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+}
+.devtools-root .pill-pending { color: var(--sys-color-info); background: rgba(33, 150, 243, 0.12); }
+.devtools-root .pill-retrying { color: var(--sys-color-warning); background: rgba(255, 167, 38, 0.12); }
+.devtools-root .pill-synced { color: var(--sys-color-state-on); background: rgba(76, 175, 80, 0.12); }
+.devtools-root .pill-rolled-back { color: var(--sys-color-error); background: rgba(244, 67, 54, 0.12); }
+.devtools-root .num { text-align: right; font-variant-numeric: tabular-nums; }
+.devtools-root th.num { font-family: var(--sys-typescale-label-font); }
+.devtools-root .sim-statusbar {
+  display: flex;
+  gap: 10px;
+  padding: 3px 10px;
+  border-top: 1px solid var(--sys-color-divider);
+  background: var(--sys-color-surface);
+  font-size: 10px;
+  color: var(--sys-color-on-surface-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.devtools-root .sim-statusbar .warn { color: var(--sys-color-warning); }
+
+/* Logs */
+.devtools-root .log-list {
+  flex: 1;
+  overflow: auto;
   font-family: var(--sys-typescale-monospace-font);
   font-size: var(--sys-typescale-monospace-size);
   line-height: var(--sys-typescale-monospace-line-height);
+}
+.devtools-root .log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 8px;
+  border-bottom: 1px solid var(--sys-color-outline-variant);
+  white-space: nowrap;
+}
+.devtools-root .log-time { color: var(--sys-color-on-surface-subtle); flex: none; }
+.devtools-root .log-level {
+  flex: none;
+  width: 38px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
   color: var(--sys-color-on-surface-subtle);
 }
+.devtools-root .log-category { flex: none; color: var(--sys-color-on-surface-variant); }
+.devtools-root .log-msg { color: var(--sys-color-on-surface); overflow: hidden; text-overflow: ellipsis; }
+.devtools-root .log-info .log-level { color: var(--sys-color-info); }
+.devtools-root .log-debug .log-msg { color: var(--sys-color-on-surface-subtle); }
+.devtools-root .log-warn { background: rgba(255, 183, 77, 0.09); }
+.devtools-root .log-warn .log-level, .devtools-root .log-warn .log-msg { color: var(--sys-color-warning); }
+.devtools-root .log-error { background: rgba(244, 143, 177, 0.09); }
+.devtools-root .log-error .log-level, .devtools-root .log-error .log-msg { color: var(--sys-color-error); }
 
 /* Queries tab */
 .devtools-root .queries-container {
@@ -691,19 +786,57 @@ const DEVTOOLS_CSS = `
 .devtools-root .text-number { color: #b5cea8; }
 `;
 
-const MOCK_EVENTS = [
-  { type: 'info', timestamp: 1715011321152, data: { msg: 'sp00ky Sidecar initialized' } },
-  { type: 'info', timestamp: 1715011321340, data: { msg: 'Loading dbsp_worker.wasm... (2.1MB)' } },
-  {
-    type: 'warn',
-    timestamp: 1715011322005,
-    data: { msg: 'State rehydration took 115ms', hints: ['optimize-query'] },
-  },
-  {
-    type: 'info',
-    timestamp: 1715011325112,
-    data: { msg: 'Registered query "thread_list_view"' },
-  },
+type MutationStatus = 'pending' | 'retrying' | 'synced' | 'rolled-back';
+
+const MOCK_MUTATIONS: Array<{
+  recordId: string;
+  op: 'create' | 'update' | 'delete';
+  status: MutationStatus;
+  tries?: number;
+  tookMs?: number;
+}> = [
+  { recordId: 'comment:01j9xq7r', op: 'create', status: 'pending' },
+  { recordId: 'thread:p09s1', op: 'update', status: 'retrying', tries: 2 },
+  { recordId: 'comment:01j9xpz4', op: 'create', status: 'synced', tookMs: 84 },
+  { recordId: 'thread:7d66s', op: 'delete', status: 'rolled-back', tookMs: 212 },
+  { recordId: 'thread:8x92m', op: 'update', status: 'synced', tookMs: 61 },
+  { recordId: 'user:khadim', op: 'update', status: 'synced', tookMs: 47 },
+];
+
+// Stroke glyphs drawn at 10px in the pill's colour, as in the real panel.
+const STATUS_ICON: Record<MutationStatus, React.ReactNode> = {
+  pending: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </>
+  ),
+  retrying: (
+    <>
+      <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+      <path d="M20 4v5h-5" />
+    </>
+  ),
+  synced: <path d="M5 12.5l4.5 4.5L19 7.5" />,
+  'rolled-back': (
+    <>
+      <path d="M9 14L4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+    </>
+  ),
+};
+
+const MOCK_LOGS: Array<{ time: string; level: 'debug' | 'info' | 'warn' | 'error'; category: string; msg: string }> = [
+  { time: '10:42:01.152', level: 'info', category: 'LocalDatabaseService::connect', msg: 'Connected to local database' },
+  { time: '10:42:01.340', level: 'info', category: 'StreamProcessorService::init', msg: 'Initialized successfully' },
+  { time: '10:42:01.512', level: 'info', category: 'RemoteDatabaseService::connect', msg: 'Connected to remote database' },
+  { time: '10:42:05.112', level: 'debug', category: 'local', msg: 'SELECT * FROM thread ORDER BY created_at DESC LIMIT 10' },
+  { time: '10:42:05.161', level: 'debug', category: 'query', msg: 'Query membership known' },
+  { time: '10:42:06.020', level: 'debug', category: 'DevToolsService::onStreamUpdate', msg: 'StreamUpdate' },
+  { time: '10:42:09.731', level: 'error', category: 'saga', msg: 'push rejected a mutation' },
+  { time: '10:42:09.742', level: 'warn', category: 'saga', msg: 'circuit revert applied' },
+  { time: '10:42:14.400', level: 'warn', category: 'saga', msg: 'push interrupted, retrying with backoff' },
+  { time: '10:42:18.902', level: 'debug', category: 'saga', msg: 'drain' },
 ];
 
 const MOCK_QUERIES = [
@@ -758,12 +891,14 @@ const MOCK_THREAD_DATA = [
 ];
 
 export const DevToolsSimulation = () => {
-  const [activeTab, setActiveTab] = useState('events');
+  const [activeTab, setActiveTab] = useState('queries');
   const [selectedQueryHash, setSelectedQueryHash] = useState('0x8f2a9c');
   const [touchStart, setTouchStart] = useState(0);
   const [touchEnd, setTouchEnd] = useState(0);
 
-  const tabs = ['events', 'queries', 'database', 'auth'];
+  // The tabs that tell the sync story; the real panel adds Timing, Storage,
+  // Access, Stack and MCP.
+  const tabs = ['queries', 'mutations', 'logs', 'database'];
   const selectedQuery = MOCK_QUERIES.find((q) => q.queryHash === selectedQueryHash);
 
   // Handle swipe gestures
@@ -905,8 +1040,21 @@ export const DevToolsSimulation = () => {
                   </button>
                 ))}
                 <div className="toolbar-group-right">
-                  <button className="btn">Refresh</button>
-                  <button className="btn">Clear Events</button>
+                  <span className="hb-badge" title="End-to-end sync latency">
+                    ♥ 61ms
+                  </span>
+                  <button className="icon-btn" title="Refresh" aria-label="Refresh">
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+                      <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4a8 8 0 1 0 7.75 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+                    </svg>
+                  </button>
+                  {(activeTab === 'mutations' || activeTab === 'logs') && (
+                    <button className="icon-btn" title="Clear" aria-label="Clear">
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zM4 12c0-4.42 3.58-8 8-8 1.85 0 3.55.63 4.9 1.69L5.69 16.9A7.902 7.902 0 0 1 4 12zm8 8c-1.85 0-3.55-.63-4.9-1.69L18.31 7.1A7.902 7.902 0 0 1 20 12c0 4.42-3.58 8-8 8z" />
+                      </svg>
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -921,33 +1069,6 @@ export const DevToolsSimulation = () => {
                 onPointerUp={handlePointerUp}
                 style={{ touchAction: 'pan-y', cursor: isDragging ? 'grabbing' : 'grab' }}
               >
-                {/* EVENTS TAB */}
-                <div className={`tab-content ${activeTab === 'events' ? 'active' : ''}`}>
-                  <div className="events-container">
-                    <div className="events-header">
-                      <h2>Events History</h2>
-                    </div>
-                    <div className="events-list">
-                      {MOCK_EVENTS.map((event, i) => (
-                        <div key={i} className="event-item">
-                          <div className="event-header">
-                            <span className="event-type">{event.type}</span>
-                            <span className="event-time">
-                              {new Date(event.timestamp).toLocaleTimeString([], { hour12: false })}.
-                              {String(event.timestamp % 1000).padStart(3, '0')}
-                            </span>
-                          </div>
-                          {event.data && (
-                            <div className="event-payload">
-                              <pre>{JSON.stringify(event.data, null, 2)}</pre>
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
                 {/* QUERIES TAB */}
                 <div className={`tab-content ${activeTab === 'queries' ? 'active' : ''}`}>
                   <div className="queries-container">
@@ -1014,7 +1135,7 @@ export const DevToolsSimulation = () => {
                 <div className={`tab-content ${activeTab === 'database' ? 'active' : ''}`}>
                   <div className="database-container">
                     <div className="database-tables">
-                      <div className="events-header">
+                      <div className="pane-header">
                         <h2>Tables</h2>
                       </div>
                       <div className="tables-list">
@@ -1054,21 +1175,94 @@ export const DevToolsSimulation = () => {
                   </div>
                 </div>
 
-                {/* AUTH TAB placeholder */}
-                <div className={`tab-content ${activeTab === 'auth' ? 'active' : ''}`}>
-                  <div className="events-container">
-                    <div className="events-header">
-                      <h2>Authentication</h2>
-                    </div>
-                    <div
-                      style={{
-                        padding: 20,
-                        color: '#858585',
-                        fontFamily: 'var(--sys-typescale-body-font)',
-                      }}
-                    >
-                      User authenticated: <span style={{ color: '#4fc3f7' }}>user:khadim</span>
-                    </div>
+                {/* MUTATIONS TAB */}
+                <div className={`tab-content ${activeTab === 'mutations' ? 'active' : ''}`}>
+                  <div className="sim-filters">
+                    <span className="filter-chip active">
+                      All <span className="chip-count">6</span>
+                    </span>
+                    <span className="filter-chip">
+                      Queued <span className="chip-count">2</span>
+                    </span>
+                    <span className="filter-chip">
+                      Synced <span className="chip-count">3</span>
+                    </span>
+                    <span className="filter-chip danger">
+                      Rolled back <span className="chip-count">1</span>
+                    </span>
+                    <span className="filter-chip danger">
+                      Failed tray <span className="chip-count">1</span>
+                    </span>
+                  </div>
+                  <div className="data-grid">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Record</th>
+                          <th>Op</th>
+                          <th>Status</th>
+                          <th className="num">Tries</th>
+                          <th className="num">Took</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {MOCK_MUTATIONS.map((m) => (
+                          <tr key={m.recordId + m.op}>
+                            <td className="text-primary">{m.recordId}</td>
+                            <td>
+                              <span className={`op-badge op-${m.op}`}>{m.op}</span>
+                            </td>
+                            <td>
+                              <span className={`status-pill pill-${m.status}`}>
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  {STATUS_ICON[m.status]}
+                                </svg>
+                                {m.status}
+                              </span>
+                            </td>
+                            <td className="num">{m.tries ?? ''}</td>
+                            <td className="num">{m.tookMs ? `${m.tookMs}ms` : ''}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="sim-statusbar">
+                    <span>connected, this tab drains for all tabs</span>
+                    <span>2 queued</span>
+                    <span className="warn">1 in failed tray</span>
+                  </div>
+                </div>
+
+                {/* LOGS TAB */}
+                <div className={`tab-content ${activeTab === 'logs' ? 'active' : ''}`}>
+                  <div className="sim-filters">
+                    <span className="filter-chip active">
+                      debug <span className="chip-count">4</span>
+                    </span>
+                    <span className="filter-chip active">
+                      info <span className="chip-count">3</span>
+                    </span>
+                    <span className="filter-chip warn active">
+                      warn <span className="chip-count">2</span>
+                    </span>
+                    <span className="filter-chip danger active">
+                      error <span className="chip-count">1</span>
+                    </span>
+                  </div>
+                  <div className="log-list">
+                    {MOCK_LOGS.map((l) => (
+                      <div key={l.time} className={`log-row log-${l.level}`}>
+                        <span className="log-time">{l.time}</span>
+                        <span className="log-level">{l.level}</span>
+                        <span className="log-category">{l.category}</span>
+                        <span className="log-msg">{l.msg}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="sim-statusbar">
+                    <span>10 lines</span>
+                    <span>recording debug+, console prints info+</span>
                   </div>
                 </div>
               </div>

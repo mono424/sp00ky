@@ -29,6 +29,13 @@ pub struct RecordUpdate {
     pub record_id: String,
     pub data: Option<Value>,
     pub version: u64,
+    /// The SSP chosen to run a job this event creates, as it was sent live.
+    /// Set on the copies queued for SSPs off the live path, so redelivery and
+    /// bootstrap replay hand the job to the same SSP the live broadcast named.
+    /// `None` in the WAL and the global event buffer, which are written before
+    /// the fan-out picks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_assignee: Option<String>,
 }
 
 /// Bootstrap request from SSP

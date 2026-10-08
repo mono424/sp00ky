@@ -110,7 +110,14 @@ pub struct PublicationLimits {
     pub operations: u64,
 }
 impl Default for PublicationLimits {
-    fn default() -> Self { Self { slots: 256, bytes: 64 * 1024 * 1024, operations: 100_000 } }
+    /// Slots were 256, one bulk insert's worth: a PGN import writes games 250
+    /// rows per transaction, and one such batch against a view of that
+    /// database (~6 operations per game) held 251 slots with 1.5k operations
+    /// and 260 KB, nowhere near the other two limits. `/ingest` answered 503,
+    /// the scheduler marked the SSP lagging and refused every user's
+    /// registrations until it caught up (whitepawn 2026-10-08). Bytes and
+    /// operations are what bound memory; slots only need to absorb a burst.
+    fn default() -> Self { Self { slots: 4096, bytes: 64 * 1024 * 1024, operations: 100_000 } }
 }
 impl PublicationLimits {
     /// The part of every limit a view registration may fill: half. A cold
@@ -192,8 +199,8 @@ impl PublicationCleanup {
     }
 }
 
-/// Most queued items one publication round takes. Matches the default
-/// admission slots, so a full queue drains in a handful of rounds.
+/// Most queued items one publication round takes. Bounds how long one round
+/// holds the publication gate; a full queue drains over several rounds.
 const MAX_ROUND_ITEMS: usize = 256;
 
 /// Edge statements one round may carry before it stops taking more work. Kept

@@ -95,18 +95,16 @@ impl JobKill for ClusterJobKill {
                 return Ok(());
             }
         }
-        let ready: Vec<SspInfo> = {
-            let pool = self.ssp_pool.read().await;
-            pool.all().into_iter().filter(|s| pool.is_ready(&s.id)).cloned().collect()
-        };
-        if ready.is_empty() {
+        // Ready and Lagging: a lagging SSP runs jobs too.
+        let runners: Vec<SspInfo> = self.ssp_pool.read().await.job_runners();
+        if runners.is_empty() {
             warn!(job_id, "schedule engine wanted to kill a job but no SSP is ready");
             return Ok(());
         }
         let req = JobActionRequest { id: job_id.to_string() };
-        let results = self.transport.broadcast_to_ssps(&ready, "/job/kill", &req).await;
+        let results = self.transport.broadcast_to_ssps(&runners, "/job/kill", &req).await;
         let dispatched = results.iter().filter(|(_, r)| r.is_ok()).count();
-        debug!(job_id, dispatched, ssps = ready.len(), "schedule engine dispatched a job kill");
+        debug!(job_id, dispatched, ssps = runners.len(), "schedule engine dispatched a job kill");
         Ok(())
     }
 }

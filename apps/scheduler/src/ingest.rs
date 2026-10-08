@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::messages::{BufferedEvent, RecordUpdate, RecordOp};
 use crate::replica::Replica;
@@ -322,6 +322,7 @@ pub async fn ingest_event_from(
         record_id: request.id.clone(),
         data: Some(request.record.clone()),
         version: seq,
+        job_assignee: None,
     };
 
     let buffered_event = BufferedEvent {
@@ -420,33 +421,52 @@ async fn fan_out_event(
     operation: RecordOp,
     seq: u64,
 ) {
-    // Select one SSP for job execution (round-robin)
-    let job_assignee = {
+    let mut request = request;
+    let mut update = RecordUpdate {
+        table: request.table.clone(),
+        operation,
+        record_id: request.id.clone(),
+        data: Some(request.record.clone()),
+        version: seq,
+        job_assignee: None,
+    };
+
+    // One pool lock settles who runs a job this event creates, who gets the
+    // event live, and who gets it queued. Every copy names the same assignee:
+    // the queued ones are replayed with it, so it holds even for a lagging
+    // SSP that is the assignee itself. Split over two locks, an SSP that went
+    // from lagging or replaying to Ready in between was neither broadcast to
+    // nor queued for, and missed the event.
+    let ready_ssps = {
         let mut pool = state.ssp_pool.write().await;
-        pool.select_for_query()
+        request.job_assignee = pool.select_job_runner();
+        update.job_assignee = request.job_assignee.clone();
+
+        let mut ready_ssps = Vec::new();
+        let mut off_live_path = Vec::new();
+        for ssp in pool.all() {
+            if pool.is_ready(&ssp.id) {
+                ready_ssps.push(ssp.clone());
+            } else {
+                off_live_path.push(ssp.id.clone());
+            }
+        }
+        // Bootstrapping, replaying, or lagging behind a failed delivery.
+        for ssp_id in off_live_path {
+            if !pool.buffer_message(&ssp_id, update.clone()) {
+                warn!("Buffer overflow for SSP '{}', needs re-bootstrap", ssp_id);
+            }
+        }
+        ready_ssps
     };
 
     info!(
         table = %request.table,
         op = %request.op,
         record_id = %request.id,
-        job_assignee = ?job_assignee,
+        job_assignee = ?request.job_assignee,
         "Ingest: job assignee selected for event"
     );
-
-    // Set assignee on request before broadcast
-    let mut request = request;
-    request.job_assignee = job_assignee;
-
-    // Get all ready SSPs and broadcast
-    let ready_ssps = {
-        let pool = state.ssp_pool.read().await;
-        pool.all()
-            .into_iter()
-            .filter(|ssp| pool.is_ready(&ssp.id))
-            .cloned()
-            .collect::<Vec<_>>()
-    };
 
     // SSPs that missed THIS event and need a redelivery task (see below).
     let mut newly_lagging: Vec<String> = Vec::new();
@@ -465,40 +485,18 @@ async fn fan_out_event(
                 // applied it (a POST that times out is dropped with the
                 // connection), and nothing downstream would ever resend it:
                 // the row would be missing from every view on that SSP until
-                // a cold re-registration. Park the SSP in `Lagging`: the
-                // not-ready buffering below then queues this event, and every
-                // later one behind it. The redelivery task is started only
-                // after that buffering, or it could find an empty queue, flip
-                // the SSP back to Ready, and lose exactly this event.
-                if state.ssp_pool.write().await.mark_lagging(&ssp_id) {
-                    newly_lagging.push(ssp_id);
+                // a cold re-registration. Park the SSP in `Lagging` and queue
+                // this event, so every later one queues behind it. The
+                // redelivery task is started only after that, or it could
+                // find an empty queue, flip the SSP back to Ready, and lose
+                // exactly this event.
+                let mut pool = state.ssp_pool.write().await;
+                if pool.mark_lagging(&ssp_id) {
+                    newly_lagging.push(ssp_id.clone());
                 }
-            }
-        }
-    }
-
-    // Buffer for SSPs that are not on the live path: bootstrapping,
-    // replaying, or lagging behind a failed delivery (including one that
-    // failed for this very event, parked above).
-    {
-        let mut pool = state.ssp_pool.write().await;
-        let bootstrapping_ids: Vec<String> = pool
-            .all()
-            .iter()
-            .filter(|ssp| !pool.is_ready(&ssp.id))
-            .map(|ssp| ssp.id.clone())
-            .collect();
-
-        for ssp_id in bootstrapping_ids {
-            let update = RecordUpdate {
-                table: request.table.clone(),
-                operation,
-                record_id: request.id.clone(),
-                data: Some(request.record.clone()),
-                version: seq,
-            };
-            if !pool.buffer_message(&ssp_id, update) {
-                warn!("Buffer overflow for SSP '{}', needs re-bootstrap", ssp_id);
+                if !pool.buffer_message(&ssp_id, update.clone()) {
+                    warn!("Buffer overflow for SSP '{}', needs re-bootstrap", ssp_id);
+                }
             }
         }
     }
@@ -532,15 +530,18 @@ pub fn foreign_table_prefix(table: &str, id: &str) -> Option<String> {
     }
 }
 
-/// The `/ingest` body for a buffered event — the same shape the bootstrap
-/// replay sends (`ssp_management::poll_and_replay_ssp`).
-fn replay_payload(message: &RecordUpdate) -> serde_json::Value {
-    serde_json::json!({
-        "table": message.table,
-        "op": message.operation.to_string(),
-        "id": message.record_id,
-        "record": message.data.clone().unwrap_or(serde_json::json!({}))
-    })
+/// The `/ingest` body for a buffered event, here and in the bootstrap replay
+/// (`ssp_management::poll_and_replay_ssp`): the request the live broadcast
+/// sent, job assignee included. Without it the SSP that was given a job while
+/// lagging received the CREATE as nobody's job and never ran it.
+pub(crate) fn replay_payload(message: &RecordUpdate) -> IngestRequest {
+    IngestRequest {
+        table: message.table.clone(),
+        op: message.operation.to_string(),
+        id: message.record_id.clone(),
+        record: message.data.clone().unwrap_or(serde_json::json!({})),
+        job_assignee: message.job_assignee.clone(),
+    }
 }
 
 /// Bring a `Lagging` SSP back to `Ready` by delivering its buffered events in
@@ -554,9 +555,7 @@ fn replay_payload(message: &RecordUpdate) -> serde_json::Value {
 /// snapshot), or overflowed its buffer (its next heartbeat gets 409 and it
 /// re-bootstraps). In every one of those the events reach it another way.
 pub async fn redeliver_to_lagging_ssp(state: IngestState, ssp_id: String) {
-    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = REDELIVERY_INITIAL_BACKOFF;
 
     loop {
         let (url, batch) = {
@@ -597,13 +596,21 @@ pub async fn redeliver_to_lagging_ssp(state: IngestState, ssp_id: String) {
                 .post_to_ssp(&url, "/ingest", &replay_payload(message))
                 .await
             {
-                warn!(
-                    ssp_id,
-                    error = %e,
-                    undelivered = batch.len() - i,
-                    "Redelivery to lagging SSP failed; retrying after backoff"
-                );
-                failed_at = Some(i);
+                let busy = crate::transport::is_publication_backlog(&e);
+                if busy && i > 0 {
+                    // Flow control, not a fault: it took events until its
+                    // publication queue filled up again.
+                    debug!(ssp_id, delivered = i, undelivered = batch.len() - i,
+                        "Lagging SSP's publication queue is full; resuming shortly");
+                } else {
+                    warn!(
+                        ssp_id,
+                        error = %e,
+                        undelivered = batch.len() - i,
+                        "Redelivery to lagging SSP failed; retrying after backoff"
+                    );
+                }
+                failed_at = Some((i, busy));
                 break;
             }
         }
@@ -611,17 +618,85 @@ pub async fn redeliver_to_lagging_ssp(state: IngestState, ssp_id: String) {
         match failed_at {
             None => {
                 info!(ssp_id, delivered = batch.len(), "Redelivered missed events to lagging SSP");
-                backoff = INITIAL_BACKOFF;
+                backoff = REDELIVERY_INITIAL_BACKOFF;
             }
-            Some(i) => {
+            Some((i, busy)) => {
                 state
                     .ssp_pool
                     .write()
                     .await
                     .requeue_front(&ssp_id, batch[i..].to_vec());
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                let (wait, next) = redelivery_wait(backoff, i, busy);
+                tokio::time::sleep(wait).await;
+                backoff = next;
             }
         }
+    }
+}
+
+/// First redelivery wait, and the doubling ceiling while the SSP does not
+/// answer at all (connection refused, timeout, an error status).
+pub(crate) const REDELIVERY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+const REDELIVERY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+/// The ceiling while the SSP answers `503 publication_backlog`: it is up and
+/// emptying its queue, which takes about a second. Riding the 10 s ceiling
+/// there kept it idle nine seconds in ten (whitepawn 2026-10-08: ~400 events
+/// per 10.5 s against a PGN import writing ~125 a second, a 4-minute lag
+/// during which every user's registrations were refused).
+const REDELIVERY_BUSY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long to wait after a redelivery attempt that stopped at a refused
+/// event, and the backoff to carry into the next one. `delivered` is how many
+/// events the attempt got through first: any progress means the SSP is taking
+/// events, so doubling starts over. A `busy` SSP is never waited on for more
+/// than [`REDELIVERY_BUSY_MAX_BACKOFF`].
+pub(crate) fn redelivery_wait(
+    backoff: std::time::Duration,
+    delivered: usize,
+    busy: bool,
+) -> (std::time::Duration, std::time::Duration) {
+    let base = if delivered > 0 { REDELIVERY_INITIAL_BACKOFF } else { backoff };
+    let wait = if busy { base.min(REDELIVERY_BUSY_MAX_BACKOFF) } else { base };
+    (wait, (wait * 2).min(REDELIVERY_MAX_BACKOFF))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn waits(mut backoff: Duration, attempts: &[(usize, bool)]) -> Vec<Duration> {
+        attempts.iter().map(|&(delivered, busy)| {
+            let (wait, next) = redelivery_wait(backoff, delivered, busy);
+            backoff = next;
+            wait
+        }).collect()
+    }
+
+    #[test]
+    fn an_unreachable_ssp_backs_off_to_ten_seconds() {
+        let ms = |v: u64| Duration::from_millis(v);
+        assert_eq!(
+            waits(REDELIVERY_INITIAL_BACKOFF, &[(0, false); 7]),
+            [ms(500), ms(1000), ms(2000), ms(4000), ms(8000), ms(10_000), ms(10_000)]
+        );
+    }
+
+    #[test]
+    fn a_busy_ssp_is_retried_within_a_second() {
+        let ms = |v: u64| Duration::from_millis(v);
+        assert_eq!(
+            waits(REDELIVERY_INITIAL_BACKOFF, &[(0, true); 5]),
+            [ms(500), ms(1000), ms(1000), ms(1000), ms(1000)]
+        );
+        // Even after an unreachable stretch reached the ten-second ceiling.
+        assert_eq!(redelivery_wait(REDELIVERY_MAX_BACKOFF, 0, true).0, ms(1000));
+    }
+
+    #[test]
+    fn progress_starts_the_backoff_over() {
+        let ms = |v: u64| Duration::from_millis(v);
+        assert_eq!(redelivery_wait(REDELIVERY_MAX_BACKOFF, 400, true), (ms(500), ms(1000)));
+        assert_eq!(redelivery_wait(REDELIVERY_MAX_BACKOFF, 1, false), (ms(500), ms(1000)));
     }
 }

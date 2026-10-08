@@ -542,7 +542,7 @@ bearer; only `/health`, `/info`, `/info/text` and `/version` are public.
 | `GET /info/text` | The same content as `/info`, formatted for a terminal |
 
 Job kill and retry are normally reached through the cluster, not directly: the
-scheduler broadcasts a kill to every ready SSP and sends a retry to exactly one.
+scheduler broadcasts a kill to every ready or lagging SSP and sends a retry to exactly one.
 See the [scheduler API](/docs/reference/scheduler-api) for that side and
 [Jobs](/docs/jobs) for what the states mean.
 
@@ -902,13 +902,16 @@ Timeout logs report statement bytes/count rather than entire SQL batches.
 
 ### Publication admission and backlog
 
-The native publisher reserves one of 256 slots before ingest side effects or
+The native publisher reserves one of 4,096 slots before ingest side effects or
 circuit evaluation. A slot stays reserved while registration metadata, source
 commit visibility, database publication, or retries are pending. When capacity
 is exhausted, ingest returns HTTP 503 before accepting the event; the scheduler
 retains it in its WAL and delivers it again. A prolonged overload can therefore
 show as lagging while memory use is protected, with explicit bootstrap recovery
-if the scheduler's replay buffer overflows.
+if the scheduler's replay buffer overflows. While an SSP is lagging behind a
+`publication_backlog` refusal, the scheduler retries it within a second rather
+than backing off toward ten, and keeps routing re-registrations of the views it
+already holds to it; only views it does not hold yet wait for a ready SSP.
 
 A view registration may only take half of the queue: once half the slots, half
 the bytes or half the operations are reserved, `/view/register` answers 503

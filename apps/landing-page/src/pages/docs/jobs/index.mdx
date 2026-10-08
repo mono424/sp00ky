@@ -260,7 +260,7 @@ update live, and each step links to the job that ran it.
 
 The job runner is built into the SSP. There is nothing to install or implement:
 
-1. **Pickup is create-only.** Writing a `pending` row fires an event that hands the job to the runner, which is why `db.run()` creates a row rather than updating one.
+1. **Pickup is create-only.** Writing a `pending` row fires an event that hands the job to the runner, which is why `db.run()` creates a row rather than updating one. With several SSPs, the scheduler names one per event; an SSP that is behind on events still takes jobs when no other is caught up, and runs them as it catches up.
 2. **The runner is the only writer of `status`.** Everything else (kill, retry, recovery) goes through guarded statements, so two writers can never disagree about a job's state.
 3. **Retries happen in-process,** with linear or exponential backoff. A job that exhausts them is marked `failed` with its error history intact.
 4. **A recovery sweep catches what events miss:** rows created while the SSP was down, jobs whose delay elapsed during a restart, and `processing` rows whose lease has run out.

@@ -857,21 +857,9 @@ async fn poll_and_replay_ssp(
             snapshot_seq
         );
 
-        for event in &events_to_replay {
-            let ingest_payload = serde_json::json!({
-                "table": event.update.table,
-                "op": event.update.operation.to_string(),
-                "id": event.update.record_id,
-                "record": event.update.data.clone().unwrap_or(serde_json::json!({}))
-            });
-
-            if let Err(e) = transport.post_to_ssp(&ssp_url, "/ingest", &ingest_payload).await {
-                warn!(
-                    "Failed to replay event seq={} to SSP '{}': {}",
-                    event.seq, ssp_id, e
-                );
-            }
-        }
+        // `replayed` holds exactly these events so far. Here and in Phase 4,
+        // an event the SSP rejected is left for the catch-up check to find.
+        replay_in_order(&ssp_id, &ssp_url, generation, &ssp_pool, &transport, &replayed).await?;
 
         info!(
             "Replayed {} global buffer events to SSP '{}'",
@@ -899,21 +887,7 @@ async fn poll_and_replay_ssp(
             ssp_id
         );
 
-        for message in &buffered {
-            let ingest_payload = serde_json::json!({
-                "table": message.table,
-                "op": message.operation.to_string(),
-                "id": message.record_id,
-                "record": message.data.clone().unwrap_or(serde_json::json!({}))
-            });
-
-            if let Err(e) = transport.post_to_ssp(&ssp_url, "/ingest", &ingest_payload).await {
-                warn!(
-                    "Failed to replay buffered event to SSP '{}': {}",
-                    ssp_id, e
-                );
-            }
-        }
+        replay_in_order(&ssp_id, &ssp_url, generation, &ssp_pool, &transport, &buffered).await?;
     }
 
     // Phase 4b: Verify the SSP's caught-up state at the cut M BEFORE routing any
@@ -991,58 +965,58 @@ async fn poll_and_replay_ssp(
         }
     };
 
-    // Phase 5: Mark SSP as Ready (atomic with final buffer drain) — only once
-    // verification has passed, so live traffic is never routed to an unverified
-    // or diverged SSP.
+    // Phase 5: Mark SSP as Ready, atomically with a final drain that comes back
+    // empty, and only once verification has passed, so live traffic is never
+    // routed to an unverified or diverged SSP. Events buffered during the
+    // verification are replayed first, while it is still `Replaying`, so live
+    // events keep queueing behind them. Replaying them after `mark_ready` let
+    // live deliveries overtake them, and any refusal (a busy SSP's 503
+    // included) forced a full re-bootstrap.
     if verified {
-        let mut pool = ssp_pool.write().await;
-        if pool.registration_gen(&ssp_id) != generation {
-            anyhow::bail!(
-                "SSP '{}' bootstrap superseded by re-registration — aborting before ready",
-                ssp_id
-            );
-        }
-        let remaining = pool.mark_ready(&ssp_id);
-
-        // Replay any events that snuck in between last drain and mark_ready
-        if !remaining.is_empty() {
-            info!(
-                "Replaying {} final buffered events to SSP '{}'",
-                remaining.len(),
-                ssp_id
-            );
-            for message in &remaining {
-                let ingest_payload = serde_json::json!({
-                    "table": message.table,
-                    "op": message.operation.to_string(),
-                    "id": message.record_id,
-                    "record": message.data.clone().unwrap_or(serde_json::json!({}))
-                });
-
-                // Drop pool lock before making HTTP call
-                drop(pool);
-
-                let outcome = transport
-                    .post_to_ssp(&ssp_url, "/ingest", &ingest_payload)
-                    .await;
-                pool = ssp_pool.write().await;
+        loop {
+            let pending = {
+                let mut pool = ssp_pool.write().await;
+                if pool.registration_gen(&ssp_id) != generation {
+                    anyhow::bail!(
+                        "SSP '{}' bootstrap superseded by re-registration — aborting before ready",
+                        ssp_id
+                    );
+                }
+                // `mark_ready` clears the flag, and with it the heartbeat's
+                // 409 that makes the SSP re-bootstrap for the dropped events.
                 anyhow::ensure!(
-                    pool.registration_gen(&ssp_id) == generation,
-                    "SSP '{}' bootstrap superseded by re-registration during final replay",
+                    !pool.has_buffer_overflow(&ssp_id),
+                    "SSP '{}' buffer overflowed before ready, it must re-bootstrap",
                     ssp_id
                 );
-                if let Err(e) = outcome {
-                    warn!(
-                        "Failed to replay final event to SSP '{}': {}",
-                        ssp_id, e
-                    );
-                    pool.mark_for_resync(&ssp_id);
-                    anyhow::bail!("Final replay failed for SSP '{}': {}", ssp_id, e);
+                let pending = pool.drain_buffer(&ssp_id);
+                if pending.is_empty() {
+                    // Drained under this same lock, so nothing is left over.
+                    let _ = pool.mark_ready(&ssp_id);
+                    // Keep recovery correlated with this registration while holding the pool lock.
+                    crate::admin::incidents::emit(&ssp_id, "ready", "recovered", "Bootstrap verification and final replay completed", None);
+                    break;
                 }
+                pending
+            };
+            info!(
+                "Replaying {} final buffered events to SSP '{}'",
+                pending.len(),
+                ssp_id
+            );
+            let rejected =
+                replay_in_order(&ssp_id, &ssp_url, generation, &ssp_pool, &transport, &pending)
+                    .await?;
+            if rejected > 0 {
+                // Past the catch-up check, so nothing else would catch the gap.
+                ssp_pool.write().await.mark_for_resync(&ssp_id);
+                anyhow::bail!(
+                    "Final replay failed for SSP '{}': it rejected {} event(s)",
+                    ssp_id,
+                    rejected
+                );
             }
         }
-        // Keep recovery correlated with this registration while holding the pool lock.
-        crate::admin::incidents::emit(&ssp_id, "ready", "recovered", "Bootstrap verification and final replay completed", None);
     }
 
     // Phase 6: Unfreeze snapshot if no other SSPs are bootstrapping/replaying
@@ -1067,6 +1041,84 @@ async fn poll_and_replay_ssp(
         info!(ssp_id = %ssp_id, "SSP withheld from broadcast pending re-bootstrap");
     }
     Ok(())
+}
+
+/// POST replayed events to a catching-up SSP in order, retrying a refused one
+/// in place so nothing after it overtakes it and nothing is skipped.
+///
+/// A skipped event left the SSP short of the scheduler, so the catch-up check
+/// failed and escalated to a re-bootstrap or a re-clone. Refusals are routine:
+/// an SSP answers `503 publication_backlog` whenever a write burst fills its
+/// publication queue. Waits follow the lagging redelivery
+/// ([`crate::ingest::redelivery_wait`]): a busy SSP is retried within a
+/// second, an unreachable one backs off to ten, and progress starts over.
+///
+/// Bails out, like the phase checks in [`poll_and_replay_ssp`], once the SSP
+/// is removed from the pool or registers again, and, like the lagging
+/// redelivery, once its buffer overflowed (it re-bootstraps, so the rest of
+/// this replay is moot). A 4xx is the one refusal that is not retried: the
+/// same body would be refused again, so the event is skipped as before.
+/// Returns how many were skipped, for the caller to judge: before the
+/// catch-up check, the check catches the gap; after it, nothing would.
+async fn replay_in_order(
+    ssp_id: &str,
+    ssp_url: &str,
+    generation: u64,
+    ssp_pool: &RwLock<SspPool>,
+    transport: &HttpTransport,
+    events: &[RecordUpdate],
+) -> Result<usize> {
+    let mut backoff = crate::ingest::REDELIVERY_INITIAL_BACKOFF;
+    // Events accepted since the last refusal.
+    let mut delivered = 0;
+    let mut skipped = 0;
+    for event in events {
+        let payload = crate::ingest::replay_payload(event);
+        loop {
+            let Err(e) = transport.post_to_ssp(ssp_url, "/ingest", &payload).await else {
+                delivered += 1;
+                break;
+            };
+            let rejected = e
+                .downcast_ref::<crate::transport::SspStatusError>()
+                .is_some_and(|s| s.status.is_client_error());
+            if rejected {
+                warn!(ssp_id, table = %event.table, id = %event.record_id, error = %e,
+                    "SSP rejected a replayed event; skipping it");
+                skipped += 1;
+                break;
+            }
+            let busy = crate::transport::is_publication_backlog(&e);
+            if busy && delivered > 0 {
+                debug!(ssp_id, delivered, "Replaying SSP's publication queue is full; resuming shortly");
+            } else {
+                warn!(ssp_id, table = %event.table, id = %event.record_id, error = %e,
+                    "Replay to SSP failed; retrying the event after backoff");
+            }
+            let (wait, next) = crate::ingest::redelivery_wait(backoff, delivered, busy);
+            tokio::time::sleep(wait).await;
+            backoff = next;
+            delivered = 0;
+
+            let pool = ssp_pool.read().await;
+            anyhow::ensure!(
+                pool.get(ssp_id).is_some(),
+                "SSP '{}' removed from pool during replay, aborting",
+                ssp_id
+            );
+            anyhow::ensure!(
+                pool.registration_gen(ssp_id) == generation,
+                "SSP '{}' replay superseded by re-registration, aborting",
+                ssp_id
+            );
+            anyhow::ensure!(
+                !pool.has_buffer_overflow(ssp_id),
+                "SSP '{}' buffer overflowed during replay, it must re-bootstrap",
+                ssp_id
+            );
+        }
+    }
+    Ok(skipped)
 }
 
 /// Verify a caught-up SSP at the catch-up cut M, comparing hashes taken at the
@@ -1532,6 +1584,7 @@ mod catchup_tests {
             record_id: id.to_string(),
             data,
             version: 0,
+            job_assignee: None,
         }
     }
 

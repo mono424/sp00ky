@@ -140,7 +140,7 @@ pub fn create_job_router(state: JobState) -> Router {
         .with_state(state)
 }
 
-/// Cluster `/job/kill` — broadcast to every ready SSP.
+/// Cluster `/job/kill`: broadcast to every SSP that may run jobs.
 ///
 /// The `JobTracker` is not populated for outbox jobs (real routing is broadcast
 /// in `ingest.rs`, not via `dispatch_job`), so we cannot look up the owner. A kill
@@ -166,16 +166,11 @@ pub async fn kill_job(
     if let Some(verdict) = pool_job_action(id, PoolAction::Kill).await {
         return verdict;
     }
-    let ready: Vec<SspInfo> = {
-        let pool = ssp_pool.read().await;
-        pool.all()
-            .into_iter()
-            .filter(|s| pool.is_ready(&s.id))
-            .cloned()
-            .collect()
-    };
+    // Lagging SSPs too: they run jobs (`SspPool::select_job_runner`), and a
+    // job started while its SSP was Ready keeps running when it lags.
+    let runners: Vec<SspInfo> = ssp_pool.read().await.job_runners();
 
-    if ready.is_empty() {
+    if runners.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             json!({ "code": "no_ssp", "message": "no ready SSP available" }),
@@ -183,15 +178,15 @@ pub async fn kill_job(
     }
 
     let req = JobActionRequest { id: id.to_string() };
-    let results = transport.broadcast_to_ssps(&ready, "/job/kill", &req).await;
+    let results = transport.broadcast_to_ssps(&runners, "/job/kill", &req).await;
     let dispatched = results.iter().filter(|(_, r)| r.is_ok()).count();
     (
         StatusCode::OK,
-        json!({ "id": id, "dispatched": dispatched, "ssps": ready.len() }),
+        json!({ "id": id, "dispatched": dispatched, "ssps": runners.len() }),
     )
 }
 
-/// Cluster `/job/retry` — pick exactly one ready SSP and forward.
+/// Cluster `/job/retry`: pick exactly one SSP that takes jobs and forward.
 ///
 /// Retry resets the row and enqueues into one SSP's local runner. Broadcasting
 /// would reset+enqueue on every SSP and run the job N times, so we choose a single
@@ -216,7 +211,7 @@ pub async fn retry_job(
     }
     let ssp = {
         let mut pool = ssp_pool.write().await;
-        match pool.select_for_query() {
+        match pool.select_job_runner() {
             Some(id) => pool.get(&id).map(|s| (id.clone(), s.url.clone())),
             None => None,
         }
@@ -266,7 +261,7 @@ async fn dispatch_job(
     // Select SSP for job execution
     let (ssp_id, ssp_url) = {
         let mut pool = state.ssp_pool.write().await;
-        match pool.select_for_query() {
+        match pool.select_job_runner() {
             Some(id) => {
                 let ssp = pool.get(&id).ok_or_else(|| {
                     (
@@ -481,9 +476,12 @@ async fn recover_table_once(
 ) -> Result<()> {
     // Snapshot live pool membership (ready or not): a job owned by a current
     // member is handled there; only re-dispatch jobs whose owner left the pool.
-    let live: HashSet<String> = {
+    // A job whose CREATE is still queued for its assignee, a lagging SSP
+    // catching up in order, is owned before its row says so: redelivery
+    // hands it over, and its pending row is no sign of an orphan.
+    let (live, queued): (HashSet<String>, HashSet<String>) = {
         let pool = ssp_pool.read().await;
-        pool.all().into_iter().map(|s| s.id.clone()).collect()
+        (pool.all().into_iter().map(|s| s.id.clone()).collect(), pool.queued_jobs())
     };
 
     // 1. Due pending rows older than the grace period. A row is DUE at
@@ -518,8 +516,9 @@ async fn recover_table_once(
             continue;
         };
         let long_overdue = row.get("long_overdue").and_then(|v| v.as_bool()).unwrap_or(false);
-        if is_orphaned(row, &live) || long_overdue {
-            if long_overdue && !is_orphaned(row, &live) {
+        let orphaned = is_orphaned(row, &live) && !queued.contains(id);
+        if orphaned || long_overdue {
+            if !orphaned {
                 warn!(job_id = %id, "Cluster job recovery: pending job long overdue despite live assignee — re-dispatching");
             }
             dispatch_recover(ssp_pool, transport, id).await;
@@ -586,7 +585,8 @@ async fn recover_table_once(
     Ok(())
 }
 
-/// Pick a ready SSP round-robin and POST `/job/recover` for one job id.
+/// Pick an SSP to run jobs (`SspPool::select_job_runner`: a Ready one, else
+/// a Lagging one) and POST `/job/recover` for one job id.
 async fn dispatch_recover(
     ssp_pool: &Arc<RwLock<SspPool>>,
     transport: &Arc<HttpTransport>,
@@ -594,7 +594,7 @@ async fn dispatch_recover(
 ) {
     let target = {
         let mut pool = ssp_pool.write().await;
-        match pool.select_for_query() {
+        match pool.select_job_runner() {
             Some(sid) => pool.get(&sid).map(|s| (sid.clone(), s.url.clone())),
             None => None,
         }

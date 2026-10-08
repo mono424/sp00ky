@@ -1,5 +1,5 @@
 use crate::config::LoadBalanceStrategy;
-use crate::messages::RecordUpdate;
+use crate::messages::{RecordOp, RecordUpdate};
 use crate::transport::SspInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -347,6 +347,65 @@ impl SspPool {
         matches!(self.ssp_states.get(ssp_id), Some(SspState::Lagging))
     }
 
+    /// Whether jobs may be handed to this SSP: `Ready`, or `Lagging` with its
+    /// buffer intact. A lagging SSP is alive and gets every event it missed,
+    /// in order and each with its `job_assignee`, so a job given to it runs
+    /// once redelivery reaches the CREATE. An overflowed buffer has dropped
+    /// those events and the SSP is about to re-bootstrap.
+    pub fn takes_jobs(&self, ssp_id: &str) -> bool {
+        match self.ssp_states.get(ssp_id) {
+            Some(SspState::Ready) => true,
+            Some(SspState::Lagging) => !self.buffer_overflowed.contains(ssp_id),
+            _ => false,
+        }
+    }
+
+    /// The SSP to run a job: a `Ready` one by the load-balancing strategy,
+    /// else a `Lagging` one that [`takes_jobs`](Self::takes_jobs). Refusing a
+    /// lagging SSP left every job created during a lag unassigned, so nobody
+    /// ran it until cluster recovery found a Ready SSP again (whitepawn
+    /// 2026-10-08: 22 pending, throughput 0, for each lag of a PGN import).
+    pub fn select_job_runner(&mut self) -> Option<String> {
+        if let Some(ready) = self.select_for_query() {
+            return Some(ready);
+        }
+        let lagging: Vec<String> = self
+            .ssps
+            .keys()
+            .filter(|id| self.is_lagging(id) && self.takes_jobs(id))
+            .cloned()
+            .collect();
+        self.select_among(&lagging)
+    }
+
+    /// Every SSP a job may be running on, `Ready` or `Lagging`: where a kill
+    /// has to reach.
+    pub fn job_runners(&self) -> Vec<SspInfo> {
+        self.ssps
+            .values()
+            .filter(|s| self.is_ready(&s.id) || self.is_lagging(&s.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Record ids of job CREATEs still queued for the SSP they were assigned
+    /// to. Such a job has an owner although its row carries no `assignee` yet
+    /// (the SSP stamps it on admission), so cluster recovery must not treat it
+    /// as orphaned and run it ahead of its turn.
+    pub fn queued_jobs(&self) -> HashSet<String> {
+        let mut queued = HashSet::new();
+        for (ssp_id, buffer) in &self.message_buffers {
+            for message in buffer {
+                if message.operation == RecordOp::Create
+                    && message.job_assignee.as_deref() == Some(ssp_id.as_str())
+                {
+                    queued.insert(message.record_id.clone());
+                }
+            }
+        }
+        queued
+    }
+
     /// Put undelivered events back at the FRONT of an SSP's buffer, keeping
     /// their order, so a redelivery that failed part-way resumes from the
     /// first event the SSP never acknowledged. Does not count toward the
@@ -512,15 +571,19 @@ impl SspPool {
             .filter(|id| matches!(self.ssp_states.get(*id), Some(SspState::Ready)))
             .cloned()
             .collect();
+        self.select_among(&ready_ids)
+    }
 
-        if ready_ids.is_empty() {
+    /// One of `ids` by the load-balancing strategy.
+    fn select_among(&mut self, ids: &[String]) -> Option<String> {
+        if ids.is_empty() {
             return None;
         }
 
         match self.strategy {
-            LoadBalanceStrategy::RoundRobin => self.select_round_robin(&ready_ids),
-            LoadBalanceStrategy::LeastQueries => self.select_least_queries(&ready_ids),
-            LoadBalanceStrategy::LeastLoad => self.select_least_load(&ready_ids),
+            LoadBalanceStrategy::RoundRobin => self.select_round_robin(ids),
+            LoadBalanceStrategy::LeastQueries => self.select_least_queries(ids),
+            LoadBalanceStrategy::LeastLoad => self.select_least_load(ids),
         }
     }
 
@@ -669,7 +732,62 @@ mod tests {
             record_id: id.to_string(),
             data: None,
             version: 0,
+            job_assignee: None,
         }
+    }
+
+    fn with_ssp(p: &mut SspPool, id: &str) {
+        p.update_ssp(id, 0, None, None, "test".to_string());
+        p.mark_bootstrapping(id);
+    }
+
+    #[test]
+    fn jobs_go_to_a_ready_ssp_first_then_a_lagging_one() {
+        let mut p = SspPool::new(LoadBalanceStrategy::RoundRobin, 1);
+        with_ssp(&mut p, "ssp-boot");
+        with_ssp(&mut p, "ssp-lag");
+        with_ssp(&mut p, "ssp-ready");
+        assert_eq!(p.select_job_runner(), None, "a bootstrapping SSP takes no jobs");
+
+        let _ = p.mark_ready("ssp-lag");
+        assert!(p.mark_lagging("ssp-lag"));
+        let _ = p.mark_ready("ssp-ready");
+        for _ in 0..3 {
+            assert_eq!(p.select_job_runner().as_deref(), Some("ssp-ready"));
+        }
+        let mut runners: Vec<String> = p.job_runners().into_iter().map(|s| s.id).collect();
+        runners.sort();
+        assert_eq!(runners, ["ssp-lag", "ssp-ready"], "a kill reaches both");
+
+        // No SSP Ready: the lagging one, while its queue is intact.
+        p.remove("ssp-ready");
+        assert_eq!(p.select_job_runner().as_deref(), Some("ssp-lag"));
+        assert!(p.buffer_message("ssp-lag", update("game:1")));
+        assert!(!p.buffer_message("ssp-lag", update("game:2")), "overflow");
+        assert!(!p.takes_jobs("ssp-lag"));
+        assert_eq!(p.select_job_runner(), None, "its queue was dropped; it re-bootstraps");
+        assert_eq!(p.job_runners().len(), 1, "but a job it already runs can still be killed");
+    }
+
+    #[test]
+    fn queued_jobs_are_only_creates_queued_for_their_assignee() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        with_ssp(&mut p, "ssp-1");
+        let assigned = |id: &str, op: crate::messages::RecordOp, to: Option<&str>| RecordUpdate {
+            operation: op,
+            job_assignee: to.map(str::to_string),
+            ..update(id)
+        };
+        use crate::messages::RecordOp::{Create, Update};
+        assert!(p.buffer_message("ssp-0", assigned("job:mine", Create, Some("ssp-0"))));
+        assert!(p.buffer_message("ssp-0", assigned("job:theirs", Create, Some("ssp-1"))));
+        assert!(p.buffer_message("ssp-0", assigned("job:nobody", Create, None)));
+        assert!(p.buffer_message("ssp-0", assigned("job:done", Update, Some("ssp-0"))));
+        assert!(p.buffer_message("ssp-1", assigned("job:other", Create, Some("ssp-1"))));
+        let mut queued: Vec<String> = p.queued_jobs().into_iter().collect();
+        queued.sort();
+        assert_eq!(queued, ["job:mine", "job:other"]);
     }
 
     #[test]
@@ -752,6 +870,7 @@ mod tests {
             record_id: "game:r1".to_string(),
             data: None,
             version: 0,
+            job_assignee: None,
         };
 
         // Normal buffering then a normal drain leaves the entry present but

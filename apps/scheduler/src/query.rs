@@ -138,8 +138,15 @@ async fn register_query(
     // already accounts for this query there, so no increment.
     let (sticky, ssp_id, ssp_url) = {
         let mut pool = state.ssp_pool.write().await;
+        // A Lagging SSP still holds the view and its circuit, and is catching
+        // up on buffered events in order, so the re-register stays there.
+        // Requiring Ready refused every client's keepalive for the length of
+        // a lag (whitepawn 2026-10-08: one user's PGN import, 386 refusals in
+        // 4 minutes on a one-SSP cluster) or moved the view to another SSP
+        // while the lagging one kept publishing it. New views still go only
+        // to a Ready SSP.
         let sticky_target = previous.as_ref().and_then(|prev| {
-            if pool.is_ready(prev) {
+            if pool.is_ready(prev) || pool.is_lagging(prev) {
                 pool.get(prev).map(|s| (prev.clone(), s.url.clone()))
             } else {
                 None
@@ -178,7 +185,7 @@ async fn register_query(
     };
     if sticky {
         // debug: clients re-register every keepalive — info would spam.
-        tracing::debug!("Query {} already assigned to ready SSP {} — sticky re-register", query_id, ssp_id);
+        tracing::debug!("Query {} already assigned to SSP {} — sticky re-register", query_id, ssp_id);
     }
 
     // Assign query to SSP in tracker

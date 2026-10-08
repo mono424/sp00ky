@@ -419,6 +419,18 @@ impl MockSsp {
     /// and accepts everything after. Stands in for a node that was blocked
     /// behind its circuit lock for one scheduler POST timeout.
     async fn start_flaky_ingest(fail_first: usize) -> Self {
+        Self::start_refusing_ingest(fail_first, None).await
+    }
+
+    /// Like `start_flaky_ingest`, but each refusal is the SSP's real
+    /// `503 publication_backlog`: up and draining, its queue full.
+    async fn start_busy_ingest(fail_first: usize) -> Self {
+        let body = json!({"code": "publication_backlog", "message": "Publication backlog is full; retry this request"});
+        Self::start_refusing_ingest(fail_first, Some(body)).await
+    }
+
+    async fn start_refusing_ingest(fail_first: usize, refusal: Option<Value>) -> Self {
+        use axum::response::IntoResponse;
         let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);
         let failures_left = Arc::new(std::sync::atomic::AtomicUsize::new(fail_first));
@@ -431,14 +443,18 @@ impl MockSsp {
                     move |axum::Json(body): axum::Json<Value>| {
                         let received = Arc::clone(&received);
                         let failures_left = Arc::clone(&failures_left);
+                        let refusal = refusal.clone();
                         async move {
                             let left = failures_left.load(Ordering::SeqCst);
                             if left > 0 {
                                 failures_left.store(left - 1, Ordering::SeqCst);
-                                return StatusCode::SERVICE_UNAVAILABLE;
+                                return match refusal {
+                                    Some(b) => (StatusCode::SERVICE_UNAVAILABLE, axum::Json(b)).into_response(),
+                                    None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                                };
                             }
                             received.lock().await.push(body);
-                            StatusCode::OK
+                            StatusCode::OK.into_response()
                         }
                     }
                 }),
@@ -638,6 +654,138 @@ mod ingest_tests {
         h.fanout.idle().await;
         assert_eq!(ssp.received_count().await, 3);
         assert!(h.ssp_pool.read().await.is_ready("ssp-flaky"));
+    }
+
+    /// An SSP answering `503 publication_backlog` is up and draining, so
+    /// redelivery retries it within a second rather than doubling toward ten.
+    /// Five refusals now cost 0.5 + 1 + 1 + 1 s; the old doubling waited
+    /// 0.5 + 1 + 2 + 4 s, and at whitepawn's scale sat on the 10 s ceiling,
+    /// moving ~400 events per 10.5 s (2026-10-08).
+    #[tokio::test]
+    async fn a_busy_ssp_is_redelivered_to_without_long_backoff() {
+        let h = TestHarness::new().await;
+        let ssp = MockSsp::start_busy_ingest(5).await;
+        h.add_ready_ssp("ssp-busy", &ssp.addr).await;
+        let app = h.ingest_router();
+
+        let started = std::time::Instant::now();
+        let (status, _) =
+            post_json(app, "/ingest", &ingest_payload("game", "CREATE", "game:1")).await;
+        assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
+        assert!(h.ssp_pool.read().await.is_lagging("ssp-busy"));
+
+        let deadline = started + std::time::Duration::from_millis(6_000);
+        while !(h.ssp_pool.read().await.is_ready("ssp-busy") && ssp.received_count().await == 1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "busy SSP not caught up within 6 s (the old backoff needed 7.5 s)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn job_assignees(bodies: &[Value]) -> Vec<(String, Option<String>)> {
+        bodies
+            .iter()
+            .map(|b| {
+                let assignee = b.get("job_assignee").and_then(|v| v.as_str()).map(str::to_string);
+                (b["id"].as_str().unwrap_or("").to_string(), assignee)
+            })
+            .collect()
+    }
+
+    /// With no SSP Ready, a Lagging one is still given the jobs: it is alive
+    /// and gets every event in order, its assignment with each. Before, an
+    /// event fanned out while the only SSP lagged had no assignee and the SSP
+    /// never ran its job; the job waited for cluster recovery to find a Ready
+    /// SSP (whitepawn 2026-10-08: 22 pending, throughput 0, for each lag).
+    #[tokio::test]
+    async fn a_lagging_ssp_is_assigned_the_jobs_created_while_it_lags() {
+        let h = TestHarness::new().await;
+        let ssp = MockSsp::start().await;
+        h.add_ready_ssp("ssp-0", &ssp.addr).await;
+        // Parked without a redelivery task, so the queue holds still.
+        assert!(h.ssp_pool.write().await.mark_lagging("ssp-0"));
+
+        let app = h.ingest_router();
+        for id in ["job:1", "job:2"] {
+            let (status, _) = post_json(app.clone(), "/ingest", &ingest_payload("job", "CREATE", id)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        h.fanout.idle().await;
+        assert_eq!(ssp.received_count().await, 0, "a lagging SSP is off the live path");
+        // Owned while queued: cluster recovery must not take these as orphans.
+        assert_eq!(
+            h.ssp_pool.read().await.queued_jobs(),
+            ["job:1", "job:2"].into_iter().map(String::from).collect()
+        );
+
+        ingest::redeliver_to_lagging_ssp(h.ingest_state(), "ssp-0".to_string()).await;
+        assert!(h.ssp_pool.read().await.is_ready("ssp-0"));
+        let ssp0 = Some("ssp-0".to_string());
+        assert_eq!(
+            job_assignees(&ssp.received_bodies().await),
+            [("job:1".to_string(), ssp0.clone()), ("job:2".to_string(), ssp0)]
+        );
+    }
+
+    /// The copy queued for an SSP whose live delivery failed names the same
+    /// assignee as the live request, and redelivery sends it. Before, the
+    /// replayed body dropped `job_assignee`, so the assignee itself received
+    /// its own job as nobody's.
+    #[tokio::test]
+    async fn a_failed_live_delivery_is_redelivered_with_its_job_assignee() {
+        let h = TestHarness::new().await;
+        let ssp = MockSsp::start_flaky_ingest(1).await;
+        h.add_ready_ssp("ssp-0", &ssp.addr).await;
+
+        let (status, _) =
+            post_json(h.ingest_router(), "/ingest", &ingest_payload("job", "CREATE", "job:1")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(h.ssp_pool.read().await.is_ready("ssp-0") && ssp.received_count().await == 1) {
+            assert!(std::time::Instant::now() < deadline, "SSP never caught up");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            job_assignees(&ssp.received_bodies().await),
+            [("job:1".to_string(), Some("ssp-0".to_string()))]
+        );
+    }
+
+    /// A Ready SSP is preferred: a lagging one is only a fallback. Every copy
+    /// of an event names the same assignee, so the lagging SSP's queued copy
+    /// says the job is someone else's and it never runs it a second time.
+    #[tokio::test]
+    async fn a_ready_ssp_is_preferred_over_a_lagging_one_for_jobs() {
+        let h = TestHarness::new().await;
+        let ready = MockSsp::start().await;
+        let lagging = MockSsp::start().await;
+        h.add_ready_ssp("ssp-ready", &ready.addr).await;
+        h.add_ready_ssp("ssp-lagging", &lagging.addr).await;
+        assert!(h.ssp_pool.write().await.mark_lagging("ssp-lagging"));
+
+        let app = h.ingest_router();
+        for id in ["job:1", "job:2", "job:3"] {
+            let (status, _) = post_json(app.clone(), "/ingest", &ingest_payload("job", "CREATE", id)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        h.fanout.idle().await;
+
+        let named = Some("ssp-ready".to_string());
+        let expected: Vec<_> =
+            ["job:1", "job:2", "job:3"].into_iter().map(|id| (id.to_string(), named.clone())).collect();
+        assert_eq!(job_assignees(&ready.received_bodies().await), expected);
+        let mut pool = h.ssp_pool.write().await;
+        assert!(pool.queued_jobs().is_empty(), "queued, but not for the lagging SSP to run");
+        let queued: Vec<_> = pool
+            .drain_buffer("ssp-lagging")
+            .into_iter()
+            .map(|u| (u.record_id, u.job_assignee))
+            .collect();
+        assert_eq!(queued, expected);
     }
 
     /// SurrealDB can fire a vertex table's DELETE event with a cascaded EDGE
@@ -1274,6 +1422,39 @@ mod query_tests {
         assert_eq!(pool.get(other).unwrap().query_count, 0);
     }
 
+    /// A Lagging SSP still serves the views it holds: a keepalive
+    /// re-register stays on it instead of answering 503 "No SSP available"
+    /// for the length of the lag (whitepawn 2026-10-08: every user's
+    /// keepalives refused while one user's PGN import was redelivered).
+    /// A view it does not hold yet still waits for a Ready SSP.
+    #[tokio::test]
+    async fn query_reregister_stays_on_a_lagging_ssp() {
+        let mock = MockSsp::start().await;
+        let h = TestHarness::new().await;
+        h.add_ready_ssp("ssp-0", &mock.addr).await;
+
+        let payload = json!({"id": "q1", "surql": "SELECT * FROM user", "clientId": "c1"});
+        let (status, _) = post_json(h.query_router(), "/view/register", &payload).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(h.ssp_pool.write().await.mark_lagging("ssp-0"));
+
+        let (status, body) = post_json(h.query_router(), "/view/register", &payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ssp_id"], "ssp-0");
+        assert_eq!(mock.received_count().await, 2, "the re-register reached the SSP");
+        assert_eq!(h.ssp_pool.read().await.get("ssp-0").unwrap().query_count, 1);
+
+        let (status, _) = post_json(
+            h.query_router(),
+            "/view/register",
+            &json!({"id": "q2", "surql": "SELECT * FROM user", "clientId": "c1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h.query_tracker.get_assignment("q2").await.is_none());
+    }
+
     #[tokio::test]
     async fn query_unregister_not_found() {
         let h = TestHarness::new().await;
@@ -1353,6 +1534,20 @@ mod metrics_tests {
 
 mod job_tests {
     use super::*;
+
+    /// A lagging SSP runs jobs, so a kill has to reach it. Before, a kill
+    /// while the only SSP lagged answered 503 and the job ran on.
+    #[tokio::test]
+    async fn job_kill_reaches_a_lagging_ssp() {
+        let h = TestHarness::new().await;
+        let ssp = MockSsp::start().await;
+        h.add_ready_ssp("ssp-0", &ssp.addr).await;
+        assert!(h.ssp_pool.write().await.mark_lagging("ssp-0"));
+
+        let (status, body) = post_json(h.job_router(), "/job/kill", &json!({"id": "job:1"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ssps"], 1);
+    }
 
     #[tokio::test]
     async fn job_dispatch_no_ssps() {
@@ -1981,6 +2176,265 @@ mod bootstrap_protocol_tests {
         }
     }
 
+    fn game_create(id: &str) -> scheduler::messages::RecordUpdate {
+        scheduler::messages::RecordUpdate {
+            table: "game".to_string(),
+            operation: scheduler::messages::RecordOp::Create,
+            record_id: id.to_string(),
+            data: Some(json!({"name": id})),
+            version: 1,
+            job_assignee: None,
+        }
+    }
+
+    /// Registers `ssp_id` at `url`, then gives it events to replay before its
+    /// poll task (100 ms interval) gets there: `global` in the global buffer
+    /// past its snapshot, `own` in its per-SSP buffer.
+    async fn register_with_replay(h: &TestHarness, ssp_id: &str, url: &str, global: &[&str], own: &[&str]) {
+        let (status, body) = post_json(
+            h.ssp_router(),
+            "/ssp/register",
+            &json!({"ssp_id": ssp_id, "url": url, "version": "test"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let snapshot_seq = body["snapshot_seq"].as_u64().unwrap();
+        {
+            let mut buffer = h.event_buffer.write().await;
+            for (i, id) in global.iter().enumerate() {
+                buffer.push_back(BufferedEvent {
+                    seq: snapshot_seq + 1 + i as u64,
+                    update: game_create(id),
+                    received_at: 0,
+                    versionstamp: 0,
+                });
+            }
+        }
+        let mut pool = h.ssp_pool.write().await;
+        for id in own {
+            assert!(pool.buffer_message(ssp_id, game_create(id)));
+        }
+    }
+
+    /// A replayed event the SSP refuses with `503 publication_backlog` is
+    /// retried before the events behind it, not skipped. Skipping it left the
+    /// SSP short of the scheduler, so the catch-up check failed and escalated
+    /// to a re-bootstrap or a re-clone; a write burst refuses routinely.
+    #[tokio::test]
+    async fn a_busy_ssp_gets_every_replayed_event_in_order() {
+        let h = TestHarness::new().await;
+        let mock = MockSsp::start_busy_ingest(2).await;
+        register_with_replay(&h, "ssp-busy", &mock.addr, &["game:g1", "game:g2", "game:g3"], &["game:p1", "game:p2"]).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while !h.ssp_pool.read().await.is_ready("ssp-busy") {
+            assert!(std::time::Instant::now() < deadline, "busy SSP never finished its replay");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let ids: Vec<String> = mock
+            .received_bodies()
+            .await
+            .iter()
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["game:g1", "game:g2", "game:g3", "game:p1", "game:p2"]);
+    }
+
+    /// Retrying a refused replay event keeps the old bail-out: an SSP removed
+    /// from the pool mid-replay ends the task, and its cleanup unfreezes the
+    /// snapshot, instead of retrying an SSP nobody routes to forever.
+    #[tokio::test]
+    async fn replay_retries_stop_once_the_ssp_is_removed() {
+        let h = TestHarness::new().await;
+        let mock = MockSsp::start_busy_ingest(usize::MAX).await;
+        register_with_replay(&h, "ssp-gone", &mock.addr, &["game:g1"], &[]).await;
+        assert_eq!(*h.status.read().await, SchedulerStatus::SnapshotFrozen);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while h.ssp_pool.read().await.get_state("ssp-gone") != Some(&scheduler::router::SspState::Replaying) {
+            assert!(std::time::Instant::now() < deadline, "SSP never started its replay");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        h.ssp_pool.write().await.remove("ssp-gone");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while *h.status.read().await != SchedulerStatus::Ready {
+            assert!(std::time::Instant::now() < deadline, "replay kept retrying a removed SSP");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(h.ssp_pool.read().await.get("ssp-gone").is_none());
+        assert_eq!(mock.received_count().await, 0);
+    }
+
+    /// A lagging SSP that registers again keeps its queue, and the bootstrap
+    /// replays it with each event's job assignee, so a job it was given while
+    /// lagging still reaches it. Global-buffer events carry none: they were
+    /// written before the fan-out picked one, and went to their assignee live
+    /// or through its own queue.
+    #[tokio::test]
+    async fn a_bootstrap_replays_queued_jobs_with_their_assignee() {
+        let h = TestHarness::new().await;
+        let mock = MockSsp::start().await;
+        register_with_replay(&h, "ssp-0", &mock.addr, &["game:g1"], &["game:p1"]).await;
+        assert!(h.ssp_pool.write().await.buffer_message(
+            "ssp-0",
+            scheduler::messages::RecordUpdate {
+                job_assignee: Some("ssp-0".to_string()),
+                ..game_create("game:p2")
+            },
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.ssp_pool.read().await.is_ready("ssp-0") {
+            assert!(std::time::Instant::now() < deadline, "SSP never finished its replay");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let replayed: Vec<(String, Option<String>)> = mock
+            .received_bodies()
+            .await
+            .iter()
+            .map(|b| {
+                let assignee = b.get("job_assignee").and_then(|v| v.as_str()).map(str::to_string);
+                (b["id"].as_str().unwrap().to_string(), assignee)
+            })
+            .collect();
+        assert_eq!(
+            replayed,
+            [
+                ("game:g1".to_string(), None),
+                ("game:p1".to_string(), None),
+                ("game:p2".to_string(), Some("ssp-0".to_string())),
+            ]
+        );
+    }
+
+    /// A mock SSP for the window between the catch-up check and Ready. Its
+    /// `/info` (the check) sets `verifying`, then answers 503 after 300 ms,
+    /// which the scheduler takes as transient and proceeds. Its `/ingest`
+    /// answers `503 publication_backlog` while `refuse` is above zero and
+    /// counts each refusal in `refused`.
+    struct SlowCheckSsp {
+        addr: String,
+        received: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        refuse: Arc<std::sync::atomic::AtomicUsize>,
+        refused: Arc<std::sync::atomic::AtomicUsize>,
+        verifying: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SlowCheckSsp {
+        async fn start() -> Self {
+            use axum::response::IntoResponse;
+            use std::sync::atomic::{AtomicBool, AtomicUsize};
+            let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let refuse = Arc::new(AtomicUsize::new(0));
+            let refused = Arc::new(AtomicUsize::new(0));
+            let verifying = Arc::new(AtomicBool::new(false));
+
+            let ingest = {
+                let (received, refuse, refused) =
+                    (Arc::clone(&received), Arc::clone(&refuse), Arc::clone(&refused));
+                move |axum::Json(body): axum::Json<Value>| {
+                    let (received, refuse, refused) =
+                        (Arc::clone(&received), Arc::clone(&refuse), Arc::clone(&refused));
+                    async move {
+                        if refuse.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                            let body = json!({"code": "publication_backlog", "message": "Publication backlog is full; retry this request"});
+                            return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+                        }
+                        received.lock().await.push(body);
+                        StatusCode::OK.into_response()
+                    }
+                }
+            };
+            let info = {
+                let verifying = Arc::clone(&verifying);
+                move || {
+                    let verifying = Arc::clone(&verifying);
+                    async move {
+                        verifying.store(true, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            };
+            let app = Router::new()
+                .route("/ingest", axum::routing::post(ingest))
+                .route("/info", axum::routing::get(info))
+                .route(
+                    "/health",
+                    axum::routing::get(|| async { axum::Json(json!({"status": "ready"})) }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("Failed to bind mock SSP");
+            let addr = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self { addr, received, refuse, refused, verifying }
+        }
+    }
+
+    /// Events that queue for an SSP while its catch-up check runs are replayed
+    /// before it goes Ready: retried while it is busy, and ahead of a live
+    /// write that arrives meanwhile. They were replayed after `mark_ready`,
+    /// where live deliveries could overtake them and the first refusal (a busy
+    /// SSP's 503 included) forced a full re-bootstrap.
+    #[tokio::test]
+    async fn events_queued_during_the_catchup_check_survive_a_busy_ssp() {
+        let h = TestHarness::new().await;
+        let ssp = SlowCheckSsp::start().await;
+        // A `game` table in the replica and one replayed event, so the
+        // catch-up check gets as far as asking the SSP.
+        let (status, _) =
+            post_json(h.ingest_router(), "/ingest", &ingest_payload("game", "CREATE", "game:g0")).await;
+        assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
+        register_with_replay(&h, "ssp-final", &ssp.addr, &["game:g1"], &[]).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ssp.verifying.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "catch-up check never started");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Mid-check: two events queue for it, and it turns busy.
+        {
+            let mut pool = h.ssp_pool.write().await;
+            for id in ["game:p1", "game:p2"] {
+                assert!(pool.buffer_message("ssp-final", game_create(id)));
+            }
+        }
+        ssp.refuse.store(2, Ordering::SeqCst);
+
+        // While it refuses them, a live write arrives.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while ssp.refused.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "final replay never reached the SSP");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (status, _) =
+            post_json(h.ingest_router(), "/ingest", &ingest_payload("game", "CREATE", "game:l1")).await;
+        assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while !h.ssp_pool.read().await.is_ready("ssp-final") {
+            assert!(std::time::Instant::now() < deadline, "SSP never went ready");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let ids: Vec<String> = ssp
+            .received
+            .lock()
+            .await
+            .iter()
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["game:g1", "game:p1", "game:p2", "game:l1"]);
+        assert_eq!(h.ssp_pool.read().await.pending_resync("ssp-final"), None);
+    }
+
     #[tokio::test]
     async fn admin_resync_rehash_repairs_hash_drift() {
         let h = TestHarness::new().await;
@@ -2137,6 +2591,7 @@ mod bootstrap_protocol_tests {
                 record_id: "user:u1".to_string(),
                 data: Some(json!({"name": "b"})),
                 version: 2,
+                job_assignee: None,
             },
             received_at: 0,
             versionstamp: 0,
@@ -2256,6 +2711,7 @@ mod bootstrap_protocol_tests {
                         record_id: "user:u1".to_string(),
                         data: Some(json!({"name": "b"})),
                         version: 2,
+                        job_assignee: None,
                     },
                     received_at: 0,
                     versionstamp: 0,

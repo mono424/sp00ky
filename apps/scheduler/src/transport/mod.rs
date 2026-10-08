@@ -29,6 +29,35 @@ pub struct SspInfo {
     pub bootstrap: Option<ssp_protocol::BootstrapProgress>,
 }
 
+/// A non-2xx answer from an SSP to [`HttpTransport::post_to_ssp`]: the SSP
+/// is up and refused the request, as opposed to a connection or timeout
+/// failure. Carried inside the `anyhow::Error`, so callers that care can
+/// downcast; the message is unchanged for those that only log it.
+#[derive(Debug)]
+pub struct SspStatusError {
+    pub status: reqwest::StatusCode,
+    pub url: String,
+    pub body: String,
+}
+
+impl std::fmt::Display for SspStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SSP returned {} for {}: {}", self.status, self.url, self.body)
+    }
+}
+
+impl std::error::Error for SspStatusError {}
+
+/// Whether `err` is an SSP's `503 publication_backlog`: its publication queue
+/// is full, so it is alive and draining and takes the request again shortly.
+pub fn is_publication_backlog(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SspStatusError>().is_some_and(|e| {
+        e.status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && serde_json::from_str::<serde_json::Value>(&e.body)
+                .is_ok_and(|body| body["code"] == "publication_backlog")
+    })
+}
+
 /// HTTP-based transport for communicating with SSP sidecars
 #[derive(Clone)]
 pub struct HttpTransport {
@@ -98,7 +127,7 @@ impl HttpTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("SSP returned {} for {}: {}", status, url, body);
+            return Err(SspStatusError { status, url, body }.into());
         }
 
         Ok(response)

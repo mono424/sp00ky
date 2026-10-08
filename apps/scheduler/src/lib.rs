@@ -1324,6 +1324,7 @@ mod drain_tests {
                 record_id: format!("{}:r1", table),
                 data: Some(serde_json::json!({"a": 1})),
                 version: 0,
+                job_assignee: None,
             },
             received_at: 0,
             versionstamp: 0,

@@ -59,6 +59,8 @@ alongside it.
 
 Ingest a record change from the database. This endpoint receives database events and broadcasts them to all ready SSP sidecars.
 
+Each event also names one SSP to run any job it creates, sent to the SSPs as `job_assignee`: a ready SSP by the load-balancing strategy, or a lagging one when none is ready. A lagging SSP (one that missed a delivery and is catching up from its queue) gets the event later, in order and with the same `job_assignee`, so a job created during a lag runs once that SSP reaches it rather than waiting for a ready SSP. Every copy of an event names the same SSP, and only that one picks the job up.
+
 **Request Body:**
 
 ```json
@@ -426,9 +428,9 @@ sweep and the admin dashboard call.
 
 | Endpoint | Body | Behaviour |
 | --- | --- | --- |
-| `POST /job/kill` | `{"id": "job:abc"}` | Broadcast to every ready SSP. A kill is idempotent and harmless on SSPs that do not host the job: only the one with the request in flight cancels it, the rest set a kill flag. `200 {id, dispatched, ssps}`; `503 no_ssp` with none ready |
-| `POST /job/retry` | `{"id": "job:abc"}` | Picks exactly one ready SSP and forwards, because a retry re-enqueues into that SSP's runner and broadcasting would run the job N times. The SSP's own verdict is relayed with its status: `409 not_terminal` for a job that is still pending or processing, `404` for an unknown one. `200 {id, status: "pending", assigned_to}` |
-| `POST /job/recover` | (SSP route) | Called on one SSP by the scheduler's 30 s recovery sweep for `pending` rows nothing picked up and `processing` rows that went stale; the SSP stamps itself as assignee and enqueues them |
+| `POST /job/kill` | `{"id": "job:abc"}` | Broadcast to every ready or lagging SSP, since both run jobs. A kill is idempotent and harmless on SSPs that do not host the job: only the one with the request in flight cancels it, the rest set a kill flag. `200 {id, dispatched, ssps}`; `503 no_ssp` with none ready or lagging |
+| `POST /job/retry` | `{"id": "job:abc"}` | Picks exactly one SSP (a ready one, else a lagging one) and forwards, because a retry re-enqueues into that SSP's runner and broadcasting would run the job N times. The SSP's own verdict is relayed with its status: `409 not_terminal` for a job that is still pending or processing, `404` for an unknown one. `200 {id, status: "pending", assigned_to}` |
+| `POST /job/recover` | (SSP route) | Called on one SSP (a ready one, else a lagging one) by the scheduler's 30 s recovery sweep for `pending` rows nothing picked up and `processing` rows that went stale; the SSP stamps itself as assignee and enqueues them. A `pending` job whose create event is still queued for its assigned SSP is not recovered: it has an owner, which claims it when its queue gets there |
 
 ---
 

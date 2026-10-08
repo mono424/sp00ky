@@ -89,6 +89,7 @@ carries counts and capped ids, never the full result set of every live query.</p
 <p>Every write the client made, from the moment it is queued until the server
 answers. A write is applied locally at once and drained to the server in the
 background; this tab is where you watch the second half.</p>
+<figure class="my-6">  <img src="/docs/devtools/mutations.png" alt="Every write this session: queued, retrying, synced or rolled back, and how long the server took." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">Every write this session: queued, retrying, synced or rolled back, and how long the server took.</figcaption> </figure>
 <p>The chips along the top switch the view:</p>
 
 
@@ -128,6 +129,7 @@ background; this tab is where you watch the second half.</p>
 server’s error for a rejected one, and the payload with the row it reverts to.
 A queued write’s payload is read from the outbox only when you open it; a synced
 one’s is gone, so look at the record itself on the Database tab.</p>
+<figure class="my-6">  <img src="/docs/devtools/mutations-tray.png" alt="A rejected write in the failed tray: the server's error, the revert, Retry and Discard." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">A rejected write in the failed tray: the server&#39;s error, the revert, Retry and Discard.</figcaption> </figure>
 <p>The status bar says first whether anything can drain at all: a <strong>follower</strong> tab
 never pushes (the leader tab does it for every tab), and a disconnected or
 degraded socket holds the queue until it recovers.</p>
@@ -139,6 +141,7 @@ exposes to your app.</p>
 <p>What the client’s own logger wrote, oldest first. Each line shows its time,
 level, category and message; click it for the structured fields it was logged
 with (an error keeps its message and stack).</p>
+<figure class="my-6">  <img src="/docs/devtools/logs.png" alt="The client's own log lines, recorded at debug while the console stays at info." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">The client&#39;s own log lines, recorded at debug while the console stays at info.</figcaption> </figure>
 <p>The page keeps its last 500 lines whether or not the panel is open, so opening
 DevTools after a failed boot still shows the boot. Filter by level with the
 chips, by category with the dropdown, or by any text in the line.</p>

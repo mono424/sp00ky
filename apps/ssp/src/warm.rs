@@ -133,6 +133,9 @@ impl RowCheckpoints {
                 .store
                 .collections
                 .iter()
+                // Runtime-internal tables (`_00_heartbeat`) are not synced and a
+                // bootstrap drops them anyway; writing them is churn.
+                .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
                 .map(|(name, coll)| (name.clone(), coll.catchup_xor))
                 .collect()
         };

@@ -34,6 +34,16 @@ function makeClient(over: Parameters<typeof fakeAdapters>[0] = {}) {
 }
 
 describe('Sp00kyClient facade', () => {
+  it('hands DevTools the outbox and the failed tray', async () => {
+    const { client } = makeClient();
+    await client.init();
+    const source = (client as any).devTools.mutationSource;
+    expect(source.state()).toBe(client.state);
+    expect(await source.listFailed()).toEqual([]);
+    expect(await source.retryFailed('_00_pending_mutations:gone')).toBe(false);
+    expect(await source.discardFailed('_00_pending_mutations:gone')).toBe(false);
+  });
+
   it('init resolves from the local store while the remote connect never does', async () => {
     const { client, a } = makeClient();
     expect(client.isLocalReady()).toBe(false);

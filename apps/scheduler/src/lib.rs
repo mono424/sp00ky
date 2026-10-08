@@ -29,6 +29,7 @@ pub mod wal;
 pub mod proxy;
 pub mod feature_flags;
 pub mod heartbeat;
+pub mod surreal_watchdog;
 pub mod schedule_engine;
 pub mod pool_cloud;
 pub mod pool_docker;

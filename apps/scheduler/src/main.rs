@@ -262,6 +262,14 @@ async fn run() -> Result<()> {
         None
     };
     
+    // New-WebSocket probe against the upstream SurrealDB; restarts it through
+    // the cloud link when it stops accepting connections (see the module).
+    scheduler::surreal_watchdog::spawn(
+        &scheduler.config().db.url,
+        scheduler::surreal_watchdog::Config::from_env(),
+        scheduler::admin::cloud::CloudLink::from_env(),
+    );
+
     // Start background monitors
     scheduler::metrics::start_query_reassignment_monitor(
         std::sync::Arc::clone(&query_state.ssp_pool),

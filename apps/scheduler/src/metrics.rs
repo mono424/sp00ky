@@ -393,6 +393,8 @@ async fn health_check(
         },
         "heartbeat": heartbeat,
         "changefeed": changefeed,
+        // Informational only, like push below.
+        "surreal_ws": crate::surreal_watchdog::status_json(),
         // Informational only: push never decides the scheduler's health.
         "push": crate::push::status_json(&state.ingest.push)
     })))
@@ -750,6 +752,7 @@ pub async fn build_entities(state: &MetricsState) -> Vec<serde_json::Value> {
         "lag": pending.lag,
         "heartbeat": heartbeat,
         "changefeed": state.changefeed.json(now_ms),
+        "surreal_ws": crate::surreal_watchdog::status_json(),
         "push": crate::push::status_json(&state.ingest.push),
         "env": mask_sensitive_env(env_vars),
     })];

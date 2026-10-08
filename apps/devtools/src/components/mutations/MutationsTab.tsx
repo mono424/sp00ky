@@ -30,6 +30,43 @@ const STATUS_HINT: Record<MutationStatus, string> = {
   dropped: 'Left the outbox without an answer this tab saw (bucket switch, sign-out, or its row was gone)',
 };
 
+// 24x24 stroke glyphs, drawn at 10px in `currentColor` so they take the pill's
+// colour: waiting, trying again, done, undone, gone. Factories, not elements:
+// Solid JSX is a real DOM node, and one node cannot sit in every row at once.
+const STATUS_ICON: Record<MutationStatus, () => JSX.Element> = {
+  pending: () => (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </>
+  ),
+  retrying: () => (
+    <>
+      <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+      <path d="M20 4v5h-5" />
+    </>
+  ),
+  synced: () => <path d="M5 12.5l4.5 4.5L19 7.5" />,
+  'rolled-back': () => (
+    <>
+      <path d="M9 14L4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+    </>
+  ),
+  dropped: () => <path d="M6 12h12" />,
+};
+
+function StatusPill(props: { status: MutationStatus }) {
+  return (
+    <span class={`status-pill ${STATUS_PILL[props.status]}`} title={STATUS_HINT[props.status]}>
+      <svg class="status-icon" viewBox="0 0 24 24" aria-hidden="true">
+        {STATUS_ICON[props.status]()}
+      </svg>
+      {props.status}
+    </span>
+  );
+}
+
 /** The id minus its table prefix, which is the same on every row. */
 const shortId = (id: string) => id.slice(id.indexOf(':') + 1);
 
@@ -163,10 +200,7 @@ function MutationDetail(props: { selection: NonNullable<Selection>; onClose: () 
               <Show when={entry()}>
                 {(e) => (
                   <Kv k="Status">
-                    <span class={`status-pill ${STATUS_PILL[e().status]}`} title={STATUS_HINT[e().status]}>
-                      <span class="status-dot" />
-                      {e().status}
-                    </span>
+                    <StatusPill status={e().status} />
                   </Kv>
                 )}
               </Show>
@@ -463,10 +497,7 @@ export function MutationsTab() {
                                 </td>
                                 <td class="mono muted">{e.fields?.join(', ') ?? ''}</td>
                                 <td>
-                                  <span class={`status-pill ${STATUS_PILL[e.status]}`} title={STATUS_HINT[e.status]}>
-                                    <span class="status-dot" />
-                                    {e.status}
-                                  </span>
+                                  <StatusPill status={e.status} />
                                 </td>
                                 <td class="qt-num">{e.attempts || ''}</td>
                                 <td class="qt-num">{e.settledAt ? formatMs(e.settledAt - e.queuedAt) : ''}</td>

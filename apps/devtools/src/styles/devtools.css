@@ -920,6 +920,10 @@ body {
   font-family: var(--sys-typescale-monospace-font);
   font-variant-numeric: tabular-nums;
 }
+/* Right-aligned, but in the header font: a monospace header sat off the row. */
+.qt-table th.qt-num {
+  font-family: var(--sys-typescale-label-font);
+}
 .qt-table .qt-time {
   font-family: var(--sys-typescale-monospace-font);
   font-variant-numeric: tabular-nums;
@@ -3316,16 +3320,17 @@ body {
 .mt-toolbar .filter-chip {
   padding: 1px 8px;
   gap: 5px;
+  /* Label and count share a baseline. Centering their boxes instead left the
+     count riding high, like a superscript. */
+  align-items: baseline;
 }
 .mt-filter {
   flex: none;
   width: 170px;
 }
 .chip-count {
-  font-family: var(--sys-typescale-monospace-font);
   font-variant-numeric: tabular-nums;
-  font-size: 10px;
-  opacity: 0.75;
+  opacity: 0.7;
 }
 .filter-chip.danger {
   color: var(--sys-color-error);
@@ -3383,6 +3388,17 @@ body {
   min-height: 16px;
   padding: 0 7px;
   border: 1px solid var(--sys-color-outline);
+}
+/* Mutation status glyph, in place of the generic dot. */
+.status-pill .status-icon {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .mt-sync-warn {
   color: var(--sys-color-warning);

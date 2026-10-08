@@ -668,12 +668,24 @@ async fn handle_heartbeat(
     State(state): State<SspManagementState>,
     Json(heartbeat): Json<SspHeartbeat>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // Reject heartbeats during restore so SSPs back off instead of spamming
-    if *state.status.read().await == SchedulerStatus::Restoring {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Scheduler is restoring from backup".to_string(),
-        ));
+    // Reject heartbeats during restore so SSPs back off instead of spamming.
+    // Same while cloning: a scheduler that just restarted has an empty pool,
+    // and a 404 tells a live SSP to re-register, which it cannot do before
+    // the clone finishes. 503 makes it wait with its circuit intact.
+    match *state.status.read().await {
+        SchedulerStatus::Restoring => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Scheduler is restoring from backup".to_string(),
+            ));
+        }
+        SchedulerStatus::Cloning => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Scheduler is cloning its replica".to_string(),
+            ));
+        }
+        _ => {}
     }
 
     // Check if SSP exists in pool

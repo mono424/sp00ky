@@ -1174,6 +1174,19 @@ mod ssp_management_tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// A restarted scheduler has an empty pool until its clone finishes. A
+    /// 404 then would send every live SSP into a re-registration the
+    /// scheduler cannot accept yet; 503 makes it wait with its circuit.
+    #[tokio::test]
+    async fn heartbeat_while_cloning_is_503_not_404() {
+        let h = TestHarness::with_status(SchedulerStatus::Cloning).await;
+        let app = h.ssp_router();
+
+        let (status, _) =
+            post_json(app, "/ssp/heartbeat", &heartbeat_payload("ssp-1")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn heartbeat_registered_ssp() {
         let h = TestHarness::new().await;

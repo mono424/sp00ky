@@ -914,6 +914,16 @@ async fn poll_and_replay_ssp(
             ssp_pool.write().await.reset_catchup_failures(&ssp_id);
             true
         }
+        Ok(false) if ssp_pool.read().await.registration_gen(&ssp_id) != generation => {
+            // The SSP registered again while this check ran (it restarted),
+            // so the hashes just compared came from the NEW instance mid-load.
+            // That registration runs its own verification; flagging it from
+            // here forced a second re-bootstrap for nothing.
+            anyhow::bail!(
+                "SSP '{}' bootstrap superseded by re-registration during catch-up verification",
+                ssp_id
+            );
+        }
         Ok(false) => {
             // Real divergence. A plain re-bootstrap can't fix a *deterministic*
             // scheduler-vs-circuit gap — the SSP refetches the same diverging

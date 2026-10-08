@@ -158,7 +158,7 @@ describe('view index selectors', () => {
     const s = R.compose(
       R.reloadViews(new Map([['v', ['t:vouched']]])),
       R.outboxReplace([buildOutboxItem({ recordId: 't:outbox' })]),
-      (st) => ({ ...st, pendingWrites: new Map([['k', { key: 'k', table: 't', recordId: 't:debounced', data: {}, before: null, firstAt: 0 }]]) })
+      (st) => ({ ...st, pendingWrites: new Map([['k', { key: 'k', table: 't', recordId: 't:debounced', data: {}, before: null, firstAt: 0, mirrorId: null }]]) })
     )(buildState([e('a', { remoteArray: [['t:member', 1]], subqueryRemoteArray: [['t:child', 1]] })]));
     const keep = S.retained(s);
     for (const id of ['t:vouched', 't:member', 't:child', 't:outbox', 't:debounced', '_00_view:x']) expect(keep(id)).toBe(true);

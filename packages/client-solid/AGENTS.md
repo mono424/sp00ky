@@ -33,7 +33,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
 
 - **`useDb<typeof schema>()`** — returns the `SyncedDb<S>` instance. Methods:
   - `db.create(id, payload)` — `id` is a full record ID like `'thread:abc'`.
-  - `db.update(table, id, payload, options?)` — `options.debounced` coalesces updates.
+  - `db.update(table, id, payload, options?)` — `options.debounced` coalesces updates; with `flushOnHide` (default `true`) a pending patch survives a reload or closed tab.
   - `db.delete(table, idOrSelector)`.
   - `db.query(table)` — returns a `QueryBuilder`. Chain `.related()`, `.orderBy()`, `.limit()`, etc., end with `.build()`.
   - `db.preload(query, options?)` — registers the query without subscribing. Resolved before on this device: returns instantly. Never resolved: awaits the server's membership and every record. `options.signal` aborts a cold wait; `refresh`/`staleTime` are ignored. Evicted a ttl after registration unless a view mounts the same query.

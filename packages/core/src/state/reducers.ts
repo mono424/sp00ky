@@ -420,7 +420,7 @@ export const mergePendingWrite =
     const pendingWrites = new Map(s.pendingWrites);
     pendingWrites.set(
       write.key,
-      prev ? { ...prev, data: { ...prev.data, ...write.data } } : write
+      prev ? { ...prev, data: { ...prev.data, ...write.data }, mirrorId: prev.mirrorId ?? write.mirrorId } : write
     );
     return { ...s, pendingWrites };
   };

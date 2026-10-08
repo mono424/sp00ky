@@ -839,4 +839,18 @@ export interface DebounceOptions {
   key?: 'recordId' | 'recordId_x_fields';
   /** The debounce delay in milliseconds. */
   delay?: number;
+  /**
+   * Keep the pending patch across a reload or a closed tab. Default `true`.
+   *
+   * Every call also writes the merged patch to `_00_pending_writes`, in the
+   * same local transaction as the row itself. When the page is hidden (tab
+   * switch, reload, close, app sent to the background) every pending patch is
+   * moved into the outbox and pushed at once instead of waiting out `delay`.
+   * A page that dies before that finishes leaves the patch in the store, and
+   * the next boot moves it into the outbox.
+   *
+   * `false` keeps the patch in memory only, so whatever is still inside its
+   * delay is lost on reload. Meant for throwaway state like a cursor position.
+   */
+  flushOnHide?: boolean;
 }

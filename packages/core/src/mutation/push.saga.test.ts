@@ -267,9 +267,9 @@ describe('loadOutbox / refreshFailedCount', () => {
     expect(out.emitted).toContainEqual(expect.objectContaining({ type: 'mutation:rolled-back', mutationId: '_00_pending_mutations:bad' }));
     expect(out.emitted).toContainEqual(expect.objectContaining({ type: 'mutation:rolled-back', mutationId: '' }));
     expect(out.state.failedCount).toBe(4);
-    expect(out.dispatched).toEqual([{ type: 'Drain' }]);
+    expect(out.dispatched).toEqual([{ type: 'Drain' }, { type: 'AdoptPendingWrites' }]);
     const empty = await runPure(loadOutbox(env), { state: buildState(), handlers: { 'local.query': () => [] } });
-    expect(empty.dispatched).toEqual([]);
+    expect(empty.dispatched).toEqual([{ type: 'AdoptPendingWrites' }]);
     const missingTable = await runPure(refreshFailedCount(), {
       state: R.setFailedCount(2)(buildState()),
       handlers: {

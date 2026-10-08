@@ -91,6 +91,8 @@ export interface PendingWrite {
   readonly data: Readonly<Record<string, unknown>>;
   readonly before: Readonly<Record<string, unknown>> | null;
   readonly firstAt: number;
+  /** Its durable copy in `_00_pending_writes`; null when `flushOnHide` is off. */
+  readonly mirrorId: string | null;
 }
 
 export interface SyncSlice {

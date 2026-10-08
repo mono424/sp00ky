@@ -49,6 +49,12 @@ export const AUTH_READY_MAX_ATTEMPTS = 10;
 /** Heartbeat at this fraction of the shortest ttl in state. */
 export const TTL_HEARTBEAT_FRACTION = 0.5;
 /**
+ * How long past its due flush another tab's `_00_pending_writes` row may sit
+ * before it counts as abandoned (its tab died before the flush) and is moved
+ * into the outbox here.
+ */
+export const PENDING_WRITE_ORPHAN_MS = 3_000;
+/**
  * Orphan body garbage collection: the first sweep waits this long after boot
  * (off the first paint and the first sync round), then repeats on the interval.
  */

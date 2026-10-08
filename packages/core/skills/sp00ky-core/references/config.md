@@ -71,6 +71,12 @@ interface UpdateOptions {
     key?: 'recordId' | 'recordId_x_fields';
     /** Debounce delay in ms */
     delay?: number;
+    /**
+     * Default true. Keep the merged patch in the local `_00_pending_writes` table and
+     * push it as soon as the page is hidden (tab switch, reload, close), so a reload
+     * inside the delay does not lose it. false: memory only.
+     */
+    flushOnHide?: boolean;
   };
 }
 ```

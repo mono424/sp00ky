@@ -5,6 +5,7 @@ description: Create, update and delete. Writes land locally first, then sync. Yo
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
 import Warning from '../../../components/ui/Warning.astro';
 
 export const code3 = `import { RecordId, Uuid } from 'surrealdb';
@@ -38,6 +39,13 @@ await db.update('thread', 'thread:123', {
   }
 });`;
 
+export const codeFlushOnHide = `// A throwaway value: skip the durable copy, lose it on reload
+await db.update('thread', 'thread:123', {
+  cursor: 42
+}, {
+  debounced: { delay: 500, flushOnHide: false }
+});`;
+
 export const code1 = `await db.delete('thread', 'thread:123');`;
 
 Mutating data in Sp00ky is performant and secure. Changes are instantly reflected in your local UI (optimistic updates) and synchronized with the server.
@@ -64,6 +72,32 @@ Use `db.update()` to update existing records. This performs a partial update (me
   code={code2}
   lang="typescript"
 />
+
+### Debounced updates and leaving the page
+
+A debounced update changes the local row at once, but the outbox entry that pushes it waits
+for `delay`. By default (`flushOnHide: true`) that wait is safe to interrupt:
+
+- Every call also stores the merged patch in the local `_00_pending_writes` table, in the same
+  transaction as the row itself.
+- When the page is hidden (tab switch, reload, closing the tab, the app going to the background)
+  every pending patch moves into the outbox and is pushed right away, without waiting out `delay`.
+- If the page is gone before that finishes, the patch is still in the local store. The next time
+  the app boots (or another open tab) moves it into the outbox, a few seconds after its delay would
+  have ended, and it syncs like any other queued write.
+
+Turn it off for values you are happy to lose on reload:
+
+<CodeBlock
+  code={codeFlushOnHide}
+  lang="typescript"
+/>
+
+<Note>
+  A browser gives no guarantee that a network request started while the page unloads completes,
+  so the push on reload or close is best effort. The local copy is what guarantees the write is not
+  lost; it reaches the server on the next start.
+</Note>
 
 ## Deleting Records
 

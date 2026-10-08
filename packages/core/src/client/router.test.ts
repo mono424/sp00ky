@@ -22,6 +22,8 @@ describe('route', () => {
       [{ type: 'GcTick' }, 'dedupe:gc'],
       [{ type: 'Drain' }, 'serial:outbox'],
       [{ type: 'FlushWrite', key: 'k' }, 'serial:outbox-write'],
+      [{ type: 'FlushPendingWrites' }, undefined],
+      [{ type: 'AdoptPendingWrites' }, 'serial:outbox-write'],
       [{ type: 'PollTick' }, 'dedupe:poll'],
       [{ type: 'SelfHealTick' }, 'dedupe:heal'],
       [{ type: 'SyncOutcome', ok: true }, 'serial:health'],

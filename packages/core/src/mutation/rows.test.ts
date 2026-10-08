@@ -103,6 +103,36 @@ describe('debounced update transactions', () => {
     expect(deferred.query.sql).toBe("BEGIN TRANSACTION;\nCREATE ONLY $mid SET mutationType = 'update', recordId = $id, tableName = $table, createdAt = $createdAt, v = 2, data = $data, beforeRecord = $before;\nCOMMIT TRANSACTION;");
     expect(rows.planDeferredOutboxRowTx({ recordId: rid('thing', '1'), mutationId: rid('_00_pending_mutations', 'm'), table: 'thing', now: 3 }).vars).toMatchObject({ data: {}, before: null });
   });
+
+  it('with a mirror: the patch is upserted beside the row, and the flush moves it in one transaction', () => {
+    const wrow = { recordId: rid('thing', '1'), tableName: 'thing', data: { a: 1, b: 2 }, beforeRecord: null, flushBy: 9 };
+    const local = rows.planLocalOnlyUpdateTx({ recordId: rid('thing', '1'), data: { b: 2 }, mirror: { id: rid('_00_pending_writes', 'w'), row: wrow } });
+    expect(local.query.sql).toBe(
+      'BEGIN TRANSACTION;\nUPDATE $id SET _00_rv += 1;LET $updated = (UPDATE ONLY $id MERGE $data);UPSERT ONLY $wid REPLACE $wrow;RETURN {target: $updated};\nCOMMIT TRANSACTION;'
+    );
+    expect(local.vars).toEqual({ id: rid('thing', '1'), data: { b: 2 }, wid: rid('_00_pending_writes', 'w'), wrow });
+    expect(local.query.extract([null, 1, 2, 3, { target: 'x' }])).toEqual({ target: 'x' });
+    const moved = rows.planDeferredOutboxRowTx({ recordId: rid('thing', '1'), mutationId: rid('_00_pending_mutations', 'm'), table: 'thing', data: { a: 1 }, now: 3, mirrorId: rid('_00_pending_writes', 'w') });
+    expect(moved.query.sql).toContain('beforeRecord = $before;DELETE $wid;\nCOMMIT');
+    expect(moved.vars.wid).toEqual(rid('_00_pending_writes', 'w'));
+  });
+
+  it('pending write ids and rows', () => {
+    expect(rows.pendingWriteId('_00_pending_mutations:0000000000001_0001_tab')).toBe('_00_pending_writes:0000000000001_0001_tab');
+    expect(rows.pendingWriteId('mutation-1')).toBe('_00_pending_writes:mutation-1');
+    expect(rows.parsePendingWriteRow({ id: '_00_pending_writes:⟨w-1⟩', recordId: rid('thing', '1'), data: { a: 1 }, beforeRecord: { a: 0 }, flushBy: 5 })).toEqual({
+      id: '_00_pending_writes:w-1',
+      recordId: 'thing:1',
+      tableName: 'thing',
+      data: { a: 1 },
+      beforeRecord: { a: 0 },
+      flushBy: 5,
+    });
+    expect(rows.parsePendingWriteRow({ id: 'w', recordId: 'thing:1', tableName: 'thing', data: {} })).toMatchObject({ beforeRecord: null, flushBy: 0 });
+    expect(rows.parsePendingWriteRow({ id: 'w', recordId: 'thing:1' })).toBeNull();
+    expect(rows.parsePendingWriteRow({ id: 'w', data: {} })).toBeNull();
+    expect(rows.parsePendingWriteRow('junk')).toBeNull();
+  });
 });
 
 describe('remoteBatch', () => {

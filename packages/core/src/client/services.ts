@@ -280,7 +280,11 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
     'releases.init': () => undefined,
     'window.attach': () => {
       if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
+      // Hidden is the last moment a page reliably gets to run: a reload or a
+      // closed tab follows it, and a backgrounded mobile tab may be killed
+      // without any further event. Pending debounced writes go out then.
       const onPageHide = (event: PageTransitionEvent) => {
+        host.dispatch({ type: 'FlushPendingWrites' });
         if (event.persisted) return;
         host.dispatch({ type: 'PageHide' });
       };
@@ -288,13 +292,17 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
         if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
         host.dispatch({ type: 'HeartbeatNow' });
       };
+      const onVisibility = () => {
+        if (document.visibilityState === 'hidden') host.dispatch({ type: 'FlushPendingWrites' });
+        else onWake();
+      };
       window.addEventListener('pagehide', onPageHide);
       window.addEventListener('online', onWake);
-      if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onWake);
+      if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
       host.setDetachWindow(() => {
         window.removeEventListener('pagehide', onPageHide);
         window.removeEventListener('online', onWake);
-        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onWake);
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
       });
     },
   };

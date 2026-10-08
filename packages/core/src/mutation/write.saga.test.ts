@@ -3,7 +3,8 @@ import { RecordId } from 'surrealdb';
 import { runPure } from '../testing/run-pure';
 import { buildEntry, buildState } from '../testing/build';
 import { defaultEnv } from '../query/env';
-import { flushWrite, write } from './write.saga';
+import { adoptPendingWrites, flushPendingWrites, flushWrite, write } from './write.saga';
+import * as R from '../state/reducers';
 
 const env = defaultEnv({ tables: [{ name: 'thing', columns: { a: {}, b: {} } }] } as any);
 const rid = new RecordId('thing', '1');
@@ -159,5 +160,157 @@ describe('write', () => {
       handlers: { 'local.query': () => [], 'local.execute': () => undefined, 'ssp.ingest': () => undefined },
     });
     expect(leaderDebounced.emitted).toContainEqual({ type: 'tabs:broadcast', message: { type: 'ingest', records: [expect.objectContaining({ op: 'UPDATE' })] } });
+  });
+
+  it('flushOnHide (default): the merged patch is mirrored in the same tx, and the flush moves it into the outbox', async () => {
+    const now = 1_000;
+    const first = await runPure(write(env, { kind: 'update', recordId: 'thing:1', data: { a: 1 }, options: { debounced: true } }), {
+      state: withQuery(),
+      now,
+      handlers: {
+        'local.query': () => [{ id: rid, a: 0, _00_rv: 1 }],
+        'local.execute': (e: any) => {
+          expect(e.query.sql).toContain('UPSERT ONLY $wid REPLACE $wrow');
+          expect(e.vars.wid).toEqual(new RecordId('_00_pending_writes', 'mutation-1'));
+          expect(e.vars.wrow).toEqual({ recordId: rid, tableName: 'thing', data: { a: 1 }, beforeRecord: { id: rid, a: 0, _00_rv: 1 }, flushBy: now + 300 });
+          return { target: { id: rid, a: 1, _00_rv: 2 } };
+        },
+        'ssp.ingest': () => undefined,
+      },
+    });
+    const key = 'thing:1::a';
+    expect(first.state.pendingWrites.get(key)!.mirrorId).toBe('_00_pending_writes:mutation-1');
+    const second = await runPure(write(env, { kind: 'update', recordId: 'thing:1', data: { a: 7 }, options: { debounced: { delay: 50 } } }), {
+      state: first.state,
+      now: now + 10,
+      handlers: {
+        'local.execute': (e: any) => {
+          expect(e.vars.wid).toEqual(new RecordId('_00_pending_writes', 'mutation-1'));
+          expect(e.vars.wrow).toMatchObject({ data: { a: 7 }, flushBy: now + 60 });
+          return { target: { id: rid, a: 7, _00_rv: 3 } };
+        },
+        'ssp.ingest': () => undefined,
+      },
+    });
+    expect(second.log.filter((e) => e.kind === 'id')).toHaveLength(0);
+    const flushed = await runPure(flushWrite(env, key), {
+      state: second.state,
+      handlers: {
+        'local.execute': (e: any) => {
+          expect(e.query.sql).toContain('DELETE $wid');
+          expect(e.vars).toMatchObject({ data: { a: 7 }, wid: new RecordId('_00_pending_writes', 'mutation-1') });
+        },
+      },
+    });
+    expect(flushed.state.pendingWrites.size).toBe(0);
+    expect(flushed.state.outbox).toHaveLength(1);
+    const armed: unknown[] = [];
+    const closed = runPure(flushWrite(env, key), {
+      state: second.state,
+      handlers: {
+        'local.execute': () => {
+          throw new Error('store closed');
+        },
+        'timer.set': (e: any) => void armed.push([e.key, e.ms, e.event]),
+      },
+    });
+    await expect(closed).rejects.toThrow('store closed');
+    expect(armed).toEqual([['adopt-writes', 3_000, { type: 'AdoptPendingWrites' }]]);
+  });
+
+  it('flushOnHide: false keeps the patch in memory only', async () => {
+    const out = await runPure(write(env, { kind: 'update', recordId: 'thing:1', data: { a: 1 }, options: { debounced: { flushOnHide: false } } }), {
+      state: withQuery(),
+      handlers: {
+        'local.query': () => [],
+        'local.execute': (e: any) => {
+          expect(e.query.sql).not.toContain('UPSERT');
+          expect(e.vars.wid).toBeUndefined();
+        },
+        'ssp.ingest': () => undefined,
+      },
+    });
+    expect(out.state.pendingWrites.get('thing:1::a')!.mirrorId).toBeNull();
+    const flushed = await runPure(flushWrite(env, 'thing:1::a'), {
+      state: out.state,
+      handlers: { 'local.execute': (e: any) => expect(e.query.sql).not.toContain('DELETE') },
+    });
+    expect(flushed.state.outbox).toHaveLength(1);
+  });
+});
+
+describe('flushPendingWrites', () => {
+  it('flushes every mirrored pending write now, leaves memory-only ones to their timer', async () => {
+    const base = { table: 'thing', recordId: 'thing:1', data: { a: 1 }, before: null, firstAt: 0 };
+    const state = R.compose(
+      R.mergePendingWrite({ ...base, key: 'k1', mirrorId: '_00_pending_writes:1' }),
+      R.mergePendingWrite({ ...base, key: 'k2', mirrorId: null }),
+      R.mergePendingWrite({ ...base, key: 'k3', mirrorId: '_00_pending_writes:3' })
+    )(buildState());
+    const out = await runPure(flushPendingWrites(), { state });
+    expect(out.log.filter((e) => e.kind === 'timer.clear').map((e: any) => e.key)).toEqual(['debounce:k1', 'debounce:k3']);
+    expect(out.dispatched).toEqual([{ type: 'FlushWrite', key: 'k1' }, { type: 'FlushWrite', key: 'k3' }]);
+    const none = await runPure(flushPendingWrites(), { state: buildState() });
+    expect(none.dispatched).toEqual([]);
+  });
+});
+
+describe('adoptPendingWrites', () => {
+  const now = 100_000;
+  const row = (id: string, flushBy: number) => ({ id: `_00_pending_writes:${id}`, recordId: rid, tableName: 'thing', data: { a: 1 }, beforeRecord: { a: 0 }, flushBy });
+  const held = R.mergePendingWrite({ key: 'k', table: 'thing', recordId: 'thing:1', data: {}, before: null, firstAt: 0, mirrorId: '_00_pending_writes:mine' })(buildState());
+
+  it('moves overdue rows nobody here holds into the outbox, re-checks rows that may still be live', async () => {
+    const moved: any[] = [];
+    const out = await runPure(adoptPendingWrites(), {
+      state: held,
+      now,
+      handlers: {
+        'local.query': (e: any) => {
+          expect(e.sql).toBe('SELECT * FROM _00_pending_writes');
+          return [[row('mine', 0), row('dead', now - 3_000), row('live', now + 500), row('other-live', now + 2_000), 'junk']];
+        },
+        'local.execute': (e: any) => {
+          moved.push(e.vars);
+        },
+      },
+    });
+    expect(moved).toHaveLength(1);
+    expect(moved[0]).toMatchObject({ id: rid, table: 'thing', data: { a: 1 }, before: { a: 0 }, createdAt: now, wid: new RecordId('_00_pending_writes', 'dead') });
+    expect(out.state.outbox).toEqual([{ id: 'mutation-1', type: 'update', recordId: 'thing:1', table: 'thing', status: 'pending', ackedAt: null, attempts: 0 }]);
+    expect(out.dispatched).toEqual([{ type: 'Drain' }]);
+    expect(out.timers.get('adopt-writes')).toEqual({ ms: 3_500, event: { type: 'AdoptPendingWrites' } });
+  });
+
+  it('a follower nudges the leader instead; a failed move is logged and skipped; no table means nothing to do', async () => {
+    const follower = await runPure(adoptPendingWrites(), { state: { ...buildState(), tabRole: 'follower' }, now, handlers: { 'local.query': () => [[row('dead', 0)]] } });
+    expect(follower.log.some((e) => e.kind === 'local.execute')).toBe(false);
+    expect(follower.emitted).toEqual([{ type: 'tabs:broadcast', message: { type: 'outbox-changed', mutationId: '' } }]);
+    const quietFollower = await runPure(adoptPendingWrites(), { state: { ...held, tabRole: 'follower' }, now, handlers: { 'local.query': () => [[row('mine', 0)]] } });
+    expect(quietFollower.emitted).toEqual([]);
+    const failing = await runPure(adoptPendingWrites(), {
+      state: buildState(),
+      now,
+      handlers: {
+        'local.query': () => [[row('dead', 0)]],
+        'local.execute': () => {
+          throw new Error('closed');
+        },
+      },
+    });
+    expect(failing.state.outbox).toEqual([]);
+    expect(failing.dispatched).toEqual([]);
+    expect(failing.emitted).toContainEqual(expect.objectContaining({ type: 'log', level: 'warn' }));
+    const noTable = await runPure(adoptPendingWrites(), {
+      state: buildState(),
+      handlers: {
+        'local.query': () => {
+          throw new Error('no table');
+        },
+      },
+    });
+    expect(noTable.dispatched).toEqual([]);
+    const empty = await runPure(adoptPendingWrites(), { state: buildState(), handlers: { 'local.query': () => [[]] } });
+    expect(empty.timers.size).toBe(0);
   });
 });

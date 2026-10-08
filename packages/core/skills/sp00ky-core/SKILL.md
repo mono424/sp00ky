@@ -120,6 +120,10 @@ await client.delete('post', 'post:abc123');
 Use `debounced` option for frequent updates (e.g., live typing):
 - `key: 'recordId'` — Debounce by record ID only (latest write wins, no merge)
 - `key: 'recordId_x_fields'` — Debounce by record ID + changed fields (recommended)
+- `flushOnHide` (default `true`): also keep the merged patch in the local `_00_pending_writes`
+  table and push it as soon as the page is hidden (tab switch, reload, close). A reload or closed
+  tab inside the delay no longer loses the edit: the next boot moves the leftover patch into the
+  outbox. Set `false` for throwaway values (cursor position) to keep the patch in memory only.
 
 ### Failed writes
 

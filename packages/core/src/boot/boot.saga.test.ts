@@ -43,7 +43,7 @@ describe('boot', () => {
     ]);
     expect(svc.calls[1]).toEqual(['local.connect', ['u1']]);
     expect(out.state).toMatchObject({ bucketId: 'u1', userId: 'user:u1', saltUserId: 'user:u1', sessionId: 'salt-1', localReady: true });
-    expect(out.dispatched.map((d) => d.type)).toEqual(['WarmBlobs', 'PrimeCircuit', 'LifecycleTick', 'StartRemote']);
+    expect(out.dispatched.map((d) => d.type)).toEqual(['WarmBlobs', 'PrimeCircuit', 'AdoptPendingWrites', 'LifecycleTick', 'StartRemote']);
     // The view index is loaded before anything can paint; the first GC waits out the boot.
     expect(out.state.views).toEqual(new Map([['k', ['t:1']]]));
     expect(out.timers.get('gc')).toEqual({ ms: 30_000, event: { type: 'GcTick' } });

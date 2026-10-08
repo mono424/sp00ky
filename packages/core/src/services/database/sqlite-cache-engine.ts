@@ -66,6 +66,8 @@ const SYSTEM_TABLES = [
   '_00_failed_mutations',
   '_00_schema',
   '_00_pending_mutations',
+  // Debounced patches still inside their delay; read on every boot.
+  '_00_pending_writes',
   // Blob cache manifest. Read before its first write on every boot (reconcile
   // asks for the ids it found in OPFS), so it has to exist up front like the
   // rest — otherwise the very first reconcile throws and the cache runs cold.

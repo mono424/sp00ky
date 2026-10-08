@@ -10,6 +10,8 @@ import { parseQueryParams } from '../utils/parser';
 
 export const PENDING_TABLE = '_00_pending_mutations';
 export const FAILED_TABLE = '_00_failed_mutations';
+/** Debounced patches still inside their delay (see `DebounceOptions.flushOnHide`). */
+export const PENDING_WRITES_TABLE = '_00_pending_writes';
 export const PENDING_ROW_VERSION = 2;
 
 /** One `_00_pending_mutations` row as this client writes it (v2). */
@@ -117,7 +119,42 @@ export const toOutboxItem = (row: PendingMutationRow): OutboxItem => ({
   attempts: 0,
 });
 
+/**
+ * One `_00_pending_writes` row: the merged patch of a debounced update that
+ * has not reached the outbox yet. `flushBy` is when the writing tab's timer
+ * is due to move it there.
+ */
+export interface PendingWriteRow {
+  id: string;
+  recordId: string;
+  tableName: string;
+  data: Record<string, unknown>;
+  beforeRecord: Record<string, unknown> | null;
+  flushBy: number;
+}
+
+/** The `_00_pending_writes` id for a minted mutation id (same suffix). */
+export const pendingWriteId = (mutationId: string): string =>
+  `${PENDING_WRITES_TABLE}:${mutationId.includes(':') ? mutationId.slice(mutationId.indexOf(':') + 1) : mutationId}`;
+
+export function parsePendingWriteRow(row: unknown): PendingWriteRow | null {
+  if (!row || typeof row !== 'object') return null;
+  const r = row as Record<string, unknown>;
+  if (typeof r.recordId !== 'string' && !(r.recordId instanceof RecordId)) return null;
+  if (!r.data || typeof r.data !== 'object') return null;
+  const recordId = typeof r.recordId === 'string' ? r.recordId : storedIdString(r.recordId);
+  return {
+    id: storedIdString(r.id),
+    recordId,
+    tableName: typeof r.tableName === 'string' ? r.tableName : extractTablePart(recordId),
+    data: r.data as Record<string, unknown>,
+    beforeRecord: r.beforeRecord && typeof r.beforeRecord === 'object' ? (r.beforeRecord as Record<string, unknown>) : null,
+    flushBy: typeof r.flushBy === 'number' ? r.flushBy : 0,
+  };
+}
+
 export const loadPendingRows = (): string => `SELECT * FROM ${PENDING_TABLE} ORDER BY id ASC`;
+export const loadPendingWriteRows = (): string => `SELECT * FROM ${PENDING_WRITES_TABLE}`;
 export const loadFailedRows = (): string => `SELECT * FROM ${FAILED_TABLE} ORDER BY failedAt ASC`;
 
 // ---- local write transactions ------------------------------------------------
@@ -199,24 +236,36 @@ export function planDeleteTx(input: WritePlanInput): LocalTx {
   };
 }
 
-/** Debounced update: bump `_00_rv` and MERGE now; the outbox row comes later. */
-export function planLocalOnlyUpdateTx(input: { recordId: RecordId<string>; data: Record<string, unknown> }): LocalTx {
+/**
+ * Debounced update: bump `_00_rv` and MERGE now; the outbox row comes later.
+ * With a `mirror`, the merged patch so far is written to `_00_pending_writes`
+ * in the same transaction, so the row never changes without a durable copy of
+ * what still has to reach the server.
+ */
+export function planLocalOnlyUpdateTx(input: {
+  recordId: RecordId<string>;
+  data: Record<string, unknown>;
+  mirror?: { id: RecordId<string>; row: Omit<PendingWriteRow, 'id' | 'recordId'> & { recordId: RecordId<string> } };
+}): LocalTx {
+  const statements = [surql.updateSet('id', [{ statement: '_00_rv += 1' }]), surql.let('updated', surql.updateMerge('id', 'data'))];
+  if (input.mirror) statements.push(surql.upsert('wid', 'wrow'));
+  statements.push(surql.returnObject([{ key: 'target', variable: 'updated' }]));
   return {
-    query: surql.seal<unknown>(
-      surql.tx([
-        surql.updateSet('id', [{ statement: '_00_rv += 1' }]),
-        surql.let('updated', surql.updateMerge('id', 'data')),
-        surql.returnObject([{ key: 'target', variable: 'updated' }]),
-      ])
-    ),
-    vars: { id: input.recordId, data: input.data },
+    query: surql.seal<unknown>(surql.tx(statements)),
+    vars: input.mirror ? { id: input.recordId, data: input.data, wid: input.mirror.id, wrow: input.mirror.row } : { id: input.recordId, data: input.data },
   };
 }
 
-/** The outbox row of a flushed debounced update, on its own. */
-export function planDeferredOutboxRowTx(input: WritePlanInput): LocalTx {
+/**
+ * The outbox row of a flushed debounced update. With `mirrorId` the
+ * `_00_pending_writes` row goes in the same transaction: the patch moves
+ * from one table to the other, it is never in both or in neither.
+ */
+export function planDeferredOutboxRowTx(input: WritePlanInput & { mirrorId?: RecordId<string> }): LocalTx {
+  const statements = [pendingInsert('update', true, true)];
+  if (input.mirrorId) statements.push(surql.delete('wid'));
   return {
-    query: surql.seal<unknown>(surql.tx([pendingInsert('update', true, true)])),
+    query: surql.seal<unknown>(surql.tx(statements)),
     vars: {
       id: input.recordId,
       mid: input.mutationId,
@@ -224,6 +273,7 @@ export function planDeferredOutboxRowTx(input: WritePlanInput): LocalTx {
       createdAt: input.now,
       data: input.data ?? {},
       before: input.before ?? null,
+      ...(input.mirrorId ? { wid: input.mirrorId } : {}),
     },
   };
 }

@@ -21,6 +21,8 @@ export type RuntimeEvent =
   | { type: 'GcTick' }
   | { type: 'Drain' }
   | { type: 'FlushWrite'; key: string }
+  | { type: 'FlushPendingWrites' }
+  | { type: 'AdoptPendingWrites' }
   | { type: 'PollTick' }
   | { type: 'SelfHealTick' }
   | { type: 'HeartbeatNow' }

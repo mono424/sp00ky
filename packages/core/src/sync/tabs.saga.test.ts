@@ -11,7 +11,7 @@ describe('setRole', () => {
   it('leader: loads the outbox and starts live/poll/registrations; follower: stops its timers; same role is a no-op', async () => {
     const leader = await runPure(setRole(env, 'leader'), { state: buildState(), handlers: { 'local.query': () => [] } });
     expect(leader.state.tabRole).toBe('leader');
-    expect(leader.dispatched).toEqual([{ type: 'LiveStart' }, { type: 'PollTick' }, { type: 'EnsureRegistered' }]);
+    expect(leader.dispatched).toEqual([{ type: 'AdoptPendingWrites' }, { type: 'LiveStart' }, { type: 'PollTick' }, { type: 'EnsureRegistered' }]);
     const follower = await runPure(setRole(env, 'follower'), { state: R.patchSync({ liveUuid: 'u' })(buildState()) });
     expect(follower.state.tabRole).toBe('follower');
     expect(follower.state.sync.liveUuid).toBeNull();

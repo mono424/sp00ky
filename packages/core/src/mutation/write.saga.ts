@@ -8,7 +8,19 @@ import { parseParams } from '../utils/parser';
 import { extractTablePart, parseRecordIdString } from '../utils/index';
 import type { SagaEnv } from '../query/env';
 import { columnsFor } from '../query/env';
-import { planCreateTx, planDeferredOutboxRowTx, planDeleteTx, planLocalOnlyUpdateTx, planUpdateTx, type LocalTx } from './rows';
+import { PENDING_WRITE_ORPHAN_MS } from '../kernel/constants';
+import {
+  loadPendingWriteRows,
+  parsePendingWriteRow,
+  pendingWriteId,
+  planCreateTx,
+  planDeferredOutboxRowTx,
+  planDeleteTx,
+  planLocalOnlyUpdateTx,
+  planUpdateTx,
+  type LocalTx,
+  type PendingWriteRow,
+} from './rows';
 
 export interface WriteInput {
   kind: MutationEventType;
@@ -34,6 +46,10 @@ const debounceKey = (input: WriteInput): string | null => {
 const debounceDelay = (input: WriteInput): number => {
   const d = input.options?.debounced;
   return d && d !== true && typeof d.delay === 'number' ? d.delay : 300;
+};
+const flushOnHide = (input: WriteInput): boolean => {
+  const d = input.options?.debounced;
+  return !(d && d !== true && d.flushOnHide === false);
 };
 
 /**
@@ -107,7 +123,12 @@ function* commitWrite(kind: MutationEventType, tx: LocalTx, ctx: CommitCtx): Sag
   return { mutationId: ctx.mutationId, record };
 }
 
-/** Apply locally now, remember the merged patch, write the outbox row on flush. */
+/**
+ * Apply locally now, remember the merged patch, write the outbox row on flush.
+ * With `flushOnHide` (the default) the merged patch is also mirrored to
+ * `_00_pending_writes` in the same transaction, so a reload or a closed tab
+ * inside the delay cannot lose it.
+ */
 function* debouncedUpdate(
   input: WriteInput,
   key: string,
@@ -118,10 +139,15 @@ function* debouncedUpdate(
   const existing = (yield fx.state.read((s) => s.pendingWrites.get(key))) as PendingWrite | undefined;
   const now = (yield fx.now()) as number;
   const before = existing ? existing.before : yield* readBefore(rid);
-  const local = planLocalOnlyUpdateTx({ recordId: rid, data: params });
+  const mirrorId = existing?.mirrorId ?? (flushOnHide(input) ? pendingWriteId((yield fx.id('mutation')) as string) : null);
+  const delay = debounceDelay(input);
+  const mirror = mirrorId
+    ? { id: parseRecordIdString(mirrorId), row: { recordId: rid, tableName: table, data: { ...existing?.data, ...params }, beforeRecord: before, flushBy: now + delay } }
+    : undefined;
+  const local = planLocalOnlyUpdateTx({ recordId: rid, data: params, mirror });
   const res = (yield fx.local.execute(local.query, local.vars)) as { target?: Record<string, unknown> } | undefined;
   const record = res?.target ?? null;
-  yield fx.state.update(R.mergePendingWrite({ key, table, recordId: input.recordId, data: params, before, firstAt: existing?.firstAt ?? now }));
+  yield fx.state.update(R.mergePendingWrite({ key, table, recordId: input.recordId, data: params, before, firstAt: existing?.firstAt ?? now, mirrorId }));
   yield fx.state.update(R.markTableDirty(table));
   const version = typeof record?._00_rv === 'number' ? (record._00_rv as number) : 0;
   const tuple = { table, op: 'UPDATE' as const, id: input.recordId, record: { ...record, _00_rv: version } };
@@ -133,7 +159,7 @@ function* debouncedUpdate(
   }
   const role = (yield fx.state.read((s) => s.tabRole)) as ClientState['tabRole'];
   if (role !== 'solo') yield fx.emit({ type: 'tabs:broadcast', message: { type: 'ingest', records: [tuple] } });
-  yield fx.timer.set(`debounce:${key}`, debounceDelay(input), { type: 'FlushWrite', key });
+  yield fx.timer.set(`debounce:${key}`, delay, { type: 'FlushWrite', key });
   return { mutationId: '', record };
 }
 
@@ -152,8 +178,15 @@ export function* flushWrite(env: SagaEnv, key: string): Saga<void> {
     data: { ...pending.data },
     before: pending.before,
     now,
+    mirrorId: pending.mirrorId ? parseRecordIdString(pending.mirrorId) : undefined,
   });
-  yield fx.local.execute(insert.query, insert.vars);
+  try {
+    yield fx.local.execute(insert.query, insert.vars);
+  } catch (error) {
+    // The patch is no longer in memory; a mirrored one is still in the store.
+    if (pending.mirrorId) yield fx.timer.set('adopt-writes', PENDING_WRITE_ORPHAN_MS, { type: 'AdoptPendingWrites' });
+    throw error;
+  }
   yield fx.state.update(R.outboxPush({ id: mutationId, type: 'update', recordId: pending.recordId, table: pending.table, status: 'pending', ackedAt: null, attempts: 0 }));
   yield fx.emit({
     type: 'mutation:event',
@@ -164,3 +197,72 @@ export function* flushWrite(env: SagaEnv, key: string): Saga<void> {
   else yield fx.dispatch({ type: 'Drain' });
 }
 
+/**
+ * The page is being hidden (tab switch, reload, close, backgrounded): flush
+ * every mirrored pending write now rather than when its timer fires. On a
+ * reload or close this races the teardown; whatever does not make it stays
+ * in `_00_pending_writes` for the next boot.
+ */
+export function* flushPendingWrites(): Saga<void> {
+  const keys = (yield fx.state.read((s) => [...s.pendingWrites.values()].filter((w) => w.mirrorId !== null).map((w) => w.key))) as string[];
+  for (const key of keys) {
+    yield fx.timer.clear(`debounce:${key}`);
+    yield fx.dispatch({ type: 'FlushWrite', key });
+  }
+}
+
+/**
+ * Move abandoned `_00_pending_writes` rows into the outbox: rows no pending
+ * write of this tab holds, `PENDING_WRITE_ORPHAN_MS` past their due flush. That
+ * is a tab that reloaded or closed inside the delay, or a flush of ours that
+ * failed. A row not yet overdue may still be live in another tab and is looked
+ * at again once it would be. A follower only nudges the leader, so a single
+ * tab adopts and a patch is never queued twice.
+ */
+export function* adoptPendingWrites(): Saga<void> {
+  const state = (yield fx.state.read((s) => s)) as ClientState;
+  let raw: unknown[] = [];
+  try {
+    const res = (yield fx.local.query(loadPendingWriteRows())) as unknown[];
+    raw = Array.isArray(res?.[0]) ? (res[0] as unknown[]) : [];
+  } catch {
+    return; // An older store may not have the table yet: nothing to adopt.
+  }
+  const held = new Set([...state.pendingWrites.values()].map((w) => w.mirrorId));
+  const rows = raw.map(parsePendingWriteRow).filter((r): r is PendingWriteRow => r !== null && !held.has(r.id));
+  if (rows.length === 0) return;
+  if (state.tabRole === 'follower') {
+    yield fx.emit({ type: 'tabs:broadcast', message: { type: 'outbox-changed', mutationId: '' } });
+    return;
+  }
+  const now = (yield fx.now()) as number;
+  let recheckAt = Infinity;
+  let adopted = 0;
+  for (const row of rows) {
+    const due = row.flushBy + PENDING_WRITE_ORPHAN_MS;
+    if (now < due) {
+      recheckAt = Math.min(recheckAt, due);
+      continue;
+    }
+    const mutationId = (yield fx.id('mutation')) as string;
+    const move = planDeferredOutboxRowTx({
+      recordId: parseRecordIdString(row.recordId),
+      mutationId: parseRecordIdString(mutationId),
+      table: row.tableName,
+      data: row.data,
+      before: row.beforeRecord,
+      now,
+      mirrorId: parseRecordIdString(row.id),
+    });
+    try {
+      yield fx.local.execute(move.query, move.vars);
+    } catch (error) {
+      yield fx.emit({ type: 'log', level: 'warn', message: 'could not move an abandoned debounced write into the outbox', data: { id: row.id, error } });
+      continue;
+    }
+    yield fx.state.update(R.outboxPush({ id: mutationId, type: 'update', recordId: row.recordId, table: row.tableName, status: 'pending', ackedAt: null, attempts: 0 }));
+    adopted += 1;
+  }
+  if (adopted > 0) yield fx.dispatch({ type: 'Drain' });
+  if (recheckAt !== Infinity) yield fx.timer.set('adopt-writes', recheckAt - now, { type: 'AdoptPendingWrites' });
+}

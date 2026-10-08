@@ -26,6 +26,7 @@ import {
 /**
  * Boot / bucket switch: mirror the outbox table into state. Rows that can
  * never be replayed (a create without its payload) go straight to the tray.
+ * Debounced patches a dead page left in `_00_pending_writes` are adopted next.
  */
 export function* loadOutbox(env: SagaEnv): Saga<void> {
   const res = (yield fx.local.query(loadPendingRows())) as unknown[];
@@ -51,6 +52,7 @@ export function* loadOutbox(env: SagaEnv): Saga<void> {
   }
   yield* refreshFailedCount();
   if (items.length > 0) yield fx.dispatch({ type: 'Drain' });
+  yield fx.dispatch({ type: 'AdoptPendingWrites' });
 }
 
 export function* refreshFailedCount(): Saga<void> {

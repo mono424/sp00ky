@@ -7,7 +7,7 @@ import { fetchRows } from '../query/fetch.saga';
 import { materialize, streamUpdate } from '../query/materialize.saga';
 import { ackPrune, gcTick, lifecycleTick } from '../query/lifecycle.saga';
 import { drain } from '../mutation/push.saga';
-import { flushWrite } from '../mutation/write.saga';
+import { adoptPendingWrites, flushPendingWrites, flushWrite } from '../mutation/write.saga';
 import { pollTick } from '../sync/poll.saga';
 import { liveChange, liveStart } from '../sync/live.saga';
 import { connectionChanged, selfHealTick, syncOutcome } from '../sync/connection.saga';
@@ -62,6 +62,10 @@ export function route(env: SagaEnv, event: RuntimeEvent): RouteTarget {
       return { saga: drain(env), lane: serial('outbox') };
     case 'FlushWrite':
       return { saga: flushWrite(env, event.key), lane: serial('outbox-write') };
+    case 'FlushPendingWrites':
+      return { saga: flushPendingWrites() };
+    case 'AdoptPendingWrites':
+      return { saga: adoptPendingWrites(), lane: serial('outbox-write') };
     case 'PollTick':
       return { saga: pollTick(env), lane: dedupe('poll') };
     case 'SelfHealTick':

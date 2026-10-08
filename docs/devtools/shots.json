@@ -78,11 +78,6 @@
       "name": "mcp",
       "caption": "The MCP bridge that lets an AI assistant read the same state.",
       "file": "mcp.png"
-    },
-    {
-      "name": "events",
-      "caption": "The client event log, filtered by type.",
-      "file": "events.png"
     }
   ]
 }

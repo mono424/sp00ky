@@ -85,6 +85,7 @@ impl MaintenanceHost for SspHost {
             &source,
             &self.processor,
             self.bootstrap_page_size,
+            &std::collections::BTreeMap::new(),
             None,
         )
         .await

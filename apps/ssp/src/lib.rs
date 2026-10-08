@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod open_telemetry;
 pub mod tables;
 pub mod view_metrics;
+pub mod warm;
 
 use metrics::Metrics;
 use view_metrics::ViewMetrics;
@@ -1211,281 +1212,39 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     info!(addr = %config.listen_addr, "Listening for requests");
 
+    // Row checkpoints: cluster mode only. A standalone SSP rebuilds from its
+    // own database, which holds no hash to verify a checkpoint against.
+    let row_checkpoints = if standalone { None } else { warm::RowCheckpoints::from_env() };
+
+    let boot = Arc::new(ClusterBoot {
+        db: db.clone(),
+        processor: processor_arc.clone(),
+        status: status.clone(),
+        metrics: metrics.clone(),
+        scheduler_url: config.scheduler_url.clone(),
+        ssp_id: config.ssp_id.clone(),
+        listen_addr: config.listen_addr.clone(),
+        advertise_addr: config.advertise_addr.clone(),
+        register_max_wait_secs: config.register_max_wait_secs,
+        bootstrap_page_size: config.bootstrap_page_size,
+        node: Arc::clone(&node),
+        row_checkpoints: row_checkpoints.clone(),
+    });
+
     // Spawn self-bootstrap task (runs while server is already accepting /health requests)
     {
-        let db = db.clone();
-        let processor = processor_arc.clone();
-        let status = status.clone();
-        let metrics = metrics.clone();
-        let scheduler_url = config.scheduler_url.clone();
-        let ssp_id = config.ssp_id.clone();
-        let listen_addr = config.listen_addr.clone();
-        let advertise_addr = config.advertise_addr.clone();
-        let register_max_wait_secs = config.register_max_wait_secs;
-        let bootstrap_page_size = config.bootstrap_page_size;
-        let bootstrap_warnings = Arc::clone(&node.bootstrap_warnings);
-        let bootstrap_node = Arc::clone(&node);
-
+        let boot = Arc::clone(&boot);
         tokio::spawn(async move {
-            // Choose bootstrap source based on mode. The metadata source
-            // (INFO FOR DB → permissions) is always upstream SurrealDB
-            // regardless of mode, because the scheduler's replica is
-            // records-only and won't carry DEFINE TABLE strings.
-            let metadata_source = BootstrapSource::Direct(db.clone());
-            // Only cluster mode has a scheduler to report progress to; in
-            // standalone there is nobody listening and this stays `None`.
-            let mut reporter: Option<BootstrapReporter> = None;
-            let (data_source, mut expected_hashes) = if let Some(ref scheduler_url) = scheduler_url {
-                // Cluster mode: register with scheduler, then bootstrap from proxy
-                let client = reqwest::Client::new();
-                let scheduler_base = scheduler_url.trim_end_matches('/');
-                reporter = Some(BootstrapReporter::new(
-                    client.clone(),
-                    scheduler_base,
-                    ssp_id.clone(),
-                ));
-
-                info!("Registering SSP {} with scheduler at {}", ssp_id, scheduler_base);
-
-                let registration = register_with_retry(
-                    &client,
-                    scheduler_url,
-                    &ssp_id,
-                    &listen_addr,
-                    advertise_addr.as_deref(),
-                    register_max_wait_secs,
-                    &status,
-                )
-                .await;
-
-                let proxy_url = format!("{}/proxy", scheduler_base);
-                info!("Bootstrapping from scheduler proxy at {}", proxy_url);
-                (
-                    BootstrapSource::Proxy { client, proxy_url },
-                    registration.table_hashes,
-                )
-            } else {
-                // Standalone mode: bootstrap directly from DB. No expected
-                // hashes — verification only applies in cluster mode.
-                info!("Standalone mode: bootstrapping from SurrealDB");
-                (BootstrapSource::Direct(db), BTreeMap::new())
-            };
-
-            // Retry bootstrap up to 10 times with backoff (tables may not exist yet
-            // if migrations haven't run). `integrity_attempt` is counted
-            // separately: a transient bootstrap error must not consume the
-            // integrity gate's one retry (it used to, sending an SSP straight
-            // to exit(2) on its first-ever hash mismatch).
-            let mut attempt = 0;
-            let mut integrity_attempt = 0;
-            loop {
-                attempt += 1;
-                match self_bootstrap_with_metadata(
-                    &metadata_source,
-                    &data_source,
-                    &processor,
-                    bootstrap_page_size,
-                    reporter.as_ref(),
-                )
-                .await
-                {
-                    Ok(bootstrap_warnings_now) => {
-                        *bootstrap_warnings.write().await = bootstrap_warnings_now;
-                        // Seed the catch-up XOR accumulators from the freshly
-                        // bulk-loaded rows (`Circuit::load` bypasses the per-row
-                        // `apply_mutation` maintenance). Must run before the SSP
-                        // goes Ready, i.e. before any replay events are ingested,
-                        // so the accumulator starts from the snapshot content.
-                        {
-                            let mut guard = processor.write().await;
-                            guard.reseed_catchup_hashes();
-                        }
-                        // Integrity check: only when the scheduler handed us
-                        // expected hashes (cluster mode). Mismatch ⇒ wipe
-                        // the circuit and retry once. Second failure exits
-                        // the process; supervisor restarts → fresh
-                        // registration with the current frozen snapshot.
-                        if !expected_hashes.is_empty() {
-                            // The XOR set-hash the reseed above just settled:
-                            // the same family the scheduler now maintains per
-                            // event, and O(tables) to read instead of a full
-                            // sorted digest over every row.
-                            let actual = {
-                                let guard = processor.read().await;
-                                guard.compute_catchup_hashes()
-                            };
-                            let mut diffs = ssp_protocol::snapshot_hash::diff_table_hashes(
-                                &expected_hashes,
-                                &actual,
-                            );
-                            // Synced `_00_*` meta tables (feature flags, app
-                            // releases) are low-stakes announcement data — a
-                            // hash mismatch there must degrade to a warning,
-                            // never crash-loop the SSP and take sync down for
-                            // every real table (observed live when
-                            // _00_app_release first joined the snapshot).
-                            diffs.retain(|d| {
-                                let meta = ssp_protocol::SYNCED_META_TABLES
-                                    .contains(&d.table.as_str());
-                                if meta {
-                                    warn!(
-                                        table = %d.table,
-                                        expected = %d.a,
-                                        actual = %d.b,
-                                        "Ignoring integrity mismatch on synced meta table"
-                                    );
-                                }
-                                !meta
-                            });
-                            if !diffs.is_empty() {
-                                integrity_attempt += 1;
-                                for d in &diffs {
-                                    error!(
-                                        table = %d.table,
-                                        expected = %d.a,
-                                        actual = %d.b,
-                                        "Bootstrap integrity mismatch"
-                                    );
-                                }
-
-                                // Ask the scheduler for a second opinion FIRST.
-                                // Our rows came from its replica over /proxy,
-                                // so a disagreement is usually its cached hash
-                                // map having drifted from its own content, not
-                                // a bad circuit. It rehashes the disputed
-                                // tables from content and tells us what it
-                                // really holds. (Blindly re-registering, the
-                                // old first move, just refetched the same
-                                // cache — a stale entry then crash-looped the
-                                // SSP forever.)
-                                let verdict = match scheduler_url.as_deref() {
-                                    Some(sched_url) => {
-                                        verify_bootstrap_with_scheduler(sched_url, &ssp_id, &actual).await
-                                    }
-                                    None => None,
-                                };
-
-                                if let Some(v) = verdict {
-                                    if v.diverging.is_empty() {
-                                        info!(
-                                            tables = diffs.len(),
-                                            "Scheduler rehashed from replica content and agrees — its hash cache was stale, continuing"
-                                        );
-                                        expected_hashes = v.table_hashes;
-                                    } else if v.admit {
-                                        error!(
-                                            diverging = ?v.diverging,
-                                            "Scheduler admitted us despite a persistent divergence — going Ready to restore sync"
-                                        );
-                                        expected_hashes = v.table_hashes;
-                                    } else {
-                                        // Genuine divergence against freshly
-                                        // hashed content. Wipe and retry once;
-                                        // a re-clone on the scheduler side also
-                                        // invalidates what we loaded.
-                                        if integrity_attempt >= 2 || v.recloned {
-                                            error!(
-                                                attempts = integrity_attempt,
-                                                diverging = ?v.diverging,
-                                                recloned = v.recloned,
-                                                "Integrity mismatch persisted against replica content — exiting for restart"
-                                            );
-                                            *status.write().await = SspStatus::Failed;
-                                            std::process::exit(2);
-                                        }
-                                        warn!(
-                                            attempt = integrity_attempt,
-                                            diverging = ?v.diverging,
-                                            "Integrity mismatch confirmed against content — reloading the circuit and retrying"
-                                        );
-                                        {
-                                            let mut guard = processor.write().await;
-                                            // Carry the merge policy across the wipe; `Circuit::new`
-                                            // is a fresh object and holds no configuration.
-                                            let merge_views = guard.merge_views();
-                                            *guard = Circuit::new();
-                                            guard.set_merge_views(merge_views);
-                                            guard.set_monotonic_row_versions(true);
-                                        }
-                                        expected_hashes = v.table_hashes;
-                                        continue;
-                                    }
-                                } else {
-                                    // No verdict (standalone, or an older
-                                    // scheduler without the endpoint): fall
-                                    // back to the previous behaviour — wipe,
-                                    // re-register for fresh hashes, retry once.
-                                    if integrity_attempt >= 2 {
-                                        error!(
-                                            attempts = integrity_attempt,
-                                            diffs = diffs.len(),
-                                            "Integrity mismatch persisted after retry — exiting for restart"
-                                        );
-                                        *status.write().await = SspStatus::Failed;
-                                        std::process::exit(2);
-                                    }
-                                    warn!(
-                                        attempt = integrity_attempt,
-                                        diffs = diffs.len(),
-                                        "Integrity mismatch — re-registering to refetch scheduler hashes before retry"
-                                    );
-                                    {
-                                        let mut guard = processor.write().await;
-                                        // Carry the merge policy across the wipe; `Circuit::new`
-                                        // is a fresh object and holds no configuration.
-                                        let merge_views = guard.merge_views();
-                                        *guard = Circuit::new();
-                                        guard.set_merge_views(merge_views);
-                                        guard.set_monotonic_row_versions(true);
-                                    }
-                                    if let Some(sched_url) = scheduler_url.as_deref() {
-                                        let client = reqwest::Client::new();
-                                        let registration = register_with_retry(
-                                            &client,
-                                            sched_url,
-                                            &ssp_id,
-                                            &listen_addr,
-                                            advertise_addr.as_deref(),
-                                            register_max_wait_secs,
-                                            &status,
-                                        )
-                                        .await;
-                                        expected_hashes = registration.table_hashes;
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let guard = processor.read().await;
-                        metrics.view_count.add(guard.view_count() as i64, &[]);
-                        info!(
-                            tables = guard.table_names().len(),
-                            views = guard.view_count(),
-                            verified = !expected_hashes.is_empty(),
-                            "Bootstrap complete"
-                        );
-                        drop(guard);
-                        if let Err(e) = bootstrap_node.republish_restored_views().await {
-                            error!(error = %e, "Bootstrap membership repair failed");
-                            *status.write().await = SspStatus::Failed;
-                            break;
-                        }
-                        *status.write().await = SspStatus::Ready;
-                        break;
-                    }
-                    Err(e) => {
-                        if attempt >= 10 {
-                            error!(error = %e, attempts = attempt, "Bootstrap failed after retries");
-                            *status.write().await = SspStatus::Failed;
-                            break;
-                        }
-                        warn!(error = %e, attempt = attempt, "Bootstrap failed, retrying in 5s...");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    }
-                }
+            // Rows from the last run go in before registering, so the
+            // scheduler's freeze window covers only the hash checks.
+            if let Some(rows) = &boot.row_checkpoints {
+                rows.load_into(&boot.processor).await;
             }
+            boot.run().await;
         });
+    }
+    if let (Some(rows), Some(every)) = (&row_checkpoints, warm::RowCheckpoints::interval_from_env()) {
+        rows.spawn_timer(processor_arc.clone(), status.clone(), every);
     }
 
     // Spawn heartbeat loop if scheduler configured
@@ -1494,12 +1253,14 @@ pub async fn run_server() -> anyhow::Result<()> {
         let scheduler_url_clone = scheduler_url.clone();
         let heartbeat_interval = config.heartbeat_interval_ms;
         let processor_clone = processor_for_scheduler.clone();
-        // listen_addr / advertise_addr aren't read here — the heartbeat
-        // path no longer self-registers; if the scheduler 404s us, we
-        // exit and the supervisor reruns the full register handshake.
+        let metrics_for_heartbeat = metrics.clone();
+        // A 404 (the scheduler forgot us, e.g. it restarted) or a resync
+        // directive re-runs the cluster bootstrap in-process, rows kept.
+        let boot_for_heartbeat = Arc::clone(&boot);
         let status_for_heartbeat = status.clone();
         let circuit_store_for_heartbeat = Arc::clone(&platform.circuit_store);
         let clean_requested_for_heartbeat = Arc::clone(&clean_requested);
+        let rows_for_heartbeat = row_checkpoints.clone();
 
         tokio::spawn(async move {
             // Bounded request: the scheduler evicts an SSP after 30 s of
@@ -1511,6 +1272,9 @@ pub async fn run_server() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| reqwest::Client::new());
             let heartbeat_url = format!("{}/ssp/heartbeat", scheduler_url_clone.trim_end_matches('/'));
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(heartbeat_interval));
+            // A re-bootstrap below can hold this loop for minutes; resume at
+            // the normal cadence afterwards rather than in a burst.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_views: usize = 0;
 
             loop {
@@ -1553,19 +1317,18 @@ pub async fn run_server() -> anyhow::Result<()> {
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
                     Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
-                        warn!("Scheduler doesn't recognize us, exiting for clean restart");
-                        // The scheduler has dropped us. Restarting through
-                        // the supervisor re-runs the bootstrap loop above,
-                        // which re-registers and re-verifies hashes — much
-                        // safer than trying to re-register from a heartbeat
-                        // task that can't replay events into the circuit.
-                        std::process::exit(3);
+                        // The scheduler has dropped us, usually because it
+                        // restarted with an empty pool. Register again with
+                        // the rows kept: the bootstrap verifies every table
+                        // against the replica and fetches only what differs.
+                        warn!("Scheduler doesn't recognize us; re-registering with the rows kept");
+                        rebootstrap_in_process(&boot_for_heartbeat, &metrics_for_heartbeat).await;
                     }
                     Ok(resp) if resp.status() == StatusCode::CONFLICT => {
-                        // Either buffer overflow or scheduler-driven
-                        // integrity-check resync. Either way the circuit
-                        // can't be trusted; exit so the supervisor brings
-                        // us back with a clean state.
+                        // Buffer overflow or a scheduler-driven resync: the
+                        // circuit missed events. Its rows are still checked
+                        // table by table against the replica on the way back
+                        // up, so only a CLEAN directive throws them away.
                         let body = resp.text().await.unwrap_or_default();
                         let directive = ssp_protocol::ResyncDirective::parse(&body);
                         if directive.clean {
@@ -1574,10 +1337,12 @@ pub async fn run_server() -> anyhow::Result<()> {
                             // point of a clean restart is a cold rebuild, and
                             // a checkpoint on the way out would undo it.
                             clean_requested_for_heartbeat.store(true, Ordering::SeqCst);
-                            wipe_local_state(circuit_store_for_heartbeat.as_ref()).await;
+                            wipe_local_state(circuit_store_for_heartbeat.as_ref(), rows_for_heartbeat.as_deref()).await;
+                            error!(reason = %directive.reason, "Scheduler requested a clean re-bootstrap, exiting");
+                            std::process::exit(4);
                         }
-                        error!(reason = %directive.reason, clean = directive.clean, "Scheduler requested re-bootstrap, exiting");
-                        std::process::exit(4);
+                        warn!(reason = %directive.reason, "Scheduler requested a resync; re-bootstrapping with the rows kept");
+                        rebootstrap_in_process(&boot_for_heartbeat, &metrics_for_heartbeat).await;
                     }
                     Ok(resp) if !resp.status().is_success() => {
                         warn!("Heartbeat failed: HTTP {}", resp.status());
@@ -1653,6 +1418,7 @@ pub async fn run_server() -> anyhow::Result<()> {
             meter_provider,
             runtime.clone(),
             Arc::clone(&clean_requested),
+            row_checkpoints.map(|rows| (rows, processor_arc.clone(), status.clone())),
         ))
         .await
         .context("Server error")?;
@@ -1668,10 +1434,13 @@ pub async fn run_server() -> anyhow::Result<()> {
 /// sparse-file cache of row bytes that bootstrap repopulates, so it is removed
 /// wholesale. Both are caches of SurrealDB, never the source of truth, which
 /// is what makes deleting them a safe thing to do from a heartbeat task.
-async fn wipe_local_state(store: &dyn ssp_node::CircuitStore) {
+async fn wipe_local_state(store: &dyn ssp_node::CircuitStore, rows: Option<&warm::RowCheckpoints>) {
     match store.clear().await {
         Ok(()) => info!("Circuit snapshot cleared for clean restart"),
         Err(e) => warn!(error = %e, "Could not clear circuit snapshot; restart will be warm"),
+    }
+    if let Some(rows) = rows {
+        rows.clear();
     }
     if let Some(dir) = std::env::var_os("SPKY_SSP_ARENA_DIR") {
         match std::fs::remove_dir_all(&dir) {
@@ -1682,10 +1451,14 @@ async fn wipe_local_state(store: &dyn ssp_node::CircuitStore) {
     }
 }
 
+/// What the shutdown path needs to write a final row checkpoint.
+type ShutdownRows = (Arc<warm::RowCheckpoints>, Arc<RwLock<Circuit>>, Arc<RwLock<SspStatus>>);
+
 async fn shutdown_signal(
     meter_provider: opentelemetry_sdk::metrics::SdkMeterProvider,
     runtime: ssp_node::Runtime,
     clean_requested: Arc<AtomicBool>,
+    rows: Option<ShutdownRows>,
 ) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1718,10 +1491,352 @@ async fn shutdown_signal(
         info!("Skipping shutdown checkpoint: clean restart requested");
     } else {
         runtime.checkpoint().await;
+        // Cluster rows: only a verified circuit is worth keeping, and ingest
+        // stops first (503, which the scheduler buffers and redelivers to
+        // whoever comes next) so the write does not race it for the lock.
+        if let Some((rows, processor, status)) = rows {
+            let was_ready = {
+                let mut status = status.write().await;
+                let was_ready = *status == SspStatus::Ready;
+                *status = SspStatus::Stopping;
+                was_ready
+            };
+            if was_ready {
+                rows.write(&processor, "shutdown").await;
+            } else {
+                info!("Skipping row checkpoint: the circuit was not Ready");
+            }
+        }
     }
 
     if let Err(e) = meter_provider.shutdown() {
         error!(error = %e, "Failed to shutdown meter provider");
+    }
+}
+
+// --- Cluster bootstrap ---
+
+/// Everything the cluster bootstrap needs, kept together so the heartbeat can
+/// run it again in-process when the scheduler forgets this SSP or asks it to
+/// resync.
+struct ClusterBoot {
+    db: SharedDb,
+    processor: Arc<RwLock<Circuit>>,
+    status: Arc<RwLock<SspStatus>>,
+    metrics: Arc<Metrics>,
+    scheduler_url: Option<String>,
+    ssp_id: String,
+    listen_addr: String,
+    advertise_addr: Option<String>,
+    register_max_wait_secs: u64,
+    bootstrap_page_size: usize,
+    node: Arc<ssp_node::SspNode>,
+    row_checkpoints: Option<Arc<warm::RowCheckpoints>>,
+}
+
+impl ClusterBoot {
+    /// Register with the scheduler, bring the circuit's rows in line with its
+    /// replica (kept, repaired or paged table by table, see [`warm`]),
+    /// rebuild the views, verify, and go Ready. Leaves the status `Failed`
+    /// when it gives up.
+    async fn run(&self) {
+        let ClusterBoot {
+            db,
+            processor,
+            status,
+            metrics,
+            scheduler_url,
+            ssp_id,
+            listen_addr,
+            advertise_addr,
+            node,
+            row_checkpoints,
+            ..
+        } = self;
+        let register_max_wait_secs = self.register_max_wait_secs;
+        let bootstrap_page_size = self.bootstrap_page_size;
+
+        // Choose bootstrap source based on mode. The metadata source
+        // (INFO FOR DB → permissions) is always upstream SurrealDB
+        // regardless of mode, because the scheduler's replica is
+        // records-only and won't carry DEFINE TABLE strings.
+        let metadata_source = BootstrapSource::Direct(db.clone());
+        // Only cluster mode has a scheduler to report progress to; in
+        // standalone there is nobody listening and this stays `None`.
+        let mut reporter: Option<BootstrapReporter> = None;
+        let (data_source, mut expected_hashes) = if let Some(scheduler_url) = scheduler_url {
+            // Cluster mode: register with scheduler, then bootstrap from proxy
+            let client = reqwest::Client::new();
+            let scheduler_base = scheduler_url.trim_end_matches('/');
+            reporter = Some(BootstrapReporter::new(
+                client.clone(),
+                scheduler_base,
+                ssp_id.clone(),
+            ));
+
+            info!("Registering SSP {} with scheduler at {}", ssp_id, scheduler_base);
+
+            let registration = register_with_retry(
+                &client,
+                scheduler_url,
+                ssp_id,
+                listen_addr,
+                advertise_addr.as_deref(),
+                register_max_wait_secs,
+                status,
+            )
+            .await;
+
+            let proxy_url = format!("{}/proxy", scheduler_base);
+            info!("Bootstrapping from scheduler proxy at {}", proxy_url);
+            (
+                BootstrapSource::Proxy { client, proxy_url },
+                registration.table_hashes,
+            )
+        } else {
+            // Standalone mode: bootstrap directly from DB. No expected
+            // hashes — verification only applies in cluster mode.
+            info!("Standalone mode: bootstrapping from SurrealDB");
+            (BootstrapSource::Direct(db.clone()), BTreeMap::new())
+        };
+
+        // Retry bootstrap up to 10 times with backoff (tables may not exist yet
+        // if migrations haven't run). `integrity_attempt` is counted
+        // separately: a transient bootstrap error must not consume the
+        // integrity gate's one retry (it used to, sending an SSP straight
+        // to exit(2) on its first-ever hash mismatch).
+        let mut attempt = 0;
+        let mut integrity_attempt = 0;
+        loop {
+            attempt += 1;
+            match self_bootstrap_with_metadata(
+                &metadata_source,
+                &data_source,
+                processor,
+                bootstrap_page_size,
+                &expected_hashes,
+                reporter.as_ref(),
+            )
+            .await
+            {
+                Ok(bootstrap_warnings_now) => {
+                    *node.bootstrap_warnings.write().await = bootstrap_warnings_now;
+                    // Seed the catch-up XOR accumulators from the freshly
+                    // bulk-loaded rows (`Circuit::load` bypasses the per-row
+                    // `apply_mutation` maintenance). Must run before the SSP
+                    // goes Ready, i.e. before any replay events are ingested,
+                    // so the accumulator starts from the snapshot content.
+                    {
+                        let mut guard = processor.write().await;
+                        guard.reseed_catchup_hashes();
+                    }
+                    // Integrity check: only when the scheduler handed us
+                    // expected hashes (cluster mode). Mismatch ⇒ wipe
+                    // the circuit and retry once. Second failure exits
+                    // the process; supervisor restarts → fresh
+                    // registration with the current frozen snapshot.
+                    if !expected_hashes.is_empty() {
+                        // The XOR set-hash the reseed above just settled:
+                        // the same family the scheduler now maintains per
+                        // event, and O(tables) to read instead of a full
+                        // sorted digest over every row.
+                        let actual = {
+                            let guard = processor.read().await;
+                            guard.compute_catchup_hashes()
+                        };
+                        let mut diffs = ssp_protocol::snapshot_hash::diff_table_hashes(
+                            &expected_hashes,
+                            &actual,
+                        );
+                        // Synced `_00_*` meta tables (feature flags, app
+                        // releases) are low-stakes announcement data — a
+                        // hash mismatch there must degrade to a warning,
+                        // never crash-loop the SSP and take sync down for
+                        // every real table (observed live when
+                        // _00_app_release first joined the snapshot).
+                        diffs.retain(|d| {
+                            let meta = ssp_protocol::SYNCED_META_TABLES
+                                .contains(&d.table.as_str());
+                            if meta {
+                                warn!(
+                                    table = %d.table,
+                                    expected = %d.a,
+                                    actual = %d.b,
+                                    "Ignoring integrity mismatch on synced meta table"
+                                );
+                            }
+                            !meta
+                        });
+                        if !diffs.is_empty() {
+                            integrity_attempt += 1;
+                            for d in &diffs {
+                                error!(
+                                    table = %d.table,
+                                    expected = %d.a,
+                                    actual = %d.b,
+                                    "Bootstrap integrity mismatch"
+                                );
+                            }
+
+                            // Ask the scheduler for a second opinion FIRST.
+                            // Our rows came from its replica over /proxy,
+                            // so a disagreement is usually its cached hash
+                            // map having drifted from its own content, not
+                            // a bad circuit. It rehashes the disputed
+                            // tables from content and tells us what it
+                            // really holds. (Blindly re-registering, the
+                            // old first move, just refetched the same
+                            // cache — a stale entry then crash-looped the
+                            // SSP forever.)
+                            let verdict = match scheduler_url.as_deref() {
+                                Some(sched_url) => {
+                                    verify_bootstrap_with_scheduler(sched_url, ssp_id, &actual).await
+                                }
+                                None => None,
+                            };
+
+                            if let Some(v) = verdict {
+                                if v.diverging.is_empty() {
+                                    info!(
+                                        tables = diffs.len(),
+                                        "Scheduler rehashed from replica content and agrees — its hash cache was stale, continuing"
+                                    );
+                                    expected_hashes = v.table_hashes;
+                                } else if v.admit {
+                                    error!(
+                                        diverging = ?v.diverging,
+                                        "Scheduler admitted us despite a persistent divergence — going Ready to restore sync"
+                                    );
+                                    expected_hashes = v.table_hashes;
+                                } else {
+                                    // Genuine divergence against freshly
+                                    // hashed content. Wipe and retry once;
+                                    // a re-clone on the scheduler side also
+                                    // invalidates what we loaded.
+                                    if integrity_attempt >= 2 || v.recloned {
+                                        error!(
+                                            attempts = integrity_attempt,
+                                            diverging = ?v.diverging,
+                                            recloned = v.recloned,
+                                            "Integrity mismatch persisted against replica content — exiting for restart"
+                                        );
+                                        *status.write().await = SspStatus::Failed;
+                                        std::process::exit(2);
+                                    }
+                                    warn!(
+                                        attempt = integrity_attempt,
+                                        diverging = ?v.diverging,
+                                        "Integrity mismatch confirmed against content — reloading the circuit and retrying"
+                                    );
+                                    {
+                                        let mut guard = processor.write().await;
+                                        // Carry the merge policy across the wipe; `Circuit::new`
+                                        // is a fresh object and holds no configuration.
+                                        let merge_views = guard.merge_views();
+                                        *guard = Circuit::new();
+                                        guard.set_merge_views(merge_views);
+                                        guard.set_monotonic_row_versions(true);
+                                    }
+                                    expected_hashes = v.table_hashes;
+                                    continue;
+                                }
+                            } else {
+                                // No verdict (standalone, or an older
+                                // scheduler without the endpoint): fall
+                                // back to the previous behaviour — wipe,
+                                // re-register for fresh hashes, retry once.
+                                if integrity_attempt >= 2 {
+                                    error!(
+                                        attempts = integrity_attempt,
+                                        diffs = diffs.len(),
+                                        "Integrity mismatch persisted after retry — exiting for restart"
+                                    );
+                                    *status.write().await = SspStatus::Failed;
+                                    std::process::exit(2);
+                                }
+                                warn!(
+                                    attempt = integrity_attempt,
+                                    diffs = diffs.len(),
+                                    "Integrity mismatch — re-registering to refetch scheduler hashes before retry"
+                                );
+                                {
+                                    let mut guard = processor.write().await;
+                                    // Carry the merge policy across the wipe; `Circuit::new`
+                                    // is a fresh object and holds no configuration.
+                                    let merge_views = guard.merge_views();
+                                    *guard = Circuit::new();
+                                    guard.set_merge_views(merge_views);
+                                    guard.set_monotonic_row_versions(true);
+                                }
+                                if let Some(sched_url) = scheduler_url.as_deref() {
+                                    let client = reqwest::Client::new();
+                                    let registration = register_with_retry(
+                                        &client,
+                                        sched_url,
+                                        ssp_id,
+                                        listen_addr,
+                                        advertise_addr.as_deref(),
+                                        register_max_wait_secs,
+                                        status,
+                                    )
+                                    .await;
+                                    expected_hashes = registration.table_hashes;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
+                    let guard = processor.read().await;
+                    metrics.view_count.add(guard.view_count() as i64, &[]);
+                    info!(
+                        tables = guard.table_names().len(),
+                        views = guard.view_count(),
+                        verified = !expected_hashes.is_empty(),
+                        "Bootstrap complete"
+                    );
+                    drop(guard);
+                    if let Err(e) = node.republish_restored_views().await {
+                        error!(error = %e, "Bootstrap membership repair failed");
+                        *status.write().await = SspStatus::Failed;
+                        break;
+                    }
+                    *status.write().await = SspStatus::Ready;
+                    // Persist what was just verified, so a restart from here on is
+                    // warm. Off the critical path: the SSP is already serving.
+                    if let Some(rows) = row_checkpoints {
+                        let rows = Arc::clone(rows);
+                        let processor = Arc::clone(processor);
+                        tokio::spawn(async move { rows.write(&processor, "bootstrap").await });
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if attempt >= 10 {
+                        error!(error = %e, attempts = attempt, "Bootstrap failed after retries");
+                        *status.write().await = SspStatus::Failed;
+                        break;
+                    }
+                    warn!(error = %e, attempt = attempt, "Bootstrap failed, retrying in 5s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+}
+
+/// Re-run the cluster bootstrap without leaving the process: views and graphs
+/// go, rows stay, and [`ClusterBoot::run`] registers again and verifies them
+/// table by table. Falls back to an exit (and a restart from the row
+/// checkpoint) only when that bootstrap gives up.
+async fn rebootstrap_in_process(boot: &ClusterBoot, metrics: &Metrics) {
+    let views = boot.processor.read().await.view_count() as i64;
+    metrics.view_count.add(-views, &[]);
+    boot.node.reset_views_keep_rows().await;
+    boot.run().await;
+    if *boot.status.read().await != SspStatus::Ready {
+        error!("In-process re-bootstrap failed, exiting for a restart");
+        std::process::exit(3);
     }
 }
 
@@ -1931,6 +2046,7 @@ async fn self_bootstrap_with_metadata(
     data_source: &BootstrapSource,
     processor: &Arc<RwLock<Circuit>>,
     page_size: usize,
+    expected: &BTreeMap<String, String>,
     reporter: Option<&BootstrapReporter>,
 ) -> anyhow::Result<Vec<String>> {
     info!("Starting self-bootstrap");
@@ -1984,11 +2100,78 @@ async fn self_bootstrap_with_metadata(
     // body. Paging keeps each round-trip bounded; the SSP still loads
     // everything into the circuit store but does so a chunk at a time.
     // `page_size` comes from NodeConfig (env: SPKY_SSP_BOOTSTRAP_PAGE_SIZE).
+    //
+    // Rows the circuit already holds (from a row checkpoint, or kept across an
+    // in-process re-bootstrap) are checked against `expected`, the scheduler's
+    // per-table hash at the cut it froze for this registration: a table that
+    // matches is kept, one that differs is repaired from an `(id, _00_rv)`
+    // listing, and only what neither settles is paged. See `warm`.
+    {
+        let mut circuit = processor.write().await;
+        let unsynced: Vec<String> = circuit
+            .store
+            .collections
+            .keys()
+            .filter(|t| !schema.tables.contains_key(*t))
+            .cloned()
+            .collect();
+        for table in unsynced {
+            circuit.forget_table(&table);
+        }
+    }
+    let (mut kept, mut repaired) = (0usize, 0usize);
     for (table, meta) in &schema.tables {
         if let Some(r) = reporter {
             r.start_table(table).await;
         }
         let omit = &meta.opaque;
+
+        let held = {
+            let circuit = processor.read().await;
+            circuit.store.get_collection(table).map(|coll| {
+                (coll.rows.len(), ssp_protocol::snapshot_hash::xor_acc_to_hex(&coll.catchup_xor))
+            })
+        };
+        if let (Some((rows, hash)), Some(want)) = (&held, expected.get(table)) {
+            if hash == want {
+                kept += 1;
+                debug!(table = %table, rows, "Kept table: rows match the scheduler");
+                if let Some(r) = reporter {
+                    r.add_rows(*rows).await;
+                    r.finish_table().await;
+                }
+                continue;
+            }
+            let started = std::time::Instant::now();
+            match warm::repair_table(source, processor, table, omit, want).await {
+                Ok(repair) if repair.matched => {
+                    repaired += 1;
+                    info!(
+                        table = %table,
+                        listed = repair.listed,
+                        fetched = repair.fetched,
+                        deleted = repair.deleted,
+                        ms = started.elapsed().as_millis() as u64,
+                        "Repaired table from the replica"
+                    );
+                    if let Some(r) = reporter {
+                        r.add_rows(repair.listed).await;
+                        r.finish_table().await;
+                    }
+                    continue;
+                }
+                Ok(repair) => info!(
+                    table = %table,
+                    listed = repair.listed,
+                    fetched = repair.fetched,
+                    "Table still differs after repair; paging it in full"
+                ),
+                Err(e) => warn!(table = %table, error = %e, "Table repair failed; paging it in full"),
+            }
+        }
+        if held.is_some() {
+            processor.write().await.store.collections.remove(table);
+        }
         let mut record_count: usize = 0;
         // Keyset cursor: the highest `id` loaded so far. `None` = first page.
         let mut after_id: Option<String> = None;
@@ -2064,6 +2247,10 @@ async fn self_bootstrap_with_metadata(
                 }
             }
         }
+    }
+
+    if kept + repaired > 0 {
+        info!(tables = schema.tables.len(), kept, repaired, "Warm bootstrap: rows reused");
     }
 
     // Step 3: Re-register views from the global `_00_query` table.

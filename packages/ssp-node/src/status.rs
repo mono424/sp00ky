@@ -8,6 +8,8 @@ pub enum SspStatus {
     Bootstrapping,
     Ready,
     Failed,
+    /// Shutting down: no more ingest, the rows are being checkpointed.
+    Stopping,
 }
 
 #[derive(Serialize)]

@@ -396,6 +396,29 @@ impl SspNode {
         Ok(())
     }
 
+    /// Take the node out of service for a warm re-bootstrap: no ingest, no
+    /// registrations, every view and graph dropped, every queued edge write
+    /// invalidated, and the rows kept. The cluster shell then re-registers
+    /// with the scheduler and verifies those rows table by table against its
+    /// replica, which is what makes a scheduler restart or a resync directive
+    /// cost a hash check instead of a full re-page.
+    ///
+    /// Views come back from `_00_query` on the way up and operator state is
+    /// primed from the rows again, the same as on a cold boot, so nothing
+    /// view-shaped has to be trusted across the gap.
+    pub async fn reset_views_keep_rows(&self) {
+        *self.status.write().await = SspStatus::Bootstrapping;
+        {
+            let _publication = self.publication_gate.lock().await;
+            let mut circuit = self.processor.write().await;
+            self.edge_update_tx.invalidate_all();
+            let store = std::mem::take(&mut circuit.store);
+            *circuit = Circuit::new();
+            circuit.store = store;
+        }
+        self.apply_circuit_policy().await;
+    }
+
     pub async fn reload(&self) -> anyhow::Result<()> {
         *self.status.write().await = SspStatus::Bootstrapping;
         {
@@ -626,6 +649,7 @@ impl SspNode {
             SspStatus::Bootstrapping => "bootstrapping",
             SspStatus::Ready => "ready",
             SspStatus::Failed => "failed",
+            SspStatus::Stopping => "stopping",
         }
     }
 

@@ -277,6 +277,33 @@ impl Collection {
     pub fn get_record_version(&self, id: &str) -> Option<i64> {
         self.rows.rv_of(raw_id(id))
     }
+
+    /// Compare the rows with an authoritative `(id, _00_rv)` listing of the
+    /// same table. Returns the ids to `fetch` (listed, but absent here or held
+    /// at another version) and the `stale` ids (held here, not listed). Ids
+    /// may be raw or `table:id`; both come back raw.
+    ///
+    /// Any version difference counts, not just "lower here": a server row can
+    /// carry a version the row-version floor synthesized, which says nothing
+    /// about whether its content matches. Equal versions are taken as equal
+    /// content, so a caller must still check the table hash afterwards.
+    pub fn version_diff(&self, listing: &[(String, Option<i64>)]) -> (Vec<String>, Vec<String>) {
+        let listed: std::collections::HashSet<&str> =
+            listing.iter().map(|(id, _)| raw_id(id)).collect();
+        let fetch = listing
+            .iter()
+            .map(|(id, rv)| (raw_id(id), *rv))
+            .filter(|(id, rv)| !self.rows.contains_key(id) || self.rows.rv_of(id) != *rv)
+            .map(|(id, _)| id.to_string())
+            .collect();
+        let stale = self
+            .rows
+            .keys()
+            .filter(|id| !listed.contains(id))
+            .map(str::to_string)
+            .collect();
+        (fetch, stale)
+    }
 }
 
 /// The store holds all base collections (tables).
@@ -643,5 +670,28 @@ mod tests {
         c.reseed_catchup_xor();
         assert_eq!(c.catchup_xor, after);
         assert!(c.zset.len() == 20, "membership is untouched by compaction");
+    }
+
+    #[test]
+    fn version_diff_names_what_to_fetch_and_what_is_gone() {
+        let mut c = coll();
+        c.apply(Operation::Create, "same", sv(json!({ "_00_rv": 3 })));
+        c.apply(Operation::Create, "older", sv(json!({ "_00_rv": 1 })));
+        c.apply(Operation::Create, "newer", sv(json!({ "_00_rv": 9 })));
+        c.apply(Operation::Create, "unversioned", sv(json!({ "n": 1 })));
+        c.apply(Operation::Create, "gone", sv(json!({ "_00_rv": 2 })));
+
+        let listing = vec![
+            ("thread:same".to_string(), Some(3)),
+            ("older".to_string(), Some(2)),
+            // Higher here than upstream: a floor-synthesized version, content unknown.
+            ("newer".to_string(), Some(5)),
+            ("unversioned".to_string(), None),
+            ("thread:added".to_string(), Some(1)),
+        ];
+        let (mut fetch, stale) = c.version_diff(&listing);
+        fetch.sort();
+        assert_eq!(fetch, vec!["added", "newer", "older"]);
+        assert_eq!(stale, vec!["gone"]);
     }
 }

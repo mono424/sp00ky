@@ -177,7 +177,12 @@ impl RowTable {
         codec::encode_record(id, value, digest, &mut self.dict, &mut scratch);
         let slot = self.arena.append(&scratch);
         self.scratch = scratch;
+        self.place(id, slot);
+        slot
+    }
 
+    /// Point `id` at `slot`, freeing whatever slot it pointed at before.
+    fn place(&mut self, id: &str, slot: RowSlot) {
         let hash = id_hash(id);
         let arena = &*self.arena;
         match self
@@ -198,7 +203,49 @@ impl RowTable {
                 });
             }
         }
-        slot
+    }
+
+    /// Every live row's raw record (header + value), in unspecified order.
+    ///
+    /// The value's field ids refer to [`Self::dict`], so the bytes only mean
+    /// something next to that dictionary. A row checkpoint writes both and
+    /// reads them back with [`Self::restore_dict`] + [`Self::insert_encoded`],
+    /// which is what makes a checkpoint a copy of bytes rather than a decode
+    /// and re-encode of every row.
+    pub fn records(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        let arena = &*self.arena;
+        self.index
+            .iter()
+            .map(move |slot| arena.get(*slot))
+            .filter(|record| !record.is_empty())
+    }
+
+    /// Give an EMPTY table the dictionary another table was written with,
+    /// `names` in id order (see [`FieldDict::names`]). Refused (`false`) when
+    /// the table already holds rows or a name repeats: in both cases the ids
+    /// would not line up with the records about to be inserted.
+    pub fn restore_dict<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> bool {
+        if !self.is_empty() || !self.dict.is_empty() {
+            return false;
+        }
+        for (expected, name) in names.into_iter().enumerate() {
+            if self.dict.intern(name) as usize != expected {
+                self.dict = FieldDict::new();
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Store a record that was encoded against this table's dictionary, as
+    /// is. `false`, and nothing stored, when it carries no readable id.
+    pub fn insert_encoded(&mut self, record: &[u8]) -> bool {
+        let Some(id) = codec::record_id(record) else {
+            return false;
+        };
+        let slot = self.arena.append(record);
+        self.place(id, slot);
+        true
     }
 
     /// Insert under a caller-chosen hash, so a test can force every row into

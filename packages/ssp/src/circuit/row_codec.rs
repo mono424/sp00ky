@@ -77,6 +77,14 @@ pub const TAG_OBJ: u8 = 0x07;
 /// and a row could in principle carry it.
 pub const RV_ABSENT: i64 = i64::MIN;
 
+/// Version of the record layout above. A row checkpoint stores records
+/// verbatim, so it is only readable by a build that lays records out the same
+/// way: bump this on ANY change to the header, the tags or the object table.
+/// Readable-but-misread is the failure it guards against, and it is silent:
+/// the digest is carried in the header rather than recomputed, so a misread
+/// body would still hash as if it were right.
+pub const RECORD_FORMAT: u32 = 1;
+
 pub const DIGEST_LEN: usize = 32;
 pub const RV_OFFSET: usize = DIGEST_LEN;
 /// Offset of the id's length prefix. The value region follows the id, so its
@@ -119,6 +127,13 @@ impl FieldDict {
 
     pub fn name(&self, id: u32) -> Option<&str> {
         self.names.get(id as usize).map(|s| s.as_str())
+    }
+
+    /// Every interned name, in id order. Interning these into an empty
+    /// dictionary in this order reproduces the same ids, which is what lets
+    /// encoded records be carried across a checkpoint without re-encoding.
+    pub fn names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.names.iter().map(|s| s.as_str())
     }
 
     pub fn len(&self) -> usize {

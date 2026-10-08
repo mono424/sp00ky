@@ -1,4 +1,5 @@
 pub mod arena;
+pub mod checkpoint;
 pub mod row_codec;
 pub mod row_table;
 pub mod store;

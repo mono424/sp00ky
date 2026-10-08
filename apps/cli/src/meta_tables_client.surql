@@ -93,24 +93,19 @@ DEFINE FIELD errorCount ON TABLE _00_query TYPE int DEFAULT 0
 
 -- ==================================================
 -- SPOOKY EVENTS
--- Stores create, update, and delete events
+-- The local outbox: one row per create, update and delete not yet pushed.
+--
+-- SCHEMALESS on purpose. The row shape belongs to the client
+-- (packages/core/src/mutation/rows.ts, `pendingInsert`), which reads every
+-- shape this table ever had. This used to be SCHEMAFULL with only
+-- id/mutationType/recordId/data, and when the client started writing
+-- `tableName`, `createdAt`, `v` and `beforeRecord`, SurrealDB rejected the
+-- unknown fields and failed the whole local write transaction: on the
+-- SurrealDB local engine no create, update or delete could be stored.
 -- ==================================================
 
-DEFINE TABLE _00_pending_mutations SCHEMAFULL
+DEFINE TABLE _00_pending_mutations SCHEMALESS
     PERMISSIONS FOR select, create, update, delete WHERE true;
-
-DEFINE FIELD IF NOT EXISTS id ON _00_pending_mutations TYPE string;
-
-DEFINE FIELD IF NOT EXISTS mutationType ON _00_pending_mutations TYPE string
-    PERMISSIONS FOR select, create, update WHERE true;
-
--- The target record ID (for update/delete) - maps to 'id' in the event object
-DEFINE FIELD IF NOT EXISTS recordId ON _00_pending_mutations TYPE option<record>
-    PERMISSIONS FOR select, create, update WHERE true;
-
--- The data payload (for create/update)
-DEFINE FIELD IF NOT EXISTS data ON _00_pending_mutations TYPE option<object> FLEXIBLE
-    PERMISSIONS FOR select, create, update WHERE true;
 
 -- CRDT state lives inline on the parent record itself (the `@crdt`-
 -- annotated field). `@crdt`-only fields hold the base64 LoroDoc

@@ -15,6 +15,13 @@ export const sha1 = async (str: string): Promise<string> => {
     .join('');
 };
 
+/**
+ * Local-only state a schema change must not throw away: the outbox, the
+ * failed-mutation tray and debounced patches not yet in the outbox. Cached
+ * rows refill from the server; these exist nowhere else.
+ */
+const KEPT_TABLES = ['_00_pending_mutations', '_00_failed_mutations', '_00_pending_writes'] as const;
+
 export class LocalMigrator {
   private logger: Logger;
 
@@ -40,6 +47,7 @@ export class LocalMigrator {
       return;
     }
 
+    const kept = await this.readKeptRows();
     await this.recreateDatabase(database);
 
     const systemSchema = `
@@ -89,7 +97,38 @@ export class LocalMigrator {
       }
     }
 
+    await this.restoreKeptRows(kept);
     await this.createHashRecord(hash);
+  }
+
+  private async readKeptRows(): Promise<Array<[string, unknown[]]>> {
+    const kept: Array<[string, unknown[]]> = [];
+    for (const table of KEPT_TABLES) {
+      try {
+        const [rows] = await this.localDb.queryUngated<[unknown[]]>(`SELECT * FROM ${table}`);
+        if (Array.isArray(rows) && rows.length > 0) kept.push([table, rows]);
+      } catch {
+        // A fresh store has no such table yet: nothing to keep.
+      }
+    }
+    return kept;
+  }
+
+  private async restoreKeptRows(kept: Array<[string, unknown[]]>): Promise<void> {
+    for (const [table, rows] of kept) {
+      try {
+        await this.localDb.queryUngated(`INSERT INTO ${table} $rows`, { rows });
+        this.logger.info(
+          { table, count: rows.length, Category: 'sp00ky-client::LocalMigrator::provision' },
+          '[Provisioning] Kept local rows across the schema change'
+        );
+      } catch (error) {
+        this.logger.error(
+          { table, count: rows.length, error, Category: 'sp00ky-client::LocalMigrator::provision' },
+          '[Provisioning] Could not restore local rows after the schema change; they are lost'
+        );
+      }
+    }
   }
 
   private async isSchemaUpToDate(hash: string): Promise<boolean> {

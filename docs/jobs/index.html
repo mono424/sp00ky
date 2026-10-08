@@ -158,7 +158,7 @@ update live, and each step links to the job that ran it.</p>
 <p>The job runner is built into the SSP. There is nothing to install or implement:</p>
 <ol>
 <li>
-<p><strong>Pickup is create-only.</strong> Writing a <code>pending</code> row fires an event that hands the job to the runner, which is why <code>db.run()</code> creates a row rather than updating one.</p>
+<p><strong>Pickup is create-only.</strong> Writing a <code>pending</code> row fires an event that hands the job to the runner, which is why <code>db.run()</code> creates a row rather than updating one. With several SSPs, the scheduler names one per event; an SSP that is behind on events still takes jobs when no other is caught up, and runs them as it catches up.</p>
 </li>
 <li>
 <p><strong>The runner is the only writer of <code>status</code>.</strong> Everything else (kill, retry, recovery) goes through guarded statements, so two writers can never disagree about a job’s state.</p>

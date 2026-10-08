@@ -458,7 +458,7 @@ bearer; only <code>/health</code>, <code>/info</code>, <code>/info/text</code> a
 
 <table><thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td><code>GET /logs</code></td><td>Server-sent events of this SSP’s own log lines. <code>?tail=false</code> returns the backfill and closes, <code>?backfill=N</code> sets how much history. This is what the dashboard’s log view reads, proxied by the scheduler</td></tr><tr><td><code>POST /job/kill</code></td><td>Cancel one outbox job: aborts it in flight if this SSP owns it, otherwise flags it so it fails at dequeue</td></tr><tr><td><code>POST /job/retry</code></td><td>Reset a terminal job to <code>pending</code> and re-admit it. Refused with <code>409 not_terminal</code> while it is still running</td></tr><tr><td><code>POST /job/recover</code></td><td>Claim a <code>pending</code> job the recovery sweep found orphaned</td></tr><tr><td><code>POST /crdt/apply</code></td><td>Apply a Loro update to a <code>@crdt</code> field</td></tr><tr><td><code>GET /debug/heartbeat</code></td><td>The last heartbeat sequence this SSP observed, used by the end-to-end latency probe</td></tr><tr><td><code>GET /debug/catchup-rows/:table</code></td><td>Row counts for one table, for drift diagnosis</td></tr><tr><td><code>GET /debug/memory</code></td><td>Circuit memory breakdown</td></tr><tr><td><code>GET /info/text</code></td><td>The same content as <code>/info</code>, formatted for a terminal</td></tr></tbody></table>
 <p>Job kill and retry are normally reached through the cluster, not directly: the
-scheduler broadcasts a kill to every ready SSP and sends a retry to exactly one.
+scheduler broadcasts a kill to every ready or lagging SSP and sends a retry to exactly one.
 See the <a href="/docs/reference/scheduler-api">scheduler API</a> for that side and
 <a href="/docs/jobs">Jobs</a> for what the states mean.</p>
 <h3 id="standalone-maintenance">Standalone maintenance</h3>
@@ -794,13 +794,16 @@ one planned transaction. Existing per-view ingest timings describe a shared
 circuit step and can include lock wait. They do not measure edge publication.
 Timeout logs report statement bytes/count rather than entire SQL batches.</p>
 <h3 id="publication-admission-and-backlog">Publication admission and backlog</h3>
-<p>The native publisher reserves one of 256 slots before ingest side effects or
+<p>The native publisher reserves one of 4,096 slots before ingest side effects or
 circuit evaluation. A slot stays reserved while registration metadata, source
 commit visibility, database publication, or retries are pending. When capacity
 is exhausted, ingest returns HTTP 503 before accepting the event; the scheduler
 retains it in its WAL and delivers it again. A prolonged overload can therefore
 show as lagging while memory use is protected, with explicit bootstrap recovery
-if the scheduler’s replay buffer overflows.</p>
+if the scheduler’s replay buffer overflows. While an SSP is lagging behind a
+<code>publication_backlog</code> refusal, the scheduler retries it within a second rather
+than backing off toward ten, and keeps routing re-registrations of the views it
+already holds to it; only views it does not hold yet wait for a ready SSP.</p>
 <p>A view registration may only take half of the queue: once half the slots, half
 the bytes or half the operations are reserved, <code>/view/register</code> answers 503
 <code>publication_backlog</code> while ingest keeps using the rest. A cold registration

@@ -7,7 +7,7 @@ import {
   onMount,
   type ParentComponent,
 } from 'solid-js';
-import { createStore } from 'solid-js/store';
+import { createStore, reconcile } from 'solid-js/store';
 import {
   DEFAULT_VERSIONS,
   type DevToolsState,
@@ -20,6 +20,11 @@ import {
   type ImpersonationStatus,
   type ImpersonationUser,
   type Sp00kyFrame,
+  type FailedMutation,
+  type PendingMutationRow,
+  type LogEntry,
+  type LogLevelName,
+  type LogRead,
 } from '../types/devtools';
 import { useChromeConnection } from '../hooks/useChromeConnection';
 import { useRunInHostPage } from '../hooks/useRunInHostPage';
@@ -57,6 +62,8 @@ interface DevToolsContextValue {
   setSelectedQueryHash: (hash: number | null) => void;
   setSelectedTable: (table: string | null) => void;
   clearEvents: () => void;
+  /** The toolbar Clear: logs on Logs, mutation history on Mutations, events elsewhere. */
+  clearActive: () => void;
   /**
    * Toolbar Refresh. Scoped to the active tab; `{ full: true }` (Shift+click)
    * refreshes everything. Options bag, not a positional boolean — see the
@@ -104,6 +111,22 @@ interface DevToolsContextValue {
   ) => Promise<void>;
   setFlagOverride: (key: string, variant: string | null) => Promise<void>;
   clearFlagOverrides: () => Promise<void>;
+  // Mutations tab: the tray is a local read on demand; the rest is pushed.
+  failedMutations: () => FailedMutation[] | null;
+  failedMutationsError: () => string | null;
+  fetchFailedMutations: () => Promise<void>;
+  retryFailedMutation: (id: string) => Promise<void>;
+  discardFailedMutation: (id: string) => Promise<void>;
+  /** The stored row (payload + before image) of a still-queued mutation. */
+  fetchPendingMutation: (id: string) => Promise<PendingMutationRow | null>;
+  mutationBusy: () => string | null;
+  // Logs tab: lines accumulate panel-side from pushes plus one backlog pull.
+  logEntries: () => LogEntry[];
+  logsDropped: () => number;
+  logsError: () => string | null;
+  logsLoaded: () => boolean;
+  fetchLogs: () => Promise<void>;
+  setLogCaptureLevel: (level: LogLevelName) => Promise<void>;
   impersonation: () => ImpersonationStatus | null;
   impersonationError: () => string | null;
   /** True while a start/stop is in flight. */
@@ -140,6 +163,8 @@ export const DevToolsProvider: ParentComponent = (props) => {
       tableData: {},
     },
     versions: DEFAULT_VERSIONS,
+    mutations: null,
+    logs: null,
   });
 
   // UI state
@@ -186,6 +211,20 @@ export const DevToolsProvider: ParentComponent = (props) => {
   const [impersonationError, setImpersonationError] = createSignal<string | null>(null);
   const [isImpersonationBusy, setIsImpersonationBusy] = createSignal(false);
   const [mcpStatus, setMcpStatus] = createSignal<McpStatus>({ enabled: false, connected: false, port: 9315 });
+  // Mutations tab: the persistent failed-writes tray, read on demand.
+  const [failedMutations, setFailedMutations] = createSignal<FailedMutation[] | null>(null);
+  const [failedMutationsError, setFailedMutationsError] = createSignal<string | null>(null);
+  const [mutationBusy, setMutationBusy] = createSignal<string | null>(null);
+  // Logs tab. The page pushes small deltas (`SP00KY_LOGS`); the backlog from
+  // before the panel attached comes from one `logOp('read')` pull. `logHead`
+  // is the newest `seq` held, so a push and a pull that overlap never double
+  // a line. A page's seq restarts at 1, so a head going backwards = new page.
+  const MAX_LOG_LINES = 2000;
+  const [logEntries, setLogEntries] = createSignal<LogEntry[]>([]);
+  const [logsDropped, setLogsDropped] = createSignal(0);
+  const [logsError, setLogsError] = createSignal<string | null>(null);
+  const [logsLoaded, setLogsLoaded] = createSignal(false);
+  let logHead = 0;
 
   // Bumped by the toolbar Refresh when the Database tab is active. Read by
   // DatabaseTab's table-list effect and TableView's row-fetch effect. Both are
@@ -400,14 +439,18 @@ export const DevToolsProvider: ParentComponent = (props) => {
         }
         break;
 
-      // BRIDGE_RESPONSE answers message-channel requests: the iframe path of
-      // query rows and row edits.
+      // BRIDGE_RESPONSE answers message-channel requests: mutation/log ops,
+      // and the iframe path of query rows and row edits.
       case 'SP00KY_QUERY_RESPONSE':
       case 'SP00KY_STORAGE_INFO_RESPONSE':
       case 'SP00KY_FLAG_RESPONSE':
       case 'SP00KY_IMPERSONATE_RESPONSE':
       case 'SP00KY_BRIDGE_RESPONSE':
         settlePending(message as any);
+        break;
+
+      case 'SP00KY_LOGS':
+        appendLogs(message.entries ?? [], message.head ?? 0);
         break;
 
       case 'MCP_STATUS':
@@ -430,6 +473,7 @@ export const DevToolsProvider: ParentComponent = (props) => {
         setFlagsError(null);
         setImpersonation(null);
         setImpersonationError(null);
+        resetMutationsAndLogs();
         setTimeout(() => {
           checkSp00ky();
         }, 500);
@@ -543,6 +587,8 @@ export const DevToolsProvider: ParentComponent = (props) => {
     setStorageInfoError(null);
     setFlagsSnapshot(null);
     setFlagsError(null);
+    setState('mutations', null);
+    resetMutationsAndLogs();
     // In-flight requests were addressed to the previous frame; their responses
     // are filtered out on arrival, so settle them here or they leak forever.
     pendingQueries.forEach(({ reject }) => reject('Switched to another frame'));
@@ -605,6 +651,50 @@ export const DevToolsProvider: ParentComponent = (props) => {
     if (frontendState.versions) {
       setState('versions', frontendState.versions);
     }
+
+    // Replaced, not merged: an optional field (`lastError`) that disappears
+    // must disappear here too. Keyed by id so unchanged rows keep their DOM.
+    if (frontendState.mutations !== undefined) {
+      setState('mutations', reconcile(frontendState.mutations));
+    }
+    if (frontendState.logs !== undefined) {
+      setState('logs', frontendState.logs);
+      // The page restarted its buffer (reload, or an iframe's new document).
+      if (frontendState.logs && frontendState.logs.head < logHead) resetLogs();
+    }
+  }
+
+  function resetLogs() {
+    logHead = 0;
+    setLogEntries([]);
+    setLogsDropped(0);
+    setLogsError(null);
+    setLogsLoaded(false);
+  }
+
+  function resetMutationsAndLogs() {
+    setFailedMutations(null);
+    setFailedMutationsError(null);
+    resetLogs();
+  }
+
+  function trimLogs(lines: LogEntry[]): LogEntry[] {
+    return lines.length > MAX_LOG_LINES ? lines.slice(lines.length - MAX_LOG_LINES) : lines;
+  }
+
+  /** A pushed delta. Lines the panel already holds (from the pull) are skipped. */
+  function appendLogs(entries: LogEntry[], head: number) {
+    if (head < logHead) resetLogs();
+    const fresh = entries.filter((e) => e.seq > logHead);
+    if (fresh.length === 0) return;
+    // A hole between what we hold and this push: the ring overwrote lines
+    // before they could be pushed (only possible while a pull is outstanding
+    // or after a long stall). Count them rather than pretend continuity.
+    if (logHead > 0 && fresh[0].seq > logHead + 1) {
+      setLogsDropped((n) => n + fresh[0].seq - logHead - 1);
+    }
+    logHead = fresh[fresh.length - 1].seq;
+    setLogEntries((prev) => trimLogs(prev.concat(fresh)));
   }
 
   /**
@@ -702,6 +792,21 @@ export const DevToolsProvider: ParentComponent = (props) => {
     setState('events', []);
   }
 
+  function clearActive() {
+    switch (activeTab()) {
+      case 'logs':
+        void clearLogs();
+        break;
+      case 'mutations':
+        void devtoolsOpRequest('mutation', 'clearHistory').catch((e) =>
+          console.error('[DevTools] Clearing mutation history failed:', e)
+        );
+        break;
+      default:
+        clearEvents();
+    }
+  }
+
   /**
    * The toolbar Refresh. Scoped to the active tab; Shift+click does everything.
    *
@@ -781,6 +886,15 @@ export const DevToolsProvider: ParentComponent = (props) => {
         // Otherwise requested exactly once, at onConnect — so a bridge that
         // connects after the panel opened shows a stale badge until reopen.
         sendMessage({ type: 'GET_MCP_STATUS' });
+        break;
+      case 'mutations':
+        // The outbox rides the baseline; the tray is a local read.
+        void fetchFailedMutations();
+        break;
+      case 'logs':
+        // New lines are pushed; this re-reads the backlog (after a Clear
+        // elsewhere, or once the capture level changed).
+        void fetchLogs();
         break;
       default: {
         // Adding a TabType member without deciding what Refresh does for it is
@@ -1228,6 +1342,130 @@ export const DevToolsProvider: ParentComponent = (props) => {
     return result;
   };
 
+  /**
+   * Mutations / Logs ops: same request-response contract as the Access tab's,
+   * over one channel (`SP00KY_OP`) whose `method` picks the page dispatcher.
+   * The answer is the dispatcher's own `{ success, ... }` object.
+   */
+  const devtoolsOpRequest = (target: 'mutation' | 'log', op: string, args?: Record<string, unknown>) => {
+    const method = target === 'mutation' ? 'mutationOp' : 'logOp';
+    return new Promise<any>((resolve, reject) => {
+      const requestId = Math.random().toString(36).substring(7);
+      const timeoutId = setTimeout(() => {
+        if (pendingQueries.has(requestId)) {
+          pendingQueries.delete(requestId);
+          reject(`${method} ${op} timed out (30s)`);
+        }
+      }, 30000);
+      pendingQueries.set(requestId, {
+        resolve: (data) => {
+          clearTimeout(timeoutId);
+          resolve(data);
+        },
+        reject: (err) => {
+          clearTimeout(timeoutId);
+          reject(err || `${method} ${op} failed`);
+        },
+      });
+
+      if (!isMainFrame()) {
+        sendMessage({ type: 'PAGE_OP', payload: { method, op, requestId, args } } as any);
+        return;
+      }
+      hostPage.devtoolsOp(
+        method,
+        op,
+        requestId,
+        args,
+        (result) => {
+          if (result && !result.success) {
+            clearTimeout(timeoutId);
+            pendingQueries.delete(requestId);
+            reject(result.error || `Failed to dispatch ${method}`);
+          }
+        },
+        (err) => {
+          clearTimeout(timeoutId);
+          pendingQueries.delete(requestId);
+          reject(err instanceof Error ? err.message : String(err));
+        }
+      );
+    });
+  };
+
+  const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  const fetchFailedMutations = async () => {
+    try {
+      const result = await devtoolsOpRequest('mutation', 'listFailed');
+      setFailedMutations((result?.failed ?? []) as FailedMutation[]);
+      setFailedMutationsError(null);
+    } catch (e) {
+      setFailedMutationsError(errText(e));
+    }
+  };
+
+  /** Retry re-applies the write as a new optimistic mutation; both drop the tray row. */
+  const trayAction = async (op: 'retry' | 'discard', id: string) => {
+    if (mutationBusy()) return;
+    setMutationBusy(id);
+    try {
+      await devtoolsOpRequest('mutation', op, { id });
+      setFailedMutationsError(null);
+    } catch (e) {
+      setFailedMutationsError(errText(e));
+    } finally {
+      setMutationBusy(null);
+      await fetchFailedMutations();
+    }
+  };
+
+  const fetchPendingMutation = async (id: string) => {
+    const result = await devtoolsOpRequest('mutation', 'get', { id });
+    return (result?.row ?? null) as PendingMutationRow | null;
+  };
+
+  const fetchLogs = async () => {
+    try {
+      const r = (await devtoolsOpRequest('log', 'read', { after: 0 })) as LogRead;
+      // Lines pushed while the pull was in flight are newer than its head; an
+      // older head means a different page, whose lines are not ours to keep.
+      setLogEntries((prev) => {
+        const kept = r.head >= logHead ? prev.filter((e) => e.seq > r.head) : [];
+        logHead = Math.max(r.head, kept.length ? kept[kept.length - 1].seq : 0);
+        return trimLogs(r.entries.concat(kept));
+      });
+      setLogsDropped(r.dropped);
+      setState('logs', { head: r.head, consoleLevel: r.consoleLevel, captureLevel: r.captureLevel });
+      setLogsError(null);
+    } catch (e) {
+      setLogsError(errText(e));
+    } finally {
+      setLogsLoaded(true);
+    }
+  };
+
+  const clearLogs = async () => {
+    try {
+      const r = await devtoolsOpRequest('log', 'clear');
+      logHead = Math.max(logHead, r?.head ?? 0);
+      setLogEntries([]);
+      setLogsDropped(0);
+    } catch (e) {
+      setLogsError(errText(e));
+    }
+  };
+
+  const setLogCaptureLevel = async (level: LogLevelName) => {
+    try {
+      const r = await devtoolsOpRequest('log', 'setCaptureLevel', { level });
+      if (state.logs) setState('logs', 'captureLevel', r?.captureLevel ?? level);
+      setLogsError(null);
+    } catch (e) {
+      setLogsError(errText(e));
+    }
+  };
+
   const fetchImpersonation = async () => {
     try {
       const status = await impersonateOpRequest('status');
@@ -1512,6 +1750,7 @@ export const DevToolsProvider: ParentComponent = (props) => {
     setSelectedQueryHash,
     setSelectedTable,
     clearEvents,
+    clearActive,
     refresh,
     isRefreshing,
     dbRefreshNonce,
@@ -1539,6 +1778,19 @@ export const DevToolsProvider: ParentComponent = (props) => {
     setFlagUserVariant,
     setFlagOverride,
     clearFlagOverrides,
+    failedMutations,
+    failedMutationsError,
+    fetchFailedMutations,
+    retryFailedMutation: (id: string) => trayAction('retry', id),
+    discardFailedMutation: (id: string) => trayAction('discard', id),
+    fetchPendingMutation,
+    mutationBusy,
+    logEntries,
+    logsDropped,
+    logsError,
+    logsLoaded,
+    fetchLogs,
+    setLogCaptureLevel,
     impersonation,
     impersonationError,
     isImpersonationBusy,

@@ -28,6 +28,15 @@ The data is invented, for a fictional team-chat app.
 One entry per tab, each naming the tab button to click. Keep the list in step
 with `Tabs.tsx`: a tab added there and not here simply goes undocumented.
 
+## `serve.mjs`
+
+The same harness in a normal browser, for working on the panel without an app:
+
+```bash
+pnpm --filter @spooky-sync/devtools build
+node apps/devtools/screenshots/serve.mjs   # http://localhost:4320/
+```
+
 ## When the panel changes
 
 - **A tab was added, renamed or removed.** Edit `SHOTS`, then add the image to

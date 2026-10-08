@@ -1,5 +1,6 @@
 import type { LocalStore, RemoteDatabaseService } from '../../services/database/index';
-import type { Logger } from '../../services/logger/index';
+import type { Level } from 'pino';
+import type { LogRead, LogTap, Logger } from '../../services/logger/index';
 import type { SchemaStructure } from '@spooky-sync/query-builder';
 import { RecordId } from 'surrealdb';
 import type { StreamUpdate, StreamUpdateReceiver } from '../../services/stream-processor/index';
@@ -13,7 +14,15 @@ export interface DevToolsEvent {
   payload: any;
 }
 
-import type { QueryState, QueryTimings } from '../../types';
+import type { MutationEventType, QueryState, QueryTimings } from '../../types';
+import type { ClientState } from '../../state/client-state';
+import {
+  parsePendingRow,
+  parseStoredRecordId,
+  storedIdString,
+  type FailedMutationRow,
+  type PendingMutationRow,
+} from '../../mutation/rows';
 import type {
   AuthService,
   ActiveImpersonation,
@@ -29,6 +38,13 @@ import {
 } from './versions';
 import { walkOpfs, type BlobCacheInfo, type SharedTabsInfo, type StorageInfo } from './storage-info';
 import { FlagsAdminService, type LocalOverrideStore } from './flags';
+import {
+  buildMutationsState,
+  queuedAtOf,
+  trimHistory,
+  type DevToolsMutationsState,
+  type MutationHistoryEntry,
+} from './mutations';
 
 // Real bundled frontend versions, injected at build time by tsdown's
 // version-define plugin (see tsdown.config.ts). The `typeof` guard keeps these
@@ -50,6 +66,28 @@ export interface DevToolsQuerySource {
 }
 
 export type ImpersonationOp = 'status' | 'listUsers' | 'start' | 'stop';
+
+/** What the Mutations tab reads and does; the client wires it to the runtime. */
+export interface DevToolsMutationSource {
+  state(): ClientState;
+  listFailed(): Promise<FailedMutationRow[]>;
+  retryFailed(mutationId: string): Promise<boolean>;
+  discardFailed(mutationId: string): Promise<boolean>;
+}
+
+export type MutationOp = 'listFailed' | 'get' | 'retry' | 'discard' | 'clearHistory';
+
+export interface MutationOpResult {
+  success: boolean;
+  error?: string;
+  failed?: FailedMutationRow[];
+  /** `get`: the stored outbox row, or null once it left the outbox. */
+  row?: PendingMutationRow | null;
+}
+
+export type LogOp = 'read' | 'setCaptureLevel' | 'clear';
+
+export type LogOpResult = { success: boolean; error?: string } & Partial<LogRead>;
 
 export interface ImpersonationOpResult {
   success: boolean;
@@ -104,6 +142,38 @@ export class DevToolsService implements StreamUpdateReceiver {
   /** Blob cache counters for the panel, wired by Sp00kyClient. */
   private blobInfoProvider: (() => BlobCacheInfo) | null = null;
 
+  /** Outbox, debounced writes and the failed tray, wired by Sp00kyClient. */
+  private mutationSource: DevToolsMutationSource | null = null;
+  /**
+   * Mutations seen since a consumer attached, by id, oldest first. The outbox
+   * only knows what is still queued; this is what lets the panel show a write
+   * as synced or rolled back after it left.
+   */
+  private mutationHistory = new Map<string, MutationHistoryEntry>();
+  private static readonly MUTATIONS_CAP = 200;
+
+  setMutationSource(source: DevToolsMutationSource): void {
+    this.mutationSource = source;
+  }
+
+  /**
+   * The page's log buffer. It records whether or not anybody is watching (so
+   * a panel opened late still sees the boot); while a consumer is attached,
+   * new lines go out as small `SP00KY_LOGS` deltas, never inside the state
+   * push, which would re-serialize the whole buffer every time.
+   */
+  private logTap: LogTap | null = null;
+  /** `seq` of the newest line already pushed. */
+  private logCursor = 0;
+  private logTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastLogPushAt = 0;
+
+  setLogTap(tap: LogTap): void {
+    this.logTap = tap;
+    this.logCursor = tap.head;
+    tap.subscribe(() => this.scheduleLogPush());
+  }
+
   setBlobInfoProvider(provider: () => BlobCacheInfo): void {
     this.blobInfoProvider = provider;
   }
@@ -152,6 +222,9 @@ export class DevToolsService implements StreamUpdateReceiver {
         const type = (e.data as { type?: string } | undefined)?.type;
         if (type === 'SP00KY_DEVTOOLS_CONNECT') {
           this.enabled = true;
+          // The consumer pulls the backlog itself (`logOp('read')`); pushes
+          // carry only what arrives after this point.
+          this.logCursor = this.logTap?.head ?? 0;
           this.refreshLocalTables();
           this.notifyDevTools();
         } else if (type === 'SP00KY_DEVTOOLS_DISCONNECT') {
@@ -322,6 +395,7 @@ export class DevToolsService implements StreamUpdateReceiver {
   public onMutation(payload: any[]) {
     const payloads = payload;
     payloads.forEach((p) => {
+      this.recordQueued(p);
       this.addEvent('MUTATION_REQUEST_EXECUTION', {
         mutation: {
           type: p.type ?? 'create',
@@ -333,6 +407,166 @@ export class DevToolsService implements StreamUpdateReceiver {
       });
     });
     this.notifyDevTools();
+  }
+
+  /** A write entered the outbox. */
+  private recordQueued(p: any): void {
+    if (!this.enabled || !p?.mutation_id) return;
+    const id = storedIdString(p.mutation_id);
+    const recordId = p.record_id ? encodeRecordId(p.record_id) : '';
+    this.mutationHistory.set(id, {
+      id,
+      op: (p.type ?? 'create') as MutationEventType,
+      recordId,
+      table: typeof p.tableName === 'string' ? p.tableName : recordId.split(':')[0],
+      fields: p.data && typeof p.data === 'object' ? Object.keys(p.data) : [],
+      queuedAt: queuedAtOf(id) || Date.now(),
+    });
+    trimHistory(this.mutationHistory, DevToolsService.MUTATIONS_CAP);
+  }
+
+  /** The server answered a write: accepted (`synced`) or rejected (`rolled-back`). */
+  public onMutationOutcome(e: {
+    mutationId: string;
+    recordId: string;
+    eventType: string;
+    status: 'synced' | 'rolled-back';
+    error?: string;
+  }): void {
+    if (!this.enabled) return;
+    const prev = this.mutationHistory.get(e.mutationId);
+    this.mutationHistory.set(e.mutationId, {
+      ...(prev ?? {
+        id: e.mutationId,
+        op: e.eventType as MutationEventType,
+        recordId: e.recordId,
+        table: e.recordId.split(':')[0],
+        queuedAt: queuedAtOf(e.mutationId),
+      }),
+      outcome: { status: e.status, at: Date.now(), error: e.error },
+    });
+    trimHistory(this.mutationHistory, DevToolsService.MUTATIONS_CAP);
+    this.addEvent(e.status === 'synced' ? 'MUTATION_SYNCED' : 'MUTATION_ROLLED_BACK', {
+      mutationId: e.mutationId,
+      recordId: e.recordId,
+      type: e.eventType,
+      error: e.error,
+    });
+    this.notifyDevTools();
+  }
+
+  /** Outbox, tray or sync health moved: re-push so the Mutations tab follows. */
+  public onMutationsChanged(): void {
+    this.notifyDevTools();
+  }
+
+  private mutationsState(): DevToolsMutationsState | null {
+    const source = this.mutationSource;
+    if (!source) return null;
+    const s = source.state();
+    return buildMutationsState({
+      outbox: s.outbox,
+      pendingWrites: s.pendingWrites.values(),
+      failedCount: s.failedCount,
+      tabRole: s.tabRole,
+      health: s.sync.health,
+      history: this.mutationHistory.values(),
+      cap: DevToolsService.MUTATIONS_CAP,
+    });
+  }
+
+  /**
+   * The Mutations tab's on-demand half: the failed tray (a local read), one
+   * queued row's payload, and the tray's retry / discard.
+   */
+  public async mutationOp(op: MutationOp, args: Record<string, unknown>): Promise<MutationOpResult> {
+    const source = this.mutationSource;
+    if (!source) return { success: false, error: 'this client does not expose its mutations' };
+    const id = String(args.id ?? '');
+    try {
+      switch (op) {
+        case 'listFailed':
+          return this.serializeForDevTools({ success: true, failed: await source.listFailed() });
+        case 'get': {
+          const res = await this.databaseService.query<any>('SELECT * FROM $ids', {
+            ids: [parseStoredRecordId(id)],
+          });
+          const raw = Array.isArray(res?.[0]) ? res[0][0] : undefined;
+          return this.serializeForDevTools({ success: true, row: raw ? parsePendingRow(raw) : null });
+        }
+        case 'retry':
+          return (await source.retryFailed(id))
+            ? { success: true }
+            : { success: false, error: `${id} is not in the failed tray` };
+        case 'discard':
+          return (await source.discardFailed(id))
+            ? { success: true }
+            : { success: false, error: `${id} is not in the failed tray` };
+        case 'clearHistory':
+          this.mutationHistory.clear();
+          this.notifyDevTools();
+          return { success: true };
+        default:
+          return { success: false, error: `Unknown mutation op: ${String(op)}` };
+      }
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** The Logs tab: read the buffer, change what it records, empty it. */
+  public logOp(op: LogOp, args: Record<string, unknown>): LogOpResult {
+    const tap = this.logTap;
+    if (!tap) return { success: false, error: 'this client does not capture its logs' };
+    try {
+      switch (op) {
+        case 'read': {
+          const limit = typeof args.limit === 'number' ? args.limit : undefined;
+          return { success: true, ...tap.read(Number(args.after ?? 0), limit) };
+        }
+        case 'setCaptureLevel':
+          tap.setCaptureLevel(String(args.level) as Level);
+          this.notifyDevTools();
+          return { success: true, captureLevel: tap.captureLevel, consoleLevel: tap.consoleLevel };
+        case 'clear':
+          tap.clear();
+          return { success: true, head: tap.head };
+        default:
+          return { success: false, error: `Unknown log op: ${String(op)}` };
+      }
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** Same coalescing as {@link notifyDevTools}, for the log delta channel. */
+  private scheduleLogPush(): void {
+    if (!this.enabled || typeof window === 'undefined' || this.logTimer !== null) return;
+    const waited = Date.now() - this.lastLogPushAt;
+    const delay = Math.max(0, DevToolsService.NOTIFY_MIN_INTERVAL_MS - waited);
+    this.logTimer = setTimeout(() => {
+      this.logTimer = null;
+      if (this.enabled) this.flushLogs();
+    }, delay);
+  }
+
+  private flushLogs(): void {
+    const tap = this.logTap;
+    if (!tap) return;
+    this.lastLogPushAt = Date.now();
+    const delta = tap.read(this.logCursor);
+    this.logCursor = delta.head;
+    if (delta.entries.length === 0) return;
+    window.postMessage(
+      {
+        type: 'SP00KY_LOGS',
+        source: 'sp00ky-devtools-page',
+        entries: delta.entries,
+        head: delta.head,
+        dropped: delta.dropped,
+      },
+      '*'
+    );
   }
 
   private hashString(str: string): number {
@@ -447,6 +681,18 @@ export class DevToolsService implements StreamUpdateReceiver {
         // Shared-tabs role state (null when the feature is off / fell back).
         tabs: this.tabsInfoProvider?.() ?? null,
       },
+      // Outbox, debounced writes, tray count and recent outcomes. Small by
+      // construction (capped entries, field names only, never payloads).
+      mutations: this.mutationsState(),
+      // Log buffer metadata only; the lines travel as `SP00KY_LOGS` deltas and
+      // through `logOp('read')`.
+      logs: this.logTap
+        ? {
+            head: this.logTap.head,
+            consoleLevel: this.logTap.consoleLevel,
+            captureLevel: this.logTap.captureLevel,
+          }
+        : null,
     });
   }
 
@@ -701,6 +947,9 @@ export class DevToolsService implements StreamUpdateReceiver {
         // nothing here grants anything.
         impersonationOp: (op: ImpersonationOp, args?: Record<string, unknown>) =>
           this.impersonationOp(op, args ?? {}),
+        // ---- Mutations + Logs tabs ---------------------------------------
+        mutationOp: (op: MutationOp, args?: Record<string, unknown>) => this.mutationOp(op, args ?? {}),
+        logOp: (op: LogOp, args?: Record<string, unknown>) => this.logOp(op, args ?? {}),
         setFlagEnabled: (key: string, enabled: boolean) =>
           this.flagsAdmin.setFlagEnabled(key, enabled),
         setFlagUserVariant: (key: string, variant: string, remove: boolean, userId?: string) =>

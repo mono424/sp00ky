@@ -3296,3 +3296,214 @@ body {
   border-color: var(--sys-color-warning);
   color: var(--sys-color-warning);
 }
+
+/* ============================================================
+   Mutations + Logs tabs. Both reuse the Queries tab shell
+   (.queries-container / .queries-body / .qt-table / status bar)
+   and add a Chrome-network-style filter row on top.
+   ============================================================ */
+.mt-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--sys-color-divider);
+  background: var(--sys-color-surface);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.mt-toolbar .filter-chip {
+  padding: 1px 8px;
+  gap: 5px;
+}
+.mt-filter {
+  flex: none;
+  width: 170px;
+}
+.chip-count {
+  font-family: var(--sys-typescale-monospace-font);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  opacity: 0.75;
+}
+.filter-chip.danger {
+  color: var(--sys-color-error);
+}
+.filter-chip.danger.active {
+  background: color-mix(in srgb, var(--sys-color-error) 18%, transparent);
+  border-color: var(--sys-color-error);
+}
+
+.qt-table th.mt-col-record {
+  width: 30%;
+}
+.qt-table-wrap.collapsed .qt-table th.mt-col-record {
+  width: auto;
+}
+.qt-table th.mt-col-op {
+  width: 62px;
+}
+.qt-table th.mt-col-status {
+  width: 108px;
+}
+.qt-table th.mt-col-num {
+  width: 64px;
+}
+.qt-table th.mt-col-time {
+  width: 96px;
+}
+.qt-table th.mt-col-actions {
+  width: 140px;
+}
+
+.op-badge {
+  display: inline-block;
+  font-family: var(--sys-typescale-monospace-font);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.op-badge.op-create {
+  color: var(--sys-color-state-on);
+}
+.op-badge.op-update {
+  color: var(--sys-color-info);
+}
+.op-badge.op-delete {
+  color: var(--sys-color-error);
+}
+
+.mt-actions {
+  display: inline-flex;
+  gap: 4px;
+}
+.mt-btn {
+  min-height: 16px;
+  padding: 0 7px;
+  border: 1px solid var(--sys-color-outline);
+}
+.mt-sync-warn {
+  color: var(--sys-color-warning);
+}
+
+/* Logs */
+.log-capture {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  color: var(--sys-color-on-surface-subtle);
+}
+.log-chip.log-warn.active {
+  color: var(--sys-color-warning);
+  border-color: var(--sys-color-warning);
+  background: color-mix(in srgb, var(--sys-color-warning) 12%, transparent);
+}
+.log-chip.log-error.active {
+  color: var(--sys-color-error);
+  border-color: var(--sys-color-error);
+  background: color-mix(in srgb, var(--sys-color-error) 12%, transparent);
+}
+.log-notice {
+  flex: none;
+  padding: 3px 10px;
+  font-size: 10px;
+  color: var(--sys-color-on-surface-subtle);
+  border-bottom: 1px solid var(--sys-color-divider);
+}
+.log-notice.error {
+  color: var(--sys-color-error);
+}
+.log-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--sys-color-surface-container-low, var(--sys-color-surface));
+  font-family: var(--sys-typescale-monospace-font);
+  font-size: var(--sys-typescale-monospace-size);
+  line-height: var(--sys-typescale-monospace-line-height);
+}
+.log-row {
+  border-bottom: 1px solid var(--sys-color-outline-variant);
+}
+.log-row.log-warn {
+  background: color-mix(in srgb, var(--sys-color-warning) 9%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--sys-color-warning) 25%, transparent);
+}
+.log-row.log-error {
+  background: color-mix(in srgb, var(--sys-color-error) 9%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--sys-color-error) 25%, transparent);
+}
+.log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 1px 8px 1px 4px;
+  cursor: pointer;
+  min-width: 0;
+}
+.log-line:hover {
+  background: var(--sys-color-state-hover);
+}
+.log-caret {
+  flex: none;
+  width: 10px;
+  color: var(--sys-color-on-surface-subtle);
+}
+.log-time {
+  flex: none;
+  color: var(--sys-color-on-surface-subtle);
+  font-variant-numeric: tabular-nums;
+}
+.log-level {
+  flex: none;
+  width: 38px;
+  text-transform: uppercase;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--sys-color-on-surface-subtle);
+}
+.log-row.log-info .log-level {
+  color: var(--sys-color-info);
+}
+.log-row.log-warn .log-level,
+.log-row.log-warn .log-msg {
+  color: var(--sys-color-warning);
+}
+.log-row.log-error .log-level,
+.log-row.log-error .log-msg {
+  color: var(--sys-color-error);
+}
+.log-row.log-trace .log-msg,
+.log-row.log-debug .log-msg {
+  color: var(--sys-color-on-surface-subtle);
+}
+.log-category {
+  flex: 0 1 auto;
+  max-width: 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--sys-color-on-surface-variant);
+}
+.log-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--sys-color-on-surface);
+}
+.log-extra,
+.log-raw {
+  margin: 0 8px 6px 26px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.log-follow {
+  min-height: 14px;
+  padding: 0 6px;
+  font-size: 10px;
+  color: var(--sys-color-primary);
+}

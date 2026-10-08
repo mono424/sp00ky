@@ -54,6 +54,10 @@ Controls the verbosity of logging output:
 - `'error'`: Critical failures
 - `'fatal'`: Fatal errors that stop execution
 
+This is what the console prints. The page also keeps its last 500 lines for the
+[DevTools Logs tab](/docs/reference/devtools), which can record below this
+level (say, `debug`) for one tab session without printing more to the console.
+
 #### `persistenceClient`
 
 Determines where small metadata values (the auth token, the stream

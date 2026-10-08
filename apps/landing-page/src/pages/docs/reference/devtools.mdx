@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: DevTools extension
-description: 'The Chrome DevTools panel for Sp00ky apps: live queries and their timings, the local cache, storage health, sessions, feature flags, impersonation, stack versions and the client event log.'
+description: 'The Chrome DevTools panel for Sp00ky apps: live queries and their timings, the mutation queue and failed writes, the client logs, the local cache, storage health, sessions, feature flags, impersonation, stack versions and the event log.'
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -10,8 +10,9 @@ import Screenshot from '../../../components/ui/Screenshot.astro';
 
 Sp00ky ships a Chrome DevTools extension. It adds a panel called **00** next to
 Elements and Network, and it inspects the live client in the page you have open:
-the queries it is running, what they cost, what is in the local cache, who the
-session belongs to, and what the backend it is talking to is running.
+the queries it is running, the writes still on their way to the server, what the
+client logged, what is in the local cache, who the session belongs to, and what
+the backend it is talking to is running.
 
 It works against a deployed app exactly as it does against `localhost`. Nothing
 is compiled out of a production build, so the panel that explains a slow query
@@ -70,7 +71,8 @@ Every tab shares one toolbar.
 - **Refresh** re-reads what the tab you are on actually shows: the table list
   on Database, the flags on Access, version discovery on Stack. Shift-click
   refreshes everything.
-- **Clear** empties the event log.
+- **Clear** empties the log on Logs, the mutation history on Mutations, and
+  the event log everywhere else.
 
 ## Queries
 
@@ -98,6 +100,52 @@ The detail panel has four sections, and hides the ones a query has nothing for:
 
 Rows are fetched only when you open the Data section. The state the page pushes
 carries counts and capped ids, never the full result set of every live query.
+
+## Mutations
+
+Every write the client made, from the moment it is queued until the server
+answers. A write is applied locally at once and drained to the server in the
+background; this tab is where you watch the second half.
+
+The chips along the top switch the view:
+
+| View        | Shows                                                                                         |
+| ----------- | --------------------------------------------------------------------------------------------- |
+| All         | The outbox plus every write that left it since the panel attached, newest first.               |
+| Queued      | `pending` (not answered yet) and `retrying` (a push failed and it is backing off).             |
+| Synced      | Accepted by the server, with how long that took.                                               |
+| Rolled back | Rejected by the server. The local change was undone and the write moved to the failed tray.    |
+| Failed tray | Every rejected write still in the tray, from any session, with **Retry** and **Discard**.      |
+| Debounced   | `{ debounced: true }` updates still waiting for their flush, and whether they survive a reload. |
+
+Click a write for its detail: the mutation id, timing, push attempts, the
+server's error for a rejected one, and the payload with the row it reverts to.
+A queued write's payload is read from the outbox only when you open it; a synced
+one's is gone, so look at the record itself on the Database tab.
+
+The status bar says first whether anything can drain at all: a **follower** tab
+never pushes (the leader tab does it for every tab), and a disconnected or
+degraded socket holds the queue until it recovers.
+
+**Retry** re-applies a rejected write as a new optimistic write and drops it
+from the tray; **Discard** drops it and leaves the local change undone. These
+are the same `retryFailedMutation` and `discardFailedMutation` the client
+exposes to your app.
+
+## Logs
+
+What the client's own logger wrote, oldest first. Each line shows its time,
+level, category and message; click it for the structured fields it was logged
+with (an error keeps its message and stack).
+
+The page keeps its last 500 lines whether or not the panel is open, so opening
+DevTools after a failed boot still shows the boot. Filter by level with the
+chips, by category with the dropdown, or by any text in the line.
+
+**Record** sets what the page captures. The console keeps printing at the
+`logLevel` from your client config; lowering **Record** to `debug` captures the
+debug lines for the panel without flooding the console. The choice holds for
+the tab's session, so a reload records its boot at that level too.
 
 ## Timing
 
@@ -234,8 +282,8 @@ The panel can hand the same state to an AI assistant.
 With the bridge enabled, [`@spooky-sync/devtools-mcp`](/docs/reference/mcp)
 connects over a local WebSocket and exposes the tab's state as MCP tools:
 `get_state`, `run_query`, `list_tables`, `get_table_data`, `get_active_queries`,
-`get_events`, `get_auth_state`, `update_table_row`, `delete_table_row`,
-`clear_history` and `list_connections`. The assistant then sees the _exact_
+`get_mutations`, `get_logs`, `get_events`, `get_auth_state`,
+`update_table_row`, `delete_table_row`, `clear_history` and `list_connections`. The assistant then sees the _exact_
 state your tab has, the same local cache, the same live queries, the same auth,
 rather than a fresh connection to the database.
 
@@ -263,6 +311,8 @@ before you use them against something that matters:
 | Action                                | Scope                                                          |
 | ------------------------------------- | -------------------------------------------------------------- |
 | Editing or deleting a row on Database | Writes to the selected source, local or remote.                |
+| Failed tray **Retry** / **Discard**   | Re-queues the write, or drops it for good.                     |
+| Logs **Record** level                 | What this tab captures for the session. The console is unchanged. |
 | Flag **Override**                     | This browser only. Never sent to the server.                   |
 | Flag enable / allowlist               | Every user, live.                                              |
 | Start / stop impersonation            | The page's session, audited and time-limited.                  |

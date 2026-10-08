@@ -250,6 +250,8 @@ async function handleBridgeRequest(msg: any) {
     updateTableRow: 'UPDATE_TABLE_ROW',
     deleteTableRow: 'DELETE_TABLE_ROW',
     clearHistory: 'CLEAR_HISTORY',
+    // `{ method: 'mutationOp' | 'logOp', op, args }`, answered by page-script.
+    pageOp: 'PAGE_OP',
   };
 
   const msgType = methodToType[method];

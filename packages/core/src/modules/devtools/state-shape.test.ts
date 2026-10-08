@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { RecordId } from 'surrealdb';
 import { DevToolsService } from './index';
+import { initialHealth } from '../../state/client-state';
+import { LogTap, createLogger } from '../../services/logger/index';
+
+// Vitest runs in node, where `pino` resolves to its node build and ignores the
+// `browser` options the tap hangs off. Apps bundle the browser build.
+// The specifier is widened to `string`: pino ships no types for that entry.
+vi.mock('pino', async () => ({ default: (await import('pino/browser.js' as string)).default }));
 
 /**
  * The pushed state used to carry every view's full record set (and both
@@ -145,5 +152,111 @@ describe('DevTools pushed state shape', () => {
     vi.setSystemTime(Date.now() + 60_000);
     fakeWindow.__00__.getState();
     expect(infoQueries.filter((q) => q.includes('INFO FOR DB')).length).toBe(connectRefreshes + 1);
+  });
+});
+
+describe('DevTools mutations and logs', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  const mutationState = (): any => ({
+    outbox: [
+      {
+        id: '_00_pending_mutations:0000000001000_0001_t',
+        type: 'create',
+        recordId: 'thread:a',
+        table: 'thread',
+        status: 'pending',
+        ackedAt: null,
+        attempts: 0,
+      },
+    ],
+    pendingWrites: new Map(),
+    failedCount: 1,
+    tabRole: 'solo',
+    sync: { health: initialHealth('connected') },
+  });
+
+  it('pushes the outbox and what already left it', async () => {
+    vi.useFakeTimers();
+    const { service, statePushes } = harness(0);
+    service.setMutationSource({
+      state: mutationState,
+      listFailed: async () => [],
+      retryFailed: async () => true,
+      discardFailed: async () => false,
+    });
+    service.onMutation([
+      {
+        type: 'update',
+        mutation_id: new RecordId('_00_pending_mutations', '0000000002000_0002_t'),
+        record_id: new RecordId('thread', 'b'),
+        data: { title: 'a very long payload the push must not carry' },
+        tableName: 'thread',
+      },
+    ]);
+    service.onMutationOutcome({
+      mutationId: '_00_pending_mutations:0000000002000_0002_t',
+      recordId: 'thread:b',
+      eventType: 'update',
+      status: 'rolled-back',
+      error: 'denied',
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    const m = statePushes().at(-1).state.mutations;
+    expect(m.counts).toMatchObject({ pending: 1, rolledBack: 1, failed: 1 });
+    expect(m.entries[0]).toMatchObject({
+      recordId: 'thread:b',
+      status: 'rolled-back',
+      error: 'denied',
+      fields: ['title'],
+      queuedAt: 2000,
+    });
+    expect(JSON.stringify(m)).not.toContain('very long payload');
+  });
+
+  it('answers the tray ops, with a reason when the row is gone', async () => {
+    const { service, fakeWindow } = harness(0);
+    service.setMutationSource({
+      state: mutationState,
+      listFailed: async () => [],
+      retryFailed: async () => true,
+      discardFailed: async () => false,
+    });
+    expect(await fakeWindow.__00__.mutationOp('retry', { id: 'm1' })).toEqual({ success: true });
+    expect(await fakeWindow.__00__.mutationOp('discard', { id: 'm1' })).toMatchObject({
+      success: false,
+      error: expect.stringContaining('not in the failed tray'),
+    });
+    expect(await fakeWindow.__00__.mutationOp('listFailed')).toEqual({ success: true, failed: [] });
+  });
+
+  it('pushes new log lines as deltas and keeps them out of the state', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { service, posted, fakeWindow } = harness(0);
+    const tap = new LogTap('info');
+    const logger = createLogger('info', undefined, tap);
+    logger.info('before attach');
+    service.setLogTap(tap);
+    logger.warn('one');
+    logger.info('two');
+    await vi.advanceTimersByTimeAsync(300);
+    const pushes = posted.filter((m) => m.type === 'SP00KY_LOGS');
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0].entries.map((e: any) => e.msg)).toEqual(['one', 'two']);
+    expect(fakeWindow.__00__.getState().logs).toEqual({ head: 3, consoleLevel: 'info', captureLevel: 'info' });
+    const backlog = fakeWindow.__00__.logOp('read', {});
+    expect(backlog.entries.map((e: any) => e.msg)).toEqual(['before attach', 'one', 'two']);
+    expect(fakeWindow.__00__.logOp('setCaptureLevel', { level: 'debug' })).toMatchObject({
+      success: true,
+      captureLevel: 'debug',
+    });
+    logger.debug('now captured');
+    expect(fakeWindow.__00__.logOp('read', { after: 3 }).entries.map((e: any) => e.msg)).toEqual(['now captured']);
+    expect(fakeWindow.__00__.logOp('setCaptureLevel', { level: 'loud' }).success).toBe(false);
   });
 });

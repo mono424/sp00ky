@@ -619,6 +619,136 @@
   };
 
   // ---------------------------------------------------------------------------
+  // Mutations: the outbox, recent outcomes, the failed tray
+  // ---------------------------------------------------------------------------
+
+  // `_00_pending_mutations:<13-digit ms>_<seq>_<tab>`, the shape core mints.
+  // oxlint-disable-next-line unicorn/consistent-function-scoping -- keep every fixture helper inside the fixture
+  const mid = (at, seq) =>
+    `_00_pending_mutations:${String(at).padStart(13, '0')}_${String(seq).padStart(4, '0')}_k3f9qa`;
+
+  const MUTATION_ENTRIES = [
+    { at: ago(1_200), seq: 41, op: 'create', recordId: 'message:01j9xq7r2d', fields: ['body', 'thread', 'author'], status: 'pending', attempts: 0 },
+    { at: ago(9_400), seq: 40, op: 'update', recordId: 'thread:standup-0917', fields: ['title'], status: 'retrying', attempts: 2 },
+    { at: ago(32_000), seq: 39, op: 'create', recordId: 'reaction:01j9xpz4mv', fields: ['emoji', 'message', 'user'], status: 'synced', took: 84 },
+    { at: ago(47_500), seq: 38, op: 'delete', recordId: 'channel_member:ops-tomas', fields: [], status: 'rolled-back', took: 212, error: 'Permission denied: only a channel owner can remove another member' },
+    { at: ago(63_000), seq: 37, op: 'update', recordId: 'message:01j9xnb0k1', fields: ['body', 'edited_at'], status: 'synced', took: 61 },
+    { at: ago(95_000), seq: 36, op: 'create', recordId: 'message:01j9xn3s8e', fields: ['body', 'thread', 'author'], status: 'synced', took: 118 },
+    { at: ago(140_000), seq: 35, op: 'update', recordId: 'read_marker:mira-general', fields: ['last_read'], status: 'synced', took: 47 },
+    { at: ago(181_000), seq: 34, op: 'create', recordId: 'thread:standup-0917', fields: ['title', 'channel', 'author'], status: 'synced', took: 96 },
+  ].map((e) => ({
+    id: mid(e.at, e.seq),
+    op: e.op,
+    recordId: e.recordId,
+    table: e.recordId.split(':')[0],
+    fields: e.fields,
+    status: e.status,
+    attempts: e.attempts ?? 0,
+    queuedAt: e.at,
+    settledAt: e.took ? e.at + e.took : undefined,
+    error: e.error,
+  }));
+
+  const MUTATIONS = {
+    role: 'leader',
+    connection: 'connected',
+    health: 'healthy',
+    consecutiveFailures: 0,
+    counts: { pending: 1, retrying: 1, debounced: 1, failed: 2, synced: 5, rolledBack: 1 },
+    entries: MUTATION_ENTRIES,
+    total: MUTATION_ENTRIES.length,
+    debounced: [
+      {
+        key: 'draft:mira-general::body',
+        recordId: 'draft:mira-general',
+        table: 'draft',
+        fields: ['body'],
+        since: ago(400),
+        durable: true,
+      },
+    ],
+  };
+
+  const FAILED_MUTATIONS = [
+    {
+      id: MUTATION_ENTRIES[3].id,
+      mutationType: 'delete',
+      recordId: 'channel_member:ops-tomas',
+      tableName: 'channel_member',
+      beforeRecord: { id: 'channel_member:ops-tomas', channel: 'channel:ops', user: 'user:tomas', role: 'member', _00_rv: 3 },
+      error: { message: MUTATION_ENTRIES[3].error, kind: 'application' },
+      attempts: 0,
+      createdAt: MUTATION_ENTRIES[3].queuedAt,
+      failedAt: MUTATION_ENTRIES[3].settledAt,
+      revert: 'full',
+    },
+    {
+      id: mid(ago(86_400_000 + 3_600_000), 12),
+      mutationType: 'update',
+      recordId: 'message:01j9t2c7aa',
+      tableName: 'message',
+      data: { body: '' },
+      beforeRecord: { id: 'message:01j9t2c7aa', body: 'see you at 10', author: 'user:mira', _00_rv: 2 },
+      error: { message: "Found '' for field `body`, but expected a string with at least 1 character", kind: 'application' },
+      attempts: 1,
+      createdAt: ago(86_400_000 + 3_600_000),
+      failedAt: ago(86_400_000 + 3_590_000),
+      revert: 'full',
+    },
+  ];
+
+  const PENDING_ROWS = {
+    [MUTATION_ENTRIES[0].id]: {
+      id: MUTATION_ENTRIES[0].id,
+      mutationType: 'create',
+      recordId: 'message:01j9xq7r2d',
+      tableName: 'message',
+      data: { body: 'Pushing the release notes now', thread: 'thread:standup-0917', author: 'user:mira' },
+      beforeRecord: null,
+      createdAt: MUTATION_ENTRIES[0].queuedAt,
+    },
+    [MUTATION_ENTRIES[1].id]: {
+      id: MUTATION_ENTRIES[1].id,
+      mutationType: 'update',
+      recordId: 'thread:standup-0917',
+      tableName: 'thread',
+      data: { title: 'Standup, Sep 17' },
+      beforeRecord: { id: 'thread:standup-0917', title: 'Standup', channel: 'channel:general', _00_rv: 1 },
+      createdAt: MUTATION_ENTRIES[1].queuedAt,
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // Logs: what the page's logger wrote, as LogTap captured it
+  // ---------------------------------------------------------------------------
+
+  const LOG_LINES = [
+    [182_000, 30, 'sp00ky-client::LocalDatabaseService::connect', 'Connecting to local database', { namespace: 'main', database: 'acme', storeUrl: 'opfs' }],
+    [181_600, 30, 'sp00ky-client::LocalDatabaseService::connect', 'Connected to local database'],
+    [181_500, 30, 'sp00ky-client::StreamProcessorService::init', 'Initializing WASM...'],
+    [181_100, 30, 'sp00ky-client::StreamProcessorService::init', 'Initialized successfully'],
+    [180_900, 30, 'sp00ky-client::RemoteDatabaseService::connect', 'Connected to remote database'],
+    [180_850, 30, 'sp00ky-client::ConnectionSupervisor::state', 'Connection state changed', { state: 'connected' }],
+    [96_400, 20, 'sp00ky-client::saga', 'membership read', { hashes: 3, rows: 41, ms: 38 }],
+    [95_100, 20, 'sp00ky-client::DevToolsService::onStreamUpdate', 'StreamUpdate', { queryHash: 814233901 }],
+    [47_700, 50, 'sp00ky-client::saga', 'push rejected a mutation', { id: MUTATION_ENTRIES[3].id, error: MUTATION_ENTRIES[3].error }],
+    [47_690, 40, 'sp00ky-client::saga', 'circuit revert applied', { recordId: 'channel_member:ops-tomas', revert: 'full' }],
+    [31_900, 20, 'sp00ky-client::DevToolsService::onStreamUpdate', 'StreamUpdate', { queryHash: 220917334 }],
+    [12_000, 40, 'sp00ky-client::ConnectionSupervisor::heartbeat', 'Heartbeat timed out; probing the socket', { timeoutMs: 8000, missed: 1 }],
+    [9_200, 40, 'sp00ky-client::saga', 'push interrupted, retrying with backoff', { id: MUTATION_ENTRIES[1].id, attempts: 2, backoffMs: 4000 }],
+    [8_800, 30, 'sp00ky-client::ConnectionSupervisor::state', 'Connection state changed', { state: 'connected' }],
+    [1_100, 20, 'sp00ky-client::saga', 'drain', { batch: 2 }],
+  ].map(([msAgo, level, Category, msg, extra], i) => ({
+    seq: 118 + i,
+    time: ago(msAgo),
+    level,
+    msg,
+    line: JSON.stringify({ time: ago(msAgo), level, ...extra, Category, msg }),
+  }));
+
+  const LOGS_META = { head: LOG_LINES.at(-1).seq, consoleLevel: 'info', captureLevel: 'debug' };
+
+  // ---------------------------------------------------------------------------
   // The state the panel receives
   // ---------------------------------------------------------------------------
 
@@ -635,6 +765,8 @@
       storage: { status: 'persistent', fallback: false, role: 'leader' },
       tabs: STORAGE_INFO.tabs,
     },
+    mutations: MUTATIONS,
+    logs: LOGS_META,
   };
 
   // ---------------------------------------------------------------------------
@@ -731,6 +863,17 @@
       };
     }
     reply({ type: 'SP00KY_IMPERSONATE_RESPONSE', requestId, success: true, data });
+  });
+
+  // Mutations + Logs tabs: one channel, `method` picks the dispatcher.
+  window.addEventListener('SP00KY_OP', (e) => {
+    const { requestId, method, op, args } = e.detail;
+    let data = { success: true };
+    if (method === 'mutationOp' && op === 'listFailed') data = { success: true, failed: FAILED_MUTATIONS };
+    if (method === 'mutationOp' && op === 'get') data = { success: true, row: PENDING_ROWS[args?.id] ?? null };
+    if (method === 'logOp' && op === 'read') data = { success: true, entries: LOG_LINES, dropped: 0, ...LOGS_META };
+    if (method === 'logOp' && op === 'setCaptureLevel') data = { success: true, captureLevel: args?.level, consoleLevel: 'info' };
+    reply({ type: 'SP00KY_BRIDGE_RESPONSE', requestId, success: true, data });
   });
 
   // ---------------------------------------------------------------------------

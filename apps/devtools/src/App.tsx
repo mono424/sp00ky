@@ -10,6 +10,8 @@ import { StorageTab } from './components/storage/StorageTab';
 import { AccessTab } from './components/access/AccessTab';
 import { VersionsTab } from './components/versions/VersionsTab';
 import { McpTab } from './components/mcp/McpTab';
+import { MutationsTab } from './components/mutations/MutationsTab';
+import { LogsTab } from './components/logs/LogsTab';
 
 function AppContent() {
   const { activeTab } = useDevTools();
@@ -29,6 +31,18 @@ function AppContent() {
         <div class="tab-content" classList={{ active: activeTab() === 'queries' }}>
           <Show when={activeTab() === 'queries'}>
             <QueriesTab />
+          </Show>
+        </div>
+
+        <div class="tab-content" classList={{ active: activeTab() === 'mutations' }}>
+          <Show when={activeTab() === 'mutations'}>
+            <MutationsTab />
+          </Show>
+        </div>
+
+        <div class="tab-content" classList={{ active: activeTab() === 'logs' }}>
+          <Show when={activeTab() === 'logs'}>
+            <LogsTab />
           </Show>
         </div>
 

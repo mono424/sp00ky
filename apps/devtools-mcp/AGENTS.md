@@ -29,6 +29,8 @@ Wire into Claude / your agent via the MCP server config (`.mcp.json` at the repo
 - **`get_active_queries` `[tabId]`** — registered live queries, their last result hashes, and a per-query `timings` breakdown.
 - **`get_query_timings` `[tabId]`** — per-query processing-time breakdown (SSP parse/plan/snapshot + store-apply/circuit-step/transform, local & remote record fetch, frontend reconcile; each as last/p50/p90/p99), sorted slowest-first. For debugging perf.
 - **`get_events` `[eventType] [limit]`** — recent event log, optionally filtered.
+- **`get_mutations` `[status] [includeTray=true] [tabId]`** — the outbox (pending / retrying with attempts), writes that left it since DevTools attached (synced with latency, or rolled back with the server error), debounced updates, tab role + connection, and the failed-writes tray rows with payload and before image (extension only).
+- **`get_logs` `[minLevel] [contains] [after] [limit=100] [captureLevel] [tabId]`** — the client's own log lines (last 500 kept in the page), each with its structured fields. `after` = a previous `head` reads only new lines; `captureLevel: 'debug'` records debug lines without printing them to the console, for the tab's session (extension only).
 - **`clear_history` `[tabId]`** — wipe the in-tab event log (extension only).
 
 ### Database (works against extension OR direct DB)
@@ -47,7 +49,8 @@ Wire into Claude / your agent via the MCP server config (`.mcp.json` at the repo
 ## How an agent should use this
 
 - **Before writing a query against a schema you haven't seen:** call `list_tables` and `get_table_data` with `limit: 1` on each table to learn the columns.
-- **After making a mutation through `db.update`:** call `get_active_queries` or `get_events` to confirm the mutation drained and any subscribed queries refreshed.
+- **After making a mutation through `db.update`:** call `get_mutations` to confirm it synced (or read why it was rolled back), then `get_active_queries` to confirm subscribed queries refreshed.
+- **When something fails without an obvious error:** `get_logs` with `minLevel: 'warn'`; set `captureLevel: 'debug'`, reproduce, and read again with `after` set to the earlier `head`.
 - **When troubleshooting "why isn't this query updating?":** `get_active_queries` shows the registered SurQL and last result hash; `get_events` shows whether new records ingested.
 - **For schema spelunking from outside the browser:** point `SURREAL_URL` at the dev DB and use `run_query` with `INFO FOR DB;`.
 

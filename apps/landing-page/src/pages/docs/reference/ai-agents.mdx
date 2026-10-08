@@ -127,6 +127,7 @@ The server connects to the Sp00ky DevTools browser extension (when an app tab is
 | `list_tables`, `get_table_data` | Read-only schema and data inspection |
 | `update_table_row`, `delete_table_row` | Direct mutations (bypass the local mutation queue) |
 | `get_active_queries`, `get_events`, `get_auth_state` | Inspect the running tab's live state |
+| `get_mutations`, `get_logs` | The write queue with server outcomes and the failed tray; the client's own log lines |
 
 <Note>
   Mutations through MCP go straight to SurrealDB and don't enter the local queue. Use them for fixtures and debugging; for in-app behavior, drive mutations through your UI.

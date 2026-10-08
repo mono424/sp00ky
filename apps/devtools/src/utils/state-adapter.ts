@@ -41,5 +41,7 @@ export function adaptBackendState(backendState: BackendDevToolsState): DevToolsS
     versions: backendState.versions
       ? { ...backendState.versions, entities: backendState.versions.entities ?? [] }
       : DEFAULT_VERSIONS,
+    mutations: backendState.mutations ?? null,
+    logs: backendState.logs ?? null,
   };
 }

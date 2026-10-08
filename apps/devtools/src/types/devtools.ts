@@ -7,6 +7,10 @@ export interface BackendDevToolsState {
   version: string;
   versions?: VersionsState;
   database: DatabaseState;
+  /** Absent on a core that predates the Mutations tab. */
+  mutations?: MutationsState | null;
+  /** Absent on a core that predates the Logs tab. */
+  logs?: LogsMeta | null;
 }
 
 // One end-to-end sync-pipeline probe cycle, as recorded by the scheduler.
@@ -88,6 +92,113 @@ export interface DevToolsState {
   auth: AuthState;
   database: DatabaseState;
   versions: VersionsState;
+  mutations: MutationsState | null;
+  logs: LogsMeta | null;
+}
+
+// Mutations tab types — mirrored from packages/core/src/modules/devtools/mutations.ts
+// (the extension deliberately doesn't import core types).
+
+export type MutationOpType = 'create' | 'update' | 'delete';
+
+/**
+ * pending: queued, not answered yet. retrying: a push failed at least once.
+ * synced: the server accepted it. rolled-back: the server rejected it (now in
+ * the failed tray). dropped: left the outbox without an answer this tab saw.
+ */
+export type MutationStatus = 'pending' | 'retrying' | 'synced' | 'rolled-back' | 'dropped';
+
+export interface MutationEntry {
+  id: string;
+  op: MutationOpType;
+  recordId: string;
+  table: string;
+  fields?: string[];
+  status: MutationStatus;
+  attempts: number;
+  queuedAt: number;
+  settledAt?: number;
+  error?: string;
+}
+
+export interface DebouncedWrite {
+  key: string;
+  recordId: string;
+  table: string;
+  fields: string[];
+  since: number;
+  durable: boolean;
+}
+
+export interface MutationsState {
+  role: 'solo' | 'leader' | 'follower';
+  connection: 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
+  health: 'healthy' | 'degraded';
+  consecutiveFailures: number;
+  lastError?: string;
+  counts: {
+    pending: number;
+    retrying: number;
+    debounced: number;
+    failed: number;
+    synced: number;
+    rolledBack: number;
+  };
+  entries: MutationEntry[];
+  total: number;
+  debounced: DebouncedWrite[];
+}
+
+/** A row of the persistent failed-writes tray (core's FailedMutationRow). */
+export interface FailedMutation {
+  id: string;
+  mutationType: MutationOpType;
+  recordId: string;
+  tableName: string;
+  data?: Record<string, unknown>;
+  beforeRecord?: Record<string, unknown> | null;
+  error: { message: string; kind: 'application' | 'unreplayable' };
+  attempts: number;
+  createdAt: number;
+  failedAt: number;
+  revert: 'full' | 'partial' | 'none';
+}
+
+/** A queued outbox row as stored (core's PendingMutationRow). */
+export interface PendingMutationRow {
+  id: string;
+  mutationType: MutationOpType;
+  recordId: string;
+  tableName: string;
+  data?: Record<string, unknown>;
+  beforeRecord?: Record<string, unknown> | null;
+  createdAt: number;
+}
+
+// Logs tab types — mirrored from packages/core/src/services/logger/index.ts.
+
+export type LogLevelName = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+
+export interface LogEntry {
+  seq: number;
+  time: number;
+  /** Pino numeric level: 10 trace, 20 debug, 30 info, 40 warn, 50 error, 60 fatal. */
+  level: number;
+  msg: string;
+  /** The whole log object as JSON, possibly cut off at 4000 chars (ends in …). */
+  line: string;
+}
+
+/** What the pushed state says about the page's log buffer (never the lines). */
+export interface LogsMeta {
+  head: number;
+  consoleLevel: LogLevelName;
+  captureLevel: LogLevelName;
+}
+
+export interface LogRead extends LogsMeta {
+  entries: LogEntry[];
+  dropped: number;
 }
 
 export interface Sp00kyEvent {
@@ -212,6 +323,10 @@ export interface ChromeMessage {
   url?: string;
   /** SP00KY_FRAMES only: every frame in the tab that announced a client. */
   frames?: Sp00kyFrame[];
+  /** SP00KY_LOGS only: lines captured since the previous push. */
+  entries?: LogEntry[];
+  head?: number;
+  dropped?: number;
 }
 
 /**
@@ -239,6 +354,10 @@ export interface Sp00kyTableDataResponse {
 export type TabType =
   | 'events'
   | 'queries'
+  // The outbox, debounced writes, the failed tray and recent outcomes.
+  | 'mutations'
+  // The client's own log lines (the pino logger), with a capture level.
+  | 'logs'
   | 'database'
   | 'storage'
   // Auth + feature flags, merged: identity and what that identity is allowed

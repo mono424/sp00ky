@@ -2,7 +2,7 @@ import type { Uuid } from 'surrealdb';
 import type { SchemaStructure } from '@spooky-sync/query-builder';
 import type { Sp00kyConfig, PersistenceClient } from '../types';
 import type { Logger } from '../services/logger/index';
-import { createLogger } from '../services/logger/index';
+import { LogTap, createLogger } from '../services/logger/index';
 import { ConnectionSupervisor, LocalMigrator, RemoteDatabaseService, createLocalEngine } from '../services/database/index';
 import type { LocalStore } from '../services/database/index';
 import { StreamProcessorService } from '../services/stream-processor/index';
@@ -63,6 +63,8 @@ export function mintSalt(): string {
 /** Everything the facade talks to besides the runtime. */
 export interface Services<S extends SchemaStructure> {
   logger: Logger;
+  /** What the logger wrote, for the DevTools Logs tab. Absent in test fakes. */
+  logTap?: LogTap;
   local: LocalStore;
   remote: RemoteDatabaseService;
   connectionSupervisor: ConnectionSupervisor;
@@ -89,7 +91,8 @@ export interface ServiceHost {
 }
 
 export function createServices<S extends SchemaStructure>(config: Sp00kyConfig<S>): Services<S> {
-  const logger = createLogger(config.logLevel ?? 'info', config.otelTransmit);
+  const logTap = new LogTap(config.logLevel ?? 'info');
+  const logger = createLogger(config.logLevel ?? 'info', config.otelTransmit, logTap);
   if (config.crdt) void preloadLoro();
   const tabsSupport = detectSharedTabsSupport(config);
   const local = createLocalEngine(config.localEngine, config.database, logger, { shared: tabsSupport.supported });
@@ -119,6 +122,7 @@ export function createServices<S extends SchemaStructure>(config: Sp00kyConfig<S
   const tabId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `tab_${Math.random().toString(36).slice(2)}`;
   return {
     logger,
+    logTap,
     local,
     remote,
     connectionSupervisor,

@@ -11,6 +11,8 @@ User-facing documentation, with screenshots of every tab, lives at
 | Tab | Shows |
 | --- | --- |
 | Queries | Every live query, its status, update count, payload size, and a per-query detail panel (SurrealQL, variables, rows, timings). |
+| Mutations | The outbox (pending / retrying), writes synced or rolled back since the panel attached, debounced updates, and the failed-writes tray with Retry / Discard. |
+| Logs | The client's own logger output (last 500 lines kept in the page), filterable by level, category and text, with a capture level that does not touch the console. |
 | Timing | All queries against all pipeline phases (SSP / local / remote / frontend) as p90s, slowest first. |
 | Database | A paginated, editable table browser over the local cache or the remote database. |
 | Storage | Engine and store, OPFS and persistence health, shared-tab ownership, origin quota, bucket file cache, OPFS files, SQLite worker stats, per-table row counts. |
@@ -20,7 +22,7 @@ User-facing documentation, with screenshots of every tab, lives at
 | Events | The client event log, filterable by type. |
 
 The toolbar carries the connection dot (and the frame picker, when a tab runs
-more than one client), the heartbeat badge, a scoped Refresh and Clear.
+more than one client), the heartbeat badge, a scoped Refresh and a scoped Clear.
 
 ## Development
 
@@ -66,6 +68,11 @@ The panel never imports the client. It reaches it through four processes:
 Most reads from the main document go through `eval` into the page; a non-main
 frame is unreachable that way when it is cross-origin, so the same request
 travels the content-script channel instead with the same `requestId`.
+
+New log lines are not part of the state push: the page sends them as small
+`SP00KY_LOGS` deltas, and the panel pulls the backlog once with
+`logOp('read')`. Mutation and log ops share one channel (`SP00KY_OP`, answered
+as `SP00KY_BRIDGE_RESPONSE`), which the MCP bridge reaches as `pageOp`.
 
 ## Requirements for an app
 

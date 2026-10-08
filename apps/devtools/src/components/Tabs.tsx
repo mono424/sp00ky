@@ -5,8 +5,11 @@ import { formatMs, formatRelativeTime } from '../utils/formatters';
 import type { HeartbeatInfo, TabType } from '../types/devtools';
 
 // Events moved to the end (was first); Queries is now the default landing tab.
+// Reads, writes, then the log: the three things you watch while reproducing.
 const tabs: { id: TabType; label: string }[] = [
   { id: 'queries', label: 'Queries' },
+  { id: 'mutations', label: 'Mutations' },
+  { id: 'logs', label: 'Logs' },
   { id: 'timing', label: 'Timing' },
   { id: 'database', label: 'Database' },
   { id: 'storage', label: 'Storage' },
@@ -28,6 +31,8 @@ const CHEVRON_W = 30;
 // behavior can't drift apart.
 const REFRESH_SCOPE: Record<TabType, string> = {
   queries: 'page state',
+  mutations: 'the outbox and the failed-writes tray',
+  logs: 'the log backlog',
   timing: 'page state',
   events: 'page state',
   access: 'feature flags',
@@ -36,6 +41,10 @@ const REFRESH_SCOPE: Record<TabType, string> = {
   versions: 'version discovery',
   mcp: 'MCP bridge status',
 };
+
+// What the toolbar Clear empties, per tab (see `clearActive` in the context).
+const clearLabel = (tab: TabType): string =>
+  tab === 'logs' ? 'Clear logs' : tab === 'mutations' ? 'Clear mutation history' : 'Clear events';
 
 function RefreshIcon() {
   return (
@@ -63,7 +72,7 @@ function DoubleChevronIcon() {
 }
 
 export function Tabs() {
-  const { state, activeTab, setActiveTab, frames, activeFrameId, refresh, isRefreshing, clearEvents } =
+  const { state, activeTab, setActiveTab, frames, activeFrameId, refresh, isRefreshing, clearActive } =
     useDevTools();
 
   // E2E sync latency from the scheduler entity, shown in the toolbar so it is
@@ -310,9 +319,9 @@ export function Tabs() {
         </button>
         <button
           class="icon-btn"
-          title="Clear events"
-          aria-label="Clear events"
-          onClick={clearEvents}
+          title={clearLabel(activeTab())}
+          aria-label={clearLabel(activeTab())}
+          onClick={clearActive}
         >
           <ClearIcon />
         </button>

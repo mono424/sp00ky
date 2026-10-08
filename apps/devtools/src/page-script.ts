@@ -225,6 +225,33 @@
     }
   });
 
+  // Mutations + Logs tabs (and the MCP's get_mutations / get_logs). One channel
+  // for both: `method` picks a whitelisted `window.__00__` dispatcher, which
+  // answers `{ success, error, ... }` itself. Answered as a BRIDGE_RESPONSE so
+  // the background routes an MCP request (`bridge-` id) without a new case.
+  const OP_METHODS = new Set(['mutationOp', 'logOp']);
+  window.addEventListener('SP00KY_OP', async (event: any) => {
+    const { requestId, method, op, args } = event.detail ?? {};
+    const sp00ky = (window as any).__00__;
+    const respond = (payload: { success: boolean; data?: any; error?: string }) => {
+      window.postMessage(
+        { type: 'SP00KY_BRIDGE_RESPONSE', source: 'sp00ky-devtools-page', requestId, ...payload },
+        '*'
+      );
+    };
+    if (!OP_METHODS.has(method) || typeof sp00ky?.[method] !== 'function') {
+      respond({ success: false, error: `${method} is not supported by this core version` });
+      return;
+    }
+    try {
+      const data = await sp00ky[method](op, args || {});
+      if (data && data.success === false) respond({ success: false, error: data.error || `${method} ${op} failed` });
+      else respond({ success: true, data });
+    } catch (err: any) {
+      respond({ success: false, error: err?.message || String(err) });
+    }
+  });
+
   // Try immediately, then fast retries, then long-tail fallback
   if (!checkForSp00ky()) {
     // Fast retries for normal case

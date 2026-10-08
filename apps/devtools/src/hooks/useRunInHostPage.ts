@@ -297,22 +297,19 @@ export function useRunInHostPage(
    * `op` are fixed by the callers below.
    */
   const pageOp = (
-    eventName: 'SP00KY_FLAG_OP' | 'SP00KY_IMPERSONATE_OP',
+    eventName: 'SP00KY_FLAG_OP' | 'SP00KY_IMPERSONATE_OP' | 'SP00KY_OP',
     op: string,
     requestId: string,
     args: Record<string, unknown> | undefined,
     onSuccess: (result: { success: boolean; error?: string }) => void,
-    onError?: (error: any) => void
+    onError?: (error: any) => void,
+    extra?: Record<string, string>
   ): void => {
     run(
       `(function() {
         try {
             window.dispatchEvent(new CustomEvent(${JSON.stringify(eventName)}, {
-                detail: {
-                    requestId: ${JSON.stringify(requestId)},
-                    op: ${JSON.stringify(op)},
-                    args: ${JSON.stringify(args ?? null)}
-                }
+                detail: ${JSON.stringify({ ...extra, requestId, op, args: args ?? null })}
             }));
             return { success: true, started: true };
         } catch (error) {
@@ -340,6 +337,16 @@ export function useRunInHostPage(
     onError?: (error: any) => void
   ): void => pageOp('SP00KY_IMPERSONATE_OP', op, requestId, args, onSuccess, onError);
 
+  /** Mutations / Logs tabs: `method` is the `window.__00__` dispatcher to call. */
+  const devtoolsOp = (
+    method: 'mutationOp' | 'logOp',
+    op: string,
+    requestId: string,
+    args: Record<string, unknown> | undefined,
+    onSuccess: (result: { success: boolean; error?: string }) => void,
+    onError?: (error: any) => void
+  ): void => pageOp('SP00KY_OP', op, requestId, args, onSuccess, onError, { method });
+
   return {
     run,
     getSp00kyState,
@@ -349,6 +356,7 @@ export function useRunInHostPage(
     storageOp,
     flagOp,
     impersonateOp,
+    devtoolsOp,
     updateTableRow,
     deleteTableRow,
     clearHistory,

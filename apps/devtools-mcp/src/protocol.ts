@@ -32,6 +32,8 @@ export const BRIDGE_METHODS = {
   UPDATE_TABLE_ROW: 'updateTableRow',
   DELETE_TABLE_ROW: 'deleteTableRow',
   CLEAR_HISTORY: 'clearHistory',
+  /** `{ method: 'mutationOp' | 'logOp', op, args }`: the Mutations / Logs dispatchers. */
+  PAGE_OP: 'pageOp',
 } as const;
 
 export const BRIDGE_PORT = 9315;

@@ -60,6 +60,31 @@ const SHOTS = [
     },
   },
   {
+    name: 'mutations',
+    tab: 'Mutations',
+    height: 360,
+    caption: 'Every write this session: queued, retrying, synced or rolled back, and how long the server took.',
+  },
+  {
+    name: 'mutations-tray',
+    tab: 'Mutations',
+    height: 460,
+    caption: 'The failed-writes tray, with the rejection and the row it reverted to. Retry or discard from here.',
+    async setup(page) {
+      await page.click('.filter-chip:has-text("Failed tray")');
+      await page.click('.qt-table tbody tr:first-child');
+    },
+  },
+  {
+    name: 'logs',
+    tab: 'Logs',
+    height: 420,
+    caption: "The client's own log lines, recorded at debug while the console stays at info.",
+    async setup(page) {
+      await page.click('.log-row.log-error .log-line');
+    },
+  },
+  {
     name: 'timing',
     tab: 'Timing',
     height: 300,
@@ -131,7 +156,7 @@ run({
   distEntry: 'panel.html',
   out: join(EXT, '../landing-page/public/docs/devtools'),
 
-  // Wide enough that all eight tabs fit on the toolbar without the overflow
+  // Wide enough that all ten tabs fit on the toolbar without the overflow
   // chevron.
   width: 1280,
   scale: 2,

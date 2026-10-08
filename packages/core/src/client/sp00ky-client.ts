@@ -168,6 +168,13 @@ export class Sp00kyClient<S extends SchemaStructure> {
     this.devTools.setFeatureFlagOverrides(this.featureFlags);
     s.streamProcessor.addReceiver(this.devTools);
     this.devTools.setBlobInfoProvider(() => s.blobs.stats());
+    this.devTools.setMutationSource({
+      state: () => this.runtime.state,
+      listFailed: () => this.listFailedMutations(),
+      retryFailed: (id) => this.retryFailedMutation(id),
+      discardFailed: (id) => this.discardFailedMutation(id),
+    });
+    if (s.logTap) this.devTools.setLogTap(s.logTap);
     if (config.sharedTabs) {
       this.devTools.setTabsInfoProvider(() => {
         const c = s.tabs;
@@ -236,6 +243,17 @@ export class Sp00kyClient<S extends SchemaStructure> {
         break;
       case 'mutation:event':
         this.devTools.onMutation([e.event]);
+        break;
+      case 'mutation:settled':
+        this.devTools.onMutationOutcome({ mutationId: e.mutationId, recordId: e.recordId, eventType: e.eventType, status: 'synced' });
+        break;
+      case 'mutation:rolled-back':
+        this.devTools.onMutationOutcome({ mutationId: e.mutationId, recordId: e.recordId, eventType: e.eventType, status: 'rolled-back', error: e.error });
+        break;
+      case 'tray:changed':
+      case 'health:changed':
+      case 'activity:changed':
+        this.devTools.onMutationsChanged();
         break;
       case 'devtools':
         this.devTools.logEvent(e.name, e.data);

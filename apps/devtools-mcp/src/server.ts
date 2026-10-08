@@ -8,6 +8,28 @@ function json(data: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
 
+const LOG_LEVELS = { trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60 } as const;
+type LogLevel = keyof typeof LOG_LEVELS;
+const LEVEL_NAMES = Object.keys(LOG_LEVELS) as [LogLevel, ...LogLevel[]];
+
+const levelName = (level: number): string =>
+  (Object.entries(LOG_LEVELS) as Array<[string, number]>).reduce(
+    (name, [n, v]) => (level >= v ? n : name),
+    'trace'
+  );
+
+/** A captured line as the agent reads it: the JSON parsed, minus what is already a field. */
+function readableLog(e: { seq: number; time: number; level: number; msg: string; line: string }) {
+  let data: unknown;
+  try {
+    const { time: _time, level: _level, msg: _msg, ...rest } = JSON.parse(e.line);
+    data = Object.keys(rest).length ? rest : undefined;
+  } catch {
+    data = { truncated: e.line };
+  }
+  return { seq: e.seq, time: new Date(e.time).toISOString(), level: levelName(e.level), msg: e.msg, data };
+}
+
 export function createServer(bridge: Bridge, surreal?: SurrealClient | null): McpServer {
   const server = new McpServer({
     name: 'sp00ky-devtools',
@@ -252,6 +274,90 @@ export function createServer(bridge: Bridge, surreal?: SurrealClient | null): Mc
         return json(result);
       }
       throw new Error('No extension connected and no direct database configured.');
+    }
+  );
+
+  server.tool(
+    'get_mutations',
+    "The client's writes: the outbox (pending / retrying with attempt counts), what left it since DevTools " +
+      'attached (synced with the server latency, or rolled back with the server error), debounced updates, ' +
+      'the tab role and connection (a follower tab never drains), and the rows of the persistent failed-writes ' +
+      'tray with their payload and before image. Answers "did my write reach the server?" and "why was it rolled back?".',
+    {
+      status: z
+        .enum(['pending', 'retrying', 'synced', 'rolled-back', 'dropped'])
+        .optional()
+        .describe('Only entries with this status'),
+      includeTray: z.boolean().optional().default(true).describe('Also read the failed-writes tray rows'),
+      tabId: z.number().optional().describe('Browser tab ID'),
+    },
+    async ({ status, includeTray, tabId }) => {
+      if (!bridge.isConnected) {
+        throw new Error('No extension connected. get_mutations requires the Sp00ky DevTools browser extension.');
+      }
+      const state = (await bridge.request(BRIDGE_METHODS.GET_STATE, {}, tabId)) as any;
+      const mutations = state?.mutations;
+      if (!mutations) {
+        throw new Error('This client does not report its mutations; update @spooky-sync/core.');
+      }
+      const entries = status
+        ? (mutations.entries ?? []).filter((e: any) => e.status === status)
+        : mutations.entries;
+      const failed = includeTray
+        ? (
+            (await bridge.request(
+              BRIDGE_METHODS.PAGE_OP,
+              { method: 'mutationOp', op: 'listFailed', args: {} },
+              tabId
+            )) as any
+          )?.failed
+        : undefined;
+      return json({ ...mutations, entries, failed });
+    }
+  );
+
+  server.tool(
+    'get_logs',
+    "Recent lines from the client's own logger (the page keeps its last 500), oldest first, each with its " +
+      "structured fields. Pass `after` = a previous call's `head` to read only what is new. `captureLevel` " +
+      "changes what the page records (e.g. 'debug') without printing more to the console; it holds for the tab's " +
+      'session, so a reload records its boot at that level.',
+    {
+      minLevel: z.enum(LEVEL_NAMES).optional().describe('Only lines at or above this level'),
+      contains: z.string().optional().describe('Only lines whose JSON contains this text (case-insensitive)'),
+      after: z.number().optional().describe('Only lines after this seq (a previous `head`)'),
+      limit: z.number().optional().default(100).describe('Max lines, newest kept'),
+      captureLevel: z.enum(LEVEL_NAMES).optional().describe('Set what the page records from now on'),
+      tabId: z.number().optional().describe('Browser tab ID'),
+    },
+    async ({ minLevel, contains, after, limit, captureLevel, tabId }) => {
+      if (!bridge.isConnected) {
+        throw new Error('No extension connected. get_logs requires the Sp00ky DevTools browser extension.');
+      }
+      if (captureLevel) {
+        await bridge.request(
+          BRIDGE_METHODS.PAGE_OP,
+          { method: 'logOp', op: 'setCaptureLevel', args: { level: captureLevel } },
+          tabId
+        );
+      }
+      const read = (await bridge.request(
+        BRIDGE_METHODS.PAGE_OP,
+        { method: 'logOp', op: 'read', args: { after: after ?? 0 } },
+        tabId
+      )) as any;
+      const floor = minLevel ? LOG_LEVELS[minLevel] : 0;
+      const term = contains?.toLowerCase();
+      const entries = ((read?.entries ?? []) as any[]).filter(
+        (e) => e.level >= floor && (!term || String(e.line).toLowerCase().includes(term))
+      );
+      return json({
+        head: read?.head,
+        dropped: read?.dropped,
+        consoleLevel: read?.consoleLevel,
+        captureLevel: read?.captureLevel,
+        entries: entries.slice(Math.max(0, entries.length - (limit ?? 100))).map(readableLog),
+      });
     }
   );
 

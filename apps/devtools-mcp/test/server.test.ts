@@ -84,6 +84,67 @@ describe('createServer', () => {
     });
   });
 
+  describe('mutations and logs', () => {
+    it('get_mutations merges the pushed outbox with the tray rows', async () => {
+      const bridge = mockBridge(true);
+      (bridge.request as any).mockImplementation(async (method: string) =>
+        method === 'getState'
+          ? {
+              mutations: {
+                counts: { pending: 1 },
+                entries: [
+                  { id: 'm1', status: 'pending' },
+                  { id: 'm2', status: 'rolled-back', error: 'denied' },
+                ],
+              },
+            }
+          : { success: true, failed: [{ id: 'm2', data: { title: 'x' } }] }
+      );
+      const server = createServer(bridge);
+
+      const data = JSON.parse((await callTool(server, 'get_mutations', { status: 'rolled-back', includeTray: true })).content[0].text);
+
+      expect(data.entries).toEqual([{ id: 'm2', status: 'rolled-back', error: 'denied' }]);
+      expect(data.failed).toEqual([{ id: 'm2', data: { title: 'x' } }]);
+      expect((bridge.request as any).mock.calls[1]).toEqual(['pageOp', { method: 'mutationOp', op: 'listFailed', args: {} }, undefined]);
+    });
+
+    it('get_logs filters by level and text and parses each line', async () => {
+      const bridge = mockBridge(true);
+      const line = (level: number, msg: string, extra: object = {}) => ({
+        seq: level,
+        time: 0,
+        level,
+        msg,
+        line: JSON.stringify({ time: 0, level, msg, ...extra }),
+      });
+      (bridge.request as any).mockResolvedValue({
+        success: true,
+        head: 50,
+        dropped: 0,
+        consoleLevel: 'info',
+        captureLevel: 'debug',
+        entries: [line(20, 'noise'), line(40, 'slow push', { ms: 900 }), line(50, 'push rejected')],
+      });
+      const server = createServer(bridge);
+
+      const data = JSON.parse((await callTool(server, 'get_logs', { minLevel: 'warn', contains: 'push', limit: 1 })).content[0].text);
+
+      expect(data.head).toBe(50);
+      expect(data.entries).toEqual([{ seq: 50, time: '1970-01-01T00:00:00.000Z', level: 'error', msg: 'push rejected' }]);
+    });
+
+    it('get_logs sets the capture level before reading', async () => {
+      const bridge = mockBridge(true);
+      (bridge.request as any).mockResolvedValue({ success: true, entries: [] });
+      const server = createServer(bridge);
+
+      await callTool(server, 'get_logs', { captureLevel: 'debug' });
+
+      expect((bridge.request as any).mock.calls.map((c: any[]) => c[1].op)).toEqual(['setCaptureLevel', 'read']);
+    });
+  });
+
   describe('with bridge disconnected, surreal available', () => {
     it('run_query falls back to surreal', async () => {
       const bridge = mockBridge(false);

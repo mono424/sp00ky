@@ -192,6 +192,9 @@ no persistence).</p>
 <li><code>&#39;error&#39;</code>: Critical failures</li>
 <li><code>&#39;fatal&#39;</code>: Fatal errors that stop execution</li>
 </ul>
+<p>This is what the console prints. The page also keeps its last 500 lines for the
+<a href="/docs/reference/devtools">DevTools Logs tab</a>, which can record below this
+level (say, <code>debug</code>) for one tab session without printing more to the console.</p>
 <h4 id="persistenceclient"><code>persistenceClient</code></h4>
 <p>Determines where small metadata values (the auth token, the stream
 processor’s persisted state) are stored:</p>

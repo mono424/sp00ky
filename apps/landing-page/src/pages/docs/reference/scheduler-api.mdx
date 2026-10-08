@@ -306,14 +306,17 @@ Send a heartbeat from an SSP to maintain health status.
 **Response:**
 - `200 OK` - Heartbeat accepted
 - `404 Not Found` - SSP not registered (SSP should re-register)
-- `409 Conflict` - The SSP must exit and re-bootstrap. The body is a JSON `ResyncDirective`:
+- `503 Service Unavailable` - The scheduler is cloning or restoring. A restarted scheduler starts with an empty pool, so it answers `503` rather than `404` until it can accept registrations; the SSP keeps heartbeating with its circuit intact
+- `409 Conflict` - The SSP must re-bootstrap. The body is a JSON `ResyncDirective`:
 
 ```json
 { "reason": "Clean restart requested. SSP must drop its snapshot and re-bootstrap.", "clean": true }
 ```
 
-`clean: true` asks the SSP to delete its circuit snapshot and arena before it
-exits, so the relaunch is a cold rebuild. A buffer overflow, an integrity-check
+`clean: true` asks the SSP to delete its circuit snapshot, row checkpoints and
+arena before it exits, so the relaunch is a cold rebuild. Without it the SSP
+re-bootstraps in place, keeping its rows and verifying them against the
+replica table by table. A buffer overflow, an integrity-check
 resync and an operator restart from the [admin dashboard](/docs/reference/admin-dashboard#restarting-an-ssp)
 all arrive this way. Older SSPs read the body as free text and restart anyway,
 and an older scheduler sends free text, which parses as `clean: false`; both

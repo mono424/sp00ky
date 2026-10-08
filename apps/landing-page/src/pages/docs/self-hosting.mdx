@@ -429,8 +429,9 @@ always safe. See [State persistence](/docs/reference/ssp-api#state-persistence).
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `SPKY_SSP_SNAPSHOT_DIR` | Directory for the circuit snapshot (`snapshot.json`). Enables snapshots when set and writable; the SSP probes it and falls back to memory-only rather than failing startup. | *(unset)* |
-| `SPKY_SSP_CHECKPOINT_INTERVAL_SECS` | How often the snapshot is rewritten while running. Only read when `SPKY_SSP_SNAPSHOT_DIR` is set, which arms the timer. | `300` |
+| `SPKY_SSP_SNAPSHOT_DIR` | Directory for what the SSP keeps across a restart: row checkpoints in `rows/` on a cluster SSP (verified against the scheduler on boot), the circuit snapshot (`snapshot.json`) on a standalone one. Enabled when set and writable; the SSP probes it and falls back to memory-only rather than failing startup. Put it on a volume that outlives the container. | *(unset)* |
+| `SPKY_SSP_ROW_CHECKPOINT_SECS` | Cluster SSP: how often tables whose content changed are written to `rows/` while running. `0` leaves only the writes on graceful shutdown and after each bootstrap. | `1800` |
+| `SPKY_SSP_CHECKPOINT_INTERVAL_SECS` | Standalone SSP: how often the snapshot is rewritten while running. Only read when `SPKY_SSP_SNAPSHOT_DIR` is set, which arms the timer. | `300` |
 | `SPKY_SSP_ARENA_DIR` | Directory for the row arena, a sparse-file cache of row bytes. Probed for writability like the snapshot dir; falls back to the heap. | *(unset)* |
 | `SPKY_SSP_ARENA_SEGMENT_MB` | Arena segment size in MB | `64` |
 

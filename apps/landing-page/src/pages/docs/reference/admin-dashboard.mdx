@@ -328,14 +328,13 @@ answer `202` with an **operation** the dashboard watches (see below).
 
 The scheduler never touches a container. Restarting an SSP means flagging it
 in the pool; the SSP's next heartbeat is answered with `409` and a JSON
-`ResyncDirective`, the SSP exits, and its supervisor relaunches it through the
-same register, bootstrap and verify path every SSP takes on boot. A restart
-from the dashboard is indistinguishable from one by Docker.
+`ResyncDirective`, and the SSP goes through the same register, bootstrap and
+verify path every SSP takes on boot.
 
 | Mode      | What happens                                                                                                                                                                                                      |
 | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `restart` | Flag, `409`, exit, relaunch. The SSP restores its circuit snapshot and catches up the delta.                                                                                                                      |
-| `clean`   | The directive carries `clean: true`, so before exiting the SSP deletes its `snapshot.json` and its arena directory. The relaunch is a cold rebuild from the database. Use it when the snapshot itself is suspect. |
+| `restart` | Flag, `409`, re-bootstrap in place. The process keeps running and keeps its rows: it drops its views, registers again, keeps the tables that still match the replica and repairs the rest, then rebuilds its views. |
+| `clean`   | The directive carries `clean: true`, so the SSP deletes its `snapshot.json`, its row checkpoints and its arena directory, then exits. The relaunch is a cold rebuild from the database. Use it when the rows themselves are suspect. |
 | `reload`  | No exit. The scheduler calls the SSP's `POST /admin/reload`, which rebuilds the circuit in-process from the database. Schema changes do not need it (they are applied live), but it is there for a suspect circuit. |
 
 Nothing happens until the next heartbeat (5 s by default). An operation is

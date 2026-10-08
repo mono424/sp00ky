@@ -2257,7 +2257,15 @@ async fn self_bootstrap_with_metadata(
     // `_00_query` is global in both modes (only `_00_list_ref` splits
     // per user); each row carries an `auth_id` field which decides
     // where the corresponding `_00_list_ref_user_<id>` writes go.
-    let result = source.query("SELECT * FROM _00_query").await
+    //
+    // Read from upstream, like the schema. The scheduler's replica copies
+    // `_00_query` once, when it clones, and its drains skip `_00_*` tables, so
+    // the proxy only knows the views that existed back then: every SSP
+    // restart came up without the views registered since, and their clients
+    // stayed silent until they noticed and registered again.
+    let result = metadata_source
+        .query("SELECT id, surql, clientId, auth_id, ttl, lastActiveAt, params FROM _00_query")
+        .await
         .context("Failed to query _00_query")?;
     let views: Vec<Value> = match result {
         Value::Array(arr) => arr,

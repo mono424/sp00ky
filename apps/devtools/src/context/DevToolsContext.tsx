@@ -400,10 +400,13 @@ export const DevToolsProvider: ParentComponent = (props) => {
         }
         break;
 
+      // BRIDGE_RESPONSE answers message-channel requests: the iframe path of
+      // query rows and row edits.
       case 'SP00KY_QUERY_RESPONSE':
       case 'SP00KY_STORAGE_INFO_RESPONSE':
       case 'SP00KY_FLAG_RESPONSE':
       case 'SP00KY_IMPERSONATE_RESPONSE':
+      case 'SP00KY_BRIDGE_RESPONSE':
         settlePending(message as any);
         break;
 

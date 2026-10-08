@@ -253,11 +253,14 @@ route is not called by the database at all; the scheduler reads the
 <ul>
 <li><code>200 OK</code> - Heartbeat accepted</li>
 <li><code>404 Not Found</code> - SSP not registered (SSP should re-register)</li>
-<li><code>409 Conflict</code> - The SSP must exit and re-bootstrap. The body is a JSON <code>ResyncDirective</code>:</li>
+<li><code>503 Service Unavailable</code> - The scheduler is cloning or restoring. A restarted scheduler starts with an empty pool, so it answers <code>503</code> rather than <code>404</code> until it can accept registrations; the SSP keeps heartbeating with its circuit intact</li>
+<li><code>409 Conflict</code> - The SSP must re-bootstrap. The body is a JSON <code>ResyncDirective</code>:</li>
 </ul>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{ </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;reason&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;Clean restart requested. SSP must drop its snapshot and re-bootstrap.&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;clean&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">true</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }</span></span></code></pre>
-<p><code>clean: true</code> asks the SSP to delete its circuit snapshot and arena before it
-exits, so the relaunch is a cold rebuild. A buffer overflow, an integrity-check
+<p><code>clean: true</code> asks the SSP to delete its circuit snapshot, row checkpoints and
+arena before it exits, so the relaunch is a cold rebuild. Without it the SSP
+re-bootstraps in place, keeping its rows and verifying them against the
+replica table by table. A buffer overflow, an integrity-check
 resync and an operator restart from the <a href="/docs/reference/admin-dashboard#restarting-an-ssp">admin dashboard</a>
 all arrive this way. Older SSPs read the body as free text and restart anyway,
 and an older scheduler sends free text, which parses as <code>clean: false</code>; both

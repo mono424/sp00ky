@@ -66,10 +66,10 @@ pre-emptively defines that user’s dedicated
 <h2 id="bootstrap">Bootstrap</h2>
 <p>When running in scheduler mode, the SSP bootstraps itself using a <strong>proxy-based pull</strong> pattern rather than receiving pushed chunks:</p>
 <ol>
+<li>SSP loads its row checkpoints, if it has any (see <a href="#state-persistence">State Persistence</a>)</li>
 <li>SSP registers with the scheduler via <code>POST /ssp/register</code></li>
-<li>Scheduler freezes its snapshot replica and returns <code>snapshot_seq</code></li>
-<li>SSP connects to the scheduler’s proxy endpoints (<code>POST /proxy/query</code>, <code>/proxy/signin</code>, <code>/proxy/use</code>) as if they were a SurrealDB instance</li>
-<li>SSP executes its own SurrealQL queries to pull the data it needs</li>
+<li>Scheduler freezes its snapshot replica and returns <code>snapshot_seq</code> and the hash of every table at that cut</li>
+<li>SSP keeps the tables whose rows already match, repairs the ones that differ, and pages the rest through the scheduler’s proxy endpoints (<code>POST /proxy/query</code>, <code>/proxy/signin</code>, <code>/proxy/use</code>) as if they were a SurrealDB instance</li>
 <li>Once bootstrapped, SSP reports healthy via <code>GET /health</code> (returns <code>{&quot;status&quot;: &quot;ready&quot;}</code>)</li>
 <li>Scheduler detects readiness, replays buffered events, then promotes SSP to <code>Ready</code></li>
 </ol>
@@ -521,33 +521,40 @@ In a cluster the scheduler owns these and the SSP’s copies go unused.</p>
 <p><strong>Response Handling:</strong></p>
 <ul>
 <li><code>200 OK</code> - heartbeat accepted, continue normal operation</li>
-<li><code>404 Not Found</code> - the scheduler no longer knows this SSP. The process exits
-with code <code>3</code></li>
-<li><code>409 Conflict</code> - the scheduler wants this SSP to re-bootstrap. The process
-exits with code <code>4</code>, after wiping local state when the directive asks for it</li>
+<li><code>404 Not Found</code> - the scheduler no longer knows this SSP, usually because it
+restarted. The SSP re-bootstraps in place: it drops its views, keeps its
+rows, registers again and verifies them table by table (see
+<a href="#state-persistence">State Persistence</a>)</li>
+<li><code>409 Conflict</code> - the scheduler wants this SSP to re-bootstrap. Same in-place
+re-bootstrap, unless the directive says <code>clean</code>: then the SSP wipes its local
+state and exits with code <code>4</code></li>
+<li><code>503 Service Unavailable</code> - the scheduler is cloning or restoring; keep
+heartbeating</li>
 <li>Other errors - log a warning and keep heartbeating</li>
 </ul>
-<p>Neither <code>404</code> nor <code>409</code> is handled in place. The SSP exits and its supervisor
-relaunches it, so it comes back through the full register, bootstrap and
-hash-verify path rather than trying to repair a circuit it can no longer trust
-from a task that cannot replay events into it.</p>
+<p>An in-place re-bootstrap goes through the same register, bootstrap and
+hash-verify path as a fresh process, with the rows it already holds as the
+starting point. Only the rows are kept: views and operator state are rebuilt
+from <code>_00_query</code>. If that re-bootstrap gives up, the SSP exits with code <code>3</code>
+and its supervisor relaunches it.</p>
 <p><strong>The 409 body is a directive:</strong></p>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;reason&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;Clean restart requested. SSP must drop its snapshot and re-bootstrap.&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;clean&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">true</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
-<p><code>clean: true</code> means delete the circuit snapshot and the arena first, so the
-relaunch is a cold rebuild instead of a snapshot restore plus catch-up; the
-final shutdown checkpoint is skipped too, or it would write back the file that
-was just removed. A 409 covers three cases: a buffer overflow, an integrity
+<p><code>clean: true</code> means delete the circuit snapshot, the row checkpoints and the
+arena first, then exit, so the relaunch is a cold rebuild; the final shutdown
+checkpoint is skipped too, or it would write back the files that were just
+removed. Without it the SSP re-bootstraps in place with its rows kept. A 409 covers three cases: a buffer overflow, an integrity
 check that found drift, and an operator pressing restart or clean restart on
 the <a href="/docs/reference/admin-dashboard#restarting-an-ssp">admin dashboard</a>.</p>
 <p>Both directions degrade safely. An older scheduler sends plain text, which
 parses as <code>clean: false</code>; an older SSP reads the JSON as an opaque reason
-string and restarts warm. See the
+string and restarts. See the
 <a href="/docs/reference/scheduler-api">scheduler API</a> for the sending side.</p>
 <p><strong>Other exit codes:</strong> <code>2</code> when a post-bootstrap integrity check keeps failing,
-<code>5</code> and <code>6</code> when registration never succeeds within its budget. All of them
+<code>3</code> when an in-place re-bootstrap gives up, <code>5</code> and <code>6</code> when registration never
+succeeds within its budget. All of them
 mean the same thing operationally: the supervisor should start the process
 again.</p>
 <hr/>
@@ -582,12 +589,13 @@ again.</p>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Job-table runner config, JSON-encoded. Read once at startup.</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_JOB_CONFIG</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&#39;{&quot;job_tables&quot;: {…}}&#39;</span></span>
 <span class="line"></span>
-<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Snapshot cache. With a writable directory the circuit is restored on boot</span></span>
-<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># and written on graceful shutdown, so restarts replay only the delta.</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Restart cache. Cluster mode keeps row checkpoints in &lt;dir&gt;/rows and verifies</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># them against the scheduler on boot; standalone keeps &lt;dir&gt;/snapshot.json.</span></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Unset means memory-only: every start is a full rebuild. See State Persistence.</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_SNAPSHOT_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">/data/ssp-0</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ARENA_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">/data/ssp-0/arena</span></span>
-<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_CHECKPOINT_INTERVAL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">300</span><span style="color:#6A737D;--shiki-dark:#6A737D">  # interval, armed by SNAPSHOT_DIR</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ROW_CHECKPOINT_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">1800</span><span style="color:#6A737D;--shiki-dark:#6A737D">      # cluster: rewrite changed tables (0 = only on shutdown/bootstrap)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_CHECKPOINT_INTERVAL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">300</span><span style="color:#6A737D;--shiki-dark:#6A737D">  # standalone: snapshot interval, armed by SNAPSHOT_DIR</span></span>
 <span class="line"></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Optional knobs</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_CRDT_CACHE_SIZE</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">10000</span><span style="color:#6A737D;--shiki-dark:#6A737D">       # in-memory CRDT cache capacity</span></span>
@@ -716,23 +724,40 @@ plus per-status backend counts.</p>
 <p>SurrealDB and the scheduler’s replica are always the durable source of truth.
 Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.</p>
 <ul>
-<li>On startup the SSP <strong>self-bootstraps</strong> by paging through the scheduler’s
-<code>POST /proxy/query</code> endpoint to replay the relevant source rows into its
-circuit.</li>
-<li>With <code>SPKY_SSP_SNAPSHOT_DIR</code> set to a writable directory, the SSP keeps a
-circuit snapshot at <code>&lt;dir&gt;/snapshot.json</code>: it loads it on boot and writes it
-on graceful shutdown, so a restart replays only the delta instead of the
-whole dataset. Row bytes live alongside it in a sparse-file arena at
-<code>SPKY_SSP_ARENA_DIR</code>.</li>
-<li>Setting the snapshot directory also arms a periodic checkpoint, every 300
-seconds by default. <code>SPKY_SSP_CHECKPOINT_INTERVAL_SECS</code> changes the interval
-and is ignored when there is no snapshot directory to write to.</li>
+<li>On a cold start the SSP <strong>self-bootstraps</strong> by paging every synced table
+through the scheduler’s <code>POST /proxy/query</code> endpoint into its circuit.</li>
+<li><strong>Cluster mode keeps its rows.</strong> With <code>SPKY_SSP_SNAPSHOT_DIR</code> set to a
+writable directory, each table’s rows are written to
+<code>&lt;dir&gt;/rows/&lt;table&gt;.rows</code>, a binary copy of the encoded rows with a checksum
+and the table’s content hash. They are written on graceful shutdown (SIGTERM;
+ingest stops first), after every bootstrap, and every
+<code>SPKY_SSP_ROW_CHECKPOINT_SECS</code> (default 1800, <code>0</code> turns the timer off).
+Only tables whose content changed since they were last written are written
+again, one table at a time.</li>
+<li><strong>On boot the rows are loaded before the SSP registers, then verified.</strong> The
+scheduler answers the registration with the hash of every table at the cut it
+freezes. A table whose rows hash the same is kept as is. One that differs is
+repaired: the SSP lists <code>(id, _00_rv)</code> from the replica, deletes what is gone
+and fetches only the rows that are missing or at another version. A table
+that still differs, has no checkpoint, or fails its checksum is paged in full
+like a cold start. Views are always rebuilt from <code>_00_query</code>, and the usual
+post-bootstrap integrity check runs over the result, so a stale or corrupt
+checkpoint costs time, never correctness.</li>
+<li>The same path runs <strong>in place</strong> when the scheduler forgets the SSP (a
+scheduler restart) or asks for a resync: the rows already in memory are the
+starting point and the process never exits.</li>
+<li>Standalone mode keeps a circuit snapshot at <code>&lt;dir&gt;/snapshot.json</code> instead,
+written every <code>SPKY_SSP_CHECKPOINT_INTERVAL_SECS</code> (default 300) and on
+graceful shutdown. Row bytes live in a sparse-file arena at
+<code>SPKY_SSP_ARENA_DIR</code> in both modes.</li>
 <li>With the directory unset or not writable, the SSP logs it once and runs
 memory-only: every start is a full rebuild.</li>
-<li>Sp00ky Cloud sets the snapshot and arena directories, so a cloud SSP restarts
-warm. A <a href="/docs/reference/admin-dashboard#restarting-an-ssp">clean restart</a>
-from the dashboard is precisely the deletion of these files, which is what
-forces the cold rebuild it promises.</li>
+<li>Sp00ky Cloud sets the snapshot and arena directories on a volume that
+survives a container recreate, and stops an SSP with SIGTERM and a grace
+period, so a cloud SSP restarts warm. A
+<a href="/docs/reference/admin-dashboard#restarting-an-ssp">clean restart</a> from the
+dashboard deletes these files, which is what forces the cold rebuild it
+promises.</li>
 </ul>
 <h3 id="memory-management">Memory Management</h3>
 <ul>

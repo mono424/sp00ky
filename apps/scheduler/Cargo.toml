@@ -36,6 +36,7 @@ ssp-protocol = { path = "../../packages/ssp-protocol" }
 maintenance = { path = "../../packages/maintenance" }
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 flate2 = "1"
+crc32fast = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 sha2 = "0.10"

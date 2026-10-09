@@ -6531,6 +6531,7 @@ dependencies = [
  "bollard",
  "chrono",
  "config",
+ "crc32fast",
  "flate2",
  "futures",
  "hex",

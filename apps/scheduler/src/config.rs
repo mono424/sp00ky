@@ -106,6 +106,9 @@ impl Default for SchedulerConfig {
             // so this interval is paid in full on every warm restart: at 3 s
             // it was up to 3 s of a 15 s restart spent waiting for a poll.
             ssp_poll_interval_ms: 500,
+            // The log's segments live in `wal/` next to this path; a JSON
+            // Lines log at the path itself (the previous format) is migrated
+            // on the first open.
             wal_path: PathBuf::from("./data/event_wal.log"),
             health_check_interval_secs: 15,
             feature_flag_sweep_interval_secs: 30,

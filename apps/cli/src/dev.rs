@@ -1873,9 +1873,9 @@ fn start_scheduler(spec: &SchedulerLaunchSpec, step: Option<&ui::Step>) -> Resul
             let sink = LineSink::new("scheduler", ui::style().infra("scheduler"), StreamKind::Infra);
             let mut cmd = Command::new(binary);
             // The scheduler defaults `replica_db_path: ./data/replica` and
-            // `wal_path: ./data/event_wal.log`, both relative to cwd. Run from
-            // `.sp00ky/scheduler_data` so the host paths land where `--clean`
-            // already wipes.
+            // `wal_path: ./data/event_wal.log` (segments in `./data/wal/`),
+            // both relative to cwd. Run from `.sp00ky/scheduler_data` so the
+            // host paths land where `--clean` already wipes.
             cmd.current_dir(&spec.data_dir);
             cmd.env("RUST_LOG", &spec.dev_log)
                 .env("SPKY_DB_URL", &spec.db_url)

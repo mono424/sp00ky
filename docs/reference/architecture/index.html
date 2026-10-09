@@ -159,7 +159,7 @@
 <li><strong>Registration</strong>: SSP sends its ID and URL to the scheduler</li>
 <li><strong>Freeze</strong>: Scheduler freezes the snapshot replica and marks SSP as <code>Bootstrapping</code></li>
 <li><strong>Proxy Query</strong>: SSP self-bootstraps by querying the scheduler’s <code>POST /proxy/query</code> endpoint (executes SurrealQL against the frozen snapshot)</li>
-<li><strong>Health Poll</strong>: Scheduler polls the SSP’s <code>GET /health</code> endpoint every <code>ssp_poll_interval_ms</code> (default 3s) until the SSP reports ready</li>
+<li><strong>Health Poll</strong>: Scheduler polls the SSP’s <code>GET /health</code> endpoint every <code>ssp_poll_interval_ms</code> (default 500 ms) until the SSP reports ready</li>
 <li><strong>Unfreeze &amp; Replay</strong>: Scheduler unfreezes the snapshot, marks SSP as <code>Replaying</code>, and replays all buffered events with <code>seq &gt; snapshot_seq</code></li>
 <li><strong>Ready</strong>: Once replay completes, scheduler marks SSP as <code>Ready</code></li>
 <li><strong>Live Updates</strong>: SSP now receives real-time updates via <code>/ingest</code> endpoint</li>

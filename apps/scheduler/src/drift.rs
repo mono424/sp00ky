@@ -331,6 +331,20 @@ impl DriftReport {
     }
 }
 
+/// Which tables a check compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every sync table: the periodic check, and the full startup pass.
+    All,
+    /// Only the tables the replica holds no row of: the startup gate
+    /// ([`run_startup_gate`]). The one mismatch acted on at first sight
+    /// ([`TableCounts::replica_empty_upstream_not`]) can only show up there.
+    /// Finding them is a key read per table locally, and counting them
+    /// upstream is cheap unless one of them is exactly the drift being looked
+    /// for.
+    ReplicaEmpty,
+}
+
 /// Compare upstream against the replica. The table set is upstream's: a table
 /// dropped upstream but lingering in the replica is not drift the SSP can
 /// serve wrong rows for, so it is skipped rather than counted.
@@ -339,9 +353,20 @@ pub async fn check_once(
     replica: &Arc<RwLock<Replica>>,
     busy: &dyn BusyTables,
     cfg: &DriftConfig,
+    scope: Scope,
 ) -> Result<DriftReport> {
     let started = Instant::now();
-    let tables = upstream.sync_tables().await?;
+    let mut tables = upstream.sync_tables().await?;
+    if scope == Scope::ReplicaEmpty {
+        let mut empty = Vec::new();
+        for table in tables {
+            // A probe that fails says nothing: that table sits the gate out.
+            if !replica.read().await.has_rows(&table).await.unwrap_or(true) {
+                empty.push(table);
+            }
+        }
+        tables = empty;
+    }
     let (upstream_counts, slowest) = count_tables(upstream, tables, cfg.count_concurrency).await;
     let upstream_ms = started.elapsed().as_millis() as u64;
     // Sampled AFTER the upstream counts, not before them: those are a full
@@ -375,6 +400,7 @@ pub async fn check_once(
             upstream_ms,
             replica_ms,
             tables = tables.len(),
+            ?scope,
             concurrency = cfg.count_concurrency,
             slowest_table = %slowest.table,
             slowest_ms = slowest.ms,
@@ -385,6 +411,7 @@ pub async fn check_once(
             upstream_ms,
             replica_ms,
             tables = tables.len(),
+            ?scope,
             concurrency = cfg.count_concurrency,
             slowest_table = %slowest.table,
             slowest_ms = slowest.ms,
@@ -559,10 +586,9 @@ pub struct DriftHook {
     /// Upstream's table set, followed on the same tick (see `crate::schema`).
     /// `None` in tests that exercise the drift rules alone.
     pub schema: Option<Arc<crate::schema::SchemaWatch>>,
-    /// Held for the length of a check. The startup check runs in the
-    /// background while the snapshot updater ticks, and two checks at once
-    /// would count every mismatch twice towards its streak and could repair
-    /// one table twice over; the later one is skipped instead.
+    /// Held for the length of a check. Two checks at once would count every
+    /// mismatch twice towards its streak and could repair one table twice
+    /// over, so a check that finds it taken is skipped instead.
     pub running: tokio::sync::Mutex<()>,
 }
 
@@ -1039,11 +1065,40 @@ async fn emit_plan<C: surrealdb::Connection>(
 ///
 /// Called by the snapshot updater after each drain, with the event buffer as
 /// the busy source and `drain_lock` released (a re-clone takes the replica
-/// write lock itself and can run for minutes). Also called once at startup.
+/// write lock itself and can run for minutes). Also called once at startup,
+/// right after `Ready`, ahead of the first tick.
 pub async fn run_check(
     hook: &DriftHook,
     replica: &Arc<RwLock<Replica>>,
     busy: &dyn BusyTables,
+) -> Action {
+    run(hook, replica, busy, Scope::All).await
+}
+
+/// The startup pass `Ready` waits for: [`run_check`] over the tables the
+/// replica holds no row of ([`Scope::ReplicaEmpty`]).
+///
+/// That is the one mismatch acted on at first sight, and the one an SSP must
+/// never bootstrap from: an empty table serves every view as confirmed empty
+/// ("contacts disappear", 2026-09-02). Any other mismatch needs
+/// `confirm_ticks` checks, so before `Ready` a full count only ever started a
+/// streak, while holding every SSP registration for as long as it took (80 s
+/// on whitepawn, 2026-10-09). The full count runs right after `Ready`, and
+/// what it acts on goes the way of every periodic finding: a repair through
+/// the ingest pipeline, or a re-clone that re-bootstraps every SSP.
+pub async fn run_startup_gate(
+    hook: &DriftHook,
+    replica: &Arc<RwLock<Replica>>,
+    busy: &dyn BusyTables,
+) -> Action {
+    run(hook, replica, busy, Scope::ReplicaEmpty).await
+}
+
+async fn run(
+    hook: &DriftHook,
+    replica: &Arc<RwLock<Replica>>,
+    busy: &dyn BusyTables,
+    scope: Scope,
 ) -> Action {
     if !hook.cfg.enabled {
         return Action::Clean;
@@ -1060,7 +1115,7 @@ pub async fn run_check(
     // updater parked in an upstream `count()` that never answered).
     let report = match tokio::time::timeout(
         hook.cfg.check_timeout,
-        check_once(&*hook.upstream, replica, busy, &hook.cfg),
+        check_once(&*hook.upstream, replica, busy, &hook.cfg, scope),
     )
     .await
     {
@@ -1487,7 +1542,7 @@ mod tests {
         ));
         let busy: BTreeSet<String> = ["job".to_string()].into_iter().collect();
 
-        let report = check_once(&upstream, &replica, &busy, &cfg()).await.unwrap();
+        let report = check_once(&upstream, &replica, &busy, &cfg(), Scope::All).await.unwrap();
         assert!(report.tables.contains_key("game"), "an idle table is still compared");
         assert!(
             !report.tables.contains_key("job"),
@@ -1521,7 +1576,7 @@ mod tests {
         ));
         let busy = LandsLate(std::sync::atomic::AtomicUsize::new(0));
 
-        let report = check_once(&upstream, &replica, &busy, &cfg()).await.unwrap();
+        let report = check_once(&upstream, &replica, &busy, &cfg(), Scope::All).await.unwrap();
         assert!(report.tables.contains_key("game"), "an idle table is still compared");
         assert!(
             !report.tables.contains_key("job"),
@@ -1737,6 +1792,68 @@ mod tests {
             running: Default::default(),
         };
         (hook, replica, tmp)
+    }
+
+    /// The startup gate holds `Ready`, so it counts upstream only the tables
+    /// the replica holds no row of: a full count of every table held every SSP
+    /// registration for 80 s on whitepawn (2026-10-09). The partial mismatch it
+    /// leaves alone is the full check's, which runs after `Ready`.
+    #[tokio::test]
+    async fn the_startup_gate_counts_only_the_tables_the_replica_holds_nothing_of() {
+        struct Recording {
+            counts: BTreeMap<String, Option<u64>>,
+            asked: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl UpstreamCounts for Recording {
+            async fn sync_tables(&self) -> Result<Vec<String>> {
+                self.counts.sync_tables().await
+            }
+            async fn count(&self, table: &str) -> Result<u64> {
+                self.asked.lock().unwrap().push(table.to_string());
+                self.counts.count(table).await
+            }
+        }
+
+        let script = Scripted::new(Ok(RepairOutcome::Applied(RepairStats { created: 48, ..Default::default() })));
+        let (mut hook, replica, _tmp) = drifted_hook(script.clone()).await;
+        let upstream = Arc::new(Recording {
+            // `game` is off by four, `puzzle` missing from the replica,
+            // `user` empty on both sides.
+            counts: [("game", Some(7u64)), ("puzzle", Some(48)), ("user", Some(0))]
+                .into_iter()
+                .map(|(t, n)| (t.to_string(), n))
+                .collect(),
+            asked: Default::default(),
+        });
+        hook.upstream = upstream.clone();
+        for id in ["game:a", "game:b", "game:c"] {
+            replica
+                .write()
+                .await
+                .apply("game", crate::replica::RecordOp::Create, id, Some(serde_json::json!({"t": 1})))
+                .await
+                .unwrap();
+        }
+
+        let action = run_startup_gate(&hook, &replica, &BTreeSet::new()).await;
+        assert_eq!(action, Action::Repair { tables: vec!["puzzle".into()] }, "the empty table is still repaired before Ready");
+        let mut asked = upstream.asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["puzzle".to_string(), "user".to_string()], "a table the replica holds rows of is not counted");
+        assert!(hook.state.read().await.streaks.is_empty());
+
+        // The full check after `Ready` takes `game` on.
+        upstream.asked.lock().unwrap().clear();
+        let action = run_check(&hook, &replica, &BTreeSet::new()).await;
+        assert_eq!(upstream.asked.lock().unwrap().len(), 3, "every table counted");
+        // `puzzle` is still off (the scripted repair wrote nothing), so it
+        // latches as stuck; `game` starts its streak.
+        assert_eq!(action, Action::Report { tables: vec!["game".into(), "puzzle".into()] });
+        let st = hook.state.read().await;
+        assert_eq!(st.streaks["game"], 1);
+        assert!(st.stuck.contains_key("puzzle"));
+        assert_eq!(script.repairs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

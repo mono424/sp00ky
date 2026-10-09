@@ -2622,6 +2622,21 @@ impl Replica {
         Ok(count)
     }
 
+    /// Whether the replica holds any row of `table_name`: one key read, where
+    /// [`Self::count_table`] scans the table. A table absent from the replica
+    /// holds none.
+    pub async fn has_rows(&self, table_name: &str) -> Result<bool> {
+        let mut response = self.db
+            .query(format!("SELECT VALUE id FROM {} LIMIT 1", table_name))
+            .await
+            .with_context(|| format!("row probe failed for table '{}'", table_name))?;
+        // Absent from the replica errors here, as in `count_table`.
+        let Ok(sdk_val) = response.take::<surrealdb::types::Value>(0) else {
+            return Ok(false);
+        };
+        Ok(sdk_val.into_json_value().as_array().is_some_and(|rows| !rows.is_empty()))
+    }
+
     /// Number of non-`_00_` tables present in the replica.
     pub async fn table_count(&self) -> Result<usize> {
         Ok(self.record_counts_per_table().await?.len())

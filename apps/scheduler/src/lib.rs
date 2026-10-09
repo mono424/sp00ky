@@ -849,44 +849,33 @@ impl Scheduler {
         // The check the integrity check above cannot do: compare the replica
         // against UPSTREAM. A persisted snapshot that missed writes made while
         // nothing was listening (a bulk migration with the stack down) is
-        // internally consistent and serves every SSP an empty table. The
-        // buffer is NOT empty after a restart: it holds the WAL backlog
-        // recovered above, which the first tick applies — so the tables in it
+        // internally consistent and serves every SSP an empty table. No SSP
+        // can register until `Ready`, so a re-clone here costs nobody a
+        // bootstrap.
+        //
+        // Only the gate runs here: the tables the replica holds no row of,
+        // the one shape acted on at first sight. Any other mismatch has to
+        // repeat across checks before anything is done about it, so the full
+        // count never protected a bootstrap, it only delayed every one: 80 s
+        // of serial upstream `count()`s on whitepawn (2026-10-09), during
+        // which no SSP could register. The snapshot updater runs the full
+        // check first thing after `Ready` (see `spawn_snapshot_updater`).
+        //
+        // The buffer is NOT empty after a restart: it holds the WAL backlog
+        // recovered above, which the first tick applies, so the tables in it
         // are excluded here exactly as on a tick, or every job table reads as
         // drift on every restart (whitepawn 2026-09-16 00:41).
-        //
-        // After a fresh clone it runs before `Ready`: nothing has registered
-        // against the clone yet, so a re-clone costs nobody a bootstrap. Over
-        // a reused snapshot it runs in the background instead. Before `Ready`
-        // it held every SSP heartbeat and registration at 503 for the whole
-        // check, 64 s of a 65 s scheduler restart on whitepawn (2026-10-09),
-        // and what it finds is acted on the way a tick acts on it: a repair
-        // goes through the ingest pipeline to every SSP, a re-clone flags them
-        // for a re-bootstrap.
-        let startup_check = {
-            let hook = Arc::clone(&drift_hook);
-            let replica = Arc::clone(&self.replica);
-            let busy = BufferBusy(Arc::clone(&self.event_buffer));
-            async move {
-                let started = std::time::Instant::now();
-                match crate::drift::run_check(&hook, &replica, &busy).await {
-                    crate::drift::Action::Clean => info!(
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "Startup drift check passed"
-                    ),
-                    other => warn!(
-                        action = ?other,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "Startup drift check acted"
-                    ),
-                }
-            }
-        };
-        if needs_bootstrap {
-            startup_check.await;
-        } else {
-            info!("Startup drift check runs in the background over the reused snapshot");
-            tokio::spawn(startup_check);
+        let drift_started = std::time::Instant::now();
+        match crate::drift::run_startup_gate(&drift_hook, &self.replica, &BufferBusy(Arc::clone(&self.event_buffer))).await {
+            crate::drift::Action::Clean => info!(
+                elapsed_ms = drift_started.elapsed().as_millis() as u64,
+                "Startup drift gate passed"
+            ),
+            other => warn!(
+                action = ?other,
+                elapsed_ms = drift_started.elapsed().as_millis() as u64,
+                "Startup drift gate acted"
+            ),
         }
 
         // Transition to Ready
@@ -1019,6 +1008,26 @@ impl Scheduler {
             );
             // Skip the first immediate tick
             interval.tick().await;
+
+            // The full startup drift check, which `start` no longer holds
+            // `Ready` for (see the gate there). Here rather than on a tick of
+            // its own: a tick skips its check while an SSP bootstraps, which
+            // right after a restart is the usual case, and in this task it can
+            // never overlap a tick's check.
+            if let Some(hook) = drift.as_deref() {
+                let started = std::time::Instant::now();
+                match crate::drift::run_check(hook, &replica, &BufferBusy(Arc::clone(&event_buffer))).await {
+                    crate::drift::Action::Clean => info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Startup drift check passed"
+                    ),
+                    other => warn!(
+                        action = ?other,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Startup drift check acted"
+                    ),
+                }
+            }
 
             loop {
                 interval.tick().await;

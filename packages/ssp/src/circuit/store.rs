@@ -288,6 +288,17 @@ impl Collection {
     /// about whether its content matches. Equal versions are taken as equal
     /// content, so a caller must still check the table hash afterwards.
     pub fn version_diff(&self, listing: &[(String, Option<i64>)]) -> (Vec<String>, Vec<String>) {
+        self.version_diff_in(listing, |_| true)
+    }
+
+    /// [`Self::version_diff`] against a listing of only part of the table:
+    /// `stale` is limited to the held ids `listed_part` says the listing
+    /// covers, so rows outside it are not taken for deleted.
+    pub fn version_diff_in(
+        &self,
+        listing: &[(String, Option<i64>)],
+        listed_part: impl Fn(&str) -> bool,
+    ) -> (Vec<String>, Vec<String>) {
         let listed: std::collections::HashSet<&str> =
             listing.iter().map(|(id, _)| raw_id(id)).collect();
         let fetch = listing
@@ -299,10 +310,21 @@ impl Collection {
         let stale = self
             .rows
             .keys()
-            .filter(|id| !listed.contains(id))
+            .filter(|id| listed_part(id) && !listed.contains(id))
             .map(str::to_string)
             .collect();
         (fetch, stale)
+    }
+
+    /// The rows folded into `ranges`' accumulators, from the digest stored
+    /// with each row: what the scheduler's id-range hashes are compared
+    /// against. `None` when a held id is not a plain string key.
+    pub fn range_accs(&self, ranges: &ssp_protocol::range_hash::RangeHashes) -> Option<Vec<[u8; 32]>> {
+        ranges.accumulate(
+            self.rows
+                .keys()
+                .filter_map(|id| self.rows.digest_of(id).map(|d| (id, d))),
+        )
     }
 }
 
@@ -693,5 +715,32 @@ mod tests {
         fetch.sort();
         assert_eq!(fetch, vec!["added", "newer", "older"]);
         assert_eq!(stale, vec!["gone"]);
+
+        // A listing of part of the table only judges the ids in that part.
+        let (fetch, stale) = c.version_diff_in(&[("same".to_string(), Some(3))], |id| id < "o");
+        assert!(fetch.is_empty());
+        assert_eq!(stale, vec!["gone", "newer"]);
+    }
+
+    #[test]
+    fn range_accs_match_the_ranges_the_same_rows_fold_to() {
+        use ssp_protocol::range_hash::RangeHashes;
+        let mut c = coll();
+        let mut ranges = RangeHashes::with_starts(vec!["".into(), "m".into()]).unwrap();
+        for (id, n) in [("a", 1), ("k", 2), ("q", 3)] {
+            let body = json!({ "id": format!("thread:{id}"), "n": n });
+            c.apply(Operation::Create, id, sv(body.clone()));
+            let i = ranges.range_of(id).unwrap();
+            ranges.add_at(i, &ssp_protocol::snapshot_hash::record_digest(id, &body));
+        }
+        let accs = c.range_accs(&ranges).unwrap();
+        assert!(ranges.differing(&accs).is_empty());
+        assert_eq!(ranges.total(), c.catchup_xor);
+
+        c.apply(Operation::Update, "q", sv(json!({ "id": "thread:q", "n": 4 })));
+        assert_eq!(ranges.differing(&c.range_accs(&ranges).unwrap()), vec![1]);
+
+        c.apply(Operation::Create, "42", sv(json!({ "id": "thread:42" })));
+        assert!(c.range_accs(&ranges).is_none(), "a numeric key cannot be ranged");
     }
 }

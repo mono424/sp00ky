@@ -14,8 +14,10 @@
 //!   registers. A file that fails its checks is deleted and its table paged.
 //! - **Verify, then repair.** Registration hands back the scheduler's hash of
 //!   every table at the cut it freezes. The bootstrap keeps a table whose rows
-//!   hash the same, repairs one that differs from an `(id, _00_rv)` listing of
-//!   the replica ([`repair_table`]), and pages the rest in full.
+//!   hash the same, repairs one that differs ([`repair_table`]), and pages the
+//!   rest in full. A repair compares the scheduler's id-range hashes with its
+//!   own and lists only the ranges that differ; without ranges it lists the
+//!   whole table's `(id, _00_rv)`.
 //!
 //! The same bootstrap serves an in-process re-bootstrap (the scheduler forgot
 //! this SSP, or asked for a resync): the rows are already in memory and only
@@ -29,12 +31,13 @@ use ssp::circuit::store::Collection;
 use ssp::circuit::{Circuit, Operation, Record};
 use ssp::types::Sp00kyValue;
 use ssp_node::SspStatus;
+use ssp_protocol::range_hash::RangeHashes;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Rows per `(id, _00_rv)` listing page. Two small fields per row, so a page
 /// can be much larger than a bootstrap page of whole bodies.
@@ -296,10 +299,15 @@ fn read_dir_tables(dir: &Path) -> Vec<Collection> {
 }
 
 /// What [`repair_table`] did.
+#[derive(Debug, Default)]
 pub struct Repair {
     pub listed: usize,
     pub fetched: usize,
     pub deleted: usize,
+    /// The scheduler's id ranges for the table (0: it served none, and the
+    /// whole table was listed) and how many of them differed.
+    pub ranges: usize,
+    pub differing: usize,
     /// The table now hashes as the scheduler expects.
     pub matched: bool,
 }
@@ -307,16 +315,146 @@ pub struct Repair {
 /// Bring one table's rows in line with the scheduler's replica, fetching only
 /// the rows that differ.
 ///
-/// Lists `(id, _00_rv)` for the whole table (two small fields per row, keyset
-/// paged), deletes what the replica no longer has, fetches what it holds at
-/// another version or that is missing here, then compares the table hash.
-/// `matched: false` tells the caller to page the table in full, which is also
-/// the answer when most of the table differs anyway.
+/// With the scheduler's id-range hashes (`/proxy/ranges`), only the ranges
+/// whose rows hash differently here are listed: one key-range scan each,
+/// against the whole table's listing without them (whitepawn 2026-10-09:
+/// 105k `game_insight` ids in 24 s to find 3 changed rows). Either way the
+/// `(id, _00_rv)` listing names what to delete and what to fetch, and a range
+/// that still differs after that (content changed at an equal version) is
+/// re-read whole. `matched: false` tells the caller to page the table in full,
+/// which is also the answer when most of the table differs anyway.
 ///
 /// Runs inside the registration window, where the scheduler holds its replica
-/// frozen at the cut it handed out, so the listing and the fetches see one
-/// consistent table.
+/// frozen at the cut it handed out, so the ranges, the listing and the fetches
+/// see one consistent table.
 pub async fn repair_table(
+    source: &BootstrapSource,
+    processor: &Arc<RwLock<Circuit>>,
+    table: &str,
+    omit: &BTreeSet<String>,
+    expected: &str,
+) -> anyhow::Result<Repair> {
+    match source.table_ranges(table).await {
+        Some(wire) if wire.hash == expected => match RangeHashes::from_wire(&wire) {
+            Some(ranges) => return repair_by_ranges(source, processor, table, omit, expected, &ranges).await,
+            None => warn!(table, "Scheduler served range hashes that do not add up; listing the table in full"),
+        },
+        Some(wire) => debug!(table, ranges = %wire.hash, expected, "Range hashes are of another cut; listing the table in full"),
+        None => {}
+    }
+    repair_by_listing(source, processor, table, omit, expected).await
+}
+
+/// [`repair_table`] over the scheduler's id ranges.
+async fn repair_by_ranges(
+    source: &BootstrapSource,
+    processor: &Arc<RwLock<Circuit>>,
+    table: &str,
+    omit: &BTreeSet<String>,
+    expected: &str,
+    ranges: &RangeHashes,
+) -> anyhow::Result<Repair> {
+    let mut repair = Repair { ranges: ranges.len(), ..Repair::default() };
+    let Some(differing) = differing_ranges(processor, table, ranges, None).await else {
+        return Ok(repair);
+    };
+    repair.differing = differing.len();
+
+    // Listing a range ships two fields a row; fetching ships bodies. Only a
+    // repair that would fetch most of the table is better off paging it.
+    let mut listing: Vec<(String, Option<i64>)> = Vec::new();
+    for &i in &differing {
+        let rows = rows_of(source.query(&range_listing_query(table, ranges, i)).await?);
+        listing.extend(rows.iter().filter_map(listing_entry));
+    }
+    repair.listed = listing.len();
+    let scope: HashSet<usize> = differing.iter().copied().collect();
+    let (fetch, stale) = {
+        let circuit = processor.read().await;
+        let Some(coll) = circuit.store.get_collection(table) else { return Ok(repair) };
+        coll.version_diff_in(&listing, |id| ranges.range_of(id).is_some_and(|i| scope.contains(&i)))
+    };
+    if fetch.len() as u64 * 2 > ranges.rows().max(1) {
+        return Ok(repair);
+    }
+    repair.deleted = delete_rows(processor, table, &stale).await;
+    repair.fetched = fetch_rows(source, processor, table, omit, &fetch).await?;
+
+    // Equal versions were taken as equal content. A range that still differs
+    // holds a row changed without a new version: read it whole.
+    let Some(still) = differing_ranges(processor, table, ranges, Some(&differing)).await else {
+        return Ok(repair);
+    };
+    let still_rows: u64 = still.iter().map(|&i| ranges.count(i)).sum();
+    if still_rows * 2 > ranges.rows().max(1) {
+        return Ok(repair);
+    }
+    for &i in &still {
+        let (fetched, deleted) = reread_range(source, processor, table, omit, ranges, i).await?;
+        repair.fetched += fetched;
+        repair.deleted += deleted;
+    }
+
+    repair.matched = table_matches(processor, table, expected).await;
+    Ok(repair)
+}
+
+/// The ranges (of `among`, or all) whose rows hash differently here. `None`
+/// when the table is not held or a held id cannot be ranged.
+async fn differing_ranges(
+    processor: &Arc<RwLock<Circuit>>,
+    table: &str,
+    ranges: &RangeHashes,
+    among: Option<&[usize]>,
+) -> Option<Vec<usize>> {
+    let circuit = processor.read().await;
+    let accs = circuit.store.get_collection(table)?.range_accs(ranges)?;
+    let differing = ranges.differing(&accs);
+    Some(match among {
+        Some(among) => differing.into_iter().filter(|i| among.contains(i)).collect(),
+        None => differing,
+    })
+}
+
+/// Replace range `i` with the replica's rows: every row read is applied (an
+/// unchanged one is a no-op in the store) and every row held here that the
+/// replica no longer has is deleted. Returns `(fetched, deleted)`.
+async fn reread_range(
+    source: &BootstrapSource,
+    processor: &Arc<RwLock<Circuit>>,
+    table: &str,
+    omit: &BTreeSet<String>,
+    ranges: &RangeHashes,
+    i: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let omit_sql = ssp_protocol::omit_clause(omit);
+    let rows = rows_of(source.query(&format!("SELECT *{omit_sql} FROM {}", ranges.target(table, i))).await?);
+    let records = records_of(table, rows);
+    let read: HashSet<&str> = records.iter().map(|r| ssp::types::raw_id(&r.id)).collect();
+    let gone: Vec<String> = {
+        let circuit = processor.read().await;
+        circuit
+            .store
+            .get_collection(table)
+            .map(|coll| {
+                coll.rows
+                    .keys()
+                    .filter(|id| ranges.range_of(id) == Some(i) && !read.contains(id))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deleted = delete_rows(processor, table, &gone).await;
+    let fetched = records.len();
+    apply_records(processor, table, records).await;
+    Ok((fetched, deleted))
+}
+
+/// [`repair_table`] without ranges: list `(id, _00_rv)` for the whole table
+/// (keyset paged), delete what the replica no longer has, fetch what it holds
+/// at another version or that is missing here, then compare the table hash.
+async fn repair_by_listing(
     source: &BootstrapSource,
     processor: &Arc<RwLock<Circuit>>,
     table: &str,
@@ -326,16 +464,9 @@ pub async fn repair_table(
     let mut listing: Vec<(String, Option<i64>)> = Vec::new();
     let mut after: Option<String> = None;
     loop {
-        let rows = match source.query(&listing_query(table, after.as_deref())).await? {
-            Value::Array(rows) => rows,
-            _ => Vec::new(),
-        };
+        let rows = rows_of(source.query(&listing_query(table, after.as_deref())).await?);
         let n = rows.len();
-        for row in rows {
-            if let Some(id) = row.get("id").and_then(Value::as_str) {
-                listing.push((id.to_string(), row.get("_00_rv").and_then(Value::as_i64)));
-            }
-        }
+        listing.extend(rows.iter().filter_map(listing_entry));
         if n < LIST_PAGE {
             break;
         }
@@ -345,55 +476,110 @@ pub async fn repair_table(
         }
     }
 
+    let mut repair = Repair { listed: listing.len(), ..Repair::default() };
     let (fetch, stale) = {
         let circuit = processor.read().await;
         match circuit.store.get_collection(table) {
             Some(coll) => coll.version_diff(&listing),
-            None => return Ok(Repair { listed: listing.len(), fetched: 0, deleted: 0, matched: false }),
+            None => return Ok(repair),
         }
     };
     if fetch.len() * 2 > listing.len().max(1) {
-        return Ok(Repair { listed: listing.len(), fetched: 0, deleted: 0, matched: false });
+        return Ok(repair);
     }
+    repair.deleted = delete_rows(processor, table, &stale).await;
+    repair.fetched = fetch_rows(source, processor, table, omit, &fetch).await?;
+    repair.matched = table_matches(processor, table, expected).await;
+    Ok(repair)
+}
 
-    {
-        let mut circuit = processor.write().await;
-        let coll = circuit.store.ensure_collection(table);
-        for id in &stale {
-            coll.apply(Operation::Delete, id, Sp00kyValue::Null);
-        }
+fn rows_of(result: Value) -> Vec<Value> {
+    match result {
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
     }
+}
 
+fn listing_entry(row: &Value) -> Option<(String, Option<i64>)> {
+    let id = row.get("id")?.as_str()?;
+    Some((id.to_string(), row.get("_00_rv").and_then(Value::as_i64)))
+}
+
+fn records_of(table: &str, rows: Vec<Value>) -> Vec<Record> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.to_string();
+            Some(Record::new(table, &id, row))
+        })
+        .collect()
+}
+
+async fn delete_rows(processor: &Arc<RwLock<Circuit>>, table: &str, ids: &[String]) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let mut circuit = processor.write().await;
+    let coll = circuit.store.ensure_collection(table);
+    for id in ids {
+        coll.apply(Operation::Delete, id, Sp00kyValue::Null);
+    }
+    ids.len()
+}
+
+async fn apply_records(processor: &Arc<RwLock<Circuit>>, table: &str, records: Vec<Record>) {
+    let mut circuit = processor.write().await;
+    let coll = circuit.store.ensure_collection(table);
+    for record in records {
+        coll.apply(Operation::Update, &record.id, record.data);
+    }
+}
+
+/// Fetch the listed ids' bodies by record id, `FETCH_BATCH` at a time, and
+/// apply them. Returns how many came back.
+async fn fetch_rows(
+    source: &BootstrapSource,
+    processor: &Arc<RwLock<Circuit>>,
+    table: &str,
+    omit: &BTreeSet<String>,
+    ids: &[String],
+) -> anyhow::Result<usize> {
     let mut fetched = 0;
-    for batch in fetch.chunks(FETCH_BATCH) {
-        let rows = match source.query(&fetch_query(table, batch, omit)).await? {
-            Value::Array(rows) => rows,
-            _ => Vec::new(),
-        };
-        let records: Vec<Record> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let id = row.get("id")?.as_str()?.to_string();
-                Some(Record::new(table, &id, row))
-            })
-            .collect();
+    for batch in ids.chunks(FETCH_BATCH) {
+        let records = records_of(table, rows_of(source.query(&fetch_query(table, batch, omit)).await?));
         fetched += records.len();
-        let mut circuit = processor.write().await;
-        let coll = circuit.store.ensure_collection(table);
-        for record in records {
-            coll.apply(Operation::Update, &record.id, record.data);
-        }
+        apply_records(processor, table, records).await;
     }
+    Ok(fetched)
+}
 
-    let matched = {
-        let circuit = processor.read().await;
-        circuit
-            .store
-            .get_collection(table)
-            .map(|coll| ssp_protocol::snapshot_hash::xor_acc_to_hex(&coll.catchup_xor) == expected)
-            .unwrap_or(false)
+async fn table_matches(processor: &Arc<RwLock<Circuit>>, table: &str, expected: &str) -> bool {
+    let circuit = processor.read().await;
+    circuit
+        .store
+        .get_collection(table)
+        .map(|coll| ssp_protocol::snapshot_hash::xor_acc_to_hex(&coll.catchup_xor) == expected)
+        .unwrap_or(false)
+}
+
+/// `FROM` targets that page `table` by its id ranges: consecutive ranges
+/// grouped up to about `page_size` rows by the scheduler's counts, one range
+/// at least, so every page is a single key-range scan.
+pub fn page_targets(table: &str, ranges: &RangeHashes, page_size: usize) -> Vec<String> {
+    let span = |first: usize, last: usize| {
+        ssp_protocol::range_hash::range_target(table, ranges.bounds(first).0, ranges.bounds(last).1)
     };
-    Ok(Repair { listed: listing.len(), fetched, deleted: stale.len(), matched })
+    let mut targets = Vec::new();
+    let (mut first, mut rows) = (0usize, 0u64);
+    for i in 0..ranges.len() {
+        let n = ranges.count(i);
+        if i > first && rows + n > page_size as u64 {
+            targets.push(span(first, i - 1));
+            (first, rows) = (i, 0);
+        }
+        rows += n;
+    }
+    targets.push(span(first, ranges.len() - 1));
+    targets
 }
 
 /// A SurrealQL string literal body: backslashes and single quotes escaped.
@@ -415,6 +601,13 @@ fn listing_query(table: &str, after: Option<&str>) -> String {
             record_expr(table, id)
         ),
     }
+}
+
+/// `(id, _00_rv)` of range `i`: a key-range scan, so it reads only that
+/// range. Not paged: `LIMIT` is not pushed into a range scan, and a range is
+/// about `RANGE_ROWS` rows.
+fn range_listing_query(table: &str, ranges: &RangeHashes, i: usize) -> String {
+    format!("SELECT id, _00_rv FROM {}", ranges.target(table, i))
 }
 
 /// Whole bodies of the listed ids, by record id rather than by scan.
@@ -447,6 +640,29 @@ mod tests {
             fetch_query("game", &["a".to_string(), "game:b".to_string()], &omit),
             "SELECT * OMIT blob FROM [type::record('game', 'a'), type::record('game', 'b')]"
         );
+    }
+
+    #[test]
+    fn range_listings_are_key_range_scans() {
+        let ranges = RangeHashes::with_starts(vec!["".into(), "g".into(), "p".into()]).unwrap();
+        assert_eq!(range_listing_query("game", &ranges, 0), "SELECT id, _00_rv FROM game:..⟨g⟩");
+        assert_eq!(range_listing_query("game", &ranges, 1), "SELECT id, _00_rv FROM game:⟨g⟩..⟨p⟩");
+        assert_eq!(range_listing_query("game", &ranges, 2), "SELECT id, _00_rv FROM game:⟨p⟩..");
+    }
+
+    #[test]
+    fn pages_group_ranges_up_to_the_page_size() {
+        let mut ranges =
+            RangeHashes::with_starts(vec!["".into(), "d".into(), "h".into(), "p".into()]).unwrap();
+        for (i, n) in [(0, 400), (1, 500), (2, 300), (3, 900)] {
+            for k in 0..n {
+                ranges.add_at(i, &ssp_protocol::snapshot_hash::record_digest(&format!("{i}{k}"), &serde_json::json!({})));
+            }
+        }
+        assert_eq!(page_targets("t", &ranges, 1000), vec!["t:..⟨h⟩", "t:⟨h⟩..⟨p⟩", "t:⟨p⟩.."]);
+        // A range bigger than a page is still one page.
+        assert_eq!(page_targets("t", &ranges, 100), vec!["t:..⟨d⟩", "t:⟨d⟩..⟨h⟩", "t:⟨h⟩..⟨p⟩", "t:⟨p⟩.."]);
+        assert_eq!(page_targets("t", &ranges, 10_000), vec!["t"]);
     }
 
     #[test]
@@ -505,5 +721,178 @@ mod tests {
         assert_eq!(game.catchup_xor, processor.read().await.store.get_collection("game").unwrap().catchup_xor);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in for the scheduler's `/proxy`: one table held as JSON rows,
+    /// answering exactly the query shapes the repair sends, and recording them.
+    #[derive(Clone)]
+    struct FakeProxy {
+        rows: Arc<std::collections::BTreeMap<String, Value>>,
+        starts: Vec<String>,
+        serve_ranges: bool,
+        queries: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeProxy {
+        fn ranges(&self) -> RangeHashes {
+            let mut r = RangeHashes::with_starts(self.starts.clone()).unwrap();
+            for (raw, row) in self.rows.iter() {
+                let i = r.range_of(raw).unwrap();
+                r.add_at(i, &ssp_protocol::snapshot_hash::record_digest(raw, row));
+            }
+            r
+        }
+
+        /// Rows whose key is in the target `game:⟨lo⟩..⟨hi⟩` (either side open).
+        fn in_target(&self, target: &str) -> Vec<Value> {
+            let spec = target.strip_prefix("game").unwrap().strip_prefix(':').unwrap_or("..");
+            let (lo, hi) = spec.split_once("..").unwrap();
+            let unwrap = |b: &str| b.trim_start_matches('⟨').trim_end_matches('⟩').to_string();
+            let (lo, hi) = (unwrap(lo), unwrap(hi));
+            self.rows
+                .iter()
+                .filter(|(k, _)| k.as_str() >= lo.as_str() && (hi.is_empty() || k.as_str() < hi.as_str()))
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
+
+        fn answer(&self, q: &str) -> Value {
+            self.queries.lock().unwrap().push(q.to_string());
+            let listing = |rows: Vec<Value>| {
+                Value::Array(rows.iter().map(|r| serde_json::json!({ "id": r["id"], "_00_rv": r["_00_rv"] })).collect())
+            };
+            if let Some(target) = q.strip_prefix("SELECT id, _00_rv FROM ") {
+                if let Some(rest) = target.strip_prefix("game ") {
+                    // The keyset listing.
+                    let after = rest
+                        .strip_prefix("WHERE id > type::record('game', '")
+                        .and_then(|r| r.split_once('\'').map(|(a, _)| a.to_string()));
+                    let rows: Vec<Value> = self
+                        .rows
+                        .iter()
+                        .filter(|(k, _)| after.as_ref().map_or(true, |a| k.as_str() > a.as_str()))
+                        .take(LIST_PAGE)
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    return listing(rows);
+                }
+                return listing(self.in_target(target));
+            }
+            if let Some(ids) = q.strip_prefix("SELECT * FROM [") {
+                let rows = ids
+                    .split("type::record('game', '")
+                    .skip(1)
+                    .filter_map(|part| part.split_once('\'').map(|(id, _)| id))
+                    .filter_map(|id| self.rows.get(id).cloned())
+                    .collect();
+                return Value::Array(rows);
+            }
+            if let Some(target) = q.strip_prefix("SELECT * FROM ") {
+                return Value::Array(self.in_target(target));
+            }
+            panic!("unexpected proxy query: {q}");
+        }
+
+        async fn serve(self) -> String {
+            use axum::{routing::post, Json, Router};
+            let query = self.clone();
+            let ranges = self.clone();
+            let app = Router::new()
+                .route(
+                    "/proxy/query",
+                    post(move |Json(body): Json<Value>| {
+                        let fake = query.clone();
+                        async move { Json(fake.answer(body["query"].as_str().unwrap())) }
+                    }),
+                )
+                .route(
+                    "/proxy/ranges",
+                    post(move || {
+                        let fake = ranges.clone();
+                        async move {
+                            if !fake.serve_ranges {
+                                return Err(axum::http::StatusCode::NOT_FOUND);
+                            }
+                            fake.queries.lock().unwrap().push("ranges".to_string());
+                            Ok(Json(fake.ranges().to_wire("game")))
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}/proxy")
+        }
+    }
+
+    fn game_row(i: usize, n: i64, rv: i64) -> (String, Value) {
+        let raw = format!("g{i:05}");
+        let row = serde_json::json!({ "id": format!("game:{raw}"), "n": n, "_00_rv": rv });
+        (raw, row)
+    }
+
+    /// The replica holds 3000 rows in three ranges. The SSP holds the same
+    /// except: one row changed without a new version (range 0), one row
+    /// missing and one extra (range 2). Range 1 must never be read.
+    async fn warm_case(serve_ranges: bool) -> (Repair, Vec<String>, bool) {
+        let rows: std::collections::BTreeMap<String, Value> =
+            (0..3000).map(|i| game_row(i, i as i64, 1)).collect();
+        let fake = FakeProxy {
+            rows: Arc::new(rows.clone()),
+            starts: vec!["".into(), "g01000".into(), "g02000".into()],
+            serve_ranges,
+            queries: Default::default(),
+        };
+        let expected = ssp_protocol::snapshot_hash::xor_acc_to_hex(&fake.ranges().total());
+        let proxy_url = fake.clone().serve().await;
+        let source = BootstrapSource::Proxy { client: reqwest::Client::new(), proxy_url };
+
+        let processor = Arc::new(RwLock::new(Circuit::new()));
+        {
+            let mut c = processor.write().await;
+            let coll = c.store.ensure_collection("game");
+            for (raw, row) in rows.iter() {
+                let row = match raw.as_str() {
+                    "g00500" => game_row(500, -1, 1).1,
+                    "g02500" => continue,
+                    _ => row.clone(),
+                };
+                coll.apply(Operation::Create, raw, Sp00kyValue::from(row));
+            }
+            let (raw, row) = game_row(2600, 0, 1);
+            coll.apply(Operation::Create, &format!("{raw}x"), Sp00kyValue::from(row));
+        }
+
+        let repair = repair_table(&source, &processor, "game", &BTreeSet::new(), &expected).await.unwrap();
+        let queries = fake.queries.lock().unwrap().clone();
+        let matched = table_matches(&processor, "game", &expected).await;
+        (repair, queries, matched)
+    }
+
+    #[tokio::test]
+    async fn repair_reads_only_the_ranges_that_differ() {
+        let (repair, queries, matched) = warm_case(true).await;
+        assert!(repair.matched && matched, "{repair:?}");
+        assert_eq!((repair.ranges, repair.differing), (3, 2));
+        assert_eq!(repair.listed, 2000, "ranges 0 and 2 listed, not range 1");
+        assert_eq!(repair.deleted, 1, "the extra row");
+        assert!(queries.iter().all(|q| !q.contains("g01000⟩..⟨g02000")), "range 1 was read: {queries:?}");
+        assert_eq!(
+            queries.iter().filter(|q| q.starts_with("SELECT id, _00_rv FROM game:")).count(),
+            2
+        );
+        // Range 0's change kept its version, so range 0 was re-read whole.
+        assert!(queries.contains(&"SELECT * FROM game:..⟨g01000⟩".to_string()), "{queries:?}");
+        assert!(!queries.iter().any(|q| q.starts_with("SELECT * FROM game:⟨g02000⟩")));
+    }
+
+    #[tokio::test]
+    async fn repair_lists_the_whole_table_without_ranges() {
+        let (repair, queries, _) = warm_case(false).await;
+        assert_eq!(repair.ranges, 0);
+        assert_eq!(repair.listed, 3000);
+        assert!(queries.iter().any(|q| q.starts_with("SELECT id, _00_rv FROM game ORDER BY id")));
+        // Without ranges an equal-version change goes unseen; the caller pages.
+        assert!(!repair.matched);
     }
 }

@@ -627,6 +627,28 @@ impl BootstrapReporter {
 }
 
 impl BootstrapSource {
+    /// The scheduler's id-range hashes for `table` (see `warm`). `None`
+    /// standalone, from a scheduler that has none for the table or predates
+    /// them, and on any error: the caller then lists or pages the whole table.
+    async fn table_ranges(&self, table: &str) -> Option<ssp_protocol::range_hash::TableRanges> {
+        let BootstrapSource::Proxy { client, proxy_url } = self else {
+            return None;
+        };
+        let request = ssp_protocol::range_hash::RangeHashesRequest { table: table.to_string() };
+        let resp = match client.post(format!("{proxy_url}/ranges")).json(&request).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                debug!(table, error = %e, "Range hashes request failed");
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            debug!(table, status = %resp.status(), "No range hashes from the scheduler");
+            return None;
+        }
+        resp.json().await.ok()
+    }
+
     async fn query(&self, surql: &str) -> anyhow::Result<Value> {
         match self {
             BootstrapSource::Direct(db) => {
@@ -2165,6 +2187,8 @@ async fn self_bootstrap_with_metadata(
                     repaired += 1;
                     info!(
                         table = %table,
+                        ranges = repair.ranges,
+                        differing = repair.differing,
                         listed = repair.listed,
                         fetched = repair.fetched,
                         deleted = repair.deleted,
@@ -2179,6 +2203,8 @@ async fn self_bootstrap_with_metadata(
                 }
                 Ok(repair) => info!(
                     table = %table,
+                    ranges = repair.ranges,
+                    differing = repair.differing,
                     listed = repair.listed,
                     fetched = repair.fetched,
                     "Table still differs after repair; paging it in full"
@@ -2189,12 +2215,35 @@ async fn self_bootstrap_with_metadata(
         if held.is_some() {
             processor.write().await.store.collections.remove(table);
         }
+        // Page by the scheduler's id ranges when it serves them for this cut:
+        // one key-range scan per window. The keyset pager is the fallback; on
+        // SurrealDB 3.1 each of its pages scans from the table's first key, so
+        // a big table costs more with every page.
+        let windows = match expected.get(table) {
+            Some(want) => source
+                .table_ranges(table)
+                .await
+                .filter(|w| &w.hash == want)
+                .and_then(|w| ssp_protocol::range_hash::RangeHashes::from_wire(&w))
+                .map(|ranges| warm::page_targets(table, &ranges, page_size)),
+            None => None,
+        };
+        let paged_by = if windows.is_some() { "ranges" } else { "keyset" };
+        let mut windows = windows.map(Vec::into_iter);
+        let omit_sql = ssp_protocol::omit_clause(omit);
         let mut record_count: usize = 0;
         // Keyset cursor: the highest `id` loaded so far. `None` = first page.
         let mut after_id: Option<String> = None;
         loop {
+            let query = match windows.as_mut() {
+                Some(targets) => match targets.next() {
+                    Some(target) => format!("SELECT *{omit_sql} FROM {target}"),
+                    None => break,
+                },
+                None => bootstrap_page_query(table, page_size, after_id.as_deref(), omit),
+            };
             let result = source
-                .query(&bootstrap_page_query(table, page_size, after_id.as_deref(), omit))
+                .query(&query)
                 .await
                 .with_context(|| format!("Failed to page-query table {}", table))?;
 
@@ -2204,6 +2253,9 @@ async fn self_bootstrap_with_metadata(
             };
             let n = rows.len();
             if n == 0 {
+                if windows.is_some() {
+                    continue;
+                }
                 break;
             }
 
@@ -2232,6 +2284,9 @@ async fn self_bootstrap_with_metadata(
             if let Some(r) = reporter {
                 r.add_rows(n).await;
             }
+            if windows.is_some() {
+                continue;
+            }
             if n < page_size {
                 break;
             }
@@ -2241,7 +2296,7 @@ async fn self_bootstrap_with_metadata(
                 None => break,
             }
         }
-        info!(table = %table, records = record_count, "Loaded table data");
+        info!(table = %table, records = record_count, paged_by, "Loaded table data");
         if let Some(r) = reporter {
             r.finish_table().await;
         }

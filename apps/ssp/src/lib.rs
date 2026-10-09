@@ -1803,11 +1803,23 @@ impl ClusterBoot {
                     }
                     *status.write().await = SspStatus::Ready;
                     // Persist what was just verified, so a restart from here on is
-                    // warm. Off the critical path: the SSP is already serving.
+                    // warm. Not right away: the scheduler replays the events it
+                    // buffered and verifies the catch-up as soon as we report
+                    // ready, and every one of those ingests waits for a table
+                    // the write is holding. On whitepawn a 16 s write held 3
+                    // replayed events for 13 s, and the SSP out of rotation
+                    // with them. A restart inside the delay still loads the
+                    // previous checkpoint and repairs the difference.
                     if let Some(rows) = row_checkpoints {
                         let rows = Arc::clone(rows);
                         let processor = Arc::clone(processor);
-                        tokio::spawn(async move { rows.write(&processor, "bootstrap").await });
+                        let status = Arc::clone(status);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(warm::POST_BOOTSTRAP_WRITE_DELAY).await;
+                            if *status.read().await == SspStatus::Ready {
+                                rows.write(&processor, "bootstrap").await;
+                            }
+                        });
                     }
                     break;
                 }

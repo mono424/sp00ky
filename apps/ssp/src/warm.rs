@@ -46,6 +46,10 @@ const FETCH_BATCH: usize = 500;
 /// Default for `SPKY_SSP_ROW_CHECKPOINT_SECS`.
 const DEFAULT_INTERVAL_SECS: u64 = 1800;
 
+/// How long after a bootstrap the first checkpoint waits, so its table locks
+/// stay out of the scheduler's replay and catch-up verification.
+pub const POST_BOOTSTRAP_WRITE_DELAY: Duration = Duration::from_secs(120);
+
 /// The row checkpoint directory and what is in it.
 pub struct RowCheckpoints {
     dir: PathBuf,

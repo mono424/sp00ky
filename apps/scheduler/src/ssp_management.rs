@@ -8,6 +8,7 @@ use axum::{
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -423,6 +424,29 @@ async fn handle_bootstrap_verify(
     }))
 }
 
+/// How long a registration's pre-drain waits for the replica before it hands
+/// out the last drained snapshot instead.
+const PRE_DRAIN_REPLICA_WAIT: Duration = Duration::from_secs(2);
+
+/// Whether a registration should drain the backlog before capturing its
+/// hashes: yes if the replica's write lock comes free within
+/// [`PRE_DRAIN_REPLICA_WAIT`], and yes regardless if a table is dirty.
+///
+/// The drain runs under `drain_lock`. On whitepawn (2026-10-09) it sat 44 s
+/// queued for the replica behind the drift check's table counts: the SSP's
+/// 10 s register call timed out four times, each retry queued its own critical
+/// section behind the first, and the new SSP registered 52 s after the old one
+/// stopped. Without the drain the SSP gets the last drained snapshot, which is
+/// self-consistent, and replays the backlog instead, as a sibling bootstrap
+/// already does. A dirty table is the exception: its persisted hash is wrong
+/// until a drain rehashes it, so that drain waits for the replica.
+async fn pre_drain_now(replica: &Arc<RwLock<Replica>>) -> bool {
+    if tokio::time::timeout(PRE_DRAIN_REPLICA_WAIT, replica.write()).await.is_ok() {
+        return true;
+    }
+    !replica.read().await.dirty_tables().is_empty()
+}
+
 /// Handle SSP registration — freezes snapshot, returns snapshot_seq, spawns poll task
 async fn handle_register(
     State(state): State<SspManagementState>,
@@ -491,7 +515,8 @@ async fn handle_register(
     //
     // Latency: registration runs under the SSP's 10s client timeout with
     // retry/backoff. A backlog, or a from-content rehash of a dirty table,
-    // may push the first attempt past that timeout. The critical section
+    // may push the first attempt past that timeout; a replica busy with a
+    // long read no longer does (see `pre_drain_now`). The critical section
     // therefore runs in its own task: when the client times out, hyper drops
     // the handler future, and an inline drain that died mid-way had already
     // taken its events out of the buffer (lost until the next boot's WAL
@@ -526,14 +551,22 @@ async fn handle_register(
                 // still gets a self-consistent (if slightly stale) snapshot —
                 // nothing else can drain while the status stays frozen.
                 info!("Skipping pre-registration drain: sibling SSP bootstrap in flight");
+            } else if !pre_drain_now(&state.replica).await {
+                info!(
+                    waited_ms = PRE_DRAIN_REPLICA_WAIT.as_millis() as u64,
+                    "Skipping pre-registration drain: the replica is busy; handing out the last drained snapshot"
+                );
             } else {
+                let started = std::time::Instant::now();
                 match crate::drain_and_apply(&state.event_buffer, &state.replica, &state.wal)
                     .await
                 {
                     Ok(0) => {}
-                    Ok(applied) => {
-                        info!(applied, "Drained pending events before handing bootstrap hashes")
-                    }
+                    Ok(applied) => info!(
+                        applied,
+                        drain_ms = started.elapsed().as_millis() as u64,
+                        "Drained pending events before handing bootstrap hashes"
+                    ),
                     Err(e) => {
                         warn!(error = %e, "Pre-registration drain failed; handing out persisted hashes")
                     }

@@ -1108,6 +1108,59 @@ mod ssp_management_tests {
         assert_eq!(pool.get_bootstrap_seq("ssp-1"), Some(expected_seq));
     }
 
+    async fn ingest_users(h: &TestHarness, n: usize) {
+        for i in 0..n {
+            let payload = ingest_payload("user", "CREATE", &format!("u{i}"));
+            let (status, _) = post_json(h.ingest_router(), "/ingest", &payload).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_does_not_wait_for_a_busy_replica() {
+        let h = TestHarness::new().await;
+        ingest_users(&h, 3).await;
+        // A long reader, as the drift check's table counts were on whitepawn.
+        let reader = h.replica.read().await;
+
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            post_json(
+                h.ssp_router(),
+                "/ssp/register",
+                &register_payload("ssp-1", "http://localhost:9999"),
+            ),
+        )
+        .await
+        .expect("registration waited for the replica");
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["snapshot_seq"].as_u64(), Some(0), "the last drained snapshot");
+        assert_eq!(h.event_buffer.read().await.len(), 3, "the backlog is left for the replay");
+        drop(reader);
+    }
+
+    #[tokio::test]
+    async fn register_waits_for_the_replica_when_a_table_is_dirty() {
+        let h = TestHarness::new().await;
+        ingest_users(&h, 1).await;
+        h.replica.write().await.mark_tables_dirty(["user".to_string()]);
+        let reader = h.replica.read().await;
+
+        let app = h.ssp_router();
+        let register = tokio::spawn(async move {
+            post_json(app, "/ssp/register", &register_payload("ssp-1", "http://localhost:9999")).await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(!register.is_finished(), "a dirty table's hash is wrong until a drain rehashes it");
+
+        drop(reader);
+        let (status, body) = register.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["snapshot_seq"].as_u64(), Some(1));
+        assert!(h.replica.read().await.dirty_tables().is_empty());
+    }
+
     #[tokio::test]
     async fn register_empty_ssp_id() {
         let h = TestHarness::new().await;

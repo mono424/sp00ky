@@ -291,6 +291,7 @@ Register a new SSP sidecar with the scheduler. The scheduler will immediately ma
   ```
   `standby: true` means the scheduler took the SSP in as the standby for `replaces`: it must not write to the database until it is promoted.
 - `400 Bad Request` - Invalid SSP ID (empty) or invalid URL format
+- `409 Conflict` - This SSP id was replaced by a successor that is still in the pool (blue/green). The SSP exits; it must not serve beside its successor.
 
 **Flow:**
 1. SSP sends registration request
@@ -812,6 +813,11 @@ caught up the scheduler promotes it:
    running are not re-run) until you stop it.
 
 If the swap fails, the old SSP is resumed and gets back every event it missed.
+
+A standby whose predecessor is still coming up (re-registering after a
+scheduler restart) waits for it. One whose predecessor is not registered at
+all takes over as an ordinary SSP, and the predecessor is refused with a `409`
+if it tries to register again, so the two never serve side by side.
 
 #### GET /handover/ssps
 

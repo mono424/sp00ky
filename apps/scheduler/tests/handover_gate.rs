@@ -63,6 +63,19 @@ async fn the_gate_holds_serves_and_relays() {
     let echoed = client.post(url("/echo")).body("payload-123").send().await.unwrap().text().await.unwrap();
     assert_eq!(echoed, "payload-123");
 
+    // A request that was relayed here already is never relayed again (two
+    // schedulers relaying to each other would bounce it forever): it waits.
+    let bounced = tokio::spawn({
+        let client = client.clone();
+        let u = url("/hello");
+        async move { client.get(u).header("x-sp00ky-relayed", "1").send().await.unwrap().text().await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!bounced.is_finished(), "a relayed request is held, not relayed again");
+    gate.set_mode(Mode::Serve);
+    assert_eq!(bounced.await.unwrap(), "local");
+    gate.set_mode(Mode::Forward("127.0.0.1".to_string()));
+
     // A relay target that is not listening yet: the request waits and is
     // answered once the mode moves on, instead of failing.
     let dead_port = free_port().await;

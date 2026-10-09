@@ -44,6 +44,13 @@ use tracing::{info, warn};
 /// comes up.
 const HOLD_MAX: Duration = Duration::from_secs(90);
 
+/// Set on every relayed request. A process asked to relay a request that was
+/// relayed to it already holds it instead: two schedulers relaying to each
+/// other (a prepare that timed out on the successor's side while the
+/// predecessor finished it) would otherwise bounce it between them forever.
+/// One of them is about to serve, and the held request goes there.
+const RELAYED_HEADER: &str = "x-sp00ky-relayed";
+
 /// Largest request body the relay buffers. Bodies are buffered so a relay that
 /// finds its target not listening yet can try again; scheduler requests are
 /// small JSON (an ingest event, a view registration, an SSP heartbeat).
@@ -319,6 +326,12 @@ async fn dispatch(slot: RouterSlot, listener: Listener, port: u16, req: Request)
                 }
                 let _ = gate.changed_from(&mode, remaining).await;
             }
+            Mode::Forward(_) if was_relayed(&req, &buffered) => {
+                if remaining.is_zero() {
+                    return held_too_long();
+                }
+                let _ = gate.changed_from(&mode, remaining).await;
+            }
             Mode::Forward(host) => {
                 if buffered.is_none() {
                     let (parts, body) = take_request(&mut req, &mut buffered).into_parts();
@@ -362,6 +375,15 @@ fn take_request(
     }
     let (parts, bytes) = buffered.take().expect("request is either live or buffered");
     Request::from_parts(parts, Body::from(bytes))
+}
+
+fn was_relayed(req: &Option<Request>, buffered: &Option<(axum::http::request::Parts, axum::body::Bytes)>) -> bool {
+    let headers = match (req, buffered) {
+        (Some(req), _) => req.headers(),
+        (None, Some((parts, _))) => &parts.headers,
+        (None, None) => return false,
+    };
+    headers.contains_key(RELAYED_HEADER)
 }
 
 fn held_too_long() -> Response {
@@ -408,6 +430,7 @@ async fn relay(
             headers.append(name.clone(), value.clone());
         }
     }
+    headers.insert(RELAYED_HEADER, HeaderValue::from_static("1"));
     let tracked = Tracked::new(&gate.relaying);
     let resp = gate
         .client
@@ -543,6 +566,9 @@ pub enum TakeOver {
     Unsupported,
     /// Nothing answers at the predecessor's address: it is gone already.
     Unreachable,
+    /// The predecessor handed over (its replica is free or about to be) but
+    /// its state never arrived: boot on our own, SSPs re-register in place.
+    Released,
 }
 
 /// How long green keeps asking a busy predecessor before it gives up.
@@ -619,12 +645,36 @@ pub async fn take_over(from: &str, successor: &str, ports: RelayPorts, auth_secr
                 return TakeOver::Unreachable;
             }
             Err(e) => {
-                // A timeout or a reset mid-prepare: blue may or may not have
-                // closed its replica. Waiting for the lock settles it either
-                // way: it frees when blue hands over or stops.
-                warn!(error = %e, "Prepare request failed; relaying to the predecessor until the replica frees");
-                return TakeOver::Unsupported;
+                // A timeout or a reset mid-prepare: the predecessor may or may
+                // not have handed over. Ask it, rather than guess: relaying to
+                // a predecessor that already relays to us would hold every
+                // request until we serve, and holding while it still serves
+                // would hold half of them for nothing.
+                warn!(error = %e, "Prepare request failed; asking the predecessor where it stands");
+                return settle_ambiguous(from).await;
             }
+        }
+    }
+}
+
+/// After a prepare whose answer was lost: read the predecessor's own status.
+async fn settle_ambiguous(from: &str) -> TakeOver {
+    let url = format!("{}/handover/status", from.trim_end_matches('/'));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match gate().client.get(&url).timeout(Duration::from_secs(5)).send().await {
+            Ok(resp) => match resp.json::<StatusReport>().await {
+                Ok(status) if status.role == "retired" => return TakeOver::Released,
+                // Still mid-handover: it finishes on its own (the work is
+                // detached from our request), so look again shortly.
+                Ok(status) if status.phase == "handing_over" && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                _ => return TakeOver::Unsupported,
+            },
+            Err(e) if e.is_connect() => return TakeOver::Unreachable,
+            Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_secs(1)).await,
+            Err(_) => return TakeOver::Unsupported,
         }
     }
 }
@@ -740,11 +790,21 @@ async fn prepare(
         return (StatusCode::BAD_REQUEST, "successor is required").into_response();
     }
     info!(successor = %req.successor, successor_version = %req.version, "Handover requested");
-    match deps
-        .scheduler
-        .hand_over(req.successor.trim(), req.ports, &deps.query_tracker, &deps.backup_restore_lock)
-        .await
-    {
+    // Detached: past its point of no return a handover must finish, and the
+    // request's own deadline (or the successor giving up on it) would
+    // otherwise drop it half done.
+    let handing = tokio::spawn(async move {
+        deps.scheduler
+            .hand_over(req.successor.trim(), req.ports, &deps.query_tracker, &deps.backup_restore_lock)
+            .await
+    });
+    let outcome = match handing.await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("handover task failed: {e}")).into_response();
+        }
+    };
+    match outcome {
         Ok(state) => axum::Json(state).into_response(),
         Err(Refusal::Busy(reason)) => {
             info!(reason = %reason, "Handover refused for now");

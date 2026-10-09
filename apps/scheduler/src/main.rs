@@ -195,7 +195,7 @@ async fn run() -> Result<()> {
                 gate.set_status("starting", "waiting_for_lock");
                 lock_wait = Duration::from_secs(24 * 3600);
             }
-            TakeOver::Unreachable => {
+            TakeOver::Unreachable | TakeOver::Released => {
                 gate.set_status("starting", "opening");
                 lock_wait = Duration::from_secs(60);
             }

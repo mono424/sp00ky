@@ -173,7 +173,12 @@ async fn run() -> Result<()> {
     if let Some(from) = std::env::var("SPKY_HANDOVER_FROM").ok().filter(|s| !s.trim().is_empty()) {
         let successor = handover::advertise_host();
         info!(from = %from, successor = %successor, "Taking over from a running scheduler");
-        match handover::take_over(&from, &successor, auth_secret.as_deref()).await {
+        let own_ports = handover::RelayPorts {
+            main: Some(config.ingest_port),
+            admin: admin_config.enabled.then_some(admin_config.port),
+            pool: pool_config.enabled.then_some(pool_config.port),
+        };
+        match handover::take_over(&from, &successor, own_ports, auth_secret.as_deref()).await {
             TakeOver::Granted(state) => {
                 gate.set_status("starting", "opening");
                 handed_over = Some(state);
@@ -182,6 +187,10 @@ async fn run() -> Result<()> {
             TakeOver::Unsupported => {
                 // Relay to the predecessor until the control plane stops it,
                 // then the lock frees and this process boots on its own.
+                gate.set_relay_ports(handover::RelayPorts {
+                    main: handover::port_of(&from),
+                    ..Default::default()
+                });
                 gate.set_mode(Mode::Forward(handover::host_of(&from)));
                 gate.set_status("starting", "waiting_for_lock");
                 lock_wait = Duration::from_secs(24 * 3600);

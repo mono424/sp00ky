@@ -56,12 +56,12 @@ async fn a_scheduler_hands_its_replica_and_pool_to_its_successor() {
     );
 
     let backup_lock = tokio::sync::Mutex::new(());
-    let state = blue.hand_over("green-host", &blue_tracker, &backup_lock).await.unwrap();
+    let state = blue.hand_over("green-host", Default::default(), &blue_tracker, &backup_lock).await.unwrap();
     assert_eq!(handover::gate().mode(), Mode::Forward("green-host".to_string()));
     assert_eq!(handover::gate().role(), "retired");
     assert!(handover::ingest_gate().try_read().is_err(), "blue takes no event after handing over");
     assert!(matches!(
-        blue.hand_over("someone-else", &blue_tracker, &backup_lock).await,
+        blue.hand_over("someone-else", Default::default(), &blue_tracker, &backup_lock).await,
         Err(Refusal::Gone(_))
     ));
 

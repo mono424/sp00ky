@@ -75,6 +75,29 @@ pub enum Listener {
     Pool,
 }
 
+/// The successor's port per listener, when it differs from ours (two
+/// schedulers on one host, as in a local test). `None` relays to the port the
+/// request came in on, which is the production case: same configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPorts {
+    #[serde(default)]
+    pub main: Option<u16>,
+    #[serde(default)]
+    pub admin: Option<u16>,
+    #[serde(default)]
+    pub pool: Option<u16>,
+}
+
+impl RelayPorts {
+    fn for_listener(&self, listener: Listener) -> Option<u16> {
+        match listener {
+            Listener::Main => self.main,
+            Listener::Admin => self.admin,
+            Listener::Pool => self.pool,
+        }
+    }
+}
+
 /// What `/handover/status` reports. The control plane polls it on green to
 /// learn when blue can go.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +121,7 @@ pub struct Gate {
     /// Requests being relayed right now (blue after the handover).
     relaying: AtomicU64,
     status: Mutex<StatusReport>,
+    relay_ports: Mutex<RelayPorts>,
     client: reqwest::Client,
 }
 
@@ -118,6 +142,7 @@ pub fn gate() -> &'static Gate {
             error: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
         }),
+        relay_ports: Mutex::new(RelayPorts::default()),
         client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             // No overall timeout: the relay carries SSE streams and long
@@ -143,6 +168,16 @@ impl Gate {
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.role = role.to_string();
         status.phase = phase.to_string();
+    }
+
+    /// Ports to relay to when the peer's differ from ours; set before
+    /// switching to [`Mode::Forward`].
+    pub fn set_relay_ports(&self, ports: RelayPorts) {
+        *self.relay_ports.lock().unwrap_or_else(|e| e.into_inner()) = ports;
+    }
+
+    fn relay_port(&self, listener: Listener) -> Option<u16> {
+        self.relay_ports.lock().unwrap_or_else(|e| e.into_inner()).for_listener(listener)
     }
 
     pub fn set_peer(&self, peer: Option<String>) {
@@ -296,7 +331,8 @@ async fn dispatch(slot: RouterSlot, listener: Listener, port: u16, req: Request)
                     buffered = Some((parts, bytes));
                 }
                 let (parts, bytes) = buffered.as_ref().expect("buffered above");
-                match relay(gate, host, port, parts, bytes.clone()).await {
+                let target_port = gate.relay_port(listener).unwrap_or(port);
+                match relay(gate, host, target_port, parts, bytes.clone()).await {
                     Ok(resp) => return resp,
                     Err(RelayError::Unreachable(e)) => {
                         // The target is not listening (green still binding,
@@ -464,6 +500,9 @@ pub struct PrepareRequest {
     /// Green's version, for the logs.
     #[serde(default)]
     pub version: String,
+    /// Green's ports, when they differ from blue's.
+    #[serde(default)]
+    pub ports: RelayPorts,
 }
 
 /// Everything a scheduler holds only in memory that its successor needs to
@@ -511,7 +550,7 @@ const BUSY_RETRY_MAX: Duration = Duration::from_secs(180);
 
 /// Ask the predecessor at `from` (a base URL, `http://host:port`) to hand
 /// over. Retries while it is busy.
-pub async fn take_over(from: &str, successor: &str, auth_secret: Option<&str>) -> TakeOver {
+pub async fn take_over(from: &str, successor: &str, ports: RelayPorts, auth_secret: Option<&str>) -> TakeOver {
     let gate = gate();
     gate.set_peer(Some(from.to_string()));
     let Some(secret) = auth_secret else {
@@ -522,6 +561,7 @@ pub async fn take_over(from: &str, successor: &str, auth_secret: Option<&str>) -
     let body = PrepareRequest {
         successor: successor.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        ports,
     };
     let started = Instant::now();
     loop {
@@ -605,6 +645,13 @@ pub fn advertise_host() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
+/// Port part of a base URL, if it names one.
+pub fn port_of(base: &str) -> Option<u16> {
+    let rest = base.split("://").nth(1).unwrap_or(base);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority.rsplit_once(':').and_then(|(_, port)| port.parse().ok())
+}
+
 /// Host part of a base URL (`http://host:port` -> `host`).
 pub fn host_of(base: &str) -> String {
     let rest = base.split("://").nth(1).unwrap_or(base);
@@ -629,6 +676,8 @@ mod tests {
 
     #[test]
     fn host_of_strips_scheme_and_port() {
+        assert_eq!(port_of("http://spooky-x-scheduler-abc:9667"), Some(9667));
+        assert_eq!(port_of("http://scheduler"), None);
         assert_eq!(host_of("http://spooky-x-scheduler-abc:9667"), "spooky-x-scheduler-abc");
         assert_eq!(host_of("http://10.0.0.5:9667/"), "10.0.0.5");
         assert_eq!(host_of("scheduler"), "scheduler");
@@ -693,7 +742,7 @@ async fn prepare(
     info!(successor = %req.successor, successor_version = %req.version, "Handover requested");
     match deps
         .scheduler
-        .hand_over(req.successor.trim(), &deps.query_tracker, &deps.backup_restore_lock)
+        .hand_over(req.successor.trim(), req.ports, &deps.query_tracker, &deps.backup_restore_lock)
         .await
     {
         Ok(state) => axum::Json(state).into_response(),

@@ -981,6 +981,7 @@ impl Scheduler {
     pub async fn hand_over(
         &self,
         successor: &str,
+        successor_ports: crate::handover::RelayPorts,
         query_tracker: &crate::query::QueryTracker,
         backup_restore_lock: &tokio::sync::Mutex<()>,
     ) -> std::result::Result<crate::handover::HandoverState, crate::handover::Refusal> {
@@ -1067,6 +1068,7 @@ impl Scheduler {
         std::mem::forget(backup_guard);
 
         gate.set_peer(Some(successor.to_string()));
+        gate.set_relay_ports(successor_ports);
         gate.set_mode(Mode::Forward(successor.to_string()));
         gate.set_status("retired", "forwarding");
         info!(

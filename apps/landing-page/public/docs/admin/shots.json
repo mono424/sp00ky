@@ -58,6 +58,11 @@
       "file": "backups.png"
     },
     {
+      "name": "resources",
+      "caption": "Sp00ky Cloud only: every service, machine and the bucket volume, with live CPU, memory and free space.",
+      "file": "resources.png"
+    },
+    {
       "name": "logs",
       "caption": "Live logs from the scheduler, an SSP or one of your backends.",
       "file": "logs.png"

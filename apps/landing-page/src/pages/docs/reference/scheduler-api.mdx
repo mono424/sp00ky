@@ -767,15 +767,18 @@ bootstrap_timeout_secs: 120
 # Replica storage
 replica_db_path: "./data/replica"
 
-# WAL (Write-Ahead Log)
+# WAL (Write-Ahead Log): append-only segments in `wal/` next to this path
+# (`./data/wal/event_wal.<seq>.seg`). A JSON Lines log found at the path
+# itself (the format before canary.297) is migrated once and renamed `.migrated`.
 wal_path: "./data/event_wal.log"
 
 # Server configuration
 ingest_host: "0.0.0.0"
 ingest_port: 9667
 
-# SSP polling and buffering
-ssp_poll_interval_ms: 3000
+# SSP polling and buffering (the poll is how the scheduler learns a
+# bootstrapping SSP is ready, so its interval is paid on every restart)
+ssp_poll_interval_ms: 500
 max_buffer_per_ssp: 10000
 
 # Snapshot update interval (seconds)
@@ -796,6 +799,7 @@ job_tables:
 - `SPKY_DB_PASS` - SurrealDB password (overrides `db.password`)
 - `SPKY_IMPERSONATION` - `on` serves `/impersonate/mint` and `/impersonate/users` (default: off; set from `impersonation.enabled`)
 - `SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS` - Override for `snapshot_update_interval_secs` (default: `300`)
+- `SPKY_WAL_SEGMENT_MB` - Size at which the event WAL rotates to a new segment file. A drain unlinks the segments it covered instead of rewriting the log, so a bigger segment only means a few more already-applied events are kept until the next drain (default: `16`)
 - `SPKY_DRIFT_CHECK` - Compare replica row counts against upstream at startup and after each snapshot drain (default: `true`). Readiness waits only for the tables the replica holds no row of, the one mismatch acted on at first sight; the full count runs right after the scheduler turns ready, so SSPs can register while it does
 - `SPKY_DRIFT_AUTO_RECLONE` - Act on a confirmed mismatch (default: `true`; `false` reports only, via `/health/snapshot`, `/metrics` and `spky verify`). The table is repaired in place: its ids and `_00_rv`s are compared with upstream, and the rows that are missing, stale or deleted go through the ingest pipeline as ordinary events, so the replica and every SSP converge without a bootstrap. Only a repair that finds no difference, would exceed `SPKY_DRIFT_REPAIR_MAX_ROWS`, or fails falls back to re-cloning the replica and re-bootstrapping every SSP. A table still off after either is reported as stuck until its counts change
 - `SPKY_DRIFT_CONFIRM_TICKS` - Consecutive checks a non-zero count mismatch must persist before it is acted on; an empty replica table upstream has rows for is acted on at first sight (default: `2`)

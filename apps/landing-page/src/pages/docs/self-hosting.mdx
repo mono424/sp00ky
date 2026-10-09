@@ -457,6 +457,7 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | `SPKY_DB_USER` | SurrealDB username | `root` |
 | `SPKY_DB_PASS` | SurrealDB password | `root` |
 | `SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS` | Snapshot update interval (seconds) | `300` |
+| `SPKY_WAL_SEGMENT_MB` | Size at which the scheduler's event WAL (`./data/wal/`, append-only segments) rotates to a new file. Drains unlink covered segments instead of rewriting the log. | `16` |
 | `SPKY_DRIFT_CHECK` | Compare the replica's row counts against upstream at startup and after each snapshot drain. Before it accepts SSPs, the scheduler only checks the tables its replica holds no row of (the mismatch an SSP must never bootstrap from); the full count runs right after | `true` |
 | `SPKY_DRIFT_COUNT_CONCURRENCY` | Upstream `count()` queries one drift check runs at once. Each scans its whole table; `1` counts one table at a time, for an upstream with no CPU to spare | `4` |
 | `SPKY_DRIFT_AUTO_RECLONE` | Act when the check confirms a mismatch: repair the table in place by sending the rows that differ through the ingest pipeline, and re-clone the replica (re-bootstrapping every SSP) only when a repair cannot fix it (`false` = report only) | `true` |

@@ -1,6 +1,6 @@
 [package]
 name = "push-core"
-version = "0.0.1-canary.299"
+version = "0.0.1-canary.300"
 edition = "2021"
 description = "Portable Web Push engine: push rules over ingested rows, VAPID keys derived from the auth secret, RFC 8291 payload encryption, subscription bookkeeping - shared by the cluster scheduler and the singlenode SSP"
 

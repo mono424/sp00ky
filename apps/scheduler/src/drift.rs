@@ -85,6 +85,10 @@ pub struct DriftConfig {
     /// that tick is a serial loop — a check that never returns stops the
     /// replica draining forever. See [`run_check`].
     pub check_timeout: Duration,
+    /// `SPKY_DRIFT_COUNT_CONCURRENCY` (default 4): upstream `count()`s in
+    /// flight at once. One at a time put a whole check at the sum of every
+    /// table's count, a minute on whitepawn's 70 tables.
+    pub count_concurrency: usize,
 }
 
 impl Default for DriftConfig {
@@ -97,6 +101,7 @@ impl Default for DriftConfig {
             repair_max_rows: 2000,
             repair_timeout: Duration::from_secs(300),
             check_timeout: Duration::from_secs(120),
+            count_concurrency: 4,
         }
     }
 }
@@ -124,6 +129,9 @@ impl DriftConfig {
         }
         if let Some(n) = env_u64("SPKY_DRIFT_CHECK_TIMEOUT_SECS") {
             cfg.check_timeout = Duration::from_secs(n.max(1));
+        }
+        if let Some(n) = env_u64("SPKY_DRIFT_COUNT_CONCURRENCY") {
+            cfg.count_concurrency = n.max(1) as usize;
         }
         cfg
     }
@@ -175,28 +183,35 @@ impl BusyTables for BTreeSet<String> {
 /// Upstream counts read through the scheduler's shared SurrealDB handle.
 pub struct SurrealUpstream {
     pub db: Arc<maintenance::db::ReconnectingDb>,
+    /// `count()`s in flight at once ([`DriftConfig::count_concurrency`]).
+    pub concurrency: usize,
 }
 
 #[async_trait]
 impl UpstreamCounts for SurrealUpstream {
     async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+        use futures::StreamExt;
         let handle = self.db.handle();
         let tables = Replica::discover_sync_tables(&*handle)
             .await
             .context("drift: discover sync tables upstream")?;
-        let mut out = BTreeMap::new();
-        for table in tables {
-            let count = match count_upstream(&*handle, &table).await {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    self.db.note_error(&e.to_string());
-                    warn!(table = %table, error = %e, "drift: upstream count failed; table skipped this check");
-                    None
-                }
-            };
-            out.insert(table, count);
-        }
-        Ok(out)
+        let handle = &handle;
+        let counts: Vec<(String, Option<u64>)> = futures::stream::iter(tables)
+            .map(|table| async move {
+                let count = match count_upstream(&**handle, &table).await {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        self.db.note_error(&e.to_string());
+                        warn!(table = %table, error = %e, "drift: upstream count failed; table skipped this check");
+                        None
+                    }
+                };
+                (table, count)
+            })
+            .buffer_unordered(self.concurrency.max(1))
+            .collect()
+            .await;
+        Ok(counts.into_iter().collect())
     }
 
     fn note_stalled(&self) {
@@ -464,6 +479,11 @@ pub struct DriftHook {
     /// Upstream's table set, followed on the same tick (see `crate::schema`).
     /// `None` in tests that exercise the drift rules alone.
     pub schema: Option<Arc<crate::schema::SchemaWatch>>,
+    /// Held for the length of a check. The startup check runs in the
+    /// background while the snapshot updater ticks, and two checks at once
+    /// would count every mismatch twice towards its streak and could repair
+    /// one table twice over; the later one is skipped instead.
+    pub running: tokio::sync::Mutex<()>,
 }
 
 /// The remediation, abstracted so tests can observe it without an upstream.
@@ -948,6 +968,10 @@ pub async fn run_check(
     if !hook.cfg.enabled {
         return Action::Clean;
     }
+    let Ok(_running) = hook.running.try_lock() else {
+        info!("Replica drift check already running; skipping this one");
+        return Action::Clean;
+    };
     // Time-boxed. This check is the last step of the snapshot updater's tick,
     // and that tick is a serial loop: a check that never returns takes the
     // replica drain with it, forever, with nothing in the log to say so — the
@@ -1235,6 +1259,7 @@ mod tests {
             repair: Arc::new(NeverReclones),
             reclone: Arc::new(NeverReclones),
             schema: None,
+            running: Default::default(),
         };
 
         assert_eq!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Clean);
@@ -1244,6 +1269,54 @@ mod tests {
         );
         let err = hook.state.read().await.last_error.clone().unwrap();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// The startup check runs in the background while the updater ticks; a
+    /// second check while one runs is skipped, not run alongside it.
+    #[tokio::test]
+    async fn a_check_while_another_runs_is_skipped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        #[async_trait]
+        impl UpstreamCounts for Counting {
+            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(BTreeMap::new())
+            }
+        }
+        struct Unused;
+        #[async_trait]
+        impl Recloner for Unused {
+            async fn reclone_and_resync(&self) -> Result<bool> {
+                unreachable!()
+            }
+        }
+        #[async_trait]
+        impl TableRepairer for Unused {
+            async fn repair(&self, _table: &str, _max_rows: Option<usize>) -> Result<RepairOutcome> {
+                unreachable!()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let replica = Arc::new(RwLock::new(Replica::new(tmp.path().join("replica")).await.unwrap()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = DriftHook {
+            cfg: DriftConfig::default(),
+            upstream: Arc::new(Counting(Arc::clone(&calls))),
+            state: Arc::new(RwLock::new(DriftState::default())),
+            repair: Arc::new(Unused),
+            reclone: Arc::new(Unused),
+            schema: None,
+            running: Default::default(),
+        };
+
+        let held = hook.running.lock().await;
+        assert_eq!(run_check(&hook, &replica, &BTreeSet::new()).await, Action::Clean);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "skipped while another check runs");
+        drop(held);
+        run_check(&hook, &replica, &BTreeSet::new()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1557,6 +1630,7 @@ mod tests {
             repair: script.clone(),
             reclone: script,
             schema: None,
+            running: Default::default(),
         };
         (hook, replica, tmp)
     }

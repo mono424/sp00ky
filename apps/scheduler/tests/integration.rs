@@ -3035,6 +3035,7 @@ mod drift_tests {
             repair: Arc::new(TooLarge),
             reclone: recloner.clone(),
             schema: Default::default(),
+            running: Default::default(),
         });
         (hook, recloner)
     }

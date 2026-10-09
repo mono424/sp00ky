@@ -488,7 +488,10 @@ impl Scheduler {
     fn drift_hook(&self, db: Arc<maintenance::db::ReconnectingDb>) -> Arc<crate::drift::DriftHook> {
         Arc::new(crate::drift::DriftHook {
             cfg: self.drift_config.clone(),
-            upstream: Arc::new(crate::drift::SurrealUpstream { db: Arc::clone(&db) }),
+            upstream: Arc::new(crate::drift::SurrealUpstream {
+                db: Arc::clone(&db),
+                concurrency: self.drift_config.count_concurrency,
+            }),
             state: Arc::clone(&self.drift),
             repair: Arc::new(SchedulerRepairer {
                 db,
@@ -502,6 +505,7 @@ impl Scheduler {
             }),
             reclone: self.recloner(),
             schema: Some(Arc::clone(&self.schema)),
+            running: Default::default(),
         })
     }
 
@@ -848,24 +852,44 @@ impl Scheduler {
         // The check the integrity check above cannot do: compare the replica
         // against UPSTREAM. A persisted snapshot that missed writes made while
         // nothing was listening (a bulk migration with the stack down) is
-        // internally consistent and serves every SSP an empty table. No SSP
-        // can register until `Ready`, so a re-clone here costs nobody a
-        // bootstrap. The buffer is NOT empty after a restart: it holds the
-        // WAL backlog recovered above, which the first tick applies — so the
-        // tables in it are excluded here exactly as on a tick, or every job
-        // table reads as drift on every restart (whitepawn 2026-09-16 00:41).
-        let drift_started = std::time::Instant::now();
-        // Startup pass: nothing has been ingested yet, so no table is busy.
-        match crate::drift::run_check(&drift_hook, &self.replica, &BufferBusy(Arc::clone(&self.event_buffer))).await {
-            crate::drift::Action::Clean => info!(
-                elapsed_ms = drift_started.elapsed().as_millis() as u64,
-                "Startup drift check passed"
-            ),
-            other => warn!(
-                action = ?other,
-                elapsed_ms = drift_started.elapsed().as_millis() as u64,
-                "Startup drift check acted"
-            ),
+        // internally consistent and serves every SSP an empty table. The
+        // buffer is NOT empty after a restart: it holds the WAL backlog
+        // recovered above, which the first tick applies — so the tables in it
+        // are excluded here exactly as on a tick, or every job table reads as
+        // drift on every restart (whitepawn 2026-09-16 00:41).
+        //
+        // After a fresh clone it runs before `Ready`: nothing has registered
+        // against the clone yet, so a re-clone costs nobody a bootstrap. Over
+        // a reused snapshot it runs in the background instead. Before `Ready`
+        // it held every SSP heartbeat and registration at 503 for the whole
+        // check, 64 s of a 65 s scheduler restart on whitepawn (2026-10-09),
+        // and what it finds is acted on the way a tick acts on it: a repair
+        // goes through the ingest pipeline to every SSP, a re-clone flags them
+        // for a re-bootstrap.
+        let startup_check = {
+            let hook = Arc::clone(&drift_hook);
+            let replica = Arc::clone(&self.replica);
+            let busy = BufferBusy(Arc::clone(&self.event_buffer));
+            async move {
+                let started = std::time::Instant::now();
+                match crate::drift::run_check(&hook, &replica, &busy).await {
+                    crate::drift::Action::Clean => info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Startup drift check passed"
+                    ),
+                    other => warn!(
+                        action = ?other,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Startup drift check acted"
+                    ),
+                }
+            }
+        };
+        if needs_bootstrap {
+            startup_check.await;
+        } else {
+            info!("Startup drift check runs in the background over the reused snapshot");
+            tokio::spawn(startup_check);
         }
 
         // Transition to Ready

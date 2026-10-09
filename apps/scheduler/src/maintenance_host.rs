@@ -27,7 +27,7 @@ impl MaintenanceHost for SchedulerHost {
     /// integrity mismatch that sends SSPs into an exit(2) loop. The backup
     /// exports the main DB either way; only `snapshot_seq` freshness is lost.
     async fn pre_backup(&self) -> Result<Option<u64>> {
-        let _drain_guard = self.ingest.drain_lock.lock().await;
+        let _drain_guard = crate::acquire_drain_lock(&self.ingest.drain_lock, "pre-backup").await;
 
         let status = *self.ingest.status.read().await;
         let active_bootstrap = self.ingest.ssp_pool.read().await.has_active_bootstrap();

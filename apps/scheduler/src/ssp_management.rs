@@ -246,7 +246,7 @@ async fn rehash_tables_from_content(
     state: &SspManagementState,
     tables: &BTreeSet<String>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let _drain_guard = state.drain_lock.lock().await;
+    let _drain_guard = crate::acquire_drain_lock(&state.drain_lock, "content rehash").await;
     let mut rep = state.replica.write().await;
     let seq = rep.snapshot_seq();
     rep.set_snapshot_state(seq, Some(tables)).await?;
@@ -507,18 +507,6 @@ async fn handle_register(
         tokio::spawn(async move {
             let _drain_guard =
                 crate::acquire_drain_lock(&state.drain_lock, "ssp registration").await;
-            // Dropped with the guard: reports a registration that held the
-            // lock long enough to have delayed the snapshot updater.
-            struct HoldReport(std::time::Instant);
-            impl Drop for HoldReport {
-                fn drop(&mut self) {
-                    let held_secs = self.0.elapsed().as_secs();
-                    if held_secs >= 60 {
-                        tracing::warn!(held_secs, "ssp registration held drain_lock for a long time");
-                    }
-                }
-            }
-            let _hold_report = HoldReport(std::time::Instant::now());
 
             *state.status.write().await = SchedulerStatus::SnapshotFrozen;
 
@@ -653,7 +641,8 @@ fn spawn_poll_and_replay(
             // Under `drain_lock` so the cleanup can't interleave with a
             // registration's freeze+insert critical section (which could
             // otherwise get its fresh freeze clobbered by the unfreeze below).
-            let _drain_guard = drain_lock_for_err.lock().await;
+            let _drain_guard =
+                crate::acquire_drain_lock(&drain_lock_for_err, "bootstrap failure cleanup").await;
             let mut pool = ssp_pool.write().await;
 
             // Only clean up if this registration is still the current one —

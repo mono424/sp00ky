@@ -1221,8 +1221,52 @@ const DRAIN_SLOW_WARN_SECS: u64 = 60;
 /// How often a caller still waiting for `drain_lock` says so.
 const DRAIN_LOCK_WAIT_WARN_SECS: u64 = 30;
 
+/// A hold of `drain_lock` this long is logged when it ends: long enough that
+/// an SSP registration queued behind it has visibly stalled.
+const DRAIN_LOCK_HOLD_WARN_SECS: u64 = 10;
+
 /// How often a snapshot updater tick that has not returned says so.
 const TICK_OVERDUE_WARN_SECS: u64 = 60;
+
+/// Who holds each `drain_lock` right now, and since when, keyed by the mutex's
+/// address. A waiter's warning names the holder from here while the stall is
+/// still going on; a holder that never lets go never logs its own hold.
+static DRAIN_LOCK_HOLDERS: std::sync::Mutex<
+    std::collections::BTreeMap<usize, (&'static str, std::time::Instant)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn drain_lock_key(drain_lock: &tokio::sync::Mutex<()>) -> usize {
+    drain_lock as *const tokio::sync::Mutex<()> as usize
+}
+
+/// The current holder of `drain_lock` and how long it has held it, if it was
+/// taken through [`acquire_drain_lock`].
+pub fn drain_lock_holder(drain_lock: &tokio::sync::Mutex<()>) -> Option<(&'static str, Duration)> {
+    let holders = DRAIN_LOCK_HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    holders
+        .get(&drain_lock_key(drain_lock))
+        .map(|(who, since)| (*who, since.elapsed()))
+}
+
+/// `drain_lock`, held by `who`. Logs the hold when it ends if it ran long.
+pub struct DrainLockGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, ()>,
+    who: &'static str,
+    since: std::time::Instant,
+}
+
+impl Drop for DrainLockGuard<'_> {
+    fn drop(&mut self) {
+        DRAIN_LOCK_HOLDERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&drain_lock_key(tokio::sync::MutexGuard::mutex(&self.guard)));
+        let held_secs = self.since.elapsed().as_secs();
+        if held_secs >= DRAIN_LOCK_HOLD_WARN_SECS {
+            warn!(who = self.who, held_secs, "drain_lock released after a long hold");
+        }
+    }
+}
 
 /// Take `drain_lock`, and say so in the log while the wait drags on.
 ///
@@ -1230,36 +1274,47 @@ const TICK_OVERDUE_WARN_SECS: u64 = 60;
 /// critical section, a rehash), but a holder that hangs — a stuck replica
 /// write, an SSP that never answers its bootstrap poll — turns every other
 /// caller into a silent wait, and the only visible symptom is a replica that
-/// stops advancing. Logging the wait, with who is waiting, is what turns that
-/// into a diagnosable incident.
+/// stops advancing. The wait warning names the waiter and the holder, and the
+/// returned guard reports a long hold when it is released.
 pub async fn acquire_drain_lock<'a>(
     drain_lock: &'a Arc<tokio::sync::Mutex<()>>,
-    who: &str,
-) -> tokio::sync::MutexGuard<'a, ()> {
+    who: &'static str,
+) -> DrainLockGuard<'a> {
     let started = std::time::Instant::now();
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(DRAIN_LOCK_WAIT_WARN_SECS),
-            drain_lock.lock(),
-        )
-        .await
-        {
-            Ok(guard) => {
-                let waited = started.elapsed().as_secs();
-                if waited >= DRAIN_LOCK_WAIT_WARN_SECS {
-                    warn!(who, waited_secs = waited, "drain_lock acquired after a long wait");
-                }
-                return guard;
-            }
-            Err(_) => {
+    // One `lock()` future for the whole wait. tokio's mutex queues waiters in
+    // order; wrapping each attempt in a timeout dropped the waiter from that
+    // queue every 30 s, and on whitepawn (2026-10-09) the first retry of an
+    // SSP registration was overtaken by the two retries after it.
+    let lock = drain_lock.lock();
+    tokio::pin!(lock);
+    let period = Duration::from_secs(DRAIN_LOCK_WAIT_WARN_SECS);
+    let mut warn_every = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    let guard = loop {
+        tokio::select! {
+            guard = &mut lock => break guard,
+            _ = warn_every.tick() => {
+                let (holder, held_secs) = drain_lock_holder(drain_lock)
+                    .map_or(("unknown", 0), |(h, d)| (h, d.as_secs()));
                 warn!(
                     who,
                     waited_secs = started.elapsed().as_secs(),
+                    holder,
+                    held_secs,
                     "still waiting for drain_lock; another holder has not released it"
                 );
             }
         }
+    };
+    let waited = started.elapsed().as_secs();
+    if waited >= DRAIN_LOCK_WAIT_WARN_SECS {
+        warn!(who, waited_secs = waited, "drain_lock acquired after a long wait");
     }
+    let since = std::time::Instant::now();
+    DRAIN_LOCK_HOLDERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(drain_lock_key(drain_lock), (who, since));
+    DrainLockGuard { guard, who, since }
 }
 
 pub async fn snapshot_updater_tick(
@@ -1424,6 +1479,49 @@ pub async fn snapshot_updater_tick(
     }
     drop(_guard);
     crate::drift::run_check(hook, replica, &BufferBusy(Arc::clone(event_buffer))).await;
+}
+
+#[cfg(test)]
+mod drain_lock_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_keeps_its_place_across_the_wait_warnings() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held = acquire_drain_lock(&lock, "holder").await;
+
+        let waiter = |who: &'static str| {
+            let (lock, order) = (Arc::clone(&lock), Arc::clone(&order));
+            tokio::spawn(async move {
+                let _guard = acquire_drain_lock(&lock, who).await;
+                order.lock().unwrap().push(who);
+            })
+        };
+        let first = waiter("first");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let second = waiter("second");
+        // Past the first waiter's 30 s warning, which used to re-queue it
+        // behind the second, and short of the second's.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        drop(held);
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn the_holder_is_named_while_it_holds_the_lock() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        assert!(drain_lock_holder(&lock).is_none());
+
+        let held = acquire_drain_lock(&lock, "ssp registration").await;
+        assert_eq!(drain_lock_holder(&lock).map(|(who, _)| who), Some("ssp registration"));
+
+        drop(held);
+        assert!(drain_lock_holder(&lock).is_none());
+    }
 }
 
 #[cfg(test)]

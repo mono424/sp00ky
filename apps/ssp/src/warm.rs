@@ -23,6 +23,25 @@
 //! this SSP, or asked for a resync): the rows are already in memory and only
 //! the views are rebuilt. Nothing is trusted beyond the scheduler's hash, so a
 //! stale, partial or corrupt checkpoint costs time, never correctness.
+//!
+//! **Shared directory (blue/green).** An SSP and the standby replacing it
+//! share one volume and one `SPKY_SSP_SNAPSHOT_DIR`: the standby loads the
+//! files while its predecessor may still write them. Only one of them writes
+//! at a time, by [`RowCheckpoints::set_gate`]: a standby writes nothing until
+//! promoted, and a retired SSP nothing after its retire, its shutdown write
+//! included. Beyond that:
+//!
+//! - every write goes to a temp file unique to its process (`<table>.rows.tmp.
+//!   <pid>.<random>`; pids repeat across containers) and is renamed into
+//!   place, so a reader sees an old file or a new one, never a torn one, and
+//!   the loader only removes temp files old enough to be abandoned;
+//! - a write removes only the files of tables this process itself loaded or
+//!   wrote and no longer holds, and only while the gate lets it write;
+//! - a file the loader cannot read is deleted, which the other instance may
+//!   have written in a format this build does not read. That table is paged
+//!   instead and the owner writes it again; time, not correctness;
+//! - [`RowCheckpoints::clear`] (a clean restart directive) empties the
+//!   directory for both; the VM shell never calls it from a standby.
 
 use crate::BootstrapSource;
 use serde_json::Value;
@@ -53,6 +72,14 @@ const DEFAULT_INTERVAL_SECS: u64 = 1800;
 /// stay out of the scheduler's replay and catch-up verification.
 pub const POST_BOOTSTRAP_WRITE_DELAY: Duration = Duration::from_secs(120);
 
+/// A temp file older than this is a write that will never finish (its process
+/// died); younger ones may belong to the other instance sharing the directory.
+const STALE_TMP_AGE: Duration = Duration::from_secs(600);
+
+/// Whether this process may write checkpoints right now. See
+/// [`RowCheckpoints::set_gate`].
+pub type WriteGate = Box<dyn Fn() -> bool + Send + Sync>;
+
 /// The row checkpoint directory and what is in it.
 pub struct RowCheckpoints {
     dir: PathBuf,
@@ -62,6 +89,8 @@ pub struct RowCheckpoints {
     /// One writer at a time: the timer, the post-bootstrap write and the
     /// shutdown write can otherwise overlap.
     writing: tokio::sync::Mutex<()>,
+    /// Consulted before a write and before each table of it. Unset: always.
+    gate: std::sync::OnceLock<WriteGate>,
 }
 
 impl RowCheckpoints {
@@ -70,7 +99,8 @@ impl RowCheckpoints {
     pub fn from_env() -> Option<Arc<Self>> {
         let base = std::env::var_os("SPKY_SSP_SNAPSHOT_DIR")?;
         let dir = PathBuf::from(base).join("rows");
-        let probe = dir.join(".probe");
+        // Unique: another instance may share the directory (blue/green).
+        let probe = dir.join(format!(".probe.{}", unique_suffix()));
         let writable = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&probe, b"").is_ok();
         let _ = std::fs::remove_file(&probe);
         if !writable {
@@ -82,7 +112,19 @@ impl RowCheckpoints {
             dir,
             on_disk: Default::default(),
             writing: Default::default(),
+            gate: Default::default(),
         }))
+    }
+
+    /// Install the write gate (once). The VM shell lets a process write only
+    /// while it owns the directory: never as a blue/green standby, never once
+    /// retired. Checked before every table, so a retire mid-write stops it.
+    pub fn set_gate(&self, gate: WriteGate) {
+        let _ = self.gate.set(gate);
+    }
+
+    fn may_write(&self) -> bool {
+        self.gate.get().is_none_or(|gate| gate())
     }
 
     /// `SPKY_SSP_ROW_CHECKPOINT_SECS`: how often the timer writes changed
@@ -132,6 +174,10 @@ impl RowCheckpoints {
     /// therefore come from slightly different moments; that is fine, because
     /// the next boot verifies every table on its own.
     pub async fn write(&self, processor: &Arc<RwLock<Circuit>>, reason: &'static str) {
+        if !self.may_write() {
+            info!(reason, "Skipping row checkpoint: this process does not own the checkpoint dir");
+            return;
+        }
         let _one_writer = self.writing.lock().await;
         let started = Instant::now();
         let held: Vec<(String, [u8; 32])> = {
@@ -156,6 +202,10 @@ impl RowCheckpoints {
 
         let (mut written, mut rows, mut failed) = (0usize, 0u64, 0usize);
         for table in changed {
+            if !self.may_write() {
+                info!(reason, written, "Row checkpoint stopped: this process no longer owns the checkpoint dir");
+                return;
+            }
             let guard = Arc::clone(processor).read_owned().await;
             let path = self.path_for(&table);
             let name = table.clone();
@@ -164,7 +214,7 @@ impl RowCheckpoints {
                     return Ok(None);
                 };
                 let hash = coll.catchup_xor;
-                let tmp = path.with_extension("rows.tmp");
+                let tmp = tmp_path_for(&path);
                 let file = std::fs::File::create(&tmp)?;
                 let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
                 let n = write_collection(coll, &mut out)?;
@@ -204,6 +254,9 @@ impl RowCheckpoints {
             }
             gone
         };
+        if !gone.is_empty() && !self.may_write() {
+            return;
+        }
         for table in &gone {
             let _ = std::fs::remove_file(self.path_for(table));
         }
@@ -233,6 +286,28 @@ impl RowCheckpoints {
         info!(dir = %self.dir.display(), "Row checkpoints cleared for clean restart");
     }
 
+    /// Persist what a bootstrap (or a blue/green promotion) just verified,
+    /// so a restart from here on is warm. Not right away: the scheduler
+    /// replays the events it buffered and verifies the catch-up as soon as
+    /// the SSP reports ready, and every one of those ingests waits for a table
+    /// the write is holding. On whitepawn a 16 s write held 3 replayed events
+    /// for 13 s, and the SSP out of rotation with them. A restart inside the
+    /// delay still loads the previous checkpoint and repairs the difference.
+    pub fn spawn_post_bootstrap_write(
+        self: &Arc<Self>,
+        processor: Arc<RwLock<Circuit>>,
+        status: Arc<RwLock<SspStatus>>,
+        reason: &'static str,
+    ) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(POST_BOOTSTRAP_WRITE_DELAY).await;
+            if *status.read().await == SspStatus::Ready {
+                this.write(&processor, reason).await;
+            }
+        });
+    }
+
     /// Write changed tables every `every` while the SSP is Ready.
     pub fn spawn_timer(
         self: &Arc<Self>,
@@ -251,6 +326,30 @@ impl RowCheckpoints {
         });
         info!(interval_secs = every.as_secs(), "Row checkpoint timer armed");
     }
+}
+
+/// `<pid>.<random>`: pids alone repeat across containers (often pid 1).
+fn unique_suffix() -> String {
+    format!("{}.{}", std::process::id(), uuid::Uuid::new_v4().simple())
+}
+
+/// `<table>.rows.tmp.<pid>.<random>` next to `<table>.rows`.
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".tmp.{}", unique_suffix()));
+    path.with_file_name(name)
+}
+
+/// A temp file of an abandoned write: `.rows.tmp` in its name (this format or
+/// the older bare one) and untouched for [`STALE_TMP_AGE`].
+fn is_stale_tmp(path: &Path) -> bool {
+    let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".rows.tmp"));
+    named
+        && std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TMP_AGE)
 }
 
 /// A file name for a table: identifier characters kept, anything else hex
@@ -278,8 +377,9 @@ fn read_dir_tables(dir: &Path) -> Vec<Collection> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("rows") {
-            // A `.rows.tmp` left by a write that never finished.
-            if path.to_string_lossy().ends_with(".tmp") {
+            // A temp file left by a write that never finished. Only an old
+            // one: a fresh one may be another instance's write in progress.
+            if is_stale_tmp(&path) {
                 let _ = std::fs::remove_file(&path);
             }
             continue;
@@ -675,6 +775,7 @@ mod tests {
             dir: dir.clone(),
             on_disk: Default::default(),
             writing: Default::default(),
+            gate: Default::default(),
         };
 
         let processor = Arc::new(RwLock::new(Circuit::new()));
@@ -702,7 +803,7 @@ mod tests {
         assert!(!checkpoints.path_for("user").exists());
 
         let fresh = Arc::new(RwLock::new(Circuit::new()));
-        let reader = RowCheckpoints { dir: dir.clone(), on_disk: Default::default(), writing: Default::default() };
+        let reader = RowCheckpoints { dir: dir.clone(), on_disk: Default::default(), writing: Default::default(), gate: Default::default() };
         assert_eq!(reader.load_into(&fresh).await, 1);
         let c = fresh.read().await;
         let game = c.store.get_collection("game").unwrap();
@@ -883,5 +984,72 @@ mod tests {
         assert!(queries.iter().any(|q| q.starts_with("SELECT id, _00_rv FROM game ORDER BY id")));
         // Without ranges an equal-version change goes unseen; the caller pages.
         assert!(!repair.matched);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ssp-rows-{name}-{}", unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn one_table_circuit() -> Arc<RwLock<Circuit>> {
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game").apply(
+            Operation::Create,
+            "a",
+            Sp00kyValue::from(serde_json::json!({ "id": "game:a", "n": 1 })),
+        );
+        Arc::new(RwLock::new(c))
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_writes_and_removes_nothing() {
+        let dir = scratch_dir("gate");
+        let checkpoints = RowCheckpoints { dir: dir.clone(), on_disk: Default::default(), writing: Default::default(), gate: Default::default() };
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&open);
+        checkpoints.set_gate(Box::new(move || flag.load(std::sync::atomic::Ordering::SeqCst)));
+
+        let processor = one_table_circuit();
+        checkpoints.write(&processor, "test").await;
+        assert!(!checkpoints.path_for("game").exists(), "a standby or retired SSP writes nothing");
+
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        checkpoints.write(&processor, "test").await;
+        assert!(checkpoints.path_for("game").exists());
+
+        // Closed again: a table this process dropped keeps its file, because
+        // the directory belongs to the other instance now.
+        open.store(false, std::sync::atomic::Ordering::SeqCst);
+        processor.write().await.store.collections.remove("game");
+        checkpoints.write(&processor, "test").await;
+        assert!(checkpoints.path_for("game").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_files_are_unique_per_write_and_only_stale_ones_are_swept() {
+        let dir = scratch_dir("tmp");
+        let target = dir.join("game.rows");
+        let (a, b) = (tmp_path_for(&target), tmp_path_for(&target));
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("game.rows.tmp."), "{name}");
+        assert_eq!(a.parent(), Some(dir.as_path()));
+
+        // A fresh one may be the other instance's write in progress.
+        std::fs::write(&a, b"partial").unwrap();
+        assert!(read_dir_tables(&dir).is_empty());
+        assert!(a.exists(), "a fresh temp file is left alone");
+
+        // An old one is an abandoned write. The bare legacy name counts too.
+        let legacy = dir.join("user.rows.tmp");
+        for path in [&a, &legacy] {
+            let file = std::fs::File::options().create(true).write(true).open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - STALE_TMP_AGE - Duration::from_secs(1)).unwrap();
+        }
+        read_dir_tables(&dir);
+        assert!(!a.exists() && !legacy.exists(), "stale temp files are swept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

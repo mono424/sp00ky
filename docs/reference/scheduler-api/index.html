@@ -661,6 +661,13 @@ second, and never refused.</li>
 <li>Stop the old scheduler. On <code>SIGTERM</code> a relaying scheduler stops accepting,
 finishes what it is relaying and exits.</li>
 </ol>
+<p>A predecessor on canary.300 or later is handed over in two steps instead,
+so the hold shrinks to the in-memory export: the new scheduler relays every
+request to the old one while it calls <code>POST /handover/release</code> (the old one
+releases its replica and keeps serving), opens the replica and connects
+upstream, and only then holds and calls <code>POST /handover/commit</code> (the old one
+holds, exports its state and starts relaying). A predecessor that released
+and never sees a commit exits after two minutes.</p>
 <p>A predecessor that predates handovers answers the prepare with a 404. The new
 scheduler then relays to it, waits for the replica lock, and boots the
 ordinary way as soon as you stop the old one.</p>
@@ -669,9 +676,12 @@ ordinary way as soon as you stop the old one.</p>
 traffic. Poll it on the new scheduler to know when the old one can go.</p>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{ </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;supported&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">true</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;role&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;active&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;phase&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;serving&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;peer&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;http://old:9667&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;error&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;version&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;0.0.1-canary.295&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }</span></span></code></pre>
 <ul>
-<li><code>role</code>: <code>starting</code> (phase <code>holding</code>, <code>opening</code>, or <code>waiting_for_lock</code> when the predecessor cannot hand over), <code>active</code>, <code>retired</code> (handed over, relaying), <code>failed</code>.</li>
+<li><code>role</code>: <code>starting</code> (phase <code>relaying</code>, <code>holding</code>, <code>opening</code>, <code>committing</code>, or <code>waiting_for_lock</code> when the predecessor cannot hand over), <code>active</code> (phase <code>serving</code>, or <code>releasing</code>/<code>released</code>/<code>committing</code> on a predecessor mid-handover), <code>retired</code> (handed over, relaying), <code>failed</code>.</li>
 </ul>
 <h4 id="post-handoverprepare">POST /handover/prepare</h4>
+<p><code>POST /handover/release</code> and <code>POST /handover/commit</code> take the same body and
+auth and split this into its two steps; <code>release</code> answers <code>{&quot;released&quot;:true}</code>,
+<code>commit</code> the handover state.</p>
 <p>Called by the new scheduler on the old one; bearer <code>SPKY_AUTH_SECRET</code>.
 Body <code>{ &quot;successor&quot;: &quot;&lt;host&gt;&quot;, &quot;version&quot;: &quot;...&quot;, &quot;ports&quot;: { &quot;main&quot;: 9667 } }</code>
 (<code>ports</code> only when the successor listens elsewhere). Answers the handover

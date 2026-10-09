@@ -72,6 +72,15 @@ impl HeapArena {
             dead: 0,
         }
     }
+
+    /// An arena over bytes that already hold records: a checkpoint image
+    /// adopted as is. `live` is the part a slot references; the rest (the
+    /// image's framing) is accounted dead from the start, and the next
+    /// compaction drops it.
+    pub fn from_buf(buf: Vec<u8>, live: u64) -> Self {
+        let dead = (buf.len() as u64).saturating_sub(live);
+        Self { buf, live, dead }
+    }
 }
 
 impl Arena for HeapArena {
@@ -165,6 +174,10 @@ pub struct MmapArena {
 /// wrong query results, then a table-hash mismatch against the scheduler,
 /// then `exit(2)`. Trading the page-cache benefit for correctness is the only
 /// acceptable direction.
+///
+/// An image segment is a checkpoint file mapped read-only: full from the
+/// start, never appended into, its pages clean page cache the kernel can drop
+/// and re-read at will. See [`MmapArena::from_image`].
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
 #[derive(Debug)]
 struct Seg {
@@ -178,6 +191,8 @@ enum SegStore {
     Mapped(memmap2::MmapMut),
     /// Fallback when the filesystem will not give us a mapping.
     Memory(Vec<u8>),
+    /// A checkpoint image, mapped read-only.
+    Image(memmap2::Mmap),
 }
 
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
@@ -186,14 +201,21 @@ impl Seg {
         match &self.store {
             SegStore::Mapped(m) => m,
             SegStore::Memory(v) => v,
+            SegStore::Image(m) => m,
         }
     }
 
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    /// The writable bytes; `None` for an image, which is never written.
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
         match &mut self.store {
-            SegStore::Mapped(m) => m,
-            SegStore::Memory(v) => v,
+            SegStore::Mapped(m) => Some(m),
+            SegStore::Memory(v) => Some(v),
+            SegStore::Image(_) => None,
         }
+    }
+
+    fn writable(&self) -> bool {
+        !matches!(self.store, SegStore::Image(_))
     }
 
     fn capacity(&self) -> usize {
@@ -221,6 +243,34 @@ impl MmapArena {
         };
         arena.map_segment(arena.segment_bytes)?;
         Ok(arena)
+    }
+
+    /// An arena whose first segment is a checkpoint image mapped read-only,
+    /// with `live` of its bytes referenced by records (the rest is the image's
+    /// framing, dead from the start). Nothing is appended into the image:
+    /// the first append maps a fresh writable segment under `dir`, exactly as
+    /// a full segment does, so the image's spans stay valid for as long as
+    /// the arena lives.
+    pub fn from_image(
+        dir: &std::path::Path,
+        name: &str,
+        segment_bytes: usize,
+        image: memmap2::Mmap,
+        live: u64,
+    ) -> Self {
+        let written = image.len();
+        Self {
+            segments: vec![Seg {
+                store: SegStore::Image(image),
+                written,
+            }],
+            segment_bytes: segment_bytes.max(64 * 1024),
+            dir: dir.to_path_buf(),
+            name: sanitize_table_name(name),
+            instance: next_instance_id(),
+            live,
+            dead: (written as u64).saturating_sub(live),
+        }
     }
 
     /// Map one more segment of at least `min_bytes`.
@@ -305,14 +355,14 @@ impl MmapArena {
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
 impl Arena for MmapArena {
     fn append(&mut self, bytes: &[u8]) -> Span {
-        let room = self
-            .segments
-            .last()
-            .map_or(0, |s| s.capacity().saturating_sub(s.written));
-        if bytes.len() > room {
-            // Retire the current segment and add another. A mapping is
-            // preferred; memory is the fallback, because the one thing this
-            // must never do is drop the write. See `Seg`.
+        // A read-only image, or a segment without room: retire it and add
+        // another. A mapping is preferred; memory is the fallback, because the
+        // one thing this must never do is drop the write. See `Seg`.
+        let needs_segment = match self.segments.last() {
+            Some(s) => !s.writable() || bytes.len() > s.capacity().saturating_sub(s.written),
+            None => true,
+        };
+        if needs_segment {
             if let Err(e) = self.map_segment(bytes.len()) {
                 tracing::warn!(
                     error = %e,
@@ -324,7 +374,9 @@ impl Arena for MmapArena {
         let seg = self.segments.len() - 1;
         let s = &mut self.segments[seg];
         let off = s.written;
-        s.bytes_mut()[off..off + bytes.len()].copy_from_slice(bytes);
+        if let Some(dst) = s.bytes_mut() {
+            dst[off..off + bytes.len()].copy_from_slice(bytes);
+        }
         s.written += bytes.len();
         self.live += bytes.len() as u64;
         Span {
@@ -616,6 +668,73 @@ mod mmap_tests {
         let f = dir.join("afile");
         std::fs::write(&f, b"x").unwrap();
         assert!(!MmapArena::probe_writable(&f.join("nested")));
+    }
+
+    fn image_file(dir: &std::path::Path, content: &[u8]) -> memmap2::Mmap {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("image.rows");
+        std::fs::write(&path, content).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        unsafe { memmap2::Mmap::map(&file).unwrap() }
+    }
+
+    /// The image is segment 0 as it lies on disk; the first append goes to a
+    /// fresh writable segment and the image's spans keep reading.
+    #[test]
+    fn an_image_segment_is_read_only_and_appends_go_elsewhere() {
+        let dir = tmpdir("image");
+        let image = image_file(&dir, b"header[record-a][record-b]trailer");
+        let mut a = MmapArena::from_image(&dir, "t", 64 * 1024, image, 20);
+        assert_eq!(a.segment_count(), 1);
+        assert_eq!(a.live_bytes(), 20);
+        assert_eq!(a.dead_bytes(), 33 - 20);
+        let in_image = Span { seg: 0, off: 7, len: 8 };
+        assert_eq!(a.get(in_image), b"record-a");
+        // Past the file's end reads empty, never the mapping's zero fill.
+        assert!(a.get(Span { seg: 0, off: 30, len: 10 }).is_empty());
+
+        let appended = a.append(b"record-c");
+        assert_eq!(a.segment_count(), 2, "the image must not be written into");
+        assert_eq!(appended.seg, 1);
+        assert_eq!(a.get(appended), b"record-c");
+        assert_eq!(a.get(in_image), b"record-a");
+        assert_eq!(a.live_bytes(), 28);
+
+        a.free(in_image);
+        assert_eq!(a.dead_bytes(), 33 - 20 + 8);
+        assert_eq!(a.get(in_image), b"record-a", "freed bytes stay until compaction");
+    }
+
+    #[test]
+    fn clear_drops_the_image() {
+        let dir = tmpdir("image-clear");
+        let image = image_file(&dir, b"0123456789");
+        let mut a = MmapArena::from_image(&dir, "t", 64 * 1024, image, 10);
+        let s = Span { seg: 0, off: 2, len: 3 };
+        assert_eq!(a.get(s), b"234");
+        a.clear();
+        assert!(a.get(s).is_empty(), "cleared image must not read back");
+        assert_eq!(a.live_bytes(), 0);
+        let again = a.append(b"new");
+        assert_eq!(a.get(again), b"new");
+    }
+
+    /// Two arenas over one image file (a rebuilt circuit beside the old one,
+    /// or two processes) share the page cache and nothing else.
+    #[test]
+    fn two_arenas_may_map_the_same_image() {
+        let dir = tmpdir("image-shared");
+        let one = image_file(&dir, b"shared-bytes");
+        let path = dir.join("image.rows");
+        let two = unsafe { memmap2::Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() };
+        let mut a = MmapArena::from_image(&dir, "t", 64 * 1024, one, 12);
+        let mut b = MmapArena::from_image(&dir, "t", 64 * 1024, two, 12);
+        let sa = a.append(b"A");
+        let sb = b.append(b"B");
+        assert_eq!(a.get(Span { seg: 0, off: 0, len: 6 }), b"shared");
+        assert_eq!(b.get(Span { seg: 0, off: 0, len: 6 }), b"shared");
+        assert_eq!(a.get(sa), b"A");
+        assert_eq!(b.get(sb), b"B");
     }
 
     #[test]

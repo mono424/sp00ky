@@ -26,7 +26,7 @@
 
 use crate::BootstrapSource;
 use serde_json::Value;
-use ssp::circuit::checkpoint::{read_collection, write_collection};
+use ssp::circuit::checkpoint::{load_file, write_collection, LoadStats};
 use ssp::circuit::store::Collection;
 use ssp::circuit::{Circuit, Operation, Record};
 use ssp::types::Sp00kyValue;
@@ -102,24 +102,46 @@ impl RowCheckpoints {
 
     /// Read every checkpointed table into the circuit, replacing whatever it
     /// held for those tables. Returns the number of tables loaded.
+    ///
+    /// The files are mapped (or adopted) rather than copied, so this costs
+    /// one verification pass and one index walk per table; the log line
+    /// carries both so the split stays visible.
     pub async fn load_into(&self, processor: &Arc<RwLock<Circuit>>) -> usize {
         let started = Instant::now();
         let dir = self.dir.clone();
         let loaded = tokio::task::spawn_blocking(move || read_dir_tables(&dir))
             .await
             .unwrap_or_default();
-        let tables = loaded.len();
-        let rows: usize = loaded.iter().map(|c| c.rows.len()).sum();
+        let tables = loaded.tables.len();
+        let rows: usize = loaded.tables.iter().map(|(c, _)| c.rows.len()).sum();
+        let bytes: u64 = loaded.tables.iter().map(|(_, s)| s.bytes).sum();
+        let mapped = loaded.tables.iter().filter(|(_, s)| s.mapped).count();
+        let verify_ms: u64 = loaded.tables.iter().map(|(_, s)| s.verify_ms).sum();
+        let index_ms: u64 = loaded.tables.iter().map(|(_, s)| s.index_ms).sum();
+        let install_started = Instant::now();
         {
             let mut circuit = processor.write().await;
             let mut on_disk = self.on_disk.lock().unwrap();
-            for coll in loaded {
+            for (coll, _) in loaded.tables {
                 on_disk.insert(coll.name.clone(), coll.catchup_xor);
                 circuit.store.collections.insert(coll.name.clone(), coll);
             }
         }
-        if tables > 0 {
-            info!(tables, rows, ms = started.elapsed().as_millis() as u64, "Loaded row checkpoint");
+        let install_ms = install_started.elapsed().as_millis() as u64;
+        if tables > 0 || loaded.discarded > 0 {
+            info!(
+                tables,
+                rows,
+                bytes,
+                mapped,
+                copied = tables - mapped,
+                discarded = loaded.discarded,
+                verify_ms,
+                index_ms,
+                install_ms,
+                ms = started.elapsed().as_millis() as u64,
+                "Loaded row checkpoint"
+            );
         }
         tables
     }
@@ -154,7 +176,8 @@ impl RowCheckpoints {
                 .collect()
         };
 
-        let (mut written, mut rows, mut failed) = (0usize, 0u64, 0usize);
+        let (mut written, mut rows, mut bytes, mut failed) = (0usize, 0u64, 0u64, 0usize);
+        let (mut encode_ms, mut fsync_ms) = (0u64, 0u64);
         for table in changed {
             let guard = Arc::clone(processor).read_owned().await;
             let path = self.path_for(&table);
@@ -165,23 +188,38 @@ impl RowCheckpoints {
                 };
                 let hash = coll.catchup_xor;
                 let tmp = path.with_extension("rows.tmp");
+                let encode_started = Instant::now();
                 let file = std::fs::File::create(&tmp)?;
                 let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-                let n = write_collection(coll, &mut out)?;
+                let w = write_collection(coll, &mut out)?;
                 // Release the circuit before the fsync: a flush to disk can
                 // take seconds and ingest has no reason to wait for it.
                 drop(guard);
+                let encode_ms = encode_started.elapsed().as_millis() as u64;
+                let sync_started = Instant::now();
                 let file = out.into_inner().map_err(|e| e.into_error())?;
                 file.sync_all()?;
                 std::fs::rename(&tmp, &path)?;
-                Ok::<_, std::io::Error>(Some((hash, n)))
+                let fsync_ms = sync_started.elapsed().as_millis() as u64;
+                Ok::<_, std::io::Error>(Some((hash, w, encode_ms, fsync_ms)))
             })
             .await;
             match result {
-                Ok(Ok(Some((hash, n)))) => {
+                Ok(Ok(Some((hash, w, table_encode_ms, table_fsync_ms)))) => {
+                    debug!(
+                        table = %table,
+                        rows = w.rows,
+                        bytes = w.bytes,
+                        encode_ms = table_encode_ms,
+                        fsync_ms = table_fsync_ms,
+                        "Row checkpoint table written"
+                    );
                     self.on_disk.lock().unwrap().insert(table, hash);
                     written += 1;
-                    rows += n;
+                    rows += w.rows;
+                    bytes += w.bytes;
+                    encode_ms += table_encode_ms;
+                    fsync_ms += table_fsync_ms;
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -216,6 +254,9 @@ impl RowCheckpoints {
                 removed = gone.len(),
                 failed,
                 rows,
+                bytes,
+                encode_ms,
+                fsync_ms,
                 ms = started.elapsed().as_millis() as u64,
                 "Row checkpoint written"
             );
@@ -268,13 +309,21 @@ fn file_stem(table: &str) -> String {
     out
 }
 
+/// What [`read_dir_tables`] found.
+#[derive(Default)]
+struct Loaded {
+    tables: Vec<(Collection, LoadStats)>,
+    /// Files that failed their checks and were deleted.
+    discarded: usize,
+}
+
 /// Read every `*.rows` file. A file that fails to read is deleted: its table
 /// is paged instead, and the next write replaces it.
-fn read_dir_tables(dir: &Path) -> Vec<Collection> {
+fn read_dir_tables(dir: &Path) -> Loaded {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return Loaded::default();
     };
-    let mut out = Vec::new();
+    let mut out = Loaded::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("rows") {
@@ -284,14 +333,25 @@ fn read_dir_tables(dir: &Path) -> Vec<Collection> {
             }
             continue;
         }
-        let read = std::fs::File::open(&path)
-            .map_err(ssp::circuit::checkpoint::CheckpointError::from)
-            .and_then(|f| read_collection(std::io::BufReader::with_capacity(1 << 20, f)));
-        match read {
-            Ok(coll) => out.push(coll),
+        let started = Instant::now();
+        match load_file(&path) {
+            Ok((coll, stats)) => {
+                debug!(
+                    table = %coll.name,
+                    rows = coll.rows.len(),
+                    bytes = stats.bytes,
+                    mapped = stats.mapped,
+                    verify_ms = stats.verify_ms,
+                    index_ms = stats.index_ms,
+                    ms = started.elapsed().as_millis() as u64,
+                    "Loaded row checkpoint table"
+                );
+                out.tables.push((coll, stats));
+            }
             Err(e) => {
                 warn!(file = %path.display(), error = %e, "Discarding row checkpoint");
                 let _ = std::fs::remove_file(&path);
+                out.discarded += 1;
             }
         }
     }

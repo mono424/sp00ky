@@ -27,10 +27,60 @@ use crate::circuit::arena::{Arena, HeapArena, Span};
 use crate::circuit::row_codec::{self as codec, FieldDict};
 use crate::eval::value_ref::{FlatRef, ValueRef};
 use crate::types::Sp00kyValue;
+use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
+use std::ops::Range;
 
 /// Where one row's encoded bytes live.
 pub type RowSlot = Span;
+
+/// An index built over records that already lie in a contiguous block of
+/// bytes, by [`RowTable::index_block`]. The block itself becomes the arena.
+pub(crate) struct IndexedBlock {
+    pub index: HashTable<RowSlot>,
+    /// XOR of every record's stored digest: the catch-up hash the block
+    /// should add up to.
+    pub xor: [u8; codec::DIGEST_LEN],
+    /// Bytes referenced by the records, i.e. the block without its framing.
+    pub live: u64,
+}
+
+/// Why a block could not be indexed. Every variant is a malformed image, not
+/// an I/O condition; the caller treats it as "not a checkpoint".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlockError {
+    /// A length prefix or a record runs past the region.
+    Truncated,
+    /// Record `n` has no readable id or digest.
+    BadRecord(u64),
+    /// Record `n` repeats an id an earlier record carried.
+    DuplicateId(u64),
+    /// The declared row count does not account for every byte of the region.
+    TrailingBytes,
+    /// The declared row count cannot fit in the region.
+    TooManyRows,
+    /// Offsets would not fit a [`Span`].
+    TooLarge,
+}
+
+impl std::fmt::Display for BlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockError::Truncated => write!(f, "a record runs past the end of the file"),
+            BlockError::BadRecord(n) => write!(f, "record {n} has no readable id"),
+            BlockError::DuplicateId(n) => write!(f, "record {n} carries an id stored twice"),
+            BlockError::TrailingBytes => write!(f, "bytes after the declared rows"),
+            BlockError::TooManyRows => write!(f, "declares more rows than the file holds"),
+            BlockError::TooLarge => write!(f, "image too large to map (4 GiB per table)"),
+        }
+    }
+}
+
+/// The id stored in the record a slot points at, within one block.
+fn id_in<'a>(block: &'a [u8], slot: &RowSlot) -> Option<&'a str> {
+    let start = slot.off as usize;
+    codec::record_id(block.get(start..start + slot.len as usize)?)
+}
 
 /// Rows of one table.
 #[derive(Debug)]
@@ -78,6 +128,88 @@ impl RowTable {
             arena,
             scratch: Vec::new(),
         }
+    }
+
+    /// A table over an index and an arena that were built together by
+    /// [`Self::index_block`]: the slots in `index` point into `arena`'s first
+    /// segment, which holds the block the index was walked over.
+    pub(crate) fn from_parts(dict: FieldDict, index: HashTable<RowSlot>, arena: Box<dyn Arena>) -> Self {
+        Self {
+            dict,
+            index,
+            arena,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Index the `rows` framed records (`[u32 len][record]` each) that fill
+    /// `block[region]`, as they lie: no record is copied or decoded, the
+    /// slots are the records' offsets in `block`, tagged with segment `seg`.
+    ///
+    /// Per record this reads the id (to hash it, with the same `id_hash` a
+    /// lookup uses, which is why this lives here and the hash is never
+    /// persisted) and the stored digest (to fold the catch-up hash). The
+    /// table is pre-sized, so there is no rehash on the way, and a repeated
+    /// id is an error rather than a silent overwrite.
+    pub(crate) fn index_block(
+        block: &[u8],
+        region: Range<usize>,
+        rows: u64,
+        seg: u16,
+    ) -> Result<IndexedBlock, BlockError> {
+        if region.end > block.len() || region.start > region.end {
+            return Err(BlockError::Truncated);
+        }
+        if region.end > u32::MAX as usize {
+            return Err(BlockError::TooLarge);
+        }
+        // The smallest record is a digest, an rv, an empty id and one value
+        // tag: 42 bytes, 46 with its length prefix.
+        const MIN_FRAMED: u64 = (codec::ID_OFFSET + 2) as u64 + 4;
+        if rows > (region.end - region.start) as u64 / MIN_FRAMED {
+            return Err(BlockError::TooManyRows);
+        }
+
+        let mut index: HashTable<RowSlot> = HashTable::with_capacity(rows as usize);
+        let mut xor = ssp_protocol::snapshot_hash::xor_empty();
+        let mut live = 0u64;
+        let mut at = region.start;
+        for n in 0..rows {
+            let len = block
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                .ok_or(BlockError::Truncated)? as usize;
+            let start = at + 4;
+            let end = start + len;
+            if end > region.end {
+                return Err(BlockError::Truncated);
+            }
+            let record = &block[start..end];
+            let id = codec::record_id(record).ok_or(BlockError::BadRecord(n))?;
+            let digest = codec::record_digest(record).ok_or(BlockError::BadRecord(n))?;
+            let slot = Span {
+                seg,
+                off: start as u32,
+                len: len as u32,
+            };
+            match index.entry(
+                id_hash(id),
+                |s| id_in(block, s) == Some(id),
+                |s| id_in(block, s).map_or(0, id_hash),
+            ) {
+                Entry::Occupied(_) => return Err(BlockError::DuplicateId(n)),
+                Entry::Vacant(v) => {
+                    v.insert(slot);
+                }
+            }
+            ssp_protocol::snapshot_hash::xor_digest(&mut xor, digest);
+            live += len as u64;
+            at = end;
+        }
+        if at != region.end {
+            return Err(BlockError::TrailingBytes);
+        }
+        Ok(IndexedBlock { index, xor, live })
     }
 
     /// The id stored in the record a slot points at.
@@ -228,13 +360,13 @@ impl RowTable {
         if !self.is_empty() || !self.dict.is_empty() {
             return false;
         }
-        for (expected, name) in names.into_iter().enumerate() {
-            if self.dict.intern(name) as usize != expected {
-                self.dict = FieldDict::new();
-                return false;
+        match FieldDict::from_names(names) {
+            Some(dict) => {
+                self.dict = dict;
+                true
             }
+            None => false,
         }
-        true
     }
 
     /// Store a record that was encoded against this table's dictionary, as
@@ -686,6 +818,91 @@ mod tests {
         let mut want: Vec<&str> = ids.to_vec();
         want.sort_unstable();
         assert_eq!(keys, want, "keys() must yield the ids that went in");
+    }
+
+    /// Frame `records` the way a checkpoint does, so a block can be indexed.
+    fn framed(records: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for r in records {
+            out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            out.extend_from_slice(r);
+        }
+        out
+    }
+
+    #[test]
+    fn index_block_finds_every_row_without_copying() {
+        let mut t = RowTable::new();
+        const N: usize = 3000;
+        for i in 0..N {
+            put(&mut t, &format!("{i:026}"), json!({ "n": i, "s": format!("v{i}") }));
+        }
+        let records: Vec<&[u8]> = t.records().collect();
+        let mut block = b"header-bytes-before-the-region".to_vec();
+        let region_start = block.len();
+        block.extend(framed(&records));
+        let region = region_start..block.len();
+
+        let indexed = RowTable::index_block(&block, region, N as u64, 0).unwrap();
+        assert_eq!(indexed.index.len(), N);
+        assert_eq!(indexed.live, records.iter().map(|r| r.len() as u64).sum::<u64>());
+        let mut expected_xor = ssp_protocol::snapshot_hash::xor_empty();
+        for r in &records {
+            ssp_protocol::snapshot_hash::xor_digest(&mut expected_xor, codec::record_digest(r).unwrap());
+        }
+        assert_eq!(indexed.xor, expected_xor);
+
+        let dict = FieldDict::from_names(t.dict().names()).unwrap();
+        let back = RowTable::from_parts(dict, indexed.index, Box::new(HeapArena::from_buf(block, indexed.live)));
+        for i in 0..N {
+            let id = format!("{i:026}");
+            assert_eq!(back.get(&id).get("n").as_i64(), Some(i as i64), "{id}");
+            assert_eq!(back.digest_of(&id), t.digest_of(&id));
+        }
+        for i in N..N + 200 {
+            assert!(back.get(&format!("{i:026}")).is_missing());
+        }
+        // Still a table: a write after the load retires the block's copy.
+        let mut back = back;
+        let (seven, eight) = (format!("{:026}", 7), format!("{:026}", 8));
+        put(&mut back, &seven, json!({ "n": 70 }));
+        assert_eq!(back.get(&seven).get("n").as_i64(), Some(70));
+        assert!(back.remove(&eight));
+        assert_eq!(back.len(), N - 1);
+    }
+
+    #[test]
+    fn index_block_rejects_malformed_regions() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "n": 1 }));
+        put(&mut t, "b", json!({ "n": 2 }));
+        let records: Vec<&[u8]> = t.records().collect();
+        let block = framed(&records);
+        let whole = 0..block.len();
+
+        assert!(RowTable::index_block(&block, whole.clone(), 2, 0).is_ok());
+        assert_eq!(RowTable::index_block(&block, whole.clone(), 1, 0).err(), Some(BlockError::TrailingBytes));
+        assert!(matches!(RowTable::index_block(&block, whole.clone(), 3, 0), Err(BlockError::Truncated | BlockError::TooManyRows)));
+        assert_eq!(RowTable::index_block(&block, 0..block.len() + 1, 2, 0).err(), Some(BlockError::Truncated));
+        assert_eq!(RowTable::index_block(&block, whole.clone(), u64::MAX, 0).err(), Some(BlockError::TooManyRows));
+
+        let twice = framed(&[records[0], records[0]]);
+        assert_eq!(RowTable::index_block(&twice, 0..twice.len(), 2, 0).err(), Some(BlockError::DuplicateId(1)));
+
+        let mut short = block.clone();
+        short.truncate(short.len() - 1);
+        assert_eq!(RowTable::index_block(&short, 0..short.len(), 2, 0).err(), Some(BlockError::Truncated));
+
+        // A region too small for one record is refused before the walk.
+        let stub = framed(&[&[0u8; 10]]);
+        assert_eq!(RowTable::index_block(&stub, 0..stub.len(), 1, 0).err(), Some(BlockError::TooManyRows));
+
+        // A record whose id length runs past its bytes has no readable id.
+        let mut bad = vec![0u8; 45];
+        bad[codec::ID_OFFSET] = 0xC8;
+        bad[codec::ID_OFFSET + 1] = 0x01;
+        let bad = framed(&[&bad]);
+        assert_eq!(RowTable::index_block(&bad, 0..bad.len(), 1, 0).err(), Some(BlockError::BadRecord(0)));
     }
 
     #[test]

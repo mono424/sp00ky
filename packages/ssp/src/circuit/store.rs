@@ -72,6 +72,24 @@ impl Collection {
         }
     }
 
+    /// A collection over rows that were loaded already, as a checkpoint
+    /// reader has them: `catchup_xor` is the hash those rows add up to (the
+    /// reader checked), and the membership is derived from the rows.
+    pub fn from_rows(name: String, rows: RowTable, catchup_xor: [u8; 32]) -> Self {
+        let mut zset: ZSet = HashMap::with_capacity(rows.len());
+        for id in rows.keys() {
+            zset.insert(make_key(&name, id), 1);
+        }
+        Self {
+            name,
+            zset,
+            rows,
+            catchup_xor,
+            scratch: Vec::new(),
+            retained: None,
+        }
+    }
+
     /// Reduce `value` to this collection's retained fields (plus
     /// [`ALWAYS_RETAINED`]). Identity when the collection keeps whole bodies
     /// or the value is not an object.

@@ -136,6 +136,19 @@ impl FieldDict {
         self.names.iter().map(|s| s.as_str())
     }
 
+    /// The dictionary that assigns `names` their position as ids, i.e. the
+    /// one [`Self::names`] was read from. `None` when a name repeats: the ids
+    /// would then not line up with records encoded against the original.
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Self> {
+        let mut dict = Self::new();
+        for (expected, name) in names.into_iter().enumerate() {
+            if dict.intern(name) as usize != expected {
+                return None;
+            }
+        }
+        Some(dict)
+    }
+
     pub fn len(&self) -> usize {
         self.names.len()
     }

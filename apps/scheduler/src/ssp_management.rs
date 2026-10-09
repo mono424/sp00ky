@@ -503,6 +503,7 @@ async fn handle_register(
         let state = state.clone();
         let ssp_info = ssp_info.clone();
         let ssp_id = request.ssp_id.clone();
+        let ssp_url = request.url.clone();
         tokio::spawn(async move {
             let _drain_guard =
                 crate::acquire_drain_lock(&state.drain_lock, "ssp registration").await;
@@ -565,12 +566,14 @@ async fn handle_register(
             pool.mark_bootstrapping(&ssp_id);
             pool.set_bootstrap_seq(&ssp_id, snapshot_seq);
             let generation = pool.bump_registration_gen(&ssp_id);
+            drop(pool);
+            spawn_poll_and_replay(&state, ssp_id, ssp_url, snapshot_seq, generation);
 
-            (snapshot_seq, table_hashes, generation)
+            (snapshot_seq, table_hashes)
         })
         .await
     };
-    let (snapshot_seq, table_hashes, generation) = match critical {
+    let (snapshot_seq, table_hashes) = match critical {
         Ok(v) => v,
         Err(e) => {
             error!(error = %e, "Registration critical section panicked");
@@ -582,9 +585,39 @@ async fn handle_register(
     };
     info!(snapshot_seq, "Snapshot frozen for SSP bootstrap");
 
-    // Spawn polling + replay task
-    let ssp_id = request.ssp_id.clone();
-    let ssp_url = request.url.clone();
+
+    info!(
+        tables = table_hashes.len(),
+        "SSP registration accepted, polling for bootstrap completion"
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SspRegistrationResponse {
+            snapshot_seq,
+            table_hashes,
+        }),
+    ))
+}
+
+/// Start the task that waits for one registration's bootstrap and replays the
+/// buffered events into it.
+///
+/// Called from inside the registration's detached critical section, right where
+/// the generation is bumped, so the two can never be separated. It used to be
+/// spawned by the handler after the section returned, and hyper drops that
+/// future when the client gives up: an SSP whose register call timed out behind
+/// a busy `drain_lock` (and retried) left registrations that bumped the
+/// generation with nothing polling them. The poll of the one registration it
+/// did hear back from then aborted as superseded, and the SSP sat ready and
+/// unadmitted until the hung-bootstrap reaper removed it six minutes later
+/// (whitepawn, 2026-10-09).
+fn spawn_poll_and_replay(
+    state: &SspManagementState,
+    ssp_id: String,
+    ssp_url: String,
+    snapshot_seq: u64,
+    generation: u64,
+) {
     let ssp_pool = state.ssp_pool.clone();
     let transport = state.transport.clone();
     let event_buffer = state.event_buffer.clone();
@@ -649,18 +682,6 @@ async fn handle_register(
             }
         }
     });
-
-    info!(
-        tables = table_hashes.len(),
-        "SSP registration accepted, polling for bootstrap completion"
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SspRegistrationResponse {
-            snapshot_seq,
-            table_hashes,
-        }),
-    ))
 }
 
 /// Handle SSP heartbeat

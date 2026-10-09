@@ -1968,9 +1968,16 @@ mod bootstrap_pagination_tests {
         assert_eq!(first, "SELECT * FROM game ORDER BY id LIMIT 200");
 
         let next = bootstrap_page_query("game", 200, Some("game:abc"), &none);
+        assert_eq!(next, "SELECT * FROM game WHERE id > game:abc ORDER BY id LIMIT 200");
+        // The id as SurrealDB spelled it: `type::record('game', '42')` was the
+        // STRING '42' (past every number) and '`a-b`' kept its backticks.
         assert_eq!(
-            next,
-            "SELECT * FROM game WHERE id > type::record('game', 'abc') ORDER BY id LIMIT 200"
+            bootstrap_page_query("game", 200, Some("game:42"), &none),
+            "SELECT * FROM game WHERE id > game:42 ORDER BY id LIMIT 200"
+        );
+        assert_eq!(
+            bootstrap_page_query("game", 200, Some("game:`a-b`"), &none),
+            "SELECT * FROM game WHERE id > game:`a-b` ORDER BY id LIMIT 200"
         );
 
         // Neither page may fall back to offset pagination.
@@ -1992,7 +1999,7 @@ mod bootstrap_pagination_tests {
         );
         assert_eq!(
             bootstrap_page_query("game", 200, Some("game:abc"), &omit),
-            "SELECT * OMIT blob, secret_token FROM game WHERE id > type::record('game', 'abc') ORDER BY id LIMIT 200"
+            "SELECT * OMIT blob, secret_token FROM game WHERE id > game:abc ORDER BY id LIMIT 200"
         );
     }
 

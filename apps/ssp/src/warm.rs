@@ -582,23 +582,13 @@ pub fn page_targets(table: &str, ranges: &RangeHashes, page_size: usize) -> Vec<
     targets
 }
 
-/// A SurrealQL string literal body: backslashes and single quotes escaped.
-fn quote(raw: &str) -> String {
-    raw.replace('\\', "\\\\").replace('\'', "\\'")
-}
-
-fn record_expr(table: &str, id: &str) -> String {
-    let raw = id.strip_prefix(&format!("{table}:")).unwrap_or(id);
-    format!("type::record('{table}', '{}')", quote(raw))
-}
-
 /// One keyset page of `(id, _00_rv)`, in id order like the bootstrap pager.
 fn listing_query(table: &str, after: Option<&str>) -> String {
     match after {
         None => format!("SELECT id, _00_rv FROM {table} ORDER BY id LIMIT {LIST_PAGE}"),
         Some(id) => format!(
             "SELECT id, _00_rv FROM {table} WHERE id > {} ORDER BY id LIMIT {LIST_PAGE}",
-            record_expr(table, id)
+            ssp_protocol::record_id_literal(table, id)
         ),
     }
 }
@@ -613,7 +603,7 @@ fn range_listing_query(table: &str, ranges: &RangeHashes, i: usize) -> String {
 /// Whole bodies of the listed ids, by record id rather than by scan.
 fn fetch_query(table: &str, ids: &[String], omit: &BTreeSet<String>) -> String {
     let omit = ssp_protocol::omit_clause(omit);
-    let ids: Vec<String> = ids.iter().map(|id| record_expr(table, id)).collect();
+    let ids: Vec<String> = ids.iter().map(|id| ssp_protocol::record_id_literal(table, id)).collect();
     format!("SELECT *{omit} FROM [{}]", ids.join(", "))
 }
 
@@ -629,7 +619,11 @@ mod tests {
         );
         assert_eq!(
             listing_query("game", Some("game:abc")),
-            "SELECT id, _00_rv FROM game WHERE id > type::record('game', 'abc') ORDER BY id LIMIT 10000"
+            "SELECT id, _00_rv FROM game WHERE id > game:abc ORDER BY id LIMIT 10000"
+        );
+        assert_eq!(
+            listing_query("game", Some("game:7")),
+            "SELECT id, _00_rv FROM game WHERE id > game:7 ORDER BY id LIMIT 10000"
         );
     }
 
@@ -637,8 +631,8 @@ mod tests {
     fn fetch_selects_by_record_id_and_omits_opaque_fields() {
         let omit: BTreeSet<String> = ["blob".to_string()].into();
         assert_eq!(
-            fetch_query("game", &["a".to_string(), "game:b".to_string()], &omit),
-            "SELECT * OMIT blob FROM [type::record('game', 'a'), type::record('game', 'b')]"
+            fetch_query("game", &["a".to_string(), "game:b".to_string(), "game:`a-b`".to_string(), "game:42".to_string()], &omit),
+            "SELECT * OMIT blob FROM [game:a, game:b, game:`a-b`, game:42]"
         );
     }
 
@@ -663,11 +657,6 @@ mod tests {
         // A range bigger than a page is still one page.
         assert_eq!(page_targets("t", &ranges, 100), vec!["t:..⟨d⟩", "t:⟨d⟩..⟨h⟩", "t:⟨h⟩..⟨p⟩", "t:⟨p⟩.."]);
         assert_eq!(page_targets("t", &ranges, 10_000), vec!["t"]);
-    }
-
-    #[test]
-    fn ids_are_quoted() {
-        assert_eq!(record_expr("t", "it's\\x"), "type::record('t', 'it\\'s\\\\x')");
     }
 
     #[test]
@@ -765,8 +754,8 @@ mod tests {
                 if let Some(rest) = target.strip_prefix("game ") {
                     // The keyset listing.
                     let after = rest
-                        .strip_prefix("WHERE id > type::record('game', '")
-                        .and_then(|r| r.split_once('\'').map(|(a, _)| a.to_string()));
+                        .strip_prefix("WHERE id > game:")
+                        .and_then(|r| r.split_once(' ').map(|(a, _)| a.to_string()));
                     let rows: Vec<Value> = self
                         .rows
                         .iter()
@@ -780,9 +769,9 @@ mod tests {
             }
             if let Some(ids) = q.strip_prefix("SELECT * FROM [") {
                 let rows = ids
-                    .split("type::record('game', '")
-                    .skip(1)
-                    .filter_map(|part| part.split_once('\'').map(|(id, _)| id))
+                    .trim_end_matches(']')
+                    .split(", ")
+                    .filter_map(|id| id.strip_prefix("game:"))
                     .filter_map(|id| self.rows.get(id).cloned())
                     .collect();
                 return Value::Array(rows);

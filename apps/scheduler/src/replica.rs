@@ -84,8 +84,8 @@ fn json_kind(v: &Value) -> &'static str {
     }
 }
 
-/// Build one page of a bootstrap table scan using KEYSET pagination on the
-/// record `id` (`WHERE id > <last>`), never `OFFSET`/`START`.
+/// Build one page of a table scan using KEYSET pagination on the record `id`
+/// (`WHERE id > <last>`), never `OFFSET`/`START`.
 ///
 /// The remote DB is live while we page it, so offset pagination is unsafe: a
 /// concurrent delete behind the offset shifts every later row up one, so the
@@ -93,7 +93,12 @@ fn json_kind(v: &Value) -> &'static str {
 /// in any SSP that bootstraps from it), so a later delete of that record emits
 /// no removal delta and clients' live queries go stale until reload. Keyset
 /// resumes from the last id seen, immune to shifts behind the cursor. Mirrors
-/// `bootstrap_page_query` in apps/ssp/src/lib.rs.
+/// `bootstrap_page_query` in packages/ssp-node.
+///
+/// The cursor is the id as SurrealDB spelled it
+/// ([`ssp_protocol::record_id_literal`]), so a numeric, uuid or escaped key
+/// resumes as itself.
+///
 /// `omit` drops opaque columns from the projection — see
 /// [`Replica::opaque_fields`]. Every producer of a content hash must emit the
 /// identical `OMIT` list or their digests diverge, so the clause is rendered by
@@ -108,8 +113,8 @@ fn keyset_page_query(
     match after_id {
         None => format!("SELECT *{omit} FROM {table} ORDER BY id LIMIT {page_size}"),
         Some(id) => {
-            let raw = id.strip_prefix(&format!("{table}:")).unwrap_or(id);
-            format!("SELECT *{omit} FROM {table} WHERE id > type::record('{table}', '{raw}') ORDER BY id LIMIT {page_size}")
+            let after = ssp_protocol::record_id_literal(table, id);
+            format!("SELECT *{omit} FROM {table} WHERE id > {after} ORDER BY id LIMIT {page_size}")
         }
     }
 }
@@ -2495,13 +2500,21 @@ mod tests {
         assert_eq!(first, "SELECT * FROM game ORDER BY id LIMIT 200");
 
         let next = keyset_page_query("game", 200, Some("game:abc"), &none);
-        assert_eq!(
-            next,
-            "SELECT * FROM game WHERE id > type::record('game', 'abc') ORDER BY id LIMIT 200"
-        );
+        assert_eq!(next, "SELECT * FROM game WHERE id > game:abc ORDER BY id LIMIT 200");
 
         assert!(!first.contains("START") && !next.contains("START"));
         assert!(first.contains("ORDER BY id") && next.contains("ORDER BY id"));
+
+        // The cursor keeps the key's type: `type::record('game', '42')` was the
+        // STRING '42', past every number, so a numeric table ended at page one.
+        assert_eq!(
+            keyset_page_query("game", 200, Some("game:42"), &none),
+            "SELECT * FROM game WHERE id > game:42 ORDER BY id LIMIT 200"
+        );
+        assert_eq!(
+            keyset_page_query("game", 200, Some("game:u'0190d5d6-0000-7000-8000-000000000000'"), &none),
+            "SELECT * FROM game WHERE id > game:u'0190d5d6-0000-7000-8000-000000000000' ORDER BY id LIMIT 200"
+        );
     }
 
     /// The clone pager must render a projection byte-identical to the SSP's
@@ -2521,7 +2534,7 @@ mod tests {
         );
         assert_eq!(
             keyset_page_query("user", 200, Some("user:abc"), &omit),
-            "SELECT * OMIT blob, secret_token FROM user WHERE id > type::record('user', 'abc') ORDER BY id LIMIT 200",
+            "SELECT * OMIT blob, secret_token FROM user WHERE id > user:abc ORDER BY id LIMIT 200",
         );
     }
 

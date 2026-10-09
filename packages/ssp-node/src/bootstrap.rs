@@ -20,7 +20,9 @@ use ssp_protocol::schema::{SchemaProbe, INFO_FOR_DB, SCHEMA_STATE_QUERY};
 use crate::ports::Db;
 
 /// Keyset-paginated page query for the bootstrap scan (ordered by id, never
-/// OFFSET — lossy under concurrent writes).
+/// OFFSET — lossy under concurrent writes). It resumes after the id as
+/// SurrealDB spelled it ([`ssp_protocol::record_id_literal`]), so a numeric,
+/// uuid or escaped key resumes as itself.
 ///
 /// `omit` names fields the circuit must never hold — see
 /// [`ssp_protocol::OPAQUE_FIELD_COMMENT`]. Omitting them here is what keeps this
@@ -38,8 +40,8 @@ pub fn bootstrap_page_query(
     match after_id {
         None => format!("SELECT *{omit} FROM {table} ORDER BY id LIMIT {page_size}"),
         Some(id) => {
-            let raw = id.strip_prefix(&format!("{table}:")).unwrap_or(id);
-            format!("SELECT *{omit} FROM {table} WHERE id > type::record('{table}', '{raw}') ORDER BY id LIMIT {page_size}")
+            let after = ssp_protocol::record_id_literal(table, id);
+            format!("SELECT *{omit} FROM {table} WHERE id > {after} ORDER BY id LIMIT {page_size}")
         }
     }
 }
@@ -459,8 +461,12 @@ mod tests {
             "SELECT * FROM game ORDER BY id LIMIT 200"
         );
         let next = bootstrap_page_query("game", 200, Some("game:abc"), &none);
-        assert_eq!(next, "SELECT * FROM game WHERE id > type::record('game', 'abc') ORDER BY id LIMIT 200");
+        assert_eq!(next, "SELECT * FROM game WHERE id > game:abc ORDER BY id LIMIT 200");
         assert!(!next.contains("START"));
+        assert_eq!(
+            bootstrap_page_query("game", 200, Some("game:u'0190d5d6-0000-7000-8000-000000000000'"), &none),
+            "SELECT * FROM game WHERE id > game:u'0190d5d6-0000-7000-8000-000000000000' ORDER BY id LIMIT 200"
+        );
     }
 
     #[test]

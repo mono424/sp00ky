@@ -530,6 +530,20 @@ mod tests {
     }
 
     #[test]
+    fn record_id_literal_keeps_the_returned_spelling() {
+        assert_eq!(record_id_literal("game", "game:abc"), "game:abc");
+        assert_eq!(record_id_literal("game", "game:42"), "game:42");
+        assert_eq!(record_id_literal("game", "game:`a-b`"), "game:`a-b`");
+        assert_eq!(
+            record_id_literal("game", "game:u'0190d5d6-0000-7000-8000-000000000000'"),
+            "game:u'0190d5d6-0000-7000-8000-000000000000'"
+        );
+        assert_eq!(record_id_literal("game", "abc"), "game:abc");
+        // A table whose name extends this one's is not this table's prefix.
+        assert_eq!(record_id_literal("game", "games:abc"), "game:games:abc");
+    }
+
+    #[test]
     fn omit_clause_is_sorted_and_comma_separated() {
         // Sorted output is not cosmetic: every producer must emit a
         // byte-identical projection or their hashes drift.
@@ -546,4 +560,22 @@ pub fn with_durable_row_versions(page_query: &str) -> String {
     // Bind the outer id before planning the lookup. A correlated $parent.id
     // predicate makes SurrealDB scan the entire ledger for every source row.
     page_query.replacen("SELECT *", "SELECT *, { LET $spky_row_id = id; RETURN (SELECT VALUE version FROM _00_version WHERE record_id = $spky_row_id LIMIT 1)[0] ?? _00_rv ?? 1; } AS _00_rv", 1)
+}
+
+/// The SurrealQL literal for a record id as a SELECT returns it: SurrealDB's
+/// own spelling (`t:abc`, `` t:`a-b` ``, `t:42`, `t:u'…'`, `t:[1, 2]`), which
+/// parses back to the same id, key type included. An id without the `table:`
+/// prefix is taken as the key.
+///
+/// What a keyset pager resumes from. `type::record('t', '<key>')` made every
+/// key a string: after a numeric key the next page skipped every other number
+/// (a table of numeric ids ended after its first page) and a uuid key did not
+/// parse. A `<record> '<id>'` cast round-trips too, but SurrealDB 3.1 cannot
+/// check it before decoding each row, which made a keyset page 3-4x slower.
+pub fn record_id_literal(table: &str, id: &str) -> String {
+    if id.starts_with(table) && id[table.len()..].starts_with(':') {
+        id.to_string()
+    } else {
+        format!("{table}:{id}")
+    }
 }

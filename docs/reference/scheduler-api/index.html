@@ -688,14 +688,14 @@ need an operator (a row the replica schema rejects, typically).
 <li><code>SPKY_DB_PASS</code> - SurrealDB password (overrides <code>db.password</code>)</li>
 <li><code>SPKY_IMPERSONATION</code> - <code>on</code> serves <code>/impersonate/mint</code> and <code>/impersonate/users</code> (default: off; set from <code>impersonation.enabled</code>)</li>
 <li><code>SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS</code> - Override for <code>snapshot_update_interval_secs</code> (default: <code>300</code>)</li>
-<li><code>SPKY_DRIFT_CHECK</code> - Compare replica row counts against upstream at startup and after each snapshot drain (default: <code>true</code>). After a fresh clone the startup check runs before the scheduler reports ready; over a reused snapshot it runs in the background, so SSPs can register while it counts</li>
-<li><code>SPKY_DRIFT_COUNT_CONCURRENCY</code> - Upstream <code>count()</code> queries one drift check runs at once (default: <code>4</code>)</li>
+<li><code>SPKY_DRIFT_CHECK</code> - Compare replica row counts against upstream at startup and after each snapshot drain (default: <code>true</code>). Readiness waits only for the tables the replica holds no row of, the one mismatch acted on at first sight; the full count runs right after the scheduler turns ready, so SSPs can register while it does</li>
 <li><code>SPKY_DRIFT_AUTO_RECLONE</code> - Act on a confirmed mismatch (default: <code>true</code>; <code>false</code> reports only, via <code>/health/snapshot</code>, <code>/metrics</code> and <code>spky verify</code>). The table is repaired in place: its ids and <code>_00_rv</code>s are compared with upstream, and the rows that are missing, stale or deleted go through the ingest pipeline as ordinary events, so the replica and every SSP converge without a bootstrap. Only a repair that finds no difference, would exceed <code>SPKY_DRIFT_REPAIR_MAX_ROWS</code>, or fails falls back to re-cloning the replica and re-bootstrapping every SSP. A table still off after either is reported as stuck until its counts change</li>
 <li><code>SPKY_DRIFT_CONFIRM_TICKS</code> - Consecutive checks a non-zero count mismatch must persist before it is acted on; an empty replica table upstream has rows for is acted on at first sight (default: <code>2</code>)</li>
 <li><code>SPKY_DRIFT_RECLONE_COOLDOWN_SECS</code> - Minimum spacing between automatic re-clones (default: <code>3600</code>)</li>
 <li><code>SPKY_DRIFT_REPAIR_MAX_ROWS</code> - Most rows one in-place repair of a table the replica already held may send through the ingest pipeline (default: <code>2000</code>). A table new to the replica is backfilled with no cap</li>
 <li><code>SPKY_DRIFT_REPAIR_TIMEOUT_SECS</code> - Deadline for one table repair, and the longest any repair (a backfill included) may go without finishing a page; on the deadline it is abandoned, the upstream connection is replaced and the repair is retried on the next check (default: <code>300</code>)</li>
 <li><code>SPKY_DRIFT_CHECK_TIMEOUT_SECS</code> - Deadline for one drift check. The check is the last step of the snapshot updater’s tick, so a check that never answers would stop the replica draining; on the deadline it is abandoned, the upstream connection is replaced and the tick finishes (default: <code>120</code>)</li>
+<li><code>SPKY_DRIFT_COUNT_CONCURRENCY</code> - Upstream <code>count()</code> queries one drift check keeps in flight. Each is a full scan of its table, so counting one at a time makes the check as slow as the sum of every table; <code>1</code> restores that, for an upstream with no CPU to spare (default: <code>4</code>)</li>
 <li><code>SPKY_BACKENDS</code> - JSON-encoded backend health-check list (<code>SPKY_SCHEDULER_BACKENDS</code> accepted as legacy fallback)</li>
 <li><code>SPKY_BOOTSTRAP_PAGE_SIZE</code> - Rows per page when the replica clone or a drift repair reads a table from upstream; the table is cut into id windows of three quarters of a page (default: about 32 MiB of rows by a one-row probe, at most <code>2000</code>)</li>
 <li><code>SPKY_CLEAR_VIEWS_ON_START</code> - Wipe <code>_00_query</code> at startup (default: <code>true</code>). <code>false</code> keeps registered views across a scheduler restart: the replica clones them, SSPs re-register them at bootstrap, clients never notice; the SSP TTL sweep retires expired ones. Single-SSP tenants only until scheduler-owned view assignment lands.</li>
@@ -746,7 +746,11 @@ answers again (its <code>component</code> is the backend name), and <code>schedu
 opens when a schedule’s per-key failure budget stops firing one <code>forEach</code> key
 (its <code>component</code> is <code>schedule:&lt;name&gt;/&lt;key&gt;</code>) and recovers when that key fires
 again, after a passing probe or a release. See
-<a href="/docs/jobs/schedules#failing-keys">Failing keys</a>.</p>
+<a href="/docs/jobs/schedules#failing-keys">Failing keys</a>. <code>hot_views</code> (component
+<code>views</code>) opens when a registered view updates at least
+<code>SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC</code> times a second and recovers once every
+view has stayed under that rate for a minute. See
+<a href="/docs/reference/admin-dashboard#hot-views">Hot views</a>.</p>
 <p>An incident carries <code>id</code>, <code>component</code>, <code>kind</code>, <code>severity</code>, <code>state</code>, <code>started_at</code>,
 <code>ended_at</code>, <code>max_buffered_events</code>, <code>event_count</code>, and <code>events</code>. Each event has
 <code>at</code>, <code>component</code>, <code>kind</code>, <code>state</code>, <code>summary</code>, <code>operation_id</code>, and <code>version</code>.

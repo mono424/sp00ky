@@ -326,11 +326,14 @@ async fn dispatch(slot: RouterSlot, listener: Listener, port: u16, req: Request)
                 }
                 let _ = gate.changed_from(&mode, remaining).await;
             }
-            Mode::Forward(_) if was_relayed(&req, &buffered) => {
+            // A retired process relays even a relayed request: its successor
+            // holds or serves, it never relays back.
+            Mode::Forward(_) if was_relayed(&req, &buffered) && gate.role() != "retired" => {
                 if remaining.is_zero() {
                     return held_too_long();
                 }
-                let _ = gate.changed_from(&mode, remaining).await;
+                // Short, so a change of role (not only of mode) is seen.
+                let _ = gate.changed_from(&mode, Duration::from_millis(250).min(remaining)).await;
             }
             Mode::Forward(host) => {
                 if buffered.is_none() {
@@ -562,6 +565,10 @@ pub struct HandoverState {
 
 pub const STATE_FORMAT: u32 = 1;
 
+/// How long a predecessor that released its replica waits for the commit
+/// before it gives up and exits (see `Scheduler::release_replica`).
+pub const COMMIT_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Why blue declined a prepare.
 #[derive(Debug)]
 pub enum Refusal {
@@ -676,6 +683,111 @@ pub async fn take_over(from: &str, successor: &str, ports: RelayPorts, auth_secr
     }
 }
 
+/// How the predecessor answered a two-step release.
+pub enum Release {
+    /// It released its replica and serves on until we commit.
+    Released,
+    /// It predates the two-step protocol (404): use the one-step prepare.
+    OneStep,
+    /// Anything [`take_over`] would have concluded instead.
+    Other(TakeOver),
+}
+
+/// Step one of the two-step handover: ask the predecessor to release its
+/// replica while it keeps serving. Retries while it is busy.
+pub async fn release(from: &str, successor: &str, ports: RelayPorts, auth_secret: Option<&str>) -> Release {
+    let gate = gate();
+    gate.set_peer(Some(from.to_string()));
+    let Some(secret) = auth_secret else {
+        warn!("SPKY_AUTH_SECRET unset; cannot authenticate a handover, waiting for the predecessor to stop instead");
+        return Release::Other(TakeOver::Unsupported);
+    };
+    let url = format!("{}/handover/release", from.trim_end_matches('/'));
+    let body = PrepareRequest { successor: successor.to_string(), version: env!("CARGO_PKG_VERSION").to_string(), ports };
+    let started = Instant::now();
+    loop {
+        let attempt = gate.client.post(&url).bearer_auth(secret).json(&body).timeout(Duration::from_secs(60)).send().await;
+        match attempt {
+            Ok(resp) if resp.status().is_success() => {
+                info!(from = %from, waited_ms = started.elapsed().as_millis() as u64, "Predecessor released its replica");
+                return Release::Released;
+            }
+            Ok(resp) if resp.status() == StatusCode::NOT_FOUND => return Release::OneStep,
+            Ok(resp) if resp.status() == StatusCode::CONFLICT => {
+                let reason = resp.text().await.unwrap_or_default();
+                if reason.contains("\"gone\"") {
+                    warn!(reason = %reason, "Predecessor already handed over to someone else; booting on our own");
+                    return Release::Other(TakeOver::Unreachable);
+                }
+                if started.elapsed() > BUSY_RETRY_MAX {
+                    warn!(reason = %reason, "Predecessor stayed busy; waiting for it to stop instead");
+                    return Release::Other(TakeOver::Unsupported);
+                }
+                info!(reason = %reason, "Predecessor busy; asking again shortly");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Ok(resp) => {
+                warn!(status = %resp.status(), "Predecessor cannot hand over; relaying to it until it stops");
+                return Release::Other(TakeOver::Unsupported);
+            }
+            Err(e) if e.is_connect() => {
+                info!(error = %e, "Predecessor unreachable; taking the replica directly");
+                return Release::Other(TakeOver::Unreachable);
+            }
+            Err(e) => {
+                warn!(error = %e, "Release request failed; asking the predecessor where it stands");
+                return Release::Other(settle_ambiguous(from).await);
+            }
+        }
+    }
+}
+
+/// Step two: the predecessor holds, exports and starts relaying to us.
+/// Retried for a while: a predecessor that released and never sees a commit
+/// exits after [`COMMIT_DEADLINE`]. `None` when no state could be had; the
+/// caller then boots without it (SSPs re-register in place).
+pub async fn commit(from: &str, successor: &str, ports: RelayPorts, auth_secret: Option<&str>) -> Option<HandoverState> {
+    let secret = auth_secret?;
+    let url = format!("{}/handover/commit", from.trim_end_matches('/'));
+    let body = PrepareRequest { successor: successor.to_string(), version: env!("CARGO_PKG_VERSION").to_string(), ports };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let attempt = gate().client.post(&url).bearer_auth(secret).json(&body).timeout(Duration::from_secs(30)).send().await;
+        match attempt {
+            Ok(resp) if resp.status().is_success() => match resp.json::<HandoverState>().await {
+                Ok(state) => {
+                    info!(from = %from, ssps = state.ssps.len(), queries = state.queries.len(), "Predecessor committed the handover");
+                    return Some(state);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Predecessor committed but its state did not parse; booting without it");
+                    return Some(HandoverState::default());
+                }
+            },
+            Ok(resp) if resp.status() == StatusCode::CONFLICT => {
+                let reason = resp.text().await.unwrap_or_default();
+                if reason.contains("\"gone\"") {
+                    // Committed already (an answer we lost): it relays to us.
+                    warn!(reason = %reason, "Predecessor handed over already; booting without its state");
+                    return None;
+                }
+                warn!(reason = %reason, "Commit refused");
+            }
+            Ok(resp) => warn!(status = %resp.status(), "Commit failed"),
+            Err(e) if e.is_connect() => {
+                warn!(error = %e, "Predecessor gone before the commit; booting without its state");
+                return None;
+            }
+            Err(e) => warn!(error = %e, "Commit request failed; asking again"),
+        }
+        if Instant::now() >= deadline {
+            warn!("No commit after 60 s; booting without the predecessor's state");
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// After a prepare whose answer was lost: read the predecessor's own status.
 async fn settle_ambiguous(from: &str) -> TakeOver {
     let url = format!("{}/handover/status", from.trim_end_matches('/'));
@@ -786,8 +898,75 @@ pub fn routes(deps: RouteDeps) -> Router {
     use axum::routing::{get, post};
     Router::new()
         .route("/handover/prepare", post(prepare))
+        .route("/handover/release", post(release_route))
+        .route("/handover/commit", post(commit_route))
         .route("/handover/ssps", get(ssps))
         .with_state(deps)
+}
+
+fn authorized(deps: &RouteDeps, headers: &HeaderMap) -> Option<Response> {
+    let Some(secret) = deps.auth_secret.as_deref() else {
+        return Some((StatusCode::FORBIDDEN, "handover needs SPKY_AUTH_SECRET").into_response());
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    (presented != Some(secret)).then(|| StatusCode::UNAUTHORIZED.into_response())
+}
+
+fn refusal(r: Refusal) -> Response {
+    match r {
+        Refusal::Busy(reason) => {
+            info!(reason = %reason, "Handover step refused for now");
+            (StatusCode::CONFLICT, axum::Json(serde_json::json!({ "code": "busy", "reason": reason }))).into_response()
+        }
+        Refusal::Gone(reason) => {
+            (StatusCode::CONFLICT, axum::Json(serde_json::json!({ "code": "gone", "reason": reason }))).into_response()
+        }
+    }
+}
+
+/// `POST /handover/release`: step one of the two-step handover. Detached for
+/// the same reason as `prepare`.
+async fn release_route(
+    axum::extract::State(deps): axum::extract::State<RouteDeps>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<PrepareRequest>,
+) -> Response {
+    if let Some(denied) = authorized(&deps, &headers) {
+        return denied;
+    }
+    info!(successor = %req.successor, successor_version = %req.version, "Handover release requested");
+    let task = tokio::spawn(async move {
+        deps.scheduler.release_replica(req.successor.trim(), &deps.backup_restore_lock).await
+    });
+    match task.await {
+        Ok(Ok(())) => axum::Json(serde_json::json!({ "released": true })).into_response(),
+        Ok(Err(r)) => refusal(r),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("release task failed: {e}")).into_response(),
+    }
+}
+
+/// `POST /handover/commit`: step two, answers the handover state.
+async fn commit_route(
+    axum::extract::State(deps): axum::extract::State<RouteDeps>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<PrepareRequest>,
+) -> Response {
+    if let Some(denied) = authorized(&deps, &headers) {
+        return denied;
+    }
+    let task = tokio::spawn(async move {
+        deps.scheduler
+            .commit_handover(req.successor.trim(), req.ports, &deps.query_tracker)
+            .await
+    });
+    match task.await {
+        Ok(Ok(state)) => axum::Json(state).into_response(),
+        Ok(Err(r)) => refusal(r),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("commit task failed: {e}")).into_response(),
+    }
 }
 
 async fn prepare(
@@ -795,15 +974,8 @@ async fn prepare(
     headers: HeaderMap,
     axum::Json(req): axum::Json<PrepareRequest>,
 ) -> Response {
-    let Some(secret) = deps.auth_secret.as_deref() else {
-        return (StatusCode::FORBIDDEN, "handover needs SPKY_AUTH_SECRET").into_response();
-    };
-    let presented = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if presented != Some(secret) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Some(denied) = authorized(&deps, &headers) {
+        return denied;
     }
     if req.successor.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "successor is required").into_response();
@@ -825,13 +997,7 @@ async fn prepare(
     };
     match outcome {
         Ok(state) => axum::Json(state).into_response(),
-        Err(Refusal::Busy(reason)) => {
-            info!(reason = %reason, "Handover refused for now");
-            (StatusCode::CONFLICT, axum::Json(serde_json::json!({ "code": "busy", "reason": reason }))).into_response()
-        }
-        Err(Refusal::Gone(reason)) => {
-            (StatusCode::CONFLICT, axum::Json(serde_json::json!({ "code": "gone", "reason": reason }))).into_response()
-        }
+        Err(r) => refusal(r),
     }
 }
 

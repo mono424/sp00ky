@@ -768,6 +768,14 @@ running one's base URL and the same `SPKY_AUTH_SECRET`:
 4. Stop the old scheduler. On `SIGTERM` a relaying scheduler stops accepting,
    finishes what it is relaying and exits.
 
+A predecessor on canary.300 or later is handed over in two steps instead,
+so the hold shrinks to the in-memory export: the new scheduler relays every
+request to the old one while it calls `POST /handover/release` (the old one
+releases its replica and keeps serving), opens the replica and connects
+upstream, and only then holds and calls `POST /handover/commit` (the old one
+holds, exports its state and starts relaying). A predecessor that released
+and never sees a commit exits after two minutes.
+
 A predecessor that predates handovers answers the prepare with a 404. The new
 scheduler then relays to it, waits for the replica lock, and boots the
 ordinary way as soon as you stop the old one.
@@ -781,9 +789,13 @@ traffic. Poll it on the new scheduler to know when the old one can go.
 { "supported": true, "role": "active", "phase": "serving", "peer": "http://old:9667", "error": null, "version": "0.0.1-canary.295" }
 ```
 
-- `role`: `starting` (phase `holding`, `opening`, or `waiting_for_lock` when the predecessor cannot hand over), `active`, `retired` (handed over, relaying), `failed`.
+- `role`: `starting` (phase `relaying`, `holding`, `opening`, `committing`, or `waiting_for_lock` when the predecessor cannot hand over), `active` (phase `serving`, or `releasing`/`released`/`committing` on a predecessor mid-handover), `retired` (handed over, relaying), `failed`.
 
 #### POST /handover/prepare
+
+`POST /handover/release` and `POST /handover/commit` take the same body and
+auth and split this into its two steps; `release` answers `{"released":true}`,
+`commit` the handover state.
 
 Called by the new scheduler on the old one; bearer `SPKY_AUTH_SECRET`.
 Body `{ "successor": "<host>", "version": "...", "ports": { "main": 9667 } }`

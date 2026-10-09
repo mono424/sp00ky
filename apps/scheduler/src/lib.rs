@@ -46,7 +46,7 @@ use anyhow::{Context, Result};
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
@@ -261,6 +261,12 @@ pub async fn drain_and_apply(
     Ok(event_count)
 }
 
+/// What [`Scheduler::boot_prepare`] hands [`Scheduler::boot_finish`].
+pub struct BootParts {
+    shared_db: Arc<maintenance::db::ReconnectingDb>,
+    drift_hook: Arc<crate::drift::DriftHook>,
+}
+
 /// How [`Scheduler::boot`] comes up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BootMode {
@@ -349,6 +355,10 @@ pub struct Scheduler {
     pub push: crate::push::PushSlot,
     /// Caps concurrent push observers (see `crate::push::observe`).
     push_permits: Arc<tokio::sync::Semaphore>,
+    /// Handover: this process released its replica to a successor.
+    released: AtomicBool,
+    /// Handover: the successor committed; this process only relays now.
+    committed: Arc<AtomicBool>,
 }
 
 impl Scheduler {
@@ -397,6 +407,8 @@ impl Scheduler {
             schema: Arc::new(crate::schema::SchemaWatch::new()),
             push: crate::push::new_slot(),
             push_permits: Arc::new(tokio::sync::Semaphore::new(crate::push::OBSERVE_PERMITS)),
+            released: AtomicBool::new(false),
+            committed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -622,6 +634,15 @@ impl Scheduler {
     /// Bring the scheduler to `Ready` and start its background work, then
     /// return.
     pub async fn boot(&self, mode: BootMode) -> Result<()> {
+        let parts = self.boot_prepare(mode).await?;
+        self.boot_finish(parts).await
+    }
+
+    /// Everything [`Self::boot`] does before `Ready`: connect upstream, clone
+    /// or reuse the replica, reconcile the schema, the startup drift gate.
+    /// None of it acts on the SSPs or runs background work, so a successor
+    /// runs it while its predecessor still serves (see `crate::handover`).
+    pub async fn boot_prepare(&self, mode: BootMode) -> Result<BootParts> {
         info!(mode = ?mode, "Starting Scheduler service...");
 
         // Step 1: Connect to remote SurrealDB
@@ -914,6 +935,12 @@ impl Scheduler {
             }
         }
 
+        Ok(BootParts { shared_db, drift_hook })
+    }
+
+    /// The rest of [`Self::boot`]: `Ready`, and every background loop.
+    pub async fn boot_finish(&self, parts: BootParts) -> Result<()> {
+        let BootParts { shared_db, drift_hook } = parts;
         // Transition to Ready
         *self.status.write().await = SchedulerStatus::Ready;
         info!(
@@ -970,14 +997,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Blue side of a handover (see `crate::handover`): stop taking work at a
-    /// clean boundary, stop every background writer, export what lives only
-    /// in memory, release the replica, and relay all traffic to `successor`.
-    ///
-    /// Refuses (retryably) while something that must not be cut short is
-    /// running: an SSP bootstrap, a snapshot drain, an SSP promotion, a
-    /// backup or restore. Past the point where the background writers are
-    /// stopped there is no way back: the process relays from then on.
+    /// Blue side of a one-step handover (`POST /handover/prepare`, see
+    /// `crate::handover`): [`Self::release_replica`], wait until the engine
+    /// has let go of the directory, then [`Self::commit_handover`]. A
+    /// successor that speaks the two-step protocol calls those itself and
+    /// opens the replica in between, while this process still serves.
     pub async fn hand_over(
         &self,
         successor: &str,
@@ -985,12 +1009,61 @@ impl Scheduler {
         query_tracker: &crate::query::QueryTracker,
         backup_restore_lock: &tokio::sync::Mutex<()>,
     ) -> std::result::Result<crate::handover::HandoverState, crate::handover::Refusal> {
-        use crate::handover::{gate, Mode, Refusal};
+        let close_started = std::time::Instant::now();
+        self.release_replica(successor, backup_restore_lock).await?;
+        // `close` drops the engine's last handle; the engine lets go of the
+        // directory lock when its own shutdown is done. Wait for that here,
+        // still serving, by opening the directory ourselves: it only opens
+        // once the old engine is gone.
+        let released = loop {
+            match Replica::new(self.config.replica_db_path.clone()).await {
+                Ok(probe) => {
+                    drop(probe);
+                    break true;
+                }
+                Err(e) if crate::handover::is_lock_error(&e) && close_started.elapsed() < Duration::from_secs(60) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Could not confirm the replica was released; the successor waits for its lock");
+                    break false;
+                }
+            }
+        };
+        info!(released, close_ms = close_started.elapsed().as_millis() as u64, "Replica released while still serving");
+        self.commit_handover(successor, successor_ports, query_tracker).await
+    }
+
+    /// Handover step one, still serving: release the replica.
+    ///
+    /// Closing a large RocksDB flushes its memtables and waits out
+    /// compactions, seconds on whitepawn (7.9 s on 2026-10-09, all of it
+    /// spent holding every request when the close sat inside the hold).
+    /// Nothing on the steady-state path touches the replica: ingest goes to
+    /// the WAL and the fan-out, view registrations and heartbeats to the
+    /// pool. So it is released with traffic flowing; only drains, re-clones,
+    /// drift work and range builds use it, and the drain lock and stopping
+    /// those writers keep them off. The changefeed tail and lagging
+    /// redelivery run on: they only take events in and pass them on.
+    ///
+    /// Refuses (retryably) while something that must not be cut short is
+    /// running: an SSP bootstrap, a snapshot drain, an SSP promotion, a
+    /// backup or restore. Past that there is no way back: if no commit
+    /// follows within [`crate::handover::COMMIT_DEADLINE`], the process exits
+    /// so its supervisor (or the control plane) brings a whole one back.
+    pub async fn release_replica(
+        &self,
+        successor: &str,
+        backup_restore_lock: &tokio::sync::Mutex<()>,
+    ) -> std::result::Result<(), crate::handover::Refusal> {
+        use crate::handover::{gate, Refusal};
         let gate = gate();
         if gate.role() == "retired" {
             return Err(Refusal::Gone(format!("already handed over to {:?}", gate.status().peer)));
         }
-        let started = std::time::Instant::now();
+        if self.released.load(Ordering::SeqCst) {
+            return Ok(()); // a retried release
+        }
 
         // Wait, briefly, for work that must finish where it started.
         let busy_deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -1018,67 +1091,70 @@ impl Scheduler {
                 }
             }
         };
-
-        info!(successor, "Handing over to a successor scheduler");
-        gate.set_status("active", "handing_over");
-
-        // Phase 1, still serving: release the replica. Closing a large
-        // RocksDB flushes its memtables and waits out compactions, seconds on
-        // whitepawn (7.9 s on 2026-10-09, all of it spent holding every
-        // request). Nothing on the steady-state path touches the replica:
-        // ingest goes to the WAL and the fan-out, view registrations and
-        // heartbeats to the pool. So the close happens before the hold, with
-        // traffic flowing. Only drains, re-clones, drift work and range builds
-        // read or write it; the drain lock and stopping those writers keep
-        // them off. The changefeed tail and lagging redelivery keep running:
-        // they only take events in and pass them on.
         let drain = match tokio::time::timeout(Duration::from_secs(30), self.drain_lock.lock()).await {
             Ok(guard) => guard,
-            Err(_) => {
-                gate.set_status("active", "serving");
-                return Err(Refusal::Busy("a snapshot drain did not finish".to_string()));
-            }
+            Err(_) => return Err(Refusal::Busy("a snapshot drain did not finish".to_string())),
         };
+
         // The point of no return.
-        let mut stopped = crate::handover::abort_singletons_except(&["changefeed-tail", "lagging-redelivery"]);
-        let close_started = std::time::Instant::now();
+        info!(successor, "Releasing the replica to a successor scheduler");
+        gate.set_status("active", "releasing");
+        self.released.store(true, Ordering::SeqCst);
+        let stopped = crate::handover::abort_singletons_except(&["changefeed-tail", "lagging-redelivery"]);
         match tokio::time::timeout(Duration::from_secs(30), self.replica.write()).await {
             Ok(mut replica) => replica.close(),
             Err(_) => error!("Replica stayed busy for 30 s; the successor waits for its lock"),
         }
-        // `close` drops the engine's last handle; the engine lets go of the
-        // directory lock when its own shutdown is done. Wait for that here,
-        // where it costs nobody anything, by opening the directory ourselves:
-        // it only opens once the old engine is gone.
-        let released = loop {
-            match Replica::new(self.config.replica_db_path.clone()).await {
-                Ok(probe) => {
-                    drop(probe);
-                    break true;
-                }
-                Err(e) if crate::handover::is_lock_error(&e) && close_started.elapsed() < Duration::from_secs(60) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => {
-                    warn!(error = %e, "Could not confirm the replica was released; the successor waits for its lock");
-                    break false;
-                }
-            }
-        };
-        info!(
-            released,
-            close_ms = close_started.elapsed().as_millis() as u64,
-            "Replica released while still serving"
-        );
+        // This process never drains or backs up again.
+        std::mem::forget(drain);
+        std::mem::forget(backup_guard);
+        gate.set_status("active", "released");
+        info!(stopped_tasks = stopped, "Replica released; serving on until the successor commits");
 
-        // Phase 2, the hold: what is left is in-memory and takes milliseconds.
+        // A successor that never commits must not leave a scheduler serving
+        // without its replica and background work: exit, and let a whole one
+        // come back.
+        let committed = Arc::clone(&self.committed);
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::handover::COMMIT_DEADLINE).await;
+            if !committed.load(Ordering::SeqCst) {
+                error!(
+                    deadline_secs = crate::handover::COMMIT_DEADLINE.as_secs(),
+                    "Released the replica but no successor committed; exiting"
+                );
+                std::process::exit(75);
+            }
+        });
+        Ok(())
+    }
+
+    /// Handover step two, the hold: what is left is in memory and takes
+    /// milliseconds. Holds traffic, lets in-flight requests finish, takes the
+    /// ingest gate (no event half taken), stops the rest of the background
+    /// work, exports the SSP pool and view assignments, and relays every
+    /// request to `successor` from then on.
+    pub async fn commit_handover(
+        &self,
+        successor: &str,
+        successor_ports: crate::handover::RelayPorts,
+        query_tracker: &crate::query::QueryTracker,
+    ) -> std::result::Result<crate::handover::HandoverState, crate::handover::Refusal> {
+        use crate::handover::{gate, Mode, Refusal};
+        let gate = gate();
+        if gate.role() == "retired" {
+            return Err(Refusal::Gone(format!("already handed over to {:?}", gate.status().peer)));
+        }
+        if !self.released.load(Ordering::SeqCst) {
+            return Err(Refusal::Busy("the replica was not released yet".to_string()));
+        }
+        let started = std::time::Instant::now();
+        gate.set_status("active", "committing");
         gate.set_mode(Mode::Hold);
         if !gate.wait_idle(Duration::from_secs(10)).await {
             warn!(inflight = gate.inflight(), "Requests still in flight after 10 s; handing over anyway");
         }
-        // No event half taken: every intake finishes, none starts again.
         let ingest = crate::handover::ingest_gate().write().await;
-        stopped += crate::handover::abort_singletons();
+        let stopped = crate::handover::abort_singletons();
         if tokio::time::timeout(Duration::from_secs(30), self.fanout.idle()).await.is_err() {
             warn!("Fan-out did not settle in 30 s; SSPs may need to catch up from the successor");
         }
@@ -1088,25 +1164,52 @@ impl Scheduler {
             ssps: self.ssp_pool.read().await.export(),
             queries: query_tracker.export().await,
         };
-
-        // This process never takes an event, drains, or backs up again.
+        // This process never takes an event again.
         std::mem::forget(ingest);
-        std::mem::forget(drain);
-        std::mem::forget(backup_guard);
+        self.committed.store(true, Ordering::SeqCst);
 
         gate.set_peer(Some(successor.to_string()));
         gate.set_relay_ports(successor_ports);
-        gate.set_mode(Mode::Forward(successor.to_string()));
+        // Retired before relaying: a relayed request arriving now must see
+        // a retired process (which relays it on), not an active one (which
+        // would hold it).
         gate.set_status("retired", "forwarding");
+        gate.set_mode(Mode::Forward(successor.to_string()));
         info!(
             successor,
             stopped_tasks = stopped,
             ssps = state.ssps.len(),
             queries = state.queries.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            hold_ms = started.elapsed().as_millis() as u64,
             "Handed over; relaying every request to the successor"
         );
         Ok(state)
+    }
+
+    /// Green side, after a two-step handover's commit: take in the events the
+    /// predecessor wrote to the shared WAL after this process opened it, so
+    /// the event buffer and the sequence counter carry on exactly where the
+    /// predecessor stopped. Returns how many it took in.
+    pub async fn catch_up_wal(&self) -> Result<usize> {
+        let events = self.wal.read().await.recover()?;
+        let have = self.seq_counter.load(Ordering::SeqCst);
+        let snapshot_seq = self.snapshot_seq_cell.load(Ordering::SeqCst);
+        let mut buffer = self.event_buffer.write().await;
+        let mut taken = 0;
+        let mut max_seq = have;
+        for event in events.into_iter().filter(|e| e.seq > have) {
+            max_seq = max_seq.max(event.seq);
+            if event.seq > snapshot_seq {
+                buffer.push_back(event);
+                taken += 1;
+            }
+        }
+        drop(buffer);
+        self.seq_counter.fetch_max(max_seq, Ordering::SeqCst);
+        if taken > 0 {
+            info!(taken, seq = max_seq, "Took in the WAL tail the predecessor wrote while we prepared");
+        }
+        Ok(taken)
     }
 
     /// Green side: take over the state a predecessor handed over with its

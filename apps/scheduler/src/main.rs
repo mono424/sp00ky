@@ -168,34 +168,59 @@ async fn run() -> Result<()> {
 
     // A predecessor named by the control plane hands its replica over (see
     // `scheduler::handover`); otherwise the replica is opened directly.
+    //
+    // Two steps when the predecessor speaks them: it releases its replica
+    // and serves on (requests that land here are relayed to it meanwhile)
+    // while this process opens the replica and prepares its boot; then it
+    // commits, and only that commit, milliseconds, holds anything. An older
+    // predecessor gets the one-step prepare, or none at all.
     let mut handed_over = None;
+    let mut two_step: Option<(String, String, handover::RelayPorts)> = None;
     let mut lock_wait = Duration::ZERO;
     if let Some(from) = std::env::var("SPKY_HANDOVER_FROM").ok().filter(|s| !s.trim().is_empty()) {
         let successor = handover::advertise_host();
-        info!(from = %from, successor = %successor, "Taking over from a running scheduler");
         let own_ports = handover::RelayPorts {
             main: Some(config.ingest_port),
             admin: admin_config.enabled.then_some(admin_config.port),
             pool: pool_config.enabled.then_some(pool_config.port),
         };
-        match handover::take_over(&from, &successor, own_ports, auth_secret.as_deref()).await {
-            TakeOver::Granted(state) => {
+        info!(from = %from, successor = %successor, "Taking over from a running scheduler");
+        gate.set_relay_ports(handover::RelayPorts {
+            main: handover::port_of(&from),
+            ..Default::default()
+        });
+        gate.set_mode(Mode::Forward(handover::host_of(&from)));
+        gate.set_status("starting", "relaying");
+        let outcome = match handover::release(&from, &successor, own_ports, auth_secret.as_deref()).await {
+            handover::Release::Released => {
+                gate.set_status("starting", "opening");
+                lock_wait = Duration::from_secs(60);
+                two_step = Some((from.clone(), successor.clone(), own_ports));
+                None
+            }
+            handover::Release::OneStep => {
+                gate.set_mode(Mode::Hold);
+                gate.set_status("starting", "holding");
+                Some(handover::take_over(&from, &successor, own_ports, auth_secret.as_deref()).await)
+            }
+            handover::Release::Other(t) => Some(t),
+        };
+        match outcome {
+            None => {}
+            Some(TakeOver::Granted(state)) => {
                 gate.set_status("starting", "opening");
                 handed_over = Some(state);
                 lock_wait = Duration::from_secs(60);
             }
-            TakeOver::Unsupported => {
+            Some(TakeOver::Unsupported) => {
                 // Relay to the predecessor until the control plane stops it,
                 // then the lock frees and this process boots on its own.
-                gate.set_relay_ports(handover::RelayPorts {
-                    main: handover::port_of(&from),
-                    ..Default::default()
-                });
                 gate.set_mode(Mode::Forward(handover::host_of(&from)));
                 gate.set_status("starting", "waiting_for_lock");
                 lock_wait = Duration::from_secs(24 * 3600);
             }
-            TakeOver::Unreachable | TakeOver::Released => {
+            Some(TakeOver::Unreachable | TakeOver::Released) => {
+                gate.set_mode(Mode::Hold);
                 gate.set_status("starting", "opening");
                 lock_wait = Duration::from_secs(60);
             }
@@ -216,6 +241,7 @@ async fn run() -> Result<()> {
             scheduler.import_handover(state, &query_tracker).await;
             scheduler::BootMode::Handover
         }
+        None if two_step.is_some() => scheduler::BootMode::Handover,
         None => scheduler::BootMode::Normal,
     };
     
@@ -513,8 +539,26 @@ async fn run() -> Result<()> {
     // failed at all.
     let scheduler_handle = {
         let scheduler = Arc::clone(&scheduler);
+        let query_tracker = Arc::clone(&query_tracker);
+        let auth_secret = auth_secret.clone();
         tokio::spawn(async move {
-            if let Err(e) = scheduler.boot(boot_mode).await {
+            let booted = async {
+                let parts = scheduler.boot_prepare(boot_mode).await?;
+                if let Some((from, successor, ports)) = &two_step {
+                    // Everything slow is done; only now hold, and commit.
+                    let gate = handover::gate();
+                    gate.set_mode(Mode::Hold);
+                    gate.set_status("starting", "committing");
+                    let state = handover::commit(from, successor, *ports, auth_secret.as_deref()).await;
+                    scheduler.catch_up_wal().await?;
+                    if let Some(state) = state {
+                        scheduler.import_handover(state, &query_tracker).await;
+                    }
+                }
+                scheduler.boot_finish(parts).await
+            }
+            .await;
+            if let Err(e) = booted {
                 error!(error = %e, "Scheduler failed to start — exiting for restart");
                 handover::gate().set_status("failed", "boot");
                 handover::gate().set_error(Some(format!("{e:#}")));

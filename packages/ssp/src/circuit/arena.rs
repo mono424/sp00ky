@@ -770,6 +770,7 @@ pub enum ArenaBacking {
 
 /// Default segment size. Sparse, so this is address space rather than disk
 /// until written.
+#[cfg_attr(not(all(feature = "mmap-store", not(target_arch = "wasm32"))), allow(dead_code))]
 const DEFAULT_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Backing chosen for this process, resolved once.
@@ -823,6 +824,7 @@ fn resolve_backing() -> ArenaBacking {
 /// Falls back to the heap if the mapping cannot be created, so a disk that
 /// fills or goes read-only mid-run degrades to the previous behaviour rather
 /// than failing the table.
+#[cfg_attr(not(all(feature = "mmap-store", not(target_arch = "wasm32"))), allow(unused_variables))]
 pub fn new_arena(table: &str) -> Box<dyn Arena> {
     match configured_backing() {
         ArenaBacking::Heap => Box::new(HeapArena::new()),

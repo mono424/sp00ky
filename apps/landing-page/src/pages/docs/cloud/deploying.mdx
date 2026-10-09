@@ -70,7 +70,7 @@ You'll see real-time progress as each step completes.
 
 | Flag | Effect |
 | --- | --- |
-| `--upgrade` | Also move the SSP and Scheduler to the newest published build. Only for a project whose [`version`](/docs/reference/config#versions) is `any` or unset: a pinned version stays where `sp00ky.yml` put it, and `newest` already rolls on every deploy. |
+| `--upgrade` | Also move the SSP and Scheduler to the newest published build. Only for a project whose [`version`](/docs/reference/config#versions) is `any` or unset: a pinned version stays where `sp00ky.yml` put it, and `newest` already rolls on every deploy. The swap is blue/green, see [Zero-downtime upgrades](#zero-downtime-upgrades). |
 | `--only api,web` | Build and deploy just these apps. Everything else keeps running untouched. |
 | `--clean` | Wipe the scheduler's persistent volume first. Last resort: the scheduler self-heals stale snapshot state on startup, and `spky verify --fix` (or `POST /admin/resync` on the scheduler) repairs it without a wipe. Your SurrealDB data is not touched either way. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when the hash says nothing changed. Drift recovery. |
@@ -89,6 +89,26 @@ A backend on a [dedicated machine](/docs/cloud/dedicated-machines) shows up in t
 `machine/<name>` with its public address, moving through `creating`, `booting` and `serving`. A
 deploy of such a backend takes a few minutes longer: a fresh VM boots beside the old one and only
 takes over once it answers its healthcheck.
+
+
+### Zero-downtime upgrades
+
+Upgrading or restarting the Scheduler and SSP never takes sync down. Sp00ky
+Cloud starts the new container first and stops the old one only after the new
+one has taken over:
+
+- **Scheduler.** The new scheduler starts on the same volume and asks the old
+  one to hand over. Requests that arrive during the swap wait a moment
+  (typically well under a second) instead of failing, writes keep succeeding,
+  and SSPs keep their registration.
+- **SSP.** The new SSP loads its rows from the old one's checkpoints and
+  follows every change as a standby, without writing anything. Once it has
+  caught up it takes over the views; only views whose results differ are
+  republished. Then the old SSP is stopped.
+
+If the new container never becomes ready, the old one keeps serving and the
+restart or deploy reports the failure. `--clean` (which wipes the scheduler
+volume) and SurrealDB upgrades still stop the old container first.
 
 ## Checking Status
 

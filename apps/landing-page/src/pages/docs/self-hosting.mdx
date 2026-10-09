@@ -283,6 +283,10 @@ pull the new images and re-apply so the sync events match the new version:
 
 <CodeBlock code={upgradeCmd} lang="bash" />
 
+To upgrade the scheduler or an SSP without downtime, start the new container
+next to the old one and let it take over, see
+[Blue/green handover](/docs/reference/scheduler-api#bluegreen-handover).
+
 ### Back up
 
 Add the `S3_*` variables from [Backup storage](#backup-storage) to the SSP and
@@ -391,6 +395,7 @@ Read straight from the process environment.
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `SPKY_SSP_LISTEN_ADDR` | Address and port for the SSP HTTP server | `0.0.0.0:8667` |
+| `SPKY_SSP_REPLACES` | Blue/green: id of the serving SSP this one replaces. It registers as that SSP's standby and is promoted in its place once caught up ([handover](/docs/reference/scheduler-api#bluegreen-handover)) | *(unset)* |
 | `SPKY_AUTH_SECRET` | Bearer token for authenticating SSP API requests. When unset the auth middleware accepts any bearer (dev only). | *(empty)* |
 | `SPKY_DB_URL` | SurrealDB URL (HTTP engine; `ws://` values are accepted and normalized) | `http://127.0.0.1:8000` |
 | `SPKY_DB_WS` | Legacy fallback for `SPKY_DB_URL` (any scheme accepted) | *(unset)* |
@@ -450,6 +455,8 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `SPKY_SCHEDULER_ID` | Unique scheduler identifier | `scheduler-<uuid>` |
+| `SPKY_HANDOVER_FROM` | Blue/green: base URL of the running scheduler to take over from, on the same data volume. Needs the same `SPKY_AUTH_SECRET` ([handover](/docs/reference/scheduler-api#bluegreen-handover)) | *(unset)* |
+| `SPKY_HANDOVER_ADVERTISE` | Host the predecessor relays to after the handover | the container hostname |
 | `SPKY_DB_URL` | SurrealDB URL (HTTP engine; `ws://` values are accepted and normalized) | `http://localhost:8000` |
 | `SPKY_DB_WS` | Legacy fallback for `SPKY_DB_URL` (any scheme accepted) | *(unset)* |
 | `SPKY_DB_NS` | SurrealDB namespace | `sp00ky` |

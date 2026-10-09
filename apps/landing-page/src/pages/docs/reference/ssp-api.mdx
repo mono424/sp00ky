@@ -664,6 +664,30 @@ succeeds within its budget. All of them
 mean the same thing operationally: the supervisor should start the process
 again.
 
+### Blue/green handover
+
+An SSP started with `SPKY_SSP_REPLACES=<id>` while that SSP still serves is
+taken in as its **standby** (the registration answer says `standby: true`).
+A standby bootstraps like any SSP (warm, from the row checkpoints it shares
+with its predecessor), takes ingest and shadow view registrations, and goes
+`ready`, but writes nothing to the database: no edges, no `_00_query` state,
+no metrics, no TTL sweep, no jobs, no row checkpoints. `GET /health` reports
+`"standby": true`. The scheduler then swaps it in through three bearer-auth
+routes (flow on the
+[scheduler side](/docs/reference/scheduler-api#bluegreen-handover)):
+
+| Route | Sent to | Does |
+| --- | --- | --- |
+| `POST /handover/retire` | the SSP being replaced | Status `retired`: `/ingest`, `/view/register` and `/view/unregister` answer `503 {"code":"retired"}`; TTL sweep, metrics flush and new job claims stop (running jobs finish); the publication queue drains (up to `SPKY_SSP_RETIRE_DRAIN_SECS`, default 60); row checkpoints stop for good. Answers `{ "digests": { "<query id>": "m1:..." }, "drained": true }`. |
+| `POST /handover/promote` | the standby | Atomically with ingest: drops views outside `keep` (without touching their edges), registers views the predecessor had and it lacks, republishes only views whose digest differs, then leaves standby. Answers `{ "views", "republished", "dropped" }`. `503` before any change when it cannot proceed. |
+| `POST /handover/resume` | the SSP being replaced | Takes a retire back after a failed promotion. Always `200`. |
+
+A digest covers a view's members with their row versions, so views whose
+edges already match are not touched. A retired SSP keeps heartbeating (its
+running jobs are not re-run), ignores `404`/`409` from the scheduler, answers
+`GET /health` with `200 {"status":"retired"}`, and exits promptly on SIGTERM
+without writing row checkpoints: the directory belongs to its successor.
+
 ---
 
 ## Configuration
@@ -736,6 +760,12 @@ SPKY_SSP_ADVERTISE_ADDR=10.100.1.30:8667
 
 # Heartbeat cadence (ms, default 5000)
 HEARTBEAT_INTERVAL_MS=5000
+
+# Blue/green: the id of the serving SSP this one replaces (optional)
+SPKY_SSP_REPLACES=ssp-primary-01
+
+# How long a retiring SSP waits for its publication queue to drain (s, default 60)
+SPKY_SSP_RETIRE_DRAIN_SECS=60
 ```
 
 ### Job Configuration (`sp00ky.yml`)

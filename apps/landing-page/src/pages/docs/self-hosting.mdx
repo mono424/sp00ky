@@ -458,7 +458,7 @@ backup storage, the dead-man heartbeat, and the tuning knobs.
 | `SPKY_DB_PASS` | SurrealDB password | `root` |
 | `SPKY_SNAPSHOT_UPDATE_INTERVAL_SECS` | Snapshot update interval (seconds) | `300` |
 | `SPKY_DRIFT_CHECK` | Compare the replica's row counts against upstream at startup and after each snapshot drain. Over a reused snapshot the startup check runs in the background, so SSPs can register while it counts | `true` |
-| `SPKY_DRIFT_COUNT_CONCURRENCY` | Upstream `count()` queries one drift check runs at once | `4` |
+| `SPKY_DRIFT_COUNT_CONCURRENCY` | Upstream `count()` queries one drift check runs at once. Each scans its whole table; `1` counts one table at a time, for an upstream with no CPU to spare | `4` |
 | `SPKY_DRIFT_AUTO_RECLONE` | Act when the check confirms a mismatch: repair the table in place by sending the rows that differ through the ingest pipeline, and re-clone the replica (re-bootstrapping every SSP) only when a repair cannot fix it (`false` = report only) | `true` |
 | `SPKY_DRIFT_CONFIRM_TICKS` | Consecutive checks a non-zero count mismatch must persist before acting (an empty table upstream has rows for is acted on immediately) | `2` |
 | `SPKY_DRIFT_RECLONE_COOLDOWN_SECS` | Minimum seconds between automatic re-clones | `3600` |

@@ -3036,18 +3036,9 @@ mod bootstrap_protocol_tests {
 // recloner; the decision table itself is unit-tested in `drift.rs`.
 mod drift_tests {
     use super::*;
-    use scheduler::drift::{self, Action, DriftConfig, DriftHook, DriftState, Recloner, UpstreamCounts};
+    use scheduler::drift::{self, Action, DriftConfig, DriftHook, DriftState, Recloner};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct StubUpstream(BTreeMap<String, Option<u64>>);
-
-    #[async_trait::async_trait]
-    impl UpstreamCounts for StubUpstream {
-        async fn upstream_counts(&self) -> anyhow::Result<BTreeMap<String, Option<u64>>> {
-            Ok(self.0.clone())
-        }
-    }
 
     struct RecordingRecloner {
         calls: AtomicUsize,
@@ -3081,9 +3072,12 @@ mod drift_tests {
         });
         let hook = Arc::new(DriftHook {
             cfg,
-            upstream: Arc::new(StubUpstream(
-                upstream.iter().map(|(t, n)| (t.to_string(), Some(*n))).collect(),
-            )),
+            upstream: Arc::new(
+                upstream
+                    .iter()
+                    .map(|(t, n)| (t.to_string(), Some(*n)))
+                    .collect::<BTreeMap<String, Option<u64>>>(),
+            ),
             state: Arc::new(RwLock::new(DriftState::default())),
             repair: Arc::new(TooLarge),
             reclone: recloner.clone(),

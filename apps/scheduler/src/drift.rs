@@ -88,9 +88,11 @@ pub struct DriftConfig {
     /// that tick is a serial loop — a check that never returns stops the
     /// replica draining forever. See [`run_check`].
     pub check_timeout: Duration,
-    /// `SPKY_DRIFT_COUNT_CONCURRENCY` (default 4): upstream `count()`s in
-    /// flight at once. One at a time put a whole check at the sum of every
-    /// table's count, a minute on whitepawn's 70 tables.
+    /// `SPKY_DRIFT_COUNT_CONCURRENCY` (default 4): upstream `count()`s one
+    /// check keeps in flight. Each is a full scan of its table, so one at a
+    /// time took the check past a minute on whitepawn (2026-10-09, 70 tables),
+    /// and the startup pass held every SSP registration that long. `1` counts
+    /// serially, for an upstream with no CPU to spare.
     pub count_concurrency: usize,
 }
 
@@ -157,14 +159,73 @@ fn env_u64(name: &str) -> Option<u64> {
 /// scheduler's upstream SurrealDB handle; tests substitute a fixed map.
 #[async_trait]
 pub trait UpstreamCounts: Send + Sync {
-    /// Sync tables upstream (already filtered by `table_excluded_from_sync` and
-    /// `@nosync`) with their row counts. A table whose count could not be read
-    /// is `None`; a table that no longer exists upstream is absent.
-    async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>>;
+    /// Sync tables upstream, already filtered by `table_excluded_from_sync`
+    /// and `@nosync`. A table that no longer exists upstream is absent.
+    async fn sync_tables(&self) -> Result<Vec<String>>;
+
+    /// One table's row count upstream.
+    async fn count(&self, table: &str) -> Result<u64>;
 
     /// Called when a check was abandoned on its deadline. The handle behind
     /// it is then presumed wedged, and the next check must not inherit it.
     fn note_stalled(&self) {}
+}
+
+/// Fixed counts, for tests. A `None` count fails to read.
+#[async_trait]
+impl UpstreamCounts for BTreeMap<String, Option<u64>> {
+    async fn sync_tables(&self) -> Result<Vec<String>> {
+        Ok(self.keys().cloned().collect())
+    }
+
+    async fn count(&self, table: &str) -> Result<u64> {
+        self.get(table)
+            .copied()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("no count for {table}"))
+    }
+}
+
+/// The slowest single count of a check, for its timings line.
+#[derive(Debug, Default)]
+struct Slowest {
+    table: String,
+    ms: u64,
+}
+
+/// Count `tables` upstream, at most `concurrency` at a time. A table whose
+/// count could not be read is `None`, and sits the check out.
+async fn count_tables(
+    upstream: &dyn UpstreamCounts,
+    tables: Vec<String>,
+    concurrency: usize,
+) -> (BTreeMap<String, Option<u64>>, Slowest) {
+    use futures::stream::{self, StreamExt};
+
+    let counted: Vec<(String, Option<u64>, u64)> = stream::iter(tables)
+        .map(|table| async move {
+            let started = Instant::now();
+            let count = match upstream.count(&table).await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    warn!(table = %table, error = %e, "drift: upstream count failed; table skipped this check");
+                    None
+                }
+            };
+            (table, count, started.elapsed().as_millis() as u64)
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+    let mut slowest = Slowest::default();
+    let mut out = BTreeMap::new();
+    for (table, count, ms) in counted {
+        if ms >= slowest.ms {
+            slowest = Slowest { table: table.clone(), ms };
+        }
+        out.insert(table, count);
+    }
+    (out, slowest)
 }
 
 /// Tables that received events since the last drain. Asked twice per check,
@@ -186,35 +247,22 @@ impl BusyTables for BTreeSet<String> {
 /// Upstream counts read through the scheduler's shared SurrealDB handle.
 pub struct SurrealUpstream {
     pub db: Arc<maintenance::db::ReconnectingDb>,
-    /// `count()`s in flight at once ([`DriftConfig::count_concurrency`]).
-    pub concurrency: usize,
 }
 
 #[async_trait]
 impl UpstreamCounts for SurrealUpstream {
-    async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
-        use futures::StreamExt;
-        let handle = self.db.handle();
-        let tables = Replica::discover_sync_tables(&*handle)
+    async fn sync_tables(&self) -> Result<Vec<String>> {
+        Replica::discover_sync_tables(&*self.db.handle())
             .await
-            .context("drift: discover sync tables upstream")?;
-        let handle = &handle;
-        let counts: Vec<(String, Option<u64>)> = futures::stream::iter(tables)
-            .map(|table| async move {
-                let count = match count_upstream(&**handle, &table).await {
-                    Ok(n) => Some(n),
-                    Err(e) => {
-                        self.db.note_error(&e.to_string());
-                        warn!(table = %table, error = %e, "drift: upstream count failed; table skipped this check");
-                        None
-                    }
-                };
-                (table, count)
-            })
-            .buffer_unordered(self.concurrency.max(1))
-            .collect()
-            .await;
-        Ok(counts.into_iter().collect())
+            .context("drift: discover sync tables upstream")
+    }
+
+    async fn count(&self, table: &str) -> Result<u64> {
+        let result = count_upstream(&*self.db.handle(), table).await;
+        if let Err(e) = &result {
+            self.db.note_error(&e.to_string());
+        }
+        result
     }
 
     fn note_stalled(&self) {
@@ -290,12 +338,14 @@ pub async fn check_once(
     upstream: &dyn UpstreamCounts,
     replica: &Arc<RwLock<Replica>>,
     busy: &dyn BusyTables,
+    cfg: &DriftConfig,
 ) -> Result<DriftReport> {
     let started = Instant::now();
-    let upstream_counts = upstream.upstream_counts().await?;
+    let tables = upstream.sync_tables().await?;
+    let (upstream_counts, slowest) = count_tables(upstream, tables, cfg.count_concurrency).await;
     let upstream_ms = started.elapsed().as_millis() as u64;
-    // Sampled AFTER the upstream counts, not before them: those are one serial
-    // `count()` per table, seconds on a large database, and a row written
+    // Sampled AFTER the upstream counts, not before them: those are a full
+    // scan per table, seconds on a large database, and a row written
     // upstream while they run sits in the event buffer, not the replica.
     // Sampling first read every job-table churn as drift on whitepawn
     // (2026-09-15: seven automatic re-clones in a day, each restarting every
@@ -321,9 +371,25 @@ pub async fn check_once(
     }
     let replica_ms = replica_started.elapsed().as_millis() as u64;
     if started.elapsed() >= SLOW_CHECK_LOG {
-        info!(upstream_ms, replica_ms, tables = tables.len(), "Replica drift check timings");
+        info!(
+            upstream_ms,
+            replica_ms,
+            tables = tables.len(),
+            concurrency = cfg.count_concurrency,
+            slowest_table = %slowest.table,
+            slowest_ms = slowest.ms,
+            "Replica drift check timings"
+        );
     } else {
-        debug!(upstream_ms, replica_ms, tables = tables.len(), "Replica drift check timings");
+        debug!(
+            upstream_ms,
+            replica_ms,
+            tables = tables.len(),
+            concurrency = cfg.count_concurrency,
+            slowest_table = %slowest.table,
+            slowest_ms = slowest.ms,
+            "Replica drift check timings"
+        );
     }
     // And once more: the replica counts take time as well.
     skip.extend(busy.busy_tables().await);
@@ -994,7 +1060,7 @@ pub async fn run_check(
     // updater parked in an upstream `count()` that never answered).
     let report = match tokio::time::timeout(
         hook.cfg.check_timeout,
-        check_once(&*hook.upstream, replica, busy),
+        check_once(&*hook.upstream, replica, busy, &hook.cfg),
     )
     .await
     {
@@ -1236,7 +1302,10 @@ mod tests {
         struct Hangs(Arc<AtomicBool>);
         #[async_trait]
         impl UpstreamCounts for Hangs {
-            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+            async fn sync_tables(&self) -> Result<Vec<String>> {
+                std::future::pending().await
+            }
+            async fn count(&self, _table: &str) -> Result<u64> {
                 std::future::pending().await
             }
             fn note_stalled(&self) {
@@ -1285,17 +1354,21 @@ mod tests {
         assert!(err.contains("timed out"), "{err}");
     }
 
-    /// The startup check runs in the background while the updater ticks; a
-    /// second check while one runs is skipped, not run alongside it.
+    /// Two checks at once would count one mismatch twice towards its streak
+    /// and could repair one table twice over: a check while one runs is
+    /// skipped, not run alongside it.
     #[tokio::test]
     async fn a_check_while_another_runs_is_skipped() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Counting(Arc<AtomicUsize>);
         #[async_trait]
         impl UpstreamCounts for Counting {
-            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
+            async fn sync_tables(&self) -> Result<Vec<String>> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(BTreeMap::new())
+                Ok(Vec::new())
+            }
+            async fn count(&self, _table: &str) -> Result<u64> {
+                unreachable!()
             }
         }
         struct Unused;
@@ -1333,6 +1406,45 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// One count at a time took the check past a minute on whitepawn
+    /// (2026-10-09, 70 tables), every one of them a full scan upstream.
+    #[tokio::test(start_paused = true)]
+    async fn upstream_counts_overlap_up_to_the_configured_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Slow {
+            in_flight: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        #[async_trait]
+        impl UpstreamCounts for Slow {
+            async fn sync_tables(&self) -> Result<Vec<String>> {
+                Ok((0..10).map(|i| format!("t{i}")).collect())
+            }
+            async fn count(&self, table: &str) -> Result<u64> {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                anyhow::ensure!(table != "t3", "boom");
+                Ok(table[1..].parse()?)
+            }
+        }
+
+        let slow = Slow::default();
+        let (counts, slowest) = count_tables(&slow, slow.sync_tables().await.unwrap(), 4).await;
+        assert_eq!(slow.peak.load(Ordering::SeqCst), 4, "never more than the bound in flight");
+        assert_eq!(counts.len(), 10);
+        assert_eq!(counts["t7"], Some(7));
+        assert_eq!(counts["t3"], None, "a count that fails sits the check out");
+        assert!(counts.contains_key(&slowest.table), "{slowest:?}");
+
+        let serial = Slow::default();
+        count_tables(&serial, serial.sync_tables().await.unwrap(), 1).await;
+        assert_eq!(serial.peak.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn matching_counts_are_clean() {
         let mut st = DriftState::default();
@@ -1367,22 +1479,15 @@ mod tests {
         // The whole point of the per-table gate: on a tenant whose scheduler
         // writes job rows several times a second, `job` is always busy and
         // would otherwise take every other table's check down with it.
-        struct Fixed;
-        #[async_trait]
-        impl UpstreamCounts for Fixed {
-            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
-                Ok([("game".to_string(), Some(0u64)), ("job".to_string(), Some(9u64))]
-                    .into_iter()
-                    .collect())
-            }
-        }
+        let upstream: BTreeMap<String, Option<u64>> =
+            [("game".to_string(), Some(0u64)), ("job".to_string(), Some(9u64))].into_iter().collect();
         let tmp = tempfile::tempdir().unwrap();
         let replica = Arc::new(RwLock::new(
             Replica::new(tmp.path().join("replica")).await.unwrap(),
         ));
         let busy: BTreeSet<String> = ["job".to_string()].into_iter().collect();
 
-        let report = check_once(&Fixed, &replica, &busy).await.unwrap();
+        let report = check_once(&upstream, &replica, &busy, &cfg()).await.unwrap();
         assert!(report.tables.contains_key("game"), "an idle table is still compared");
         assert!(
             !report.tables.contains_key("job"),
@@ -1397,15 +1502,8 @@ mod tests {
         // fewer than the replica drained a moment earlier. The busy set taken
         // before the counts did not contain the table; the one taken after
         // does, and that is the one that must win.
-        struct Fixed;
-        #[async_trait]
-        impl UpstreamCounts for Fixed {
-            async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
-                Ok([("game".to_string(), Some(0u64)), ("job".to_string(), Some(9u64))]
-                    .into_iter()
-                    .collect())
-            }
-        }
+        let upstream: BTreeMap<String, Option<u64>> =
+            [("game".to_string(), Some(0u64)), ("job".to_string(), Some(9u64))].into_iter().collect();
         /// Empty the first time it is asked, `job` from then on.
         struct LandsLate(std::sync::atomic::AtomicUsize);
         #[async_trait]
@@ -1423,7 +1521,7 @@ mod tests {
         ));
         let busy = LandsLate(std::sync::atomic::AtomicUsize::new(0));
 
-        let report = check_once(&Fixed, &replica, &busy).await.unwrap();
+        let report = check_once(&upstream, &replica, &busy, &cfg()).await.unwrap();
         assert!(report.tables.contains_key("game"), "an idle table is still compared");
         assert!(
             !report.tables.contains_key("job"),
@@ -1582,14 +1680,6 @@ mod tests {
         );
     }
 
-    struct FixedCounts(BTreeMap<String, Option<u64>>);
-    #[async_trait]
-    impl UpstreamCounts for FixedCounts {
-        async fn upstream_counts(&self) -> Result<BTreeMap<String, Option<u64>>> {
-            Ok(self.0.clone())
-        }
-    }
-
     struct Scripted {
         outcome: std::sync::Mutex<Option<Result<RepairOutcome>>>,
         repairs: std::sync::atomic::AtomicUsize,
@@ -1639,7 +1729,7 @@ mod tests {
         let hook = DriftHook {
             cfg: DriftConfig::default(),
             // Nothing in the replica: acted on at first sight.
-            upstream: Arc::new(FixedCounts([("puzzle".to_string(), Some(48u64))].into_iter().collect())),
+            upstream: Arc::new([("puzzle".to_string(), Some(48u64))].into_iter().collect::<BTreeMap<_, _>>()),
             state: Arc::new(RwLock::new(DriftState::default())),
             repair: script.clone(),
             reclone: script,

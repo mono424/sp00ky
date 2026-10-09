@@ -488,10 +488,7 @@ impl Scheduler {
     fn drift_hook(&self, db: Arc<maintenance::db::ReconnectingDb>) -> Arc<crate::drift::DriftHook> {
         Arc::new(crate::drift::DriftHook {
             cfg: self.drift_config.clone(),
-            upstream: Arc::new(crate::drift::SurrealUpstream {
-                db: Arc::clone(&db),
-                concurrency: self.drift_config.count_concurrency,
-            }),
+            upstream: Arc::new(crate::drift::SurrealUpstream { db: Arc::clone(&db) }),
             state: Arc::clone(&self.drift),
             repair: Arc::new(SchedulerRepairer {
                 db,

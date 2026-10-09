@@ -2058,6 +2058,91 @@ impl Circuit {
         self.views.keys().cloned().collect()
     }
 
+    /// Every registration that receives publications, owners and merged
+    /// subscribers alike, by canonical id (`<hash>`, the form `ViewDelta`
+    /// carries). A detached owner is not listed: it publishes nothing.
+    pub fn registration_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .views
+            .keys()
+            .filter(|id| !self.detached_owners.contains(*id))
+            .cloned()
+            .collect();
+        ids.extend(self.subscribers.values().flatten().map(|s| s.query_id.clone()));
+        ids
+    }
+
+    /// Registration id -> digest of what its edges hold, for every
+    /// registration (see [`Self::registration_ids`]).
+    ///
+    /// Built for a blue/green handover: the outgoing SSP reports these once
+    /// its publication queue is drained, and its successor republishes only
+    /// the registrations whose digest it does not reproduce. Two processes
+    /// must therefore agree on it exactly when their edges would agree, so it
+    /// is NOT `View::last_hash`: that one folds in `content_generation`, a
+    /// per-process counter, and hashes with `DefaultHasher`, which is not
+    /// stable across toolchains, and it leaves out row versions, so a member
+    /// row updated in the handover window would compare equal while the
+    /// edge still carries the old version.
+    ///
+    /// What goes in is exactly what a full publish writes for the
+    /// registration: the `_00_list_ref*` routing identity, each member row
+    /// with its version, and each subquery child with its parent, alias and
+    /// version. Order independent (sorted before hashing), blake3.
+    pub fn membership_digests(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (owner, view) in &self.views {
+            let membership = self.membership_hash(view);
+            if !self.detached_owners.contains(owner) {
+                out.insert(owner.clone(), Self::registration_digest(&membership, &view.auth_id));
+            }
+            for sub in self.subscribers_of(owner) {
+                out.insert(sub.query_id.clone(), Self::registration_digest(&membership, &sub.auth_id));
+            }
+        }
+        out
+    }
+
+    fn membership_hash(&self, view: &View) -> [u8; 32] {
+        let version = |key: &str| self.store.get_record_version_by_key(key).unwrap_or(1);
+        let mut rows: Vec<(&str, i64)> = view.cache.keys().map(|k| (k.as_ref(), version(k.as_ref()))).collect();
+        rows.sort_unstable();
+        let mut children: Vec<(&str, &str, &str, i64)> = view
+            .subquery_cache
+            .iter()
+            .map(|(child, (parent, alias))| (child.as_ref(), parent.as_ref(), alias.as_str(), version(child.as_ref())))
+            .collect();
+        children.sort_unstable();
+
+        let mut hasher = blake3::Hasher::new();
+        // Length-prefixed fields: no two different inputs share a byte stream.
+        let field = |h: &mut blake3::Hasher, s: &str| {
+            h.update(&(s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        };
+        hasher.update(&(rows.len() as u64).to_le_bytes());
+        for (key, v) in rows {
+            field(&mut hasher, key);
+            hasher.update(&v.to_le_bytes());
+        }
+        hasher.update(&(children.len() as u64).to_le_bytes());
+        for (child, parent, alias, v) in children {
+            field(&mut hasher, child);
+            field(&mut hasher, parent);
+            field(&mut hasher, alias);
+            hasher.update(&v.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    fn registration_digest(membership: &[u8; 32], auth_id: &str) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(membership);
+        hasher.update(&(auth_id.len() as u64).to_le_bytes());
+        hasher.update(auth_id.as_bytes());
+        format!("m1:{}", hasher.finalize().to_hex())
+    }
+
     /// Names of all tables in the store.
     pub fn table_names(&self) -> Vec<String> {
         self.store.collections.keys().cloned().collect()
@@ -4551,5 +4636,86 @@ mod row_version_floor_tests {
         step(&mut circuit, Change::merge("thread", "b", json!({ "extra": "field" })));
         assert_eq!(rv(&circuit, "thread:b"), Some(3));
         assert_eq!(circuit.synthesized_row_versions(), 0);
+    }
+}
+
+#[cfg(test)]
+mod membership_digest_tests {
+    use super::*;
+    use crate::operator::plan::OperatorPlan;
+    use serde_json::json;
+
+    fn scan(id: &str) -> QueryPlan {
+        QueryPlan { id: id.to_string(), root: OperatorPlan::Scan { table: "thread".to_string() } }
+    }
+
+    fn circuit_with(rows: &[(&str, i64)]) -> Circuit {
+        let mut circuit = Circuit::new();
+        circuit.store.ensure_collection("thread");
+        for (id, rv) in rows {
+            circuit
+                .store
+                .apply_change(&Change::create("thread", id, json!({ "title": id, "_00_rv": rv })));
+        }
+        circuit
+    }
+
+    #[test]
+    fn owners_and_subscribers_are_all_listed_by_canonical_id() {
+        let mut circuit = circuit_with(&[("a", 1)]);
+        circuit.add_query_with_auth(scan("owner"), None, None, "user:alice".into());
+        circuit.attach_subscriber("owner", "_00_query:sub".into(), "user:alice".into());
+        circuit.attach_subscriber("owner", "other".into(), "user:bob".into());
+
+        let digests = circuit.membership_digests();
+        assert_eq!(digests.keys().cloned().collect::<Vec<_>>(), vec!["other", "owner", "sub"]);
+        // Same graph, same identity: same edges, same digest.
+        assert_eq!(digests["owner"], digests["sub"]);
+        // Same graph, another identity: its edges live in another table.
+        assert_ne!(digests["owner"], digests["other"]);
+        assert!(digests["owner"].starts_with("m1:"));
+
+        let mut ids = circuit.registration_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["other", "owner", "sub"]);
+    }
+
+    #[test]
+    fn a_detached_owner_is_not_a_registration() {
+        let mut circuit = circuit_with(&[("a", 1)]);
+        circuit.add_query_with_auth(scan("owner"), None, None, String::new());
+        circuit.attach_subscriber("owner", "sub".into(), String::new());
+        circuit.detach_subscriber("owner");
+        assert_eq!(circuit.membership_digests().keys().cloned().collect::<Vec<_>>(), vec!["sub"]);
+        assert_eq!(circuit.registration_ids(), vec!["sub".to_string()]);
+    }
+
+    #[test]
+    fn two_circuits_with_the_same_edges_agree_whatever_their_history() {
+        // `last_hash` would differ here: the second circuit reached the same
+        // membership through extra steps.
+        let mut first = circuit_with(&[("a", 1), ("b", 2)]);
+        first.add_query_with_auth(scan("v"), None, None, String::new());
+
+        let mut second = circuit_with(&[("b", 2)]);
+        second.add_query_with_auth(scan("v"), None, None, String::new());
+        second.step(ChangeSet { changes: vec![Change::create("thread", "z", json!({ "title": "z", "_00_rv": 9 }))] });
+        second.step(ChangeSet { changes: vec![Change::delete("thread", "z")] });
+        second.step(ChangeSet { changes: vec![Change::create("thread", "a", json!({ "title": "a", "_00_rv": 1 }))] });
+
+        assert_eq!(first.membership_digests(), second.membership_digests());
+    }
+
+    #[test]
+    fn a_member_row_at_another_version_changes_the_digest() {
+        let mut blue = circuit_with(&[("a", 1)]);
+        blue.add_query_with_auth(scan("v"), None, None, String::new());
+        let mut green = circuit_with(&[("a", 1)]);
+        green.add_query_with_auth(scan("v"), None, None, String::new());
+        assert_eq!(blue.membership_digests(), green.membership_digests());
+
+        // An update in the handover window: membership unchanged, edge version not.
+        green.step(ChangeSet { changes: vec![Change::update("thread", "a", json!({ "title": "new", "_00_rv": 2 }))] });
+        assert_ne!(blue.membership_digests()["v"], green.membership_digests()["v"]);
     }
 }

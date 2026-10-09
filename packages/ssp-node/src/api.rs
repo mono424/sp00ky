@@ -90,6 +90,13 @@ pub enum RouteId {
     ImpersonateMint,
     /// Root-backed user search for the impersonation picker.
     ImpersonateUsers,
+    /// Blue/green handover (scheduler -> SSP, `ssp_protocol::SspRetireRequest`):
+    /// stop serving, drain, report membership digests.
+    HandoverRetire,
+    /// Blue/green handover: a standby takes over (`SspPromoteRequest`).
+    HandoverPromote,
+    /// Blue/green handover: undo a retire whose promotion failed.
+    HandoverResume,
     // -- standalone maintenance plane (authenticated) --
     BackendsUpdate,
     BackupCreate,
@@ -128,6 +135,9 @@ impl RouteId {
             (Post, ["job", "recover"]) => RouteId::JobRecover,
             (Post, ["impersonate", "mint"]) => RouteId::ImpersonateMint,
             (Post, ["impersonate", "users"]) => RouteId::ImpersonateUsers,
+            (Post, ["handover", "retire"]) => RouteId::HandoverRetire,
+            (Post, ["handover", "promote"]) => RouteId::HandoverPromote,
+            (Post, ["handover", "resume"]) => RouteId::HandoverResume,
             (Put, ["backends"]) => RouteId::BackendsUpdate,
             (Post, ["backup", "create"]) => RouteId::BackupCreate,
             (Get, ["backup", "status"]) => RouteId::BackupStatus,
@@ -168,6 +178,9 @@ mod tests {
             (Method::Get, "/debug/memory", RouteId::DebugMemory),
             (Method::Put, "/backends", RouteId::BackendsUpdate),
             (Method::Post, "/impersonate/mint", RouteId::ImpersonateMint),
+            (Method::Post, "/handover/retire", RouteId::HandoverRetire),
+            (Method::Post, "/handover/promote", RouteId::HandoverPromote),
+            (Method::Post, "/handover/resume", RouteId::HandoverResume),
             (Method::Get, "/backup/status/b1", RouteId::BackupStatusById { backup_id: "b1".into() }),
             (Method::Get, "/backup/restore/status/r1", RouteId::BackupRestoreStatusById { restore_id: "r1".into() }),
             (Method::Get, "/health", RouteId::Health),
@@ -186,6 +199,9 @@ mod tests {
         assert!(RouteId::BackupCreate.requires_auth());
         assert!(RouteId::DebugHeartbeat.requires_auth());
         assert!(RouteId::ImpersonateMint.requires_auth());
+        assert!(RouteId::HandoverRetire.requires_auth());
+        assert!(RouteId::HandoverPromote.requires_auth());
+        assert!(RouteId::HandoverResume.requires_auth());
         assert!(!RouteId::Health.requires_auth());
         assert!(!RouteId::Version.requires_auth());
     }

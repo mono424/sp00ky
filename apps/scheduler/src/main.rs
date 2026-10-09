@@ -1,8 +1,10 @@
 use anyhow::Result;
 use scheduler::config::SchedulerConfig;
+use scheduler::handover::{self, Listener, Mode, RouterSlot, TakeOver};
 use scheduler::transport::HttpTransport;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -70,13 +72,181 @@ async fn run() -> Result<()> {
     
     // Initialize transport (HTTP)
     let transport = Arc::new(HttpTransport::new());
-    
+
+    let auth_secret = std::env::var("SPKY_AUTH_SECRET").ok().filter(|s| !s.is_empty());
+    let gate = handover::gate();
+
+    // Every port is bound before anything slow (the replica, the upstream
+    // connection) and served through the handover gate, which holds requests
+    // until a router is installed and this process may answer. A scheduler
+    // taking over from a predecessor is reachable under the shared alias the
+    // moment its container starts; a request that lands here early must wait,
+    // never be refused.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let main_slot: RouterSlot = Default::default();
+    let admin_slot: RouterSlot = Default::default();
+    let pool_slot: RouterSlot = Default::default();
+
+    let ingest_addr = format!(
+        "{}:{}",
+        config.ingest_host.as_deref().unwrap_or("0.0.0.0"),
+        config.ingest_port
+    );
+    info!("Starting HTTP server on {}...", ingest_addr);
+    let main_listener = tokio::net::TcpListener::bind(&ingest_addr)
+        .await
+        .expect("Failed to bind port");
+    let server_handle = {
+        let router = handover::gated(Arc::clone(&main_slot), Listener::Main, config.ingest_port);
+        let shutdown = shutdown_signal(shutdown_rx.clone());
+        tokio::spawn(async move {
+            axum::serve(main_listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .expect("HTTP server failed");
+        })
+    };
+
+    // The admin and pool listeners. Failing to bind either is loud but not
+    // fatal: an occupied port must not take down sync for every client.
+    let admin_config = scheduler::admin::AdminConfig::from_env();
+    let admin_handle = {
+        let enabled = admin_config.enabled;
+        let addr = admin_config.bind_addr();
+        let port = admin_config.port;
+        let slot = Arc::clone(&admin_slot);
+        let shutdown = shutdown_signal(shutdown_rx.clone());
+        tokio::spawn(async move {
+            if !enabled {
+                // Nothing to serve; park forever so the select! arm never fires.
+                std::future::pending::<()>().await;
+                return;
+            }
+            info!("Starting admin server on {}...", addr);
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    // `into_make_service_with_connect_info` so the login
+                    // handler can see the peer address it rate-limits on.
+                    let router = handover::gated(slot, Listener::Admin, port);
+                    if let Err(e) = axum::serve(
+                        listener,
+                        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                    {
+                        error!(error = %e, "Admin server failed");
+                    }
+                }
+                Err(e) => {
+                    error!(addr = %addr, error = %e, "Failed to bind the admin port; dashboard unavailable");
+                }
+            }
+            std::future::pending::<()>().await;
+        })
+    };
+    // No request deadline on the pool listener: a poll is SUPPOSED to be held open.
+    let pool_config = scheduler::pool_engine::PoolHostConfig::from_env();
+    if pool_config.enabled {
+        let addr = pool_config.bind_addr();
+        let port = pool_config.port;
+        let slot = Arc::clone(&pool_slot);
+        let shutdown = shutdown_signal(shutdown_rx.clone());
+        tokio::spawn(async move {
+            info!("Starting pool listener on {}...", addr);
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    let router = handover::gated(slot, Listener::Pool, port);
+                    if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
+                        error!(error = %e, "Pool listener failed");
+                    }
+                }
+                Err(e) => error!(addr = %addr, error = %e, "Failed to bind the pool port; pool machines cannot connect"),
+            }
+        });
+    }
+
+    // A predecessor named by the control plane hands its replica over (see
+    // `scheduler::handover`); otherwise the replica is opened directly.
+    //
+    // Two steps when the predecessor speaks them: it releases its replica
+    // and serves on (requests that land here are relayed to it meanwhile)
+    // while this process opens the replica and prepares its boot; then it
+    // commits, and only that commit, milliseconds, holds anything. An older
+    // predecessor gets the one-step prepare, or none at all.
+    let mut handed_over = None;
+    let mut two_step: Option<(String, String, handover::RelayPorts)> = None;
+    let mut lock_wait = Duration::ZERO;
+    if let Some(from) = std::env::var("SPKY_HANDOVER_FROM").ok().filter(|s| !s.trim().is_empty()) {
+        let successor = handover::advertise_host();
+        let own_ports = handover::RelayPorts {
+            main: Some(config.ingest_port),
+            admin: admin_config.enabled.then_some(admin_config.port),
+            pool: pool_config.enabled.then_some(pool_config.port),
+        };
+        info!(from = %from, successor = %successor, "Taking over from a running scheduler");
+        gate.set_relay_ports(handover::RelayPorts {
+            main: handover::port_of(&from),
+            ..Default::default()
+        });
+        gate.set_mode(Mode::Forward(handover::host_of(&from)));
+        gate.set_status("starting", "relaying");
+        let outcome = match handover::release(&from, &successor, own_ports, auth_secret.as_deref()).await {
+            handover::Release::Released => {
+                gate.set_status("starting", "opening");
+                lock_wait = Duration::from_secs(60);
+                two_step = Some((from.clone(), successor.clone(), own_ports));
+                None
+            }
+            handover::Release::OneStep => {
+                // Keep relaying while the predecessor prepares: it serves
+                // until it commits, then relays back here, where a relayed
+                // request waits for us to serve (holding here instead held
+                // 12 s of requests on whitepawn, 2026-10-09).
+                Some(handover::take_over(&from, &successor, own_ports, auth_secret.as_deref()).await)
+            }
+            handover::Release::Other(t) => Some(t),
+        };
+        match outcome {
+            None => {}
+            Some(TakeOver::Granted(state)) => {
+                gate.set_mode(Mode::Hold);
+                gate.set_status("starting", "opening");
+                handed_over = Some(state);
+                lock_wait = Duration::from_secs(60);
+            }
+            Some(TakeOver::Unsupported) => {
+                // Relay to the predecessor until the control plane stops it,
+                // then the lock frees and this process boots on its own.
+                gate.set_mode(Mode::Forward(handover::host_of(&from)));
+                gate.set_status("starting", "waiting_for_lock");
+                lock_wait = Duration::from_secs(24 * 3600);
+            }
+            Some(TakeOver::Unreachable | TakeOver::Released) => {
+                gate.set_mode(Mode::Hold);
+                gate.set_status("starting", "opening");
+                lock_wait = Duration::from_secs(60);
+            }
+        }
+    }
+
     // Create scheduler
-    let scheduler = scheduler::Scheduler::new(config.clone(), transport.clone()).await?;
+    let scheduler = Arc::new(open_scheduler(&config, &transport, lock_wait).await?);
     
     // Create shared trackers for state consistency
     let query_tracker = std::sync::Arc::new(scheduler::query::QueryTracker::new());
     let job_tracker = std::sync::Arc::new(scheduler::job_scheduler::JobTracker::new());
+
+    // Carry on the predecessor's SSP pool and view assignments before any
+    // router can answer an SSP: its heartbeat must find its registration.
+    let boot_mode = match handed_over {
+        Some(state) => {
+            scheduler.import_handover(state, &query_tracker).await;
+            scheduler::BootMode::Handover
+        }
+        None if two_step.is_some() => scheduler::BootMode::Handover,
+        None => scheduler::BootMode::Normal,
+    };
     
     // Create HTTP server with all routers
     let ingest_router = scheduler::ingest::create_ingest_router(scheduler.ingest_state());
@@ -163,6 +333,20 @@ async fn run() -> Result<()> {
         backup_restore_lock: Arc::clone(&backup_restore_lock),
     });
     let backup_router = scheduler::backup::create_backup_router((*backup_state).clone());
+    let handover_router = handover::routes(handover::RouteDeps {
+        scheduler: Arc::clone(&scheduler),
+        query_tracker: Arc::clone(&query_tracker),
+        backup_restore_lock: Arc::clone(&backup_restore_lock),
+        auth_secret: auth_secret.clone(),
+    });
+    // A standby SSP that has caught up is promoted through these.
+    scheduler::ssp_handover::install(scheduler::ssp_handover::PromoteDeps {
+        ssp_pool: Arc::clone(&scheduler.ssp_pool),
+        transport: Arc::clone(&transport),
+        query_tracker: Arc::clone(&query_tracker),
+        fanout: scheduler.fanout(),
+        ingest: scheduler.ingest_state(),
+    });
 
     // Global request deadline: a handler that never resolves must produce a
     // 408, never an indefinitely-hung connection (the wedge signature was
@@ -181,6 +365,7 @@ async fn run() -> Result<()> {
         .merge(proxy_router)
         .merge(metrics_router)
         .merge(backup_router)
+        .merge(handover_router)
         .merge(scheduler::impersonation::create_impersonation_router(
             scheduler::impersonation::ImpersonationState::from_env(std::sync::Arc::clone(
                 &scheduler.db_slot,
@@ -191,18 +376,12 @@ async fn run() -> Result<()> {
             std::time::Duration::from_secs(http_timeout_secs),
         ));
     
-    let ingest_addr = format!("{}:{}", 
-        scheduler.config().ingest_host.as_deref().unwrap_or("0.0.0.0"),
-        scheduler.config().ingest_port
-    );
-
     // Admin plane, on its OWN listener. Everything merged into `app` above is
     // unauthenticated on the assumption that the ingest port is private; the
     // dashboard is the first surface meant for a browser, so it gets a port an
     // operator can publish without publishing `/proxy/query` alongside it.
     // Machine pools: built before the admin plane, which routes pool job kills
     // through it; started further down with the other background work.
-    let pool_config = scheduler::pool_engine::PoolHostConfig::from_env();
     let pool_host = pool_config.enabled.then(|| {
         let host = scheduler::pool_engine::PoolHost::new(
             pool_config.clone(),
@@ -213,9 +392,7 @@ async fn run() -> Result<()> {
         host
     });
 
-    let admin_config = scheduler::admin::AdminConfig::from_env();
-    let admin_server = if admin_config.enabled {
-        let admin_addr = admin_config.bind_addr();
+    let admin_router = if admin_config.enabled {
         let cloud = scheduler::admin::cloud::CloudLink::from_env();
         match &cloud {
             Some(link) => info!(api = %link.api_url, project = %link.project, "Linked to Sp00ky Cloud"),
@@ -256,7 +433,7 @@ async fn run() -> Result<()> {
         // and `/admin/api/workflows/stream` are SSE streams that are SUPPOSED
         // to stay open indefinitely, and a request deadline would sever them on
         // a timer. The admin plane has no long-blocking handlers to protect.
-        Some((admin_addr, admin_router))
+        Some(admin_router)
     } else {
         info!("Admin dashboard disabled (SPKY_ADMIN_ENABLED)");
         None
@@ -340,92 +517,92 @@ async fn run() -> Result<()> {
 
     info!("Started background monitors for query reassignment, job failover, backups, and restores");
     
-    // Spawn HTTP server
-    let server_handle = tokio::spawn(async move {
-        info!("Starting HTTP server on {}...", ingest_addr);
-        let listener = tokio::net::TcpListener::bind(&ingest_addr)
-            .await
-            .expect("Failed to bind port");
-        
-        axum::serve(listener, app)
-            .await
-            .expect("HTTP server failed");
-    });
+    // Everything is wired: install the routers. A normal start serves at
+    // once (handlers answer 503 where the boot state requires it, and ingest
+    // is taken as soon as a persisted snapshot exists). A handover keeps
+    // holding until the boot below is done, so nothing reaches a scheduler
+    // that is still connecting.
+    let _ = main_slot.set(app);
+    if let Some(router) = admin_router {
+        let _ = admin_slot.set(router);
+    }
+    if let Some((_, router)) = pool_server {
+        let _ = pool_slot.set(router);
+    }
+    if boot_mode == scheduler::BootMode::Normal {
+        gate.set_mode(Mode::Serve);
+    }
 
-    // Spawn the admin server. A failure to bind it is loud but NOT fatal: an
-    // occupied admin port must not take down sync for every client just to
-    // deny an operator a dashboard.
-    let admin_handle = tokio::spawn(async move {
-        let Some((addr, router)) = admin_server else {
-            // Nothing to serve; park forever so the select! arm never fires.
-            std::future::pending::<()>().await;
-            return;
-        };
-        info!("Starting admin server on {}...", addr);
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                // `into_make_service_with_connect_info` so the login handler
-                // can see the peer address it rate-limits on.
-                if let Err(e) = axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .await
-                {
-                    error!(error = %e, "Admin server failed");
-                }
-            }
-            Err(e) => {
-                error!(addr = %addr, error = %e, "Failed to bind the admin port; dashboard unavailable");
-            }
-        }
-        std::future::pending::<()>().await;
-    });
-    
-    // Spawn the pool listener. Like the admin port, failing to bind it is loud
-    // but not fatal: sync must not go down because pool machines cannot dial in.
-    // No request deadline on this listener: a poll is SUPPOSED to be held open.
-    tokio::spawn(async move {
-        let Some((addr, router)) = pool_server else { return };
-        info!("Starting pool listener on {}...", addr);
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                if let Err(e) = axum::serve(listener, router).await {
-                    error!(error = %e, "Pool listener failed");
-                }
-            }
-            Err(e) => error!(addr = %addr, error = %e, "Failed to bind the pool port; pool machines cannot connect"),
-        }
-    });
-
-    // Handle graceful shutdown
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-    
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for ctrl-c");
-        info!("Received shutdown signal");
-        let _ = shutdown_tx.send(());
-    });
-    
     // Start scheduler.
     //
-    // A failed start() is fatal and must LOOK fatal: the process exits
+    // A failed boot is fatal and must LOOK fatal: the process exits
     // non-zero so the container restart policy retries it and the exit code
     // says why. The previous `eprintln!` let the task end quietly, main return
     // `Ok(())`, and the container come back with no signal that bootstrap had
     // failed at all.
-    let scheduler_handle = tokio::spawn(async move {
-        if let Err(e) = scheduler.start().await {
-            error!(error = %e, "Scheduler failed to start — exiting for restart");
-            std::process::exit(1);
+    let scheduler_handle = {
+        let scheduler = Arc::clone(&scheduler);
+        let query_tracker = Arc::clone(&query_tracker);
+        let auth_secret = auth_secret.clone();
+        tokio::spawn(async move {
+            let booted = async {
+                let parts = scheduler.boot_prepare(boot_mode).await?;
+                if let Some((from, successor, ports)) = &two_step {
+                    // Everything slow is done; only now hold, and commit.
+                    let gate = handover::gate();
+                    gate.set_mode(Mode::Hold);
+                    gate.set_status("starting", "committing");
+                    let state = handover::commit(from, successor, *ports, auth_secret.as_deref()).await;
+                    scheduler.catch_up_wal().await?;
+                    if let Some(state) = state {
+                        scheduler.import_handover(state, &query_tracker).await;
+                    }
+                }
+                scheduler.boot_finish(parts).await
+            }
+            .await;
+            if let Err(e) = booted {
+                error!(error = %e, "Scheduler failed to start — exiting for restart");
+                handover::gate().set_status("failed", "boot");
+                handover::gate().set_error(Some(format!("{e:#}")));
+                std::process::exit(1);
+            }
+            let gate = handover::gate();
+            gate.set_mode(Mode::Serve);
+            gate.set_status("active", "serving");
+            if boot_mode == scheduler::BootMode::Handover {
+                info!("Handover complete; serving");
+                // A standby SSP that caught up under the predecessor.
+                if let Some(deps) = scheduler::ssp_handover::deps() {
+                    scheduler::ssp_handover::promote_ready_standbys(deps).await;
+                }
+            }
+            std::future::pending::<()>().await;
+        })
+    };
+
+    // SIGINT, or SIGTERM (the control plane's stop). A scheduler that handed
+    // over and only relays stops accepting, lets what it relays finish and
+    // exits; one that serves exits at once, as it always has.
+    let signal = async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to listen for SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
         }
-    });
-    
+    };
+
     // Wait for shutdown or error
     tokio::select! {
-        _ = &mut shutdown_rx => {
+        name = signal => {
+            info!(signal = name, "Received shutdown signal");
+            if gate.role() == "retired" {
+                let _ = shutdown_tx.send(true);
+                if !gate.wait_relays(Duration::from_secs(10)).await {
+                    warn!("Relays still open after 10 s; exiting anyway");
+                }
+            }
             info!("Shutting down...");
         }
         _ = server_handle => info!("HTTP server stopped"),
@@ -434,4 +611,44 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves once `rx` reads `true`: the graceful-shutdown trigger for every
+/// listener.
+async fn shutdown_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Open the replica (via `Scheduler::new`), retrying for up to `lock_wait`
+/// while another process still holds its RocksDB lock: a predecessor that is
+/// closing it after a handover, or one the control plane is about to stop.
+async fn open_scheduler(
+    config: &SchedulerConfig,
+    transport: &Arc<HttpTransport>,
+    lock_wait: Duration,
+) -> Result<scheduler::Scheduler> {
+    let started = std::time::Instant::now();
+    let mut logged = false;
+    loop {
+        match scheduler::Scheduler::new(config.clone(), Arc::clone(transport)).await {
+            Ok(s) => {
+                if logged {
+                    info!(waited_ms = started.elapsed().as_millis() as u64, "Replica lock acquired");
+                }
+                return Ok(s);
+            }
+            Err(e) if handover::is_lock_error(&e) && started.elapsed() < lock_wait => {
+                if !logged {
+                    info!("Replica is locked by the previous scheduler; waiting for it to let go");
+                    logged = true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }

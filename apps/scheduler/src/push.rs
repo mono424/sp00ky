@@ -54,7 +54,7 @@ pub fn start(db: Arc<maintenance::db::ReconnectingDb>) -> Option<Arc<PushEngine>
         opts,
     ));
     let ticker = Arc::clone(&engine);
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("push-ticker", async move {
         let mut interval = tokio::time::interval(TICK_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

@@ -101,6 +101,11 @@ pub struct AppState {
     /// The portable node — serves every route already migrated out of this
     /// shell (mounted as the axum fallback in `create_app`).
     pub node: Arc<ssp_node::SspNode>,
+    /// Env-derived options for the node's routes (`SPKY_SSP_RETIRE_DRAIN_SECS`).
+    pub route_options: ssp_node::handover::RouteOptions,
+    /// Cluster row checkpoints, for the write a promotion out of standby
+    /// schedules (see `node_fallback`). `None` standalone or without a dir.
+    pub row_checkpoints: Option<Arc<warm::RowCheckpoints>>,
 }
 
 // --- Request/Response DTOs ---
@@ -309,6 +314,7 @@ async fn register_with_scheduler(
     ssp_id: &str,
     listen_addr: &str,
     advertise_addr: Option<&str>,
+    replaces: Option<&str>,
 ) -> Result<ssp_protocol::SspRegistrationResponse, RegisterError> {
     let scheduler_base = scheduler_url.trim_end_matches('/');
     let registration_url = format!("{}/ssp/register", scheduler_base);
@@ -341,6 +347,7 @@ async fn register_with_scheduler(
         url: format!("http://{}", registration_host),
         version: env!("CARGO_PKG_VERSION").to_string(),
         env: if env_vars.is_empty() { None } else { Some(env_vars) },
+        replaces: replaces.map(str::to_string),
     };
 
     match client
@@ -394,12 +401,14 @@ async fn register_with_scheduler(
 /// Exit codes: 6 = fatal rejection (4xx, retrying won't help); 5 = retry
 /// budget exhausted. Distinct from the data-bootstrap exit(2) and heartbeat
 /// exit(3)/exit(4) so the failure mode is identifiable in logs.
+#[allow(clippy::too_many_arguments)]
 async fn register_with_retry(
     client: &reqwest::Client,
     scheduler_url: &str,
     ssp_id: &str,
     listen_addr: &str,
     advertise_addr: Option<&str>,
+    replaces: Option<&str>,
     register_max_wait_secs: u64,
     status: &Arc<RwLock<SspStatus>>,
 ) -> ssp_protocol::SspRegistrationResponse {
@@ -411,7 +420,7 @@ async fn register_with_retry(
     let mut start = started;
     let mut backoff_ms: u64 = 1000;
     loop {
-        match register_with_scheduler(client, scheduler_url, ssp_id, listen_addr, advertise_addr)
+        match register_with_scheduler(client, scheduler_url, ssp_id, listen_addr, advertise_addr, replaces)
             .await
         {
             Ok(r) => {
@@ -419,6 +428,7 @@ async fn register_with_retry(
                     snapshot_seq = r.snapshot_seq,
                     tables = r.table_hashes.len(),
                     waited_secs = started.elapsed().as_secs(),
+                    standby = r.standby,
                     "Successfully registered with scheduler"
                 );
                 return r;
@@ -766,9 +776,22 @@ async fn node_fallback(State(state): State<AppState>, req: Request) -> Response 
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
 
+    // A promotion out of standby is where this process takes over the shared
+    // row checkpoint dir: schedule the write a fresh bootstrap would.
+    let promote = method == ssp_node::Method::Post && path.trim_end_matches('/') == "/handover/promote";
+    let was_standby = state.node.is_standby();
     let api_req = ssp_node::ApiRequest { method, path, bearer, body };
-    match state.node.route(api_req).await {
+    match state.node.route_with(api_req, &state.route_options).await {
         Some(resp) => {
+            if promote && resp.status == 200 && was_standby && !state.node.is_standby() {
+                if let Some(rows) = &state.row_checkpoints {
+                    rows.spawn_post_bootstrap_write(
+                        Arc::clone(&state.processor),
+                        Arc::clone(&state.status),
+                        "promotion",
+                    );
+                }
+            }
             let mut builder = Response::builder().status(resp.status);
             for (name, value) in &resp.headers {
                 builder = builder.header(*name, value);
@@ -1127,6 +1150,32 @@ pub async fn run_server() -> anyhow::Result<()> {
         });
     }
 
+    // Row checkpoints: cluster mode only. A standalone SSP rebuilds from its
+    // own database, which holds no hash to verify a checkpoint against.
+    let row_checkpoints = if standalone { None } else { warm::RowCheckpoints::from_env() };
+    if let Some(rows) = &row_checkpoints {
+        // Blue/green: the directory is shared with the SSP this one replaces
+        // (or its replacement), and only the one serving writes it. Never a
+        // standby, never once retired (its successor owns it from the
+        // retire on, the SIGTERM write included); `Stopping` is the shutdown
+        // write of a serving SSP. A contended status lock reads as "not now".
+        let node = Arc::clone(&node);
+        rows.set_gate(Box::new(move || {
+            !node.is_standby()
+                && node
+                    .status
+                    .try_read()
+                    .is_ok_and(|s| matches!(*s, SspStatus::Ready | SspStatus::Stopping))
+        }));
+    }
+    let route_options = ssp_node::handover::RouteOptions {
+        retire_drain: std::env::var("SPKY_SSP_RETIRE_DRAIN_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(ssp_node::handover::DEFAULT_RETIRE_DRAIN),
+    };
+
     let state = AppState {
         db: db.clone(),
         processor: processor_arc.clone(),
@@ -1149,6 +1198,8 @@ pub async fn run_server() -> anyhow::Result<()> {
         platform: platform.clone(),
         auth_secret: config.auth_secret.clone(),
         node: Arc::clone(&node),
+        route_options,
+        row_checkpoints: row_checkpoints.clone(),
     };
 
     let publication_for_heartbeat = state.edge_update_tx.clone();
@@ -1239,10 +1290,6 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     info!(addr = %config.listen_addr, "Listening for requests");
 
-    // Row checkpoints: cluster mode only. A standalone SSP rebuilds from its
-    // own database, which holds no hash to verify a checkpoint against.
-    let row_checkpoints = if standalone { None } else { warm::RowCheckpoints::from_env() };
-
     let boot = Arc::new(ClusterBoot {
         db: db.clone(),
         processor: processor_arc.clone(),
@@ -1256,6 +1303,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         bootstrap_page_size: config.bootstrap_page_size,
         node: Arc::clone(&node),
         row_checkpoints: row_checkpoints.clone(),
+        replaces: ReplacesClaim::new(std::env::var("SPKY_SSP_REPLACES").ok()),
     });
 
     // Spawn self-bootstrap task (runs while server is already accepting /health requests)
@@ -1312,7 +1360,10 @@ pub async fn run_server() -> anyhow::Result<()> {
                 // race ahead of `POST /ssp/register`, hit the scheduler as
                 // an unknown SSP, get 404, and we'd exit while our own
                 // registration is still in flight.
-                if *status_for_heartbeat.read().await != SspStatus::Ready {
+                //
+                // A retired SSP keeps heartbeating: the scheduler watches it
+                // until it is stopped, for the jobs it may still be running.
+                if !matches!(*status_for_heartbeat.read().await, SspStatus::Ready | SspStatus::Retired) {
                     continue;
                 }
 
@@ -1343,6 +1394,15 @@ pub async fn run_server() -> anyhow::Result<()> {
                 };
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
+                    // Retired: its successor serves. Being forgotten or asked
+                    // to resync is no reason to register, rebootstrap or exit;
+                    // the process waits to be stopped.
+                    Ok(resp)
+                        if matches!(resp.status(), StatusCode::NOT_FOUND | StatusCode::CONFLICT)
+                            && *status_for_heartbeat.read().await == SspStatus::Retired =>
+                    {
+                        debug!(status = %resp.status(), "Retired: ignoring the heartbeat answer");
+                    }
                     Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
                         // The scheduler has dropped us, usually because it
                         // restarted with an empty pool. Register again with
@@ -1364,7 +1424,10 @@ pub async fn run_server() -> anyhow::Result<()> {
                             // point of a clean restart is a cold rebuild, and
                             // a checkpoint on the way out would undo it.
                             clean_requested_for_heartbeat.store(true, Ordering::SeqCst);
-                            wipe_local_state(circuit_store_for_heartbeat.as_ref(), rows_for_heartbeat.as_deref()).await;
+                            // A standby leaves the shared row checkpoints to
+                            // the SSP it replaces, which still serves from them.
+                            let rows = rows_for_heartbeat.as_deref().filter(|_| !boot_for_heartbeat.node.is_standby());
+                            wipe_local_state(circuit_store_for_heartbeat.as_ref(), rows).await;
                             error!(reason = %directive.reason, "Scheduler requested a clean re-bootstrap, exiting");
                             std::process::exit(4);
                         }
@@ -1522,16 +1585,15 @@ async fn shutdown_signal(
         // stops first (503, which the scheduler buffers and redelivers to
         // whoever comes next) so the write does not race it for the lock.
         if let Some((rows, processor, status)) = rows {
-            let was_ready = {
+            let was = {
                 let mut status = status.write().await;
-                let was_ready = *status == SspStatus::Ready;
-                *status = SspStatus::Stopping;
-                was_ready
+                std::mem::replace(&mut *status, SspStatus::Stopping)
             };
-            if was_ready {
-                rows.write(&processor, "shutdown").await;
-            } else {
-                info!("Skipping row checkpoint: the circuit was not Ready");
+            match was {
+                // `write` itself refuses for a standby (the gate).
+                SspStatus::Ready => rows.write(&processor, "shutdown").await,
+                SspStatus::Retired => info!("Skipping row checkpoint: retired, the successor owns the checkpoint dir"),
+                _ => info!("Skipping row checkpoint: the circuit was not Ready"),
             }
         }
     }
@@ -1559,9 +1621,64 @@ struct ClusterBoot {
     bootstrap_page_size: usize,
     node: Arc<ssp_node::SspNode>,
     row_checkpoints: Option<Arc<warm::RowCheckpoints>>,
+    /// Blue/green: the live SSP this one is meant to replace.
+    replaces: ReplacesClaim,
+}
+
+/// What an SSP claims to replace when it registers (`SPKY_SSP_REPLACES`):
+/// sent with every registration until the process serves. One that registered
+/// as a normal SSP, or was promoted out of standby since, owns its views and
+/// must never be taken in as a standby again when a scheduler restart or a
+/// resync makes it register once more.
+struct ReplacesClaim {
+    replaces: std::sync::Mutex<Option<String>>,
+    /// Whether the last registration answered `standby: true`.
+    registered_standby: AtomicBool,
+}
+
+impl ReplacesClaim {
+    fn new(replaces: Option<String>) -> Self {
+        Self {
+            replaces: std::sync::Mutex::new(replaces.filter(|s| !s.is_empty())),
+            registered_standby: AtomicBool::new(false),
+        }
+    }
+
+    /// The claim for the next registration, `standby_now` being whether the
+    /// node is still a standby (false after a promotion).
+    fn next(&self, standby_now: bool) -> Option<String> {
+        let mut replaces = self.replaces.lock().unwrap();
+        if self.registered_standby.load(Ordering::SeqCst) && !standby_now {
+            *replaces = None;
+        }
+        replaces.clone()
+    }
+
+    fn on_registered(&self, standby: bool) {
+        self.registered_standby.store(standby, Ordering::SeqCst);
+        if !standby {
+            *self.replaces.lock().unwrap() = None;
+        }
+    }
 }
 
 impl ClusterBoot {
+    fn replaces(&self) -> Option<String> {
+        self.replaces.next(self.node.is_standby())
+    }
+
+    /// Apply a registration's answer: enter standby, or serve normally.
+    fn on_registered(&self, registration: &ssp_protocol::SspRegistrationResponse) {
+        if registration.standby {
+            info!(
+                replaces = ?self.replaces.replaces.lock().unwrap(),
+                "Registered as a standby: following ingest, writing nothing until promoted"
+            );
+        }
+        self.node.set_standby(registration.standby);
+        self.replaces.on_registered(registration.standby);
+    }
+
     /// Register with the scheduler, bring the circuit's rows in line with its
     /// replica (kept, repaired or paged table by table, see [`warm`]),
     /// rebuild the views, verify, and go Ready. Leaves the status `Failed`
@@ -1609,10 +1726,12 @@ impl ClusterBoot {
                 ssp_id,
                 listen_addr,
                 advertise_addr.as_deref(),
+                self.replaces().as_deref(),
                 register_max_wait_secs,
                 status,
             )
             .await;
+            self.on_registered(&registration);
 
             let proxy_url = format!("{}/proxy", scheduler_base);
             info!("Bootstrapping from scheduler proxy at {}", proxy_url);
@@ -1798,10 +1917,12 @@ impl ClusterBoot {
                                         ssp_id,
                                         listen_addr,
                                         advertise_addr.as_deref(),
+                                        self.replaces().as_deref(),
                                         register_max_wait_secs,
                                         status,
                                     )
                                     .await;
+                                    self.on_registered(&registration);
                                     expected_hashes = registration.table_hashes;
                                 }
                                 continue;
@@ -1818,6 +1939,10 @@ impl ClusterBoot {
                         "Bootstrap complete"
                     );
                     drop(guard);
+                    // A standby republishes nothing here (the call only
+                    // refreshes the allowlist): its predecessor's edges stand
+                    // until `POST /handover/promote` compares digests.
+                    let standby = node.is_standby();
                     let republish_started = std::time::Instant::now();
                     if let Err(e) = node.republish_restored_views().await {
                         error!(error = %e, "Bootstrap membership repair failed");
@@ -1826,27 +1951,15 @@ impl ClusterBoot {
                     }
                     *status.write().await = SspStatus::Ready;
                     info!(
+                        standby,
                         republish_ms = republish_started.elapsed().as_millis() as u64,
                         "SSP ready"
                     );
-                    // Persist what was just verified, so a restart from here on is
-                    // warm. Not right away: the scheduler replays the events it
-                    // buffered and verifies the catch-up as soon as we report
-                    // ready, and every one of those ingests waits for a table
-                    // the write is holding. On whitepawn a 16 s write held 3
-                    // replayed events for 13 s, and the SSP out of rotation
-                    // with them. A restart inside the delay still loads the
-                    // previous checkpoint and repairs the difference.
-                    if let Some(rows) = row_checkpoints {
-                        let rows = Arc::clone(rows);
-                        let processor = Arc::clone(processor);
-                        let status = Arc::clone(status);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(warm::POST_BOOTSTRAP_WRITE_DELAY).await;
-                            if *status.read().await == SspStatus::Ready {
-                                rows.write(&processor, "bootstrap").await;
-                            }
-                        });
+                    if standby {
+                        info!("Standby ready: following ingest, publishing nothing until promoted");
+                    } else if let Some(rows) = row_checkpoints {
+                        // A promotion schedules this write for a standby.
+                        rows.spawn_post_bootstrap_write(Arc::clone(processor), Arc::clone(status), "bootstrap");
                     }
                     break;
                 }
@@ -1934,6 +2047,25 @@ mod checkpoint_gating_tests {
         assert!(!registration_budget_restarts_on(&RegisterError::Retryable("HTTP 502".into())));
         assert!(!registration_budget_restarts_on(&RegisterError::Retryable("connection refused".into())));
         assert!(!registration_budget_restarts_on(&RegisterError::Fatal("HTTP 400".into())));
+    }
+
+    #[test]
+    fn a_replacement_claim_lasts_only_until_the_process_serves() {
+        use super::ReplacesClaim;
+        assert_eq!(ReplacesClaim::new(Some(String::new())).next(false), None, "empty env is no claim");
+
+        // Taken in as a standby: re-registering while still one claims again.
+        let claim = ReplacesClaim::new(Some("ssp-blue".into()));
+        assert_eq!(claim.next(false).as_deref(), Some("ssp-blue"));
+        claim.on_registered(true);
+        assert_eq!(claim.next(true).as_deref(), Some("ssp-blue"));
+        // Promoted since: it owns its views now.
+        assert_eq!(claim.next(false), None);
+
+        // Registered as a normal SSP (the predecessor was gone): never again.
+        let claim = ReplacesClaim::new(Some("ssp-blue".into()));
+        claim.on_registered(false);
+        assert_eq!(claim.next(false), None);
     }
 
     #[tokio::test]

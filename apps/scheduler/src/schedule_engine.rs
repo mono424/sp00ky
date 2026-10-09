@@ -184,7 +184,7 @@ pub fn start_schedule_sweep(
     transport: Arc<HttpTransport>,
     db_slot: crate::admin::SharedDbSlot,
 ) {
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("schedule-sweep", async move {
         let mut engine: Option<ScheduleEngine> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(SCHEDULE_SWEEP_INTERVAL_SECS));
         loop {

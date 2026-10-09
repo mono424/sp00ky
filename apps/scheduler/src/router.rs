@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// SSP initialization state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SspState {
     /// SSP is bootstrapping from the snapshot proxy
     Bootstrapping,
@@ -20,6 +21,38 @@ pub enum SspState {
     /// a bootstrap state: it neither freezes the snapshot nor counts as an
     /// active bootstrap, and the heartbeat-stale sweep still applies.
     Lagging,
+    /// Blue/green: an SSP whose standby is being promoted in its place. Off
+    /// the live path, its events queue exactly as for `Lagging` (without a
+    /// redelivery task), so a promotion that fails can hand it back every
+    /// event it missed. Gets no views and no jobs.
+    Retiring,
+    /// Blue/green: replaced by its standby and on its way out. Gets nothing
+    /// at all, but stays in the pool while it heartbeats, so jobs it is still
+    /// running are not taken for orphans and re-run before it stops.
+    Retired,
+}
+
+/// One SSP as a scheduler handover carries it to the successor scheduler.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SspSnapshot {
+    pub info: SspInfo,
+    pub state: SspState,
+    #[serde(default)]
+    pub buffer: Vec<RecordUpdate>,
+    #[serde(default)]
+    pub bootstrap_seq: Option<u64>,
+    #[serde(default)]
+    pub registration_gen: u64,
+    #[serde(default)]
+    pub buffer_overflowed: bool,
+    #[serde(default)]
+    pub forced_resync: Option<ResyncKind>,
+    /// Set on a standby: the SSP it is to replace.
+    #[serde(default)]
+    pub standby_of: Option<String>,
+    /// Set on a successor: the SSP it replaced (see `SspPool::replaced_by`).
+    #[serde(default)]
+    pub replaced: Option<String>,
 }
 
 /// What a forced re-bootstrap should do on the SSP's side before it exits.
@@ -70,6 +103,16 @@ pub struct SspPool {
     /// so a stale poll task never removes or admits the newer registration.
     registration_gen: HashMap<String, u64>,
     publication: HashMap<String, ssp_protocol::PublicationMetrics>,
+    /// Blue/green standbys: standby id -> the SSP it is to replace. A standby
+    /// follows ingest like any Ready SSP but is never chosen for a view or a
+    /// job until it is promoted.
+    standby_of: HashMap<String, String>,
+    /// Blue/green: replaced SSP id -> the SSP that replaced it. While the
+    /// successor is in the pool, the replaced id may not register again: a
+    /// predecessor that comes back (a scheduler restart made it re-register,
+    /// or it crashed after retiring) would serve every view beside its
+    /// successor and publish each change twice.
+    replaced_by: HashMap<String, String>,
     strategy: LoadBalanceStrategy,
     round_robin_index: usize,
     max_buffer_size: usize,
@@ -90,6 +133,8 @@ impl SspPool {
             state_since: HashMap::new(),
             registration_gen: HashMap::new(),
             publication: HashMap::new(),
+            standby_of: HashMap::new(),
+            replaced_by: HashMap::new(),
             strategy,
             round_robin_index: 0,
             max_buffer_size,
@@ -251,7 +296,10 @@ impl SspPool {
         // Buffer for SSPs that are bootstrapping, replaying, or lagging behind
         // a failed live delivery.
         match self.ssp_states.get(ssp_id) {
-            Some(SspState::Bootstrapping) | Some(SspState::Replaying) | Some(SspState::Lagging) => {
+            Some(SspState::Bootstrapping)
+            | Some(SspState::Replaying)
+            | Some(SspState::Lagging)
+            | Some(SspState::Retiring) => {
                 let buffer = self
                     .message_buffers
                     .entry(ssp_id.to_string())
@@ -353,6 +401,9 @@ impl SspPool {
     /// once redelivery reaches the CREATE. An overflowed buffer has dropped
     /// those events and the SSP is about to re-bootstrap.
     pub fn takes_jobs(&self, ssp_id: &str) -> bool {
+        if self.standby_of.contains_key(ssp_id) {
+            return false;
+        }
         match self.ssp_states.get(ssp_id) {
             Some(SspState::Ready) => true,
             Some(SspState::Lagging) => !self.buffer_overflowed.contains(ssp_id),
@@ -383,7 +434,13 @@ impl SspPool {
     pub fn job_runners(&self) -> Vec<SspInfo> {
         self.ssps
             .values()
-            .filter(|s| self.is_ready(&s.id) || self.is_lagging(&s.id))
+            .filter(|s| !self.standby_of.contains_key(&s.id))
+            .filter(|s| {
+                matches!(
+                    self.ssp_states.get(&s.id),
+                    Some(SspState::Ready | SspState::Lagging | SspState::Retiring | SspState::Retired)
+                )
+            })
             .cloned()
             .collect()
     }
@@ -527,6 +584,7 @@ impl SspPool {
         self.bootstrap_failures.remove(ssp_id);
         self.buffer_overflowed.remove(ssp_id);
         self.state_since.remove(ssp_id);
+        self.standby_of.remove(ssp_id);
         // registration_gen is intentionally kept: it must stay monotonic
         // across remove/re-register so stale poll tasks always lose.
         self.ssps.remove(ssp_id)
@@ -547,6 +605,7 @@ impl SspPool {
         self.bootstrap_failures.clear();
         self.buffer_overflowed.clear();
         self.state_since.clear();
+        self.standby_of.clear();
         // registration_gen kept monotonic; see `remove`.
         self.round_robin_index = 0;
         count
@@ -569,6 +628,7 @@ impl SspPool {
             .ssps
             .keys()
             .filter(|id| matches!(self.ssp_states.get(*id), Some(SspState::Ready)))
+            .filter(|id| !self.standby_of.contains_key(*id))
             .cloned()
             .collect();
         self.select_among(&ready_ids)
@@ -629,6 +689,15 @@ impl SspPool {
         }
     }
 
+    /// Move `from`'s query count onto `to` (a promoted standby takes over
+    /// every view its predecessor held).
+    pub fn transfer_query_count(&mut self, from: &str, to: &str) {
+        let moved = self.ssps.get_mut(from).map(|s| std::mem::take(&mut s.query_count)).unwrap_or(0);
+        if let Some(ssp) = self.ssps.get_mut(to) {
+            ssp.query_count += moved;
+        }
+    }
+
     /// Decrement query count for an SSP
     pub fn decrement_query_count(&mut self, ssp_id: &str) {
         if let Some(ssp) = self.ssps.get_mut(ssp_id) {
@@ -646,6 +715,162 @@ impl SspPool {
             .filter(|(_, info)| now.duration_since(info.last_heartbeat) > timeout)
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Record that `successor` replaces `replaced` (see `replaced_by`).
+    pub fn mark_replaced(&mut self, replaced: &str, successor: &str) {
+        self.replaced_by.insert(replaced.to_string(), successor.to_string());
+    }
+
+    /// The live SSP that replaced `ssp_id`, if any. A successor that left the
+    /// pool (a swap that was abandoned) no longer blocks its predecessor.
+    pub fn replaced_by(&self, ssp_id: &str) -> Option<&str> {
+        self.replaced_by
+            .get(ssp_id)
+            .map(String::as_str)
+            .filter(|successor| self.ssps.contains_key(*successor))
+    }
+
+    /// Whether `predecessor` is still on its way to serving: registered and
+    /// bootstrapping or replaying. A standby for it waits instead of taking
+    /// over, or both would end up serving.
+    pub fn is_coming_up(&self, ssp_id: &str) -> bool {
+        matches!(self.ssp_states.get(ssp_id), Some(SspState::Bootstrapping | SspState::Replaying))
+    }
+
+    /// Take `ssp_id` in as the standby for `predecessor` (blue/green).
+    pub fn mark_standby(&mut self, ssp_id: &str, predecessor: &str) {
+        self.standby_of.insert(ssp_id.to_string(), predecessor.to_string());
+    }
+
+    /// The SSP `ssp_id` is standing by to replace, if it is a standby.
+    pub fn standby_predecessor(&self, ssp_id: &str) -> Option<&str> {
+        self.standby_of.get(ssp_id).map(String::as_str)
+    }
+
+    pub fn is_standby(&self, ssp_id: &str) -> bool {
+        self.standby_of.contains_key(ssp_id)
+    }
+
+    /// Promotion done: `ssp_id` is an ordinary SSP from now on.
+    pub fn clear_standby(&mut self, ssp_id: &str) {
+        self.standby_of.remove(ssp_id);
+    }
+
+    /// Ready standbys waiting to replace `predecessor`: where a view
+    /// registration or teardown sent to it is shadowed.
+    pub fn ready_standbys_of(&self, predecessor: &str) -> Vec<SspInfo> {
+        self.standby_of
+            .iter()
+            .filter(|(id, pred)| pred.as_str() == predecessor && self.is_ready(id))
+            .filter_map(|(id, _)| self.ssps.get(id).cloned())
+            .collect()
+    }
+
+    /// An SSP serving views and jobs right now: `Ready` or `Lagging`, not a
+    /// standby, not retiring. What a standby may be promoted in place of.
+    pub fn is_serving(&self, ssp_id: &str) -> bool {
+        !self.standby_of.contains_key(ssp_id)
+            && matches!(self.ssp_states.get(ssp_id), Some(SspState::Ready | SspState::Lagging))
+    }
+
+    /// Start retiring `ssp_id`: off the live path, events queued for it.
+    pub fn mark_retiring(&mut self, ssp_id: &str) {
+        if self.ssps.contains_key(ssp_id) {
+            self.ssp_states.insert(ssp_id.to_string(), SspState::Retiring);
+            self.state_since.insert(ssp_id.to_string(), Instant::now());
+        }
+    }
+
+    /// Finish retiring `ssp_id`: nothing more goes to it, and the events
+    /// queued while it was retiring are dropped (its standby has them).
+    pub fn mark_retired(&mut self, ssp_id: &str) {
+        if self.ssps.contains_key(ssp_id) {
+            self.ssp_states.insert(ssp_id.to_string(), SspState::Retired);
+            self.state_since.insert(ssp_id.to_string(), Instant::now());
+            self.message_buffers.remove(ssp_id);
+            self.buffer_overflowed.remove(ssp_id);
+            self.forced_resync.remove(ssp_id);
+        }
+    }
+
+    /// Take back a retire: the SSP lags behind by exactly the events queued
+    /// while it was retiring, and the caller starts their redelivery.
+    pub fn unretire(&mut self, ssp_id: &str) -> bool {
+        if self.ssp_states.get(ssp_id) == Some(&SspState::Retiring) {
+            self.ssp_states.insert(ssp_id.to_string(), SspState::Lagging);
+            self.state_since.insert(ssp_id.to_string(), Instant::now());
+            return true;
+        }
+        false
+    }
+
+    pub fn is_retired(&self, ssp_id: &str) -> bool {
+        matches!(self.ssp_states.get(ssp_id), Some(SspState::Retiring | SspState::Retired))
+    }
+
+    /// Everything a successor scheduler needs to carry this pool on.
+    pub fn export(&self) -> Vec<SspSnapshot> {
+        self.ssps
+            .values()
+            .filter_map(|info| {
+                let state = *self.ssp_states.get(&info.id)?;
+                Some(SspSnapshot {
+                    info: info.clone(),
+                    state,
+                    buffer: self
+                        .message_buffers
+                        .get(&info.id)
+                        .map(|b| b.iter().cloned().collect())
+                        .unwrap_or_default(),
+                    bootstrap_seq: self.ssp_snapshot_seqs.get(&info.id).copied(),
+                    registration_gen: self.registration_gen(&info.id),
+                    buffer_overflowed: self.buffer_overflowed.contains(&info.id),
+                    forced_resync: self.forced_resync.get(&info.id).copied(),
+                    standby_of: self.standby_of.get(&info.id).cloned(),
+                    replaced: self
+                        .replaced_by
+                        .iter()
+                        .find(|(_, successor)| **successor == info.id)
+                        .map(|(replaced, _)| replaced.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Take over a predecessor's pool. Heartbeat clocks start now: the
+    /// predecessor stopped answering heartbeats a moment ago, and an SSP must
+    /// not be counted stale for that.
+    pub fn import(&mut self, snapshots: Vec<SspSnapshot>) {
+        let now = Instant::now();
+        for snap in snapshots {
+            let id = snap.info.id.clone();
+            let mut info = snap.info;
+            info.last_heartbeat = now;
+            self.ssps.insert(id.clone(), info);
+            self.ssp_states.insert(id.clone(), snap.state);
+            self.state_since.insert(id.clone(), now);
+            if !snap.buffer.is_empty() {
+                self.message_buffers.insert(id.clone(), snap.buffer.into_iter().collect());
+            }
+            if let Some(seq) = snap.bootstrap_seq {
+                self.ssp_snapshot_seqs.insert(id.clone(), seq);
+            }
+            let gen = self.registration_gen.entry(id.clone()).or_insert(0);
+            *gen = (*gen).max(snap.registration_gen);
+            if snap.buffer_overflowed {
+                self.buffer_overflowed.insert(id.clone());
+            }
+            if let Some(kind) = snap.forced_resync {
+                self.forced_resync.insert(id.clone(), kind);
+            }
+            if let Some(replaced) = snap.replaced {
+                self.replaced_by.insert(replaced, id.clone());
+            }
+            if let Some(pred) = snap.standby_of {
+                self.standby_of.insert(id, pred);
+            }
+        }
     }
 
     /// Count of connected SSPs
@@ -739,6 +964,127 @@ mod tests {
     fn with_ssp(p: &mut SspPool, id: &str) {
         p.update_ssp(id, 0, None, None, "test".to_string());
         p.mark_bootstrapping(id);
+    }
+
+    #[test]
+    fn a_standby_follows_ingest_but_gets_no_views_and_no_jobs() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        let _ = p.mark_ready("ssp-0");
+        with_ssp(&mut p, "ssp-0-g1");
+        p.mark_standby("ssp-0-g1", "ssp-0");
+        let _ = p.mark_ready("ssp-0-g1");
+
+        assert!(p.is_ready("ssp-0-g1"), "a ready standby is broadcast to");
+        for _ in 0..4 {
+            assert_eq!(p.select_for_query().as_deref(), Some("ssp-0"));
+            assert_eq!(p.select_job_runner().as_deref(), Some("ssp-0"));
+        }
+        assert!(!p.takes_jobs("ssp-0-g1"));
+        assert!(p.job_runners().iter().all(|s| s.id != "ssp-0-g1"));
+        assert_eq!(
+            p.ready_standbys_of("ssp-0").iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["ssp-0-g1"]
+        );
+        assert!(p.is_serving("ssp-0"));
+        assert!(!p.is_serving("ssp-0-g1"));
+    }
+
+    #[test]
+    fn retiring_queues_events_and_unretire_hands_them_back() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        let _ = p.mark_ready("ssp-0");
+        p.mark_retiring("ssp-0");
+        assert!(!p.is_ready("ssp-0"), "off the live path");
+        assert!(p.is_retired("ssp-0"));
+        assert!(p.buffer_message("ssp-0", update("game:1")));
+        assert_eq!(p.buffer_size("ssp-0"), 1);
+        assert_eq!(p.select_for_query(), None);
+        assert!(p.job_runners().iter().any(|s| s.id == "ssp-0"), "kills still reach it");
+
+        assert!(p.unretire("ssp-0"));
+        assert!(p.is_lagging("ssp-0"));
+        assert_eq!(p.buffer_size("ssp-0"), 1, "the missed event waits for redelivery");
+    }
+
+    #[test]
+    fn promotion_retires_the_predecessor_and_moves_its_query_count() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        let _ = p.mark_ready("ssp-0");
+        p.increment_query_count("ssp-0");
+        p.increment_query_count("ssp-0");
+        with_ssp(&mut p, "ssp-0-g1");
+        p.mark_standby("ssp-0-g1", "ssp-0");
+        let _ = p.mark_ready("ssp-0-g1");
+        p.mark_retiring("ssp-0");
+        assert!(p.buffer_message("ssp-0", update("game:1")));
+
+        p.clear_standby("ssp-0-g1");
+        p.mark_retired("ssp-0");
+        p.transfer_query_count("ssp-0", "ssp-0-g1");
+
+        assert_eq!(p.get_state("ssp-0"), Some(&SspState::Retired));
+        assert_eq!(p.buffer_size("ssp-0"), 0, "its standby has those events");
+        assert!(p.buffer_message("ssp-0", update("game:2")), "a retired SSP takes nothing");
+        assert_eq!(p.buffer_size("ssp-0"), 0);
+        assert_eq!(p.get("ssp-0-g1").map(|s| s.query_count), Some(2));
+        assert_eq!(p.select_for_query().as_deref(), Some("ssp-0-g1"));
+        assert!(!p.unretire("ssp-0"), "only a retiring SSP can be taken back");
+    }
+
+    #[test]
+    fn a_replaced_ssp_is_refused_only_while_its_successor_lives() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0-g1");
+        p.mark_replaced("ssp-0", "ssp-0-g1");
+        assert_eq!(p.replaced_by("ssp-0"), Some("ssp-0-g1"));
+        assert_eq!(p.replaced_by("ssp-0-g1"), None);
+        // The successor left (a swap that was abandoned): the old one may
+        // register again.
+        p.remove("ssp-0-g1");
+        assert_eq!(p.replaced_by("ssp-0"), None);
+    }
+
+    #[test]
+    fn a_predecessor_re_registering_is_coming_up_not_serving() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        assert!(p.is_coming_up("ssp-0"));
+        assert!(!p.is_serving("ssp-0"));
+        let _ = p.mark_ready("ssp-0");
+        assert!(!p.is_coming_up("ssp-0"));
+        assert!(p.is_serving("ssp-0"));
+        assert!(!p.is_coming_up("nobody"));
+    }
+
+    #[test]
+    fn export_import_carries_the_pool_to_a_successor() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        let _ = p.mark_ready("ssp-0");
+        assert!(p.mark_lagging("ssp-0"));
+        assert!(p.buffer_message("ssp-0", update("game:1")));
+        p.set_bootstrap_seq("ssp-0", 41);
+        let _ = p.bump_registration_gen("ssp-0");
+        with_ssp(&mut p, "ssp-0-g1");
+        p.mark_standby("ssp-0-g1", "ssp-0");
+        with_ssp(&mut p, "ssp-1-g2");
+        p.mark_replaced("ssp-1", "ssp-1-g2");
+
+        let wire = serde_json::to_string(&p.export()).unwrap();
+        let mut q = pool();
+        q.import(serde_json::from_str(&wire).unwrap());
+
+        assert!(q.is_lagging("ssp-0"));
+        assert_eq!(q.buffer_size("ssp-0"), 1);
+        assert_eq!(q.get_bootstrap_seq("ssp-0"), Some(41));
+        assert_eq!(q.registration_gen("ssp-0"), 1);
+        assert_eq!(q.standby_predecessor("ssp-0-g1"), Some("ssp-0"));
+        assert_eq!(q.replaced_by("ssp-1"), Some("ssp-1-g2"));
+        assert_eq!(q.get_state("ssp-0-g1"), Some(&SspState::Bootstrapping));
+        assert!(q.get_stale_ssps(1_000).is_empty(), "heartbeat clocks restart on import");
     }
 
     #[test]

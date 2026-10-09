@@ -32,7 +32,7 @@ expose it:
 
 | Port | Env | Serves | Exposure |
 | --- | --- | --- | --- |
-| `9667` | `ingest_port` (YAML) | `/ingest`, `/proxy/*`, `/view/*`, `/ssp/*`, `/job/*`, `/metrics`, `/health*`, `/info`, `/backup/*` | **Private network only** |
+| `9667` | `ingest_port` (YAML) | `/ingest`, `/proxy/*`, `/view/*`, `/ssp/*`, `/job/*`, `/metrics`, `/health*`, `/info`, `/backup/*`, `/handover/*` | **Private network only** |
 | `9668` | `SPKY_ADMIN_PORT` | `/admin` (dashboard) and `/admin/api/*` | Safe to publish |
 | `9669` | `SPKY_POOL_PORT` | `/pool/v1/*`, the [machine pool](/docs/jobs/machine-pools) agents' connection | Publish when pool machines live outside the scheduler's network |
 
@@ -282,13 +282,16 @@ Register a new SSP sidecar with the scheduler. The scheduler will immediately ma
 **Fields:**
 - `ssp_id` (string, required) - Unique identifier for the SSP
 - `url` (string, required) - HTTP URL of the SSP (must start with http:// or https://)
+- `replaces` (string, optional) - Blue/green: the id of a serving SSP this one is meant to replace (`SPKY_SSP_REPLACES`). See [Blue/green handover](#bluegreen-handover).
 
 **Response:**
 - `202 Accepted` - Registration accepted, bootstrap starting
   ```json
-  { "snapshot_seq": 123 }
+  { "snapshot_seq": 123, "table_hashes": { "game": "b3:..." }, "standby": false }
   ```
+  `standby: true` means the scheduler took the SSP in as the standby for `replaces`: it must not write to the database until it is promoted.
 - `400 Bad Request` - Invalid SSP ID (empty) or invalid URL format
+- `409 Conflict` - This SSP id was replaced by a successor that is still in the pool (blue/green). The SSP exits; it must not serve beside its successor.
 
 **Flow:**
 1. SSP sends registration request
@@ -737,6 +740,116 @@ While an SSP is bootstrapping, the scheduler buffers incoming messages:
 - Buffer exists both globally (event_buffer) and per-SSP
 - If buffer overflows: SSP marked for re-bootstrap, buffer cleared
 - Heartbeat returns `409 Conflict` when buffer overflow occurs
+
+---
+
+## Blue/green handover
+
+Upgrades and restarts replace the scheduler and its SSPs without a moment in
+which nobody answers. Sp00ky Cloud drives both handovers; a self-hosted setup
+can drive them the same way.
+
+### Scheduler
+
+Start the new scheduler next to the running one, on the **same data volume**
+and reachable under the same address, with `SPKY_HANDOVER_FROM` set to the
+running one's base URL and the same `SPKY_AUTH_SECRET`:
+
+1. The new process binds its ports at once and holds every request it gets.
+2. It calls `POST /handover/prepare` on the old one. The old scheduler holds
+   its own traffic, lets in-flight requests finish, stops taking events at a
+   clean boundary, stops its background work, closes its replica and answers
+   with its SSP pool and view assignments. From then on it relays every
+   request to the new one.
+3. The new scheduler opens the replica (no `_00_query` wipe, no startup drift
+   pass), takes the state over and serves what it held. SSPs keep their
+   registration. Requests are delayed by the handover, typically well under a
+   second, and never refused.
+4. Stop the old scheduler. On `SIGTERM` a relaying scheduler stops accepting,
+   finishes what it is relaying and exits.
+
+A predecessor on canary.300 or later is handed over in two steps instead,
+so the hold shrinks to the in-memory export: the new scheduler relays every
+request to the old one while it calls `POST /handover/release` (the old one
+releases its replica and keeps serving), opens the replica and connects
+upstream, and only then holds and calls `POST /handover/commit` (the old one
+holds, exports its state and starts relaying). A predecessor that released
+and never sees a commit exits after two minutes.
+
+A predecessor that predates handovers answers the prepare with a 404. The new
+scheduler then relays to it, waits for the replica lock, and boots the
+ordinary way as soon as you stop the old one.
+
+#### GET /handover/status
+
+Answered by the process itself whatever its state, even while it holds
+traffic. Poll it on the new scheduler to know when the old one can go.
+
+```json
+{ "supported": true, "role": "active", "phase": "serving", "peer": "http://old:9667", "error": null, "version": "0.0.1-canary.295" }
+```
+
+- `role`: `starting` (phase `relaying`, `preparing`, `holding`, `opening`, `committing`, or `waiting_for_lock` when the predecessor cannot hand over), `active` (phase `serving`, or `releasing`/`released`/`committing` on a predecessor mid-handover), `retired` (handed over, relaying), `failed`.
+
+#### POST /handover/prepare
+
+`POST /handover/release` and `POST /handover/commit` take the same body and
+auth and split this into its two steps; `release` answers `{"released":true}`,
+`commit` the handover state.
+
+Called by the new scheduler on the old one; bearer `SPKY_AUTH_SECRET`.
+Body `{ "successor": "<host>", "version": "...", "ports": { "main": 9667 } }`
+(`ports` only when the successor listens elsewhere). Answers the handover
+state, or `409 {"code":"busy"}` while an SSP bootstraps, a snapshot drain, an
+SSP promotion or a backup runs (the caller retries), or `409 {"code":"gone"}`
+once it has handed over.
+
+### SSPs
+
+Start the new SSP with its own `SPKY_SSP_ID` and advertise address, the same
+row-checkpoint directory (`SPKY_SSP_SNAPSHOT_DIR`), its own
+`SPKY_SSP_ARENA_DIR`, and `SPKY_SSP_REPLACES` set to the id of the SSP it
+replaces. It registers as that SSP's **standby**: it loads its rows (warm,
+from the shared checkpoints), follows every event and receives a copy of every
+view registration, but gets no views or jobs and writes nothing. Once it has
+caught up the scheduler promotes it:
+
+1. View registrations are held for the swap.
+2. The old SSP is taken off the live path and asked to retire
+   (`POST /handover/retire`): it drains its publication queue and answers with
+   a membership digest per view.
+3. The standby is promoted (`POST /handover/promote`): it republishes only the
+   views whose membership differs from the old SSP's, then publishes like any
+   SSP. Views move to it and registrations resume.
+4. The old SSP stays `retired` (it keeps heartbeating so jobs it is still
+   running are not re-run) until you stop it.
+
+If the swap fails, the old SSP is resumed and gets back every event it missed.
+
+A standby whose predecessor is still coming up (re-registering after a
+scheduler restart) waits for it. One whose predecessor is not registered at
+all takes over as an ordinary SSP, and the predecessor is refused with a `409`
+if it tries to register again, so the two never serve side by side.
+
+#### GET /handover/ssps
+
+The pool as a handover watches it, plus the last promotions:
+
+```json
+{
+  "ssps": [
+    { "id": "ssp-0", "url": "http://ssp-0:8667", "state": "retired", "standby": false, "replaces": null, "version": "..." },
+    { "id": "ssp-0-g1a2b3c", "url": "http://...:8667", "state": "ready", "standby": false, "replaces": null, "version": "..." }
+  ],
+  "promotions": [
+    { "standby": "ssp-0-g1a2b3c", "predecessor": "ssp-0", "phase": "done", "error": null, "started_ms": 0, "finished_ms": 0, "republished": 0 }
+  ]
+}
+```
+
+`state` is one of `bootstrapping`, `replaying`, `ready`, `lagging`,
+`retiring`, `retired`. The swap is complete when the new SSP is `ready` with
+`standby: false` and the old one is `retired` or gone.
 
 ---
 

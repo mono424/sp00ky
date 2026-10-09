@@ -129,6 +129,11 @@ struct Shared {
     /// no runner at all — so without this latch every ingest on those hosts
     /// would kick a drain query that can never lead anywhere.
     closed: Mutex<bool>,
+    /// Blue/green: claims stopped (a standby that must not write, or a
+    /// retired SSP whose successor now owns new work). Jobs already admitted
+    /// run to completion; nothing new is admitted or drained, and refused
+    /// rows stay `pending`, flagged as backlog for when claims resume.
+    paused: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -216,6 +221,22 @@ impl JobDispatcher {
         *self.shared.closed.lock().unwrap()
     }
 
+    /// Stop (`true`) or resume (`false`) new job claims; see `Shared::paused`.
+    /// Resuming kicks a drain for every table with a known backlog, so the
+    /// rows refused meanwhile are picked up without waiting for a trigger.
+    pub fn set_paused(self: &Arc<Self>, paused: bool) {
+        let was = self.shared.paused.swap(paused, std::sync::atomic::Ordering::SeqCst);
+        if was && !paused {
+            for table in self.backlogged_tables() {
+                self.kick_drain(&table);
+            }
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Record that a pending row is waiting, so the next drain (and the drain
     /// timer) know there is something to do.
     pub fn note_backlog(&self, table: &str) {
@@ -263,6 +284,11 @@ impl JobDispatcher {
             return false;
         }
         let table = entry.table.clone();
+        if self.is_paused() {
+            // No drain kick: it would refuse too. `set_paused(false)` kicks.
+            self.note_backlog(&table);
+            return false;
+        }
 
         enum Decision {
             Admit,
@@ -343,7 +369,7 @@ impl JobDispatcher {
     /// one to loop again, so N simultaneous completions cannot each read the
     /// same free count and each admit that many.
     pub async fn drain(self: &Arc<Self>, table: &str) {
-        if self.is_closed() {
+        if self.is_closed() || self.is_paused() {
             return;
         }
         let start = self.shared.with(table, |st| {
@@ -437,7 +463,9 @@ impl JobDispatcher {
 
         let mut admitted = 0u32;
         for row in &rows {
-            if admitted >= free {
+            // Paused mid-drain (a retire): stop before stamping another row
+            // with a claim this node will not run.
+            if admitted >= free || self.is_paused() {
                 break;
             }
             let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };

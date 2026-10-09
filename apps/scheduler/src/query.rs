@@ -84,6 +84,47 @@ impl QueryTracker {
         removed
     }
 
+    /// Queries assigned to `ssp_id`.
+    pub async fn queries_of(&self, ssp_id: &str) -> Vec<String> {
+        let assignments = self.assignments.read().await;
+        assignments
+            .iter()
+            .filter(|(_, (sid, _))| sid == ssp_id)
+            .map(|(qid, _)| qid.clone())
+            .collect()
+    }
+
+    /// Move every query of `from` to `to`, keeping registration stamps (a
+    /// promoted standby took the views over as they were). Returns how many.
+    pub async fn reassign(&self, from: &str, to: &str) -> usize {
+        let mut assignments = self.assignments.write().await;
+        let mut moved = 0;
+        for (sid, _) in assignments.values_mut() {
+            if sid == from {
+                *sid = to.to_string();
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// `(query id, ssp id, registered at ms)` for a scheduler handover.
+    pub async fn export(&self) -> Vec<(String, String, u64)> {
+        let assignments = self.assignments.read().await;
+        assignments
+            .iter()
+            .map(|(q, (s, at))| (q.clone(), s.clone(), *at))
+            .collect()
+    }
+
+    /// Take over a predecessor scheduler's assignments.
+    pub async fn import(&self, entries: Vec<(String, String, u64)>) {
+        let mut assignments = self.assignments.write().await;
+        for (q, s, at) in entries {
+            assignments.insert(q, (s, at));
+        }
+    }
+
     /// Get all assignments
     pub async fn all(&self) -> HashMap<String, String> {
         let assignments = self.assignments.read().await;
@@ -123,6 +164,10 @@ async fn register_query(
     Json(request): Json<ViewRegisterRequest>,
 ) -> Result<Json<QueryAssignment>, (StatusCode, String)> {
     let query_id = request.id.clone();
+
+    // Held while an SSP is swapped for its standby, so no registration lands
+    // on either mid-swap (see `crate::ssp_handover`).
+    let _swap = crate::ssp_handover::shared().view_gate.read().await;
 
     // Clients re-issue `fn::query::register` for live views on reconnect and
     // keepalive, so re-registration of an already-assigned query is the
@@ -243,6 +288,7 @@ async fn register_query(
     if !sticky {
         info!("Assigned query {} to SSP {}", assignment.query_id, assignment.ssp_id);
     }
+    shadow_to_standbys(&state, &assignment.ssp_id, "/view/register", request);
     Ok(Json(assignment))
 }
 
@@ -314,6 +360,7 @@ pub async fn unregister_local(state: &QueryState, query_id: &str, deleted_at_ms:
     let transport = Arc::clone(&state.transport);
     let ssp_pool = Arc::clone(&state.ssp_pool);
     let request = ViewUnregisterRequest { id: query_id.to_string() };
+    shadow_to_standbys(state, &ssp_id, "/view/unregister", request.clone());
     let query_id = query_id.to_string();
     tokio::spawn(async move {
         if let Err(e) = transport
@@ -326,6 +373,29 @@ pub async fn unregister_local(state: &QueryState, query_id: &str, deleted_at_ms:
         info!("Unregistered query {}", query_id);
     });
     true
+}
+
+/// Send a copy of a view registration or teardown that went to `owner` to
+/// every ready standby waiting to replace it, so the standby holds the same
+/// views when it is promoted. Best effort and off the request path: a standby
+/// that misses one picks the view up from `_00_query` when it is promoted.
+fn shadow_to_standbys<T: serde::Serialize + Send + Sync + 'static>(
+    state: &QueryState,
+    owner: &str,
+    path: &'static str,
+    payload: T,
+) {
+    let pool = Arc::clone(&state.ssp_pool);
+    let transport = Arc::clone(&state.transport);
+    let owner = owner.to_string();
+    tokio::spawn(async move {
+        let standbys = pool.read().await.ready_standbys_of(&owner);
+        for standby in standbys {
+            if let Err(e) = transport.post_to_ssp(&standby.url, path, &payload).await {
+                tracing::debug!(standby = %standby.id, path, error = %e, "Shadow copy to the standby failed; it reconciles on promotion");
+            }
+        }
+    });
 }
 
 #[cfg(test)]

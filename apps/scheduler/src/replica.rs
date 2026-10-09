@@ -406,6 +406,19 @@ pub struct Replica {
 
 impl Replica {
     /// Create a new replica with persistent SurrealDB/RocksDB storage
+    /// Release the embedded RocksDB, and with it the directory lock, without
+    /// ending the process: the scheduler handing over to a successor on the
+    /// same volume (see `crate::handover`) must keep relaying requests after
+    /// its successor has opened this directory. Dropping the last connected
+    /// handle closes the engine (measured: the lock frees within ~40 ms); the
+    /// unconnected handle left in its place fails every later call instead of
+    /// touching the files.
+    pub fn close(&mut self) {
+        let closed = Surreal::<surrealdb::engine::local::Db>::init();
+        drop(std::mem::replace(&mut self.db, closed));
+        info!(path = ?self.db_path, "Closed replica for the handover");
+    }
+
     pub async fn new(db_path: PathBuf) -> Result<Self> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = db_path.parent() {

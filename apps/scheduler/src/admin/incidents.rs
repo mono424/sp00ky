@@ -433,7 +433,7 @@ impl Incidents {
         let mut rx = state.logs.subscribe();
         let this = self.clone();
         let started_at = super::ops::now_ms();
-        tokio::spawn(async move {
+        crate::handover::spawn_singleton("incident-observer", async move {
             this.observe(Event {
                 at: started_at,
                 component: "scheduler".into(),

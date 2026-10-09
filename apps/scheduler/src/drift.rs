@@ -1275,7 +1275,7 @@ async fn run(
 fn spawn_backfill(hook: &DriftHook, table: String) {
     let repair = Arc::clone(&hook.repair);
     let state = Arc::clone(&hook.state);
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("drift-backfill", async move {
         let outcome = repair.repair(&table, None).await;
         let mut st = state.write().await;
         st.backfilling.remove(&table);

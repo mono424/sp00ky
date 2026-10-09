@@ -307,6 +307,11 @@ pub async fn ingest_event_from(
         return Ok(0);
     }
 
+    // From the seq to the fan-out hand-off, one unit: a scheduler handing
+    // over takes this gate for writing, so no event is ever half taken (in
+    // the WAL but never fanned out) when its successor starts.
+    let _ingest = crate::handover::ingest_gate().read().await;
+
     // Assign monotonic sequence number
     let seq = state.seq_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -504,7 +509,7 @@ async fn fan_out_event(
     // Only now, with the missed event safely queued, start catching up the
     // SSPs that missed it. One task per `Ready → Lagging` transition.
     for ssp_id in newly_lagging {
-        tokio::spawn(redeliver_to_lagging_ssp(state.clone(), ssp_id));
+        crate::handover::spawn_singleton("lagging-redelivery", redeliver_to_lagging_ssp(state.clone(), ssp_id));
     }
 
     info!(seq, "Ingest fanned out to SSPs");

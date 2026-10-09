@@ -435,7 +435,7 @@ pub async fn start_job_recovery_sweep(
         return;
     }
 
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("job-recovery-sweep", async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             JOB_RECOVERY_INTERVAL_SECS,
         ));

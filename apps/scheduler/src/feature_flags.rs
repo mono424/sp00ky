@@ -35,7 +35,7 @@ const RULE_ROLLOUT: &str = "rollout";
 /// assignments within half a minute, and a quiet table costs one cheap
 /// SELECT-per-flag per tick.
 pub fn spawn(db: Arc<maintenance::db::ReconnectingDb>, interval_secs: u64) {
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("feature-flag-sweep", async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await; // skip the immediate first tick
         loop {

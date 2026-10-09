@@ -95,9 +95,11 @@ fn json_kind(v: &Value) -> &'static str {
 /// resumes from the last id seen, immune to shifts behind the cursor. Mirrors
 /// `bootstrap_page_query` in packages/ssp-node.
 ///
-/// The cursor is the id as SurrealDB spelled it
-/// ([`ssp_protocol::record_id_literal`]), so a numeric, uuid or escaped key
-/// resumes as itself.
+/// SurrealDB 3.1 runs it as a table scan from the first key, so a page costs
+/// more the further in it starts: reading upstream, this is only the fallback
+/// for a table whose keys cannot be ranged (see [`TableCursor`]). The cursor
+/// is the id as SurrealDB spelled it ([`ssp_protocol::record_id_literal`]),
+/// so a numeric or uuid key resumes as one.
 ///
 /// `omit` drops opaque columns from the projection — see
 /// [`Replica::opaque_fields`]. Every producer of a content hash must emit the
@@ -115,6 +117,94 @@ fn keyset_page_query(
         Some(id) => {
             let after = ssp_protocol::record_id_literal(table, id);
             format!("SELECT *{omit} FROM {table} WHERE id > {after} ORDER BY id LIMIT {page_size}")
+        }
+    }
+}
+
+/// Rows per window when an upstream read cuts a table for pages of
+/// `page_size` rows: three quarters of a page, so a window is read in one page
+/// even after it grew by a third while the table was being read.
+fn window_rows(page_size: usize) -> usize {
+    (page_size * 3 / 4).max(1)
+}
+
+/// Where a read of one upstream table stands (see [`Replica::page_table`]).
+///
+/// The keyset pager ([`keyset_page_query`]) is a table scan from the first
+/// key on SurrealDB 3.1, so each page costs more than the one before it and a
+/// table costs the square of its pages (3.1.5 server, 2000-row pages: 1.7 s
+/// for 200k rows, 30 s for 800k; by windows 0.3 s and 1.3 s). So a table is
+/// read by windows instead: its key every [`window_rows`] rows, from one
+/// linear scan that ships only those keys, cuts it into ranges, and each is
+/// read with the record-id range form `t:⟨lo⟩..⟨hi⟩`, a key-range scan whose
+/// cost is its own rows. `LIMIT` is not pushed into that scan, which is why
+/// the bounds come first. The first window is open below and the last open
+/// above, so together they hold every key, numeric, uuid and array ones
+/// included. A window that grew past a page since it was cut resumes after
+/// its last id: `t:⟨last⟩>..⟨hi⟩`, or a filter on the window for a key that
+/// is not a plain string.
+///
+/// Keyset stays for a table whose boundaries are not plain string keys
+/// (`range_hash::string_key`).
+#[derive(Debug)]
+enum TableCursor {
+    Keyset {
+        after: Option<String>,
+    },
+    Windows {
+        windows: RangeHashes,
+        i: usize,
+        after: Option<String>,
+    },
+}
+
+impl TableCursor {
+    fn paged_by(&self) -> &'static str {
+        match self {
+            Self::Keyset { .. } => "keyset",
+            Self::Windows { .. } => "ranges",
+        }
+    }
+
+    /// The next page's query, at most `page_size` rows in id order.
+    fn query(&self, table: &str, page_size: usize, omit: &BTreeSet<String>) -> String {
+        let (windows, i, after) = match self {
+            Self::Keyset { after } => return keyset_page_query(table, page_size, after.as_deref(), omit),
+            Self::Windows { windows, i, after } => (windows, *i, after.as_deref()),
+        };
+        let omit = ssp_protocol::omit_clause(omit);
+        let prefix = format!("{table}:");
+        let resume_key = after.map(|id| range_hash::string_key(id.strip_prefix(&prefix).unwrap_or(id)));
+        let (target, filter) = match (after, resume_key) {
+            (Some(_), Some(Some(key))) => (range_hash::range_target_after(table, key, windows.bounds(i).1), String::new()),
+            (Some(id), _) => (
+                windows.target(table, i),
+                format!(" WHERE id > {}", ssp_protocol::record_id_literal(table, id)),
+            ),
+            (None, _) => (windows.target(table, i), String::new()),
+        };
+        format!("SELECT *{omit} FROM {target}{filter} ORDER BY id LIMIT {page_size}")
+    }
+
+    /// Move past a page of `read` rows whose last id is `last`: on in the same
+    /// window after a full page, to the next one otherwise. `false` once the
+    /// table is read.
+    fn advance(&mut self, read: usize, last: Option<String>, page_size: usize) -> bool {
+        // No id to resume from: stop rather than loop forever.
+        let resume = last.filter(|_| read >= page_size);
+        match self {
+            Self::Keyset { after } => {
+                let more = resume.is_some();
+                *after = resume;
+                more
+            }
+            Self::Windows { windows, i, after } => {
+                if resume.is_none() {
+                    *i += 1;
+                }
+                *after = resume;
+                *i < windows.len()
+            }
         }
     }
 }
@@ -639,7 +729,23 @@ impl Replica {
         db: &Surreal<surrealdb::engine::local::Db>,
         table: &str,
     ) -> Result<Option<RangeHashes>> {
-        let ids = match db.query(range_hash::boundary_query(table)).await {
+        Ok(Self::boundary_keys_on(db, table, range_hash::RANGE_ROWS)
+            .await?
+            .and_then(RangeHashes::from_boundaries))
+    }
+
+    /// The key every `rows` rows of `table` in id order, unwrapped to plain
+    /// strings, from one scan that ships only those keys. `None` when one is
+    /// not a plain string key; empty for a table that does not exist.
+    pub(crate) async fn boundary_keys_on<C>(
+        db: &Surreal<C>,
+        table: &str,
+        rows: usize,
+    ) -> Result<Option<Vec<String>>>
+    where
+        C: surrealdb::Connection,
+    {
+        let ids = match db.query(range_hash::boundary_query_every(table, rows)).await {
             Ok(mut response) => match response.take::<surrealdb::types::Value>(0) {
                 Ok(v) => v.into_json_value(),
                 Err(e) if is_missing_error(&e) => Value::Array(Vec::new()),
@@ -663,7 +769,7 @@ impl Replica {
                 None => return Ok(None),
             }
         }
-        Ok(RangeHashes::from_boundaries(keys))
+        Ok(Some(keys))
     }
 
     /// Read range `i` of `table` (a key-range scan) and digest its rows into
@@ -1550,30 +1656,6 @@ impl Replica {
         out
     }
 
-    /// Page a whole table out of the remote with a keyset cursor.
-    ///
-    /// Paging instead of one SELECT: the SurrealDB Rust SDK's WebSocket
-    /// engine inherits tungstenite's default `max_message_size` of 64 MiB. A
-    /// SELECT response that exceeds that fails the entire query, which
-    /// historically caused bootstrap to stall on tables past ~60 MiB.
-    ///
-    /// Page size is chosen adaptively: a one-row probe measures actual
-    /// serialised row size, then we pick a page count that targets ~32 MiB
-    /// per response (half the WS frame ceiling, comfortable headroom).
-    /// `SPKY_BOOTSTRAP_PAGE_SIZE` lets the operator override the result.
-    ///
-    /// Keyset cursor rationale: offset (`START n`) pagination silently drops
-    /// rows when a concurrent write shifts the table between page requests —
-    /// and the remote DB is LIVE during bootstrap — leaving the replica (and
-    /// every SSP that bootstraps from it) with an incomplete table. Resume by
-    /// `id > $last` instead: a delete behind the cursor can't shift rows
-    /// ahead of it out of view. Mirrors `bootstrap_page_query` in apps/ssp.
-    ///
-    /// Takes the SDK's own `Value` then calls `into_json_value()` so
-    /// RecordId/Datetime are flattened into normal JSON strings instead of
-    /// `{"RecordId":{...}}` shapes. Tolerates the table disappearing between
-    /// INFO FOR DB and SELECT (race) or simply not existing yet — treated as
-    /// zero records.
     /// Page a whole table and collect it in memory. Used by the spool path,
     /// which writes one file per table and needs the rows together.
     ///
@@ -1595,28 +1677,63 @@ impl Replica {
         Ok(out)
     }
 
-    /// Page a table with keyset pagination, handing each page to `sink` as it
-    /// arrives, and return the row count.
+    /// Page a whole table out of the remote, handing each page to `sink` as
+    /// it arrives, and return the row count.
     ///
     /// The sink exists so a caller can consume a table it could not hold: the
     /// clone inserts each page and drops it, which keeps peak memory at one
     /// page instead of one table. Buffering the whole table first put ~220MB
     /// of `analysis` in a single `Vec` on a scheduler capped at 1GB.
+    ///
+    /// Paging instead of one SELECT: the SurrealDB Rust SDK's WebSocket
+    /// engine inherits tungstenite's default `max_message_size` of 64 MiB. A
+    /// SELECT response that exceeds that fails the entire query, which
+    /// historically caused bootstrap to stall on tables past ~60 MiB.
+    ///
+    /// Page size is chosen adaptively: a one-row probe measures actual
+    /// serialised row size, then we pick a page count that targets ~32 MiB
+    /// per response (half the WS frame ceiling, comfortable headroom).
+    /// `SPKY_BOOTSTRAP_PAGE_SIZE` lets the operator override the result.
+    ///
+    /// Pages are id windows, not offsets (see [`TableCursor`]): offset
+    /// (`START n`) pagination silently drops rows when a concurrent write
+    /// shifts the table between page requests, and the remote DB is LIVE
+    /// while it is paged. A window is a key range, which a delete elsewhere
+    /// cannot shift. A row that exists for the whole read is read exactly
+    /// once; one written meanwhile may be read or not, which is why every
+    /// caller takes its changefeed cursor (or its wait-for-ingest mark)
+    /// BEFORE the read.
+    ///
+    /// Takes the SDK's own `Value` then calls `into_json_value()` so
+    /// RecordId/Datetime are flattened into normal JSON strings instead of
+    /// `{"RecordId":{...}}` shapes. Tolerates the table disappearing between
+    /// INFO FOR DB and SELECT (race) or simply not existing yet — treated as
+    /// zero records.
     pub(crate) async fn page_table<C, F, Fut>(
         remote_db: &surrealdb::Surreal<C>,
         table_name: &str,
         omit: &BTreeSet<String>,
-        mut sink: F,
+        sink: F,
     ) -> Result<usize>
     where
         C: surrealdb::Connection,
         F: FnMut(Vec<Value>) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let mut info = remote_db.query("INFO FOR DB").await?;
-        let info: surrealdb::types::Value = info.take(0)?;
-        let has_versions = info.into_json_value().get("tables")
-            .and_then(|v| v.get("_00_version")).is_some();
+        let page_size = Self::clone_page_size(remote_db, table_name, omit).await;
+        Self::page_table_by(remote_db, table_name, omit, page_size, sink).await
+    }
+
+    /// Rows per page for reading `table`: ~32 MiB by a one-row probe (with
+    /// the same projection the pages use), at most 2000.
+    async fn clone_page_size<C>(
+        remote_db: &surrealdb::Surreal<C>,
+        table_name: &str,
+        omit: &BTreeSet<String>,
+    ) -> usize
+    where
+        C: surrealdb::Connection,
+    {
         let omit_clause = ssp_protocol::omit_clause(omit);
         let target_page_bytes: usize = 32 * 1024 * 1024;
         // Probe with the same projection the real pages use, or the auto-tuned
@@ -1659,16 +1776,38 @@ impl Replica {
                 "bootstrap page-size auto-tuned",
             );
         }
+        page_size
+    }
+
+    /// [`Self::page_table`] with pages of at most `page_size` rows.
+    pub(crate) async fn page_table_by<C, F, Fut>(
+        remote_db: &surrealdb::Surreal<C>,
+        table_name: &str,
+        omit: &BTreeSet<String>,
+        page_size: usize,
+        mut sink: F,
+    ) -> Result<usize>
+    where
+        C: surrealdb::Connection,
+        F: FnMut(Vec<Value>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let page_size = page_size.max(1);
+        let mut info = remote_db.query("INFO FOR DB").await?;
+        let info: surrealdb::types::Value = info.take(0)?;
+        let has_versions = info.into_json_value().get("tables")
+            .and_then(|v| v.get("_00_version")).is_some();
+        let started = std::time::Instant::now();
+        let mut cursor = Self::table_cursor(remote_db, table_name, window_rows(page_size)).await;
         let mut total: usize = 0;
-        // Keyset cursor: the highest `id` paged so far (`None` = first page).
-        let mut after_id: Option<String> = None;
+        let mut pages: usize = 0;
         loop {
-            let query = keyset_page_query(table_name, page_size, after_id.as_deref(), omit);
+            let query = cursor.query(table_name, page_size, omit);
             let query = if has_versions {
                 ssp_protocol::with_durable_row_versions(&query)
             } else { query };
-            trace!(table = %table_name, after_id = ?after_id, page_size, "remote page query: {}", query);
-            let resp = remote_db.query(query).await;
+            trace!(table = %table_name, paged_by = cursor.paged_by(), page_size, "remote page query: {}", query);
+            let resp = remote_db.query(&query).await;
             let page: Vec<Value> = match resp {
                 Ok(mut response) => match response.take::<surrealdb::types::Value>(0) {
                     Ok(sdk_val) => match sdk_val.into_json_value() {
@@ -1684,8 +1823,8 @@ impl Replica {
                         break;
                     }
                     Err(e) => return Err(anyhow::anyhow!(
-                        "take(0) failed for table '{}' page (after_id={:?}): {}",
-                        table_name, after_id, e,
+                        "take(0) failed for table '{}' page [{}]: {}",
+                        table_name, query, e,
                     )),
                 },
                 Err(e) if is_missing_error(&e) => {
@@ -1693,33 +1832,52 @@ impl Replica {
                     break;
                 }
                 Err(e) => return Err(anyhow::Error::from(e)
-                    .context(format!(
-                        "SELECT page from {} (after_id={:?}, limit={}) failed",
-                        table_name, after_id, page_size,
-                    ))),
+                    .context(format!("SELECT page from {} [{}] failed", table_name, query))),
             };
             let n = page.len();
-            // Advance the cursor to this page's last id (page is ORDER BY id,
-            // so the last row carries the max id) BEFORE consuming `page`.
-            let next_after = page
+            // The page is ORDER BY id, so its last row carries the id the
+            // next read resumes after. Taken BEFORE `page` is consumed.
+            let last = page
                 .last()
                 .and_then(|row| row.get("id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             total += n;
+            pages += 1;
             // Hand the page over and drop it here: from this point the caller
             // owns those rows, and this loop holds nothing but the cursor.
             sink(page).await?;
-            if n < page_size {
+            if !cursor.advance(n, last, page_size) {
                 break;
             }
-            // No usable id to resume from → stop rather than loop forever.
-            match next_after {
-                Some(id) => after_id = Some(id),
-                None => break,
+        }
+        debug!(
+            table = %table_name,
+            paged_by = cursor.paged_by(),
+            pages,
+            rows = total,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Paged table from upstream",
+        );
+        Ok(total)
+    }
+
+    /// How to read `table`: by windows of about `rows` rows when its keys are
+    /// plain strings, by keyset otherwise (see [`TableCursor`]).
+    async fn table_cursor<C>(remote_db: &surrealdb::Surreal<C>, table: &str, rows: usize) -> TableCursor
+    where
+        C: surrealdb::Connection,
+    {
+        let keyset = TableCursor::Keyset { after: None };
+        match Self::boundary_keys_on(remote_db, table, rows).await {
+            Ok(Some(keys)) => RangeHashes::with_starts(keys)
+                .map_or(keyset, |windows| TableCursor::Windows { windows, i: 0, after: None }),
+            Ok(None) => keyset,
+            Err(e) => {
+                warn!(table, error = %format!("{e:#}"), "Range boundaries failed; paging the table by keyset");
+                keyset
             }
         }
-        Ok(total)
     }
 
     /// The current rows of `table` upstream for the given record ids (as the
@@ -2517,6 +2675,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_window_cursor_reads_key_ranges_and_resumes_inside_a_grown_window() {
+        let none = BTreeSet::new();
+        let windows = RangeHashes::with_starts(vec!["".into(), "g".into(), "p".into()]).unwrap();
+        let mut c = TableCursor::Windows { windows, i: 0, after: None };
+        assert_eq!(c.paged_by(), "ranges");
+        assert_eq!(c.query("game", 4, &none), "SELECT * FROM game:..⟨g⟩ ORDER BY id LIMIT 4");
+
+        // A short page finishes its window.
+        assert!(c.advance(3, Some("game:f".into()), 4));
+        assert_eq!(c.query("game", 4, &none), "SELECT * FROM game:⟨g⟩..⟨p⟩ ORDER BY id LIMIT 4");
+
+        // A full one resumes in the same window, after its last id.
+        assert!(c.advance(4, Some("game:k".into()), 4));
+        assert_eq!(c.query("game", 4, &none), "SELECT * FROM game:⟨k⟩>..⟨p⟩ ORDER BY id LIMIT 4");
+        assert!(c.advance(4, Some("game:`m-n`".into()), 4));
+        assert_eq!(c.query("game", 4, &none), "SELECT * FROM game:⟨m-n⟩>..⟨p⟩ ORDER BY id LIMIT 4");
+        assert!(c.advance(0, None, 4));
+        assert_eq!(c.query("game", 4, &none), "SELECT * FROM game:⟨p⟩.. ORDER BY id LIMIT 4");
+
+        // The last window is open above, so it holds the uuid and array keys
+        // that sort after every string: one of those resumes by a filter.
+        assert!(c.advance(4, Some("game:u'0190d5d6-0000-7000-8000-000000000000'".into()), 4));
+        assert_eq!(
+            c.query("game", 4, &none),
+            "SELECT * FROM game:⟨p⟩.. WHERE id > game:u'0190d5d6-0000-7000-8000-000000000000' ORDER BY id LIMIT 4"
+        );
+        assert!(!c.advance(2, Some("game:[1, 2]".into()), 4));
+
+        // Fewer rows than one window: the whole table, from its first key.
+        let mut one = TableCursor::Windows { windows: RangeHashes::with_starts(Vec::new()).unwrap(), i: 0, after: None };
+        assert_eq!(one.query("game", 4, &none), "SELECT * FROM game ORDER BY id LIMIT 4");
+        assert!(one.advance(4, Some("game:42".into()), 4));
+        assert_eq!(one.query("game", 4, &none), "SELECT * FROM game WHERE id > game:42 ORDER BY id LIMIT 4");
+        assert!(!one.advance(1, Some("game:43".into()), 4));
+
+        let mut k = TableCursor::Keyset { after: None };
+        assert_eq!(k.paged_by(), "keyset");
+        assert!(k.advance(4, Some("game:7".into()), 4));
+        assert_eq!(k.query("game", 4, &none), "SELECT * FROM game WHERE id > game:7 ORDER BY id LIMIT 4");
+        assert!(!k.advance(4, None, 4), "no id to resume from");
+        assert_eq!(window_rows(2000), 1500);
+        assert_eq!(window_rows(1), 1);
+    }
+
     /// The clone pager must render a projection byte-identical to the SSP's
     /// `bootstrap_page_query` — the two feed opposite sides of the same content
     /// hash comparison. Both delegate the clause to `ssp_protocol::omit_clause`
@@ -2535,6 +2738,11 @@ mod tests {
         assert_eq!(
             keyset_page_query("user", 200, Some("user:abc"), &omit),
             "SELECT * OMIT blob, secret_token FROM user WHERE id > user:abc ORDER BY id LIMIT 200",
+        );
+        let windows = RangeHashes::with_starts(vec!["".into(), "m".into()]).unwrap();
+        assert_eq!(
+            TableCursor::Windows { windows, i: 1, after: None }.query("user", 200, &omit),
+            "SELECT * OMIT blob, secret_token FROM user:⟨m⟩.. ORDER BY id LIMIT 200",
         );
     }
 
@@ -2917,6 +3125,141 @@ mod tests {
         replica.apply("game", RecordOp::Update, "game:g00003", row(1, 2)).await?;
         assert_eq!(replica.range_build_step().await?, RangeBuildStep::Idle);
         assert!(!replica.range_build_finish().await);
+        Ok(())
+    }
+
+    /// An upstream stand-in: an embedded database with `ns`/`db` selected.
+    async fn source_db() -> Result<(tempfile::TempDir, Surreal<surrealdb::engine::local::Db>)> {
+        let tmp = tempfile::tempdir()?;
+        let db = Surreal::new::<RocksDb>(tmp.path().join("source").to_str().unwrap()).await?;
+        db.use_ns("test").use_db("test").await?;
+        Ok((tmp, db))
+    }
+
+    /// Run `surql` statements in transactions of 500.
+    async fn create_rows(db: &Surreal<surrealdb::engine::local::Db>, rows: Vec<String>) -> Result<()> {
+        for chunk in rows.chunks(500) {
+            db.query(format!("BEGIN; {} COMMIT;", chunk.join(" "))).await?.check()?;
+        }
+        Ok(())
+    }
+
+    /// Page `table` with `page_size`; every row's id, in the order read, and
+    /// the largest page.
+    async fn read_ids(
+        db: &Surreal<surrealdb::engine::local::Db>,
+        table: &str,
+        page_size: usize,
+    ) -> Result<(Vec<String>, usize)> {
+        let ids = std::sync::Mutex::new(Vec::new());
+        let largest = std::sync::atomic::AtomicUsize::new(0);
+        let n = Replica::page_table_by(db, table, &BTreeSet::new(), page_size, |page| {
+            largest.fetch_max(page.len(), std::sync::atomic::Ordering::Relaxed);
+            ids.lock().unwrap().extend(page.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            std::future::ready(Ok(()))
+        })
+        .await?;
+        let ids = ids.into_inner().unwrap();
+        assert_eq!(n, ids.len());
+        Ok((ids, largest.into_inner()))
+    }
+
+    fn assert_once(ids: &[String], want: impl IntoIterator<Item = String>) {
+        let read: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(read.len(), ids.len(), "a row was read twice");
+        let want: BTreeSet<String> = want.into_iter().collect();
+        assert_eq!(read.into_iter().cloned().collect::<BTreeSet<_>>(), want);
+    }
+
+    #[tokio::test]
+    async fn a_string_keyed_table_is_read_by_ranges_once_each() -> Result<()> {
+        let (_tmp, db) = source_db().await?;
+        create_rows(&db, (0..2500).map(|i| format!("CREATE game:g{i:05} SET n = {i};")).collect()).await?;
+        let TableCursor::Windows { windows, .. } = Replica::table_cursor(&db, "game", window_rows(200)).await else {
+            panic!("string keys are ranged");
+        };
+        assert_eq!(windows.len(), 17);
+        assert_eq!(&windows.starts()[..3], &["".to_string(), "g00150".into(), "g00300".into()]);
+
+        let (ids, largest) = read_ids(&db, "game", 200).await?;
+        assert_once(&ids, (0..2500).map(|i| format!("game:g{i:05}")));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "read in id order");
+        assert_eq!(largest, 150);
+
+        // A table that does not exist reads as empty.
+        assert_eq!(read_ids(&db, "nothing", 200).await?.0, Vec::<String>::new());
+        Ok(())
+    }
+
+    /// The clone runs against a live upstream: windows cut before rows moved
+    /// still read every row that existed throughout exactly once, and a
+    /// window that grew past a page is read whole by resuming inside it.
+    #[tokio::test]
+    async fn rows_written_while_a_table_is_read_are_never_read_twice() -> Result<()> {
+        let (_tmp, db) = source_db().await?;
+        create_rows(&db, (0..1000).map(|i| format!("CREATE game:g{i:05} SET n = {i};")).collect()).await?;
+        let ids = std::sync::Mutex::new(Vec::new());
+        let pages = std::sync::atomic::AtomicUsize::new(0);
+        Replica::page_table_by(&db, "game", &BTreeSet::new(), 100, |page| {
+            let first = pages.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+            ids.lock().unwrap().extend(page.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            let db = db.clone();
+            async move {
+                if first {
+                    // Into window 0, read already: missed (the changefeed's job).
+                    db.query("CREATE game:g00001a").await?.check()?;
+                    // 250 into an unread window, more than a page past its cut.
+                    let grown = (0..250).map(|i| format!("CREATE game:g00500x{i:03};")).collect();
+                    create_rows(&db, grown).await?;
+                    // Past every string key: the last window is open above.
+                    let tail = (0..120).map(|_| "CREATE type::record('game', rand::uuid());".to_string()).collect();
+                    create_rows(&db, tail).await?;
+                    db.query("CREATE game:[1, 2]; DELETE game:g00700;").await?.check()?;
+                }
+                Ok(())
+            }
+        })
+        .await?;
+        let ids = ids.into_inner().unwrap();
+        let uuids = ids.iter().filter(|id| id.starts_with("game:u'")).count();
+        assert_eq!(uuids, 120);
+        let want = (0..1000)
+            .filter(|i| *i != 700)
+            .map(|i| format!("game:g{i:05}"))
+            .chain((0..250).map(|i| format!("game:g00500x{i:03}")))
+            .chain(["game:[1, 2]".to_string()])
+            .chain(ids.iter().filter(|id| id.starts_with("game:u'")).cloned());
+        assert_once(&ids, want);
+        Ok(())
+    }
+
+    /// Keys that are not plain strings page by keyset, and the keyset resumes
+    /// after a numeric or uuid key as one (it used to stop after page one).
+    #[tokio::test]
+    async fn numeric_and_uuid_keyed_tables_fall_back_to_keyset_and_read_whole() -> Result<()> {
+        let (_tmp, db) = source_db().await?;
+        create_rows(&db, (1..=450).map(|i| format!("CREATE num:{i} SET n = {i};")).collect()).await?;
+        create_rows(&db, (0..250).map(|_| "CREATE type::record('uid', rand::uuid());".to_string()).collect()).await?;
+        // A numeric first key makes the whole table keyset, strings after it too.
+        create_rows(&db, (0..300).map(|i| format!("CREATE mixed:m{i:03};")).collect()).await?;
+        db.query("CREATE mixed:-5; CREATE mixed:7;").await?.check()?;
+        for table in ["num", "uid", "mixed"] {
+            assert!(
+                matches!(Replica::table_cursor(&db, table, window_rows(100)).await, TableCursor::Keyset { .. }),
+                "{table} is not ranged"
+            );
+        }
+
+        let (ids, _) = read_ids(&db, "num", 100).await?;
+        assert_once(&ids, (1..=450).map(|i| format!("num:{i}")));
+        let (ids, _) = read_ids(&db, "uid", 100).await?;
+        assert_eq!(ids.len(), 250);
+        assert_once(&ids, ids.clone());
+        let (ids, _) = read_ids(&db, "mixed", 100).await?;
+        assert_once(
+            &ids,
+            ["mixed:-5".to_string(), "mixed:7".into()].into_iter().chain((0..300).map(|i| format!("mixed:m{i:03}"))),
+        );
         Ok(())
     }
 }

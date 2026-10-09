@@ -326,19 +326,35 @@ per-query stream updates before they reach `useQuery`.
 
 Both the scheduler's snapshot replica and the SSP load large tables in
 bounded pages rather than one giant `SELECT` (which overflows the
-WebSocket frame ceiling on multi-GB databases). Paging uses **keyset
-pagination**, `… ORDER BY id LIMIT n`, then resuming from the last id
-seen with `WHERE id > <last> ORDER BY id LIMIT n`, never an
+WebSocket frame ceiling on multi-GB databases). A page is never an
 `OFFSET`/`START`. The source database is live while it is paged (and the
 SSP re-bootstraps from the scheduler's replica on every restart), so an
 offset scan would be unsafe: a concurrent delete behind the offset shifts
 every later row up one, and the next page silently **skips** a row. A
 skipped record never enters the circuit, so it is invisible to the
 materialized views, so a later delete of it emits no removal delta and the
-client's live query goes stale until a manual reload. Keyset pagination
-resumes from a value rather than a row count, so deletes behind the cursor
-can't shift rows out of view (even deleting the cursor row itself is safe,
-because the next page is `id > <value>`, not a reference to a live row).
+client's live query goes stale until a manual reload.
+
+Pages are **id windows** instead. One scan returns every n-th record id
+of the table, n being three quarters of a page
+(`array::clump((SELECT VALUE id FROM t), n)`), and each window between two
+of them is read with SurrealDB's record-id range form, `t:⟨lo⟩..⟨hi⟩`, a
+key-range scan whose cost is the window's own rows.
+The first window is open below and the last open above, so together they
+hold every key. A window that grew past a page while the table was being
+read resumes after its last id. The scheduler cuts windows when it clones
+upstream into the replica and when a drift repair reads a table; the SSP
+reads the replica by the id ranges the scheduler keeps per table.
+
+A table whose ids are not plain strings (numeric, uuid, array or object
+keys) falls back to **keyset pagination**: `… ORDER BY id LIMIT n`, then
+`WHERE id > <last> ORDER BY id LIMIT n` from the last id seen, spelled as
+SurrealDB returned it so the key keeps its type. Keyset resumes from a
+value rather than a row count, so it is just as safe under concurrent
+deletes, but SurrealDB 3.1 runs each page as a table scan from the first
+key: a page costs more the further in it starts, and paging a whole table
+is quadratic (800k rows: 30 s of server time, against 1.3 s by windows).
+
 Page size is tunable via `SPKY_SSP_BOOTSTRAP_PAGE_SIZE` (SSP) and
 `SPKY_BOOTSTRAP_PAGE_SIZE` (scheduler).
 

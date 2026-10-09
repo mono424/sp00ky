@@ -40,7 +40,8 @@ const OVERGROWN_FACTOR: u64 = 4;
 
 /// The string a raw record id (`abc`, `` `a-b` ``, `⟨a-b⟩`) keys on, when it is
 /// a plain string key: letters, digits, `_` and `-`. `None` for a numeric key
-/// (a bare all-digit id), and for uuid, array, object or escaped keys.
+/// (a bare integer id, `-5` included), and for uuid, array, object or escaped
+/// keys.
 pub fn string_key(raw: &str) -> Option<&str> {
     let (key, quoted) = match raw
         .strip_prefix('`')
@@ -54,7 +55,8 @@ pub fn string_key(raw: &str) -> Option<&str> {
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    let numeric = !quoted && key.bytes().all(|b| b.is_ascii_digit());
+    let digits = key.strip_prefix('-').unwrap_or(key);
+    let numeric = !quoted && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
     (plain && !numeric).then_some(key)
 }
 
@@ -70,10 +72,26 @@ pub fn range_target(table: &str, lo: Option<&str>, hi: Option<&str>) -> String {
     }
 }
 
+/// The `FROM` target that reads the keys after `after` and before `hi`:
+/// `t:⟨after⟩>..⟨hi⟩`, open above when `hi` is `None`. How a read resumes
+/// inside a range that holds more rows than one page.
+pub fn range_target_after(table: &str, after: &str, hi: Option<&str>) -> String {
+    match hi {
+        None => format!("{table}:⟨{after}⟩>.."),
+        Some(hi) => format!("{table}:⟨{after}⟩>..⟨{hi}⟩"),
+    }
+}
+
 /// The SurrealQL that returns the key every `RANGE_ROWS` rows of `table`, in
 /// id order: the range boundaries, from one linear scan that ships only them.
 pub fn boundary_query(table: &str) -> String {
-    format!("RETURN array::clump((SELECT VALUE id FROM {table}), {RANGE_ROWS}).map(|$c| $c[0])")
+    boundary_query_every(table, RANGE_ROWS)
+}
+
+/// [`boundary_query`] with a key every `rows` rows instead.
+pub fn boundary_query_every(table: &str, rows: usize) -> String {
+    let rows = rows.max(1);
+    format!("RETURN array::clump((SELECT VALUE id FROM {table}), {rows}).map(|$c| $c[0])")
 }
 
 /// One table's ranges. Range `i` holds the string keys in
@@ -277,8 +295,12 @@ mod tests {
         assert_eq!(string_key("`123`"), Some("123"));
         assert_eq!(string_key("`a-b`"), Some("a-b"));
         assert_eq!(string_key("⟨a-b⟩"), Some("a-b"));
-        // A bare all-digit id is a numeric key: SurrealDB orders it as a number.
+        // A bare integer id is a numeric key: SurrealDB orders it as a number.
         assert_eq!(string_key("123"), None);
+        assert_eq!(string_key("-5"), None);
+        assert_eq!(string_key("`-5`"), Some("-5"));
+        assert_eq!(string_key("-a5"), Some("-a5"));
+        assert_eq!(string_key("-"), Some("-"));
         assert_eq!(string_key("u'0190d5d6-0000-7000-8000-000000000000'"), None);
         assert_eq!(string_key("[1, 2]"), None);
         assert_eq!(string_key("`a b`"), None);
@@ -291,9 +313,19 @@ mod tests {
         assert_eq!(range_target("game", Some("a"), None), "game:⟨a⟩..");
         assert_eq!(range_target("game", None, Some("m")), "game:..⟨m⟩");
         assert_eq!(range_target("game", Some("a"), Some("m")), "game:⟨a⟩..⟨m⟩");
+        assert_eq!(range_target_after("game", "a", Some("m")), "game:⟨a⟩>..⟨m⟩");
+        assert_eq!(range_target_after("game", "a", None), "game:⟨a⟩>..");
         assert_eq!(
             boundary_query("game"),
             "RETURN array::clump((SELECT VALUE id FROM game), 1000).map(|$c| $c[0])"
+        );
+        assert_eq!(
+            boundary_query_every("game", 1500),
+            "RETURN array::clump((SELECT VALUE id FROM game), 1500).map(|$c| $c[0])"
+        );
+        assert_eq!(
+            boundary_query_every("game", 0),
+            "RETURN array::clump((SELECT VALUE id FROM game), 1).map(|$c| $c[0])"
         );
     }
 

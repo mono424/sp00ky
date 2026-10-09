@@ -348,8 +348,13 @@ async fn register_with_scheduler(
         .json(&payload)
         // Bound a single attempt so a hung connection can't stall the retry
         // loop. Per-request (not client-wide) so it doesn't shorten the proxy
-        // bootstrap queries that reuse the same client.
-        .timeout(std::time::Duration::from_secs(10))
+        // bootstrap queries that reuse the same client. Generous on purpose:
+        // the scheduler answers only after its registration section gets
+        // `drain_lock`, which a drain in progress legitimately holds for tens
+        // of seconds. At 10 s every such wait became a retry, and every retry
+        // queued one more registration that froze, drained and bumped the
+        // generation (four of them on whitepawn, 2026-10-09).
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
     {

@@ -341,6 +341,7 @@ async fn register_with_scheduler(
         url: format!("http://{}", registration_host),
         version: env!("CARGO_PKG_VERSION").to_string(),
         env: if env_vars.is_empty() { None } else { Some(env_vars) },
+        replaces: std::env::var("SPKY_SSP_REPLACES").ok().filter(|s| !s.is_empty()),
     };
 
     match client

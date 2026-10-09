@@ -258,6 +258,14 @@ pub struct SspRegistration {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// Blue/green: the id of the live SSP this instance is meant to replace
+    /// (`SPKY_SSP_REPLACES`). When that SSP is still serving, the scheduler
+    /// takes this one in as its standby: it bootstraps and follows ingest
+    /// without publishing, and is promoted in its predecessor's place once it
+    /// has caught up. Absent, or naming an SSP that is gone, it registers
+    /// like any other. Older schedulers ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,7 +277,79 @@ pub struct SspRegistrationResponse {
     /// re-registers from a fresh frozen snapshot.
     #[serde(default)]
     pub table_hashes: BTreeMap<String, String>,
+    /// The scheduler took this SSP in as the standby for `replaces`: it must
+    /// not write anything to the database (edges, `_00_query` state, metrics,
+    /// TTL sweeps, jobs, row checkpoints) until `POST /handover/promote`.
+    /// Older schedulers never send it, which reads as a normal registration.
+    #[serde(default)]
+    pub standby: bool,
 }
+
+// --- SSP blue/green handover (scheduler -> SSP, bearer `SPKY_AUTH_SECRET`) ---
+
+/// `POST /handover/retire`, sent to the SSP being replaced once its standby
+/// has caught up. The scheduler has stopped fanning out events and holds view
+/// registrations while this runs, so the SSP's state is final: it stops
+/// taking ingest and registrations (503 `retired`), stops every database
+/// writer of its own (TTL sweep, metrics flush, job pickup, row checkpoints),
+/// lets its publication queue drain, and answers with what it published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SspRetireRequest {
+    /// The SSP taking over, for the logs.
+    pub successor: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SspRetireResponse {
+    /// Registration id (`_00_query` id) -> hash of the membership this SSP
+    /// last computed for it (the circuit's per-view result hash). With the
+    /// queue drained, this is what the edges in the database hold.
+    #[serde(default)]
+    pub digests: BTreeMap<String, String>,
+    /// `false` when the publication queue did not drain before the deadline:
+    /// the digests then describe intent, not the database, and the successor
+    /// must republish every view instead of trusting them.
+    #[serde(default)]
+    pub drained: bool,
+}
+
+/// `POST /handover/promote`, sent to the standby once its predecessor has
+/// retired. The standby compares the predecessor's digests with its own,
+/// republishes only the views that differ (or that the predecessor never
+/// had), drops the views it should not own, and from then on publishes and
+/// runs its database writers like any SSP.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SspPromoteRequest {
+    /// The predecessor's [`SspRetireResponse::digests`]. `None` when it could
+    /// not supply trustworthy ones (an older SSP, a queue that did not drain):
+    /// every view is republished, exactly as a warm restart does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digests: Option<BTreeMap<String, String>>,
+    /// Registration ids this SSP is to own after promotion. Views outside the
+    /// set are dropped from the circuit WITHOUT touching their edges, which
+    /// belong to another SSP. `None` keeps every view (single-SSP tenants).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SspPromoteResponse {
+    /// Views kept after promotion.
+    #[serde(default)]
+    pub views: usize,
+    /// Views whose membership was republished because it differed.
+    #[serde(default)]
+    pub republished: usize,
+    /// Views dropped because another SSP owns them.
+    #[serde(default)]
+    pub dropped: usize,
+}
+
+/// `POST /handover/resume` takes back a retire when the promotion behind it
+/// failed: the SSP returns to serving as if it had never been asked. Empty
+/// body. Answered 200 by an SSP that is not retired, too.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SspResumeRequest {}
 
 /// Sent by an SSP whose post-bootstrap integrity check disagreed with the
 /// hashes handed out at registration, carrying the hashes it actually computed

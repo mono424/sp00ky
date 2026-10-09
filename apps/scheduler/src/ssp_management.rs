@@ -616,6 +616,7 @@ async fn handle_register(
         Json(SspRegistrationResponse {
             snapshot_seq,
             table_hashes,
+            standby: false,
         }),
     ))
 }

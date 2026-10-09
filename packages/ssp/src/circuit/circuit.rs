@@ -1,6 +1,6 @@
 use crate::algebra::{RowKey, ZSet};
 use crate::circuit::graph::Graph;
-use crate::circuit::store::{Change, ChangeSet, Operation, Record, Store};
+use crate::circuit::store::{Change, ChangeSet, Collection, Operation, Record, Store};
 use crate::circuit::view::{OutputFormat, View};
 use crate::operator::{OperatorPlan, QueryPlan};
 use crate::types::{make_key, raw_id, Sp00kyValue};
@@ -546,23 +546,17 @@ impl Circuit {
     }
 
     /// Bulk-load initial data into base collections.
+    ///
+    /// Each record goes through the one row-mutation chokepoint,
+    /// [`Collection::apply`], so the catch-up accumulator, the row store and
+    /// a built membership are maintained exactly as for a live write, and a
+    /// page that overlaps a row already held replaces it instead of folding
+    /// it twice.
     pub fn load(&mut self, records: impl IntoIterator<Item = Record>) {
         for record in records {
-            let coll = self.store.ensure_collection(&record.table);
-            let key = make_key(&record.table, &record.id);
-            let normalized = crate::types::raw_id(&record.id);
-            // Maintain the catch-up XOR accumulator for this fresh insert. `load`
-            // is initial bulk data (fresh collections), so there is no prior
-            // value to XOR out — same chokepoint guarantee as `apply_mutation`.
-            // Digested straight off the value rather than through a throwaway
-            // `serde_json::Value` clone, which on a bootstrap meant one full
-            // extra copy of every row in the database.
-            // One canonicalization, whose digest is then handed straight to
-            // the row store to be written into the record header.
-            let digest = coll.digest_for(normalized, &record.data);
-            ssp_protocol::snapshot_hash::xor_digest(&mut coll.catchup_xor, &digest);
-            coll.rows.insert(normalized, &record.data, &digest);
-            coll.zset.insert(key, 1);
+            self.store
+                .ensure_collection(&record.table)
+                .apply(Operation::Create, &record.id, record.data);
         }
     }
 
@@ -666,11 +660,21 @@ impl Circuit {
         self.graphs.remove(query_id);
         self.views.remove(query_id);
 
-        // Clean up dependency map
-        for (_, query_ids) in self.dependency_map.iter_mut() {
+        // Clean up dependency map; a table no view scans any more drops its
+        // membership z-set (rebuilt from the rows if a view comes back).
+        let mut orphaned: Vec<String> = Vec::new();
+        for (table, query_ids) in self.dependency_map.iter_mut() {
             query_ids.retain(|id| id != query_id);
+            if query_ids.is_empty() {
+                orphaned.push(table.clone());
+            }
         }
         self.dependency_map.retain(|_, ids| !ids.is_empty());
+        for table in orphaned {
+            if let Some(coll) = self.store.collections.get_mut(&table) {
+                coll.release_membership();
+            }
+        }
     }
 
     /// Advance the circuit by one time step.
@@ -818,7 +822,7 @@ impl Circuit {
                 let full_zset = table_name
                     .first()
                     .and_then(|t| self.store.get_collection(t))
-                    .map(|c| &c.zset)
+                    .map(Collection::membership)
                     .unwrap_or(&empty);
                 graph.nodes[node_id]
                     .operator
@@ -1131,8 +1135,9 @@ pub struct TableSize {
     /// the encoded bodies it cannot become reclaimable page cache no matter
     /// where those bodies live. Reported separately so it stays visible.
     pub index_bytes: usize,
-    /// Membership Z-set. Separate from `rows_bytes` because its keys are a
-    /// second `"table:id"` string per row on top of the raw id in `rows`.
+    /// Bucket array of the membership z-set: 0 until a view scans the
+    /// table, since the set is built on first use and released when the
+    /// last view goes.
     pub zset_bytes: usize,
     /// Row bytes referenced by a live slot.
     #[serde(default)]

@@ -1,4 +1,5 @@
 use crate::algebra::{RowKey, Weight, ZSet};
+use crate::circuit::row_codec as codec;
 use crate::circuit::row_table::RowTable;
 use crate::eval::value_ref::ValueRef;
 use crate::types::{make_key, raw_id, Sp00kyValue};
@@ -27,14 +28,24 @@ pub struct Applied {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Collection {
     pub name: String,
-    /// Z-set tracking record membership and weights.
-    pub zset: ZSet,
     /// Actual record data, keyed by raw record ID (without table prefix).
     ///
     /// Flat-encoded behind an index rather than a map of parsed values — see
     /// [`RowTable`]. Serializes to the same shape as the `HashMap` it replaced,
     /// so existing snapshots still load.
     pub rows: RowTable,
+    /// `{table:id -> 1}` for every row: the z-set a Scan node injects as the
+    /// initial delta when a view registers. It is a function of `rows`, so
+    /// it is built on first use and kept in step by every write only while
+    /// it exists; a table no view scans never pays for it, and
+    /// [`Self::release_membership`] drops it when the last view goes. It used
+    /// to be a stored field, which cost one `Arc<str>` per row on every load
+    /// and ~56 MB resident on a 629k-row tenant.
+    ///
+    /// Never serialized; a snapshot written when it was stored still loads,
+    /// its `zset` key ignored.
+    #[serde(skip)]
+    membership: std::sync::OnceLock<ZSet>,
     /// Incremental XOR set-hash of `rows`, maintained in lockstep with every
     /// mutation (see `apply_mutation`) so it can never drift from the actual
     /// rows. The scheduler reconstructs the same hash at the catch-up cut to
@@ -62,31 +73,69 @@ pub struct Collection {
 impl Collection {
     pub fn new(name: String) -> Self {
         let rows = RowTable::with_arena(crate::circuit::arena::new_arena(&name));
-        Self {
-            name,
-            zset: HashMap::new(),
-            rows,
-            catchup_xor: ssp_protocol::snapshot_hash::xor_empty(),
-            scratch: Vec::new(),
-            retained: None,
-        }
+        Self::from_rows(name, rows, ssp_protocol::snapshot_hash::xor_empty())
     }
 
     /// A collection over rows that were loaded already, as a checkpoint
     /// reader has them: `catchup_xor` is the hash those rows add up to (the
-    /// reader checked), and the membership is derived from the rows.
+    /// reader checked). Nothing else is derived until something asks.
     pub fn from_rows(name: String, rows: RowTable, catchup_xor: [u8; 32]) -> Self {
-        let mut zset: ZSet = HashMap::with_capacity(rows.len());
-        for id in rows.keys() {
-            zset.insert(make_key(&name, id), 1);
-        }
         Self {
             name,
-            zset,
             rows,
             catchup_xor,
             scratch: Vec::new(),
             retained: None,
+            membership: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The membership z-set, `{table:id -> 1}` over every row. Built from the
+    /// rows on first use and maintained by every write after that.
+    pub fn membership(&self) -> &ZSet {
+        self.membership.get_or_init(|| {
+            let mut zset: ZSet = HashMap::with_capacity(self.rows.len());
+            // The stored id is already raw, so the key is a plain join: no
+            // `make_key`, whose prefix stripping would mangle an id with a
+            // colon of its own.
+            let mut key = String::with_capacity(self.name.len() + 32);
+            for id in self.rows.keys() {
+                key.clear();
+                key.push_str(&self.name);
+                key.push(':');
+                key.push_str(id);
+                zset.insert(RowKey::from(key.as_str()), 1);
+            }
+            zset
+        })
+    }
+
+    /// Whether `key` (`table:id`) names a row this collection holds.
+    pub fn has_key(&self, key: &str) -> bool {
+        self.rows.contains_key(raw_id(key))
+    }
+
+    /// Whether the membership z-set is currently materialized.
+    pub fn membership_built(&self) -> bool {
+        self.membership.get().is_some()
+    }
+
+    /// Drop the membership z-set; the next [`Self::membership`] rebuilds it.
+    /// For a table no registered view scans any more.
+    pub fn release_membership(&mut self) {
+        self.membership.take();
+    }
+
+    /// Keep a built membership in step with a row that appeared (`+1`) or
+    /// went (`-1`). A no-op while nothing holds the set.
+    fn bump_membership(&mut self, key: &RowKey, weight: Weight) {
+        let Some(zset) = self.membership.get_mut() else {
+            return;
+        };
+        let entry = zset.entry(key.clone()).or_insert(0);
+        *entry += weight;
+        if *entry == 0 {
+            zset.remove(key);
         }
     }
 
@@ -128,18 +177,16 @@ impl Collection {
         self.catchup_xor = acc;
     }
 
-    /// Recompute the incremental XOR accumulator from the current rows. Call
-    /// after a bulk load (`Circuit::load`) or a deserialize, where the per-row
-    /// `apply_mutation` maintenance didn't run.
+    /// Recompute the incremental XOR accumulator from the current rows: after
+    /// a deserialize, where no write maintained it, or to check one that was.
     ///
-    /// Reads each row's stored digest rather than re-canonicalizing it, so a
-    /// re-seed is now a walk of 32-byte header reads.
+    /// Reads each record's stored digest straight out of the arena, so a
+    /// re-seed is one walk of 32-byte header reads with no lookups.
     pub fn reseed_catchup_xor(&mut self) {
         let mut acc = ssp_protocol::snapshot_hash::xor_empty();
-        let ids: Vec<&str> = self.rows.keys().collect();
-        for id in ids {
-            if let Some(digest) = self.rows.digest_of(id) {
-                ssp_protocol::snapshot_hash::xor_digest(&mut acc, &digest);
+        for record in self.rows.records() {
+            if let Some(digest) = codec::record_digest(record) {
+                ssp_protocol::snapshot_hash::xor_digest(&mut acc, digest);
             }
         }
         self.catchup_xor = acc;
@@ -212,7 +259,7 @@ impl Collection {
                 ssp_protocol::snapshot_hash::xor_digest(&mut self.catchup_xor, &d);
             }
             self.rows.remove(normalized);
-            self.bump_zset(&key, -1);
+            self.bump_membership(&key, -1);
             return Applied { key, weight: -1, content_changed: true };
         }
 
@@ -245,17 +292,9 @@ impl Collection {
 
         let weight = if present { 0 } else { 1 };
         if weight != 0 {
-            self.bump_zset(&key, weight);
+            self.bump_membership(&key, weight);
         }
         Applied { key, weight, content_changed: true }
-    }
-
-    fn bump_zset(&mut self, key: &RowKey, weight: Weight) {
-        let entry = self.zset.entry(key.clone()).or_insert(0);
-        *entry += weight;
-        if *entry == 0 {
-            self.zset.remove(key);
-        }
     }
 
     /// Look up a row by its raw ID.
@@ -280,12 +319,11 @@ impl Collection {
         self.rows.index_bytes()
     }
 
-    /// Approximate heap bytes held by `zset`.
-    ///
-    /// Only its bucket array: the keys are shared `Arc<str>` clones, so their
-    /// bytes are charged once rather than once per structure holding them.
+    /// Approximate heap bytes held by the membership z-set: 0 until a view
+    /// scans the table, then its bucket array only (the keys are shared
+    /// `Arc<str>` clones, charged once rather than per holder).
     pub fn zset_bytes(&self) -> usize {
-        crate::size::zset_bytes(&self.zset)
+        self.membership.get().map_or(0, crate::size::zset_bytes)
     }
 
     /// Get the version of a record from its `_00_rv` field.
@@ -602,12 +640,62 @@ mod tests {
         let second = c.apply(Operation::Create, "a", sv(json!({ "title": "y" })));
         assert_eq!(second.weight, 0);
         assert!(second.content_changed);
-        assert_eq!(c.zset.get(&*second.key), Some(&1), "weight must not climb to 2");
+        assert_eq!(c.membership().get(&*second.key), Some(&1), "weight must not climb to 2");
 
         let gone = c.apply(Operation::Delete, "a", Sp00kyValue::Null);
         assert_eq!(gone.weight, -1);
-        assert!(c.zset.is_empty(), "the row must leave the z-set");
+        assert!(c.membership().is_empty(), "the row must leave the z-set");
         assert!(c.rows.is_empty());
+    }
+
+    /// Once built, the membership follows every write; released, it is
+    /// rebuilt from the rows on the next ask, and a table nobody scanned
+    /// never built one.
+    #[test]
+    fn membership_is_built_on_demand_maintained_and_released() {
+        let mut c = coll();
+        c.apply(Operation::Create, "a", sv(json!({ "n": 1 })));
+        c.apply(Operation::Create, "thread:b", sv(json!({ "n": 2 })));
+        assert!(!c.membership_built(), "nothing asked for it yet");
+        assert_eq!(c.zset_bytes(), 0);
+
+        let mut keys: Vec<String> = c.membership().keys().map(|k| k.to_string()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["thread:a", "thread:b"]);
+        assert!(c.membership_built());
+        assert!(c.zset_bytes() > 0);
+
+        // Maintained through a create, a content-only update and a delete.
+        c.apply(Operation::Create, "c", sv(json!({ "n": 3 })));
+        c.apply(Operation::Update, "a", sv(json!({ "n": 10 })));
+        c.apply(Operation::Delete, "b", Sp00kyValue::Null);
+        let mut keys: Vec<String> = c.membership().keys().map(|k| k.to_string()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["thread:a", "thread:c"]);
+        assert!(c.membership().values().all(|w| *w == 1));
+        assert!(c.has_key("thread:a") && c.has_key("c") && !c.has_key("thread:b"));
+
+        c.release_membership();
+        assert!(!c.membership_built());
+        assert_eq!(c.membership().len(), 2, "rebuilt from the rows");
+    }
+
+    /// A raw id that carries a colon of its own keys the same way whether the
+    /// membership was maintained or rebuilt.
+    #[test]
+    fn membership_keys_agree_for_ids_with_colons() {
+        let mut c = coll();
+        c.apply(Operation::Create, "thread:a:b", sv(json!({ "n": 1 })));
+        let maintained = c.membership().keys().next().unwrap().to_string();
+        let mut rebuilt = coll();
+        rebuilt.apply(Operation::Create, "thread:a:b", sv(json!({ "n": 1 })));
+        let _ = rebuilt.membership();
+        rebuilt.apply(Operation::Create, "x", sv(json!({ "n": 1 })));
+        rebuilt.release_membership();
+        let mut keys: Vec<String> = rebuilt.membership().keys().map(|k| k.to_string()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![maintained.clone(), "thread:x".to_string()]);
+        assert_eq!(maintained, "thread:a:b");
     }
 
     #[test]
@@ -616,7 +704,7 @@ mod tests {
         let applied = c.apply(Operation::Delete, "ghost", Sp00kyValue::Null);
         assert_eq!(applied.weight, 0);
         assert!(!applied.content_changed);
-        assert!(c.zset.is_empty(), "no -1 entry for a row that never existed");
+        assert!(c.membership().is_empty(), "no -1 entry for a row that never existed");
     }
 
     #[test]
@@ -624,7 +712,7 @@ mod tests {
         let mut c = coll();
         let applied = c.apply(Operation::Update, "a", sv(json!({ "title": "x" })));
         assert_eq!(applied.weight, 1, "the row appeared, whatever the verb said");
-        assert_eq!(c.zset.get(&*applied.key), Some(&1));
+        assert_eq!(c.membership().get(&*applied.key), Some(&1));
         assert!(c.rows.contains_key("a"));
     }
 
@@ -709,7 +797,7 @@ mod tests {
         let after = c.catchup_xor;
         c.reseed_catchup_xor();
         assert_eq!(c.catchup_xor, after);
-        assert!(c.zset.len() == 20, "membership is untouched by compaction");
+        assert!(c.membership().len() == 20, "membership is untouched by compaction");
     }
 
     #[test]

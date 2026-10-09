@@ -257,10 +257,11 @@ pub fn map_image(
 /// the arena is file-backed, adopted into the heap otherwise.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_file(path: &std::path::Path) -> Result<(Collection, LoadStats), CheckpointError> {
-    use crate::circuit::arena::{configured_backing, ArenaBacking};
-    match configured_backing() {
+    match crate::circuit::arena::configured_backing() {
         #[cfg(feature = "mmap-store")]
-        ArenaBacking::Files { dir, segment_bytes } => map_image(path, dir, *segment_bytes),
+        crate::circuit::arena::ArenaBacking::Files { dir, segment_bytes } => {
+            map_image(path, dir, *segment_bytes)
+        }
         _ => read_image(std::fs::read(path)?),
     }
 }
@@ -429,10 +430,11 @@ mod tests {
             assert_eq!(back.rows.digest_of(id), coll.rows.digest_of(id), "{id}");
             assert_eq!(back.rows.rv_of(id), coll.rows.rv_of(id), "{id}");
         }
-        let mut keys: Vec<_> = back.zset.keys().map(|k| k.to_string()).collect();
+        assert!(!back.membership_built(), "a loaded table builds no z-set until a view scans it");
+        let mut keys: Vec<_> = back.membership().keys().map(|k| k.to_string()).collect();
         keys.sort();
         assert_eq!(keys, vec!["game:a", "game:b", "game:⟨odd id⟩"]);
-        assert!(back.zset.values().all(|w| *w == 1));
+        assert!(back.membership().values().all(|w| *w == 1));
     }
 
     #[test]

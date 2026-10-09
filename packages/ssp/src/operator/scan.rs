@@ -26,7 +26,7 @@ impl super::Operator for Scan {
     fn snapshot(&self, _inputs: &[&ZSet], store: &Store, _ctx: Option<&Sp00kyValue>) -> ZSet {
         store
             .get_collection(&self.table)
-            .map(|c| c.zset.clone())
+            .map(|c| c.membership().clone())
             .unwrap_or_default()
     }
 
@@ -62,7 +62,7 @@ impl super::Operator for Scan {
     ) -> bool {
         store
             .get_collection(&self.table)
-            .map(|c| c.zset.contains_key(key))
+            .map(|c| c.has_key(key))
             .unwrap_or(false)
     }
 }

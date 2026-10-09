@@ -11,9 +11,9 @@
 //! volume's throughput on top.
 
 use ssp::circuit::checkpoint::{read_image, write_collection, FORMAT, MAGIC};
-use ssp::circuit::row_codec::{self as codec, RECORD_FORMAT};
+use ssp::circuit::row_codec::RECORD_FORMAT;
 use ssp::circuit::store::{Collection, Operation};
-use ssp::types::{make_key, Sp00kyValue};
+use ssp::types::Sp00kyValue;
 use std::io::{self, BufReader, BufWriter, Read};
 use std::time::Instant;
 
@@ -98,8 +98,8 @@ fn legacy_read<R: Read>(input: R) -> io::Result<Collection> {
     let mut record = Vec::new();
     for _ in 0..rows {
         chunk_into(&mut r, &mut record)?;
-        let id = codec::record_id(&record).unwrap();
-        coll.zset.insert(make_key(&name, id), 1);
+        // The stored z-set this reader also built per row is gone from the
+        // collection; the baseline keeps the copies and the reseed walk.
         coll.rows.insert_encoded(&record);
     }
     let computed = r.hasher.finalize();

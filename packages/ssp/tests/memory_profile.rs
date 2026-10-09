@@ -256,9 +256,16 @@ fn size_report_attributes_every_component() {
     assert_eq!(table.table, "thread");
     assert_eq!(table.rows, 64);
     assert!(table.rows_bytes > 0, "row bodies must be counted");
-    assert!(table.zset_bytes > 0, "the membership zset must be counted");
+    assert_eq!(table.zset_bytes, 0, "no view scans the table, so no membership z-set exists yet");
     assert_eq!(table.total_bytes(), table.rows_bytes + table.zset_bytes);
     assert_eq!(report.store_bytes, table.total_bytes());
+
+    // Once something asks for the membership, its bucket array is charged.
+    let _ = circuit.store.get_collection("thread").unwrap().membership();
+    let report = circuit.size_report();
+    let table = &report.tables[0];
+    assert!(table.zset_bytes > 0, "a built membership z-set must be counted");
+    assert_eq!(table.total_bytes(), table.rows_bytes + table.zset_bytes);
     assert_eq!(report.total_bytes(), report.store_bytes + report.query_bytes);
     assert!(table.bytes_per_row() > 0.0);
 }

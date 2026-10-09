@@ -374,14 +374,24 @@ pub async fn rebuild_from_db(
         }
     }
 
-    // Seed catch-up XOR accumulators from the bulk-loaded rows (bypassed by
-    // `Circuit::load`), before any replay/ingest.
-    processor.write().await.reseed_catchup_hashes();
+    // `Circuit::load` folds every row into the catch-up accumulators as it
+    // goes, so nothing is re-seeded here. Debug builds prove it.
+    #[cfg(debug_assertions)]
+    {
+        let mut circuit = processor.write().await;
+        let maintained = circuit.compute_catchup_hashes();
+        circuit.reseed_catchup_hashes();
+        assert_eq!(
+            maintained,
+            circuit.compute_catchup_hashes(),
+            "catch-up accumulators drifted from the rows during the rebuild"
+        );
+    }
     Ok(())
 }
 
 /// Incremental catch-up after a snapshot restore: for each table load rows
-/// whose `_00_rv` is newer than the snapshot's `max_row_version`, then reseed.
+/// whose `_00_rv` is newer than the snapshot's `max_row_version`.
 /// A table without a tracked `max_row_version` catches up from `-1` (every row
 /// carrying an `_00_rv`). Tables/rows without `_00_rv` are not caught here —
 /// the staleness gate + the 503-during-bootstrap window bound that risk, and a
@@ -445,7 +455,8 @@ pub async fn catch_up_from_db(
         info!(table = %table, caught_up = n, since_rv = since, "Catch-up stepped rows");
     }
 
-    processor.write().await.reseed_catchup_hashes();
+    // The restored store re-seeded its accumulators and `step` maintains
+    // them, so nothing is re-seeded here.
     Ok(())
 }
 

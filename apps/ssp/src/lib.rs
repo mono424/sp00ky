@@ -1648,15 +1648,10 @@ impl ClusterBoot {
             {
                 Ok(bootstrap_warnings_now) => {
                     *node.bootstrap_warnings.write().await = bootstrap_warnings_now;
-                    // Seed the catch-up XOR accumulators from the freshly
-                    // bulk-loaded rows (`Circuit::load` bypasses the per-row
-                    // `apply_mutation` maintenance). Must run before the SSP
-                    // goes Ready, i.e. before any replay events are ingested,
-                    // so the accumulator starts from the snapshot content.
-                    {
-                        let mut guard = processor.write().await;
-                        guard.reseed_catchup_hashes();
-                    }
+                    // The catch-up accumulators are already seeded: every
+                    // path that put rows in the circuit (checkpoint load,
+                    // repair, `Circuit::load`) folds each row as it goes, and
+                    // the bootstrap proves it in debug builds.
                     // Integrity check: only when the scheduler handed us
                     // expected hashes (cluster mode). Mismatch ⇒ wipe
                     // the circuit and retry once. Second failure exits
@@ -2352,6 +2347,9 @@ async fn self_bootstrap_with_metadata(
     };
     info!(count = views.len(), "Found persisted views in _00_query");
 
+    let registration_started = std::time::Instant::now();
+    let (mut registered, mut failed_views) = (0usize, 0usize);
+    let mut snapshot_ms = 0f64;
     for view_row in views {
         let view_id = match view_row.get("id") {
             Some(Value::String(s)) => s.clone(),
@@ -2423,15 +2421,24 @@ async fn self_bootstrap_with_metadata(
         match prep {
             Ok(data) => {
                 let mut circuit = processor.write().await;
-                circuit.add_query_with_auth(
+                let (_, timings) = circuit.add_query_with_auth_timed(
                     data.plan,
                     data.safe_params,
                     Some(OutputFormat::Streaming),
                     auth_id.clone(),
                 );
-                info!(view_id = %raw_id, auth_id = %auth_id, "Re-registered view");
+                registered += 1;
+                snapshot_ms += timings.snapshot_ms;
+                debug!(
+                    view_id = %raw_id,
+                    auth_id = %auth_id,
+                    plan_ms = timings.plan_ms,
+                    snapshot_ms = timings.snapshot_ms,
+                    "Re-registered view"
+                );
             }
             Err(e) => {
+                failed_views += 1;
                 warn!(
                     target: "ssp::policy",
                     view_id = %raw_id,
@@ -2440,6 +2447,30 @@ async fn self_bootstrap_with_metadata(
                 );
             }
         }
+    }
+    info!(
+        views = registered,
+        failed = failed_views,
+        ms = registration_started.elapsed().as_millis() as u64,
+        snapshot_ms = snapshot_ms as u64,
+        "Re-registered views"
+    );
+
+    // Every path above keeps the catch-up accumulators in step with the rows
+    // (a checkpoint load re-seeds and verifies, a repair goes through
+    // `Collection::apply`, a page through `Circuit::load`). Debug builds prove
+    // it on every bootstrap, so a path that stops doing so fails a test
+    // instead of the scheduler's verification in production.
+    #[cfg(debug_assertions)]
+    {
+        let mut circuit = processor.write().await;
+        let maintained = circuit.compute_catchup_hashes();
+        circuit.reseed_catchup_hashes();
+        assert_eq!(
+            maintained,
+            circuit.compute_catchup_hashes(),
+            "catch-up accumulators drifted from the rows during bootstrap"
+        );
     }
 
     Ok(warnings)

@@ -811,16 +811,18 @@ impl Circuit {
             let arity = graph.nodes[node_id].operator.arity();
 
             let output = if arity == 0 {
-                // Scan node: inject the full collection as initial delta
+                // Scan node: inject the full collection as the initial delta,
+                // borrowed rather than cloned (a big table is 200k keys).
                 let table_name = graph.nodes[node_id].operator.collections();
+                let empty = ZSet::new();
                 let full_zset = table_name
                     .first()
                     .and_then(|t| self.store.get_collection(t))
-                    .map(|c| c.zset.clone())
-                    .unwrap_or_default();
+                    .map(|c| &c.zset)
+                    .unwrap_or(&empty);
                 graph.nodes[node_id]
                     .operator
-                    .step(&[&full_zset], &self.store, view.params.as_ref())
+                    .step(&[full_zset], &self.store, view.params.as_ref())
             } else {
                 let inputs: Vec<&ZSet> = input_ids
                     .iter()
@@ -1358,7 +1360,11 @@ impl Circuit {
     /// [`Self::save_store_only`] (or a full [`Self::save`]; the views are
     /// ignored). The caller installs it with [`Self::replace_store`].
     pub fn restore_store(bytes: &[u8]) -> serde_json::Result<Store> {
-        let state: CircuitState = serde_json::from_slice(bytes)?;
+        let mut state: CircuitState = serde_json::from_slice(bytes)?;
+        // The accumulators are `#[serde(skip)]`: seed them from the rows.
+        for coll in state.store.collections.values_mut() {
+            coll.reseed_catchup_xor();
+        }
         Ok(state.store)
     }
 
@@ -1671,6 +1677,9 @@ impl Circuit {
             }
         }
 
+        // The accumulators are `#[serde(skip)]`: seed them from the restored
+        // rows here, so no caller has to remember to.
+        circuit.reseed_catchup_hashes();
         Ok(circuit)
     }
 
@@ -2391,7 +2400,7 @@ mod tests {
         );
 
         let blob = circuit.save().unwrap();
-        let mut restored = Circuit::restore(&blob).unwrap();
+        let restored = Circuit::restore(&blob).unwrap();
 
         assert_eq!(
             restored.compute_table_hashes(),
@@ -2401,21 +2410,13 @@ mod tests {
         assert_eq!(restored.max_row_versions(), circuit.max_row_versions());
         assert_eq!(restored.view_count(), circuit.view_count());
 
-        // `catchup_xor` is `#[serde(skip)]`, so a freshly restored circuit
-        // carries a zeroed accumulator until it is re-seeded — which is
-        // exactly what `Runtime::bootstrap` does after a restore. Assert the
-        // documented sequence, since a restore that silently kept a zero
-        // accumulator would fail the scheduler's catch-up verification.
-        assert_ne!(
-            restored.compute_catchup_hashes(),
-            circuit.compute_catchup_hashes(),
-            "restore alone must not resurrect the skipped accumulator"
-        );
-        restored.reseed_catchup_hashes();
+        // `catchup_xor` is `#[serde(skip)]`; `restore` re-seeds it from the
+        // rows itself, so no caller has to remember to. A restore that kept
+        // a zero accumulator would fail the scheduler's catch-up verification.
         assert_eq!(
             restored.compute_catchup_hashes(),
             circuit.compute_catchup_hashes(),
-            "re-seeding after restore must reproduce the accumulator"
+            "restore must re-seed the skipped accumulator"
         );
 
         // A second round trip must be a fixed point *in content*. Not in

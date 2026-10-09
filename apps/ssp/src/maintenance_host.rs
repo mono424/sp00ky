@@ -91,10 +91,6 @@ impl MaintenanceHost for SspHost {
         .await
             .context("Failed to re-bootstrap circuit from restored database")?;
         {
-            let mut guard = self.processor.write().await;
-            guard.reseed_catchup_hashes();
-        }
-        {
             let guard = self.processor.read().await;
             self.platform
                 .telemetry

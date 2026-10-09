@@ -49,10 +49,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::replica::Replica;
 use maintenance::changefeed::TailerStats;
+
+/// A check at least this slow logs its upstream and replica timings at info.
+const SLOW_CHECK_LOG: Duration = Duration::from_secs(10);
 
 /// Tunables, read from the environment by [`DriftConfig::from_env`].
 #[derive(Debug, Clone)]
@@ -288,7 +291,9 @@ pub async fn check_once(
     replica: &Arc<RwLock<Replica>>,
     busy: &dyn BusyTables,
 ) -> Result<DriftReport> {
+    let started = Instant::now();
     let upstream_counts = upstream.upstream_counts().await?;
+    let upstream_ms = started.elapsed().as_millis() as u64;
     // Sampled AFTER the upstream counts, not before them: those are one serial
     // `count()` per table, seconds on a large database, and a row written
     // upstream while they run sits in the event buffer, not the replica.
@@ -298,18 +303,27 @@ pub async fn check_once(
     // just been deleted upstream.
     let mut skip = busy.busy_tables().await;
     let mut tables = BTreeMap::new();
-    {
-        let rep = replica.read().await;
-        for (table, upstream_count) in upstream_counts {
-            let replica_count = rep.count_table(&table).await.unwrap_or(0) as u64;
-            tables.insert(
-                table,
-                TableCounts {
-                    upstream: upstream_count,
-                    replica: replica_count,
-                },
-            );
-        }
+    let replica_started = Instant::now();
+    for (table, upstream_count) in upstream_counts {
+        // A read guard per table, not one across the loop. Each count is a
+        // full scan, and a writer queued behind the whole loop waited for all
+        // of them: on whitepawn (2026-10-09) an SSP registration's pre-drain,
+        // holding `drain_lock`, waited 44 s for the replica, and every retry of
+        // that registration queued behind it.
+        let replica_count = replica.read().await.count_table(&table).await.unwrap_or(0) as u64;
+        tables.insert(
+            table,
+            TableCounts {
+                upstream: upstream_count,
+                replica: replica_count,
+            },
+        );
+    }
+    let replica_ms = replica_started.elapsed().as_millis() as u64;
+    if started.elapsed() >= SLOW_CHECK_LOG {
+        info!(upstream_ms, replica_ms, tables = tables.len(), "Replica drift check timings");
+    } else {
+        debug!(upstream_ms, replica_ms, tables = tables.len(), "Replica drift check timings");
     }
     // And once more: the replica counts take time as well.
     skip.extend(busy.busy_tables().await);

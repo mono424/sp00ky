@@ -271,6 +271,9 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let timeout = Duration::from_secs(cfg.timeout_secs);
         let mut wedged: u32 = 0;
+        // Separate from `wedged`, which a restart request resets: the
+        // incident stays open until a new WebSocket actually connects again.
+        let mut incident_open = false;
         let mut last_restart: Option<Instant> = None;
         loop {
             interval.tick().await;
@@ -286,8 +289,8 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
                         STATS.last_upgrade_ms.store(ms, Ordering::Relaxed);
                     }
                     STATS.last_ok_epoch_ms.store(now_epoch_ms(), Ordering::Relaxed);
-                    if wedged > 0 {
-                        info!(cycles = wedged, "SurrealDB accepts WebSockets again");
+                    if incident_open {
+                        info!("SurrealDB accepts WebSockets again");
                         crate::admin::incidents::emit(
                             "surrealdb",
                             "ws_accept_wedge",
@@ -295,6 +298,7 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
                             "SurrealDB accepts new WebSocket connections again",
                             None,
                         );
+                        incident_open = false;
                     }
                     wedged = 0;
                     debug!(?probe, "SurrealDB WebSocket probe ok");
@@ -313,7 +317,8 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
                         timeout_secs = cfg.timeout_secs,
                         "SurrealDB answers HTTP but a new WebSocket got no upgrade response"
                     );
-                    if wedged == 1 {
+                    if !incident_open {
+                        incident_open = true;
                         crate::admin::incidents::emit(
                             "surrealdb",
                             "ws_accept_wedge",

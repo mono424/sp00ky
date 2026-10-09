@@ -249,19 +249,29 @@ pub struct SurrealUpstream {
     pub db: Arc<maintenance::db::ReconnectingDb>,
 }
 
+impl SurrealUpstream {
+    /// Hand an error to the handle, which reconnects on a dead session. With
+    /// its whole chain: the context on top ("count() failed for ...") is all
+    /// `to_string` shows, and the "Session not found" under it is what the
+    /// handle looks for.
+    fn note<T>(&self, result: &Result<T>) {
+        if let Err(e) = result {
+            self.db.note_error(&format!("{e:#}"));
+        }
+    }
+}
+
 #[async_trait]
 impl UpstreamCounts for SurrealUpstream {
     async fn sync_tables(&self) -> Result<Vec<String>> {
-        Replica::discover_sync_tables(&*self.db.handle())
-            .await
-            .context("drift: discover sync tables upstream")
+        let result = Replica::discover_sync_tables(&*self.db.handle()).await;
+        self.note(&result);
+        result.context("drift: discover sync tables upstream")
     }
 
     async fn count(&self, table: &str) -> Result<u64> {
         let result = count_upstream(&*self.db.handle(), table).await;
-        if let Err(e) = &result {
-            self.db.note_error(&e.to_string());
-        }
+        self.note(&result);
         result
     }
 

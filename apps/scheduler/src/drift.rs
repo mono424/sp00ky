@@ -492,6 +492,14 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig) -
             // Its counts move with every page the backfill sends.
             continue;
         }
+        if counts.upstream.is_none() {
+            // Its count could not be read, so it was not compared. Like a
+            // table that sat the pass out, it keeps its streak, its verify
+            // mark and its place in `new_tables`: read as clean, a new table
+            // lost its uncapped backfill, and the capped repair it got instead
+            // escalated to a re-clone of everything.
+            continue;
+        }
         let verifying = state.verify_tables.remove(table);
         if let Some(stuck) = state.stuck.get(table) {
             if *stuck == *counts {
@@ -524,11 +532,12 @@ pub fn decide(report: &DriftReport, state: &mut DriftState, cfg: &DriftConfig) -
         }
     }
     // A table missing from the report was not compared this pass (its events
-    // are still buffered), so its streak stands: only a table that WAS
-    // compared and came back clean loses it.
+    // are still buffered), nor was one whose upstream count failed, so its
+    // streak stands: only a table that WAS compared and came back clean
+    // loses it.
     state
         .streaks
-        .retain(|t, _| report.tables.get(t).map_or(true, |c| c.mismatched()));
+        .retain(|t, _| report.tables.get(t).map_or(true, |c| c.upstream.is_none() || c.mismatched()));
     state.last_report = Some(report.clone());
 
     if mismatched.is_empty() {
@@ -1609,6 +1618,21 @@ mod tests {
         let mut st = DriftState::default();
         let a = decide(&report(&[("game", None, 0)]), &mut st, &cfg());
         assert_eq!(a, Action::Clean);
+    }
+
+    #[test]
+    fn an_unreadable_count_leaves_the_bookkeeping_alone() {
+        let mut st = DriftState::default();
+        st.new_tables.insert("puzzle".into());
+        st.verify_tables.insert("game".into());
+        st.streaks.insert("user".into(), 1);
+        let unread = report(&[("puzzle", None, 0), ("game", None, 3), ("user", None, 2)]);
+        assert_eq!(decide(&unread, &mut st, &cfg()), Action::Clean);
+        assert!(st.new_tables.contains("puzzle"), "still backfilled once its count reads, never re-cloned for");
+        assert!(st.verify_tables.contains("game"), "still verified by the next pass that compares it");
+        assert_eq!(st.streaks["user"], 1, "the streak stands");
+        // The next readable sighting is the second.
+        assert_eq!(decide(&report(&[("user", Some(3), 2)]), &mut st, &cfg()), Action::Repair { tables: vec!["user".into()] });
     }
 
     #[test]

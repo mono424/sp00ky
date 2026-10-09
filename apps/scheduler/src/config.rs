@@ -101,7 +101,11 @@ impl Default for SchedulerConfig {
             // SSP exit → re-register → re-freeze, forever. Override with
             // SPKY_BOOTSTRAP_TIMEOUT_SECS.
             bootstrap_timeout_secs: 300,
-            ssp_poll_interval_ms: 3000,
+            // How often a bootstrapping SSP's /health is polled for `ready`.
+            // The poll is the only way the scheduler learns the SSP is done,
+            // so this interval is paid in full on every warm restart: at 3 s
+            // it was up to 3 s of a 15 s restart spent waiting for a poll.
+            ssp_poll_interval_ms: 500,
             wal_path: PathBuf::from("./data/event_wal.log"),
             health_check_interval_secs: 15,
             feature_flag_sweep_interval_secs: 30,

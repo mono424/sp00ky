@@ -776,7 +776,7 @@ pub fn format_incantation_id(id: &str) -> String {
 }
 
 /// The incantation KEY (`<key>` of `_00_query:<key>`) — what gets bound.
-fn incantation_key(id: &str) -> String {
+pub(crate) fn incantation_key(id: &str) -> String {
     id.rsplit(':').next().unwrap_or(id).to_string()
 }
 

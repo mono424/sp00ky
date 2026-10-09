@@ -30,12 +30,24 @@ const SECRET: &str = "unit-secret";
 
 // --- Mock ports --------------------------------------------------------------
 
-struct MemDb(Arc<Surreal<MemEngine>>);
+struct MemDb {
+    db: Arc<Surreal<MemEngine>>,
+    /// Every `query` call, so a test can assert how many round trips a path
+    /// costs.
+    queries: Arc<AtomicUsize>,
+}
+
+impl MemDb {
+    fn new(db: Arc<Surreal<MemEngine>>) -> Self {
+        Self { db, queries: Arc::new(AtomicUsize::new(0)) }
+    }
+}
 
 #[async_trait::async_trait]
 impl Db for MemDb {
     async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
-        let mut q = self.0.query(surql);
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        let mut q = self.db.query(surql);
         for (name, value) in binds {
             q = q.bind(((*name).to_string(), value.clone()));
         }
@@ -132,6 +144,8 @@ impl BackendHealth for MockBackendHealth {
 struct Harness {
     node: Arc<SspNode>,
     raw_db: Arc<Surreal<MemEngine>>,
+    /// `Db::query` calls made through the node's port.
+    db_queries: Arc<AtomicUsize>,
     http_calls: Arc<Mutex<Vec<String>>>,
     scheduled: Arc<Mutex<Vec<TimerKind>>>,
     telemetry_gauge: Arc<Mutex<i64>>,
@@ -206,9 +220,11 @@ async fn build(opts: HarnessOpts) -> Harness {
     let http_calls = Arc::new(Mutex::new(Vec::new()));
     let scheduled = Arc::new(Mutex::new(Vec::new()));
     let telemetry_gauge = Arc::new(Mutex::new(0));
+    let mem_db = MemDb::new(Arc::clone(&raw));
+    let db_queries = Arc::clone(&mem_db.queries);
 
     let platform = Platform {
-        db: Arc::new(MemDb(Arc::clone(&raw))),
+        db: Arc::new(mem_db),
         http: Arc::new(MockHttp { calls: Arc::clone(&http_calls), status: Arc::new(AtomicUsize::new(0)) }),
         scheduler: Arc::new(MockScheduler { scheduled: Arc::clone(&scheduled) }),
         spawner: Arc::new(MockSpawner),
@@ -287,7 +303,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         schedule_engine: opts.schedules.then(|| {
             ssp_node::schedules::build_engine(
                 true,
-                Arc::new(MemDb(Arc::clone(&raw))),
+                Arc::new(MemDb::new(Arc::clone(&raw))),
                 job_control.clone(),
             )
             .expect("standalone builds an engine")
@@ -315,6 +331,7 @@ async fn build(opts: HarnessOpts) -> Harness {
     Harness {
         node: Arc::new(node),
         raw_db: raw,
+        db_queries,
         http_calls,
         scheduled,
         telemetry_gauge,
@@ -1129,7 +1146,7 @@ async fn bootstrap_restore_evict_mutate_catches_up_to_full_rebuild() {
 
     // 6. Oracle: a cold full rebuild over the same mutated DB.
     let fresh = Arc::new(RwLock::new(Circuit::new()));
-    ssp_node::bootstrap::rebuild_from_db(&MemDb(Arc::clone(&h.raw_db)), &fresh, 200)
+    ssp_node::bootstrap::rebuild_from_db(&MemDb::new(Arc::clone(&h.raw_db)), &fresh, 200)
         .await
         .unwrap();
     let hashes_fresh = fresh.read().await.compute_table_hashes();
@@ -1451,7 +1468,7 @@ async fn a_due_schedule_spawns_a_job_that_ingest_picks_up() {
 /// second one would only lose the claim CAS and waste the work.
 #[tokio::test]
 async fn cluster_mode_builds_no_schedule_engine() {
-    let db: Arc<dyn Db> = Arc::new(MemDb(Arc::new({
+    let db: Arc<dyn Db> = Arc::new(MemDb::new(Arc::new({
         let db = Surreal::new::<Mem>(()).await.unwrap();
         db.use_ns("test").use_db("test").await.unwrap();
         db
@@ -1584,7 +1601,7 @@ async fn boot_re_registration_rebuilds_onto_one_shared_graph() {
     // Cold rebuild from the DB rows those registrations left behind.
     let fresh = Arc::new(RwLock::new(Circuit::new()));
     fresh.write().await.set_merge_views(true);
-    ssp_node::bootstrap::rebuild_from_db(&MemDb(Arc::clone(&h.raw_db)), &fresh, 200)
+    ssp_node::bootstrap::rebuild_from_db(&MemDb::new(Arc::clone(&h.raw_db)), &fresh, 200)
         .await
         .unwrap();
 
@@ -1605,7 +1622,7 @@ async fn boot_re_registration_does_not_merge_when_the_flag_is_off() {
     }
 
     let fresh = Arc::new(RwLock::new(Circuit::new()));
-    ssp_node::bootstrap::rebuild_from_db(&MemDb(Arc::clone(&h.raw_db)), &fresh, 200)
+    ssp_node::bootstrap::rebuild_from_db(&MemDb::new(Arc::clone(&h.raw_db)), &fresh, 200)
         .await
         .unwrap();
 
@@ -2196,6 +2213,76 @@ async fn reload_repairs_versions_deleted_memberships_and_shared_empty_views() {
     }
 }
 
+#[test]
+fn view_metadata_batch_binds_one_pair_per_delta() {
+    let delta = |id: &str, rows: usize| ssp::circuit::ViewDelta {
+        query_id: id.to_string(),
+        additions: vec![],
+        removals: vec![],
+        updates: vec![],
+        row_count: rows,
+        result_hash: String::new(),
+        subquery_items: vec![],
+        auth_id: String::new(),
+        initial: true,
+    };
+    let (sql, binds) = ssp_node::node::view_metadata_batch(&[delta("_00_query:abc", 3), delta("def", 0)]);
+    assert_eq!(
+        sql,
+        "UPDATE type::record('_00_query', $q0) SET rowCount = $c0, state = 'materializing';\n\
+         UPDATE type::record('_00_query', $q1) SET rowCount = $c1, state = 'materializing';\n"
+    );
+    assert_eq!(
+        binds,
+        vec![
+            ("q0".to_string(), json!("abc")),
+            ("c0".to_string(), json!(3)),
+            ("q1".to_string(), json!("def")),
+            ("c1".to_string(), json!(0)),
+        ]
+    );
+    assert_eq!(ssp_node::node::view_metadata_batch(&[]), (String::new(), vec![]));
+}
+
+/// Going Ready republishes every restored view as one batch: a metadata
+/// query for all of them and one edge publish, not two round trips and a
+/// commit per view (33 views took 3.5 s on whitepawn).
+#[tokio::test]
+async fn republishing_restored_views_is_one_batch() {
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db.query("DEFINE TABLE thread SCHEMALESS PERMISSIONS FULL; \
+        CREATE thread:1 SET title = 'a'; CREATE thread:2 SET title = 'b'; CREATE thread:3 SET title = 'c';")
+        .await.unwrap().check().unwrap();
+    for i in 0..12 {
+        let id = format!("v{i}");
+        h.raw_db.query("CREATE type::record('_00_query', $id) SET surql = 'SELECT * FROM thread', \
+            clientId = 'c', auth_id = '', params = {}, ttl = 30m, lastActiveAt = time::now(), rowCount = 0;")
+            .bind(("id", id.clone())).await.unwrap().check().unwrap();
+        // Stale edges from a previous life: a full publish replaces them.
+        h.raw_db.query(format!("RELATE _00_query:{id}->_00_list_ref->thread:1 SET version = 1; \
+            RELATE _00_query:{id}->_00_list_ref->thread:deleted SET version = 1;"))
+            .await.unwrap().check().unwrap();
+    }
+    // Views come back from `_00_query` the way a boot brings them.
+    h.node.reload().await.unwrap();
+    publication_drained(&h).await;
+
+    h.db_queries.store(0, Ordering::SeqCst);
+    h.node.republish_restored_views().await.unwrap();
+    publication_drained(&h).await;
+    let queries = h.db_queries.load(Ordering::SeqCst);
+    assert!(
+        (1..=3).contains(&queries),
+        "republishing 12 views took {queries} queries; expected one metadata query and one edge transaction"
+    );
+    for i in 0..12 {
+        let id = format!("v{i}");
+        assert_eq!(edge_count_of(&h, &id).await, 3, "{id}");
+        assert_eq!(row_count_of(&h, &id).await, 3, "{id}");
+        assert_eq!(state_of(&h, &id).await, "ready", "{id}");
+    }
+}
+
 #[tokio::test]
 async fn ledger_snapshot_recovery_sees_low_version_updates_and_deletions() {
     let store = MemStore::default();
@@ -2214,7 +2301,7 @@ async fn ledger_snapshot_recovery_sees_low_version_updates_and_deletions() {
     runtime.bootstrap().await;
     assert_eq!(*h.node.status.read().await, SspStatus::Ready);
     let fresh = Arc::new(RwLock::new(Circuit::new()));
-    ssp_node::bootstrap::rebuild_from_db(&MemDb(Arc::clone(&h.raw_db)), &fresh, 200).await.unwrap();
+    ssp_node::bootstrap::rebuild_from_db(&MemDb::new(Arc::clone(&h.raw_db)), &fresh, 200).await.unwrap();
     assert_eq!(h.node.processor.read().await.compute_table_hashes(),
         fresh.read().await.compute_table_hashes());
 }

@@ -1818,12 +1818,17 @@ impl ClusterBoot {
                         "Bootstrap complete"
                     );
                     drop(guard);
+                    let republish_started = std::time::Instant::now();
                     if let Err(e) = node.republish_restored_views().await {
                         error!(error = %e, "Bootstrap membership repair failed");
                         *status.write().await = SspStatus::Failed;
                         break;
                     }
                     *status.write().await = SspStatus::Ready;
+                    info!(
+                        republish_ms = republish_started.elapsed().as_millis() as u64,
+                        "SSP ready"
+                    );
                     // Persist what was just verified, so a restart from here on is
                     // warm. Not right away: the scheduler replays the events it
                     // buffered and verifies the catch-up as soon as we report

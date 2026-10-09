@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use ssp::circuit::Circuit;
+use ssp::circuit::{Circuit, ViewDelta};
 
 use crate::api::{ApiRequest, ApiResponse, RouteId};
 use crate::jobs::{
@@ -169,6 +169,27 @@ fn ok_json(json: Value) -> ApiResponse {
 
 fn err_json(status: u16, code: &str, message: impl Into<String>) -> ApiResponse {
     ApiResponse::json(status, json!({ "code": code, "message": message.into() }))
+}
+
+/// `_00_query` rows per metadata query in [`SspNode::republish_restored_views`].
+pub const VIEW_METADATA_BATCH: usize = 100;
+
+/// The `_00_query` metadata statements of a restored-view publish, one per
+/// delta, as a single multi-statement query with its bindings. Pure.
+///
+/// Each view's row goes to `materializing` with its row count; the edge
+/// publish that follows ends every full publish with `state = 'ready'`.
+pub fn view_metadata_batch(deltas: &[ViewDelta]) -> (String, Vec<(String, Value)>) {
+    let mut sql = String::with_capacity(deltas.len() * 96);
+    let mut binds = Vec::with_capacity(deltas.len() * 2);
+    for (i, delta) in deltas.iter().enumerate() {
+        sql.push_str(&format!(
+            "UPDATE type::record('_00_query', $q{i}) SET rowCount = $c{i}, state = 'materializing';\n"
+        ));
+        binds.push((format!("q{i}"), json!(crate::edges::incantation_key(&delta.query_id))));
+        binds.push((format!("c{i}"), json!(delta.row_count)));
+    }
+    (sql, binds)
 }
 
 impl SspNode {
@@ -376,23 +397,47 @@ impl SspNode {
             .await;
     }
 
+    /// Publish every restored view's whole membership again, as one batch.
+    ///
+    /// The views came back from `_00_query` and were primed from the rows;
+    /// their `_00_list_ref` edges upstream may be stale, missing or
+    /// duplicated (a scheduler restart, a half-reclaimed view), so each gets
+    /// a full publish, which replaces its edges. One `_00_query` metadata
+    /// statement per view rides in a few multi-statement queries, and every
+    /// delta goes through one `write_deltas_unlocked` call, which packs them
+    /// into transactions of at most `MAX_TX_STATEMENTS`. Per view this used
+    /// to be two round trips and one commit: 33 views took 3.5 s on
+    /// whitepawn, with ~250 members between them.
     pub async fn republish_restored_views(&self) -> anyhow::Result<()> {
         self.refresh_query_allowlist().await;
-        let ids = self.processor.read().await.view_ids();
-        for id in ids {
-            let deltas = self.processor.read().await.snapshot_deltas_for_view(&id);
-            for delta in &deltas {
-                self.platform.db.query(
-                    "UPDATE type::record('_00_query', $qid) SET rowCount = $count, state = 'materializing'",
-                    &[("qid", json!(delta.query_id)), ("count", json!(delta.row_count))],
-                ).await.map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
-            }
-            let left = crate::edges::write_deltas_unlocked(
-                self.platform.db.as_ref(), deltas, &self.processor, &self.publication_gate, self.ref_mode,
-                self.platform.telemetry.as_ref(),
-            ).await;
-            anyhow::ensure!(left.is_empty(), "restored view membership repair failed");
+        let started = web_time::Instant::now();
+        let (views, deltas): (usize, Vec<ViewDelta>) = {
+            let circuit = self.processor.read().await;
+            let ids = circuit.view_ids();
+            let deltas = ids.iter().flat_map(|id| circuit.snapshot_deltas_for_view(id)).collect();
+            (ids.len(), deltas)
+        };
+        let members: usize = deltas.iter().map(|d| d.row_count).sum();
+        for chunk in deltas.chunks(VIEW_METADATA_BATCH) {
+            let (sql, binds) = view_metadata_batch(chunk);
+            let binds: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            query_retrying(self.platform.db.as_ref(), &sql, &binds)
+                .await
+                .map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
         }
+        let delta_count = deltas.len();
+        let left = crate::edges::write_deltas_unlocked(
+            self.platform.db.as_ref(), deltas, &self.processor, &self.publication_gate, self.ref_mode,
+            self.platform.telemetry.as_ref(),
+        ).await;
+        anyhow::ensure!(left.is_empty(), "restored view membership repair failed");
+        info!(
+            views,
+            deltas = delta_count,
+            members,
+            ms = started.elapsed().as_millis() as u64,
+            "Republished restored views"
+        );
         Ok(())
     }
 

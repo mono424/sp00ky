@@ -50,6 +50,9 @@ pub struct SspSnapshot {
     /// Set on a standby: the SSP it is to replace.
     #[serde(default)]
     pub standby_of: Option<String>,
+    /// Set on a successor: the SSP it replaced (see `SspPool::replaced_by`).
+    #[serde(default)]
+    pub replaced: Option<String>,
 }
 
 /// What a forced re-bootstrap should do on the SSP's side before it exits.
@@ -104,6 +107,12 @@ pub struct SspPool {
     /// follows ingest like any Ready SSP but is never chosen for a view or a
     /// job until it is promoted.
     standby_of: HashMap<String, String>,
+    /// Blue/green: replaced SSP id -> the SSP that replaced it. While the
+    /// successor is in the pool, the replaced id may not register again: a
+    /// predecessor that comes back (a scheduler restart made it re-register,
+    /// or it crashed after retiring) would serve every view beside its
+    /// successor and publish each change twice.
+    replaced_by: HashMap<String, String>,
     strategy: LoadBalanceStrategy,
     round_robin_index: usize,
     max_buffer_size: usize,
@@ -125,6 +134,7 @@ impl SspPool {
             registration_gen: HashMap::new(),
             publication: HashMap::new(),
             standby_of: HashMap::new(),
+            replaced_by: HashMap::new(),
             strategy,
             round_robin_index: 0,
             max_buffer_size,
@@ -707,6 +717,27 @@ impl SspPool {
             .collect()
     }
 
+    /// Record that `successor` replaces `replaced` (see `replaced_by`).
+    pub fn mark_replaced(&mut self, replaced: &str, successor: &str) {
+        self.replaced_by.insert(replaced.to_string(), successor.to_string());
+    }
+
+    /// The live SSP that replaced `ssp_id`, if any. A successor that left the
+    /// pool (a swap that was abandoned) no longer blocks its predecessor.
+    pub fn replaced_by(&self, ssp_id: &str) -> Option<&str> {
+        self.replaced_by
+            .get(ssp_id)
+            .map(String::as_str)
+            .filter(|successor| self.ssps.contains_key(*successor))
+    }
+
+    /// Whether `predecessor` is still on its way to serving: registered and
+    /// bootstrapping or replaying. A standby for it waits instead of taking
+    /// over, or both would end up serving.
+    pub fn is_coming_up(&self, ssp_id: &str) -> bool {
+        matches!(self.ssp_states.get(ssp_id), Some(SspState::Bootstrapping | SspState::Replaying))
+    }
+
     /// Take `ssp_id` in as the standby for `predecessor` (blue/green).
     pub fn mark_standby(&mut self, ssp_id: &str, predecessor: &str) {
         self.standby_of.insert(ssp_id.to_string(), predecessor.to_string());
@@ -797,6 +828,11 @@ impl SspPool {
                     buffer_overflowed: self.buffer_overflowed.contains(&info.id),
                     forced_resync: self.forced_resync.get(&info.id).copied(),
                     standby_of: self.standby_of.get(&info.id).cloned(),
+                    replaced: self
+                        .replaced_by
+                        .iter()
+                        .find(|(_, successor)| **successor == info.id)
+                        .map(|(replaced, _)| replaced.clone()),
                 })
             })
             .collect()
@@ -827,6 +863,9 @@ impl SspPool {
             }
             if let Some(kind) = snap.forced_resync {
                 self.forced_resync.insert(id.clone(), kind);
+            }
+            if let Some(replaced) = snap.replaced {
+                self.replaced_by.insert(replaced, id.clone());
             }
             if let Some(pred) = snap.standby_of {
                 self.standby_of.insert(id, pred);
@@ -996,6 +1035,31 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_ssp_is_refused_only_while_its_successor_lives() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0-g1");
+        p.mark_replaced("ssp-0", "ssp-0-g1");
+        assert_eq!(p.replaced_by("ssp-0"), Some("ssp-0-g1"));
+        assert_eq!(p.replaced_by("ssp-0-g1"), None);
+        // The successor left (a swap that was abandoned): the old one may
+        // register again.
+        p.remove("ssp-0-g1");
+        assert_eq!(p.replaced_by("ssp-0"), None);
+    }
+
+    #[test]
+    fn a_predecessor_re_registering_is_coming_up_not_serving() {
+        let mut p = pool();
+        with_ssp(&mut p, "ssp-0");
+        assert!(p.is_coming_up("ssp-0"));
+        assert!(!p.is_serving("ssp-0"));
+        let _ = p.mark_ready("ssp-0");
+        assert!(!p.is_coming_up("ssp-0"));
+        assert!(p.is_serving("ssp-0"));
+        assert!(!p.is_coming_up("nobody"));
+    }
+
+    #[test]
     fn export_import_carries_the_pool_to_a_successor() {
         let mut p = pool();
         with_ssp(&mut p, "ssp-0");
@@ -1006,6 +1070,8 @@ mod tests {
         let _ = p.bump_registration_gen("ssp-0");
         with_ssp(&mut p, "ssp-0-g1");
         p.mark_standby("ssp-0-g1", "ssp-0");
+        with_ssp(&mut p, "ssp-1-g2");
+        p.mark_replaced("ssp-1", "ssp-1-g2");
 
         let wire = serde_json::to_string(&p.export()).unwrap();
         let mut q = pool();
@@ -1016,6 +1082,7 @@ mod tests {
         assert_eq!(q.get_bootstrap_seq("ssp-0"), Some(41));
         assert_eq!(q.registration_gen("ssp-0"), 1);
         assert_eq!(q.standby_predecessor("ssp-0-g1"), Some("ssp-0"));
+        assert_eq!(q.replaced_by("ssp-1"), Some("ssp-1-g2"));
         assert_eq!(q.get_state("ssp-0-g1"), Some(&SspState::Bootstrapping));
         assert!(q.get_stale_ssps(1_000).is_empty(), "heartbeat clocks restart on import");
     }

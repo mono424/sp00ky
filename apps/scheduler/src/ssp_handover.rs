@@ -162,13 +162,34 @@ pub struct PromoteDeps {
     pub ingest: IngestState,
 }
 
+/// How often a standby whose predecessor is still coming up asks again.
+const WAIT_FOR_PREDECESSOR: Duration = Duration::from_secs(3);
+
 /// Start promoting `standby` in the background, if it is a ready standby.
+/// While its predecessor is still coming up (re-registering after a scheduler
+/// restart), it waits and tries again.
 pub fn spawn_promotion(deps: PromoteDeps, standby: String) {
     tokio::spawn(async move {
-        if let Err(e) = promote(&deps, &standby).await {
-            error!(standby = %standby, error = %e, "SSP promotion failed; the predecessor keeps serving");
+        loop {
+            match promote(&deps, &standby).await {
+                Ok(Promotion::Done) => return,
+                Ok(Promotion::WaitForPredecessor) => tokio::time::sleep(WAIT_FOR_PREDECESSOR).await,
+                Err(e) => {
+                    error!(standby = %standby, error = %e, "SSP promotion failed; the predecessor keeps serving");
+                    return;
+                }
+            }
         }
     });
+}
+
+/// What [`promote`] got done.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Promotion {
+    /// Promoted, or nothing to do (not a standby any more).
+    Done,
+    /// The predecessor is registered but not serving yet: ask again shortly.
+    WaitForPredecessor,
 }
 
 /// Promote every ready standby: after a scheduler handover, a standby that was
@@ -188,14 +209,20 @@ pub async fn promote_ready_standbys(deps: PromoteDeps) {
 }
 
 /// Swap `standby` in for the SSP it stands by for. See the module docs.
-pub async fn promote(deps: &PromoteDeps, standby: &str) -> anyhow::Result<()> {
+pub async fn promote(deps: &PromoteDeps, standby: &str) -> anyhow::Result<Promotion> {
     let _one_at_a_time = shared().promoting.lock().await;
 
     let (predecessor, predecessor_url, standby_url, others) = {
         let pool = deps.ssp_pool.read().await;
         let Some(predecessor) = pool.standby_predecessor(standby).map(str::to_string) else {
-            return Ok(()); // promoted already, or no longer a standby
+            return Ok(Promotion::Done); // promoted already, or no longer a standby
         };
+        if !pool.get(standby).is_some() {
+            return Ok(Promotion::Done); // the standby left the pool
+        }
+        if pool.is_coming_up(&predecessor) {
+            return Ok(Promotion::WaitForPredecessor);
+        }
         anyhow::ensure!(pool.is_ready(standby), "standby '{standby}' is not ready");
         let standby_url = pool
             .get(standby)
@@ -221,7 +248,7 @@ pub async fn promote(deps: &PromoteDeps, standby: &str) -> anyhow::Result<()> {
     let Some(predecessor_url) = predecessor_url else {
         warn!(standby, predecessor = %predecessor, "Predecessor no longer serving; promoting the standby with a full republish");
         let promoted = promote_call(deps, &standby_url, None, None).await;
-        return commit_or_fail(deps, standby, &predecessor, promoted, None).await;
+        return commit_or_fail(deps, standby, &predecessor, promoted, None).await.map(|()| Promotion::Done);
     };
 
     // Off the live path first, then let anything already in flight to it land.
@@ -265,11 +292,11 @@ pub async fn promote(deps: &PromoteDeps, standby: &str) -> anyhow::Result<()> {
         }
         Ok((status, body)) => {
             let why = format!("retire answered {status}: {body}");
-            return abandon(deps, standby, &predecessor, &predecessor_url, why).await;
+            return abandon(deps, standby, &predecessor, &predecessor_url, why).await.map(|()| Promotion::Done);
         }
         Err(e) => {
             let why = format!("retire failed: {e:#}");
-            return abandon(deps, standby, &predecessor, &predecessor_url, why).await;
+            return abandon(deps, standby, &predecessor, &predecessor_url, why).await.map(|()| Promotion::Done);
         }
     };
 
@@ -281,9 +308,9 @@ pub async fn promote(deps: &PromoteDeps, standby: &str) -> anyhow::Result<()> {
     let promoted = promote_call(deps, &standby_url, digests, keep).await;
     if let Err(e) = &promoted {
         let why = format!("{e:#}");
-        return abandon(deps, standby, &predecessor, &predecessor_url, why).await;
+        return abandon(deps, standby, &predecessor, &predecessor_url, why).await.map(|()| Promotion::Done);
     }
-    commit_or_fail(deps, standby, &predecessor, promoted, Some(&predecessor_url)).await
+    commit_or_fail(deps, standby, &predecessor, promoted, Some(&predecessor_url)).await.map(|()| Promotion::Done)
 }
 
 async fn promote_call(
@@ -330,6 +357,7 @@ async fn commit_or_fail(
         let mut pool = deps.ssp_pool.write().await;
         pool.clear_standby(standby);
         pool.mark_retired(predecessor);
+        pool.mark_replaced(predecessor, standby);
         pool.transfer_query_count(predecessor, standby);
     }
     crate::admin::incidents::emit(

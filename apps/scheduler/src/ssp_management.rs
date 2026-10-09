@@ -489,6 +489,16 @@ async fn handle_register(
         }
     }
 
+    // Blue/green: an SSP that was replaced does not come back beside its
+    // successor. A 4xx makes it exit; the control plane removes it.
+    if let Some(successor) = state.ssp_pool.read().await.replaced_by(&request.ssp_id) {
+        warn!(ssp_id = %request.ssp_id, successor, "Refusing registration: this SSP was replaced");
+        return Err((
+            StatusCode::CONFLICT,
+            format!("SSP '{}' was replaced by '{}'", request.ssp_id, successor),
+        ));
+    }
+
     // Create SspInfo
     let ssp_info = SspInfo {
         id: request.ssp_id.clone(),
@@ -588,8 +598,22 @@ async fn handle_register(
             // comes in as its standby (see `crate::ssp_handover`). Decided
             // here, under the pool lock, so the decision and the insert are
             // one step.
+            //
+            // A predecessor still coming up (re-registering after a scheduler
+            // restart) counts as there: the standby waits for it. One that is
+            // not in the pool at all is gone or about to come back; this SSP
+            // takes over as an ordinary one and the predecessor is refused if
+            // it tries to register again. Either way, never both serving.
+            let replaces = replaces.filter(|pred| *pred != ssp_id);
             let standby_for = replaces
-                .filter(|pred| *pred != ssp_id && pool.is_serving(pred));
+                .clone()
+                .filter(|pred| pool.is_serving(pred) || pool.is_coming_up(pred));
+            if let (Some(pred), None) = (&replaces, &standby_for) {
+                if !pool.is_retired(pred) {
+                    info!(ssp_id = %ssp_id, predecessor = %pred, "Predecessor not in the pool; taking over as an ordinary SSP");
+                }
+                pool.mark_replaced(pred, &ssp_id);
+            }
             pool.upsert(ssp_info);
             match &standby_for {
                 Some(pred) => pool.mark_standby(&ssp_id, pred),

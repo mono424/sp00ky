@@ -238,6 +238,7 @@ route is not called by the database at all; the scheduler reads the
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{ </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;snapshot_seq&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">123</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;table_hashes&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;game&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;b3:...&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;standby&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">false</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }</span></span></code></pre>
 <code>standby: true</code> means the scheduler took the SSP in as the standby for <code>replaces</code>: it must not write to the database until it is promoted.</li>
 <li><code>400 Bad Request</code> - Invalid SSP ID (empty) or invalid URL format</li>
+<li><code>409 Conflict</code> - This SSP id was replaced by a successor that is still in the pool (blue/green). The SSP exits; it must not serve beside its successor.</li>
 </ul>
 <p><strong>Flow:</strong></p>
 <ol>
@@ -697,6 +698,10 @@ SSP. Views move to it and registrations resume.</li>
 running are not re-run) until you stop it.</li>
 </ol>
 <p>If the swap fails, the old SSP is resumed and gets back every event it missed.</p>
+<p>A standby whose predecessor is still coming up (re-registering after a
+scheduler restart) waits for it. One whose predecessor is not registered at
+all takes over as an ordinary SSP, and the predecessor is refused with a <code>409</code>
+if it tries to register again, so the two never serve side by side.</p>
 <h4 id="get-handoverssps">GET /handover/ssps</h4>
 <p>The pool as a handover watches it, plus the last promotions:</p>
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>

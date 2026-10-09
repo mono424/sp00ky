@@ -143,10 +143,10 @@ pub const TOOLS: &[ToolDef] = &[
         path_params = &[req("name", "string", "Backend name as listed by backends_list")], read_only = true),
     // ---- Views (who is connected, and what they are watching) ----
     tool!("incidents_list", "Persistent incident history: automatic lag, recovery, heartbeat failures and operator actions. History survives scheduler restart.", "GET", "/incidents",
-        query = &[p("component", "string", "SSP id or scheduler"), p("state", "string", "open, recovered, interrupted, failed or recorded"), p("severity", "string", "warning or info"), p("since", "integer", "Earliest start, epoch milliseconds"), p("before", "integer", "Latest start, epoch milliseconds"), p("offset", "integer", "Page offset"), p("limit", "integer", "Page size, maximum 200")], read_only = true),
+        query = &[p("component", "string", "SSP id, scheduler, or views (hot_views episodes)"), p("state", "string", "open, recovered, interrupted, failed or recorded"), p("severity", "string", "warning or info"), p("since", "integer", "Earliest start, epoch milliseconds"), p("before", "integer", "Latest start, epoch milliseconds"), p("offset", "integer", "Page offset"), p("limit", "integer", "Page size, maximum 200")], read_only = true),
     tool!("incident_get", "One incident and its bounded event timeline, version, recovery and operation correlation.", "GET", "/incidents/{id}", path_params = &[req("id", "string", "Incident id from incidents_list")], read_only = true),
     tool!("presence", "Live users, sessions and registered views right now, with a recent sample history and the heaviest users. A client refreshes its liveness on a 0.9 x ttl timer (about 9 minutes by default), so a closed tab decays out of these numbers rather than vanishing from them.", "GET", "/presence", read_only = true),
-    tool!("views_list", "Registered live queries. Sort by slowest to find what is costing materialization time, or filter to one user or SSP.", "GET", "/views",
+    tool!("views_list", "Registered live queries. Sort by slowest to find what is costing materialization time, filter to one user or SSP, or to the hot views updating many times a second (a bulk import into a table someone has open).", "GET", "/views",
         query = &[
             p("limit", "integer", "Rows to return (default 100, max 500)"),
             p("user", "string", "auth_id to filter by, e.g. 'user:abc'"),
@@ -156,6 +156,7 @@ pub const TOOLS: &[ToolDef] = &[
             p("q", "string", "Substring of the registered SurrealQL"),
             p("shared", "boolean", "Only views more than one session subscribes to"),
             p("large", "boolean", "Only views holding at least the large-view row threshold (SPKY_ADMIN_LARGE_VIEW_ROWS, default 1000); these republish every row on each cold registration"),
+            p("hot", "boolean", "Only views updating at least SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC times a second (default 5) as of the last presence sample; every row carries update_rate either way"),
             p("include_expired", "boolean", "Include rows past lastActiveAt + ttl that the sweep has not reclaimed yet"),
         ], read_only = true),
     tool!("view_get", "One registered view in full: its SurrealQL and params, every subscribing session with its age, materialization percentiles, the SSP serving it with that view's memory footprint, and the other live sessions running the identical query.", "GET", "/views/{key}",

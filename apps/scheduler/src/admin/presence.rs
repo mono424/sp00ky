@@ -33,6 +33,19 @@
 //! `GET /presence`, and the totals folded into `/overview` — serves from its
 //! snapshot. Ten open dashboards cost the database exactly what one does, which
 //! is the same bargain `workflows.rs` strikes for its run poller.
+//!
+//! # Update rate
+//!
+//! `updateCount` on a row is a running total, so the only way to tell a view
+//! that changed a hundred times this minute from one that changed a hundred
+//! times this month is to read it twice. The sampler already does, every tick,
+//! so it keeps the previous count per view and divides. A view at or over
+//! `SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC` is *hot*: flagged in the listing and
+//! on the Overview, and while any view is hot one `hot_views` incident stays
+//! open, so a burst nobody was watching still leaves a trace. The shape it
+//! exists for is a bulk import into a table someone has open (2026-10-08:
+//! a PGN import moved one game-list view ~125 times a second and filled the
+//! SSP's publication queue).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -64,6 +77,17 @@ const TOP_USERS: usize = 20;
 /// Cap on the sibling lookup — "how many others run this exact query" is a
 /// count, not a list, past a certain size.
 const MAX_SIBLINGS: usize = 200;
+
+/// How many hot views the snapshot names, hottest first.
+const TOP_HOT: usize = 10;
+
+/// How long every view has to stay under the hot rate before an open
+/// `hot_views` incident closes. A bulk import runs in slices with pauses
+/// between them; without this, each slice would be an incident of its own.
+const HOT_COOLDOWN_MS: u64 = 60_000;
+
+/// The incident component hot views are reported under.
+const HOT_COMPONENT: &str = "views";
 
 /// The `_00_query` key of a view id, whichever way it was spelled.
 ///
@@ -118,6 +142,9 @@ pub struct Totals {
     /// and SurrealDB 3.0.5 stalled under it (2026-09-08). Surfaced so the
     /// tenant sees the query to window before the database tells them.
     pub large_views: u64,
+    /// Views whose `updateCount` climbed at least `hot_view_rate` times a
+    /// second since the previous sample. See the module docs.
+    pub hot_views: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -127,12 +154,138 @@ pub struct TopUser {
     pub sessions: u64,
 }
 
+/// A view updating at or over the hot rate, as of the last sample.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HotView {
+    pub key: String,
+    pub auth_id: String,
+    pub ssp_id: Option<String>,
+    /// Updates per second since the previous sample.
+    pub per_sec: f64,
+}
+
+/// One view's update counter as of the last sample, and the rate it implies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rate {
+    count: i64,
+    at_ms: u64,
+    /// Updates per second over the gap to the previous sample. `None` until
+    /// the view has been seen twice, and right after its counter went back.
+    per_sec: Option<f64>,
+    /// The highest `per_sec` seen while the view stayed registered, and when.
+    peak: Option<(f64, u64)>,
+}
+
+impl Rate {
+    /// The rate after reading `count` at `at_ms`, given the previous reading.
+    ///
+    /// A counter that went *down* is not negative traffic: the SSP keeps it in
+    /// memory and starts from zero when it restarts or a view moves to another
+    /// SSP, then its flush overwrites the row. That reading becomes the new
+    /// baseline, and the peak survives it.
+    fn advance(prev: Option<&Rate>, count: i64, at_ms: u64) -> Rate {
+        let Some(prev) = prev else {
+            return Rate { count, at_ms, per_sec: None, peak: None };
+        };
+        let elapsed = at_ms.saturating_sub(prev.at_ms);
+        if count < prev.count || elapsed == 0 {
+            return Rate { count, at_ms, per_sec: None, peak: prev.peak };
+        }
+        let per_sec = (count - prev.count) as f64 * 1000.0 / elapsed as f64;
+        let peak = match prev.peak {
+            Some((p, _)) if p >= per_sec => prev.peak,
+            _ if per_sec > 0.0 => Some((per_sec, at_ms)),
+            _ => prev.peak,
+        };
+        Rate { count, at_ms, per_sec: Some(per_sec), peak }
+    }
+}
+
+/// The open `hot_views` incident, as the sampler tracks it.
+#[derive(Debug, Clone)]
+struct Episode {
+    /// The hottest view seen since the episode opened.
+    peak: HotView,
+    /// When every view last dropped under the rate. `None` while any is hot.
+    quiet_since_ms: Option<u64>,
+}
+
+/// An incident transition the sampler owes the history: `(state, summary)`.
+type Transition = (&'static str, String);
+
+fn fmt_rate(per_sec: f64) -> String {
+    if per_sec >= 10.0 {
+        format!("{per_sec:.0}/s")
+    } else {
+        format!("{per_sec:.1}/s")
+    }
+}
+
+fn who(auth_id: &str) -> &str {
+    if is_real_user(auth_id) {
+        auth_id
+    } else {
+        "an anonymous session"
+    }
+}
+
+/// Advance the hot-view episode by one sample. `hot` is hottest first, and
+/// `hot_count` counts every hot view, not just the ones `hot` names.
+///
+/// Pure, so the open / cooldown / close rules are testable without a log ring.
+fn step_episode(
+    episode: Option<Episode>,
+    hot: &[HotView],
+    hot_count: u64,
+    rate: f64,
+    now: u64,
+) -> (Option<Episode>, Option<Transition>) {
+    match (episode, hot.first()) {
+        (None, None) => (None, None),
+        (None, Some(top)) => {
+            let summary = format!(
+                "{hot_count} {} updating at least {}; hottest {} at {} by {}",
+                if hot_count == 1 { "view" } else { "views" },
+                fmt_rate(rate),
+                top.key,
+                fmt_rate(top.per_sec),
+                who(&top.auth_id),
+            );
+            let episode = Episode { peak: top.clone(), quiet_since_ms: None };
+            (Some(episode), Some(("open", summary)))
+        }
+        (Some(mut episode), Some(top)) => {
+            if top.per_sec > episode.peak.per_sec {
+                episode.peak = top.clone();
+            }
+            episode.quiet_since_ms = None;
+            (Some(episode), None)
+        }
+        (Some(mut episode), None) => {
+            let since = *episode.quiet_since_ms.get_or_insert(now);
+            if now.saturating_sub(since) < HOT_COOLDOWN_MS {
+                return (Some(episode), None);
+            }
+            let summary = format!(
+                "Every view back under {}; peak {} on {} by {}",
+                fmt_rate(rate),
+                fmt_rate(episode.peak.per_sec),
+                episode.peak.key,
+                who(&episode.peak.auth_id),
+            );
+            (None, Some(("recovered", summary)))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Snapshot {
     taken_at_ms: u64,
     totals: Totals,
     top_users: Vec<TopUser>,
     by_ssp: Vec<Value>,
+    /// The hottest views, at most [`TOP_HOT`] of them.
+    hot: Vec<HotView>,
     /// The row cap was hit, so every figure here is a floor rather than a count.
     truncated: bool,
     /// What went wrong on the last tick, if anything. Reported rather than
@@ -150,6 +303,7 @@ struct LiveRow {
     p99: Option<f64>,
     errors: i64,
     row_count: i64,
+    updates: i64,
 }
 
 fn str_field(v: &Value, key: &str) -> String {
@@ -177,7 +331,14 @@ pub struct PresenceTracker {
     slow_ms: f64,
     /// Row count from which a view counts as large. See `Totals::large_views`.
     large_view_rows: u64,
+    /// Updates per second from which a view counts as hot. See
+    /// `Totals::hot_views`.
+    hot_view_rate: f64,
     max_rows: usize,
+    /// The last [`Rate`] of every live view, by query key. Only the sampler
+    /// writes it, and a view that left the sample leaves the map.
+    rates: RwLock<HashMap<String, Rate>>,
+    episode: Mutex<Option<Episode>>,
 }
 
 impl PresenceTracker {
@@ -188,7 +349,10 @@ impl PresenceTracker {
             interval: config.presence_interval,
             slow_ms: config.presence_slow_ms,
             large_view_rows: config.presence_large_view_rows,
+            hot_view_rate: config.presence_hot_view_rate,
             max_rows: config.presence_max_rows,
+            rates: RwLock::new(HashMap::new()),
+            episode: Mutex::new(None),
         })
     }
 
@@ -202,6 +366,33 @@ impl PresenceTracker {
 
     pub fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    pub fn hot_view_rate(&self) -> f64 {
+        self.hot_view_rate
+    }
+
+    /// Keys of the views at or over the hot rate, hottest first, at most
+    /// `limit` of them. What `GET /views?hot=true` narrows the listing to.
+    fn hot_keys(&self, limit: usize) -> Vec<String> {
+        let Ok(rates) = self.rates.read() else { return Vec::new() };
+        let mut hot: Vec<(&String, f64)> = rates
+            .iter()
+            .filter_map(|(k, r)| r.per_sec.filter(|v| *v >= self.hot_view_rate).map(|v| (k, v)))
+            .collect();
+        hot.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        hot.into_iter().take(limit).map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Put a view's update rate on its listing row: `update_rate` (per second,
+    /// null until it has been sampled twice), its peak and whether it is hot.
+    fn annotate_rate(&self, row: &mut Value, key: &str) {
+        let rate = self.rates.read().ok().and_then(|r| r.get(key).copied());
+        let per_sec = rate.and_then(|r| r.per_sec);
+        row["update_rate"] = json!(per_sec);
+        row["update_rate_peak"] = json!(rate.and_then(|r| r.peak).map(|p| p.0));
+        row["update_rate_peak_at_ms"] = json!(rate.and_then(|r| r.peak).map(|p| p.1));
+        row["hot"] = json!(per_sec.is_some_and(|v| v >= self.hot_view_rate));
     }
 
     /// Start the one sampler. Ticks harmlessly while the scheduler is still
@@ -237,7 +428,7 @@ impl PresenceTracker {
             "SELECT type::string(id) AS id, auth_id, clientId AS client_id, \
              array::len(subscribers ?? []) AS subscribers, \
              materializationP99 AS p99, errorCount AS errors, \
-             rowCount AS row_count \
+             rowCount AS row_count, updateCount AS updates \
              FROM _00_query WHERE lastActiveAt + ttl > time::now() LIMIT {};",
             self.max_rows.saturating_add(1)
         );
@@ -282,6 +473,7 @@ impl PresenceTracker {
                             totals: Totals::default(),
                             top_users: Vec::new(),
                             by_ssp: Vec::new(),
+                            hot: Vec::new(),
                             truncated: false,
                             error: Some(e),
                         });
@@ -303,11 +495,21 @@ impl PresenceTracker {
                 p99: f64_field(&v, "p99"),
                 errors: int_field(&v, "errors"),
                 row_count: int_field(&v, "row_count"),
+                updates: int_field(&v, "updates"),
             })
             .collect();
 
         let assignments = state.metrics.query_tracker.all().await;
-        let snapshot = self.fold(rows, truncated, &assignments);
+        let now = now_ms();
+        let rates = match self.rates.read() {
+            Ok(prev) => advance_rates(&prev, &rows, now),
+            Err(_) => advance_rates(&HashMap::new(), &rows, now),
+        };
+        let snapshot = self.fold(rows, truncated, &assignments, &rates);
+        if let Ok(mut guard) = self.rates.write() {
+            *guard = rates;
+        }
+        self.step_hot_episode(&snapshot, now);
 
         let sample = PresenceSample {
             ts: snapshot.taken_at_ms,
@@ -327,6 +529,22 @@ impl PresenceTracker {
         }
     }
 
+    /// Open or close the `hot_views` incident off this sample.
+    fn step_hot_episode(&self, snapshot: &Snapshot, now: u64) {
+        let Ok(mut guard) = self.episode.lock() else { return };
+        let (next, transition) = step_episode(
+            guard.take(),
+            &snapshot.hot,
+            snapshot.totals.hot_views,
+            self.hot_view_rate,
+            now,
+        );
+        *guard = next;
+        if let Some((state, summary)) = transition {
+            super::incidents::emit(HOT_COMPONENT, "hot_views", state, &summary, None);
+        }
+    }
+
     /// Turn live rows into the rollup. Split out from [`Self::sample`] so it can
     /// be tested without a database.
     fn fold(
@@ -334,6 +552,7 @@ impl PresenceTracker {
         rows: Vec<LiveRow>,
         truncated: bool,
         assignments: &HashMap<String, String>,
+        rates: &HashMap<String, Rate>,
     ) -> Snapshot {
         // query key -> ssp, both spellings collapsed to the key.
         let by_key: HashMap<&str, &str> = assignments
@@ -353,6 +572,7 @@ impl PresenceTracker {
         let mut slow = 0u64;
         let mut errored = 0u64;
         let mut large = 0u64;
+        let mut hot: Vec<HotView> = Vec::new();
 
         for row in &rows {
             let authed = is_real_user(&row.auth_id);
@@ -372,8 +592,22 @@ impl PresenceTracker {
                     entry.1.insert(&row.client_id);
                 }
             }
-            if let Some(ssp) = by_key.get(canonical_query_id(&row.id)) {
+            let key = canonical_query_id(&row.id);
+            let ssp = by_key.get(key).copied();
+            if let Some(ssp) = ssp {
                 *per_ssp.entry(ssp).or_insert(0) += 1;
+            }
+            if let Some(per_sec) = rates
+                .get(key)
+                .and_then(|r| r.per_sec)
+                .filter(|v| *v >= self.hot_view_rate)
+            {
+                hot.push(HotView {
+                    key: key.to_string(),
+                    auth_id: row.auth_id.clone(),
+                    ssp_id: ssp.map(str::to_string),
+                    per_sec,
+                });
             }
             if row.subscribers > 1 {
                 shared += 1;
@@ -402,6 +636,10 @@ impl PresenceTracker {
         top_users.sort_by(|a, b| b.views.cmp(&a.views).then_with(|| a.auth_id.cmp(&b.auth_id)));
         top_users.truncate(TOP_USERS);
 
+        let hot_views = hot.len() as u64;
+        hot.sort_by(|a, b| b.per_sec.total_cmp(&a.per_sec).then_with(|| a.key.cmp(&b.key)));
+        hot.truncate(TOP_HOT);
+
         Snapshot {
             taken_at_ms: now_ms(),
             totals: Totals {
@@ -413,8 +651,10 @@ impl PresenceTracker {
                 slow_views: slow,
                 errored_views: errored,
                 large_views: large,
+                hot_views,
             },
             top_users,
+            hot,
             by_ssp: per_ssp
                 .into_iter()
                 .map(|(ssp_id, views)| json!({ "ssp_id": ssp_id, "views": views }))
@@ -468,10 +708,27 @@ impl PresenceTracker {
         let snap = self.snapshot.read().ok().and_then(|g| g.clone());
         out["slow_ms"] = json!(self.slow_ms);
         out["large_view_rows"] = json!(self.large_view_rows);
+        out["hot_view_rate"] = json!(self.hot_view_rate);
+        out["hot"] = json!(snap.as_ref().map(|s| s.hot.clone()).unwrap_or_default());
         out["top_users"] = json!(snap.as_ref().map(|s| s.top_users.clone()).unwrap_or_default());
         out["by_ssp"] = json!(snap.as_ref().map(|s| s.by_ssp.clone()).unwrap_or_default());
         out
     }
+}
+
+/// Every live view's [`Rate`] after this sample. A view that is not in `rows`
+/// any more drops out, so the map is bounded by the sample.
+fn advance_rates(
+    prev: &HashMap<String, Rate>,
+    rows: &[LiveRow],
+    now: u64,
+) -> HashMap<String, Rate> {
+    rows.iter()
+        .map(|row| {
+            let key = canonical_query_id(&row.id);
+            (key.to_string(), Rate::advance(prev.get(key), row.updates, now))
+        })
+        .collect()
 }
 
 /* ------------------------------------------------------------------ */
@@ -514,6 +771,8 @@ pub struct ViewsQuery {
     shared: Option<bool>,
     /// Only views holding at least the large-view row threshold.
     large: Option<bool>,
+    /// Only views updating at least the hot rate as of the last sample.
+    hot: Option<bool>,
     include_expired: Option<bool>,
 }
 
@@ -541,7 +800,9 @@ fn order_by(sort: Option<&str>) -> Result<&'static str, ApiError> {
     })
 }
 
-fn where_clause(params: &ViewsQuery, large_view_rows: u64) -> String {
+/// `hot_keys` is what `?hot=true` narrows to: the sampler measured the rate, the
+/// database only holds the running total, so the set is handed in by key.
+fn where_clause(params: &ViewsQuery, large_view_rows: u64, hot_keys: &[String]) -> String {
     let mut conds: Vec<String> = Vec::new();
     if !params.include_expired.unwrap_or(false) {
         conds.push("lastActiveAt + ttl > time::now()".to_string());
@@ -561,6 +822,13 @@ fn where_clause(params: &ViewsQuery, large_view_rows: u64) -> String {
     if params.large.unwrap_or(false) {
         conds.push(format!("rowCount >= {}", large_view_rows));
     }
+    if params.hot.unwrap_or(false) {
+        let ids: Vec<String> = hot_keys
+            .iter()
+            .map(|k| format!("type::record('_00_query', '{}')", esc(k)))
+            .collect();
+        conds.push(format!("id IN [{}]", ids.join(", ")));
+    }
     if conds.is_empty() {
         // `WHERE true` rather than branching the format strings below on
         // whether there is a clause at all.
@@ -578,7 +846,12 @@ pub async fn list_views(
     // whether or not the scheduler has finished cloning, and answering 503 to
     // it would send the caller looking in the wrong place.
     let order = order_by(params.sort.as_deref())?;
-    let filter = where_clause(&params, state.presence.large_view_rows());
+    let hot_keys = if params.hot.unwrap_or(false) {
+        state.presence.hot_keys(MAX_LIMIT)
+    } else {
+        Vec::new()
+    };
+    let filter = where_clause(&params, state.presence.large_view_rows(), &hot_keys);
 
     let Some(db) = state.db() else {
         return Err(db_unavailable());
@@ -642,6 +915,7 @@ pub async fn list_views(
             .and_then(|v| v.as_str())
             .and_then(parse_iso_ms);
         row["ttl_secs"] = json!(ttl_secs(&row, expires_at_ms));
+        state.presence.annotate_rate(&mut row, &key);
         row["key"] = json!(key);
         row["ssp_id"] = json!(ssp);
         row["shared"] = json!(int_field(&row, "subscriber_count") > 1);
@@ -664,6 +938,7 @@ pub async fn list_views(
         "sort": params.sort.clone().unwrap_or_else(|| "slowest".to_string()),
         "slow_ms": params.slow_ms.unwrap_or_else(|| state.presence.slow_ms()),
         "large_view_rows": state.presence.large_view_rows(),
+        "hot_view_rate": state.presence.hot_view_rate(),
         "server_time_ms": now,
     })))
 }
@@ -785,6 +1060,7 @@ pub async fn view_detail(
         .find(|(q, _)| canonical_query_id(q) == key)
         .map(|(_, s)| s.clone());
 
+    state.presence.annotate_rate(&mut view, &key);
     view["key"] = json!(key);
     view["ssp_id"] = json!(ssp_id);
     view["shared"] = json!(subscribers.len() > 1);
@@ -808,6 +1084,7 @@ pub async fn view_detail(
         "siblings": siblings,
         "slow_ms": state.presence.slow_ms(),
         "large_view_rows": state.presence.large_view_rows(),
+        "hot_view_rate": state.presence.hot_view_rate(),
         "server_time_ms": now,
     })))
 }
@@ -937,7 +1214,10 @@ mod tests {
             interval: Duration::from_secs(15),
             slow_ms,
             large_view_rows: 1000,
+            hot_view_rate: 5.0,
             max_rows: 100,
+            rates: RwLock::new(HashMap::new()),
+            episode: Mutex::new(None),
         })
     }
 
@@ -950,6 +1230,7 @@ mod tests {
             p99,
             errors: errs,
             row_count: 0,
+            updates: 0,
         }
     }
 
@@ -961,7 +1242,7 @@ mod tests {
         let mut edge = row("_00_query:b", "user:x", "s1", 1, None, 0);
         edge.row_count = 1000;
         let small = row("_00_query:c", "user:y", "s2", 1, None, 0);
-        let snap = t.fold(vec![big, edge, small], false, &HashMap::new());
+        let snap = t.fold(vec![big, edge, small], false, &HashMap::new(), &HashMap::new());
         assert_eq!(snap.totals.large_views, 2, "the threshold is inclusive");
         assert_eq!(snap.totals.views, 3);
     }
@@ -970,9 +1251,9 @@ mod tests {
     fn the_large_filter_lowers_to_a_row_count_predicate() {
         let mut params = ViewsQuery::default();
         params.large = Some(true);
-        let clause = where_clause(&params, 1000);
+        let clause = where_clause(&params, 1000, &[]);
         assert!(clause.contains("rowCount >= 1000"), "{clause}");
-        assert!(!where_clause(&ViewsQuery::default(), 1000).contains("rowCount"));
+        assert!(!where_clause(&ViewsQuery::default(), 1000, &[]).contains("rowCount"));
     }
 
     #[test]
@@ -987,6 +1268,7 @@ mod tests {
                 row("_00_query:b", "user:x", "sess-2", 1, None, 0),
             ],
             false,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(snap.totals.users, 1);
@@ -1006,6 +1288,7 @@ mod tests {
             ],
             false,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(snap.totals.users, 1, "only the authenticated row is a user");
         assert_eq!(snap.totals.anon_sessions, 2);
@@ -1022,6 +1305,7 @@ mod tests {
                 row("_00_query:c", "user:y", "s2", 1, None, 0),
             ],
             false,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(snap.totals.shared_views, 1);
@@ -1049,6 +1333,7 @@ mod tests {
             ],
             false,
             &assignments,
+            &HashMap::new(),
         );
         assert_eq!(snap.by_ssp, vec![json!({ "ssp_id": "ssp-0", "views": 2 })]);
     }
@@ -1065,6 +1350,7 @@ mod tests {
             ],
             false,
             &HashMap::new(),
+            &HashMap::new(),
         );
         let names: Vec<&str> = snap.top_users.iter().map(|u| u.auth_id.as_str()).collect();
         assert_eq!(names, vec!["user:a", "user:b", "user:c"]);
@@ -1076,14 +1362,14 @@ mod tests {
     fn the_liveness_filter_is_in_every_default_listing() {
         // Eager unsubscribe is off by default, so a listing without this reports
         // every tab ever opened.
-        let clause = where_clause(&ViewsQuery::default(), 1000);
+        let clause = where_clause(&ViewsQuery::default(), 1000, &[]);
         assert!(clause.contains("lastActiveAt + ttl > time::now()"), "{clause}");
 
         let with_expired = ViewsQuery {
             include_expired: Some(true),
             ..Default::default()
         };
-        assert!(!where_clause(&with_expired, 1000).contains("lastActiveAt + ttl"));
+        assert!(!where_clause(&with_expired, 1000, &[]).contains("lastActiveAt + ttl"));
     }
 
     #[test]
@@ -1093,7 +1379,7 @@ mod tests {
             q: Some("it's".to_string()),
             ..Default::default()
         };
-        let clause = where_clause(&params, 1000);
+        let clause = where_clause(&params, 1000, &[]);
         assert!(clause.contains("auth_id = 'user:o\\'brien'"), "{clause}");
         assert!(clause.contains("string::contains(surql ?? '', 'it\\'s')"), "{clause}");
     }
@@ -1130,6 +1416,158 @@ mod tests {
         // is what the "stale subscriber" rule keys off.
         assert_eq!(ttl_secs(&json!({}), expires), 0);
         assert_eq!(ttl_secs(&row, None), 0);
+    }
+
+    #[test]
+    fn the_rate_is_the_count_delta_over_the_sample_gap() {
+        let first = Rate::advance(None, 100, 0);
+        assert_eq!(first.per_sec, None, "one reading is not a rate");
+
+        let second = Rate::advance(Some(&first), 1_975, 15_000);
+        assert_eq!(second.per_sec, Some(125.0));
+        assert_eq!(second.peak, Some((125.0, 15_000)));
+
+        // Quieter afterwards: the rate drops, the peak stays where it was.
+        let third = Rate::advance(Some(&second), 1_990, 30_000);
+        assert_eq!(third.per_sec, Some(1.0));
+        assert_eq!(third.peak, Some((125.0, 15_000)));
+    }
+
+    #[test]
+    fn a_counter_that_went_back_is_a_new_baseline_not_negative_traffic() {
+        // The SSP keeps `update_count` in memory and starts it from zero on a
+        // restart; its next flush overwrites the row with the small number.
+        let before = Rate::advance(Some(&Rate::advance(None, 0, 0)), 3_000, 15_000);
+        let reset = Rate::advance(Some(&before), 40, 30_000);
+        assert_eq!(reset.per_sec, None);
+        assert_eq!(reset.peak, before.peak, "the peak survives the reset");
+
+        let after = Rate::advance(Some(&reset), 190, 45_000);
+        assert_eq!(after.per_sec, Some(10.0));
+    }
+
+    #[test]
+    fn rates_follow_the_sample_and_drop_views_that_left_it() {
+        let mut a = row("_00_query:a", "user:x", "s1", 1, None, 0);
+        a.updates = 10;
+        let b = row("b", "user:y", "s2", 1, None, 0);
+        let first = advance_rates(&HashMap::new(), &[a, b], 0);
+        assert_eq!(first.len(), 2);
+
+        // `b` unregistered; `a` arrives under the other spelling of its id.
+        let mut a = row("a", "user:x", "s1", 1, None, 0);
+        a.updates = 160;
+        let second = advance_rates(&first, &[a], 15_000);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second["a"].per_sec, Some(10.0));
+    }
+
+    #[test]
+    fn hot_views_are_counted_off_the_rate_and_ranked() {
+        let t = tracker(250.0);
+        let rate = |per_sec: f64| Rate { count: 0, at_ms: 0, per_sec: Some(per_sec), peak: None };
+        let rates: HashMap<String, Rate> = [
+            ("a".to_string(), rate(125.0)),
+            ("b".to_string(), rate(4.9)),
+            ("c".to_string(), rate(5.0)),
+        ]
+        .into_iter()
+        .collect();
+        let assignments: HashMap<String, String> =
+            [("_00_query:a".to_string(), "ssp-0".to_string())].into_iter().collect();
+        let snap = t.fold(
+            vec![
+                row("_00_query:a", "user:x", "s1", 1, None, 0),
+                row("_00_query:b", "user:y", "s2", 1, None, 0),
+                row("_00_query:c", "user:z", "s3", 1, None, 0),
+                // Seen once so far: no rate, never hot.
+                row("_00_query:d", "user:z", "s3", 1, None, 0),
+            ],
+            false,
+            &assignments,
+            &rates,
+        );
+        assert_eq!(snap.totals.hot_views, 2, "the threshold is inclusive, 4.9 is under it");
+        let keys: Vec<&str> = snap.hot.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "c"], "hottest first");
+        assert_eq!(snap.hot[0].ssp_id.as_deref(), Some("ssp-0"));
+        assert_eq!(snap.hot[0].auth_id, "user:x");
+    }
+
+    fn hot(key: &str, per_sec: f64) -> HotView {
+        HotView {
+            key: key.to_string(),
+            auth_id: "user:x".to_string(),
+            ssp_id: None,
+            per_sec,
+        }
+    }
+
+    #[test]
+    fn a_hot_episode_opens_once_tracks_its_peak_and_closes_after_the_cooldown() {
+        let (ep, t) = step_episode(None, &[hot("a", 40.0)], 1, 5.0, 0);
+        let (state, summary) = t.expect("the first hot sample opens the incident");
+        assert_eq!(state, "open");
+        assert!(summary.contains("1 view updating at least 5.0/s"), "{summary}");
+        assert!(summary.contains("hottest a at 40/s by user:x"), "{summary}");
+
+        // Still hot, hotter: no new transition, the peak moves.
+        let (ep, t) = step_episode(ep, &[hot("b", 125.0), hot("a", 30.0)], 2, 5.0, 15_000);
+        assert!(t.is_none());
+        assert_eq!(ep.as_ref().unwrap().peak.key, "b");
+
+        // Quiet, but not for long enough. A pause between import slices must
+        // not close the episode and open a second one a moment later.
+        let (ep, t) = step_episode(ep, &[], 0, 5.0, 30_000);
+        assert!(t.is_none());
+        let (ep, t) = step_episode(ep, &[hot("a", 50.0)], 1, 5.0, 45_000);
+        assert!(t.is_none(), "hot again inside the cooldown keeps the same episode");
+        assert_eq!(ep.as_ref().unwrap().quiet_since_ms, None);
+
+        let (ep, t) = step_episode(ep, &[], 0, 5.0, 60_000);
+        assert!(t.is_none());
+        let (ep, t) = step_episode(ep, &[], 0, 5.0, 60_000 + HOT_COOLDOWN_MS);
+        assert!(ep.is_none());
+        let (state, summary) = t.expect("a full cooldown closes it");
+        assert_eq!(state, "recovered");
+        assert!(summary.contains("peak 125/s on b by user:x"), "{summary}");
+    }
+
+    #[test]
+    fn the_hot_filter_lowers_to_the_sampled_keys() {
+        let params = ViewsQuery { hot: Some(true), ..Default::default() };
+        let clause = where_clause(&params, 1000, &["a".to_string(), "o'b".to_string()]);
+        assert!(
+            clause.contains(
+                "id IN [type::record('_00_query', 'a'), type::record('_00_query', 'o\\'b')]"
+            ),
+            "{clause}"
+        );
+        // Nothing hot: an empty set, which matches nothing, rather than no
+        // filter, which would match everything.
+        assert!(where_clause(&params, 1000, &[]).contains("id IN []"));
+        assert!(!where_clause(&ViewsQuery::default(), 1000, &["a".to_string()]).contains("id IN"));
+    }
+
+    #[test]
+    fn listing_rows_carry_the_rate_and_the_hot_flag() {
+        let t = tracker(250.0);
+        t.rates.write().unwrap().insert(
+            "a".to_string(),
+            Rate { count: 0, at_ms: 0, per_sec: Some(12.0), peak: Some((80.0, 7)) },
+        );
+        let mut hot_row = json!({});
+        t.annotate_rate(&mut hot_row, "a");
+        assert_eq!(hot_row["update_rate"], json!(12.0));
+        assert_eq!(hot_row["update_rate_peak"], json!(80.0));
+        assert_eq!(hot_row["update_rate_peak_at_ms"], json!(7));
+        assert_eq!(hot_row["hot"], json!(true));
+
+        let mut unseen = json!({});
+        t.annotate_rate(&mut unseen, "nope");
+        assert_eq!(unseen["update_rate"], Value::Null);
+        assert_eq!(unseen["hot"], json!(false));
+        assert_eq!(t.hot_keys(10), vec!["a".to_string()]);
     }
 
     #[test]

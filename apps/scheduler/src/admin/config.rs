@@ -45,6 +45,13 @@ pub struct AdminConfig {
     /// thousand of those in one transaction is what stalled a tenant's
     /// SurrealDB 3.0.5. Env `SPKY_ADMIN_LARGE_VIEW_ROWS`, default 1000.
     pub presence_large_view_rows: u64,
+    /// A registered view whose `updateCount` climbs at least this many times a
+    /// second between two presence samples is counted as hot: flagged on the
+    /// Views tab and the Overview, and opens a `hot_views` incident. One view
+    /// per user changing ~125 times a second is what a bulk PGN import into an
+    /// open game list produced, and it filled the SSP's publication queue
+    /// (2026-10-08). Env `SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC`, default 5.
+    pub presence_hot_view_rate: f64,
     /// Ceiling on rows any one presence/views query may pull back, so a tenant
     /// with a runaway number of registrations cannot make the sampler the
     /// expensive thing on the box.
@@ -100,6 +107,12 @@ impl AdminConfig {
             .filter(|n| *n > 0)
             .unwrap_or(1000);
 
+        let presence_hot_view_rate = std::env::var("SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .unwrap_or(5.0);
+
         let presence_max_rows = std::env::var("SPKY_ADMIN_PRESENCE_MAX_ROWS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -140,6 +153,7 @@ impl AdminConfig {
             presence_interval: std::time::Duration::from_secs(presence_interval_secs),
             presence_slow_ms,
             presence_large_view_rows,
+            presence_hot_view_rate,
             presence_max_rows,
             job_interval: std::time::Duration::from_secs(job_interval_secs),
             // Never slower than the idle cadence: a "live" tick that ticks less

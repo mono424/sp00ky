@@ -64,6 +64,13 @@ export function formatMs(ms: number | null | undefined): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
+/** An update rate in updates per second: `125/s`, `4.9/s`, `—`. */
+export function formatRate(perSec: number | null | undefined): string {
+  if (perSec === null || perSec === undefined || !Number.isFinite(perSec)) return '—';
+  if (perSec === 0) return '0/s';
+  return perSec >= 10 ? `${Math.round(perSec).toLocaleString()}/s` : `${perSec.toFixed(1)}/s`;
+}
+
 /** Split a formatted measurement so the unit can be styled down. */
 export function splitValue(text: string): { value: string; unit: string } {
   const m = /^([\d.,]+)(\D+)$/.exec(text);

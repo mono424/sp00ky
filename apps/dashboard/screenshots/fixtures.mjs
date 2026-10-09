@@ -152,6 +152,7 @@ const PRESENCE = {
     slow_views: 2,
     errored_views: 0,
     large_views: 1,
+    hot_views: 1,
   },
   samples: Array.from({ length: 40 }, (_, i) => ({
     ts: ago((39 - i) * 30_000),
@@ -202,6 +203,26 @@ const incidentEvent = (at, component, kind, state, summary) => ({
 });
 
 const INCIDENTS = [
+  {
+    id: 'inc-c90e17',
+    component: 'views',
+    kind: 'hot_views',
+    severity: 'warning',
+    state: 'open',
+    started_at: ago(140_000),
+    ended_at: null,
+    max_buffered_events: 0,
+    event_count: 1,
+    events: [
+      incidentEvent(
+        ago(140_000),
+        'views',
+        'hot_views',
+        'open',
+        '1 view updating at least 5.0/s; hottest 907461255 at 104/s by user:iris'
+      ),
+    ],
+  },
   {
     id: 'inc-7f21c4',
     component: 'ssp-1',
@@ -391,6 +412,10 @@ const view = (o) => ({
   ssp_id: o.ssp,
   row_count: o.rows,
   update_count: o.updates,
+  update_rate: o.rate === undefined ? 0 : o.rate,
+  update_rate_peak: o.peak?.[0] ?? null,
+  update_rate_peak_at_ms: o.peak ? ago(o.peak[1]) : null,
+  hot: (o.rate ?? 0) >= 5,
   error_count: o.errors ?? 0,
   registration_ms: o.registration,
   p55: o.p55,
@@ -416,6 +441,8 @@ export const VIEWS = {
       ssp: 'ssp-0',
       rows: 50,
       updates: 1_284,
+      rate: 0.6,
+      peak: [3.2, 260_000],
       registration: 26.4,
       p55: 3.8,
       p90: 7.1,
@@ -447,7 +474,10 @@ export const VIEWS = {
       subscribers: 1,
       ssp: 'ssp-1',
       rows: 231,
-      updates: 96,
+      // Mid-import: a CSV of tasks landing in the project iris has open.
+      updates: 14_208,
+      rate: 118.4,
+      peak: [131.2, 45_000],
       errors: 1,
       registration: 44.2,
       p55: 27.7,
@@ -481,6 +511,8 @@ export const VIEWS = {
       ssp: 'ssp-0',
       rows: 1,
       updates: 44,
+      rate: 0.6,
+      peak: [1.4, 80_000],
       registration: 6.2,
       p55: 1.7,
       p90: 2.8,
@@ -497,6 +529,8 @@ export const VIEWS = {
       ssp: 'ssp-1',
       rows: 412,
       updates: 6,
+      // Seen by one presence sample so far: no rate yet.
+      rate: null,
       registration: 51.8,
       p55: 12.2,
       p90: 24.4,
@@ -512,6 +546,37 @@ export const VIEWS = {
   sort: 'active',
   slow_ms: 50,
   large_view_rows: 400,
+  hot_view_rate: 5,
+  server_time_ms: NOW,
+};
+
+const HOT_VIEW = VIEWS.views.find((v) => v.key === '907461255');
+
+export const VIEW_DETAIL = {
+  view: {
+    ...HOT_VIEW,
+    params: { 'auth.id': 'user:iris', access: 'account' },
+    subscribers: [{ id: 'tab-ce0043', seen_at_ms: ago(11_400), age_secs: 11, stale: false }],
+  },
+  ssp: {
+    ssp_id: 'ssp-1',
+    view: {
+      query_id: `_00_query:${HOT_VIEW.key}`,
+      auth_id: 'user:iris',
+      cached_records: 231,
+      view_bytes: 182_400,
+      operator_bytes: 96_300,
+      total_bytes: 278_700,
+    },
+    merging: false,
+    graphs: 34,
+    subscribers: 34,
+    total_bytes: 41_200_000,
+  },
+  siblings: { sessions: 1, users: 1, truncated: false, rows: [] },
+  slow_ms: 50,
+  large_view_rows: 400,
+  hot_view_rate: 5,
   server_time_ms: NOW,
 };
 
@@ -519,6 +584,8 @@ export const PRESENCE_FULL = {
   ...PRESENCE,
   slow_ms: 50,
   large_view_rows: 400,
+  hot_view_rate: 5,
+  hot: [{ key: '907461255', auth_id: 'user:iris', ssp_id: 'ssp-1', per_sec: 118.4 }],
   top_users: [
     { auth_id: 'user:mira', views: 9, sessions: 3 },
     { auth_id: 'user:iris', views: 7, sessions: 2 },
@@ -1045,6 +1112,7 @@ export const ROUTES = {
   'GET /overview': OVERVIEW,
   'GET /presence': PRESENCE_FULL,
   'GET /views': VIEWS,
+  'GET /views/907461255': VIEW_DETAIL,
   'GET /schedules': SCHEDULES,
   'GET /backends': { backends: BACKENDS, check_interval_secs: 10 },
   'GET /incidents': INCIDENT_LIST,

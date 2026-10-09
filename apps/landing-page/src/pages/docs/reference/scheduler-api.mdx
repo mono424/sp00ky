@@ -858,7 +858,11 @@ answers again (its `component` is the backend name), and `schedule_quarantined`
 opens when a schedule's per-key failure budget stops firing one `forEach` key
 (its `component` is `schedule:<name>/<key>`) and recovers when that key fires
 again, after a passing probe or a release. See
-[Failing keys](/docs/jobs/schedules#failing-keys).
+[Failing keys](/docs/jobs/schedules#failing-keys). `hot_views` (component
+`views`) opens when a registered view updates at least
+`SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC` times a second and recovers once every
+view has stayed under that rate for a minute. See
+[Hot views](/docs/reference/admin-dashboard#hot-views).
 
 An incident carries `id`, `component`, `kind`, `severity`, `state`, `started_at`,
 `ended_at`, `max_buffered_events`, `event_count`, and `events`. Each event has

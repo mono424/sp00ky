@@ -24,6 +24,8 @@ import {
   formatCount,
   formatDuration,
   formatMs,
+  formatRate,
+  formatRelativeTime,
   formatStamp,
   formatUptime,
   isAbsent,
@@ -80,6 +82,7 @@ export function Views() {
   const [sharedOnly, setSharedOnly] = createSignal(false);
   const [slowOnly, setSlowOnly] = createSignal(false);
   const [largeOnly, setLargeOnly] = createSignal(false);
+  const [hotOnly, setHotOnly] = createSignal(false);
 
   // `/presence` is served from the scheduler's sampler memory, so this is a
   // cheap request: it carries the ranking, the per-SSP split and the slow
@@ -101,6 +104,7 @@ export function Views() {
     if (sharedOnly()) params.set('shared', 'true');
     if (slowOnly() && extra()) params.set('slow_ms', String(extra()!.slow_ms));
     if (largeOnly()) params.set('large', 'true');
+    if (hotOnly()) params.set('hot', 'true');
     return `/views?${params.toString()}`;
   });
 
@@ -153,8 +157,68 @@ export function Views() {
             </div>
           </Panel>
 
-          {/* The one thing on this page that is a warning rather than a
-              reading. A view this size is republished row by row as
+          {/* A live condition rather than a standing one, so it goes first.
+              The scheduler reads every view's running `updateCount` on each
+              presence sample and divides by the gap; a view at or over the
+              hot rate is churning its SSP's publication queue and every
+              subscriber's socket. The shape this exists for is a bulk import
+              into a table someone has open: a PGN import moved one game-list
+              view ~125 times a second and backed the SSP up for minutes
+              (2026-10-08). The `hot_views` incident keeps the record once
+              the burst is over. */}
+          <Show when={(extra()?.totals.hot_views ?? 0) > 0}>
+            <Panel>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: '12px',
+                  'align-items': 'flex-start',
+                  'justify-content': 'space-between',
+                }}
+              >
+                <div>
+                  <div>
+                    <Pill tone="warn" dot>
+                      {formatCount(extra()!.totals.hot_views)}{' '}
+                      {extra()!.totals.hot_views === 1 ? 'view is' : 'views are'} hot
+                    </Pill>
+                  </div>
+                  <div class="dim" style={{ 'margin-top': '6px' }}>
+                    Updating at least {formatRate(extra()!.hot_view_rate)} between
+                    the last two presence samples. Every update is a delta the SSP publishes and every
+                    subscriber downloads. A burst like this is usually a bulk
+                    write (an import, a backfill, a script) into a table
+                    somebody has open. Pace the writer, or window the view so
+                    most of those rows never land in it.
+                  </div>
+                  <div style={{ 'margin-top': '8px', display: 'grid', gap: '4px' }}>
+                    <For each={extra()!.hot.slice(0, 3)}>
+                      {(h) => (
+                        <div class="dim">
+                          <span class="tone-warn">{formatRate(h.per_sec)}</span>{' '}
+                          <A href={`/views/${encodeURIComponent(h.key)}`}>
+                            <span class="id">{h.key.slice(0, 12)}</span>
+                          </A>{' '}
+                          · {h.auth_id || 'no auth'}
+                          <Show when={h.ssp_id}> · {h.ssp_id}</Show>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </div>
+                <button
+                  class="btn btn-sm"
+                  style={{ flex: 'none' }}
+                  onClick={() => setHotOnly(true)}
+                  title="Filter the table to the hot views"
+                >
+                  Show them
+                </button>
+              </div>
+            </Panel>
+          </Show>
+
+          {/* The standing warning. A view this size is republished row by row as
               `_00_list_ref` edges on every cold registration, in one
               transaction; a few thousand of them at once stalled a tenant's
               SurrealDB (3.0.5) for minutes and took every other registration
@@ -190,6 +254,7 @@ export function Views() {
                 </div>
                 <button
                   class="btn btn-sm"
+                  style={{ flex: 'none' }}
                   onClick={() => setLargeOnly(true)}
                   title="Filter the table to the large views"
                 >
@@ -303,7 +368,11 @@ export function Views() {
               </Show>
             }
             actions={
-              <Show when={user() || ssp() || search() || sharedOnly() || slowOnly() || largeOnly()}>
+              <Show
+                when={
+                  user() || ssp() || search() || sharedOnly() || slowOnly() || largeOnly() || hotOnly()
+                }
+              >
                 <button
                   class="btn btn-sm"
                   onClick={() => {
@@ -313,6 +382,7 @@ export function Views() {
                     setSharedOnly(false);
                     setSlowOnly(false);
                     setLargeOnly(false);
+                    setHotOnly(false);
                   }}
                 >
                   Clear filters
@@ -370,6 +440,14 @@ export function Views() {
                 />
                 Large only
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={hotOnly()}
+                  onChange={(e) => setHotOnly(e.currentTarget.checked)}
+                />
+                Hot only
+              </label>
             </div>
           </Panel>
 
@@ -419,6 +497,10 @@ export function Views() {
                               v.p99 !== null && v.p99 >= d().slow_ms;
                             const large = () =>
                               v.row_count >= d().large_view_rows;
+                            // Was hot while registered, but is not now: the
+                            // burst is over and the incident has the rest.
+                            const cooled = () =>
+                              !v.hot && (v.update_rate_peak ?? 0) >= d().hot_view_rate;
                             return (
                               <tr>
                                 <td class="cell-surql">
@@ -479,8 +561,37 @@ export function Views() {
                                 >
                                   {formatMs(v.p99)}
                                 </td>
-                                <td class="dim" data-label="Updates">
-                                  {formatCount(v.update_count)}
+                                <td
+                                  classList={{ dim: !v.hot, 'tone-warn': v.hot }}
+                                  data-label="Updates"
+                                  title={
+                                    v.hot
+                                      ? `Updating ${formatRate(v.update_rate)}, at or over ${formatRate(d().hot_view_rate)}. Usually a bulk write into a table this view watches.`
+                                      : cooled()
+                                        ? `Peaked at ${formatRate(v.update_rate_peak)} ${formatRelativeTime(v.update_rate_peak_at_ms!)}`
+                                        : undefined
+                                  }
+                                >
+                                  <span style={{ 'white-space': 'nowrap' }}>
+                                    {formatCount(v.update_count)}
+                                    <Show
+                                      when={v.hot}
+                                      fallback={
+                                        <Show when={(v.update_rate ?? 0) > 0 || cooled()}>
+                                          <span class="ghost">
+                                            {' '}
+                                            · {cooled()
+                                              ? `peaked ${formatRate(v.update_rate_peak)}`
+                                              : formatRate(v.update_rate)}
+                                          </span>
+                                        </Show>
+                                      }
+                                    >
+                                      {' · '}
+                                      {formatRate(v.update_rate)}{' '}
+                                      <Pill tone="warn">hot</Pill>
+                                    </Show>
+                                  </span>
                                 </td>
                                 <td
                                   classList={{
@@ -559,6 +670,11 @@ export function ViewDetail() {
                 <Show when={slow()}>
                   <Pill tone="warn">slow</Pill>
                 </Show>
+                <Show when={v().hot}>
+                  <Pill tone="warn" dot>
+                    hot
+                  </Pill>
+                </Show>
               </>
             )}
           </Show>
@@ -582,6 +698,17 @@ export function ViewDetail() {
                 <Cell
                   label="Updates"
                   value={formatCount(d().view.update_count)}
+                />
+                <Cell
+                  label="Update rate"
+                  value={formatRate(d().view.update_rate)}
+                  tone={d().view.hot ? 'warn' : undefined}
+                  foot={
+                    d().view.update_rate_peak !== null &&
+                    d().view.update_rate_peak_at_ms !== null
+                      ? `peak ${formatRate(d().view.update_rate_peak)} ${formatRelativeTime(d().view.update_rate_peak_at_ms!)}`
+                      : `hot at ${formatRate(d().hot_view_rate)}`
+                  }
                 />
                 <Cell
                   label="Errors"

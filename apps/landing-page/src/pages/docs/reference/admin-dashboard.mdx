@@ -513,7 +513,7 @@ Two surfaces, split by the question each answers.
 **Overview** carries the rollup, because "is anyone using this?" is a
 landing-page question: a band of four tiles — users, sessions and registered
 views, each with its count and its history, and a view-health tile with the
-shared / slow / errored counts. Each chart keeps its own scale; views outnumber
+hot / large / slow / errored counts. Each chart keeps its own scale; views outnumber
 users by one to two orders of magnitude, and a shared axis would flatten the
 users line onto the baseline.
 
@@ -548,6 +548,31 @@ One background sampler feeds both surfaces, so ten open dashboards cost the
 database exactly what one does, and the totals ride the overview poll the app
 already makes rather than a request of their own.
 
+### Hot views
+
+A view whose `updateCount` climbs at least `SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC`
+times a second (default `5`) is **hot**. The count on `_00_query` is a running
+total, so the sampler reads it on every tick and divides the difference by the
+gap since the last one. The Views tab shows each row's current rate next to its
+update count, marks hot rows, and opens with a banner naming the hottest ones;
+**Hot only** (`?hot=true`) narrows the table to them. A row that was hot earlier
+but has calmed down keeps its peak (`peaked 125/s`) for as long as it stays
+registered. The view's own page shows the rate and the peak with its time.
+
+The shape this catches is a bulk write into a table somebody has open: an
+import, a backfill, a script. Every update is a delta the SSP publishes and
+every subscriber downloads, so one view moving a hundred times a second can
+fill the SSP's publication queue and stall registrations for everyone. Pace the
+writer, or window the view so most of those rows never land in it.
+
+While any view is hot, one `hot_views` incident stays open under the component
+`views`, so a burst nobody was watching still leaves a record. It closes once
+every view has stayed under the rate for a minute (a pause between import
+slices does not split one episode in two) and its summary names the peak, the
+view key and the user. A rate needs two samples, so a view registered less than
+one presence interval ago has none yet, and the rate is measured over that
+interval (`15s` by default).
+
 ## Configuration
 
 | Variable                            | Default                       | Meaning                                                                                                                                                                                                                                                                |
@@ -562,6 +587,7 @@ already makes rather than a request of their own.
 | `SPKY_ADMIN_PRESENCE_INTERVAL_SECS` | `15`                          | How often the presence sampler reads `_00_query`. One sampler serves every open dashboard                                                                                                                                                                              |
 | `SPKY_ADMIN_SLOW_VIEW_MS`           | `250`                         | Materialization p99 at which a view counts as slow. `?slow_ms=` overrides it per request                                                                                                                                                                               |
 | `SPKY_ADMIN_LARGE_VIEW_ROWS`        | `1000`                        | Row count from which a view is flagged **large** on the Views tab and the Overview. Every row of an unwindowed live view is republished as an edge on each cold registration, so a few thousand at once can stall the database; `?large=true` filters the list to them |
+| `SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC` | `5`                         | Updates per second, between two presence samples, from which a view is flagged **hot** on the Views tab and the Overview and opens a `hot_views` incident. `?hot=true` filters the list to them. See [Hot views](#hot-views) |
 | `SPKY_ADMIN_PRESENCE_MAX_ROWS`      | `20000`                       | Ceiling on rows one presence or views query may pull back                                                                                                                                                                                                              |
 | `SPKY_ADMIN_JOB_INTERVAL_SECS`      | `15`                          | How often the job sampler reads the outbox tables while nobody has the Jobs page open. `0` switches the sampler off: the Jobs list still works, the totals and the Overview tile report that they are not measured                                                     |
 | `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | `2`                           | The cadence while at least one dashboard holds `/admin/api/jobs/stream` open. Clamped to no slower than the idle interval                                                                                                                                              |
@@ -617,7 +643,7 @@ and port with no path lands on the dashboard.
 | `GET /admin/api/me`                         | Current session's subject, label, mode and scope                                                                                                                                                                                                                     |
 | `GET /admin/api/overview`                   | Scheduler, SSP and backend entities plus totals, and the presence rollup                                                                                                                                                                                             |
 | `GET /admin/api/presence`                   | Live users, sessions and views, the sample ring behind the charts, the heaviest users and the per-SSP split. Served from the sampler's memory                                                                                                                        |
-| `GET /admin/api/views`                      | Registered live queries. `?limit=`, `?user=`, `?ssp=`, `?sort=`, `?slow_ms=`, `?q=`, `?shared=`, `?include_expired=`                                                                                                                                                 |
+| `GET /admin/api/views`                      | Registered live queries. `?limit=`, `?user=`, `?ssp=`, `?sort=`, `?slow_ms=`, `?q=`, `?shared=`, `?large=`, `?hot=`, `?include_expired=`. Every row carries `update_rate` (per second, `null` until sampled twice), `update_rate_peak`, `update_rate_peak_at_ms` and `hot`                                                                                                                                                 |
 | `GET /admin/api/views/:key`                 | One view: SurrealQL, params, subscribers, percentiles, its SSP's memory attribution, and the other sessions running the identical query                                                                                                                              |
 | `GET /admin/api/backends`                   | Backend list                                                                                                                                                                                                                                                         |
 | `GET /admin/api/backends/:name`             | One backend with probe history and masked env                                                                                                                                                                                                                        |

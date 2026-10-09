@@ -190,7 +190,7 @@ export function Overview(props: {
     const t = totals();
     if (!t) return undefined;
     if (t.errored_views) return 'bad';
-    if (t.slow_views || t.large_views) return 'warn';
+    if (t.slow_views || t.large_views || t.hot_views) return 'warn';
     return undefined;
   };
 
@@ -445,10 +445,15 @@ export function Overview(props: {
                         when={p().ready}
                         fallback={<Empty>Waiting for the first presence sample…</Empty>}
                       >
+                        {/* Hot, not Shared, in the first slot: shared is a
+                            reading the Registered views tile already carries,
+                            and this tile is about what needs looking at. */}
                         <div class="stat3 stat4">
                           <div>
-                            <div class="k">Shared</div>
-                            <div class="v">{formatCount(p().totals.shared_views)}</div>
+                            <div class="k">Hot</div>
+                            <div class="v" classList={{ 'tone-warn': p().totals.hot_views > 0 }}>
+                              {formatCount(p().totals.hot_views)}
+                            </div>
                           </div>
                           <div>
                             <div class="k">Large</div>

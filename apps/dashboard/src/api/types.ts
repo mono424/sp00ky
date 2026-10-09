@@ -256,6 +256,17 @@ export interface PresenceTotals {
   errored_views: number;
   /** Views holding at least `large_view_rows` rows (see Presence). */
   large_views: number;
+  /** Views updating at least `hot_view_rate` times a second (see Presence). */
+  hot_views: number;
+}
+
+/** A view updating at or over the hot rate, as of the last sample. */
+export interface HotView {
+  key: string;
+  auth_id: string;
+  ssp_id: string | null;
+  /** Updates per second since the previous presence sample. */
+  per_sec: number;
 }
 
 export interface PresenceSample {
@@ -283,6 +294,10 @@ export interface Presence extends PresenceBlock {
   slow_ms: number;
   /** Row count from which a view is flagged large. */
   large_view_rows: number;
+  /** Updates per second from which a view is flagged hot. */
+  hot_view_rate: number;
+  /** The hottest views right now, at most ten, hottest first. */
+  hot: HotView[];
   top_users: { auth_id: string; views: number; sessions: number }[];
   by_ssp: { ssp_id: string; views: number }[];
 }
@@ -301,6 +316,16 @@ export interface ViewSummary {
   ssp_id: string | null;
   row_count: number;
   update_count: number;
+  /**
+   * Updates per second between the last two presence samples. Null until the
+   * scheduler has sampled the view twice.
+   */
+  update_rate: number | null;
+  /** Highest `update_rate` seen while the view stayed registered, and when. */
+  update_rate_peak: number | null;
+  update_rate_peak_at_ms: number | null;
+  /** `update_rate` is at or over the hot rate. */
+  hot: boolean;
   error_count: number;
   registration_ms: number | null;
   p55: number | null;
@@ -326,6 +351,7 @@ export interface ViewsList {
   sort: string;
   slow_ms: number;
   large_view_rows: number;
+  hot_view_rate: number;
   server_time_ms: number;
 }
 
@@ -375,6 +401,8 @@ export interface ViewDetailData {
     }[];
   };
   slow_ms: number;
+  large_view_rows: number;
+  hot_view_rate: number;
   server_time_ms: number;
 }
 

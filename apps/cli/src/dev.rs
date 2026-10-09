@@ -23,6 +23,8 @@ const NETWORK_NAME: &str = "sp00ky-dev-net";
 const SURREAL_CONTAINER: &str = "sp00ky-dev-surrealdb";
 const SSP_CONTAINER: &str = "sp00ky-dev-ssp";
 const SCHEDULER_CONTAINER: &str = "sp00ky-dev-scheduler";
+/// How long `docker stop` lets SurrealDB flush before Docker SIGKILLs it.
+const SURREAL_STOP_GRACE_SECS: &str = "30";
 
 pub(crate) const SURREAL_PORT: u16 = 8666;
 pub(crate) const SSP_PORT: u16 = 8667;
@@ -452,9 +454,9 @@ fn run_direct_mode(
 
     // Clean up any stale resources from a previous run
     remove_pool_machines();
-    let _ = docker(&["rm", "-f", SURREAL_CONTAINER]);
     let _ = docker(&["rm", "-f", SSP_CONTAINER]);
     let _ = docker(&["rm", "-f", SCHEDULER_CONTAINER]);
+    stop_surreal_gracefully();
     let _ = docker(&["network", "rm", NETWORK_NAME]);
 
     let use_local_surreal = resolved_surreal.hosting != HostingMode::External;
@@ -841,19 +843,21 @@ fn cleanup_direct(_stop: &Arc<AtomicBool>) -> Result<()> {
     // `docker run` client, which neither stops the container nor triggers
     // `--rm`, so without this sweep their published ports stay bound after
     // Ctrl+C. Fall back to the known infra names if enumeration fails.
+    // SurrealDB is skipped here and stopped last, gracefully, once nothing
+    // writes to it any more (see `stop_surreal_gracefully`).
     let removed = match Command::new("docker")
-        .args(["ps", "-aq", "--filter", "name=^sp00ky-dev-"])
+        .args(["ps", "-a", "--filter", "name=^sp00ky-dev-", "--format", "{{.Names}}"])
         .output()
     {
         Ok(out) if out.status.success() => {
-            let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
                 .split_whitespace()
                 .map(|s| s.to_string())
                 .collect();
-            for id in &ids {
-                let _ = docker(&["rm", "-f", id]);
+            for name in names.iter().filter(|n| n.as_str() != SURREAL_CONTAINER) {
+                let _ = docker(&["rm", "-f", name]);
             }
-            !ids.is_empty()
+            !names.is_empty()
         }
         _ => false,
     };
@@ -861,8 +865,8 @@ fn cleanup_direct(_stop: &Arc<AtomicBool>) -> Result<()> {
         // Enumeration failed (or matched nothing) — remove infra by name.
         let _ = docker(&["rm", "-f", SCHEDULER_CONTAINER]);
         let _ = docker(&["rm", "-f", SSP_CONTAINER]);
-        let _ = docker(&["rm", "-f", SURREAL_CONTAINER]);
     }
+    stop_surreal_gracefully();
 
     // Pool machines hold the network open, so they go before it does.
     remove_pool_machines();
@@ -872,6 +876,23 @@ fn cleanup_direct(_stop: &Arc<AtomicBool>) -> Result<()> {
 
     ui::info(format!("Cleaned up. Goodbye! {}", ui::glyphs().ghost));
     Ok(())
+}
+
+/// Stop the dev SurrealDB with SIGTERM and a grace period, then remove it.
+///
+/// Never `docker rm -f` a SurrealDB that holds data: the SIGKILL can lose
+/// acknowledged commits. SurrealKV (0.21.2 to at least 0.21.4, so SurrealDB
+/// v3.1 to v3.3.2) appends a commit to the active WAL segment, and if that
+/// commit then overflows the memtable it rotates the WAL and applies the
+/// commit to the new memtable. The flush of the old memtable deletes the old
+/// segment, so the commit lives only in memory until the new memtable
+/// flushes. A kill in that window drops it: one whole 500-row INSERT batch
+/// was gone after a Ctrl+C restart. On SIGTERM SurrealDB flushes every
+/// memtable to an SSTable before exiting, which closes the window.
+/// Best effort: a missing container is not an error.
+fn stop_surreal_gracefully() {
+    let _ = docker(&["stop", "-t", SURREAL_STOP_GRACE_SECS, SURREAL_CONTAINER]);
+    let _ = docker(&["rm", "-f", SURREAL_CONTAINER]);
 }
 
 // ── Compose mode ────────────────────────────────────────────────────────────

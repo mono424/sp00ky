@@ -1021,33 +1021,64 @@ impl Scheduler {
 
         info!(successor, "Handing over to a successor scheduler");
         gate.set_status("active", "handing_over");
-        gate.set_mode(Mode::Hold);
-        if !gate.wait_idle(Duration::from_secs(10)).await {
-            warn!(inflight = gate.inflight(), "Requests still in flight after 10 s; handing over anyway");
-        }
 
-        // No event half taken: every intake finishes, none starts again.
-        let ingest = match tokio::time::timeout(Duration::from_secs(15), crate::handover::ingest_gate().write()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                gate.set_mode(Mode::Serve);
-                gate.set_status("active", "serving");
-                return Err(Refusal::Busy("an ingest did not finish".to_string()));
-            }
-        };
-        // No drain mid-way either.
+        // Phase 1, still serving: release the replica. Closing a large
+        // RocksDB flushes its memtables and waits out compactions, seconds on
+        // whitepawn (7.9 s on 2026-10-09, all of it spent holding every
+        // request). Nothing on the steady-state path touches the replica:
+        // ingest goes to the WAL and the fan-out, view registrations and
+        // heartbeats to the pool. So the close happens before the hold, with
+        // traffic flowing. Only drains, re-clones, drift work and range builds
+        // read or write it; the drain lock and stopping those writers keep
+        // them off. The changefeed tail and lagging redelivery keep running:
+        // they only take events in and pass them on.
         let drain = match tokio::time::timeout(Duration::from_secs(30), self.drain_lock.lock()).await {
             Ok(guard) => guard,
             Err(_) => {
-                drop(ingest);
-                gate.set_mode(Mode::Serve);
                 gate.set_status("active", "serving");
                 return Err(Refusal::Busy("a snapshot drain did not finish".to_string()));
             }
         };
-
         // The point of no return.
-        let stopped = crate::handover::abort_singletons();
+        let mut stopped = crate::handover::abort_singletons_except(&["changefeed-tail", "lagging-redelivery"]);
+        let close_started = std::time::Instant::now();
+        match tokio::time::timeout(Duration::from_secs(30), self.replica.write()).await {
+            Ok(mut replica) => replica.close(),
+            Err(_) => error!("Replica stayed busy for 30 s; the successor waits for its lock"),
+        }
+        // `close` drops the engine's last handle; the engine lets go of the
+        // directory lock when its own shutdown is done. Wait for that here,
+        // where it costs nobody anything, by opening the directory ourselves:
+        // it only opens once the old engine is gone.
+        let released = loop {
+            match Replica::new(self.config.replica_db_path.clone()).await {
+                Ok(probe) => {
+                    drop(probe);
+                    break true;
+                }
+                Err(e) if crate::handover::is_lock_error(&e) && close_started.elapsed() < Duration::from_secs(60) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Could not confirm the replica was released; the successor waits for its lock");
+                    break false;
+                }
+            }
+        };
+        info!(
+            released,
+            close_ms = close_started.elapsed().as_millis() as u64,
+            "Replica released while still serving"
+        );
+
+        // Phase 2, the hold: what is left is in-memory and takes milliseconds.
+        gate.set_mode(Mode::Hold);
+        if !gate.wait_idle(Duration::from_secs(10)).await {
+            warn!(inflight = gate.inflight(), "Requests still in flight after 10 s; handing over anyway");
+        }
+        // No event half taken: every intake finishes, none starts again.
+        let ingest = crate::handover::ingest_gate().write().await;
+        stopped += crate::handover::abort_singletons();
         if tokio::time::timeout(Duration::from_secs(30), self.fanout.idle()).await.is_err() {
             warn!("Fan-out did not settle in 30 s; SSPs may need to catch up from the successor");
         }
@@ -1057,10 +1088,6 @@ impl Scheduler {
             ssps: self.ssp_pool.read().await.export(),
             queries: query_tracker.export().await,
         };
-        match tokio::time::timeout(Duration::from_secs(30), self.replica.write()).await {
-            Ok(mut replica) => replica.close(),
-            Err(_) => error!("Replica stayed busy for 30 s; the successor waits for its lock"),
-        }
 
         // This process never takes an event, drains, or backs up again.
         std::mem::forget(ingest);

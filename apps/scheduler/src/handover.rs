@@ -497,6 +497,25 @@ where
     handle
 }
 
+/// Abort every [`spawn_singleton`] task except the named ones, which stay
+/// registered for a later [`abort_singletons`]. Returns how many it stopped.
+pub fn abort_singletons_except(keep: &[&str]) -> usize {
+    let mut all = SINGLETONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut running = 0;
+    all.retain(|(name, handle)| {
+        if keep.contains(name) {
+            return !handle.is_finished();
+        }
+        if !handle.is_finished() {
+            running += 1;
+            tracing::debug!(task = *name, "Stopping background task for the handover");
+            handle.abort();
+        }
+        false
+    });
+    running
+}
+
 /// Abort every [`spawn_singleton`] task. Returns how many were running.
 pub fn abort_singletons() -> usize {
     let all = std::mem::take(&mut *SINGLETONS.lock().unwrap_or_else(|e| e.into_inner()));

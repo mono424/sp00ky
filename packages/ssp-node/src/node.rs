@@ -193,6 +193,12 @@ impl SspNode {
     /// Dispatch one request. `None` = the route is not (yet) served by the
     /// core — the shell keeps handling it in its own framework layer.
     pub async fn route(&self, req: ApiRequest) -> Option<ApiResponse> {
+        self.route_with(req, &crate::handover::RouteOptions::default()).await
+    }
+
+    /// [`Self::route`] with host-supplied options (values a shell reads from
+    /// its environment, which the core never does).
+    pub async fn route_with(&self, req: ApiRequest, opts: &crate::handover::RouteOptions) -> Option<ApiResponse> {
         let route = RouteId::match_path(req.method, &req.path)?;
 
         // Bearer auth, identical to the shell middleware it replaces: the
@@ -225,6 +231,9 @@ impl SspNode {
             RouteId::ViewUnregister => self.unregister_view_handler(&req).await?,
             RouteId::ViewRegister => self.register_view_handler(&req).await?,
             RouteId::Ingest => self.ingest_handler(&req).await?,
+            RouteId::HandoverRetire => self.handover_retire_handler(&req, opts.retire_drain).await,
+            RouteId::HandoverPromote => self.handover_promote_handler(&req).await,
+            RouteId::HandoverResume => self.handover_resume().await,
             // Known route, not migrated yet — the shell's framework layer
             // still owns it.
             _ => return None,
@@ -316,6 +325,11 @@ impl SspNode {
     }
 
     async fn reset_handler(&self) -> ApiResponse {
+        // Deletes every edge in the database: never from a standby (writes
+        // nothing) or a retired SSP (its successor owns the edges now).
+        if let Some(refused) = self.handover_gate().await {
+            return refused;
+        }
         let _publication = self.publication_gate.lock().await;
         self.edge_update_tx.invalidate_all();
         info!("Resetting circuit state");
@@ -335,6 +349,12 @@ impl SspNode {
     /// a schema change is invisible until a reload). Gates ingest (status →
     /// Bootstrapping) for the duration, exactly like a cold start.
     async fn reload_handler(&self) -> ApiResponse {
+        // A reload republishes everything and rebuilds from upstream rather
+        // than from the scheduler's stream: neither fits a standby or a
+        // retired SSP.
+        if let Some(refused) = self.handover_gate().await {
+            return refused;
+        }
         match self.reload().await {
             Ok(()) => ok_json(json!({ "status": "ready" })),
             Err(e) => err_json(500, "reload_failed", e.to_string()),
@@ -378,6 +398,11 @@ impl SspNode {
 
     pub async fn republish_restored_views(&self) -> anyhow::Result<()> {
         self.refresh_query_allowlist().await;
+        // A standby writes nothing: `POST /handover/promote` republishes what
+        // its predecessor's digests do not vouch for.
+        if self.is_standby() {
+            return Ok(());
+        }
         let ids = self.processor.read().await.view_ids();
         for id in ids {
             let deltas = self.processor.read().await.snapshot_deltas_for_view(&id);
@@ -458,6 +483,11 @@ impl SspNode {
     ///   the runner honors at dequeue.
     /// - `success`/`failed`: idempotent no-op.
     async fn job_kill_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
+        // A standby runs no jobs and writes nothing. A retired SSP still may:
+        // its in-flight jobs run to completion and stay cancellable.
+        if self.is_standby() {
+            return self.handover_gate().await;
+        }
         let Ok(action) = serde_json::from_slice::<JobActionRequest>(&req.body) else {
             return Some(err_json(422, "bad_body", "invalid job action payload"));
         };
@@ -518,6 +548,10 @@ impl SspNode {
     /// the row and re-enqueues a fresh `JobEntry` directly, because a plain
     /// `UPDATE` would not re-trigger the CREATE-gated ingest path.
     async fn job_retry_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
+        // A new execution is a new claim: not on a standby or a retired SSP.
+        if let Some(refused) = self.handover_gate().await {
+            return Some(refused);
+        }
         let Ok(action) = serde_json::from_slice::<JobActionRequest>(&req.body) else {
             return Some(err_json(422, "bad_body", "invalid job action payload"));
         };
@@ -590,6 +624,9 @@ impl SspNode {
     /// still guarantees a job already moving here is never double-executed.
     /// Only acts on rows that are still `pending`.
     async fn job_recover_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
+        if let Some(refused) = self.handover_gate().await {
+            return Some(refused);
+        }
         let Ok(action) = serde_json::from_slice::<JobActionRequest>(&req.body) else {
             return Some(err_json(422, "bad_body", "invalid job action payload"));
         };
@@ -650,6 +687,7 @@ impl SspNode {
             SspStatus::Ready => "ready",
             SspStatus::Failed => "failed",
             SspStatus::Stopping => "stopping",
+            SspStatus::Retired => "retired",
         }
     }
 
@@ -660,6 +698,7 @@ impl SspNode {
         let status = *self.status.read().await;
         let ssp_ready = status == SspStatus::Ready;
         let status_str = Self::status_str(status);
+        let standby = self.is_standby();
 
         // `status` deliberately still reflects only bootstrap state. The
         // scheduler's bootstrap handshake compares it to the literal "ready"
@@ -679,8 +718,16 @@ impl SspNode {
         let Some(backend_health) = &self.backend_health else {
             // Cluster mode (or no monitor): historical shape, plus `db` only
             // when there is something wrong to report.
-            let http_status = if ssp_ready { 200 } else { 503 };
+            //
+            // A retired SSP answers 200: it is alive and deliberately not
+            // serving, waiting to be stopped. A failing probe would have the
+            // cloud's autoheal recreate it, and a recreated predecessor
+            // registers all over again.
+            let http_status = if ssp_ready || status == SspStatus::Retired { 200 } else { 503 };
             let mut body = json!({ "status": status_str });
+            if standby {
+                body["standby"] = json!(true);
+            }
             if let Some(consecutive_timeouts) = db_stall {
                 body["db"] = json!({
                     "status": "stalled",
@@ -714,6 +761,9 @@ impl SspNode {
                 "total": c.total,
             }
         });
+        if standby {
+            body["ssp"]["standby"] = json!(true);
+        }
         if let Some(consecutive_timeouts) = db_stall {
             body["db"] = json!({
                 "status": "stalled",
@@ -785,10 +835,11 @@ impl SspNode {
             .collect();
 
         let uptime_seconds = crate::now_epoch_ms().saturating_sub(self.start_epoch_ms) / 1000;
+        let standby = self.is_standby();
         let bootstrap_warnings = self.bootstrap_warnings.read().await.clone();
         let query_allowlist = self.query_allowlist.info().await;
 
-        json!([
+        let mut info = json!([
             {
                 "entity": "ssp",
                 "id": self.ssp_id,
@@ -808,7 +859,11 @@ impl SspNode {
                 "query_allowlist": query_allowlist,
                 "push": self.push_engine.as_ref().map(|e| serde_json::to_value(e.status()).unwrap_or(Value::Null)),
             }
-        ])
+        ]);
+        if standby {
+            info[0]["standby"] = json!(true);
+        }
+        info
     }
 
     async fn info_handler(&self) -> ApiResponse {
@@ -952,6 +1007,13 @@ impl SspNode {
     /// 503 with the `SspError` shape when the SSP isn't `Ready`.
     async fn ready_gate(&self) -> Option<ApiResponse> {
         let status = *self.status.read().await;
+        if status == SspStatus::Retired {
+            return Some(err_json(
+                503,
+                crate::status::error_codes::RETIRED,
+                "SSP is retired; its successor serves this tenant",
+            ));
+        }
         if status != SspStatus::Ready {
             return Some(ApiResponse::json(
                 503,
@@ -968,6 +1030,10 @@ impl SspNode {
     async fn crdt_apply_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
+        }
+        // Writes `_00_crdt`: never from a standby.
+        if self.is_standby() {
+            return self.handover_gate().await;
         }
         let Ok(payload) = serde_json::from_slice::<crate::crdt::ApplyRequest>(&req.body) else {
             return Some(err_json(422, "bad_body", "invalid crdt apply payload"));
@@ -1014,6 +1080,12 @@ impl SspNode {
         }
         self.view_metrics.write().await.remove(&view_key);
         self.platform.telemetry.gauge_add("view_count", -1);
+
+        // A standby follows the registration set (the scheduler forwards it a
+        // shadow of every unregister) but the edges are its predecessor's.
+        if self.is_standby() {
+            return Some(ok_json(Value::Null));
+        }
 
         // Delete all edges for this incantation via the Db port.
         let incantation_id = crate::edges::format_incantation_id(&payload.id);
@@ -1091,6 +1163,9 @@ impl SspNode {
             view_id = %view_id,
             "View was registered without an identity - rebuilding it for the caller who has one"
         );
+        if self.is_standby() {
+            return true;
+        }
 
         let cleanup = format!(
             "LET $from = type::record('_00_query', $qid); \
@@ -1381,11 +1456,19 @@ impl SspNode {
             }
         };
 
+        // A standby (blue/green) computes the registration and writes
+        // nothing: no tables, no `_00_query` row, no edges. Its predecessor
+        // does all of that for the same registration, which the scheduler
+        // forwards to both.
+        let standby = self.is_standby();
+
         // Lazy-define per-user tables (idempotent; no-op in Single mode).
-        if let Err(e) =
-            crate::tables::ensure_user_tables(self.platform.db.as_ref(), self.ref_mode, &auth_id)
-                .await
-        {
+        let tables = if standby {
+            Ok(())
+        } else {
+            crate::tables::ensure_user_tables(self.platform.db.as_ref(), self.ref_mode, &auth_id).await
+        };
+        if let Err(e) = tables {
             // `?` (Debug) prints the whole anyhow chain; `%` showed only the
             // outer context and hid the database's actual reason.
             error!(error = ?e, auth_id = %auth_id, "Failed to ensure per-user tables");
@@ -1476,6 +1559,9 @@ impl SspNode {
             }
 
             info!(target: "ssp::edges", view_id = %incantation_id, "View already existed - joining as an additional subscriber");
+            if standby {
+                return Some(ok_json(Value::Null));
+            }
             // Record this session as a watcher and refresh liveness.
             //
             // `auth_id` is deliberately NOT written here: it is write-once,
@@ -1552,11 +1638,15 @@ impl SspNode {
             }
         };
 
-        let (initial_row_count, initial_state, publication_ready) = {
+        let (initial_row_count, initial_state, publication_ready, standby) = {
             let mut circuit = self.processor.write().await;
             if !self.edge_update_tx.is_current(&permit) || *self.status.read().await != SspStatus::Ready {
                 return Some(err_json(503, "publication_epoch", "Circuit restarted; retry registration"));
             }
+            // Read again under the lock the enqueue below holds, the lock a
+            // promotion flips standby under: the metadata write follows the
+            // publication's fate.
+            let standby = self.is_standby();
             self.edge_update_tx.invalidate_view(&data.plan.id);
             let update = match &merge_owner {
                 Some(owner) => {
@@ -1588,7 +1678,7 @@ impl SspNode {
             let row_count = update.as_ref().map(|d| d.row_count as i64).unwrap_or(0);
             let state = crate::edges::publish_state_for(update.as_ref());
             let ready = self.edge_update_tx.enqueue(permit, update.into_iter().collect(), &circuit, None, true, vec![]);
-            (row_count, state, ready)
+            (row_count, state, ready, standby)
         };
         let registration_time_ms = register_start.elapsed().as_secs_f64() * 1000.0;
         self.platform.telemetry.gauge_add("view_count", 1);
@@ -1599,6 +1689,10 @@ impl SspNode {
             .await
             .entry(data.plan.id.clone())
             .or_default();
+
+        if standby {
+            return Some(ok_json(Value::Null));
+        }
 
         let params = data.metadata.get("safe_params").cloned().unwrap_or(Value::Null);
         // Publish state for the client. A delta with anything to write goes to
@@ -1695,7 +1789,9 @@ impl SspNode {
         // circuit could give it a collection.
         if payload.table == push_core::engine::MESSAGE_TABLE {
             drop(permit);
-            self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
+            if !self.is_standby() {
+                self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
+            }
             return Some(ok_json(json!({ "status": "ok" })));
         }
 
@@ -1708,8 +1804,12 @@ impl SspNode {
         // User table lifecycle is ordered with publication below. Dropping a
         // table on this request path could race older queued RELATE statements.
 
+        // A standby only follows: no job pickup, no schedule or push side
+        // effects. Its predecessor (or the scheduler) owns all of them.
+        let standby = self.is_standby();
+
         // Job routing.
-        if let Some(backend_info) = self.job_config.job_tables.get(&payload.table).cloned() {
+        if let Some(backend_info) = self.job_config.job_tables.get(&payload.table).filter(|_| !standby).cloned() {
             let is_assigned =
                 self.standalone || payload.job_assignee.as_deref() == Some(self.ssp_id.as_str());
 
@@ -1729,7 +1829,9 @@ impl SspNode {
 
         // Push rules watch synced rows. Spawned: the ingest answer never
         // waits on a push service.
-        self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
+        if !standby {
+            self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
+        }
 
         // Step the circuit.
         let change = match op {
@@ -2049,10 +2151,18 @@ impl SspNode {
     /// One TTL sweep over this node's ports (see [`ttl_cleanup_sweep`]).
     /// Timer entry: flush the dirty per-view metrics (see `flush_view_metrics`).
     pub async fn flush_view_metrics(&self) -> usize {
+        // A standby's metrics stay in memory (dirty) and flush once promoted.
+        if self.is_standby() {
+            return 0;
+        }
         flush_view_metrics(self.platform.db.as_ref(), &self.view_metrics).await
     }
 
     pub async fn ttl_cleanup_sweep(&self) -> usize {
+        // Not on a standby: the sweep deletes `_00_query` rows and edges.
+        if self.is_standby() {
+            return 0;
+        }
         let _publication = self.publication_gate.lock().await;
         let removed = ttl_cleanup_sweep(
             self.platform.db.as_ref(),

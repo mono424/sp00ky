@@ -301,83 +301,100 @@ pub async fn rebuild_from_db(
     };
     info!(count = views.len(), "Found persisted views in _00_query");
     for view_row in views {
-        let view_id = match view_row.get("id") {
-            Some(Value::String(s)) => s.clone(),
-            Some(v) => v.to_string().trim_matches('"').to_string(),
-            None => continue,
-        };
-        let raw_id = view_id.strip_prefix("_00_query:").unwrap_or(&view_id).to_string();
-        let Some(surql) = view_row.get("surql").and_then(|v| v.as_str()) else {
-            warn!(view_id = %raw_id, "Skipping view with missing surql");
-            continue;
-        };
-        let get = |k: &str| view_row.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let auth_id = get("auth_id");
-        let payload = json!({
-            "id": raw_id,
-            "surql": surql,
-            "clientId": get("clientId"),
-            "authId": auth_id,
-            "ttl": view_row.get("ttl").and_then(|v| v.as_str()).unwrap_or("30m"),
-            "lastActiveAt": get("lastActiveAt"),
-            "params": view_row.get("params").cloned().unwrap_or(json!({})),
-        });
-        let prep = {
-            let circuit = processor.read().await;
-            ssp::service::view::prepare_registration_dbsp(
-                payload,
-                circuit.permissions(),
-                circuit.link_targets(),
-                circuit.opaque_fields(),
-            )
-        };
-        match prep {
-            Ok(data) => {
-                let mut circuit = processor.write().await;
-                // Merge here as well as on the live path, or every restart
-                // un-merges the whole tenant: these rows are exactly the
-                // registrations that were sharing graphs before the restart,
-                // and rebuilding them one graph apiece is the memory blowup
-                // merging exists to prevent. Initial deltas are deferred here:
-                // the host republishes all restored memberships before Ready,
-                // once the complete circuit has been loaded and verified.
-                let owner = if circuit.merge_views() {
-                    circuit
-                        .owner_for_merge_key(&data.merge_key)
-                        .filter(|owner| *owner != data.plan.id)
-                        .map(|owner| owner.to_string())
-                } else {
-                    None
-                };
-                match owner {
-                    Some(owner) => {
-                        circuit.attach_subscriber(&owner, data.plan.id.clone(), auth_id.clone());
-                        info!(view_id = %raw_id, auth_id = %auth_id, owner = %owner, "Re-registered view onto a shared graph");
-                    }
-                    None => {
-                        let merge_key = data.merge_key.clone();
-                        let query_id = data.plan.id.clone();
-                        circuit.add_query_with_auth(
-                            data.plan,
-                            data.safe_params,
-                            Some(OutputFormat::Streaming),
-                            auth_id.clone(),
-                        );
-                        if circuit.merge_views() {
-                            circuit.claim_merge_key(merge_key, query_id);
-                        }
-                        info!(view_id = %raw_id, auth_id = %auth_id, "Re-registered view");
-                    }
-                }
-            }
-            Err(e) => warn!(target: "ssp::policy", view_id = %raw_id, error = %e, "Failed to re-register view"),
-        }
+        let mut circuit = processor.write().await;
+        // Initial deltas are deferred here: the host republishes all restored
+        // memberships before Ready, once the complete circuit has been loaded
+        // and verified.
+        register_persisted_view(&mut circuit, &view_row);
     }
 
     // Seed catch-up XOR accumulators from the bulk-loaded rows (bypassed by
     // `Circuit::load`), before any replay/ingest.
     processor.write().await.reseed_catchup_hashes();
     Ok(())
+}
+
+/// The `_00_query` columns a persisted view is rebuilt from.
+pub const PERSISTED_VIEW_FIELDS: &str = "id, surql, clientId, auth_id, ttl, lastActiveAt, params";
+
+/// The key of a `_00_query` row (`abc` of `_00_query:abc`), the form the
+/// circuit and `ViewDelta.query_id` use. `None` without an id.
+pub fn persisted_view_key(view_row: &Value) -> Option<String> {
+    let view_id = match view_row.get("id")? {
+        Value::String(s) => s.clone(),
+        v => v.to_string().trim_matches('"').to_string(),
+    };
+    Some(view_id.strip_prefix("_00_query:").unwrap_or(&view_id).to_string())
+}
+
+/// Register one persisted `_00_query` row into `circuit` the way a boot does:
+/// prepared against the circuit's current schema, attached to an existing
+/// graph when merging finds one computing the same thing, and with no
+/// publication (the caller decides what, if anything, to publish). Returns
+/// the canonical registration id, or `None` when the row is unusable or its
+/// registration is refused (logged).
+pub fn register_persisted_view(circuit: &mut Circuit, view_row: &Value) -> Option<String> {
+    let raw_id = persisted_view_key(view_row)?;
+    let Some(surql) = view_row.get("surql").and_then(|v| v.as_str()) else {
+        warn!(view_id = %raw_id, "Skipping view with missing surql");
+        return None;
+    };
+    let get = |k: &str| view_row.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let auth_id = get("auth_id");
+    let payload = json!({
+        "id": raw_id,
+        "surql": surql,
+        "clientId": get("clientId"),
+        "authId": auth_id,
+        "ttl": view_row.get("ttl").and_then(|v| v.as_str()).unwrap_or("30m"),
+        "lastActiveAt": get("lastActiveAt"),
+        "params": view_row.get("params").cloned().unwrap_or(json!({})),
+    });
+    let data = match ssp::service::view::prepare_registration_dbsp(
+        payload,
+        circuit.permissions(),
+        circuit.link_targets(),
+        circuit.opaque_fields(),
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(target: "ssp::policy", view_id = %raw_id, error = %e, "Failed to re-register view");
+            return None;
+        }
+    };
+    let query_id = data.plan.id.clone();
+    // Merge here as well as on the live path, or every restart un-merges the
+    // whole tenant: these rows are exactly the registrations that were
+    // sharing graphs before the restart, and rebuilding them one graph apiece
+    // is the memory blowup merging exists to prevent.
+    let owner = if circuit.merge_views() {
+        circuit
+            .owner_for_merge_key(&data.merge_key)
+            .filter(|owner| *owner != data.plan.id)
+            .map(|owner| owner.to_string())
+    } else {
+        None
+    };
+    match owner {
+        Some(owner) => {
+            circuit.attach_subscriber(&owner, data.plan.id.clone(), auth_id.clone());
+            info!(view_id = %raw_id, auth_id = %auth_id, owner = %owner, "Re-registered view onto a shared graph");
+        }
+        None => {
+            let merge_key = data.merge_key.clone();
+            circuit.add_query_with_auth(
+                data.plan,
+                data.safe_params,
+                Some(OutputFormat::Streaming),
+                auth_id.clone(),
+            );
+            if circuit.merge_views() {
+                circuit.claim_merge_key(merge_key, query_id.clone());
+            }
+            info!(view_id = %raw_id, auth_id = %auth_id, "Re-registered view");
+        }
+    }
+    Some(ssp::canonical_query_id(&query_id))
 }
 
 /// Incremental catch-up after a snapshot restore: for each table load rows

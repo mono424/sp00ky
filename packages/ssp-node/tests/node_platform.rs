@@ -2609,3 +2609,287 @@ async fn impersonate_users_searches_with_root_access() {
     let r = h.node.route(authed(Method::Post, "/impersonate/users", bad)).await.unwrap();
     assert_eq!(r.status, 400);
 }
+
+// --- Blue/green handover -------------------------------------------------------
+//
+// A standby follows ingest and registrations without writing anything; promote
+// republishes only what its predecessor's digests do not vouch for; retire
+// drains and reports those digests; resume takes a retire back.
+
+fn ingest_thread(id: &str, rv: i64) -> Value {
+    json!({ "table": "thread", "op": "CREATE", "id": format!("thread:{id}"), "record": { "title": id, "_00_rv": rv } })
+}
+
+async fn query_row_exists(h: &Harness, key: &str) -> bool {
+    row_count_of(h, key).await != -1
+}
+
+async fn promote(h: &Harness, body: Value) -> ApiResponse {
+    h.node.route(authed(Method::Post, "/handover/promote", body)).await.unwrap()
+}
+
+/// Serving node with `v1` registered and `thread:1` published: the state a
+/// predecessor leaves in the database.
+async fn published_v1() -> Harness {
+    let h = thread_harness().await;
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest_thread("1", 1))).await.unwrap().status, 200);
+    assert_eq!(
+        h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap().status,
+        200
+    );
+    assert_eq!(edge_count_of(&h, "v1").await, 1);
+    assert_eq!(state_of(&h, "v1").await, "ready");
+    h
+}
+
+#[tokio::test]
+async fn handover_routes_require_the_bearer() {
+    let h = build(HarnessOpts::default()).await;
+    for path in ["/handover/retire", "/handover/promote", "/handover/resume"] {
+        let r = h.node.route(req(Method::Post, path, None, json!({}))).await.unwrap();
+        assert_eq!(r.status, 401, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_standby_computes_but_writes_nothing() {
+    let h = thread_harness().await;
+    h.node.set_standby(true);
+
+    // Health and info say so; the scheduler's handshake still reads "ready".
+    let r = h.node.route(req(Method::Get, "/health", None, Value::Null)).await.unwrap();
+    assert_eq!((r.status, &json_of(&r)["status"], &json_of(&r)["standby"]), (200, &json!("ready"), &json!(true)));
+    let r = h.node.route(req(Method::Get, "/info", None, Value::Null)).await.unwrap();
+    assert_eq!(json_of(&r)[0]["standby"], json!(true));
+
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest_thread("1", 1))).await.unwrap().status, 200);
+    let r = h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest_thread("2", 1))).await.unwrap().status, 200);
+    // A re-registration takes the warm path: still nothing written.
+    assert_eq!(
+        h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap().status,
+        200
+    );
+
+    // The circuit follows...
+    assert_eq!(h.node.processor.read().await.get_view("v1").map(|v| v.cache.len()), Some(2));
+    // ...the database does not.
+    assert!(!query_row_exists(&h, "v1").await, "no _00_query row from a standby");
+    assert_eq!(edge_count_of(&h, "v1").await, 0, "no edges from a standby");
+    assert_eq!(h.node.edge_update_tx.snapshot().pending_batches, 0, "nothing queued either");
+
+    // Its own writers are off.
+    assert_eq!(h.node.flush_view_metrics().await, 0);
+    assert_eq!(h.node.ttl_cleanup_sweep().await, 0);
+    for path in ["/reset", "/admin/reload", "/crdt/apply"] {
+        let r = h.node.route(authed(Method::Post, path, json!({}))).await.unwrap();
+        assert_eq!((r.status, &json_of(&r)["code"]), (503, &json!("standby")), "{path}");
+    }
+
+    // An unregister releases the view and leaves the predecessor's edges be.
+    h.raw_db
+        .query("RELATE _00_query:v1->_00_list_ref->thread:1 SET version = 1, clientId = 'blue', auth_id = '';")
+        .await
+        .unwrap();
+    let r = h.node.route(authed(Method::Post, "/view/unregister", json!({ "id": "_00_query:v1" }))).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(h.node.processor.read().await.view_count(), 0);
+    assert_eq!(edge_count_of(&h, "v1").await, 1, "a standby deletes no edges");
+}
+
+#[tokio::test]
+async fn a_standby_picks_up_no_jobs() {
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://worker")], ..Default::default() }).await;
+    h.node.set_standby(true);
+    insert_job(&h.raw_db, "j1", "pending").await;
+    let body = json!({ "table": "job", "op": "CREATE", "id": "job:j1", "record": { "status": "pending" } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap().status, 200);
+    assert!(h.job_rx.lock().await.try_recv().is_err(), "a standby must not pick up a job");
+    for path in ["/job/retry", "/job/recover", "/job/kill"] {
+        let r = h.node.route(authed(Method::Post, path, json!({ "id": "job:j1" }))).await.unwrap();
+        assert_eq!(r.status, 503, "{path}");
+    }
+    assert_eq!(job_status(&h.raw_db, "j1").await.as_deref(), Some("pending"));
+}
+
+#[tokio::test]
+async fn promote_with_matching_digests_republishes_nothing() {
+    let h = published_v1().await;
+    let blue = h.node.processor.read().await.membership_digests();
+    h.node.set_standby(true);
+    // Mark the row so a republish would show: promote must leave it alone.
+    h.raw_db.query("UPDATE _00_query:v1 SET state = 'blue'").await.unwrap();
+
+    let r = promote(&h, json!({ "digests": blue })).await;
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    assert_eq!(json_of(&r), &json!({ "views": 1, "republished": 0, "dropped": 0 }));
+    assert!(!h.node.is_standby());
+    assert_eq!(edge_count_of(&h, "v1").await, 1);
+    assert_eq!(state_of(&h, "v1").await, "blue", "an equal digest is not republished");
+
+    // Promoted: the next change is published.
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest_thread("2", 1))).await.unwrap().status, 200);
+    assert_eq!(edge_count_of(&h, "v1").await, 2);
+
+    // Idempotent: a second promote is a no-op.
+    let r = promote(&h, json!({ "digests": blue })).await;
+    assert_eq!(json_of(&r), &json!({ "views": 0, "republished": 0, "dropped": 0 }));
+}
+
+#[tokio::test]
+async fn promote_republishes_a_view_that_changed_while_standby() {
+    let h = published_v1().await;
+    let blue = h.node.processor.read().await.membership_digests();
+    h.node.set_standby(true);
+    // The predecessor stopped receiving ingest; the standby did not.
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest_thread("2", 1))).await.unwrap().status, 200);
+    assert_eq!(edge_count_of(&h, "v1").await, 1, "dropped while standby");
+
+    let r = promote(&h, json!({ "digests": blue })).await;
+    assert_eq!(json_of(&r), &json!({ "views": 1, "republished": 1, "dropped": 0 }));
+    assert_eq!(edge_count_of(&h, "v1").await, 2, "the full publish replaces the edges");
+    assert_eq!(row_count_of(&h, "v1").await, 2);
+    assert_eq!(state_of(&h, "v1").await, "ready");
+}
+
+#[tokio::test]
+async fn promote_republishes_an_updated_member_even_with_unchanged_membership() {
+    let h = published_v1().await;
+    let blue = h.node.processor.read().await.membership_digests();
+    h.node.set_standby(true);
+    let update = json!({ "table": "thread", "op": "UPDATE", "id": "thread:1", "record": { "title": "new", "_00_rv": 7 } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", update)).await.unwrap().status, 200);
+
+    let r = promote(&h, json!({ "digests": blue })).await;
+    assert_eq!(json_of(&r)["republished"], json!(1));
+    publication_drained(&h).await;
+    let version: Option<i64> = h
+        .raw_db
+        .query("SELECT VALUE version FROM ONLY _00_list_ref WHERE in = _00_query:v1 LIMIT 1")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap_or(None);
+    assert_eq!(version, Some(7), "the edge carries the version the predecessor never published");
+}
+
+#[tokio::test]
+async fn promote_without_digests_republishes_every_view_whose_row_exists() {
+    let h = published_v1().await;
+    h.node.set_standby(true);
+    // A view the predecessor's TTL sweep removed: the standby still holds it,
+    // its row is gone.
+    let mut gone = thread_register("_00_query:v2");
+    gone["clientId"] = json!("tab-b");
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", gone)).await.unwrap().status, 200);
+    assert!(!query_row_exists(&h, "v2").await);
+
+    let r = promote(&h, json!({})).await;
+    assert_eq!(json_of(&r), &json!({ "views": 1, "republished": 1, "dropped": 0 }));
+    assert!(!h.node.processor.read().await.is_registered("v2"), "a vanished row is dropped locally");
+    assert!(!query_row_exists(&h, "v2").await, "and not recreated");
+    assert_eq!(edge_count_of(&h, "v2").await, 0);
+    assert_eq!(edge_count_of(&h, "v1").await, 1);
+    assert_eq!(state_of(&h, "v1").await, "ready");
+}
+
+#[tokio::test]
+async fn promote_drops_views_outside_keep_without_touching_their_edges() {
+    let h = published_v1().await;
+    let mut v2 = thread_register("_00_query:v2");
+    v2["surql"] = json!("SELECT * FROM thread WHERE title = '1'");
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", v2)).await.unwrap().status, 200);
+    assert_eq!(edge_count_of(&h, "v2").await, 1);
+    let blue = h.node.processor.read().await.membership_digests();
+    h.node.set_standby(true);
+
+    let r = promote(&h, json!({ "digests": blue, "keep": ["_00_query:v1"] })).await;
+    assert_eq!(json_of(&r), &json!({ "views": 1, "republished": 0, "dropped": 1 }));
+    assert!(!h.node.processor.read().await.is_registered("v2"));
+    assert_eq!(edge_count_of(&h, "v2").await, 1, "another SSP's edges stay");
+    assert!(query_row_exists(&h, "v2").await, "and so does its row");
+}
+
+#[tokio::test]
+async fn promote_registers_a_view_the_predecessor_held_and_the_standby_missed() {
+    let h = published_v1().await;
+    let blue = h.node.processor.read().await.membership_digests();
+    // The standby never got v1's shadow registration.
+    h.node.processor.write().await.detach_subscriber("v1");
+    h.node.set_standby(true);
+
+    let r = promote(&h, json!({ "digests": blue })).await;
+    assert_eq!(json_of(&r), &json!({ "views": 1, "republished": 0, "dropped": 0 }));
+    assert!(h.node.processor.read().await.is_registered("v1"), "registered from its _00_query row");
+    assert_eq!(h.node.processor.read().await.membership_digests(), blue);
+}
+
+#[tokio::test]
+async fn retire_drains_reports_digests_and_refuses_until_resumed() {
+    let h = published_v1().await;
+    let expected = h.node.processor.read().await.membership_digests();
+
+    let r = h.node.route(authed(Method::Post, "/handover/retire", json!({ "successor": "ssp-green" }))).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    assert_eq!(json_of(&r)["drained"], json!(true));
+    assert_eq!(json_of(&r)["digests"], json!(expected));
+    assert_eq!(*h.node.status.read().await, SspStatus::Retired);
+
+    for (path, body) in [
+        ("/ingest", ingest_thread("2", 1)),
+        ("/view/register", thread_register("_00_query:v1")),
+        ("/view/unregister", json!({ "id": "v1" })),
+    ] {
+        let r = h.node.route(authed(Method::Post, path, body)).await.unwrap();
+        assert_eq!((r.status, &json_of(&r)["code"]), (503, &json!("retired")), "{path}");
+    }
+    // Alive and saying so, never a failing probe.
+    let r = h.node.route(req(Method::Get, "/health", None, Value::Null)).await.unwrap();
+    assert_eq!((r.status, &json_of(&r)["status"]), (200, &json!("retired")));
+    assert!(h.node.job_dispatcher.is_paused());
+
+    let r = h.node.route(authed(Method::Post, "/handover/resume", json!({}))).await.unwrap();
+    assert_eq!((r.status, &json_of(&r)["resumed"]), (200, &json!(true)));
+    assert_eq!(*h.node.status.read().await, SspStatus::Ready);
+    assert!(!h.node.job_dispatcher.is_paused());
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest_thread("2", 1))).await.unwrap().status, 200);
+    assert_eq!(edge_count_of(&h, "v1").await, 2);
+
+    // Resume on a serving node: 200, nothing to undo.
+    let r = h.node.route(authed(Method::Post, "/handover/resume", json!({}))).await.unwrap();
+    assert_eq!((r.status, &json_of(&r)["resumed"]), (200, &json!(false)));
+}
+
+#[tokio::test]
+async fn retire_waits_for_outstanding_publication_and_reports_a_missed_deadline() {
+    let h = published_v1().await;
+    // Outstanding work: an admitted publication that has not landed.
+    let held = h.node.edge_update_tx.try_reserve(0).unwrap();
+    let r = h.node.handover_retire(
+        ssp_protocol::SspRetireRequest { successor: "ssp-green".into() },
+        Duration::from_millis(100),
+    ).await.unwrap_or_else(|_| panic!("retire refused"));
+    assert!(!r.drained, "the deadline passed with work outstanding");
+
+    // Released while a retire waits: it answers drained, woken by the queue.
+    let node = Arc::clone(&h.node);
+    let retire = tokio::spawn(async move {
+        node.handover_retire(ssp_protocol::SspRetireRequest { successor: "ssp-green".into() }, Duration::from_secs(10)).await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(held);
+    let started = std::time::Instant::now();
+    let r = retire.await.unwrap().unwrap_or_else(|_| panic!("retire refused"));
+    assert!(r.drained);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn a_standby_cannot_be_retired() {
+    let h = thread_harness().await;
+    h.node.set_standby(true);
+    let r = h.node.route(authed(Method::Post, "/handover/retire", json!({ "successor": "x" }))).await.unwrap();
+    assert_eq!(r.status, 409);
+    assert_eq!(*h.node.status.read().await, SspStatus::Ready);
+}

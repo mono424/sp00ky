@@ -137,7 +137,16 @@ pub struct EdgePublisher(Arc<PublicationQueue>);
 struct PublicationQueue {
     state: std::sync::Mutex<PublicationState>,
     wake: tokio::sync::Notify,
+    /// Signalled (`notify_waiters`) whenever the last lease is released, for
+    /// [`EdgePublisher::wait_drained`]. Separate from `wake`, which the run
+    /// loop waits on with `notify_one` semantics: a second waiter there could
+    /// take the run loop's wakeup.
+    idle: tokio::sync::Notify,
     started: std::sync::atomic::AtomicBool,
+    /// Blue/green standby: this SSP follows ingest but must not write to the
+    /// database, so [`EdgePublisher::enqueue`] drops everything it is handed.
+    /// The node's one standby flag (`SspNode::is_standby` reads it here).
+    standby: std::sync::atomic::AtomicBool,
     telemetry: std::sync::OnceLock<Arc<dyn Telemetry>>,
     limits: PublicationLimits,
 }
@@ -168,8 +177,15 @@ pub struct PublicationPermit {
 impl Drop for PublicationPermit {
     fn drop(&mut self) {
         if let Some(queue) = self.queue.upgrade() {
-            queue.state.lock().unwrap().leases.remove(&self.id);
+            let idle = {
+                let mut state = queue.state.lock().unwrap();
+                state.leases.remove(&self.id);
+                state.leases.is_empty()
+            };
             queue.wake.notify_one();
+            if idle {
+                queue.idle.notify_waiters();
+            }
         }
     }
 }
@@ -355,7 +371,52 @@ impl Drop for PublicationReady {
 impl EdgePublisher {
     pub fn new(limits: PublicationLimits) -> Self {
         Self(Arc::new(PublicationQueue { state: Default::default(), wake: Default::default(),
-            started: Default::default(), telemetry: Default::default(), limits }))
+            idle: Default::default(), started: Default::default(), standby: Default::default(),
+            telemetry: Default::default(), limits }))
+    }
+    /// Enter or leave blue/green standby. While set, [`Self::enqueue`] drops
+    /// its work (deltas and cleanup alike) and returns the capacity at once;
+    /// the circuit has already applied the change, only its publication is
+    /// suppressed. Flip it under the circuit write lock, the lock every
+    /// enqueue site holds, so a delta is either computed before the flip
+    /// (and dropped) or after it (and published), never half of each.
+    pub fn set_standby(&self, standby: bool) {
+        self.0.standby.store(standby, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn is_standby(&self) -> bool {
+        self.0.standby.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Nothing admitted is outstanding: no reservation, no queued or parked
+    /// work, no publication in flight.
+    pub fn is_drained(&self) -> bool {
+        self.0.state.lock().unwrap().leases.is_empty()
+    }
+    /// Wait until [`Self::is_drained`], or `timeout`. Woken by the queue's own
+    /// release signal, so a drained queue answers at once and a draining one
+    /// the moment its last lease goes; the timer only bounds the wait.
+    pub async fn wait_drained(&self, scheduler: &dyn Scheduler, timeout: Duration) -> bool {
+        let started = web_time::Instant::now();
+        loop {
+            let idle = self.0.idle.notified();
+            let mut idle = std::pin::pin!(idle);
+            // Registered before the check, so a release between the check and
+            // the await cannot be missed.
+            idle.as_mut().enable();
+            if self.is_drained() {
+                return true;
+            }
+            let left = timeout.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            tokio::select! {
+                _ = idle => {}
+                _ = scheduler.sleep(left) => {}
+            }
+            // A host whose sleep returns at once (tests) must still let the
+            // publisher run between checks.
+            publication_yield().await;
+        }
     }
     /// The estimate covers request-owned input before evaluation. Oversize input
     /// is refused immediately. Delta sizes replace this estimate when enqueued.
@@ -422,6 +483,10 @@ impl EdgePublisher {
     pub fn enqueue(&self, permit: PublicationPermit, deltas: Vec<ViewDelta>, circuit: &Circuit,
         source: Option<(String, i64)>, metadata_pending: bool, cleanup: Vec<PublicationCleanup>) -> Option<PublicationReady> {
         if deltas.is_empty() && cleanup.is_empty() { return None; }
+        if self.is_standby() {
+            // Standby writes nothing. The permit's drop returns the capacity.
+            return None;
+        }
         let capture_started = web_time::Instant::now();
         let ready = Arc::new(std::sync::atomic::AtomicU8::new(if metadata_pending { 0 } else { 1 }));
         let mut versions = HashMap::new();
@@ -2701,5 +2766,42 @@ mod publication_tests {
         let st = statements(&db);
         assert!(position_of(&st, "->thread:a SET") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
         task.abort();
+    }
+    #[tokio::test]
+    async fn standby_drops_publications_and_returns_their_capacity() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 1, bytes: 4096, operations: 100 });
+        let c = circuit();
+        p.set_standby(true);
+        let cleanup = vec![PublicationCleanup::DropEdgesTo { table: "_00_list_ref".into(), record: "thread:a".into() }];
+        let ready = p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, true, cleanup);
+        assert!(ready.is_none(), "no registration barrier for dropped work");
+        assert!(p.is_drained(), "nothing outstanding");
+        assert!(p.try_reserve(0).is_some(), "the slot came back at once");
+
+        p.set_standby(false);
+        let db = Arc::new(TestDb::default());
+        let task = start(p.clone(), db.clone(), c.clone());
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:b", true)], &*c.read().await, None, false, vec![]);
+        drained(&p).await;
+        let sent = statements(&db);
+        assert!(sent.iter().any(|s| s.contains("thread:b")), "published once out of standby: {sent:#?}");
+        assert!(!sent.iter().any(|s| s.contains("thread:a")), "standby work never reaches the database");
+        task.abort();
+    }
+    #[tokio::test]
+    async fn wait_drained_wakes_on_the_last_release_and_honours_its_deadline() {
+        let p = EdgePublisher::default();
+        assert!(p.wait_drained(&FastScheduler, Duration::ZERO).await, "an idle queue is drained");
+        let held = p.try_reserve(0).unwrap();
+        assert!(!p.wait_drained(&FastScheduler, Duration::from_millis(20)).await, "deadline with work outstanding");
+        let waiter = {
+            let p = p.clone();
+            tokio::spawn(async move { p.wait_drained(&FastScheduler, Duration::from_secs(30)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let started = web_time::Instant::now();
+        drop(held);
+        assert!(waiter.await.unwrap());
+        assert!(started.elapsed() < Duration::from_secs(5), "woken by the release, not the deadline");
     }
 }

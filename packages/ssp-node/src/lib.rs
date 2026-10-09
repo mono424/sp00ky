@@ -27,6 +27,7 @@ pub mod crdt;
 pub mod edges;
 pub mod http_sql_db;
 pub mod jobs;
+pub mod handover;
 pub mod node;
 pub mod platform;
 pub mod ports;

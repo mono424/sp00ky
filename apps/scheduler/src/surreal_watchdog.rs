@@ -255,7 +255,7 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
         "SurrealDB WebSocket watchdog started"
     );
 
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("surreal-watchdog", async move {
         let health = match reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()

@@ -296,7 +296,7 @@ impl PoolHost {
     /// there instead (idle at zero machines, not unreachable).
     pub fn start_sweep(&self, backends: maintenance::BackendHealthCache) {
         let host = self.clone();
-        tokio::spawn(async move {
+        crate::handover::spawn_singleton("pool-sweep", async move {
             // The SWEEP engine is kept: its pass counter paces the orphan sweep.
             let mut engine: Option<PoolEngine> = None;
             let mut interval = tokio::time::interval(Duration::from_secs(POOL_SWEEP_INTERVAL_SECS));

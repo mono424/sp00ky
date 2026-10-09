@@ -186,7 +186,8 @@ async fn get_metrics(
         let ready_ssps = pool
             .all()
             .iter()
-            .filter(|ssp| pool.is_ready(&ssp.id))
+            // A standby follows ingest but serves nothing until promoted.
+            .filter(|ssp| pool.is_ready(&ssp.id) && !pool.is_standby(&ssp.id))
             .count();
         let ssps: Vec<SspMetrics> = pool
             .all()
@@ -282,7 +283,8 @@ async fn health_check(
         let ready = pool
             .all()
             .iter()
-            .filter(|ssp| pool.is_ready(&ssp.id))
+            // A standby follows ingest but serves nothing until promoted.
+            .filter(|ssp| pool.is_ready(&ssp.id) && !pool.is_standby(&ssp.id))
             .count();
         (total, ready, pool.has_active_bootstrap())
     };
@@ -672,6 +674,8 @@ pub async fn build_entities(state: &MetricsState) -> Vec<serde_json::Value> {
                     Some(SspState::Replaying) => "replaying",
                     Some(SspState::Ready) => "ready",
                     Some(SspState::Lagging) => "lagging",
+                    Some(SspState::Retiring) => "retiring",
+                    Some(SspState::Retired) => "retired",
                     None => "unknown",
                 };
                 let last_heartbeat_seconds_ago = now
@@ -830,7 +834,7 @@ pub async fn start_query_reassignment_monitor(
     query_tracker: Arc<QueryTracker>,
     stale_bootstrap_max_age: std::time::Duration,
 ) {
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("stale-ssp-sweep", async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
         loop {

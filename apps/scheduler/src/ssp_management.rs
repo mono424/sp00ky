@@ -529,6 +529,7 @@ async fn handle_register(
         let ssp_info = ssp_info.clone();
         let ssp_id = request.ssp_id.clone();
         let ssp_url = request.url.clone();
+        let replaces = request.replaces.clone();
         tokio::spawn(async move {
             let _drain_guard =
                 crate::acquire_drain_lock(&state.drain_lock, "ssp registration").await;
@@ -583,18 +584,31 @@ async fn handle_register(
             // previous registration of this ssp_id knows it has been
             // superseded.
             let mut pool = state.ssp_pool.write().await;
+            // Blue/green: an SSP sent to replace one that is still serving
+            // comes in as its standby (see `crate::ssp_handover`). Decided
+            // here, under the pool lock, so the decision and the insert are
+            // one step.
+            let standby_for = replaces
+                .filter(|pred| *pred != ssp_id && pool.is_serving(pred));
             pool.upsert(ssp_info);
+            match &standby_for {
+                Some(pred) => pool.mark_standby(&ssp_id, pred),
+                None => pool.clear_standby(&ssp_id),
+            }
             pool.mark_bootstrapping(&ssp_id);
             pool.set_bootstrap_seq(&ssp_id, snapshot_seq);
             let generation = pool.bump_registration_gen(&ssp_id);
             drop(pool);
+            if let Some(pred) = &standby_for {
+                info!(ssp_id = %ssp_id, predecessor = %pred, "SSP registered as standby; it is promoted once caught up");
+            }
             spawn_poll_and_replay(&state, ssp_id, ssp_url, snapshot_seq, generation);
 
-            (snapshot_seq, table_hashes)
+            (snapshot_seq, table_hashes, standby_for.is_some())
         })
         .await
     };
-    let (snapshot_seq, table_hashes) = match critical {
+    let (snapshot_seq, table_hashes, standby) = match critical {
         Ok(v) => v,
         Err(e) => {
             error!(error = %e, "Registration critical section panicked");
@@ -616,7 +630,7 @@ async fn handle_register(
         Json(SspRegistrationResponse {
             snapshot_seq,
             table_hashes,
-            standby: false,
+            standby,
         }),
     ))
 }
@@ -653,7 +667,7 @@ fn spawn_poll_and_replay(
     let replica = state.replica.clone();
     let changefeed = Arc::clone(&state.changefeed);
     tokio::spawn(async move {
-        if let Err(e) = poll_and_replay_ssp(
+        let outcome = poll_and_replay_ssp(
             ssp_id.clone(),
             ssp_url,
             snapshot_seq,
@@ -668,8 +682,22 @@ fn spawn_poll_and_replay(
             reclone_lock,
             changefeed,
         )
-        .await
-        {
+        .await;
+        if outcome.is_ok() {
+            // A standby that just caught up takes its predecessor's place.
+            let caught_up_standby = {
+                let pool = ssp_pool.read().await;
+                pool.is_standby(&ssp_id)
+                    && pool.is_ready(&ssp_id)
+                    && pool.registration_gen(&ssp_id) == generation
+            };
+            if caught_up_standby {
+                if let Some(deps) = crate::ssp_handover::deps() {
+                    crate::ssp_handover::spawn_promotion(deps, ssp_id.clone());
+                }
+            }
+        }
+        if let Err(e) = outcome {
             error!("Bootstrap/replay failed for SSP '{}': {}", ssp_id, e);
 
             // Under `drain_lock` so the cleanup can't interleave with a
@@ -761,6 +789,11 @@ async fn handle_heartbeat(
             heartbeat.version.clone(),
         );
         pool.update_publication(&heartbeat.ssp_id, heartbeat.publication.clone());
+        // A retiring or retired SSP is on its way out: keep it alive (its
+        // running jobs are not orphans) and tell it nothing else.
+        if pool.is_retired(&heartbeat.ssp_id) {
+            return Ok(StatusCode::OK);
+        }
         resync_requested = pool.take_resync(&heartbeat.ssp_id);
         has_overflow = pool.has_buffer_overflow(&heartbeat.ssp_id);
     }

@@ -39,6 +39,8 @@ pub mod schema;
 pub mod changefeed;
 pub mod impersonation;
 pub mod push;
+pub mod handover;
+pub mod ssp_handover;
 
 use anyhow::{Context, Result};
 
@@ -257,6 +259,16 @@ pub async fn drain_and_apply(
     }
 
     Ok(event_count)
+}
+
+/// How [`Scheduler::boot`] comes up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootMode {
+    /// A start of its own: cold clone or warm reuse of a persisted replica.
+    Normal,
+    /// Taking over a replica a predecessor handed over a moment ago (see
+    /// `crate::handover`): no `_00_query` wipe, no startup drift pass.
+    Handover,
 }
 
 /// Scheduler lifecycle status
@@ -575,6 +587,11 @@ impl Scheduler {
         })
     }
 
+    /// The SSP fan-out queue (a promotion waits for it to settle).
+    pub fn fanout(&self) -> Arc<crate::ingest::Fanout> {
+        Arc::clone(&self.fanout)
+    }
+
     /// Get config
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
@@ -595,9 +612,17 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Start the scheduler service
+    /// Start the scheduler service and run until SIGINT.
     pub async fn start(&self) -> Result<()> {
-        info!("Starting Scheduler service...");
+        self.boot(BootMode::Normal).await?;
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
+
+    /// Bring the scheduler to `Ready` and start its background work, then
+    /// return.
+    pub async fn boot(&self, mode: BootMode) -> Result<()> {
+        info!(mode = ?mode, "Starting Scheduler service...");
 
         // Step 1: Connect to remote SurrealDB
         info!(
@@ -662,7 +687,11 @@ impl Scheduler {
         // heartbeats any more are retired by the SSP's TTL sweep once it is
         // ready, edges included. Single-SSP tenants only for now, see the
         // config field doc.
-        if self.config.clear_views_on_start {
+        if mode == BootMode::Handover {
+            // The predecessor handed its SSP pool and view assignments over
+            // with the replica: every `_00_query` row is live.
+            info!("Taking over from a predecessor; keeping registered views");
+        } else if self.config.clear_views_on_start {
             info!("Clearing registered view data from remote SurrealDB...");
             trace!(ns = %self.config.db.namespace, db = %self.config.db.database, "remote query: DELETE _00_query");
             match db.query("DELETE _00_query").await {
@@ -865,17 +894,24 @@ impl Scheduler {
         // recovered above, which the first tick applies, so the tables in it
         // are excluded here exactly as on a tick, or every job table reads as
         // drift on every restart (whitepawn 2026-09-16 00:41).
-        let drift_started = std::time::Instant::now();
-        match crate::drift::run_startup_gate(&drift_hook, &self.replica, &BufferBusy(Arc::clone(&self.event_buffer))).await {
-            crate::drift::Action::Clean => info!(
-                elapsed_ms = drift_started.elapsed().as_millis() as u64,
-                "Startup drift gate passed"
-            ),
-            other => warn!(
-                action = ?other,
-                elapsed_ms = drift_started.elapsed().as_millis() as u64,
-                "Startup drift gate acted"
-            ),
+        //
+        // Not even the gate on a handover: the replica was serving a second
+        // ago, and every request the handover holds would wait for it.
+        if mode == BootMode::Handover {
+            info!("Taking over a live replica; the startup drift gate is left to the periodic check");
+        } else {
+            let drift_started = std::time::Instant::now();
+            match crate::drift::run_startup_gate(&drift_hook, &self.replica, &BufferBusy(Arc::clone(&self.event_buffer))).await {
+                crate::drift::Action::Clean => info!(
+                    elapsed_ms = drift_started.elapsed().as_millis() as u64,
+                    "Startup drift gate passed"
+                ),
+                other => warn!(
+                    action = ?other,
+                    elapsed_ms = drift_started.elapsed().as_millis() as u64,
+                    "Startup drift gate acted"
+                ),
+            }
         }
 
         // Transition to Ready
@@ -931,10 +967,151 @@ impl Scheduler {
             changefeed_poke,
         );
 
-        // Keep running until shutdown signal
-        tokio::signal::ctrl_c().await?;
-
         Ok(())
+    }
+
+    /// Blue side of a handover (see `crate::handover`): stop taking work at a
+    /// clean boundary, stop every background writer, export what lives only
+    /// in memory, release the replica, and relay all traffic to `successor`.
+    ///
+    /// Refuses (retryably) while something that must not be cut short is
+    /// running: an SSP bootstrap, a snapshot drain, an SSP promotion, a
+    /// backup or restore. Past the point where the background writers are
+    /// stopped there is no way back: the process relays from then on.
+    pub async fn hand_over(
+        &self,
+        successor: &str,
+        query_tracker: &crate::query::QueryTracker,
+        backup_restore_lock: &tokio::sync::Mutex<()>,
+    ) -> std::result::Result<crate::handover::HandoverState, crate::handover::Refusal> {
+        use crate::handover::{gate, Mode, Refusal};
+        let gate = gate();
+        if gate.role() == "retired" {
+            return Err(Refusal::Gone(format!("already handed over to {:?}", gate.status().peer)));
+        }
+        let started = std::time::Instant::now();
+
+        // Wait, briefly, for work that must finish where it started.
+        let busy_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let backup_guard = loop {
+            let reason = {
+                let status = *self.status.read().await;
+                if status != SchedulerStatus::Ready {
+                    Some(format!("scheduler is {status:?}"))
+                } else if self.ssp_pool.read().await.has_active_bootstrap() {
+                    Some("an SSP is bootstrapping".to_string())
+                } else if crate::ssp_handover::shared().in_progress() {
+                    Some("an SSP promotion is running".to_string())
+                } else {
+                    None
+                }
+            };
+            match (reason, backup_restore_lock.try_lock()) {
+                (None, Ok(guard)) => break guard,
+                (reason, _) => {
+                    let reason = reason.unwrap_or_else(|| "a backup or restore is running".to_string());
+                    if std::time::Instant::now() >= busy_deadline {
+                        return Err(Refusal::Busy(reason));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        };
+
+        info!(successor, "Handing over to a successor scheduler");
+        gate.set_status("active", "handing_over");
+        gate.set_mode(Mode::Hold);
+        if !gate.wait_idle(Duration::from_secs(10)).await {
+            warn!(inflight = gate.inflight(), "Requests still in flight after 10 s; handing over anyway");
+        }
+
+        // No event half taken: every intake finishes, none starts again.
+        let ingest = match tokio::time::timeout(Duration::from_secs(15), crate::handover::ingest_gate().write()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                gate.set_mode(Mode::Serve);
+                gate.set_status("active", "serving");
+                return Err(Refusal::Busy("an ingest did not finish".to_string()));
+            }
+        };
+        // No drain mid-way either.
+        let drain = match tokio::time::timeout(Duration::from_secs(30), self.drain_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                drop(ingest);
+                gate.set_mode(Mode::Serve);
+                gate.set_status("active", "serving");
+                return Err(Refusal::Busy("a snapshot drain did not finish".to_string()));
+            }
+        };
+
+        // The point of no return.
+        let stopped = crate::handover::abort_singletons();
+        if tokio::time::timeout(Duration::from_secs(30), self.fanout.idle()).await.is_err() {
+            warn!("Fan-out did not settle in 30 s; SSPs may need to catch up from the successor");
+        }
+        let state = crate::handover::HandoverState {
+            format: crate::handover::STATE_FORMAT,
+            from_version: env!("CARGO_PKG_VERSION").to_string(),
+            ssps: self.ssp_pool.read().await.export(),
+            queries: query_tracker.export().await,
+        };
+        match tokio::time::timeout(Duration::from_secs(30), self.replica.write()).await {
+            Ok(mut replica) => replica.close(),
+            Err(_) => error!("Replica stayed busy for 30 s; the successor waits for its lock"),
+        }
+
+        // This process never takes an event, drains, or backs up again.
+        std::mem::forget(ingest);
+        std::mem::forget(drain);
+        std::mem::forget(backup_guard);
+
+        gate.set_peer(Some(successor.to_string()));
+        gate.set_mode(Mode::Forward(successor.to_string()));
+        gate.set_status("retired", "forwarding");
+        info!(
+            successor,
+            stopped_tasks = stopped,
+            ssps = state.ssps.len(),
+            queries = state.queries.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Handed over; relaying every request to the successor"
+        );
+        Ok(state)
+    }
+
+    /// Green side: take over the state a predecessor handed over with its
+    /// replica. Call after `new()`, before `boot(BootMode::Handover)`.
+    pub async fn import_handover(
+        &self,
+        state: crate::handover::HandoverState,
+        query_tracker: &crate::query::QueryTracker,
+    ) {
+        if state.format != crate::handover::STATE_FORMAT {
+            warn!(
+                format = state.format,
+                expected = crate::handover::STATE_FORMAT,
+                "Predecessor's handover state has an unknown format; SSPs re-register in place instead"
+            );
+            return;
+        }
+        let lagging: Vec<String> = state
+            .ssps
+            .iter()
+            .filter(|s| s.state == crate::router::SspState::Lagging)
+            .map(|s| s.info.id.clone())
+            .collect();
+        let ssps = state.ssps.len();
+        let queries = state.queries.len();
+        self.ssp_pool.write().await.import(state.ssps);
+        query_tracker.import(state.queries).await;
+        for ssp_id in lagging {
+            crate::handover::spawn_singleton(
+                "lagging-redelivery",
+                crate::ingest::redeliver_to_lagging_ssp(self.ingest_state(), ssp_id),
+            );
+        }
+        info!(ssps, queries, from = %state.from_version, "Imported the predecessor's SSP pool and view assignments");
     }
 
     /// Recompute every table's hash from the current replica state and
@@ -1002,7 +1179,7 @@ impl Scheduler {
         let wal = Arc::clone(&self.wal);
         let drain_lock = Arc::clone(&self.drain_lock);
 
-        tokio::spawn(async move {
+        crate::handover::spawn_singleton("snapshot-updater", async move {
             let mut interval = tokio::time::interval(
                 std::time::Duration::from_secs(interval_secs)
             );
@@ -1127,7 +1304,7 @@ pub async fn build_ranges_once(
 /// Run [`build_ranges_once`] until no table needs ranges, every
 /// [`RANGE_BUILD_INTERVAL`], outside clones, restores and SSP bootstraps.
 fn spawn_range_builder(replica: Arc<RwLock<Replica>>, status: Arc<RwLock<SchedulerStatus>>) {
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("range-builder", async move {
         let mut retry_at: std::collections::BTreeMap<String, std::time::Instant> = Default::default();
         loop {
             tokio::time::sleep(RANGE_BUILD_INTERVAL).await;

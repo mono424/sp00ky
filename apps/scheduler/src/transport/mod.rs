@@ -159,6 +159,30 @@ impl HttpTransport {
         Ok((status, body))
     }
 
+    /// [`Self::post_to_ssp_status`] with its own deadline instead of the
+    /// client's 30 s: an SSP handing over drains its publication queue inside
+    /// the request.
+    pub async fn post_to_ssp_with_timeout<T: Serialize>(
+        &self,
+        ssp_url: &str,
+        path: &str,
+        payload: &T,
+        timeout: std::time::Duration,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let url = format!("{}{}", ssp_url.trim_end_matches('/'), path);
+        let mut request = self.stream_client.post(&url).json(payload).timeout(timeout);
+        if let Some(ref secret) = self.ssp_auth_secret {
+            request = request.bearer_auth(secret);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("Failed to POST to SSP at {}", url))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
     /// Broadcast a JSON payload to all ready SSPs
     pub async fn broadcast_to_ssps<T: Serialize + std::fmt::Debug>(
         &self,

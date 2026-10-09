@@ -244,7 +244,7 @@ pub fn spawn(
         "E2E heartbeat probe started"
     );
 
-    tokio::spawn(async move {
+    crate::handover::spawn_singleton("heartbeat-probe", async move {
         let alerter = Alerter::new(
             cfg.ping_url.clone(),
             cfg.webhook_url.clone(),

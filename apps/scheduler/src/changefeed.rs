@@ -223,7 +223,7 @@ pub fn spawn(
         first_sight: Default::default(),
     });
     let source: Arc<dyn ChangeSource> = Arc::new(ReconnectingSource { db });
-    tokio::spawn(maintenance::changefeed::run_tailer(
+    crate::handover::spawn_singleton("changefeed-tail", maintenance::changefeed::run_tailer(
         source, sink, cfg, stats, notify,
     ));
 }

@@ -209,6 +209,8 @@ impl TestHarness {
                     last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 })
             },
+            route_options: Default::default(),
+            row_checkpoints: None,
         };
         create_app(state)
     }

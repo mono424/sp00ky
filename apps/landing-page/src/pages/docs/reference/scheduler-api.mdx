@@ -789,7 +789,7 @@ traffic. Poll it on the new scheduler to know when the old one can go.
 { "supported": true, "role": "active", "phase": "serving", "peer": "http://old:9667", "error": null, "version": "0.0.1-canary.295" }
 ```
 
-- `role`: `starting` (phase `relaying`, `holding`, `opening`, `committing`, or `waiting_for_lock` when the predecessor cannot hand over), `active` (phase `serving`, or `releasing`/`released`/`committing` on a predecessor mid-handover), `retired` (handed over, relaying), `failed`.
+- `role`: `starting` (phase `relaying`, `preparing`, `holding`, `opening`, `committing`, or `waiting_for_lock` when the predecessor cannot hand over), `active` (phase `serving`, or `releasing`/`released`/`committing` on a predecessor mid-handover), `retired` (handed over, relaying), `failed`.
 
 #### POST /handover/prepare
 

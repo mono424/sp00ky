@@ -199,8 +199,10 @@ async fn run() -> Result<()> {
                 None
             }
             handover::Release::OneStep => {
-                gate.set_mode(Mode::Hold);
-                gate.set_status("starting", "holding");
+                // Keep relaying while the predecessor prepares: it serves
+                // until it commits, then relays back here, where a relayed
+                // request waits for us to serve (holding here instead held
+                // 12 s of requests on whitepawn, 2026-10-09).
                 Some(handover::take_over(&from, &successor, own_ports, auth_secret.as_deref()).await)
             }
             handover::Release::Other(t) => Some(t),
@@ -208,6 +210,7 @@ async fn run() -> Result<()> {
         match outcome {
             None => {}
             Some(TakeOver::Granted(state)) => {
+                gate.set_mode(Mode::Hold);
                 gate.set_status("starting", "opening");
                 handed_over = Some(state);
                 lock_wait = Duration::from_secs(60);

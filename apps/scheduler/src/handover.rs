@@ -617,7 +617,7 @@ pub async fn take_over(from: &str, successor: &str, ports: RelayPorts, auth_secr
     };
     let started = Instant::now();
     loop {
-        gate.set_status("starting", "holding");
+        gate.set_status("starting", "preparing");
         let attempt = gate
             .client
             .post(&url)

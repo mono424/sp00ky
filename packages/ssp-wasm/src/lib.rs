@@ -428,7 +428,7 @@ impl Sp00kyProcessor {
     /// stepped and never read. Pair with `load_store_state`.
     pub fn save_store_state(&self) -> Result<Vec<u8>, JsValue> {
         self.circuit
-            .save_store_only()
+            .save_store_image()
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize store: {}", e)))
     }
 

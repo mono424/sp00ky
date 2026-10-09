@@ -51,7 +51,7 @@
 use crate::circuit::arena::{Arena, HeapArena};
 use crate::circuit::row_codec::{FieldDict, RECORD_FORMAT};
 use crate::circuit::row_table::{IndexedBlock, RowTable};
-use crate::circuit::store::Collection;
+use crate::circuit::store::{Collection, Store};
 use std::io::{self, Write};
 use std::ops::Range;
 
@@ -340,6 +340,71 @@ fn write_chunk<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
+// --- store containers ---
+
+/// Magic of a whole-store snapshot: the per-table images of every collection
+/// in one byte string, which is what a browser or Dart client persists.
+pub const STORE_MAGIC: &[u8; 8] = b"SPKYSTOR";
+pub const STORE_FORMAT: u32 = 1;
+
+/// Write every collection of `store` as one snapshot:
+///
+/// ```text
+/// [8] "SPKYSTOR" [u32] STORE_FORMAT [u32] table count
+/// per table: [u64 len][a complete per-table image, trailer included]
+/// ```
+///
+/// There is no outer checksum: each image verifies itself, and the lengths
+/// have to account for every byte. Tables are written in name order so the
+/// same store always produces the same bytes.
+pub fn write_store(store: &Store) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(STORE_MAGIC);
+    out.extend_from_slice(&STORE_FORMAT.to_le_bytes());
+    out.extend_from_slice(&(store.collections.len() as u32).to_le_bytes());
+    let mut names: Vec<&String> = store.collections.keys().collect();
+    names.sort();
+    for name in names {
+        let len_at = out.len();
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let start = out.len();
+        write_collection(&store.collections[name], &mut out)?;
+        let len = (out.len() - start) as u64;
+        out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Read a snapshot written by [`write_store`]. Every table lands in a
+/// heap-backed arena of its own (the client builds have no other kind).
+pub fn read_store(bytes: &[u8]) -> Result<Store, CheckpointError> {
+    if bytes.len() < STORE_MAGIC.len() + 4 + 4 || &bytes[..STORE_MAGIC.len()] != STORE_MAGIC {
+        return Err(invalid("not a store snapshot"));
+    }
+    let mut c = Cursor {
+        bytes,
+        at: STORE_MAGIC.len(),
+    };
+    let format = c.u32()?;
+    if format != STORE_FORMAT {
+        return Err(invalid(format!("store format {format}, this build reads {STORE_FORMAT}")));
+    }
+    let tables = c.u32()?;
+    let mut store = Store::new();
+    for _ in 0..tables {
+        let len = usize::try_from(c.u64()?).map_err(|_| invalid("table image too large"))?;
+        let image = c.bytes(len)?;
+        let (coll, _) = read_image(image.to_vec())?;
+        if store.collections.insert(coll.name.clone(), coll).is_some() {
+            return Err(invalid("a table appears twice"));
+        }
+    }
+    if c.at != bytes.len() {
+        return Err(invalid("bytes after the last table"));
+    }
+    Ok(store)
+}
+
 /// Bounds-checked reads over the verified body.
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -609,6 +674,70 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["x", "y"]);
         assert_eq!(image.records.end, bytes.len() - TRAILER_LEN);
+    }
+
+    fn store_of(tables: &[(&str, &[(&str, serde_json::Value)])]) -> Store {
+        let mut store = Store::new();
+        for (table, rows) in tables {
+            let coll = store.ensure_collection(table);
+            for (id, body) in rows.iter() {
+                coll.apply(Operation::Create, id, Sp00kyValue::from(body.clone()));
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn a_store_round_trips_table_by_table() {
+        let store = store_of(&[
+            ("game", &[("a", json!({ "n": 1 })), ("b", json!({ "s": "x", "_00_rv": 3 }))]),
+            ("empty", &[]),
+            ("user", &[("u", json!({ "name": "alice", "tags": ["x"] }))]),
+        ]);
+        let bytes = write_store(&store).unwrap();
+        assert_eq!(&bytes[..8], STORE_MAGIC);
+        let back = read_store(&bytes).unwrap();
+        assert_eq!(back.collections.len(), 3);
+        for (name, coll) in &store.collections {
+            let restored = &back.collections[name];
+            assert_eq!(restored.rows.len(), coll.rows.len(), "{name}");
+            assert_eq!(restored.catchup_xor, coll.catchup_xor, "{name}");
+            for id in coll.rows.keys() {
+                assert_eq!(restored.get_row(id).to_owned_value(), coll.get_row(id).to_owned_value());
+                assert_eq!(restored.rows.rv_of(id), coll.rows.rv_of(id));
+            }
+        }
+        // Deterministic: the same store, the same bytes.
+        assert_eq!(write_store(&store).unwrap(), bytes);
+    }
+
+    #[test]
+    fn an_empty_store_round_trips() {
+        let bytes = write_store(&Store::new()).unwrap();
+        assert!(read_store(&bytes).unwrap().collections.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_store_is_rejected() {
+        let store = store_of(&[("game", &[("a", json!({ "n": 1 }))]), ("user", &[("u", json!({}))])]);
+        let bytes = write_store(&store).unwrap();
+        assert!(read_store(&bytes[..bytes.len() - 1]).is_err(), "truncated");
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(read_store(&extra).is_err(), "trailing bytes");
+        let mut wrong_len = bytes.clone();
+        wrong_len[16..24].copy_from_slice(&7u64.to_le_bytes());
+        assert!(read_store(&wrong_len).is_err(), "a length that does not describe its image");
+        let mut flipped = bytes.clone();
+        flipped[40] ^= 1;
+        assert!(read_store(&flipped).is_err(), "a flipped byte inside an image");
+        let mut magic = bytes.clone();
+        magic[0] ^= 1;
+        assert!(read_store(&magic).is_err(), "wrong magic");
+        let mut format = bytes.clone();
+        format[8..12].copy_from_slice(&(STORE_FORMAT + 1).to_le_bytes());
+        assert!(read_store(&format).is_err(), "another format");
+        assert!(read_store(b"{\"store\":{}}").is_err(), "JSON is not a store snapshot");
     }
 
     #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]

@@ -1343,29 +1343,32 @@ impl Circuit {
         Ok(String::from_utf8(buf).expect("serde_json emits UTF-8"))
     }
 
-    /// Serialize ONLY the base collections, as bytes.
+    /// Snapshot ONLY the base collections, as the binary store image
+    /// (`checkpoint::write_store`): every table's records as the row table
+    /// holds them, digests included, so a restore is a copy of bytes and an
+    /// index walk rather than a decode, re-digest and re-encode of every row.
     ///
     /// For a circuit whose views are re-registered from scratch on every boot
     /// (the browser client mints a fresh session-salted id per query), views
-    /// in the snapshot are zombies: stepped on every ingest, never read. The
-    /// store is the part worth keeping. Bytes rather than a `String` because
-    /// the consumer is a JS host, where a string doubles to UTF-16 on the way
-    /// across and the snapshot is the largest single allocation it makes.
-    pub fn save_store_only(&self) -> serde_json::Result<Vec<u8>> {
-        let state = CircuitStateRef {
-            store: &self.store,
-            queries: Vec::new(),
-        };
-        let mut buf = Vec::with_capacity(self.estimated_snapshot_bytes());
-        serde_json::to_writer(&mut buf, &state)?;
-        Ok(buf)
+    /// in a snapshot are zombies: stepped on every ingest, never read. The
+    /// store is the part worth keeping.
+    pub fn save_store_image(&self) -> std::io::Result<Vec<u8>> {
+        crate::circuit::checkpoint::write_store(&self.store)
     }
 
-    /// Read the base collections out of a snapshot written by
-    /// [`Self::save_store_only`] (or a full [`Self::save`]; the views are
-    /// ignored). The caller installs it with [`Self::replace_store`].
-    pub fn restore_store(bytes: &[u8]) -> serde_json::Result<Store> {
-        let mut state: CircuitState = serde_json::from_slice(bytes)?;
+    /// Read the base collections out of a snapshot: one written by
+    /// [`Self::save_store_image`], or the JSON that a full [`Self::save`] or
+    /// the previous store-only writer produced (its views are ignored). The
+    /// two are told apart by their first bytes, so a client's stored snapshot
+    /// keeps loading across the format change. The caller installs the
+    /// result with [`Self::replace_store`].
+    pub fn restore_store(bytes: &[u8]) -> Result<Store, crate::circuit::checkpoint::CheckpointError> {
+        use crate::circuit::checkpoint::{read_store, CheckpointError, STORE_MAGIC};
+        if bytes.starts_with(STORE_MAGIC) {
+            return read_store(bytes);
+        }
+        let mut state: CircuitState = serde_json::from_slice(bytes)
+            .map_err(|e| CheckpointError::Invalid(format!("legacy JSON snapshot: {e}")))?;
         // The accumulators are `#[serde(skip)]`: seed them from the rows.
         for coll in state.store.collections.values_mut() {
             coll.reseed_catchup_xor();
@@ -4141,12 +4144,18 @@ mod snapshot_and_projection_tests {
     }
 
     #[test]
-    fn save_store_only_round_trips_rows_and_carries_no_views() {
+    fn save_store_image_round_trips_rows_and_carries_no_views() {
         let mut a = seeded(5);
         a.add_query(scan("q", "thread"), None, None);
-        let bytes = a.save_store_only().unwrap();
+        let bytes = a.save_store_image().unwrap();
+        assert!(bytes.starts_with(crate::circuit::checkpoint::STORE_MAGIC));
 
         let store = Circuit::restore_store(&bytes).unwrap();
+        assert_eq!(
+            store.collections["thread"].catchup_xor,
+            a.store.collections["thread"].catchup_xor,
+            "the restored accumulator comes straight out of the image"
+        );
         let mut b = Circuit::new();
         let deltas = b.replace_store(store);
         assert!(deltas.is_empty(), "no views registered, nothing to publish");
@@ -4154,18 +4163,24 @@ mod snapshot_and_projection_tests {
         assert_eq!(b.compute_table_hashes(), a.compute_table_hashes());
         assert_eq!(b.max_row_versions()["thread"], 4);
 
-        // A full snapshot's views are ignored on the store-only path too.
+        // The JSON a full snapshot (or the previous store-only writer)
+        // produced still loads on the same call, views ignored and the
+        // accumulators re-seeded.
         let full = a.save().unwrap();
         let store = Circuit::restore_store(full.as_bytes()).unwrap();
+        assert_eq!(store.collections["thread"].catchup_xor, a.store.collections["thread"].catchup_xor);
         let mut c = Circuit::new();
         c.replace_store(store);
         assert_eq!(c.view_count(), 0);
+        assert_eq!(c.compute_table_hashes(), a.compute_table_hashes());
+
+        assert!(Circuit::restore_store(b"neither").is_err());
     }
 
     #[test]
     fn replace_store_reprimes_views_registered_before_the_snapshot_landed() {
         let a = seeded(6);
-        let bytes = a.save_store_only().unwrap();
+        let bytes = a.save_store_image().unwrap();
 
         // Boot order on a client: views register against an empty store,
         // THEN the snapshot arrives.

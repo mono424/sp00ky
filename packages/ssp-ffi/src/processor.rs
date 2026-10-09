@@ -300,7 +300,7 @@ impl Processor {
     /// with [`Processor::load_store_state`].
     pub fn save_store_state(&self) -> Result<Vec<u8>> {
         self.circuit
-            .save_store_only()
+            .save_store_image()
             .map_err(|e| anyhow!("Failed to serialize store: {}", e))
     }
 

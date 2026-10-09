@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod impersonation;
+pub mod range_hash;
 pub mod schema;
 pub mod snapshot_hash;
 

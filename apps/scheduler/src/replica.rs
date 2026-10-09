@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use ssp_protocol::range_hash::{self, RangeHashes, TableRanges};
 use ssp_protocol::snapshot_hash;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -143,6 +144,66 @@ struct SnapshotState {
     changefeed_vs: u64,
 }
 
+/// A table's hash as computed from its content, with the id ranges cut along
+/// the way. `ranges` is `None` for a table whose keys cannot be ranged (see
+/// `range_hash::string_key`).
+#[derive(Debug, Clone)]
+pub struct ContentHash {
+    pub hash: String,
+    pub ranges: Option<RangeHashes>,
+}
+
+/// A table's ranges being built a window at a time while the replica keeps
+/// draining (see [`Replica::range_build_step`]). Windows below `scanned` are
+/// read and receive every later fold; the rest are read when their turn comes,
+/// with whatever they hold by then.
+struct RangeBuild {
+    table: String,
+    ranges: RangeHashes,
+    scanned: usize,
+}
+
+/// What one background build step did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeBuildStep {
+    /// A window was read; more remain.
+    More,
+    /// Every window is read; [`Replica::range_build_finish`] installs it.
+    Done,
+    /// No build is running (nothing started, or it was abandoned).
+    Idle,
+    /// The table's keys cannot be ranged; the build was dropped.
+    Unsupported,
+}
+
+/// The `_00_metadata` record id a table's ranges persist under.
+fn ranges_record_key(table: &str) -> String {
+    format!("ranges:{table}")
+}
+
+/// Fold one applied change into `ranges`, but only into ranges below `limit`
+/// (a build's unread windows pick the change up when they are read). `false`
+/// when an id is not a plain string key, so the table cannot be ranged.
+fn fold_into_ranges(
+    ranges: &mut RangeHashes,
+    before: Option<(&str, &[u8; 32])>,
+    after: Option<(&str, &[u8; 32])>,
+    limit: usize,
+) -> bool {
+    for (side, add) in [(before, false), (after, true)] {
+        let Some((id, digest)) = side else { continue };
+        let Some(i) = ranges.range_of(id) else { return false };
+        if i < limit {
+            if add {
+                ranges.add_at(i, digest);
+            } else {
+                ranges.remove_at(i, digest);
+            }
+        }
+    }
+    true
+}
+
 /// Chunk of replica data for bootstrap
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReplicaChunk {
@@ -228,6 +289,24 @@ pub struct Replica {
     /// or reclone holds the replica write lock for a long time; probes must
     /// never queue behind it just to read one number.
     seq_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Per-id-range hashes per table (see `ssp_protocol::range_hash`): what a
+    /// warm SSP whose table hash differs compares against to find the rows
+    /// that differ, instead of listing the whole table. Folded with the table
+    /// hash on every applied event, replaced by every from-content hash, and
+    /// persisted per table as `_00_metadata:⟨ranges:<table>⟩`. A table without
+    /// them (not built yet, or keys that are not plain strings) is listed in
+    /// full by the SSP, as before.
+    ranges: BTreeMap<String, RangeHashes>,
+    /// Tables whose ranges changed (or were dropped) since last persisted.
+    ranges_unpersisted: BTreeSet<String>,
+    /// Tables whose keys cannot be ranged. Not persisted: a fresh process
+    /// finds out again on its first attempt.
+    ranges_unsupported: BTreeSet<String>,
+    /// The background range build, if one is running. Behind a mutex so a
+    /// step runs under a READ guard: an event is applied under the write
+    /// guard, so it lands either before a window is read or after it is, never
+    /// in between.
+    range_build: std::sync::Mutex<Option<RangeBuild>>,
 }
 
 impl Replica {
@@ -290,7 +369,7 @@ impl Replica {
         }
         let dirty_hashes = Self::stale_format_hashes(&snapshot_hashes);
 
-        Ok(Self {
+        let mut replica = Self {
             db,
             db_path,
             snapshot_seq,
@@ -304,7 +383,310 @@ impl Replica {
             opaque_fields: BTreeMap::new(),
             opaque_known: false,
             seq_cell: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(snapshot_seq)),
-        })
+            ranges: BTreeMap::new(),
+            ranges_unpersisted: BTreeSet::new(),
+            ranges_unsupported: BTreeSet::new(),
+            range_build: std::sync::Mutex::new(None),
+        };
+        replica.load_ranges().await;
+        Ok(replica)
+    }
+
+    /// Read the persisted ranges back, keeping a table's only when they add up
+    /// to its persisted hash and that hash is not about to be recomputed.
+    /// Persisted ranges that do not match are left for the next build: they
+    /// are from an older commit (a write lost in a crash), and the check is
+    /// what makes losing one harmless.
+    async fn load_ranges(&mut self) {
+        self.ranges.clear();
+        self.ranges_unpersisted.clear();
+        *self.range_build.get_mut().unwrap() = None;
+        let rows = match self
+            .db
+            .query("SELECT table, hash, starts, hashes, counts FROM _00_metadata WHERE starts != NONE")
+            .await
+        {
+            Ok(mut r) => r
+                .take::<surrealdb::types::Value>(0)
+                .map(|v| v.into_json_value())
+                .unwrap_or(Value::Null),
+            Err(e) => {
+                debug!(error = %e, "No persisted range hashes");
+                return;
+            }
+        };
+        let (mut loaded, mut stale) = (0usize, 0usize);
+        for row in rows.as_array().into_iter().flatten() {
+            let Ok(wire) = serde_json::from_value::<TableRanges>(row.clone()) else { continue };
+            let current = self.snapshot_hashes.get(&wire.table);
+            match RangeHashes::from_wire(&wire) {
+                Some(r) if current == Some(&wire.hash) && !self.dirty_hashes.contains(&wire.table) => {
+                    self.ranges.insert(wire.table, r);
+                    loaded += 1;
+                }
+                _ => stale += 1,
+            }
+        }
+        if loaded > 0 || stale > 0 {
+            info!(tables = loaded, stale, "Restored range hashes from metadata");
+        }
+    }
+
+    /// Write the ranges that changed since they were last persisted, and
+    /// delete those of tables that lost theirs. Ranges are an optimisation:
+    /// a failure is logged and retried with the next commit.
+    async fn persist_ranges(&mut self) {
+        if self.ranges_unpersisted.is_empty() {
+            return;
+        }
+        let tables: Vec<String> = self.ranges_unpersisted.iter().cloned().collect();
+        let mut surql = String::new();
+        let mut binds: Vec<(String, Value)> = Vec::new();
+        for (i, table) in tables.iter().enumerate() {
+            binds.push((format!("k{i}"), Value::String(ranges_record_key(table))));
+            match self.ranges.get(table) {
+                Some(r) => {
+                    surql.push_str(&format!("UPSERT type::record('_00_metadata', $k{i}) CONTENT $v{i};\n"));
+                    binds.push((
+                        format!("v{i}"),
+                        serde_json::to_value(r.to_wire(table)).unwrap_or(Value::Null),
+                    ));
+                }
+                None => surql.push_str(&format!("DELETE type::record('_00_metadata', $k{i});\n")),
+            }
+        }
+        let mut query = self.db.query(surql);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        match query.await.and_then(|r| r.check()) {
+            Ok(_) => {
+                for t in &tables {
+                    self.ranges_unpersisted.remove(t);
+                }
+            }
+            Err(e) => warn!(error = %e, tables = tables.len(), "Could not persist range hashes; retrying with the next commit"),
+        }
+    }
+
+    /// `table`'s ranges as `/proxy/ranges` serves them: only while the table's
+    /// hash is current and the ranges add up to it, so an SSP never compares
+    /// against ranges of another cut than the hash it was handed.
+    pub fn table_ranges(&self, table: &str) -> Option<TableRanges> {
+        if self.dirty_hashes.contains(table) {
+            return None;
+        }
+        let hash = self.snapshot_hashes.get(table)?;
+        let wire = self.ranges.get(table)?.to_wire(table);
+        if wire.hash != *hash {
+            warn!(table, ranges = %wire.hash, table_hash = %hash, "Range hashes do not add up to the table hash; not serving them");
+            return None;
+        }
+        Some(wire)
+    }
+
+    /// Install a table's ranges from a from-content hash (`None`: its keys
+    /// cannot be ranged). Any build of the table is dropped: it would only
+    /// arrive at the same thing later.
+    fn install_ranges(&mut self, table: &str, ranges: Option<RangeHashes>) {
+        match ranges {
+            Some(r) => {
+                self.ranges.insert(table.to_string(), r);
+                self.ranges_unsupported.remove(table);
+            }
+            None => {
+                self.ranges.remove(table);
+                self.ranges_unsupported.insert(table.to_string());
+            }
+        }
+        self.ranges_unpersisted.insert(table.to_string());
+        self.drop_range_build(table);
+    }
+
+    /// Abandon a build of `table`: an event reached it that could not be
+    /// folded, so its windows no longer describe the rows.
+    fn drop_range_build(&mut self, table: &str) {
+        let build = self.range_build.get_mut().unwrap();
+        if build.as_ref().is_some_and(|b| b.table == table) {
+            *build = None;
+        }
+    }
+
+    /// The table the background builder should range next: one with a
+    /// current hash and no ranges, or ranges with one far past its share
+    /// (keys that only grow all land in the last range).
+    pub fn next_range_build(&self, skip: &BTreeSet<String>) -> Option<String> {
+        self.snapshot_hashes
+            .keys()
+            .filter(|t| !ssp_protocol::table_excluded_from_sync(t))
+            .filter(|t| !self.dirty_hashes.contains(*t) && !self.ranges_unsupported.contains(*t))
+            .filter(|t| !skip.contains(*t))
+            .find(|t| self.ranges.get(*t).map_or(true, RangeHashes::overgrown))
+            .cloned()
+    }
+
+    /// Start building `table`'s ranges: cut the boundaries (one linear scan
+    /// that returns only every `RANGE_ROWS`th key) with no window read yet,
+    /// so nothing folds into it until [`Self::range_build_step`] reads one.
+    pub async fn range_build_begin(&self, table: &str) -> Result<RangeBuildStep> {
+        let boundaries = Self::range_boundaries_on(&self.db, table).await?;
+        Ok(self.range_build_start(table, boundaries))
+    }
+
+    /// The replica's database handle, for a read that needs no consistency
+    /// with the replica lock (the range boundaries: any increasing keys cut a
+    /// table correctly, so they can be read without holding up a drain).
+    pub fn db_handle(&self) -> Surreal<surrealdb::engine::local::Db> {
+        self.db.clone()
+    }
+
+    /// Install a build over boundaries [`Self::range_boundaries_on`] cut
+    /// (`None`: the keys cannot be ranged). Skipped when the table's hash is
+    /// no longer current: the from-content rehash it waits for cuts ranges.
+    pub fn range_build_start(&self, table: &str, boundaries: Option<RangeHashes>) -> RangeBuildStep {
+        let Some(ranges) = boundaries else {
+            return RangeBuildStep::Unsupported;
+        };
+        if !self.snapshot_hashes.contains_key(table) || self.dirty_hashes.contains(table) {
+            return RangeBuildStep::Idle;
+        }
+        *self.range_build.lock().unwrap() = Some(RangeBuild {
+            table: table.to_string(),
+            ranges,
+            scanned: 0,
+        });
+        RangeBuildStep::More
+    }
+
+    /// Read the build's next window. Under a READ guard, which is what makes
+    /// it atomic against `apply` (see `range_build`).
+    pub async fn range_build_step(&self) -> Result<RangeBuildStep> {
+        let (table, mut ranges, i) = {
+            let build = self.range_build.lock().unwrap();
+            let Some(b) = build.as_ref() else { return Ok(RangeBuildStep::Idle) };
+            if b.scanned == b.ranges.len() {
+                return Ok(RangeBuildStep::Done);
+            }
+            (b.table.clone(), b.ranges.clone(), b.scanned)
+        };
+        let in_window = self.scan_window(&table, &mut ranges, i).await?;
+        let mut build = self.range_build.lock().unwrap();
+        let Some(b) = build.as_mut().filter(|b| b.table == table && b.scanned == i) else {
+            return Ok(RangeBuildStep::Idle);
+        };
+        if !in_window {
+            *build = None;
+            return Ok(RangeBuildStep::Unsupported);
+        }
+        b.ranges = ranges;
+        b.scanned += 1;
+        Ok(if b.scanned == b.ranges.len() { RangeBuildStep::Done } else { RangeBuildStep::More })
+    }
+
+    /// Drop the running build, after a step failed.
+    pub fn range_build_abandon(&self) {
+        *self.range_build.lock().unwrap() = None;
+    }
+
+    /// Install a finished build when it adds up to the table's current hash,
+    /// and persist it. A build that does not add up is dropped and `false`
+    /// returned: either the cached table hash disagrees with the rows (the
+    /// next SSP dispute or rehash settles that) or something reached the rows
+    /// without a fold.
+    pub async fn range_build_finish(&mut self) -> bool {
+        let Some(b) = self.range_build.get_mut().unwrap().take() else { return false };
+        if b.scanned < b.ranges.len() {
+            return false;
+        }
+        let total = snapshot_hash::xor_acc_to_hex(&b.ranges.total());
+        let current = self.snapshot_hashes.get(&b.table);
+        if self.dirty_hashes.contains(&b.table) || current != Some(&total) {
+            warn!(
+                table = %b.table,
+                built = %total,
+                table_hash = %current.map(String::as_str).unwrap_or("<none>"),
+                "Built range hashes do not add up to the table hash; dropping them"
+            );
+            return false;
+        }
+        info!(table = %b.table, ranges = b.ranges.len(), rows = b.ranges.rows(), "Range hashes built");
+        self.ranges.insert(b.table.clone(), b.ranges);
+        self.ranges_unpersisted.insert(b.table);
+        self.persist_ranges().await;
+        true
+    }
+
+    /// Mark a table's keys as unrangeable (a build found a key that is not a
+    /// plain string), so the builder stops trying.
+    pub fn mark_ranges_unsupported(&mut self, table: &str) {
+        self.ranges_unsupported.insert(table.to_string());
+        if self.ranges.remove(table).is_some() {
+            self.ranges_unpersisted.insert(table.to_string());
+        }
+        self.drop_range_build(table);
+    }
+
+    /// The ranges `table` is cut into, with empty accumulators: the key every
+    /// `RANGE_ROWS` rows, from one scan that ships only those keys. `None`
+    /// when a key is not a plain string. A table that does not exist is one
+    /// empty range.
+    pub async fn range_boundaries_on(
+        db: &Surreal<surrealdb::engine::local::Db>,
+        table: &str,
+    ) -> Result<Option<RangeHashes>> {
+        let ids = match db.query(range_hash::boundary_query(table)).await {
+            Ok(mut response) => match response.take::<surrealdb::types::Value>(0) {
+                Ok(v) => v.into_json_value(),
+                Err(e) if is_missing_error(&e) => Value::Array(Vec::new()),
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("range boundaries: take(0) failed for '{table}'")))
+                }
+            },
+            Err(e) if is_missing_error(&e) => Value::Array(Vec::new()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("range boundaries: query failed for '{table}'")))
+            }
+        };
+        let prefix = format!("{table}:");
+        let mut keys = Vec::new();
+        for id in ids.as_array().into_iter().flatten() {
+            let Some(id) = id.as_str() else { return Ok(None) };
+            match range_hash::string_key(id.strip_prefix(&prefix).unwrap_or(id)) {
+                Some(key) => keys.push(key.to_string()),
+                None => return Ok(None),
+            }
+        }
+        Ok(RangeHashes::from_boundaries(keys))
+    }
+
+    /// Read range `i` of `table` (a key-range scan) and digest its rows into
+    /// `ranges`. `false` when a row read there does not belong there by key
+    /// order, or is not a plain string key: SurrealDB orders those keys
+    /// differently, so the table cannot be ranged.
+    async fn scan_window(&self, table: &str, ranges: &mut RangeHashes, i: usize) -> Result<bool> {
+        let omit = ssp_protocol::omit_clause(self.omit_for(table));
+        let query = format!("SELECT *{omit} FROM {}", ranges.target(table, i));
+        let rows = match self.db.query(&query).await {
+            Ok(mut response) => match response.take::<surrealdb::types::Value>(0) {
+                Ok(v) => v.into_json_value(),
+                Err(e) if is_missing_error(&e) => Value::Array(Vec::new()),
+                Err(e) => return Err(anyhow::Error::from(e).context(format!("scan_window: take(0) failed for [{query}]"))),
+            },
+            Err(e) if is_missing_error(&e) => Value::Array(Vec::new()),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("scan_window: [{query}] failed"))),
+        };
+        let prefix = format!("{table}:");
+        for row in rows.as_array().into_iter().flatten() {
+            let Some(id) = row.get("id").and_then(Value::as_str) else { continue };
+            let raw_id = id.strip_prefix(&prefix).unwrap_or(id);
+            if ranges.range_of(raw_id) != Some(i) {
+                return Ok(false);
+            }
+            ranges.add_at(i, &snapshot_hash::record_digest(raw_id, row));
+        }
+        Ok(true)
     }
 
     /// Get current snapshot sequence number
@@ -452,6 +834,9 @@ impl Replica {
                     .collect();
                 if !moved.is_empty() {
                     info!(tables = ?moved, "Opaque fields changed upstream; rehashing those tables from content at the next drain");
+                    for t in &moved {
+                        self.drop_range_build(t);
+                    }
                     self.dirty_hashes.extend(moved);
                 }
             }
@@ -479,6 +864,10 @@ impl Replica {
             self.known_tables.remove(t);
             self.snapshot_hashes.remove(t);
             self.dirty_hashes.remove(t);
+            self.ranges.remove(t);
+            self.ranges_unsupported.remove(t);
+            self.ranges_unpersisted.insert(t.clone());
+            self.drop_range_build(t);
         }
         let seq = self.snapshot_seq;
         self.commit_snapshot_state(seq, BTreeMap::new(), BTreeSet::new())
@@ -518,7 +907,7 @@ impl Replica {
     pub async fn compute_hashes_for(
         &self,
         touched_tables: Option<&BTreeSet<String>>,
-    ) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    ) -> (BTreeMap<String, ContentHash>, BTreeSet<String>) {
         // `Some(tables)`: hash exactly those from content (the admin rehash,
         // the bootstrap-verify dispute) plus whatever is dirty. The drain
         // passes an EMPTY set: its tables were folded event by event in
@@ -556,15 +945,16 @@ impl Replica {
     pub async fn commit_snapshot_state(
         &mut self,
         seq: u64,
-        hashed: BTreeMap<String, String>,
+        hashed: BTreeMap<String, ContentHash>,
         failed: BTreeSet<String>,
     ) -> Result<()> {
         self.snapshot_seq = seq;
         self.publish_seq();
 
-        for (table, hash) in hashed {
+        for (table, content) in hashed {
             self.dirty_hashes.remove(&table);
-            self.snapshot_hashes.insert(table, hash);
+            self.install_ranges(&table, content.ranges);
+            self.snapshot_hashes.insert(table, content.hash);
         }
         for table in failed {
             self.dirty_hashes.insert(table);
@@ -588,6 +978,9 @@ impl Replica {
             .await
             .context("Failed to persist snapshot state")?;
         self.interrupted_apply = false;
+        // After the hashes, so ranges that made it to disk never describe a
+        // newer cut than the hash they are checked against at load.
+        self.persist_ranges().await;
         Ok(())
     }
 
@@ -631,7 +1024,7 @@ impl Replica {
         for table in &self.known_tables {
             match self.hash_one_table(table).await {
                 Ok(h) => {
-                    out.insert(table.clone(), h);
+                    out.insert(table.clone(), h.hash);
                 }
                 Err(e) => {
                     warn!(table = %table, error = %e, "Failed to hash table during recompute");
@@ -682,6 +1075,36 @@ impl Replica {
         Ok(pairs)
     }
 
+    /// Hash one table from its content, cutting its id ranges on the way.
+    ///
+    /// Two passes, both linear: the range boundaries (one scan that returns
+    /// only every `RANGE_ROWS`th key), then one key-range scan per range. The
+    /// keyset pager this replaced (`WHERE id > $last ORDER BY id LIMIT n`) is
+    /// a table scan from the first key on SurrealDB 3.1, so every page cost
+    /// more than the one before it and a table cost the square of its pages.
+    /// A table whose keys cannot be ranged still goes through that pager.
+    async fn hash_one_table(&self, table: &str) -> Result<ContentHash> {
+        if let Some(mut ranges) = Self::range_boundaries_on(&self.db, table).await? {
+            let mut in_order = true;
+            for i in 0..ranges.len() {
+                if !self.scan_window(table, &mut ranges, i).await? {
+                    in_order = false;
+                    break;
+                }
+            }
+            if in_order {
+                return Ok(ContentHash {
+                    hash: snapshot_hash::xor_acc_to_hex(&ranges.total()),
+                    ranges: Some(ranges),
+                });
+            }
+        }
+        Ok(ContentHash {
+            hash: self.hash_one_table_paged(table).await?,
+            ranges: None,
+        })
+    }
+
     /// Hash one table by paging it out of the replica instead of a single
     /// `SELECT * FROM table`. The single-shot form materialized the WHOLE
     /// table three times over (SDK `Value` → JSON `Value` → pairs vec) on
@@ -697,7 +1120,7 @@ impl Replica {
     /// undefined table — treat that as an empty table instead of failing so
     /// its hash still lands in the snapshot map (the old path warned
     /// "Failed to hash table" forever and never hashed such tables).
-    async fn hash_one_table(&self, table: &str) -> Result<String> {
+    async fn hash_one_table_paged(&self, table: &str) -> Result<String> {
         const HASH_PAGE_SIZE: usize = 500;
         // The `x3:` set-hash: what `apply` folds into per event. Computing it
         // from content is the exception (clone, upgrade, a fold that failed),
@@ -840,16 +1263,34 @@ impl Replica {
         let Some(current) = self.snapshot_hashes.get(table) else { return };
         let Some(mut acc) = snapshot_hash::xor_acc_from_hex(current) else {
             self.dirty_hashes.insert(table.to_string());
+            self.drop_range_build(table);
             return;
         };
-        if let Some((id, value)) = before {
-            snapshot_hash::xor_out(&mut acc, id, value);
-        }
-        if let Some((id, value)) = after {
-            snapshot_hash::xor_in(&mut acc, id, value);
+        let before = before.map(|(id, value)| (id.as_str(), snapshot_hash::record_digest(id, value)));
+        let after = after.map(|(id, value)| (id.as_str(), snapshot_hash::record_digest(id, value)));
+        for (_, digest) in before.iter().chain(after.iter()) {
+            snapshot_hash::xor_digest(&mut acc, digest);
         }
         self.snapshot_hashes
             .insert(table.to_string(), snapshot_hash::xor_acc_to_hex(&acc));
+
+        // The ranges, and a build's windows already read, take the same
+        // change. A key that cannot be ranged ends both for this table.
+        let before = before.as_ref().map(|(id, d)| (*id, d));
+        let after = after.as_ref().map(|(id, d)| (*id, d));
+        if let Some(ranges) = self.ranges.get_mut(table) {
+            if !fold_into_ranges(ranges, before, after, usize::MAX) {
+                self.mark_ranges_unsupported(table);
+                return;
+            }
+            self.ranges_unpersisted.insert(table.to_string());
+        }
+        let build = self.range_build.get_mut().unwrap();
+        if let Some(b) = build.as_mut().filter(|b| b.table == table) {
+            if !fold_into_ranges(&mut b.ranges, before, after, b.scanned) {
+                self.mark_ranges_unsupported(table);
+            }
+        }
     }
 
     /// Read combined snapshot state (seq + hashes + tables) from metadata.
@@ -1750,9 +2191,14 @@ impl Replica {
         if tracking {
             if fold_failed {
                 self.dirty_hashes.insert(table.to_string());
+                self.drop_range_build(table);
             } else {
                 self.fold_hash_delta(table, before.as_ref(), after.as_ref());
             }
+        } else if synced {
+            // Not folded, so a build of the table no longer describes it. Its
+            // ranges are replaced with the from-content hash it is waiting for.
+            self.drop_range_build(table);
         }
 
         debug!("Applied {:?} for {}", op, thing_id);
@@ -1809,6 +2255,10 @@ impl Replica {
         self.changefeed_vs = 0;
         self.opaque_fields.clear();
         self.opaque_known = false;
+        self.ranges.clear();
+        self.ranges_unpersisted.clear();
+        self.ranges_unsupported.clear();
+        *self.range_build.get_mut().unwrap() = None;
         info!(path = ?self.db_path, "Replica reset (REMOVE DATABASE)");
         Ok(())
     }
@@ -1864,6 +2314,8 @@ impl Replica {
         self.snapshot_hashes = state.hashes;
         self.known_tables = state.tables;
         self.interrupted_apply = state.applying;
+        self.ranges_unsupported.clear();
+        self.load_ranges().await;
         Ok(self.snapshot_seq)
     }
 
@@ -2274,6 +2726,184 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("title").and_then(|v| v.as_str()), Some("hello"));
 
+        Ok(())
+    }
+
+    /// A replica holding `game` rows `g00000..` (n of them), hashed from content.
+    async fn ranged_replica(n: usize) -> Result<(tempfile::TempDir, Replica)> {
+        let tmp = tempfile::tempdir()?;
+        let mut replica = Replica::new(tmp.path().join("replica")).await?;
+        let mut i = 0;
+        while i < n {
+            let mut q = String::from("BEGIN;");
+            for j in i..(i + 500).min(n) {
+                q.push_str(&format!(" CREATE game:g{j:05} SET n = {j}, _00_rv = 1;"));
+            }
+            q.push_str(" COMMIT;");
+            replica.db.query(q).await?.check()?;
+            i += 500;
+        }
+        replica.known_tables.insert("game".to_string());
+        replica.set_snapshot_state(1, None).await?;
+        Ok((tmp, replica))
+    }
+
+    fn row(n: i64, rv: i64) -> Option<Value> {
+        Some(serde_json::json!({ "n": n, "_00_rv": rv }))
+    }
+
+    #[tokio::test]
+    async fn content_hash_cuts_ranges_and_matches_the_keyset_pager() -> Result<()> {
+        let (_tmp, replica) = ranged_replica(2500).await?;
+        let paged = replica.hash_one_table_paged("game").await?;
+        assert_eq!(replica.snapshot_hashes()["game"], paged);
+
+        let wire = replica.table_ranges("game").expect("ranges cut by the content hash");
+        assert_eq!(wire.hash, paged);
+        assert_eq!(wire.starts, vec!["", "g01000", "g02000"]);
+        assert_eq!(wire.counts, vec![1000, 1000, 500]);
+
+        // A table with a numeric key cannot be ranged, and still hashes right.
+        replica.db.query("CREATE mixed:abc SET n = 1; CREATE mixed:7 SET n = 2;").await?.check()?;
+        let content = replica.hash_one_table("mixed").await?;
+        assert!(content.ranges.is_none());
+        assert_eq!(content.hash, replica.hash_one_table_paged("mixed").await?);
+
+        // A table that does not exist is one empty range.
+        let empty = replica.hash_one_table("nothing").await?;
+        assert_eq!(empty.hash, snapshot_hash::xor_empty_table_hash());
+        assert_eq!(empty.ranges.map(|r| r.len()), Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applied_events_keep_the_ranges_equal_to_a_rebuild() -> Result<()> {
+        let (_tmp, mut replica) = ranged_replica(2500).await?;
+        replica.apply("game", RecordOp::Update, "game:g00010", row(-1, 2)).await?;
+        replica.apply("game", RecordOp::Delete, "game:g01500", None).await?;
+        replica.apply("game", RecordOp::Create, "game:g01500x", row(7, 1)).await?;
+        replica.apply("game", RecordOp::Update, "game:zz", row(8, 1)).await?;
+        replica.apply("game", RecordOp::Create, "game:`a-b`", row(9, 1)).await?;
+
+        let folded = replica.table_ranges("game").unwrap();
+        assert_eq!(folded.hash, replica.hash_one_table("game").await?.hash);
+        // Same boundaries as before the events, and every range holds what a
+        // fresh read of it holds now.
+        assert_eq!(folded.starts, vec!["", "g01000", "g02000"]);
+        let mut fresh = RangeHashes::with_starts(folded.starts.clone()).unwrap();
+        for i in 0..fresh.len() {
+            assert!(replica.scan_window("game", &mut fresh, i).await?);
+        }
+        assert_eq!(folded, fresh.to_wire("game"));
+        assert_eq!(folded.counts, vec![1001, 1000, 501]);
+
+        // A numeric key ends ranging for the table, not the hash.
+        replica.apply("game", RecordOp::Create, "game:42", row(1, 1)).await?;
+        assert!(replica.table_ranges("game").is_none());
+        assert_eq!(replica.snapshot_hashes()["game"], replica.hash_one_table_paged("game").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranges_persist_and_are_dropped_when_they_do_not_add_up() -> Result<()> {
+        let (_tmp, mut replica) = ranged_replica(1500).await?;
+        replica.apply("game", RecordOp::Update, "game:g00001", row(5, 2)).await?;
+        replica.commit_snapshot_state(2, BTreeMap::new(), BTreeSet::new()).await?;
+        let before = replica.table_ranges("game").unwrap();
+
+        replica.reload_snapshot_seq().await?;
+        assert_eq!(replica.table_ranges("game"), Some(before.clone()));
+
+        // A persisted hash newer than the persisted ranges (a crash between
+        // the two writes): the ranges are not trusted.
+        replica
+            .db
+            .query("UPSERT _00_metadata:snapshot SET hashes.game = $h")
+            .bind(("h", snapshot_hash::xor_empty_table_hash()))
+            .await?
+            .check()?;
+        replica.reload_snapshot_seq().await?;
+        assert!(replica.table_ranges("game").is_none());
+
+        // A dirty table serves none either.
+        let (_tmp2, mut other) = ranged_replica(10).await?;
+        assert!(other.table_ranges("game").is_some());
+        other.mark_tables_dirty(["game".to_string()]);
+        assert!(other.table_ranges("game").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_background_build_takes_the_events_applied_while_it_runs() -> Result<()> {
+        let (_tmp, mut replica) = ranged_replica(3500).await?;
+        // A replica from before ranges: hashes, no ranges.
+        replica.ranges.clear();
+        assert_eq!(replica.next_range_build(&BTreeSet::new()).as_deref(), Some("game"));
+        assert_eq!(replica.range_build_begin("game").await?, RangeBuildStep::More);
+        assert_eq!(replica.range_build_step().await?, RangeBuildStep::More);
+        assert_eq!(replica.range_build_step().await?, RangeBuildStep::More);
+
+        // Windows 0 and 1 are read, 2 and 3 are not.
+        replica.apply("game", RecordOp::Update, "game:g00002", row(-2, 2)).await?;
+        replica.apply("game", RecordOp::Delete, "game:g01999", None).await?;
+        replica.apply("game", RecordOp::Update, "game:g02500", row(-3, 2)).await?;
+        replica.apply("game", RecordOp::Create, "game:g03999x", row(-4, 1)).await?;
+
+        assert_eq!(replica.range_build_step().await?, RangeBuildStep::More);
+        replica.apply("game", RecordOp::Update, "game:g02001", row(-5, 2)).await?;
+        assert_eq!(replica.range_build_step().await?, RangeBuildStep::Done);
+        assert!(replica.range_build_finish().await);
+
+        let built = replica.table_ranges("game").unwrap();
+        assert_eq!(built.hash, replica.hash_one_table("game").await?.hash);
+        // Every range holds what a fresh read of it holds now.
+        let mut fresh = RangeHashes::with_starts(built.starts.clone()).unwrap();
+        for i in 0..fresh.len() {
+            assert!(replica.scan_window("game", &mut fresh, i).await?);
+        }
+        assert_eq!(built, fresh.to_wire("game"));
+        assert_eq!(built.counts, vec![1000, 999, 1000, 501]);
+        assert_eq!(replica.next_range_build(&BTreeSet::new()), None);
+        Ok(())
+    }
+
+    /// The background driver ranges every table that lacks ranges, a window
+    /// per read guard, and leaves a table whose keys cannot be ranged alone.
+    #[tokio::test]
+    async fn the_builder_ranges_every_table_that_has_none() -> Result<()> {
+        let (_tmp, mut replica) = ranged_replica(2200).await?;
+        replica.db.query("CREATE mixed:abc SET n = 1; CREATE mixed:7 SET n = 2;").await?.check()?;
+        replica.known_tables.insert("mixed".to_string());
+        replica.set_snapshot_state(2, None).await?;
+        assert!(replica.ranges_unsupported.contains("mixed"));
+        replica.ranges.clear();
+        replica.ranges_unsupported.clear();
+        let replica = std::sync::Arc::new(tokio::sync::RwLock::new(replica));
+
+        let mut skip = BTreeSet::new();
+        let mut built = Vec::new();
+        while let Some((table, installed)) = crate::build_ranges_once(&replica, &skip).await {
+            built.push((table.clone(), installed));
+            skip.insert(table);
+        }
+        assert_eq!(built, vec![("game".to_string(), true), ("mixed".to_string(), false)]);
+        let rep = replica.read().await;
+        assert_eq!(rep.table_ranges("game").unwrap().counts, vec![1000, 1000, 200]);
+        assert!(rep.table_ranges("mixed").is_none());
+        assert_eq!(rep.next_range_build(&BTreeSet::new()), None, "mixed is not tried again");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_build_is_dropped_when_its_table_goes_dirty() -> Result<()> {
+        let (_tmp, mut replica) = ranged_replica(1200).await?;
+        replica.ranges.clear();
+        replica.range_build_begin("game").await?;
+        replica.range_build_step().await?;
+        replica.mark_tables_dirty(["game".to_string()]);
+        replica.apply("game", RecordOp::Update, "game:g00003", row(1, 2)).await?;
+        assert_eq!(replica.range_build_step().await?, RangeBuildStep::Idle);
+        assert!(!replica.range_build_finish().await);
         Ok(())
     }
 }

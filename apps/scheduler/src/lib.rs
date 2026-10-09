@@ -899,6 +899,10 @@ impl Scheduler {
             "Scheduler is ready and running"
         );
 
+        // Cut the id ranges warm SSPs repair against, for tables that have
+        // none (a replica from before ranges, or one a build gave up on).
+        spawn_range_builder(Arc::clone(&self.replica), Arc::clone(&self.status));
+
         // Step 3: Spawn periodic snapshot update task (which also runs the
         // periodic drift check after each drain).
         self.spawn_snapshot_updater(Some(drift_hook));
@@ -1054,6 +1058,93 @@ impl Scheduler {
             }
         });
     }
+}
+
+/// How often the range builder looks for a table without id ranges.
+const RANGE_BUILD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a table whose range build failed waits before the next attempt.
+const RANGE_BUILD_RETRY: Duration = Duration::from_secs(600);
+
+/// Build the id ranges (see `ssp_protocol::range_hash`) of one table that has
+/// none, or whose ranges grew lopsided, a window per read guard so the replica
+/// keeps draining and serving `/proxy` while it runs. Returns the table and
+/// whether its ranges were installed; `None` when no table needs a build.
+///
+/// A from-content hash cuts ranges on its own (every clone, every dirty
+/// table); this is for the tables whose hash is current and was never
+/// recomputed, which on a replica from before ranges is all of them.
+pub async fn build_ranges_once(
+    replica: &Arc<RwLock<Replica>>,
+    skip: &BTreeSet<String>,
+) -> Option<(String, bool)> {
+    use crate::replica::RangeBuildStep;
+    let (table, db) = {
+        let rep = replica.read().await;
+        (rep.next_range_build(skip)?, rep.db_handle())
+    };
+    let started = std::time::Instant::now();
+    // The boundary scan reads the whole table once; it holds no guard, so a
+    // drain is not kept waiting behind it. Each window below holds one.
+    let mut step = match Replica::range_boundaries_on(&db, &table).await {
+        Ok(boundaries) => Ok(replica.read().await.range_build_start(&table, boundaries)),
+        Err(e) => Err(e),
+    };
+    loop {
+        match step {
+            Ok(RangeBuildStep::More) => {
+                tokio::task::yield_now().await;
+                step = replica.read().await.range_build_step().await;
+            }
+            Ok(RangeBuildStep::Done) => break,
+            Ok(RangeBuildStep::Unsupported) => {
+                info!(table = %table, "Table keys are not plain strings; it gets no range hashes");
+                replica.write().await.mark_ranges_unsupported(&table);
+                return Some((table, false));
+            }
+            Ok(RangeBuildStep::Idle) => {
+                debug!(table = %table, "Range build abandoned: the table went dirty under it");
+                return Some((table, false));
+            }
+            Err(e) => {
+                warn!(table = %table, error = %e, "Range build failed; retrying later");
+                replica.read().await.range_build_abandon();
+                return Some((table, false));
+            }
+        }
+    }
+    let installed = replica.write().await.range_build_finish().await;
+    debug!(table = %table, installed, ms = started.elapsed().as_millis() as u64, "Range build finished");
+    Some((table, installed))
+}
+
+/// Run [`build_ranges_once`] until no table needs ranges, every
+/// [`RANGE_BUILD_INTERVAL`], outside clones, restores and SSP bootstraps.
+fn spawn_range_builder(replica: Arc<RwLock<Replica>>, status: Arc<RwLock<SchedulerStatus>>) {
+    tokio::spawn(async move {
+        let mut retry_at: std::collections::BTreeMap<String, std::time::Instant> = Default::default();
+        loop {
+            tokio::time::sleep(RANGE_BUILD_INTERVAL).await;
+            let now = std::time::Instant::now();
+            retry_at.retain(|_, at| *at > now);
+            let mut skip: BTreeSet<String> = retry_at.keys().cloned().collect();
+            loop {
+                if !matches!(
+                    *status.read().await,
+                    SchedulerStatus::Ready | SchedulerStatus::SnapshotUpdating
+                ) {
+                    break;
+                }
+                let Some((table, installed)) = build_ranges_once(&replica, &skip).await else {
+                    break;
+                };
+                if !installed {
+                    retry_at.insert(table.clone(), now + RANGE_BUILD_RETRY);
+                }
+                skip.insert(table);
+            }
+        }
+    });
 }
 
 /// The drift module's remediation, bound to this scheduler's replica: the same

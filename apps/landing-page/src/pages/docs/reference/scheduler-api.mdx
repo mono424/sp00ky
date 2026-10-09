@@ -131,6 +131,35 @@ curl -X POST http://localhost:9667/proxy/query \
   -d '{"query": "SELECT * FROM users"}'
 ```
 
+### POST /proxy/ranges
+
+A table's id-range hashes: the table's `x3:` content hash split into ranges of
+about 1000 rows in record-id order (at most 1024 ranges, so a bigger table gets
+bigger ranges), each with its own hash and row count. A warm SSP whose table
+hash differs from the registration's compares its own rows range by range and
+reads only the ranges that differ; a cold bootstrap pages by them. The ranges
+always add up to the table hash the scheduler hands out at registration.
+
+The scheduler keeps them current with every applied event, persists them with
+its snapshot state, cuts them whenever it hashes a table from content, and
+builds them in the background (one range at a time, so draining never waits on
+it) for tables that have none, such as every table of a replica from before
+ranges existed.
+
+**Request Body:**
+
+```json
+{ "table": "game" }
+```
+
+**Response:**
+- `200 OK` - `{ "table", "hash", "starts", "hashes", "counts" }`. Range `i` holds
+  the record keys from `starts[i]` up to `starts[i + 1]`; `starts[0]` is `""`.
+- `404 Not Found` - No ranges for this table: not built yet, its hash is about
+  to be recomputed, or its keys are not plain strings (numeric, uuid, array or
+  object ids). The SSP then lists the whole table.
+- `503 Service Unavailable` - The scheduler is restoring from a backup
+
 ### POST /proxy/signin
 
 No-op endpoint for SurrealDB client compatibility during SSP bootstrap. Returns success without performing authentication.

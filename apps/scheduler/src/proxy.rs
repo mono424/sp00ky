@@ -30,6 +30,7 @@ pub struct ProxyState {
 pub fn create_proxy_router(state: ProxyState) -> Router {
     Router::new()
         .route("/proxy/query", post(handle_proxy_query))
+        .route("/proxy/ranges", post(handle_proxy_ranges))
         .route("/proxy/signin", post(handle_proxy_signin))
         .route("/proxy/use", post(handle_proxy_use))
         .with_state(state)
@@ -67,6 +68,26 @@ async fn handle_proxy_query(
             ))
         }
     }
+}
+
+/// A table's id-range hashes (see `ssp_protocol::range_hash`), for a warm SSP
+/// whose table hash differs to find the ranges that differ instead of listing
+/// the whole table. 404 when the replica has none to vouch for (not built yet,
+/// keys that cannot be ranged, or a hash waiting to be recomputed): the SSP
+/// then lists the table in full, which is also what an older scheduler, which
+/// has no such route, makes it do.
+async fn handle_proxy_ranges(
+    State(state): State<ProxyState>,
+    Json(request): Json<ssp_protocol::range_hash::RangeHashesRequest>,
+) -> Result<Json<ssp_protocol::range_hash::TableRanges>, (StatusCode, String)> {
+    reject_if_restoring(&state.status).await?;
+    let replica = state.replica.read().await;
+    replica.table_ranges(&request.table).map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no range hashes for table {}", request.table),
+        )
+    })
 }
 
 /// No-op signin — snapshot DB doesn't need auth

@@ -219,12 +219,25 @@ List<String> suspectHashes(
   return out;
 }
 
-/// The record ids a stored `_00_view` / `_00_window` row names. Used by the
-/// orphan collector, which only needs the ids and not their versions.
-Iterable<String> decodeIdsOfView(Map<String, dynamic> row) sync* {
-  final ids = row['ids'];
-  if (ids is! List) return;
-  for (final entry in ids) {
-    if (entry is List && entry.isNotEmpty) yield entry.first.toString();
+/// A stored `_00_view` row as the orphan collector sees it: its view key (null
+/// when the row carries no id, so it can never be retired), every id it vouches
+/// for (members and subquery children) and when a server answer last wrote it.
+typedef ViewIndexRow = ({String? key, Set<String> ids, int updatedAt});
+
+ViewIndexRow parseViewIndexRow(Map<String, dynamic> row) {
+  final id = row['id']?.toString();
+  final ids = <String>{};
+  for (final field in const ['ids', 'children']) {
+    final raw = row[field];
+    if (raw is! List) continue;
+    for (final entry in raw) {
+      if (entry is List && entry.isNotEmpty) ids.add(entry.first.toString());
+    }
   }
+  final updatedAt = row['updatedAt'];
+  return (
+    key: id?.substring(id.indexOf(':') + 1),
+    ids: ids,
+    updatedAt: updatedAt is num ? updatedAt.toInt() : 0,
+  );
 }

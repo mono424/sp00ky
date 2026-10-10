@@ -196,10 +196,29 @@ void main() {
       expect(put.data['ids'], [
         ['thing:1', 2]
       ]);
+      expect(put.data['children'], isEmpty);
       expect(out.dispatched.whereType<FetchRows>(), hasLength(1));
     });
 
-    test('a verified removal applies an empty set with no server row', () async {
+    test('the view row records the children the query holds', () async {
+      final out = await runPure<MembershipOutcome>(
+        (ctx) => applyMembership(ctx, 'a', [('thing:1', 1)]),
+        state: buildState([
+          buildEntry(
+              def: buildDefinition(hash: 'a'),
+              lifecycle: life(QueryPhase.cached),
+              subqueryRemoteArray: [('user:a', 2)])
+        ]),
+        handlers: defaults(),
+      );
+      final put = out.ofKind('local.put').single as LocalPut;
+      expect(put.data['children'], [
+        ['user:a', 2]
+      ]);
+    });
+
+    test('a verified removal applies an empty set with no server row',
+        () async {
       final out = await runPure<MembershipOutcome>(
         (ctx) => applyMembership(ctx, 'a', const [], verifiedRemoval: true),
         state: buildState([
@@ -253,6 +272,31 @@ void main() {
       expect(changed.state.queries['a']!.subqueryRemoteArray,
           [('child:2', 1)]);
       expect(changed.dispatched.single, isA<FetchRows>());
+      expect(changed.ofKind('local.put'), isEmpty,
+          reason: 'a cold query has no view row to record children in');
+    });
+
+    test('past cold, the children are written to the view row', () async {
+      final out = await runPure<void>(
+        (ctx) => applySubqueryChildren(ctx, 'a', [('user:b', 1)]),
+        state: buildState([
+          buildEntry(
+              def: buildDefinition(hash: 'a'),
+              lifecycle: life(QueryPhase.live),
+              remoteArray: [('thing:1', 4)])
+        ]),
+        handlers: defaults(),
+      );
+      final put = out.ofKind('local.put').single as LocalPut;
+      expect(put.id, sql.viewRecordId('view-a'));
+      expect(put.data['ids'], [
+        ['thing:1', 4]
+      ]);
+      expect(put.data['children'], [
+        ['user:b', 1]
+      ]);
+      expect(put.data['confirmed'], isTrue);
+      expect(out.dispatched.single, isA<FetchRows>());
     });
   });
 

@@ -90,7 +90,7 @@ Future<MembershipOutcome> applyMembership(
   final now = await ctx(Fx.now());
   try {
     await ctx(Fx.localPut(sql.viewTable, sql.viewRecordId(entry.def.viewKey),
-        sql.viewRow(remoteArray, true, now)));
+        sql.viewRow(remoteArray, entry.subqueryRemoteArray, true, now)));
   } catch (e) {
     await ctx(Fx.log(LogLevel.debug, 'view row write failed',
         {'hash': hash, 'error': e}));
@@ -113,7 +113,9 @@ Future<void> recoverLostView(Ctx ctx, QueryHash hash) async {
   await ctx(Fx.dispatch(RegisterRemote(hash)));
 }
 
-/// Replace the subquery child set; bodies follow through the fetch plan.
+/// Replace the subquery child set; bodies follow through the fetch plan. A
+/// query with a `_00_view` row (past `cold`) records the children there too,
+/// so the orphan collector keeps their bodies across restarts.
 Future<void> applySubqueryChildren(
     Ctx ctx, QueryHash hash, RecordVersionArray children) async {
   final entry = await ctx(Fx.stateRead((s) => s.queries[hash]));
@@ -122,6 +124,18 @@ Future<void> applySubqueryChildren(
     return;
   }
   await ctx(Fx.stateUpdate(r.setSubqueryRemoteArray(hash, children)));
+  if (entry.lifecycle.phase != QueryPhase.cold) {
+    // No merge upsert locally: rewrite the row from the committed members,
+    // which `applyMembership` has already put in state in every caller.
+    final now = await ctx(Fx.now());
+    try {
+      await ctx(Fx.localPut(sql.viewTable, sql.viewRecordId(entry.def.viewKey),
+          sql.viewRow(entry.remoteArray, children, true, now)));
+    } catch (e) {
+      await ctx(Fx.log(
+          LogLevel.debug, 'view row write failed', {'hash': hash, 'error': e}));
+    }
+  }
   await ctx(Fx.dispatch(const FetchRows()));
 }
 

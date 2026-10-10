@@ -54,7 +54,10 @@ void main() {
       expect(out.state.saltUserId, 'user:u1');
       expect(names, contains(ServiceName.sspSetSessionAuth));
       expect(out.state.localReady, isTrue);
-      expect(out.dispatched.map((e) => e.type), ['LifecycleTick', 'GcTick']);
+      expect(out.dispatched.map((e) => e.type), ['LifecycleTick']);
+      expect(out.timers['gc']!.ms, 30000,
+          reason:
+              'the orphan sweep waits for the first answers, never at boot');
     });
 
     test('no hint and no session: the anon bucket, no identity seeded',

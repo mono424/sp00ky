@@ -14,12 +14,17 @@ const String legacyViewTable = '_00_window';
 /// Record id of the durable local membership row for [viewKey].
 String viewRecordId(String viewKey) => '$viewTable:$viewKey';
 
-/// The durable local membership row's document.
-Map<String, dynamic> viewRow(
-        RecordVersionArray ids, bool confirmed, int now) =>
+/// The durable local membership row's document. [children] are the
+/// `.related()` subquery rows the view vouches for: the orphan collector keeps
+/// them as it keeps the members.
+Map<String, dynamic> viewRow(RecordVersionArray ids,
+        RecordVersionArray children, bool confirmed, int now) =>
     {
       'ids': [
         for (final (id, version) in ids) [id, version]
+      ],
+      'children': [
+        for (final (id, version) in children) [id, version]
       ],
       'confirmed': confirmed,
       'updatedAt': now,

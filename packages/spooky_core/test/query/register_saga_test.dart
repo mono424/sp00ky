@@ -212,10 +212,17 @@ void main() {
       expect(out.emitted.whereType<QueryAuthorityEvent>().single.known, isTrue);
       expect(out.dispatched.whereType<FetchRows>(), isNotEmpty);
       expect(out.dispatched.whereType<SyncOutcome>().last.ok, isTrue);
-      // The durable view row was written.
-      final put = out.ofKind('local.put').single as LocalPut;
+      // The durable view row was written, and its last write carries the
+      // children so the orphan collector keeps their bodies.
+      final put = out.ofKind('local.put').last as LocalPut;
       expect(put.table, sql.viewTable);
       expect(put.data['confirmed'], isTrue);
+      expect(put.data['ids'], [
+        ['thing:1', 1]
+      ]);
+      expect(put.data['children'], [
+        ['child:1', 1]
+      ]);
     });
 
     test('guards: missing entry, already registered, registering without retry',

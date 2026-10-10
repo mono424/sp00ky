@@ -35,9 +35,12 @@ void main() {
 
     test('view rows and ids', () {
       expect(viewRecordId('k1'), '_00_view:k1');
-      final row = viewRow([('t:1', 2)], true, 99);
+      final row = viewRow([('t:1', 2)], [('c:1', 3)], true, 99);
       expect(row['ids'], [
         ['t:1', 2]
+      ]);
+      expect(row['children'], [
+        ['c:1', 3]
       ]);
       expect(row['confirmed'], isTrue);
       expect(row['updatedAt'], 99);

@@ -1,3 +1,4 @@
+import '../kernel/constants.dart';
 import '../kernel/effects.dart';
 import '../kernel/events.dart';
 import '../kernel/saga.dart';
@@ -44,7 +45,9 @@ Future<void> boot(Ctx ctx, SagaEnv env) async {
   await ctx(Fx.service<void>(ServiceName.featuresInit));
   await ctx(Fx.service<void>(ServiceName.releasesInit));
   await ctx(Fx.dispatch(const LifecycleTick()));
-  await ctx(Fx.dispatch(const GcTick()));
+  // Not at once: right after the prime `versions` names every local body while
+  // no query has answered yet, so a sweep now could only judge by `_00_view`.
+  await ctx(Fx.timerSet('gc', gcBootDelayMs, const GcTick()));
   await ctx(Fx.stateUpdate(r.setIdentity(localReady: true)));
 }
 

@@ -148,6 +148,30 @@ List<QueryHash> desiredRegistrations(ClientState s) => [
         if (e.value.lifecycle.remote == RemotePhase.unregistered) e.key,
     ];
 
+/// The bodies the orphan collector must keep: internal rows, what a durable
+/// `_00_view` row vouches for ([viewIds], members and subquery children), what
+/// any query in state holds as members or children, and anything a write is
+/// still in flight for.
+bool Function(String id) retained(ClientState s, Set<String> viewIds) {
+  final held = <String>{};
+  for (final e in s.queries.values) {
+    for (final (id, _) in e.remoteArray) {
+      held.add(id);
+    }
+    for (final (id, _) in e.subqueryRemoteArray) {
+      held.add(id);
+    }
+  }
+  for (final item in s.outbox) {
+    held.add(item.recordId);
+  }
+  for (final write in s.pendingWrites.values) {
+    held.add(write.recordId);
+  }
+  return (id) =>
+      id.startsWith('_00_') || viewIds.contains(id) || held.contains(id);
+}
+
 List<QueryHash> evictable(ClientState s, int now) => [
       for (final e in s.queries.entries)
         if (e.value.subscribers == 0 &&

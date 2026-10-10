@@ -66,8 +66,16 @@ const int authReadyMaxAttempts = 10;
 /// Heartbeat at this fraction of the shortest ttl in state.
 const double ttlHeartbeatFraction = 0.5;
 
-/// Orphan body garbage collection cadence.
-const int gcIntervalMs = 7 * 24 * 60 * 60 * 1000;
+/// Orphan body collection: first sweep this long after boot (the circuit is
+/// primed and the first registrations have answered), then every
+/// [gcIntervalMs], deleting [gcChunk] bodies per step.
+const int gcBootDelayMs = 30000;
+const int gcIntervalMs = 60 * 60 * 1000;
+const int gcChunk = 200;
+
+/// A `_00_view` row no query has resolved for this long is retired, and the
+/// bodies only it vouched for become collectable.
+const int viewRetentionMs = 14 * 24 * 60 * 60 * 1000;
 
 /// Rolling telemetry sample window per query.
 const int telemetrySampleWindow = 100;

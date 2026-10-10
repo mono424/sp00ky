@@ -150,10 +150,27 @@ void main() {
   });
 
   group('gcTick', () {
-    test('deletes bodies no view names and no outbox item touches', () async {
+    const day = 24 * 60 * 60 * 1000;
+    const now = 1700000000000;
+
+    /// Answers `local.getAll` on the view table with [views], everything else
+    /// empty, and records which ids were deleted from which table.
+    Map<String, EffectHandler> viewHandlers(List<Map<String, dynamic>> views) =>
+        defaults(over: {
+          'local.getAll': (e, __) => (e as LocalGetAll).table == sql.viewTable
+              ? views
+              : <Map<String, dynamic>>[],
+        });
+
+    List<String> deletedIds(RunPureResult<void> out) =>
+        out.ofKind('local.delete').map((e) => (e as LocalDelete).id).toList();
+
+    test('deletes bodies no view, query or outbox item retains', () async {
       final out = await runPure<void>(
         gcTick,
+        now: now,
         state: buildState([], [
+          r.setIdentity(primed: true),
           r.setVersions([
             ('thing:keep', 1),
             ('thing:pending', 1),
@@ -162,32 +179,133 @@ void main() {
           ]),
           r.outboxReplace([buildOutboxItem(recordId: 'thing:pending')]),
         ]),
-        handlers: defaults(over: {
-          'local.getAll': (e, __) => (e as LocalGetAll).table == sql.viewTable
-              ? [
-                  {
-                    'ids': [
-                      ['thing:keep', 1]
-                    ]
-                  }
-                ]
-              : <Map<String, dynamic>>[],
-        }),
+        handlers: viewHandlers([
+          {
+            'id': '_00_view:x',
+            'ids': [
+              ['thing:keep', 1]
+            ],
+            'updatedAt': now,
+          }
+        ]),
       );
-      final deleted = out
-          .ofKind('local.delete')
-          .map((e) => (e as LocalDelete).id)
-          .toList();
-      expect(deleted, ['thing:orphan'],
+      expect(deletedIds(out), ['thing:orphan'],
           reason: 'internal rows and anything a view or the outbox names stay');
       expect(out.state.versions.containsKey('thing:orphan'), isFalse);
       expect(out.ofKind('ssp.ingest'), hasLength(1));
-      expect(out.timers['gc']!.ms, 604800000);
+      expect(out.dispatched.map((e) => e.type), ['FetchRows']);
+      expect(out.timers['gc']!.ms, 60 * 60 * 1000);
+    });
+
+    test('keeps the subquery children a view row records', () async {
+      final out = await runPure<void>(
+        gcTick,
+        now: now,
+        state: buildState([], [
+          r.setIdentity(primed: true),
+          r.setVersions([('thing:1', 1), ('user:a', 1), ('user:gone', 1)]),
+        ]),
+        handlers: viewHandlers([
+          {
+            'id': '_00_view:list',
+            'ids': [
+              ['thing:1', 1]
+            ],
+            'children': [
+              ['user:a', 1]
+            ],
+            'updatedAt': now,
+          }
+        ]),
+      );
+      expect(deletedIds(out), ['user:gone']);
+    });
+
+    test('keeps what a query in state holds, members and children', () async {
+      final out = await runPure<void>(
+        gcTick,
+        now: now,
+        state: buildState([
+          buildEntry(
+            remoteArray: const [('thing:1', 1)],
+            subqueryRemoteArray: const [('user:a', 1)],
+          ),
+        ], [
+          r.setIdentity(primed: true),
+          r.setVersions([('thing:1', 1), ('user:a', 1), ('user:gone', 1)]),
+        ]),
+        handlers: viewHandlers(const []),
+      );
+      expect(deletedIds(out), ['user:gone'],
+          reason: 'a view row written before children were recorded must not '
+              'cost the bodies a live query has just been answered with');
+    });
+
+    test('retires stale unheld view rows and collects what only they named',
+        () async {
+      final out = await runPure<void>(
+        gcTick,
+        now: now,
+        state: buildState([
+          buildEntry(def: buildDefinition(hash: 'h', viewKey: 'held')),
+        ], [
+          r.setIdentity(primed: true),
+          r.setVersions(
+              [('thing:old', 1), ('thing:held', 1), ('thing:new', 1)]),
+        ]),
+        handlers: viewHandlers([
+          {
+            'id': '_00_view:stale',
+            'ids': [
+              ['thing:old', 1]
+            ],
+            'updatedAt': now - 15 * day,
+          },
+          {
+            'id': '_00_view:held',
+            'ids': [
+              ['thing:held', 1]
+            ],
+            'updatedAt': now - 15 * day,
+          },
+          {
+            'id': '_00_view:fresh',
+            'ids': [
+              ['thing:new', 1]
+            ],
+            'updatedAt': now - day,
+          },
+        ]),
+      );
+      expect(deletedIds(out), ['_00_view:stale', 'thing:old'],
+          reason: 'a held view row stays however old, a fresh one stays');
+      expect(out.emitted.whereType<LogEvent>().last.data,
+          {'removed': 1, 'retiredViews': 1});
+    });
+
+    test('stops when the bucket moved under the sweep', () async {
+      final out = await runPure<void>(
+        gcTick,
+        now: now,
+        state: buildState([], [
+          r.setIdentity(primed: true, bucketId: 'u1'),
+          r.setVersions([('thing:orphan', 1)]),
+        ]),
+        handlers: defaults(over: {
+          'local.getAll': (_, ctx) {
+            ctx.state = r.setIdentity(bucketId: 'u2')(ctx.state);
+            return <Map<String, dynamic>>[];
+          },
+        }),
+      );
+      expect(deletedIds(out), isEmpty);
+      expect(out.timers['gc'], isNotNull);
     });
 
     test('a failing sweep is logged and still reschedules', () async {
       final out = await runPure<void>(
         gcTick,
+        state: buildState([], [r.setIdentity(primed: true)]),
         handlers: defaults(over: {
           'local.getAll': (_, __) => throw StateError('store closed'),
         }),

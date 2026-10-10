@@ -82,7 +82,7 @@ Each event also names one SSP to run any job it creates, sent to the SSPs as `jo
 - `record` (object, required) - Record data
 
 **Response:**
-- `200 OK` - Successfully ingested and broadcast to SSPs
+- `200 OK` - Durably accepted into the WAL and queued for SSP delivery
 - `400 Bad Request` - Invalid operation or malformed request
 - `500 Internal Server Error` - Failed to apply to replica or broadcast
 - `503 Service Unavailable` - Scheduler is in `Cloning` state
@@ -311,6 +311,14 @@ curl -X POST http://localhost:9667/ssp/register \
     "url": "http://localhost:8667"
   }'
 ```
+
+The optional registration field `ingest_batch_limit` advertises the number of
+ordinary records the SSP accepts at `/ingest/batch` (maximum 128). Missing or zero
+means single-record delivery. The scheduler preserves this capability through
+handover, coalesces only already queued events, and checks each final JSON batch
+against the 1 MiB wire limit. Job, user and `_00_*` records stay on `/ingest`.
+A failed batch and every later undelivered row are buffered in order; replay uses
+single records, preserving each event's WAL sequence and assigned job runner.
 
 ### POST /ssp/heartbeat
 
@@ -1010,3 +1018,26 @@ not a complete transaction trace. `publication.worst_views` contains at most
 eight query IDs and backlog sizes, with no source rows or query bindings.
 Older history files and SSPs omit these optional details. Each SSP in the
 overview exposes the latest `publication` snapshot, or `null` when unavailable.
+
+## Slow sync operation history
+
+`GET /admin/api/views/history` is an authenticated, read-only admin endpoint.
+Optional filters: `kind` (`registration`, `ingest`, `ingest_batch`), `since`
+(inclusive epoch milliseconds) and `limit` (default 50, clamped to 1–100).
+It returns `samples` newest first, `total` after filtering, `limit`, `capacity`
+(100), `slow_ms` (250), `server_time_ms` and a measurement description.
+An unavailable upstream database returns `503`; invalid kinds return `400`.
+
+The private `_00_sync_evidence:slow_operations` record retains the newest 100
+recorded successful registration and ingest requests taking at least 250 ms
+across SSP/scheduler restarts and view TTL cleanup.
+Recording is best effort: at most four evidence writes run concurrently per
+process; excess requests increment `ssp_slow_evidence_dropped_total` and do not
+wait or spawn another writer. Samples contain
+masked query shapes, software version and registration/ingest stages; registration
+samples also include selected indexes and result cardinality. They exclude raw
+SQL, bindings, authentication and session identifiers. Older deployments return
+an empty history until their first slow request. Live view inspection includes
+optional `registration_stages` and `ingest_stages`; publication queue age and DB
+transaction timing are separate, available in metrics and incident history.
+MCP `view_history` uses the same endpoint and permissions.

@@ -1,4 +1,5 @@
-use crate::algebra::{ZSet, ZSetOps};
+use super::witness::WitnessState;
+use crate::algebra::ZSet;
 use crate::circuit::store::Store;
 use crate::eval::value_ops::{compare_values, hash_value, resolve_field};
 use crate::eval::value_ref::ValueRef;
@@ -15,30 +16,20 @@ use std::collections::HashMap;
 /// the inner subquery's plan becomes the right, and the correlation predicate
 /// becomes the join condition.
 ///
-/// Anti-joins are inherently non-incremental in the simple sense — a single
-/// new right row can flip many left rows from "in" to "out". We use the same
-/// `I → snapshot → D` pattern as `Distinct`: integrate, recompute the snapshot
-/// from accumulated state, differentiate against the previous output. This is
-/// O(|left|×|right|) per step worst case, which is acceptable at permission
-/// scale.
+/// Integrated input rows are indexed by join value. A step refreshes only
+/// changed rows and rechecks left rows in the affected witness buckets; an
+/// empty or unrelated delta never recomputes the whole joined snapshot.
 #[derive(Debug)]
 pub struct AntiJoin {
     pub condition: JoinCondition,
-    /// Z⁻¹: accumulated left input state.
-    left_state: ZSet,
-    /// Z⁻¹: accumulated right input state.
-    right_state: ZSet,
-    /// Last emitted thresholded output, used for differentiation.
-    prev_output: ZSet,
+    state: WitnessState,
 }
 
 impl AntiJoin {
     pub fn new(condition: JoinCondition) -> Self {
         Self {
             condition,
-            left_state: HashMap::new(),
-            right_state: HashMap::new(),
-            prev_output: HashMap::new(),
+            state: WitnessState::default(),
         }
     }
 
@@ -102,24 +93,12 @@ impl super::Operator for AntiJoin {
         Self::anti_join(inputs[0], inputs[1], &self.condition, store)
     }
 
-    fn step(
-        &mut self,
-        input_deltas: &[&ZSet],
-        store: &Store,
-        _ctx: Option<&Sp00kyValue>,
-    ) -> ZSet {
-        self.left_state.add(input_deltas[0]);
-        self.right_state.add(input_deltas[1]);
+    fn step(&mut self, input_deltas: &[&ZSet], store: &Store, _ctx: Option<&Sp00kyValue>) -> ZSet {
+        self.state.step(input_deltas, store, &self.condition, true)
+    }
 
-        let new_output = Self::anti_join(
-            &self.left_state,
-            &self.right_state,
-            &self.condition,
-            store,
-        );
-        let delta_out = self.prev_output.diff(&new_output);
-        self.prev_output = new_output;
-        delta_out
+    fn note_content_updates(&mut self, keys: &[crate::algebra::RowKey]) {
+        self.state.note_content_updates(keys);
     }
 
     fn arity(&self) -> usize {
@@ -127,15 +106,11 @@ impl super::Operator for AntiJoin {
     }
 
     fn reset(&mut self) {
-        self.left_state.clear();
-        self.right_state.clear();
-        self.prev_output.clear();
+        self.state.reset();
     }
 
     fn state_bytes(&self) -> usize {
-        crate::size::zset_bytes(&self.left_state)
-            + crate::size::zset_bytes(&self.right_state)
-            + crate::size::zset_bytes(&self.prev_output)
+        self.state.state_bytes()
     }
 
     fn evaluate_key(
@@ -148,9 +123,8 @@ impl super::Operator for AntiJoin {
         if !input_evals.first().copied().unwrap_or(false) {
             return false;
         }
-        // Witness-check this row's join field against the integrated
-        // right-side state (up to date: step() ran for every node before
-        // the membership re-evaluation pass calls evaluate_key). Anti-join
+        // Witness-check this row's join field against the indexed
+        // right-side state (refreshed before membership re-evaluation). Anti-join
         // admits the key iff NO witness exists; a missing left field counts
         // as anti, mirroring anti_join().
         // Note the two absences differ: no row rejects, a row missing the join
@@ -163,19 +137,14 @@ impl super::Operator for AntiJoin {
         if l_field.is_missing() {
             return true;
         }
-        !self.right_state.iter().any(|(r_key, &w)| {
-            if w <= 0 {
-                return false;
-            }
-            let r_field = resolve_field(store.get_row_by_key(r_key), &self.condition.right_field);
-            !r_field.is_missing() && compare_values(l_field, r_field) == Ordering::Equal
-        })
+        !self.state.has_point_witness(l_field)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algebra::ZSetOps;
     use crate::circuit::store::Change;
     use crate::operator::Operator;
     use crate::types::Path;
@@ -301,14 +270,11 @@ mod tests {
 
         let new_a = zset(&[("threads:1", 1), ("threads:2", 1), ("threads:3", 1)]);
         let new_b = zset(&[("collab:1", 1), ("collab:2", 1)]);
-        let snap_after =
-            AntiJoin::new(condition.clone()).snapshot(&[&new_a, &new_b], &store, None);
+        let snap_after = AntiJoin::new(condition.clone()).snapshot(&[&new_a, &new_b], &store, None);
         let expected_delta = snap_before.diff(&snap_after);
 
         let mut aj = AntiJoin::new(condition);
-        aj.left_state = state_a;
-        aj.right_state = state_b;
-        aj.prev_output = snap_before;
+        aj.step(&[&state_a, &state_b], &store, None);
 
         let dl = zset(&[("threads:3", 1)]);
         let dr = zset(&[("collab:2", 1)]);

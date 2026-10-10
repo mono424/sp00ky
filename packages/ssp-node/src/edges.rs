@@ -319,7 +319,7 @@ struct PublicationWork {
     deltas: Vec<ViewDelta>,
     versions: CapturedVersions,
     epochs: HashMap<String, u64>,
-    source: Option<(String, i64)>,
+    source: Option<Vec<(String, i64)>>,
     source_ready: Arc<std::sync::atomic::AtomicBool>,
     source_cancel: Arc<tokio::sync::Notify>,
     cleanup: Vec<PublicationCleanup>,
@@ -482,7 +482,13 @@ impl EdgePublisher {
     /// only after its metadata write succeeds.
     pub fn enqueue(&self, permit: PublicationPermit, deltas: Vec<ViewDelta>, circuit: &Circuit,
         source: Option<(String, i64)>, metadata_pending: bool, cleanup: Vec<PublicationCleanup>) -> Option<PublicationReady> {
+        self.enqueue_sources(permit, deltas, circuit, source.into_iter().collect(), metadata_pending, cleanup)
+    }
+    /// A batch publishes only after every surviving source row is visible.
+    pub fn enqueue_sources(&self, permit: PublicationPermit, deltas: Vec<ViewDelta>, circuit: &Circuit,
+        sources: Vec<(String, i64)>, metadata_pending: bool, cleanup: Vec<PublicationCleanup>) -> Option<PublicationReady> {
         if deltas.is_empty() && cleanup.is_empty() { return None; }
+        let source = if sources.is_empty() { None } else { Some(sources) };
         if self.is_standby() {
             // Standby writes nothing. The permit's drop returns the capacity.
             return None;
@@ -517,7 +523,12 @@ impl EdgePublisher {
         }).collect::<HashMap<_, _>>();
         if let Some(stats) = state.leases.get_mut(&permit.id) {
             stats.operations = views.iter().map(|v| v.1).sum::<u64>() + cleanup.len() as u64;
-            stats.bytes = views.iter().map(|v| v.2).sum::<u64>() + cleanup.iter().map(PublicationCleanup::bytes).sum::<u64>();
+            let source_bytes = source.as_ref().map_or(0, |rows| {
+                (std::mem::size_of::<Vec<(String, i64)>>() + rows.capacity() * std::mem::size_of::<(String, i64)>()
+                    + rows.iter().map(|(id, _)| id.capacity()).sum::<usize>()) as u64
+            });
+            stats.bytes = views.iter().map(|v| v.2).sum::<u64>()
+                + cleanup.iter().map(PublicationCleanup::bytes).sum::<u64>() + source_bytes;
             stats.views = views;
         }
         let generation = permit.generation;
@@ -586,7 +597,7 @@ impl EdgePublisher {
                     (source, work.permit.clone(), work.source_ready.clone(), work.source_cancel.clone())))
                     .collect::<Vec<_>>()
             };
-            for ((row, version), permit, ready, cancel) in sources {
+            for (rows, permit, ready, cancel) in sources {
                 let db = source_db.clone();
                 let scheduler = scheduler.clone();
                 let probes = probes.clone();
@@ -595,11 +606,23 @@ impl EdgePublisher {
                     // The shared lease outlives canceled queued work until this
                     // task and its DB future have actually been dropped.
                     let _permit = permit;
+                    let mut waits = rows.iter().map(|(row, version)| Some(Box::pin(
+                        crate::node::wait_for_row_committed(db.as_ref(), scheduler.as_ref(), row, *version,
+                            Duration::from_secs(5), probes.as_ref())
+                    ))).collect::<Vec<_>>();
+                    let all_visible = std::future::poll_fn(|cx| {
+                        for wait in &mut waits {
+                            if let Some(future) = wait {
+                                if std::future::Future::poll(future.as_mut(), cx).is_ready() { *wait = None; }
+                            }
+                        }
+                        if waits.iter().all(Option::is_none) { std::task::Poll::Ready(()) }
+                        else { std::task::Poll::Pending }
+                    });
                     tokio::select! {
                         _ = cancel.notified() => {},
                         _ = scheduler.sleep(Duration::from_secs(5)) => {},
-                        _ = crate::node::wait_for_row_committed(db.as_ref(), scheduler.as_ref(), &row, version,
-                            Duration::from_secs(5), probes.as_ref()) => {},
+                        _ = all_visible => {},
                     }
                     ready.store(true, std::sync::atomic::Ordering::Release);
                     queue.wake.notify_one();
@@ -2348,6 +2371,7 @@ mod publication_tests {
         block_source: AtomicBool,
         hold_all_sources: AtomicBool,
         source_delay_ms: std::sync::atomic::AtomicU64,
+        source_gates: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
         /// Fail any statement containing this, on top of `fail`.
         fail_marker: Mutex<Option<String>>,
         active_probes: std::sync::atomic::AtomicUsize,
@@ -2356,7 +2380,7 @@ mod publication_tests {
     }
     #[async_trait::async_trait]
     impl Db for TestDb {
-        async fn query(&self, sql: &str, _binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        async fn query(&self, sql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
             if sql.contains("SELECT VALUE version") {
                 struct Active<'a>(&'a std::sync::atomic::AtomicUsize);
                 impl Drop for Active<'_> { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
@@ -2364,6 +2388,10 @@ mod publication_tests {
                 let _active = Active(&self.active_probes);
                 self.max_probes.fetch_max(active, Ordering::AcqRel);
                 if self.hold_all_sources.load(Ordering::Acquire) { std::future::pending::<()>().await; }
+                let source_gate = binds.iter().find(|(key, _)| *key == "rid")
+                    .and_then(|(_, id)| id.as_str())
+                    .and_then(|id| self.source_gates.lock().unwrap().get(id).cloned());
+                if let Some(gate) = source_gate { gate.acquire().await.unwrap().forget(); }
                 let delay = self.source_delay_ms.load(Ordering::Acquire);
                 if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
                 if self.block_source.swap(false, Ordering::AcqRel) {
@@ -2456,6 +2484,17 @@ mod publication_tests {
         assert_eq!(p.snapshot().worst_views[0].query_id, "q");
     }
     #[tokio::test]
+    async fn batch_source_identifiers_count_against_publication_byte_admission() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 8, bytes: 4096, operations: 100 });
+        let c = circuit();
+        let sources = vec![(format!("thread:{}", "x".repeat(4096)), 9)];
+        p.enqueue_sources(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)],
+            &*c.read().await, sources, false, vec![]);
+        assert!(p.snapshot().pending_bytes >= 4096);
+        assert!(p.try_reserve(0).is_none(), "source waits consume the byte budget too");
+    }
+
+    #[tokio::test]
     async fn publication_registration_barrier_and_commit_wait_preserve_add_delete_order() {
         let p = EdgePublisher::default();
         let c = circuit();
@@ -2509,6 +2548,72 @@ mod publication_tests {
         drained(&p).await;
         let st = statements(&db);
         assert!(position_of(&st, "->_00_list_ref->thread:a") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_batch_waits_for_all_sources_and_allows_unrelated_view() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        c.write().await.add_query(ssp::operator::QueryPlan { id: "other".into(), root: ssp::operator::OperatorPlan::Scan { table: "thread".into() } }, None, None);
+        let db = Arc::new(TestDb::default());
+        let first = Arc::new(tokio::sync::Semaphore::new(0));
+        let second = Arc::new(tokio::sync::Semaphore::new(0));
+        db.source_gates.lock().unwrap().extend([
+            ("thread:a".into(), first.clone()), ("thread:b".into(), second.clone()),
+        ]);
+        p.enqueue_sources(p.try_reserve(0).unwrap(), vec![delta("thread:a", true), delta("thread:b", true)],
+            &*c.read().await, vec![("thread:a".into(), 9), ("thread:b".into(), 9)], false, vec![]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", false)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c.clone());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while db.active_probes.load(Ordering::Acquire) < 2 { tokio::task::yield_now().await; }
+        }).await.expect("both sources are probed concurrently");
+        assert!(c.try_write().is_ok(), "batch commit waits release the circuit");
+
+        let mut other = delta("thread:free", true);
+        other.query_id = "other".into();
+        p.enqueue(p.try_reserve(0).unwrap(), vec![other], &*c.read().await, None, false, vec![]);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while db.sql.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.expect("an unrelated view publishes during a batch visibility wait");
+        first.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while db.active_probes.load(Ordering::Acquire) != 1 { tokio::task::yield_now().await; }
+        }).await.expect("the first source becomes visible");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let st = statements(&db);
+        assert_eq!(st.len(), 1, "a partial source commit cannot release the batch: {st:#?}");
+        assert!(st[0].contains("thread:free"));
+        assert_eq!(p.snapshot().pending_batches, 2, "same-view deletion remains behind the batch");
+
+        second.add_permits(1);
+        drained(&p).await;
+        let st = statements(&db);
+        assert!(position_of(&st, "->_00_list_ref->thread:a") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
+        assert!(position_of(&st, "->_00_list_ref->thread:b") < position_of(&st, "thread:a<-_00_list_ref WHERE in"));
+        assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn publication_batch_invalidation_cancels_active_and_waiting_probes() {
+        let p = EdgePublisher::new(PublicationLimits { slots: 1, ..Default::default() });
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.hold_all_sources.store(true, Ordering::Release);
+        let sources = (0..32).map(|i| (format!("thread:r{i}"), 9)).collect();
+        p.enqueue_sources(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await,
+            sources, false, vec![]);
+        let task = start(p.clone(), db.clone(), c);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while db.active_probes.load(Ordering::Acquire) < 16 { tokio::task::yield_now().await; }
+        }).await.expect("batch fills the shared probe capacity while other sources wait");
+        assert!(p.try_reserve(0).is_none());
+        p.invalidate_all();
+        drained(&p).await;
+        assert!(p.try_reserve(0).is_some(), "the batch lease is released only after all probe futures drop");
+        assert_eq!(db.max_probes.load(Ordering::Acquire), 16);
+        assert_eq!(db.active_probes.load(Ordering::Acquire), 0);
+        assert!(db.sql.lock().unwrap().is_empty(), "invalidated batch never publishes");
         task.abort();
     }
     #[tokio::test]

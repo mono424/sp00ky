@@ -157,7 +157,12 @@ pub fn apply_schema(circuit: &mut Circuit, tables: &BTreeMap<String, TableMeta>)
         for index in &meta.indexes {
             info!(target: "ssp::policy", table = %table, index = %index.name, fields = ?index.fields, "mirrored index");
         }
-        circuit.set_table_meta(table, meta.clone());
+        let builds = circuit.set_table_meta_timed(table, meta.clone());
+        if builds.indexes_built > 0 {
+            info!(table = %table, index_build_ms = builds.index_build_ms,
+                indexes_built = builds.indexes_built, rows_indexed = builds.rows_indexed,
+                "Prewarmed indexes for restored views");
+        }
     }
 }
 
@@ -329,6 +334,11 @@ pub async fn rebuild_from_db(
         // and verified.
         register_persisted_view(&mut circuit, &view_row);
     }
+    let builds = processor.read().await.prewarm_active_indexes();
+    if builds.indexes_built > 0 {
+        info!(index_build_ms = builds.index_build_ms, indexes_built = builds.indexes_built,
+            rows_indexed = builds.rows_indexed, "Prewarmed remaining active indexes before Ready");
+    }
 
     // `Circuit::load` folds every row into the catch-up accumulators as it
     // goes, so nothing is re-seeded here. Debug builds prove it.
@@ -414,7 +424,7 @@ pub fn register_persisted_view(circuit: &mut Circuit, view_row: &Value) -> Optio
         }
         None => {
             let merge_key = data.merge_key.clone();
-            circuit.add_query_with_auth(
+            let (_, timings) = circuit.add_query_with_auth_timed(
                 data.plan,
                 data.safe_params,
                 Some(OutputFormat::Streaming),
@@ -423,7 +433,10 @@ pub fn register_persisted_view(circuit: &mut Circuit, view_row: &Value) -> Optio
             if circuit.merge_views() {
                 circuit.claim_merge_key(merge_key, query_id.clone());
             }
-            info!(view_id = %raw_id, auth_id = %auth_id, "Re-registered view");
+            info!(view_id = %raw_id, auth_id = %auth_id,
+                plan_ms = timings.plan_ms, snapshot_ms = timings.snapshot_ms,
+                index_build_ms = timings.index_build_ms, indexes_built = timings.indexes_built,
+                rows_indexed = timings.rows_indexed, "Re-registered view");
         }
     }
     Some(ssp::canonical_query_id(&query_id))
@@ -496,12 +509,48 @@ pub async fn catch_up_from_db(
 
     // The restored store re-seeded its accumulators and `step` maintains
     // them, so nothing is re-seeded here.
+    let builds = processor.read().await.prewarm_active_indexes();
+    if builds.indexes_built > 0 {
+        info!(index_build_ms = builds.index_build_ms, indexes_built = builds.indexes_built,
+            rows_indexed = builds.rows_indexed, "Prewarmed remaining active indexes before Ready");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_sparse_view_warms_only_its_chosen_index_before_ready() {
+        use ssp::circuit::index::IndexDef;
+
+        let mut circuit = Circuit::new();
+        circuit.set_table_meta("game", TableMeta {
+            permission: "true".into(),
+            indexes: vec![
+                IndexDef { name: "game_database_sort".into(), fields: vec!["database".into(), "sort_index".into()] },
+                IndexDef { name: "game_owner".into(), fields: vec!["owner".into()] },
+            ],
+            ..Default::default()
+        });
+        for i in 0..32 {
+            circuit.load([Record::new("game", &format!("g{i:03}"), json!({
+                "database": if i < 2 { "game_database:sparse" } else { "game_database:hot" },
+                "sort_index": i, "owner": "user:a",
+            }))]);
+        }
+        let id = register_persisted_view(&mut circuit, &json!({
+            "id": "_00_query:sparse", "clientId": "tab", "auth_id": "user:a",
+            "surql": "SELECT * FROM game WHERE database = $database ORDER BY sort_index LIMIT 50",
+            "params": { "database": "game_database:sparse" },
+        })).expect("persisted view registers");
+        assert_eq!(id, "sparse");
+        assert_eq!(circuit.view_keys(&id).len(), 2);
+        assert_eq!(circuit.store.get_collection("game").unwrap().built_indexes(), vec!["game_database_sort"]);
+        assert_eq!(circuit.prewarm_active_indexes(), ssp::circuit::IndexBuildStats::default(),
+            "all selected indexes must already exist before the Ready transition");
+    }
 
     #[test]
     fn page_query_uses_ordered_keyset_not_offset() {

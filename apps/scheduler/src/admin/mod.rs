@@ -330,6 +330,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/incidents", get(incidents::list))
         .route("/incidents/:id", get(incidents::detail))
         .route("/views", get(presence::list_views))
+        .route("/views/history", get(presence::view_history))
         .route("/views/:key", get(presence::view_detail))
         .route("/backends", get(backends::list))
         .route("/backends/:name", get(backends::detail))

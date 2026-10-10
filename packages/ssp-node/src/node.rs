@@ -27,6 +27,8 @@ use crate::db_retry::query_retrying;
 use crate::ports::{BackendHealth, Db, Telemetry};
 use crate::status::SspStatus;
 
+mod ingest_batch;
+
 /// Everything the migrated handlers need, platform-independent. Constructed
 /// once by the shell and shared with its framework layer.
 pub struct SspNode {
@@ -252,6 +254,7 @@ impl SspNode {
             RouteId::ViewUnregister => self.unregister_view_handler(&req).await?,
             RouteId::ViewRegister => self.register_view_handler(&req).await?,
             RouteId::Ingest => self.ingest_handler(&req).await?,
+            RouteId::IngestBatch => self.ingest_batch_handler(&req).await?,
             RouteId::HandoverRetire => self.handover_retire_handler(&req, opts.retire_drain).await,
             RouteId::HandoverPromote => self.handover_promote_handler(&req).await,
             RouteId::HandoverResume => self.handover_resume().await,
@@ -1242,10 +1245,8 @@ impl SspNode {
     /// That holds only while the DB side still matches the circuit, and it
     /// stops matching when a TTL sweep releases a row and its edges while
     /// another holder keeps the graph alive. The next registration then finds
-    /// the view in the circuit, takes this path, and its metadata `UPDATE`
-    /// recreates `_00_query` with `rowCount` back at its schema `DEFAULT 0`
-    /// and nothing behind it. A client cannot tell that from a genuinely empty
-    /// result: it stops loading and renders nothing, permanently.
+    /// the view in the circuit. Restoring metadata alone would leave no edges
+    /// behind the row, so the join must also repair its published membership.
     ///
     /// Verify-then-heal rather than republish-always, because
     /// `edges::build_edge_batch` writes additions with a bare `RELATE`, so
@@ -1262,6 +1263,7 @@ impl SspNode {
         meta: &Value,
         auth_id: &str,
         permit: crate::edges::PublicationPermit,
+        metadata_created: bool,
     ) {
         // Read the row count and the STORED auth id: the latter is what
         // `build_edge_batch` routes on, so the probe has to look in the same
@@ -1312,7 +1314,7 @@ impl SspNode {
         // Healthy: the row is there, and either it has edges or the view is
         // genuinely empty (`rowCount = 0` is then the truth, not a default
         // standing in for one).
-        if row_present && (expected_rows == 0 || edge_count > 0) {
+        if !metadata_created && row_present && (expected_rows == 0 || edge_count > 0) {
             return;
         }
         // No edges yet, but a publication for this view is already queued or
@@ -1333,11 +1335,10 @@ impl SspNode {
             "Re-registered view is not backed by the DB - republishing from the live view"
         );
 
-        // UPSERT, not UPDATE. The warm path's own metadata write is an
-        // `UPDATE`, which on a record that no longer exists matches nothing and
-        // silently writes NOTHING — so a sweep that took the row while the
-        // circuit kept the view left the client with no `_00_query` row at all,
-        // and a re-registration could not put it back. Rebuild the whole row,
+        // Rebuild the row after a sweep removed its edges while the graph
+        // remained live. The warm metadata UPSERT preserves existing fields;
+        // this repair also restores the truthful row count and publish state.
+        // Rebuild the whole row,
         // with the same fields the cold path writes (minus `registrationTime`,
         // which belongs to a real registration).
         //
@@ -1347,18 +1348,16 @@ impl SspNode {
         let meta_str = |key: &str| meta.get(key).and_then(|v| v.as_str()).unwrap_or_default();
         let stmt = "UPSERT type::record($id) SET clientId = <string>$clientId, \
                     auth_id = <string>$authId, surql = <string>$surql, params = $params, \
-                    ttl = <duration>$ttl, lastActiveAt = <datetime>$lastActiveAt, \
+                    ttl = (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }), \
+                    lastActiveAt = <datetime>$lastActiveAt, \
                     rowCount = <int>$rowCount, state = <string>$state, \
                     subscribers = array::append( \
                         array::filter(subscribers ?? [], |$s| \
                             <string>$s.id != $sid \
-                            AND <datetime>$s.seenAt + <duration>$ttl > time::now()), \
+                            AND <datetime>$s.seenAt + (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }) > time::now()), \
                         { id: $sid, seenAt: time::now() })";
-        if let Err(e) = self
-            .platform
-            .db
-            .query(
-                stmt,
+        if let Err(e) = query_retrying(
+                self.platform.db.as_ref(), stmt,
                 &[
                     ("id", json!(incantation_id)),
                     ("clientId", json!(meta_str("clientId"))),
@@ -1404,18 +1403,196 @@ impl SspNode {
 
     /// Parse a registration and inject each scanned table's permission,
     /// against the circuit's current schema.
-    async fn prepare_registration(&self, payload: Value) -> anyhow::Result<ssp::service::view::DbspRegistrationData> {
+    async fn prepare_registration(&self, payload: Value, stages: &mut crate::view_metrics::RegistrationStages) -> anyhow::Result<ssp::service::view::DbspRegistrationData> {
+        let wait = web_time::Instant::now();
         let circuit = self.processor.read().await;
-        ssp::service::view::prepare_registration_dbsp(
+        stages.lock_wait_ms += wait.elapsed().as_secs_f64() * 1000.0;
+        let hold = web_time::Instant::now();
+        let prepared = ssp::service::view::prepare_registration_dbsp(
             payload,
             circuit.permissions(),
             circuit.link_targets(),
             circuit.opaque_fields(),
-        )
+        );
+        stages.lock_hold_ms += hold.elapsed().as_secs_f64() * 1000.0;
+        prepared
+    }
+
+    async fn join_registered_view(
+        &self,
+        data: &ssp::service::view::DbspRegistrationData,
+        auth_id: &str,
+        incantation_id: &str,
+        permit: crate::edges::PublicationPermit,
+        mut stages: crate::view_metrics::RegistrationStages,
+        request_start: web_time::Instant,
+    ) -> Option<ApiResponse> {
+        let standby = self.is_standby();
+        let meta_str = |k: &str| data.metadata.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // A second (or tenth) session subscribing to a view that already
+        // exists. This is the SHARED path and it is deliberately
+        // metadata-only: calling `add_query_with_auth` again would
+        // `views.insert` over the live view, discarding its cache and
+        // subquery state, and push the query id onto the dependency map a
+        // second time so every ingest stepped it twice.
+        //
+        // The joiner does not need a re-publish. It reads current
+        // membership itself with a SELECT over `_00_list_ref*`, and the
+        // `rowCount` written below on the cold path is what lets it tell
+        // "no results" from "edges still flushing".
+        let wait = web_time::Instant::now();
+        let existing_registration = {
+            let circuit = self.processor.read().await;
+            stages.lock_wait_ms += wait.elapsed().as_secs_f64() * 1000.0;
+            let hold = web_time::Instant::now();
+            let existing = circuit.registration(&data.plan.id).map(|(owner, auth)| {
+                let (rows, shape) = circuit.get_view(&owner).map_or((0, data.shape.clone()), |view| {
+                    (view.cache.len(), ssp::allowlist::Shape::of(&view.plan.root))
+                });
+                (auth, rows, shape, circuit.view_index_uses(&data.plan.id))
+            });
+            stages.lock_hold_ms += hold.elapsed().as_secs_f64() * 1000.0;
+            existing
+        };
+
+        // Query ids are derived from (surql, params, auth), so a caller
+        // arriving at someone else's view means the id was guessed or
+        // forged. Refuse rather than adopt it: the view's plan was
+        // permission-injected for the OTHER user's identity, so serving it
+        // here would hand them that user's rows.
+        //
+        // An EMPTY `auth_id` is not such a caller and must not be refused.
+        // It means the registration asserted no identity at all, which
+        // happens routinely: `fn::query::register` sends
+        // `<string>($auth.id OR '')`, so any re-registration issued while
+        // the session's auth is not (yet) established carries ''. Observed
+        // in production after a SurrealDB restart — every client re-registered
+        // with '' mid-reconnect, every one was refused 409, and their views
+        // never came back, which rendered as "not found" on a page that had
+        // been working. Treat '' as "no assertion" and let it join; the
+        // stored `auth_id` is write-once and the per-user
+        // `_00_list_ref_user_<uid>` table still gates what can actually be
+        // read back.
+        //
+        // The converse — an identity-asserting caller meeting a view that
+        // holds none — never reaches here: `identity_upgrade` above has
+        // already discarded that view so the cold path can rebuild it
+        // under the caller's own permission injection.
+        if let Some((existing, _, _, _)) = &existing_registration {
+            if !auth_id.is_empty() && !existing.is_empty() && existing != auth_id {
+                warn!(
+                    target: "ssp::edges",
+                    view_id = %incantation_id,
+                    existing = %existing,
+                    attempted = %auth_id,
+                    "Refusing to share a view across identities"
+                );
+                return Some(err_json(
+                    409,
+                    "auth_mismatch",
+                    "This query id belongs to a different identity",
+                ));
+            }
+        }
+
+        info!(target: "ssp::edges", view_id = %incantation_id, "View already existed - joining as an additional subscriber");
+        if standby {
+            return Some(ok_json(Value::Null));
+        }
+        // Record this session as a watcher and refresh liveness.
+        //
+        // A warm join may beat the creating request's metadata write. UPSERT
+        // keeps that watcher rather than silently updating no row; fill only
+        // absent metadata using the live registration's identity and row count.
+        // Existing auth/query/state stay write-once on this path.
+        //
+        // `ttl` is max-wins so a subscriber asking for a shorter TTL
+        // cannot shorten a view another tab is depending on. The bare `ttl`
+        // reads below are correct: the field is `TYPE duration`, so
+        // `<datetime> + ttl` is valid arithmetic. (`$ttl` the PARAMETER is
+        // a string off the register payload, hence the explicit
+        // `<duration>` cast on that side only.)
+        let (stored_auth, row_count, shape, index_uses) = existing_registration
+            .unwrap_or_else(|| (auth_id.to_string(), 0, data.shape.clone(), Vec::new()));
+        let stmt = "UPSERT type::record($id) SET clientId = <string>$clientId, \
+                    auth_id = auth_id ?? <string>$authId, surql = surql ?? <string>$surql, \
+                    params = params ?? $params, rowCount = rowCount ?? <int>$rowCount, \
+                    state = state ?? <string>$state, \
+                    lastActiveAt = <datetime>$lastActiveAt, \
+                    ttl = (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }), \
+                    subscribers = array::append( \
+                        array::filter(subscribers ?? [], |$s| \
+                            <string>$s.id != $sid \
+                            AND <datetime>$s.seenAt + ttl > time::now()), \
+                        { id: $sid, seenAt: time::now() }) RETURN BEFORE";
+        let metadata_start = web_time::Instant::now();
+        let previous = query_retrying(
+                self.platform.db.as_ref(), stmt,
+                &[
+                    ("id", json!(incantation_id)),
+                    ("clientId", json!(meta_str("clientId"))),
+                    ("sid", json!(meta_str("clientId"))),
+                    ("authId", json!(stored_auth)),
+                    ("surql", json!(meta_str("sql"))),
+                    ("params", data.metadata.get("safe_params").cloned().unwrap_or(Value::Null)),
+                    ("rowCount", json!(row_count)),
+                    ("state", json!(if row_count == 0 { "ready" } else { "materializing" })),
+                    ("ttl", json!(meta_str("ttl"))),
+                    ("lastActiveAt", json!(meta_str("lastActiveAt"))),
+                ],
+            )
+            .await;
+        let metadata_created = match previous {
+            Ok(rows) => rows.first().map_or(true, |row| row.is_null() || row.as_array().is_some_and(|rows| rows.iter().all(Value::is_null))),
+            Err(e) => {
+                error!("Failed to update incantation metadata: {}", e);
+                false
+            }
+        };
+
+        // The metadata write above is all the warm path used to do. That
+        // assumes the DB still holds the edges this view published when it
+        // was cold — see `repair_stranded_view` for when it does not.
+        self.repair_stranded_view(&data.plan.id, &incantation_id, &data.metadata, &auth_id, permit, metadata_created)
+            .await;
+        stages.metadata_db_ms += metadata_start.elapsed().as_secs_f64() * 1000.0;
+        self.record_registration_metrics(&data.plan.id, &shape, &index_uses, row_count as i64, stages, request_start).await;
+
+        Some(ok_json(Value::Null))
+    }
+
+    async fn record_registration_metrics(
+        &self,
+        view_id: &str,
+        shape: &ssp::allowlist::Shape,
+        indexes: &[(String, String)],
+        row_count: i64,
+        mut stages: crate::view_metrics::RegistrationStages,
+        request_start: web_time::Instant,
+    ) {
+        stages.request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        {
+            let mut metrics = self.view_metrics.write().await;
+            let state = metrics.entry(view_id.to_string()).or_insert_with(|| {
+                let mut state = crate::view_metrics::ViewMetricsState::default();
+                state.row_count = row_count.max(0) as usize;
+                state
+            });
+            state.registration = Some(stages.clone());
+            state.dirty = true;
+        }
+        if stages.request_ms >= crate::view_metrics::SLOW_REGISTRATION_MS {
+            let evidence = crate::view_metrics::slow_registration_evidence(
+                shape, self.version, indexes, row_count, &stages,
+            );
+            crate::view_metrics::spawn_slow_evidence(&self.platform, evidence);
+        }
     }
 
     async fn register_view_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
         use ssp::circuit::view::OutputFormat;
+        let request_start = web_time::Instant::now();
+        let mut stages = crate::view_metrics::RegistrationStages::default();
 
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
@@ -1429,7 +1606,7 @@ impl SspNode {
 
         // Parse + validate under the read lock (permission injection). Failures
         // are 400 with the offending table named.
-        let mut prepared = self.prepare_registration(payload.clone()).await;
+        let mut prepared = self.prepare_registration(payload.clone(), &mut stages).await;
         // A table this circuit holds no schema for is, right after a deploy,
         // most likely one the deploy just added and the schema poll has not
         // seen yet: a root scan on it was default-denied, a subquery on it
@@ -1443,7 +1620,7 @@ impl SspNode {
         if unknown {
             drop(permit);
             if self.refresh_schema_on_miss().await {
-                prepared = self.prepare_registration(payload).await;
+                prepared = self.prepare_registration(payload, &mut stages).await;
             }
             permit = match self.registration_admission(req.body.len()) {
                 Some(p) => p,
@@ -1464,6 +1641,7 @@ impl SspNode {
         // the circuit enforces this too, but only the value we carry downstream
         // makes the comparisons below correct. See `ssp::canonical_query_id`.
         let mut data = data;
+        stages.parse_ms = data.parse_ms;
         data.plan.id = ssp::canonical_query_id(&data.plan.id);
 
         // Query allowlist: refuse (or log) a shape the app does not ship.
@@ -1549,144 +1727,33 @@ impl SspNode {
         let meta_str = |k: &str| data.metadata.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         if view_existed && !identity_upgrade {
-            // A second (or tenth) session subscribing to a view that already
-            // exists. This is the SHARED path and it is deliberately
-            // metadata-only: calling `add_query_with_auth` again would
-            // `views.insert` over the live view, discarding its cache and
-            // subquery state, and push the query id onto the dependency map a
-            // second time so every ingest stepped it twice.
-            //
-            // The joiner does not need a re-publish. It reads current
-            // membership itself with a SELECT over `_00_list_ref*`, and the
-            // `rowCount` written below on the cold path is what lets it tell
-            // "no results" from "edges still flushing".
-            let existing_auth = {
-                let circuit = self.processor.read().await;
-                circuit.registration(&data.plan.id).map(|(_, auth)| auth)
-            };
-
-            // Query ids are derived from (surql, params, auth), so a caller
-            // arriving at someone else's view means the id was guessed or
-            // forged. Refuse rather than adopt it: the view's plan was
-            // permission-injected for the OTHER user's identity, so serving it
-            // here would hand them that user's rows.
-            //
-            // An EMPTY `auth_id` is not such a caller and must not be refused.
-            // It means the registration asserted no identity at all, which
-            // happens routinely: `fn::query::register` sends
-            // `<string>($auth.id OR '')`, so any re-registration issued while
-            // the session's auth is not (yet) established carries ''. Observed
-            // in production after a SurrealDB restart — every client re-registered
-            // with '' mid-reconnect, every one was refused 409, and their views
-            // never came back, which rendered as "not found" on a page that had
-            // been working. Treat '' as "no assertion" and let it join; the
-            // stored `auth_id` is write-once and the per-user
-            // `_00_list_ref_user_<uid>` table still gates what can actually be
-            // read back.
-            //
-            // The converse — an identity-asserting caller meeting a view that
-            // holds none — never reaches here: `identity_upgrade` above has
-            // already discarded that view so the cold path can rebuild it
-            // under the caller's own permission injection.
-            if let Some(existing) = existing_auth {
-                if !auth_id.is_empty() && !existing.is_empty() && existing != auth_id {
-                    warn!(
-                        target: "ssp::edges",
-                        view_id = %incantation_id,
-                        existing = %existing,
-                        attempted = %auth_id,
-                        "Refusing to share a view across identities"
-                    );
-                    return Some(err_json(
-                        409,
-                        "auth_mismatch",
-                        "This query id belongs to a different identity",
-                    ));
-                }
-            }
-
-            info!(target: "ssp::edges", view_id = %incantation_id, "View already existed - joining as an additional subscriber");
-            if standby {
-                return Some(ok_json(Value::Null));
-            }
-            // Record this session as a watcher and refresh liveness.
-            //
-            // `auth_id` is deliberately NOT written here: it is write-once,
-            // set by whoever created the row. The in-memory `View.auth_id`
-            // has no setter, so letting a later registrant change the stored
-            // value would desynchronize the two — edges would be stamped with
-            // one identity while routed to the other's table.
-            //
-            // `ttl` is max-wins so a subscriber asking for a shorter TTL
-            // cannot shorten a view another tab is depending on. The bare `ttl`
-            // reads below are correct: the field is `TYPE duration`, so
-            // `<datetime> + ttl` is valid arithmetic. (`$ttl` the PARAMETER is
-            // a string off the register payload, hence the explicit
-            // `<duration>` cast on that side only.)
-            let stmt = "UPDATE type::record($id) SET clientId = <string>$clientId, \
-                        lastActiveAt = <datetime>$lastActiveAt, \
-                        ttl = (IF <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }), \
-                        subscribers = array::append( \
-                            array::filter(subscribers ?? [], |$s| \
-                                <string>$s.id != $sid \
-                                AND <datetime>$s.seenAt + ttl > time::now()), \
-                            { id: $sid, seenAt: time::now() })";
-            if let Err(e) = self
-                .platform
-                .db
-                .query(
-                    stmt,
-                    &[
-                        ("id", json!(incantation_id)),
-                        ("clientId", json!(meta_str("clientId"))),
-                        ("sid", json!(meta_str("clientId"))),
-                        ("ttl", json!(meta_str("ttl"))),
-                        ("lastActiveAt", json!(meta_str("lastActiveAt"))),
-                    ],
-                )
-                .await
-            {
-                error!("Failed to update incantation metadata: {}", e);
-            }
-
-            // The metadata write above is all the warm path used to do. That
-            // assumes the DB still holds the edges this view published when it
-            // was cold — see `repair_stranded_view` for when it does not.
-            self.repair_stranded_view(&data.plan.id, &incantation_id, &data.metadata, &auth_id, permit)
-                .await;
-
-            return Some(ok_json(Value::Null));
+            stages.prepare_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+            return self.join_registered_view(&data, &auth_id, &incantation_id, permit, stages, request_start).await;
         }
 
         debug!("Registering view: {}", data.plan.id);
 
         let register_start = web_time::Instant::now();
-        // Does another registration already compute exactly this? If so, attach
-        // to its graph instead of building an identical one. `merge_key` is the
-        // injected plan plus the params that plan dereferences, so an attach
-        // provably yields the same rows (see `ssp::merge_key`).
-        //
-        // Everything below this point is shared with the cold path on purpose:
-        // a joiner needs the same `_00_query` row write (notably `rowCount`,
-        // which is how the client tells "no results" from "edges still
-        // flushing") and the same initial edge publish.
-        // Read the policy off the circuit, not off `self`: boot re-registration
-        // reads it there too, and one source is what keeps the two paths from
-        // disagreeing about whether a graph is shareable.
-        let merge_owner = {
+        stages.prepare_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        // Build a chosen index before taking the exclusive circuit lock. This
+        // still holds a read lock, so a first build is measured separately and
+        // must not be mistaken for an inexpensive reused-index registration.
+        let wait = web_time::Instant::now();
+        {
             let circuit = self.processor.read().await;
-            if circuit.merge_views() {
-                circuit
-                    .owner_for_merge_key(&data.merge_key)
-                    .filter(|owner| *owner != data.plan.id)
-                    .map(|owner| owner.to_string())
-            } else {
-                None
-            }
-        };
-
-        let (initial_row_count, initial_state, publication_ready, standby) = {
+            stages.lock_wait_ms += wait.elapsed().as_secs_f64() * 1000.0;
+            let hold = web_time::Instant::now();
+            let built = circuit.prewarm_query_indexes(&data.plan, data.safe_params.as_ref());
+            stages.index_build_ms += built.index_build_ms;
+            stages.indexes_built += built.indexes_built;
+            stages.rows_indexed += built.rows_indexed;
+            stages.lock_hold_ms += hold.elapsed().as_secs_f64() * 1000.0;
+        }
+        let wait = web_time::Instant::now();
+        let (initial_row_count, initial_state, publication_ready, standby, index_uses) = {
             let mut circuit = self.processor.write().await;
+            stages.lock_wait_ms += wait.elapsed().as_secs_f64() * 1000.0;
+            let hold = web_time::Instant::now();
             if !self.edge_update_tx.is_current(&permit) || *self.status.read().await != SspStatus::Ready {
                 return Some(err_json(503, "publication_epoch", "Circuit restarted; retry registration"));
             }
@@ -1694,6 +1761,24 @@ impl SspNode {
             // promotion flips standby under: the metadata write follows the
             // publication's fate.
             let standby = self.is_standby();
+            // The earlier read is only a fast path. Another request may have
+            // installed this id or claimed its merge key while we waited.
+            // Resolve both under the same writer that installs the graph.
+            if let Some((_, existing_auth)) = circuit.registration(&data.plan.id) {
+                if !auth_id.is_empty() && !existing_auth.is_empty() && existing_auth != auth_id {
+                    return Some(err_json(409, "auth_mismatch", "This query id belongs to a different identity"));
+                }
+                if !auth_id.is_empty() && existing_auth.is_empty() {
+                    return Some(err_json(409, "identity_upgrade", "Identity changed during registration; retry"));
+                }
+                stages.lock_hold_ms += hold.elapsed().as_secs_f64() * 1000.0;
+                drop(circuit);
+                return self.join_registered_view(&data, &auth_id, &incantation_id, permit, stages, request_start).await;
+            }
+            let merge_owner = if circuit.merge_views() {
+                circuit.owner_for_merge_key(&data.merge_key)
+                    .filter(|owner| *owner != data.plan.id).map(str::to_string)
+            } else { None };
             self.edge_update_tx.invalidate_view(&data.plan.id);
             let update = match &merge_owner {
                 Some(owner) => {
@@ -1706,12 +1791,17 @@ impl SspNode {
                     circuit.attach_subscriber(owner, data.plan.id.clone(), auth_id.clone())
                 }
                 None => {
-                    let delta = circuit.add_query_with_auth(
+                    let (delta, timing) = circuit.add_query_with_auth_timed(
                         data.plan.clone(),
-                        data.safe_params,
+                        data.safe_params.clone(),
                         Some(OutputFormat::Streaming),
                         auth_id.clone(),
                     );
+                    stages.plan_ms = timing.plan_ms;
+                    stages.snapshot_ms = timing.snapshot_ms;
+                    stages.index_build_ms += timing.index_build_ms;
+                    stages.indexes_built += timing.indexes_built;
+                    stages.rows_indexed += timing.rows_indexed;
                     // Claim the key only once the graph exists, or a later
                     // registration would attach to nothing.
                     if circuit.merge_views() {
@@ -1725,7 +1815,9 @@ impl SspNode {
             let row_count = update.as_ref().map(|d| d.row_count as i64).unwrap_or(0);
             let state = crate::edges::publish_state_for(update.as_ref());
             let ready = self.edge_update_tx.enqueue(permit, update.into_iter().collect(), &circuit, None, true, vec![]);
-            (row_count, state, ready, standby)
+            stages.lock_hold_ms += hold.elapsed().as_secs_f64() * 1000.0;
+            let index_uses = circuit.view_index_uses(&data.plan.id);
+            (row_count, state, ready, standby, index_uses)
         };
         let registration_time_ms = register_start.elapsed().as_secs_f64() * 1000.0;
         self.platform.telemetry.gauge_add("view_count", 1);
@@ -1735,7 +1827,11 @@ impl SspNode {
             .write()
             .await
             .entry(data.plan.id.clone())
-            .or_default();
+            .or_insert_with(|| {
+                let mut state = crate::view_metrics::ViewMetricsState::default();
+                state.row_count = initial_row_count as usize;
+                state
+            });
 
         if standby {
             return Some(ok_json(Value::Null));
@@ -1750,24 +1846,24 @@ impl SspNode {
 
         // createdAt is DEFAULT time::now() READONLY (set only on insert);
         // counters default to 0 if absent.
-        // The creating session is also the first subscriber. `$ttl` is used
-        // rather than the `ttl` field because both are being set in this same
-        // statement and the field's value is not yet observable.
+        // The creating session is also the first subscriber. A warm join may
+        // have created the row while this request awaited metadata, so TTL
+        // remains max-wins here too and existing watchers are retained.
         let stmt = "UPSERT type::record($id) SET clientId = <string>$clientId, \
                     auth_id = <string>$authId, surql = <string>$surql, params = $params, \
-                    ttl = <duration>$ttl, lastActiveAt = <datetime>$lastActiveAt, \
+                    ttl = (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }), \
+                    lastActiveAt = <datetime>$lastActiveAt, \
                     registrationTime = <float>$registrationTime, rowCount = <int>$rowCount, \
                     state = <string>$state, \
                     subscribers = array::append( \
                         array::filter(subscribers ?? [], |$s| \
                             <string>$s.id != $sid \
-                            AND <datetime>$s.seenAt + <duration>$ttl > time::now()), \
-                        { id: $sid, seenAt: time::now() })";
-        if let Err(e) = self
-            .platform
-            .db
-            .query(
-                stmt,
+                            AND <datetime>$s.seenAt + (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }) > time::now()), \
+                        { id: $sid, seenAt: time::now() }) \
+                    WHERE <string>$authId != '' OR auth_id = NONE OR auth_id = ''";
+        let metadata_start = web_time::Instant::now();
+        if let Err(e) = query_retrying(
+                self.platform.db.as_ref(), stmt,
                 &[
                     ("id", json!(incantation_id)),
                     ("clientId", json!(meta_str("clientId"))),
@@ -1796,7 +1892,9 @@ impl SspNode {
             return Some(err_json(500, "db_error", "Database error"));
         }
 
+        stages.metadata_db_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
         if let Some(ready) = publication_ready { ready.complete(); }
+        self.record_registration_metrics(&data.plan.id, &data.shape, &index_uses, initial_row_count, stages, request_start).await;
 
         Some(ok_json(Value::Null))
     }
@@ -1805,6 +1903,8 @@ impl SspNode {
     /// each mutation here: route jobs, step the circuit, fan out edge writes.
     async fn ingest_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
         use ssp::circuit::{Change, ChangeSet, Operation};
+        let request_start = web_time::Instant::now();
+        let mut ingest_stages = crate::view_metrics::IngestStages::default();
 
         if let Some(gate) = self.ready_gate().await {
             return Some(gate);
@@ -1888,13 +1988,17 @@ impl SspNode {
             Operation::Delete => Change::delete(&payload.table, &payload.id),
         };
         let step_start = web_time::Instant::now();
-        let (record_counts, view_ids, rv_made_up, rv_made_up_total, rv_missing_total) = {
+        let (record_counts, view_ids, rv_made_up, rv_made_up_total, rv_missing_total, slow_shapes) = {
             let mut circuit = self.processor.write().await;
+            ingest_stages.lock_wait_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            let hold = web_time::Instant::now();
             if !self.edge_update_tx.is_current(&permit) || *self.status.read().await != SspStatus::Ready {
                 return Some(err_json(503, "publication_epoch", "Circuit restarted; retry ingest"));
             }
             let before = circuit.synthesized_row_versions();
-            let deltas = circuit.step(ChangeSet { changes: vec![change] });
+            let (deltas, timing) = circuit.step_timed(ChangeSet { changes: vec![change] });
+            ingest_stages.store_apply_ms = timing.store_apply_ms;
+            ingest_stages.circuit_step_ms = timing.circuit_step_ms;
             let total = circuit.synthesized_row_versions();
             let record_counts = deltas.iter().map(|d| d.row_count).collect::<Vec<_>>();
             let view_ids = deltas.iter().map(|d| d.query_id.clone()).collect::<Vec<_>>();
@@ -1921,12 +2025,23 @@ impl SspNode {
                     cleanup.push(crate::edges::PublicationCleanup::DropUser(payload.id.clone()));
                 }
             }
+            let enqueue = web_time::Instant::now();
             self.edge_update_tx.enqueue(permit, deltas, &circuit, source, false, cleanup);
+            ingest_stages.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1000.0;
+            ingest_stages.lock_hold_ms = hold.elapsed().as_secs_f64() * 1000.0;
+            // Only collect masked shapes when this event was slow. Never keep
+            // source records or parameter bindings in durable performance data.
+            let slow_shapes: Vec<Value> = if request_start.elapsed().as_secs_f64() * 1000.0 >= crate::view_metrics::SLOW_REGISTRATION_MS {
+                view_ids.iter().take(8).filter_map(|id| circuit.get_view(id))
+                    .map(|view| serde_json::to_value(ssp::allowlist::Shape::of(&view.plan.root)).unwrap_or(Value::Null))
+                    .filter(|shape| shape.to_string().len() <= 4096).collect()
+            } else { Vec::new() };
             (
                 record_counts, view_ids,
                 total - before,
                 total,
                 circuit.synthesized_row_versions_missing(),
+                slow_shapes,
             )
         };
         let materialization_time_ms = step_start.elapsed().as_secs_f64() * 1000.0;
@@ -1971,7 +2086,22 @@ impl SspNode {
         }
 
         if !view_ids.is_empty() {
-            note_view_metrics(&self.view_metrics, record_counts, view_ids, materialization_time_ms).await;
+            note_view_metrics(&self.view_metrics, record_counts, view_ids.clone(), materialization_time_ms).await;
+            ingest_stages.request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+            let mut metrics = self.view_metrics.write().await;
+            for id in &view_ids {
+                if let Some(state) = metrics.get_mut(id) { state.ingest = Some(ingest_stages.clone()); }
+            }
+        }
+
+        ingest_stages.request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        if !standby && ingest_stages.request_ms >= crate::view_metrics::SLOW_REGISTRATION_MS {
+            let evidence = json!({
+                "at_ms": crate::now_epoch_ms(), "kind": "ingest", "version": self.version,
+                "table": payload.table.chars().take(128).collect::<String>(),
+                "affected_views": view_ids.len(), "shapes": slow_shapes, "stages": ingest_stages,
+            });
+            crate::view_metrics::spawn_slow_evidence(&self.platform, evidence);
         }
 
         // Orphan cleanup is queued with the deletion above, so it cannot
@@ -2446,7 +2576,7 @@ pub async fn note_view_metrics(
 /// Write every dirty view's metrics to its `_00_query` row, one retried
 /// UPDATE each, and clear the dirty marks. Returns how many rows were written.
 /// Same statement and columns as the old per-ingest write, so the row shape is
-/// unchanged; only the cadence moved (registration still writes `rowCount`
+/// preserved, with registration/ingest stages added (registration still writes `rowCount`
 /// synchronously, so first paint does not wait on this).
 pub async fn flush_view_metrics(
     db: &dyn Db,
@@ -2458,21 +2588,22 @@ pub async fn flush_view_metrics(
             .filter(|(_, st)| st.dirty)
             .map(|(view_id, st)| {
                 st.dirty = false;
-                (view_id.clone(), st.row_count, st.update_count, st.last_ingest_ms, st.percentiles())
+                (view_id.clone(), st.row_count, std::mem::take(&mut st.update_count), st.last_ingest_ms, st.percentiles(), st.registration.clone(), st.ingest.clone())
             })
             .collect()
     };
     let mut written = 0usize;
-    for (view_id, row_count, update_count, last_ingest_ms, percentiles) in snapshots {
+    for (view_id, row_count, update_count, last_ingest_ms, percentiles, registration, ingest) in snapshots {
         let incantation_id = crate::edges::format_incantation_id(&view_id);
         let (p55, p90, p99) = match percentiles {
             Some(t) => (json!(t.0), json!(t.1), json!(t.2)),
             None => (Value::Null, Value::Null, Value::Null),
         };
         let stmt = "UPDATE type::record($id) SET \
-            rowCount = <int>$rowCount, updateCount = <int>$updateCount, \
-            lastIngestLatency = <float>$lastIngestLatency, \
-            materializationP55 = $p55, materializationP90 = $p90, materializationP99 = $p99";
+            rowCount = <int>$rowCount, updateCount = (updateCount ?? 0) + <int>$updateCount, \
+            lastIngestLatency = (IF $updateCount > 0 { <float>$lastIngestLatency } ELSE { lastIngestLatency }), \
+            materializationP55 = $p55 ?? materializationP55, materializationP90 = $p90 ?? materializationP90, materializationP99 = $p99 ?? materializationP99, \
+            registrationStages = $registration ?? registrationStages, ingestStages = $ingest ?? ingestStages";
         match query_retrying(
             db,
             stmt,
@@ -2484,6 +2615,8 @@ pub async fn flush_view_metrics(
                 ("p55", p55),
                 ("p90", p90),
                 ("p99", p99),
+                ("registration", json!(registration)),
+                ("ingest", json!(ingest)),
             ],
         )
         .await
@@ -2491,7 +2624,10 @@ pub async fn flush_view_metrics(
             Ok(_) => written += 1,
             Err(e) => {
                 // Left dirty for the next flush: the sample is still in memory.
-                view_metrics.write().await.entry(view_id).or_default().dirty = true;
+                let mut map = view_metrics.write().await;
+                let state = map.entry(view_id).or_default();
+                state.update_count = state.update_count.saturating_add(update_count);
+                state.dirty = true;
                 warn!(target: "ssp::view_metrics", error = %e, view_id = %incantation_id, "Failed to persist per-view metrics");
             }
         }

@@ -252,6 +252,7 @@ impl SspPool {
         } else {
             // Add new SSP
             let info = SspInfo {
+                ingest_batch_limit: 0,
                 id: ssp_id.to_string(),
                 url: String::new(), // URL must be set via registration, not heartbeat
                 version,

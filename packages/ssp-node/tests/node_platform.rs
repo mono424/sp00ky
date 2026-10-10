@@ -3037,3 +3037,219 @@ async fn a_standby_cannot_be_retired() {
     assert_eq!(r.status, 409);
     assert_eq!(*h.node.status.read().await, SspStatus::Ready);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_id_keeps_one_graph_and_rejects_another_identity() {
+    let h = merging_harness().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for identity in ["user:alice", "user:bob"] {
+        let node = h.node.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let r = node.route(authed(Method::Post, "/view/register", merge_register("same", identity))).await.unwrap();
+            (identity, r.status)
+        }));
+    }
+    let a = tasks.remove(0).await.unwrap();
+    let b = tasks.remove(0).await.unwrap();
+    assert!(matches!((a.1, b.1), (200, 409) | (409, 200)), "{a:?} {b:?}");
+    let circuit = h.node.processor.read().await;
+    assert_eq!(circuit.graph_count(), 1);
+    let winner = if a.1 == 200 { a.0 } else { b.0 };
+    assert_eq!(circuit.registration("same").unwrap().1, winner);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_merge_key_installs_one_graph_and_preserves_every_registration() {
+    let h = merging_harness().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let node = h.node.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let id = format!("parallel{i}");
+            let r = node.route(authed(Method::Post, "/view/register", merge_register(&id, "user:alice"))).await.unwrap();
+            assert_eq!(r.status, 200, "register {id}: {:?}", json_of(&r));
+        }));
+    }
+    for task in tasks { task.await.unwrap(); }
+    let circuit = h.node.processor.read().await;
+    assert_eq!(circuit.graph_count(), 1);
+    assert_eq!(circuit.registration_ids().len(), 8);
+    for i in 0..8 { assert!(circuit.registration(&format!("parallel{i}")).is_some()); }
+}
+
+struct SlowRegistrationDb { inner: Arc<dyn Db> }
+#[async_trait::async_trait]
+impl Db for SlowRegistrationDb {
+    async fn query(&self, sql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        if sql.starts_with("UPSERT type::record($id) SET clientId") {
+            tokio::time::sleep(Duration::from_millis(275)).await;
+        }
+        self.inner.query(sql, binds).await
+    }
+    async fn version(&self) -> Result<String, DbError> { self.inner.version().await }
+}
+
+#[tokio::test]
+async fn registration_stages_include_early_lock_wait_and_db_but_exclude_publication() {
+    let mut h = merging_harness().await;
+    let node = Arc::get_mut(&mut h.node).unwrap();
+    node.platform.db = Arc::new(SlowRegistrationDb { inner: node.platform.db.clone() });
+    let guard = h.node.processor.write().await;
+    let request = h.node.route(authed(Method::Post, "/view/register", merge_register("timed", "user:alice")));
+    let unlock = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        drop(guard);
+    };
+    let (r, _) = tokio::join!(request, unlock);
+    assert_eq!(r.unwrap().status, 200);
+    // The publisher is deliberately not started in this harness. Its queued
+    // metadata barrier must not prevent the registration request completing.
+    assert!(h.node.edge_update_tx.snapshot().pending_batches > 0);
+    h.node.flush_view_metrics().await;
+    let r = h.raw_db.query("SELECT registrationTime, registrationStages FROM ONLY _00_query:timed").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    let stages = &r["registrationStages"];
+    assert!(stages["lock_wait_ms"].as_f64().unwrap() >= 20.0, "{stages}");
+    assert!(stages["metadata_db_ms"].as_f64().unwrap() >= 250.0, "{stages}");
+    assert!(stages["request_ms"].as_f64().unwrap() >= stages["metadata_db_ms"].as_f64().unwrap());
+    assert!(r["registrationTime"].as_f64().unwrap() < stages["metadata_db_ms"].as_f64().unwrap(), "legacy evaluation timing excludes DB wait");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_same_id_same_identity_keeps_every_watcher() {
+    let h = merging_harness().await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let mut tasks = Vec::new();
+    for i in 0..4 {
+        let node = h.node.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut payload = merge_register("same_identity", "user:alice");
+            payload["clientId"] = json!(format!("watcher{i}"));
+            barrier.wait().await;
+            let r = node.route(authed(Method::Post, "/view/register", payload)).await.unwrap();
+            assert_eq!(r.status, 200, "{:?}", json_of(&r));
+        }));
+    }
+    for task in tasks { task.await.unwrap(); }
+    assert_eq!(h.node.processor.read().await.graph_count(), 1);
+    let r = h.raw_db.query("SELECT subscribers FROM ONLY _00_query:same_identity").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    assert_eq!(r["subscribers"].as_array().unwrap().len(), 4, "{r}");
+}
+
+struct HoldColdRegistrationDb {
+    inner: Arc<dyn Db>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    held: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl Db for HoldColdRegistrationDb {
+    async fn query(&self, sql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        if sql.contains("registrationTime = <float>$registrationTime") && self.held.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.query(sql, binds).await
+    }
+    async fn version(&self) -> Result<String, DbError> { self.inner.version().await }
+}
+
+#[tokio::test]
+async fn late_cold_metadata_preserves_warm_watcher_and_longer_ttl() {
+    let mut h = merging_harness().await;
+    let db = Arc::new(HoldColdRegistrationDb {
+        inner: h.node.platform.db.clone(), entered: Default::default(), release: Default::default(), held: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut h.node).unwrap().platform.db = db.clone();
+    let node = h.node.clone();
+    let cold = tokio::spawn(async move {
+        let mut payload = merge_register("ttl_race", "user:alice");
+        payload["ttl"] = json!("1m");
+        payload["clientId"] = json!("cold");
+        node.route(authed(Method::Post, "/view/register", payload)).await.unwrap()
+    });
+    db.entered.notified().await;
+    let mut warm = merge_register("ttl_race", "user:alice");
+    warm["ttl"] = json!("1h");
+    warm["clientId"] = json!("warm");
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", warm)).await.unwrap().status, 200);
+    db.release.notify_one();
+    assert_eq!(cold.await.unwrap().status, 200);
+    let r = h.raw_db.query("SELECT <string>ttl AS ttl, subscribers FROM ONLY _00_query:ttl_race").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    assert_eq!(r["ttl"], "1h", "{r}");
+    assert_eq!(r["subscribers"].as_array().unwrap().len(), 2, "{r}");
+}
+
+#[tokio::test]
+async fn warm_registration_stages_and_slow_evidence_include_metadata_wait() {
+    let mut h = merging_harness().await;
+    let payload = merge_register("warm_timed", "user:alice");
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", payload.clone())).await.unwrap().status, 200);
+    Arc::get_mut(&mut h.node).unwrap().platform.db = Arc::new(SlowRegistrationDb { inner: h.node.platform.db.clone() });
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", payload)).await.unwrap().status, 200);
+    h.node.flush_view_metrics().await;
+    let r = h.raw_db.query("SELECT registrationStages FROM ONLY _00_query:warm_timed").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    let stages = &r["registrationStages"];
+    assert!(stages["metadata_db_ms"].as_f64().unwrap() >= 250.0, "{stages}");
+    assert!(stages["request_ms"].as_f64().unwrap() >= stages["metadata_db_ms"].as_f64().unwrap());
+    assert_eq!(stages["snapshot_ms"], 0.0);
+    // The background write need not be on the request path, but must retain a
+    // slow warm request once scheduled.
+    for _ in 0..100 {
+        let evidence = h.raw_db.query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations").await.unwrap()
+            .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+        if evidence["samples"].as_array().is_some_and(|samples| !samples.is_empty()) { return; }
+        tokio::task::yield_now().await;
+    }
+    panic!("slow warm evidence was not persisted");
+}
+
+#[tokio::test]
+async fn late_empty_identity_metadata_cannot_replace_a_concrete_rebuild() {
+    let mut h = thread_harness().await;
+    for (id, title) in [("old", "old"), ("new", "new")] {
+        let body = json!({ "table": "thread", "id": format!("thread:{id}"), "op": "CREATE", "record": { "title": title } });
+        assert_eq!(h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap().status, 200);
+    }
+    let db = Arc::new(HoldColdRegistrationDb {
+        inner: h.node.platform.db.clone(), entered: Default::default(), release: Default::default(), held: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut h.node).unwrap().platform.db = db.clone();
+    let node = h.node.clone();
+    let cold = tokio::spawn(async move {
+        let mut payload = merge_register("auth_race", "");
+        payload["surql"] = json!("SELECT * FROM thread WHERE title = 'old'");
+        node.route(authed(Method::Post, "/view/register", payload)).await.unwrap()
+    });
+    db.entered.notified().await;
+    let mut upgraded = merge_register("auth_race", "user:alice");
+    upgraded["surql"] = json!("SELECT * FROM thread WHERE title = 'new'");
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", upgraded)).await.unwrap().status, 200);
+    db.release.notify_one();
+    assert_eq!(cold.await.unwrap().status, 200);
+    publication_drained(&h).await;
+    let r = h.raw_db.query("SELECT auth_id, surql FROM ONLY _00_query:auth_race").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    assert_eq!(r["auth_id"], "user:alice", "{r}");
+    assert_eq!(r["surql"], "SELECT * FROM thread WHERE title = 'new'", "{r}");
+    let circuit = h.node.processor.read().await;
+    assert_eq!(circuit.registration("auth_race").unwrap().1, "user:alice");
+    let view = circuit.get_view("auth_race").unwrap();
+    assert_eq!(view.cache.len(), 1);
+    assert!(view.cache.keys().any(|key| key.contains("thread:new")), "{:?}", view.cache);
+    drop(circuit);
+    let ids: Vec<String> = h.raw_db.query("SELECT VALUE type::string(out) FROM _00_list_ref WHERE in = _00_query:auth_race").await.unwrap().take(0).unwrap();
+    assert_eq!(ids, vec!["thread:new"], "stale empty-auth publication must stay invalidated");
+}
+
+mod ingest_batch_tests;

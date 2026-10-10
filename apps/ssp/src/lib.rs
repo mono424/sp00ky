@@ -313,6 +313,7 @@ async fn register_with_scheduler(
         ssp_id: ssp_id.to_string(),
         url: format!("http://{}", registration_host),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        ingest_batch_limit: ssp_protocol::MAX_INGEST_BATCH_RECORDS,
         env: if env_vars.is_empty() { None } else { Some(env_vars) },
         replaces: replaces.map(str::to_string),
     };
@@ -2540,6 +2541,7 @@ async fn self_bootstrap_with_metadata(
     let registration_started = std::time::Instant::now();
     let (mut registered, mut failed_views) = (0usize, 0usize);
     let mut snapshot_ms = 0f64;
+    let mut index_builds = ssp::circuit::IndexBuildStats::default();
     for view_row in views {
         let view_id = match view_row.get("id") {
             Some(Value::String(s)) => s.clone(),
@@ -2619,11 +2621,19 @@ async fn self_bootstrap_with_metadata(
                 );
                 registered += 1;
                 snapshot_ms += timings.snapshot_ms;
+                index_builds += ssp::circuit::IndexBuildStats {
+                    index_build_ms: timings.index_build_ms,
+                    indexes_built: timings.indexes_built,
+                    rows_indexed: timings.rows_indexed,
+                };
                 debug!(
                     view_id = %raw_id,
                     auth_id = %auth_id,
                     plan_ms = timings.plan_ms,
                     snapshot_ms = timings.snapshot_ms,
+                    index_build_ms = timings.index_build_ms,
+                    indexes_built = timings.indexes_built,
+                    rows_indexed = timings.rows_indexed,
                     "Re-registered view"
                 );
             }
@@ -2638,11 +2648,17 @@ async fn self_bootstrap_with_metadata(
             }
         }
     }
+    // All selected indexes must be warm before this bootstrap can become
+    // Ready, including sources whose initial permission gate matched nothing.
+    index_builds += processor.read().await.prewarm_active_indexes();
     info!(
         views = registered,
         failed = failed_views,
         ms = registration_started.elapsed().as_millis() as u64,
         snapshot_ms = snapshot_ms as u64,
+        index_build_ms = index_builds.index_build_ms as u64,
+        indexes_built = index_builds.indexes_built,
+        rows_indexed = index_builds.rows_indexed,
         "Re-registered views"
     );
 

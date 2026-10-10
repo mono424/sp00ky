@@ -25,8 +25,10 @@ impl Telemetry for OtelTelemetry {
                 self.metrics.ingest_counter.add(value, &[]);
                 self.metrics.inc_ingest(value, &[]);
             }
+            "ingest_batch" => self.metrics.ingest_batch_counter.add(value, &[]),
             "edge_operations" => self.metrics.edge_operations.add(value, &[]),
             "edge_publish_failures" => self.metrics.edge_publish_failures.add(value, &[]),
+            "slow_evidence_dropped" => self.metrics.slow_evidence_dropped.add(value, &[]),
             "ttl_cleanup" => self.metrics.ttl_cleanup_count.add(value, &[]),
             other => tracing::debug!(name = other, "unmapped telemetry counter"),
         }

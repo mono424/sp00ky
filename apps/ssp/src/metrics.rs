@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 pub struct Metrics {
     meter: opentelemetry::metrics::Meter,
     pub ingest_counter: opentelemetry::metrics::Counter<u64>,
+    pub ingest_batch_counter: opentelemetry::metrics::Counter<u64>,
     pub ingest_duration: opentelemetry::metrics::Histogram<f64>,
     pub view_count: opentelemetry::metrics::UpDownCounter<i64>,
     pub edge_operations: opentelemetry::metrics::Counter<u64>,
     pub edge_publish_failures: opentelemetry::metrics::Counter<u64>,
+    pub slow_evidence_dropped: opentelemetry::metrics::Counter<u64>,
     pub edge_lock_wait: opentelemetry::metrics::Histogram<f64>,
     pub edge_lock_hold: opentelemetry::metrics::Histogram<f64>,
     pub edge_publish: opentelemetry::metrics::Histogram<f64>,
@@ -145,6 +147,7 @@ impl Metrics {
                 .u64_counter("ssp_ingest_total")
                 .with_description("Total number of ingest operations")
                 .build(),
+            ingest_batch_counter: meter.u64_counter("ssp_ingest_batch_total").build(),
             ingest_duration: meter
                 .f64_histogram("ssp_ingest_duration_milliseconds")
                 .with_description("Ingest operation duration")
@@ -158,6 +161,7 @@ impl Metrics {
                 .with_description("Total edge operations by type")
                 .build(),
             edge_publish_failures: meter.u64_counter("ssp_edge_publish_failures_total").build(),
+            slow_evidence_dropped: meter.u64_counter("ssp_slow_evidence_dropped_total").build(),
             edge_lock_wait: meter.f64_histogram("ssp_edge_lock_wait_milliseconds").build(),
             edge_lock_hold: meter.f64_histogram("ssp_edge_lock_hold_milliseconds").build(),
             edge_publish: meter.f64_histogram("ssp_edge_publish_milliseconds").build(),

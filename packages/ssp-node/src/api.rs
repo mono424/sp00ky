@@ -62,6 +62,7 @@ impl ApiResponse {
 pub enum RouteId {
     // -- authenticated --
     Ingest,
+    IngestBatch,
     Log,
     DebugView { view_id: String },
     DebugDeps,
@@ -119,6 +120,7 @@ impl RouteId {
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
         let route = match (method, segments.as_slice()) {
             (Post, ["ingest"]) => RouteId::Ingest,
+            (Post, ["ingest", "batch"]) => RouteId::IngestBatch,
             (Post, ["log"]) => RouteId::Log,
             (Get, ["debug", "view", view_id]) => RouteId::DebugView { view_id: (*view_id).to_string() },
             (Get, ["debug", "deps"]) => RouteId::DebugDeps,
@@ -171,6 +173,7 @@ mod tests {
     fn matches_the_full_route_table() {
         let cases = [
             (Method::Post, "/ingest", RouteId::Ingest),
+            (Method::Post, "/ingest/batch", RouteId::IngestBatch),
             (Method::Post, "/view/register", RouteId::ViewRegister),
             (Method::Get, "/debug/view/v1", RouteId::DebugView { view_id: "v1".into() }),
             (Method::Get, "/debug/catchup-rows/thread", RouteId::DebugCatchupRows { table: "thread".into() }),
@@ -196,6 +199,7 @@ mod tests {
     #[test]
     fn auth_split_matches_current_middleware_groups() {
         assert!(RouteId::Ingest.requires_auth());
+        assert!(RouteId::IngestBatch.requires_auth());
         assert!(RouteId::BackupCreate.requires_auth());
         assert!(RouteId::DebugHeartbeat.requires_auth());
         assert!(RouteId::ImpersonateMint.requires_auth());

@@ -592,3 +592,8 @@ DEFINE FIELD OVERWRITE last_e2e_ms ON TABLE _00_heartbeat_rollup TYPE option<int
 DEFINE FIELD OVERWRITE last_ok_at ON TABLE _00_heartbeat_rollup TYPE option<datetime>;
 DEFINE FIELD OVERWRITE updated_at ON TABLE _00_heartbeat_rollup TYPE datetime VALUE time::now();
 DEFINE INDEX OVERWRITE idx_heartbeat_bucket ON TABLE _00_heartbeat_rollup COLUMNS bucket;
+
+-- Bounded slow sync-operation evidence. Separate from expiring _00_query rows.
+-- One record, slow_operations, holds at most 100 sanitized samples.
+-- No sync events: this private _00_ table must never enter the data plane.
+DEFINE TABLE OVERWRITE _00_sync_evidence SCHEMALESS PERMISSIONS NONE;

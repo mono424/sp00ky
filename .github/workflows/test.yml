@@ -39,6 +39,33 @@ jobs:
       - name: Test core with coverage
         run: pnpm --filter @spooky-sync/core test:coverage
 
+  sync-engine:
+    name: Rust sync engine, node and scheduler
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install RocksDB build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Core and wire protocol regressions
+        run: cargo test --locked -p ssp -p ssp-protocol --lib
+      - name: Portable node regressions
+        run: cargo test --locked -p ssp-node --lib --test node_platform --test view_metrics_flush
+      - name: Scheduler delivery and handover regressions
+        run: cargo test --locked -p scheduler --lib --test integration --test handover --test handover_two_step
+      - name: Native SSP adapter builds
+        run: cargo check --locked -p ssp-server
+      - name: Portable node builds for wasm
+        run: bash scripts/check-portability.sh --locked
+
   dart-core:
     name: Dart core (native, analysis, codegen)
     runs-on: ubuntu-latest

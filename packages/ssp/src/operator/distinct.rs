@@ -1,4 +1,4 @@
-use crate::algebra::{ZSet, ZSetOps};
+use crate::algebra::ZSet;
 use crate::circuit::store::Store;
 use crate::types::Sp00kyValue;
 use std::collections::HashMap;
@@ -10,22 +10,23 @@ use std::collections::HashMap;
 ///
 /// On each step:
 ///   1. integrated += delta_in       (I: integration)
-///   2. new_output = threshold(integrated)  (clamp to 0/1)
-///   3. delta_out = new_output - prev_output (D: differentiation)
-///   4. prev_output = new_output
+///   2. Emit only the changed keys whose integrated weight crosses zero.
+///
+/// Unchanged keys are never walked and no duplicate output cache is needed.
 #[derive(Debug)]
 pub struct Distinct {
     /// Z⁻¹: accumulated input state.
     integrated: ZSet,
-    /// Previous thresholded output (for differentiation).
-    prev_output: ZSet,
+    #[cfg(test)]
+    processed_keys: usize,
 }
 
 impl Distinct {
     pub fn new() -> Self {
         Self {
             integrated: HashMap::new(),
-            prev_output: HashMap::new(),
+            #[cfg(test)]
+            processed_keys: 0,
         }
     }
 
@@ -42,25 +43,29 @@ impl super::Operator for Distinct {
         Self::threshold(inputs[0])
     }
 
-    fn step(
-        &mut self,
-        input_deltas: &[&ZSet],
-        _store: &Store,
-        _ctx: Option<&Sp00kyValue>,
-    ) -> ZSet {
-        // I: integrate input
-        self.integrated.add(input_deltas[0]);
-
-        // threshold: clamp to {0, 1}
-        let new_output = Self::threshold(&self.integrated);
-
-        // D: differentiate output
-        let delta_out = self.prev_output.diff(&new_output);
-
-        // Update state for next step
-        self.prev_output = new_output;
-
-        delta_out
+    fn step(&mut self, input_deltas: &[&ZSet], _store: &Store, _ctx: Option<&Sp00kyValue>) -> ZSet {
+        let mut output = ZSet::new();
+        #[cfg(test)]
+        {
+            self.processed_keys = 0;
+        }
+        for (key, &delta) in input_deltas[0] {
+            #[cfg(test)]
+            {
+                self.processed_keys += 1;
+            }
+            let old = self.integrated.get(key).copied().unwrap_or(0);
+            let new = old + delta;
+            if (old > 0) != (new > 0) {
+                output.insert(key.clone(), if new > 0 { 1 } else { -1 });
+            }
+            if new == 0 {
+                self.integrated.remove(key);
+            } else {
+                self.integrated.insert(key.clone(), new);
+            }
+        }
+        output
     }
 
     fn arity(&self) -> usize {
@@ -69,11 +74,14 @@ impl super::Operator for Distinct {
 
     fn reset(&mut self) {
         self.integrated.clear();
-        self.prev_output.clear();
+        #[cfg(test)]
+        {
+            self.processed_keys = 0;
+        }
     }
 
     fn state_bytes(&self) -> usize {
-        crate::size::zset_bytes(&self.integrated) + crate::size::zset_bytes(&self.prev_output)
+        crate::size::zset_bytes(&self.integrated)
     }
 
     fn evaluate_key(
@@ -92,6 +100,7 @@ impl super::Operator for Distinct {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algebra::ZSetOps;
     use crate::operator::Operator;
 
     fn zset(items: &[(&str, i64)]) -> ZSet {
@@ -134,5 +143,46 @@ mod tests {
         let d2 = zset(&[("a", 2)]);
         let result = distinct.step(&[&d2], &store, None); // weight 1→3, threshold unchanged
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn incremental_threshold_matches_snapshot_through_signed_weight_churn_and_reset() {
+        let store = Store::new();
+        let mut distinct = Distinct::new();
+        let mut integrated = ZSet::new();
+        let mut output = ZSet::new();
+        let mut rng = 0xDEAD_BEEFu64;
+        for _ in 0..500 {
+            let mut delta = ZSet::new();
+            for _ in 0..4 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                *delta.entry(format!("r{}", rng % 30).into()).or_insert(0) += (rng % 7) as i64 - 3;
+            }
+            integrated.add(&delta);
+            let expected = distinct.snapshot(&[&integrated], &store, None);
+            let actual = distinct.step(&[&delta], &store, None);
+            assert_eq!(actual, output.diff(&expected));
+            output.add(&actual);
+            assert_eq!(output, expected);
+        }
+        distinct.reset();
+        assert_eq!(distinct.step(&[&integrated], &store, None), output);
+    }
+
+    #[test]
+    fn large_state_only_processes_keys_in_the_delta() {
+        let store = Store::new();
+        let mut distinct = Distinct::new();
+        let initial = (0..10_000).map(|i| (format!("r{i}").into(), 1)).collect();
+        distinct.step(&[&initial], &store, None);
+        assert!(distinct.step(&[&ZSet::new()], &store, None).is_empty());
+        assert_eq!(distinct.processed_keys, 0);
+        assert_eq!(
+            distinct.step(&[&zset(&[("r5000", -1)])], &store, None),
+            zset(&[("r5000", -1)])
+        );
+        assert_eq!(distinct.processed_keys, 1);
     }
 }

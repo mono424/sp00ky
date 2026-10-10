@@ -12,7 +12,7 @@ import '../state/reducers.dart' as r;
 import '../state/selectors.dart' show evictable, retained, shortestTtlMs;
 import '../utils/record_id_utils.dart';
 import 'env.dart';
-import 'membership.dart' show parseViewIndexRow;
+import 'membership.dart' show ViewIndexRow, parseViewIndexRow;
 import 'sql.dart' as sql;
 
 /// One tick for every query in state: evict the ones nobody has watched for a
@@ -92,48 +92,52 @@ Future<void> ackPrune(Ctx ctx) async {
 /// [gcIntervalMs]. Retires the `_00_view` rows no query in state holds and no
 /// server answer has rewritten for [viewRetentionMs], then deletes the bodies
 /// nothing retains (see [retained]) from the store and the circuit, a chunk at
-/// a time. Each chunk is re-checked against fresh state (a membership committed
-/// meanwhile may name an id again) and the sweep stops if the bucket moved.
+/// a time. Each chunk is re-checked against fresh state (a query mounted or a
+/// membership committed meanwhile keeps what it names), every write is fenced
+/// to the store the sweep started in, and the sweep stops once the bucket
+/// moved.
 Future<void> gcTick(Ctx ctx) async {
   await ctx(Fx.stateWait((s) => s.primed));
   try {
-    // The bucket the view rows are read from: a sweep that finds another one
-    // in place stops instead of judging its bodies by these rows.
     final bucket = await ctx(Fx.stateRead((s) => s.bucketId));
-    final rows = [
-      for (final row in await ctx(Fx.localGetAll(sql.viewTable)))
-        parseViewIndexRow(row)
-    ];
-    final held = await ctx(Fx.stateRead((s) => s.bucketId != bucket
-        ? null
-        : {for (final e in s.queries.values) e.def.viewKey}));
-    if (held == null) return;
+    final epoch = await ctx(Fx.localEpoch());
+    Future<bool> moved() async =>
+        await ctx(Fx.localEpoch()) != epoch ||
+        await ctx(Fx.stateRead((s) => s.bucketId)) != bucket;
+
+    final rows = await _readViews(ctx);
     final now = await ctx(Fx.now());
     final expired = [
       for (final row in rows)
-        if (row.key != null &&
-            !held.contains(row.key) &&
-            now - row.updatedAt >= viewRetentionMs)
-          row.key!
+        if (row.key != null && now - row.updatedAt >= viewRetentionMs) row.key!
     ];
-    final retired = <String>{};
+    var retired = 0;
     for (var i = 0; i < expired.length; i += gcChunk) {
-      final chunk = expired.sublist(i, math.min(i + gcChunk, expired.length));
+      final slice = expired.sublist(i, math.min(i + gcChunk, expired.length));
+      final chunk = await ctx(Fx.stateRead((s) {
+        if (s.bucketId != bucket) return null;
+        final held = {for (final e in s.queries.values) e.def.viewKey};
+        return [
+          for (final key in slice)
+            if (!held.contains(key)) key
+        ];
+      }));
+      if (chunk == null) return;
       final settled = await ctx(Fx.all([
         for (final key in chunk)
-          Fx.localDelete(sql.viewTable, sql.viewRecordId(key))
+          Fx.localDelete(sql.viewTable, sql.viewRecordId(key), epoch: epoch)
       ]));
-      for (var j = 0; j < chunk.length; j++) {
-        if (settled[j].ok) retired.add(chunk[j]);
-      }
+      if (await moved()) return;
+      retired += settled.where((r) => r.ok).length;
     }
+    // Read again: a query answered meanwhile has rewritten its row.
     final viewIds = <String>{
-      for (final row in rows)
-        if (!retired.contains(row.key)) ...row.ids
+      for (final row in retired > 0 ? await _readViews(ctx) : rows) ...row.ids
     };
-    final removed = await _collectOrphans(ctx, bucket, viewIds);
+    if (await moved()) return;
+    final removed = await _collectOrphans(ctx, bucket, epoch, viewIds, moved);
     await ctx(Fx.log(LogLevel.info, 'orphan gc done',
-        {'removed': removed, 'retiredViews': retired.length}));
+        {'removed': removed, 'retiredViews': retired}));
   } catch (error) {
     await ctx(Fx.log(LogLevel.warn, 'orphan gc failed', {'error': error}));
   } finally {
@@ -141,8 +145,13 @@ Future<void> gcTick(Ctx ctx) async {
   }
 }
 
-Future<int> _collectOrphans(
-    Ctx ctx, String? bucket, Set<String> viewIds) async {
+Future<List<ViewIndexRow>> _readViews(Ctx ctx) async => [
+      for (final row in await ctx(Fx.localGetAll(sql.viewTable)))
+        parseViewIndexRow(row)
+    ];
+
+Future<int> _collectOrphans(Ctx ctx, String? bucket, int epoch,
+    Set<String> viewIds, Future<bool> Function() moved) async {
   final candidates = await ctx(Fx.stateRead((s) {
     final keep = retained(s, viewIds);
     return [
@@ -163,8 +172,13 @@ Future<int> _collectOrphans(
       ];
     }));
     if (chunk == null) break;
-    final settled = await ctx(Fx.all(
-        [for (final id in chunk) Fx.localDelete(extractTablePart(id), id)]));
+    final settled = await ctx(Fx.all([
+      for (final id in chunk)
+        Fx.localDelete(extractTablePart(id), id, epoch: epoch)
+    ]));
+    // A fenced delete reads as done; the circuit and `versions` now belong to
+    // another bucket, so they must not hear about it.
+    if (await moved()) break;
     final done = [
       for (var j = 0; j < chunk.length; j++)
         if (settled[j].ok) chunk[j]

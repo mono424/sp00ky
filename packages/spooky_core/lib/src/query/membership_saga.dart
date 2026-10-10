@@ -88,9 +88,13 @@ Future<MembershipOutcome> applyMembership(
     await ctx(Fx.emit(QueryAuthorityEvent(hash, true)));
   }
   final now = await ctx(Fx.now());
+  // The children as they are now: another read for this query may have
+  // committed newer ones since `entry` was read.
+  final children = await ctx(Fx.stateRead(
+      (s) => s.queries[hash]?.subqueryRemoteArray ?? entry.subqueryRemoteArray));
   try {
     await ctx(Fx.localPut(sql.viewTable, sql.viewRecordId(entry.def.viewKey),
-        sql.viewRow(remoteArray, entry.subqueryRemoteArray, true, now)));
+        sql.viewRow(remoteArray, children, true, now)));
   } catch (e) {
     await ctx(Fx.log(LogLevel.debug, 'view row write failed',
         {'hash': hash, 'error': e}));
@@ -125,12 +129,14 @@ Future<void> applySubqueryChildren(
   }
   await ctx(Fx.stateUpdate(r.setSubqueryRemoteArray(hash, children)));
   if (entry.lifecycle.phase != QueryPhase.cold) {
-    // No merge upsert locally: rewrite the row from the committed members,
-    // which `applyMembership` has already put in state in every caller.
+    // No merge upsert locally: rewrite the row from the members committed
+    // now, which may be newer than `entry`'s.
     final now = await ctx(Fx.now());
+    final members = await ctx(Fx.stateRead(
+        (s) => s.queries[hash]?.remoteArray ?? entry.remoteArray));
     try {
       await ctx(Fx.localPut(sql.viewTable, sql.viewRecordId(entry.def.viewKey),
-          sql.viewRow(entry.remoteArray, children, true, now)));
+          sql.viewRow(members, children, true, now)));
     } catch (e) {
       await ctx(Fx.log(
           LogLevel.debug, 'view row write failed', {'hash': hash, 'error': e}));

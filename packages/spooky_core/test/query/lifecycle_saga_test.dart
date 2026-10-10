@@ -154,14 +154,23 @@ void main() {
     const day = 24 * 60 * 60 * 1000;
     const now = 1700000000000;
 
-    /// Answers `local.getAll` on the view table with [views], everything else
-    /// empty, and records which ids were deleted from which table.
-    Map<String, EffectHandler> viewHandlers(List<Map<String, dynamic>> views) =>
-        defaults(over: {
-          'local.getAll': (e, __) => (e as LocalGetAll).table == sql.viewTable
-              ? views
-              : <Map<String, dynamic>>[],
-        });
+    /// A view table holding [views] (deletes remove rows), every other table
+    /// empty.
+    Map<String, EffectHandler> viewHandlers(List<Map<String, dynamic>> views) {
+      final table = [...views];
+      return defaults(over: {
+        'local.getAll': (e, __) => (e as LocalGetAll).table == sql.viewTable
+            ? [...table]
+            : <Map<String, dynamic>>[],
+        'local.delete': (e, __) {
+          final del = e as LocalDelete;
+          if (del.table == sql.viewTable) {
+            table.removeWhere((row) => row['id'] == del.id);
+          }
+          return null;
+        },
+      });
+    }
 
     List<String> deletedIds(RunPureResult<void> out) =>
         out.ofKind('local.delete').map((e) => (e as LocalDelete).id).toList();
@@ -321,6 +330,36 @@ void main() {
           reason: 'a held view row stays however old, a fresh one stays');
       expect(out.emitted.whereType<LogEvent>().last.data,
           {'removed': 1, 'retiredViews': 1});
+    });
+
+    test('a query mounted while the rows were read keeps its row', () async {
+      final out = await runPure<void>(
+        gcTick,
+        now: now,
+        state: buildState([], [
+          r.setIdentity(primed: true),
+          r.setVersions([('thing:old', 1)]),
+        ]),
+        handlers: defaults(over: {
+          'local.getAll': (e, ctx) {
+            if ((e as LocalGetAll).table != sql.viewTable) {
+              return <Map<String, dynamic>>[];
+            }
+            ctx.state = r.putQuery(buildEntry(
+                def: buildDefinition(hash: 'm', viewKey: 'stale')))(ctx.state);
+            return [
+              {
+                'id': '_00_view:stale',
+                'ids': [
+                  ['thing:old', 1]
+                ],
+                'updatedAt': now - 15 * day,
+              }
+            ];
+          },
+        }),
+      );
+      expect(deletedIds(out), isEmpty);
     });
 
     test('stops when the bucket moved under the sweep', () async {

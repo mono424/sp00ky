@@ -29,7 +29,8 @@ List<Map<String, dynamic>> sortRows(
   indexed.sort((a, b) {
     for (final (field, direction) in orderBy) {
       final cmp = compareValues(a.$1[field], b.$1[field]);
-      if (cmp != 0) return direction == 'desc' ? -cmp : cmp;
+      // `.related()` plans keep the builder's spelling (`DESC`).
+      if (cmp != 0) return direction.toLowerCase() == 'desc' ? -cmp : cmp;
     }
     return a.$2 - b.$2; // stable tiebreak
   });

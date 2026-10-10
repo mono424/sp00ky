@@ -364,6 +364,21 @@ DEFINE FIELD threads ON user TYPE string;
       expect((rows[1]['comments'] as List).map((c) => c['id']), ['comment:c4']);
     });
 
+    test('a direction spelled as the builder emits it (DESC) still sorts down',
+        () async {
+      final rows = threads(['thread:t1']);
+      await resolveRelations(
+        rows,
+        [
+          plan('comments', 'comment', 'many', 'thread',
+              orderBy: [('score', 'DESC')], limit: 1)
+        ],
+        fetcher,
+      );
+      expect((rows.single['comments'] as List).map((c) => c['id']),
+          ['comment:c1']);
+    });
+
     test('a sub-where filters the children', () async {
       final rows = threads();
       await resolveRelations(

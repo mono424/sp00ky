@@ -183,11 +183,6 @@ impl SortableValue {
         SortableValue { scalar, descending }
     }
 
-    /// The bound above every value, see [`Scalar::Top`].
-    pub(crate) fn top() -> Self {
-        SortableValue { scalar: Scalar::Top, descending: false }
-    }
-
     /// Whether `val` orders as itself rather than collapsing with nulls: a
     /// container sorts as null, so equality on one says nothing an index can
     /// answer.

@@ -27,7 +27,7 @@ use crate::eval::value_ref::ValueRef;
 use crate::operator::filter::resolve_predicate_value;
 use crate::operator::predicate::Predicate;
 use crate::operator::top_k::{Scalar, SortableValue};
-use crate::operator::{IndexBinding, IndexWindow, IndexedScan, Operator, OrderSpec};
+use crate::operator::{IndexBinding, IndexWindow, IndexedScan, KeyScan, Operator, OrderSpec};
 use crate::types::{Path, Sp00kyValue};
 
 /// One `DEFINE INDEX … FIELDS a, b` as the circuit uses it: the name, to tell
@@ -232,13 +232,12 @@ impl OrderedIndex {
         self.entries.get_index(position).map(|(_, row)| row)
     }
 
-    /// The position of the first entry whose values equal those at
-    /// `position`: the start of its run of ties.
-    pub(crate) fn tie_start(&self, position: usize) -> usize {
-        match self.entries.get_index(position) {
-            Some((values, _)) => self.entries.rank(&(values.clone(), RowKey::from(""))),
-            None => position,
-        }
+    /// `[lo, hi)`: the positions of every entry sharing its first `fields`
+    /// values with the entry at `position`.
+    pub(crate) fn group_of(&self, position: usize, fields: usize) -> Option<(usize, usize)> {
+        let (values, _) = self.entries.get_index(position)?;
+        let leading = &values[..fields.min(values.len())];
+        Some(self.prefix_range(leading))
     }
 
     /// Approximate heap bytes held, for the admin memory views: the entries
@@ -254,10 +253,14 @@ impl OrderedIndex {
 ///
 /// - a window (`LIMIT`, optional `START` and `ORDER BY`) whose filter is
 ///   equalities on an index's leading fields, in any order, and whose
-///   `ORDER BY` is the rest of that index in one direction, reads its rows
-///   off the index ([`IndexWindow`]);
+///   `ORDER BY` is the rest of that index (each field in either direction),
+///   reads its rows off the index ([`IndexWindow`]);
+/// - any other filter holding `id` equal to one record starts from that row
+///   ([`KeyScan`]), the record key being the index every table has;
 /// - any other filter with equalities on an index's leading fields starts
-///   from that range ([`IndexedScan`]) and keeps every `Filter` above it.
+///   from that range ([`IndexedScan`]).
+///
+/// The last two keep every `Filter` above them.
 ///
 /// Anything else builds as written. Either way the view's result is the one
 /// the plan as written would produce; this only changes how much of the
@@ -275,6 +278,8 @@ struct Conjuncts<'p> {
     eqs: Vec<(String, &'p Value)>,
     /// Predicates that read no row.
     gates: Vec<&'p Predicate>,
+    /// `id = operand`: the record key.
+    id: Option<&'p Value>,
     /// Anything an index cannot answer (ranges, `OR` over fields, `id`, …).
     residual: bool,
 }
@@ -306,6 +311,10 @@ impl IndexChoice<'_> {
                 for p in predicates {
                     self.split(p, out);
                 }
+            }
+            Predicate::Eq { field, value } if field.segments() == ["id"] => {
+                out.id.get_or_insert(value);
+                out.residual = true;
             }
             Predicate::Eq { field, value } if field.segments().first().is_some_and(|f| f != "id") && self.orderable(value) => {
                 out.eqs.push((field.as_str(), value));
@@ -383,10 +392,7 @@ impl IndexPlanner for IndexChoice<'_> {
         if order.iter().any(|(field, _)| field == "id" || conj.eqs.iter().any(|(f, _)| f == field)) {
             return None;
         }
-        let descending = order.first().is_some_and(|(_, desc)| *desc);
-        if order.iter().any(|(_, desc)| *desc != descending) {
-            return None;
-        }
+        let descending: Vec<bool> = order.iter().map(|(_, desc)| *desc).collect();
         let k = conj.eqs.len();
         let def = self.candidates(table).into_iter().find(|def| {
             def.fields.len() == k + order.len()
@@ -400,6 +406,9 @@ impl IndexPlanner for IndexChoice<'_> {
 
     fn scan(&self, table: &str, predicates: &[&Predicate]) -> Option<Box<dyn Operator>> {
         let conj = self.conjuncts(predicates)?;
+        if let Some(key) = conj.id {
+            return Some(Box::new(KeyScan { table: table.to_string(), key: key.clone() }));
+        }
         let (def, k) = self
             .candidates(table)
             .into_iter()

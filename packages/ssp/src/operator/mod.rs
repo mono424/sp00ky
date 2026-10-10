@@ -149,7 +149,7 @@ pub trait Operator: Debug + Send + Sync {
 pub use aggregate::{Aggregate, AggregateFunc};
 pub use distinct::Distinct;
 pub use filter::Filter;
-pub use index_scan::{IndexBinding, IndexWindow, IndexedScan};
+pub use index_scan::{IndexBinding, IndexWindow, IndexedScan, KeyScan};
 pub use join::Join;
 pub use map::Map;
 pub use plan::{JoinCondition, OperatorPlan, OrderSpec, Projection, QueryPlan};

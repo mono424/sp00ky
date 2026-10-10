@@ -132,16 +132,17 @@ A windowed list reads its window straight off an index when:
 
 - its `WHERE` is equalities (`field = value` or `field = $param`, joined
   with `AND`) on the index's leading fields, in any order, and
-- its `ORDER BY` is the rest of the index, every field in the same
-  direction. A trailing `id ASC` tiebreaker is free.
+- its `ORDER BY` is the rest of the index, in order, each field `ASC` or
+  `DESC` as you like. A trailing `id ASC` tiebreaker is free.
 
 <CodeBlock code={indexedListCode} lang="sql" />
 
 Registering such a window touches the rows it returns, not the table,
 and a write re-reads only that window. Any other filter with equalities
 on an index's leading fields still starts from that index range instead
-of the whole table. Full-text, vector (`HNSW`, `MTREE`) and `COUNT`
-indexes are not used; neither are ranges or `OR` across fields.
+of the whole table, and `WHERE id = $id` reads that one record. Full-text,
+vector (`HNSW`, `MTREE`) and `COUNT` indexes are not used; neither are
+ranges or `OR` across fields.
 
 Results are identical either way; an index changes only the cost. On a
 1M-row table with 422k rows in one list, 20 scroll windows took 14.6 s
@@ -254,8 +255,8 @@ node apps/benchmark/dist/verify-bootstrap.js --rows 1000 --row-bytes 2000000
 Each suite writes `summary.md`, `samples.json`, and `run.json` into
 `results/<suite>/`. The 3-run aggregate lives at `results/aggregated.md`.
 
-export const indexedListCode = `DEFINE INDEX game_database_sort ON game FIELDS database, sort_index;
+export const indexedListCode = `DEFINE INDEX game_list ON game FIELDS database, sort_index, date;
 
 -- answered from the index, any LIMIT / START
 SELECT * FROM game WHERE database = $database
-  ORDER BY sort_index ASC, id ASC LIMIT 50 START 100;`;
+  ORDER BY sort_index ASC, date DESC, id ASC LIMIT 50 START 100;`;

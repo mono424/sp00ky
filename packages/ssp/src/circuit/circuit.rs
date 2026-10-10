@@ -4964,6 +4964,7 @@ mod index_tests {
             def("game_database", &["database"]),
             def("game_owner_db_sort", &["owner", "database", "sort_index"]),
             def("game_created", &["created_at"]),
+            def("game_database_sort_created", &["database", "sort_index", "created_at"]),
         ]
     }
 
@@ -5098,6 +5099,28 @@ mod index_tests {
                 true,
             ),
             (
+                // WhitePawn's game list: mixed directions.
+                "mixed_deep",
+                limit(db.clone(), 6, 7, order(&[("sort_index", "ASC"), ("created_at", "DESC"), ("id", "ASC")])),
+                json!({ "database": "game_database:d2" }),
+                true,
+            ),
+            (
+                "desc_asc",
+                limit(db.clone(), 5, 2, order(&[("sort_index", "DESC"), ("created_at", "ASC")])),
+                json!({ "database": "game_database:d3" }),
+                true,
+            ),
+            // The record key is not a mirrored index: these report none.
+            ("by_id", filter(scan(), eq("id", param("id"))), json!({ "id": "game:g3" }), false),
+            (
+                "by_id_window",
+                limit(filter(scan(), eq("id", param("id"))), 1, 0, None),
+                json!({ "id": "game:g5" }),
+                false,
+            ),
+            ("by_id_other_table", filter(scan(), eq("id", json!("user:g3"))), json!({}), false),
+            (
                 "id_desc",
                 limit(db.clone(), 5, 0, order(&[("sort_index", "ASC"), ("id", "DESC")])),
                 json!({ "database": "game_database:d1" }),
@@ -5168,23 +5191,30 @@ mod index_tests {
         (sorted(out.0), sorted(out.1), sorted(out.2))
     }
 
-    /// The asc/asc_deep/desc windows computed straight from the rows.
+    /// Windows checked against the rows themselves.
+    const ORACLE_VIEWS: [&str; 5] = ["asc", "asc_deep", "desc", "mixed_deep", "desc_asc"];
+
+    /// A window computed straight from the rows.
     fn oracle(circuit: &Circuit, id: &str) -> Vec<String> {
         use crate::operator::top_k::SortableValue;
-        let (db, limit, start, desc) = match id {
-            "asc" => ("game_database:d1", 7, 0, false),
-            "asc_deep" => ("game_database:d2", 5, 9, false),
-            "desc" => ("game_database:d1", 6, 3, true),
+        let (db, limit, start, order): (&str, usize, usize, &[(&str, bool)]) = match id {
+            "asc" => ("game_database:d1", 7, 0, &[("sort_index", false)]),
+            "asc_deep" => ("game_database:d2", 5, 9, &[("sort_index", false)]),
+            "desc" => ("game_database:d1", 6, 3, &[("sort_index", true)]),
+            "mixed_deep" => ("game_database:d2", 6, 7, &[("sort_index", false), ("created_at", true)]),
+            "desc_asc" => ("game_database:d3", 5, 2, &[("sort_index", true), ("created_at", false)]),
             _ => return vec![],
         };
         let coll = circuit.store.get_collection("game").unwrap();
-        let mut rows: Vec<(SortableValue, String)> = coll
+        let mut rows: Vec<(Vec<SortableValue>, String)> = coll
             .membership()
             .keys()
             .filter_map(|key| {
                 let row = circuit.store.get_row_by_key(key);
-                (row.get("database").as_str() == Some(db))
-                    .then(|| (SortableValue::from_value(row.get("sort_index"), desc), key.to_string()))
+                (row.get("database").as_str() == Some(db)).then(|| {
+                    let sort = order.iter().map(|(f, desc)| SortableValue::from_value(row.get(f), *desc)).collect();
+                    (sort, key.to_string())
+                })
             })
             .collect();
         rows.sort();
@@ -5244,7 +5274,7 @@ mod index_tests {
                     }
                 }
                 // Both sides against the rows themselves, not just each other.
-                for id in ["asc", "asc_deep", "desc"] {
+                for id in ORACLE_VIEWS {
                     assert_eq!(sorted(plain.view_keys(id)), oracle(&plain, id), "view {id} wrong at step {step}, seed {seed}");
                 }
                 assert_same(&indexed, &plain, &format!("at step {step}, seed {seed}"));
@@ -5355,6 +5385,11 @@ mod index_tests {
                 }
             }
             eprintln!("{label}: 20 registrations {:?}", t.elapsed());
+            let t = Instant::now();
+            let by_id = QueryPlan { id: "by_id".into(), root: filter(scan(), eq("id", param("id"))) };
+            c.add_query_with_auth(by_id, Some(json!({ "id": format!("game:{:020}", 4242) })), None, String::new());
+            assert_eq!(c.view_keys("by_id").len(), 1);
+            eprintln!("{label}: by-id registration {:?}", t.elapsed());
             let t = Instant::now();
             for step in 0..20u64 {
                 let changes = (0..50u64)

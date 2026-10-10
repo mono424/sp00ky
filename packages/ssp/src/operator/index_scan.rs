@@ -8,13 +8,15 @@
 //!   every predicate, so it narrows work and never changes results.
 //! - [`IndexWindow`] stands in for `Limit` over `Filter` over `Scan` when the
 //!   filter is equalities on an index's leading fields and the `ORDER BY` is
-//!   the rest of that index. Its window is a rank range in the index: a
+//!   the rest of that index. Its window is read by position in the index: a
 //!   registration reads `limit` rows, and a write re-reads the window instead
 //!   of re-sorting the filtered rows.
+//! - [`KeyScan`] stands in for the `Scan` under a filter holding `id` equal to
+//!   one record: the record key is the index SurrealDB always has.
 //!
-//! The circuit decides where these apply (`Circuit::build_graph`); both keep
-//! the semantics of the operators they replace, `TopK` order included: index
-//! values ascending, ties by row key.
+//! The circuit decides where these apply (`Circuit::build_graph`); all keep
+//! the semantics of the operators they replace, `TopK` order included: each
+//! `ORDER BY` field in its own direction, ties by row key ascending.
 
 use serde_json::Value;
 
@@ -126,16 +128,16 @@ pub struct IndexWindow {
     pub binding: IndexBinding,
     pub limit: usize,
     pub offset: usize,
-    /// Every `ORDER BY` field descending: the window counts from the end of
-    /// the range.
-    pub descending: bool,
+    /// Per `ORDER BY` field (the index fields after the equality prefix),
+    /// whether it sorts descending.
+    pub descending: Vec<bool>,
     /// The keys currently in the window, in order.
     window: Vec<RowKey>,
     primed: bool,
 }
 
 impl IndexWindow {
-    pub fn new(binding: IndexBinding, limit: usize, offset: usize, descending: bool) -> Self {
+    pub fn new(binding: IndexBinding, limit: usize, offset: usize, descending: Vec<bool>) -> Self {
         Self { binding, limit, offset, descending, window: Vec::new(), primed: false }
     }
 
@@ -144,7 +146,7 @@ impl IndexWindow {
         let (Some(prefix), Some(coll)) = (self.binding.prefix_values(store, ctx), store.get_collection(&self.binding.table)) else {
             return Vec::new();
         };
-        let (limit, offset, descending) = (self.limit, self.offset, self.descending);
+        let (limit, offset) = (self.limit, self.offset);
         coll.with_index(&self.binding.def, |index| {
             let (lo, hi) = index.prefix_range(&prefix);
             let len = hi - lo;
@@ -152,36 +154,38 @@ impl IndexWindow {
                 return Vec::new();
             }
             let take = limit.min(len - offset);
-            if !descending {
+            if !self.descending.contains(&true) {
+                // All ascending: the order is the index's own.
                 return (lo + offset..lo + offset + take).filter_map(|p| index.row_at(p).cloned()).collect();
             }
-            // Descending as TopK orders it: values from the top down, but ties
-            // by row key ASCENDING. So walk runs of equal values from the end
-            // of the range, each run read front to back, and skip whole runs
-            // while they all fall before the window.
-            let mut out = Vec::with_capacity(take);
-            let mut skip = offset;
-            let mut end = hi;
-            while end > lo && out.len() < take {
-                let run_start = index.tie_start(end - 1).max(lo);
-                let run = end - run_start;
-                if skip >= run {
-                    skip -= run;
-                } else {
-                    for p in run_start + skip..end {
-                        if out.len() == take {
-                            break;
-                        }
-                        if let Some(row) = index.row_at(p) {
-                            out.push(row.clone());
-                        }
-                    }
-                    skip = 0;
-                }
-                end = run_start;
-            }
-            out
+            (offset..offset + take)
+                .filter_map(|k| self.nth(index, prefix.len(), lo, hi, k))
+                .filter_map(|p| index.row_at(p).cloned())
+                .collect()
         })
+    }
+
+    /// The index position of the `k`-th row of `[lo, hi)` in this window's
+    /// order. Field by field: the rows sharing their values up to a field sit
+    /// together in the index, and those groups come in index order for an
+    /// ascending field and reversed for a descending one. So the `k`-th row
+    /// falls in the group holding index position `lo + k` (or `hi - 1 - k`),
+    /// and the search narrows to that group with `k` less the rows of the
+    /// groups before it. Ties left after the last field are by row key
+    /// ascending, which is index order: TopK's order exactly, at two rank
+    /// lookups per field.
+    fn nth(&self, index: &crate::circuit::index::OrderedIndex, prefix_len: usize, lo: usize, hi: usize, k: usize) -> Option<usize> {
+        let (mut a, mut b, mut k) = (lo, hi, k);
+        for (field, &desc) in self.descending.iter().enumerate() {
+            if k >= b - a {
+                return None;
+            }
+            let p = if desc { b - 1 - k } else { a + k };
+            let (g_lo, g_hi) = index.group_of(p, prefix_len + field + 1)?;
+            k -= if desc { b - g_hi } else { g_lo - a };
+            (a, b) = (g_lo, g_hi);
+        }
+        (k < b - a).then_some(a + k)
     }
 
     /// Replace the window with `next` and return the membership change.
@@ -252,5 +256,61 @@ impl super::Operator for IndexWindow {
 
     fn state_bytes(&self) -> usize {
         self.window.len() * std::mem::size_of::<RowKey>()
+    }
+}
+
+/// The `Scan` under a filter holding `id` equal to one record: starts from
+/// that row alone and passes deltas through like `Scan`; the `Filter` above
+/// still checks every predicate.
+#[derive(Debug)]
+pub struct KeyScan {
+    pub table: String,
+    /// The `id` operand: a literal or `{"$param": …}`.
+    pub key: Value,
+}
+
+impl KeyScan {
+    /// The row the operand names, when this table holds it. The `Filter` on
+    /// `id` compares the whole key, so only `<table>:<id>` spelled out can
+    /// match.
+    fn start(&self, store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
+        let Some(Sp00kyValue::Str(key)) = resolve_predicate_value(&self.key, ctx) else {
+            return ZSet::new();
+        };
+        let held = key.strip_prefix(self.table.as_str()).is_some_and(|rest| rest.starts_with(':'))
+            && store.get_collection(&self.table).is_some_and(|c| c.has_key(&key));
+        if held {
+            std::iter::once((RowKey::from(key.as_str()), 1)).collect()
+        } else {
+            ZSet::new()
+        }
+    }
+}
+
+impl super::Operator for KeyScan {
+    fn snapshot(&self, _inputs: &[&ZSet], store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
+        self.start(store, ctx)
+    }
+
+    fn step(&mut self, input_deltas: &[&ZSet], _store: &Store, _ctx: Option<&Sp00kyValue>) -> ZSet {
+        input_deltas.first().map(|d| (*d).clone()).unwrap_or_default()
+    }
+
+    fn arity(&self) -> usize {
+        0
+    }
+
+    fn reset(&mut self) {}
+
+    fn collections(&self) -> Vec<String> {
+        vec![self.table.clone()]
+    }
+
+    fn initial_input(&self, store: &Store, ctx: Option<&Sp00kyValue>) -> Option<ZSet> {
+        Some(self.start(store, ctx))
+    }
+
+    fn evaluate_key(&self, key: &str, _input_evals: &[bool], store: &Store, _ctx: Option<&Sp00kyValue>) -> bool {
+        store.get_collection(&self.table).is_some_and(|c| c.has_key(key))
     }
 }

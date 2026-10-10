@@ -19,7 +19,7 @@ export const compareRecordIds = (
 };
 
 export const encodeRecordId = (recordId: RecordId<string>): string => {
-  return `${recordId.table.toString()}:${recordId.id}`;
+  return `${recordId.table.name}:${recordId.id}`;
 };
 
 export const extractIdPart = (id: string | RecordId<string>): string => {
@@ -39,7 +39,7 @@ export const extractTablePart = (id: string | RecordId<string>): string => {
   if (typeof id === 'string') {
     return id.split(':')[0];
   }
-  return id.table.toString();
+  return id.table.name;
 };
 
 export const parseRecordIdString = (id: string): RecordId<string> => {
@@ -76,7 +76,7 @@ export function decodeFromSp00ky<S extends SchemaStructure, T extends TableNames
     const relation = schema.relationships.find((r) => r.from === tableName && r.field === field);
     if ((column.recordId || relation) && encoded[field] !== null && encoded[field] !== undefined) {
       if (encoded[field] instanceof RecordId) {
-        encoded[field] = `${encoded[field].table.toString()}:${encoded[field].id}`;
+        encoded[field] = `${encoded[field].table.name}:${encoded[field].id}`;
       } else if (
         relation &&
         (encoded[field] instanceof Object || Array.isArray(encoded[field]))

@@ -105,7 +105,7 @@ describe('parseRecordIdString', () => {
 
   it('parses id containing colons', () => {
     const rid = parseRecordIdString('table:part1:part2');
-    expect(rid.table.toString()).toBe('table');
+    expect(rid.table.name).toBe('table');
     expect(rid.id).toBe('part1:part2');
   });
 });

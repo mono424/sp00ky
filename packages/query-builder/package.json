@@ -39,7 +39,7 @@
   },
   "packageManager": "pnpm@9.0.0",
   "dependencies": {
-    "surrealdb": "2.0.3"
+    "surrealdb": "2.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

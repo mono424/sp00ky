@@ -82,7 +82,7 @@ export function* landChunk(
     const rid = row?.id as RecordId<string> | undefined;
     if (!rid || typeof rid !== 'object') continue;
     const id = encodeRecordId(rid);
-    const table = String(rid.table);
+    const table = rid.table.name;
     const version = versions.get(id) ?? 0;
     const columns = env.schema.tables.find((t) => t.name === table)?.columns;
     const cleaned = columns ? cleanRecord(columns, row) : row;

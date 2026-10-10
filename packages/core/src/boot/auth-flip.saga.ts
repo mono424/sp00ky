@@ -59,7 +59,7 @@ export function* persistVerifiedUser(env: SagaEnv): Saga<void> {
   const row = (yield fx.service('auth.currentUser')) as Record<string, unknown> | null;
   if (!row || !(row.id instanceof RecordId) || Object.keys(row).length <= 1) return;
   const rid = row.id as RecordId<string>;
-  const table = String(rid.table);
+  const table = rid.table.name;
   const columns = columnsFor(env, table);
   if (!columns) return;
   const id = encodeRecordId(rid);

@@ -53,9 +53,9 @@ export function parseStoredRecordId(id: string): RecordId<string> {
 
 /** Stable `table:id` string for an id read from the store, escaping removed. */
 export const storedIdString = (id: unknown): string => {
-  if (id instanceof RecordId) return `${id.table}:${String(id.id)}`;
+  if (id instanceof RecordId) return `${id.table.name}:${String(id.id)}`;
   const rid = parseStoredRecordId(String(id));
-  return `${rid.table}:${rid.id}`;
+  return `${rid.table.name}:${rid.id}`;
 };
 
 /** Timestamp prefix of a v1/v2 mutation id, or `null` for a legacy numeric id. */

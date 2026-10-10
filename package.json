@@ -32,6 +32,6 @@
   "devDependencies": {
     "@tanstack/intent": "^0.0.21",
     "prettier": "^3.7.4",
-    "surrealdb": "2.0.3"
+    "surrealdb": "2.1.0"
   }
 }

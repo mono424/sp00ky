@@ -531,6 +531,7 @@ heap inside its SSP, and the other live sessions running the identical query.
 Everything is derived from `_00_query`, the registry of live queries. One row
 there is one _client session x query_ — the query id is hashed with a
 per-browser-session salt, so two tabs of the same person register two rows.
+A reload keeps its tab's salt and re-registers onto the rows it already had.
 That is what makes the rollup possible: distinct `auth_id` counts people,
 distinct `clientId` counts open tabs, and the row count is registered views.
 

@@ -70,6 +70,8 @@ export type EffectKind = Effect['kind'];
 export interface ServiceCalls {
   'hint.read': () => string | null;
   'hint.write': (bucketId: string) => void;
+  'salt.take': (authId: string | null) => string | null;
+  'salt.leave': (salt: string, authId: string | null) => void;
   'local.connect': (bucketId: string) => Promise<void>;
   'local.switchStore': (bucketId: string) => Promise<void>;
   'local.beginSwitch': () => () => void;

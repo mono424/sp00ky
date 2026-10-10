@@ -34,6 +34,7 @@ describe('boot', () => {
       'ssp.setPermissions',
       'auth.restoreSession',
       'auth.sessionAuthId',
+      'salt.take',
       'crdt.setSessionId',
       'auth.access',
       'ssp.setSessionAuth',
@@ -48,6 +49,18 @@ describe('boot', () => {
     expect(out.state.views).toEqual(new Map([['k', ['t:1']]]));
     expect(out.timers.get('gc')).toEqual({ ms: 30_000, event: { type: 'GcTick' } });
     expect(svc.names()).not.toContain('remote.connect');
+  });
+  it('a reload keeps the salt its tab left for the same principal', async () => {
+    const svc = fakeServices({
+      'hint.read': () => 'u1',
+      'auth.restoreSession': async () => 'user:u1',
+      'auth.sessionAuthId': () => 'user:u1',
+      'salt.take': () => 'kept-salt',
+    });
+    const out = await runPure(boot(env, { sharedTabs: false }), { handlers: { service: svc.handler, 'local.query': () => [] } });
+    expect(svc.calls).toContainEqual(['salt.take', ['user:u1']]);
+    expect(svc.calls).toContainEqual(['crdt.setSessionId', ['kept-salt']]);
+    expect(out.state).toMatchObject({ sessionId: 'kept-salt', saltUserId: 'user:u1' });
   });
   it('shared tabs: takes the role from the coordinator, or falls back to solo; schemaless engines skip provisioning; anonymous skips session auth', async () => {
     const leader = fakeServices({ 'hint.read': () => null, 'tabs.start': async () => 'leader', 'local.usesSurqlSchema': () => false, 'auth.restoreSession': async () => null, 'auth.sessionAuthId': () => null });
@@ -132,6 +145,15 @@ describe('startRemote / primeCircuit / versionsPrimed / pageHide / warmBlobs', (
     const f = await runPure(primeCircuit(), { state: buildState(), handlers: { service: failing.handler } });
     expect(f.state.primed).toBe(true);
     expect(f.emitted).toEqual([expect.objectContaining({ level: 'warn' })]);
+  });
+  it('pageHide leaves the salt for a reload before releasing views', async () => {
+    const svc = fakeServices();
+    const s = { ...buildState([buildEntry({ def: { hash: 'a' }, lifecycle: { remote: 'registered' } })]), sessionId: 'salt-1', saltUserId: 'user:u1' };
+    await runPure(pageHide(), { state: s, handlers: { service: svc.handler } });
+    expect(svc.calls).toEqual([
+      ['salt.leave', ['salt-1', 'user:u1']],
+      ['remote.releaseViews', [[new RecordId('_00_query', 'a')]]],
+    ]);
   });
   it('versionsPrimed records versions; pageHide releases registered views; warmBlobs is best-effort', async () => {
     const v = await runPure(versionsPrimed([['thing:1', 3]]), { state: buildState() });

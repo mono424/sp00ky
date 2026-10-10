@@ -43,8 +43,9 @@ export function* boot(env: SagaEnv, opts: BootOptions): Saga<void> {
   yield fx.dispatch({ type: 'PrimeCircuit' });
 
   const restoredUserId = (yield fx.service('auth.restoreSession')) as string | null;
-  const salt = (yield fx.id('salt')) as string;
   const authId = (yield fx.service('auth.sessionAuthId')) as string | null;
+  // A reload keeps the salt its tab had, so registrations land on warm views.
+  const salt = (((yield fx.service('salt.take', authId)) as string | null) ?? (yield fx.id('salt'))) as string;
   yield fx.state.update(R.setIdentity({ sessionId: salt, userId: restoredUserId, saltUserId: authId }));
   yield fx.service('crdt.setSessionId', salt);
   if (restoredUserId) yield fx.service('ssp.setSessionAuth', authId, (yield fx.service('auth.access')) as string | null);
@@ -115,9 +116,17 @@ export function* versionsPrimed(entries: Array<readonly [string, number]>): Saga
   yield fx.state.update(R.setVersions(entries));
 }
 
-/** Hand this tab's views back to the server when the page goes away for good. */
+/**
+ * The page is going away for good: leave the salt for a reload of this tab,
+ * then hand this tab's views back to the server.
+ */
 export function* pageHide(): Saga<void> {
-  const ids = (yield fx.state.read((s) => [...s.queries.values()].filter((e) => e.lifecycle.remote === 'registered').map((e) => e.def.id))) as unknown[];
+  const [salt, saltUserId, ids] = (yield fx.state.read((s) => [
+    s.sessionId,
+    s.saltUserId,
+    [...s.queries.values()].filter((e) => e.lifecycle.remote === 'registered').map((e) => e.def.id),
+  ])) as [string | null, string | null, unknown[]];
+  if (salt) yield fx.service('salt.leave', salt, saltUserId);
   if (ids.length > 0) yield fx.service('remote.releaseViews', ids);
 }
 

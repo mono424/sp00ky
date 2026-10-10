@@ -50,6 +50,40 @@ export function writeBootBucketHint(bucketId: string): void {
   }
 }
 
+const RELOAD_SALT_KEY = 'sp00ky:salt';
+
+/**
+ * Take the salt this tab's previous page left on its way out, if it was minted
+ * for the same principal. A reload that keeps its salt re-registers every
+ * query onto the `_00_query` row it already had, which the SSP answers from
+ * the live view instead of building a new one.
+ *
+ * Taken, not read: the key is absent while a page lives, so a duplicated tab
+ * (which copies sessionStorage) mints its own salt rather than sharing this
+ * tab's remote views.
+ */
+export function takeReloadSalt(authId: string | null): string | null {
+  try {
+    if (typeof sessionStorage === 'undefined') return null;
+    const raw = sessionStorage.getItem(RELOAD_SALT_KEY);
+    if (raw === null) return null;
+    sessionStorage.removeItem(RELOAD_SALT_KEY);
+    const left = JSON.parse(raw) as { salt?: unknown; authId?: unknown };
+    return typeof left.salt === 'string' && left.salt !== '' && (left.authId ?? null) === authId ? left.salt : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Leave this page's salt for the next page in this tab; see {@link takeReloadSalt}. */
+export function leaveReloadSalt(salt: string, authId: string | null): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(RELOAD_SALT_KEY, JSON.stringify({ salt, authId }));
+  } catch {
+    /* private-mode storage errors: the next page mints a fresh salt */
+  }
+}
+
 // Moved to a pure module so `@spooky-sync/core/pure` and the live feed share
 // it; re-exported here for existing imports.
 export { sha256Hex };
@@ -220,6 +254,8 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
   const services: ServiceCalls = {
     'hint.read': readBootBucketHint,
     'hint.write': writeBootBucketHint,
+    'salt.take': takeReloadSalt,
+    'salt.leave': leaveReloadSalt,
     'local.connect': (bucketId) => s.local.connect(bucketId),
     'local.switchStore': (bucketId) => s.local.switchStore(bucketId),
     'local.beginSwitch': () => s.local.beginSwitch(),

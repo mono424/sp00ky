@@ -608,6 +608,16 @@ impl BootstrapReporter {
         self.post(true).await;
     }
 
+    /// One of several tables in flight at once is done; the current label
+    /// (the phase) stays.
+    pub async fn table_done(&self) {
+        {
+            let mut st = self.state.lock().expect("bootstrap progress poisoned");
+            st.tables_done = st.tables_done.saturating_add(1);
+        }
+        self.post(true).await;
+    }
+
     async fn post(&self, force: bool) {
         let payload = {
             // Both locks are held for a handful of instructions and never
@@ -2347,61 +2357,101 @@ async fn self_bootstrap_with_metadata(
             circuit.forget_table(&table);
         }
     }
-    let (mut kept, mut repaired) = (0usize, 0usize);
-    for (table, meta) in &schema.tables {
-        if let Some(r) = reporter {
-            r.start_table(table).await;
-        }
-        let omit = &meta.opaque;
-
-        let held = {
-            let circuit = processor.read().await;
-            circuit.store.get_collection(table).map(|coll| {
-                (coll.rows.len(), ssp_protocol::snapshot_hash::xor_acc_to_hex(&coll.catchup_xor))
-            })
-        };
-        if let (Some((rows, hash)), Some(want)) = (&held, expected.get(table)) {
-            if hash == want {
-                kept += 1;
-                debug!(table = %table, rows, "Kept table: rows match the scheduler");
-                if let Some(r) = reporter {
-                    r.add_rows(*rows).await;
-                    r.finish_table().await;
+    // Phase 1: classify every table under one read lock. Kept tables are
+    // done; the rest are repaired `concurrency` at a time, and what a repair
+    // cannot settle is paged after, in name order as before.
+    let (mut kept, mut repaired, mut paged) = (0usize, 0usize, 0usize);
+    let mut kept_rows: Vec<(String, usize)> = Vec::new();
+    let mut jobs: Vec<warm::RepairJob> = Vec::new();
+    let mut page: Vec<(String, bool)> = Vec::new();
+    {
+        let circuit = processor.read().await;
+        for (table, meta) in &schema.tables {
+            let held = circuit
+                .store
+                .get_collection(table)
+                .map(|coll| (coll.rows.len(), ssp_protocol::snapshot_hash::xor_acc_to_hex(&coll.catchup_xor)));
+            match (held, expected.get(table)) {
+                (Some((rows, hash)), Some(want)) if hash == *want => {
+                    kept += 1;
+                    debug!(table = %table, rows, "Kept table: rows match the scheduler");
+                    kept_rows.push((table.clone(), rows));
                 }
-                continue;
+                (Some(_), Some(want)) => jobs.push(warm::RepairJob {
+                    table: table.clone(),
+                    omit: meta.opaque.clone(),
+                    want: want.clone(),
+                }),
+                (held, _) => page.push((table.clone(), held.is_some())),
             }
-            let started = std::time::Instant::now();
-            match warm::repair_table(source, processor, table, omit, want).await {
-                Ok(repair) if repair.matched => {
-                    repaired += 1;
-                    info!(
-                        table = %table,
-                        ranges = repair.ranges,
-                        differing = repair.differing,
-                        listed = repair.listed,
-                        fetched = repair.fetched,
-                        deleted = repair.deleted,
-                        ms = started.elapsed().as_millis() as u64,
-                        "Repaired table from the replica"
-                    );
-                    if let Some(r) = reporter {
-                        r.add_rows(repair.listed).await;
-                        r.finish_table().await;
-                    }
-                    continue;
-                }
-                Ok(repair) => info!(
-                    table = %table,
+        }
+    }
+    if let Some(r) = reporter {
+        for (table, rows) in &kept_rows {
+            r.start_table(table).await;
+            r.add_rows(*rows).await;
+            r.finish_table().await;
+        }
+    }
+
+    // Phase 2: repair, concurrently.
+    let concurrency = warm::repair_concurrency();
+    let repair_started = std::time::Instant::now();
+    if !jobs.is_empty() {
+        if let Some(r) = reporter {
+            r.start_table(&format!("repairing {} tables", jobs.len())).await;
+        }
+    }
+    for (job, outcome, ms) in warm::repair_tables(source, processor, jobs, concurrency).await {
+        match outcome {
+            Ok(repair) if repair.matched => {
+                repaired += 1;
+                info!(
+                    table = %job.table,
                     ranges = repair.ranges,
                     differing = repair.differing,
                     listed = repair.listed,
                     fetched = repair.fetched,
+                    deleted = repair.deleted,
+                    ms,
+                    "Repaired table from the replica"
+                );
+                if let Some(r) = reporter {
+                    r.add_rows(repair.listed).await;
+                    r.table_done().await;
+                }
+            }
+            Ok(repair) => {
+                info!(
+                    table = %job.table,
+                    ranges = repair.ranges,
+                    differing = repair.differing,
+                    listed = repair.listed,
+                    fetched = repair.fetched,
+                    ms,
                     "Table still differs after repair; paging it in full"
-                ),
-                Err(e) => warn!(table = %table, error = %e, "Table repair failed; paging it in full"),
+                );
+                page.push((job.table, true));
+            }
+            Err(e) => {
+                warn!(table = %job.table, error = %e, ms, "Table repair failed; paging it in full");
+                page.push((job.table, true));
             }
         }
-        if held.is_some() {
+    }
+    let repair_ms = repair_started.elapsed().as_millis() as u64;
+
+    // Phase 3: page the rest.
+    page.sort();
+    for (owned, held) in page {
+        let table = &owned;
+        let meta = &schema.tables[table];
+        if let Some(r) = reporter {
+            r.start_table(table).await;
+        }
+        let omit = &meta.opaque;
+        paged += 1;
+        if held {
             processor.write().await.store.collections.remove(table);
         }
         // Page by the scheduler's id ranges when it serves them for this cut:
@@ -2511,7 +2561,15 @@ async fn self_bootstrap_with_metadata(
     }
 
     if kept + repaired > 0 {
-        info!(tables = schema.tables.len(), kept, repaired, "Warm bootstrap: rows reused");
+        info!(
+            tables = schema.tables.len(),
+            kept,
+            repaired,
+            paged,
+            repair_ms,
+            concurrency,
+            "Warm bootstrap: rows reused"
+        );
     }
 
     // Step 3: Re-register views from the global `_00_query` table.

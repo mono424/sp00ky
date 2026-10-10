@@ -90,6 +90,28 @@ const LIST_PAGE: usize = 10_000;
 /// Rows per fetch of changed bodies.
 const FETCH_BATCH: usize = 500;
 
+/// Default for `SPKY_SSP_REPAIR_CONCURRENCY`: how many tables, and within a
+/// table how many range listings, fetches or re-reads, a repair runs at a
+/// time. The scheduler's default worker count: every proxy query is one
+/// synchronous embedded-SurrealDB read on one of its workers, so more only
+/// queues there. On whitepawn 11 tables repaired one after another took
+/// 5.1 s, `game` alone 1.4 s over 203 range listings.
+const REPAIR_CONCURRENCY_DEFAULT: usize = 4;
+
+/// `SPKY_SSP_REPAIR_CONCURRENCY`, or the default; never zero.
+pub fn resolve_repair_concurrency(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(REPAIR_CONCURRENCY_DEFAULT)
+}
+
+/// The repair concurrency for this process, resolved once.
+pub fn repair_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| resolve_repair_concurrency(std::env::var("SPKY_SSP_REPAIR_CONCURRENCY").ok().as_deref()))
+}
+
 /// Default for `SPKY_SSP_ROW_CHECKPOINT_SECS`. A delta costs the churn, so
 /// a short cadence is cheap, and it keeps the repair after a restart small.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
@@ -910,6 +932,40 @@ pub struct Repair {
     pub matched: bool,
 }
 
+/// One table to repair: what the scheduler expects it to hash to, and the
+/// opaque fields to leave out of the fetches.
+#[derive(Debug, Clone)]
+pub struct RepairJob {
+    pub table: String,
+    pub omit: BTreeSet<String>,
+    pub want: String,
+}
+
+/// Repair `jobs`, `concurrency` tables at a time, each with the same
+/// concurrency inside ([`repair_table`]). Returns every job's outcome and
+/// how long it took; the order is completion order.
+pub async fn repair_tables(
+    source: &BootstrapSource,
+    processor: &Arc<RwLock<Circuit>>,
+    jobs: Vec<RepairJob>,
+    concurrency: usize,
+) -> Vec<(RepairJob, anyhow::Result<Repair>, u64)> {
+    use futures::stream::{self, StreamExt};
+    let concurrency = concurrency.max(1);
+    // The futures are built up front rather than by `StreamExt::map`: a
+    // closure producing futures over borrowed arguments is what rustc cannot
+    // prove `Send` for every lifetime, and this whole bootstrap is spawned.
+    let repairs: Vec<_> = jobs
+        .into_iter()
+        .map(|job| async move {
+            let started = Instant::now();
+            let outcome = repair_table(source, processor, &job.table, &job.omit, &job.want, concurrency).await;
+            (job, outcome, started.elapsed().as_millis() as u64)
+        })
+        .collect();
+    stream::iter(repairs).buffer_unordered(concurrency).collect().await
+}
+
 /// Bring one table's rows in line with the scheduler's replica, fetching only
 /// the rows that differ.
 ///
@@ -924,23 +980,28 @@ pub struct Repair {
 ///
 /// Runs inside the registration window, where the scheduler holds its replica
 /// frozen at the cut it handed out, so the ranges, the listing and the fetches
-/// see one consistent table.
+/// see one consistent table. `concurrency` range listings, fetches or
+/// re-reads run at a time; the ranges are disjoint, so their writes never
+/// touch the same rows.
 pub async fn repair_table(
     source: &BootstrapSource,
     processor: &Arc<RwLock<Circuit>>,
     table: &str,
     omit: &BTreeSet<String>,
     expected: &str,
+    concurrency: usize,
 ) -> anyhow::Result<Repair> {
     match source.table_ranges(table).await {
         Some(wire) if wire.hash == expected => match RangeHashes::from_wire(&wire) {
-            Some(ranges) => return repair_by_ranges(source, processor, table, omit, expected, &ranges).await,
+            Some(ranges) => {
+                return repair_by_ranges(source, processor, table, omit, expected, &ranges, concurrency).await
+            }
             None => warn!(table, "Scheduler served range hashes that do not add up; listing the table in full"),
         },
         Some(wire) => debug!(table, ranges = %wire.hash, expected, "Range hashes are of another cut; listing the table in full"),
         None => {}
     }
-    repair_by_listing(source, processor, table, omit, expected).await
+    repair_by_listing(source, processor, table, omit, expected, concurrency).await
 }
 
 /// [`repair_table`] over the scheduler's id ranges.
@@ -951,7 +1012,10 @@ async fn repair_by_ranges(
     omit: &BTreeSet<String>,
     expected: &str,
     ranges: &RangeHashes,
+    concurrency: usize,
 ) -> anyhow::Result<Repair> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    let concurrency = concurrency.max(1);
     let mut repair = Repair { ranges: ranges.len(), ..Repair::default() };
     let Some(differing) = differing_ranges(processor, table, ranges, None).await else {
         return Ok(repair);
@@ -960,11 +1024,17 @@ async fn repair_by_ranges(
 
     // Listing a range ships two fields a row; fetching ships bodies. Only a
     // repair that would fetch most of the table is better off paging it.
-    let mut listing: Vec<(String, Option<i64>)> = Vec::new();
-    for &i in &differing {
-        let rows = rows_of(source.query(&range_listing_query(table, ranges, i)).await?);
-        listing.extend(rows.iter().filter_map(listing_entry));
-    }
+    // (Futures built up front, see `repair_tables`.)
+    let listing_reads: Vec<_> = differing
+        .iter()
+        .map(|&i| async move { source.query(&range_listing_query(table, ranges, i)).await.map(rows_of) })
+        .collect();
+    let listings: Vec<Vec<Value>> = stream::iter(listing_reads)
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+    let listing: Vec<(String, Option<i64>)> =
+        listings.iter().flatten().filter_map(listing_entry).collect();
     repair.listed = listing.len();
     let scope: HashSet<usize> = differing.iter().copied().collect();
     let (fetch, stale) = {
@@ -976,7 +1046,7 @@ async fn repair_by_ranges(
         return Ok(repair);
     }
     repair.deleted = delete_rows(processor, table, &stale).await;
-    repair.fetched = fetch_rows(source, processor, table, omit, &fetch).await?;
+    repair.fetched = fetch_rows(source, processor, table, omit, &fetch, concurrency).await?;
 
     // Equal versions were taken as equal content. A range that still differs
     // holds a row changed without a new version: read it whole.
@@ -987,8 +1057,15 @@ async fn repair_by_ranges(
     if still_rows * 2 > ranges.rows().max(1) {
         return Ok(repair);
     }
-    for &i in &still {
-        let (fetched, deleted) = reread_range(source, processor, table, omit, ranges, i).await?;
+    let rereads: Vec<_> = still
+        .iter()
+        .map(|&i| reread_range(source, processor, table, omit, ranges, i))
+        .collect();
+    let reread: Vec<(usize, usize)> = stream::iter(rereads)
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+    for (fetched, deleted) in reread {
         repair.fetched += fetched;
         repair.deleted += deleted;
     }
@@ -1058,6 +1135,7 @@ async fn repair_by_listing(
     table: &str,
     omit: &BTreeSet<String>,
     expected: &str,
+    concurrency: usize,
 ) -> anyhow::Result<Repair> {
     let mut listing: Vec<(String, Option<i64>)> = Vec::new();
     let mut after: Option<String> = None;
@@ -1086,7 +1164,7 @@ async fn repair_by_listing(
         return Ok(repair);
     }
     repair.deleted = delete_rows(processor, table, &stale).await;
-    repair.fetched = fetch_rows(source, processor, table, omit, &fetch).await?;
+    repair.fetched = fetch_rows(source, processor, table, omit, &fetch, concurrency).await?;
     repair.matched = table_matches(processor, table, expected).await;
     Ok(repair)
 }
@@ -1132,22 +1210,31 @@ async fn apply_records(processor: &Arc<RwLock<Circuit>>, table: &str, records: V
     }
 }
 
-/// Fetch the listed ids' bodies by record id, `FETCH_BATCH` at a time, and
-/// apply them. Returns how many came back.
+/// Fetch the listed ids' bodies by record id, `FETCH_BATCH` at a time and
+/// `concurrency` batches at once, and apply them. Returns how many came back.
 async fn fetch_rows(
     source: &BootstrapSource,
     processor: &Arc<RwLock<Circuit>>,
     table: &str,
     omit: &BTreeSet<String>,
     ids: &[String],
+    concurrency: usize,
 ) -> anyhow::Result<usize> {
-    let mut fetched = 0;
-    for batch in ids.chunks(FETCH_BATCH) {
-        let records = records_of(table, rows_of(source.query(&fetch_query(table, batch, omit)).await?));
-        fetched += records.len();
-        apply_records(processor, table, records).await;
-    }
-    Ok(fetched)
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    let fetches: Vec<_> = ids
+        .chunks(FETCH_BATCH)
+        .map(|batch| async move {
+            let records = records_of(table, rows_of(source.query(&fetch_query(table, batch, omit)).await?));
+            let fetched = records.len();
+            apply_records(processor, table, records).await;
+            Ok::<usize, anyhow::Error>(fetched)
+        })
+        .collect();
+    let counts: Vec<usize> = stream::iter(fetches)
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+    Ok(counts.into_iter().sum())
 }
 
 async fn table_matches(processor: &Arc<RwLock<Circuit>>, table: &str, expected: &str) -> bool {
@@ -1350,6 +1437,9 @@ mod tests {
         starts: Vec<String>,
         serve_ranges: bool,
         queries: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Queries in flight right now, and the most there ever were.
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeProxy {
@@ -1421,7 +1511,16 @@ mod tests {
                     "/proxy/query",
                     post(move |Json(body): Json<Value>| {
                         let fake = query.clone();
-                        async move { Json(fake.answer(body["query"].as_str().unwrap())) }
+                        async move {
+                            use std::sync::atomic::Ordering;
+                            let now = fake.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            fake.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                            // Long enough for concurrent queries to overlap.
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            let answer = fake.answer(body["query"].as_str().unwrap());
+                            fake.in_flight.fetch_sub(1, Ordering::SeqCst);
+                            Json(answer)
+                        }
                     }),
                 )
                 .route(
@@ -1450,10 +1549,21 @@ mod tests {
         (raw, row)
     }
 
+    /// What a repair of the warm case produced: its outcome, the queries
+    /// the proxy saw, whether the table matches, and the most queries the
+    /// proxy had in flight at once.
+    struct WarmOutcome {
+        repair: Repair,
+        queries: Vec<String>,
+        matched: bool,
+        max_in_flight: usize,
+        xor: [u8; 32],
+    }
+
     /// The replica holds 3000 rows in three ranges. The SSP holds the same
     /// except: one row changed without a new version (range 0), one row
     /// missing and one extra (range 2). Range 1 must never be read.
-    async fn warm_case(serve_ranges: bool) -> (Repair, Vec<String>, bool) {
+    async fn warm_case(serve_ranges: bool, concurrency: usize) -> WarmOutcome {
         let rows: std::collections::BTreeMap<String, Value> =
             (0..3000).map(|i| game_row(i, i as i64, 1)).collect();
         let fake = FakeProxy {
@@ -1461,6 +1571,8 @@ mod tests {
             starts: vec!["".into(), "g01000".into(), "g02000".into()],
             serve_ranges,
             queries: Default::default(),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
         };
         let expected = ssp_protocol::snapshot_hash::xor_acc_to_hex(&fake.ranges().total());
         let proxy_url = fake.clone().serve().await;
@@ -1482,15 +1594,22 @@ mod tests {
             coll.apply(Operation::Create, &format!("{raw}x"), Sp00kyValue::from(row));
         }
 
-        let repair = repair_table(&source, &processor, "game", &BTreeSet::new(), &expected).await.unwrap();
+        let repair = repair_table(&source, &processor, "game", &BTreeSet::new(), &expected, concurrency).await.unwrap();
         let queries = fake.queries.lock().unwrap().clone();
         let matched = table_matches(&processor, "game", &expected).await;
-        (repair, queries, matched)
+        let xor = processor.read().await.store.get_collection("game").unwrap().catchup_xor;
+        WarmOutcome {
+            repair,
+            queries,
+            matched,
+            max_in_flight: fake.max_in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            xor,
+        }
     }
 
     #[tokio::test]
     async fn repair_reads_only_the_ranges_that_differ() {
-        let (repair, queries, matched) = warm_case(true).await;
+        let WarmOutcome { repair, queries, matched, .. } = warm_case(true, 1).await;
         assert!(repair.matched && matched, "{repair:?}");
         assert_eq!((repair.ranges, repair.differing), (3, 2));
         assert_eq!(repair.listed, 2000, "ranges 0 and 2 listed, not range 1");
@@ -1505,9 +1624,76 @@ mod tests {
         assert!(!queries.iter().any(|q| q.starts_with("SELECT * FROM game:⟨g02000⟩")));
     }
 
+    /// Four listings, fetches and re-reads at a time land on the same rows
+    /// and the same hash as one at a time, and the proxy does see them
+    /// overlap.
+    #[tokio::test]
+    async fn concurrent_repair_matches_the_sequential_result() {
+        let one = warm_case(true, 1).await;
+        let four = warm_case(true, 4).await;
+        assert!(one.repair.matched && four.repair.matched);
+        assert_eq!(
+            (four.repair.ranges, four.repair.differing, four.repair.listed, four.repair.fetched, four.repair.deleted),
+            (one.repair.ranges, one.repair.differing, one.repair.listed, one.repair.fetched, one.repair.deleted)
+        );
+        assert_eq!(four.xor, one.xor);
+        assert_eq!(one.max_in_flight, 1, "sequential");
+        assert!((2..=4).contains(&four.max_in_flight), "concurrent: {}", four.max_in_flight);
+        assert_eq!(one.queries.len(), four.queries.len());
+    }
+
+    #[tokio::test]
+    async fn repair_tables_hands_back_every_job_with_its_outcome() {
+        let rows: std::collections::BTreeMap<String, Value> = (0..300).map(|i| game_row(i, i as i64, 1)).collect();
+        let fake = FakeProxy {
+            rows: Arc::new(rows.clone()),
+            starts: vec!["".into(), "g00100".into(), "g00200".into()],
+            serve_ranges: true,
+            queries: Default::default(),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+        };
+        let expected = ssp_protocol::snapshot_hash::xor_acc_to_hex(&fake.ranges().total());
+        let proxy_url = fake.clone().serve().await;
+        let source = BootstrapSource::Proxy { client: reqwest::Client::new(), proxy_url };
+        let processor = Arc::new(RwLock::new(Circuit::new()));
+        {
+            let mut c = processor.write().await;
+            let coll = c.store.ensure_collection("game");
+            for (raw, row) in rows.iter().filter(|(raw, _)| raw.as_str() != "g00250") {
+                coll.apply(Operation::Create, raw, Sp00kyValue::from(row.clone()));
+            }
+        }
+        let jobs = vec![
+            RepairJob { table: "game".into(), omit: BTreeSet::new(), want: expected.clone() },
+            RepairJob { table: "absent".into(), omit: BTreeSet::new(), want: "x3:00".into() },
+        ];
+        let outcomes = repair_tables(&source, &processor, jobs, 4).await;
+        assert_eq!(outcomes.len(), 2);
+        for (job, outcome, _ms) in outcomes {
+            match job.table.as_str() {
+                "game" => {
+                    let repair = outcome.unwrap();
+                    assert!(repair.matched, "{repair:?}");
+                    assert_eq!(repair.fetched, 1);
+                }
+                "absent" => assert!(!outcome.map(|r| r.matched).unwrap_or(false), "a table not held cannot be repaired"),
+                other => panic!("{other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repair_concurrency_defaults_to_four_and_rejects_zero() {
+        assert_eq!(resolve_repair_concurrency(None), 4);
+        assert_eq!(resolve_repair_concurrency(Some("0")), 4);
+        assert_eq!(resolve_repair_concurrency(Some("nope")), 4);
+        assert_eq!(resolve_repair_concurrency(Some(" 8 ")), 8);
+    }
+
     #[tokio::test]
     async fn repair_lists_the_whole_table_without_ranges() {
-        let (repair, queries, _) = warm_case(false).await;
+        let WarmOutcome { repair, queries, .. } = warm_case(false, 1).await;
         assert_eq!(repair.ranges, 0);
         assert_eq!(repair.listed, 3000);
         assert!(queries.iter().any(|q| q.starts_with("SELECT id, _00_rv FROM game ORDER BY id")));

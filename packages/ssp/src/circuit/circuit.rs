@@ -742,9 +742,19 @@ impl Circuit {
             }
         }
 
-        // Clean up zero weights in deltas
-        for delta in table_deltas.values_mut() {
-            delta.retain(|_, w| *w != 0);
+        // Clean up zero weights in deltas. A key that nets to zero and is
+        // held now was deleted and written again within this one step: its
+        // membership is unchanged and its content is new, so it is a content
+        // update like any other. Dropping it left every view on the old row
+        // (a delete + re-create moving a row between filters went unseen).
+        for (table, delta) in table_deltas.iter_mut() {
+            let coll = self.store.get_collection(table);
+            delta.retain(|key, w| {
+                if *w == 0 && coll.is_some_and(|c| c.has_key(key)) {
+                    content_updates.entry(table.clone()).or_default().push(key.clone());
+                }
+                *w != 0
+            });
         }
         timings.store_apply_ms = ms_since(t_store);
 
@@ -4345,6 +4355,26 @@ mod snapshot_and_projection_tests {
         let result = c.reconcile("nope", &entries);
         assert_eq!(result.fetch.len(), 3);
         assert_eq!(result.deleted, 0);
+    }
+
+    /// A row deleted and written again inside one step nets to weight zero.
+    /// It used to be dropped with the other zero weights, so a view never saw
+    /// the new content: here the row moves into the filter and stayed out.
+    #[test]
+    fn a_row_deleted_and_written_again_in_one_step_reaches_views() {
+        let mut c = Circuit::new();
+        c.add_query(filtered("pub", "thread", "published", json!(true)), None, None);
+        c.step(ChangeSet { changes: vec![Change::create("thread", "t1", json!({ "published": false }))] });
+        assert!(c.view_keys("pub").is_empty());
+
+        let deltas = c.step(ChangeSet {
+            changes: vec![
+                Change::delete("thread", "t1"),
+                Change::create("thread", "t1", json!({ "published": true })),
+            ],
+        });
+        assert_eq!(c.view_keys("pub"), vec!["thread:t1"]);
+        assert!(deltas.iter().any(|d| d.query_id == "pub" && d.additions == vec!["thread:t1"]));
     }
 
     #[test]

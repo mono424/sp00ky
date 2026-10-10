@@ -51,8 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 FROM runtime-base AS ssp
 RUN mkdir -p /data
 COPY --from=builder /usr/src/app/target/release/ssp-server /usr/local/bin/
-ENV RUST_LOG=info \
-    SP00KY_PERSISTENCE_FILE=/data/sp00ky_state.json
+ENV RUST_LOG=info
 EXPOSE 8667
 CMD ["ssp-server"]
 

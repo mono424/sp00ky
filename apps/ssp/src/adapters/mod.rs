@@ -36,35 +36,12 @@ pub fn vm_platform(
         scheduler: Arc::new(scheduler),
         spawner: Arc::new(TokioSpawner),
         telemetry: Arc::new(OtelTelemetry::new(metrics)),
-        circuit_store: circuit_store(),
+        // The VM never restores a circuit snapshot: a cluster SSP keeps row
+        // checkpoints (`crate::warm`) and a standalone one rebuilds from its
+        // own database, which holds no content hash to verify a snapshot
+        // against. `DiskCircuitStore` stays in ssp-node for the portable
+        // host, which does restore one.
+        circuit_store: Arc::new(ssp_node::NoopCircuitStore),
     };
     (platform, timer_rx)
-}
-
-/// Snapshot store for the VM.
-///
-/// Without one, every restart is a cold rebuild: the SSP re-pages the whole
-/// database over HTTP while the scheduler holds the tenant's sync frozen under
-/// `drain_lock` for up to its bootstrap budget. With one, a restart restores
-/// the snapshot and catches up only the rows past its resume point.
-///
-/// Enabled by pointing `SPKY_SSP_SNAPSHOT_DIR` at a writable directory —
-/// writable being checked, not assumed, because a missing volume or a
-/// read-only root is a real deployment state and the right response is to run
-/// without snapshots rather than to fail startup. The snapshot is a cache;
-/// SurrealDB remains the source of truth.
-fn circuit_store() -> Arc<dyn ssp_node::CircuitStore> {
-    let Some(dir) = std::env::var_os("SPKY_SSP_SNAPSHOT_DIR") else {
-        return Arc::new(ssp_node::NoopCircuitStore);
-    };
-    let dir = std::path::PathBuf::from(dir);
-    if !ssp_node::DiskCircuitStore::probe_writable(&dir) {
-        tracing::warn!(
-            dir = %dir.display(),
-            "SPKY_SSP_SNAPSHOT_DIR is not writable — restarts will do a full rebuild"
-        );
-        return Arc::new(ssp_node::NoopCircuitStore);
-    }
-    tracing::info!(dir = %dir.display(), "Circuit snapshots enabled");
-    Arc::new(ssp_node::DiskCircuitStore::new(&dir))
 }

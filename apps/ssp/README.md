@@ -89,26 +89,14 @@ When a client subscribes to a live query:
 4.  **Initial Population**: Takes the initial snapshot and bulk-inserts edges in a single transaction.
     - **Metric**: **1 Registration = 2 DB Round-trips** (1 Metadata + 1 Edges).
 
-## 💾 Persistence & Background Saving
+## 💾 What survives a restart
 
-SSP uses an asynchronous, debounced persistence strategy to ensure durability without blocking the main ingest loop.
-
-### Mechanism
-
-- **State File**: `data/sp00ky_state.json` (Configurable via `SP00KY_PERSISTENCE_FILE`).
-- **Trigger**: Every `ingest`, `register`, `unregister`, or `reset` marks the state as "dirty".
-- **Debounce**: The background saver waits for **2 seconds** of inactivity before writing to disk. This prevents disk thrashing during high-load bursts.
-- **Shutdown**: On `SIGINT` or `SIGTERM`, the server performs a forced synchronous save to ensure no data is lost.
-
-```rust
-// apps/ssp/src/background_saver.rs
-// Simplified Logic:
-loop {
-    notify.notified().await;
-    sleep(Duration::from_millis(2000)).await; // Debounce
-    save_now(); // Dump memory to JSON
-}
-```
+SurrealDB is the source of truth; the SSP keeps caches that make a restart
+cheaper. A cluster SSP (one with a scheduler) writes its rows as row
+checkpoints under `$SPKY_SSP_SNAPSHOT_DIR/rows` (`src/warm.rs`), loads them
+before registering and verifies every table against the scheduler's hash. A
+standalone SSP rebuilds from SurrealDB on every start. See
+[State persistence](https://sp00ky.dev/docs/reference/ssp-api#state-persistence).
 
 ## 🚀 API Reference
 

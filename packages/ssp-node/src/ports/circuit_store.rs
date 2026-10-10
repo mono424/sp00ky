@@ -38,8 +38,10 @@ pub struct ResumePoint {
 
 /// Persist / restore the DBSP circuit across process (or Durable Object)
 /// lifetimes. Generalizes the cold-start / eviction problem into a port: a
-/// long-lived host (VM) supplies a noop (the process holds the circuit); an
-/// ephemeral host (edge/DO/serverless) supplies a durable blob store.
+/// long-lived host (VM) supplies a noop (the process holds the circuit; a
+/// cluster SSP's warm restart is its own mechanism, row checkpoints in
+/// `apps/ssp/src/warm.rs`); an ephemeral host (edge/DO/serverless, the
+/// portable host) supplies a durable blob store.
 ///
 /// The blob is the output of `ssp::circuit::Circuit::save()` (a JSON string;
 /// the operator DAG is rebuilt from plans on `restore`, not serialized).
@@ -53,13 +55,13 @@ pub trait CircuitStore: MaybeSendSync {
     /// Load the latest snapshot. `NotFound` = cold start (caller rebuilds).
     async fn load(&self) -> Result<(String, ResumePoint), CircuitStoreError>;
 
-    /// Drop the snapshot (used by `/reset` and after a divergence wipe).
+    /// Drop the snapshot, for a host's clean-restart wipe.
     async fn clear(&self) -> Result<(), CircuitStoreError>;
 }
 
 /// A `CircuitStore` that never persists — every `load` is a cold start. Used by
 /// long-lived hosts (the VM) whose process already holds the circuit in memory,
-/// so `bootstrap()` always takes the rebuild-from-DB branch (today's behavior).
+/// so `bootstrap()` always takes the rebuild-from-DB branch.
 pub struct NoopCircuitStore;
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]

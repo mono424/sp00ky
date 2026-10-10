@@ -117,36 +117,6 @@ pub struct AppState {
 /// so both shells share one definition; this shell builds it from env vars.
 pub use ssp_node::NodeConfig as Config;
 
-/// Resolve the circuit checkpoint cadence from the environment.
-///
-/// `None` means "never checkpoint", and it is the answer whenever a checkpoint
-/// could not be consumed:
-///
-/// - no `SPKY_SSP_SNAPSHOT_DIR`: there is no store to write into;
-/// - a cluster node (scheduler URL set): the cluster bootstrap pages the
-///   database through the scheduler proxy and never calls
-///   `CircuitStore::load` (`ssp_node::Runtime::bootstrap` is the standalone
-///   path only), so a checkpoint here is write-only. On a large tenant that
-///   write was measured at 709 MB every ~6 minutes, serialised under the
-///   circuit read lock: `/ingest` blocked for a minute, SurrealDB's fsyncs
-///   stalled past 25 s behind it, and the SSP heartbeat queued behind the
-///   blocked ingest writer until the scheduler evicted the node;
-/// - `SPKY_SSP_CHECKPOINT_INTERVAL_SECS=0`: explicit opt-out. Before this
-///   guard a zero re-armed the timer immediately, i.e. checkpointed in a loop.
-pub fn resolve_checkpoint_interval(
-    snapshot_dir_set: bool,
-    interval_env: Option<&str>,
-    standalone: bool,
-) -> Option<u64> {
-    if !snapshot_dir_set || !standalone {
-        return None;
-    }
-    let secs = interval_env
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(300);
-    (secs > 0).then_some(secs)
-}
-
 /// The view count a heartbeat reports, without waiting on the circuit.
 ///
 /// Liveness must not queue behind the circuit lock: a checkpoint or a long
@@ -164,7 +134,6 @@ pub fn heartbeat_view_count(processor: &Arc<RwLock<Circuit>>, last: &mut usize) 
 
 pub fn load_config() -> Config {
     let scheduler_url = std::env::var("SPKY_SCHEDULER_URL").ok();
-    let standalone = scheduler_url.is_none();
     Config {
         listen_addr: std::env::var("SPKY_SSP_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8667".to_string()),
         // SPKY_DB_URL is canonical; SPKY_DB_WS kept as a legacy fallback
@@ -251,16 +220,14 @@ pub fn load_config() -> Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(15),
-        // Standalone hosts with a snapshot dir only; see
-        // `resolve_checkpoint_interval` for why a cluster node never
-        // checkpoints. `Circuit::save` still builds the whole JSON text in
-        // memory (and clones every view's params on the way), so even where it
-        // runs the peak is the serialised store, not a no-op.
-        checkpoint_interval_secs: resolve_checkpoint_interval(
-            std::env::var_os("SPKY_SSP_SNAPSHOT_DIR").is_some(),
-            std::env::var("SPKY_SSP_CHECKPOINT_INTERVAL_SECS").ok().as_deref(),
-            standalone,
-        ),
+        // Never. A cluster node bootstraps from the scheduler proxy and keeps
+        // its rows as row checkpoints (`warm`); a standalone node rebuilds
+        // from its own database, which holds no content hash to verify a
+        // snapshot against. The circuit snapshot `Runtime::checkpoint` writes
+        // (the whole store as JSON, built in memory under the circuit lock)
+        // is read by the portable and Cloudflare shells only; here it was
+        // written every five minutes and never read.
+        checkpoint_interval_secs: None,
         max_snapshot_age_secs: 3600,
     }
 }
@@ -1346,7 +1313,6 @@ pub async fn run_server() -> anyhow::Result<()> {
         // directive re-runs the cluster bootstrap in-process, rows kept.
         let boot_for_heartbeat = Arc::clone(&boot);
         let status_for_heartbeat = status.clone();
-        let circuit_store_for_heartbeat = Arc::clone(&platform.circuit_store);
         let clean_requested_for_heartbeat = Arc::clone(&clean_requested);
         let rows_for_heartbeat = row_checkpoints.clone();
 
@@ -1440,7 +1406,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                             // A standby leaves the shared row checkpoints to
                             // the SSP it replaces, which still serves from them.
                             let rows = rows_for_heartbeat.as_deref().filter(|_| !boot_for_heartbeat.node.is_standby());
-                            wipe_local_state(circuit_store_for_heartbeat.as_ref(), rows).await;
+                            wipe_local_state(rows).await;
                             error!(reason = %directive.reason, "Scheduler requested a clean re-bootstrap, exiting");
                             std::process::exit(4);
                         }
@@ -1498,28 +1464,9 @@ pub async fn run_server() -> anyhow::Result<()> {
         .await;
     info!(interval_ms = config.view_metrics_flush_ms, "View metrics flush timer armed");
 
-    // Circuit checkpoint: only where a later boot can restore it, which is the
-    // standalone path with a snapshot dir (see `resolve_checkpoint_interval`).
-    if let Some(secs) = config.checkpoint_interval_secs {
-        platform
-            .scheduler
-            .schedule(
-                ssp_node::TimerKind::CircuitCheckpoint,
-                ssp_node::now_epoch_ms() + secs * 1000,
-            )
-            .await;
-        info!(interval_secs = secs, "Circuit checkpoint timer armed");
-    } else if std::env::var_os("SPKY_SSP_SNAPSHOT_DIR").is_some() {
-        info!(
-            standalone = config.scheduler_url.is_none(),
-            "Circuit checkpoints disabled: a cluster node bootstraps from the scheduler proxy and never restores a checkpoint, so writing one would only stall ingest"
-        );
-    }
-
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(
             meter_provider,
-            runtime.clone(),
             Arc::clone(&clean_requested),
             row_checkpoints.map(|rows| (rows, processor_arc.clone(), status.clone())),
         ))
@@ -1533,21 +1480,36 @@ pub async fn run_server() -> anyhow::Result<()> {
 
 /// Delete the on-disk circuit state so the next boot is a cold rebuild.
 ///
-/// The snapshot goes through the `CircuitStore` port; the arena is a
-/// sparse-file cache of row bytes that bootstrap repopulates, so it is removed
-/// wholesale. Both are caches of SurrealDB, never the source of truth, which
-/// is what makes deleting them a safe thing to do from a heartbeat task.
-async fn wipe_local_state(store: &dyn ssp_node::CircuitStore, rows: Option<&warm::RowCheckpoints>) {
-    match store.clear().await {
-        Ok(()) => info!("Circuit snapshot cleared for clean restart"),
-        Err(e) => warn!(error = %e, "Could not clear circuit snapshot; restart will be warm"),
-    }
+/// The row checkpoints and the arena (a sparse-file cache of row bytes that
+/// bootstrap repopulates) are caches of SurrealDB, never the source of truth,
+/// which is what makes deleting them a safe thing to do from a heartbeat
+/// task. A `snapshot.json` an older build left in the snapshot dir goes too.
+async fn wipe_local_state(rows: Option<&warm::RowCheckpoints>) {
+    wipe_local_state_in(
+        std::env::var_os("SPKY_SSP_SNAPSHOT_DIR").map(std::path::PathBuf::from),
+        std::env::var_os("SPKY_SSP_ARENA_DIR").map(std::path::PathBuf::from),
+        rows,
+    );
+}
+
+fn wipe_local_state_in(
+    snapshot_dir: Option<std::path::PathBuf>,
+    arena_dir: Option<std::path::PathBuf>,
+    rows: Option<&warm::RowCheckpoints>,
+) {
     if let Some(rows) = rows {
         rows.clear();
     }
-    if let Some(dir) = std::env::var_os("SPKY_SSP_ARENA_DIR") {
+    if let Some(dir) = snapshot_dir {
+        match std::fs::remove_file(dir.join("snapshot.json")) {
+            Ok(()) => info!(dir = %dir.display(), "Removed the circuit snapshot an older build left"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(error = %e, "Could not remove the old circuit snapshot"),
+        }
+    }
+    if let Some(dir) = arena_dir {
         match std::fs::remove_dir_all(&dir) {
-            Ok(()) => info!(dir = %std::path::Path::new(&dir).display(), "Arena cleared for clean restart"),
+            Ok(()) => info!(dir = %dir.display(), "Arena cleared for clean restart"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!(error = %e, "Could not clear arena dir"),
         }
@@ -1559,7 +1521,6 @@ type ShutdownRows = (Arc<warm::RowCheckpoints>, Arc<RwLock<Circuit>>, Arc<RwLock
 
 async fn shutdown_signal(
     meter_provider: opentelemetry_sdk::metrics::SdkMeterProvider,
-    runtime: ssp_node::Runtime,
     clean_requested: Arc<AtomicBool>,
     rows: Option<ShutdownRows>,
 ) {
@@ -1587,27 +1548,23 @@ async fn shutdown_signal(
 
     info!("Signal received, starting graceful shutdown");
 
-    // Persist a final snapshot so an ephemeral host restarts warm. No-op on the
-    // VM (NoopCircuitStore) and skipped unless the circuit is Ready. Skipped
-    // outright after a clean-restart directive, which just deleted it.
+    // Cluster rows: a final checkpoint so the next boot is warm. Only a
+    // verified circuit is worth keeping, and ingest stops first (503, which
+    // the scheduler buffers and redelivers to whoever comes next) so the
+    // write does not race it for the lock. Skipped outright after a
+    // clean-restart directive, which just deleted the files.
     if clean_requested.load(Ordering::SeqCst) {
         info!("Skipping shutdown checkpoint: clean restart requested");
-    } else {
-        runtime.checkpoint().await;
-        // Cluster rows: only a verified circuit is worth keeping, and ingest
-        // stops first (503, which the scheduler buffers and redelivers to
-        // whoever comes next) so the write does not race it for the lock.
-        if let Some((rows, processor, status)) = rows {
-            let was = {
-                let mut status = status.write().await;
-                std::mem::replace(&mut *status, SspStatus::Stopping)
-            };
-            match was {
-                // `write` itself refuses for a standby (the gate).
-                SspStatus::Ready => rows.write(&processor, "shutdown").await,
-                SspStatus::Retired => info!("Skipping row checkpoint: retired, the successor owns the checkpoint dir"),
-                _ => info!("Skipping row checkpoint: the circuit was not Ready"),
-            }
+    } else if let Some((rows, processor, status)) = rows {
+        let was = {
+            let mut status = status.write().await;
+            std::mem::replace(&mut *status, SspStatus::Stopping)
+        };
+        match was {
+            // `write` itself refuses for a standby (the gate).
+            SspStatus::Ready => rows.write(&processor, "shutdown").await,
+            SspStatus::Retired => info!("Skipping row checkpoint: retired, the successor owns the checkpoint dir"),
+            _ => info!("Skipping row checkpoint: the circuit was not Ready"),
         }
     }
 
@@ -2060,42 +2017,30 @@ fn spawn_body_verification(rows: Arc<warm::RowCheckpoints>, boot: Arc<ClusterBoo
 // split-source path below.
 
 #[cfg(test)]
-mod checkpoint_gating_tests {
-    use super::{heartbeat_view_count, resolve_checkpoint_interval};
+mod shell_policy_tests {
+    use super::heartbeat_view_count;
     use ssp::circuit::Circuit;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    /// A clean restart removes the row checkpoints, the arena and the
+    /// circuit snapshot an older build may have left; nothing else, and
+    /// nothing twice.
     #[test]
-    fn standalone_with_snapshot_dir_checkpoints_every_300s_by_default() {
-        assert_eq!(resolve_checkpoint_interval(true, None, true), Some(300));
-        assert_eq!(resolve_checkpoint_interval(true, Some("45"), true), Some(45));
-    }
-
-    #[test]
-    fn no_snapshot_dir_means_no_checkpoint() {
-        assert_eq!(resolve_checkpoint_interval(false, None, true), None);
-        assert_eq!(resolve_checkpoint_interval(false, Some("45"), true), None);
-    }
-
-    #[test]
-    fn cluster_node_never_checkpoints() {
-        // The cluster bootstrap goes through the scheduler proxy and never
-        // restores a checkpoint, so writing one is pure cost (709 MB every
-        // ~6 min on whitepawn, under the circuit lock).
-        assert_eq!(resolve_checkpoint_interval(true, None, false), None);
-        assert_eq!(resolve_checkpoint_interval(true, Some("45"), false), None);
-    }
-
-    #[test]
-    fn zero_interval_is_an_opt_out_not_a_tight_loop() {
-        assert_eq!(resolve_checkpoint_interval(true, Some("0"), true), None);
-        assert_eq!(resolve_checkpoint_interval(true, Some(" 0 "), true), None);
-    }
-
-    #[test]
-    fn unparseable_interval_falls_back_to_default() {
-        assert_eq!(resolve_checkpoint_interval(true, Some("soon"), true), Some(300));
+    fn wipe_local_state_removes_a_leftover_snapshot_json() {
+        let dir = std::env::temp_dir().join(format!("ssp-wipe-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        let arena = dir.join("arena");
+        std::fs::create_dir_all(&arena).unwrap();
+        std::fs::write(dir.join("snapshot.json"), b"{}").unwrap();
+        std::fs::write(arena.join("game.0.arena"), b"rows").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"not ours").unwrap();
+        super::wipe_local_state_in(Some(dir.clone()), Some(arena.clone()), None);
+        assert!(!dir.join("snapshot.json").exists());
+        assert!(!arena.exists());
+        assert!(dir.join("keep.txt").exists());
+        // Again, on what is left: not an error.
+        super::wipe_local_state_in(Some(dir.clone()), Some(arena), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

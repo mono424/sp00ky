@@ -5,21 +5,28 @@
 //! tenant's sync frozen, four minutes on whitepawn and growing with the data.
 //! It keeps its rows instead:
 //!
-//! - **Checkpoint.** Each table's rows go to
-//!   `$SPKY_SSP_SNAPSHOT_DIR/rows/<table>.rows` in the binary format of
-//!   [`ssp::circuit::checkpoint`]: on SIGTERM, after every bootstrap, and on a
-//!   slow timer. Only tables whose content hash moved since they were last
-//!   written are written again.
+//! - **Checkpoint.** Each table's rows go to `$SPKY_SSP_SNAPSHOT_DIR/rows/` in
+//!   the binary format of [`ssp::circuit::checkpoint`]: on SIGTERM, after
+//!   every bootstrap, and on a timer. A table is written whole once
+//!   (`<table>.rows`, a base image); after that, only the rows changed since
+//!   the last write go out, as a delta (`<table>.NNNNNN.delta`) chained on
+//!   the file before it, so a write costs the churn rather than the table.
+//!   The table is written whole again when its deltas pile up
+//!   ([`MAX_DELTAS`], or more than half the base's bytes), when a legacy
+//!   file was converted at load, or when the base on disk is not the one
+//!   this process extends. Only tables whose content hash moved since they
+//!   were last written are written at all.
 //! - **Load.** At boot the files go back into the circuit before the SSP
-//!   registers. A file that fails its checks is deleted and its table paged.
-//!   The load reads only the heads of each file (`checkpoint`); the bodies
-//!   are verified by a pass that starts right away and runs while the SSP
-//!   registers and repairs, streaming each file through sequentially, which
-//!   is also what warms the page cache for the view priming that follows. A
-//!   table whose bodies fail is dropped and paged again by an in-process
-//!   re-bootstrap once this one has finished (`SPKY_SSP_CHECKPOINT_VERIFY=load`
-//!   verifies before the table is served instead, at the cost of reading
-//!   every file whole at boot).
+//!   registers. A file that fails its checks is deleted and its table paged;
+//!   a delta that does not chain is deleted with the ones after it, and the
+//!   table keeps the files before it. The load reads only the heads of each
+//!   file (`checkpoint`); the bodies are verified by a pass that starts right
+//!   away and runs while the SSP registers and repairs, streaming each file
+//!   through sequentially, which is also what warms the page cache for the
+//!   view priming that follows. A table whose bodies fail is dropped and
+//!   paged again by an in-process re-bootstrap once this one has finished
+//!   (`SPKY_SSP_CHECKPOINT_VERIFY=load` verifies before the table is served
+//!   instead, at the cost of reading every file whole at boot).
 //! - **Verify, then repair.** Registration hands back the scheduler's hash of
 //!   every table at the cut it freezes. The bootstrap keeps a table whose rows
 //!   hash the same, repairs one that differs ([`repair_table`]), and pages the
@@ -39,10 +46,17 @@
 //! promoted, and a retired SSP nothing after its retire, its shutdown write
 //! included. Beyond that:
 //!
-//! - every write goes to a temp file unique to its process (`<table>.rows.tmp.
+//! - every write goes to a temp file unique to its process (`<file>.tmp.
 //!   <pid>.<random>`; pids repeat across containers) and is renamed into
 //!   place, so a reader sees an old file or a new one, never a torn one, and
 //!   the loader only removes temp files old enough to be abandoned;
+//! - a standby loads whatever listing it sees; every file is whole, a delta
+//!   renamed in after the listing is simply not seen, and a chain the
+//!   predecessor moved on from is caught by the chain checks;
+//! - once promoted, before extending a chain it checks that the base on
+//!   disk is still the one it loaded (the predecessor may have written the
+//!   table whole meanwhile) and writes the table whole otherwise, and after
+//!   a delta it removes the predecessor's later deltas of the old chain;
 //! - a write removes only the files of tables this process itself loaded or
 //!   wrote and no longer holds, and only while the gate lets it write;
 //! - a file the loader cannot read is deleted, which the other instance may
@@ -55,14 +69,14 @@ use crate::BootstrapSource;
 use serde_json::Value;
 use ssp::circuit::arena::{configured_backing, ArenaBacking};
 use ssp::circuit::checkpoint::{
-    load_file_with, verify_bodies, write_collection, BodyVerify, LoadStats, PendingVerify, Throttle,
+    fresh_image_id, load_table, peek_identity, touch_bodies, verify_bodies, write_collection, write_delta,
+    BodyVerify, ImageId, PendingVerify, TableLoad, Throttle, FORMAT,
 };
-use ssp::circuit::store::Collection;
 use ssp::circuit::{Circuit, Operation, Record};
 use ssp::types::Sp00kyValue;
 use ssp_node::SspStatus;
 use ssp_protocol::range_hash::RangeHashes;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,8 +90,17 @@ const LIST_PAGE: usize = 10_000;
 /// Rows per fetch of changed bodies.
 const FETCH_BATCH: usize = 500;
 
-/// Default for `SPKY_SSP_ROW_CHECKPOINT_SECS`.
-const DEFAULT_INTERVAL_SECS: u64 = 1800;
+/// Default for `SPKY_SSP_ROW_CHECKPOINT_SECS`. A delta costs the churn, so
+/// a short cadence is cheap, and it keeps the repair after a restart small.
+const DEFAULT_INTERVAL_SECS: u64 = 300;
+
+/// A table with this many deltas is written whole next time.
+pub const MAX_DELTAS: usize = if cfg!(test) { 4 } else { 64 };
+
+/// Deltas that outweigh half the base's bytes end the chain too.
+fn deltas_outweigh(base_bytes: u64, delta_bytes: u64) -> bool {
+    delta_bytes * 2 > base_bytes
+}
 
 /// How long after a bootstrap the first checkpoint waits, so its table locks
 /// stay out of the scheduler's replay and catch-up verification.
@@ -91,12 +114,48 @@ const STALE_TMP_AGE: Duration = Duration::from_secs(600);
 /// [`RowCheckpoints::set_gate`].
 pub type WriteGate = Box<dyn Fn() -> bool + Send + Sync>;
 
+/// One table as it is on disk, the way this process last saw it.
+#[derive(Debug, Clone)]
+struct OnDisk {
+    /// The table's catch-up hash as the last file written or loaded holds it.
+    xor: [u8; 32],
+    image_id: ImageId,
+    base_bytes: u64,
+    /// `(seq, bytes)` of each delta, in seq order.
+    deltas: Vec<(u32, u64)>,
+}
+
+impl OnDisk {
+    fn delta_bytes(&self) -> u64 {
+        self.deltas.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    fn next_seq(&self) -> u32 {
+        self.deltas.last().map_or(1, |(seq, _)| seq + 1)
+    }
+
+    fn wants_full(&self) -> bool {
+        self.deltas.len() >= MAX_DELTAS || deltas_outweigh(self.base_bytes, self.delta_bytes())
+    }
+}
+
+/// What one write of a table produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    Full,
+    Delta {
+        seq: u32,
+        base: ImageId,
+        prev_xor: [u8; 32],
+    },
+}
+
 /// The row checkpoint directory and what is in it.
 pub struct RowCheckpoints {
     dir: PathBuf,
-    /// Each table's catch-up hash as it is on disk, so a write skips the
-    /// tables that have not changed since.
-    on_disk: std::sync::Mutex<HashMap<String, [u8; 32]>>,
+    /// Each table as it is on disk, so a write skips the tables that have
+    /// not changed since and extends the chain of those that have.
+    on_disk: std::sync::Mutex<HashMap<String, OnDisk>>,
     /// One writer at a time: the timer, the post-bootstrap write and the
     /// shutdown write can otherwise overlap.
     writing: tokio::sync::Mutex<()>,
@@ -186,8 +245,14 @@ impl RowCheckpoints {
         (secs > 0).then(|| Duration::from_secs(secs))
     }
 
+    /// `<table>.rows`: the base image.
     fn path_for(&self, table: &str) -> PathBuf {
         self.dir.join(format!("{}.rows", file_stem(table)))
+    }
+
+    /// `<table>.NNNNNN.delta`: delta `seq` of the base.
+    fn delta_path_for(&self, table: &str, seq: u32) -> PathBuf {
+        self.dir.join(delta_file_name(&file_stem(table), seq))
     }
 
     /// Read every checkpointed table into the circuit, replacing whatever it
@@ -204,30 +269,39 @@ impl RowCheckpoints {
             .await
             .unwrap_or_default();
         let tables = loaded.tables.len();
-        let rows: usize = loaded.tables.iter().map(|(c, _)| c.rows.len()).sum();
-        let bytes: u64 = loaded.tables.iter().map(|(_, s)| s.bytes).sum();
-        let bodies_bytes: u64 = loaded.tables.iter().map(|(_, s)| s.bodies_bytes).sum();
-        let mapped = loaded.tables.iter().filter(|(_, s)| s.mapped).count();
-        let converted = loaded.tables.iter().filter(|(_, s)| s.converted).count();
-        let heads_ms: u64 = loaded.tables.iter().map(|(_, s)| s.heads_ms).sum();
-        let verify_ms: u64 = loaded.tables.iter().map(|(_, s)| s.verify_ms).sum();
+        let rows: usize = loaded.tables.iter().map(|t| t.collection.rows.len()).sum();
+        let bytes: u64 = loaded.tables.iter().map(|t| t.stats.bytes).sum();
+        let bodies_bytes: u64 = loaded.tables.iter().map(|t| t.stats.bodies_bytes).sum();
+        let mapped = loaded.tables.iter().filter(|t| t.stats.mapped).count();
+        let converted = loaded.tables.iter().filter(|t| t.stats.converted).count();
+        let heads_ms: u64 = loaded.tables.iter().map(|t| t.stats.heads_ms).sum();
+        let verify_ms: u64 = loaded.tables.iter().map(|t| t.stats.verify_ms).sum();
         let pending = loaded.pending.len();
         let install_started = Instant::now();
         {
             let mut circuit = processor.write().await;
             let mut on_disk = self.on_disk.lock().unwrap();
-            for (coll, stats) in loaded.tables {
+            for load in loaded.tables {
+                let name = load.collection.name.clone();
                 // A converted file is not what is on disk: leaving it out of
                 // `on_disk` makes the next write rewrite it in this format.
-                if !stats.converted {
-                    on_disk.insert(coll.name.clone(), coll.catchup_xor);
+                if !load.stats.converted {
+                    on_disk.insert(
+                        name.clone(),
+                        OnDisk {
+                            xor: load.collection.catchup_xor,
+                            image_id: load.image_id,
+                            base_bytes: load.base_bytes,
+                            deltas: load.deltas,
+                        },
+                    );
                 }
-                circuit.store.collections.insert(coll.name.clone(), coll);
+                circuit.store.collections.insert(name, load.collection);
             }
         }
         self.pending.lock().unwrap().extend(loaded.pending);
         let install_ms = install_started.elapsed().as_millis() as u64;
-        if tables > 0 || loaded.discarded > 0 {
+        if tables > 0 || loaded.discarded > 0 || loaded.deltas_discarded > 0 {
             info!(
                 tables,
                 rows,
@@ -236,7 +310,9 @@ impl RowCheckpoints {
                 mapped,
                 copied = tables - mapped,
                 converted,
+                deltas = loaded.deltas,
                 discarded = loaded.discarded,
+                deltas_discarded = loaded.deltas_discarded,
                 pending,
                 heads_ms,
                 verify_ms,
@@ -260,13 +336,13 @@ impl RowCheckpoints {
     /// cache behind the mappings.
     pub async fn verify_pending(&self, pending: Vec<PendingVerify>) -> Vec<PendingVerify> {
         let started = Instant::now();
-        let (tables, mut bytes, mut failed) = (pending.len(), 0u64, Vec::new());
+        let (files, mut bytes, mut failed) = (pending.len(), 0u64, Vec::new());
         for p in pending {
             bytes += p.image.bodies.len() as u64;
             let image = p.image.clone();
             let outcome = tokio::task::spawn_blocking(move || verify_bodies(&image, Throttle::background())).await;
             match outcome {
-                Ok(Ok(true)) => debug!(table = %p.table, "Row checkpoint bodies verified"),
+                Ok(Ok(true)) => debug!(table = %p.table, file = %p.path.display(), "Row checkpoint bodies verified"),
                 Ok(Ok(false)) => {
                     error!(table = %p.table, file = %p.path.display(), "Row checkpoint bodies do not match their hash");
                     failed.push(p);
@@ -281,9 +357,9 @@ impl RowCheckpoints {
                 }
             }
         }
-        if tables > 0 {
+        if files > 0 {
             info!(
-                tables,
+                files,
                 bytes,
                 failed = failed.len(),
                 ms = started.elapsed().as_millis() as u64,
@@ -295,9 +371,9 @@ impl RowCheckpoints {
 
     /// Drop the tables whose bodies failed verification: each is removed
     /// from the store if it still holds that very image (a table paged or
-    /// replaced since is left alone), its file is deleted when this process
-    /// may write the directory, and it is forgotten on disk either way.
-    /// Returns the tables removed, for the caller to page again.
+    /// replaced since is left alone), its files are deleted when this
+    /// process may write the directory, and it is forgotten on disk either
+    /// way. Returns the tables removed, for the caller to page again.
     pub async fn discard_failed(&self, processor: &Arc<RwLock<Circuit>>, failed: Vec<PendingVerify>) -> Vec<String> {
         let mut dropped = Vec::new();
         let mut circuit = processor.write().await;
@@ -305,21 +381,35 @@ impl RowCheckpoints {
             let holds_image = circuit
                 .store
                 .get_collection(&p.table)
-                .is_some_and(|coll| coll.rows.image(0).is_some_and(|image| image.same_mapping(&p.image)));
+                .is_some_and(|coll| coll.rows.holds_image(&p.image));
             if holds_image {
                 circuit.store.collections.remove(&p.table);
-                dropped.push(p.table.clone());
+                if !dropped.contains(&p.table) {
+                    dropped.push(p.table.clone());
+                }
                 warn!(table = %p.table, "Dropped the table loaded from a checkpoint whose bodies failed verification");
             }
             self.on_disk.lock().unwrap().remove(&p.table);
             if self.may_write() {
-                let _ = std::fs::remove_file(&p.path);
+                self.remove_table_files(&p.table);
             }
         }
         dropped
     }
 
-    /// Write every table whose content changed since it was last written, and
+    /// Delete a table's base and every delta of it in the directory.
+    fn remove_table_files(&self, table: &str) {
+        let stem = file_stem(table);
+        let _ = std::fs::remove_file(self.path_for(table));
+        if let Some(state) = list_dir(&self.dir).get(&stem) {
+            for seq in &state.deltas {
+                let _ = std::fs::remove_file(self.delta_path_for(table, *seq));
+            }
+        }
+    }
+
+    /// Write every table whose content changed since it was last written,
+    /// as a delta where a chain can be extended and whole otherwise, and
     /// drop the files of tables the circuit no longer holds.
     ///
     /// Each table is written under its own short read lock, so ingest waits
@@ -333,7 +423,8 @@ impl RowCheckpoints {
         }
         let _one_writer = self.writing.lock().await;
         let started = Instant::now();
-        let held: Vec<(String, [u8; 32])> = {
+        // (name, hash, whether nothing of the table's arena is on disk)
+        let held: Vec<(String, [u8; 32], bool)> = {
             let circuit = processor.read().await;
             circuit
                 .store
@@ -342,37 +433,81 @@ impl RowCheckpoints {
                 // Runtime-internal tables (`_00_heartbeat`) are not synced and a
                 // bootstrap drops them anyway; writing them is churn.
                 .filter(|(name, _)| !ssp_protocol::table_excluded_from_sync(name))
-                .map(|(name, coll)| (name.clone(), coll.catchup_xor))
+                .map(|(name, coll)| (name.clone(), coll.catchup_xor, coll.rows.persisted().is_none()))
                 .collect()
         };
-        let changed: Vec<String> = {
-            let on_disk = self.on_disk.lock().unwrap();
-            held.iter()
-                .filter(|(name, hash)| on_disk.get(name) != Some(hash))
-                .map(|(name, _)| name.clone())
-                .collect()
-        };
+        let known: HashMap<String, OnDisk> = self.on_disk.lock().unwrap().clone();
+        let listing = list_dir(&self.dir);
+        let plans: Vec<(String, Plan)> = held
+            .iter()
+            .filter_map(|(name, hash, unpersisted)| {
+                let entry = known.get(name);
+                if entry.is_some_and(|d| d.xor == *hash) {
+                    return None;
+                }
+                let plan = match entry {
+                    Some(d) if !unpersisted && !d.wants_full() && self.base_on_disk_is(name, d.image_id, &listing) => {
+                        Plan::Delta {
+                            seq: d.next_seq(),
+                            base: d.image_id,
+                            prev_xor: d.xor,
+                        }
+                    }
+                    _ => Plan::Full,
+                };
+                Some((name.clone(), plan))
+            })
+            .collect();
 
-        let (mut written, mut rows, mut bytes, mut failed) = (0usize, 0u64, 0u64, 0usize);
+        let (mut written, mut full, mut deltas, mut tombstones, mut rows, mut bytes, mut failed) =
+            (0usize, 0usize, 0usize, 0u64, 0u64, 0u64, 0usize);
         let (mut encode_ms, mut fsync_ms) = (0u64, 0u64);
-        for table in changed {
+        for (table, plan) in plans {
             if !self.may_write() {
                 info!(reason, written, "Row checkpoint stopped: this process no longer owns the checkpoint dir");
                 return;
             }
+            if plan == Plan::Full {
+                // A whole write copies every body; read the mapped ones
+                // through first, outside the lock, so the copy under it
+                // never waits on the disk.
+                let images = processor
+                    .read()
+                    .await
+                    .store
+                    .get_collection(&table)
+                    .map(|coll| coll.rows.images())
+                    .unwrap_or_default();
+                for image in images {
+                    let _ = tokio::task::spawn_blocking(move || touch_bodies(&image, Throttle::none())).await;
+                }
+            }
             let guard = Arc::clone(processor).read_owned().await;
-            let path = self.path_for(&table);
-            let name = table.clone();
+            let stem = file_stem(&table);
+            let (name, dir, task_stem) = (table.clone(), self.dir.clone(), stem.clone());
             let result = tokio::task::spawn_blocking(move || {
                 let Some(coll) = guard.store.collections.get(&name) else {
                     return Ok(None);
                 };
                 let hash = coll.catchup_xor;
+                // The chain can only be extended from a watermark; one that
+                // went between the plan and now makes this a whole write.
+                let plan = match plan {
+                    Plan::Delta { .. } if coll.rows.persisted().is_none() => Plan::Full,
+                    plan => plan,
+                };
+                let path = match plan {
+                    Plan::Full => dir.join(format!("{task_stem}.rows")),
+                    Plan::Delta { seq, .. } => dir.join(delta_file_name(&task_stem, seq)),
+                };
                 let tmp = tmp_path_for(&path);
                 let encode_started = Instant::now();
                 let file = std::fs::File::create(&tmp)?;
                 let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-                let w = write_collection(coll, ssp::circuit::checkpoint::fresh_image_id(), &mut out)?;
+                let w = match plan {
+                    Plan::Full => write_collection(coll, fresh_image_id(), &mut out)?,
+                    Plan::Delta { seq, base, prev_xor } => write_delta(coll, base, seq, prev_xor, &mut out)?,
+                };
                 // Release the circuit before the fsync: a flush to disk can
                 // take seconds and ingest has no reason to wait for it.
                 drop(guard);
@@ -382,21 +517,69 @@ impl RowCheckpoints {
                 file.sync_all()?;
                 std::fs::rename(&tmp, &path)?;
                 let fsync_ms = sync_started.elapsed().as_millis() as u64;
-                Ok::<_, std::io::Error>(Some((hash, w, encode_ms, fsync_ms)))
+                Ok::<_, std::io::Error>(Some((hash, w, plan, encode_ms, fsync_ms)))
             })
             .await;
             match result {
-                Ok(Ok(Some((hash, w, table_encode_ms, table_fsync_ms)))) => {
+                Ok(Ok(Some((hash, w, plan, table_encode_ms, table_fsync_ms)))) => {
                     debug!(
                         table = %table,
+                        kind = match plan { Plan::Full => "full", Plan::Delta { .. } => "delta" },
+                        seq = w.seq,
                         rows = w.rows,
+                        tombstones = w.tombstones,
                         bytes = w.bytes,
                         encode_ms = table_encode_ms,
                         fsync_ms = table_fsync_ms,
                         "Row checkpoint table written"
                     );
-                    self.on_disk.lock().unwrap().insert(table, hash);
+                    // The table knows what is on disk now. A mark of another
+                    // epoch means the table was replaced meanwhile; its
+                    // watermark is gone and the next write is whole.
+                    {
+                        let mut circuit = processor.write().await;
+                        if let Some(coll) = circuit.store.collections.get_mut(&table) {
+                            coll.rows.mark_persisted(w.mark);
+                        }
+                    }
+                    let stale: Vec<u32> = {
+                        let mut on_disk = self.on_disk.lock().unwrap();
+                        let in_dir = listing.get(&stem).map(|s| s.deltas.clone()).unwrap_or_default();
+                        match plan {
+                            Plan::Full => {
+                                let old = on_disk.insert(
+                                    table.clone(),
+                                    OnDisk { xor: hash, image_id: w.image_id, base_bytes: w.bytes, deltas: Vec::new() },
+                                );
+                                // Every delta is of a chain that ended; a
+                                // crash before this leaves orphans the
+                                // loader discards.
+                                old.map(|d| d.deltas.into_iter().map(|(seq, _)| seq).collect::<Vec<_>>())
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .chain(in_dir)
+                                    .collect()
+                            }
+                            Plan::Delta { seq, .. } => {
+                                if let Some(d) = on_disk.get_mut(&table) {
+                                    d.deltas.push((seq, w.bytes));
+                                    d.xor = hash;
+                                }
+                                // The predecessor's tail of the chain this
+                                // process just moved past.
+                                in_dir.into_iter().filter(|s| *s > seq).collect()
+                            }
+                        }
+                    };
+                    for seq in stale {
+                        let _ = std::fs::remove_file(self.delta_path_for(&table, seq));
+                    }
                     written += 1;
+                    match plan {
+                        Plan::Full => full += 1,
+                        Plan::Delta { .. } => deltas += 1,
+                    }
+                    tombstones += w.tombstones;
                     rows += w.rows;
                     bytes += w.bytes;
                     encode_ms += table_encode_ms;
@@ -414,7 +597,7 @@ impl RowCheckpoints {
             }
         }
 
-        let live: HashSet<&str> = held.iter().map(|(name, _)| name.as_str()).collect();
+        let live: HashSet<&str> = held.iter().map(|(name, _, _)| name.as_str()).collect();
         let gone: Vec<String> = {
             let mut on_disk = self.on_disk.lock().unwrap();
             let gone: Vec<String> = on_disk.keys().filter(|t| !live.contains(t.as_str())).cloned().collect();
@@ -427,13 +610,16 @@ impl RowCheckpoints {
             return;
         }
         for table in &gone {
-            let _ = std::fs::remove_file(self.path_for(table));
+            self.remove_table_files(table);
         }
 
         if written > 0 || failed > 0 || !gone.is_empty() {
             info!(
                 reason,
                 written,
+                full,
+                deltas,
+                tombstones,
                 unchanged = held.len() - written - failed,
                 removed = gone.len(),
                 failed,
@@ -445,6 +631,15 @@ impl RowCheckpoints {
                 "Row checkpoint written"
             );
         }
+    }
+
+    /// Whether the base on disk for `table` is the image this process
+    /// extends. The other instance of a shared directory may have written
+    /// the table whole since; a delta of the old chain would be an orphan.
+    fn base_on_disk_is(&self, table: &str, image_id: ImageId, listing: &BTreeMap<String, DirState>) -> bool {
+        listing.get(&file_stem(table)).is_some_and(|s| s.base)
+            && peek_identity(&self.path_for(table))
+                .is_ok_and(|identity| identity.format == FORMAT && identity.image_id == image_id)
     }
 
     /// Delete every checkpoint, for a clean restart.
@@ -505,17 +700,20 @@ fn unique_suffix() -> String {
     format!("{}.{}", std::process::id(), uuid::Uuid::new_v4().simple())
 }
 
-/// `<table>.rows.tmp.<pid>.<random>` next to `<table>.rows`.
+/// `<file>.tmp.<pid>.<random>` next to `<file>`.
 fn tmp_path_for(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!(".tmp.{}", unique_suffix()));
     path.with_file_name(name)
 }
 
-/// A temp file of an abandoned write: `.rows.tmp` in its name (this format or
-/// the older bare one) and untouched for [`STALE_TMP_AGE`].
+/// A temp file of an abandoned write: `.tmp.` in its name (or the older
+/// bare `.tmp` ending) and untouched for [`STALE_TMP_AGE`].
 fn is_stale_tmp(path: &Path) -> bool {
-    let named = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".rows.tmp"));
+    let named = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".tmp.") || n.ends_with(".tmp"));
     named
         && std::fs::metadata(path)
             .and_then(|m| m.modified())
@@ -525,8 +723,9 @@ fn is_stale_tmp(path: &Path) -> bool {
 }
 
 /// A file name for a table: identifier characters kept, anything else hex
-/// escaped. The table name inside the file is what counts on load; this only
-/// has to be unique and safe.
+/// escaped, so a stem never holds a `.` and the file kinds below parse
+/// without ambiguity. The table name inside the file is what counts on
+/// load; this only has to be unique and safe.
 fn file_stem(table: &str) -> String {
     let mut out = String::with_capacity(table.len());
     for b in table.bytes() {
@@ -539,56 +738,157 @@ fn file_stem(table: &str) -> String {
     out
 }
 
+fn delta_file_name(stem: &str, seq: u32) -> String {
+    format!("{stem}.{seq:06}.delta")
+}
+
+/// What a file in the directory is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Base,
+    Delta(u32),
+}
+
+/// `<stem>.rows` or `<stem>.NNNNNN.delta`; anything else (temp files,
+/// probes) is `None`.
+fn parse_file_name(name: &str) -> Option<(&str, FileKind)> {
+    let stem_ok = |stem: &str| !stem.is_empty() && !stem.contains('.');
+    if let Some(stem) = name.strip_suffix(".rows") {
+        return stem_ok(stem).then_some((stem, FileKind::Base));
+    }
+    let rest = name.strip_suffix(".delta")?;
+    let (stem, seq) = rest.rsplit_once('.')?;
+    if !stem_ok(stem) || seq.len() != 6 || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seq: u32 = seq.parse().ok()?;
+    (seq > 0).then_some((stem, FileKind::Delta(seq)))
+}
+
+/// The files of one table, by stem.
+#[derive(Debug, Default, Clone)]
+struct DirState {
+    base: bool,
+    deltas: BTreeSet<u32>,
+}
+
+/// One readdir: which files each stem has right now. Temp files are not
+/// listed.
+fn list_dir(dir: &Path) -> BTreeMap<String, DirState> {
+    let mut out: BTreeMap<String, DirState> = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((stem, kind)) = name.to_str().and_then(parse_file_name) else {
+            continue;
+        };
+        let state = out.entry(stem.to_string()).or_default();
+        match kind {
+            FileKind::Base => state.base = true,
+            FileKind::Delta(seq) => {
+                state.deltas.insert(seq);
+            }
+        }
+    }
+    out
+}
+
 /// What [`read_dir_tables`] found.
 #[derive(Default)]
 struct Loaded {
-    tables: Vec<(Collection, LoadStats)>,
-    /// Files that failed their checks and were deleted.
+    tables: Vec<TableLoad>,
+    /// Tables whose base failed its checks; their files were deleted.
     discarded: usize,
+    /// Deltas applied.
+    deltas: usize,
+    /// Deltas that did not chain, were orphaned or left a gap; deleted.
+    deltas_discarded: usize,
     /// Mapped files whose bodies are still to be verified.
     pending: Vec<PendingVerify>,
 }
 
-/// Read every `*.rows` file. A file that fails to read is deleted: its table
-/// is paged instead, and the next write replaces it.
+/// Read every table in the directory: its base and the longest unbroken
+/// chain of deltas after it. A base that fails to read is deleted with its
+/// deltas and its table paged instead; a delta that fails is deleted with
+/// every later one and the table keeps the files before it. The next write
+/// replaces what went.
 fn read_dir_tables(dir: &Path, verify: BodyVerify, backing: &ArenaBacking) -> Loaded {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Loaded::default();
     };
-    let mut out = Loaded::default();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rows") {
-            // A temp file left by a write that never finished. Only an old
-            // one: a fresh one may be another instance's write in progress.
-            if is_stale_tmp(&path) {
-                let _ = std::fs::remove_file(&path);
+        let known = path.file_name().and_then(|n| n.to_str()).and_then(parse_file_name).is_some();
+        // A temp file left by a write that never finished. Only an old one:
+        // a fresh one may be another instance's write in progress.
+        if !known && is_stale_tmp(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let mut out = Loaded::default();
+    for (stem, state) in list_dir(dir) {
+        let base = dir.join(format!("{stem}.rows"));
+        let delta_path = |seq: u32| dir.join(delta_file_name(&stem, seq));
+        if !state.base {
+            warn!(stem, deltas = state.deltas.len(), "Discarding row checkpoint deltas without a base");
+            for seq in &state.deltas {
+                let _ = std::fs::remove_file(delta_path(*seq));
             }
+            out.deltas_discarded += state.deltas.len();
             continue;
         }
+        // The chain is the longest run 1, 2, ... present; a gap ends it.
+        let mut chain: Vec<PathBuf> = Vec::new();
+        for seq in &state.deltas {
+            if *seq == chain.len() as u32 + 1 {
+                chain.push(delta_path(*seq));
+            } else {
+                let _ = std::fs::remove_file(delta_path(*seq));
+                out.deltas_discarded += 1;
+            }
+        }
         let started = Instant::now();
-        match load_file_with(&path, verify, backing) {
+        match load_table(&base, &chain, verify, backing) {
             Ok(load) => {
-                let (coll, stats) = (load.collection, load.stats);
+                if let Some((k, e)) = &load.refused {
+                    warn!(
+                        table = %load.collection.name,
+                        file = %chain[*k].display(),
+                        error = %e,
+                        later = chain.len() - k - 1,
+                        "Discarding a row checkpoint delta and the ones after it"
+                    );
+                    for path in &chain[*k..] {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    out.deltas_discarded += chain.len() - k;
+                }
                 debug!(
-                    table = %coll.name,
-                    rows = coll.rows.len(),
-                    bytes = stats.bytes,
-                    bodies_bytes = stats.bodies_bytes,
-                    mapped = stats.mapped,
-                    converted = stats.converted,
-                    deferred = load.pending.is_some(),
-                    heads_ms = stats.heads_ms,
-                    verify_ms = stats.verify_ms,
+                    table = %load.collection.name,
+                    rows = load.collection.rows.len(),
+                    bytes = load.stats.bytes,
+                    bodies_bytes = load.stats.bodies_bytes,
+                    deltas = load.deltas.len(),
+                    mapped = load.stats.mapped,
+                    converted = load.stats.converted,
+                    deferred = load.pending.len(),
+                    heads_ms = load.stats.heads_ms,
+                    verify_ms = load.stats.verify_ms,
                     ms = started.elapsed().as_millis() as u64,
                     "Loaded row checkpoint table"
                 );
-                out.pending.extend(load.pending);
-                out.tables.push((coll, stats));
+                out.deltas += load.deltas.len();
+                out.pending.extend(load.pending.iter().cloned());
+                out.tables.push(load);
             }
             Err(e) => {
-                warn!(file = %path.display(), error = %e, "Discarding row checkpoint");
-                let _ = std::fs::remove_file(&path);
+                warn!(file = %base.display(), error = %e, "Discarding row checkpoint");
+                let _ = std::fs::remove_file(&base);
+                for path in &chain {
+                    let _ = std::fs::remove_file(path);
+                }
                 out.discarded += 1;
             }
         }
@@ -981,6 +1281,13 @@ mod tests {
                     Sp00kyValue::from(serde_json::json!({ "id": format!("{table}:{id}"), "n": 1 })),
                 );
             }
+            for i in 0..40 {
+                c.store.ensure_collection("game").apply(
+                    Operation::Create,
+                    &format!("r{i}"),
+                    Sp00kyValue::from(serde_json::json!({ "id": format!("game:r{i}"), "n": i, "s": "filler row" })),
+                );
+            }
         }
         checkpoints.write(&processor, "test").await;
         let game_file = checkpoints.path_for("game");
@@ -989,6 +1296,18 @@ mod tests {
         // Unchanged: nothing is rewritten.
         checkpoints.write(&processor, "test").await;
         assert_eq!(std::fs::metadata(&game_file).unwrap().modified().unwrap(), first_write);
+
+        // Changed: a delta, the base untouched.
+        processor.write().await.store.ensure_collection("game").apply(
+            Operation::Update,
+            "a",
+            Sp00kyValue::from(serde_json::json!({ "id": "game:a", "n": 2 })),
+        );
+        checkpoints.write(&processor, "test").await;
+        assert_eq!(std::fs::metadata(&game_file).unwrap().modified().unwrap(), first_write);
+        assert!(checkpoints.delta_path_for("game", 1).exists());
+        checkpoints.write(&processor, "test").await;
+        assert!(!checkpoints.delta_path_for("game", 2).exists(), "unchanged again: nothing");
 
         // A table that disappears loses its file.
         processor.write().await.store.collections.remove("user");
@@ -999,10 +1318,26 @@ mod tests {
         let reader = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
         assert_eq!(reader.load_into(&fresh).await, 1);
         assert!(reader.take_pending().is_empty(), "a heap load verifies at once");
-        let c = fresh.read().await;
+        {
+            let c = fresh.read().await;
+            let game = c.store.get_collection("game").unwrap();
+            assert_eq!(game.rows.len(), 42);
+            assert_eq!(game.get_row("a").get("n").as_i64(), Some(2), "the delta applied");
+            assert_eq!(game.catchup_xor, processor.read().await.store.get_collection("game").unwrap().catchup_xor);
+        }
+        // Seeded from the load: nothing to write, and the next change
+        // extends the chain the load saw.
+        reader.write(&fresh, "test").await;
+        assert!(!reader.delta_path_for("game", 2).exists());
+        fresh.write().await.store.ensure_collection("game").apply(Operation::Delete, "b", Sp00kyValue::Null);
+        reader.write(&fresh, "test").await;
+        assert!(reader.delta_path_for("game", 2).exists(), "the chain continues after a load");
+        let again = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap).load_into(&again).await, 1);
+        let c = again.read().await;
         let game = c.store.get_collection("game").unwrap();
-        assert_eq!(game.rows.len(), 2);
-        assert_eq!(game.catchup_xor, processor.read().await.store.get_collection("game").unwrap().catchup_xor);
+        assert!(!game.has_row("b"), "the tombstone applied");
+        assert_eq!(game.catchup_xor, fresh.read().await.store.get_collection("game").unwrap().catchup_xor);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1187,12 +1522,26 @@ mod tests {
     }
 
     fn one_table_circuit() -> Arc<RwLock<Circuit>> {
+        table_circuit(0)
+    }
+
+    /// A `game` table with row `a` and `filler` more rows: enough of a base
+    /// that a one-row delta does not outweigh it.
+    fn table_circuit(filler: usize) -> Arc<RwLock<Circuit>> {
         let mut c = Circuit::new();
-        c.store.ensure_collection("game").apply(
+        let coll = c.store.ensure_collection("game");
+        coll.apply(
             Operation::Create,
             "a",
             Sp00kyValue::from(serde_json::json!({ "id": "game:a", "n": 1 })),
         );
+        for i in 0..filler {
+            coll.apply(
+                Operation::Create,
+                &format!("r{i}"),
+                Sp00kyValue::from(serde_json::json!({ "id": format!("game:r{i}"), "n": i, "s": "filler row" })),
+            );
+        }
         Arc::new(RwLock::new(c))
     }
 
@@ -1233,17 +1582,239 @@ mod tests {
 
         // A fresh one may be the other instance's write in progress.
         std::fs::write(&a, b"partial").unwrap();
+        let d = tmp_path_for(&dir.join("game.000003.delta"));
+        std::fs::write(&d, b"partial").unwrap();
         assert!(read_dir_tables(&dir, BodyVerify::AtLoad, &ArenaBacking::Heap).tables.is_empty());
-        assert!(a.exists(), "a fresh temp file is left alone");
+        assert!(a.exists() && d.exists(), "a fresh temp file is left alone");
 
         // An old one is an abandoned write. The bare legacy name counts too.
         let legacy = dir.join("user.rows.tmp");
-        for path in [&a, &legacy] {
+        for path in [&a, &d, &legacy] {
             let file = std::fs::File::options().create(true).write(true).open(path).unwrap();
             file.set_modified(std::time::SystemTime::now() - STALE_TMP_AGE - Duration::from_secs(1)).unwrap();
         }
         read_dir_tables(&dir, BodyVerify::AtLoad, &ArenaBacking::Heap);
-        assert!(!a.exists() && !legacy.exists(), "stale temp files are swept");
+        assert!(!a.exists() && !d.exists() && !legacy.exists(), "stale temp files are swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_names_parse_back_to_stem_and_kind() {
+        assert_eq!(parse_file_name("game.rows"), Some(("game", FileKind::Base)));
+        assert_eq!(parse_file_name("a%2eb.rows"), Some(("a%2eb", FileKind::Base)));
+        assert_eq!(parse_file_name("game.000001.delta"), Some(("game", FileKind::Delta(1))));
+        assert_eq!(parse_file_name("game.123456.delta"), Some(("game", FileKind::Delta(123456))));
+        assert_eq!(parse_file_name(&delta_file_name(&file_stem("a.b"), 7)), Some(("a%2eb", FileKind::Delta(7))));
+        for name in [
+            "game.rows.tmp.1.abc",
+            "game.000001.delta.tmp.1.abc",
+            ".probe.1.abc",
+            "game.000000.delta",
+            "game.1.delta",
+            "game.delta",
+            ".rows",
+            "game.x.rows",
+        ] {
+            assert_eq!(parse_file_name(name), None, "{name}");
+        }
+    }
+
+    /// Change the table, write, and hand back the new file's path.
+    async fn change_and_write(checkpoints: &RowCheckpoints, processor: &Arc<RwLock<Circuit>>, n: i64) {
+        processor.write().await.store.ensure_collection("game").apply(
+            Operation::Update,
+            "a",
+            Sp00kyValue::from(serde_json::json!({ "id": "game:a", "n": n })),
+        );
+        checkpoints.write(processor, "test").await;
+    }
+
+    fn files_of(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn the_delta_cap_and_the_bytes_cap_force_a_full_base() {
+        let dir = scratch_dir("cap");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let processor = table_circuit(40);
+        checkpoints.write(&processor, "test").await;
+        let base = checkpoints.path_for("game");
+        let first = ssp::circuit::checkpoint::peek_identity(&base).unwrap().image_id;
+        // `n = 1` is what the base holds: a change has to change something.
+        for n in 2..=MAX_DELTAS as i64 + 1 {
+            change_and_write(&checkpoints, &processor, n).await;
+        }
+        assert_eq!(files_of(&dir).len(), 1 + MAX_DELTAS, "{:?}", files_of(&dir));
+        // One more change: the chain is full, the table is written whole and
+        // the deltas go.
+        change_and_write(&checkpoints, &processor, 100).await;
+        assert_eq!(files_of(&dir), vec!["game.rows".to_string()]);
+        assert_ne!(ssp::circuit::checkpoint::peek_identity(&base).unwrap().image_id, first, "a fresh image id");
+
+        // The bytes cap: a one-row base, a delta that outweighs half of it.
+        let big = Arc::new(RwLock::new(Circuit::new()));
+        big.write().await.store.ensure_collection("game").apply(
+            Operation::Create,
+            "a",
+            Sp00kyValue::from(serde_json::json!({ "id": "game:a", "n": 1 })),
+        );
+        let dir2 = scratch_dir("bytes-cap");
+        let checkpoints = RowCheckpoints::at(dir2.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        checkpoints.write(&big, "test").await;
+        big.write().await.store.ensure_collection("game").apply(
+            Operation::Create,
+            "b",
+            Sp00kyValue::from(serde_json::json!({ "id": "game:b", "blob": "x".repeat(4000) })),
+        );
+        checkpoints.write(&big, "test").await;
+        assert!(checkpoints.delta_path_for("game", 1).exists(), "the first change is still a delta");
+        big.write().await.store.ensure_collection("game").apply(
+            Operation::Update,
+            "a",
+            Sp00kyValue::from(serde_json::json!({ "id": "game:a", "n": 2 })),
+        );
+        checkpoints.write(&big, "test").await;
+        assert_eq!(files_of(&dir2), vec!["game.rows".to_string()], "the deltas outweighed the base");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn a_delta_with_a_seq_gap_is_discarded_with_everything_after_it() {
+        let dir = scratch_dir("gap");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let processor = table_circuit(40);
+        checkpoints.write(&processor, "test").await;
+        for n in 2..=4 {
+            change_and_write(&checkpoints, &processor, n).await;
+        }
+        std::fs::remove_file(checkpoints.delta_path_for("game", 2)).unwrap();
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        let reader = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        assert_eq!(reader.load_into(&fresh).await, 1);
+        assert_eq!(fresh.read().await.store.get_collection("game").unwrap().get_row("a").get("n").as_i64(), Some(2), "the state after delta 1");
+        assert_eq!(files_of(&dir), vec!["game.000001.delta".to_string(), "game.rows".to_string()], "delta 3 went");
+        // The next write continues from delta 1.
+        change_and_write(&reader, &fresh, 9).await;
+        assert!(reader.delta_path_for("game", 2).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_delta_of_another_base_is_an_orphan() {
+        let dir = scratch_dir("orphan");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let processor = table_circuit(40);
+        checkpoints.write(&processor, "test").await;
+        change_and_write(&checkpoints, &processor, 2).await;
+        let delta = checkpoints.delta_path_for("game", 1);
+        let kept = std::fs::read(&delta).unwrap();
+        // A second process writes the table whole: a new chain.
+        let other = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        other.write(&processor, "test").await;
+        assert!(!delta.exists(), "a whole write ends the old chain");
+        std::fs::write(&delta, kept).unwrap();
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        let reader = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        assert_eq!(reader.load_into(&fresh).await, 1);
+        assert!(!delta.exists(), "the orphan is removed");
+        assert_eq!(fresh.read().await.store.get_collection("game").unwrap().get_row("a").get("n").as_i64(), Some(2));
+        // Deltas without any base go too.
+        std::fs::remove_file(checkpoints.path_for("game")).unwrap();
+        std::fs::write(&delta, b"whatever").unwrap();
+        let none = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap).load_into(&none).await, 0);
+        assert!(files_of(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Blue/green: a promoted standby loaded a chain its predecessor has
+    /// since replaced. Its next write is whole, not an orphan delta, and
+    /// after a delta of its own it removes the predecessor's later ones.
+    #[tokio::test]
+    async fn a_base_replaced_underneath_makes_the_next_write_full() {
+        let dir = scratch_dir("underneath");
+        let processor = table_circuit(40);
+        let predecessor = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        predecessor.write(&processor, "test").await;
+        change_and_write(&predecessor, &processor, 2).await;
+
+        let standby_circuit = Arc::new(RwLock::new(Circuit::new()));
+        let standby = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        assert_eq!(standby.load_into(&standby_circuit).await, 1);
+
+        // The predecessor compacts: a new base, then a delta of it.
+        for n in 3..=MAX_DELTAS as i64 + 2 {
+            change_and_write(&predecessor, &processor, n).await;
+        }
+        assert_eq!(files_of(&dir), vec!["game.rows".to_string()]);
+        change_and_write(&predecessor, &processor, 50).await;
+        assert!(predecessor.delta_path_for("game", 1).exists());
+        let new_base = ssp::circuit::checkpoint::peek_identity(&standby.path_for("game")).unwrap().image_id;
+
+        // The standby, promoted, writes: whole, since its chain is gone.
+        change_and_write(&standby, &standby_circuit, 7).await;
+        assert_eq!(files_of(&dir), vec!["game.rows".to_string()], "{:?}", files_of(&dir));
+        assert_ne!(ssp::circuit::checkpoint::peek_identity(&standby.path_for("game")).unwrap().image_id, new_base);
+        // And its chain continues from there: the loader agrees.
+        change_and_write(&standby, &standby_circuit, 8).await;
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap).load_into(&fresh).await, 1);
+        assert_eq!(fresh.read().await.store.get_collection("game").unwrap().get_row("a").get("n").as_i64(), Some(8));
+
+        // A foreign delta beyond this process's chain goes with its delta.
+        std::fs::write(standby.delta_path_for("game", 5), b"the predecessor's tail").unwrap();
+        change_and_write(&standby, &standby_circuit, 9).await;
+        assert_eq!(files_of(&dir), vec!["game.000001.delta".to_string(), "game.000002.delta".to_string(), "game.rows".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_removed_table_loses_its_base_and_its_deltas() {
+        let dir = scratch_dir("removed");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let processor = table_circuit(40);
+        checkpoints.write(&processor, "test").await;
+        change_and_write(&checkpoints, &processor, 2).await;
+        assert_eq!(files_of(&dir).len(), 2);
+        processor.write().await.store.collections.remove("game");
+        checkpoints.write(&processor, "test").await;
+        assert!(files_of(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A table replaced wholesale between two writes (a re-bootstrap paged
+    /// it) has no watermark: its next write is whole and starts a chain.
+    #[tokio::test]
+    async fn a_replaced_table_starts_a_new_chain() {
+        let dir = scratch_dir("replaced-chain");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let processor = table_circuit(40);
+        checkpoints.write(&processor, "test").await;
+        change_and_write(&checkpoints, &processor, 2).await;
+        assert!(checkpoints.delta_path_for("game", 1).exists());
+        {
+            let mut c = processor.write().await;
+            c.store.collections.remove("game");
+            c.store.ensure_collection("game").apply(
+                Operation::Create,
+                "z",
+                Sp00kyValue::from(serde_json::json!({ "id": "game:z", "n": 1 })),
+            );
+        }
+        checkpoints.write(&processor, "test").await;
+        assert_eq!(files_of(&dir), vec!["game.rows".to_string()]);
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap).load_into(&fresh).await, 1);
+        assert!(fresh.read().await.store.get_collection("game").unwrap().has_row("z"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1263,7 +1834,10 @@ mod tests {
         let dir = scratch_dir(name);
         let backing = ArenaBacking::Files { dir: dir.join("arena"), segment_bytes: 64 * 1024 };
         let writer = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing.clone());
-        writer.write(&one_table_circuit(), "test").await;
+        let processor = table_circuit(40);
+        writer.write(&processor, "test").await;
+        change_and_write(&writer, &processor, 2).await;
+        assert!(writer.delta_path_for("game", 1).exists());
         let file = writer.path_for("game");
         let mut bytes = std::fs::read(&file).unwrap();
         let body_at = ssp::circuit::checkpoint::parse_header(&bytes).unwrap().bodies.start + 2;
@@ -1273,6 +1847,7 @@ mod tests {
         let reader = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing);
         let fresh = Arc::new(RwLock::new(Circuit::new()));
         assert_eq!(reader.load_into(&fresh).await, 1, "the heads check out, the table is served");
+        assert_eq!(fresh.read().await.store.get_collection("game").unwrap().get_row("a").get("n").as_i64(), Some(2));
         (reader, fresh, file)
     }
 
@@ -1280,14 +1855,15 @@ mod tests {
     async fn a_failed_body_check_drops_the_table_and_its_file() {
         let (reader, fresh, file) = mapped_with_a_flipped_body("flipped").await;
         let pending = reader.take_pending();
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.len(), 2, "the base and its delta");
         assert!(reader.take_pending().is_empty(), "handed over once");
         let failed = reader.verify_pending(pending).await;
-        assert_eq!(failed.len(), 1);
+        assert_eq!(failed.len(), 1, "only the base was damaged");
         let dropped = reader.discard_failed(&fresh, failed).await;
         assert_eq!(dropped, vec!["game".to_string()]);
         assert!(fresh.read().await.store.get_collection("game").is_none());
         assert!(!file.exists(), "the file is gone with the table");
+        assert!(!reader.delta_path_for("game", 1).exists(), "and so are its deltas");
         assert!(reader.on_disk.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
@@ -1295,8 +1871,10 @@ mod tests {
     #[tokio::test]
     async fn discard_leaves_a_table_that_no_longer_holds_the_image() {
         let (reader, fresh, file) = mapped_with_a_flipped_body("replaced").await;
-        let failed = reader.verify_pending(reader.take_pending()).await;
-        assert_eq!(failed.len(), 1);
+        let pending = reader.take_pending();
+        assert_eq!(pending.len(), 2, "the base and its delta");
+        let failed = reader.verify_pending(pending).await;
+        assert_eq!(failed.len(), 1, "only the base was damaged");
         // Paged again meanwhile: the table is not the one the file backed.
         {
             let mut c = fresh.write().await;
@@ -1349,7 +1927,7 @@ mod tests {
         let dir = scratch_dir("verified");
         let backing = ArenaBacking::Files { dir: dir.join("arena"), segment_bytes: 64 * 1024 };
         let writer = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing.clone());
-        writer.write(&one_table_circuit(), "test").await;
+        writer.write(&table_circuit(40), "test").await;
         let reader = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing);
         let fresh = Arc::new(RwLock::new(Circuit::new()));
         assert_eq!(reader.load_into(&fresh).await, 1);
@@ -1357,6 +1935,19 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(reader.verify_pending(pending).await.is_empty());
         assert!(fresh.read().await.store.get_collection("game").unwrap().has_row("a"));
+        // A mapped table extends its chain: the delta's rows are appended
+        // past the images, and a whole write copies the images through.
+        change_and_write(&reader, &fresh, 2).await;
+        assert!(reader.delta_path_for("game", 1).exists());
+        for n in 3..=MAX_DELTAS as i64 + 2 {
+            change_and_write(&reader, &fresh, n).await;
+        }
+        assert_eq!(files_of(&dir).iter().filter(|f| f.ends_with(".rows")).count(), 1);
+        assert!(files_of(&dir).iter().all(|f| !f.ends_with(".delta")), "{:?}", files_of(&dir));
+        let again = Arc::new(RwLock::new(Circuit::new()));
+        let reader = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Files { dir: dir.join("arena"), segment_bytes: 64 * 1024 });
+        assert_eq!(reader.load_into(&again).await, 1);
+        assert_eq!(again.read().await.store.get_collection("game").unwrap().get_row("a").get("n").as_i64(), Some(MAX_DELTAS as i64 + 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

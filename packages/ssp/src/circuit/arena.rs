@@ -22,6 +22,26 @@ pub struct Span {
     pub len: u32,
 }
 
+impl Span {
+    /// Where this span starts, in the arena's append order.
+    pub fn start(&self) -> Cursor {
+        Cursor {
+            seg: self.seg,
+            off: self.off,
+        }
+    }
+}
+
+/// A point in an arena's append order: every slot appended at or after it
+/// starts at or past it. Segments are never reused until `clear`, which is
+/// what makes the order total; a checkpoint mark's epoch guards against
+/// `clear` (see `row_table`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Cursor {
+    pub seg: u16,
+    pub off: u32,
+}
+
 /// Append-only byte storage addressed by [`Span`].
 pub trait Arena: std::fmt::Debug + Send + Sync {
     /// Append `bytes`, returning where they landed.
@@ -54,6 +74,9 @@ pub trait Arena: std::fmt::Debug + Send + Sync {
 
     /// Total allocated capacity.
     fn capacity_bytes(&self) -> u64;
+
+    /// Where the next append lands. Monotone until `clear`.
+    fn end_cursor(&self) -> Cursor;
 
     /// Drop everything.
     fn clear(&mut self);
@@ -133,6 +156,13 @@ impl Arena for HeapArena {
 
     fn capacity_bytes(&self) -> u64 {
         self.buf.capacity() as u64
+    }
+
+    fn end_cursor(&self) -> Cursor {
+        Cursor {
+            seg: 0,
+            off: self.buf.len() as u32,
+        }
     }
 
     fn clear(&mut self) {
@@ -485,6 +515,21 @@ impl Arena for MmapArena {
         self.segments.iter().map(|s| s.capacity() as u64).sum()
     }
 
+    fn end_cursor(&self) -> Cursor {
+        // An image, or no segment at all, puts the next append in a segment
+        // that does not exist yet.
+        match self.segments.last() {
+            Some(s) if s.writable() => Cursor {
+                seg: (self.segments.len() - 1) as u16,
+                off: s.written as u32,
+            },
+            _ => Cursor {
+                seg: self.segments.len() as u16,
+                off: 0,
+            },
+        }
+    }
+
     fn clear(&mut self) {
         // Drop every mapping rather than just resetting the write cursor. The
         // bytes stay in a mapping until it is unmapped, so keeping one around
@@ -525,6 +570,20 @@ mod tests {
             a.append(&i.to_le_bytes());
         }
         assert_eq!(a.get(first), b"first");
+    }
+
+    #[test]
+    fn end_cursor_advances_with_appends_and_resets_on_clear() {
+        let mut a = HeapArena::new();
+        assert_eq!(a.end_cursor(), Cursor { seg: 0, off: 0 });
+        let first = a.append(b"12345");
+        assert_eq!(first.start(), Cursor { seg: 0, off: 0 });
+        assert_eq!(a.end_cursor(), Cursor { seg: 0, off: 5 });
+        let second = a.append(b"67");
+        assert!(second.start() >= Cursor { seg: 0, off: 5 });
+        assert!(first.start() < Cursor { seg: 0, off: 5 });
+        a.clear();
+        assert_eq!(a.end_cursor(), Cursor { seg: 0, off: 0 });
     }
 
     #[test]
@@ -800,6 +859,20 @@ mod mmap_tests {
         assert_eq!(a.live_bytes(), 0);
         let again = a.append(b"new");
         assert_eq!(a.get(again), b"new");
+    }
+
+    /// After an image the next append opens a new segment, and the cursor
+    /// says so before it exists.
+    #[test]
+    fn end_cursor_after_an_image_points_at_the_next_segment() {
+        let dir = tmpdir("image-cursor");
+        let image = image_file(&dir, b"0123456789");
+        let mut a = MmapArena::from_images(&dir, "t", 64 * 1024, vec![image]);
+        assert_eq!(a.end_cursor(), Cursor { seg: 1, off: 0 });
+        let s = a.append(b"new");
+        assert_eq!(s.start(), Cursor { seg: 1, off: 0 });
+        assert_eq!(a.end_cursor(), Cursor { seg: 1, off: 3 });
+        assert!(Span { seg: 0, off: 9, len: 1 }.start() < Cursor { seg: 1, off: 0 });
     }
 
     /// Images are segments in the order given; appends land after them.

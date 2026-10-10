@@ -46,6 +46,20 @@
 //! `FORMAT` describes these bytes, not the reader. Bump it only when the
 //! layout changes.
 //!
+//! # Deltas
+//!
+//! A table whose rows change is not written whole every time. A delta is the
+//! same layout with `seq` 1, 2, ... and the base's `image_id`, holding the
+//! rows changed since the previous file (`RowTable::records_since_persisted`)
+//! and a tombstone (a head without a body) for each row deleted; its
+//! `catch-up hash` is the table's whole hash once it is applied and its
+//! `previous hash` the hash the file before it declared, so a chain is
+//! checked before anything is absorbed. The dictionary only ever grows, so
+//! each file's dictionary extends the previous one's. [`load_table`] applies
+//! a base and its deltas in order and refuses a delta that does not chain,
+//! together with everything after it. Store containers hold base images
+//! only; a client never writes a delta.
+//!
 //! # Trust
 //!
 //! A load has three checks. The heads hash, verified over every byte before
@@ -75,6 +89,9 @@
 use crate::circuit::arena::ImageRef;
 use crate::circuit::arena::{Arena, HeapArena};
 use crate::circuit::row_codec::{self as codec, FieldDict, RECORD_FORMAT};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::circuit::row_table::AbsorbInto;
+pub use crate::circuit::row_table::CheckpointMark;
 use crate::circuit::row_table::{IndexedHeads, RowTable};
 use crate::circuit::store::{Collection, Store};
 use std::io::{self, Write};
@@ -174,6 +191,9 @@ pub struct Written {
     pub bodies_bytes: u64,
     pub image_id: ImageId,
     pub seq: u32,
+    /// What the file covers of the table; hand it to
+    /// `RowTable::mark_persisted` once the file is in place.
+    pub mark: CheckpointMark,
 }
 
 /// Everything above the rows.
@@ -189,12 +209,12 @@ struct ImageHeader<'a> {
 /// One row as the writer sees it.
 enum Rec<'a> {
     Row { head: &'a [u8], body: &'a [u8] },
-    #[allow(dead_code)]
     Tombstone(&'a str),
 }
 
 /// Write `coll`'s rows to `out` as a base image carrying `image_id`.
 pub fn write_collection<W: Write>(coll: &Collection, image_id: ImageId, out: W) -> io::Result<Written> {
+    let mark = coll.rows.checkpoint_mark();
     let header = ImageHeader {
         name: &coll.name,
         image_id,
@@ -203,11 +223,58 @@ pub fn write_collection<W: Write>(coll: &Collection, image_id: ImageId, out: W) 
         prev_xor: ssp_protocol::snapshot_hash::xor_empty(),
         field_names: coll.rows.dict().names().collect(),
     };
-    write_image(
+    let mut written = write_image(
         &header,
         || coll.rows.records().map(|(head, body)| Rec::Row { head, body }),
         out,
-    )
+    )?;
+    written.mark = mark;
+    Ok(written)
+}
+
+/// Write delta `seq` of base `base` to `out`: the rows changed since the
+/// table's watermark and a tombstone for each row deleted since. `prev_xor`
+/// is the catch-up hash the file before this one declared, which the loader
+/// checks the chain by. Refused when the table has no watermark: nothing of
+/// it is on disk, so there is nothing to extend.
+pub fn write_delta<W: Write>(
+    coll: &Collection,
+    base: ImageId,
+    seq: u32,
+    prev_xor: [u8; XOR_LEN],
+    out: W,
+) -> io::Result<Written> {
+    if seq == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a delta's seq starts at 1"));
+    }
+    if coll.rows.persisted().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the table has no checkpoint to extend",
+        ));
+    }
+    let mark = coll.rows.checkpoint_mark();
+    let tombstones = coll.rows.tombstones_pending();
+    let header = ImageHeader {
+        name: &coll.name,
+        image_id: base,
+        seq,
+        catchup_xor: coll.catchup_xor,
+        prev_xor,
+        field_names: coll.rows.dict().names().collect(),
+    };
+    let mut written = write_image(
+        &header,
+        || {
+            coll.rows
+                .records_since_persisted()
+                .map(|(head, body)| Rec::Row { head, body })
+                .chain(tombstones.iter().map(|id| Rec::Tombstone(id)))
+        },
+        out,
+    )?;
+    written.mark = mark;
+    Ok(written)
 }
 
 /// The writer behind every image. Three passes over `records` (which must
@@ -301,6 +368,7 @@ where
         bodies_bytes: bodies_len,
         image_id: header.image_id,
         seq: header.seq,
+        mark: CheckpointMark::default(),
     })
 }
 
@@ -650,75 +718,11 @@ pub fn map_image(
     segment_bytes: usize,
     verify: BodyVerify,
 ) -> Result<Mapped, CheckpointError> {
-    let started = web_time::Instant::now();
-    let file = std::fs::File::open(path)?;
-    // SAFETY: the file is opened read-only and the mapping is private. The
-    // one way such a mapping faults is the file being truncated underneath
-    // it, and every writer of these files replaces them by rename, which
-    // leaves the mapped inode intact.
-    let map = unsafe { memmap2::Mmap::map(&file)? };
-    if parse_identity(&map)?.format == legacy::FORMAT_V1 {
-        // Converted into a fresh table of the process's own backing; the
-        // mapping goes, and the next write replaces the file.
-        let collection = legacy::read_v1(&map)?;
-        let stats = LoadStats {
-            bytes: map.len() as u64,
-            heads_ms: ms_since(started),
-            converted: true,
-            ..LoadStats::default()
-        };
-        return Ok(Mapped {
-            collection,
-            stats,
-            pending: None,
-        });
-    }
-    let header = parse_header(&map)?;
-    #[cfg(unix)]
-    let _ = map.advise_range(memmap2::Advice::Sequential, 0, header.heads.end);
-    let ix = index_parsed(&map, header)?;
-    #[cfg(unix)]
-    let _ = map.advise_range(memmap2::Advice::Normal, 0, ix.bodies.start);
-    let heads_ms = ms_since(started);
-
-    let image = ImageRef {
-        map: std::sync::Arc::new(map),
-        file: std::sync::Arc::new(file),
-        bodies: ix.bodies.clone(),
-        bodies_hash: ix.bodies_hash,
-    };
-    let (verify_ms, pending) = match verify {
-        BodyVerify::AtLoad => {
-            let started = web_time::Instant::now();
-            if !verify_bodies(&image, Throttle::none())? {
-                return Err(invalid("bodies checksum mismatch"));
-            }
-            (ms_since(started), None)
-        }
-        BodyVerify::Deferred => (
-            0,
-            Some(PendingVerify {
-                table: ix.name.clone(),
-                path: path.to_path_buf(),
-                image: image.clone(),
-            }),
-        ),
-    };
-    let stats = LoadStats {
-        bytes: image.len() as u64,
-        bodies_bytes: ix.bodies.len() as u64,
-        heads_ms,
-        verify_ms,
-        mapped: true,
-        converted: false,
-        image_id: ix.image_id,
-    };
-    let mut arena = crate::circuit::arena::MmapArena::from_images(dir, &ix.name, segment_bytes, vec![image]);
-    arena.adopt(ix.heads.live);
+    let load = map_table(path, &[], dir, segment_bytes, verify)?;
     Ok(Mapped {
-        collection: assemble(ix, Box::new(arena)),
-        stats,
-        pending,
+        collection: load.collection,
+        stats: load.stats,
+        pending: load.pending.into_iter().next(),
     })
 }
 
@@ -773,14 +777,23 @@ fn stream_bodies(image: &ImageRef, throttle: Throttle, mut f: impl FnMut(&[u8]))
     Ok(())
 }
 
-/// What [`load_file`] produced.
+/// What [`load_table`] produced.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct TableLoad {
     pub collection: Collection,
+    /// `bytes` counts every file applied; `mapped` and `converted` describe
+    /// the base.
     pub stats: LoadStats,
-    /// The bodies still to verify: only a mapped, deferred load has one.
+    pub image_id: ImageId,
+    pub base_bytes: u64,
+    /// `(seq, bytes)` of each delta applied, in order.
+    pub deltas: Vec<(u32, u64)>,
+    /// The first delta refused (its index in the input) and why. It and
+    /// every later one were not applied; the caller removes them.
+    pub refused: Option<(usize, CheckpointError)>,
+    /// The bodies still to verify, one per mapped file, when deferred.
     #[cfg(feature = "mmap-store")]
-    pub pending: Option<PendingVerify>,
+    pub pending: Vec<PendingVerify>,
 }
 
 /// Load the image at `path` the way this process stores rows: mapped when
@@ -788,7 +801,7 @@ pub struct TableLoad {
 /// bodies are always verified at once).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_file(path: &std::path::Path, verify: BodyVerify) -> Result<TableLoad, CheckpointError> {
-    load_file_with(path, verify, crate::circuit::arena::configured_backing())
+    load_table(path, &[], verify, crate::circuit::arena::configured_backing())
 }
 
 /// [`load_file`] for a given backing rather than the process's.
@@ -798,27 +811,408 @@ pub fn load_file_with(
     verify: BodyVerify,
     backing: &crate::circuit::arena::ArenaBacking,
 ) -> Result<TableLoad, CheckpointError> {
+    load_table(path, &[], verify, backing)
+}
+
+/// Load `base` and apply `deltas` in order (module docs). The base failing
+/// is `Err`; a delta failing is reported in `refused`, with the table as it
+/// was before that delta.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_table(
+    base: &std::path::Path,
+    deltas: &[std::path::PathBuf],
+    verify: BodyVerify,
+    backing: &crate::circuit::arena::ArenaBacking,
+) -> Result<TableLoad, CheckpointError> {
     match backing {
         #[cfg(feature = "mmap-store")]
         crate::circuit::arena::ArenaBacking::Files { dir, segment_bytes } => {
-            let mapped = map_image(path, dir, *segment_bytes, verify)?;
-            Ok(TableLoad {
-                collection: mapped.collection,
-                stats: mapped.stats,
-                pending: mapped.pending,
-            })
+            map_table(base, deltas, dir, *segment_bytes, verify)
         }
         _ => {
             let _ = verify;
-            let (collection, stats) = read_image(std::fs::read(path)?)?;
-            Ok(TableLoad {
-                collection,
-                stats,
-                #[cfg(feature = "mmap-store")]
-                pending: None,
-            })
+            read_table(base, deltas)
         }
     }
+}
+
+/// Where a chain of files stands: what the next delta has to declare.
+#[cfg(not(target_arch = "wasm32"))]
+struct Chain {
+    name: String,
+    image_id: ImageId,
+    seq: u32,
+    xor: [u8; XOR_LEN],
+    field_names: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Chain {
+    fn from_base(image: &Image<'_>) -> Self {
+        Self {
+            name: image.name.to_string(),
+            image_id: image.image_id,
+            seq: 0,
+            xor: image.stored_xor,
+            field_names: image.field_names.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    /// Parse a delta's header and check that it is the next link: same
+    /// table, same base, the next seq, chained on this file's hash, a
+    /// dictionary that extends this one. The heads hash is verified; the
+    /// bodies are the caller's business. Nothing of the index is touched.
+    fn check<'a>(&self, bytes: &'a [u8]) -> Result<Image<'a>, CheckpointError> {
+        let identity = parse_identity(bytes)?;
+        if identity.format != FORMAT {
+            return Err(invalid(format!("delta of checkpoint format {}", identity.format)));
+        }
+        let image = parse_image(bytes)?;
+        if image.name != self.name {
+            return Err(invalid("delta of another table"));
+        }
+        if image.image_id != self.image_id {
+            return Err(invalid("delta of another base image"));
+        }
+        if image.seq != self.seq + 1 {
+            return Err(invalid(format!("delta seq {}, expected {}", image.seq, self.seq + 1)));
+        }
+        if image.prev_xor != self.xor {
+            return Err(invalid("delta does not chain to the file before it"));
+        }
+        let extends = image.field_names.len() >= self.field_names.len()
+            && image
+                .field_names
+                .iter()
+                .zip(&self.field_names)
+                .all(|(a, b)| *a == b.as_str());
+        if !extends {
+            return Err(invalid("delta dictionary does not extend the base's"));
+        }
+        Ok(image)
+    }
+
+    fn advance(&mut self, image: &Image<'_>) {
+        self.seq = image.seq;
+        self.xor = image.stored_xor;
+        self.field_names = image.field_names.iter().map(|n| n.to_string()).collect();
+    }
+}
+
+/// Absorb one checked delta into `rows`, extend the dictionary and fold the
+/// hash. `Err` when the rows do not add up to what the delta declares, in
+/// which case the index was already changed.
+#[cfg(not(target_arch = "wasm32"))]
+fn absorb_delta(
+    rows: &mut RowTable,
+    xor: &mut [u8; XOR_LEN],
+    bytes: &[u8],
+    image: &Image<'_>,
+    into: AbsorbInto,
+) -> Result<(), CheckpointError> {
+    let known = rows.dict().len();
+    if !rows.extend_dict(image.field_names.iter().skip(known).copied()) {
+        return Err(invalid("delta dictionary repeats a name"));
+    }
+    let absorbed = rows
+        .absorb(bytes, image.heads.clone(), image.bodies.clone(), image.rows, into)
+        .map_err(|e| invalid(e.to_string()))?;
+    ssp_protocol::snapshot_hash::xor_digest(xor, &absorbed.xor);
+    if *xor != image.stored_xor {
+        return Err(invalid("rows do not add up to the delta's stored catch-up hash"));
+    }
+    Ok(())
+}
+
+/// [`load_table`] on the heap: every file is read whole and its bodies
+/// verified at once, and a delta's records are copied into the arena.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_table(base: &std::path::Path, deltas: &[std::path::PathBuf]) -> Result<TableLoad, CheckpointError> {
+    let started = web_time::Instant::now();
+    let bytes = std::fs::read(base)?;
+    if parse_identity(&bytes)?.format == legacy::FORMAT_V1 {
+        let collection = legacy::read_v1(&bytes)?;
+        let refused = (!deltas.is_empty()).then(|| (0, invalid("a legacy image cannot be extended by deltas")));
+        return Ok(TableLoad {
+            collection,
+            stats: LoadStats {
+                bytes: bytes.len() as u64,
+                heads_ms: ms_since(started),
+                converted: true,
+                ..LoadStats::default()
+            },
+            image_id: 0,
+            base_bytes: bytes.len() as u64,
+            deltas: Vec::new(),
+            refused,
+            #[cfg(feature = "mmap-store")]
+            pending: Vec::new(),
+        });
+    }
+    let header = parse_header(&bytes)?;
+    let mut chain = Chain::from_base(&header);
+    let ix = index_parsed(&bytes, header)?;
+    let heads_ms = ms_since(started);
+    let started = web_time::Instant::now();
+    if blake3::hash(&bytes[ix.bodies.clone()]).as_bytes() != &ix.bodies_hash {
+        return Err(invalid("bodies checksum mismatch"));
+    }
+    let mut verify_ms = ms_since(started);
+    let (base_bytes, bodies_bytes, image_id) = (bytes.len() as u64, ix.bodies.len() as u64, ix.image_id);
+    let mut xor = ix.stored_xor;
+    let live = ix.heads.live;
+    let (name, dict, index) = (ix.name, ix.dict, ix.heads.index);
+    let mut rows = RowTable::from_parts(dict, index, Box::new(HeapArena::from_buf(bytes, live)));
+
+    let mut applied = Vec::new();
+    let mut refused = None;
+    let mut total = base_bytes;
+    for (k, path) in deltas.iter().enumerate() {
+        let outcome = (|| {
+            let delta = std::fs::read(path)?;
+            let image = chain.check(&delta)?;
+            let started = web_time::Instant::now();
+            if blake3::hash(&delta[image.bodies.clone()]).as_bytes() != &image.bodies_hash {
+                return Err(invalid("bodies checksum mismatch"));
+            }
+            verify_ms += ms_since(started);
+            absorb_delta(&mut rows, &mut xor, &delta, &image, AbsorbInto::Copy)?;
+            chain.advance(&image);
+            Ok::<_, CheckpointError>((image.seq, delta.len() as u64))
+        })();
+        match outcome {
+            Ok((seq, bytes)) => {
+                applied.push((seq, bytes));
+                total += bytes;
+            }
+            Err(e) => {
+                // The hash check is the one failure that leaves the index
+                // changed: start over with the files before this one.
+                if xor != chain.xor {
+                    let mut shorter = read_table(base, &deltas[..k])?;
+                    shorter.refused = Some((k, e));
+                    return Ok(shorter);
+                }
+                refused = Some((k, e));
+                break;
+            }
+        }
+    }
+    rows.set_persisted_at_end();
+    Ok(TableLoad {
+        collection: Collection::from_rows(name, rows, xor),
+        stats: LoadStats {
+            bytes: total,
+            bodies_bytes,
+            heads_ms,
+            verify_ms,
+            mapped: false,
+            converted: false,
+            image_id,
+        },
+        image_id,
+        base_bytes,
+        deltas: applied,
+        refused,
+        #[cfg(feature = "mmap-store")]
+        pending: Vec::new(),
+    })
+}
+
+/// [`load_table`] over mappings: the base and every accepted delta become
+/// the arena's first segments (see [`map_image`] for what a mapped load
+/// reads and does not read).
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+fn map_table(
+    base: &std::path::Path,
+    deltas: &[std::path::PathBuf],
+    dir: &std::path::Path,
+    segment_bytes: usize,
+    verify: BodyVerify,
+) -> Result<TableLoad, CheckpointError> {
+    let started = web_time::Instant::now();
+    let (file, map) = open_mapped(base)?;
+    if parse_identity(&map)?.format == legacy::FORMAT_V1 {
+        // Converted into a fresh table of the process's own backing; the
+        // mapping goes, and the next write replaces the file.
+        let collection = legacy::read_v1(&map)?;
+        let refused = (!deltas.is_empty()).then(|| (0, invalid("a legacy image cannot be extended by deltas")));
+        return Ok(TableLoad {
+            collection,
+            stats: LoadStats {
+                bytes: map.len() as u64,
+                heads_ms: ms_since(started),
+                converted: true,
+                ..LoadStats::default()
+            },
+            image_id: 0,
+            base_bytes: map.len() as u64,
+            deltas: Vec::new(),
+            refused,
+            pending: Vec::new(),
+        });
+    }
+    let header = parse_header(&map)?;
+    #[cfg(unix)]
+    let _ = map.advise_range(memmap2::Advice::Sequential, 0, header.heads.end);
+    let mut chain = Chain::from_base(&header);
+    let ix = index_parsed(&map, header)?;
+    #[cfg(unix)]
+    let _ = map.advise_range(memmap2::Advice::Normal, 0, ix.bodies.start);
+    let base_image = ImageRef {
+        map: std::sync::Arc::new(map),
+        file: std::sync::Arc::new(file),
+        bodies: ix.bodies.clone(),
+        bodies_hash: ix.bodies_hash,
+    };
+
+    // Every delta that chains, checked before anything is absorbed; the
+    // first that does not ends the chain.
+    struct Link {
+        image: ImageRef,
+        heads: Range<usize>,
+        rows: u64,
+        seq: u32,
+        stored_xor: [u8; XOR_LEN],
+        field_names: Vec<String>,
+    }
+    let mut links: Vec<Link> = Vec::new();
+    let mut refused = None;
+    let mut verify_ms = 0;
+    for (k, path) in deltas.iter().enumerate() {
+        let outcome = (|| {
+            let (file, map) = open_mapped(path)?;
+            let (heads, bodies, rows, seq, stored_xor, bodies_hash, field_names) = {
+                let image = chain.check(&map)?;
+                chain.advance(&image);
+                (
+                    image.heads.clone(),
+                    image.bodies.clone(),
+                    image.rows,
+                    image.seq,
+                    image.stored_xor,
+                    image.bodies_hash,
+                    image.field_names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                )
+            };
+            let link = Link {
+                heads,
+                rows,
+                seq,
+                stored_xor,
+                field_names,
+                image: ImageRef {
+                    bodies,
+                    bodies_hash,
+                    map: std::sync::Arc::new(map),
+                    file: std::sync::Arc::new(file),
+                },
+            };
+            if verify == BodyVerify::AtLoad {
+                let started = web_time::Instant::now();
+                if !verify_bodies(&link.image, Throttle::none())? {
+                    return Err(invalid("bodies checksum mismatch"));
+                }
+                verify_ms += ms_since(started);
+            }
+            Ok::<_, CheckpointError>(link)
+        })();
+        match outcome {
+            Ok(link) => links.push(link),
+            Err(e) => {
+                refused = Some((k, e));
+                break;
+            }
+        }
+    }
+    let heads_ms = ms_since(started);
+
+    if verify == BodyVerify::AtLoad {
+        let started = web_time::Instant::now();
+        if !verify_bodies(&base_image, Throttle::none())? {
+            return Err(invalid("bodies checksum mismatch"));
+        }
+        verify_ms += ms_since(started);
+    }
+    let mut pending = Vec::new();
+    if verify == BodyVerify::Deferred {
+        pending.push(PendingVerify {
+            table: ix.name.clone(),
+            path: base.to_path_buf(),
+            image: base_image.clone(),
+        });
+        for (k, link) in links.iter().enumerate() {
+            pending.push(PendingVerify {
+                table: ix.name.clone(),
+                path: deltas[k].clone(),
+                image: link.image.clone(),
+            });
+        }
+    }
+
+    let (base_bytes, bodies_bytes, image_id) = (base_image.len() as u64, ix.bodies.len() as u64, ix.image_id);
+    let mut images = vec![base_image];
+    images.extend(links.iter().map(|l| l.image.clone()));
+    let mut arena = crate::circuit::arena::MmapArena::from_images(dir, &ix.name, segment_bytes, images);
+    arena.adopt(ix.heads.live);
+    let mut xor = ix.stored_xor;
+    let (name, dict, index) = (ix.name, ix.dict, ix.heads.index);
+    let mut rows = RowTable::from_parts(dict, index, Box::new(arena));
+    let mut applied = Vec::new();
+    let mut total = base_bytes;
+    for (k, link) in links.iter().enumerate() {
+        let image = Image {
+            name: &name,
+            record_format: RECORD_FORMAT,
+            image_id,
+            seq: link.seq,
+            stored_xor: link.stored_xor,
+            prev_xor: [0; XOR_LEN],
+            field_names: link.field_names.iter().map(|n| n.as_str()).collect(),
+            rows: link.rows,
+            heads: link.heads.clone(),
+            bodies: link.image.bodies.clone(),
+            bodies_hash: link.image.bodies_hash,
+        };
+        if let Err(e) = absorb_delta(&mut rows, &mut xor, &link.image.map, &image, AbsorbInto::Segment((k + 1) as u16)) {
+            // The index is already changed: start over with the files
+            // before this one.
+            let mut shorter = map_table(base, &deltas[..k], dir, segment_bytes, verify)?;
+            shorter.refused = Some((k, e));
+            return Ok(shorter);
+        }
+        applied.push((link.seq, link.image.len() as u64));
+        total += link.image.len() as u64;
+    }
+    rows.set_persisted_at_end();
+    Ok(TableLoad {
+        collection: Collection::from_rows(name, rows, xor),
+        stats: LoadStats {
+            bytes: total,
+            bodies_bytes,
+            heads_ms,
+            verify_ms,
+            mapped: true,
+            converted: false,
+            image_id,
+        },
+        image_id,
+        base_bytes,
+        deltas: applied,
+        refused,
+        pending,
+    })
+}
+
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+fn open_mapped(path: &std::path::Path) -> io::Result<(std::fs::File, memmap2::Mmap)> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: the file is opened read-only and the mapping is private. The
+    // one way such a mapping faults is the file being truncated underneath
+    // it, and every writer of these files replaces them by rename, which
+    // leaves the mapped inode intact.
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    Ok((file, map))
 }
 
 fn ms_since(started: web_time::Instant) -> u64 {
@@ -1619,6 +2013,289 @@ mod tests {
         );
     }
 
+    /// Write `coll` as a base, then as deltas after each `mutate`, each file
+    /// marking the table persisted as the writer would.
+    fn chain_of(coll: &mut Collection, dir: &std::path::Path, mutations: &[&dyn Fn(&mut Collection)]) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let base = dir.join("game.rows");
+        let mut out = std::fs::File::create(&base).unwrap();
+        let written = write_collection(coll, ID, &mut out).unwrap();
+        assert!(coll.rows.mark_persisted(written.mark));
+        let mut prev_xor = coll.catchup_xor;
+        let mut deltas = Vec::new();
+        for (i, mutate) in mutations.iter().enumerate() {
+            mutate(coll);
+            let path = dir.join(format!("game.{:06}.delta", i + 1));
+            let mut out = std::fs::File::create(&path).unwrap();
+            let written = write_delta(coll, ID, (i + 1) as u32, prev_xor, &mut out).unwrap();
+            assert_eq!(written.seq, (i + 1) as u32);
+            assert!(coll.rows.mark_persisted(written.mark));
+            prev_xor = coll.catchup_xor;
+            deltas.push(path);
+        }
+        (base, deltas)
+    }
+
+    fn heap() -> crate::circuit::arena::ArenaBacking {
+        crate::circuit::arena::ArenaBacking::Heap
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ssp-delta-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn assert_same_rows(back: &Collection, expected: &Collection) {
+        assert_eq!(back.rows.len(), expected.rows.len());
+        assert_eq!(back.catchup_xor, expected.catchup_xor);
+        for id in expected.rows.keys() {
+            assert_eq!(back.get_row(id).to_owned_value(), expected.get_row(id).to_owned_value(), "{id}");
+            assert_eq!(back.rows.digest_of(id), expected.rows.digest_of(id), "{id}");
+            assert_eq!(back.rows.rv_of(id), expected.rows.rv_of(id), "{id}");
+        }
+        let mut reseeded = back.clone();
+        reseeded.reseed_catchup_xor();
+        assert_eq!(reseeded.catchup_xor, back.catchup_xor, "the folded hash is the rows' hash");
+    }
+
+    #[test]
+    fn write_delta_then_load_table_round_trips() {
+        let dir = scratch("round-trip");
+        let mut coll = collection(&[("a", json!({ "v": 1 })), ("b", json!({ "v": 1, "_00_rv": 2 }))]);
+        let (base, deltas) = chain_of(
+            &mut coll,
+            &dir,
+            &[
+                &|c| {
+                    c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2, "fresh": "field" })));
+                    c.apply(Operation::Create, "c", Sp00kyValue::from(json!({ "v": 3 })));
+                },
+                &|c| {
+                    c.apply(Operation::Delete, "b", Sp00kyValue::Null);
+                },
+            ],
+        );
+        let load = load_table(&base, &deltas, BodyVerify::AtLoad, &heap()).unwrap();
+        assert!(load.refused.is_none());
+        assert_eq!(load.deltas.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(load.image_id, ID);
+        assert_eq!(load.stats.bytes, load.base_bytes + load.deltas.iter().map(|(_, b)| b).sum::<u64>());
+        assert_same_rows(&load.collection, &coll);
+        assert!(load.collection.rows.persisted().is_some(), "the files are the watermark");
+        assert!(load.collection.rows.records_since_persisted().next().is_none());
+        // A delta's dictionary extended the base's: the new field reads.
+        assert_eq!(load.collection.get_row("a").get("fresh").as_str(), Some("field"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delta_carries_only_the_changed_rows_and_the_tombstones() {
+        let dir = scratch("content");
+        let mut coll = collection(&[("a", json!({ "v": 1 })), ("b", json!({ "v": 1 })), ("c", json!({ "v": 1 }))]);
+        let (_, deltas) = chain_of(
+            &mut coll,
+            &dir,
+            &[&|c| {
+                c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 })));
+                c.apply(Operation::Delete, "b", Sp00kyValue::Null);
+                c.apply(Operation::Create, "d", Sp00kyValue::from(json!({ "v": 4 })));
+                c.apply(Operation::Delete, "d", Sp00kyValue::Null);
+            }],
+        );
+        let bytes = std::fs::read(&deltas[0]).unwrap();
+        let image = parse_image(&bytes).unwrap();
+        assert_eq!(image.seq, 1);
+        assert_eq!(image.image_id, ID);
+        assert_eq!(image.rows, 3, "a updated, b deleted, d created and deleted (a tombstone the loader ignores)");
+        let heads = &bytes[image.heads.clone()];
+        let mut seen = Vec::new();
+        let mut at = 0;
+        while at < heads.len() {
+            let len = codec::head_len(&heads[at..]).unwrap();
+            let head = &heads[at..at + len];
+            seen.push((codec::head_id(head).unwrap().to_string(), codec::head_body_len(head).unwrap() == 0));
+            at += len;
+        }
+        seen.sort();
+        assert_eq!(seen, vec![("a".to_string(), false), ("b".to_string(), true), ("d".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_then_recreated_row_is_an_upsert_with_no_tombstone() {
+        let dir = scratch("recreated");
+        let mut coll = collection(&[("a", json!({ "v": 1 }))]);
+        let (base, deltas) = chain_of(
+            &mut coll,
+            &dir,
+            &[&|c| {
+                c.apply(Operation::Delete, "a", Sp00kyValue::Null);
+                c.apply(Operation::Create, "a", Sp00kyValue::from(json!({ "v": 2 })));
+            }],
+        );
+        let image_rows = parse_image(&std::fs::read(&deltas[0]).unwrap()).unwrap().rows;
+        assert_eq!(image_rows, 1);
+        let load = load_table(&base, &deltas, BodyVerify::AtLoad, &heap()).unwrap();
+        assert_same_rows(&load.collection, &coll);
+        assert_eq!(load.collection.get_row("a").get("v").as_i64(), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_overridden_by_delta_1_and_deleted_by_delta_2_is_gone() {
+        let dir = scratch("override-delete");
+        let mut coll = collection(&[("a", json!({ "v": 1 })), ("keep", json!({ "v": 1 }))]);
+        let (base, deltas) = chain_of(
+            &mut coll,
+            &dir,
+            &[
+                &|c| {
+                    c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 })));
+                },
+                &|c| {
+                    c.apply(Operation::Delete, "a", Sp00kyValue::Null);
+                },
+            ],
+        );
+        let load = load_table(&base, &deltas, BodyVerify::AtLoad, &heap()).unwrap();
+        assert_same_rows(&load.collection, &coll);
+        assert!(!load.collection.has_row("a"));
+        assert!(load.collection.has_row("keep"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delta_of_a_foreign_image_id_is_refused_before_absorbing() {
+        let dir = scratch("foreign");
+        let mut coll = collection(&[("a", json!({ "v": 1 }))]);
+        let (base, _) = chain_of(&mut coll, &dir, &[]);
+        let before = coll.clone();
+        coll.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 })));
+        let foreign = dir.join("game.000001.delta");
+        let mut out = std::fs::File::create(&foreign).unwrap();
+        write_delta(&coll, ID + 1, 1, before.catchup_xor, &mut out).unwrap();
+        let load = load_table(&base, &[foreign], BodyVerify::AtLoad, &heap()).unwrap();
+        let (k, err) = load.refused.expect("refused");
+        assert_eq!(k, 0);
+        assert!(err.to_string().contains("another base"), "{err}");
+        assert!(load.deltas.is_empty());
+        assert_same_rows(&load.collection, &before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delta_that_does_not_chain_is_refused() {
+        let dir = scratch("chain");
+        let mut coll = collection(&[("a", json!({ "v": 1 }))]);
+        let (base, _) = chain_of(&mut coll, &dir, &[]);
+        let before = coll.clone();
+        coll.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 })));
+        let mut wrong = before.catchup_xor;
+        wrong[0] ^= 1;
+        let delta = dir.join("game.000001.delta");
+        write_delta(&coll, ID, 1, wrong, &mut std::fs::File::create(&delta).unwrap()).unwrap();
+        let load = load_table(&base, &[delta], BodyVerify::AtLoad, &heap()).unwrap();
+        let (_, err) = load.refused.expect("refused");
+        assert!(err.to_string().contains("chain"), "{err}");
+        assert_same_rows(&load.collection, &before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seq_gap_refuses_that_delta_and_every_later_one() {
+        let dir = scratch("gap");
+        let mut coll = collection(&[("a", json!({ "v": 1 }))]);
+        let (base, deltas) = chain_of(
+            &mut coll,
+            &dir,
+            &[
+                &|c| c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 }))).weight.clone_from(&0),
+                &|c| c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 3 }))).weight.clone_from(&0),
+                &|c| c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 4 }))).weight.clone_from(&0),
+            ],
+        );
+        // What the table looked like after delta 1.
+        let after_one = load_table(&base, &deltas[..1], BodyVerify::AtLoad, &heap()).unwrap().collection.catchup_xor;
+        let with_gap = vec![deltas[0].clone(), deltas[2].clone()];
+        let load = load_table(&base, &with_gap, BodyVerify::AtLoad, &heap()).unwrap();
+        let (k, err) = load.refused.expect("refused");
+        assert_eq!(k, 1);
+        assert!(err.to_string().contains("seq"), "{err}");
+        assert_eq!(load.deltas.len(), 1);
+        assert_eq!(load.collection.catchup_xor, after_one);
+        assert_eq!(load.collection.get_row("a").get("v").as_i64(), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delta_whose_dictionary_does_not_extend_the_base_is_refused() {
+        let dir = scratch("dict");
+        let mut coll = collection(&[("a", json!({ "v": 1 }))]);
+        let (base, _) = chain_of(&mut coll, &dir, &[]);
+        // A delta written from a table whose dictionary starts differently:
+        // `w` interned first, then `v`, where the base has `v` alone.
+        let mut other = Collection::new("game".to_string());
+        other.apply(Operation::Create, "w-first", Sp00kyValue::from(json!({ "w": 1 })));
+        other.apply(Operation::Create, "a", Sp00kyValue::from(json!({ "v": 1 })));
+        assert_eq!(other.rows.dict().names().collect::<Vec<_>>(), vec!["w", "v"]);
+        let mark = other.rows.checkpoint_mark();
+        other.rows.mark_persisted(mark);
+        other.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "w": 2 })));
+        let delta = dir.join("game.000001.delta");
+        write_delta(&other, ID, 1, coll.catchup_xor, &mut std::fs::File::create(&delta).unwrap()).unwrap();
+        let load = load_table(&base, &[delta], BodyVerify::AtLoad, &heap()).unwrap();
+        let (_, err) = load.refused.expect("refused");
+        assert!(err.to_string().contains("dictionary"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_delta_is_refused_and_the_table_keeps_the_files_before_it() {
+        let dir = scratch("corrupt-delta");
+        let mut coll = collection(&[("a", json!({ "v": 1 })), ("b", json!({ "s": "a longer body to flip" }))]);
+        let (base, deltas) = chain_of(
+            &mut coll,
+            &dir,
+            &[
+                &|c| c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 }))).weight.clone_from(&0),
+                &|c| c.apply(Operation::Update, "b", Sp00kyValue::from(json!({ "s": "another longer body" }))).weight.clone_from(&0),
+            ],
+        );
+        let after_one = load_table(&base, &deltas[..1], BodyVerify::AtLoad, &heap()).unwrap().collection.catchup_xor;
+        let mut bytes = std::fs::read(&deltas[1]).unwrap();
+        let body_at = parse_header(&bytes).unwrap().bodies.start + 3;
+        bytes[body_at] ^= 0x40;
+        std::fs::write(&deltas[1], &bytes).unwrap();
+        let load = load_table(&base, &deltas, BodyVerify::AtLoad, &heap()).unwrap();
+        let (k, err) = load.refused.expect("refused");
+        assert_eq!(k, 1);
+        assert!(err.to_string().contains("bodies"), "{err}");
+        assert_eq!(load.collection.catchup_xor, after_one);
+        // A delta whose stored hash does not describe its rows is found
+        // after absorbing, and the table is rebuilt without it.
+        let mut bytes = std::fs::read(&deltas[1]).unwrap();
+        let body_at = parse_header(&bytes).unwrap().bodies.start + 3;
+        bytes[body_at] ^= 0x40;
+        bytes[36] ^= 1;
+        reseal(&mut bytes);
+        std::fs::write(&deltas[1], &bytes).unwrap();
+        let load = load_table(&base, &deltas, BodyVerify::AtLoad, &heap()).unwrap();
+        let (k, err) = load.refused.expect("refused");
+        assert_eq!(k, 1);
+        assert!(err.to_string().contains("add up"), "{err}");
+        assert_eq!(load.collection.catchup_xor, after_one);
+        assert_eq!(load.collection.get_row("b").get("s").as_str(), Some("a longer body to flip"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_delta_needs_a_watermark() {
+        let coll = collection(&[("a", json!({ "v": 1 }))]);
+        let err = write_delta(&coll, ID, 1, ssp_protocol::snapshot_hash::xor_empty(), &mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
     #[test]
     fn image_ids_are_fresh_per_write_and_stable_per_content() {
         let coll = collection(&[("a", json!({ "n": 1 }))]);
@@ -1845,6 +2522,50 @@ mod tests {
             assert!(mapped.pending.is_none(), "the file was verified whole on the way");
             assert_converted(&mapped.collection, &fixture_collection(), "mapped");
             assert!(mapped.collection.rows.image(0).is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Mapped base and deltas keep serving after the files are renamed
+        /// over and unlinked, and appends land past the watermark.
+        #[test]
+        fn a_mapped_chain_keeps_reading_after_the_files_are_replaced() {
+            let dir = tmpdir("chain");
+            let mut coll = collection(&[("a", json!({ "v": 1 })), ("b", json!({ "v": 1 }))]);
+            let (base, deltas) = chain_of(
+                &mut coll,
+                &dir,
+                &[
+                    &|c| c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 }))).weight.clone_from(&0),
+                    &|c| c.apply(Operation::Delete, "b", Sp00kyValue::Null).weight.clone_from(&0),
+                ],
+            );
+            let backing = crate::circuit::arena::ArenaBacking::Files { dir: dir.join("arena"), segment_bytes: 64 * 1024 };
+            let load = load_table(&base, &deltas, BodyVerify::Deferred, &backing).unwrap();
+            assert!(load.refused.is_none());
+            assert_eq!(load.pending.len(), 3, "the base and both deltas await verification");
+            assert!(load.stats.mapped);
+            assert_same_rows(&load.collection, &coll);
+            let mut table = load.collection;
+            assert!(table.rows.image(0).is_some() && table.rows.image(2).is_some() && table.rows.image(3).is_none());
+
+            // Replace and unlink every file; the mappings serve on.
+            for path in std::iter::once(&base).chain(&deltas) {
+                std::fs::write(path.with_extension("tmp"), b"replaced").unwrap();
+                std::fs::rename(path.with_extension("tmp"), path).unwrap();
+                std::fs::remove_file(path).unwrap();
+            }
+            assert_eq!(table.get_row("a").get("v").as_i64(), Some(2));
+            assert!(!table.has_row("b"));
+            for p in &load.pending {
+                assert_eq!(verify_bodies(&p.image, Throttle::none()).unwrap(), true, "{}", p.path.display());
+            }
+
+            // Appends go past the watermark: a delta of them has them alone.
+            table.apply(Operation::Create, "c", Sp00kyValue::from(json!({ "v": 3 })));
+            table.apply(Operation::Delete, "a", Sp00kyValue::Null);
+            let since: Vec<&str> = table.rows.records_since_persisted().map(|(h, _)| codec::head_id(h).unwrap()).collect();
+            assert_eq!(since, vec!["c"]);
+            assert_eq!(table.rows.tombstones_pending(), vec!["a"]);
             let _ = std::fs::remove_dir_all(&dir);
         }
 

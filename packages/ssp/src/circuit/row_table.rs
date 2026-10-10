@@ -33,7 +33,7 @@
 //! heads together, so loading one is a walk over the heads that leaves the
 //! bodies on disk until a row is read.
 
-use crate::circuit::arena::{Arena, HeapArena, Span};
+use crate::circuit::arena::{Arena, Cursor, HeapArena, Span};
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
 use crate::circuit::arena::ImageRef;
 use crate::circuit::row_codec::{self as codec, FieldDict};
@@ -115,6 +115,51 @@ fn body_of(head: &[u8], slot: RowSlot) -> Option<Span> {
     })
 }
 
+/// Bound on the tombstones kept between two checkpoints. Past it the table
+/// forgets its watermark, and the next checkpoint is a full image: a standby
+/// never writes, so its list would otherwise grow for the whole handover.
+const MAX_TOMBSTONES: usize = if cfg!(test) { 64 } else { 1 << 20 };
+
+/// What one checkpoint covers: the arena's end and the tombstones recorded
+/// at the time the records were read, under the same lock. Applied with
+/// [`RowTable::mark_persisted`] once the file is in place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckpointMark {
+    epoch: u64,
+    cursor: Cursor,
+    tombstones: usize,
+}
+
+fn next_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Where a delta's records go when it is absorbed.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(all(feature = "mmap-store", not(target_arch = "wasm32"))), allow(dead_code))]
+pub(crate) enum AbsorbInto {
+    /// The records already lie in this arena segment (a mapped delta).
+    Segment(u16),
+    /// Copy each record into the arena (the heap backing has one buffer).
+    Copy,
+}
+
+/// What [`RowTable::absorb`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) struct Absorbed {
+    /// The net change to the catch-up hash: every digest replaced or removed
+    /// XORed with every digest added.
+    pub xor: [u8; codec::DIGEST_LEN],
+    pub upserts: u64,
+    pub tombstones: u64,
+    /// Tombstones for ids the table did not hold: a row created and deleted
+    /// between two checkpoints leaves one, and it means nothing.
+    pub tombstones_absent: u64,
+}
+
 /// Rows of one table.
 #[derive(Debug)]
 pub struct RowTable {
@@ -126,6 +171,19 @@ pub struct RowTable {
     /// Reused encode buffer, so a steady stream of writes does not allocate
     /// one per row.
     scratch: Vec<u8>,
+    /// Identity of this arena's contents: fresh per table, bumped by `clear`.
+    /// A checkpoint mark of another epoch describes bytes that are gone.
+    epoch: u64,
+    /// Up to where the rows are in the checkpoint files. `None`: nothing of
+    /// this arena is on disk, and the next checkpoint has to be a full image.
+    /// Rows appended past it are exactly what a delta carries; no per-row
+    /// bookkeeping, since the arena only ever appends.
+    persisted: Option<Cursor>,
+    /// Ids removed while `persisted` was set, in order. A superset of what a
+    /// delta needs: a row created and removed between two checkpoints lands
+    /// here too, and the loader takes a tombstone for an absent id as a
+    /// no-op.
+    tombstones: Vec<Box<str>>,
 }
 
 /// Hash of a record id, used as the index key.
@@ -160,6 +218,9 @@ impl RowTable {
             index: HashTable::new(),
             arena,
             scratch: Vec::new(),
+            epoch: next_epoch(),
+            persisted: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -172,7 +233,175 @@ impl RowTable {
             index,
             arena,
             scratch: Vec::new(),
+            epoch: next_epoch(),
+            persisted: None,
+            tombstones: Vec::new(),
         }
+    }
+
+    /// Up to where this table's rows are in the checkpoint files, if any of
+    /// this arena is.
+    pub fn persisted(&self) -> Option<Cursor> {
+        self.persisted
+    }
+
+    /// The mark a checkpoint written now would set: the end of the arena and
+    /// every tombstone recorded so far. Take it under the lock the records
+    /// are read under.
+    pub fn checkpoint_mark(&self) -> CheckpointMark {
+        CheckpointMark {
+            epoch: self.epoch,
+            cursor: self.arena.end_cursor(),
+            tombstones: self.tombstones.len(),
+        }
+    }
+
+    /// Live rows at or past the watermark, i.e. what a delta carries. Every
+    /// row while nothing is persisted.
+    pub fn records_since_persisted(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        let since = self.persisted;
+        let arena = &*self.arena;
+        self.index.iter().filter_map(move |slot| {
+            if since.is_some_and(|cursor| slot.start() < cursor) {
+                return None;
+            }
+            let head = arena.get(*slot);
+            if head.is_empty() {
+                return None;
+            }
+            let body = arena.get(body_of(head, *slot)?);
+            Some((head, body))
+        })
+    }
+
+    /// Ids removed since the watermark that are not live now, each once.
+    pub fn tombstones_pending(&self) -> Vec<&str> {
+        let mut seen = std::collections::HashSet::new();
+        self.tombstones
+            .iter()
+            .map(|id| &**id)
+            .filter(|id| seen.insert(*id) && !self.contains_key(id))
+            .collect()
+    }
+
+    /// The checkpoint `mark` describes is on disk. `false`, and nothing
+    /// changed, when the mark is of another epoch: the table was cleared or
+    /// replaced since it was taken, and the next checkpoint starts over.
+    pub fn mark_persisted(&mut self, mark: CheckpointMark) -> bool {
+        if mark.epoch != self.epoch {
+            return false;
+        }
+        self.persisted = Some(mark.cursor);
+        self.tombstones.drain(..mark.tombstones.min(self.tombstones.len()));
+        true
+    }
+
+    /// For a loader: the arena's current contents are the files.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn set_persisted_at_end(&mut self) {
+        self.persisted = Some(self.arena.end_cursor());
+        self.tombstones.clear();
+    }
+
+    /// Intern `names` in order after the dictionary's current names, the way
+    /// a delta's dictionary extends its base's. `false` when a name was
+    /// already there, which would put the ids out of step with the records.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn extend_dict<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> bool {
+        for name in names {
+            let expected = self.dict.len() as u32;
+            if self.dict.intern(name) != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Apply one delta's heads in file order: a head with a body replaces or
+    /// adds its row, a head without one removes it. The bodies must tile
+    /// `bodies` in head order, as in [`Self::index_heads`]. Returns the net
+    /// change to the catch-up hash, for the caller to fold in and compare.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn absorb(
+        &mut self,
+        image: &[u8],
+        heads: Range<usize>,
+        bodies: Range<usize>,
+        rows: u64,
+        into: AbsorbInto,
+    ) -> Result<Absorbed, BlockError> {
+        if heads.start > heads.end
+            || heads.end > bodies.start
+            || bodies.start > bodies.end
+            || bodies.end > image.len()
+        {
+            return Err(BlockError::Truncated);
+        }
+        if bodies.end > u32::MAX as usize {
+            return Err(BlockError::TooLarge);
+        }
+        if rows > (heads.end - heads.start) as u64 / codec::HEAD_MIN_LEN as u64 {
+            return Err(BlockError::TooManyRows);
+        }
+        let mut out = Absorbed {
+            xor: ssp_protocol::snapshot_hash::xor_empty(),
+            ..Absorbed::default()
+        };
+        let (mut at, mut next_body) = (heads.start, bodies.start);
+        for n in 0..rows {
+            let head_len = codec::head_len(&image[at..heads.end]).ok_or(BlockError::Truncated)?;
+            let head = &image[at..at + head_len];
+            let id = codec::head_id(head).ok_or(BlockError::BadRecord(n))?;
+            let digest = *codec::head_digest(head).ok_or(BlockError::BadRecord(n))?;
+            let rel = codec::head_body_rel(head).ok_or(BlockError::BadRecord(n))? as usize;
+            let len = codec::head_body_len(head).ok_or(BlockError::BadRecord(n))? as usize;
+            if len == 0 {
+                match self.digest_of(id) {
+                    Some(old) => {
+                        ssp_protocol::snapshot_hash::xor_digest(&mut out.xor, &old);
+                        self.remove_slot(id);
+                        out.tombstones += 1;
+                    }
+                    None => out.tombstones_absent += 1,
+                }
+                at += head_len;
+                continue;
+            }
+            if rel < head_len || at + rel != next_body || next_body + len > bodies.end {
+                return Err(BlockError::BadBody(n));
+            }
+            if let Some(old) = self.digest_of(id) {
+                ssp_protocol::snapshot_hash::xor_digest(&mut out.xor, &old);
+            }
+            ssp_protocol::snapshot_hash::xor_digest(&mut out.xor, &digest);
+            let slot = match into {
+                AbsorbInto::Segment(seg) => {
+                    self.arena.adopt((head_len + len) as u64);
+                    Span {
+                        seg,
+                        off: at as u32,
+                        len: head_len as u32,
+                    }
+                }
+                AbsorbInto::Copy => {
+                    let mut scratch = std::mem::take(&mut self.scratch);
+                    scratch.clear();
+                    codec::relink_head(head, head_len as u32, &mut scratch);
+                    scratch.extend_from_slice(&image[next_body..next_body + len]);
+                    let slot = self.append_record(&scratch, head_len);
+                    self.scratch = scratch;
+                    slot
+                }
+            };
+            self.place(id, slot);
+            out.upserts += 1;
+            at += head_len;
+            next_body += len;
+        }
+        if at != heads.end || next_body != bodies.end {
+            return Err(BlockError::TrailingBytes);
+        }
+        Ok(out)
     }
 
     /// Index the `rows` heads that fill `block[heads]`, whose bodies tile
@@ -536,6 +765,21 @@ impl RowTable {
 
     /// Remove a row. Returns whether it was present.
     pub fn remove(&mut self, id: &str) -> bool {
+        if !self.remove_slot(id) {
+            return false;
+        }
+        if self.persisted.is_some() {
+            self.tombstones.push(id.into());
+            if self.tombstones.len() > MAX_TOMBSTONES {
+                self.persisted = None;
+                self.tombstones.clear();
+            }
+        }
+        true
+    }
+
+    /// Drop `id`'s slot and free its bytes, leaving no tombstone.
+    fn remove_slot(&mut self, id: &str) -> bool {
         let arena = &*self.arena;
         let Ok(entry) = self
             .index
@@ -552,6 +796,9 @@ impl RowTable {
         self.index.clear();
         self.arena.clear();
         self.dict = FieldDict::new();
+        self.epoch = next_epoch();
+        self.persisted = None;
+        self.tombstones.clear();
     }
 
     /// Iterate `(raw_id, row)` pairs. Order is unspecified.
@@ -574,6 +821,23 @@ impl RowTable {
         self.arena.image(seg)
     }
 
+    /// Every checkpoint image the arena holds, in segment order: the base
+    /// and its deltas after a mapped load.
+    #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+    pub fn images(&self) -> Vec<ImageRef> {
+        (0..u16::MAX)
+            .map_while(|seg| self.arena.image(seg).cloned())
+            .collect()
+    }
+
+    /// Whether `image`'s mapping is one of this table's segments.
+    #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+    pub fn holds_image(&self, image: &ImageRef) -> bool {
+        (0..u16::MAX)
+            .map_while(|seg| self.arena.image(seg))
+            .any(|held| held.same_mapping(image))
+    }
+
     /// Heap held by the index: the id strings and the bucket array. Reported
     /// apart from the arena because this is the part that does not shrink.
     /// The index holds only slots — the ids live in the arena — so this is the
@@ -594,7 +858,9 @@ impl RowTable {
 
     /// Total approximate heap for this table's rows.
     pub fn heap_bytes(&self) -> usize {
-        self.index_bytes() + self.arena_bytes() + self.dict_bytes()
+        let tombstones = crate::size::vec_bytes::<Box<str>>(self.tombstones.capacity())
+            + self.tombstones.iter().map(|id| id.len()).sum::<usize>();
+        self.index_bytes() + self.arena_bytes() + self.dict_bytes() + tombstones
     }
 
     /// Bytes orphaned by updates and deletes — what a compaction pass would
@@ -1115,6 +1381,175 @@ mod tests {
     }
 
     #[test]
+    fn records_since_persisted_is_everything_until_marked_then_only_new_slots() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        put(&mut t, "b", json!({ "v": 1 }));
+        assert_eq!(t.persisted(), None);
+        assert_eq!(t.records_since_persisted().count(), 2, "nothing persisted: every row");
+        let mark = t.checkpoint_mark();
+        assert!(t.mark_persisted(mark));
+        assert!(t.persisted().is_some());
+        assert_eq!(t.records_since_persisted().count(), 0);
+        put(&mut t, "c", json!({ "v": 1 }));
+        let since: Vec<&str> = t.records_since_persisted().map(|(h, _)| codec::head_id(h).unwrap()).collect();
+        assert_eq!(since, vec!["c"]);
+    }
+
+    #[test]
+    fn an_update_after_the_mark_is_one_record_even_if_updated_twice() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        let mark = t.checkpoint_mark();
+        t.mark_persisted(mark);
+        put(&mut t, "a", json!({ "v": 2 }));
+        put(&mut t, "a", json!({ "v": 3 }));
+        let since: Vec<(&str, i64)> = t
+            .records_since_persisted()
+            .map(|(h, b)| (codec::head_id(h).unwrap(), codec::decode_value(b, t.dict()).unwrap().get("v").unwrap().as_i64().unwrap()))
+            .collect();
+        assert_eq!(since, vec![("a", 3)]);
+        assert!(t.tombstones_pending().is_empty(), "an update is no tombstone");
+    }
+
+    #[test]
+    fn remove_records_a_tombstone_only_while_something_is_persisted() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        t.remove("a");
+        assert_eq!(t.checkpoint_mark().tombstones, 0, "nothing persisted, nothing to tombstone");
+        put(&mut t, "b", json!({ "v": 1 }));
+        let mark = t.checkpoint_mark();
+        t.mark_persisted(mark);
+        t.remove("b");
+        assert_eq!(t.checkpoint_mark().tombstones, 1);
+        assert_eq!(t.tombstones_pending(), vec!["b"]);
+        // Persisted, updated, deleted: the base holds it, so it needs one.
+        put(&mut t, "c", json!({ "v": 1 }));
+        let mark = t.checkpoint_mark();
+        t.mark_persisted(mark);
+        put(&mut t, "c", json!({ "v": 2 }));
+        t.remove("c");
+        assert_eq!(t.tombstones_pending(), vec!["c"]);
+    }
+
+    #[test]
+    fn tombstones_pending_skips_recreated_ids_and_dedupes() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        put(&mut t, "b", json!({ "v": 1 }));
+        let mark = t.checkpoint_mark();
+        t.mark_persisted(mark);
+        t.remove("a");
+        put(&mut t, "a", json!({ "v": 2 }));
+        t.remove("b");
+        put(&mut t, "b", json!({ "v": 2 }));
+        t.remove("b");
+        assert_eq!(t.checkpoint_mark().tombstones, 3);
+        assert_eq!(t.tombstones_pending(), vec!["b"], "a is live again; b once");
+        let since: Vec<&str> = t.records_since_persisted().map(|(h, _)| codec::head_id(h).unwrap()).collect();
+        assert_eq!(since, vec!["a"]);
+    }
+
+    #[test]
+    fn mark_persisted_drains_only_the_tombstones_it_covers() {
+        let mut t = RowTable::new();
+        for id in ["a", "b", "c"] {
+            put(&mut t, id, json!({ "v": 1 }));
+        }
+        let mark = t.checkpoint_mark();
+        t.mark_persisted(mark);
+        t.remove("a");
+        t.remove("b");
+        let mark = t.checkpoint_mark();
+        assert_eq!(mark.tombstones, 2);
+        t.remove("c");
+        assert!(t.mark_persisted(mark));
+        assert_eq!(t.tombstones_pending(), vec!["c"], "the one recorded after the mark remains");
+    }
+
+    #[test]
+    fn clear_starts_a_new_epoch_and_a_stale_mark_is_refused() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        let mark = t.checkpoint_mark();
+        t.clear();
+        assert!(!t.mark_persisted(mark), "the bytes the mark described are gone");
+        assert_eq!(t.persisted(), None);
+        let other = RowTable::new();
+        let foreign = other.checkpoint_mark();
+        assert!(!t.mark_persisted(foreign), "another table's mark");
+        assert!(!t.mark_persisted(CheckpointMark::default()), "the default mark belongs to no table");
+    }
+
+    #[test]
+    fn too_many_tombstones_force_a_full_checkpoint() {
+        let mut t = RowTable::new();
+        for i in 0..=MAX_TOMBSTONES {
+            put(&mut t, &format!("r{i}"), json!({ "v": 1 }));
+        }
+        let mark = t.checkpoint_mark();
+        t.mark_persisted(mark);
+        for i in 0..MAX_TOMBSTONES {
+            t.remove(&format!("r{i}"));
+        }
+        assert!(t.persisted().is_some());
+        t.remove(&format!("r{MAX_TOMBSTONES}"));
+        assert_eq!(t.persisted(), None, "past the cap the watermark goes");
+        assert_eq!(t.checkpoint_mark().tombstones, 0);
+    }
+
+    /// A delta image absorbed by copying: upserts replace or add, tombstones
+    /// remove, absent tombstones do nothing, and the folded hash equals the
+    /// one a table built by plain inserts carries.
+    #[test]
+    fn absorb_copy_upserts_tombstones_and_folds_the_hash() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        put(&mut t, "b", json!({ "v": 1 }));
+        put(&mut t, "c", json!({ "v": 1 }));
+        let mut xor = ssp_protocol::snapshot_hash::xor_empty();
+        for h in t.heads() {
+            ssp_protocol::snapshot_hash::xor_digest(&mut xor, codec::head_digest(h).unwrap());
+        }
+
+        // The delta: a replaced, d added, b and the absent z removed.
+        let mut src = RowTable::new();
+        assert!(src.restore_dict(t.dict().names()));
+        put(&mut src, "a", json!({ "v": 2 }));
+        put(&mut src, "d", json!({ "v": 4, "w": "new field" }));
+        let mut records: Vec<(Vec<u8>, Vec<u8>)> = src.records().map(|(h, b)| (h.to_vec(), b.to_vec())).collect();
+        records.sort();
+        let mut tomb = Vec::new();
+        for id in ["b", "z"] {
+            let mut head = Vec::new();
+            codec::encode_head(id, &[0; codec::DIGEST_LEN], codec::RV_ABSENT, 0, 0, &mut head);
+            tomb.push((head, Vec::new()));
+        }
+        records.extend(tomb);
+        let refs: Vec<(&[u8], &[u8])> = records.iter().map(|(h, b)| (h.as_slice(), b.as_slice())).collect();
+        let (block, heads, bodies) = split_image(&refs);
+
+        assert!(t.extend_dict(src.dict().names().skip(t.dict().len())));
+        let absorbed = t.absorb(&block, heads, bodies, 4, AbsorbInto::Copy).unwrap();
+        assert_eq!((absorbed.upserts, absorbed.tombstones, absorbed.tombstones_absent), (2, 1, 1));
+        ssp_protocol::snapshot_hash::xor_digest(&mut xor, &absorbed.xor);
+
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get("a").get("v").as_i64(), Some(2));
+        assert_eq!(t.get("d").get("w").as_str(), Some("new field"));
+        assert!(t.get("b").is_missing());
+        let mut fresh = ssp_protocol::snapshot_hash::xor_empty();
+        for h in t.heads() {
+            ssp_protocol::snapshot_hash::xor_digest(&mut fresh, codec::head_digest(h).unwrap());
+        }
+        assert_eq!(xor, fresh, "the folded hash is the table's hash");
+        assert_eq!(t.digest_of("a"), src.digest_of("a"));
+        let (head, body) = t.records().map(|(h, b)| (h.len() as u64, b.len() as u64)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(t.live_bytes(), head + body, "accounting is exact after an absorb");
+    }
+
+    #[test]
     fn field_names_are_stored_once_per_table_not_once_per_row() {
         // The entire point of the dictionary. 200 rows sharing 4 field names
         // must intern 4 entries, not 800.
@@ -1130,6 +1565,15 @@ mod tests {
         for name in ["alpha", "beta", "gamma", "delta"] {
             assert!(t.dict().id_of(name).is_some(), "{name} interned");
         }
+    }
+
+    #[test]
+    fn extend_dict_appends_in_order_and_refuses_repeats() {
+        let mut t = RowTable::new();
+        assert!(t.restore_dict(["a", "b"]));
+        assert!(t.extend_dict(["c", "d"]));
+        assert_eq!(t.dict().id_of("d"), Some(3));
+        assert!(!t.extend_dict(["b"]), "a name already interned would not get the next id");
     }
 
     #[test]

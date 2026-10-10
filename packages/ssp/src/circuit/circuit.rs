@@ -200,7 +200,14 @@ pub struct Circuit {
     /// Per-table secondary index definitions (`TableMeta::indexes`), what
     /// `build_graph` plans index-backed sources from.
     index_defs: HashMap<String, Vec<crate::circuit::index::IndexDef>>,
+    /// How long a built index outlives its last reader; see
+    /// [`Collection::release_indexes`].
+    index_idle_release: std::time::Duration,
 }
+
+/// How long a built index outlives its last reader before
+/// [`Circuit::release_unused_indexes`] frees it.
+pub const INDEX_IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// One table's schema as the circuit uses it, read from upstream DDL: the
 /// select permission from `DEFINE TABLE`, the rest from `INFO FOR TABLE`.
@@ -441,6 +448,7 @@ impl Circuit {
             projection: false,
             missing_fields: BTreeMap::new(),
             index_defs: HashMap::new(),
+            index_idle_release: INDEX_IDLE_RELEASE,
         }
     }
 
@@ -627,7 +635,8 @@ impl Circuit {
         stats
     }
 
-    /// Drop every built index no registered graph reads any more.
+    /// Drop the built indexes no registered graph reads any more (see
+    /// [`Collection::release_indexes`] for when).
     fn release_unused_indexes(&mut self) {
         let mut used: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
         for graph in self.graphs.values() {
@@ -636,9 +645,44 @@ impl Circuit {
             }
         }
         let empty = std::collections::BTreeSet::new();
+        let now = Instant::now();
         for (name, coll) in self.store.collections.iter_mut() {
-            coll.release_indexes_except(used.get(name).unwrap_or(&empty));
+            let defined: std::collections::BTreeSet<String> = self
+                .index_defs
+                .get(name)
+                .map(|defs| defs.iter().map(|d| d.name.clone()).collect())
+                .unwrap_or_default();
+            coll.release_indexes(used.get(name).unwrap_or(&empty), &defined, now, self.index_idle_release);
         }
+    }
+
+    /// See [`INDEX_IDLE_RELEASE`].
+    pub fn set_index_idle_release(&mut self, grace: std::time::Duration) {
+        self.index_idle_release = grace;
+    }
+
+    /// Every built index, by table: what a restart rebuilds before it serves
+    /// (see [`Self::prebuild_indexes`]).
+    pub fn built_indexes(&self) -> BTreeMap<String, Vec<String>> {
+        self.store
+            .collections
+            .iter()
+            .map(|(table, coll)| (table.clone(), coll.built_indexes()))
+            .filter(|(_, names)| !names.is_empty())
+            .collect()
+    }
+
+    /// Build the named indexes the schema still defines and return how many
+    /// were built. A restart calls this with what the previous process held
+    /// ([`Self::built_indexes`]) before it serves, so a list someone opened
+    /// before a deploy does not pay the build, under the circuit lock, on
+    /// its first window after.
+    pub fn prebuild_indexes(&self, wanted: &BTreeMap<String, Vec<String>>) -> IndexBuildStats {
+        self.prewarm_index_uses(
+            wanted
+                .iter()
+                .flat_map(|(table, names)| names.iter().map(move |name| (table.clone(), name.clone()))),
+        )
     }
 
     /// Drop a table this circuit no longer syncs: its rows and its schema.
@@ -1803,6 +1847,7 @@ impl Circuit {
             projection: false,
             missing_fields: BTreeMap::new(),
             index_defs: HashMap::new(),
+            index_idle_release: INDEX_IDLE_RELEASE,
         };
 
         for qs in state.queries {
@@ -5513,7 +5558,14 @@ mod index_tests {
         c.remove_query("sparse");
         assert_eq!(c.store.get_collection("game").unwrap().built_indexes(), vec!["game_database_sort"]);
         c.remove_query("hot");
-        assert!(c.store.get_collection("game").unwrap().built_indexes().is_empty(), "final view releases the index");
+        assert_eq!(
+            c.store.get_collection("game").unwrap().built_indexes(),
+            vec!["game_database_sort"],
+            "the final view leaves the index warm for the idle grace"
+        );
+        c.set_index_idle_release(std::time::Duration::ZERO);
+        c.release_unused_indexes();
+        assert!(c.store.get_collection("game").unwrap().built_indexes().is_empty(), "released past the grace");
         assert_eq!(c.prewarm_query_indexes(&plan("again"), Some(&empty_params)).indexes_built, 1);
     }
 
@@ -5767,8 +5819,37 @@ mod index_tests {
         }
     }
 
+    /// `prewarm_query_indexes` builds what a registration would, ahead of it, and
+    /// `compact` keeps an index whose fields every row still holds.
     #[test]
-    fn unregistering_the_last_reader_releases_the_index() {
+    fn indexes_build_ahead_of_registration_and_survive_compaction() {
+        let mut c = Circuit::new();
+        c.set_projection(true);
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        let (id, plan, params, _) = views().into_iter().next().unwrap();
+        let plan = QueryPlan { id: id.into(), root: plan };
+        // Projection is decided by the registered plans; register first so
+        // rows keep the indexed fields, then drop and re-prepare.
+        c.add_query_with_auth(plan.clone(), Some(params.clone()), None, String::new());
+        for i in 0..30 {
+            c.step(ChangeSet {
+                changes: vec![Change::create("game", &format!("g{i}"), json!({ "database": "game_database:d1", "sort_index": i, "title": "x" }))],
+            });
+        }
+        c.set_index_idle_release(std::time::Duration::ZERO);
+        c.remove_query(id);
+        assert!(c.store.get_collection("game").unwrap().built_indexes().is_empty());
+        assert_eq!(c.prewarm_query_indexes(&plan, Some(&params)).indexes_built, 1);
+        assert_eq!(c.prewarm_query_indexes(&plan, Some(&params)).indexes_built, 0, "already built");
+        c.add_query_with_auth(plan, Some(params), None, String::new());
+        assert_eq!(c.view_keys(id).len(), 7);
+        c.store.collections.get_mut("game").unwrap().compact();
+        assert_eq!(c.store.get_collection("game").unwrap().built_indexes(), vec!["game_database_sort".to_string()]);
+    }
+
+    #[test]
+    fn an_index_outlives_its_last_reader_by_the_grace_then_goes() {
         let mut circuit = Circuit::new();
         circuit.store.ensure_collection("game");
         circuit.set_table_meta("game", meta(game_indexes()));
@@ -5784,6 +5865,15 @@ mod index_tests {
         assert_eq!(circuit.view_keys(id).len(), 7);
         assert!(!circuit.store.get_collection("game").unwrap().built_indexes().is_empty());
         circuit.remove_query(id);
+        // Still warm for the next window a moment later...
+        assert_eq!(circuit.built_indexes()["game"], vec!["game_database_sort".to_string()]);
+        // ...and freed once it has sat unused past the grace.
+        circuit.set_index_idle_release(std::time::Duration::ZERO);
+        circuit.release_unused_indexes();
         assert!(circuit.store.get_collection("game").unwrap().built_indexes().is_empty());
+        // A restart rebuilds what the previous process held.
+        let held = BTreeMap::from([("game".to_string(), vec!["game_database_sort".to_string(), "gone".to_string()])]);
+        assert_eq!(circuit.prebuild_indexes(&held).indexes_built, 1);
+        assert_eq!(circuit.prebuild_indexes(&held).indexes_built, 0);
     }
 }

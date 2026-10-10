@@ -1916,6 +1916,18 @@ impl ClusterBoot {
                     // refreshes the allowlist): its predecessor's edges stand
                     // until `POST /handover/promote` compares digests.
                     let standby = node.is_standby();
+                    // Rebuild the indexes the previous process held before
+                    // serving: a list opened before the restart would
+                    // otherwise pay the build, a pass over its whole table
+                    // under the circuit lock, on its first window after.
+                    if let Some(rows) = row_checkpoints.as_deref() {
+                        let wanted = rows.read_built_indexes();
+                        if !wanted.is_empty() {
+                            let started = std::time::Instant::now();
+                            let built = processor.read().await.prebuild_indexes(&wanted).indexes_built;
+                            info!(built, ms = started.elapsed().as_millis() as u64, "Rebuilt the indexes the previous process held");
+                        }
+                    }
                     let republish_started = std::time::Instant::now();
                     if let Err(e) = node.republish_restored_views().await {
                         error!(error = %e, "Bootstrap membership repair failed");

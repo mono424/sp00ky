@@ -213,9 +213,29 @@ impl Collection {
         index
     }
 
-    /// Drop every built index whose name is not in `keep`.
-    pub fn release_indexes_except(&mut self, keep: &BTreeSet<String>) {
-        self.indexes.get_mut().retain(|name, _| keep.contains(name));
+    /// Drop the built indexes no graph needs: at once when the schema no
+    /// longer `defined` them, after `grace` unused when it still does. Views
+    /// come and go all the time (a scrolled-away window unregisters), and a
+    /// rebuild is a pass over the whole table, so an index outlives its last
+    /// reader for a while in case the next one is a moment away.
+    pub fn release_indexes(
+        &mut self,
+        used: &BTreeSet<String>,
+        defined: &BTreeSet<String>,
+        now: web_time::Instant,
+        grace: std::time::Duration,
+    ) {
+        self.indexes.get_mut().retain(|name, index| {
+            if used.contains(name) {
+                index.idle_since = None;
+                return true;
+            }
+            if !defined.contains(name) {
+                return false;
+            }
+            let since = *index.idle_since.get_or_insert(now);
+            now.duration_since(since) < grace
+        });
     }
 
     /// See the `writes` field.
@@ -328,8 +348,18 @@ impl Collection {
     /// the hot path (a checkpoint, an idle timer) and only when
     /// `rows.dead_bytes()` is worth it.
     pub fn compact(&mut self) {
-        // A narrowed projection can drop indexed fields; rebuild on next use.
-        self.indexes.get_mut().clear();
+        // Re-projecting drops the fields no view evaluates. An index on such a
+        // field would hold values its rows no longer have, so it goes (rebuilt
+        // on next use); every other index still matches its rows exactly and
+        // is kept, since rebuilding one costs a pass over the whole table.
+        if let Some(keep) = &self.retained {
+            self.indexes.get_mut().retain(|_, index| {
+                index.def.fields.iter().all(|field| {
+                    let root = field.split('.').next().unwrap_or(field);
+                    keep.contains(root) || ALWAYS_RETAINED.contains(&root)
+                })
+            });
+        }
         self.writes += 1;
         let decoded: Vec<(String, Sp00kyValue)> = self
             .rows

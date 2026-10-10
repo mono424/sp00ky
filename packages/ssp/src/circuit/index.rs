@@ -129,6 +129,9 @@ pub struct OrderedIndex {
     entries: BTreeSet<(IndexKey, RowKey)>,
     /// Heap the entries point at; see [`Self::bytes`].
     heap: usize,
+    /// Since when no graph has read this index; see
+    /// [`super::store::Collection::release_indexes`].
+    pub(crate) idle_since: Option<web_time::Instant>,
 }
 
 fn entry_heap(key: &IndexKey, row: &RowKey) -> usize {
@@ -145,7 +148,7 @@ fn entry_heap(key: &IndexKey, row: &RowKey) -> usize {
 impl OrderedIndex {
     pub(crate) fn new(def: IndexDef) -> Self {
         let paths = def.paths();
-        Self { def, paths, entries: BTreeSet::new(), heap: 0 }
+        Self { def, paths, entries: BTreeSet::new(), heap: 0, idle_since: None }
     }
 
     /// The key `row` files under. `id` is the record key, not a body field,

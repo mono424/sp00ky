@@ -132,6 +132,11 @@ pub const POST_BOOTSTRAP_WRITE_DELAY: Duration = Duration::from_secs(120);
 /// died); younger ones may belong to the other instance sharing the directory.
 const STALE_TMP_AGE: Duration = Duration::from_secs(600);
 
+/// The secondary indexes the circuit held at the last checkpoint, by table,
+/// next to the row files. Not a `.rows`/`.delta` name, so the table listing
+/// skips it.
+const INDEXES_FILE: &str = "indexes.json";
+
 /// Whether this process may write checkpoints right now. See
 /// [`RowCheckpoints::set_gate`].
 pub type WriteGate = Box<dyn Fn() -> bool + Send + Sync>;
@@ -448,6 +453,7 @@ impl RowCheckpoints {
         // (name, hash, whether nothing of the table's arena is on disk)
         let held: Vec<(String, [u8; 32], bool)> = {
             let circuit = processor.read().await;
+            self.write_built_indexes(&circuit.built_indexes());
             circuit
                 .store
                 .collections
@@ -665,6 +671,30 @@ impl RowCheckpoints {
     }
 
     /// Delete every checkpoint, for a clean restart.
+    /// What [`Self::write`] last recorded of the circuit's built indexes; a
+    /// bootstrap rebuilds these before it serves (`Circuit::prebuild_indexes`).
+    pub fn read_built_indexes(&self) -> BTreeMap<String, Vec<String>> {
+        std::fs::read(self.dir.join(INDEXES_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_built_indexes(&self, built: &BTreeMap<String, Vec<String>>) {
+        let path = self.dir.join(INDEXES_FILE);
+        if built.is_empty() && !path.exists() {
+            return;
+        }
+        let tmp = tmp_path_for(&path);
+        let written = serde_json::to_vec(built)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&tmp, bytes))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            warn!(error = %e, "Could not record the built indexes for the next restart");
+        }
+    }
+
     pub fn clear(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
@@ -1960,6 +1990,29 @@ mod tests {
         std::fs::write(standby.delta_path_for("game", 5), b"the predecessor's tail").unwrap();
         change_and_write(&standby, &standby_circuit, 9).await;
         assert_eq!(files_of(&dir), vec!["game.000001.delta".to_string(), "game.000002.delta".to_string(), "game.rows".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint records the built indexes, and the next process's
+    /// bootstrap reads them back to rebuild before it serves.
+    #[tokio::test]
+    async fn a_checkpoint_records_the_built_indexes() {
+        use ssp::circuit::index::IndexDef;
+        use ssp::circuit::TableMeta;
+        let dir = scratch_dir("indexes");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let processor = table_circuit(10);
+        let def = IndexDef { name: "game_n".into(), fields: vec!["n".into()] };
+        {
+            let mut c = processor.write().await;
+            c.set_table_meta("game", TableMeta { permission: "true".into(), indexes: vec![def.clone()], ..Default::default() });
+        }
+        checkpoints.write(&processor, "test").await;
+        assert!(checkpoints.read_built_indexes().is_empty(), "nothing built, nothing recorded");
+        let wanted = BTreeMap::from([("game".to_string(), vec!["game_n".to_string()])]);
+        assert_eq!(processor.read().await.prebuild_indexes(&wanted).indexes_built, 1);
+        change_and_write(&checkpoints, &processor, 2).await;
+        assert_eq!(checkpoints.read_built_indexes(), wanted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -643,7 +643,7 @@ and <code>whole_tables</code>; the final replay logs <code>since_verify_ms</code
 <h3 id="message-buffering">Message Buffering</h3>
 <p>While an SSP is bootstrapping, the scheduler buffers incoming messages:</p>
 <ul>
-<li>Maximum buffer size: 10,000 messages per SSP (configurable via <code>max_buffer_per_ssp</code>)</li>
+<li>Maximum buffer size: 50,000 messages per SSP (<code>max_buffer_per_ssp</code> in <code>sp00ky.yml</code>, or <code>SPKY_MAX_BUFFER_PER_SSP</code>). A registration always starts with an empty buffer, so an overflow is reported once and the re-bootstrap it asks for begins clean</li>
 <li>Buffer exists both globally (event_buffer) and per-SSP</li>
 <li>If buffer overflows: SSP marked for re-bootstrap, buffer cleared</li>
 <li>Heartbeat returns <code>409 Conflict</code> when buffer overflow occurs</li>
@@ -773,7 +773,7 @@ if it tries to register again, so the two never serve side by side.</p>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># SSP polling and buffering (the poll is how the scheduler learns a</span></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># bootstrapping SSP is ready, so its interval is paid on every restart)</span></span>
 <span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">ssp_poll_interval_ms</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">500</span></span>
-<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">max_buffer_per_ssp</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">10000</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">max_buffer_per_ssp</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">50000</span></span>
 <span class="line"></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Snapshot update interval (seconds)</span></span>
 <span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">snapshot_update_interval_secs</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">300</span></span>
@@ -808,8 +808,9 @@ if it tries to register again, so the two never serve side by side.</p>
 <p>Every other field (<code>ingest_host</code>, <code>ingest_port</code>, <code>load_balance</code>,
 <code>heartbeat_*</code>, <code>bootstrap_chunk_size</code>, <code>bootstrap_timeout_secs</code>,
 <code>replica_db_path</code>, <code>wal_path</code>, <code>ssp_poll_interval_ms</code>,
-<code>max_buffer_per_ssp</code>, <code>job_tables</code>) is set via <code>sp00ky.yml</code>. There
-is no env-var override path for them.</p>
+<code>max_buffer_per_ssp</code>, <code>job_tables</code>) is set via <code>sp00ky.yml</code>. Only
+<code>bootstrap_timeout_secs</code> (<code>SPKY_BOOTSTRAP_TIMEOUT_SECS</code>) and <code>max_buffer_per_ssp</code>
+(<code>SPKY_MAX_BUFFER_PER_SSP</code>) also answer to an environment variable.</p>
 <hr/>
 <h2 id="error-handling">Error Handling</h2>
 <h3 id="common-status-codes">Common Status Codes</h3>

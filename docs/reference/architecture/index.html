@@ -169,7 +169,7 @@
 <li>SSPs send heartbeats every 5 seconds (configurable) with <code>views</code> count, CPU, and memory usage</li>
 <li>Scheduler marks SSPs as stale after 15 seconds without heartbeat (configurable)</li>
 <li>Stale SSPs are removed from the pool</li>
-<li>Maximum buffer size per SSP: 10,000 messages (configurable via <code>max_buffer_per_ssp</code>)</li>
+<li>Maximum buffer size per SSP: 50,000 messages (<code>max_buffer_per_ssp</code>, or <code>SPKY_MAX_BUFFER_PER_SSP</code>); every registration starts with an empty buffer</li>
 <li>Queries are reassigned to healthy SSPs</li>
 </ul>
 <hr/>

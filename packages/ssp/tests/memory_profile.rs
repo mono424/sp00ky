@@ -64,7 +64,9 @@ fn load_rows(n: usize) -> (Circuit, usize) {
 /// Baseline on the flat-encoded store, measured 2026-08-11: **624 B/row
 /// against ~327 B of source JSON, a 1.9x blowup**, down from 2054 B/row and
 /// 6.3x on the parsed-`Sp00kyValue` store it replaced. Confirmed against real
-/// RSS on 200k rows: 508 MB peak before, 175 MB after.
+/// RSS on 200k rows: 508 MB peak before, 175 MB after. The split head/body
+/// record (2026-10-09) adds the body pointer, 8 B/row, in exchange for a
+/// checkpoint load that never touches a body.
 ///
 /// Of what remains, the encoded bodies dominate. The id index is broken out
 /// separately by [`index_is_the_anonymous_floor`], because it is the part that
@@ -73,7 +75,7 @@ fn load_rows(n: usize) -> (Circuit, usize) {
 #[ignore = "allocates ~100MB and takes seconds; run with --ignored"]
 fn store_bytes_per_row_stays_under_budget() {
     const ROWS: usize = 50_000;
-    const MAX_BYTES_PER_ROW: f64 = 620.0;
+    const MAX_BYTES_PER_ROW: f64 = 628.0;
 
     let (circuit, json_bytes) = load_rows(ROWS);
     let report = circuit.size_report();

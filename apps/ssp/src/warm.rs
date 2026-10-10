@@ -158,8 +158,8 @@ impl RowCheckpoints {
         let rows: usize = loaded.tables.iter().map(|(c, _)| c.rows.len()).sum();
         let bytes: u64 = loaded.tables.iter().map(|(_, s)| s.bytes).sum();
         let mapped = loaded.tables.iter().filter(|(_, s)| s.mapped).count();
+        let heads_ms: u64 = loaded.tables.iter().map(|(_, s)| s.heads_ms).sum();
         let verify_ms: u64 = loaded.tables.iter().map(|(_, s)| s.verify_ms).sum();
-        let index_ms: u64 = loaded.tables.iter().map(|(_, s)| s.index_ms).sum();
         let install_started = Instant::now();
         {
             let mut circuit = processor.write().await;
@@ -178,8 +178,8 @@ impl RowCheckpoints {
                 mapped,
                 copied = tables - mapped,
                 discarded = loaded.discarded,
+                heads_ms,
                 verify_ms,
-                index_ms,
                 install_ms,
                 ms = started.elapsed().as_millis() as u64,
                 "Loaded row checkpoint"
@@ -241,7 +241,7 @@ impl RowCheckpoints {
                 let encode_started = Instant::now();
                 let file = std::fs::File::create(&tmp)?;
                 let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-                let w = write_collection(coll, &mut out)?;
+                let w = write_collection(coll, ssp::circuit::checkpoint::fresh_image_id(), &mut out)?;
                 // Release the circuit before the fsync: a flush to disk can
                 // take seconds and ingest has no reason to wait for it.
                 drop(guard);
@@ -434,15 +434,16 @@ fn read_dir_tables(dir: &Path) -> Loaded {
             continue;
         }
         let started = Instant::now();
-        match load_file(&path) {
-            Ok((coll, stats)) => {
+        match load_file(&path, ssp::circuit::checkpoint::BodyVerify::AtLoad) {
+            Ok(load) => {
+                let (coll, stats) = (load.collection, load.stats);
                 debug!(
                     table = %coll.name,
                     rows = coll.rows.len(),
                     bytes = stats.bytes,
                     mapped = stats.mapped,
+                    heads_ms = stats.heads_ms,
                     verify_ms = stats.verify_ms,
-                    index_ms = stats.index_ms,
                     ms = started.elapsed().as_millis() as u64,
                     "Loaded row checkpoint table"
                 );

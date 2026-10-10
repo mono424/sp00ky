@@ -6,14 +6,16 @@
 //! upstream schema. That is also what keeps them right, since operator state
 //! is a function of the rows and registering a view primes it from them.
 //!
-//! Records are written exactly as the row table holds them, next to the field
-//! dictionary they were encoded against. Writing is a copy of bytes. Reading
-//! does not copy them back: the file's bytes BECOME the table's arena, either
+//! Records are written as the row table holds them, next to the field
+//! dictionary they were encoded against, with the heads of every row in one
+//! region and the bodies in another. Writing is a copy of bytes. Reading does
+//! not copy them back: the file's bytes BECOME the table's arena, either
 //! mapped read-only ([`map_image`]) or adopted as the heap buffer
-//! ([`read_image`]), and the index is rebuilt by one walk over the records
-//! that reads nothing but each record's id and its stored digest. That walk
-//! is what turned a 629k-row load from seconds of per-row copies and
-//! allocations into a hash insert per row.
+//! ([`read_image`]), and the index is rebuilt by one walk over the heads that
+//! reads each row's id and stored digest and never touches a body. A mapped
+//! load therefore costs the heads (about 75 bytes a row) and leaves the
+//! bodies on disk until a row is read; on whitepawn that is 57 MB of a
+//! 1.15 GB checkpoint, where reading all of it cold took 6 s.
 //!
 //! # Layout
 //!
@@ -21,53 +23,84 @@
 //! [8]   magic "SPKYROWS"
 //! [u32] checkpoint format       FORMAT
 //! [u32] record format           row_codec::RECORD_FORMAT
+//! [u64] image id                fresh per base image; a delta carries its base's
+//! [u32] seq                     0 for a base image, 1.. for a delta
 //! [u32 len][bytes]              table name
-//! [32]  catch-up hash           the collection's XOR set-hash at write time
+//! [32]  catch-up hash           the collection's XOR set-hash once this file is applied
+//! [32]  previous hash           the file before this one in a chain; the empty hash for a base
 //! [u32] field count, then per field [u32 len][bytes]   dictionary, id order
-//! [u64] row count, then per row [u32 len][bytes]       raw records
-//! [32]  blake3 of every byte above
+//! [u64] row count  [u64] heads length  [u64] bodies length
+//! heads                         one head per row, back to back (row_codec)
+//! bodies                        one body per row, back to back, in head order
+//! [32]  blake3 of every byte before the bodies
+//! [32]  blake3 of the bodies
 //! ```
 //!
-//! Integers are little-endian. `FORMAT` describes these bytes, not the reader:
-//! the readers here changed from copying to mapping without the number moving,
-//! so a file written by either build loads in either. Bump it only when the
+//! Integers are little-endian. The first 28 bytes identify a file without
+//! reading the rest ([`peek_identity`]). A head's `body_rel` is the distance
+//! from that head to its body in the file, so a mapped file reads exactly
+//! like an in-memory record. Heads precede bodies, which keeps the distance
+//! positive; it and every offset is a `u32`, so an image is at most 4 GiB
+//! and the writer refuses a larger table rather than wrap.
+//!
+//! `FORMAT` describes these bytes, not the reader. Bump it only when the
 //! layout changes.
 //!
 //! # Trust
 //!
-//! A read has two independent checks: the blake3 trailer, verified over the
-//! whole file before anything else is parsed, catches torn or flipped bytes;
-//! and the catch-up hash XOR-folded from the loaded records' digests has to
-//! equal the one stored, which catches a writer whose accumulator had
-//! drifted. Neither makes the rows *right*: the scheduler's per-table hash at
-//! registration decides whether a loaded table is kept, repaired or paged. A
-//! checkpoint is trusted for time, never for correctness.
+//! A load has three checks. The heads hash, verified over every byte before
+//! the bodies before anything else is trusted, catches a torn or flipped
+//! byte in the header, the dictionary or a head. The walk over the heads then
+//! requires the bodies to tile their region exactly in head order, so the
+//! bodies hash covers exactly the bytes a row can read, and XOR-folds the
+//! stored digests into a catch-up hash that has to equal the one stored,
+//! which catches a writer whose accumulator had drifted. The bodies hash is
+//! the third check. A heap load ([`read_image`]) runs it at once, the bytes
+//! being in memory anyway. A mapped load may defer it
+//! ([`BodyVerify::Deferred`]): the table is served while [`verify_bodies`]
+//! streams the bodies through, sequentially, which is also what warms the
+//! page cache for the reads to come. Until that pass reaches a file, a
+//! flipped body byte could be served; the caller drops the table and pages it
+//! again when the pass fails. None of this makes the rows *right*: the
+//! scheduler's per-table hash at registration decides whether a loaded table
+//! is kept, repaired or paged. A checkpoint is trusted for time, never for
+//! correctness.
 //!
 //! A mapped file must only ever be replaced by `rename`, never truncated or
 //! written in place: that is the one way a read-only mapping can fault. The
 //! writer renames a finished `.tmp` over the file, and a clean restart
 //! unlinks, which keeps the mapped inode alive until the process exits.
 
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+use crate::circuit::arena::ImageRef;
 use crate::circuit::arena::{Arena, HeapArena};
-use crate::circuit::row_codec::{FieldDict, RECORD_FORMAT};
-use crate::circuit::row_table::{IndexedBlock, RowTable};
+use crate::circuit::row_codec::{self as codec, FieldDict, RECORD_FORMAT};
+use crate::circuit::row_table::{IndexedHeads, RowTable};
 use crate::circuit::store::{Collection, Store};
 use std::io::{self, Write};
 use std::ops::Range;
 
 pub const MAGIC: &[u8; 8] = b"SPKYROWS";
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
+
+/// Identifies a base image; its deltas carry the same id.
+pub type ImageId = u64;
 
 /// Upper bound on any one length field, so a corrupt length cannot ask for a
-/// multi-gigabyte allocation before the trailer gets to reject the file.
+/// multi-gigabyte allocation before the hash gets to reject the file.
 const MAX_CHUNK: u32 = 256 << 20;
 
 const XOR_LEN: usize = 32;
-const TRAILER_LEN: usize = 32;
+const HASH_LEN: usize = 32;
+const TRAILER_LEN: usize = 2 * HASH_LEN;
+
+/// Magic, both formats, image id and seq: what [`peek_identity`] reads.
+const FIXED_PREFIX_LEN: usize = MAGIC.len() + 4 + 4 + 8 + 4;
 
 /// The smallest image: every fixed field, an empty name, no dictionary, no
 /// rows. Anything shorter cannot be a checkpoint.
-const MIN_IMAGE_LEN: usize = MAGIC.len() + 4 + 4 + 4 + XOR_LEN + 4 + 8 + TRAILER_LEN;
+const MIN_IMAGE_LEN: usize =
+    FIXED_PREFIX_LEN + 4 + XOR_LEN + XOR_LEN + 4 + 8 + 8 + 8 + TRAILER_LEN;
 
 #[derive(Debug)]
 pub enum CheckpointError {
@@ -99,92 +132,268 @@ fn invalid(why: impl Into<String>) -> CheckpointError {
     CheckpointError::Invalid(why.into())
 }
 
+/// A fresh image id for a base written by a server: blake3 of the clock, the
+/// process and a counter, so two writers of one directory never agree on
+/// one. No randomness dependency needed.
+pub fn fresh_image_id() -> ImageId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut h = blake3::Hasher::new();
+    let nanos = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    h.update(&nanos.to_le_bytes());
+    #[cfg(not(target_arch = "wasm32"))]
+    h.update(&std::process::id().to_le_bytes());
+    h.update(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
+/// An image id derived from the table's name and content hash: what the
+/// store container uses, so the same store always produces the same bytes.
+pub fn content_image_id(coll: &Collection) -> ImageId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"spky-row-image\0");
+    h.update(coll.name.as_bytes());
+    h.update(&coll.catchup_xor);
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
 /// What [`write_collection`] produced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Written {
+    /// Rows in the file, tombstones included.
     pub rows: u64,
+    pub tombstones: u64,
     /// Every byte of the file, trailer included.
     pub bytes: u64,
+    /// The heads region alone.
+    pub heads_bytes: u64,
+    /// The bodies region alone.
+    pub bodies_bytes: u64,
+    pub image_id: ImageId,
+    pub seq: u32,
 }
 
-/// Write `coll`'s rows to `out`.
-pub fn write_collection<W: Write>(coll: &Collection, out: W) -> io::Result<Written> {
+/// Everything above the rows.
+struct ImageHeader<'a> {
+    name: &'a str,
+    image_id: ImageId,
+    seq: u32,
+    catchup_xor: [u8; XOR_LEN],
+    prev_xor: [u8; XOR_LEN],
+    field_names: Vec<&'a str>,
+}
+
+/// One row as the writer sees it.
+enum Rec<'a> {
+    Row { head: &'a [u8], body: &'a [u8] },
+    #[allow(dead_code)]
+    Tombstone(&'a str),
+}
+
+/// Write `coll`'s rows to `out` as a base image carrying `image_id`.
+pub fn write_collection<W: Write>(coll: &Collection, image_id: ImageId, out: W) -> io::Result<Written> {
+    let header = ImageHeader {
+        name: &coll.name,
+        image_id,
+        seq: 0,
+        catchup_xor: coll.catchup_xor,
+        prev_xor: ssp_protocol::snapshot_hash::xor_empty(),
+        field_names: coll.rows.dict().names().collect(),
+    };
+    write_image(
+        &header,
+        || coll.rows.records().map(|(head, body)| Rec::Row { head, body }),
+        out,
+    )
+}
+
+/// The writer behind every image. Three passes over `records` (which must
+/// yield the same rows in the same order each time, as an unmodified table
+/// does): the first sums the heads and bodies so the bodies' offset is known,
+/// the second writes the header and every head with its body pointer
+/// recomputed for the file, the third writes the bodies. Heads and bodies
+/// are copied as they are; nothing is decoded.
+fn write_image<'a, W, I, F>(header: &ImageHeader<'_>, records: F, out: W) -> io::Result<Written>
+where
+    W: Write,
+    I: Iterator<Item = Rec<'a>>,
+    F: Fn() -> I,
+{
+    let (mut rows, mut tombstones, mut heads_len, mut bodies_len) = (0u64, 0u64, 0u64, 0u64);
+    for rec in records() {
+        rows += 1;
+        match rec {
+            Rec::Row { head, body } => {
+                heads_len += head.len() as u64;
+                bodies_len += body.len() as u64;
+            }
+            Rec::Tombstone(id) => {
+                tombstones += 1;
+                heads_len += codec::head_len_for(id) as u64;
+            }
+        }
+    }
+
     let mut w = Hashing::new(out);
     w.write_all(MAGIC)?;
     w.write_all(&FORMAT.to_le_bytes())?;
     w.write_all(&RECORD_FORMAT.to_le_bytes())?;
-    write_chunk(&mut w, coll.name.as_bytes())?;
-    w.write_all(&coll.catchup_xor)?;
-
-    let names: Vec<&str> = coll.rows.dict().names().collect();
-    w.write_all(&(names.len() as u32).to_le_bytes())?;
-    for name in names {
+    w.write_all(&header.image_id.to_le_bytes())?;
+    w.write_all(&header.seq.to_le_bytes())?;
+    write_chunk(&mut w, header.name.as_bytes())?;
+    w.write_all(&header.catchup_xor)?;
+    w.write_all(&header.prev_xor)?;
+    w.write_all(&(header.field_names.len() as u32).to_le_bytes())?;
+    for name in &header.field_names {
         write_chunk(&mut w, name.as_bytes())?;
     }
-
-    let rows = coll.rows.records().count() as u64;
     w.write_all(&rows.to_le_bytes())?;
-    for record in coll.rows.records() {
-        write_chunk(&mut w, record)?;
+    w.write_all(&heads_len.to_le_bytes())?;
+    w.write_all(&bodies_len.to_le_bytes())?;
+
+    let heads_off = w.bytes;
+    let bodies_off = heads_off + heads_len;
+    if bodies_off + bodies_len > u32::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "checkpoint image would exceed 4 GiB",
+        ));
     }
 
-    let digest = w.hasher.finalize();
-    w.inner.write_all(digest.as_bytes())?;
+    let (mut head_cursor, mut body_cursor) = (0u64, 0u64);
+    let mut buf = Vec::with_capacity(256);
+    for rec in records() {
+        buf.clear();
+        match rec {
+            Rec::Row { head, body } => {
+                let body_rel = (bodies_off + body_cursor) - (heads_off + head_cursor);
+                codec::relink_head(head, body_rel as u32, &mut buf);
+                body_cursor += body.len() as u64;
+            }
+            Rec::Tombstone(id) => {
+                codec::encode_head(id, &[0u8; codec::DIGEST_LEN], codec::RV_ABSENT, 0, 0, &mut buf);
+            }
+        }
+        head_cursor += buf.len() as u64;
+        w.write_all(&buf)?;
+    }
+    debug_assert_eq!(head_cursor, heads_len, "the heads pass must agree with the count pass");
+    let heads_hash = w.take_hash();
+
+    for rec in records() {
+        if let Rec::Row { body, .. } = rec {
+            w.write_all(body)?;
+        }
+    }
+    let bodies_hash = w.take_hash();
+
+    w.inner.write_all(&heads_hash)?;
+    w.inner.write_all(&bodies_hash)?;
     w.inner.flush()?;
     Ok(Written {
         rows,
+        tombstones,
         bytes: w.bytes + TRAILER_LEN as u64,
+        heads_bytes: heads_len,
+        bodies_bytes: bodies_len,
+        image_id: header.image_id,
+        seq: header.seq,
     })
 }
 
-/// The header of one image, borrowed from its bytes, and where its records
-/// are. Produced by [`parse_image`] after the trailer has been verified.
+/// The header of one image, borrowed from its bytes, and where its regions
+/// are. Produced by [`parse_header`]; [`parse_image`] also verifies the
+/// heads hash.
 #[derive(Debug)]
 pub struct Image<'a> {
     pub name: &'a str,
+    pub record_format: u32,
+    pub image_id: ImageId,
+    pub seq: u32,
     pub stored_xor: [u8; XOR_LEN],
+    pub prev_xor: [u8; XOR_LEN],
     /// Dictionary names in id order.
     pub field_names: Vec<&'a str>,
     pub rows: u64,
-    /// The record region: `rows` times `[u32 len][record]`.
-    pub records: Range<usize>,
+    /// The heads region.
+    pub heads: Range<usize>,
+    /// The bodies region; the trailer follows it.
+    pub bodies: Range<usize>,
+    /// blake3 of the bodies region, as the trailer stores it.
+    pub bodies_hash: [u8; HASH_LEN],
 }
 
-/// Verify an image's trailer and parse its header. Pure over a byte slice, so
-/// every target has it; the records are not touched beyond locating them.
-pub fn parse_image(bytes: &[u8]) -> Result<Image<'_>, CheckpointError> {
-    if bytes.len() < MIN_IMAGE_LEN {
+/// What the fixed prefix of a file says it is, without reading the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageIdentity {
+    pub format: u32,
+    pub record_format: u32,
+    pub image_id: ImageId,
+    pub seq: u32,
+}
+
+/// Parse the fixed prefix of an image's bytes. Nothing is verified.
+pub fn parse_identity(bytes: &[u8]) -> Result<ImageIdentity, CheckpointError> {
+    if bytes.len() < FIXED_PREFIX_LEN {
         return Err(invalid("too short to be a row checkpoint"));
     }
     if &bytes[..MAGIC.len()] != MAGIC {
         return Err(invalid("not a row checkpoint"));
     }
-    // The trailer first: after this, every length below is as the writer left
-    // it. The reads stay bounds-checked anyway.
-    let (body, trailer) = bytes.split_at(bytes.len() - TRAILER_LEN);
-    if blake3::hash(body).as_bytes() != trailer {
-        return Err(invalid("checksum mismatch"));
-    }
-
     let mut c = Cursor {
-        bytes: body,
+        bytes,
         at: MAGIC.len(),
     };
-    let format = c.u32()?;
-    if format != FORMAT {
-        return Err(invalid(format!("checkpoint format {format}, this build reads {FORMAT}")));
+    Ok(ImageIdentity {
+        format: c.u32()?,
+        record_format: c.u32()?,
+        image_id: c.u64()?,
+        seq: c.u32()?,
+    })
+}
+
+/// Read a file's identity from its first bytes: what a writer does to check
+/// that the base it is about to extend is still the one it loaded.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn peek_identity(path: &std::path::Path) -> Result<ImageIdentity, CheckpointError> {
+    use std::io::Read;
+    let mut prefix = [0u8; FIXED_PREFIX_LEN];
+    let mut file = std::fs::File::open(path)?;
+    let mut read = 0;
+    while read < prefix.len() {
+        match file.read(&mut prefix[read..])? {
+            0 => break,
+            n => read += n,
+        }
     }
-    let record_format = c.u32()?;
-    if record_format != RECORD_FORMAT {
+    parse_identity(&prefix[..read])
+}
+
+/// Parse an image's header and locate its regions, checking every length
+/// against the file's size. Pure over a byte slice, so every target has it;
+/// nothing is hashed and the record format is not judged, which is
+/// [`parse_image`]'s job.
+pub fn parse_header(bytes: &[u8]) -> Result<Image<'_>, CheckpointError> {
+    if bytes.len() < MIN_IMAGE_LEN {
+        return Err(invalid("too short to be a row checkpoint"));
+    }
+    let identity = parse_identity(bytes)?;
+    if identity.format != FORMAT {
         return Err(invalid(format!(
-            "record format {record_format}, this build encodes {RECORD_FORMAT}"
+            "checkpoint format {}, this build reads {FORMAT}",
+            identity.format
         )));
     }
+    let mut c = Cursor {
+        bytes,
+        at: FIXED_PREFIX_LEN,
+    };
     let name = c.str_chunk("table name")?;
-    let stored_xor: [u8; XOR_LEN] = c
-        .bytes(XOR_LEN)?
-        .try_into()
-        .expect("cursor returned the requested length");
+    let stored_xor = c.hash()?;
+    let prev_xor = c.hash()?;
 
     let fields = c.u32()?;
     let mut field_names = Vec::with_capacity(fields.min(4096) as usize);
@@ -193,108 +402,387 @@ pub fn parse_image(bytes: &[u8]) -> Result<Image<'_>, CheckpointError> {
     }
 
     let rows = c.u64()?;
+    let heads_len = c.u64()?;
+    let bodies_len = c.u64()?;
+    let heads_start = c.at;
+    let heads_end = usize::try_from(heads_len)
+        .ok()
+        .and_then(|len| heads_start.checked_add(len))
+        .ok_or_else(|| invalid("heads length overflows the file"))?;
+    let bodies_end = usize::try_from(bodies_len)
+        .ok()
+        .and_then(|len| heads_end.checked_add(len))
+        .ok_or_else(|| invalid("bodies length overflows the file"))?;
+    if bodies_end.checked_add(TRAILER_LEN) != Some(bytes.len()) {
+        return Err(invalid("the lengths do not account for every byte"));
+    }
+    let bodies_hash: [u8; HASH_LEN] = bytes[bodies_end + HASH_LEN..]
+        .try_into()
+        .expect("the trailer is exactly two hashes");
     Ok(Image {
         name,
+        record_format: identity.record_format,
+        image_id: identity.image_id,
+        seq: identity.seq,
         stored_xor,
+        prev_xor,
         field_names,
         rows,
-        records: c.at..body.len(),
+        heads: heads_start..heads_end,
+        bodies: heads_end..bodies_end,
+        bodies_hash,
     })
+}
+
+/// Whether the trailer's first hash covers every byte before the bodies.
+pub fn heads_verified(bytes: &[u8], image: &Image<'_>) -> bool {
+    let trailer = &bytes[image.bodies.end..];
+    blake3::hash(&bytes[..image.heads.end]).as_bytes() == &trailer[..HASH_LEN]
+}
+
+/// What makes a parsed header trustworthy: its record layout is this
+/// build's, and the heads hash covers every byte before the bodies.
+fn check_heads(bytes: &[u8], image: &Image<'_>) -> Result<(), CheckpointError> {
+    if image.record_format != RECORD_FORMAT {
+        return Err(invalid(format!(
+            "record format {}, this build encodes {RECORD_FORMAT}",
+            image.record_format
+        )));
+    }
+    if !heads_verified(bytes, image) {
+        return Err(invalid("heads checksum mismatch"));
+    }
+    Ok(())
+}
+
+/// Parse an image's header and verify its heads hash; the bodies are not
+/// touched beyond locating them.
+pub fn parse_image(bytes: &[u8]) -> Result<Image<'_>, CheckpointError> {
+    let image = parse_header(bytes)?;
+    check_heads(bytes, &image)?;
+    Ok(image)
+}
+
+/// When a load checks the bodies hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyVerify {
+    /// Before the table is handed out: today's guarantee at today's cost.
+    AtLoad,
+    /// Later, by a [`verify_bodies`] pass the caller runs; the load hands out
+    /// a [`PendingVerify`] per mapped file.
+    Deferred,
 }
 
 /// How a load went, for the log line that proves the gain.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LoadStats {
+    /// Every byte of the file.
     pub bytes: u64,
-    /// Trailer verification: the sequential pass over the file.
+    /// The bodies region: what a body verification reads.
+    pub bodies_bytes: u64,
+    /// Everything up to the arena: parsing, the heads hash, the index walk.
+    pub heads_ms: u64,
+    /// The bodies hash, when it ran at load; 0 when deferred.
     pub verify_ms: u64,
-    /// The index walk over the records.
-    pub index_ms: u64,
     /// The file is mapped rather than copied.
     pub mapped: bool,
+    /// A file of another format, re-encoded at load.
+    pub converted: bool,
+    pub image_id: ImageId,
+}
+
+/// A parsed, verified and indexed image, short of its arena.
+struct Indexed {
+    name: String,
+    dict: FieldDict,
+    heads: IndexedHeads,
+    image_id: ImageId,
+    bodies: Range<usize>,
+    bodies_hash: [u8; HASH_LEN],
+    stored_xor: [u8; XOR_LEN],
+}
+
+/// Verify the heads hash of a parsed base image, restore its dictionary and
+/// walk its heads. Shared by every reader; only the arena differs.
+fn index_parsed(bytes: &[u8], image: Image<'_>) -> Result<Indexed, CheckpointError> {
+    check_heads(bytes, &image)?;
+    if image.seq != 0 {
+        return Err(invalid("a delta checkpoint, not a base image"));
+    }
+    let dict = FieldDict::from_names(image.field_names.iter().copied())
+        .ok_or_else(|| invalid("field dictionary repeats a name"))?;
+    let heads = RowTable::index_heads(bytes, image.heads.clone(), image.bodies.clone(), image.rows, 0)
+        .map_err(|e| invalid(e.to_string()))?;
+    if heads.xor != image.stored_xor {
+        return Err(invalid("rows do not add up to the stored catch-up hash"));
+    }
+    Ok(Indexed {
+        name: image.name.to_string(),
+        dict,
+        heads,
+        image_id: image.image_id,
+        bodies: image.bodies,
+        bodies_hash: image.bodies_hash,
+        stored_xor: image.stored_xor,
+    })
+}
+
+fn index_image(bytes: &[u8]) -> Result<Indexed, CheckpointError> {
+    index_parsed(bytes, parse_header(bytes)?)
+}
+
+fn assemble(ix: Indexed, arena: Box<dyn Arena>) -> Collection {
+    let rows = RowTable::from_parts(ix.dict, ix.heads.index, arena);
+    Collection::from_rows(ix.name, rows, ix.stored_xor)
 }
 
 /// Read an image whose bytes are already in memory. The buffer BECOMES the
 /// table's arena: no record is copied, the slots point into it at the file
 /// offsets. The arena is heap-backed whatever the process configured, which
-/// is what the browser, the Durable Object and the Dart build need.
+/// is what the browser, the Durable Object and the Dart build need. The
+/// bodies are verified here: they are in memory, and hashing them costs less
+/// than reading them did.
 pub fn read_image(bytes: Vec<u8>) -> Result<(Collection, LoadStats), CheckpointError> {
-    let (name, dict, block, stats) = index_image(&bytes)?;
-    let arena = HeapArena::from_buf(bytes, block.live);
-    Ok((assemble(name, dict, block, Box::new(arena)), stats))
+    let started = web_time::Instant::now();
+    let ix = index_image(&bytes)?;
+    let heads_ms = ms_since(started);
+
+    let started = web_time::Instant::now();
+    if blake3::hash(&bytes[ix.bodies.clone()]).as_bytes() != &ix.bodies_hash {
+        return Err(invalid("bodies checksum mismatch"));
+    }
+    let verify_ms = ms_since(started);
+
+    let stats = LoadStats {
+        bytes: bytes.len() as u64,
+        bodies_bytes: ix.bodies.len() as u64,
+        heads_ms,
+        verify_ms,
+        mapped: false,
+        converted: false,
+        image_id: ix.image_id,
+    };
+    let live = ix.heads.live;
+    let arena = HeapArena::from_buf(bytes, live);
+    Ok((assemble(ix, Box::new(arena)), stats))
+}
+
+/// A mapped file whose bodies have not been verified yet: what
+/// [`verify_bodies`] takes, and what names the table to drop when it fails.
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone)]
+pub struct PendingVerify {
+    pub table: String,
+    pub path: std::path::PathBuf,
+    pub image: ImageRef,
+}
+
+/// What [`map_image`] produced.
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+pub struct Mapped {
+    pub collection: Collection,
+    pub stats: LoadStats,
+    /// The bodies still to verify, when the load deferred them.
+    pub pending: Option<PendingVerify>,
+}
+
+/// How fast a pass over the bodies runs.
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy)]
+pub struct Throttle {
+    /// Bytes read per step.
+    pub chunk: usize,
+    /// A pause after every step, so a pass leaves a single vCPU to the work
+    /// that is serving.
+    pub pause: std::time::Duration,
+}
+
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+impl Throttle {
+    pub const CHUNK: usize = 8 << 20;
+
+    /// Flat out.
+    pub fn none() -> Self {
+        Self {
+            chunk: Self::CHUNK,
+            pause: std::time::Duration::ZERO,
+        }
+    }
+
+    /// About half of one core: 8 MiB hashes in a few milliseconds, then as
+    /// long again of pause.
+    pub fn background() -> Self {
+        Self {
+            chunk: Self::CHUNK,
+            pause: std::time::Duration::from_millis(5),
+        }
+    }
 }
 
 /// Map the file at `path` read-only and make it the first segment of a
 /// file-backed arena whose later appends go to fresh segments under `dir`
-/// (see [`arena::MmapArena::from_image`]).
+/// (see [`crate::circuit::arena::MmapArena::from_images`]).
+///
+/// The mapping is made without pre-faulting: the heads are read (and advised
+/// sequential while they are), the bodies are not. Nothing is advised for
+/// the bodies either. `MADV_WILLNEED` on a file mapping is clamped to a few
+/// megabytes per call on Linux, so it cannot prefetch a gigabyte, and
+/// `MADV_RANDOM` would turn fault-around off; the one thing that pulls the
+/// bodies in sequentially is a reader streaming them, which is what
+/// [`verify_bodies`] is.
 ///
 /// The mapping stays for the life of the collection, so the file must only
-/// ever be replaced by `rename` (module docs). `populate` asks the kernel to
-/// fault the pages in up front, which the verification pass needs anyway.
+/// ever be replaced by `rename` (module docs).
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
 pub fn map_image(
     path: &std::path::Path,
     dir: &std::path::Path,
     segment_bytes: usize,
-) -> Result<(Collection, LoadStats), CheckpointError> {
+    verify: BodyVerify,
+) -> Result<Mapped, CheckpointError> {
+    let started = web_time::Instant::now();
     let file = std::fs::File::open(path)?;
     // SAFETY: the file is opened read-only and the mapping is private. The
     // one way such a mapping faults is the file being truncated underneath
     // it, and every writer of these files replaces them by rename, which
     // leaves the mapped inode intact.
-    let map = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    let header = parse_header(&map)?;
     #[cfg(unix)]
-    let _ = map.advise(memmap2::Advice::Sequential);
-    let (name, dict, block, stats) = index_image(&map)?;
-    let arena = crate::circuit::arena::MmapArena::from_image(dir, &name, segment_bytes, map, block.live);
-    Ok((
-        assemble(name, dict, block, Box::new(arena)),
-        LoadStats { mapped: true, ..stats },
-    ))
+    let _ = map.advise_range(memmap2::Advice::Sequential, 0, header.heads.end);
+    let ix = index_parsed(&map, header)?;
+    #[cfg(unix)]
+    let _ = map.advise_range(memmap2::Advice::Normal, 0, ix.bodies.start);
+    let heads_ms = ms_since(started);
+
+    let image = ImageRef {
+        map: std::sync::Arc::new(map),
+        file: std::sync::Arc::new(file),
+        bodies: ix.bodies.clone(),
+        bodies_hash: ix.bodies_hash,
+    };
+    let (verify_ms, pending) = match verify {
+        BodyVerify::AtLoad => {
+            let started = web_time::Instant::now();
+            if !verify_bodies(&image, Throttle::none())? {
+                return Err(invalid("bodies checksum mismatch"));
+            }
+            (ms_since(started), None)
+        }
+        BodyVerify::Deferred => (
+            0,
+            Some(PendingVerify {
+                table: ix.name.clone(),
+                path: path.to_path_buf(),
+                image: image.clone(),
+            }),
+        ),
+    };
+    let stats = LoadStats {
+        bytes: image.len() as u64,
+        bodies_bytes: ix.bodies.len() as u64,
+        heads_ms,
+        verify_ms,
+        mapped: true,
+        converted: false,
+        image_id: ix.image_id,
+    };
+    let mut arena = crate::circuit::arena::MmapArena::from_images(dir, &ix.name, segment_bytes, vec![image]);
+    arena.adopt(ix.heads.live);
+    Ok(Mapped {
+        collection: assemble(ix, Box::new(arena)),
+        stats,
+        pending,
+    })
+}
+
+/// Hash an image's bodies and compare with its trailer. `Ok(false)` on a
+/// mismatch.
+///
+/// Reads through the file the image was mapped from, `chunk` bytes at a
+/// time with a pause between chunks: the same inode whatever the path holds
+/// by now, and a sequential read the kernel reads ahead for, which is also
+/// what warms the page cache behind the mapping.
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+pub fn verify_bodies(image: &ImageRef, throttle: Throttle) -> io::Result<bool> {
+    let mut hasher = blake3::Hasher::new();
+    stream_bodies(image, throttle, |chunk| {
+        hasher.update(chunk);
+    })?;
+    Ok(hasher.finalize().as_bytes() == &image.bodies_hash)
+}
+
+/// Read an image's bodies through, so their pages are in the page cache
+/// before something reads them under a lock.
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+pub fn touch_bodies(image: &ImageRef, throttle: Throttle) -> io::Result<()> {
+    stream_bodies(image, throttle, |_| {})
+}
+
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+fn stream_bodies(image: &ImageRef, throttle: Throttle, mut f: impl FnMut(&[u8])) -> io::Result<()> {
+    let (start, end) = (image.bodies.start, image.bodies.end);
+    if start >= end {
+        return Ok(());
+    }
+    let chunk = throttle.chunk.clamp(1, end - start);
+    let mut at = start;
+    #[cfg(unix)]
+    let mut buf = vec![0u8; chunk];
+    while at < end {
+        let n = chunk.min(end - at);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            image.file.read_exact_at(&mut buf[..n], at as u64)?;
+            f(&buf[..n]);
+        }
+        #[cfg(not(unix))]
+        f(&image.map[at..at + n]);
+        at += n;
+        if at < end && !throttle.pause.is_zero() {
+            std::thread::sleep(throttle.pause);
+        }
+    }
+    Ok(())
+}
+
+/// What [`load_file`] produced.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TableLoad {
+    pub collection: Collection,
+    pub stats: LoadStats,
+    /// The bodies still to verify: only a mapped, deferred load has one.
+    #[cfg(feature = "mmap-store")]
+    pub pending: Option<PendingVerify>,
 }
 
 /// Load the image at `path` the way this process stores rows: mapped when
-/// the arena is file-backed, adopted into the heap otherwise.
+/// the arena is file-backed, adopted into the heap otherwise (where the
+/// bodies are always verified at once).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_file(path: &std::path::Path) -> Result<(Collection, LoadStats), CheckpointError> {
+pub fn load_file(path: &std::path::Path, verify: BodyVerify) -> Result<TableLoad, CheckpointError> {
     match crate::circuit::arena::configured_backing() {
         #[cfg(feature = "mmap-store")]
         crate::circuit::arena::ArenaBacking::Files { dir, segment_bytes } => {
-            map_image(path, dir, *segment_bytes)
+            let mapped = map_image(path, dir, *segment_bytes, verify)?;
+            Ok(TableLoad {
+                collection: mapped.collection,
+                stats: mapped.stats,
+                pending: mapped.pending,
+            })
         }
-        _ => read_image(std::fs::read(path)?),
+        _ => {
+            let _ = verify;
+            let (collection, stats) = read_image(std::fs::read(path)?)?;
+            Ok(TableLoad {
+                collection,
+                stats,
+                #[cfg(feature = "mmap-store")]
+                pending: None,
+            })
+        }
     }
-}
-
-/// Verify, parse and index one image. Shared by the two readers; only the
-/// arena differs.
-fn index_image(bytes: &[u8]) -> Result<(String, FieldDict, IndexedBlock, LoadStats), CheckpointError> {
-    let started = web_time::Instant::now();
-    let image = parse_image(bytes)?;
-    let dict = FieldDict::from_names(image.field_names.iter().copied())
-        .ok_or_else(|| invalid("field dictionary repeats a name"))?;
-    let verify_ms = ms_since(started);
-
-    let started = web_time::Instant::now();
-    let block = RowTable::index_block(bytes, image.records.clone(), image.rows, 0)
-        .map_err(|e| invalid(e.to_string()))?;
-    if block.xor != image.stored_xor {
-        return Err(invalid("rows do not add up to the stored catch-up hash"));
-    }
-    let index_ms = ms_since(started);
-
-    let stats = LoadStats {
-        bytes: bytes.len() as u64,
-        verify_ms,
-        index_ms,
-        mapped: false,
-    };
-    Ok((image.name.to_string(), dict, block, stats))
-}
-
-fn assemble(name: String, dict: FieldDict, block: IndexedBlock, arena: Box<dyn Arena>) -> Collection {
-    let rows = RowTable::from_parts(dict, block.index, arena);
-    Collection::from_rows(name, rows, block.xor)
 }
 
 fn ms_since(started: web_time::Instant) -> u64 {
@@ -315,6 +803,14 @@ impl<W> Hashing<W> {
             hasher: blake3::Hasher::new(),
             bytes: 0,
         }
+    }
+
+    /// The hash of everything written since the last take, and a fresh
+    /// hasher for what follows.
+    fn take_hash(&mut self) -> [u8; HASH_LEN] {
+        let hash = *self.hasher.finalize().as_bytes();
+        self.hasher.reset();
+        hash
     }
 }
 
@@ -351,12 +847,13 @@ pub const STORE_FORMAT: u32 = 1;
 ///
 /// ```text
 /// [8] "SPKYSTOR" [u32] STORE_FORMAT [u32] table count
-/// per table: [u64 len][a complete per-table image, trailer included]
+/// per table: [u64 len][a complete per-table base image, trailer included]
 /// ```
 ///
 /// There is no outer checksum: each image verifies itself, and the lengths
-/// have to account for every byte. Tables are written in name order so the
-/// same store always produces the same bytes.
+/// have to account for every byte. Tables are written in name order with a
+/// content-derived image id, so the same store always produces the same
+/// bytes. A container holds base images only; a client never writes deltas.
 pub fn write_store(store: &Store) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(STORE_MAGIC);
@@ -368,7 +865,8 @@ pub fn write_store(store: &Store) -> io::Result<Vec<u8>> {
         let len_at = out.len();
         out.extend_from_slice(&0u64.to_le_bytes());
         let start = out.len();
-        write_collection(&store.collections[name], &mut out)?;
+        let coll = &store.collections[name];
+        write_collection(coll, content_image_id(coll), &mut out)?;
         let len = (out.len() - start) as u64;
         out[len_at..len_at + 8].copy_from_slice(&len.to_le_bytes());
     }
@@ -376,7 +874,8 @@ pub fn write_store(store: &Store) -> io::Result<Vec<u8>> {
 }
 
 /// Read a snapshot written by [`write_store`]. Every table lands in a
-/// heap-backed arena of its own (the client builds have no other kind).
+/// heap-backed arena of its own (the client builds have no other kind), its
+/// bodies verified on the way.
 pub fn read_store(bytes: &[u8]) -> Result<Store, CheckpointError> {
     if bytes.len() < STORE_MAGIC.len() + 4 + 4 || &bytes[..STORE_MAGIC.len()] != STORE_MAGIC {
         return Err(invalid("not a store snapshot"));
@@ -405,7 +904,7 @@ pub fn read_store(bytes: &[u8]) -> Result<Store, CheckpointError> {
     Ok(store)
 }
 
-/// Bounds-checked reads over the verified body.
+/// Bounds-checked reads over a byte string.
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -425,6 +924,10 @@ impl<'a> Cursor<'a> {
 
     fn u64(&mut self) -> Result<u64, CheckpointError> {
         Ok(u64::from_le_bytes(self.bytes(8)?.try_into().expect("8 bytes")))
+    }
+
+    fn hash(&mut self) -> Result<[u8; HASH_LEN], CheckpointError> {
+        Ok(self.bytes(HASH_LEN)?.try_into().expect("cursor returned the requested length"))
     }
 
     fn chunk(&mut self) -> Result<&'a [u8], CheckpointError> {
@@ -447,6 +950,8 @@ mod tests {
     use crate::types::Sp00kyValue;
     use serde_json::json;
 
+    const ID: ImageId = 0x5eed_1234_abcd_0001;
+
     fn collection(rows: &[(&str, serde_json::Value)]) -> Collection {
         let mut coll = Collection::new("game".to_string());
         for (id, body) in rows {
@@ -457,7 +962,7 @@ mod tests {
 
     fn bytes_of(coll: &Collection) -> Vec<u8> {
         let mut bytes = Vec::new();
-        write_collection(coll, &mut bytes).unwrap();
+        write_collection(coll, ID, &mut bytes).unwrap();
         bytes
     }
 
@@ -465,41 +970,27 @@ mod tests {
         read_image(bytes_of(coll)).map(|(c, _)| c)
     }
 
-    /// Recompute the trailer after the test edited the body, so the edit is
-    /// what gets rejected rather than the checksum.
+    /// Recompute both trailer hashes after the test edited the bytes, so the
+    /// edit is what gets rejected rather than a checksum.
     fn reseal(bytes: &mut [u8]) {
-        let (body, trailer) = bytes.split_at_mut(bytes.len() - TRAILER_LEN);
-        trailer.copy_from_slice(blake3::hash(body).as_bytes());
+        let image = parse_header(bytes).expect("the header still parses");
+        let (heads_end, bodies) = (image.heads.end, image.bodies.clone());
+        let heads = *blake3::hash(&bytes[..heads_end]).as_bytes();
+        let body = *blake3::hash(&bytes[bodies.clone()]).as_bytes();
+        let at = bodies.end;
+        bytes[at..at + HASH_LEN].copy_from_slice(&heads);
+        bytes[at + HASH_LEN..at + TRAILER_LEN].copy_from_slice(&body);
     }
 
     /// Offset of the `[u64 rows]` field in an image of `coll`.
     fn rows_offset(coll: &Collection) -> usize {
         let dict: usize = coll.rows.dict().names().map(|n| 4 + n.len()).sum();
-        MAGIC.len() + 4 + 4 + 4 + coll.name.len() + XOR_LEN + 4 + dict
+        FIXED_PREFIX_LEN + 4 + coll.name.len() + XOR_LEN + XOR_LEN + 4 + dict
     }
 
-    #[test]
-    fn rows_survive_byte_for_byte() {
-        let coll = collection(&[
-            ("a", json!({ "id": "game:a", "white": "x", "moves": [1, 2, 3], "_00_rv": 4 })),
-            ("b", json!({ "id": "game:b", "meta": { "site": "lichess", "rated": true }, "elo": 1.5 })),
-            ("⟨odd id⟩", json!({ "id": "game:⟨odd id⟩", "nil": null })),
-        ]);
-        let back = round_trip(&coll).unwrap();
-
-        assert_eq!(back.name, "game");
-        assert_eq!(back.rows.len(), 3);
-        assert_eq!(back.catchup_xor, coll.catchup_xor);
-        for id in ["a", "b", "⟨odd id⟩"] {
-            assert_eq!(back.get_row(id).to_owned_value(), coll.get_row(id).to_owned_value(), "{id}");
-            assert_eq!(back.rows.digest_of(id), coll.rows.digest_of(id), "{id}");
-            assert_eq!(back.rows.rv_of(id), coll.rows.rv_of(id), "{id}");
-        }
-        assert!(!back.membership_built(), "a loaded table builds no z-set until a view scans it");
-        let mut keys: Vec<_> = back.membership().keys().map(|k| k.to_string()).collect();
-        keys.sort();
-        assert_eq!(keys, vec!["game:a", "game:b", "game:⟨odd id⟩"]);
-        assert!(back.membership().values().all(|w| *w == 1));
+    /// Offset of the first head in an image of `coll`.
+    fn heads_offset(coll: &Collection) -> usize {
+        rows_offset(coll) + 8 + 8 + 8
     }
 
     /// Writes the FORMAT 1 fixture the legacy reader is tested against. Run
@@ -527,26 +1018,114 @@ mod tests {
     }
 
     #[test]
+    fn rows_survive_byte_for_byte() {
+        let coll = collection(&[
+            ("a", json!({ "id": "game:a", "white": "x", "moves": [1, 2, 3], "_00_rv": 4 })),
+            ("b", json!({ "id": "game:b", "meta": { "site": "lichess", "rated": true }, "elo": 1.5 })),
+            ("⟨odd id⟩", json!({ "id": "game:⟨odd id⟩", "nil": null })),
+        ]);
+        let back = round_trip(&coll).unwrap();
+
+        assert_eq!(back.name, "game");
+        assert_eq!(back.rows.len(), 3);
+        assert_eq!(back.catchup_xor, coll.catchup_xor);
+        for id in ["a", "b", "⟨odd id⟩"] {
+            assert_eq!(back.get_row(id).to_owned_value(), coll.get_row(id).to_owned_value(), "{id}");
+            assert_eq!(back.rows.digest_of(id), coll.rows.digest_of(id), "{id}");
+            assert_eq!(back.rows.rv_of(id), coll.rows.rv_of(id), "{id}");
+        }
+        assert!(!back.membership_built(), "a loaded table builds no z-set until a view scans it");
+        let mut keys: Vec<_> = back.membership().keys().map(|k| k.to_string()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["game:a", "game:b", "game:⟨odd id⟩"]);
+        assert!(back.membership().values().all(|w| *w == 1));
+    }
+
+    #[test]
     fn written_reports_rows_and_every_byte() {
         let coll = collection(&[("a", json!({ "n": 1 })), ("b", json!({ "n": 2 }))]);
         let mut bytes = Vec::new();
-        let written = write_collection(&coll, &mut bytes).unwrap();
+        let written = write_collection(&coll, ID, &mut bytes).unwrap();
         assert_eq!(written.rows, 2);
+        assert_eq!(written.tombstones, 0);
         assert_eq!(written.bytes, bytes.len() as u64);
+        assert_eq!(written.heads_bytes, coll.rows.records().map(|(h, _)| h.len() as u64).sum::<u64>());
+        assert_eq!(written.bodies_bytes, coll.rows.records().map(|(_, b)| b.len() as u64).sum::<u64>());
+        assert_eq!(written.image_id, ID);
+        assert_eq!(written.seq, 0);
+    }
+
+    /// An independent walk over the bytes, so the layout cannot drift
+    /// without this test noticing.
+    #[test]
+    fn format_two_layout_is_pinned() {
+        let coll = collection(&[("a", json!({ "x": 1, "y": "two" })), ("bb", json!({ "x": 3 }))]);
+        let bytes = bytes_of(&coll);
+        assert_eq!(&bytes[..8], MAGIC);
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &2u32.to_le_bytes());
+        assert_eq!(&bytes[16..24], &ID.to_le_bytes());
+        assert_eq!(&bytes[24..28], &0u32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &4u32.to_le_bytes());
+        assert_eq!(&bytes[32..36], b"game");
+        assert_eq!(&bytes[36..68], &coll.catchup_xor);
+        assert_eq!(&bytes[68..100], &ssp_protocol::snapshot_hash::xor_empty());
+        let names: Vec<&str> = coll.rows.dict().names().collect();
+        assert_eq!(&bytes[100..104], &(names.len() as u32).to_le_bytes());
+        let mut at = 104;
+        for name in &names {
+            assert_eq!(&bytes[at..at + 4], &(name.len() as u32).to_le_bytes());
+            assert_eq!(&bytes[at + 4..at + 4 + name.len()], name.as_bytes());
+            at += 4 + name.len();
+        }
+        assert_eq!(at, rows_offset(&coll));
+        let rows = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let heads_len = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        let bodies_len = u64::from_le_bytes(bytes[at + 16..at + 24].try_into().unwrap()) as usize;
+        assert_eq!(rows, 2);
+        let heads_start = at + 24;
+        let bodies_start = heads_start + heads_len;
+        assert_eq!(bodies_start + bodies_len + TRAILER_LEN, bytes.len());
+        // Every head points at the body that follows the previous one.
+        let (mut head_at, mut body_at) = (heads_start, bodies_start);
+        let mut seen = Vec::new();
+        for _ in 0..rows {
+            let head_len = codec::head_len(&bytes[head_at..bodies_start]).unwrap();
+            let head = &bytes[head_at..head_at + head_len];
+            assert_eq!(head_at + codec::head_body_rel(head).unwrap() as usize, body_at);
+            let id = codec::head_id(head).unwrap();
+            let body_len = codec::head_body_len(head).unwrap() as usize;
+            let body = &bytes[body_at..body_at + body_len];
+            assert_eq!(codec::decode_value(body, coll.rows.dict()).unwrap(), coll.get_row(id).to_owned_value());
+            assert_eq!(codec::head_digest(head).copied(), coll.rows.digest_of(id));
+            seen.push(id.to_string());
+            head_at += head_len;
+            body_at += body_len;
+        }
+        assert_eq!(head_at, bodies_start);
+        assert_eq!(body_at, bodies_start + bodies_len);
+        seen.sort();
+        assert_eq!(seen, vec!["a", "bb"]);
+        let trailer = &bytes[body_at..];
+        assert_eq!(&trailer[..32], blake3::hash(&bytes[..bodies_start]).as_bytes());
+        assert_eq!(&trailer[32..], blake3::hash(&bytes[bodies_start..body_at]).as_bytes());
     }
 
     /// The adopted buffer is the arena: nothing was copied, and the bytes
-    /// that are not records (header, prefixes, trailer) are accounted dead.
+    /// that are not rows (header, dictionary, trailer) are accounted dead.
     #[test]
     fn the_heap_image_is_the_arena() {
         let coll = collection(&[("a", json!({ "n": 1 })), ("b", json!({ "s": "two" }))]);
         let bytes = bytes_of(&coll);
-        let records: u64 = coll.rows.records().map(|r| r.len() as u64).sum();
+        let records: u64 = coll.rows.records().map(|(h, b)| (h.len() + b.len()) as u64).sum();
         let (back, stats) = read_image(bytes.clone()).unwrap();
         assert_eq!(back.rows.live_bytes(), records);
         assert_eq!(back.rows.dead_bytes(), bytes.len() as u64 - records);
         assert_eq!(stats.bytes, bytes.len() as u64);
+        assert_eq!(stats.bodies_bytes, coll.rows.records().map(|(_, b)| b.len() as u64).sum::<u64>());
+        assert_eq!(stats.image_id, ID);
         assert!(!stats.mapped);
+        assert!(!stats.converted);
         // The table keeps working as a table: a later write appends, an
         // update retires the image's copy, and a second checkpoint of the
         // mixed table loads again.
@@ -577,24 +1156,54 @@ mod tests {
     #[test]
     fn an_empty_table_round_trips() {
         let coll = Collection::new("empty".to_string());
-        let back = round_trip(&coll).unwrap();
+        let bytes = bytes_of(&coll);
+        assert_eq!(bytes.len(), MIN_IMAGE_LEN + "empty".len());
+        let back = read_image(bytes).unwrap().0;
         assert_eq!(back.rows.len(), 0);
         assert_eq!(back.catchup_xor, coll.catchup_xor);
     }
 
     #[test]
-    fn a_flipped_byte_anywhere_is_rejected() {
+    fn a_flipped_byte_in_the_heads_is_rejected_at_load() {
         let coll = collection(&[
             ("a", json!({ "title": "hello" })),
             ("b", json!({ "title": "world", "n": 2 })),
         ]);
         let bytes = bytes_of(&coll);
-        // One byte in each region: magic, name, dictionary, a record, the trailer.
-        let rows_at = rows_offset(&coll);
-        for at in [0, MAGIC.len() + 9, rows_at - 2, rows_at + 12, rows_at + 60, bytes.len() - 1] {
+        let heads_at = heads_offset(&coll);
+        // Magic, image id, name, the stored hash, the dictionary, a digest, an
+        // id, a body pointer, the heads hash.
+        for at in [
+            0,
+            17,
+            33,
+            40,
+            rows_offset(&coll) - 2,
+            heads_at + 3,
+            heads_at + codec::HEAD_ID_OFFSET + 1,
+            heads_at + codec::HEAD_BODY_REL_OFFSET,
+            bytes.len() - TRAILER_LEN + 5,
+        ] {
             let mut bad = bytes.clone();
             bad[at] ^= 0x40;
+            assert!(parse_image(&bad).is_err(), "flipped byte at {at} passed the heads hash");
             assert!(read_image(bad).is_err(), "flipped byte at {at} was accepted");
+        }
+    }
+
+    /// A body byte, or the bodies hash itself: the heads still check out, so
+    /// the load succeeds and the bodies check is what fails.
+    #[test]
+    fn a_flipped_byte_in_the_bodies_passes_the_heads_and_fails_the_bodies() {
+        let coll = collection(&[("a", json!({ "title": "hello" })), ("b", json!({ "n": 2 }))]);
+        let bytes = bytes_of(&coll);
+        let image = parse_image(&bytes).unwrap();
+        for at in [image.bodies.start + 2, image.bodies.end - 1, bytes.len() - 1] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0x40;
+            assert!(parse_image(&bad).is_ok(), "flipped byte at {at} failed the heads hash");
+            let err = read_image(bad).unwrap_err();
+            assert!(err.to_string().contains("bodies"), "{err}");
         }
     }
 
@@ -606,6 +1215,10 @@ mod tests {
         assert!(read_image(bytes).is_err());
         assert!(read_image(Vec::new()).is_err());
         assert!(read_image(b"SPKYROWS".to_vec()).is_err());
+        let coll = collection(&[("a", json!({ "n": 1 }))]);
+        let mut extra = bytes_of(&coll);
+        extra.push(0);
+        assert!(read_image(extra).is_err(), "a byte past the trailer");
     }
 
     #[test]
@@ -621,11 +1234,22 @@ mod tests {
     #[test]
     fn another_checkpoint_format_is_refused() {
         let coll = collection(&[("a", json!({ "n": 1 }))]);
+        for format in [FORMAT + 1, 1] {
+            let mut bytes = bytes_of(&coll);
+            bytes[8..12].copy_from_slice(&format.to_le_bytes());
+            let err = read_image(bytes).unwrap_err();
+            assert!(err.to_string().contains("checkpoint format"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_delta_is_refused_by_the_base_loader() {
+        let coll = collection(&[("a", json!({ "n": 1 }))]);
         let mut bytes = bytes_of(&coll);
-        bytes[8..12].copy_from_slice(&(FORMAT + 1).to_le_bytes());
+        bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
         reseal(&mut bytes);
         let err = read_image(bytes).unwrap_err();
-        assert!(err.to_string().contains("checkpoint format"), "{err}");
+        assert!(err.to_string().contains("delta"), "{err}");
     }
 
     #[test]
@@ -638,7 +1262,7 @@ mod tests {
         assert!(err.to_string().contains("catch-up hash"), "{err}");
     }
 
-    /// The row count has to describe the region exactly: more declared than
+    /// The row count has to describe the heads exactly: more declared than
     /// present is a truncated walk, fewer leaves bytes nobody indexed.
     #[test]
     fn a_row_count_that_does_not_match_the_region_is_rejected() {
@@ -653,16 +1277,58 @@ mod tests {
         }
     }
 
+    /// Every way a head can point at the wrong bytes.
+    #[test]
+    fn body_spans_are_bounds_checked() {
+        let coll = collection(&[("a", json!({ "n": 1 })), ("b", json!({ "n": 2 }))]);
+        let bytes = bytes_of(&coll);
+        let head_at = heads_offset(&coll);
+        let head_len = codec::head_len(&bytes[head_at..]).unwrap();
+        let rel_at = head_at + codec::HEAD_BODY_REL_OFFSET;
+        let len_at = head_at + codec::HEAD_BODY_LEN_OFFSET;
+        let rel = u32::from_le_bytes(bytes[rel_at..rel_at + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[len_at..len_at + 4].try_into().unwrap());
+
+        let patched = |at: usize, value: u32| {
+            let mut bad = bytes.clone();
+            bad[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            reseal(&mut bad);
+            read_image(bad).unwrap_err().to_string()
+        };
+        assert!(patched(rel_at, (head_len - 1) as u32).contains("body"), "a body inside its head");
+        assert!(patched(rel_at, rel + 1).contains("body"), "a body not where the previous one ended");
+        assert!(patched(len_at, len + 1).contains("body"), "a body running into the next");
+        assert!(patched(len_at, 0).contains("tombstone"), "a tombstone in a base image");
+
+        // A bodies region longer than its bodies: bytes no row accounts for.
+        let mut longer = bytes.clone();
+        let image = parse_header(&longer).unwrap();
+        let (bodies_end, bodies_len_at) = (image.bodies.end, rows_offset(&coll) + 16);
+        let bodies_len = u64::from_le_bytes(longer[bodies_len_at..bodies_len_at + 8].try_into().unwrap());
+        longer.insert(bodies_end, 0);
+        longer[bodies_len_at..bodies_len_at + 8].copy_from_slice(&(bodies_len + 1).to_le_bytes());
+        reseal(&mut longer);
+        assert!(read_image(longer).unwrap_err().to_string().contains("after"), "trailing bytes");
+    }
+
     #[test]
     fn a_duplicated_record_is_rejected() {
         let coll = collection(&[("a", json!({ "n": 1 }))]);
         let bytes = bytes_of(&coll);
+        let image = parse_header(&bytes).unwrap();
+        let head = &bytes[image.heads.clone()];
+        let body = &bytes[image.bodies.clone()];
         let at = rows_offset(&coll);
-        let record = bytes[at + 8..bytes.len() - TRAILER_LEN].to_vec();
         let mut bad = bytes[..at].to_vec();
         bad.extend_from_slice(&2u64.to_le_bytes());
-        bad.extend_from_slice(&record);
-        bad.extend_from_slice(&record);
+        bad.extend_from_slice(&(2 * head.len() as u64).to_le_bytes());
+        bad.extend_from_slice(&(2 * body.len() as u64).to_le_bytes());
+        let heads_start = bad.len();
+        let bodies_start = heads_start + 2 * head.len();
+        codec::relink_head(head, (bodies_start - heads_start) as u32, &mut bad);
+        codec::relink_head(head, (bodies_start + body.len() - (heads_start + head.len())) as u32, &mut bad);
+        bad.extend_from_slice(body);
+        bad.extend_from_slice(body);
         bad.extend_from_slice(&[0u8; TRAILER_LEN]);
         reseal(&mut bad);
         let err = read_image(bad).unwrap_err();
@@ -673,7 +1339,7 @@ mod tests {
     fn a_dictionary_that_repeats_a_name_is_rejected() {
         let coll = collection(&[("a", json!({ "n": 1 }))]);
         let bytes = bytes_of(&coll);
-        let dict_at = MAGIC.len() + 4 + 4 + 4 + coll.name.len() + XOR_LEN;
+        let dict_at = FIXED_PREFIX_LEN + 4 + coll.name.len() + XOR_LEN + XOR_LEN;
         let mut bad = bytes[..dict_at].to_vec();
         bad.extend_from_slice(&2u32.to_le_bytes());
         for _ in 0..2 {
@@ -692,12 +1358,31 @@ mod tests {
         let bytes = bytes_of(&coll);
         let image = parse_image(&bytes).unwrap();
         assert_eq!(image.name, "game");
+        assert_eq!(image.image_id, ID);
+        assert_eq!(image.seq, 0);
         assert_eq!(image.rows, 1);
         assert_eq!(image.stored_xor, coll.catchup_xor);
+        assert_eq!(image.prev_xor, ssp_protocol::snapshot_hash::xor_empty());
         let mut names = image.field_names.clone();
         names.sort();
         assert_eq!(names, vec!["x", "y"]);
-        assert_eq!(image.records.end, bytes.len() - TRAILER_LEN);
+        assert_eq!(image.heads.start, heads_offset(&coll));
+        assert_eq!(image.heads.end, image.bodies.start);
+        assert_eq!(image.bodies.end + TRAILER_LEN, bytes.len());
+        assert_eq!(&image.bodies_hash, blake3::hash(&bytes[image.bodies.clone()]).as_bytes());
+        assert_eq!(
+            parse_identity(&bytes).unwrap(),
+            ImageIdentity { format: FORMAT, record_format: RECORD_FORMAT, image_id: ID, seq: 0 }
+        );
+    }
+
+    #[test]
+    fn image_ids_are_fresh_per_write_and_stable_per_content() {
+        let coll = collection(&[("a", json!({ "n": 1 }))]);
+        assert_ne!(fresh_image_id(), fresh_image_id());
+        assert_eq!(content_image_id(&coll), content_image_id(&coll));
+        let other = collection(&[("a", json!({ "n": 2 }))]);
+        assert_ne!(content_image_id(&coll), content_image_id(&other));
     }
 
     fn store_of(tables: &[(&str, &[(&str, serde_json::Value)])]) -> Store {
@@ -733,6 +1418,8 @@ mod tests {
         }
         // Deterministic: the same store, the same bytes.
         assert_eq!(write_store(&store).unwrap(), bytes);
+        // Every embedded image is a base image of this format.
+        assert_eq!(parse_identity(&bytes[16 + 8..]).unwrap().format, FORMAT);
     }
 
     #[test]
@@ -754,7 +1441,11 @@ mod tests {
         assert!(read_store(&wrong_len).is_err(), "a length that does not describe its image");
         let mut flipped = bytes.clone();
         flipped[40] ^= 1;
-        assert!(read_store(&flipped).is_err(), "a flipped byte inside an image");
+        assert!(read_store(&flipped).is_err(), "a flipped byte inside an image's header");
+        let mut body = bytes.clone();
+        let last = body.len() - TRAILER_LEN - 1;
+        body[last] ^= 1;
+        assert!(read_store(&body).is_err(), "a flipped byte inside an image's bodies");
         let mut magic = bytes.clone();
         magic[0] ^= 1;
         assert!(read_store(&magic).is_err(), "wrong magic");
@@ -785,15 +1476,28 @@ mod tests {
             let path = dir.join("game.rows");
             std::fs::write(&path, bytes_of(&coll)).unwrap();
 
-            let (mut back, stats) = map_image(&path, &dir.join("arena"), 64 * 1024).unwrap();
+            let Mapped { collection: mut back, stats, pending } =
+                map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::Deferred).unwrap();
             assert!(stats.mapped);
+            assert_eq!(stats.verify_ms, 0, "deferred: nothing verified yet");
             assert_eq!(stats.bytes, std::fs::metadata(&path).unwrap().len());
+            assert_eq!(stats.image_id, ID);
+            let pending = pending.expect("a deferred load hands the bodies out");
+            assert_eq!(pending.table, "game");
+            assert_eq!(pending.path, path);
+            assert_eq!(pending.image.bodies.len() as u64, stats.bodies_bytes);
             assert_eq!(back.rows.len(), 2);
             assert_eq!(back.catchup_xor, coll.catchup_xor);
             for id in ["a", "b"] {
                 assert_eq!(back.get_row(id).to_owned_value(), coll.get_row(id).to_owned_value());
                 assert_eq!(back.rows.digest_of(id), coll.rows.digest_of(id));
             }
+            assert_eq!(
+                back.rows.live_bytes(),
+                coll.rows.records().map(|(h, b)| (h.len() + b.len()) as u64).sum::<u64>()
+            );
+            assert!(back.rows.image(0).is_some_and(|i| i.same_mapping(&pending.image)));
+            assert!(back.rows.image(1).is_none());
 
             // Appends land in a fresh writable segment; the image's rows stay.
             back.apply(Operation::Create, "c", Sp00kyValue::from(json!({ "n": 3 })));
@@ -801,32 +1505,110 @@ mod tests {
             assert_eq!(back.get_row("c").get("n").as_i64(), Some(3));
             assert_eq!(back.get_row("a").get("n").as_i64(), Some(11));
             assert_eq!(back.get_row("b").get("n").as_i64(), Some(2));
+            assert!(back.rows.image(1).is_none(), "the writable segment is no image");
 
             // The file is replaced by rename while mapped, as the writer does;
-            // the mapping keeps serving the old inode.
+            // the mapping keeps serving the old inode, and so does the
+            // verification, which reads the inode it mapped.
             let tmp = dir.join("game.rows.tmp");
             let mut out = std::fs::File::create(&tmp).unwrap();
-            write_collection(&back, &mut out).unwrap();
+            write_collection(&back, fresh_image_id(), &mut out).unwrap();
             std::fs::rename(&tmp, &path).unwrap();
             assert_eq!(back.get_row("b").get("n").as_i64(), Some(2));
+            assert_eq!(verify_bodies(&pending.image, Throttle::none()).unwrap(), true);
 
-            let (again, _) = map_image(&path, &dir.join("arena"), 64 * 1024).unwrap();
-            assert_eq!(again.rows.len(), 3);
-            assert_eq!(again.catchup_xor, back.catchup_xor);
-            assert_eq!(again.get_row("a").get("n").as_i64(), Some(11));
+            let again = map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::AtLoad).unwrap();
+            assert_eq!(again.collection.rows.len(), 3);
+            assert_eq!(again.collection.catchup_xor, back.catchup_xor);
+            assert_eq!(again.collection.get_row("a").get("n").as_i64(), Some(11));
+            assert!(again.pending.is_none(), "verified at load: nothing pending");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
-        fn a_corrupt_file_is_refused_when_mapped() {
-            let dir = tmpdir("corrupt");
+        fn a_flipped_head_is_refused_when_mapped() {
+            let dir = tmpdir("corrupt-head");
             let coll = collection(&[("a", json!({ "n": 1 }))]);
             let mut bytes = bytes_of(&coll);
-            let mid = bytes.len() / 2;
-            bytes[mid] ^= 1;
+            bytes[heads_offset(&coll) + 3] ^= 1;
             let path = dir.join("game.rows");
             std::fs::write(&path, bytes).unwrap();
-            assert!(map_image(&path, &dir.join("arena"), 64 * 1024).is_err());
+            assert!(map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::Deferred).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_flipped_body_loads_deferred_and_fails_its_verification() {
+            let dir = tmpdir("corrupt-body");
+            let coll = collection(&[("a", json!({ "n": 1, "s": "a value long enough to flip" }))]);
+            let mut bytes = bytes_of(&coll);
+            let body_at = parse_header(&bytes).unwrap().bodies.start + 4;
+            bytes[body_at] ^= 1;
+            let path = dir.join("game.rows");
+            std::fs::write(&path, bytes).unwrap();
+            assert!(map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::AtLoad).is_err());
+            let mapped = map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::Deferred).unwrap();
+            assert_eq!(mapped.collection.rows.len(), 1);
+            let pending = mapped.pending.unwrap();
+            assert_eq!(verify_bodies(&pending.image, Throttle::none()).unwrap(), false);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn verify_bodies_in_chunks_matches_one_shot() {
+            let dir = tmpdir("chunks");
+            let rows: Vec<(String, serde_json::Value)> =
+                (0..200).map(|i| (format!("r{i}"), json!({ "n": i, "s": "x".repeat(i) }))).collect();
+            let coll = collection(&rows.iter().map(|(id, v)| (id.as_str(), v.clone())).collect::<Vec<_>>());
+            let path = dir.join("game.rows");
+            std::fs::write(&path, bytes_of(&coll)).unwrap();
+            let mapped = map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::Deferred).unwrap();
+            let image = mapped.pending.unwrap().image;
+            for chunk in [1usize, 7, 4096, 1 << 20] {
+                let throttle = Throttle { chunk, pause: std::time::Duration::ZERO };
+                assert!(verify_bodies(&image, throttle).unwrap(), "chunk {chunk}");
+                touch_bodies(&image, throttle).unwrap();
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The verifier holds the mapping on its own: the table can be
+        /// cleared, replaced or dropped meanwhile.
+        #[test]
+        fn a_pending_verify_outlives_the_table() {
+            let dir = tmpdir("outlive");
+            let coll = collection(&[("a", json!({ "n": 1 }))]);
+            let path = dir.join("game.rows");
+            std::fs::write(&path, bytes_of(&coll)).unwrap();
+            let mapped = map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::Deferred).unwrap();
+            let pending = mapped.pending.unwrap();
+            let mut table = mapped.collection;
+            table.rows.clear();
+            assert!(table.rows.image(0).is_none());
+            drop(table);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(verify_bodies(&pending.image, Throttle::none()).unwrap(), true);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn peek_identity_reads_the_prefix_only() {
+            let dir = tmpdir("peek");
+            let coll = collection(&[("a", json!({ "n": 1 }))]);
+            let mut bytes = bytes_of(&coll);
+            let path = dir.join("game.rows");
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                peek_identity(&path).unwrap(),
+                ImageIdentity { format: FORMAT, record_format: RECORD_FORMAT, image_id: ID, seq: 0 }
+            );
+            // A damaged body does not stop the peek; a short file does.
+            let last = bytes.len() - TRAILER_LEN - 1;
+            bytes[last] ^= 1;
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(peek_identity(&path).unwrap().image_id, ID);
+            std::fs::write(&path, &bytes[..20]).unwrap();
+            assert!(peek_identity(&path).is_err());
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

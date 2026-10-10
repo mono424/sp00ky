@@ -35,6 +35,17 @@ pub trait Arena: std::fmt::Debug + Send + Sync {
     /// stay until compaction.
     fn free(&mut self, span: Span);
 
+    /// Count `bytes` of the arena's existing contents as referenced: what a
+    /// loader does for the records of an image it adopted, which came in
+    /// accounted dead.
+    fn adopt(&mut self, bytes: u64);
+
+    /// The checkpoint image behind segment `seg`, if that is what it is.
+    #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+    fn image(&self, _seg: u16) -> Option<&ImageRef> {
+        None
+    }
+
     /// Bytes currently referenced by a live slot.
     fn live_bytes(&self) -> u64;
 
@@ -107,6 +118,11 @@ impl Arena for HeapArena {
         self.dead += len;
     }
 
+    fn adopt(&mut self, bytes: u64) {
+        self.live += bytes;
+        self.dead = self.dead.saturating_sub(bytes);
+    }
+
     fn live_bytes(&self) -> u64 {
         self.live
     }
@@ -177,12 +193,45 @@ pub struct MmapArena {
 ///
 /// An image segment is a checkpoint file mapped read-only: full from the
 /// start, never appended into, its pages clean page cache the kernel can drop
-/// and re-read at will. See [`MmapArena::from_image`].
+/// and re-read at will. See [`MmapArena::from_images`].
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
 #[derive(Debug)]
 struct Seg {
     store: SegStore,
     written: usize,
+}
+
+/// A checkpoint image as the arena holds it: the read-only mapping, the open
+/// file it was mapped from (the same inode whatever the path holds later),
+/// and what a verification of its bodies needs. Cloneable, so a verifier can
+/// hold the mapping without the table's lock; the arena never writes into it
+/// and nothing writes the file in place (see `checkpoint`), so sharing the
+/// bytes is sound.
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone)]
+pub struct ImageRef {
+    pub map: std::sync::Arc<memmap2::Mmap>,
+    pub file: std::sync::Arc<std::fs::File>,
+    /// The bodies region, which the mapping's heads point into.
+    pub bodies: std::ops::Range<usize>,
+    /// blake3 of the bodies region, as the file's trailer stores it.
+    pub bodies_hash: [u8; 32],
+}
+
+#[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
+impl ImageRef {
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Whether both refer to one mapping (not merely one file).
+    pub fn same_mapping(&self, other: &ImageRef) -> bool {
+        std::sync::Arc::ptr_eq(&self.map, &other.map)
+    }
 }
 
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
@@ -192,7 +241,7 @@ enum SegStore {
     /// Fallback when the filesystem will not give us a mapping.
     Memory(Vec<u8>),
     /// A checkpoint image, mapped read-only.
-    Image(memmap2::Mmap),
+    Image(ImageRef),
 }
 
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
@@ -201,7 +250,7 @@ impl Seg {
         match &self.store {
             SegStore::Mapped(m) => m,
             SegStore::Memory(v) => v,
-            SegStore::Image(m) => m,
+            SegStore::Image(i) => &i.map,
         }
     }
 
@@ -245,31 +294,34 @@ impl MmapArena {
         Ok(arena)
     }
 
-    /// An arena whose first segment is a checkpoint image mapped read-only,
-    /// with `live` of its bytes referenced by records (the rest is the image's
-    /// framing, dead from the start). Nothing is appended into the image:
-    /// the first append maps a fresh writable segment under `dir`, exactly as
-    /// a full segment does, so the image's spans stay valid for as long as
-    /// the arena lives.
-    pub fn from_image(
+    /// An arena whose first segments are checkpoint images mapped read-only,
+    /// in the order given: segment `i` is `images[i]`. Every byte of them is
+    /// accounted dead until a loader adopts the records it indexed
+    /// ([`Arena::adopt`]). Nothing is appended into an image: the first
+    /// append maps a fresh writable segment under `dir`, exactly as a full
+    /// segment does, so the images' spans stay valid for as long as the
+    /// arena lives.
+    pub fn from_images(
         dir: &std::path::Path,
         name: &str,
         segment_bytes: usize,
-        image: memmap2::Mmap,
-        live: u64,
+        images: Vec<ImageRef>,
     ) -> Self {
-        let written = image.len();
+        let dead: u64 = images.iter().map(|i| i.len() as u64).sum();
         Self {
-            segments: vec![Seg {
-                store: SegStore::Image(image),
-                written,
-            }],
+            segments: images
+                .into_iter()
+                .map(|image| Seg {
+                    written: image.len(),
+                    store: SegStore::Image(image),
+                })
+                .collect(),
             segment_bytes: segment_bytes.max(64 * 1024),
             dir: dir.to_path_buf(),
             name: sanitize_table_name(name),
             instance: next_instance_id(),
-            live,
-            dead: (written as u64).saturating_sub(live),
+            live: 0,
+            dead,
         }
     }
 
@@ -407,6 +459,18 @@ impl Arena for MmapArena {
         let len = span.len as u64;
         self.live = self.live.saturating_sub(len);
         self.dead += len;
+    }
+
+    fn adopt(&mut self, bytes: u64) {
+        self.live += bytes;
+        self.dead = self.dead.saturating_sub(bytes);
+    }
+
+    fn image(&self, seg: u16) -> Option<&ImageRef> {
+        match &self.segments.get(seg as usize)?.store {
+            SegStore::Image(image) => Some(image),
+            _ => None,
+        }
     }
 
     fn live_bytes(&self) -> u64 {
@@ -670,12 +734,23 @@ mod mmap_tests {
         assert!(!MmapArena::probe_writable(&f.join("nested")));
     }
 
-    fn image_file(dir: &std::path::Path, content: &[u8]) -> memmap2::Mmap {
+    fn map_path(path: &std::path::Path) -> ImageRef {
+        let file = std::fs::File::open(path).unwrap();
+        let map = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let len = map.len();
+        ImageRef {
+            map: std::sync::Arc::new(map),
+            file: std::sync::Arc::new(file),
+            bodies: 0..len,
+            bodies_hash: [0; 32],
+        }
+    }
+
+    fn image_file(dir: &std::path::Path, content: &[u8]) -> ImageRef {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join("image.rows");
         std::fs::write(&path, content).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        unsafe { memmap2::Mmap::map(&file).unwrap() }
+        map_path(&path)
     }
 
     /// The image is segment 0 as it lies on disk; the first append goes to a
@@ -684,14 +759,19 @@ mod mmap_tests {
     fn an_image_segment_is_read_only_and_appends_go_elsewhere() {
         let dir = tmpdir("image");
         let image = image_file(&dir, b"header[record-a][record-b]trailer");
-        let mut a = MmapArena::from_image(&dir, "t", 64 * 1024, image, 20);
+        let mut a = MmapArena::from_images(&dir, "t", 64 * 1024, vec![image]);
         assert_eq!(a.segment_count(), 1);
+        assert_eq!(a.live_bytes(), 0);
+        assert_eq!(a.dead_bytes(), 33, "an image is dead until its records are adopted");
+        a.adopt(20);
         assert_eq!(a.live_bytes(), 20);
         assert_eq!(a.dead_bytes(), 33 - 20);
         let in_image = Span { seg: 0, off: 7, len: 8 };
         assert_eq!(a.get(in_image), b"record-a");
         // Past the file's end reads empty, never the mapping's zero fill.
         assert!(a.get(Span { seg: 0, off: 30, len: 10 }).is_empty());
+        assert!(a.image(0).is_some());
+        assert!(a.image(1).is_none());
 
         let appended = a.append(b"record-c");
         assert_eq!(a.segment_count(), 2, "the image must not be written into");
@@ -699,6 +779,7 @@ mod mmap_tests {
         assert_eq!(a.get(appended), b"record-c");
         assert_eq!(a.get(in_image), b"record-a");
         assert_eq!(a.live_bytes(), 28);
+        assert!(a.image(1).is_none(), "a writable segment is not an image");
 
         a.free(in_image);
         assert_eq!(a.dead_bytes(), 33 - 20 + 8);
@@ -709,14 +790,33 @@ mod mmap_tests {
     fn clear_drops_the_image() {
         let dir = tmpdir("image-clear");
         let image = image_file(&dir, b"0123456789");
-        let mut a = MmapArena::from_image(&dir, "t", 64 * 1024, image, 10);
+        let mut a = MmapArena::from_images(&dir, "t", 64 * 1024, vec![image]);
+        a.adopt(10);
         let s = Span { seg: 0, off: 2, len: 3 };
         assert_eq!(a.get(s), b"234");
         a.clear();
         assert!(a.get(s).is_empty(), "cleared image must not read back");
+        assert!(a.image(0).is_none(), "the image is gone with the clear");
         assert_eq!(a.live_bytes(), 0);
         let again = a.append(b"new");
         assert_eq!(a.get(again), b"new");
+    }
+
+    /// Images are segments in the order given; appends land after them.
+    #[test]
+    fn from_images_orders_segments_as_given() {
+        let dir = tmpdir("images");
+        let one = image_file(&dir.join("a"), b"first-image");
+        let two = image_file(&dir.join("b"), b"second-image");
+        let mut a = MmapArena::from_images(&dir, "t", 64 * 1024, vec![one, two]);
+        assert_eq!(a.segment_count(), 2);
+        assert_eq!(a.get(Span { seg: 0, off: 0, len: 5 }), b"first");
+        assert_eq!(a.get(Span { seg: 1, off: 0, len: 6 }), b"second");
+        assert_eq!(a.dead_bytes(), 11 + 12);
+        let appended = a.append(b"third");
+        assert_eq!(appended.seg, 2);
+        assert!(a.image(1).is_some());
+        assert!(a.image(2).is_none());
     }
 
     /// Two arenas over one image file (a rebuilt circuit beside the old one,
@@ -725,10 +825,12 @@ mod mmap_tests {
     fn two_arenas_may_map_the_same_image() {
         let dir = tmpdir("image-shared");
         let one = image_file(&dir, b"shared-bytes");
-        let path = dir.join("image.rows");
-        let two = unsafe { memmap2::Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() };
-        let mut a = MmapArena::from_image(&dir, "t", 64 * 1024, one, 12);
-        let mut b = MmapArena::from_image(&dir, "t", 64 * 1024, two, 12);
+        let two = map_path(&dir.join("image.rows"));
+        assert!(!one.same_mapping(&two));
+        let mut a = MmapArena::from_images(&dir, "t", 64 * 1024, vec![one]);
+        let mut b = MmapArena::from_images(&dir, "t", 64 * 1024, vec![two]);
+        a.adopt(12);
+        b.adopt(12);
         let sa = a.append(b"A");
         let sb = b.append(b"B");
         assert_eq!(a.get(Span { seg: 0, off: 0, len: 6 }), b"shared");

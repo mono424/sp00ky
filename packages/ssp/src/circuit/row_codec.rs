@@ -7,17 +7,31 @@
 //!
 //! # Layout
 //!
-//! A record is a header followed by one encoded value:
+//! A record is a head followed by its body:
 //!
 //! ```text
+//! head:
 //! [u8; 32] digest    blake3 of the canonical form, computed once at write time
 //! [i64]    rv        `_00_rv` lifted out of the body; RV_ABSENT when there is none
+//! [u32]    body_rel  where the body starts, counted from the head's own first byte
+//! [u32]    body_len  the body's length; 0 marks a tombstone (a delta checkpoint's
+//!                    "this row is gone"), which is never a live row
 //! [varint] id_len
 //! [bytes]  id        the raw record id, i.e. the row's own key
+//! body:
 //! [value]            tag-prefixed, see below
 //! ```
 //!
-//! The id lives in the record so the index does not have to own a copy of it.
+//! The head is what the index points at and what a lookup, a version read or
+//! a hash fold touches; the body is read only when a row's value is wanted.
+//! Keeping the two apart is what lets a checkpoint be loaded by reading its
+//! heads alone (see `checkpoint`). An appended record lays the body right
+//! behind its head (`body_rel` equals the head's length); a checkpoint image
+//! keeps every head in one region and every body in another, and `body_rel`
+//! spans the distance. Either way the body lives in the same arena segment as
+//! its head, further on.
+//!
+//! The id lives in the head so the index does not have to own a copy of it.
 //! That moves one string allocation per row out of anonymous memory and into
 //! the arena — which, when the arena is file-backed, is reclaimable page cache
 //! instead. It is also what lets a lookup verify a hash match against the real
@@ -79,17 +93,22 @@ pub const RV_ABSENT: i64 = i64::MIN;
 
 /// Version of the record layout above. A row checkpoint stores records
 /// verbatim, so it is only readable by a build that lays records out the same
-/// way: bump this on ANY change to the header, the tags or the object table.
+/// way: bump this on ANY change to the head, the tags or the object table.
 /// Readable-but-misread is the failure it guards against, and it is silent:
-/// the digest is carried in the header rather than recomputed, so a misread
-/// body would still hash as if it were right.
-pub const RECORD_FORMAT: u32 = 1;
+/// the digest is carried in the head rather than recomputed, so a misread
+/// body would still hash as if it were right. Version 1 kept the body behind
+/// the id with no pointer; `checkpoint::legacy` still reads it.
+pub const RECORD_FORMAT: u32 = 2;
 
 pub const DIGEST_LEN: usize = 32;
-pub const RV_OFFSET: usize = DIGEST_LEN;
-/// Offset of the id's length prefix. The value region follows the id, so its
-/// position is record-dependent — use [`record_value`].
-pub const ID_OFFSET: usize = DIGEST_LEN + 8;
+/// Head field offsets. The head is fixed up to the id's length prefix.
+pub const HEAD_RV_OFFSET: usize = DIGEST_LEN;
+pub const HEAD_BODY_REL_OFFSET: usize = HEAD_RV_OFFSET + 8;
+pub const HEAD_BODY_LEN_OFFSET: usize = HEAD_BODY_REL_OFFSET + 4;
+/// Offset of the id's length prefix; the id follows it and ends the head.
+pub const HEAD_ID_OFFSET: usize = HEAD_BODY_LEN_OFFSET + 4;
+/// The smallest head: every fixed field and an empty id.
+pub const HEAD_MIN_LEN: usize = HEAD_ID_OFFSET + 1;
 
 /// Per-table field-name dictionary.
 ///
@@ -173,6 +192,16 @@ impl FieldDict {
 
 // --- varint ---
 
+fn varint_len(v: u64) -> usize {
+    let mut n = 1;
+    let mut v = v >> 7;
+    while v != 0 {
+        n += 1;
+        v >>= 7;
+    }
+    n
+}
+
 fn write_varint(v: u64, out: &mut Vec<u8>) {
     let mut v = v;
     loop {
@@ -206,7 +235,9 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 
 // --- encoding ---
 
-/// Encode a row into `out`, returning nothing — the caller owns the buffer.
+/// Encode a row into `out` (cleared first) as a head followed by its body,
+/// and return the head's length. The head's `body_rel` equals that length:
+/// the body sits right behind it.
 ///
 /// `digest` is supplied rather than computed here so it always comes from the
 /// canonical writer, which is the thing pinned against the `serde_json`
@@ -217,17 +248,51 @@ pub fn encode_record(
     digest: &[u8; DIGEST_LEN],
     dict: &mut FieldDict,
     out: &mut Vec<u8>,
-) {
+) -> usize {
     out.clear();
-    out.extend_from_slice(digest);
     let rv = match value.get("_00_rv") {
         Some(Sp00kyValue::Int(rv)) => *rv,
         _ => RV_ABSENT,
     };
+    let head_len = encode_head(id, digest, rv, head_len_for(id) as u32, 0, out);
+    encode_value(value, dict, out);
+    let body_len = (out.len() - head_len) as u32;
+    out[HEAD_BODY_LEN_OFFSET..HEAD_BODY_LEN_OFFSET + 4].copy_from_slice(&body_len.to_le_bytes());
+    head_len
+}
+
+/// Append one head to `out` and return its length. `rv` is the raw lifted
+/// value, `RV_ABSENT` included; the digest, `body_rel` and `body_len` are
+/// stored as given.
+pub fn encode_head(
+    id: &str,
+    digest: &[u8; DIGEST_LEN],
+    rv: i64,
+    body_rel: u32,
+    body_len: u32,
+    out: &mut Vec<u8>,
+) -> usize {
+    let start = out.len();
+    out.extend_from_slice(digest);
     out.extend_from_slice(&rv.to_le_bytes());
+    out.extend_from_slice(&body_rel.to_le_bytes());
+    out.extend_from_slice(&body_len.to_le_bytes());
     write_varint(id.len() as u64, out);
     out.extend_from_slice(id.as_bytes());
-    encode_value(value, dict, out);
+    out.len() - start
+}
+
+/// The length of a head carrying `id`.
+pub fn head_len_for(id: &str) -> usize {
+    HEAD_ID_OFFSET + varint_len(id.len() as u64) + id.len()
+}
+
+/// Copy `head` to `out` with `body_rel` replaced: what a checkpoint writer
+/// does when it lays the bodies out apart from the heads.
+pub fn relink_head(head: &[u8], body_rel: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&head[..HEAD_BODY_REL_OFFSET]);
+    out.extend_from_slice(&body_rel.to_le_bytes());
+    out.extend_from_slice(&head[HEAD_BODY_LEN_OFFSET..]);
 }
 
 fn encode_value(value: &Sp00kyValue, dict: &mut FieldDict, out: &mut Vec<u8>) {
@@ -284,38 +349,75 @@ fn encode_value(value: &Sp00kyValue, dict: &mut FieldDict, out: &mut Vec<u8>) {
     }
 }
 
-// --- header reads ---
+// --- head reads ---
+//
+// Every read is bounds-checked and answers `None` on a short or malformed
+// head: once the bytes come from a file they are untrusted input.
 
-/// The stored digest. `None` if the record is too short to hold one.
-pub fn record_digest(record: &[u8]) -> Option<&[u8; DIGEST_LEN]> {
-    record.get(..DIGEST_LEN)?.try_into().ok()
+/// The head's whole length: the fixed fields, the id's length prefix and the
+/// id. `None` when `bytes` does not hold a whole head.
+pub fn head_len(bytes: &[u8]) -> Option<usize> {
+    let (len, n) = read_varint(bytes.get(HEAD_ID_OFFSET..)?)?;
+    let end = HEAD_ID_OFFSET
+        .checked_add(n)?
+        .checked_add(usize::try_from(len).ok()?)?;
+    (end <= bytes.len()).then_some(end)
+}
+
+/// The stored digest. `None` if the head is too short to hold one.
+pub fn head_digest(head: &[u8]) -> Option<&[u8; DIGEST_LEN]> {
+    head.get(..DIGEST_LEN)?.try_into().ok()
 }
 
 /// The lifted `_00_rv`, or `None` when the row carries none.
 ///
 /// Reading this is two loads at a fixed offset, which is why
 /// `max_row_versions` no longer decodes anything.
-pub fn record_rv(record: &[u8]) -> Option<i64> {
-    let raw = i64::from_le_bytes(record.get(RV_OFFSET..RV_OFFSET + 8)?.try_into().ok()?);
+pub fn head_rv(head: &[u8]) -> Option<i64> {
+    let raw = head_rv_raw(head)?;
     (raw != RV_ABSENT).then_some(raw)
 }
 
-/// The raw record id stored in a record.
+/// The rv field as stored, `RV_ABSENT` included: for copying a head.
+pub fn head_rv_raw(head: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(
+        head.get(HEAD_RV_OFFSET..HEAD_RV_OFFSET + 8)?.try_into().ok()?,
+    ))
+}
+
+/// Where the body starts, counted from the head's first byte.
+pub fn head_body_rel(head: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        head.get(HEAD_BODY_REL_OFFSET..HEAD_BODY_REL_OFFSET + 4)?.try_into().ok()?,
+    ))
+}
+
+/// The body's length. Zero marks a tombstone.
+pub fn head_body_len(head: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        head.get(HEAD_BODY_LEN_OFFSET..HEAD_BODY_LEN_OFFSET + 4)?.try_into().ok()?,
+    ))
+}
+
+/// The raw record id stored in a head.
 ///
 /// This is the authority a lookup compares against: the index is keyed by a
 /// hash, and a hash match is only a candidate until the id itself agrees.
-pub fn record_id(record: &[u8]) -> Option<&str> {
-    let (len, n) = read_varint(record.get(ID_OFFSET..)?)?;
-    let start = ID_OFFSET + n;
-    std::str::from_utf8(record.get(start..start + len as usize)?).ok()
+pub fn head_id(head: &[u8]) -> Option<&str> {
+    let (len, n) = read_varint(head.get(HEAD_ID_OFFSET..)?)?;
+    let start = HEAD_ID_OFFSET + n;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    std::str::from_utf8(head.get(start..end)?).ok()
 }
 
-/// The encoded value region of a record, which follows the id.
-pub fn record_value(record: &[u8]) -> &[u8] {
-    let Some((len, n)) = record.get(ID_OFFSET..).and_then(read_varint) else {
+/// The body of a record held in one piece, head then body, as the encoder
+/// leaves it. Empty when the head does not describe one.
+pub fn record_body(record: &[u8]) -> &[u8] {
+    let (Some(rel), Some(len)) = (head_body_rel(record), head_body_len(record)) else {
         return &[];
     };
-    record.get(ID_OFFSET + n + len as usize..).unwrap_or(&[])
+    let start = rel as usize;
+    record.get(start..start + len as usize).unwrap_or(&[])
 }
 
 // --- structural reads ---
@@ -484,10 +586,51 @@ mod tests {
         let sv = Sp00kyValue::from(j.clone());
         let mut dict = FieldDict::new();
         let mut buf = Vec::new();
-        encode_record("r1", &sv, &[7u8; DIGEST_LEN], &mut dict, &mut buf);
-        let decoded = decode_value(record_value(&buf), &dict).expect("decodes");
+        let head_len = encode_record("r1", &sv, &[7u8; DIGEST_LEN], &mut dict, &mut buf);
+        let decoded = decode_value(record_body(&buf), &dict).expect("decodes");
         assert_eq!(decoded, sv, "round trip changed {j}");
-        assert_eq!(record_digest(&buf), Some(&[7u8; DIGEST_LEN]));
+        assert_eq!(head_digest(&buf), Some(&[7u8; DIGEST_LEN]));
+        assert_eq!(head_len, head_len_for("r1"));
+        assert_eq!(super::head_len(&buf), Some(head_len));
+        assert_eq!(head_body_rel(&buf), Some(head_len as u32));
+        assert_eq!(head_body_len(&buf), Some((buf.len() - head_len) as u32));
+        assert_eq!(head_id(&buf), Some("r1"));
+    }
+
+    #[test]
+    fn head_layout_is_pinned() {
+        assert_eq!(HEAD_RV_OFFSET, 32);
+        assert_eq!(HEAD_BODY_REL_OFFSET, 40);
+        assert_eq!(HEAD_BODY_LEN_OFFSET, 44);
+        assert_eq!(HEAD_ID_OFFSET, 48);
+        assert_eq!(HEAD_MIN_LEN, 49);
+        let mut buf = Vec::new();
+        let len = encode_head("ab", &[9u8; DIGEST_LEN], -5, 1000, 7, &mut buf);
+        assert_eq!(len, 51);
+        assert_eq!(buf.len(), 51);
+        assert_eq!(&buf[..32], &[9u8; 32]);
+        assert_eq!(&buf[32..40], &(-5i64).to_le_bytes());
+        assert_eq!(&buf[40..44], &1000u32.to_le_bytes());
+        assert_eq!(&buf[44..48], &7u32.to_le_bytes());
+        assert_eq!(&buf[48..], &[2, b'a', b'b']);
+        assert_eq!(head_rv_raw(&buf), Some(-5));
+        assert_eq!(head_len_for("ab"), 51);
+        assert_eq!(head_len_for(""), HEAD_MIN_LEN);
+        assert_eq!(head_len_for(&"x".repeat(200)), HEAD_ID_OFFSET + 2 + 200);
+    }
+
+    #[test]
+    fn relinking_a_head_changes_only_the_body_pointer() {
+        let mut dict = FieldDict::new();
+        let mut buf = Vec::new();
+        let head_len = encode_record("r1", &Sp00kyValue::from(json!({ "a": 1 })), &[3u8; DIGEST_LEN], &mut dict, &mut buf);
+        let mut moved = Vec::new();
+        relink_head(&buf[..head_len], 4096, &mut moved);
+        assert_eq!(moved.len(), head_len);
+        assert_eq!(head_body_rel(&moved), Some(4096));
+        assert_eq!(head_body_len(&moved), head_body_len(&buf));
+        assert_eq!(head_digest(&moved), head_digest(&buf));
+        assert_eq!(head_id(&moved), Some("r1"));
     }
 
     #[test]
@@ -519,7 +662,7 @@ mod tests {
             let mut dict = FieldDict::new();
             let mut buf = Vec::new();
             encode_record("r1", &sv, &[0u8; DIGEST_LEN], &mut dict, &mut buf);
-            let back = decode_value(record_value(&buf), &dict).unwrap();
+            let back = decode_value(record_body(&buf), &dict).unwrap();
             match back {
                 Sp00kyValue::Float(g) => {
                     assert_eq!(g.is_nan(), f.is_nan());
@@ -552,8 +695,8 @@ mod tests {
         let (mut a, mut b) = (Vec::new(), Vec::new());
         encode_record("a", &i, &[0; DIGEST_LEN], &mut dict, &mut a);
         encode_record("b", &f, &[0; DIGEST_LEN], &mut dict, &mut b);
-        assert_eq!(decode_value(record_value(&a), &dict).unwrap(), i);
-        assert_eq!(decode_value(record_value(&b), &dict).unwrap(), f);
+        assert_eq!(decode_value(record_body(&a), &dict).unwrap(), i);
+        assert_eq!(decode_value(record_body(&b), &dict).unwrap(), f);
     }
 
     #[test]
@@ -567,7 +710,7 @@ mod tests {
             &mut dict,
             &mut buf,
         );
-        assert_eq!(record_rv(&buf), Some(42));
+        assert_eq!(head_rv(&buf), Some(42));
 
         encode_record(
             "r1",
@@ -576,7 +719,8 @@ mod tests {
             &mut dict,
             &mut buf,
         );
-        assert_eq!(record_rv(&buf), None, "absent rv must not read as a value");
+        assert_eq!(head_rv(&buf), None, "absent rv must not read as a value");
+        assert_eq!(head_rv_raw(&buf), Some(RV_ABSENT));
 
         // A non-integer `_00_rv` is not a version — matching max_row_versions,
         // which counts only ints so the resume point cannot advance past rows
@@ -588,7 +732,7 @@ mod tests {
             &mut dict,
             &mut buf,
         );
-        assert_eq!(record_rv(&buf), None);
+        assert_eq!(head_rv(&buf), None);
     }
 
     #[test]
@@ -599,7 +743,7 @@ mod tests {
         let mut dict = FieldDict::new();
         let mut buf = Vec::new();
         encode_record("r1", &sv, &[0; DIGEST_LEN], &mut dict, &mut buf);
-        let value = record_value(&buf);
+        let value = record_body(&buf);
 
         for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
             let id = dict.id_of(name).expect("interned");
@@ -624,7 +768,7 @@ mod tests {
         dict.intern("m");
         let mut buf = Vec::new();
         encode_record("r1", &sv, &[0; DIGEST_LEN], &mut dict, &mut buf);
-        let value = record_value(&buf);
+        let value = record_body(&buf);
         let mut prev = None;
         for i in 0..4 {
             let (id, _) = obj_entry_at(value, i).unwrap();
@@ -664,12 +808,22 @@ mod tests {
         // Every prefix must be handled without panicking. Once the arena is
         // file-backed these bytes are untrusted input.
         for cut in 0..buf.len() {
-            let _ = decode_value(record_value(&buf[..cut]), &dict);
-            let _ = value_len(record_value(&buf[..cut]));
-            let _ = record_rv(&buf[..cut]);
-            let _ = record_digest(&buf[..cut]);
-            let _ = obj_lookup(record_value(&buf[..cut]), 0);
+            let _ = decode_value(record_body(&buf[..cut]), &dict);
+            let _ = value_len(record_body(&buf[..cut]));
+            let _ = head_len(&buf[..cut]);
+            let _ = head_rv(&buf[..cut]);
+            let _ = head_rv_raw(&buf[..cut]);
+            let _ = head_digest(&buf[..cut]);
+            let _ = head_body_rel(&buf[..cut]);
+            let _ = head_body_len(&buf[..cut]);
+            let _ = head_id(&buf[..cut]);
+            let _ = obj_lookup(record_body(&buf[..cut]), 0);
         }
+        // A head whose id length runs past its bytes has no id and no length.
+        let mut bad = buf[..HEAD_MIN_LEN].to_vec();
+        bad[HEAD_ID_OFFSET] = 0xC8;
+        assert_eq!(head_len(&bad), None);
+        assert_eq!(head_id(&bad), None);
     }
 
     #[test]

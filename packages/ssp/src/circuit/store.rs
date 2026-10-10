@@ -180,12 +180,12 @@ impl Collection {
     /// Recompute the incremental XOR accumulator from the current rows: after
     /// a deserialize, where no write maintained it, or to check one that was.
     ///
-    /// Reads each record's stored digest straight out of the arena, so a
-    /// re-seed is one walk of 32-byte header reads with no lookups.
+    /// Reads each row's stored digest straight out of its head, so a re-seed
+    /// is one walk of 32-byte reads with no lookups and no body touched.
     pub fn reseed_catchup_xor(&mut self) {
         let mut acc = ssp_protocol::snapshot_hash::xor_empty();
-        for record in self.rows.records() {
-            if let Some(digest) = codec::record_digest(record) {
+        for head in self.rows.heads() {
+            if let Some(digest) = codec::head_digest(head) {
                 ssp_protocol::snapshot_hash::xor_digest(&mut acc, digest);
             }
         }
@@ -788,7 +788,7 @@ mod tests {
         c.retained = Some(["n".to_string()].into_iter().collect());
         c.compact();
         assert_eq!(c.rows.dead_bytes(), 0);
-        assert!(c.rows.live_bytes() < live_before / 4, "the 200-byte blobs are gone");
+        assert!(c.rows.live_bytes() < live_before / 3, "the 200-byte blobs are gone");
         assert_eq!(c.rows.len(), 20);
         assert_eq!(c.rows.get("r3").to_owned_value(), sv(json!({ "n": 4 })));
 

@@ -727,15 +727,32 @@ impl SspPool {
         }
     }
 
-    /// Get SSPs that haven't sent a heartbeat within the timeout
-    pub fn get_stale_ssps(&self, timeout_ms: u64) -> Vec<String> {
-        let now = Instant::now();
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-
+    /// The SSPs the heartbeat sweep evicts as of `now`: silent past `timeout`,
+    /// except the last serving one.
+    ///
+    /// With nothing to route to instead, evicting the sole serving SSP only
+    /// turns a stall into a re-bootstrap. On whitepawn a 41 s freeze of the
+    /// only SSP under a saturated host became 4.5 min without a ready SSP and
+    /// every view re-registered. Kept, it lags: its events buffer and replay
+    /// once ingest reaches it again, and its next heartbeat lands instead of
+    /// drawing a 404. Past `sole_max` it is taken for dead and evicted anyway,
+    /// as is one whose buffer overflowed, which re-bootstraps regardless.
+    pub fn stale_evictions_at(&self, now: Instant, timeout: Duration, sole_max: Duration) -> Vec<String> {
+        let silent_for = |info: &SspInfo| now.duration_since(info.last_heartbeat);
+        let fresh_serving = self
+            .ssps
+            .values()
+            .any(|info| silent_for(info) <= timeout && self.is_serving(&info.id));
         self.ssps
-            .iter()
-            .filter(|(_, info)| now.duration_since(info.last_heartbeat) > timeout)
-            .map(|(id, _)| id.clone())
+            .values()
+            .filter(|info| silent_for(info) > timeout)
+            .filter(|info| {
+                fresh_serving
+                    || !self.is_serving(&info.id)
+                    || self.buffer_overflowed.contains(&info.id)
+                    || silent_for(info) > sole_max
+            })
+            .map(|info| info.id.clone())
             .collect()
     }
 
@@ -1125,7 +1142,8 @@ mod tests {
         assert_eq!(q.standby_predecessor("ssp-0-g1"), Some("ssp-0"));
         assert_eq!(q.replaced_by("ssp-1"), Some("ssp-1-g2"));
         assert_eq!(q.get_state("ssp-0-g1"), Some(&SspState::Bootstrapping));
-        assert!(q.get_stale_ssps(1_000).is_empty(), "heartbeat clocks restart on import");
+        let second = Duration::from_secs(1);
+        assert!(q.stale_evictions_at(Instant::now(), second, second).is_empty(), "heartbeat clocks restart on import");
     }
 
     #[test]
@@ -1244,6 +1262,77 @@ mod tests {
         let _ = p.mark_ready("ssp-1");
         assert!(!p.is_active_bootstrap("ssp-1"));
         assert!(!p.is_active_bootstrap("never-seen"));
+    }
+
+    /// A Ready SSP whose last heartbeat was `silent` before `now`.
+    fn serving_silent_for(p: &mut SspPool, id: &str, now: Instant, silent: Duration) {
+        p.update_ssp(id, 0, None, None, "test".to_string());
+        p.ssps.get_mut(id).unwrap().last_heartbeat = now - silent;
+        let _ = p.mark_ready(id);
+    }
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const SOLE_MAX: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn the_last_serving_ssp_survives_a_stall() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = pool();
+        serving_silent_for(&mut p, "ssp-0", now, Duration::from_secs(41));
+        assert!(p.stale_evictions_at(now, TIMEOUT, SOLE_MAX).is_empty());
+        // Lagging still serves, and still keeps its place.
+        assert!(p.mark_lagging("ssp-0"));
+        assert!(p.stale_evictions_at(now, TIMEOUT, SOLE_MAX).is_empty());
+    }
+
+    #[test]
+    fn the_last_serving_ssp_goes_once_silent_past_the_cap() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = pool();
+        serving_silent_for(&mut p, "ssp-0", now, Duration::from_secs(301));
+        assert_eq!(p.stale_evictions_at(now, TIMEOUT, SOLE_MAX), vec!["ssp-0".to_string()]);
+    }
+
+    #[test]
+    fn a_stale_ssp_goes_when_another_serves() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = pool();
+        serving_silent_for(&mut p, "ssp-0", now, Duration::from_secs(41));
+        serving_silent_for(&mut p, "ssp-1", now, Duration::from_secs(1));
+        assert_eq!(p.stale_evictions_at(now, TIMEOUT, SOLE_MAX), vec!["ssp-0".to_string()]);
+    }
+
+    #[test]
+    fn two_stale_serving_ssps_both_stay() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = pool();
+        serving_silent_for(&mut p, "ssp-0", now, Duration::from_secs(41));
+        serving_silent_for(&mut p, "ssp-1", now, Duration::from_secs(45));
+        assert!(p.stale_evictions_at(now, TIMEOUT, SOLE_MAX).is_empty());
+    }
+
+    #[test]
+    fn a_stale_retired_or_standby_ssp_goes_even_alone() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = pool();
+        serving_silent_for(&mut p, "ssp-old", now, Duration::from_secs(41));
+        p.mark_retired("ssp-old");
+        serving_silent_for(&mut p, "ssp-new", now, Duration::from_secs(41));
+        p.mark_standby("ssp-new", "ssp-old");
+        let mut evicted = p.stale_evictions_at(now, TIMEOUT, SOLE_MAX);
+        evicted.sort();
+        assert_eq!(evicted, vec!["ssp-new".to_string(), "ssp-old".to_string()]);
+    }
+
+    #[test]
+    fn a_sole_ssp_with_an_overflowed_buffer_goes() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = SspPool::new(LoadBalanceStrategy::RoundRobin, 1);
+        serving_silent_for(&mut p, "ssp-0", now, Duration::from_secs(41));
+        assert!(p.mark_lagging("ssp-0"));
+        assert!(p.buffer_message("ssp-0", update("game:a")));
+        assert!(!p.buffer_message("ssp-0", update("game:b")));
+        assert_eq!(p.stale_evictions_at(now, TIMEOUT, SOLE_MAX), vec!["ssp-0".to_string()]);
     }
 
     #[test]

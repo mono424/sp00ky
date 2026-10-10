@@ -828,6 +828,12 @@ async fn info_text_handler(
     )
 }
 
+/// Heartbeat silence after which an SSP is evicted when another serves.
+const STALE_SSP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Heartbeat silence after which even the last serving SSP is evicted.
+const SOLE_SSP_STALE_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Start query reassignment monitor
 pub async fn start_query_reassignment_monitor(
     ssp_pool: Arc<RwLock<SspPool>>,
@@ -870,9 +876,12 @@ pub async fn start_query_reassignment_monitor(
             // heartbeat and exited. Hung bootstraps are reaped by the snapshot
             // updater's `stale_active_bootstraps` sweep instead, which is
             // budgeted against `bootstrap_timeout_secs`.
+            //
+            // The last serving SSP gets `SOLE_SSP_STALE_MAX` instead of 30 s;
+            // see `stale_evictions_at`.
             let stale_ssps = {
                 let pool = ssp_pool.read().await;
-                pool.get_stale_ssps(30000) // 30s timeout
+                pool.stale_evictions_at(std::time::Instant::now(), STALE_SSP_TIMEOUT, SOLE_SSP_STALE_MAX)
                     .into_iter()
                     .filter(|id| !pool.is_active_bootstrap(id))
                     .collect::<Vec<_>>()

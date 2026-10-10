@@ -48,7 +48,9 @@ export const composeSingle = `services:
       SPKY_DB_USER: root
       SPKY_DB_PASS: \${SURREAL_PASS}
       SPKY_AUTH_SECRET: \${SPKY_AUTH_SECRET}
-      # Restart from a snapshot instead of re-reading the whole database
+      # Row bytes on disk. With a scheduler, SPKY_SSP_SNAPSHOT_DIR also keeps
+      # row checkpoints across restarts; a standalone SSP rebuilds from the
+      # database on every start.
       SPKY_SSP_SNAPSHOT_DIR: /data/snapshot
       SPKY_SSP_ARENA_DIR: /data/arena
     volumes:
@@ -312,8 +314,9 @@ The scheduler sits between SurrealDB and your SSPs. You still run one SSP. What
 you get:
 
 - The [operator dashboard](#operator-dashboard) and its [MCP server](/docs/reference/mcp).
-- A replica of your database, so an SSP restart loads from the replica instead
-  of reading everything from SurrealDB again.
+- A replica of your database, so an SSP restart loads its own row checkpoints
+  and repairs only what changed against the replica, instead of reading
+  everything from SurrealDB again.
 - An end-to-end heartbeat that can page you through a webhook, and drift checks
   that repair the replica on their own.
 - The option to [run more SSPs](#run-more-than-one-ssp) later.
@@ -424,19 +427,23 @@ Read straight from the process environment.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector endpoint for SSP metrics | *(unset)* |
 | `OTEL_SERVICE_NAME` | OTEL service identifier | `ssp` |
 
-#### Circuit persistence
+#### Row checkpoints
 
-Without a snapshot directory every restart is a cold rebuild: the SSP re-pages
-the whole database while the scheduler holds sync frozen. Point these at a
-volume and a restart restores the snapshot and catches up only what it missed.
-Both are caches of SurrealDB, never the source of truth, so deleting them is
-always safe. See [State persistence](/docs/reference/ssp-api#state-persistence).
+Without a snapshot directory every restart of a cluster SSP is a cold rebuild:
+the SSP re-pages the whole database while the scheduler holds sync frozen.
+Point these at a volume and a restart loads the rows it kept, verifies them
+against the scheduler and repairs only what changed. Both are caches of
+SurrealDB, never the source of truth, so deleting them is always safe. A
+standalone SSP rebuilds from the database on every start; a `snapshot.json`
+an older build left in the directory is removed by the next clean restart.
+See [State persistence](/docs/reference/ssp-api#state-persistence).
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `SPKY_SSP_SNAPSHOT_DIR` | Directory for what the SSP keeps across a restart: row checkpoints in `rows/` on a cluster SSP (verified against the scheduler on boot), the circuit snapshot (`snapshot.json`) on a standalone one. Enabled when set and writable; the SSP probes it and falls back to memory-only rather than failing startup. Put it on a volume that outlives the container. | *(unset)* |
-| `SPKY_SSP_ROW_CHECKPOINT_SECS` | Cluster SSP: how often tables whose content changed are written to `rows/` while running. `0` leaves only the writes on graceful shutdown and after each bootstrap. | `1800` |
-| `SPKY_SSP_CHECKPOINT_INTERVAL_SECS` | Standalone SSP: how often the snapshot is rewritten while running. Only read when `SPKY_SSP_SNAPSHOT_DIR` is set, which arms the timer. | `300` |
+| `SPKY_SSP_SNAPSHOT_DIR` | Directory for what a cluster SSP keeps across a restart: row checkpoints in `rows/`, a base image and its deltas per table, verified against the scheduler on boot. Enabled when set and writable; the SSP probes it and falls back to memory-only rather than failing startup. Put it on a volume that outlives the container. | *(unset)* |
+| `SPKY_SSP_ROW_CHECKPOINT_SECS` | Cluster SSP: how often tables whose content changed are written to `rows/` while running, as a delta of the rows changed since the last write (whole again after 64 deltas or when they outweigh half the base). `0` leaves only the writes on graceful shutdown and after each bootstrap. | `300` |
+| `SPKY_SSP_CHECKPOINT_VERIFY` | Cluster SSP: `background` verifies the bodies of a loaded checkpoint while the SSP registers and repairs (a table that fails is dropped and paged again); `load` verifies before a table is served, reading every file whole at boot. | `background` |
+| `SPKY_SSP_REPAIR_CONCURRENCY` | Cluster SSP: how many tables, and within a table how many id-range listings, fetches and re-reads, a warm bootstrap repairs at a time. Each proxy query is one read on a scheduler worker, so the scheduler's worker count is the useful ceiling. | `4` |
 | `SPKY_SSP_ARENA_DIR` | Directory for the row arena, a sparse-file cache of row bytes. Probed for writability like the snapshot dir; falls back to the heap. | *(unset)* |
 | `SPKY_SSP_ARENA_SEGMENT_MB` | Arena segment size in MB | `64` |
 

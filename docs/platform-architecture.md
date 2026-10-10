@@ -169,7 +169,7 @@ flowchart TD
         direction TB
         API["route(ApiRequest) → ApiResponse<br/>on_timer(TimerKind)<br/>bootstrap()"]
         LOGIC["handlers · jobs (absorbed job-runner) · edge_updates<br/>tables · crdt · view_metrics  (migrate in over phases)"]
-        PORTS["ports: Db · Scheduler · HttpClient · Spawner · Telemetry · ArtifactStore"]
+        PORTS["ports: Db · Scheduler · HttpClient · Spawner · Telemetry · ArtifactStore · CircuitStore (noop on the VM)"]
         API --> LOGIC --> PORTS
     end
 
@@ -198,7 +198,12 @@ way — `bootstrap()` rebuilds the circuit from the external DB, and the
 recovery sweep re-picks pending job rows whose deadline checks live **in
 SurrealQL, not host time**. No new durability mechanism is needed for
 Cloudflare; the design rule is to keep it that way (never compare deadlines
-against host clocks — always `time::now()` in the query).
+against host clocks — always `time::now()` in the query). On the VM, a
+cluster SSP additionally keeps its rows across a restart as row checkpoints
+(`apps/ssp/src/warm.rs`) and repairs them against the scheduler's hashes; a
+standalone SSP rebuilds from the database, and the VM shell supplies the noop
+`CircuitStore` (the portable host is the one that restores a circuit
+snapshot).
 
 ## 6. Request flow: ingest on each platform
 

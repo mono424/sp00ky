@@ -51,10 +51,10 @@ pub struct AppState {
 
 ## Self-Bootstrap
 
-The SSP is stateless — all state lives in SurrealDB. On every startup, the SSP self-bootstraps:
+SurrealDB is the source of truth; what the SSP holds is a cache. On every startup, the SSP self-bootstraps:
 
-1. **Discover tables** — `INFO FOR DB`, filter out system tables (`_00_*`)
-2. **Load table data** — `SELECT * FROM {table}` for each table, bulk-load via `Circuit::load()`
+1. **Discover tables** — `INFO FOR DB` upstream, filter out system tables (`_00_*`)
+2. **Load table data** — standalone: keyset-paged `SELECT *` per table through `ssp_node::bootstrap::rebuild_from_db`, bulk-load via `Circuit::load()`. Cluster: the rows kept as row checkpoints (`src/warm.rs`) are loaded first, then every table is verified against the scheduler's hash at the registration cut; a matching table is kept, a differing one repaired range by range, the rest paged through the scheduler proxy
 3. **Re-register views** — `SELECT * FROM _00_query`, rebuild each view via `prepare_registration_dbsp()` + `circuit.add_query()`
 4. **Set status to Ready** — `/health` transitions from `"bootstrapping"` to `"ready"`
 
@@ -276,7 +276,7 @@ The scheduler can poll `GET /health` and wait for `"status": "ready"` before rou
 ### Already done
 - The SSP app uses the **new circuit module** (`ssp::circuit::Circuit`) exclusively. All handlers go through `Circuit::step()`, `Circuit::add_query()`, `Circuit::remove_query()`.
 - View registration uses `prepare_registration_dbsp()` which produces `operator::plan::QueryPlan` + `circuit::view::OutputFormat`.
-- Persistence removed — SSP is stateless, self-bootstraps from SurrealDB on every startup.
+- No standalone persistence: the circuit snapshot a standalone SSP used to write every five minutes was never read back, so the VM shell no longer writes it. A cluster SSP keeps row checkpoints (`src/warm.rs`); a standalone one self-bootstraps from SurrealDB on every startup.
 
 ### Still needed
 

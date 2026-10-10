@@ -16,7 +16,7 @@ The browser-side stream processor: a Rust crate compiled to WebAssembly via `was
   - `register_view(config: WasmViewConfig)` — register a materialized view by ID + SurQL + params.
   - `unregister_view(id)` — remove a view.
   - `ingest(table, op, id, record)` / `ingest_many(items)` — push row changes (`CREATE`/`UPDATE`/`MERGE`/`DELETE`); returns the affected views' deltas (`WasmViewUpdate[]`). Membership is presence-driven: the verb never double-counts or ghosts a row, and an unchanged write is a no-op.
-  - `save_store_state()` / `load_store_state(bytes)` — snapshot/restore the base rows as bytes (the binary row image: records as the circuit holds them, loaded without decoding a row; a JSON snapshot written by an older build still loads), under the registered views; `reconcile(table, [id, rv][])` steps in the delta against the durable store.
+  - `save_store_state()` / `load_store_state(bytes)` — snapshot/restore the base rows as bytes (the binary row image: one per-table image of heads and bodies as the circuit holds them, loaded without decoding a row; an image of the previous layout and a JSON snapshot written by older builds still load), under the registered views; `reconcile(table, [id, rv][])` steps in the delta against the durable store.
   - `set_projection(bool)` — keep only the fields registered plans evaluate per row; `register_view` reports `missing_fields` to widen with `MERGE`.
   - `compact()` / `dead_bytes()` / `live_bytes()` / `size_report()` — row-arena hygiene and memory attribution.
   - `save_state()` / `load_state(json)` — full circuit snapshot including views (server-shaped; the client uses the store-only pair).

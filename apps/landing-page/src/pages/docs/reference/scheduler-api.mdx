@@ -345,8 +345,8 @@ Send a heartbeat from an SSP to maintain health status.
 { "reason": "Clean restart requested. SSP must drop its snapshot and re-bootstrap.", "clean": true }
 ```
 
-`clean: true` asks the SSP to delete its circuit snapshot, row checkpoints and
-arena before it exits, so the relaunch is a cold rebuild. Without it the SSP
+`clean: true` asks the SSP to delete its row checkpoints and arena before it
+exits, so the relaunch is a cold rebuild. Without it the SSP
 re-bootstraps in place, keeping its rows and verifying them against the
 replica table by table. A buffer overflow, an integrity-check
 resync and an operator restart from the [admin dashboard](/docs/reference/admin-dashboard#restarting-an-ssp)
@@ -732,6 +732,18 @@ sequenceDiagram
         Scheduler-->>SSP: 200 OK
     end
 ```
+
+After the replay and before it routes live traffic to the SSP, the scheduler
+verifies the catch-up: for every table the replayed events touched it folds
+those events into the table's maintained hash (one batched read of the rows
+they touch, their before-images at the cut, XORed out; each row's final
+state XORed in) and compares the result with the hash the SSP reports on
+`GET /info`. Only a dirty table, or one without a maintained hash, is read
+whole for that. A persistent mismatch is checked against the whole-table
+projection before it counts, then diffed row by row. The `Catch-up
+verification passed` line carries `verify_ms`, `rows_read`, `fast_tables`
+and `whole_tables`; the final replay logs `since_verify_ms` and
+`lock_wait_ms`.
 
 ### Message Buffering
 

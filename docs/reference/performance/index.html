@@ -85,8 +85,10 @@ range conditions (<code>&lt;</code>, <code>&gt;</code>) narrow nothing on their 
 1M-row table with 422k rows in one list, 20 scroll windows took 14.6 s
 to register without the index and 0.6 s with it (the first window builds
 the index, each one after that takes ~30 µs). The index costs about
-130 bytes per row of the table, is built when a view first needs it, and
-is dropped when the last such view goes.</p>
+100 bytes per row of the table and is built when a view first needs it.
+It stays for an hour after its last view goes, so the next list opened
+does not pay the build again, and a restarted SSP rebuilds the indexes in
+use before it takes traffic.</p>
 <p>Restored active views now prewarm the indexes their plans select before the
 SSP reports Ready. Schema changes prewarm replacement indexes before evaluating
 replacement graphs, including a changed definition under the same index name.

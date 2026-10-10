@@ -1304,6 +1304,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         node: Arc::clone(&node),
         row_checkpoints: row_checkpoints.clone(),
         replaces: ReplacesClaim::new(std::env::var("SPKY_SSP_REPLACES").ok()),
+        rebootstrap: tokio::sync::Mutex::new(()),
     });
 
     // Spawn self-bootstrap task (runs while server is already accepting /health requests)
@@ -1311,9 +1312,11 @@ pub async fn run_server() -> anyhow::Result<()> {
         let boot = Arc::clone(&boot);
         tokio::spawn(async move {
             // Rows from the last run go in before registering, so the
-            // scheduler's freeze window covers only the hash checks.
+            // scheduler's freeze window covers only the hash checks. Their
+            // bodies are verified alongside the bootstrap, not before it.
             if let Some(rows) = &boot.row_checkpoints {
                 rows.load_into(&boot.processor).await;
+                spawn_body_verification(Arc::clone(rows), Arc::clone(&boot));
             }
             boot.run().await;
         });
@@ -1409,7 +1412,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                         // the rows kept: the bootstrap verifies every table
                         // against the replica and fetches only what differs.
                         warn!("Scheduler doesn't recognize us; re-registering with the rows kept");
-                        rebootstrap_in_process(&boot_for_heartbeat, &metrics_for_heartbeat).await;
+                        rebootstrap_in_process(&boot_for_heartbeat, &metrics_for_heartbeat, &[]).await;
                     }
                     Ok(resp) if resp.status() == StatusCode::CONFLICT => {
                         // Buffer overflow or a scheduler-driven resync: the
@@ -1432,7 +1435,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                             std::process::exit(4);
                         }
                         warn!(reason = %directive.reason, "Scheduler requested a resync; re-bootstrapping with the rows kept");
-                        rebootstrap_in_process(&boot_for_heartbeat, &metrics_for_heartbeat).await;
+                        rebootstrap_in_process(&boot_for_heartbeat, &metrics_for_heartbeat, &[]).await;
                     }
                     Ok(resp) if !resp.status().is_success() => {
                         warn!("Heartbeat failed: HTTP {}", resp.status());
@@ -1623,6 +1626,8 @@ struct ClusterBoot {
     row_checkpoints: Option<Arc<warm::RowCheckpoints>>,
     /// Blue/green: the live SSP this one is meant to replace.
     replaces: ReplacesClaim,
+    /// Serializes in-process re-bootstraps (see `rebootstrap_in_process`).
+    rebootstrap: tokio::sync::Mutex<()>,
 }
 
 /// What an SSP claims to replace when it registers (`SPKY_SSP_REPLACES`):
@@ -1978,18 +1983,63 @@ impl ClusterBoot {
 }
 
 /// Re-run the cluster bootstrap without leaving the process: views and graphs
-/// go, rows stay, and [`ClusterBoot::run`] registers again and verifies them
-/// table by table. Falls back to an exit (and a restart from the row
-/// checkpoint) only when that bootstrap gives up.
-async fn rebootstrap_in_process(boot: &ClusterBoot, metrics: &Metrics) {
+/// go, rows stay except for `drop_tables`, which are paged again, and
+/// [`ClusterBoot::run`] registers again and verifies them table by table.
+/// Falls back to an exit (and a restart from the row checkpoint) only when
+/// that bootstrap gives up. One at a time: the heartbeat and the checkpoint
+/// verification can both ask for one.
+async fn rebootstrap_in_process(boot: &ClusterBoot, metrics: &Metrics, drop_tables: &[String]) {
+    let _one_at_a_time = boot.rebootstrap.lock().await;
     let views = boot.processor.read().await.view_count() as i64;
     metrics.view_count.add(-views, &[]);
     boot.node.reset_views_keep_rows().await;
+    if !drop_tables.is_empty() {
+        let mut circuit = boot.processor.write().await;
+        for table in drop_tables {
+            circuit.store.collections.remove(table);
+        }
+    }
     boot.run().await;
     if *boot.status.read().await != SspStatus::Ready {
         error!("In-process re-bootstrap failed, exiting for a restart");
         std::process::exit(3);
     }
+}
+
+/// Verify the bodies of the checkpoints the boot mapped, alongside the
+/// bootstrap rather than before it: the sequential read through each file
+/// is also what warms the page cache for the view priming that follows,
+/// and nothing waits for it. A table whose bodies fail is dropped and paged
+/// again by an in-process re-bootstrap once this bootstrap has finished.
+fn spawn_body_verification(rows: Arc<warm::RowCheckpoints>, boot: Arc<ClusterBoot>) {
+    let pending = rows.take_pending();
+    if pending.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let failed = rows.verify_pending(pending).await;
+        if failed.is_empty() {
+            return;
+        }
+        loop {
+            match *boot.status.read().await {
+                SspStatus::Ready => break,
+                SspStatus::Failed | SspStatus::Stopping | SspStatus::Retired => {
+                    warn!(
+                        tables = failed.len(),
+                        "Row checkpoint bodies failed verification on an SSP that is not serving; leaving the tables"
+                    );
+                    return;
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+            }
+        }
+        let dropped = rows.discard_failed(&boot.processor, failed).await;
+        if !dropped.is_empty() {
+            warn!(tables = ?dropped, "Re-bootstrapping to page the tables whose checkpoint bodies failed verification");
+            rebootstrap_in_process(&boot, &boot.metrics, &dropped).await;
+        }
+    });
 }
 
 // --- Self-Bootstrap ---

@@ -762,7 +762,17 @@ pub struct TableLoad {
 /// bodies are always verified at once).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_file(path: &std::path::Path, verify: BodyVerify) -> Result<TableLoad, CheckpointError> {
-    match crate::circuit::arena::configured_backing() {
+    load_file_with(path, verify, crate::circuit::arena::configured_backing())
+}
+
+/// [`load_file`] for a given backing rather than the process's.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_file_with(
+    path: &std::path::Path,
+    verify: BodyVerify,
+    backing: &crate::circuit::arena::ArenaBacking,
+) -> Result<TableLoad, CheckpointError> {
+    match backing {
         #[cfg(feature = "mmap-store")]
         crate::circuit::arena::ArenaBacking::Files { dir, segment_bytes } => {
             let mapped = map_image(path, dir, *segment_bytes, verify)?;

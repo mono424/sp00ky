@@ -12,6 +12,14 @@
 //!   written are written again.
 //! - **Load.** At boot the files go back into the circuit before the SSP
 //!   registers. A file that fails its checks is deleted and its table paged.
+//!   The load reads only the heads of each file (`checkpoint`); the bodies
+//!   are verified by a pass that starts right away and runs while the SSP
+//!   registers and repairs, streaming each file through sequentially, which
+//!   is also what warms the page cache for the view priming that follows. A
+//!   table whose bodies fail is dropped and paged again by an in-process
+//!   re-bootstrap once this one has finished (`SPKY_SSP_CHECKPOINT_VERIFY=load`
+//!   verifies before the table is served instead, at the cost of reading
+//!   every file whole at boot).
 //! - **Verify, then repair.** Registration hands back the scheduler's hash of
 //!   every table at the cut it freezes. The bootstrap keeps a table whose rows
 //!   hash the same, repairs one that differs ([`repair_table`]), and pages the
@@ -45,7 +53,10 @@
 
 use crate::BootstrapSource;
 use serde_json::Value;
-use ssp::circuit::checkpoint::{load_file, write_collection, LoadStats};
+use ssp::circuit::arena::{configured_backing, ArenaBacking};
+use ssp::circuit::checkpoint::{
+    load_file_with, verify_bodies, write_collection, BodyVerify, LoadStats, PendingVerify, Throttle,
+};
 use ssp::circuit::store::Collection;
 use ssp::circuit::{Circuit, Operation, Record};
 use ssp::types::Sp00kyValue;
@@ -56,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Rows per `(id, _00_rv)` listing page. Two small fields per row, so a page
 /// can be much larger than a bootstrap page of whole bodies.
@@ -91,6 +102,34 @@ pub struct RowCheckpoints {
     writing: tokio::sync::Mutex<()>,
     /// Consulted before a write and before each table of it. Unset: always.
     gate: std::sync::OnceLock<WriteGate>,
+    /// When a load checks the bodies of a mapped file.
+    verify: BodyVerify,
+    /// How the loaded rows are backed: mapped files or the heap.
+    backing: ArenaBacking,
+    /// Mapped files whose bodies the load left to [`Self::verify_pending`].
+    pending: std::sync::Mutex<Vec<PendingVerify>>,
+}
+
+/// `SPKY_SSP_CHECKPOINT_VERIFY`: `background` (the default) verifies the
+/// bodies of a mapped checkpoint while the SSP bootstraps; `load` verifies
+/// them before the table is served, reading every file whole at boot.
+pub fn verify_mode(value: Option<&str>) -> Result<BodyVerify, String> {
+    match value.map(str::trim) {
+        None | Some("") | Some("background") => Ok(BodyVerify::Deferred),
+        Some("load") => Ok(BodyVerify::AtLoad),
+        Some(other) => Err(format!("SPKY_SSP_CHECKPOINT_VERIFY={other:?}: expected `background` or `load`")),
+    }
+}
+
+fn verify_mode_from_env() -> BodyVerify {
+    let value = std::env::var("SPKY_SSP_CHECKPOINT_VERIFY").ok();
+    match verify_mode(value.as_deref()) {
+        Ok(mode) => mode,
+        Err(why) => {
+            warn!("{why}; verifying in the background");
+            BodyVerify::Deferred
+        }
+    }
 }
 
 impl RowCheckpoints {
@@ -107,13 +146,22 @@ impl RowCheckpoints {
             warn!(dir = %dir.display(), "Row checkpoint dir is not writable; every restart will bootstrap cold");
             return None;
         }
-        info!(dir = %dir.display(), "Row checkpoints enabled");
-        Some(Arc::new(Self {
+        let verify = verify_mode_from_env();
+        info!(dir = %dir.display(), ?verify, "Row checkpoints enabled");
+        Some(Arc::new(Self::at(dir, verify, configured_backing().clone())))
+    }
+
+    /// Checkpoints in `dir`, loaded with `backing` and verified per `verify`.
+    pub fn at(dir: PathBuf, verify: BodyVerify, backing: ArenaBacking) -> Self {
+        Self {
             dir,
             on_disk: Default::default(),
             writing: Default::default(),
             gate: Default::default(),
-        }))
+            verify,
+            backing,
+            pending: Default::default(),
+        }
     }
 
     /// Install the write gate (once). The VM shell lets a process write only
@@ -145,39 +193,51 @@ impl RowCheckpoints {
     /// Read every checkpointed table into the circuit, replacing whatever it
     /// held for those tables. Returns the number of tables loaded.
     ///
-    /// The files are mapped (or adopted) rather than copied, so this costs
-    /// one verification pass and one index walk per table; the log line
-    /// carries both so the split stays visible.
+    /// The files are mapped (or adopted) rather than copied, and a mapped
+    /// load reads the heads alone: the bodies wait for
+    /// [`Self::verify_pending`], unless the verify mode says otherwise. The
+    /// log line carries the split so it stays visible.
     pub async fn load_into(&self, processor: &Arc<RwLock<Circuit>>) -> usize {
         let started = Instant::now();
-        let dir = self.dir.clone();
-        let loaded = tokio::task::spawn_blocking(move || read_dir_tables(&dir))
+        let (dir, verify, backing) = (self.dir.clone(), self.verify, self.backing.clone());
+        let loaded = tokio::task::spawn_blocking(move || read_dir_tables(&dir, verify, &backing))
             .await
             .unwrap_or_default();
         let tables = loaded.tables.len();
         let rows: usize = loaded.tables.iter().map(|(c, _)| c.rows.len()).sum();
         let bytes: u64 = loaded.tables.iter().map(|(_, s)| s.bytes).sum();
+        let bodies_bytes: u64 = loaded.tables.iter().map(|(_, s)| s.bodies_bytes).sum();
         let mapped = loaded.tables.iter().filter(|(_, s)| s.mapped).count();
+        let converted = loaded.tables.iter().filter(|(_, s)| s.converted).count();
         let heads_ms: u64 = loaded.tables.iter().map(|(_, s)| s.heads_ms).sum();
         let verify_ms: u64 = loaded.tables.iter().map(|(_, s)| s.verify_ms).sum();
+        let pending = loaded.pending.len();
         let install_started = Instant::now();
         {
             let mut circuit = processor.write().await;
             let mut on_disk = self.on_disk.lock().unwrap();
-            for (coll, _) in loaded.tables {
-                on_disk.insert(coll.name.clone(), coll.catchup_xor);
+            for (coll, stats) in loaded.tables {
+                // A converted file is not what is on disk: leaving it out of
+                // `on_disk` makes the next write rewrite it in this format.
+                if !stats.converted {
+                    on_disk.insert(coll.name.clone(), coll.catchup_xor);
+                }
                 circuit.store.collections.insert(coll.name.clone(), coll);
             }
         }
+        self.pending.lock().unwrap().extend(loaded.pending);
         let install_ms = install_started.elapsed().as_millis() as u64;
         if tables > 0 || loaded.discarded > 0 {
             info!(
                 tables,
                 rows,
                 bytes,
+                bodies_bytes,
                 mapped,
                 copied = tables - mapped,
+                converted,
                 discarded = loaded.discarded,
+                pending,
                 heads_ms,
                 verify_ms,
                 install_ms,
@@ -186,6 +246,77 @@ impl RowCheckpoints {
             );
         }
         tables
+    }
+
+    /// The mapped files whose bodies the load did not verify, handed over
+    /// once: whoever takes them runs [`Self::verify_pending`].
+    pub fn take_pending(&self) -> Vec<PendingVerify> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+
+    /// Hash the bodies of each pending file against its trailer, one file
+    /// after another on the blocking pool with a throttle, and return the
+    /// ones that failed. Reading them through is also what warms the page
+    /// cache behind the mappings.
+    pub async fn verify_pending(&self, pending: Vec<PendingVerify>) -> Vec<PendingVerify> {
+        let started = Instant::now();
+        let (tables, mut bytes, mut failed) = (pending.len(), 0u64, Vec::new());
+        for p in pending {
+            bytes += p.image.bodies.len() as u64;
+            let image = p.image.clone();
+            let outcome = tokio::task::spawn_blocking(move || verify_bodies(&image, Throttle::background())).await;
+            match outcome {
+                Ok(Ok(true)) => debug!(table = %p.table, "Row checkpoint bodies verified"),
+                Ok(Ok(false)) => {
+                    error!(table = %p.table, file = %p.path.display(), "Row checkpoint bodies do not match their hash");
+                    failed.push(p);
+                }
+                Ok(Err(e)) => {
+                    error!(table = %p.table, file = %p.path.display(), error = %e, "Row checkpoint bodies could not be read");
+                    failed.push(p);
+                }
+                Err(e) => {
+                    error!(table = %p.table, error = %e, "Row checkpoint verification task failed");
+                    failed.push(p);
+                }
+            }
+        }
+        if tables > 0 {
+            info!(
+                tables,
+                bytes,
+                failed = failed.len(),
+                ms = started.elapsed().as_millis() as u64,
+                "Verified row checkpoint bodies"
+            );
+        }
+        failed
+    }
+
+    /// Drop the tables whose bodies failed verification: each is removed
+    /// from the store if it still holds that very image (a table paged or
+    /// replaced since is left alone), its file is deleted when this process
+    /// may write the directory, and it is forgotten on disk either way.
+    /// Returns the tables removed, for the caller to page again.
+    pub async fn discard_failed(&self, processor: &Arc<RwLock<Circuit>>, failed: Vec<PendingVerify>) -> Vec<String> {
+        let mut dropped = Vec::new();
+        let mut circuit = processor.write().await;
+        for p in failed {
+            let holds_image = circuit
+                .store
+                .get_collection(&p.table)
+                .is_some_and(|coll| coll.rows.image(0).is_some_and(|image| image.same_mapping(&p.image)));
+            if holds_image {
+                circuit.store.collections.remove(&p.table);
+                dropped.push(p.table.clone());
+                warn!(table = %p.table, "Dropped the table loaded from a checkpoint whose bodies failed verification");
+            }
+            self.on_disk.lock().unwrap().remove(&p.table);
+            if self.may_write() {
+                let _ = std::fs::remove_file(&p.path);
+            }
+        }
+        dropped
     }
 
     /// Write every table whose content changed since it was last written, and
@@ -414,11 +545,13 @@ struct Loaded {
     tables: Vec<(Collection, LoadStats)>,
     /// Files that failed their checks and were deleted.
     discarded: usize,
+    /// Mapped files whose bodies are still to be verified.
+    pending: Vec<PendingVerify>,
 }
 
 /// Read every `*.rows` file. A file that fails to read is deleted: its table
 /// is paged instead, and the next write replaces it.
-fn read_dir_tables(dir: &Path) -> Loaded {
+fn read_dir_tables(dir: &Path, verify: BodyVerify, backing: &ArenaBacking) -> Loaded {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Loaded::default();
     };
@@ -434,19 +567,23 @@ fn read_dir_tables(dir: &Path) -> Loaded {
             continue;
         }
         let started = Instant::now();
-        match load_file(&path, ssp::circuit::checkpoint::BodyVerify::AtLoad) {
+        match load_file_with(&path, verify, backing) {
             Ok(load) => {
                 let (coll, stats) = (load.collection, load.stats);
                 debug!(
                     table = %coll.name,
                     rows = coll.rows.len(),
                     bytes = stats.bytes,
+                    bodies_bytes = stats.bodies_bytes,
                     mapped = stats.mapped,
+                    converted = stats.converted,
+                    deferred = load.pending.is_some(),
                     heads_ms = stats.heads_ms,
                     verify_ms = stats.verify_ms,
                     ms = started.elapsed().as_millis() as u64,
                     "Loaded row checkpoint table"
                 );
+                out.pending.extend(load.pending);
                 out.tables.push((coll, stats));
             }
             Err(e) => {
@@ -832,12 +969,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ssp-rows-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let checkpoints = RowCheckpoints {
-            dir: dir.clone(),
-            on_disk: Default::default(),
-            writing: Default::default(),
-            gate: Default::default(),
-        };
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
 
         let processor = Arc::new(RwLock::new(Circuit::new()));
         {
@@ -864,8 +996,9 @@ mod tests {
         assert!(!checkpoints.path_for("user").exists());
 
         let fresh = Arc::new(RwLock::new(Circuit::new()));
-        let reader = RowCheckpoints { dir: dir.clone(), on_disk: Default::default(), writing: Default::default(), gate: Default::default() };
+        let reader = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
         assert_eq!(reader.load_into(&fresh).await, 1);
+        assert!(reader.take_pending().is_empty(), "a heap load verifies at once");
         let c = fresh.read().await;
         let game = c.store.get_collection("game").unwrap();
         assert_eq!(game.rows.len(), 2);
@@ -1066,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_gate_writes_and_removes_nothing() {
         let dir = scratch_dir("gate");
-        let checkpoints = RowCheckpoints { dir: dir.clone(), on_disk: Default::default(), writing: Default::default(), gate: Default::default() };
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
         let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&open);
         checkpoints.set_gate(Box::new(move || flag.load(std::sync::atomic::Ordering::SeqCst)));
@@ -1100,7 +1233,7 @@ mod tests {
 
         // A fresh one may be the other instance's write in progress.
         std::fs::write(&a, b"partial").unwrap();
-        assert!(read_dir_tables(&dir).tables.is_empty());
+        assert!(read_dir_tables(&dir, BodyVerify::AtLoad, &ArenaBacking::Heap).tables.is_empty());
         assert!(a.exists(), "a fresh temp file is left alone");
 
         // An old one is an abandoned write. The bare legacy name counts too.
@@ -1109,8 +1242,91 @@ mod tests {
             let file = std::fs::File::options().create(true).write(true).open(path).unwrap();
             file.set_modified(std::time::SystemTime::now() - STALE_TMP_AGE - Duration::from_secs(1)).unwrap();
         }
-        read_dir_tables(&dir);
+        read_dir_tables(&dir, BodyVerify::AtLoad, &ArenaBacking::Heap);
         assert!(!a.exists() && !legacy.exists(), "stale temp files are swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_mode_defaults_to_background() {
+        assert_eq!(verify_mode(None), Ok(BodyVerify::Deferred));
+        assert_eq!(verify_mode(Some("")), Ok(BodyVerify::Deferred));
+        assert_eq!(verify_mode(Some("background")), Ok(BodyVerify::Deferred));
+        assert_eq!(verify_mode(Some(" load ")), Ok(BodyVerify::AtLoad));
+        assert!(verify_mode(Some("eager")).is_err());
+    }
+
+    /// A mapped checkpoint, loaded with its bodies deferred, then written
+    /// over with a flipped body byte: the table serves until the pass finds
+    /// it, then it is dropped with its file.
+    async fn mapped_with_a_flipped_body(name: &str) -> (RowCheckpoints, Arc<RwLock<Circuit>>, PathBuf) {
+        let dir = scratch_dir(name);
+        let backing = ArenaBacking::Files { dir: dir.join("arena"), segment_bytes: 64 * 1024 };
+        let writer = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing.clone());
+        writer.write(&one_table_circuit(), "test").await;
+        let file = writer.path_for("game");
+        let mut bytes = std::fs::read(&file).unwrap();
+        let body_at = ssp::circuit::checkpoint::parse_header(&bytes).unwrap().bodies.start + 2;
+        bytes[body_at] ^= 0x40;
+        std::fs::write(&file, &bytes).unwrap();
+
+        let reader = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing);
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(reader.load_into(&fresh).await, 1, "the heads check out, the table is served");
+        (reader, fresh, file)
+    }
+
+    #[tokio::test]
+    async fn a_failed_body_check_drops_the_table_and_its_file() {
+        let (reader, fresh, file) = mapped_with_a_flipped_body("flipped").await;
+        let pending = reader.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert!(reader.take_pending().is_empty(), "handed over once");
+        let failed = reader.verify_pending(pending).await;
+        assert_eq!(failed.len(), 1);
+        let dropped = reader.discard_failed(&fresh, failed).await;
+        assert_eq!(dropped, vec!["game".to_string()]);
+        assert!(fresh.read().await.store.get_collection("game").is_none());
+        assert!(!file.exists(), "the file is gone with the table");
+        assert!(reader.on_disk.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn discard_leaves_a_table_that_no_longer_holds_the_image() {
+        let (reader, fresh, file) = mapped_with_a_flipped_body("replaced").await;
+        let failed = reader.verify_pending(reader.take_pending()).await;
+        assert_eq!(failed.len(), 1);
+        // Paged again meanwhile: the table is not the one the file backed.
+        {
+            let mut c = fresh.write().await;
+            c.store.collections.remove("game");
+            c.store.ensure_collection("game").apply(
+                Operation::Create,
+                "z",
+                Sp00kyValue::from(serde_json::json!({ "id": "game:z", "n": 9 })),
+            );
+        }
+        let dropped = reader.discard_failed(&fresh, failed).await;
+        assert!(dropped.is_empty());
+        assert!(fresh.read().await.store.get_collection("game").unwrap().has_row("z"));
+        assert!(!file.exists(), "the failed file still goes");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_verified_file_keeps_its_table() {
+        let dir = scratch_dir("verified");
+        let backing = ArenaBacking::Files { dir: dir.join("arena"), segment_bytes: 64 * 1024 };
+        let writer = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing.clone());
+        writer.write(&one_table_circuit(), "test").await;
+        let reader = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, backing);
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(reader.load_into(&fresh).await, 1);
+        let pending = reader.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert!(reader.verify_pending(pending).await.is_empty());
+        assert!(fresh.read().await.store.get_collection("game").unwrap().has_row("a"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

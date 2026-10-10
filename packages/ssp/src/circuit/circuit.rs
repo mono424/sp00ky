@@ -764,7 +764,15 @@ impl Circuit {
         let t_step = Instant::now();
         let mut results = Vec::new();
         for query_id in affected_queries {
-            if let Some(delta) = self.step_query(&query_id, &table_deltas, &content_updates) {
+            let delta = self.step_query(&query_id, &table_deltas, &content_updates);
+            // A bounded operator lost the rows its window needs: this step's
+            // delta is incomplete, so the view is primed again from the store
+            // and published whole instead.
+            if self.graphs.get(&query_id).is_some_and(Graph::needs_rebuild) {
+                results.extend(self.reprime_view(&query_id));
+                continue;
+            }
+            if let Some(delta) = delta {
                 // One computation, one step, then one delta per subscriber.
                 // With no subscribers this is `vec![delta]`, so the unmerged
                 // path is byte-identical to before.
@@ -1395,38 +1403,46 @@ impl Circuit {
         let ids: Vec<String> = self.views.keys().cloned().collect();
         let mut out = Vec::new();
         for id in ids {
-            let (root, previous) = {
-                let view = self.views.get_mut(&id).expect("view listed");
-                let previous: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
-                view.cache.clear();
-                view.subquery_cache.clear();
-                view.last_hash = String::new();
-                (view.plan.root.clone(), previous)
-            };
-            self.graphs.insert(id.clone(), Graph::from_plan(&root));
-            match self.run_initial_snapshot(&id) {
-                Some(delta) => out.extend(self.fan_out(delta)),
-                None => {
-                    let view = self.views.get_mut(&id).expect("view listed");
-                    view.last_hash = view.compute_hash();
-                    let delta = ViewDelta {
-                        query_id: id.clone(),
-                        additions: vec![],
-                        removals: previous,
-                        updates: vec![],
-                        row_count: 0,
-                        result_hash: view.last_hash.clone(),
-                        subquery_items: vec![],
-                        auth_id: view.auth_id.clone(),
-                        // The store was replaced and the view came back
-                        // empty: this IS the view's whole membership now.
-                        initial: true,
-                    };
-                    out.extend(self.fan_out(delta));
-                }
-            }
+            out.extend(self.reprime_view(&id));
         }
         out
+    }
+
+    /// Give one view a fresh graph and a full initial snapshot from the
+    /// store, returned as the deltas to publish (operator state is a function
+    /// of the store). A view that comes back empty still gets a delta so its
+    /// consumer drops the stale rows.
+    fn reprime_view(&mut self, id: &str) -> Vec<ViewDelta> {
+        let Some(view) = self.views.get_mut(id) else {
+            return Vec::new();
+        };
+        let previous: Vec<String> = view.cache.keys().map(|k| k.to_string()).collect();
+        view.cache.clear();
+        view.subquery_cache.clear();
+        view.last_hash = String::new();
+        let root = view.plan.root.clone();
+        self.graphs.insert(id.to_string(), Graph::from_plan(&root));
+        match self.run_initial_snapshot(id) {
+            Some(delta) => self.fan_out(delta),
+            None => {
+                let view = self.views.get_mut(id).expect("view checked above");
+                view.last_hash = view.compute_hash();
+                let delta = ViewDelta {
+                    query_id: id.to_string(),
+                    additions: vec![],
+                    removals: previous,
+                    updates: vec![],
+                    row_count: 0,
+                    result_hash: view.last_hash.clone(),
+                    subquery_items: vec![],
+                    auth_id: view.auth_id.clone(),
+                    // The view was primed again and came back empty: this IS
+                    // its whole membership now.
+                    initial: true,
+                };
+                self.fan_out(delta)
+            }
+        }
     }
 
     /// Bring one table in line with the caller's authoritative `(id, rv)`
@@ -4717,5 +4733,72 @@ mod membership_digest_tests {
         // An update in the handover window: membership unchanged, edge version not.
         green.step(ChangeSet { changes: vec![Change::update("thread", "a", json!({ "title": "new", "_00_rv": 2 }))] });
         assert_ne!(blue.membership_digests()["v"], green.membership_digests()["v"]);
+    }
+}
+
+#[cfg(test)]
+mod bounded_window_tests {
+    use super::*;
+    use crate::operator::plan::{OperatorPlan, OrderSpec};
+    use crate::types::Path;
+    use serde_json::json;
+
+    fn window(id: &str, limit: usize, start: usize) -> QueryPlan {
+        QueryPlan {
+            id: id.to_string(),
+            root: OperatorPlan::Limit {
+                input: Box::new(OperatorPlan::Scan { table: "game".to_string() }),
+                limit,
+                start,
+                order_by: Some(vec![OrderSpec { field: Path::new("rank"), direction: "ASC".into() }]),
+            },
+        }
+    }
+
+    fn sorted_ids(live: &std::collections::BTreeMap<String, i64>, limit: usize, start: usize) -> Vec<String> {
+        let mut rows: Vec<(i64, String)> = live.iter().map(|(id, rank)| (*rank, format!("game:{id}"))).collect();
+        rows.sort();
+        let mut ids: Vec<String> = rows.into_iter().skip(start).take(limit).map(|(_, id)| id).collect();
+        ids.sort();
+        ids
+    }
+
+    fn view_ids(circuit: &Circuit, id: &str) -> Vec<String> {
+        let mut ids = circuit.view_keys(id);
+        ids.sort();
+        ids
+    }
+
+    /// Draining a deep window past its slack makes the circuit prime the view
+    /// again from the store, and it stays exact the whole way down.
+    #[test]
+    fn a_drained_window_is_primed_again_and_stays_exact() {
+        let mut circuit = Circuit::new();
+        circuit.store.ensure_collection("game");
+        let mut live = std::collections::BTreeMap::new();
+        for i in 0..1_000i64 {
+            let id = format!("g{i}");
+            let rank = (i * 7919) % 1_000;
+            circuit.store.apply_change(&Change::create("game", &id, json!({ "rank": rank })));
+            live.insert(id, rank);
+        }
+        let (limit, start) = (10, 20);
+        circuit.add_query_with_auth(window("w", limit, start), None, None, String::new());
+        assert_eq!(view_ids(&circuit, "w"), sorted_ids(&live, limit, start));
+
+        let mut republished = 0;
+        for _ in 0..60 {
+            // Delete the row at the head of the window each time.
+            let mut rows: Vec<(i64, String)> = live.iter().map(|(id, rank)| (*rank, id.clone())).collect();
+            rows.sort();
+            let victim = rows[start].1.clone();
+            live.remove(&victim);
+            let deltas = circuit.step(ChangeSet { changes: vec![Change::delete("game", &victim)] });
+            if deltas.iter().any(|d| d.query_id == "w" && d.initial) {
+                republished += 1;
+            }
+            assert_eq!(view_ids(&circuit, "w"), sorted_ids(&live, limit, start));
+        }
+        assert!(republished > 0, "draining past the slack should have primed the view again");
     }
 }

@@ -219,6 +219,12 @@ impl Graph {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
+
+    /// Some operator's state can no longer be stepped; see
+    /// [`Operator::needs_rebuild`](crate::operator::Operator::needs_rebuild).
+    pub fn needs_rebuild(&self) -> bool {
+        self.nodes.iter().any(|node| node.operator.needs_rebuild())
+    }
 }
 
 #[cfg(test)]

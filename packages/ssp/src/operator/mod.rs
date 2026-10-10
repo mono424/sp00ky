@@ -52,6 +52,13 @@ pub trait Operator: Debug + Send + Sync {
     /// Reset all internal state (for re-initialization).
     fn reset(&mut self);
 
+    /// The operator's state can no longer answer from deltas alone and the
+    /// view must be primed again from the store. Only a bounded TopK that
+    /// dropped rows and then lost enough of its window to need them says yes.
+    fn needs_rebuild(&self) -> bool {
+        false
+    }
+
     /// Base collections this operator directly reads from (Scan only).
     fn collections(&self) -> Vec<String> {
         vec![]

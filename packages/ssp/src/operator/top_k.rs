@@ -22,25 +22,44 @@ use std::collections::HashMap;
 /// than spilling those.
 type SortKey = SmallVec<[SortableValue; 1]>;
 
+/// Least slack a bounded buffer keeps past its window; see [`TopK`].
+const MIN_SLACK: usize = 16;
+
 /// TopK operator with sorted buffer state (Z⁻¹).
 ///
-/// Maintains a sorted buffer of all input records and emits the window
+/// Keeps the smallest input records in a sorted buffer and emits the window
 /// `[offset, offset + limit)` of it (SurrealQL `LIMIT limit START offset`).
 /// On each delta:
 ///   1. Insert/remove records from the buffer
 ///   2. Compute which records enter/leave the window
 ///   3. Emit +1 for new entrants, -1 for displaced records
+///
+/// The buffer is bounded at `capacity` (the window plus `limit` of slack).
+/// It used to hold every input record: on whitepawn a 50-row window over a
+/// 422,000-game database kept 422,000 sort keys twice over, about 60 MB, and
+/// built them under the circuit lock in up to 37 s, once per window, so a
+/// user scrolling registered a new one every 50 rows until the SSP stalled
+/// and neared its memory limit. Records past the bound are dropped and the
+/// smallest of them becomes `boundary`; the buffer then holds exactly the
+/// input records below it, which is all the window needs while at least
+/// `offset + limit` of them remain. Retractions that leave fewer make the
+/// operator ask for a rebuild from the store ([`Operator::needs_rebuild`]).
 #[derive(Debug)]
 pub struct TopK {
     pub limit: usize,
     /// Number of leading sorted rows to skip (SurrealQL `START`). 0 = top-N.
     pub offset: usize,
     pub order_by: Option<Vec<OrderSpec>>,
-    /// All records seen so far, sorted. Each entry is (sort_key_parts, row_key).
+    /// The smallest input records, sorted. Each entry is (sort_key_parts, row_key).
     /// Using BTreeSet for automatic sorted order.
     buffer: BTreeSet<(SortKey, RowKey)>,
     /// Reverse index: row_key → sort key parts (for removal)
     key_index: HashMap<RowKey, SortKey>,
+    /// Most records the buffer keeps.
+    capacity: usize,
+    /// The smallest record ever dropped for want of room, if any. Every input
+    /// record below it is buffered; nothing at or above it is.
+    boundary: Option<(SortKey, RowKey)>,
 }
 
 /// One field's sort key: an orderable scalar plus the field's direction.
@@ -183,12 +202,24 @@ fn sortable_bytes(key: &SortKey) -> usize {
 
 impl TopK {
     pub fn new(limit: usize, offset: usize, order_by: Option<Vec<OrderSpec>>) -> Self {
+        // Slack so ordinary retractions inside the window refill from the
+        // buffer instead of costing a rebuild.
+        let slack = limit.max(MIN_SLACK);
         Self {
             limit,
             offset,
             order_by,
             buffer: BTreeSet::new(),
             key_index: HashMap::new(),
+            capacity: offset.saturating_add(limit).saturating_add(slack),
+            boundary: None,
+        }
+    }
+
+    /// Remember `entry` as dropped: the boundary is the smallest such record.
+    fn lower_boundary(&mut self, entry: (SortKey, RowKey)) {
+        if self.boundary.as_ref().is_none_or(|b| entry < *b) {
+            self.boundary = Some(entry);
         }
     }
 
@@ -259,9 +290,25 @@ impl super::Operator for TopK {
 
         for (key, &weight) in upstream_delta {
             if weight > 0 {
-                let sort_key = self.compute_sort_key(key, store);
-                self.buffer.insert((sort_key.clone(), key.clone()));
-                self.key_index.insert(key.clone(), sort_key);
+                if let Some(stale) = self.key_index.remove(key) {
+                    self.buffer.remove(&(stale, key.clone()));
+                }
+                let entry = (self.compute_sort_key(key, store), key.clone());
+                // At or past the boundary, or past a full buffer: not needed.
+                let full_and_larger =
+                    self.buffer.len() >= self.capacity && self.buffer.last().is_some_and(|last| entry > *last);
+                if full_and_larger || self.boundary.as_ref().is_some_and(|b| entry >= *b) {
+                    self.lower_boundary(entry);
+                    continue;
+                }
+                self.key_index.insert(key.clone(), entry.0.clone());
+                self.buffer.insert(entry);
+                if self.buffer.len() > self.capacity {
+                    if let Some(evicted) = self.buffer.pop_last() {
+                        self.key_index.remove(&evicted.1);
+                        self.lower_boundary(evicted);
+                    }
+                }
             } else if weight < 0 {
                 if let Some(sort_key) = self.key_index.remove(key) {
                     self.buffer.remove(&(sort_key, key.clone()));
@@ -298,15 +345,19 @@ impl super::Operator for TopK {
     fn reset(&mut self) {
         self.buffer.clear();
         self.key_index.clear();
+        self.boundary = None;
+    }
+
+    fn needs_rebuild(&self) -> bool {
+        // Records were dropped and the window now reaches past what is left:
+        // the rows that belong there are among the dropped ones.
+        self.boundary.is_some() && self.buffer.len() < self.offset.saturating_add(self.limit)
     }
 
     fn state_bytes(&self) -> usize {
-        // Both structures hold every row that reaches the operator, not just
-        // the `[offset, offset+limit)` window — `buffer` to keep them sorted,
-        // `key_index` so a retraction can find its sort key again. So an
-        // `ORDER BY x LIMIT 20` over a million-row table is two million-entry
-        // structures, per registered query, and the row key plus the sort key
-        // are each allocated twice over.
+        // Both structures hold up to `capacity` rows (the window plus slack)
+        // — `buffer` to keep them sorted, `key_index` so a retraction can
+        // find its sort key again.
         let buffer: usize = self
             .buffer
             .iter()
@@ -378,6 +429,88 @@ mod tests {
 
     fn zset(items: &[(&str, i64)]) -> ZSet {
         items.iter().map(|(k, w)| ((*k).into(), *w)).collect()
+    }
+
+
+    fn by_rank() -> Option<Vec<OrderSpec>> {
+        Some(vec![OrderSpec { field: Path::new("rank"), direction: "ASC".into() }])
+    }
+
+    fn window_of(op: &TopK) -> Vec<String> {
+        op.current_window().iter().map(|k| k.to_string()).collect()
+    }
+
+    fn sorted_window(store: &Store, live: &std::collections::BTreeSet<String>, limit: usize, offset: usize) -> Vec<String> {
+        let full: ZSet = live.iter().map(|k| (k.as_str().into(), 1)).collect();
+        let op = TopK::new(limit, offset, by_rank());
+        let mut items: Vec<(SortKey, String)> =
+            full.keys().map(|k| (op.compute_sort_key(k, store), k.to_string())).collect();
+        items.sort();
+        items.into_iter().skip(offset).take(limit).map(|(_, k)| k).collect()
+    }
+
+    /// A deep window over a big input keeps only the window plus slack, not
+    /// every input row, and still answers exactly what a full sort would.
+    #[test]
+    fn a_window_over_many_rows_keeps_only_the_window_and_slack() {
+        let mut store = Store::new();
+        store.ensure_collection("g");
+        let mut input = ZSet::new();
+        for i in 0..5_000 {
+            store.apply_change(&Change::create("g", &format!("r{i}"), json!({ "rank": (i * 7919) % 5_000 })));
+            input.insert(format!("g:r{i}").as_str().into(), 1);
+        }
+        let mut op = TopK::new(50, 100, by_rank());
+        op.step(&[&input], &store, None);
+        assert!(op.buffer.len() <= op.capacity && op.key_index.len() <= op.capacity, "buffer {} > capacity {}", op.buffer.len(), op.capacity);
+        assert_eq!(op.capacity, 200);
+        let live: std::collections::BTreeSet<String> = input.keys().map(|k| k.to_string()).collect();
+        assert_eq!(window_of(&op), sorted_window(&store, &live, 50, 100));
+        assert!(!op.needs_rebuild());
+    }
+
+    /// Random inserts and retractions against a full sort: while the operator
+    /// does not ask for a rebuild its window is exact, and when it does ask, a
+    /// fresh operator primed from the input is exact again.
+    #[test]
+    fn a_bounded_window_matches_a_full_sort_through_random_churn() {
+        let mut store = Store::new();
+        store.ensure_collection("g");
+        let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let (limit, offset) = (5usize, 3usize);
+        let mut op = TopK::new(limit, offset, by_rank());
+        // A deterministic LCG; the crate has no rand dependency.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut rebuilds = 0;
+        for round in 0..2_000 {
+            let mut delta = ZSet::new();
+            for _ in 0..(1 + next(6)) {
+                let id = format!("r{}", next(40));
+                let key = format!("g:{id}");
+                if live.contains(&key) && next(2) == 0 {
+                    delta.insert(key.as_str().into(), -1);
+                    live.remove(&key);
+                } else if !live.contains(&key) && !delta.contains_key(key.as_str()) {
+                    store.apply_change(&Change::create("g", &id, json!({ "rank": next(1_000) })));
+                    delta.insert(key.as_str().into(), 1);
+                    live.insert(key);
+                }
+            }
+            op.step(&[&delta], &store, None);
+            if op.needs_rebuild() {
+                rebuilds += 1;
+                let full: ZSet = live.iter().map(|k| (k.as_str().into(), 1)).collect();
+                op = TopK::new(limit, offset, by_rank());
+                op.step(&[&full], &store, None);
+            }
+            assert!(op.buffer.len() <= op.capacity, "round {round}: buffer over capacity");
+            assert_eq!(window_of(&op), sorted_window(&store, &live, limit, offset), "round {round}");
+        }
+        assert!(rebuilds > 0, "the churn should have drained the buffer at least once");
     }
 
     /// Sort keys used to be stored as `(value * 1_000_000.0) as i64`. That
@@ -679,18 +812,23 @@ mod tests {
             items.push((format!("posts:{}", i), 1));
         }
 
-        let mut top_k = TopK::new(
-            30,
-            0,
-            Some(vec![OrderSpec {
-                field: Path::new("score"),
-                direction: "ASC".into(),
-            }]),
-        );
         // Seed all rows in one delta (mirrors Circuit::run_initial_snapshot).
+        // One operator per depth: the buffer is bounded at the window plus
+        // slack, so it only reaches as deep as the offset it was built for.
         let delta: ZSet = items.into_iter().map(|(k, w)| (k.into(), w)).collect();
-        let _ = top_k.step(&[&delta], &store, None);
-        assert_eq!(top_k.buffer.len(), n);
+        let seeded = |offset: usize| {
+            let mut top_k = TopK::new(
+                30,
+                offset,
+                Some(vec![OrderSpec {
+                    field: Path::new("score"),
+                    direction: "ASC".into(),
+                }]),
+            );
+            let _ = top_k.step(&[&delta], &store, None);
+            assert_eq!(top_k.buffer.len(), offset + 60);
+            top_k
+        };
 
         let measure = |tk: &TopK, iters: usize| -> u128 {
             let mut acc = 0usize;
@@ -704,13 +842,11 @@ mod tests {
         };
 
         let iters = 2000;
-        let _ = measure(&top_k, 200); // warm up
-        top_k.offset = 0;
-        let t_shallow = measure(&top_k, iters);
-        top_k.offset = 1_000;
-        let t_mid = measure(&top_k, iters);
-        top_k.offset = 10_000;
-        let t_deep = measure(&top_k, iters);
+        let (shallow, mid, deep) = (seeded(0), seeded(1_000), seeded(10_000));
+        let _ = measure(&shallow, 200); // warm up
+        let t_shallow = measure(&shallow, iters);
+        let t_mid = measure(&mid, iters);
+        let t_deep = measure(&deep, iters);
 
         eprintln!(
             "current_window {} iters: offset0={}ns offset1k={}ns offset10k={}ns",

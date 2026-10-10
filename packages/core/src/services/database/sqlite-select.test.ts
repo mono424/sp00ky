@@ -45,6 +45,10 @@ const FIXTURE: Record<string, Row[]> = {
     { id: 'comment:2', thread: 'thread:B', body: 'second' },
     { id: 'comment:3', thread: 'thread:A', body: 'other thread' },
   ],
+  game: [
+    { id: 'game:476gsdlvro7cme8nwied', white: 'player_name:a' },
+    { id: 'game:stgyqp7fm3sc4tmyc8fm', white: 'player_name:b' },
+  ],
 };
 
 /** The `.one()` detail-view plan shape: id baked as a literal AND slaved to
@@ -187,12 +191,23 @@ describe('SqliteCacheEngine.select via worker (one hop)', () => {
     const rid = new RecordId('comment', '2');
     const { engine, calls } = makeEngine({ workerSelect: true, answerSelect: true });
     await engine.connect('anon');
-    await engine.select({ table: 'comment', ids: [rid, 'comment:1'] }, {});
+    const rows = await engine.select({ table: 'comment', ids: [rid, 'comment:1'] }, {});
     const sel = calls.find((c) => c.type === 'select')!;
-    // stableKey output (surrealdb may escape the id part, e.g. comment:⟨2⟩) —
-    // identical to what the legacy `selectByIds` binds, so stored rows match.
-    expect(sel.payload.plan.ids).toEqual([stableKey(rid), 'comment:1']);
-    expect(sel.payload.plan.ids.every((i: unknown) => typeof i === 'string')).toBe(true);
+    // The raw spelling the rows are stored under, never the SDK's escaped
+    // `comment:⟨2⟩`: that one matched no stored row.
+    expect(sel.payload.plan.ids).toEqual(['comment:2', 'comment:1']);
+    expect(rows.map((r) => r.id)).toEqual(['comment:2', 'comment:1']);
+  });
+
+  it('finds a window row whose id starts with a digit (SDK 2.1.0 escapes it)', async () => {
+    // `materializeEffect` parses every window id into a RecordId, and SDK
+    // 2.1.0's `toString()` spells this one `game:⟨476g…⟩`. Keyed that way the
+    // row went missing, the window came back short and read as the list end.
+    const { engine } = makeEngine({ workerSelect: true, answerSelect: true });
+    await engine.connect('anon');
+    const ids = [new RecordId('game', '476gsdlvro7cme8nwied'), new RecordId('game', 'stgyqp7fm3sc4tmyc8fm')];
+    const rows = await engine.select({ table: 'game', ids }, {});
+    expect(rows.map((r) => r.id)).toEqual(['game:476gsdlvro7cme8nwied', 'game:stgyqp7fm3sc4tmyc8fm']);
   });
 
   it('normalizes RecordId values baked inside the plan\'s where tree', async () => {

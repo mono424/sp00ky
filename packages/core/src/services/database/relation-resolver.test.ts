@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { RecordId } from 'surrealdb';
 import type { RelationPlan, WhereNode } from '@spooky-sync/query-builder';
 import { looksLikeRecordId, resolveRelations, sortRows, stableKey } from './relation-resolver';
 import {
@@ -305,6 +306,22 @@ describe('stableKey', () => {
   it('collapses RecordId object and string form', () => {
     expect(stableKey({ tb: 'user', id: '1' })).toBe('user:1');
     expect(stableKey('user:1')).toBe('user:1');
+  });
+
+  it('spells an SDK RecordId raw, never as escaped SurrealQL', () => {
+    // SDK 2.1.0 `toString()`s these as `game:⟨476g…⟩`, `t:⟨123⟩`, `t:⟨a-b⟩`.
+    expect(stableKey(new RecordId('game', '476gsdlvro7cme8nwied'))).toBe('game:476gsdlvro7cme8nwied');
+    expect(stableKey(new RecordId('t', '123'))).toBe('t:123');
+    expect(stableKey(new RecordId('t', 'a-b'))).toBe('t:a-b');
+    expect(stableKey(new RecordId('t', 7))).toBe('t:7');
+    expect(looksLikeRecordId(new RecordId('game', '476gsdlvro7cme8nwied'))).toBe(true);
+  });
+
+  it('leaves a complex key to toString and a plain row with table/id columns alone', () => {
+    const complex = new RecordId('t', [1, 'x']);
+    expect(stableKey(complex)).toBe(complex.toString());
+    const row = { table: { name: 'x' }, id: 'y' };
+    expect(stableKey(row)).toBe(JSON.stringify(row));
   });
 });
 

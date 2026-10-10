@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { RecordId } from 'surrealdb';
 import type { WhereNode } from '@spooky-sync/query-builder';
 import {
   comparisonSql,
@@ -95,6 +96,11 @@ describe('serializeRow / reviveRow round-trip', () => {
   it('serializes RecordId-shaped links to strings and takes the fast parse path otherwise', () => {
     const json = serializeRow({ id: 't:1', author: { tb: 'user', id: 'u1' }, n: 2 });
     expect(reviveRow(json)).toEqual({ id: 't:1', author: 'user:u1', n: 2 });
+  });
+
+  it('stores an SDK RecordId link raw, not as its escaped toJSON', () => {
+    const json = serializeRow({ id: 'game:1', white: new RecordId('player_name', '3abc'), tags: [new RecordId('t', '9z')] });
+    expect(reviveRow(json)).toEqual({ id: 'game:1', white: 'player_name:3abc', tags: ['t:9z'] });
   });
 });
 

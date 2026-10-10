@@ -7,6 +7,7 @@ import type { WasmProcessor, WasmStreamUpdate } from './wasm-types';
 import type { Duration } from 'surrealdb';
 import type { QueryTimeToLive, RecordVersionArray } from '../../types';
 import { encodeRecordId } from '../../utils/index';
+import { recordIdKey } from '../database/relation-resolver';
 
 // Simple interface for query plan registration (replaces Incantation class)
 interface QueryPlanConfig {
@@ -1044,7 +1045,9 @@ export class StreamProcessorService {
       const isNotPlainObject = value.constructor !== Object;
 
       if (hasTable && hasId && hasToString && isNotPlainObject) {
-        const result = value.toString();
+        // The raw `table:id`, as the store spells it. `toString()` is escaped
+        // SurrealQL (SDK 2.1.0: `game:⟨476g…⟩`); only a complex key uses it.
+        const result = recordIdKey(value) ?? value.toString();
         this.logger.trace(
           { result, Category: 'sp00ky-client::StreamProcessorService::normalizeValue' },
           'RecordId detected'

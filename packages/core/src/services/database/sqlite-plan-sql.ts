@@ -1,5 +1,5 @@
 import type { WhereComparison, WhereNode } from '@spooky-sync/query-builder';
-import { stableKey } from './relation-resolver';
+import { recordIdKey, stableKey } from './relation-resolver';
 import type { OrderBy, Row } from './cache-engine';
 
 /**
@@ -60,11 +60,14 @@ export function scalar(value: unknown): unknown {
 }
 
 export function serializeRow(row: Row): string {
-  return JSON.stringify(row, (_k, v) => {
+  return JSON.stringify(row, function (this: Record<string, unknown>, k, v) {
     if (v instanceof Uint8Array) return { __u8: toBase64(v) };
-    if (v && typeof v === 'object') {
-      const rid = v as { tb?: unknown; id?: unknown };
-      if (rid.tb !== undefined && rid.id !== undefined) return stableKey(v);
+    // `v` has already been through `toJSON()`, and a RecordId's is escaped
+    // SurrealQL (`game:⟨476g…⟩`), so key the original value instead.
+    const raw = this[k];
+    if (raw && typeof raw === 'object') {
+      const key = recordIdKey(raw);
+      if (key !== null) return key;
     }
     return v;
   });

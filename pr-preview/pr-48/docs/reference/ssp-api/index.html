@@ -1,0 +1,1006 @@
+<!DOCTYPE html><html lang="en" class="dark"> <head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta property="og:type" content="article"><meta property="og:title" content="SSP API | sp00ky Docs"><meta name="description" content="HTTP contract for the stream processor: ingest, bootstrap, view management, debugging and configuration."><meta property="og:description" content="HTTP contract for the stream processor: ingest, bootstrap, view management, debugging and configuration."><meta property="og:image" content="https://sp00ky.cloud/social-card.png"><meta property="twitter:card" content="summary_large_image"><meta property="twitter:title" content="SSP API | sp00ky Docs"><meta property="twitter:description" content="HTTP contract for the stream processor: ingest, bootstrap, view management, debugging and configuration."><meta property="twitter:image" content="https://sp00ky.cloud/social-card.png"><title>SSP API | sp00ky Docs</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"><link rel="help" type="text/markdown" href="/llm.txt" title="LLM Info"><script type="module" src="/pr-preview/pr-48/_astro/DocsLayout.astro_astro_type_script_index_0_lang.CmeQIgZ3.js"></script><meta name="astro-view-transitions-enabled" content="true"><meta name="astro-view-transitions-fallback" content="animate"><script type="module" src="/pr-preview/pr-48/_astro/ClientRouter.astro_astro_type_script_index_0_lang.zIqIeV6h.js"></script><link rel="stylesheet" href="/pr-preview/pr-48/_astro/CodeBlock.SfORvXmu.css"><script type="module" src="/pr-preview/pr-48/_astro/page.CFbxjes3.js"></script><style>[data-astro-transition-scope="astro-jo646ijk-1"] { view-transition-name: root; }@layer astro { ::view-transition-old(root) { animation: none; opacity: 0; mix-blend-mode: normal; }::view-transition-new(root) { animation: none; mix-blend-mode: normal; }::view-transition-group(root) { animation: none } }[data-astro-transition-fallback="old"] [data-astro-transition-scope="astro-jo646ijk-1"],
+			[data-astro-transition-fallback="old"][data-astro-transition-scope="astro-jo646ijk-1"] { animation: none; mix-blend-mode: normal; }[data-astro-transition-fallback="new"] [data-astro-transition-scope="astro-jo646ijk-1"],
+			[data-astro-transition-fallback="new"][data-astro-transition-scope="astro-jo646ijk-1"] { animation: none; mix-blend-mode: normal; }</style></head> <body class="bg-background text-text-secondary antialiased selection:bg-brand-500/30" data-astro-transition-scope="astro-jo646ijk-1"> <header class="h-16 border-b border-white/[0.06] bg-background/75 backdrop-blur-xl backdrop-saturate-150 sticky top-0 z-50"> <div class="max-w-[1600px] mx-auto h-full flex items-center justify-between px-6"> <div class="flex items-center gap-4"> <button id="mobile-menu-trigger" class="lg:hidden p-2 -ml-2 text-text-muted hover:text-text-primary hover:bg-white/[0.06] rounded-lg transition-colors" aria-label="Toggle menu"> <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path> </svg> </button> <a href="/" class="flex items-center gap-2 hover:opacity-80 transition-opacity"> <img src="/logo.svg" alt="sp00ky Logo" class="h-6"> </a> </div> <div> <style>astro-island,astro-slot,astro-static-slot{display:contents}</style><script>(()=>{var l=(n,t)=>{let i=async()=>{await(await n())()},e=typeof t.value=="object"?t.value:void 0,s={timeout:e==null?void 0:e.timeout};"requestIdleCallback"in window?window.requestIdleCallback(i,s):setTimeout(i,s.timeout||200)};(self.Astro||(self.Astro={})).idle=l;window.dispatchEvent(new Event("astro:idle"));})();</script><script>(()=>{var A=Object.defineProperty;var g=(i,o,a)=>o in i?A(i,o,{enumerable:!0,configurable:!0,writable:!0,value:a}):i[o]=a;var d=(i,o,a)=>g(i,typeof o!="symbol"?o+"":o,a);{let i={0:t=>m(t),1:t=>a(t),2:t=>new RegExp(t),3:t=>new Date(t),4:t=>new Map(a(t)),5:t=>new Set(a(t)),6:t=>BigInt(t),7:t=>new URL(t),8:t=>new Uint8Array(t),9:t=>new Uint16Array(t),10:t=>new Uint32Array(t),11:t=>Number.POSITIVE_INFINITY*t},o=t=>{let[l,e]=t;return l in i?i[l](e):void 0},a=t=>t.map(o),m=t=>typeof t!="object"||t===null?t:Object.fromEntries(Object.entries(t).map(([l,e])=>[l,o(e)]));class y extends HTMLElement{constructor(){super(...arguments);d(this,"Component");d(this,"hydrator");d(this,"hydrate",async()=>{var b;if(!this.hydrator||!this.isConnected)return;let e=(b=this.parentElement)==null?void 0:b.closest("astro-island[ssr]");if(e){e.addEventListener("astro:hydrate",this.hydrate,{once:!0});return}let c=this.querySelectorAll("astro-slot"),n={},h=this.querySelectorAll("template[data-astro-template]");for(let r of h){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("data-astro-template")||"default"]=r.innerHTML,r.remove())}for(let r of c){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("name")||"default"]=r.innerHTML)}let p;try{p=this.hasAttribute("props")?m(JSON.parse(this.getAttribute("props"))):{}}catch(r){let s=this.getAttribute("component-url")||"<unknown>",v=this.getAttribute("component-export");throw v&&(s+=` (export ${v})`),console.error(`[hydrate] Error parsing props for component ${s}`,this.getAttribute("props"),r),r}let u;await this.hydrator(this)(this.Component,p,n,{client:this.getAttribute("client")}),this.removeAttribute("ssr"),this.dispatchEvent(new CustomEvent("astro:hydrate"))});d(this,"unmount",()=>{this.isConnected||this.dispatchEvent(new CustomEvent("astro:unmount"))})}disconnectedCallback(){document.removeEventListener("astro:after-swap",this.unmount),document.addEventListener("astro:after-swap",this.unmount,{once:!0})}connectedCallback(){if(!this.hasAttribute("await-children")||document.readyState==="interactive"||document.readyState==="complete")this.childrenConnectedCallback();else{let e=()=>{document.removeEventListener("DOMContentLoaded",e),c.disconnect(),this.childrenConnectedCallback()},c=new MutationObserver(()=>{var n;((n=this.lastChild)==null?void 0:n.nodeType)===Node.COMMENT_NODE&&this.lastChild.nodeValue==="astro:end"&&(this.lastChild.remove(),e())});c.observe(this,{childList:!0}),document.addEventListener("DOMContentLoaded",e)}}async childrenConnectedCallback(){let e=this.getAttribute("before-hydration-url");e&&await import(e),this.start()}async start(){let e=JSON.parse(this.getAttribute("opts")),c=this.getAttribute("client");if(Astro[c]===void 0){window.addEventListener(`astro:${c}`,()=>this.start(),{once:!0});return}try{await Astro[c](async()=>{let n=this.getAttribute("renderer-url"),[h,{default:p}]=await Promise.all([import(this.getAttribute("component-url")),n?import(n):()=>()=>{}]),u=this.getAttribute("component-export")||"default";if(!u.includes("."))this.Component=h[u];else{this.Component=h;for(let f of u.split("."))this.Component=this.Component[f]}return this.hydrator=p,this.hydrate},e,this)}catch(n){console.error(`[astro-island] Error hydrating ${this.getAttribute("component-url")}`,n)}}attributeChangedCallback(){this.hydrate()}}d(y,"observedAttributes",["props"]),customElements.get("astro-island")||customElements.define("astro-island",y)}})();</script><astro-island uid="Z12LyUL" prefix="r2" component-url="/pr-preview/pr-48/_astro/Search.D8MxjVSz.js" component-export="Search" renderer-url="/pr-preview/pr-48/_astro/client.NQDPFRSz.js" props="{}" ssr client="idle" opts="{&quot;name&quot;:&quot;Search&quot;,&quot;value&quot;:true}" await-children><button class="flex items-center gap-2 px-3 py-1.5 text-sm text-zinc-400 bg-white/[0.04] border border-white/[0.08] shadow-glass-inset hover:bg-white/[0.07] hover:text-zinc-200 rounded-lg transition-colors w-full md:w-64"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-search w-4 h-4" aria-hidden="true"><path d="m21 21-4.34-4.34"></path><circle cx="11" cy="11" r="8"></circle></svg><span class="hidden md:inline">Search...</span><kbd class="hidden md:inline-flex items-center gap-1 px-1.5 py-0.5 text-xs font-mono text-zinc-400 bg-white/[0.06] rounded-md border border-white/10 ml-auto"><span class="text-xs">⌘</span>K</kbd></button><!--astro:end--></astro-island> </div> <div class="flex items-center gap-4 text-sm text-text-muted"> <script>(()=>{var e=async t=>{await(await t())()};(self.Astro||(self.Astro={})).load=e;window.dispatchEvent(new Event("astro:load"));})();</script><astro-island uid="ZcVTy6" prefix="r3" component-url="/pr-preview/pr-48/_astro/GitHubStars.CBnmlTzL.js" component-export="default" renderer-url="/pr-preview/pr-48/_astro/client.NQDPFRSz.js" props="{}" ssr client="load" opts="{&quot;name&quot;:&quot;GitHubStars&quot;,&quot;value&quot;:true}" await-children><a href="https://github.com/mono424/sp00ky" target="_blank" rel="noreferrer" class="group inline-flex items-center gap-2 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 font-mono text-xs font-medium uppercase tracking-wider text-zinc-300 shadow-glass-inset transition-colors hover:bg-white/[0.08] hover:text-white"><span class="flex items-center gap-2"><svg viewBox="0 0 24 24" class="fill-current h-3.5 w-3.5" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-3.795-.735-.54-1.38-1.335-1.755-1.335-1.755-1.095-.75.075-.735.075-.735 1.215.09 1.845 1.245 1.845 1.245 1.05 1.785 2.76 1.275 3.435.975.105-.75.405-1.275.735-1.575-2.415-.27-4.95-1.215-4.95-5.43 0-1.185.42-2.16 1.11-2.94-.105-.27-.48-1.395.105-2.94 0 0 .93-.3 3.045 1.125a10.59 10.59 0 0 1 2.76-.375c.945.0.1875.1275 2.76.375 2.115-1.425 3.045-1.125 3.045-1.125.585 1.545.21 2.67.105 2.94 1.185.78 1.11 1.755 1.11 2.94 0 4.23-2.55 5.145-4.965 5.415.42.375.78 1.11.78 2.235 0 1.605-.015 2.895-.015 3.285 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12Z"></path></svg><span>Github</span><span class="text-white/20">|</span><span class="animate-pulse text-neutral-500">...</span></span></a><!--astro:end--></astro-island> </div> </div> </header> <div class="max-w-[1600px] mx-auto flex w-full min-h-screen"> <aside class="docs-rail hidden lg:block w-[272px] shrink-0 border-r border-white/[0.06]"> <div class="docs-rail-scroll pt-8 pb-16 pl-6 pr-5" data-sidebar-scroller> <nav class="docs-sidebar" aria-label="Documentation"> <section class="docs-sidebar-group"> <p class="docs-sidebar-title">Start here</p> <ul> <li> <a href="/pr-preview/pr-48/docs" class="docs-sidebar-link"> <span class="truncate">Introduction</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/quickstart" class="docs-sidebar-link"> <span class="truncate">Quickstart</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/how-it-works" class="docs-sidebar-link"> <span class="truncate">How it works</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/install" class="docs-sidebar-link"> <span class="truncate">Installation</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Schema</p> <ul> <li> <a href="/pr-preview/pr-48/docs/schema" class="docs-sidebar-link"> <span class="truncate">Define your schema</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/relationships" class="docs-sidebar-link"> <span class="truncate">Relationships</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/generated-types" class="docs-sidebar-link"> <span class="truncate">Generated types</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/migrations" class="docs-sidebar-link"> <span class="truncate">Migrations</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Client SDK</p> <ul> <li> <a href="/pr-preview/pr-48/docs/client/queries" class="docs-sidebar-link"> <span class="truncate">Reactive queries</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/pagination" class="docs-sidebar-link"> <span class="truncate">Pagination</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/mutations" class="docs-sidebar-link"> <span class="truncate">Mutations</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/auth" class="docs-sidebar-link"> <span class="truncate">Authentication</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/offline-sync" class="docs-sidebar-link"> <span class="truncate">Offline &amp; sync health</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/query-allowlist" class="docs-sidebar-link"> <span class="truncate">Query allowlist</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/feature-flags" class="docs-sidebar-link"> <span class="truncate">Feature flags</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/push-notifications" class="docs-sidebar-link"> <span class="truncate">Push notifications</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/native-push" class="docs-sidebar-link"> <span class="truncate">Native push (iOS, Android)</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/impersonation" class="docs-sidebar-link"> <span class="truncate">Admin impersonation</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/buckets" class="docs-sidebar-link"> <span class="truncate">File buckets</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/crdt" class="docs-sidebar-link"> <span class="truncate">CRDT fields</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Framework guides</p> <ul> <li> <a href="/pr-preview/pr-48/docs/guide/solid" class="docs-sidebar-link"> <span class="truncate">SolidJS</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/solid2" class="docs-sidebar-link"> <span class="truncate">Solid 2 (RC)</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/flutter" class="docs-sidebar-link"> <span class="truncate">Flutter</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/vanilla" class="docs-sidebar-link"> <span class="truncate">Vanilla JS / TS</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Backends</p> <ul> <li> <a href="/pr-preview/pr-48/docs/backend" class="docs-sidebar-link"> <span class="truncate">What is a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/add" class="docs-sidebar-link"> <span class="truncate">Add a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/options" class="docs-sidebar-link"> <span class="truncate">Backend options</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Background jobs</p> <ul> <li> <a href="/pr-preview/pr-48/docs/jobs" class="docs-sidebar-link"> <span class="truncate">Jobs</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/schedules" class="docs-sidebar-link"> <span class="truncate">Schedules</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/workflows" class="docs-sidebar-link"> <span class="truncate">Workflows</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/machine-pools" class="docs-sidebar-link"> <span class="truncate">Machine pools</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Local development</p> <ul> <li> <a href="/pr-preview/pr-48/docs/dev" class="docs-sidebar-link"> <span class="truncate">spky dev</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/servers" class="docs-sidebar-link"> <span class="truncate">Dev servers &amp; sidecars</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/env" class="docs-sidebar-link"> <span class="truncate">Environment variables</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/doctor" class="docs-sidebar-link"> <span class="truncate">Doctor &amp; troubleshooting</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/devtools" class="docs-sidebar-link"> <span class="truncate">DevTools extension</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Deploy</p> <ul> <li> <a href="/pr-preview/pr-48/docs/cloud/getting-started" class="docs-sidebar-link"> <span class="truncate">Getting started</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/deploying" class="docs-sidebar-link"> <span class="truncate">Deploying</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/dedicated-machines" class="docs-sidebar-link"> <span class="truncate">Dedicated machines</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/env-variables" class="docs-sidebar-link"> <span class="truncate">Environment &amp; vault</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/logs" class="docs-sidebar-link"> <span class="truncate">Logs &amp; monitoring</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/backups" class="docs-sidebar-link"> <span class="truncate">Backups</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/ci-cd" class="docs-sidebar-link"> <span class="truncate">CI/CD</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/team" class="docs-sidebar-link"> <span class="truncate">Teams</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/self-hosting" class="docs-sidebar-link"> <span class="truncate">Self-hosting</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Operations</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/admin-dashboard" class="docs-sidebar-link"> <span class="truncate">Admin dashboard</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/mcp" class="docs-sidebar-link"> <span class="truncate">MCP server</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Reference</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/cli" class="docs-sidebar-link"> <span class="truncate">CLI</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/config" class="docs-sidebar-link"> <span class="truncate">sp00ky.yml</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/client-config" class="docs-sidebar-link"> <span class="truncate">Client config</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ai-agents" class="docs-sidebar-link"> <span class="truncate">AI coding agents</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/grok-bot" class="docs-sidebar-link"> <span class="truncate">Grok Bot recipe</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/architecture" class="docs-sidebar-link"> <span class="truncate">Architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/performance" class="docs-sidebar-link"> <span class="truncate">Performance</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/vault" class="docs-sidebar-link"> <span class="truncate">Vault architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ssp-api" class="docs-sidebar-link" aria-current="page" data-sidebar-active> <span class="truncate">SSP API</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/scheduler-api" class="docs-sidebar-link"> <span class="truncate">Scheduler API</span>  </a> </li> </ul> </section> </nav> </div> </aside> <main class="flex-1 min-w-0 pt-8 pb-16 px-6 lg:px-12"> <div class="prose prose-invert prose-docs max-w-3xl w-full"> <nav class="not-prose flex items-center gap-1.5 text-[13px] text-zinc-500 mb-5 overflow-x-auto whitespace-nowrap" aria-label="Breadcrumb"> <a href="/pr-preview/pr-48/docs" class="hover:text-zinc-200 transition-colors">Docs</a>  <svg class="h-3.5 w-3.5 shrink-0 text-zinc-700" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"> <path d="m9 18 6-6-6-6"></path> </svg> <span class="text-zinc-400">Reference</span>  </nav> <h1 class="text-4xl font-semibold tracking-tight mb-4"> SSP API </h1> <p class="text-lg text-text-muted leading-relaxed mb-8">HTTP contract for the stream processor: ingest, bootstrap, view management, debugging and configuration.</p> <p>The SSP (Sp00ky Sidecar Processor) is a stateful service that maintains materialized views and executes backend functions.</p>
+<h2 id="base-url">Base URL</h2>
+<p>Default: <code>http://localhost:8667</code></p>
+<p>Configure via: <code>SPKY_SSP_LISTEN_ADDR</code> environment variable (form <code>host:port</code>).</p>
+<h2 id="authentication">Authentication</h2>
+<p>All endpoints (except <code>/health</code>, <code>/version</code>, and <code>/info</code>) require authentication via the <code>Authorization</code> header:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="plaintext"><code><span class="line"><span>Authorization: Bearer &lt;SPKY_AUTH_SECRET&gt;</span></span></code></pre>
+<p>Set via <code>SPKY_AUTH_SECRET</code> environment variable. When unset, the middleware accepts any bearer token and is intended for dev only.</p>
+<hr/>
+<h2 id="data-ingestion">Data Ingestion</h2>
+<h3 id="post-ingest">POST /ingest</h3>
+<p>Process a single record update and propagate changes to affected views.</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Request Body:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;table&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;users&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;op&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;CREATE&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;user:123&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;record&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: {</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;name&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;Alice&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;email&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;alice@example.com&quot;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><strong>Fields:</strong></p>
+<ul>
+<li><code>table</code> (string, required) - Table name</li>
+<li><code>op</code> (string, required) - Operation: <code>CREATE</code>, <code>UPDATE</code>, or <code>DELETE</code></li>
+<li><code>id</code> (string, required) - Record ID</li>
+<li><code>record</code> (object, required) - Record data. For tables generated by
+the Sp00ky CLI’s schema event, <code>record._00_rv</code> carries the row’s
+content version (bumped inside the source transaction). The SSP
+polls <code>_00_version</code> for that record before issuing the per-user
+edge update, so list_ref bumps never race ahead of the source
+row’s visibility on other connections.</li>
+</ul>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - Record accepted. Returned <strong>immediately</strong> after the
+in-memory DBSP step; the database fan-out
+(<code>UPDATE _00_list_ref_user_&lt;id&gt;</code>, view-metric persistence) runs in
+a background task so the caller’s transaction (the schema event
+that invoked <code>http::post</code>) can commit without waiting on it. Side
+effects: when <code>table = &quot;user&quot;</code> and <code>op = &quot;CREATE&quot;</code>, the SSP
+pre-emptively defines that user’s dedicated
+<code>_00_list_ref_user_&lt;id&gt;</code> table (no-op in <code>refMode: single</code>); when
+<code>op = &quot;DELETE&quot;</code>, it drops the same table.</li>
+<li><code>400 Bad Request</code> - Invalid operation or malformed request</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+<li><code>503 Service Unavailable</code> - SSP is not in Ready state (<code>SSP_NOT_READY</code>)</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -X</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> POST</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/ingest</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Content-Type: application/json&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -d</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &#39;{</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;table&quot;: &quot;users&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;op&quot;: &quot;CREATE&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;id&quot;: &quot;user:alice&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;record&quot;: {&quot;name&quot;: &quot;Alice&quot;, &quot;email&quot;: &quot;alice@example.com&quot;}</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">  }&#39;</span></span></code></pre>
+<p><strong>Job Processing:</strong></p>
+<p>If the ingested table is configured as a job table and the record has <code>status: &quot;pending&quot;</code>, the SSP will automatically queue and execute the job.</p>
+<hr/>
+<h2 id="bootstrap">Bootstrap</h2>
+<p>When running in scheduler mode, the SSP bootstraps itself using a <strong>proxy-based pull</strong> pattern rather than receiving pushed chunks:</p>
+<ol>
+<li>SSP loads its row checkpoints, if it has any (see <a href="#state-persistence">State Persistence</a>)</li>
+<li>SSP registers with the scheduler via <code>POST /ssp/register</code></li>
+<li>Scheduler freezes its snapshot replica and returns <code>snapshot_seq</code> and the hash of every table at that cut</li>
+<li>SSP keeps the tables whose rows already match, repairs the ones that differ, and pages the rest through the scheduler’s proxy endpoints (<code>POST /proxy/query</code>, <code>/proxy/signin</code>, <code>/proxy/use</code>) as if they were a SurrealDB instance. When the scheduler serves a table’s id ranges (<code>POST /proxy/ranges</code>), both the repair and the paging go range by range</li>
+<li>Once bootstrapped, SSP reports healthy via <code>GET /health</code> (returns <code>{&quot;status&quot;: &quot;ready&quot;}</code>)</li>
+<li>Scheduler detects readiness, replays buffered events, then promotes SSP to <code>Ready</code></li>
+</ol>
+<p>This approach is more efficient than chunk pushing because the SSP only fetches the data it actually needs, and the scheduler doesn’t need to know the SSP’s data requirements.</p>
+<p><strong>Notes:</strong></p>
+<ul>
+<li>During bootstrap, the SSP’s <code>/health</code> endpoint returns <code>{&quot;status&quot;: &quot;bootstrapping&quot;}</code></li>
+<li>The scheduler polls <code>/health</code> every <code>ssp_poll_interval_ms</code> (default: 500 ms; the poll is how the scheduler learns the SSP is done, so the interval is paid on every restart)</li>
+<li>Bootstrap must complete within <code>bootstrap_timeout_secs</code> (default: 120 seconds)</li>
+<li>If the scheduler’s per-SSP message buffer overflows (max 10,000), the SSP must re-bootstrap</li>
+</ul>
+<hr/>
+<h3 id="post-ingestbatch">POST /ingest/batch</h3>
+<p>Authenticated ordinary-record ingestion. Body: <code>{ &quot;records&quot;: [ /* /ingest bodies */ ] }</code>.
+The array must contain 1–128 records and the complete JSON body must be at most
+1 MiB. All records are validated before any source mutation. Supported operations
+are <code>CREATE</code>, <code>UPDATE</code>, <code>MERGE</code> and <code>DELETE</code>; <code>user</code>, configured job tables and
+<code>_00_*</code> tables require the single-record endpoint for their lifecycle effects.</p>
+<p>The circuit applies changes in array order, steps affected graphs once and
+reserves one publication slot. The publisher checks all surviving source versions
+before publishing, subject to the existing five-second fallback. Delete and
+recreate sequences restore visible edges after deletion cleanup. <code>200</code> acknowledges
+circuit application and enqueueing; publication finishes asynchronously. Invalid
+bodies return <code>400</code>, oversized bodies <code>413</code>, and readiness or publication admission
+failures <code>503</code> before source changes. Retry the complete batch in order.</p>
+<p>The scheduler uses this endpoint only after the SSP advertises <code>ingest_batch_limit</code>
+in its registration. A missing or zero capability keeps single-record delivery.</p>
+<h2 id="view-management">View Management</h2>
+<h3 id="post-viewregister">POST /view/register</h3>
+<p>Register a new view (live query) with the SSP.</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Request Body:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;query:abc123&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;surql&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;SELECT * FROM users WHERE active = true&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;clientId&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;client-456&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ttl&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;30s&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;params&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;lastActiveAt&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;2024-01-01T00:00:00Z&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;format&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><strong>Fields:</strong></p>
+<ul>
+<li><code>id</code> (string, required) - Unique view identifier (e.g. <code>query:abc123</code>)</li>
+<li><code>surql</code> (string, required) - SurrealQL query to materialize</li>
+<li><code>clientId</code> (string, required) - Client identifier</li>
+<li><code>ttl</code> (string, required) - Time-to-live for the view (e.g. <code>&quot;30s&quot;</code>)</li>
+<li><code>params</code> (object, optional) - Query parameters</li>
+<li><code>lastActiveAt</code> (string, optional) - ISO 8601 timestamp of last activity</li>
+<li><code>format</code> (string, optional) - Response format</li>
+</ul>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - View registered, initial results returned</li>
+<li><code>400 Bad Request</code> - Invalid view registration payload</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+<li><code>403 Forbidden</code> - The query’s shape is not in the query allowlist and
+<code>SPKY_SSP_QUERY_ALLOWLIST=enforce</code>. Body:
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;error&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;not_allowlisted&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;message&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;shape of query on `game` is not in the allowlist (42 entries from 2 releases). Regenerate the allowlist (spky generate) and redeploy.&quot;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+Decided on the parsed shape before any database write, so a refused
+registration leaves no <code>_00_query</code> row behind. Under <code>warn</code> the same miss is
+logged (<code>allowlist miss (warn mode): admitted</code>, target <code>ssp::policy</code>) and the
+view registers. The scheduler relays this status and body to the client
+unchanged. Shapes over <code>_00_app_release</code> / <code>_00_user_feature</code> are always
+admitted. See the <a href="/docs/guide/query-allowlist">Query allowlist guide</a>.</li>
+<li><code>503 Service Unavailable</code> - SSP is not in Ready state (<code>SSP_NOT_READY</code>), or
+registrations already fill their half of the publication queue
+(<code>publication_backlog</code>, see <a href="#publication-admission-and-backlog">Publication admission and backlog</a>).
+Retry later.</li>
+</ul>
+<p><strong>What the SSP writes:</strong> the <code>_00_query</code> row for the view (<code>UPSERT</code>) with
+<code>rowCount</code> (the size of the initial set) and <code>state</code>. A view with rows is
+written <code>state = &#39;materializing&#39;</code> and its edges go to the edge flusher; the
+batch that commits those <code>_00_list_ref</code> edges also sets <code>state = &#39;ready&#39;</code>, in
+the same transaction, and first deletes any edges the row already had (a full
+publish replaces, never duplicates). A view with no rows is written
+<code>state = &#39;ready&#39;</code> at once. Clients read <code>state</code> next to the edges: <code>ready</code> with
+<code>rowCount 0</code> is a real empty result, <code>materializing</code> is a publish in flight,
+and a missing row means the SSP no longer has the view (they keep their rows
+and re-register). Re-registering a view the SSP already holds only refreshes
+<code>clientId</code>, <code>lastActiveAt</code>, <code>ttl</code> and <code>subscribers</code>; it re-publishes only when
+the row or its edges are found missing.</p>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -X</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> POST</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/view/register</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Content-Type: application/json&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -d</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &#39;{</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;id&quot;: &quot;query:abc123&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;surql&quot;: &quot;SELECT * FROM users WHERE active = true&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;clientId&quot;: &quot;client-456&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;ttl&quot;: &quot;30s&quot;</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">  }&#39;</span></span></code></pre>
+<h3 id="post-viewunregister">POST /view/unregister</h3>
+<p>Unregister a view and clean up associated resources.</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Request Body:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;users_view&quot;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - View unregistered</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -X</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> POST</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/view/unregister</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Content-Type: application/json&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -d</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &#39;{&quot;id&quot;: &quot;users_view&quot;}&#39;</span></span></code></pre>
+<hr/>
+<h2 id="impersonation">Impersonation</h2>
+<p>Two routes behind the <code>fn::_00_impersonate::*</code> SurrealDB functions (see
+<a href="/docs/client/impersonation">Admin impersonation</a>). Both return <code>404</code> unless
+<code>SPKY_IMPERSONATION=on</code> and <code>SPKY_AUTH_SECRET</code> is non-empty. The SSP serves
+them in singlenode mode, where the functions call it directly.</p>
+<p><strong>Authentication:</strong> Required (the shared bearer)</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Endpoint</th><th>Body</th><th>Behaviour</th></tr></thead><tbody><tr><td><code>POST /impersonate/mint</code></td><td><code>{&quot;session&quot;, &quot;target&quot;, &quot;admin&quot;, &quot;access&quot;, &quot;ns&quot;, &quot;db&quot;, &quot;ttl_secs&quot;, &quot;session_remaining_secs&quot;}</code></td><td>Signs an HS256 token for the <code>_00_impersonate</code> access method, bound to the <code>_00_impersonation</code> row in <code>session</code>. Expiry is <code>min(ttl_secs, 1h, session_remaining_secs)</code>. Stateless: every revocation check runs in the access method’s <code>AUTHENTICATE</code> block. <code>200 {token, exp}</code>; <code>400 invalid</code> for a session that is not an <code>_00_impersonation</code> record, a target equal to the admin, or an expired session</td></tr><tr><td><code>POST /impersonate/users</code></td><td><code>{&quot;table&quot;, &quot;fields&quot;, &quot;search&quot;, &quot;limit&quot;}</code></td><td>Root-backed search for the DevTools user picker: rows of <code>table</code> whose id or any of <code>fields</code> contains <code>search</code> (case-insensitive), at most <code>limit</code> (max 100), each with <code>is_admin</code>. <code>table</code> and <code>fields</code> must be plain identifiers (<code>400 invalid</code> otherwise)</td></tr></tbody></table>
+<hr/>
+<h2 id="state-management">State Management</h2>
+<h3 id="post-reset">POST /reset</h3>
+<p>Reset all SSP state (clear all views and data).</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - State reset successfully</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -X</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> POST</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/reset</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span></span></code></pre>
+<p><strong>Warning:</strong> This is a destructive operation and cannot be undone.</p>
+<p><code>/reset</code> empties the circuit but does not rebuild it. Use <code>POST /admin/reload</code>
+below when you want the SSP to come back with data.</p>
+<h3 id="post-adminreload">POST /admin/reload</h3>
+<p>Rebuild the circuit from the database, in process. The SSP re-scans the schema,
+reloads rows and re-registers the views recorded in <code>_00_query</code>, then returns to
+<code>ready</code>. It does <strong>not</strong> exit, and it does not re-run the scheduler handshake.</p>
+<p>You do not need it for a schema change: a running SSP probes upstream’s schema
+every <code>SPKY_SCHEMA_POLL_SECS</code> (and whenever a view registration names a table it
+does not know yet) and applies added, changed and removed tables in place. A
+removed table’s rows are retracted from every view it fed. Reload is the full,
+explicit rebuild, for when the circuit itself is suspect. Ingest is gated for the
+duration, exactly as during a cold start.</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - <code>{&quot;status&quot;: &quot;ready&quot;}</code></li>
+<li><code>500</code> - <code>{&quot;code&quot;: &quot;reload_failed&quot;}</code> with the error; the SSP is left <code>failed</code></li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -X</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> POST</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/admin/reload</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span></span></code></pre>
+<p>The <a href="/docs/reference/admin-dashboard#restarting-an-ssp">admin dashboard</a> offers
+this as “Reload schema” next to the two restart modes.</p>
+<hr/>
+<h2 id="monitoring--debugging">Monitoring &amp; Debugging</h2>
+<h3 id="get-health">GET /health</h3>
+<p>Health check endpoint (no authentication required).</p>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - SSP is ready
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ready&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+</li>
+<li><code>503 Service Unavailable</code> - SSP is not ready
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;bootstrapping&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+</li>
+</ul>
+<p>Possible status values: <code>&quot;bootstrapping&quot;</code>, <code>&quot;ready&quot;</code>, <code>&quot;failed&quot;</code>.</p>
+<p><code>status</code> reports bootstrap state only. It deliberately does <strong>not</strong> move when
+the database goes slow: the scheduler’s bootstrap handshake compares it to the
+literal <code>&quot;ready&quot;</code>, and the cloud autoheal recreates a container whose probe
+fails, so a stalled SurrealDB must not make the SSP look dead.</p>
+<p>When the SSP’s database calls are timing out (see <code>SPKY_SSP_DB_TIMEOUT_SECS</code>),
+an extra <code>db</code> object is included. It is informational — the HTTP status and
+<code>status</code> are unaffected — and the field is absent while the connection is
+healthy:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ready&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;db&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;stalled&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;consecutive_timeouts&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">3</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><code>consecutive_timeouts</code> resets on the first call that succeeds. A non-zero
+count means every database-touching route (<code>/ingest</code>, <code>/view/register</code>,
+<code>/job/recover</code>) is failing fast rather than hanging, and the scheduler will be
+parking this SSP as <code>Lagging</code> until the database recovers.</p>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/health</span></span></code></pre>
+<h3 id="get-version">GET /version</h3>
+<p>Get SSP version information (no authentication required).</p>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - Version information
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;version&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;0.1.0&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;mode&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;streaming&quot;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/version</span></span></code></pre>
+<h3 id="get-info">GET /info</h3>
+<p>Get entity information for this SSP (no authentication required).</p>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - Entity list
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">[{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;entity&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ssp&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ssp-primary-01&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;status&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ready&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;views&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">5</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ref_mode&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;dedicated&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;version&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;0.0.1-canary.66&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;uptime_seconds&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">3204</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;circuit_tables&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;thread&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">12</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;user&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">3</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> },</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;circuit_hashes&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;thread&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ab12…&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;user&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;cd34…&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> },</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;bootstrap_warnings&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;query_allowlist&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: {</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;mode&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;warn&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;loaded_at_epoch_ms&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">1757923200000</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;entries&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">42</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;sources&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [{ </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;app&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;web&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;version&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;1.4.0&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;released_at&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;2026-09-15T08:00:00Z&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;entries&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">42</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;skipped&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;counters&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;checked&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">118</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;allowed_static&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">101</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;allowed_any&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">9</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;allowed_builtin&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">6</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;warned&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">2</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;refused&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">0</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> },</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;last_refused&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [{ </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;at_epoch_ms&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">1757923400000</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;table&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;game&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;surql&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;SELECT id, pgn FROM game WHERE white = $w;&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#005CC5;--shiki-dark:#79B8FF">&quot;reason&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;shape of query on `game` is not in the allowlist (42 entries from 1 release)&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8"> }]</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}]</span></span></code></pre>
+</li>
+</ul>
+<p><code>query_allowlist</code> reports the <a href="/docs/guide/query-allowlist">query allowlist</a>
+gate: <code>mode</code> (<code>off</code>, <code>warn</code>, <code>enforce</code>), when the <code>_00_query_allowlist</code> rows
+were last loaded, how many compiled <code>entries</code> that gave, one <code>sources</code> row per
+<code>&lt;app&gt;__&lt;version&gt;</code> row loaded, <code>skipped</code> as <code>[name, error]</code> pairs for entries
+whose SurrealQL did not compile, the decision <code>counters</code> since start
+(<code>warned</code> counts misses admitted under <code>warn</code>, <code>refused</code> the 403s under
+<code>enforce</code>), and the last 20 misses in <code>last_refused</code>. The list is reloaded at
+every Ready transition, whenever a <code>_00_query_allowlist</code> row changes, and at
+most once per 5 s after a miss.</p>
+<p><code>push</code> is the <a href="/docs/client/push-notifications">Web Push</a> engine’s status
+(same shape as the scheduler’s <code>/health</code> <code>push</code> block) on a standalone SSP,
+which hosts the engine in singlenode mode. It is <code>null</code> behind a scheduler,
+which runs the engine instead.</p>
+<p><code>bootstrap_warnings</code> is non-empty when the last bootstrap loaded zero rows
+for a table that upstream SurrealDB has rows in. That is the scheduler’s
+replica missing data (see the scheduler’s <code>/health/snapshot</code> <code>drift</code>
+block); views on such a table compute empty until the replica is re-cloned.</p>
+<p><code>ref_mode</code> reports the currently-active <code>_00_list_ref</code> storage
+layout, <code>&quot;dedicated&quot;</code> for per-user tables, <code>&quot;single&quot;</code> for the
+legacy shared table. e2e suites can probe this to gate
+mode-specific assertions; see the <code>z-single-mode-smoke</code> spec in the
+example app.</p>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/info</span></span></code></pre>
+<h3 id="get-debugviewview_id">GET /debug/view/:view_id</h3>
+<p>Get detailed information about a specific view for debugging.</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>view_id</code> (path parameter) - View identifier</li>
+</ul>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - View details
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;view_id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;users_view&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;cache_size&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">10</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;last_hash&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;abc123&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;format&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;cache&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="color:#B31D28;--shiki-light-font-style:italic;--shiki-dark:#FDAEB7;--shiki-dark-font-style:italic">...</span><span style="color:#24292E;--shiki-dark:#E1E4E8">],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;subquery_tables&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;users&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;referenced_tables&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;users&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;content_generation&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">5</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;subquery_cache&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: {}</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+</li>
+<li><code>404 Not Found</code> - View not found</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/debug/view/users_view</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span></span></code></pre>
+<h3 id="get-debugdeps">GET /debug/deps</h3>
+<p>Get dependency map for all views.</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - Dependency information
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;dependency_map&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: {},</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;tables_in_store&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;users&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">, </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;posts&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">],</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;view_count&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">5</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/debug/deps</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span></span></code></pre>
+<h3 id="post-log">POST /log</h3>
+<p>Receive logs from clients (for remote logging).</p>
+<p><strong>Authentication:</strong> Required</p>
+<p><strong>Request Body:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;message&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;User action completed&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;level&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;info&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;data&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: {</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;user_id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;123&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">    &quot;action&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;click&quot;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">  }</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><strong>Fields:</strong></p>
+<ul>
+<li><code>message</code> (string, required) - Log message</li>
+<li><code>level</code> (string, optional) - Log level: <code>error</code>, <code>warn</code>, <code>info</code>, <code>debug</code>, <code>trace</code> (default: <code>info</code>)</li>
+<li><code>data</code> (object, optional) - Additional structured data</li>
+</ul>
+<p><strong>Response:</strong></p>
+<ul>
+<li><code>200 OK</code> - Log received</li>
+<li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> -X</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> POST</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:8667/log</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Content-Type: application/json&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -H</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &quot;Authorization: Bearer your-secret-token&quot;</span><span style="color:#005CC5;--shiki-dark:#79B8FF"> \</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  -d</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> &#39;{</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;message&quot;: &quot;User logged in&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;level&quot;: &quot;info&quot;,</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">    &quot;data&quot;: {&quot;user_id&quot;: &quot;alice&quot;}</span></span>
+<span class="line"><span style="color:#032F62;--shiki-dark:#9ECBFF">  }&#39;</span></span></code></pre>
+<hr/>
+<h2 id="other-endpoints">Other endpoints</h2>
+<p>The routes above are the ones you call by hand. The rest of the surface exists
+for the scheduler, the dashboard and the CRDT client. All of them require the
+bearer; only <code>/health</code>, <code>/info</code>, <code>/info/text</code> and <code>/version</code> are public.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead><tbody><tr><td><code>GET /logs</code></td><td>Server-sent events of this SSP’s own log lines. <code>?tail=false</code> returns the backfill and closes, <code>?backfill=N</code> sets how much history. This is what the dashboard’s log view reads, proxied by the scheduler</td></tr><tr><td><code>POST /job/kill</code></td><td>Cancel one outbox job: aborts it in flight if this SSP owns it, otherwise flags it so it fails at dequeue</td></tr><tr><td><code>POST /job/retry</code></td><td>Reset a terminal job to <code>pending</code> and re-admit it. Refused with <code>409 not_terminal</code> while it is still running</td></tr><tr><td><code>POST /job/recover</code></td><td>Claim a <code>pending</code> job the recovery sweep found orphaned</td></tr><tr><td><code>POST /crdt/apply</code></td><td>Apply a Loro update to a <code>@crdt</code> field</td></tr><tr><td><code>GET /debug/heartbeat</code></td><td>The last heartbeat sequence this SSP observed, used by the end-to-end latency probe</td></tr><tr><td><code>GET /debug/catchup-rows/:table</code></td><td>Row counts for one table, for drift diagnosis</td></tr><tr><td><code>GET /debug/memory</code></td><td>Circuit memory breakdown</td></tr><tr><td><code>GET /info/text</code></td><td>The same content as <code>/info</code>, formatted for a terminal</td></tr></tbody></table>
+<p>Job kill and retry are normally reached through the cluster, not directly: the
+scheduler broadcasts a kill to every ready or lagging SSP and sends a retry to exactly one.
+See the <a href="/docs/reference/scheduler-api">scheduler API</a> for that side and
+<a href="/docs/jobs">Jobs</a> for what the states mean.</p>
+<h3 id="standalone-maintenance">Standalone maintenance</h3>
+<p>A single-node SSP with no scheduler also serves the backup plane, since there is
+no scheduler to own it: <code>PUT /backends</code>, <code>POST /backup/create</code>,
+<code>GET /backup/status</code> and <code>GET /backup/status/:id</code>, <code>POST /backup/restore</code>, and
+<code>GET /backup/restore/status/:id</code>. Shapes and semantics match the scheduler’s, so
+they are documented once in the <a href="/docs/reference/scheduler-api">scheduler API</a>.
+In a cluster the scheduler owns these and the SSP’s copies go unused.</p>
+<hr/>
+<h2 id="scheduler-integration">Scheduler Integration</h2>
+<p>When running with a scheduler, the SSP automatically:</p>
+<h3 id="registration-flow">Registration Flow</h3>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="mermaid"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">sequenceDiagram</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    participant SSP</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    participant Scheduler</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note over SSP: On Startup</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    SSP-&gt;&gt;Scheduler: POST /ssp/register</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note right of SSP: Send ssp_id and url</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Scheduler--&gt;&gt;SSP: 202 Accepted {snapshot_seq}</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note left of Scheduler: Mark as bootstrapping</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    SSP-&gt;&gt;Scheduler: GET /proxy/query</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note right of SSP: Bootstrap from scheduler</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Scheduler--&gt;&gt;SSP: Query results</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    loop Scheduler polls SSP</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        Scheduler-&gt;&gt;SSP: GET /health</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        SSP--&gt;&gt;Scheduler: {&quot;status&quot;: &quot;ready&quot;}</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    end</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note left of Scheduler: Mark as ready</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    loop Replay buffered events</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        Scheduler-&gt;&gt;SSP: POST /ingest</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        SSP--&gt;&gt;Scheduler: 200 OK</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    end</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note over SSP,Scheduler: SSP is now ready</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    loop Every 5 seconds</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        SSP-&gt;&gt;Scheduler: POST /ssp/heartbeat</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        Scheduler--&gt;&gt;SSP: 200 OK</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    end</span></span></code></pre>
+<h3 id="heartbeat-loop">Heartbeat Loop</h3>
+<p>The SSP sends periodic heartbeats to the scheduler:</p>
+<p><strong>Frequency:</strong> Every 5 seconds (default, configurable via <code>HEARTBEAT_INTERVAL_MS</code>)</p>
+<p><strong>Payload:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ssp_id&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;ssp-primary-01&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;timestamp&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">1707654321</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;views&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">5</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;cpu_usage&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">45.2</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;memory_usage&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">512.5</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;version&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;0.0.1-canary.212&quot;</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><strong>Response Handling:</strong></p>
+<ul>
+<li><code>200 OK</code> - heartbeat accepted, continue normal operation</li>
+<li><code>404 Not Found</code> - the scheduler no longer knows this SSP, usually because it
+restarted. The SSP re-bootstraps in place: it drops its views, keeps its
+rows, registers again and verifies them table by table (see
+<a href="#state-persistence">State Persistence</a>)</li>
+<li><code>409 Conflict</code> - the scheduler wants this SSP to re-bootstrap. Same in-place
+re-bootstrap, unless the directive says <code>clean</code>: then the SSP wipes its local
+state and exits with code <code>4</code></li>
+<li><code>503 Service Unavailable</code> - the scheduler is cloning or restoring; keep
+heartbeating</li>
+<li>Other errors - log a warning and keep heartbeating</li>
+</ul>
+<p>An in-place re-bootstrap goes through the same register, bootstrap and
+hash-verify path as a fresh process, with the rows it already holds as the
+starting point. Only the rows are kept: views and operator state are rebuilt
+from <code>_00_query</code>. If that re-bootstrap gives up, the SSP exits with code <code>3</code>
+and its supervisor relaunches it.</p>
+<p><strong>The 409 body is a directive:</strong></p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;reason&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;Clean restart requested. SSP must drop its snapshot and re-bootstrap.&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;clean&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">true</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
+<p><code>clean: true</code> means delete the circuit snapshot, the row checkpoints and the
+arena first, then exit, so the relaunch is a cold rebuild; the final shutdown
+checkpoint is skipped too, or it would write back the files that were just
+removed. Without it the SSP re-bootstraps in place with its rows kept. A 409 covers three cases: a buffer overflow, an integrity
+check that found drift, and an operator pressing restart or clean restart on
+the <a href="/docs/reference/admin-dashboard#restarting-an-ssp">admin dashboard</a>.</p>
+<p>Both directions degrade safely. An older scheduler sends plain text, which
+parses as <code>clean: false</code>; an older SSP reads the JSON as an opaque reason
+string and restarts. See the
+<a href="/docs/reference/scheduler-api">scheduler API</a> for the sending side.</p>
+<p><strong>Other exit codes:</strong> <code>2</code> when a post-bootstrap integrity check keeps failing,
+<code>3</code> when an in-place re-bootstrap gives up, <code>5</code> and <code>6</code> when registration never
+succeeds within its budget. All of them
+mean the same thing operationally: the supervisor should start the process
+again.</p>
+<h3 id="bluegreen-handover">Blue/green handover</h3>
+<p>An SSP started with <code>SPKY_SSP_REPLACES=&lt;id&gt;</code> while that SSP still serves is
+taken in as its <strong>standby</strong> (the registration answer says <code>standby: true</code>).
+A standby bootstraps like any SSP (warm, from the row checkpoints it shares
+with its predecessor), takes ingest and shadow view registrations, and goes
+<code>ready</code>, but writes nothing to the database: no edges, no <code>_00_query</code> state,
+no metrics, no TTL sweep, no jobs, no row checkpoints. <code>GET /health</code> reports
+<code>&quot;standby&quot;: true</code>. The scheduler then swaps it in through three bearer-auth
+routes (flow on the
+<a href="/docs/reference/scheduler-api#bluegreen-handover">scheduler side</a>):</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Route</th><th>Sent to</th><th>Does</th></tr></thead><tbody><tr><td><code>POST /handover/retire</code></td><td>the SSP being replaced</td><td>Status <code>retired</code>: <code>/ingest</code>, <code>/view/register</code> and <code>/view/unregister</code> answer <code>503 {&quot;code&quot;:&quot;retired&quot;}</code>; TTL sweep, metrics flush and new job claims stop (running jobs finish); the publication queue drains (up to <code>SPKY_SSP_RETIRE_DRAIN_SECS</code>, default 60); row checkpoints stop for good. Answers <code>{ &quot;digests&quot;: { &quot;&lt;query id&gt;&quot;: &quot;m1:...&quot; }, &quot;drained&quot;: true }</code>.</td></tr><tr><td><code>POST /handover/promote</code></td><td>the standby</td><td>Atomically with ingest: drops views outside <code>keep</code> (without touching their edges), registers views the predecessor had and it lacks, republishes only views whose digest differs, then leaves standby. Answers <code>{ &quot;views&quot;, &quot;republished&quot;, &quot;dropped&quot; }</code>. <code>503</code> before any change when it cannot proceed.</td></tr><tr><td><code>POST /handover/resume</code></td><td>the SSP being replaced</td><td>Takes a retire back after a failed promotion. Always <code>200</code>.</td></tr></tbody></table>
+<p>A digest covers a view’s members with their row versions, so views whose
+edges already match are not touched. A retired SSP keeps heartbeating (its
+running jobs are not re-run), ignores <code>404</code>/<code>409</code> from the scheduler, answers
+<code>GET /health</code> with <code>200 {&quot;status&quot;:&quot;retired&quot;}</code>, and exits promptly on SIGTERM
+without writing row checkpoints: the directory belongs to its successor.</p>
+<hr/>
+<h2 id="configuration">Configuration</h2>
+<p>Configure the SSP via environment variables:</p>
+<h3 id="core-configuration">Core Configuration</h3>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Server</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_LISTEN_ADDR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">0.0.0.0:8667</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Authentication. When unset the auth middleware accepts any bearer</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># token, which is intended for dev only.</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_AUTH_SECRET</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">your-secret-token</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Database connection (HTTP engine; ws:// values are accepted and normalized).</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># SPKY_DB_WS is read as a legacy fallback.</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_DB_URL</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">http://127.0.0.1:8000</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_DB_USER</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">root</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_DB_PASS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">root</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_DB_NS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">main</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_DB_NAME</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">app</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># _00_list_ref layout. See Architecture</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_REF_MODE</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">dedicated</span><span style="color:#6A737D;--shiki-dark:#6A737D">   # or &#39;single&#39;</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># TTL cleanup interval (seconds, default: 60)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">TTL_CLEANUP_INTERVAL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">60</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Schema poll: added, changed and removed tables applied in place</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># (seconds, default: 15, 0 = off)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SCHEMA_POLL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">15</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Job-table runner config, JSON-encoded. Read once at startup.</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_JOB_CONFIG</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&#39;{&quot;job_tables&quot;: {…}}&#39;</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Restart cache. Cluster mode keeps row checkpoints in &lt;dir&gt;/rows and verifies</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># them against the scheduler on boot; a standalone SSP rebuilds from SurrealDB</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># on every start. Unset means memory-only. See State Persistence.</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_SNAPSHOT_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">/data/ssp-0</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ARENA_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">/data/ssp-0/arena</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ROW_CHECKPOINT_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">300</span><span style="color:#6A737D;--shiki-dark:#6A737D">       # cluster: write changed tables (0 = only on shutdown/bootstrap)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_CHECKPOINT_VERIFY</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">background</span><span style="color:#6A737D;--shiki-dark:#6A737D">  # cluster: verify checkpoint bodies alongside the bootstrap, or `load` before serving</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_REPAIR_CONCURRENCY</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">4</span><span style="color:#6A737D;--shiki-dark:#6A737D">          # cluster: tables, and ranges within one, repaired at once at a warm bootstrap</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Optional knobs</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_CRDT_CACHE_SIZE</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">10000</span><span style="color:#6A737D;--shiki-dark:#6A737D">       # in-memory CRDT cache capacity</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_CRDT_FIELDS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&#39;{&quot;thread&quot;: [&quot;content&quot;]}&#39;</span><span style="color:#6A737D;--shiki-dark:#6A737D">  # override @crdt detection</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_BOOTSTRAP_PAGE_SIZE</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">500</span><span style="color:#6A737D;--shiki-dark:#6A737D"> # rows pulled per /proxy/query page</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ARENA_SEGMENT_MB</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">64</span><span style="color:#6A737D;--shiki-dark:#6A737D">     # arena segment size (default: 64)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_MEMORY_LIMIT_MB</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">1024</span><span style="color:#6A737D;--shiki-dark:#6A737D">    # memory ceiling reported for load balancing</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_REGISTER_MAX_WAIT_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">180</span><span style="color:#6A737D;--shiki-dark:#6A737D"> # give up registering and exit (default: 180)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_VIEW_METRICS_FLUSH_MS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">2000</span><span style="color:#6A737D;--shiki-dark:#6A737D"> # view metrics flush interval (default: 2000)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ANON_LIVE_QUERIES</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">false</span><span style="color:#6A737D;--shiki-dark:#6A737D"> # allow LIVE queries with no auth context</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_QUERY_ALLOWLIST</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">off</span><span style="color:#6A737D;--shiki-dark:#6A737D">     # off | warn | enforce: refuse view shapes the app does not ship</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_IMPERSONATION</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">off</span><span style="color:#6A737D;--shiki-dark:#6A737D">           # on: serve /impersonate/* (set from impersonation.enabled)</span></span></code></pre>
+<h3 id="scheduler-integration-1">Scheduler Integration</h3>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Scheduler URL (optional - enables scheduler integration)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SCHEDULER_URL</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">http://localhost:9667</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># SSP identification (defaults to ssp-&lt;uuid&gt; if not set)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ID</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">ssp-primary-01</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Externally reachable address for this SSP (optional)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ADVERTISE_ADDR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">10.100.1.30:8667</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Heartbeat cadence (ms, default 5000)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">HEARTBEAT_INTERVAL_MS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">5000</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Blue/green: the id of the serving SSP this one replaces (optional)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_REPLACES</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">ssp-primary-01</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># How long a retiring SSP waits for its publication queue to drain (s, default 60)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_RETIRE_DRAIN_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">60</span></span></code></pre>
+<h3 id="job-configuration-sp00kyyml">Job Configuration (<code>sp00ky.yml</code>)</h3>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="yaml"><code><span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">job_tables</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  backend_api</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">    name</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;Backend API&quot;</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">    base_url</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;https://api.example.com&quot;</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">    auth_token</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;your-api-token&quot;</span></span></code></pre>
+<p>When a record is created in a job table with <code>status: &quot;pending&quot;</code>, the SSP will:</p>
+<ol>
+<li>Extract the job details</li>
+<li>Execute HTTP request to the backend</li>
+<li>Update the job status based on response</li>
+</ol>
+<hr/>
+<h2 id="standalone-vs-scheduler-mode">Standalone vs. Scheduler Mode</h2>
+<h3 id="standalone-mode">Standalone Mode</h3>
+<p>When <code>SPKY_SCHEDULER_URL</code> is not set:</p>
+<ul>
+<li>SSP runs independently</li>
+<li>No registration or heartbeat</li>
+<li>Direct client connections only</li>
+<li>Useful for development and single-SSP deployments</li>
+<li>The SSP owns the full maintenance plane the scheduler provides in
+cluster mode (see below)</li>
+</ul>
+<h4 id="standalone-maintenance-plane">Standalone Maintenance Plane</h4>
+<p>A standalone SSP exposes the same backup/restore and backend-health
+surface the scheduler serves on port 9667 in cluster mode:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th style="text-align:left">Endpoint</th><th style="text-align:left">Method</th><th style="text-align:left">Description</th></tr></thead><tbody><tr><td style="text-align:left"><code>/backup/create</code></td><td style="text-align:left">POST</td><td style="text-align:left">Enqueue a backup (<code>{backup_id, project_slug}</code>), exports the main SurrealDB, gzips, uploads to S3 (<code>S3_*</code> env vars)</td></tr><tr><td style="text-align:left"><code>/backup/status</code></td><td style="text-align:left">GET</td><td style="text-align:left">Recent backup jobs + S3 reachability</td></tr><tr><td style="text-align:left"><code>/backup/status/:backup_id</code></td><td style="text-align:left">GET</td><td style="text-align:left">Single backup job status</td></tr><tr><td style="text-align:left"><code>/backup/restore</code></td><td style="text-align:left">POST</td><td style="text-align:left">Enqueue a restore (<code>{restore_id?, backup_id, project_slug, storage_path}</code>)</td></tr><tr><td style="text-align:left"><code>/backup/restore/status/:restore_id</code></td><td style="text-align:left">GET</td><td style="text-align:left">Single restore job status</td></tr><tr><td style="text-align:left"><code>/backends</code></td><td style="text-align:left">PUT</td><td style="text-align:left">Replace the backend health-check list at runtime (JSON array; same shape as <code>SPKY_BACKENDS</code>)</td></tr></tbody></table>
+<p>Unlike the scheduler’s (unauthenticated) equivalents, these routes sit
+behind the SSP’s bearer auth; callers must send
+<code>Authorization: Bearer $SPKY_AUTH_SECRET</code>.</p>
+<p>During a restore the SSP transitions <code>Ready → Bootstrapping</code>: <code>/ingest</code>
+returns 503 and events pushed by SurrealDB <code>DEFINE EVENT</code> triggers in
+that window are rejected and <strong>not</strong> replayed, after the restore the
+state is exactly the imported dump, and the circuit is re-bootstrapped
+from it. If the circuit re-bootstrap fails after the main DB was
+already replaced, the SSP stays <code>Bootstrapping</code> (blocking traffic); a
+process restart reruns the normal startup bootstrap and self-heals.</p>
+<p>With a backend list configured (<code>SPKY_BACKENDS</code>, or legacy
+<code>SPKY_SCHEDULER_BACKENDS</code>; poll interval
+<code>SPKY_HEALTH_CHECK_INTERVAL_SECS</code>, default 15s), <code>GET /health</code> mirrors
+the scheduler’s aggregation, <code>healthy</code> / <code>degraded</code> / <code>unavailable</code>
+plus per-status backend counts.</p>
+<h3 id="scheduler-mode">Scheduler Mode</h3>
+<p>When <code>SPKY_SCHEDULER_URL</code> is set:</p>
+<ul>
+<li>SSP registers with scheduler on startup</li>
+<li>Receives bootstrap data from scheduler</li>
+<li>Sends periodic heartbeats</li>
+<li>Receives data updates from scheduler</li>
+<li>Supports horizontal scaling with multiple SSPs</li>
+</ul>
+<hr/>
+<h2 id="performance-considerations">Performance Considerations</h2>
+<h3 id="view-updates">View Updates</h3>
+<ul>
+<li>Views are updated incrementally when records change</li>
+<li>Only affected views are recomputed</li>
+<li>Edge updates are batched and written to SurrealDB</li>
+</ul>
+<h3 id="state-persistence">State Persistence</h3>
+<p>SurrealDB and the scheduler’s replica are always the durable source of truth.
+Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.</p>
+<ul>
+<li>On a cold start the SSP <strong>self-bootstraps</strong> by paging every synced table
+through the scheduler’s <code>POST /proxy/query</code> endpoint into its circuit.</li>
+<li><strong>Cluster mode keeps its rows.</strong> With <code>SPKY_SSP_SNAPSHOT_DIR</code> set to a
+writable directory, each table’s rows go to <code>&lt;dir&gt;/rows/</code>: a base image
+<code>&lt;table&gt;.rows</code> (a binary copy of the encoded rows, each row’s head, that is
+its digest, version, id and body pointer, in one region and the bodies in
+another, with a hash over each region and the table’s content hash), and
+after that deltas <code>&lt;table&gt;.NNNNNN.delta</code>, each holding only the rows changed
+since the previous file and a tombstone per row deleted, chained on the
+file before it. A table is written whole again after 64 deltas, when the
+deltas outweigh half the base, or when the base on disk is not the one this
+process extends. Writes happen on graceful shutdown (SIGTERM; ingest stops
+first), two minutes after every bootstrap or promotion, and every
+<code>SPKY_SSP_ROW_CHECKPOINT_SECS</code> (default 300, <code>0</code> turns the timer off). Only
+tables whose content changed since they were last written are written at
+all, one table at a time, and a delta costs the churn rather than the
+table. <code>Row checkpoint written</code> carries <code>full</code>, <code>deltas</code>, <code>tombstones</code>,
+<code>bytes</code>, <code>encode_ms</code> and <code>fsync_ms</code>.</li>
+<li><strong>On boot the rows are loaded before the SSP registers, then verified.</strong>
+A checkpoint file is not read whole: its heads are read and checked against
+their hash (about 75 bytes a row), the file is mapped read-only as the
+table’s row arena (or adopted into memory where there is no file-backed
+arena), the index is rebuilt by one walk over the heads, and the bodies stay
+on disk until a row is read. Their hash is checked by a pass that starts
+right away and runs while the SSP registers and repairs, streaming each file
+through sequentially, which is also what warms the page cache for the view
+priming that follows (<code>Verified row checkpoint bodies</code>, with <code>files</code>,
+<code>bytes</code>, <code>failed</code> and <code>ms</code>). A table whose bodies fail is dropped and paged
+again by an in-process re-bootstrap. <code>SPKY_SSP_CHECKPOINT_VERIFY=load</code>
+verifies before a table is served instead, reading every file whole at
+boot. The <code>Loaded row checkpoint</code> line carries <code>bytes</code>, <code>bodies_bytes</code>,
+<code>mapped</code>, <code>converted</code>, <code>deltas</code>, <code>deltas_discarded</code>, <code>pending</code>, <code>heads_ms</code>,
+<code>verify_ms</code> and <code>install_ms</code>. The scheduler answers the registration with
+the hash of every table at the cut it freezes. A table whose rows hash the
+same is kept as is. One that differs is repaired: the SSP fetches the
+table’s id-range hashes from the scheduler (<code>POST /proxy/ranges</code>, about 1000
+rows per range), hashes its own rows over the same ranges, and lists
+<code>(id, _00_rv)</code> only for the ranges that differ. It deletes what is gone,
+fetches the rows that are missing or at another version, and re-reads
+whole any range that still differs (a row changed without a new version).
+Tables are repaired <code>SPKY_SSP_REPAIR_CONCURRENCY</code> at a time (default 4),
+with the same concurrency for the listings, fetches and re-reads inside
+one; <code>Warm bootstrap: rows reused</code> carries <code>kept</code>, <code>repaired</code>, <code>paged</code> and
+<code>repair_ms</code>. A scheduler that serves no ranges for the table gets the whole
+table’s <code>(id, _00_rv)</code> listed instead. A table that still differs, has no
+checkpoint, or fails its checks is paged in full like a cold start, range
+by range when the scheduler serves ranges. Views are always rebuilt from
+<code>_00_query</code> (<code>Re-registered views</code> logs how many and how long their priming
+took), their memberships are republished to SurrealDB as one batch
+(<code>Republished restored views</code>), and <code>SSP ready</code> closes the boot with the
+republish time. The usual post-bootstrap integrity check runs over the
+result, so a stale or corrupt checkpoint costs time, never correctness.
+What changed with the lazy verification: until the pass reaches a file, a
+flipped body byte could be served; the scheduler’s hash check cannot catch
+it, since the hash is folded from the digests in the heads. The exposure
+is seconds, and <code>load</code> restores the old guarantee at the old cost.</li>
+<li>Files written before the split layout (sp00ky before canary.303) are
+converted at load, which costs what loading them used to, and rewritten
+whole at the next write. A build from before it refuses the new files and
+pages the table instead.</li>
+<li>The same path runs <strong>in place</strong> when the scheduler forgets the SSP (a
+scheduler restart) or asks for a resync: the rows already in memory are the
+starting point and the process never exits.</li>
+<li>Standalone mode keeps nothing but the arena across restarts: every start
+rebuilds from SurrealDB. Without a scheduler there is no content hash to
+verify a checkpoint against, and listing a table’s ids to reconcile one
+costs as much as the rebuild. Row bytes live in a sparse-file arena at
+<code>SPKY_SSP_ARENA_DIR</code> in both modes.</li>
+<li>With the directory unset or not writable, the SSP logs it once and runs
+memory-only: every start is a full rebuild.</li>
+<li>Sp00ky Cloud sets the snapshot and arena directories on a volume that
+survives a container recreate, and stops an SSP with SIGTERM and a grace
+period, so a cloud SSP restarts warm. A
+<a href="/docs/reference/admin-dashboard#restarting-an-ssp">clean restart</a> from the
+dashboard deletes these files, which is what forces the cold rebuild it
+promises.</li>
+</ul>
+<h3 id="memory-management">Memory Management</h3>
+<ul>
+<li>Views store materialized results in memory</li>
+<li>Periodic metrics report memory usage</li>
+<li>Consider SSP resource limits when running multiple views</li>
+</ul>
+<hr/>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="ssp-not-receiving-updates">SSP Not Receiving Updates</h3>
+<ol>
+<li>Check scheduler connectivity:
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="bash"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">curl</span><span style="color:#032F62;--shiki-dark:#9ECBFF"> http://localhost:9667/metrics</span></span></code></pre>
+</li>
+<li>Verify SSP appears in scheduler metrics with <code>state: &quot;ready&quot;</code></li>
+<li>Check SSP logs for heartbeat success messages</li>
+<li>Verify authentication tokens match</li>
+</ol>
+<h3 id="bootstrap-failures">Bootstrap Failures</h3>
+<ol>
+<li>Check scheduler logs for bootstrap errors</li>
+<li>Verify SSP <code>/health</code> endpoint is accessible from the scheduler</li>
+<li>Verify the scheduler’s proxy endpoints (<code>/proxy/query</code>) are reachable from the SSP</li>
+<li>Check database connectivity from scheduler</li>
+<li>Increase <code>bootstrap_timeout_secs</code> if bootstrap is timing out</li>
+</ol>
+<h3 id="high-memory-usage">High Memory Usage</h3>
+<ol>
+<li>Review number of registered views</li>
+<li>Check view complexity (joins, filters)</li>
+<li>Monitor records per view via <code>/debug/view/:view_id</code></li>
+<li>Consider horizontal scaling with additional SSPs</li>
+</ol>
+<h3 id="job-execution-issues">Job Execution Issues</h3>
+<ol>
+<li>Verify job table configuration in <code>sp00ky.yml</code></li>
+<li>Check job status updates in database</li>
+<li>Review SSP logs for job execution errors</li>
+<li>Verify backend API connectivity and authentication</li>
+</ol>
+<h2 id="publication-isolation-and-latency">Publication isolation and latency</h2>
+<p>Edge publication captures the versions it needs under a short circuit read lock
+and releases that lock before database I/O. Ingest can continue while publication
+is slow. Cleanup uses a separate publication gate, and queued deltas for detached
+registrations are discarded. The native SSP uses a separate database session for
+bulk publication, including its token refresh and reconnect lifecycle.</p>
+<p>Removals, version updates and subquery parent lookups find an edge by walking
+from its row (<code>row&lt;-list_ref WHERE in = view</code>), so they cost the few views that
+row is in rather than every edge of the view. Version updates return no row
+bodies. Version-only deltas are idempotent and can be split at the transaction
+statement cap; membership-changing incremental deltas remain atomic. Direct
+correlated joins invalidate affected parents and children; complex joins retain
+conservative invalidation when precise dependency tracking is unavailable.</p>
+<p>Additional OpenTelemetry instruments expose <code>ssp_edge_lock_wait_milliseconds</code>,
+<code>ssp_edge_lock_hold_milliseconds</code>, <code>ssp_edge_publish_milliseconds</code>,
+<code>ssp_edge_transaction_milliseconds</code>, and <code>ssp_edge_publish_failures_total</code>.
+<code>ssp_ingest_total</code> counts records; <code>ssp_ingest_batch_total</code> counts accepted batch
+requests. <code>ssp_slow_evidence_dropped_total</code> counts slow-operation samples skipped
+when all four best-effort evidence writers are occupied.
+Publication includes retries; transaction timing includes conflict retries for
+one planned transaction. Existing per-view ingest timings describe a shared
+circuit step and can include lock wait. They do not measure edge publication.
+Timeout logs report statement bytes/count rather than entire SQL batches.</p>
+<h3 id="publication-admission-and-backlog">Publication admission and backlog</h3>
+<p>The native publisher reserves one of 4,096 slots before ingest side effects or
+circuit evaluation. A slot stays reserved while registration metadata, source
+commit visibility, database publication, or retries are pending. When capacity
+is exhausted, ingest returns HTTP 503 before accepting the event; the scheduler
+retains it in its WAL and delivers it again. A prolonged overload can therefore
+show as lagging while memory use is protected, with explicit bootstrap recovery
+if the scheduler’s replay buffer overflows. While an SSP is lagging behind a
+<code>publication_backlog</code> refusal, the scheduler retries it within a second rather
+than backing off toward ten, and keeps routing re-registrations of the views it
+already holds to it; only views it does not hold yet wait for a ready SSP.</p>
+<p>A view registration may only take half of the queue: once half the slots, half
+the bytes or half the operations are reserved, <code>/view/register</code> answers 503
+<code>publication_backlog</code> while ingest keeps using the rest. A cold registration
+publishes its whole result as edges, so without this a burst of them (a client
+reloading many tabs at once) took every slot, ingest was refused, and the
+scheduler marked the SSP lagging and refused every other registration until the
+queue drained.</p>
+<p>New admission also stops at measured pending-delta thresholds of 64 MiB or
+100,000 operations. These are admission thresholds, not a strict RSS or total
+byte cap: deltas are sized after evaluation, so already reserved slots can
+overshoot them. Large individual memberships remain atomic. Source-commit waits
+and metadata barriers preserve publication order; disjoint views may proceed
+while an earlier failed view waits for retry. Internal lifecycle generations
+prevent queued work from an old registration or restore from recreating edges.</p>
+<p>Ready work at the head of the queue is published together, in rounds of up to
+256 admitted requests. A round writes its deltas in queue order in as few
+transactions as the statement cap allows, and folds the edge cleanup for
+deleted rows into one statement per table, so a bulk delete costs a handful of
+round trips instead of several per row. Table lifecycle work (per-user tables
+created or dropped) keeps a round of its own. If a delta of a view fails, later
+deltas of that view in the same round wait for its retry rather than landing
+first. Registering an id that is already registered, including a merged
+subscriber sharing another registration’s graph, joins the existing view and
+does not publish its membership again unless its edges are missing and no
+publication for it is pending.</p>
+<p>Source-commit visibility checks run outside the writer on the control database
+session, with at most 16 simultaneous probes. Each wait has a five-second total
+deadline, including probe-capacity and network waits, after which the existing
+visibility fallback applies. Same-view work remains ordered, while unrelated
+views can publish during a wait. Deletes do not wait for a deleted row to become
+visible. A canceled probe retains its admission slot until its task has stopped.</p>
+<p>SSP heartbeat data includes optional <code>publication</code> measurements: pending batches,
+operations and estimated bytes, oldest age, parked batches, last successful
+publication, overload rejections, and at most eight views with the largest
+backlog. Older schedulers ignore the field; older SSPs omit it. The native shell
+also includes bulk database session generation and reconnect attempt timing.
+These values require no database query or circuit lock to collect.</p>
+<p>OpenTelemetry exports <code>ssp_edge_pending_batches</code>, <code>ssp_edge_pending_operations</code>,
+<code>ssp_edge_pending_bytes</code>, <code>ssp_edge_oldest_age_milliseconds</code>,
+<code>ssp_edge_parked_batches</code>, <code>ssp_edge_overload_rejections</code>,
+<code>ssp_edge_last_success_epoch_milliseconds</code>, and <code>ssp_edge_connection_generation</code>.
+Timeout logs include a bounded statement fingerprint and session generation;
+they do not include the SQL batch or bindings.</p>
+<h3 id="registration-and-ingest-stages">Registration and ingest stages</h3>
+<p>View metadata on <code>_00_query</code> carries optional <code>registrationStages</code> and
+<code>ingestStages</code>, also exposed as <code>registration_stages</code> and <code>ingest_stages</code> by the
+scheduler’s view inspection API. Older rows may omit these fields.</p>
+<p>Registration stages are <code>request_ms</code>, <code>prepare_ms</code>, <code>parse_ms</code>, <code>lock_wait_ms</code>,
+<code>lock_hold_ms</code>, <code>index_build_ms</code>, <code>indexes_built</code>, <code>rows_indexed</code>, <code>plan_ms</code>,
+<code>snapshot_ms</code> and <code>metadata_db_ms</code>. Cold registrations and warm joins both record
+stages. Lock wait and hold accumulate preparation/read, index-prewarm/read and
+installation/write guards. Parsing, index build, plan and snapshot timings are
+subsets of their containing stages. Warm metadata timing includes its repair
+probe and any repair writes.
+Ingest stages are <code>request_ms</code>, <code>lock_wait_ms</code>, <code>lock_hold_ms</code>, <code>store_apply_ms</code>,
+<code>circuit_step_ms</code> and <code>enqueue_ms</code>. Nested stages overlap their containing totals;
+do not add all fields together. Neither request total includes asynchronous
+publication completion. Slow request history is independent of the view’s TTL;
+see <a href="/docs/reference/scheduler-api#slow-sync-operation-history">persistent evidence</a>.</p> <nav class="not-prose mt-16 grid gap-3 border-t border-white/[0.08] pt-8 sm:grid-cols-2" aria-label="Page navigation"><a href="/pr-preview/pr-48/docs/reference/vault" rel="prev" class="group flex items-center gap-3 rounded-glass border border-white/[0.08] bg-white/[0.03] p-4 no-underline shadow-glass-inset transition-colors duration-200 hover:border-brand-400/30 hover:bg-white/[0.06]"><svg class="h-4 w-4 shrink-0 text-text-muted transition-all duration-200 group-hover:-translate-x-0.5 group-hover:text-brand-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M11 18l-6-6 6-6"></path></svg><span class="min-w-0"><span class="block text-[11px] font-medium uppercase tracking-wider text-text-muted">
+Previous
+</span><span class="block truncate text-sm font-medium text-text-primary">Vault architecture</span></span></a><a href="/pr-preview/pr-48/docs/reference/scheduler-api" rel="next" class="group flex items-center justify-end gap-3 rounded-glass border border-white/[0.08] bg-white/[0.03] p-4 text-right no-underline shadow-glass-inset transition-colors duration-200 hover:border-brand-400/30 hover:bg-white/[0.06]"><span class="min-w-0"><span class="block text-[11px] font-medium uppercase tracking-wider text-text-muted">
+Next
+</span><span class="block truncate text-sm font-medium text-text-primary">Scheduler API</span></span><svg class="h-4 w-4 shrink-0 text-text-muted transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-brand-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a></nav> </div> </main> <aside class="docs-rail hidden xl:block w-[248px] shrink-0"> <div class="docs-rail-scroll pt-8 pb-16 pl-2 pr-6" data-toc-scroller> <nav class="docs-toc" aria-labelledby="docs-toc-title" data-toc><p id="docs-toc-title" class="docs-toc-title">
+On this page
+</p><div class="docs-toc-track"><span class="docs-toc-indicator" data-toc-indicator aria-hidden="true"></span><ul><li><a href="#base-url" class="docs-toc-link" data-toc-link="base-url">Base URL</a></li><li><a href="#authentication" class="docs-toc-link" data-toc-link="authentication">Authentication</a></li><li><a href="#data-ingestion" class="docs-toc-link" data-toc-link="data-ingestion">Data Ingestion</a></li><li><a href="#post-ingest" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-ingest">POST /ingest</a></li><li><a href="#bootstrap" class="docs-toc-link" data-toc-link="bootstrap">Bootstrap</a></li><li><a href="#post-ingestbatch" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-ingestbatch">POST /ingest/batch</a></li><li><a href="#view-management" class="docs-toc-link" data-toc-link="view-management">View Management</a></li><li><a href="#post-viewregister" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-viewregister">POST /view/register</a></li><li><a href="#post-viewunregister" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-viewunregister">POST /view/unregister</a></li><li><a href="#impersonation" class="docs-toc-link" data-toc-link="impersonation">Impersonation</a></li><li><a href="#state-management" class="docs-toc-link" data-toc-link="state-management">State Management</a></li><li><a href="#post-reset" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-reset">POST /reset</a></li><li><a href="#post-adminreload" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-adminreload">POST /admin/reload</a></li><li><a href="#monitoring--debugging" class="docs-toc-link" data-toc-link="monitoring--debugging">Monitoring &amp; Debugging</a></li><li><a href="#get-health" class="docs-toc-link docs-toc-link-nested" data-toc-link="get-health">GET /health</a></li><li><a href="#get-version" class="docs-toc-link docs-toc-link-nested" data-toc-link="get-version">GET /version</a></li><li><a href="#get-info" class="docs-toc-link docs-toc-link-nested" data-toc-link="get-info">GET /info</a></li><li><a href="#get-debugviewview_id" class="docs-toc-link docs-toc-link-nested" data-toc-link="get-debugviewview_id">GET /debug/view/:view_id</a></li><li><a href="#get-debugdeps" class="docs-toc-link docs-toc-link-nested" data-toc-link="get-debugdeps">GET /debug/deps</a></li><li><a href="#post-log" class="docs-toc-link docs-toc-link-nested" data-toc-link="post-log">POST /log</a></li><li><a href="#other-endpoints" class="docs-toc-link" data-toc-link="other-endpoints">Other endpoints</a></li><li><a href="#standalone-maintenance" class="docs-toc-link docs-toc-link-nested" data-toc-link="standalone-maintenance">Standalone maintenance</a></li><li><a href="#scheduler-integration" class="docs-toc-link" data-toc-link="scheduler-integration">Scheduler Integration</a></li><li><a href="#registration-flow" class="docs-toc-link docs-toc-link-nested" data-toc-link="registration-flow">Registration Flow</a></li><li><a href="#heartbeat-loop" class="docs-toc-link docs-toc-link-nested" data-toc-link="heartbeat-loop">Heartbeat Loop</a></li><li><a href="#bluegreen-handover" class="docs-toc-link docs-toc-link-nested" data-toc-link="bluegreen-handover">Blue/green handover</a></li><li><a href="#configuration" class="docs-toc-link" data-toc-link="configuration">Configuration</a></li><li><a href="#core-configuration" class="docs-toc-link docs-toc-link-nested" data-toc-link="core-configuration">Core Configuration</a></li><li><a href="#scheduler-integration-1" class="docs-toc-link docs-toc-link-nested" data-toc-link="scheduler-integration-1">Scheduler Integration</a></li><li><a href="#job-configuration-sp00kyyml" class="docs-toc-link docs-toc-link-nested" data-toc-link="job-configuration-sp00kyyml">Job Configuration (sp00ky.yml)</a></li><li><a href="#standalone-vs-scheduler-mode" class="docs-toc-link" data-toc-link="standalone-vs-scheduler-mode">Standalone vs. Scheduler Mode</a></li><li><a href="#standalone-mode" class="docs-toc-link docs-toc-link-nested" data-toc-link="standalone-mode">Standalone Mode</a></li><li><a href="#scheduler-mode" class="docs-toc-link docs-toc-link-nested" data-toc-link="scheduler-mode">Scheduler Mode</a></li><li><a href="#performance-considerations" class="docs-toc-link" data-toc-link="performance-considerations">Performance Considerations</a></li><li><a href="#view-updates" class="docs-toc-link docs-toc-link-nested" data-toc-link="view-updates">View Updates</a></li><li><a href="#state-persistence" class="docs-toc-link docs-toc-link-nested" data-toc-link="state-persistence">State Persistence</a></li><li><a href="#memory-management" class="docs-toc-link docs-toc-link-nested" data-toc-link="memory-management">Memory Management</a></li><li><a href="#troubleshooting" class="docs-toc-link" data-toc-link="troubleshooting">Troubleshooting</a></li><li><a href="#ssp-not-receiving-updates" class="docs-toc-link docs-toc-link-nested" data-toc-link="ssp-not-receiving-updates">SSP Not Receiving Updates</a></li><li><a href="#bootstrap-failures" class="docs-toc-link docs-toc-link-nested" data-toc-link="bootstrap-failures">Bootstrap Failures</a></li><li><a href="#high-memory-usage" class="docs-toc-link docs-toc-link-nested" data-toc-link="high-memory-usage">High Memory Usage</a></li><li><a href="#job-execution-issues" class="docs-toc-link docs-toc-link-nested" data-toc-link="job-execution-issues">Job Execution Issues</a></li><li><a href="#publication-isolation-and-latency" class="docs-toc-link" data-toc-link="publication-isolation-and-latency">Publication isolation and latency</a></li><li><a href="#publication-admission-and-backlog" class="docs-toc-link docs-toc-link-nested" data-toc-link="publication-admission-and-backlog">Publication admission and backlog</a></li><li><a href="#registration-and-ingest-stages" class="docs-toc-link docs-toc-link-nested" data-toc-link="registration-and-ingest-stages">Registration and ingest stages</a></li></ul></div><button type="button" class="docs-toc-top" data-toc-top hidden><svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"></path></svg>
+Back to top
+</button></nav><script type="module">let p;function B(){p?.(),p=void 0;const n=document.querySelector("[data-toc]");if(!n)return;const i=n.querySelector("[data-toc-indicator]"),u=n.querySelector("[data-toc-top]"),m=n.closest("[data-toc-scroller]"),l=[...n.querySelectorAll("[data-toc-link]")].map(t=>({link:t,heading:document.getElementById(t.dataset.tocLink??"")})).filter(t=>!!t.heading);if(l.length===0)return;const f=window.matchMedia("(prefers-reduced-motion: reduce)").matches;let w=null,r=null,c,a=0;function h(t){if(t!==w&&(w?.removeAttribute("aria-current"),w=t,!!i)){if(!t){i.style.opacity="0";return}t.setAttribute("aria-current","location"),i.style.opacity="1",i.style.transform=`translateY(${t.offsetTop}px)`,i.style.height=`${t.offsetHeight}px`,v(t)}}function v(t){if(!m)return;const e=t.getBoundingClientRect(),o=m.getBoundingClientRect(),d=64;e.top>=o.top+d&&e.bottom<=o.bottom-d||m.scrollBy({top:e.top-o.top-o.height/3,behavior:f?"auto":"smooth"})}function g(){if(a=0,u&&(u.hidden=window.scrollY<window.innerHeight*.6),r)return;if(window.innerHeight+window.scrollY>=document.documentElement.scrollHeight-4){h(l[l.length-1].link);return}let e=null;for(const{link:o,heading:d}of l){if(d.getBoundingClientRect().top-96>1)break;e=o}h(e)}function s(){r&&(window.clearTimeout(c),c=window.setTimeout(()=>{r=null},150)),a||(a=requestAnimationFrame(g))}function y(t){const e=t.target.closest("[data-toc-link]"),o=e&&document.getElementById(e.dataset.tocLink??"");!e||!o||(t.preventDefault(),r=e,h(e),history.pushState(history.state,"",`#${o.id}`),o.scrollIntoView({behavior:f?"auto":"smooth",block:"start"}),window.clearTimeout(c),c=window.setTimeout(()=>{r=null},1e3))}function E(){window.scrollTo({top:0,behavior:f?"auto":"smooth"}),history.replaceState(history.state,"",location.pathname+location.search)}window.addEventListener("scroll",s,{passive:!0}),window.addEventListener("resize",s,{passive:!0}),n.addEventListener("click",y),u?.addEventListener("click",E),g(),p=()=>{window.removeEventListener("scroll",s),window.removeEventListener("resize",s),window.clearTimeout(c),a&&cancelAnimationFrame(a)}}document.addEventListener("astro:page-load",B);</script> </div> </aside> <!-- Mobile Menu Overlay --> <div id="mobile-menu" class="fixed inset-x-0 bottom-0 top-16 z-40 bg-black/50 backdrop-blur-md lg:hidden hidden"> <div class="h-full w-[85%] max-w-[320px] overflow-y-auto overscroll-contain border-r border-white/[0.08] bg-[#0c0c0e] px-6 pb-12 pt-4 shadow-glass-lg [scrollbar-width:none]"> <div class="flex justify-end mb-2 -mr-2"> <button id="mobile-menu-close" aria-label="Close menu" class="p-2 text-text-muted hover:text-text-primary hover:bg-white/[0.06] rounded-lg transition-colors"> <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path> </svg> </button> </div> <nav class="docs-sidebar" aria-label="Documentation"> <section class="docs-sidebar-group"> <p class="docs-sidebar-title">Start here</p> <ul> <li> <a href="/pr-preview/pr-48/docs" class="docs-sidebar-link"> <span class="truncate">Introduction</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/quickstart" class="docs-sidebar-link"> <span class="truncate">Quickstart</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/how-it-works" class="docs-sidebar-link"> <span class="truncate">How it works</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/install" class="docs-sidebar-link"> <span class="truncate">Installation</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Schema</p> <ul> <li> <a href="/pr-preview/pr-48/docs/schema" class="docs-sidebar-link"> <span class="truncate">Define your schema</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/relationships" class="docs-sidebar-link"> <span class="truncate">Relationships</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/generated-types" class="docs-sidebar-link"> <span class="truncate">Generated types</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/migrations" class="docs-sidebar-link"> <span class="truncate">Migrations</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Client SDK</p> <ul> <li> <a href="/pr-preview/pr-48/docs/client/queries" class="docs-sidebar-link"> <span class="truncate">Reactive queries</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/pagination" class="docs-sidebar-link"> <span class="truncate">Pagination</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/mutations" class="docs-sidebar-link"> <span class="truncate">Mutations</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/auth" class="docs-sidebar-link"> <span class="truncate">Authentication</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/offline-sync" class="docs-sidebar-link"> <span class="truncate">Offline &amp; sync health</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/query-allowlist" class="docs-sidebar-link"> <span class="truncate">Query allowlist</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/feature-flags" class="docs-sidebar-link"> <span class="truncate">Feature flags</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/push-notifications" class="docs-sidebar-link"> <span class="truncate">Push notifications</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/native-push" class="docs-sidebar-link"> <span class="truncate">Native push (iOS, Android)</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/impersonation" class="docs-sidebar-link"> <span class="truncate">Admin impersonation</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/buckets" class="docs-sidebar-link"> <span class="truncate">File buckets</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/crdt" class="docs-sidebar-link"> <span class="truncate">CRDT fields</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Framework guides</p> <ul> <li> <a href="/pr-preview/pr-48/docs/guide/solid" class="docs-sidebar-link"> <span class="truncate">SolidJS</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/solid2" class="docs-sidebar-link"> <span class="truncate">Solid 2 (RC)</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/flutter" class="docs-sidebar-link"> <span class="truncate">Flutter</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/vanilla" class="docs-sidebar-link"> <span class="truncate">Vanilla JS / TS</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Backends</p> <ul> <li> <a href="/pr-preview/pr-48/docs/backend" class="docs-sidebar-link"> <span class="truncate">What is a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/add" class="docs-sidebar-link"> <span class="truncate">Add a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/options" class="docs-sidebar-link"> <span class="truncate">Backend options</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Background jobs</p> <ul> <li> <a href="/pr-preview/pr-48/docs/jobs" class="docs-sidebar-link"> <span class="truncate">Jobs</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/schedules" class="docs-sidebar-link"> <span class="truncate">Schedules</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/workflows" class="docs-sidebar-link"> <span class="truncate">Workflows</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/machine-pools" class="docs-sidebar-link"> <span class="truncate">Machine pools</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Local development</p> <ul> <li> <a href="/pr-preview/pr-48/docs/dev" class="docs-sidebar-link"> <span class="truncate">spky dev</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/servers" class="docs-sidebar-link"> <span class="truncate">Dev servers &amp; sidecars</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/env" class="docs-sidebar-link"> <span class="truncate">Environment variables</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/doctor" class="docs-sidebar-link"> <span class="truncate">Doctor &amp; troubleshooting</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/devtools" class="docs-sidebar-link"> <span class="truncate">DevTools extension</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Deploy</p> <ul> <li> <a href="/pr-preview/pr-48/docs/cloud/getting-started" class="docs-sidebar-link"> <span class="truncate">Getting started</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/deploying" class="docs-sidebar-link"> <span class="truncate">Deploying</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/dedicated-machines" class="docs-sidebar-link"> <span class="truncate">Dedicated machines</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/env-variables" class="docs-sidebar-link"> <span class="truncate">Environment &amp; vault</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/logs" class="docs-sidebar-link"> <span class="truncate">Logs &amp; monitoring</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/backups" class="docs-sidebar-link"> <span class="truncate">Backups</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/ci-cd" class="docs-sidebar-link"> <span class="truncate">CI/CD</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/team" class="docs-sidebar-link"> <span class="truncate">Teams</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/self-hosting" class="docs-sidebar-link"> <span class="truncate">Self-hosting</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Operations</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/admin-dashboard" class="docs-sidebar-link"> <span class="truncate">Admin dashboard</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/mcp" class="docs-sidebar-link"> <span class="truncate">MCP server</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Reference</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/cli" class="docs-sidebar-link"> <span class="truncate">CLI</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/config" class="docs-sidebar-link"> <span class="truncate">sp00ky.yml</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/client-config" class="docs-sidebar-link"> <span class="truncate">Client config</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ai-agents" class="docs-sidebar-link"> <span class="truncate">AI coding agents</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/grok-bot" class="docs-sidebar-link"> <span class="truncate">Grok Bot recipe</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/architecture" class="docs-sidebar-link"> <span class="truncate">Architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/performance" class="docs-sidebar-link"> <span class="truncate">Performance</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/vault" class="docs-sidebar-link"> <span class="truncate">Vault architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ssp-api" class="docs-sidebar-link" aria-current="page" data-sidebar-active> <span class="truncate">SSP API</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/scheduler-api" class="docs-sidebar-link"> <span class="truncate">Scheduler API</span>  </a> </li> </ul> </section> </nav> </div> </div> </div> <script type="module">let c;document.addEventListener("astro:before-swap",()=>{c=document.querySelector("[data-sidebar-scroller]")?.scrollTop});document.addEventListener("astro:page-load",()=>{const o=document.querySelector("[data-sidebar-scroller]"),i=o?.querySelector("[data-sidebar-active]");if(o&&(c!==void 0&&(o.scrollTop=c),i)){const e=o.getBoundingClientRect(),l=i.getBoundingClientRect();(l.top<e.top+32||l.bottom>e.bottom-32)&&(o.scrollTop+=l.top-e.top-e.height/2+l.height/2)}const d=document.getElementById("mobile-menu-trigger"),r=document.getElementById("mobile-menu-close"),t=document.getElementById("mobile-menu");if(!t)return;const n=e=>{t.classList.toggle("hidden",!e),document.body.style.overflow=e?"hidden":"",d?.setAttribute("aria-expanded",String(e))};n(!1),d?.addEventListener("click",()=>n(t.classList.contains("hidden"))),r?.addEventListener("click",()=>n(!1)),t.addEventListener("click",e=>{e.target===t&&n(!1)}),t.querySelectorAll("a").forEach(e=>{e.addEventListener("click",()=>n(!1))})});</script> </body> </html>

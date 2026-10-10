@@ -1,0 +1,1709 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sp00ky.cloud/schema/sp00ky.schema.json",
+  "title": "sp00ky.yml",
+  "description": "Configuration file for Sp00ky — an offline-first, real-time sync framework built on SurrealDB.",
+  "type": "object",
+  "properties": {
+    "slug": {
+      "type": "string",
+      "description": "Cloud project slug used by `spooky cloud` commands. Must be unique across Sp00ky Cloud.",
+      "pattern": "^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+    },
+    "mode": {
+      "type": "string",
+      "description": "Deployment mode.",
+      "enum": [
+        "singlenode",
+        "cluster",
+        "surrealism"
+      ],
+      "default": "singlenode"
+    },
+    "surrealdb": {
+      "description": "SurrealDB configuration. Can be a version string (e.g. \"v3.0.0\") or a full config object.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "SurrealDB Docker image version tag (e.g. \"v3.0.0\")."
+        },
+        {
+          "$ref": "#/$defs/surrealdbConfig"
+        }
+      ]
+    },
+    "version": {
+      "description": "Sp00ky service versions, enforced. An exact version (e.g. \"0.0.1-canary.270\") is pinned: Sp00ky Cloud runs exactly that on every deploy, CLI or git push, and `--upgrade` does not move it. `newest` rolls the stack to the newest build on every deploy. `any` (or no `version` at all) changes nothing on deploy and leaves upgrades to a manual `spky deploy --upgrade` / `spky restart --upgrade`. A string sets both SSP and Scheduler everywhere. A `{ssp, scheduler}` object splits per service. A `{dev, cloud}` object splits per environment: `dev` selects the images `spky dev` runs, `cloud` is what Sp00ky Cloud enforces. Each service entry may also be a `{ path }` object pointing at a host-built binary (`spky dev` only).",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Applied to both SSP and Scheduler: an exact version (pinned, e.g. \"0.0.1-canary.270\"), `newest` (always roll to the newest build) or `any` (manual upgrades only)."
+        },
+        {
+          "type": "object",
+          "description": "Individual versions for SSP and Scheduler (applies to all envs). Each is an image tag or a `{ path }` to a host-built binary.",
+          "properties": {
+            "ssp": {
+              "$ref": "#/$defs/serviceVersion"
+            },
+            "scheduler": {
+              "$ref": "#/$defs/serviceVersion"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Per-environment versions. `dev` selects the images `spky dev` runs; `cloud` is the policy Sp00ky Cloud enforces on every deploy.",
+          "properties": {
+            "dev": {
+              "$ref": "#/$defs/versionSpec"
+            },
+            "cloud": {
+              "$ref": "#/$defs/versionSpec"
+            }
+          },
+          "additionalProperties": false,
+          "minProperties": 1
+        }
+      ]
+    },
+    "logLevel": {
+      "description": "`RUST_LOG` directive applied to the Scheduler and SSP containers (both `spky dev` and `spky cloud deploy`). A plain string applies everywhere (e.g. `trace`, `info,ssp=debug`). A `{dev, cloud}` map sets per-environment levels. Unset → defaults to `info`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Single `RUST_LOG` directive applied in every environment. Accepts bare levels (`trace`, `debug`, `info`, `warn`, `error`, `off`) or comma-separated `target=level` pairs."
+        },
+        {
+          "type": "object",
+          "description": "Per-environment log level. `dev` is consumed by `spky dev`; `cloud` is sent to the cloud control plane on every deploy.",
+          "properties": {
+            "dev": {
+              "type": "string",
+              "description": "RUST_LOG directive used for local `spky dev` containers."
+            },
+            "cloud": {
+              "type": "string",
+              "description": "RUST_LOG directive applied to the remote scheduler/SSP after `spky cloud deploy`."
+            }
+          },
+          "additionalProperties": false,
+          "minProperties": 1
+        }
+      ]
+    },
+    "schema": {
+      "description": "Schema directory or explicit paths. A string is treated as the base directory (convention: schema/src/schema.surql, schema/migrations/, schema/src/buckets/).",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Base directory for schema files. Sub-paths are derived by convention."
+        },
+        {
+          "type": "object",
+          "description": "Explicit paths for schema, migrations, and buckets.",
+          "properties": {
+            "schema": {
+              "type": "string",
+              "description": "Path to the main SurrealQL schema file.",
+              "default": "src/schema.surql"
+            },
+            "migrations": {
+              "type": "string",
+              "description": "Path to the migrations directory.",
+              "default": "migrations"
+            },
+            "bucketsDir": {
+              "type": "string",
+              "description": "Path to the buckets directory.",
+              "default": "src/buckets"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "apps": {
+      "type": "object",
+      "description": "Application definitions (backends, frontends, docker). Each key is the app name. A value is either an inline app config, or a reference `{ path: ./dir }` that pulls the app config from `./dir/sp00ky.app.yml` (fields set alongside `path` override the referenced file).",
+      "additionalProperties": {
+        "$ref": "#/$defs/appEntry"
+      }
+    },
+    "schedules": {
+      "description": "Server-side cron/interval schedules, keyed by name. Each cycle the scheduler creates a new job row in the backend's outbox table. The whole section may instead be a path to a YAML file holding the map.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Path to a YAML file holding the whole schedules map, relative to the manifest."
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/scheduleEntry"
+          }
+        }
+      ]
+    },
+    "workflows": {
+      "description": "Server-side workflow DAGs, keyed by name. Same file-linking rule as `schedules`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Path to a YAML file holding the whole workflows map, relative to the manifest."
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/workflowEntry"
+          }
+        }
+      ]
+    },
+    "pools": {
+      "type": "object",
+      "description": "Machine pools, keyed by name. See https://sp00ky.cloud/docs/jobs/machine-pools",
+      "additionalProperties": {
+        "$ref": "#/$defs/poolEntry"
+      }
+    },
+    "machines": {
+      "type": "object",
+      "description": "Dedicated machines, keyed by name: a Hetzner VM of its own for one or more always-on backends. A backend opts in with `runOn: { machine: <name> }`. See https://sp00ky.cloud/docs/cloud/dedicated-machines",
+      "additionalProperties": {
+        "$ref": "#/$defs/machineEntry"
+      }
+    },
+    "buckets": {
+      "type": "array",
+      "description": "List of SurrealQL bucket definition files.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "clientTypes": {
+      "type": "array",
+      "description": "Generated client type configurations.",
+      "items": {
+        "$ref": "#/$defs/clientTypeConfig"
+      }
+    },
+    "deployment": {
+      "$ref": "#/$defs/deploymentConfig"
+    },
+    "retention": {
+      "$ref": "#/$defs/retentionConfig"
+    },
+    "cloudApi": {
+      "type": "string",
+      "description": "Override the Sp00ky Cloud API endpoint (e.g. for staging).",
+      "examples": [
+        "https://api-staging.sp00ky.cloud"
+      ]
+    },
+    "refMode": {
+      "type": "string",
+      "description": "Storage layout for the SSP's internal `_00_list_ref` table. 'dedicated' (default) gives each authenticated user their own `_00_list_ref_user_<id>` table; 'single' keeps the legacy shared `_00_list_ref`. Dedicated works around a SurrealDB v3 LIVE-permission gap on permission-gated tables.",
+      "enum": [
+        "single",
+        "dedicated"
+      ],
+      "default": "dedicated"
+    },
+    "anonymousLiveQueries": {
+      "type": "boolean",
+      "description": "Enable realtime sync for unauthenticated (anonymous) clients. When true, the SSP materializes anonymous query registrations into a world-readable `_00_list_ref_anon` table so logged-out visitors get live updates. Defaults to false (anonymous clients can read one-shot but never sync live).",
+      "default": false
+    },
+    "sync": {
+      "$ref": "#/$defs/syncConfig"
+    },
+    "push": {
+      "description": "Push rules: when a row of a table looks like `when`, push to the users named by `to`. Browsers subscribe through `db.webPush` (VAPID keys derived from SPKY_AUTH_SECRET, or SPKY_VAPID_PRIVATE_KEY); iOS and Android apps register through `fn::push::register` once `apns` / `fcm` are configured. The platform delivers. Stored in `_00_push_config` at every migrate/deploy; a missing block means enabled with no rules, so direct pushes (`_00_push_message`) still work. May instead be a path to a YAML file holding the whole block.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Path to a YAML file holding the whole push block, relative to the manifest."
+        },
+        {
+          "$ref": "#/$defs/pushConfig"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "versionSpec": {
+      "description": "A version tag (string) or `{ssp, scheduler}` object. Used inside per-environment version splits.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ssp": {
+              "$ref": "#/$defs/serviceVersion"
+            },
+            "scheduler": {
+              "$ref": "#/$defs/serviceVersion"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "serviceVersion": {
+      "description": "A single Sp00ky service version: either an image version tag (string) or a `{ path }` object pointing at a host-built binary (consumed by `spky dev`).",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "An exact version (pinned, e.g. \"0.0.1-canary.270\"), `newest` (always roll to the newest build) or `any` (manual upgrades only)."
+        },
+        {
+          "type": "object",
+          "description": "Run a host-built binary instead of a published image.",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to a locally-built binary, relative to sp00ky.yml or absolute (e.g. \"../target/debug/ssp-server\")."
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "secretValue": {
+      "description": "A literal value, or a reference to an encrypted vault key resolved at deploy time.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "vault": {
+              "type": "string",
+              "description": "Vault key name whose decrypted value is used."
+            }
+          },
+          "required": [
+            "vault"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "surrealdbConfig": {
+      "type": "object",
+      "description": "Full SurrealDB configuration.",
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "SurrealDB Docker image version tag.",
+          "default": "v3.0.0"
+        },
+        "namespace": {
+          "type": "string",
+          "description": "SurrealDB namespace.",
+          "default": "main"
+        },
+        "database": {
+          "type": "string",
+          "description": "SurrealDB database name.",
+          "default": "main"
+        },
+        "hosting": {
+          "type": "string",
+          "description": "Whether SurrealDB is hosted on Sp00ky Cloud or externally.",
+          "enum": [
+            "cloud",
+            "external"
+          ],
+          "default": "cloud"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/secretValue",
+          "description": "SurrealDB endpoint URL (literal or { vault: KEY }). Required when hosting is \"external\"; not allowed otherwise.",
+          "examples": [
+            "https://api.example.com"
+          ]
+        },
+        "username": {
+          "$ref": "#/$defs/secretValue",
+          "description": "SurrealDB username (literal or { vault: KEY }). Only valid when hosting is \"external\". Default \"root\"."
+        },
+        "password": {
+          "$ref": "#/$defs/secretValue",
+          "description": "SurrealDB password (literal or { vault: KEY }). Only valid when hosting is \"external\". Default \"root\"."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "hosting": {
+                "const": "external"
+              }
+            },
+            "required": [
+              "hosting"
+            ]
+          },
+          "then": {
+            "required": [
+              "endpoint"
+            ]
+          },
+          "else": {
+            "description": "Credentials are only meaningful for external hosting; the managed DB generates its own root password.",
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "endpoint"
+                  ]
+                },
+                {
+                  "required": [
+                    "username"
+                  ]
+                },
+                {
+                  "required": [
+                    "password"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "appEntry": {
+      "description": "An app entry. Either a full inline app config (see app.schema.json), or a `{ path }` reference that pulls the app's config from `<path>/sp00ky.app.yml`. Fields set alongside `path` override the referenced file (main overrides sub).",
+      "oneOf": [
+        {
+          "$ref": "https://sp00ky.cloud/schema/app.schema.json"
+        },
+        {
+          "type": "object",
+          "description": "Reference a service's own config file. `path` points at a directory containing sp00ky.app.yml; any other field set here overrides the referenced file.",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Directory (relative to sp00ky.yml) that contains this app's sp00ky.app.yml."
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "backend",
+                "frontend",
+                "docker"
+              ]
+            },
+            "scope": {
+              "type": "string",
+              "enum": [
+                "all",
+                "devOnly",
+                "cloudOnly"
+              ]
+            },
+            "hosting": {
+              "type": "string",
+              "enum": [
+                "cloud",
+                "external"
+              ]
+            },
+            "image": {
+              "type": "string"
+            },
+            "ports": {
+              "type": "array",
+              "items": {
+                "type": [
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "volumes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "workdir": {
+              "type": "string"
+            },
+            "dependsOn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "healthcheck": {
+              "type": "string"
+            },
+            "spec": {
+              "type": "string"
+            },
+            "baseUrl": {
+              "type": "string"
+            },
+            "auth": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/authConfig"
+            },
+            "method": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/backendMethod"
+            },
+            "runOn": {
+              "description": "Where this backend runs instead of an always-on container on the core host. Exactly one of `pool` (its outbox jobs run on the machines of a pool declared under `pools:`, see https://sp00ky.cloud/docs/jobs/machine-pools) or `machine` (the whole backend runs, always on, on a dedicated machine declared under `machines:`, see https://sp00ky.cloud/docs/cloud/dedicated-machines).",
+              "type": "object",
+              "oneOf": [
+                {
+                  "required": ["pool"],
+                  "additionalProperties": false,
+                  "properties": { "pool": { "type": "string", "description": "Name of the pool." } }
+                },
+                {
+                  "required": ["machine"],
+                  "additionalProperties": false,
+                  "properties": { "machine": { "type": "string", "description": "Name of the dedicated machine." } }
+                }
+              ]
+            },
+            "dev": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/devConfig"
+            },
+            "deploy": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/appDeployConfig"
+            },
+            "env": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/envConfig"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "clientTypeConfig": {
+      "type": "object",
+      "description": "Generated client type configuration.",
+      "required": [
+        "format",
+        "output"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "description": "Output format. 'typescript' uses the built-in generator; 'dart' runs spooky_core's rich generator (`dart run spooky_core:spooky_gen`) from `workdir`.",
+          "enum": [
+            "typescript",
+            "dart"
+          ]
+        },
+        "output": {
+          "type": "string",
+          "description": "Output file path for the generated types (relative to sp00ky.yml)."
+        },
+        "workdir": {
+          "type": "string",
+          "description": "For format: dart — optional override for the directory (relative to sp00ky.yml) to run the Dart generator from. Must be a Dart package that depends on spooky_core. By default it's auto-derived from `output`'s nearest ancestor pubspec.yaml. Ignored for TypeScript."
+        },
+        "queries": {
+          "type": "string",
+          "description": "For format: typescript. The app's query module (relative to sp00ky.yml). spky generate runs it against a recording client and writes the query allowlist JSON that deploy/release/dev publish to _00_query_allowlist. See sync.queryAllowlist."
+        },
+        "allowlistOutput": {
+          "type": "string",
+          "description": "Where the allowlist JSON goes (relative to sp00ky.yml). Defaults to <queries>.allowlist.json. Commit it: deploy reads it, it does not regenerate."
+        },
+        "app": {
+          "type": "string",
+          "description": "App name the allowlist rows are keyed by. Defaults to the frontend app in apps:."
+        }
+      },
+      "additionalProperties": false
+    },
+    "deploymentConfig": {
+      "type": "object",
+      "description": "Deployment-level configuration for Sp00ky Cloud.",
+      "properties": {
+        "sspCount": {
+          "type": "integer",
+          "description": "Number of SSP instances to provision. Overrides the plan default.",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "backup": {
+          "$ref": "#/$defs/backupConfig"
+        },
+        "storage": {
+          "$ref": "#/$defs/storageConfig"
+        },
+        "env": {
+          "type": "object",
+          "description": "Extra environment variables for the infrastructure containers, keyed by role. Backends read their env from the encrypted vault (`spky env set`); this is the equivalent for the containers Sp00ky Cloud owns. Values are NOT secrets - they are stored unencrypted in the project's cloud config. Keys the control plane manages itself (SPKY_DB_*, SPKY_AUTH_SECRET, SPKY_SSP_ID, SPKY_JOB_CONFIG, S3_*) are refused. Takes effect on the next container creation, so a deploy or restart is required.",
+          "propertyNames": {
+            "enum": [
+              "ssp",
+              "scheduler",
+              "surrealdb"
+            ]
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "examples": [
+            {
+              "ssp": {
+                "SPKY_SSP_MERGE_VIEWS": "true"
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "storageConfig": {
+      "type": "object",
+      "description": "Persistent bucket storage. When sizeGB is set, buckets use a file backend on a volume mounted at /buckets (path file:/buckets/<name>) instead of memory, and the size provisions an extra disk (dev docker mount + cloud). sizeGB is provisioning size only, not a SurrealDB-enforced quota.",
+      "properties": {
+        "sizeGB": {
+          "type": "integer",
+          "description": "GB to allocate for persistent bucket files. A positive value enables the file backend for new buckets and mounts the storage volume.",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "backupConfig": {
+      "type": "object",
+      "description": "Automated backup configuration.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable automated backups.",
+          "default": false
+        },
+        "schedule": {
+          "type": "string",
+          "description": "Cron schedule expression (e.g. \"0 2 * * *\" for 2am daily)."
+        },
+        "retention": {
+          "type": "integer",
+          "description": "Number of backups to retain.",
+          "minimum": 1
+        },
+        "bucketUrl": {
+          "type": "string",
+          "description": "External S3-compatible bucket URL. If set, MinIO is skipped.",
+          "examples": [
+            "https://api.example.com"
+          ]
+        },
+        "credentialsEnvFile": {
+          "type": "string",
+          "description": "Path to env file with BACKUP_ACCESS_KEY and BACKUP_SECRET_KEY."
+        }
+      },
+      "additionalProperties": false
+    },
+    "forEachConfig": {
+      "type": "object",
+      "description": "Fan out: run this SurrealQL SELECT each fire and spawn one job per row. The row is passed to the handler as `payload.row`.",
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "A single SurrealQL SELECT statement. Runs with root privileges."
+        },
+        "key": {
+          "type": "string",
+          "description": "Row field whose value keys the per-row concurrency check. Defaults to `id`."
+        }
+      }
+    },
+    "retryConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum retries per run."
+        },
+        "strategy": {
+          "enum": [
+            "linear",
+            "exponential"
+          ],
+          "description": "Backoff shape, matching the job runner."
+        }
+      }
+    },
+    "retentionConfig": {
+      "type": "object",
+      "description": "How long finished jobs and run history are kept, before they are deleted automatically. Asymmetric by outcome: a success is read once if at all, a failure is what you went looking for. Whatever is deleted is first folded into permanent hourly counters, so totals survive the rows. `pending` and `processing` jobs, and `running` runs, are never pruned at any age.",
+      "additionalProperties": false,
+      "properties": {
+        "success": {
+          "type": "string",
+          "description": "How long outbox jobs in `success` are kept, e.g. `6h`. Ages by `updated_at` — a terminal job's last write is its terminalization.",
+          "default": "6h"
+        },
+        "failed": {
+          "type": "string",
+          "description": "How long outbox jobs in `failed` are kept, e.g. `14d`.",
+          "default": "14d"
+        },
+        "runSuccess": {
+          "type": "string",
+          "description": "How long schedule/workflow runs in `success`, `skipped` or `replaced` are kept, e.g. `24h`. Ages by `finished_at`.",
+          "default": "24h"
+        },
+        "runFailed": {
+          "type": "string",
+          "description": "How long schedule/workflow runs in `failed` or `killed` are kept, e.g. `30d`.",
+          "default": "30d"
+        },
+        "maxRows": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Hard ceiling on rows in a successful status, per table. `0` (the default) disables it. Trims oldest-first and never touches failures — a valve for very wide fan-out, where the age windows above are the main mechanism.",
+          "default": 0
+        },
+        "mode": {
+          "enum": [
+            "all",
+            "failures-only"
+          ],
+          "default": "all",
+          "description": "Default history mode for every schedule. `failures-only` means a successful execution leaves nothing but a rollup counter. A schedule's own `history:` overrides it either way. Resolved at deploy time, so changing it needs a redeploy — unlike the windows above, which are one UPDATE away. Never applies to client `db.run()` jobs."
+        }
+      }
+    },
+    "historyConfig": {
+      "description": "Per-schedule override of the project's run-history retention. Accepts the shorthand `failures-only` (or `all`) as well as the full object, because \"never keep a successful run\" is the common answer for a wide fan-out and should not require thinking about durations.",
+      "oneOf": [
+        {
+          "enum": [
+            "all",
+            "failures-only"
+          ],
+          "description": "Shorthand for `{ mode: ... }`."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "enum": [
+                "all",
+                "failures-only"
+              ],
+              "description": "`failures-only` never persists a successful run: a suppressed tick writes no row at all, and a clean run is deleted as it finalizes. Counts still land in the rollup."
+            },
+            "success": {
+              "type": "string",
+              "description": "How long this schedule's `success` / `skipped` / `replaced` runs are kept, e.g. `15m`. Omitted falls back to the project's `retention.runSuccess`."
+            },
+            "failed": {
+              "type": "string",
+              "description": "How long this schedule's `failed` / `killed` runs are kept, e.g. `30d`. Omitted falls back to the project's `retention.runFailed`."
+            }
+          }
+        }
+      ]
+    },
+    "scheduleEntry": {
+      "description": "A server-side schedule: either an inline definition, or a path to a YAML file containing one. Set exactly one of `cron` or `every`. `cron` is a standard 5-field expression evaluated in `timezone` (default UTC); `every` is a fixed interval measured from each fire.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Path to a YAML file holding this schedule's definition, relative to the manifest."
+        },
+        {
+          "type": "object",
+          "required": [
+            "backend",
+            "route"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "cron": {
+              "type": "string",
+              "description": "Standard 5-field cron expression (an optional leading seconds field is accepted), e.g. `0 3 * * *`."
+            },
+            "every": {
+              "type": "string",
+              "description": "Fixed interval, e.g. `30s`, `5m`, `1h30m`. Minimum 10s."
+            },
+            "timezone": {
+              "type": "string",
+              "description": "IANA timezone the cron expression is evaluated in, e.g. `Europe/Berlin`. Defaults to UTC."
+            },
+            "backend": {
+              "type": "string",
+              "description": "Name of an `apps:` entry with an outbox method."
+            },
+            "route": {
+              "type": "string",
+              "description": "Route path on that backend, e.g. `/syncGames`."
+            },
+            "payload": {
+              "type": "object",
+              "description": "Static payload merged into every spawned job's payload."
+            },
+            "forEach": {
+              "$ref": "#/$defs/forEachConfig"
+            },
+            "concurrency": {
+              "enum": [
+                "skip",
+                "allow",
+                "replace"
+              ],
+              "default": "skip",
+              "description": "What happens when a fire lands while the previous run for the same key is still going. `skip` records the suppressed tick and leaves the in-flight run alone; `allow` permits overlap; `replace` kills the in-flight run first."
+            },
+            "retry": {
+              "$ref": "#/$defs/retryConfig"
+            },
+            "timeout": {
+              "type": "string",
+              "description": "Per-job HTTP timeout, e.g. `120s`. Honoured only when the backend sets `deploy.timeoutOverridable`."
+            },
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "`false` deploys the schedule but leaves it inert. Distinct from `spky schedules pause`, which config never overwrites."
+            },
+            "history": {
+              "$ref": "#/$defs/historyConfig"
+            }
+          }
+        }
+      ]
+    },
+    "workflowStep": {
+      "type": "object",
+      "required": [
+        "backend",
+        "route"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "type": "string",
+          "description": "Name of an `apps:` entry with an outbox method."
+        },
+        "route": {
+          "type": "string",
+          "description": "Route path on that backend."
+        },
+        "payload": {
+          "type": "object",
+          "description": "Static payload for this step."
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Steps that must succeed first. A step with none is a root and runs in parallel with the other roots; a step with several is a fan-in join."
+        },
+        "retry": {
+          "$ref": "#/$defs/retryConfig"
+        },
+        "timeout": {
+          "type": "string",
+          "description": "Per-step HTTP timeout, e.g. `30s`."
+        }
+      }
+    },
+    "workflowEntry": {
+      "description": "A workflow DAG: either an inline definition, or a path to a YAML file containing one.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Path to a YAML file holding this workflow's definition, relative to the manifest."
+        },
+        {
+          "type": "object",
+          "required": [
+            "steps"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "schedule": {
+              "type": "object",
+              "description": "When to run it. Omit for a trigger-only workflow. Set exactly one of `cron` or `every`. `cron` is a standard 5-field expression evaluated in `timezone` (default UTC); `every` is a fixed interval measured from each fire.",
+              "additionalProperties": false,
+              "properties": {
+                "cron": {
+                  "type": "string"
+                },
+                "every": {
+                  "type": "string"
+                },
+                "timezone": {
+                  "type": "string"
+                }
+              }
+            },
+            "steps": {
+              "type": "object",
+              "description": "Steps by name. Order is irrelevant — `dependsOn` decides execution.",
+              "additionalProperties": {
+                "$ref": "#/$defs/workflowStep"
+              }
+            },
+            "onFailure": {
+              "enum": [
+                "halt",
+                "continue-independent"
+              ],
+              "default": "halt",
+              "description": "`halt` fails the run and skips every step that hasn't started; `continue-independent` skips only the branch below the failure. Either way the run ends failed."
+            },
+            "concurrency": {
+              "enum": [
+                "skip",
+                "allow",
+                "replace"
+              ],
+              "default": "skip",
+              "description": "What happens when a fire lands while the previous run for the same key is still going. `skip` records the suppressed tick and leaves the in-flight run alone; `allow` permits overlap; `replace` kills the in-flight run first."
+            },
+            "forEach": {
+              "$ref": "#/$defs/forEachConfig"
+            }
+          }
+        }
+      ]
+    },
+    "syncConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How mutations reach the sync engine and which query shapes it accepts.",
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": [
+            "http",
+            "changefeed"
+          ],
+          "default": "http",
+          "description": "'http' (default): every generated event http::posts the mutation to the scheduler inside the user's transaction. 'changefeed': synced tables carry a CHANGEFEED clause and the scheduler tails it post-commit."
+        },
+        "changefeedRetention": {
+          "type": "string",
+          "default": "1d",
+          "examples": [
+            "1d",
+            "12h",
+            "1d12h"
+          ],
+          "description": "Retention of the CHANGEFEED clause, in the form SurrealDB renders."
+        },
+        "queryAllowlist": {
+          "type": "string",
+          "enum": [
+            "off",
+            "warn",
+            "enforce"
+          ],
+          "default": "off",
+          "description": "Query allowlist enforcement on the SSP. 'off': any parseable query registers. 'warn': a registration whose shape is not in the allowlist generated from clientTypes[].queries is logged and counted but admitted. 'enforce': it is refused with 403 not_allowlisted. Also gates useRemote/remoteQuery/queryRaw in the client SDK (allowRawRemote: true opts back in)."
+        }
+      }
+    },
+    "machineEntry": {
+      "type": "object",
+      "description": "A dedicated machine: one Hetzner Cloud VM that runs every always-on backend placed on it with `runOn: { machine: <name> }`, each in a container of its own. Sp00ky Cloud creates it, updates each app on it in place, replaces the VM when its type or locations change or it dies, and proxies traffic to the apps. Apps on one machine may not share a port.",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": ["hetzner"],
+          "default": "hetzner",
+          "description": "Where the VM comes from. Only `hetzner`; under `spky dev` the backend runs as an ordinary app."
+        },
+        "type": {
+          "type": "string",
+          "default": "cx33",
+          "description": "Hetzner Cloud server type. x86 types only."
+        },
+        "fallbackTypes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Server types tried in order after `type` when Hetzner has none of it to give (no capacity, or the account over a limit that type counts against). Changing them never replaces a running VM. x86 types only."
+        },
+        "locations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Hetzner locations in order of preference. Empty lets Hetzner choose."
+        }
+      }
+    },
+    "poolEntry": {
+      "type": "object",
+      "description": "A machine pool: machines created while its backend has jobs and destroyed when it has none. Exactly one backend uses it, through `runOn: { pool: <name> }`. Fixed (autoscale false, exactly `min` machines), on demand up to `max`, or with a warm `buffer`.",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "enum": [
+            "hetzner",
+            "docker"
+          ],
+          "default": "docker",
+          "description": "Where machines come from. `hetzner`: a Hetzner Cloud VM per machine, created by Sp00ky Cloud. `docker`: a container per machine on the scheduler's Docker host. `spky dev` always uses `docker`."
+        },
+        "machine": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The machine to create (hetzner).",
+          "properties": {
+            "type": {
+              "type": "string",
+              "default": "cx33",
+              "description": "Hetzner Cloud server type, e.g. `cx33`, `cpx42`. x86 types only: backend images are built for linux/amd64."
+            },
+            "fallbackTypes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Server types tried in order after `type` when Hetzner has none of it to give: no capacity in any listed location, or the account at a limit that type counts against. Shared (CX, CPX) and dedicated (CCX) vCPUs are capped separately, so a CCX fallback still boots when the shared cores are used up. x86 types only."
+            },
+            "locations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Hetzner locations in order of preference, e.g. `[fsn1, nbg1]`. A full location, or one without the server type, is skipped. Empty lets Hetzner choose."
+            }
+          }
+        },
+        "slots": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Jobs one machine runs at the same time."
+        },
+        "min": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Machines that always run. The whole size of a fixed pool, which needs at least 1."
+        },
+        "autoscale": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add machines while jobs wait, up to `max`."
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Most machines the pool may have. Required with `autoscale: true`, rejected without it."
+        },
+        "buffer": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Ready machines kept above what is in use, so jobs start without waiting for a boot. Autoscaling pools only."
+        },
+        "idleTimeout": {
+          "type": "string",
+          "default": "10m",
+          "description": "How long a surplus machine may sit idle before it is destroyed, e.g. `10m`."
+        },
+        "recycle": {
+          "enum": [
+            "job",
+            "never"
+          ],
+          "default": "job",
+          "description": "`job`: restart the backend process between jobs. `never`: keep it running."
+        },
+        "maxJobDuration": {
+          "type": "string",
+          "default": "8h",
+          "description": "Longest a job may run, e.g. `8h`. A job's own timeout can only shorten it."
+        },
+        "maxLifetime": {
+          "type": "string",
+          "default": "24h",
+          "description": "Oldest a machine gets before it is drained and replaced, e.g. `24h`. Not shorter than `maxJobDuration`."
+        },
+        "lease": {
+          "type": "string",
+          "default": "90s",
+          "description": "How long a job attempt survives without a word from its machine, e.g. `90s`. Minimum 30s."
+        },
+        "bootTimeout": {
+          "type": "string",
+          "default": "5m",
+          "description": "How long a machine may take to become ready, e.g. `5m`."
+        }
+      }
+    },
+    "pushDuration": {
+      "description": "A duration: `30s`, `10m`, `1h30m`, `2d`, `500ms` (units ms, s, m, h, d, w), or a plain number of seconds.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^\\s*(\\d+|(\\d+(ms|s|m|h|d|w))+)\\s*$",
+          "examples": [
+            "30s",
+            "10m",
+            "1h30m",
+            "1d"
+          ]
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds."
+        }
+      ]
+    },
+    "pushUrgency": {
+      "type": "string",
+      "enum": [
+        "very-low",
+        "low",
+        "normal",
+        "high"
+      ],
+      "description": "RFC 8030 `Urgency`: how eagerly a battery-saving device is woken up for it."
+    },
+    "pushConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The `push:` block.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch. `false` stops every rule and every direct message; subscriptions are kept."
+        },
+        "subject": {
+          "type": "string",
+          "pattern": "^(mailto:|https:)",
+          "examples": [
+            "mailto:ops@example.com"
+          ],
+          "description": "VAPID `sub` claim: a `mailto:` or `https:` contact the push services can reach about this sender. Defaults to `https://sp00ky.cloud`; Apple and Mozilla want one of yours."
+        },
+        "defaults": {
+          "$ref": "#/$defs/pushRuleDefaults"
+        },
+        "limits": {
+          "$ref": "#/$defs/pushLimits"
+        },
+        "rules": {
+          "type": "object",
+          "description": "Push rules keyed by name. The name travels in every push (`payload.rule`) and is what a device filters on.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/pushRule"
+          }
+        },
+        "apns": {
+          "$ref": "#/$defs/pushApns"
+        },
+        "fcm": {
+          "$ref": "#/$defs/pushFcm"
+        }
+      }
+    },
+    "pushRuleDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Applied to every rule (and to direct messages) unless the rule says otherwise.",
+      "properties": {
+        "ttl": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "How long the push service keeps an undelivered push. Default `1d`."
+        },
+        "urgency": {
+          "$ref": "#/$defs/pushUrgency"
+        },
+        "throttle": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "Default minimum gap between two pushes of a rule to one recipient under one topic."
+        },
+        "notification": {
+          "$ref": "#/$defs/pushNotification",
+          "description": "Merged under every rule's `notification` (icon, badge, lang, ...); a rule's own keys win. Not applied to nudge-only rules."
+        },
+        "native": {
+          "$ref": "#/$defs/pushNative",
+          "description": "Merged under every rule's `native` block (sound, channel, ...)."
+        }
+      }
+    },
+    "pushLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Built-in ceilings. Over a limit a push is dropped and counted.",
+      "properties": {
+        "perUserPerMinute": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60,
+          "description": "Pushes one user may receive per minute, across rules, counted once per matched recipient (not per device)."
+        },
+        "perMinute": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6000,
+          "description": "Pushes the whole project may send per minute (one per subscription)."
+        },
+        "maxRecipients": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000,
+          "description": "Recipients one matched row may fan out to."
+        }
+      }
+    },
+    "pushRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "to"
+      ],
+      "description": "When a row of `table` looks like `when`, push to `to`.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "table": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_]+$",
+          "not": {
+            "pattern": "^_00_"
+          },
+          "description": "Synced table whose rows this rule watches. A `-- @nosync` table never reaches the push engine; `_00_` platform tables cannot be watched (use `_00_push_message` for direct pushes)."
+        },
+        "on": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update",
+              "delete"
+            ]
+          },
+          "default": [
+            "create"
+          ],
+          "description": "Which operations. A `delete` sees the row as it was before the delete."
+        },
+        "when": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/pushCondition"
+          },
+          "description": "Conditions on the row after the change, keyed by field path (`data.kind`); all must hold."
+        },
+        "once": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Fire at most once per record for each distinct combination of these fields' values: `once: [state]` pushes when a row reaches `ready`, not on every later update while it stays `ready`. Unset: once per record version."
+        },
+        "to": {
+          "$ref": "#/$defs/pushTarget"
+        },
+        "except": {
+          "description": "Users removed from the recipients, as field paths (the author of a message, the actor of an event).",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "topic": {
+          "type": "string",
+          "description": "Collapse key (template). Undelivered pushes with the same topic replace each other at the push service, the service worker uses it as the notification `tag`, and throttling is per (rule, recipient, topic). Default: the record id."
+        },
+        "throttle": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "Minimum gap between two pushes of this rule to one recipient under one topic. Pushes inside the gap collapse into one trailing push carrying the latest row."
+        },
+        "urgency": {
+          "$ref": "#/$defs/pushUrgency"
+        },
+        "ttl": {
+          "$ref": "#/$defs/pushDuration",
+          "description": "How long the push service keeps an undelivered push. Default `1d`."
+        },
+        "maxAge": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "field",
+            "within"
+          ],
+          "description": "Ignore rows older than this, e.g. `{ field: created_at, within: 45s }`. The field may hold a datetime or epoch milliseconds / seconds.",
+          "properties": {
+            "field": {
+              "type": "string"
+            },
+            "within": {
+              "$ref": "#/$defs/pushDuration"
+            }
+          }
+        },
+        "with": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra template context: one root SurrealQL query per name, with `$row` (the changed row) and `$rule` bound, e.g. `sender: SELECT username FROM ONLY $row.sender`. Evaluated only when the rule matched."
+        },
+        "notification": {
+          "$ref": "#/$defs/pushNotification",
+          "description": "What the device shows. Absent: a content-free nudge, and the app's service worker renders it from its own data."
+        },
+        "data": {
+          "description": "`payload.data`: row field paths to copy, or a map of name to template. Sent with nudges too.",
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "web",
+              "ios",
+              "android"
+            ]
+          },
+          "description": "Which kinds of device receive it. Default: every kind."
+        },
+        "native": {
+          "$ref": "#/$defs/pushNative",
+          "description": "What iOS and Android devices show, over `notification`. With no notification anywhere a native device gets a silent data push."
+        }
+      }
+    },
+    "pushTarget": {
+      "description": "Recipients. Field paths on the row (a value may be a record id `user:abc`, its string form, or an array of either), or a root SurrealQL query with `$row` bound that returns ids, strings or rows with an `id`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "One field path, e.g. `recipient`."
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Several field paths, e.g. `[owner, assignee]`."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "query"
+          ],
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "e.g. `SELECT VALUE user FROM member WHERE club = $row.club`."
+            }
+          }
+        }
+      ]
+    },
+    "pushCondition": {
+      "description": "A condition on one field: a scalar is equality (`null` included), a list is membership, a map is operators that must all hold.",
+      "oneOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "eq": {
+              "description": "Equal to."
+            },
+            "ne": {
+              "description": "Not equal to."
+            },
+            "in": {
+              "type": "array",
+              "description": "One of."
+            },
+            "nin": {
+              "type": "array",
+              "description": "None of."
+            },
+            "gt": {
+              "description": "Greater than (numbers, or strings compared as strings)."
+            },
+            "gte": {
+              "description": "Greater than or equal."
+            },
+            "lt": {
+              "description": "Less than."
+            },
+            "lte": {
+              "description": "Less than or equal."
+            },
+            "exists": {
+              "type": "boolean",
+              "description": "Present and not null (`true`), or absent or null (`false`)."
+            },
+            "contains": {
+              "description": "Array element or substring."
+            },
+            "startsWith": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "pushNotification": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Passed to `showNotification` by the service worker bridge. Every string is a `{{ path | filter }}` template over the row, `with` results and `recipient`. Keys not listed here (`vibrate`, `timestamp`, ...) pass through, templated too.",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "string"
+        },
+        "badge": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "lang": {
+          "type": "string"
+        },
+        "dir": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "description": "Defaults to the rule's topic."
+        },
+        "url": {
+          "type": "string",
+          "description": "Opened (or focused) on click."
+        },
+        "requireInteraction": {
+          "type": "boolean"
+        },
+        "renotify": {
+          "type": "boolean"
+        },
+        "silent": {
+          "type": "boolean"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "action",
+              "title"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "icon": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "data": {
+          "description": "Merged into the notification's `data` next to the bridge's own keys."
+        }
+      }
+    },
+    "pushSecret": {
+      "description": "A secret the CLI resolves at migrate/deploy and stores in `_00_push_credential` (root only). Never stored in `_00_push_config`.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Inline. Works, but it is committed with sp00ky.yml; `spky lint` warns."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "vault"
+          ],
+          "properties": {
+            "vault": {
+              "type": "string",
+              "description": "Project vault key (`spky env set`)."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "env"
+          ],
+          "properties": {
+            "env": {
+              "type": "string",
+              "description": "Environment variable of the machine running the CLI."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ],
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "File relative to sp00ky.yml. Never commit it."
+            }
+          }
+        }
+      ]
+    },
+    "pushApns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "teamId",
+        "keyId",
+        "key"
+      ],
+      "description": "Native iOS delivery through the Apple Push Notification service with a token-auth key (.p8). Devices register with `fn::push::register` (`spooky_push` in Flutter).",
+      "properties": {
+        "teamId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{10}$",
+          "description": "Apple Developer team id."
+        },
+        "keyId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{10}$",
+          "description": "Id of the APNs auth key."
+        },
+        "key": {
+          "$ref": "#/$defs/pushSecret",
+          "description": "The .p8 key (PEM)."
+        },
+        "bundleIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "description": "Bundle ids devices may register with (the APNs topic). Empty: any."
+        }
+      }
+    },
+    "pushFcm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceAccount"
+      ],
+      "description": "Native Android (and FCM-registered iOS) delivery through FCM HTTP v1.",
+      "properties": {
+        "serviceAccount": {
+          "$ref": "#/$defs/pushSecret",
+          "description": "The Firebase service account JSON."
+        },
+        "android": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "projectId",
+            "appId",
+            "apiKey",
+            "senderId"
+          ],
+          "description": "The Android app's Firebase client config (from google-services.json). Not secret: served to the app through `fn::push::info()`, so the app ships no google-services.json.",
+          "properties": {
+            "projectId": {
+              "type": "string"
+            },
+            "appId": {
+              "type": "string",
+              "description": "`mobilesdk_app_id`, `1:<sender>:android:<hex>`."
+            },
+            "apiKey": {
+              "type": "string"
+            },
+            "senderId": {
+              "type": "string",
+              "pattern": "^[0-9]+$",
+              "description": "`project_number`."
+            }
+          }
+        }
+      }
+    },
+    "pushNative": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What iOS and Android show.",
+      "properties": {
+        "notification": {
+          "$ref": "#/$defs/pushNotification",
+          "description": "Over the rule's `notification`, key by key. Only title, body, image, tag, url and data mean anything on a phone."
+        },
+        "apns": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "APNs `aps` keys. Strings are templates; unknown keys go into `aps` verbatim.",
+          "properties": {
+            "sound": {
+              "type": "string",
+              "description": "A sound in the app bundle, or `default` (the default for alerts); `none` for silence."
+            },
+            "badge": {
+              "description": "App icon badge; a template that is exactly one `{{expr}}` keeps its number type.",
+              "type": [
+                "integer",
+                "string"
+              ]
+            },
+            "category": {
+              "type": "string",
+              "description": "A `UNNotificationCategory` the app registered."
+            },
+            "threadId": {
+              "type": "string",
+              "description": "Groups notifications. Default: the notification tag."
+            },
+            "interruptionLevel": {
+              "type": "string",
+              "description": "passive, active, time-sensitive or critical."
+            },
+            "relevanceScore": {
+              "type": [
+                "number",
+                "string"
+              ]
+            },
+            "mutableContent": {
+              "type": "boolean",
+              "description": "Lets a notification service extension rewrite the push."
+            }
+          }
+        },
+        "android": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "FCM `android.notification` keys. Strings are templates; unknown keys go into `android.notification` verbatim (FCM spelling).",
+          "properties": {
+            "channelId": {
+              "type": "string",
+              "description": "Notification channel the app created."
+            },
+            "sound": {
+              "type": "string"
+            },
+            "icon": {
+              "type": "string",
+              "description": "A drawable resource name."
+            },
+            "color": {
+              "type": "string",
+              "pattern": "^#[0-9a-fA-F]{6}$"
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "high",
+                "normal"
+              ],
+              "description": "Message priority. Default: high for anything shown or `urgency: high`, normal for silent pushes."
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1143 @@
+<!DOCTYPE html><html lang="en" class="dark"> <head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta property="og:type" content="article"><meta property="og:title" content="sp00ky.yml | sp00ky Docs"><meta name="description" content="Every key in the project config the CLI reads: apps, schedules, schema paths, versions and per-environment overrides."><meta property="og:description" content="Every key in the project config the CLI reads: apps, schedules, schema paths, versions and per-environment overrides."><meta property="og:image" content="https://sp00ky.cloud/social-card.png"><meta property="twitter:card" content="summary_large_image"><meta property="twitter:title" content="sp00ky.yml | sp00ky Docs"><meta property="twitter:description" content="Every key in the project config the CLI reads: apps, schedules, schema paths, versions and per-environment overrides."><meta property="twitter:image" content="https://sp00ky.cloud/social-card.png"><title>sp00ky.yml | sp00ky Docs</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet"><link rel="help" type="text/markdown" href="/llm.txt" title="LLM Info"><script type="module" src="/pr-preview/pr-48/_astro/DocsLayout.astro_astro_type_script_index_0_lang.CmeQIgZ3.js"></script><meta name="astro-view-transitions-enabled" content="true"><meta name="astro-view-transitions-fallback" content="animate"><script type="module" src="/pr-preview/pr-48/_astro/ClientRouter.astro_astro_type_script_index_0_lang.zIqIeV6h.js"></script><link rel="stylesheet" href="/pr-preview/pr-48/_astro/CodeBlock.SfORvXmu.css"><script type="module" src="/pr-preview/pr-48/_astro/page.CFbxjes3.js"></script><style>[data-astro-transition-scope="astro-jo646ijk-1"] { view-transition-name: root; }@layer astro { ::view-transition-old(root) { animation: none; opacity: 0; mix-blend-mode: normal; }::view-transition-new(root) { animation: none; mix-blend-mode: normal; }::view-transition-group(root) { animation: none } }[data-astro-transition-fallback="old"] [data-astro-transition-scope="astro-jo646ijk-1"],
+			[data-astro-transition-fallback="old"][data-astro-transition-scope="astro-jo646ijk-1"] { animation: none; mix-blend-mode: normal; }[data-astro-transition-fallback="new"] [data-astro-transition-scope="astro-jo646ijk-1"],
+			[data-astro-transition-fallback="new"][data-astro-transition-scope="astro-jo646ijk-1"] { animation: none; mix-blend-mode: normal; }</style></head> <body class="bg-background text-text-secondary antialiased selection:bg-brand-500/30" data-astro-transition-scope="astro-jo646ijk-1"> <header class="h-16 border-b border-white/[0.06] bg-background/75 backdrop-blur-xl backdrop-saturate-150 sticky top-0 z-50"> <div class="max-w-[1600px] mx-auto h-full flex items-center justify-between px-6"> <div class="flex items-center gap-4"> <button id="mobile-menu-trigger" class="lg:hidden p-2 -ml-2 text-text-muted hover:text-text-primary hover:bg-white/[0.06] rounded-lg transition-colors" aria-label="Toggle menu"> <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path> </svg> </button> <a href="/" class="flex items-center gap-2 hover:opacity-80 transition-opacity"> <img src="/logo.svg" alt="sp00ky Logo" class="h-6"> </a> </div> <div> <style>astro-island,astro-slot,astro-static-slot{display:contents}</style><script>(()=>{var l=(n,t)=>{let i=async()=>{await(await n())()},e=typeof t.value=="object"?t.value:void 0,s={timeout:e==null?void 0:e.timeout};"requestIdleCallback"in window?window.requestIdleCallback(i,s):setTimeout(i,s.timeout||200)};(self.Astro||(self.Astro={})).idle=l;window.dispatchEvent(new Event("astro:idle"));})();</script><script>(()=>{var A=Object.defineProperty;var g=(i,o,a)=>o in i?A(i,o,{enumerable:!0,configurable:!0,writable:!0,value:a}):i[o]=a;var d=(i,o,a)=>g(i,typeof o!="symbol"?o+"":o,a);{let i={0:t=>m(t),1:t=>a(t),2:t=>new RegExp(t),3:t=>new Date(t),4:t=>new Map(a(t)),5:t=>new Set(a(t)),6:t=>BigInt(t),7:t=>new URL(t),8:t=>new Uint8Array(t),9:t=>new Uint16Array(t),10:t=>new Uint32Array(t),11:t=>Number.POSITIVE_INFINITY*t},o=t=>{let[l,e]=t;return l in i?i[l](e):void 0},a=t=>t.map(o),m=t=>typeof t!="object"||t===null?t:Object.fromEntries(Object.entries(t).map(([l,e])=>[l,o(e)]));class y extends HTMLElement{constructor(){super(...arguments);d(this,"Component");d(this,"hydrator");d(this,"hydrate",async()=>{var b;if(!this.hydrator||!this.isConnected)return;let e=(b=this.parentElement)==null?void 0:b.closest("astro-island[ssr]");if(e){e.addEventListener("astro:hydrate",this.hydrate,{once:!0});return}let c=this.querySelectorAll("astro-slot"),n={},h=this.querySelectorAll("template[data-astro-template]");for(let r of h){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("data-astro-template")||"default"]=r.innerHTML,r.remove())}for(let r of c){let s=r.closest(this.tagName);s!=null&&s.isSameNode(this)&&(n[r.getAttribute("name")||"default"]=r.innerHTML)}let p;try{p=this.hasAttribute("props")?m(JSON.parse(this.getAttribute("props"))):{}}catch(r){let s=this.getAttribute("component-url")||"<unknown>",v=this.getAttribute("component-export");throw v&&(s+=` (export ${v})`),console.error(`[hydrate] Error parsing props for component ${s}`,this.getAttribute("props"),r),r}let u;await this.hydrator(this)(this.Component,p,n,{client:this.getAttribute("client")}),this.removeAttribute("ssr"),this.dispatchEvent(new CustomEvent("astro:hydrate"))});d(this,"unmount",()=>{this.isConnected||this.dispatchEvent(new CustomEvent("astro:unmount"))})}disconnectedCallback(){document.removeEventListener("astro:after-swap",this.unmount),document.addEventListener("astro:after-swap",this.unmount,{once:!0})}connectedCallback(){if(!this.hasAttribute("await-children")||document.readyState==="interactive"||document.readyState==="complete")this.childrenConnectedCallback();else{let e=()=>{document.removeEventListener("DOMContentLoaded",e),c.disconnect(),this.childrenConnectedCallback()},c=new MutationObserver(()=>{var n;((n=this.lastChild)==null?void 0:n.nodeType)===Node.COMMENT_NODE&&this.lastChild.nodeValue==="astro:end"&&(this.lastChild.remove(),e())});c.observe(this,{childList:!0}),document.addEventListener("DOMContentLoaded",e)}}async childrenConnectedCallback(){let e=this.getAttribute("before-hydration-url");e&&await import(e),this.start()}async start(){let e=JSON.parse(this.getAttribute("opts")),c=this.getAttribute("client");if(Astro[c]===void 0){window.addEventListener(`astro:${c}`,()=>this.start(),{once:!0});return}try{await Astro[c](async()=>{let n=this.getAttribute("renderer-url"),[h,{default:p}]=await Promise.all([import(this.getAttribute("component-url")),n?import(n):()=>()=>{}]),u=this.getAttribute("component-export")||"default";if(!u.includes("."))this.Component=h[u];else{this.Component=h;for(let f of u.split("."))this.Component=this.Component[f]}return this.hydrator=p,this.hydrate},e,this)}catch(n){console.error(`[astro-island] Error hydrating ${this.getAttribute("component-url")}`,n)}}attributeChangedCallback(){this.hydrate()}}d(y,"observedAttributes",["props"]),customElements.get("astro-island")||customElements.define("astro-island",y)}})();</script><astro-island uid="Z12LyUL" prefix="r2" component-url="/pr-preview/pr-48/_astro/Search.D8MxjVSz.js" component-export="Search" renderer-url="/pr-preview/pr-48/_astro/client.NQDPFRSz.js" props="{}" ssr client="idle" opts="{&quot;name&quot;:&quot;Search&quot;,&quot;value&quot;:true}" await-children><button class="flex items-center gap-2 px-3 py-1.5 text-sm text-zinc-400 bg-white/[0.04] border border-white/[0.08] shadow-glass-inset hover:bg-white/[0.07] hover:text-zinc-200 rounded-lg transition-colors w-full md:w-64"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-search w-4 h-4" aria-hidden="true"><path d="m21 21-4.34-4.34"></path><circle cx="11" cy="11" r="8"></circle></svg><span class="hidden md:inline">Search...</span><kbd class="hidden md:inline-flex items-center gap-1 px-1.5 py-0.5 text-xs font-mono text-zinc-400 bg-white/[0.06] rounded-md border border-white/10 ml-auto"><span class="text-xs">⌘</span>K</kbd></button><!--astro:end--></astro-island> </div> <div class="flex items-center gap-4 text-sm text-text-muted"> <script>(()=>{var e=async t=>{await(await t())()};(self.Astro||(self.Astro={})).load=e;window.dispatchEvent(new Event("astro:load"));})();</script><astro-island uid="ZcVTy6" prefix="r3" component-url="/pr-preview/pr-48/_astro/GitHubStars.CBnmlTzL.js" component-export="default" renderer-url="/pr-preview/pr-48/_astro/client.NQDPFRSz.js" props="{}" ssr client="load" opts="{&quot;name&quot;:&quot;GitHubStars&quot;,&quot;value&quot;:true}" await-children><a href="https://github.com/mono424/sp00ky" target="_blank" rel="noreferrer" class="group inline-flex items-center gap-2 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 font-mono text-xs font-medium uppercase tracking-wider text-zinc-300 shadow-glass-inset transition-colors hover:bg-white/[0.08] hover:text-white"><span class="flex items-center gap-2"><svg viewBox="0 0 24 24" class="fill-current h-3.5 w-3.5" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-3.795-.735-.54-1.38-1.335-1.755-1.335-1.755-1.095-.75.075-.735.075-.735 1.215.09 1.845 1.245 1.845 1.245 1.05 1.785 2.76 1.275 3.435.975.105-.75.405-1.275.735-1.575-2.415-.27-4.95-1.215-4.95-5.43 0-1.185.42-2.16 1.11-2.94-.105-.27-.48-1.395.105-2.94 0 0 .93-.3 3.045 1.125a10.59 10.59 0 0 1 2.76-.375c.945.0.1875.1275 2.76.375 2.115-1.425 3.045-1.125 3.045-1.125.585 1.545.21 2.67.105 2.94 1.185.78 1.11 1.755 1.11 2.94 0 4.23-2.55 5.145-4.965 5.415.42.375.78 1.11.78 2.235 0 1.605-.015 2.895-.015 3.285 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12Z"></path></svg><span>Github</span><span class="text-white/20">|</span><span class="animate-pulse text-neutral-500">...</span></span></a><!--astro:end--></astro-island> </div> </div> </header> <div class="max-w-[1600px] mx-auto flex w-full min-h-screen"> <aside class="docs-rail hidden lg:block w-[272px] shrink-0 border-r border-white/[0.06]"> <div class="docs-rail-scroll pt-8 pb-16 pl-6 pr-5" data-sidebar-scroller> <nav class="docs-sidebar" aria-label="Documentation"> <section class="docs-sidebar-group"> <p class="docs-sidebar-title">Start here</p> <ul> <li> <a href="/pr-preview/pr-48/docs" class="docs-sidebar-link"> <span class="truncate">Introduction</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/quickstart" class="docs-sidebar-link"> <span class="truncate">Quickstart</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/how-it-works" class="docs-sidebar-link"> <span class="truncate">How it works</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/install" class="docs-sidebar-link"> <span class="truncate">Installation</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Schema</p> <ul> <li> <a href="/pr-preview/pr-48/docs/schema" class="docs-sidebar-link"> <span class="truncate">Define your schema</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/relationships" class="docs-sidebar-link"> <span class="truncate">Relationships</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/generated-types" class="docs-sidebar-link"> <span class="truncate">Generated types</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/migrations" class="docs-sidebar-link"> <span class="truncate">Migrations</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Client SDK</p> <ul> <li> <a href="/pr-preview/pr-48/docs/client/queries" class="docs-sidebar-link"> <span class="truncate">Reactive queries</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/pagination" class="docs-sidebar-link"> <span class="truncate">Pagination</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/mutations" class="docs-sidebar-link"> <span class="truncate">Mutations</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/auth" class="docs-sidebar-link"> <span class="truncate">Authentication</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/offline-sync" class="docs-sidebar-link"> <span class="truncate">Offline &amp; sync health</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/query-allowlist" class="docs-sidebar-link"> <span class="truncate">Query allowlist</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/feature-flags" class="docs-sidebar-link"> <span class="truncate">Feature flags</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/push-notifications" class="docs-sidebar-link"> <span class="truncate">Push notifications</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/native-push" class="docs-sidebar-link"> <span class="truncate">Native push (iOS, Android)</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/impersonation" class="docs-sidebar-link"> <span class="truncate">Admin impersonation</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/buckets" class="docs-sidebar-link"> <span class="truncate">File buckets</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/crdt" class="docs-sidebar-link"> <span class="truncate">CRDT fields</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Framework guides</p> <ul> <li> <a href="/pr-preview/pr-48/docs/guide/solid" class="docs-sidebar-link"> <span class="truncate">SolidJS</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/solid2" class="docs-sidebar-link"> <span class="truncate">Solid 2 (RC)</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/flutter" class="docs-sidebar-link"> <span class="truncate">Flutter</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/vanilla" class="docs-sidebar-link"> <span class="truncate">Vanilla JS / TS</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Backends</p> <ul> <li> <a href="/pr-preview/pr-48/docs/backend" class="docs-sidebar-link"> <span class="truncate">What is a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/add" class="docs-sidebar-link"> <span class="truncate">Add a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/options" class="docs-sidebar-link"> <span class="truncate">Backend options</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Background jobs</p> <ul> <li> <a href="/pr-preview/pr-48/docs/jobs" class="docs-sidebar-link"> <span class="truncate">Jobs</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/schedules" class="docs-sidebar-link"> <span class="truncate">Schedules</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/workflows" class="docs-sidebar-link"> <span class="truncate">Workflows</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/machine-pools" class="docs-sidebar-link"> <span class="truncate">Machine pools</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Local development</p> <ul> <li> <a href="/pr-preview/pr-48/docs/dev" class="docs-sidebar-link"> <span class="truncate">spky dev</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/servers" class="docs-sidebar-link"> <span class="truncate">Dev servers &amp; sidecars</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/env" class="docs-sidebar-link"> <span class="truncate">Environment variables</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/doctor" class="docs-sidebar-link"> <span class="truncate">Doctor &amp; troubleshooting</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/devtools" class="docs-sidebar-link"> <span class="truncate">DevTools extension</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Deploy</p> <ul> <li> <a href="/pr-preview/pr-48/docs/cloud/getting-started" class="docs-sidebar-link"> <span class="truncate">Getting started</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/deploying" class="docs-sidebar-link"> <span class="truncate">Deploying</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/dedicated-machines" class="docs-sidebar-link"> <span class="truncate">Dedicated machines</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/env-variables" class="docs-sidebar-link"> <span class="truncate">Environment &amp; vault</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/logs" class="docs-sidebar-link"> <span class="truncate">Logs &amp; monitoring</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/backups" class="docs-sidebar-link"> <span class="truncate">Backups</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/ci-cd" class="docs-sidebar-link"> <span class="truncate">CI/CD</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/team" class="docs-sidebar-link"> <span class="truncate">Teams</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/self-hosting" class="docs-sidebar-link"> <span class="truncate">Self-hosting</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Operations</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/admin-dashboard" class="docs-sidebar-link"> <span class="truncate">Admin dashboard</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/mcp" class="docs-sidebar-link"> <span class="truncate">MCP server</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Reference</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/cli" class="docs-sidebar-link"> <span class="truncate">CLI</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/config" class="docs-sidebar-link" aria-current="page" data-sidebar-active> <span class="truncate">sp00ky.yml</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/client-config" class="docs-sidebar-link"> <span class="truncate">Client config</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ai-agents" class="docs-sidebar-link"> <span class="truncate">AI coding agents</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/grok-bot" class="docs-sidebar-link"> <span class="truncate">Grok Bot recipe</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/architecture" class="docs-sidebar-link"> <span class="truncate">Architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/performance" class="docs-sidebar-link"> <span class="truncate">Performance</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/vault" class="docs-sidebar-link"> <span class="truncate">Vault architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ssp-api" class="docs-sidebar-link"> <span class="truncate">SSP API</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/scheduler-api" class="docs-sidebar-link"> <span class="truncate">Scheduler API</span>  </a> </li> </ul> </section> </nav> </div> </aside> <main class="flex-1 min-w-0 pt-8 pb-16 px-6 lg:px-12"> <div class="prose prose-invert prose-docs max-w-3xl w-full"> <nav class="not-prose flex items-center gap-1.5 text-[13px] text-zinc-500 mb-5 overflow-x-auto whitespace-nowrap" aria-label="Breadcrumb"> <a href="/pr-preview/pr-48/docs" class="hover:text-zinc-200 transition-colors">Docs</a>  <svg class="h-3.5 w-3.5 shrink-0 text-zinc-700" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"> <path d="m9 18 6-6-6-6"></path> </svg> <span class="text-zinc-400">Reference</span>  </nav> <h1 class="text-4xl font-semibold tracking-tight mb-4"> sp00ky.yml </h1> <p class="text-lg text-text-muted leading-relaxed mb-8">Every key in the project config the CLI reads: apps, schedules, schema paths, versions and per-environment overrides.</p> <p><code>sp00ky.yml</code> at your project root is the single source of truth for the <code>spky</code> CLI. It tells <code>spky dev</code>, <code>spky deploy</code> and <code>spky doctor</code> how to run your stack, which SurrealDB version to spin up, where your schema and buckets live, which client types to generate, and how your apps boot.</p>
+<p>For the client-side object you pass to <code>new SyncedDb(...)</code>, see <a href="/docs/reference/client-config">Client config</a>.</p>
+<p>Validate it at any time with <code>spky lint</code>, or run <a href="/docs/dev/doctor"><code>spky doctor</code></a> for a fuller
+project health check.</p>
+<p>Add the schema comment as the first line of <code>sp00ky.yml</code> to get autocomplete and validation in editors that support <code>yaml-language-server</code>:</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="# yaml-language-server: $schema=https://sp00ky.cloud/schema/sp00ky.schema.json"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># yaml-language-server: $schema=https://sp00ky.cloud/schema/sp00ky.schema.json</span></span></code></pre> </div> </div> </div> <script type="module">const s=document.querySelectorAll(".copy-btn");s.forEach(c=>{c.addEventListener("click",async()=>{const o=c.getAttribute("data-code"),e=c.querySelector(".copy-icon"),t=c.querySelector(".check-icon");if(!(!o||!e||!t))try{await navigator.clipboard.writeText(o),e.classList.add("hidden"),t.classList.remove("hidden"),setTimeout(()=>{e.classList.remove("hidden"),t.classList.add("hidden")},2e3)}catch{}})});</script>
+<h2 id="minimal-example">Minimal example</h2>
+<p>The smallest viable file to get <code>spky dev</code> running:</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="mode: singlenode
+surrealdb:
+  namespace: main
+  database: main
+schema: ./schema
+buckets:
+  - ./schema/src/buckets/profile.surql
+clientTypes:
+  - format: typescript
+    output: ./src/schema.gen.ts
+  - format: dart
+    output: ../app/lib/sync/app_db.g.dart"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">mode</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">singlenode</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">surrealdb</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  namespace</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">main</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  database</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">main</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">schema</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./schema</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">buckets</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  - </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./schema/src/buckets/profile.surql</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">clientTypes</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  - </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">format</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">typescript</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    output</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./src/schema.gen.ts</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  - </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">format</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">dart</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    output</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">../app/lib/sync/app_db.g.dart</span></span></code></pre> </div> </div> </div> 
+<p>For a fully annotated reference covering every option, see <a href="https://github.com/sp00ky-org/sp00ky/blob/main/example/sp00ky.yml"><code>example/sp00ky.yml</code></a> in the repo.</p>
+<h2 id="top-level-settings">Top-level settings</h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>mode</code></td><td><code>singlenode</code> | <code>cluster</code> | <code>surrealism</code></td><td><code>singlenode</code></td><td>Deployment topology. <code>singlenode</code> is one SSP with no scheduler, <code>cluster</code> puts a scheduler in front of one or more SSPs, <code>surrealism</code> is for embedded setups. See <a href="/docs/self-hosting">Self-hosting</a>.</td></tr><tr><td><code>slug</code></td><td>string</td><td>(none)</td><td>Project slug used by <code>spky deploy</code> and the other cloud commands.</td></tr><tr><td><code>surrealdb</code></td><td>object</td><td>(none)</td><td>DB connection. Sub-fields: <code>namespace</code>, <code>database</code>, <code>username</code>, <code>password</code>, <code>hosting</code> (<code>cloud</code> or <code>external</code>), <code>endpoint</code> (required when <code>hosting: external</code>).</td></tr><tr><td><code>schema</code></td><td>path</td><td>(none)</td><td>Directory containing your <code>.surql</code> schema sources. See <a href="/docs/schema">Schema</a>.</td></tr><tr><td><code>buckets</code></td><td>path[]</td><td><code>[]</code></td><td>Bucket definition files referenced from your schema. See <a href="/docs/client/buckets">Buckets</a>.</td></tr><tr><td><code>clientTypes</code></td><td>array</td><td><code>[]</code></td><td>Codegen targets. Each entry has <code>format</code> (<code>typescript</code> or <code>dart</code>), an <code>output</code> path, (dart only) an optional <code>workdir</code>, and (typescript only) optional <code>queries</code>, <code>allowlistOutput</code> and <code>app</code> for the <a href="#query-allowlist">query allowlist</a>. See <a href="#client-types">Client types</a>.</td></tr><tr><td><code>version</code></td><td>string | object</td><td><code>any</code></td><td>Which SSP and scheduler build runs, enforced: an exact version, <code>newest</code> or <code>any</code>. Accepts a single value, a <code>{ssp, scheduler}</code> split, a <code>{dev, cloud}</code> split, or a <code>path:</code> override pointing at a local binary. See <a href="#versions">Versions</a>.</td></tr><tr><td><code>logLevel</code></td><td>string | object</td><td><code>info</code></td><td>Log verbosity for the SSP and scheduler. Accepts <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>, <code>off</code>, target=level directives, or a <code>{dev, cloud}</code> split. Under <code>spky dev</code> a bare level applies to the sp00ky crates only (third-party crates stay at <code>warn</code>); pass a full directive list such as <code>ssp=debug,hyper=info,warn</code> to control those too.</td></tr><tr><td><code>refMode</code></td><td><code>dedicated</code> | <code>single</code></td><td><code>dedicated</code></td><td>Storage layout for the SSP’s <code>_00_list_ref</code> table. <code>dedicated</code> gives each user their own table and works around a SurrealDB v3 LIVE-permission gap.</td></tr><tr><td><code>sync</code></td><td>object</td><td><code>{ transport: http, queryAllowlist: off }</code></td><td>How row changes reach the scheduler: <code>transport</code> (<code>http</code> or <code>changefeed</code>) and <code>changefeedRetention</code>, see <a href="#sync-transport">Sync transport</a>; and whether the SSP refuses query shapes the app does not ship: <code>queryAllowlist</code>, see <a href="#query-allowlist">Query allowlist</a>.</td></tr><tr><td><code>impersonation</code></td><td>object</td><td><code>{ enabled: false }</code></td><td>Lets admins act as other users from the DevTools. See <a href="#impersonation">Impersonation</a>.</td></tr><tr><td><code>apps</code></td><td>map</td><td><code>{}</code></td><td>Your frontend and backend services. See <a href="#apps">Apps</a> below.</td></tr><tr><td><code>pools</code></td><td>map</td><td><code>{}</code></td><td>Machine pools: machines that run one backend’s jobs while there is work. See <a href="#machine-pools">Machine pools</a>.</td></tr><tr><td><code>machines</code></td><td>map</td><td><code>{}</code></td><td>Dedicated machines: one Hetzner VM of its own per always-on backend. See <a href="#dedicated-machines">Dedicated machines</a>.</td></tr><tr><td><code>schedules</code></td><td>map | path</td><td><code>{}</code></td><td>Server-side cron/interval jobs. See <a href="/docs/jobs/schedules">Schedules</a>.</td></tr><tr><td><code>workflows</code></td><td>map | path</td><td><code>{}</code></td><td>Server-side workflow DAGs. See <a href="/docs/jobs/workflows">Workflows</a>.</td></tr><tr><td><code>deployment</code></td><td>object</td><td>(none)</td><td>Cloud deployment knobs: <code>sspCount</code>, <code>backup</code>, <code>env</code> (per-role infra environment variables), <code>storage.sizeGB</code> (the volume behind <code>file:</code> buckets; only grows). See <a href="/docs/cloud/deploying">Cloud Deployment</a> and <a href="/docs/cloud/deploying#bucket-storage">Bucket storage</a>.</td></tr><tr><td><code>retention</code></td><td>object</td><td>(see below)</td><td>How long finished jobs and run history are kept. See <a href="#retention">Retention</a>.</td></tr><tr><td><code>push</code></td><td>object | path</td><td>enabled, no rules</td><td>Web Push rules: which row changes notify which users. See <a href="#web-push">Web Push</a>.</td></tr></tbody></table>
+<h2 id="apps">Apps</h2>
+<p>Each entry under <code>apps</code> is a service <code>spky</code> knows how to run locally and deploy to the cloud. Set <code>type: frontend</code>, <code>type: backend</code>, or <code>type: docker</code>, then describe how it boots (<code>dev</code>) and how it deploys (<code>deploy</code>). Backends additionally need an OpenAPI <code>spec</code>, a <code>baseUrl</code>, an optional <code>auth</code> block, and a <code>method</code> (typically <code>outbox</code>) so the SSP can deliver jobs.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="apps:
+  web:
+    type: frontend
+    dev:
+      type: npm
+      script: dev:app
+    deploy:
+      dockerfile: ./app/Dockerfile
+      context: ../
+      port: 80
+  api:
+    type: backend
+    spec: ./api/openapi.yml
+    baseUrl: http://host.docker.internal:3660
+    dev:
+      type: npm
+      script: dev
+      workdir: ./api
+    deploy:
+      dockerfile: ./api/Dockerfile
+      context: ../
+      port: 3660
+      healthcheck: /health
+    auth:
+      type: token
+      token: THIS_IS_TOP_SECRET
+    method:
+      type: outbox
+      table: job
+      schema: ./schema/src/outbox/api.surql
+  livekit:
+    type: docker
+    scope: devOnly
+    image: livekit/livekit-server:latest
+    ports: [7880, 7881, &#34;7882/udp&#34;]
+    args: [&#34;--dev&#34;, &#34;--bind&#34;, &#34;0.0.0.0&#34;]"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">apps</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  web</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">frontend</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    dev</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">npm</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      script</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">dev:app</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    deploy</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      dockerfile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./app/Dockerfile</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      context</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">../</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      port</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">80</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  api</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">backend</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    spec</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./api/openapi.yml</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    baseUrl</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">http://host.docker.internal:3660</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    dev</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">npm</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      script</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">dev</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      workdir</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./api</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    deploy</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      dockerfile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./api/Dockerfile</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      context</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">../</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      port</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">3660</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      healthcheck</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/health</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    auth</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">token</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      token</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">THIS_IS_TOP_SECRET</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    method</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">outbox</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      table</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">job</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      schema</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./schema/src/outbox/api.surql</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  livekit</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">docker</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    scope</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">devOnly</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    image</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">livekit/livekit-server:latest</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    ports</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">7880</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">7881</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"7882/udp"</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    args</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"--dev"</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"--bind"</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"0.0.0.0"</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]</span></span></code></pre> </div> </div> </div> 
+<p>A backend may also set <code>runOn: { pool: &lt;name&gt; }</code> to run its jobs on a <a href="#machine-pools">machine pool</a> instead of an always-on container, or <code>runOn: { machine: &lt;name&gt; }</code> to run, always on, on a <a href="#dedicated-machines">dedicated machine</a>, alone or next to other backends.</p>
+<p><code>method</code> describes the outbox the SSP delivers jobs through: <code>type: outbox</code>, the <code>table</code> the rows live in, the <code>schema</code> file defining it, and an optional <code>concurrency</code> bounding how many of that table’s jobs run at once (default <code>1</code>; extra rows wait as <code>pending</code> and are admitted oldest-first). See <a href="/docs/jobs#concurrency">Jobs → Concurrency</a>.</p>
+<p><code>dev</code> accepts either a raw command string or a typed form: <code>{type: npm, script, workdir?}</code>, <code>{type: docker, file, workdir?, port?}</code> (builds a Dockerfile for this app’s dev server), or <code>{type: uv, script, workdir?}</code>. <code>deploy</code> accepts <code>dockerfile</code>, <code>context</code>, <code>port</code>, <code>healthcheck</code>, <code>resources</code> (<code>vcpus</code>, <code>memory</code>, <code>disk</code>), a <code>timeout</code>, a <code>cmd</code> (override the image’s ENTRYPOINT/CMD), <code>build_args</code> (build-time-only args, same shape as <code>env</code>), <code>expose</code> (backends only: publish it at <code>&lt;slug&gt;-&lt;name&gt;.&lt;domain&gt;</code>, which is also what a <a href="/docs/reference/cli">custom domain</a> can point at), <code>grpc_port</code> (a second, h2c port at <code>&lt;slug&gt;-&lt;name&gt;-grpc.&lt;domain&gt;</code>), and <code>static</code> (<code>{build, dir}</code>, for Cloudflare static-asset frontends).</p>
+<h4 id="scope-where-an-app-runs"><code>scope</code>: where an app runs</h4>
+<p>Every app accepts an optional <code>scope</code> controlling where it runs:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th><code>scope</code></th><th>Behavior</th></tr></thead><tbody><tr><td><code>all</code> (default)</td><td>Started by <code>spky dev</code> <strong>and</strong> deployed to the cloud.</td></tr><tr><td><code>devOnly</code></td><td>Local-only, started by <code>spky dev</code>, never deployed. Validation is relaxed (no <code>spec</code>/<code>method</code>/<code>deploy</code> required), so it’s handy for a local sidecar.</td></tr><tr><td><code>cloudOnly</code></td><td>Deployed to the cloud but skipped by <code>spky dev</code>.</td></tr></tbody></table>
+<h4 id="type-docker-run-a-prebuilt-image"><code>type: docker</code>: run a prebuilt image</h4>
+<p>A <code>docker</code> app runs a prebuilt image directly (no Dockerfile build), useful for local infra like a LiveKit SFU, a mock service, or a cache. Fields:</p>
+<ul>
+<li><code>image</code> (required): the image to run, e.g. <code>livekit/livekit-server:latest</code>.</li>
+<li><code>ports</code>: published ports. A bare port (<code>7880</code>) maps host→container 1:1 (<code>7880:7880</code>); use <code>&quot;host:container&quot;</code> to remap and a <code>/proto</code> suffix for UDP (<code>&quot;7882/udp&quot;</code>). On a <a href="#dedicated-machines">dedicated machine</a> they are published on the VM’s public address and opened in its firewall to everyone; the core host only proxies <code>port</code> and <code>grpc_port</code>.</li>
+<li><code>args</code>: appended after the image as the container command (e.g. <code>[&quot;--dev&quot;]</code>, or <code>[&quot;go&quot;, &quot;run&quot;, &quot;.&quot;]</code> to run a service from source).</li>
+<li><code>volumes</code>: bind/volume mounts (<code>docker run -v</code>), e.g. <code>[&quot;/var/run/docker.sock:/var/run/docker.sock&quot;, &quot;${PROJECT_DIR}/../..:/src&quot;, &quot;gomod:/go&quot;]</code>. <code>${PROJECT_DIR}</code> (the absolute directory of <code>sp00ky.yml</code>) is expanded in the host portion.</li>
+<li><code>workdir</code>: working directory inside the container (<code>docker run -w</code>).</li>
+<li><code>dependsOn</code>: names of other <code>docker</code> apps that must be <strong>ready</strong> before this one starts. <code>spky dev</code> launches apps in dependency order; an unknown name, a self-dependency, or a cycle is rejected at config load (caught by <code>spky lint</code>/<code>spky doctor</code>).</li>
+<li><code>healthcheck</code>: an HTTP path (e.g. <code>/health</code>) polled on the app’s first published host port until it returns 200. A <code>dependsOn</code> waits for this, i.e. for the service to be genuinely up, not just for the container to have started. Without it, a dependency is “ready” as soon as its container is running.</li>
+</ul>
+<p>Under <code>spky dev</code> it runs as the container <code>sp00ky-dev-&lt;name&gt;</code> on the dev network (reachable from sibling apps by its <strong>name</strong>) with <code>--rm</code> teardown. <code>${PROJECT_DIR}</code> is also expanded in <code>env</code> values, and user <code>env</code> overrides the auto-injected <code>SPKY_*</code> vars. With <code>scope</code> left as <code>all</code>/<code>cloudOnly</code>, deploys pull the image and ship it through the same image pipeline as a backend; pair it with <code>scope: devOnly</code> for a purely local service (<code>dependsOn</code>/<code>healthcheck</code> are <code>spky dev</code>-only). <code>env</code> (below) is passed through as container environment variables.</p>
+<p>For per-app environment variables (<code>env: { dev, cloud, vault }</code>), see <a href="/docs/dev/env">Environment Variables</a>.</p>
+<h4 id="split-a-services-config-into-its-own-file">Split a service’s config into its own file</h4>
+<p>An app entry can also be a <code>{ path }</code> reference instead of an inline block. <code>path</code> points at a directory containing a <code>sp00ky.app.yml</code> file, so a backend service can keep its own config next to its code:</p>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="yaml"><code><span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># sp00ky.yml (project root)</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">apps</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  web</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">    type</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">frontend</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D">    # ...</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  api</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">    path</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">./api</span><span style="color:#6A737D;--shiki-dark:#6A737D">            # pulls ./api/sp00ky.app.yml in as this app</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">    scope</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">cloudOnly</span><span style="color:#6A737D;--shiki-dark:#6A737D">       # fields set here override the referenced file</span></span></code></pre>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="yaml"><code><span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># ./api/sp00ky.app.yml</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># yaml-language-server: $schema=https://sp00ky.cloud/schema/app.schema.json</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">type</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">backend</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">spec</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">./openapi.yml</span><span style="color:#6A737D;--shiki-dark:#6A737D">        # paths are relative to THIS file&#39;s directory</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">method</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  type</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">outbox</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  table</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">job</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  schema</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">./src/outbox/api.surql</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">deploy</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  dockerfile</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">./Dockerfile</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  port</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">3660</span></span></code></pre>
+<p>The referenced file holds a single app config (the same fields you’d inline under <code>apps.&lt;name&gt;</code>) and validates against its own <a href="https://sp00ky.cloud/schema/app.schema.json"><code>app.schema.json</code></a>. Its relative paths are resolved from the service directory, and at load time the whole thing is merged into one effective config. Any field you also set alongside <code>path</code> in the root file wins (main overrides sub). The split is entirely optional, leave your apps inline and nothing changes.</p>
+<h2 id="sync-transport">Sync transport</h2>
+<p><code>sync.transport</code> decides how a committed row change reaches the scheduler (and from there the SSPs and your clients).</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>transport</code></td><td><code>http</code> | <code>changefeed</code></td><td><code>http</code></td><td><code>http</code>: every generated <code>_00_&lt;table&gt;_mutation</code> / <code>_delete</code> event calls the scheduler’s <code>/ingest</code> with <code>http::post</code> <strong>inside the user’s transaction</strong>. <code>changefeed</code>: every synced table carries a SurrealDB <code>CHANGEFEED</code> clause and the scheduler tails <code>SHOW CHANGES FOR DATABASE</code>; the events keep only the <code>_00_version</code> bookkeeping and never make a network call.</td></tr><tr><td><code>changefeedRetention</code></td><td>duration</td><td><code>1d</code></td><td>Retention of the <code>CHANGEFEED</code> clause, in the form SurrealDB renders it (<code>1d</code>, <code>12h</code>, <code>1d12h</code>). A scheduler that falls further behind than this re-clones its replica.</td></tr></tbody></table>
+<pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="yaml"><code><span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">sync</span><span style="color:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  transport</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">changefeed</span></span>
+<span class="line"><span style="color:#22863A;--shiki-dark:#85E89D">  changefeedRetention</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">1d</span></span></code></pre>
+<p>Why <code>changefeed</code>: the feed is written by the same commit as the row, so it is post-commit only (a transaction that fails after its event fired can no longer announce a change that never happened), ordered by commit versionstamp, durable and resumable. User writes stop waiting on the scheduler: a scheduler restart delays delivery instead of failing writes, and no transaction holds row locks for the length of a network call. Propagation rides a <code>LIVE SELECT</code> doorbell on <code>_00_version</code> plus a 2 s safety-net poll, about 8 ms from commit to SSP.</p>
+<p>What a deploy does with it: <code>spky deploy</code> / <code>spky migrate</code> add <code>CHANGEFEED &lt;retention&gt; INCLUDE ORIGINAL</code> to every synced table (<code>ALTER TABLE IF EXISTS</code>, so your own table definitions are kept and a migration that redefined a table gets the clause back), remove the <code>_00_dbsp_cleanup</code> event, and generate events that do not post. The scheduler and SSP containers receive <code>SPKY_INGEST_TRANSPORT</code> and <code>SPKY_CHANGEFEED_RETENTION</code> automatically (cloud: merged into <code>deployment.env</code>; <code>spky dev</code>: injected into the containers). Switching back to <code>http</code> regenerates the posting events; the <code>CHANGEFEED</code> clauses stay and are harmless.</p>
+<p>“Synced” means every table that is not <code>@nosync</code>, <strong><code>TYPE RELATION</code> tables included</strong>: an edge table is queryable from a client like any other, so it has to be in the feed like any other.</p>
+<p>A table is also born with its feed. Your migrations define tables bare, and the clause used to arrive only with the pass that follows them, so rows written in between were committed to a table with no feed and surfaced minutes later as a <code>drift_repair</code> incident. Each migration’s <code>DEFINE TABLE</code> is now completed as it is applied (the clause, and the <code>sp00ky:nosync</code> marker for a <code>@nosync</code> table), decided by your current annotated schema. The file on disk and its recorded checksum are untouched, and <code>spky migrate create</code> still diffs against exactly what your migrations say.</p>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">Note</strong> <p>Set <code>sync.transport</code> before the first deploy of a database or plan a short window: the scheduler must run with <code>SPKY_INGEST_TRANSPORT=changefeed</code> from the moment the schema stops posting, or nothing arrives. Deploy the schema, then restart the scheduler with the new env. The changefeed tail starts one second before the restart’s clone, so the window is replayed rather than lost.</p> </div> </div>
+<h2 id="query-allowlist">Query allowlist</h2>
+<p><code>sync.queryAllowlist</code> decides what the SSP does with a view registration whose <strong>shape</strong> is not one <code>spky generate</code> recorded from the app’s query module (<code>clientTypes[].queries</code>). Off by default.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>queryAllowlist</code></td><td><code>off</code> | <code>warn</code> | <code>enforce</code></td><td><code>off</code></td><td><code>off</code>: any parseable query registers. <code>warn</code>: the SSP logs <code>allowlist miss</code>, counts it, and admits the registration; the discovery mode for switching on. <code>enforce</code>: the registration is refused with HTTP 403 <code>not_allowlisted</code>.</td></tr></tbody></table>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="sync:
+  queryAllowlist: warn          # off | warn | enforce
+
+clientTypes:
+  - format: typescript
+    output: ./src/schema.gen.ts
+    queries: ./src/lib/query.ts # recorded by spky generate
+    # allowlistOutput: ./src/lib/query.ts.allowlist.json
+    # app: web"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">sync</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  queryAllowlist</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">warn</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">          # off | warn | enforce</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">clientTypes</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  - </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">format</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">typescript</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    output</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./src/schema.gen.ts</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    queries</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./src/lib/query.ts</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"> # recorded by spky generate</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # allowlistOutput: ./src/lib/query.ts.allowlist.json</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # app: web</span></span></code></pre> </div> </div> </div> 
+<p>What it changes elsewhere: the SSP receives <code>SPKY_SSP_QUERY_ALLOWLIST</code> (cloud: merged into the <code>ssp</code> role’s <code>deployment.env</code>; <code>spky dev</code>: injected into the container). The generated TypeScript <code>schema</code> carries <code>policy: { queryAllowlist }</code>, and when it is <code>warn</code> or <code>enforce</code> the client SDK refuses <code>useRemote</code>, <code>remoteQuery</code> and <code>queryRaw</code> unless <a href="/docs/reference/client-config#allowrawremote"><code>allowRawRemote</code></a> is set. <code>spky deploy</code>, <code>spky release</code> and <code>spky dev</code> publish the allowlist JSON as <code>_00_query_allowlist</code> rows; under <code>enforce</code> a missing or stale JSON fails the deploy. Matching rules, sidecar exports and the rollout recipe are in the <a href="/docs/guide/query-allowlist">Query allowlist guide</a>.</p>
+<h2 id="impersonation">Impersonation</h2>
+<p><code>impersonation</code> lets a <code>_00_admin</code> member act as any non-admin user from the DevTools Access tab. Off by default; when off, every deploy removes the access method and functions, which also invalidates tokens issued earlier.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Turns the feature on. Needs a non-empty <code>SPKY_AUTH_SECRET</code>; the token signing key is derived from it.</td></tr><tr><td><code>tokenTtl</code></td><td>duration</td><td><code>15m</code></td><td>Lifetime of one token, between <code>1m</code> and <code>1h</code>. The client renews it before it expires. One unit only (<code>30m</code>, <code>1h</code>).</td></tr><tr><td><code>maxDuration</code></td><td>duration</td><td><code>2h</code></td><td>Hard cap on one impersonation session. At least <code>tokenTtl</code>.</td></tr><tr><td><code>userTable</code></td><td>identifier</td><td><code>user</code></td><td>The table whose records can be impersonated.</td></tr><tr><td><code>searchFields</code></td><td>identifier[]</td><td><code>[username, email, name]</code></td><td>Fields the DevTools user picker searches and shows. Missing fields are ignored.</td></tr></tbody></table>
+<p>What it changes elsewhere: the SSP and scheduler receive <code>SPKY_IMPERSONATION=on</code> (cloud: merged into both roles’ <code>deployment.env</code>; <code>spky dev</code>: injected into the containers). The generated TypeScript <code>schema</code> carries <code>policy: { impersonation }</code>, which the DevTools read to decide whether to offer the feature. Only <code>singlenode</code> and <code>cluster</code> modes support it. Usage, the security model and the audit tables are in <a href="/docs/client/impersonation">Admin impersonation</a>.</p>
+<h2 id="retention">Retention</h2>
+<p>Finished jobs and run history are deleted automatically, asymmetrically by outcome: a success is read once if at all, a failure is what you went looking for.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="retention:
+  success: 6h        # job rows that succeeded
+  failed: 14d        # job rows that failed
+  runSuccess: 24h    # run history: success | skipped | replaced
+  runFailed: 30d     # run history: failed | killed"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">retention</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  success</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">6h</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">        # job rows that succeeded</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  failed</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">14d</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">        # job rows that failed</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  runSuccess</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">24h</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # run history: success | skipped | replaced</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  runFailed</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">30d</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">     # run history: failed | killed</span></span></code></pre> </div> </div> </div> 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>success</code></td><td>duration</td><td><code>6h</code></td><td>Job rows in <code>success</code>.</td></tr><tr><td><code>failed</code></td><td>duration</td><td><code>14d</code></td><td>Job rows in <code>failed</code>.</td></tr><tr><td><code>runSuccess</code></td><td>duration</td><td><code>24h</code></td><td>Schedule/workflow runs in <code>success</code>, <code>skipped</code>, <code>replaced</code>.</td></tr><tr><td><code>runFailed</code></td><td>duration</td><td><code>30d</code></td><td>Schedule/workflow runs in <code>failed</code>, <code>killed</code>.</td></tr><tr><td><code>maxRows</code></td><td>integer</td><td><code>0</code> (off)</td><td>Hard ceiling on rows in a successful status, per table. Trims oldest-first and never touches failures. A valve for very wide fan-out; the age windows above are the main mechanism.</td></tr><tr><td><code>mode</code></td><td><code>all</code> | <code>failures-only</code></td><td><code>all</code></td><td>Default history mode for every schedule: <code>failures-only</code> means a successful execution leaves nothing but a counter. A schedule’s own <code>history:</code> overrides it either way. Resolved at deploy time, so changing it needs a redeploy — unlike the windows above. Never applies to client <code>db.run()</code> jobs.</td></tr></tbody></table>
+<p>Whatever retention deletes is first folded into permanent hourly counters (<code>_00_run_rollup</code>), so totals survive the rows; <code>spky schedules get</code> shows them. <code>pending</code> and <code>processing</code> jobs, and <code>running</code> runs, are never pruned at any age. An individual schedule can override the run-history windows with <code>history:</code> (see <a href="#schedules-and-workflows">Schedules and workflows</a>). Full behaviour in <a href="/docs/jobs#retention">Jobs → Retention</a>.</p>
+<h2 id="schedules-and-workflows">Schedules and workflows</h2>
+<p><code>schedules</code> and <code>workflows</code> declare work that runs server-side on a clock, whether or not a client is connected. Each cycle the scheduler creates a new job row in the target backend’s outbox table, so a scheduled run is an ordinary job with the usual retry, kill, and recovery behaviour.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="schedules:
+  nightly-cleanup:
+    cron: &#34;0 3 * * *&#34;
+    timezone: Europe/Berlin
+    backend: api
+    route: /cleanupExpired
+    payload:
+      olderThanDays: 30
+
+  game-sync:
+    every: 5m
+    backend: api
+    route: /syncGames
+    forEach:
+      query: SELECT id FROM connection WHERE active = true
+      key: id
+    concurrency: skip
+    retry: { max: 3, strategy: linear }
+    timeout: 120s
+
+workflows:
+  monthly-report:
+    schedule: { cron: &#34;0 6 1 * *&#34; }
+    steps:
+      extract-orders: { backend: api, route: /exportOrders }
+      extract-users:  { backend: api, route: /exportUsers }
+      transform:
+        backend: analytics
+        route: /buildReport
+        dependsOn: [extract-orders, extract-users]
+      notify: { backend: notify, route: /postSlack, dependsOn: [transform] }
+    onFailure: halt"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">schedules</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  nightly-cleanup</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    cron</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"0 3 * * *"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    timezone</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">Europe/Berlin</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">api</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/cleanupExpired</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    payload</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      olderThanDays</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">30</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  game-sync</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    every</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">5m</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">api</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/syncGames</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    forEach</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      query</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">SELECT id FROM connection WHERE active = true</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      key</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">id</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    concurrency</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">skip</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    retry</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">max</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">3</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">strategy</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">linear</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    timeout</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">120s</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">workflows</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  monthly-report</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    schedule</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">cron</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"0 6 1 * *"</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    steps</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      extract-orders</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">api</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/exportOrders</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      extract-users</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:  { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">api</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/exportUsers</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      transform</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">analytics</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/buildReport</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        dependsOn</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">extract-orders</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">extract-users</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      notify</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">notify</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/postSlack</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">dependsOn</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">transform</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">] }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    onFailure</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">halt</span></span></code></pre> </div> </div> </div> 
+<p>A schedule sets exactly one of <code>cron</code> (a 5-field expression, evaluated in <code>timezone</code>, default UTC) or <code>every</code> (a fixed interval, minimum 10s). <code>forEach</code> fans one schedule out into one job per row, and <code>concurrency</code> decides what a fire does when that row’s previous run is still going: <code>skip</code> (default) records the suppressed tick, <code>allow</code> permits overlap, <code>replace</code> kills the in-flight run first.</p>
+<p><code>quarantineAfter</code> sets a per-key consecutive-failure budget: past it the schedule stops firing that key and opens an incident, so one permanently broken <code>forEach</code> row cannot burn a job every tick forever. A quarantined key is probed on a doubling backoff (1h up to 24h), so one that recovers heals itself. Opt-in, and one success forgets the streak. See <a href="/docs/jobs/schedules#failing-keys">Failing keys</a>.</p>
+<p>A schedule may also set <code>history:</code> to override the project’s <a href="#retention">retention</a> for its own run history — worth doing for a wide fan-out, which writes one run row per item per fire. It takes either the shorthand <code>history: failures-only</code> (a successful run then never persists at all), or an object with <code>mode</code>, <code>success</code> and <code>failed</code>.</p>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-amber-500/20 bg-amber-500/[0.07]"> <div class="shrink-0 mt-0.5 text-amber-500"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-amber-200/70"> <strong class="block mb-1 text-sm font-medium text-amber-500">Warning</strong> <p><code>forEach.key</code> must be unique per row. The run id is derived from it, so two rows producing the same key collide and only the first spawns; a <code>key</code> naming a field the rows don’t have collapses the whole fan-out onto one run. The scheduler records this on the schedule, visible in <code>spky schedules list</code>.</p> </div> </div>
+<p>A workflow is a DAG: steps with no <code>dependsOn</code> are roots and run in parallel, a step with several dependencies is a fan-in join, and each step receives its dependencies’ response bodies under <code>payload.steps</code>. See <a href="/docs/jobs/schedules">Schedules</a> and <a href="/docs/jobs/workflows">Workflows</a> for the full behaviour and the <code>spky schedules</code> / <code>spky workflows</code> commands.</p>
+<p>Either section can also live in its own file, per entry or wholesale, useful once you have more than a handful:</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="schedules: ./schedules.yml            # the whole map lives in that file
+
+workflows:
+  monthly-report: ./workflows/monthly-report.yml   # one definition per file
+  quick-one: { steps: { ping: { backend: api, route: /ping } } }   # mixing is fine"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">schedules</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./schedules.yml</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">            # the whole map lives in that file</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">workflows</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  monthly-report</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./workflows/monthly-report.yml</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">   # one definition per file</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  quick-one</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">steps</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">ping</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">backend</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">api</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">route</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/ping</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> } } }   </span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># mixing is fine</span></span></code></pre> </div> </div> </div> 
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">Note</strong> <p><code>spky lint</code> parses every cron expression, checks each interval, resolves each <code>backend</code> and <code>route</code> against that app’s OpenAPI spec, and rejects a workflow whose <code>dependsOn</code> edges form a cycle, so a definition that lints is one the scheduler can actually run.</p> </div> </div>
+<h2 id="web-push">Web Push</h2>
+<p><code>push</code> declares rules of the form “when a row of this table looks like this, push to the users in that field”. Browsers subscribe through <code>db.webPush</code> in the client, iOS and Android apps through the <code>spooky_push</code> Flutter plugin once <code>apns</code> / <code>fcm</code> are set (<a href="/docs/client/native-push">Native push</a>), and the platform delivers: no app backend, no push library, no key management. The VAPID key is derived from <code>SPKY_AUTH_SECRET</code> (or taken from <code>SPKY_VAPID_PRIVATE_KEY</code>); <code>SPKY_PUSH=off</code> turns push off. The scheduler runs the engine in <code>cluster</code> mode, the SSP in <code>singlenode</code>; <code>surrealism</code> has no push host. Subscribing and the service worker side are in <a href="/docs/client/push-notifications">Push notifications</a>.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="push:
+  subject: mailto:ops@example.com
+  defaults:
+    ttl: 1d
+    notification: { icon: /icon-192.png, badge: /badge-72.png }
+  rules:
+    # A content push: the notification is rendered on the server.
+    new-message:
+      table: message
+      on: [create]
+      when: { kind: text }
+      to: recipient                    # a record<user> field
+      except: sender
+      topic: &#34;dm:{{conversation | key}}&#34;
+      throttle: 30s                    # a burst becomes one push, then a trailing one
+      with:
+        sender: SELECT username FROM ONLY $row.sender
+      notification:
+        title: &#34;{{sender.username}}&#34;
+        body: &#34;{{text | truncate(120)}}&#34;
+        url: &#34;/messages/{{conversation | key}}&#34;
+      data: [conversation]"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">push</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  subject</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">mailto:ops@example.com</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  defaults</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    ttl</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">1d</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    notification</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">icon</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/icon-192.png</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">badge</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/badge-72.png</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  rules</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # A content push: the notification is rendered on the server.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    new-message</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      table</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">message</span></span>
+<span class="line"><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">      on</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">create</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      when</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">kind</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">text</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      to</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">recipient</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                    # a record&#x3C;user> field</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      except</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">sender</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      topic</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"dm:{{conversation | key}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      throttle</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">30s</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                    # a burst becomes one push, then a trailing one</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      with</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        sender</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">SELECT username FROM ONLY $row.sender</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      notification</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        title</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"{{sender.username}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        body</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"{{text | truncate(120)}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        url</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"/messages/{{conversation | key}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      data</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">conversation</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]</span></span></code></pre> </div> </div> </div> 
+<p>Without a <code>push</code> block, push is on with no rules: direct pushes (a <code>_00_push_message</code> row, <code>db.webPush.notify()</code>, <code>spky push send</code>) still work. The block may also be a path to a YAML file holding it, <code>push: ./push.yml</code>.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Master switch. <code>false</code> stops every rule and every direct push; subscriptions are kept.</td></tr><tr><td><code>subject</code></td><td><code>mailto:</code> or <code>https:</code> URI</td><td><code>https://sp00ky.cloud</code></td><td>The VAPID contact the push services can reach about your pushes. Apple and Mozilla want one of yours.</td></tr><tr><td><code>defaults</code></td><td>object</td><td>(none)</td><td><code>ttl</code>, <code>urgency</code>, <code>throttle</code> and <code>notification</code>, applied to every rule unless it sets its own. <code>defaults.notification</code> (an <code>icon</code>, a <code>badge</code>, a <code>lang</code>) is merged under each rule’s notification, the rule’s keys winning.</td></tr><tr><td><code>limits.perUserPerMinute</code></td><td>integer</td><td><code>60</code></td><td>Pushes one user may receive per minute, counted once per matched recipient, not per device.</td></tr><tr><td><code>limits.perMinute</code></td><td>integer</td><td><code>6000</code></td><td>Pushes the whole project may send per minute, one per subscription.</td></tr><tr><td><code>limits.maxRecipients</code></td><td>integer</td><td><code>10000</code></td><td>Recipients one matched row may fan out to.</td></tr><tr><td><code>rules</code></td><td>map</td><td><code>{}</code></td><td>Rules keyed by name (letters, digits, <code>-</code>, <code>_</code>, <code>.</code>). The name travels in every push and is what a device filters on.</td></tr><tr><td><code>apns</code></td><td>object</td><td>(none)</td><td>iOS delivery through APNs, see <a href="#native-providers">Native providers</a>.</td></tr><tr><td><code>fcm</code></td><td>object</td><td>(none)</td><td>Android (and FCM-registered iOS) delivery through FCM, see <a href="#native-providers">Native providers</a>.</td></tr></tbody></table>
+<p><code>defaults</code> also takes <code>native</code> (merged under every rule’s <code>native</code> block).</p>
+<p>Over a limit a push is dropped and counted, and the engine warns at most once a minute.</p>
+<h3 id="rules">Rules</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Purpose</th></tr></thead><tbody><tr><td><code>table</code></td><td>table name</td><td>(required)</td><td>The synced table whose rows the rule watches. A <code>-- @nosync</code> table never reaches the engine, and <code>_00_</code> platform tables cannot be watched.</td></tr><tr><td><code>on</code></td><td><code>create</code> | <code>update</code> | <code>delete</code> list</td><td><code>[create]</code></td><td>Which operations. A <code>delete</code> sees the row as it was before the delete.</td></tr><tr><td><code>when</code></td><td>map</td><td>(none)</td><td>Conditions on the row after the change, keyed by field path (<code>data.kind</code>). All must hold. See <a href="#conditions">Conditions</a>.</td></tr><tr><td><code>to</code></td><td>field path(s) | <code>{ query }</code></td><td>(required)</td><td>Who receives it: one field (<code>recipient</code>), several (<code>[owner, assignee]</code>), or a root SurrealQL query with <code>$row</code> bound. A value may be a record id, its string form, an array of either, or rows with an <code>id</code>.</td></tr><tr><td><code>except</code></td><td>field path(s)</td><td>(none)</td><td>Users removed from the recipients, typically the author of the change.</td></tr><tr><td><code>once</code></td><td>field path list</td><td>once per record version</td><td>Push at most once per record for each distinct combination of these fields’ values: <code>once: [state]</code> pushes when a row reaches <code>ready</code>, not on every later update while it stays <code>ready</code>.</td></tr><tr><td><code>topic</code></td><td>template</td><td>the record id</td><td>Collapse key. An undelivered push is replaced at the push service by a newer one with the same topic, the service worker uses it as the notification <code>tag</code>, and throttling is per rule, recipient and topic.</td></tr><tr><td><code>throttle</code></td><td>duration</td><td>(none)</td><td>Minimum gap between two pushes of this rule to one recipient under one topic. Changes inside the gap collapse into one trailing push carrying the latest row, sent when the gap ends.</td></tr><tr><td><code>maxAge</code></td><td><code>{ field, within }</code></td><td>(none)</td><td>Ignore rows older than <code>within</code>, judged by <code>field</code> (a datetime, or epoch milliseconds or seconds). Keeps a backfill or an import from paging everyone.</td></tr><tr><td><code>with</code></td><td>map of SurrealQL</td><td>(none)</td><td>Extra template context: one root query per name, with <code>$row</code> and <code>$rule</code> bound, run only when the rule matched. A name wins over a row field of the same name.</td></tr><tr><td><code>notification</code></td><td>object</td><td>(none: a nudge)</td><td>What the device shows: <code>title</code>, <code>body</code>, <code>icon</code>, <code>badge</code>, <code>image</code>, <code>tag</code>, <code>url</code> (opened on click), <code>lang</code>, <code>dir</code>, <code>requireInteraction</code>, <code>renotify</code>, <code>silent</code>, <code>actions</code> (<code>{ action, title, icon }</code>), <code>data</code>. Any other key passes through to <code>showNotification</code>. Every string is a template.</td></tr><tr><td><code>data</code></td><td>field list | map of templates</td><td>(none)</td><td><code>payload.data</code> for the service worker: row fields to copy, or named templates. Sent with nudges too.</td></tr><tr><td><code>urgency</code></td><td><code>very-low</code> | <code>low</code> | <code>normal</code> | <code>high</code></td><td>(push service default)</td><td>How eagerly a sleeping device is woken for it.</td></tr><tr><td><code>ttl</code></td><td>duration</td><td><code>1d</code></td><td>How long the push service keeps a push for a device that is offline.</td></tr><tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Switch one rule off without deleting it.</td></tr><tr><td><code>platforms</code></td><td><code>web</code> | <code>ios</code> | <code>android</code> list</td><td>every kind</td><td>Which kinds of device receive it.</td></tr><tr><td><code>native</code></td><td><code>{ notification, apns, android }</code></td><td>(none)</td><td>What iOS and Android show. <code>notification</code> overrides the rule’s <code>notification</code> key by key; <code>apns</code> sets <code>aps</code> keys (<code>sound</code>, <code>badge</code>, <code>category</code>, <code>threadId</code>, <code>interruptionLevel</code>, <code>relevanceScore</code>, <code>mutableContent</code>, anything else as written); <code>android</code> sets <code>android.notification</code> keys (<code>channelId</code>, <code>sound</code>, <code>icon</code>, <code>color</code>, anything else as written) and <code>priority</code> (<code>high</code> | <code>normal</code>). A rule with no notification anywhere is a silent push on phones.</td></tr></tbody></table>
+<p>Durations are <code>500ms</code>, <code>30s</code>, <code>10m</code>, <code>1h30m</code>, <code>2d</code>, <code>1w</code>, or a plain number of seconds.</p>
+<p>A rule without <code>notification</code> sends a <strong>nudge</strong>: a push with no visible content that wakes the app’s service worker, which renders the notification from its own live data (and the client decides what to show). A matching row pushes to every enabled subscription of every recipient; whether the user is currently looking at the app is the service worker’s call (it can suppress the notification when a visible window exists), because the server cannot know.</p>
+<h4 id="conditions">Conditions</h4>
+<p>A key of <code>when</code> is a field path, its value one of:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Form</th><th>Meaning</th></tr></thead><tbody><tr><td><code>state: ready</code>, <code>count: 3</code>, <code>muted: false</code>, <code>deleted_at: null</code></td><td>Equal to.</td></tr><tr><td><code>state: [ready, urgent]</code></td><td>One of.</td></tr><tr><td><code>count: { gte: 2, lt: 10 }</code></td><td>Operators, all of which must hold: <code>eq</code>, <code>ne</code>, <code>in</code>, <code>nin</code>, <code>gt</code>, <code>gte</code>, <code>lt</code>, <code>lte</code> (numbers, or strings compared as strings), <code>exists</code> (<code>true</code>: present and not null), <code>contains</code> (array element or substring), <code>startsWith</code>.</td></tr></tbody></table>
+<h4 id="templates">Templates</h4>
+<p><code>topic</code>, every string in <code>notification</code> and the values of a <code>data</code> map are templates: <code>{{ path | filter }}</code> over the row’s fields (also under <code>row</code>), <code>id</code>, <code>table</code>, <code>op</code>, <code>rule</code>, each <code>with</code> name, <code>recipient</code> (the user being rendered for) and <code>now</code>. A missing path renders empty. Filters: <code>default(x)</code>, <code>truncate(n)</code>, <code>upper</code>, <code>lower</code>, <code>trim</code>, <code>key</code> (<code>user:abc</code> to <code>abc</code>), <code>table</code>, <code>json</code>, <code>len</code>, <code>join(sep)</code>, <code>first</code>, <code>last</code>, <code>date(format)</code>. In <code>data</code>, a value that is exactly one <code>{{ expr }}</code> keeps its JSON type.</p>
+<h4 id="native-providers">Native providers</h4>
+<p><code>apns</code> and <code>fcm</code> turn on delivery to native apps. Their secrets are references the CLI resolves at every migrate and deploy: <code>{ vault: KEY }</code> (the project vault, recommended), <code>{ env: KEY }</code>, <code>{ file: path }</code> (relative to <code>sp00ky.yml</code>), or an inline string (<code>spky lint</code> warns: it is committed). The resolved secret is checked and stored in the root-only <code>_00_push_credential</code> table; <code>_00_push_config</code> holds the block with the secrets redacted. A reference that does not resolve on the machine running the deploy keeps the stored credential; removing the block removes it. The engine reloads credentials with the config, so a rotated key needs no restart.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Field</th><th>Type</th><th>Purpose</th></tr></thead><tbody><tr><td><code>apns.teamId</code></td><td>10 characters</td><td>Apple Developer team id.</td></tr><tr><td><code>apns.keyId</code></td><td>10 characters</td><td>Id of the APNs auth key.</td></tr><tr><td><code>apns.key</code></td><td>secret</td><td>The <code>.p8</code> key (PEM).</td></tr><tr><td><code>apns.bundleIds</code></td><td>list</td><td>Bundle ids devices may register with (the APNs topic). Empty: any.</td></tr><tr><td><code>fcm.serviceAccount</code></td><td>secret</td><td>The Firebase service account JSON.</td></tr><tr><td><code>fcm.android</code></td><td><code>{ projectId, appId, apiKey, senderId }</code></td><td>The Android app’s Firebase client config (from <code>google-services.json</code>: <code>project_id</code>, <code>mobilesdk_app_id</code>, <code>current_key</code>, <code>project_number</code>). Not secret: apps read it through <code>fn::push::info()</code> and ship no <code>google-services.json</code>.</td></tr></tbody></table>
+<h4 id="more-rules">More rules</h4>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="push:
+  limits: { perUserPerMinute: 30 }
+  rules:
+    # A nudge: no notification, the app's service worker renders from its own data.
+    inbox-changed:
+      table: message
+      to: recipient
+      topic: inbox
+      urgency: high
+
+    # Fan-out: every member of the club, except the author.
+    club-post:
+      table: post
+      to:
+        query: SELECT VALUE user FROM member WHERE club = $row.club
+      except: author
+      notification:
+        title: &#34;New post in {{club_name}}&#34;
+        body: &#34;{{title}}&#34;
+        url: &#34;/clubs/{{club | key}}&#34;
+      with:
+        club_name: SELECT VALUE name FROM ONLY $row.club
+
+    # Once per state transition, only for fresh rows.
+    order-ready:
+      table: order
+      on: [create, update]
+      when:
+        state: ready
+        total: { gt: 0 }
+      once: [state]                    # not again while it stays ready
+      maxAge: { field: updated_at, within: 10m }
+      to: customer
+      notification:
+        title: Your order is ready
+        tag: &#34;order-{{id | key}}&#34;
+        requireInteraction: true
+        actions: [{ action: open, title: Open }]
+
+# Or keep the whole block in its own file:
+# push: ./push.yml"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">push</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  limits</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">perUserPerMinute</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">30</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  rules</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # A nudge: no notification, the app's service worker renders from its own data.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    inbox-changed</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      table</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">message</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      to</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">recipient</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      topic</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">inbox</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      urgency</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">high</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # Fan-out: every member of the club, except the author.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    club-post</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      table</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">post</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      to</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        query</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">SELECT VALUE user FROM member WHERE club = $row.club</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      except</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">author</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      notification</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        title</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"New post in {{club_name}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        body</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"{{title}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        url</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"/clubs/{{club | key}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      with</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        club_name</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">SELECT VALUE name FROM ONLY $row.club</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # Once per state transition, only for fresh rows.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    order-ready</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      table</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">order</span></span>
+<span class="line"><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">      on</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">create</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">update</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      when</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        state</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">ready</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        total</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">gt</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">0</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      once</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">state</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]                    </span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># not again while it stays ready</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      maxAge</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">field</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">updated_at</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">within</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">10m</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      to</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">customer</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      notification</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        title</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">Your order is ready</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        tag</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">"order-{{id | key}}"</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        requireInteraction</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">true</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        actions</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [{ </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">action</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">open</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">title</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">Open</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }]</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># Or keep the whole block in its own file:</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># push: ./push.yml</span></span></code></pre> </div> </div> </div> 
+<p>What a deploy does with it: <code>spky migrate</code> and <code>spky deploy</code> store the block, normalized, in <code>_00_push_config:default</code> (unchanged blocks are not rewritten), and the engine picks it up within 30 seconds, no restart. A block that fails validation is not stored and the previous rules stay. <code>spky lint</code> checks every rule, including against your schema: a table that does not exist or is <code>@nosync</code>, a field path the table does not define, and a field that is <code>@opaque</code>, <code>@crdt</code> or <code>@nosync</code> (stripped from what the engine sees) are reported. <code>spky push sync</code> stores the block (and the native credentials) without a deploy, and <code>spky push status</code> shows what is stored, each native provider included. See <a href="/docs/reference/cli#web-push"><code>spky push</code></a>.</p>
+<h2 id="machine-pools">Machine pools</h2>
+<p><code>pools</code> declares machines that exist only while a backend has work: a pool is sized by the scheduler and its machines are created and destroyed on demand. A backend opts in with <code>runOn: { pool: &lt;name&gt; }</code>, and its outbox jobs then run on the pool’s machines instead of on an always-on container.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="mode: cluster
+
+pools:
+  render:
+    provider: hetzner                 # hetzner (Sp00ky Cloud) | docker (local, self-hosted)
+    machine: { type: cx33, fallbackTypes: [ccx23], locations: [fsn1, nbg1] }
+    slots: 1                          # jobs per machine at once
+    min: 0                            # machines that always run
+    autoscale: true
+    max: 2                            # required with autoscale
+    buffer: 0                         # ready machines kept above what is in use
+    idleTimeout: 10m
+    recycle: job                      # restart the backend between jobs (or: never)
+    maxJobDuration: 8h
+    maxLifetime: 24h
+    lease: 90s
+    bootTimeout: 5m
+
+apps:
+  renderer:
+    type: backend
+    runOn: { pool: render }
+    # ...spec, baseUrl, method (an outbox table) and deploy as usual"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">mode</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">cluster</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">pools</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  render</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    provider</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">hetzner</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                 # hetzner (Sp00ky Cloud) | docker (local, self-hosted)</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    machine</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">cx33</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">fallbackTypes</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">ccx23</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">], </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">locations</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">fsn1</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">nbg1</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">] }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    slots</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">1</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                          # jobs per machine at once</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    min</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">0</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                            # machines that always run</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    autoscale</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">true</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    max</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">2</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                            # required with autoscale</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    buffer</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">0</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                         # ready machines kept above what is in use</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    idleTimeout</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">10m</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    recycle</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">job</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                      # restart the backend between jobs (or: never)</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    maxJobDuration</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">8h</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    maxLifetime</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">24h</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    lease</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">90s</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    bootTimeout</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">5m</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">apps</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  renderer</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">backend</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    runOn</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">pool</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">render</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # ...spec, baseUrl, method (an outbox table) and deploy as usual</span></span></code></pre> </div> </div> </div> 
+<p>A pool is fixed (<code>autoscale: false</code>, exactly <code>min</code> machines), scales on demand up to <code>max</code>, or keeps a warm <code>buffer</code> of ready machines above what is in use. <code>provider</code> is <code>hetzner</code> for VMs on Sp00ky Cloud; <code>spky dev</code> always runs pools as local containers (<code>docker</code>). Each pool serves exactly one backend, and pools need <code>mode: cluster</code>. The full behaviour, every field with its default, and how to operate a pool are in <a href="/docs/jobs/machine-pools">Machine pools</a>.</p>
+<h2 id="dedicated-machines">Dedicated machines</h2>
+<p><code>machines</code> declares Hetzner VMs for always-on backends, one or several per machine. A backend opts in with <code>runOn: { machine: &lt;name&gt; }</code>; Sp00ky Cloud then creates the VM, updates each backend on it in place when it is deployed (the others and the machine’s address stay as they are), replaces the VM when its type or locations change or it dies, and proxies traffic to the backends, so <code>deploy.expose</code> and <code>spky domain add --app</code> work exactly as for any backend.</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="machines:
+  api-box:
+    provider: hetzner                 # the only provider
+    type: cx33                        # Hetzner server type
+    locations: [fsn1, nbg1]           # tried in order
+
+apps:
+  api:
+    type: backend
+    runOn: { machine: api-box }
+    deploy:
+      dockerfile: ./api/Dockerfile
+      port: 8080
+      healthcheck: /health            # required: probed before traffic is sent
+      expose: true                    # https://<slug>-api.<domain>
+    # ...spec, baseUrl and method (if it takes jobs) as usual"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">machines</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  api-box</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    provider</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">hetzner</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                 # the only provider</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">cx33</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                        # Hetzner server type</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    locations</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: [</span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">fsn1</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">, </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">nbg1</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">]           </span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># tried in order</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">apps</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  api</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    type</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">backend</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    runOn</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: { </span><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">machine</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">api-box</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8"> }</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    deploy</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      dockerfile</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">./api/Dockerfile</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      port</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">8080</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      healthcheck</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">/health</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">            # required: probed before traffic is sent</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      expose</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF">true</span><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">                    # https://&#x3C;slug>-api.&#x3C;domain></span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">    # ...spec, baseUrl and method (if it takes jobs) as usual</span></span></code></pre> </div> </div> </div> 
+<p>Each backend on a machine needs <code>deploy.port</code> and <code>deploy.healthcheck</code> and must be <code>hosting: cloud</code>, and no two backends on one machine may use the same port. They reach each other as <code>http://&lt;app&gt;:&lt;port&gt;</code> and get the machine’s public address as <code>SPKY_MACHINE_IP</code>. Its <code>deploy.ports</code>, if any, are raw TCP/UDP ports opened on the VM’s public address to everyone (WebRTC media, RTMP); they are not proxied. <code>spky dev</code> ignores the placement and runs the backend as an ordinary app. Everything else, from what <code>spky deploy</code> shows to how a redeploy rolls the VM, is in <a href="/docs/cloud/dedicated-machines">Dedicated machines</a>.</p>
+<h2 id="client-types">Client types</h2>
+<p><code>clientTypes</code> is a list of codegen targets; <code>spky generate</code> (run with no args) regenerates every entry from your schema. Each entry has a <code>format</code> and an <code>output</code> path (relative to <code>sp00ky.yml</code>):</p>
+<ul>
+<li><strong><code>typescript</code></strong>: the CLI’s built-in generator emits a typed schema module (e.g. <code>schema.gen.ts</code>). Three optional keys feed the <a href="#query-allowlist">query allowlist</a>:
+<ul>
+<li><code>queries</code>: path to the app’s query module (relative to <code>sp00ky.yml</code>), the file that exports the <code>q*</code> builder functions. When set, <code>spky generate</code> runs it through <code>@spooky-sync/query-allowlist</code> after the schema module is written and records the resulting SurrealQL shapes.</li>
+<li><code>allowlistOutput</code>: where the allowlist JSON goes. Defaults to <code>&lt;queries&gt;.allowlist.json</code> next to the module. Commit it; deploy reads it and does not regenerate.</li>
+<li><code>app</code>: the app name the <code>_00_query_allowlist</code> rows are keyed by. Defaults to the frontend app in <code>apps:</code>.</li>
+</ul>
+</li>
+<li><strong><code>dart</code></strong>: runs spooky_core’s richer generator (<code>dart run spooky_core:spooky_gen</code>), which emits the typed client, <code>Patch</code> classes, and <code>spookySchema</code>/<code>surqlSchema</code>. Because that tool resolves <code>spooky_core</code> from the enclosing Dart package, it runs from the package directory, <strong>auto-derived from <code>output</code>’s nearest ancestor <code>pubspec.yaml</code></strong>. Set the optional <code>workdir</code> only to override that. (This replaces a manual <code>dart run spooky_core:spooky_gen</code> / Makefile step.)</li>
+</ul>
+<p>A project can list several outputs, e.g. a TypeScript web client plus one or more Dart clients (a Flutter app, a renderer), and keep them all in sync from one command.</p>
+<h2 id="versions">Versions</h2>
+<p><code>version</code> decides which SSP and scheduler build your project runs, and Sp00ky Cloud enforces it on every deploy, from the CLI and from a git push alike. Each value is one of three policies:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Value</th><th>Policy</th><th>What a deploy does</th><th>What <code>--upgrade</code> does</th></tr></thead><tbody><tr><td>an exact version, e.g. <code>0.0.1-canary.270</code></td><td><strong>Pinned</strong></td><td>Runs exactly that version. A stack on anything else is moved to it, up or down.</td><td>Nothing. The file wins: change <code>version</code> and deploy.</td></tr><tr><td><code>newest</code></td><td><strong>Tracked</strong></td><td>Rolls the stack to the newest published build whenever there is one.</td><td>The same as any deploy.</td></tr><tr><td><code>any</code>, or no <code>version</code> at all</td><td><strong>Manual</strong></td><td>Leaves the stack alone.</td><td>Moves the stack to the newest published build.</td></tr></tbody></table>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="# Pinned: the cloud runs exactly this, and --upgrade cannot move it.
+version: 0.0.1-canary.270
+
+# Tracked: every deploy (and every git push) rolls to the newest build.
+version: newest
+
+# Manual: deploys never touch it, only --upgrade does. Same as leaving it out.
+version: any
+
+# Per service and per environment, in any combination.
+version:
+  dev: newest
+  cloud:
+    ssp: 0.0.1-canary.270
+    scheduler: 0.0.1-canary.270"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># Pinned: the cloud runs exactly this, and --upgrade cannot move it.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">version</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">0.0.1-canary.270</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># Tracked: every deploy (and every git push) rolls to the newest build.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">version</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">newest</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># Manual: deploys never touch it, only --upgrade does. Same as leaving it out.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">version</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">any</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D"># Per service and per environment, in any combination.</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">version</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  dev</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">newest</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  cloud</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    ssp</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">0.0.1-canary.270</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    scheduler</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">0.0.1-canary.270</span></span></code></pre> </div> </div> </div> 
+<p>Whatever the policy, Sp00ky Cloud records the concrete version it resolved, so a container that is recreated later for an unrelated reason (a changed env var, a crash) comes back on the version it had, not on whatever is newest by then. <code>spky status</code> prints the policy next to the running versions and warns when a pinned stack is not running its pin.</p>
+<p>A pinned version that was never published fails the deploy before anything is built. A roll restarts the scheduler and the SSPs (about a minute of sync downtime), so with <code>newest</code> every deploy can include one: pin a version when you want rolls to happen only on purpose.</p>
+<p>Under <code>spky dev</code>, an exact version is the image tag to run, <code>any</code> runs the local <code>canary</code> image (pulling it once if missing), and <code>newest</code> re-pulls <code>canary</code> on every start.</p>
+<h2 id="per-environment-overrides">Per-environment overrides</h2>
+<p><code>version</code>, <code>logLevel</code>, and <code>apps.&lt;name&gt;.env</code> each accept a <code>{dev, cloud}</code> split so your local stack can differ from what runs in Sp00ky Cloud. A common pattern is to run host-built binaries during <code>spky dev</code> and a pinned image tag in the cloud:</p>
+<div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">    <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="version:
+  dev:
+    ssp:
+      path: ../target/debug/ssp-server
+    scheduler:
+      path: ../target/debug/scheduler
+  cloud: 0.0.1-canary.270
+
+logLevel:
+  dev: trace
+  cloud: info
+
+apps:
+  api:
+    env:
+      dev: '.env.local'
+      cloud:
+        vault:
+          - 'API_AUTH_TOKEN'"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path> </svg> <svg class="check-icon w-4 h-4 hidden text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path> </svg> </button>  <div class="code-content px-4 pb-4 text-sm font-mono leading-relaxed overflow-x-auto custom-scrollbar pt-4">  <pre class="astro-code astro-code-themes github-light github-dark" style="--shiki-light:#24292e;--shiki-dark:#e1e4e8;--shiki-light-bg:#fff;--shiki-dark-bg:#24292e; overflow-x: auto;" tabindex="0" data-language="yaml"><code><span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">version</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  dev</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    ssp</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      path</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">../target/debug/ssp-server</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    scheduler</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      path</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">../target/debug/scheduler</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  cloud</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">0.0.1-canary.270</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">logLevel</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  dev</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">trace</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  cloud</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">info</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">apps</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">  api</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">    env</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      dev</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">: </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'.env.local'</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">      cloud</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#22863A;--shiki-dark:#85E89D">        vault</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">:</span></span>
+<span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">          - </span><span style="--shiki-light:#032F62;--shiki-dark:#9ECBFF">'API_AUTH_TOKEN'</span></span></code></pre> </div> </div> </div>  <nav class="not-prose mt-16 grid gap-3 border-t border-white/[0.08] pt-8 sm:grid-cols-2" aria-label="Page navigation"><a href="/pr-preview/pr-48/docs/reference/cli" rel="prev" class="group flex items-center gap-3 rounded-glass border border-white/[0.08] bg-white/[0.03] p-4 no-underline shadow-glass-inset transition-colors duration-200 hover:border-brand-400/30 hover:bg-white/[0.06]"><svg class="h-4 w-4 shrink-0 text-text-muted transition-all duration-200 group-hover:-translate-x-0.5 group-hover:text-brand-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5M11 18l-6-6 6-6"></path></svg><span class="min-w-0"><span class="block text-[11px] font-medium uppercase tracking-wider text-text-muted">
+Previous
+</span><span class="block truncate text-sm font-medium text-text-primary">CLI</span></span></a><a href="/pr-preview/pr-48/docs/reference/client-config" rel="next" class="group flex items-center justify-end gap-3 rounded-glass border border-white/[0.08] bg-white/[0.03] p-4 text-right no-underline shadow-glass-inset transition-colors duration-200 hover:border-brand-400/30 hover:bg-white/[0.06]"><span class="min-w-0"><span class="block text-[11px] font-medium uppercase tracking-wider text-text-muted">
+Next
+</span><span class="block truncate text-sm font-medium text-text-primary">Client config</span></span><svg class="h-4 w-4 shrink-0 text-text-muted transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-brand-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a></nav> </div> </main> <aside class="docs-rail hidden xl:block w-[248px] shrink-0"> <div class="docs-rail-scroll pt-8 pb-16 pl-2 pr-6" data-toc-scroller> <nav class="docs-toc" aria-labelledby="docs-toc-title" data-toc><p id="docs-toc-title" class="docs-toc-title">
+On this page
+</p><div class="docs-toc-track"><span class="docs-toc-indicator" data-toc-indicator aria-hidden="true"></span><ul><li><a href="#minimal-example" class="docs-toc-link" data-toc-link="minimal-example">Minimal example</a></li><li><a href="#top-level-settings" class="docs-toc-link" data-toc-link="top-level-settings">Top-level settings</a></li><li><a href="#apps" class="docs-toc-link" data-toc-link="apps">Apps</a></li><li><a href="#sync-transport" class="docs-toc-link" data-toc-link="sync-transport">Sync transport</a></li><li><a href="#query-allowlist" class="docs-toc-link" data-toc-link="query-allowlist">Query allowlist</a></li><li><a href="#impersonation" class="docs-toc-link" data-toc-link="impersonation">Impersonation</a></li><li><a href="#retention" class="docs-toc-link" data-toc-link="retention">Retention</a></li><li><a href="#schedules-and-workflows" class="docs-toc-link" data-toc-link="schedules-and-workflows">Schedules and workflows</a></li><li><a href="#web-push" class="docs-toc-link" data-toc-link="web-push">Web Push</a></li><li><a href="#rules" class="docs-toc-link docs-toc-link-nested" data-toc-link="rules">Rules</a></li><li><a href="#machine-pools" class="docs-toc-link" data-toc-link="machine-pools">Machine pools</a></li><li><a href="#dedicated-machines" class="docs-toc-link" data-toc-link="dedicated-machines">Dedicated machines</a></li><li><a href="#client-types" class="docs-toc-link" data-toc-link="client-types">Client types</a></li><li><a href="#versions" class="docs-toc-link" data-toc-link="versions">Versions</a></li><li><a href="#per-environment-overrides" class="docs-toc-link" data-toc-link="per-environment-overrides">Per-environment overrides</a></li></ul></div><button type="button" class="docs-toc-top" data-toc-top hidden><svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"></path></svg>
+Back to top
+</button></nav><script type="module">let p;function B(){p?.(),p=void 0;const n=document.querySelector("[data-toc]");if(!n)return;const i=n.querySelector("[data-toc-indicator]"),u=n.querySelector("[data-toc-top]"),m=n.closest("[data-toc-scroller]"),l=[...n.querySelectorAll("[data-toc-link]")].map(t=>({link:t,heading:document.getElementById(t.dataset.tocLink??"")})).filter(t=>!!t.heading);if(l.length===0)return;const f=window.matchMedia("(prefers-reduced-motion: reduce)").matches;let w=null,r=null,c,a=0;function h(t){if(t!==w&&(w?.removeAttribute("aria-current"),w=t,!!i)){if(!t){i.style.opacity="0";return}t.setAttribute("aria-current","location"),i.style.opacity="1",i.style.transform=`translateY(${t.offsetTop}px)`,i.style.height=`${t.offsetHeight}px`,v(t)}}function v(t){if(!m)return;const e=t.getBoundingClientRect(),o=m.getBoundingClientRect(),d=64;e.top>=o.top+d&&e.bottom<=o.bottom-d||m.scrollBy({top:e.top-o.top-o.height/3,behavior:f?"auto":"smooth"})}function g(){if(a=0,u&&(u.hidden=window.scrollY<window.innerHeight*.6),r)return;if(window.innerHeight+window.scrollY>=document.documentElement.scrollHeight-4){h(l[l.length-1].link);return}let e=null;for(const{link:o,heading:d}of l){if(d.getBoundingClientRect().top-96>1)break;e=o}h(e)}function s(){r&&(window.clearTimeout(c),c=window.setTimeout(()=>{r=null},150)),a||(a=requestAnimationFrame(g))}function y(t){const e=t.target.closest("[data-toc-link]"),o=e&&document.getElementById(e.dataset.tocLink??"");!e||!o||(t.preventDefault(),r=e,h(e),history.pushState(history.state,"",`#${o.id}`),o.scrollIntoView({behavior:f?"auto":"smooth",block:"start"}),window.clearTimeout(c),c=window.setTimeout(()=>{r=null},1e3))}function E(){window.scrollTo({top:0,behavior:f?"auto":"smooth"}),history.replaceState(history.state,"",location.pathname+location.search)}window.addEventListener("scroll",s,{passive:!0}),window.addEventListener("resize",s,{passive:!0}),n.addEventListener("click",y),u?.addEventListener("click",E),g(),p=()=>{window.removeEventListener("scroll",s),window.removeEventListener("resize",s),window.clearTimeout(c),a&&cancelAnimationFrame(a)}}document.addEventListener("astro:page-load",B);</script> </div> </aside> <!-- Mobile Menu Overlay --> <div id="mobile-menu" class="fixed inset-x-0 bottom-0 top-16 z-40 bg-black/50 backdrop-blur-md lg:hidden hidden"> <div class="h-full w-[85%] max-w-[320px] overflow-y-auto overscroll-contain border-r border-white/[0.08] bg-[#0c0c0e] px-6 pb-12 pt-4 shadow-glass-lg [scrollbar-width:none]"> <div class="flex justify-end mb-2 -mr-2"> <button id="mobile-menu-close" aria-label="Close menu" class="p-2 text-text-muted hover:text-text-primary hover:bg-white/[0.06] rounded-lg transition-colors"> <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"> <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path> </svg> </button> </div> <nav class="docs-sidebar" aria-label="Documentation"> <section class="docs-sidebar-group"> <p class="docs-sidebar-title">Start here</p> <ul> <li> <a href="/pr-preview/pr-48/docs" class="docs-sidebar-link"> <span class="truncate">Introduction</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/quickstart" class="docs-sidebar-link"> <span class="truncate">Quickstart</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/how-it-works" class="docs-sidebar-link"> <span class="truncate">How it works</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/install" class="docs-sidebar-link"> <span class="truncate">Installation</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Schema</p> <ul> <li> <a href="/pr-preview/pr-48/docs/schema" class="docs-sidebar-link"> <span class="truncate">Define your schema</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/relationships" class="docs-sidebar-link"> <span class="truncate">Relationships</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/generated-types" class="docs-sidebar-link"> <span class="truncate">Generated types</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/schema/migrations" class="docs-sidebar-link"> <span class="truncate">Migrations</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Client SDK</p> <ul> <li> <a href="/pr-preview/pr-48/docs/client/queries" class="docs-sidebar-link"> <span class="truncate">Reactive queries</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/pagination" class="docs-sidebar-link"> <span class="truncate">Pagination</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/mutations" class="docs-sidebar-link"> <span class="truncate">Mutations</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/auth" class="docs-sidebar-link"> <span class="truncate">Authentication</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/offline-sync" class="docs-sidebar-link"> <span class="truncate">Offline &amp; sync health</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/query-allowlist" class="docs-sidebar-link"> <span class="truncate">Query allowlist</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/feature-flags" class="docs-sidebar-link"> <span class="truncate">Feature flags</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/push-notifications" class="docs-sidebar-link"> <span class="truncate">Push notifications</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/native-push" class="docs-sidebar-link"> <span class="truncate">Native push (iOS, Android)</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/impersonation" class="docs-sidebar-link"> <span class="truncate">Admin impersonation</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/client/buckets" class="docs-sidebar-link"> <span class="truncate">File buckets</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/client/crdt" class="docs-sidebar-link"> <span class="truncate">CRDT fields</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Framework guides</p> <ul> <li> <a href="/pr-preview/pr-48/docs/guide/solid" class="docs-sidebar-link"> <span class="truncate">SolidJS</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/solid2" class="docs-sidebar-link"> <span class="truncate">Solid 2 (RC)</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/flutter" class="docs-sidebar-link"> <span class="truncate">Flutter</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/guide/vanilla" class="docs-sidebar-link"> <span class="truncate">Vanilla JS / TS</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Backends</p> <ul> <li> <a href="/pr-preview/pr-48/docs/backend" class="docs-sidebar-link"> <span class="truncate">What is a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/add" class="docs-sidebar-link"> <span class="truncate">Add a backend</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/backend/options" class="docs-sidebar-link"> <span class="truncate">Backend options</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Background jobs</p> <ul> <li> <a href="/pr-preview/pr-48/docs/jobs" class="docs-sidebar-link"> <span class="truncate">Jobs</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/schedules" class="docs-sidebar-link"> <span class="truncate">Schedules</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/workflows" class="docs-sidebar-link"> <span class="truncate">Workflows</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/jobs/machine-pools" class="docs-sidebar-link"> <span class="truncate">Machine pools</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Local development</p> <ul> <li> <a href="/pr-preview/pr-48/docs/dev" class="docs-sidebar-link"> <span class="truncate">spky dev</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/servers" class="docs-sidebar-link"> <span class="truncate">Dev servers &amp; sidecars</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/env" class="docs-sidebar-link"> <span class="truncate">Environment variables</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/dev/doctor" class="docs-sidebar-link"> <span class="truncate">Doctor &amp; troubleshooting</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/devtools" class="docs-sidebar-link"> <span class="truncate">DevTools extension</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Deploy</p> <ul> <li> <a href="/pr-preview/pr-48/docs/cloud/getting-started" class="docs-sidebar-link"> <span class="truncate">Getting started</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/deploying" class="docs-sidebar-link"> <span class="truncate">Deploying</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/dedicated-machines" class="docs-sidebar-link"> <span class="truncate">Dedicated machines</span> <svg class="docs-sidebar-experimental" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" role="img" aria-label="Experimental"> <title>Experimental</title> <path d="M9 3h6"></path> <path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.7 3h11.6a2 2 0 0 0 1.7-3L14 9.5V3"></path> <path d="M7 14h10"></path> </svg> </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/env-variables" class="docs-sidebar-link"> <span class="truncate">Environment &amp; vault</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/logs" class="docs-sidebar-link"> <span class="truncate">Logs &amp; monitoring</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/backups" class="docs-sidebar-link"> <span class="truncate">Backups</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/ci-cd" class="docs-sidebar-link"> <span class="truncate">CI/CD</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/cloud/team" class="docs-sidebar-link"> <span class="truncate">Teams</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/self-hosting" class="docs-sidebar-link"> <span class="truncate">Self-hosting</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Operations</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/admin-dashboard" class="docs-sidebar-link"> <span class="truncate">Admin dashboard</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/mcp" class="docs-sidebar-link"> <span class="truncate">MCP server</span>  </a> </li> </ul> </section><section class="docs-sidebar-group"> <p class="docs-sidebar-title">Reference</p> <ul> <li> <a href="/pr-preview/pr-48/docs/reference/cli" class="docs-sidebar-link"> <span class="truncate">CLI</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/config" class="docs-sidebar-link" aria-current="page" data-sidebar-active> <span class="truncate">sp00ky.yml</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/client-config" class="docs-sidebar-link"> <span class="truncate">Client config</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ai-agents" class="docs-sidebar-link"> <span class="truncate">AI coding agents</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/grok-bot" class="docs-sidebar-link"> <span class="truncate">Grok Bot recipe</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/architecture" class="docs-sidebar-link"> <span class="truncate">Architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/performance" class="docs-sidebar-link"> <span class="truncate">Performance</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/vault" class="docs-sidebar-link"> <span class="truncate">Vault architecture</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/ssp-api" class="docs-sidebar-link"> <span class="truncate">SSP API</span>  </a> </li><li> <a href="/pr-preview/pr-48/docs/reference/scheduler-api" class="docs-sidebar-link"> <span class="truncate">Scheduler API</span>  </a> </li> </ul> </section> </nav> </div> </div> </div> <script type="module">let c;document.addEventListener("astro:before-swap",()=>{c=document.querySelector("[data-sidebar-scroller]")?.scrollTop});document.addEventListener("astro:page-load",()=>{const o=document.querySelector("[data-sidebar-scroller]"),i=o?.querySelector("[data-sidebar-active]");if(o&&(c!==void 0&&(o.scrollTop=c),i)){const e=o.getBoundingClientRect(),l=i.getBoundingClientRect();(l.top<e.top+32||l.bottom>e.bottom-32)&&(o.scrollTop+=l.top-e.top-e.height/2+l.height/2)}const d=document.getElementById("mobile-menu-trigger"),r=document.getElementById("mobile-menu-close"),t=document.getElementById("mobile-menu");if(!t)return;const n=e=>{t.classList.toggle("hidden",!e),document.body.style.overflow=e?"hidden":"",d?.setAttribute("aria-expanded",String(e))};n(!1),d?.addEventListener("click",()=>n(t.classList.contains("hidden"))),r?.addEventListener("click",()=>n(!1)),t.addEventListener("click",e=>{e.target===t&&n(!1)}),t.querySelectorAll("a").forEach(e=>{e.addEventListener("click",()=>n(!1))})});</script> </body> </html>

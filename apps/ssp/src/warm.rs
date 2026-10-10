@@ -1314,6 +1314,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
+    /// A FORMAT 1 file is converted at load and, although its rows did not
+    /// change, written again in this format by the next write.
+    #[tokio::test]
+    async fn a_converted_table_is_rewritten_as_format_two() {
+        use ssp::circuit::checkpoint::{legacy, peek_identity};
+        let dir = scratch_dir("legacy");
+        let processor = one_table_circuit();
+        let file = dir.join("game.rows");
+        {
+            let c = processor.read().await;
+            let mut out = std::fs::File::create(&file).unwrap();
+            legacy::write_v1(c.store.get_collection("game").unwrap(), &mut out).unwrap();
+        }
+        assert_eq!(peek_identity(&file).unwrap().format, legacy::FORMAT_V1);
+
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::Deferred, ArenaBacking::Heap);
+        let fresh = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(checkpoints.load_into(&fresh).await, 1);
+        assert!(checkpoints.take_pending().is_empty());
+        assert!(fresh.read().await.store.get_collection("game").unwrap().has_row("a"));
+        assert!(checkpoints.on_disk.lock().unwrap().is_empty(), "a converted file is not what is on disk");
+
+        checkpoints.write(&fresh, "test").await;
+        assert_eq!(peek_identity(&file).unwrap().format, ssp::circuit::checkpoint::FORMAT);
+        let rewritten = std::fs::metadata(&file).unwrap().modified().unwrap();
+        checkpoints.write(&fresh, "test").await;
+        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), rewritten, "written once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_verified_file_keeps_its_table() {
         let dir = scratch_dir("verified");

@@ -202,7 +202,7 @@ fn varint_len(v: u64) -> usize {
     n
 }
 
-fn write_varint(v: u64, out: &mut Vec<u8>) {
+pub(crate) fn write_varint(v: u64, out: &mut Vec<u8>) {
     let mut v = v;
     loop {
         let byte = (v & 0x7f) as u8;
@@ -217,7 +217,7 @@ fn write_varint(v: u64, out: &mut Vec<u8>) {
 
 /// Read a varint, returning the value and the number of bytes consumed.
 /// `None` on a truncated or over-long encoding.
-fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, byte) in bytes.iter().enumerate() {

@@ -11,7 +11,7 @@
 //! over the volume's throughput on top: the heads for a mapped load, the
 //! whole file for a verification.
 
-use ssp::circuit::checkpoint::{fresh_image_id, read_image, write_collection};
+use ssp::circuit::checkpoint::{fresh_image_id, legacy, read_image, write_collection};
 use ssp::circuit::store::{Collection, Operation};
 use ssp::types::Sp00kyValue;
 use std::io::BufWriter;
@@ -107,6 +107,21 @@ fn checkpoint_readers() {
     println!("    heads {} ms, bodies {} ms", stats.heads_ms, stats.verify_ms);
     check(&heap, &reference, &ids);
     drop(heap);
+
+    // The previous format, converted at load.
+    let v1 = dir.join("game.v1.rows");
+    let started = Instant::now();
+    {
+        let mut out = BufWriter::with_capacity(1 << 20, std::fs::File::create(&v1).unwrap());
+        legacy::write_v1(&reference, &mut out).unwrap();
+    }
+    let v1_bytes = std::fs::metadata(&v1).unwrap().len();
+    report("write_v1 (previous format)", started, v1_bytes);
+    let started = Instant::now();
+    let converted = legacy::read_v1(&std::fs::read(&v1).unwrap()).unwrap();
+    report("read_v1 (convert)", started, v1_bytes);
+    check(&converted, &reference, &ids);
+    drop(converted);
 
     #[cfg(feature = "mmap-store")]
     {

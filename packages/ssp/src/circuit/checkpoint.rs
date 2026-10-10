@@ -544,6 +544,16 @@ fn assemble(ix: Indexed, arena: Box<dyn Arena>) -> Collection {
 /// than reading them did.
 pub fn read_image(bytes: Vec<u8>) -> Result<(Collection, LoadStats), CheckpointError> {
     let started = web_time::Instant::now();
+    if parse_identity(&bytes)?.format == legacy::FORMAT_V1 {
+        let collection = legacy::read_v1(&bytes)?;
+        let stats = LoadStats {
+            bytes: bytes.len() as u64,
+            heads_ms: ms_since(started),
+            converted: true,
+            ..LoadStats::default()
+        };
+        return Ok((collection, stats));
+    }
     let ix = index_image(&bytes)?;
     let heads_ms = ms_since(started);
 
@@ -647,6 +657,22 @@ pub fn map_image(
     // it, and every writer of these files replaces them by rename, which
     // leaves the mapped inode intact.
     let map = unsafe { memmap2::Mmap::map(&file)? };
+    if parse_identity(&map)?.format == legacy::FORMAT_V1 {
+        // Converted into a fresh table of the process's own backing; the
+        // mapping goes, and the next write replaces the file.
+        let collection = legacy::read_v1(&map)?;
+        let stats = LoadStats {
+            bytes: map.len() as u64,
+            heads_ms: ms_since(started),
+            converted: true,
+            ..LoadStats::default()
+        };
+        return Ok(Mapped {
+            collection,
+            stats,
+            pending: None,
+        });
+    }
     let header = parse_header(&map)?;
     #[cfg(unix)]
     let _ = map.advise_range(memmap2::Advice::Sequential, 0, header.heads.end);
@@ -846,6 +872,137 @@ fn write_chunk<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
+// --- the previous format ---
+
+/// FORMAT 1, which every tenant's volume holds at the upgrade to FORMAT 2.
+///
+/// One region of framed records, `[u32 len][digest][rv][varint id][id]
+/// [value]`, under one blake3 trailer over the whole file. Reading it means
+/// reading it whole, which is the cost FORMAT 2 removed. It is converted
+/// rather than discarded because the alternative is paging every table
+/// through the scheduler again: four minutes on whitepawn against a
+/// five-minute bootstrap budget. The converter verifies the trailer, then
+/// re-encodes every record as head + body into a fresh table of the
+/// process's own backing, so a converted load costs what a FORMAT 1 load
+/// used to, once, and the next checkpoint write replaces the file.
+pub mod legacy {
+    use super::{invalid, write_chunk, CheckpointError, Cursor, Hashing, MAGIC};
+    use crate::circuit::row_codec::{self as codec, DIGEST_LEN};
+    use crate::circuit::store::Collection;
+    use std::io::{self, Write};
+
+    pub const FORMAT_V1: u32 = 1;
+    const RECORD_FORMAT_V1: u32 = 1;
+    const TRAILER_LEN: usize = 32;
+    const RV_OFFSET: usize = DIGEST_LEN;
+    const ID_OFFSET: usize = DIGEST_LEN + 8;
+    /// The smallest record: a digest, an rv, an empty id, one value tag; and
+    /// its length prefix.
+    const MIN_FRAMED: u64 = (ID_OFFSET + 2) as u64 + 4;
+    /// Every fixed field, an empty name, no dictionary, no rows.
+    const MIN_LEN: usize = MAGIC.len() + 4 + 4 + 4 + 32 + 4 + 8 + TRAILER_LEN;
+
+    /// Read a FORMAT 1 image into a fresh collection: the trailer verified
+    /// over the whole file, every record re-encoded as head + body.
+    pub fn read_v1(bytes: &[u8]) -> Result<Collection, CheckpointError> {
+        if bytes.len() < MIN_LEN {
+            return Err(invalid("too short to be a row checkpoint"));
+        }
+        if &bytes[..MAGIC.len()] != MAGIC {
+            return Err(invalid("not a row checkpoint"));
+        }
+        let (body, trailer) = bytes.split_at(bytes.len() - TRAILER_LEN);
+        if blake3::hash(body).as_bytes() != trailer {
+            return Err(invalid("checksum mismatch"));
+        }
+        let mut c = Cursor {
+            bytes: body,
+            at: MAGIC.len(),
+        };
+        let format = c.u32()?;
+        if format != FORMAT_V1 {
+            return Err(invalid(format!("checkpoint format {format} is not the previous one")));
+        }
+        let record_format = c.u32()?;
+        if record_format != RECORD_FORMAT_V1 {
+            return Err(invalid(format!("record format {record_format} is not the previous one")));
+        }
+        let name = c.str_chunk("table name")?;
+        let stored_xor = c.hash()?;
+        let fields = c.u32()?;
+        let mut names = Vec::with_capacity(fields.min(4096) as usize);
+        for _ in 0..fields {
+            names.push(c.str_chunk("field name")?);
+        }
+        let rows = c.u64()?;
+        if rows > (body.len() - c.at) as u64 / MIN_FRAMED {
+            return Err(invalid("declares more rows than the file holds"));
+        }
+
+        let mut coll = Collection::new(name.to_string());
+        if !coll.rows.restore_dict(names.iter().copied()) {
+            return Err(invalid("field dictionary repeats a name"));
+        }
+        coll.rows.reserve(rows as usize);
+        let mut xor = ssp_protocol::snapshot_hash::xor_empty();
+        for n in 0..rows {
+            let record = c.chunk()?;
+            let bad = || invalid(format!("record {n} has no readable id"));
+            let digest: &[u8; DIGEST_LEN] = record.get(..DIGEST_LEN).and_then(|d| d.try_into().ok()).ok_or_else(bad)?;
+            let rv = i64::from_le_bytes(record.get(RV_OFFSET..ID_OFFSET).and_then(|b| b.try_into().ok()).ok_or_else(bad)?);
+            let (id_len, n_prefix) = codec::read_varint(record.get(ID_OFFSET..).ok_or_else(bad)?).ok_or_else(bad)?;
+            let id_start = ID_OFFSET + n_prefix;
+            let id_end = usize::try_from(id_len).ok().and_then(|len| id_start.checked_add(len)).ok_or_else(bad)?;
+            let id = std::str::from_utf8(record.get(id_start..id_end).ok_or_else(bad)?).map_err(|_| bad())?;
+            let value = &record[id_end..];
+            if value.is_empty() {
+                return Err(invalid(format!("record {n} has no value")));
+            }
+            let (_, replaced) = coll.rows.insert_raw(id, digest, rv, value);
+            if replaced {
+                return Err(invalid(format!("record {n} carries an id stored twice")));
+            }
+            ssp_protocol::snapshot_hash::xor_digest(&mut xor, digest);
+        }
+        if c.at != body.len() {
+            return Err(invalid("bytes after the declared rows"));
+        }
+        if xor != stored_xor {
+            return Err(invalid("rows do not add up to the stored catch-up hash"));
+        }
+        coll.catchup_xor = xor;
+        Ok(coll)
+    }
+
+    /// The FORMAT 1 writer, byte for byte: for the fixture and the timing
+    /// harness, never for a checkpoint.
+    pub fn write_v1<W: Write>(coll: &Collection, out: W) -> io::Result<()> {
+        let mut w = Hashing::new(out);
+        w.write_all(MAGIC)?;
+        w.write_all(&FORMAT_V1.to_le_bytes())?;
+        w.write_all(&RECORD_FORMAT_V1.to_le_bytes())?;
+        write_chunk(&mut w, coll.name.as_bytes())?;
+        w.write_all(&coll.catchup_xor)?;
+        let names: Vec<&str> = coll.rows.dict().names().collect();
+        w.write_all(&(names.len() as u32).to_le_bytes())?;
+        for name in names {
+            write_chunk(&mut w, name.as_bytes())?;
+        }
+        w.write_all(&(coll.rows.records().count() as u64).to_le_bytes())?;
+        let mut record = Vec::new();
+        for (head, body) in coll.rows.records() {
+            record.clear();
+            record.extend_from_slice(&head[..codec::HEAD_BODY_REL_OFFSET]);
+            record.extend_from_slice(&head[codec::HEAD_ID_OFFSET..]);
+            record.extend_from_slice(body);
+            write_chunk(&mut w, &record)?;
+        }
+        let digest = w.take_hash();
+        w.inner.write_all(&digest)?;
+        w.inner.flush()
+    }
+}
+
 // --- store containers ---
 
 /// Magic of a whole-store snapshot: the per-table images of every collection
@@ -1003,12 +1160,12 @@ mod tests {
         rows_offset(coll) + 8 + 8 + 8
     }
 
-    /// Writes the FORMAT 1 fixture the legacy reader is tested against. Run
-    /// once, on a build whose writer still emits FORMAT 1:
-    /// `cargo test -p ssp --lib write_format_one_fixture -- --ignored`
-    #[test]
-    #[ignore = "writes the committed FORMAT 1 fixture; run on purpose"]
-    fn write_format_one_fixture() {
+    /// The FORMAT 1 fixture, written by the FORMAT 1 build's writer from
+    /// [`fixture_collection`] before the format moved.
+    const FIXTURE_V1: &[u8] = include_bytes!("testdata/rows_v1.bin");
+
+    /// The collection the fixture was written from.
+    fn fixture_collection() -> Collection {
         let mut coll = collection(&[
             ("a", json!({ "id": "game:a", "white": "x", "moves": [1, 2, 3], "_00_rv": 4 })),
             ("b", json!({ "id": "game:b", "meta": { "site": "lichess", "rated": true }, "elo": 1.5 })),
@@ -1022,9 +1179,87 @@ mod tests {
             "a",
             Sp00kyValue::from(json!({ "id": "game:a", "white": "y", "moves": [1], "_00_rv": 5 })),
         );
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/circuit/testdata/rows_v1.bin");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, bytes_of(&coll)).unwrap();
+        coll
+    }
+
+    /// `write_v1` mirrors the writer that produced the fixture: the same
+    /// header, the same length, and a file the converter reads back to the
+    /// same rows. Not byte for byte: a row's fields are interned in the
+    /// order its `HashMap` iterates, which differs per process, so the
+    /// dictionary (and the field ids inside bodies) is a permutation.
+    #[test]
+    fn the_format_one_writer_mirrors_the_fixture() {
+        let mut bytes = Vec::new();
+        legacy::write_v1(&fixture_collection(), &mut bytes).unwrap();
+        assert_eq!(bytes.len(), FIXTURE_V1.len());
+        let through_xor = 8 + 4 + 4 + 4 + "game".len() + XOR_LEN;
+        assert_eq!(&bytes[..through_xor], &FIXTURE_V1[..through_xor]);
+        let (fixture, _) = read_image(FIXTURE_V1.to_vec()).unwrap();
+        let (mirrored, _) = read_image(bytes).unwrap();
+        assert_converted(&mirrored, &fixture, "mirrored");
+    }
+
+    fn assert_converted(back: &Collection, expected: &Collection, what: &str) {
+        assert_eq!(back.name, "game", "{what}");
+        assert_eq!(back.rows.len(), expected.rows.len(), "{what}");
+        assert_eq!(back.catchup_xor, expected.catchup_xor, "{what}");
+        let mut names: Vec<&str> = back.rows.dict().names().collect();
+        let mut want: Vec<&str> = expected.rows.dict().names().collect();
+        names.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(names, want, "{what}: the dictionary is restored");
+        for id in expected.rows.keys() {
+            assert_eq!(back.get_row(id).to_owned_value(), expected.get_row(id).to_owned_value(), "{what} {id:?}");
+            assert_eq!(back.rows.digest_of(id), expected.rows.digest_of(id), "{what} {id:?}");
+            assert_eq!(back.rows.rv_of(id), expected.rows.rv_of(id), "{what} {id:?}");
+        }
+    }
+
+    #[test]
+    fn a_format_one_image_converts_at_load() {
+        let expected = fixture_collection();
+        let mut mirrored = Vec::new();
+        legacy::write_v1(&expected, &mut mirrored).unwrap();
+        for (what, bytes) in [("fixture", FIXTURE_V1.to_vec()), ("writer", mirrored)] {
+            let (back, stats) = read_image(bytes).unwrap();
+            assert!(stats.converted && !stats.mapped, "{what}");
+            assert_converted(&back, &expected, what);
+            assert_eq!(back.rows.dead_bytes(), 0, "{what}: converted rows are compact");
+            // The rewrite is a FORMAT 2 image that loads as itself.
+            let (again, stats) = read_image(bytes_of(&back)).unwrap();
+            assert!(!stats.converted, "{what}");
+            assert_converted(&again, &expected, what);
+        }
+    }
+
+    #[test]
+    fn a_damaged_format_one_image_is_refused() {
+        for at in [3, 20, 60, FIXTURE_V1.len() - 50, FIXTURE_V1.len() - 1] {
+            let mut bad = FIXTURE_V1.to_vec();
+            bad[at] ^= 0x40;
+            assert!(read_image(bad).is_err(), "flipped byte at {at} was accepted");
+        }
+        assert!(read_image(FIXTURE_V1[..FIXTURE_V1.len() - 1].to_vec()).is_err(), "truncated");
+        // A FORMAT 1 header over FORMAT 2 bytes is neither.
+        let coll = collection(&[("a", json!({ "n": 1 }))]);
+        let mut bytes = bytes_of(&coll);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(read_image(bytes).is_err());
+    }
+
+    #[test]
+    fn a_store_with_a_format_one_image_converts() {
+        let expected = fixture_collection();
+        let mut image = Vec::new();
+        legacy::write_v1(&expected, &mut image).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(STORE_MAGIC);
+        bytes.extend_from_slice(&STORE_FORMAT.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&image);
+        let store = read_store(&bytes).unwrap();
+        assert_converted(&store.collections["game"], &expected, "store");
     }
 
     #[test]
@@ -1244,12 +1479,10 @@ mod tests {
     #[test]
     fn another_checkpoint_format_is_refused() {
         let coll = collection(&[("a", json!({ "n": 1 }))]);
-        for format in [FORMAT + 1, 1] {
-            let mut bytes = bytes_of(&coll);
-            bytes[8..12].copy_from_slice(&format.to_le_bytes());
-            let err = read_image(bytes).unwrap_err();
-            assert!(err.to_string().contains("checkpoint format"), "{err}");
-        }
+        let mut bytes = bytes_of(&coll);
+        bytes[8..12].copy_from_slice(&(FORMAT + 1).to_le_bytes());
+        let err = read_image(bytes).unwrap_err();
+        assert!(err.to_string().contains("checkpoint format"), "{err}");
     }
 
     #[test]
@@ -1598,6 +1831,20 @@ mod tests {
             drop(table);
             std::fs::remove_file(&path).unwrap();
             assert_eq!(verify_bodies(&pending.image, Throttle::none()).unwrap(), true);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_format_one_file_converts_when_mapped() {
+            let dir = tmpdir("legacy");
+            let path = dir.join("game.rows");
+            std::fs::write(&path, FIXTURE_V1).unwrap();
+            let mapped = map_image(&path, &dir.join("arena"), 64 * 1024, BodyVerify::Deferred).unwrap();
+            assert!(mapped.stats.converted);
+            assert!(!mapped.stats.mapped, "a converted table lives in a fresh arena, not the file");
+            assert!(mapped.pending.is_none(), "the file was verified whole on the way");
+            assert_converted(&mapped.collection, &fixture_collection(), "mapped");
+            assert!(mapped.collection.rows.image(0).is_none());
             let _ = std::fs::remove_dir_all(&dir);
         }
 

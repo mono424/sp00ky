@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod row_codec;
 pub mod row_table;
 pub mod store;
+pub mod index;
 pub mod graph;
 pub mod view;
 pub mod circuit;

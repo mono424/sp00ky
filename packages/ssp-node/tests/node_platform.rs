@@ -1382,6 +1382,63 @@ async fn a_table_removed_upstream_is_dropped_from_a_running_node() {
 }
 
 #[tokio::test]
+async fn an_index_defined_by_hand_upstream_is_mirrored_and_windows_read_it() {
+    let h = build(HarnessOpts::default()).await;
+    let mut ddl = String::from("DEFINE TABLE game SCHEMALESS PERMISSIONS FOR select FULL;");
+    for i in 0..30 {
+        let db = if i % 2 == 0 { "a" } else { "b" };
+        ddl.push_str(&format!("CREATE game:g{i} SET database = 'game_database:{db}', sort_index = {};", 30 - i));
+    }
+    h.raw_db.query(ddl).await.unwrap();
+    let r = h.node.route(authed(Method::Post, "/admin/reload", Value::Null)).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    let reg = json!({
+        "id": "v1",
+        "surql": "SELECT * FROM game WHERE database = $database ORDER BY sort_index ASC LIMIT 3",
+        "clientId": "c", "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z",
+        "params": { "database": "game_database:a" }
+    });
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", reg)).await.unwrap().status, 200);
+    let window = |h: &Harness| {
+        let h = h.node.processor.clone();
+        async move {
+            let c = h.read().await;
+            let mut keys = c.view_keys("v1");
+            keys.sort();
+            (keys, c.view_index_uses("v1"))
+        }
+    };
+    let (keys, uses) = window(&h).await;
+    assert_eq!(keys, vec!["game:g24", "game:g26", "game:g28"]);
+    assert!(uses.is_empty(), "no index upstream yet");
+
+    // Someone runs DEFINE INDEX in the SurrealDB console. Nothing the schema
+    // fingerprint reads moves; the periodic index read picks it up.
+    h.node.refresh_schema(true).await.unwrap();
+    h.raw_db.query("DEFINE INDEX game_db_sort ON game FIELDS database, sort_index;").await.unwrap();
+    for _ in 0..ssp_node::schema::INDEX_POLL_EVERY {
+        h.node.refresh_schema(true).await.unwrap();
+    }
+    let (keys, uses) = window(&h).await;
+    assert_eq!(uses, vec![("game".to_string(), "game_db_sort".to_string())]);
+    assert_eq!(keys, vec!["game:g24", "game:g26", "game:g28"], "re-planning leaves the view as it was");
+
+    // The index-backed window follows writes.
+    let ingest = json!({ "table": "game", "op": "CREATE", "id": "game:n1", "record": { "database": "game_database:a", "sort_index": -1 } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest)).await.unwrap().status, 200);
+    assert_eq!(window(&h).await.0, vec!["game:g26", "game:g28", "game:n1"]);
+
+    // REMOVE INDEX: the view falls back to the plan as written.
+    h.raw_db.query("REMOVE INDEX game_db_sort ON game;").await.unwrap();
+    for _ in 0..ssp_node::schema::INDEX_POLL_EVERY {
+        h.node.refresh_schema(true).await.unwrap();
+    }
+    let (keys, uses) = window(&h).await;
+    assert!(uses.is_empty());
+    assert_eq!(keys, vec!["game:g26", "game:g28", "game:n1"]);
+}
+
+#[tokio::test]
 async fn admin_reload_requires_auth() {
     let h = build(HarnessOpts::default()).await;
     let r = h.node.route(req(Method::Post, "/admin/reload", None, Value::Null)).await.unwrap();

@@ -116,6 +116,47 @@ that, the answer is more SSPs, not bigger ones. The scheduler
 load-balances views across them.
 </Note>
 
+## Big tables: give each list its index
+
+A view starts from the rows its filter could match. Without help that is
+every row of the table, so on a table of a million rows each new list
+window costs the SSP a pass over all of them, even for `LIMIT 50`.
+
+The SSP holds the same indexes SurrealDB does. Every plain
+`DEFINE INDEX … FIELDS` on a synced table is mirrored: one applied by
+`spky migrate` or a deploy arrives with the next schema poll, and one
+defined by hand in the SurrealDB console within about a minute. A
+`REMOVE INDEX` is followed the same way.
+
+A windowed list reads its window straight off an index when:
+
+- its `WHERE` is equalities (`field = value` or `field = $param`, joined
+  with `AND`) on the index's leading fields, in any order, and
+- its `ORDER BY` is the rest of the index, every field in the same
+  direction. A trailing `id ASC` tiebreaker is free.
+
+<CodeBlock code={indexedListCode} lang="sql" />
+
+Registering such a window touches the rows it returns, not the table,
+and a write re-reads only that window. Any other filter with equalities
+on an index's leading fields still starts from that index range instead
+of the whole table. Full-text, vector (`HNSW`, `MTREE`) and `COUNT`
+indexes are not used; neither are ranges or `OR` across fields.
+
+Results are identical either way; an index changes only the cost. On a
+1M-row table with 422k rows in one list, 20 scroll windows took 14.6 s
+to register without the index and 0.6 s with it (the first window builds
+the index, each one after that takes ~30 µs). The index costs about
+130 bytes per row of the table, is built when a view first needs it, and
+is dropped when the last such view goes.
+
+<Note>
+**Define the index your list query needs.** For every list over a big
+table, the equality fields of its `WHERE` followed by its `ORDER BY`
+fields make the index. It is the same index SurrealDB wants for the
+same query, so the database's own reads get faster too.
+</Note>
+
 ## A single SSP holds thousands of small views
 
 The other side of the same coin: many small scoped queries are cheap.
@@ -212,3 +253,9 @@ node apps/benchmark/dist/verify-bootstrap.js --rows 1000 --row-bytes 2000000
 
 Each suite writes `summary.md`, `samples.json`, and `run.json` into
 `results/<suite>/`. The 3-run aggregate lives at `results/aggregated.md`.
+
+export const indexedListCode = `DEFINE INDEX game_database_sort ON game FIELDS database, sort_index;
+
+-- answered from the index, any LIMIT / START
+SELECT * FROM game WHERE database = $database
+  ORDER BY sort_index ASC, id ASC LIMIT 50 START 100;`;

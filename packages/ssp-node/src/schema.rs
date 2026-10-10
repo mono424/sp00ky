@@ -8,6 +8,11 @@
 //! applies what changed in place: the metadata of added or changed tables, and
 //! a dropped table's rows stepped out of every view.
 //!
+//! Indexes follow the same way (see [`ssp::circuit::index`]): a `DEFINE
+//! INDEX` the CLI applies moves the fingerprint like any schema change, and
+//! one run by hand on SurrealDB, which moves nothing the fingerprint reads, is
+//! caught by a batched index read every [`INDEX_POLL_EVERY`] polls.
+//!
 //! It runs on the `SchemaPoll` timer and, rate-limited, when a registration
 //! names a table the circuit has no schema for: the window between a deploy
 //! and the next poll is exactly when clients on the new app version register
@@ -17,8 +22,9 @@
 
 use std::collections::BTreeSet;
 
+use anyhow::Context;
 use ssp::circuit::{Change, ChangeSet};
-use ssp_protocol::schema::SchemaTracker;
+use ssp_protocol::schema::{SchemaProbe, SchemaTracker};
 use tracing::{info, warn};
 
 use crate::node::SspNode;
@@ -31,6 +37,11 @@ const DROP_CHUNK: usize = 500;
 /// registering views on a table that really does not exist cannot turn into a
 /// schema read per request.
 const ON_MISS_MIN_INTERVAL_MS: u64 = 1000;
+
+/// Polls between reads of every synced table's indexes: a minute at the
+/// default 15 s poll. Indexes defined by hand on SurrealDB reach the circuit
+/// within that; the read is one batched `INFO FOR TABLE` round trip.
+pub const INDEX_POLL_EVERY: u64 = 4;
 
 /// The node's schema-following state. `Default` is "never probed": the first
 /// refresh re-reads every table's metadata once, which is what the bootstrap
@@ -46,6 +57,7 @@ pub struct SchemaWatch {
 struct WatchState {
     tracker: SchemaTracker,
     primed: bool,
+    polls: u64,
 }
 
 impl SspNode {
@@ -100,6 +112,11 @@ impl SspNode {
                 // Allowlist entries are compiled against the link map.
                 self.refresh_query_allowlist().await;
             }
+        } else if drop && primed {
+            st.polls += 1;
+            if st.polls % INDEX_POLL_EVERY == 0 {
+                changed |= self.refresh_indexes(&probe).await?;
+            }
         }
 
         if drop {
@@ -120,6 +137,48 @@ impl SspNode {
             }
         }
         Ok(changed)
+    }
+
+    /// Mirror indexes defined or removed straight on upstream. Those move
+    /// neither `INFO FOR DB` nor the CLI's schema hashes, so the fingerprint
+    /// never notices them: read every synced table's indexes in one batch and
+    /// hand the circuit the tables whose set changed, which re-plans the
+    /// views over them.
+    pub(crate) async fn refresh_indexes(&self, probe: &SchemaProbe) -> anyhow::Result<bool> {
+        let tables: Vec<&String> = probe.synced.keys().collect();
+        if tables.is_empty() {
+            return Ok(false);
+        }
+        let surql: String = tables.iter().map(|t| format!("INFO FOR TABLE {t};")).collect::<Vec<_>>().join("\n");
+        let answers = self.platform.db.query(&surql, &[]).await.context("INFO FOR TABLE (indexes)")?;
+        let mut moved = Vec::new();
+        {
+            let circuit = self.processor.read().await;
+            for (table, info) in tables.iter().zip(&answers) {
+                // Every `INFO FOR TABLE` answer has an `indexes` object, empty
+                // or not; one without it failed, and must not read as "none".
+                if !info.get("indexes").is_some_and(serde_json::Value::is_object) {
+                    continue;
+                }
+                let indexes = crate::bootstrap::indexes_from_info(info);
+                if let Some(mut meta) = circuit.table_meta(table) {
+                    if meta.indexes != indexes {
+                        meta.indexes = indexes;
+                        moved.push(((*table).clone(), meta));
+                    }
+                }
+            }
+        }
+        if moved.is_empty() {
+            return Ok(false);
+        }
+        let mut circuit = self.processor.write().await;
+        for (table, meta) in moved {
+            let names: Vec<&str> = meta.indexes.iter().map(|i| i.name.as_str()).collect();
+            info!(target: "ssp::policy", table = %table, indexes = ?names, "Schema: indexes changed upstream; views re-planned");
+            circuit.set_table_meta(&table, meta);
+        }
+        Ok(true)
     }
 
     /// [`Self::refresh_schema`] for a registration that named a table the

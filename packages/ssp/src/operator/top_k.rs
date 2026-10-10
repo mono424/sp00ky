@@ -20,7 +20,7 @@ use std::collections::HashMap;
 /// so reserving two slots costs 88 bytes inline on *every* key to save an
 /// allocation only multi-field sorts would make — measurably worse overall
 /// than spilling those.
-type SortKey = SmallVec<[SortableValue; 1]>;
+pub(crate) type SortKey = SmallVec<[SortableValue; 1]>;
 
 /// Least slack a bounded buffer keeps past its window; see [`TopK`].
 const MIN_SLACK: usize = 16;
@@ -74,8 +74,8 @@ pub struct TopK {
 /// or `datetime` field silently sorted ascending.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortableValue {
-    scalar: Scalar,
-    descending: bool,
+    pub(crate) scalar: Scalar,
+    pub(crate) descending: bool,
 }
 
 /// One orderable scalar.
@@ -90,7 +90,7 @@ pub struct SortableValue {
 /// `Int` and `Float` compare numerically across the pair, matching
 /// `compare_values`, so `5` and `5.0` still order together.
 #[derive(Debug, Clone, PartialEq)]
-enum Scalar {
+pub(crate) enum Scalar {
     Null,
     Bool(bool),
     Int(i64),
@@ -98,6 +98,9 @@ enum Scalar {
     /// `SmolStr` stores up to 22 bytes inline, which covers most sort keys
     /// (an RFC3339 timestamp is 20) and avoids a heap allocation per row.
     Str(SmolStr),
+    /// Above every value. Never read from a row: a range bound only, so an
+    /// index lookup can say "everything that starts with this prefix".
+    Top,
 }
 
 impl Eq for Scalar {}
@@ -110,6 +113,7 @@ impl Scalar {
             Scalar::Bool(_) => 1,
             Scalar::Int(_) | Scalar::Float(_) => 2,
             Scalar::Str(_) => 3,
+            Scalar::Top => u8::MAX,
         }
     }
 }
@@ -137,6 +141,7 @@ impl Ord for Scalar {
             (Scalar::Int(a), Scalar::Float(b)) => (*a as f64).total_cmp(b),
             (Scalar::Float(a), Scalar::Int(b)) => a.total_cmp(&(*b as f64)),
             (Scalar::Str(a), Scalar::Str(b)) => a.cmp(b),
+            (Scalar::Top, Scalar::Top) => Ordering::Equal,
             // Unreachable: equal ranks are covered above.
             _ => Ordering::Equal,
         }
@@ -164,7 +169,7 @@ impl Ord for SortableValue {
 }
 
 impl SortableValue {
-    fn from_value(val: ValueRef<'_>, descending: bool) -> Self {
+    pub(crate) fn from_value(val: ValueRef<'_>, descending: bool) -> Self {
         let scalar = match val {
             ValueRef::Missing | ValueRef::Null => Scalar::Null,
             ValueRef::Bool(b) => Scalar::Bool(b),
@@ -177,6 +182,18 @@ impl SortableValue {
         };
         SortableValue { scalar, descending }
     }
+
+    /// The bound above every value, see [`Scalar::Top`].
+    pub(crate) fn top() -> Self {
+        SortableValue { scalar: Scalar::Top, descending: false }
+    }
+
+    /// Whether `val` orders as itself rather than collapsing with nulls: a
+    /// container sorts as null, so equality on one says nothing an index can
+    /// answer.
+    pub(crate) fn is_orderable(val: ValueRef<'_>) -> bool {
+        matches!(val, ValueRef::Bool(_) | ValueRef::Int(_) | ValueRef::Float(_) | ValueRef::Str(_))
+    }
 }
 
 /// Heap bytes held by one row's sort key.
@@ -184,7 +201,7 @@ impl SortableValue {
 /// `SmallVec` keeps up to two keys inline, and `SmolStr` keeps strings up to
 /// 22 bytes inline, so a typical single-field sort key now costs no heap at
 /// all.
-fn sortable_bytes(key: &SortKey) -> usize {
+pub(crate) fn sortable_bytes(key: &SortKey) -> usize {
     let spilled = if key.spilled() {
         crate::size::vec_bytes::<SortableValue>(key.len())
     } else {

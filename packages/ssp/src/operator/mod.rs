@@ -8,6 +8,7 @@ pub mod anti_join;
 pub mod union;
 pub mod map;
 pub mod top_k;
+pub mod index_scan;
 pub mod aggregate;
 pub mod distinct;
 
@@ -62,6 +63,20 @@ pub trait Operator: Debug + Send + Sync {
     /// Base collections this operator directly reads from (Scan only).
     fn collections(&self) -> Vec<String> {
         vec![]
+    }
+
+    /// What a source operator starts from when its view registers, instead
+    /// of the whole collection. `None` (the default) is the whole collection;
+    /// an index-backed source answers with just the rows its index range
+    /// holds, which is what spares a registration the full-table pass.
+    fn initial_input(&self, _store: &Store, _ctx: Option<&Sp00kyValue>) -> Option<ZSet> {
+        None
+    }
+
+    /// The `(table, index name)` this operator reads, so the circuit can drop
+    /// an index no registered view plans over any more.
+    fn index_use(&self) -> Option<(&str, &str)> {
+        None
     }
 
     /// Membership test for a single key against this operator's CURRENT
@@ -134,6 +149,7 @@ pub trait Operator: Debug + Send + Sync {
 pub use aggregate::{Aggregate, AggregateFunc};
 pub use distinct::Distinct;
 pub use filter::Filter;
+pub use index_scan::{IndexBinding, IndexWindow, IndexedScan};
 pub use join::Join;
 pub use map::Map;
 pub use plan::{JoinCondition, OperatorPlan, OrderSpec, Projection, QueryPlan};

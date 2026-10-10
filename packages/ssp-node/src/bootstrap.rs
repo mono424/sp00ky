@@ -104,7 +104,26 @@ pub async fn load_table_meta(db: &dyn Db, table: &str, define: &str) -> TableMet
         link_targets,
         opaque: ssp_protocol::opaque_fields_from_info(&info),
         columns: ssp_protocol::columns_from_info(&info),
+        indexes: indexes_from_info(&info),
     }
+}
+
+/// The table's `DEFINE INDEX` statements the circuit can plan over (see
+/// [`ssp::circuit::index`]), sorted by name so an unchanged schema reads back
+/// equal.
+pub fn indexes_from_info(info: &serde_json::Value) -> Vec<ssp::circuit::index::IndexDef> {
+    let mut defs: Vec<_> = info
+        .get("indexes")
+        .and_then(|i| i.as_object())
+        .map(|indexes| {
+            indexes
+                .values()
+                .filter_map(|define| define.as_str().and_then(ssp::circuit::index::parse_define_index))
+                .collect()
+        })
+        .unwrap_or_default();
+    defs.sort();
+    defs
 }
 
 /// Probe upstream and read every synced table's metadata. The one loader
@@ -134,6 +153,9 @@ pub fn apply_schema(circuit: &mut Circuit, tables: &BTreeMap<String, TableMeta>)
         }
         if !meta.opaque.is_empty() {
             info!(target: "ssp::policy", table = %table, fields = ?meta.opaque, "omitting opaque fields from row scans");
+        }
+        for index in &meta.indexes {
+            info!(target: "ssp::policy", table = %table, index = %index.name, fields = ?index.fields, "mirrored index");
         }
         circuit.set_table_meta(table, meta.clone());
     }

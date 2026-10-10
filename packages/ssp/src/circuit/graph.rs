@@ -1,5 +1,66 @@
-use crate::operator::{self, Operator};
+use crate::operator::predicate::Predicate;
+use crate::operator::{self, Operator, OrderSpec};
 use std::collections::HashMap;
+
+/// Chooses index-backed source operators while a graph is built; see
+/// `Circuit::build_graph`. Each method answers for one plan shape with the
+/// operator to stand in for it, or `None` to build the plan as written.
+pub trait IndexPlanner {
+    /// `Limit` over `Filter`s over `Scan(table)` (any `Project`s in between
+    /// are kept above the window).
+    fn window(
+        &self,
+        table: &str,
+        predicates: &[&Predicate],
+        order_by: Option<&[OrderSpec]>,
+        limit: usize,
+        start: usize,
+    ) -> Option<Box<dyn Operator>>;
+
+    /// The `Scan(table)` under a chain of `Filter`s.
+    fn scan(&self, table: &str, predicates: &[&Predicate]) -> Option<Box<dyn Operator>>;
+}
+
+/// Builds every plan as written.
+pub struct NoIndexes;
+
+impl IndexPlanner for NoIndexes {
+    fn window(&self, _: &str, _: &[&Predicate], _: Option<&[OrderSpec]>, _: usize, _: usize) -> Option<Box<dyn Operator>> {
+        None
+    }
+
+    fn scan(&self, _: &str, _: &[&Predicate]) -> Option<Box<dyn Operator>> {
+        None
+    }
+}
+
+/// `Project`s (outermost first), then `Filter` predicates (outermost first),
+/// then the table, for a plan that is exactly that chain over a `Scan`.
+fn window_shape(plan: &operator::OperatorPlan) -> Option<(Vec<&Vec<operator::Projection>>, Vec<&Predicate>, &str)> {
+    let mut projections = Vec::new();
+    let mut node = plan;
+    while let operator::OperatorPlan::Project { input, projections: p } = node {
+        projections.push(p);
+        node = input;
+    }
+    let (predicates, table) = filter_chain(node)?;
+    Some((projections, predicates, table))
+}
+
+/// `Filter` predicates (outermost first) down to a `Scan`, or `None` when
+/// the chain ends in anything else.
+fn filter_chain(plan: &operator::OperatorPlan) -> Option<(Vec<&Predicate>, &str)> {
+    let mut predicates = Vec::new();
+    let mut node = plan;
+    while let operator::OperatorPlan::Filter { input, predicate } = node {
+        predicates.push(predicate);
+        node = input;
+    }
+    match node {
+        operator::OperatorPlan::Scan { table } => Some((predicates, table)),
+        _ => None,
+    }
+}
 
 /// Unique identifier for a node in the circuit graph.
 pub type NodeId = usize;
@@ -49,9 +110,15 @@ impl Graph {
     ///
     /// Recursively walks the plan, creating operator nodes and wiring edges.
     pub fn from_plan(plan: &operator::OperatorPlan) -> Self {
+        Self::from_plan_with(plan, &NoIndexes)
+    }
+
+    /// Build a Graph, letting `planner` put index-backed sources in place of
+    /// the shapes it recognises.
+    pub fn from_plan_with(plan: &operator::OperatorPlan, planner: &dyn IndexPlanner) -> Self {
         let mut nodes = Vec::new();
         let mut scan_index: HashMap<String, Vec<NodeId>> = HashMap::new();
-        let output_node = Self::build_node(plan, &mut nodes, &mut scan_index);
+        let output_node = Self::build_node(plan, &mut nodes, &mut scan_index, planner);
 
         let topo_order = Self::compute_topo_order(&nodes);
 
@@ -63,10 +130,24 @@ impl Graph {
         }
     }
 
+    /// Add a source node reading `table`, routed its deltas like a Scan.
+    fn push_source(
+        operator: Box<dyn Operator>,
+        table: &str,
+        nodes: &mut Vec<Node>,
+        scan_index: &mut HashMap<String, Vec<NodeId>>,
+    ) -> NodeId {
+        let id = nodes.len();
+        nodes.push(Node { id, operator, inputs: vec![] });
+        scan_index.entry(table.to_string()).or_default().push(id);
+        id
+    }
+
     fn build_node(
         plan: &operator::OperatorPlan,
         nodes: &mut Vec<Node>,
         scan_index: &mut HashMap<String, Vec<NodeId>>,
+        planner: &dyn IndexPlanner,
     ) -> NodeId {
         match plan {
             operator::OperatorPlan::Scan { table } => {
@@ -80,7 +161,24 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::Filter { input, predicate } => {
-                let input_id = Self::build_node(input, nodes, scan_index);
+                // A filter chain straight over a Scan may start from an index
+                // range; every Filter is still built above it.
+                if let Some((predicates, table)) = filter_chain(plan) {
+                    if let Some(source) = planner.scan(table, &predicates) {
+                        let mut id = Self::push_source(source, table, nodes, scan_index);
+                        for predicate in predicates.iter().rev() {
+                            let next = nodes.len();
+                            nodes.push(Node {
+                                id: next,
+                                operator: Box::new(operator::Filter::new((*predicate).clone())),
+                                inputs: vec![id],
+                            });
+                            id = next;
+                        }
+                        return id;
+                    }
+                }
+                let input_id = Self::build_node(input, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -90,8 +188,8 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::Join { left, right, on } => {
-                let left_id = Self::build_node(left, nodes, scan_index);
-                let right_id = Self::build_node(right, nodes, scan_index);
+                let left_id = Self::build_node(left, nodes, scan_index, planner);
+                let right_id = Self::build_node(right, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -101,8 +199,8 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::SemiJoin { left, right, on } => {
-                let left_id = Self::build_node(left, nodes, scan_index);
-                let right_id = Self::build_node(right, nodes, scan_index);
+                let left_id = Self::build_node(left, nodes, scan_index, planner);
+                let right_id = Self::build_node(right, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -112,8 +210,8 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::AntiJoin { left, right, on } => {
-                let left_id = Self::build_node(left, nodes, scan_index);
-                let right_id = Self::build_node(right, nodes, scan_index);
+                let left_id = Self::build_node(left, nodes, scan_index, planner);
+                let right_id = Self::build_node(right, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -123,8 +221,8 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::Union { left, right } => {
-                let left_id = Self::build_node(left, nodes, scan_index);
-                let right_id = Self::build_node(right, nodes, scan_index);
+                let left_id = Self::build_node(left, nodes, scan_index, planner);
+                let right_id = Self::build_node(right, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -134,7 +232,7 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::Distinct { input } => {
-                let input_id = Self::build_node(input, nodes, scan_index);
+                let input_id = Self::build_node(input, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -144,7 +242,7 @@ impl Graph {
                 id
             }
             operator::OperatorPlan::Project { input, projections } => {
-                let input_id = Self::build_node(input, nodes, scan_index);
+                let input_id = Self::build_node(input, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -159,7 +257,23 @@ impl Graph {
                 start,
                 order_by,
             } => {
-                let input_id = Self::build_node(input, nodes, scan_index);
+                // A window over an index range: Projects stay above it.
+                if let Some((projections, predicates, table)) = window_shape(input) {
+                    if let Some(source) = planner.window(table, &predicates, order_by.as_deref(), *limit, *start) {
+                        let mut id = Self::push_source(source, table, nodes, scan_index);
+                        for projection in projections.iter().rev() {
+                            let next = nodes.len();
+                            nodes.push(Node {
+                                id: next,
+                                operator: Box::new(operator::Map::new((*projection).clone())),
+                                inputs: vec![id],
+                            });
+                            id = next;
+                        }
+                        return id;
+                    }
+                }
+                let input_id = Self::build_node(input, nodes, scan_index, planner);
                 let id = nodes.len();
                 nodes.push(Node {
                     id,
@@ -224,6 +338,15 @@ impl Graph {
     /// [`Operator::needs_rebuild`](crate::operator::Operator::needs_rebuild).
     pub fn needs_rebuild(&self) -> bool {
         self.nodes.iter().any(|node| node.operator.needs_rebuild())
+    }
+
+    /// Every `(table, index name)` this graph's sources read.
+    pub fn index_uses(&self) -> Vec<(String, String)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| node.operator.index_use())
+            .map(|(table, index)| (table.to_string(), index.to_string()))
+            .collect()
     }
 }
 

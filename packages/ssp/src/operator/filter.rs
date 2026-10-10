@@ -87,7 +87,7 @@ impl super::Operator for Filter {
 /// Hoisting it needs a compiled predicate tree carrying pre-converted
 /// operands, which is deferred to the `ValueRef` migration that rewrites these
 /// call sites anyway.
-fn resolve_predicate_value(value: &Value, ctx: Option<&Sp00kyValue>) -> Option<Sp00kyValue> {
+pub(crate) fn resolve_predicate_value(value: &Value, ctx: Option<&Sp00kyValue>) -> Option<Sp00kyValue> {
     if let Some(obj) = value.as_object() {
         if let Some(param_path) = obj.get("$param") {
             let ctx = ctx?;
@@ -115,7 +115,7 @@ fn resolve_predicate_value(value: &Value, ctx: Option<&Sp00kyValue>) -> Option<S
     }
 }
 
-fn check_predicate_recursive(
+pub(crate) fn check_predicate_recursive(
     pred: &Predicate,
     key: &str,
     store: &Store,

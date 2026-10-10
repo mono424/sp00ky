@@ -44,6 +44,12 @@ duplicated rows. See
 [Architecture](/docs/reference/architecture#bootstrap-pagination) for the mechanism.
 
 <Note>
+  On a big table, define the index the window's query needs (its `WHERE` equality fields, then its
+  `ORDER BY` fields). The SSP mirrors it from SurrealDB and serves each window straight off it; see
+  [Performance](/docs/reference/performance#big-tables-give-each-list-its-index).
+</Note>
+
+<Note>
   For long lists pair this with a virtualizer (e.g. `@tanstack/solid-virtual`) keyed by record `id`,
   so only visible rows render even though several windows are subscribed.
 </Note>

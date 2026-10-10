@@ -1,5 +1,6 @@
 use crate::algebra::{RowKey, ZSet};
 use crate::circuit::graph::Graph;
+use crate::circuit::index::IndexChoice;
 use crate::circuit::store::{Change, ChangeSet, Collection, Operation, Record, Store};
 use crate::circuit::view::{OutputFormat, View};
 use crate::operator::{OperatorPlan, QueryPlan};
@@ -192,6 +193,9 @@ pub struct Circuit {
     /// silently matches nothing on them. Drained by
     /// [`Self::take_missing_fields`].
     missing_fields: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Per-table secondary index definitions (`TableMeta::indexes`), what
+    /// `build_graph` plans index-backed sources from.
+    index_defs: HashMap<String, Vec<crate::circuit::index::IndexDef>>,
 }
 
 /// One table's schema as the circuit uses it, read from upstream DDL: the
@@ -208,6 +212,9 @@ pub struct TableMeta {
     pub opaque: std::collections::BTreeSet<String>,
     /// Root column names, see `columns`.
     pub columns: std::collections::BTreeSet<String>,
+    /// Secondary indexes, mirrored from upstream's `DEFINE INDEX`; see
+    /// [`crate::circuit::index`].
+    pub indexes: Vec<crate::circuit::index::IndexDef>,
 }
 
 /// What [`Circuit::reconcile`] found when a table's rows were compared against
@@ -429,6 +436,7 @@ impl Circuit {
             columns: HashMap::new(),
             projection: false,
             missing_fields: BTreeMap::new(),
+            index_defs: HashMap::new(),
         }
     }
 
@@ -514,6 +522,18 @@ impl Circuit {
             self.opaque_fields.insert(table.to_string(), meta.opaque);
         }
         self.columns.insert(table.to_string(), meta.columns);
+        let indexes_changed = self
+            .index_defs
+            .get(table)
+            .map_or(!meta.indexes.is_empty(), |held| *held != meta.indexes);
+        if meta.indexes.is_empty() {
+            self.index_defs.remove(table);
+        } else {
+            self.index_defs.insert(table.to_string(), meta.indexes);
+        }
+        if indexes_changed {
+            self.replan_table(table);
+        }
     }
 
     /// What [`Self::set_table_meta`] last stored for `table`, or `None` for a
@@ -528,7 +548,49 @@ impl Circuit {
                 .unwrap_or_default(),
             opaque: self.opaque_fields.get(table).cloned().unwrap_or_default(),
             columns: self.columns.get(table).cloned().unwrap_or_default(),
+            indexes: self.index_defs.get(table).cloned().unwrap_or_default(),
         })
+    }
+
+    /// Build a view's operator DAG, with index-backed sources wherever an
+    /// index mirrored from upstream answers the shape (see [`IndexChoice`]):
+    /// the same result as the plan as written, from far less work on a large
+    /// table.
+    pub(crate) fn build_graph(&self, root: &OperatorPlan, params: Option<&Sp00kyValue>) -> Graph {
+        Graph::from_plan_with(root, &IndexChoice { defs: &self.index_defs, params })
+    }
+
+    /// A table's index definitions changed: rebuild the graphs whose index
+    /// choice changes with them. An index-backed graph has the same output as
+    /// the plan built as written, so the new graph is primed against the
+    /// store and swapped in without touching the view's membership.
+    fn replan_table(&mut self, table: &str) {
+        let ids: Vec<String> = self.dependency_map.get(table).cloned().unwrap_or_default();
+        for id in ids {
+            let Some(view) = self.views.get(&id) else { continue };
+            let params = view.params.clone();
+            let mut graph = self.build_graph(&view.plan.root, params.as_ref());
+            if self.graphs.get(&id).is_some_and(|old| old.index_uses() == graph.index_uses()) {
+                continue;
+            }
+            Self::prime_graph(&mut graph, &self.store, params.as_ref());
+            self.graphs.insert(id, graph);
+        }
+        self.release_unused_indexes();
+    }
+
+    /// Drop every built index no registered graph reads any more.
+    fn release_unused_indexes(&mut self) {
+        let mut used: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+        for graph in self.graphs.values() {
+            for (table, index) in graph.index_uses() {
+                used.entry(table).or_default().insert(index);
+            }
+        }
+        let empty = std::collections::BTreeSet::new();
+        for (name, coll) in self.store.collections.iter_mut() {
+            coll.release_indexes_except(used.get(name).unwrap_or(&empty));
+        }
     }
 
     /// Drop a table this circuit no longer syncs: its rows and its schema.
@@ -543,6 +605,7 @@ impl Circuit {
         self.opaque_fields.remove(table);
         self.columns.remove(table);
         self.missing_fields.remove(table);
+        self.index_defs.remove(table);
     }
 
     /// Bulk-load initial data into base collections.
@@ -614,7 +677,7 @@ impl Circuit {
         let params_sv = params.map(Sp00kyValue::from);
 
         // Build the operator DAG
-        let graph = Graph::from_plan(&plan.root);
+        let graph = self.build_graph(&plan.root, params_sv.as_ref());
 
         // Create view state
         let view = View::new(
@@ -675,6 +738,7 @@ impl Circuit {
                 coll.release_membership();
             }
         }
+        self.release_unused_indexes();
     }
 
     /// Advance the circuit by one time step.
@@ -802,6 +866,14 @@ impl Circuit {
     /// Every key currently in a view. Membership on demand for the shells that
     /// ship it to a client (`ssp-wasm`, `ssp-ffi`); a delta itself carries only
     /// `row_count`. Empty for an unknown view.
+    /// `(table, index)` for every mirrored index the view's graph reads.
+    pub fn view_index_uses(&self, query_id: &str) -> Vec<(String, String)> {
+        self.graphs
+            .get(&crate::canonical_query_id(query_id))
+            .map(Graph::index_uses)
+            .unwrap_or_default()
+    }
+
     pub fn view_keys(&self, query_id: &str) -> Vec<String> {
         self.get_view(query_id)
             .map(|view| view.cache.keys().map(|k| k.to_string()).collect())
@@ -814,6 +886,51 @@ impl Circuit {
             .or_else(|| self.views.get(&crate::canonical_query_id(query_id)))
     }
 
+    /// Evaluate a fresh graph from the store: every source starts from what
+    /// it reads (the whole collection, or an index range), stateful operators
+    /// prime their state on the way, and the output is the graph's full
+    /// result. `None` for a graph without an output.
+    fn prime_graph(graph: &mut Graph, store: &Store, params: Option<&Sp00kyValue>) -> Option<ZSet> {
+        let num_nodes = graph.node_count();
+        let mut node_outputs: Vec<Option<ZSet>> = vec![None; num_nodes];
+        let topo_order: Vec<usize> = graph.topo_order().to_vec();
+
+        for &node_id in &topo_order {
+            let input_ids = graph.nodes[node_id].inputs.clone();
+            let arity = graph.nodes[node_id].operator.arity();
+
+            let output = if arity == 0 {
+                // An index-backed source starts from its index range (or, for
+                // a window, from nothing at all): no full-collection pass.
+                if let Some(start) = graph.nodes[node_id].operator.initial_input(store, params) {
+                    graph.nodes[node_id].operator.step(&[&start], store, params)
+                } else {
+                    // Scan node: inject the full collection as the initial
+                    // delta, borrowed rather than cloned (a big table is 200k
+                    // keys).
+                    let table_name = graph.nodes[node_id].operator.collections();
+                    let empty = ZSet::new();
+                    let full_zset = table_name
+                        .first()
+                        .and_then(|t| store.get_collection(t))
+                        .map(Collection::membership)
+                        .unwrap_or(&empty);
+                    graph.nodes[node_id].operator.step(&[full_zset], store, params)
+                }
+            } else {
+                let inputs: Vec<&ZSet> = input_ids
+                    .iter()
+                    .map(|&input_id| node_outputs[input_id].as_ref().unwrap())
+                    .collect();
+                graph.nodes[node_id].operator.step(&inputs, store, params)
+            };
+
+            node_outputs[node_id] = Some(output);
+        }
+
+        node_outputs[graph.output_node].take()
+    }
+
     /// Run initial evaluation for a newly registered query.
     ///
     /// Uses `step()` so that stateful operators (TopK, Join, Aggregate,
@@ -823,42 +940,7 @@ impl Circuit {
         let graph = self.graphs.get_mut(query_id)?;
         let view = self.views.get_mut(query_id)?;
 
-        let num_nodes = graph.node_count();
-        let mut node_outputs: Vec<Option<ZSet>> = vec![None; num_nodes];
-
-        let topo_order: Vec<usize> = graph.topo_order().to_vec();
-
-        for &node_id in &topo_order {
-            let input_ids = graph.nodes[node_id].inputs.clone();
-            let arity = graph.nodes[node_id].operator.arity();
-
-            let output = if arity == 0 {
-                // Scan node: inject the full collection as the initial delta,
-                // borrowed rather than cloned (a big table is 200k keys).
-                let table_name = graph.nodes[node_id].operator.collections();
-                let empty = ZSet::new();
-                let full_zset = table_name
-                    .first()
-                    .and_then(|t| self.store.get_collection(t))
-                    .map(Collection::membership)
-                    .unwrap_or(&empty);
-                graph.nodes[node_id]
-                    .operator
-                    .step(&[full_zset], &self.store, view.params.as_ref())
-            } else {
-                let inputs: Vec<&ZSet> = input_ids
-                    .iter()
-                    .map(|&input_id| node_outputs[input_id].as_ref().unwrap())
-                    .collect();
-                graph.nodes[node_id]
-                    .operator
-                    .step(&inputs, &self.store, view.params.as_ref())
-            };
-
-            node_outputs[node_id] = Some(output);
-        }
-
-        let view_output = node_outputs[graph.output_node].take()?;
+        let view_output = Self::prime_graph(graph, &self.store, view.params.as_ref())?;
 
         if view_output.is_empty() {
             return None;
@@ -1166,11 +1248,18 @@ pub struct TableSize {
     /// Fields kept per row under projection; `None` when whole bodies are kept.
     #[serde(default)]
     pub retained_fields: Option<Vec<String>>,
+    /// Mirrored secondary indexes currently built (see
+    /// [`crate::circuit::index`]): built when a view first plans over one,
+    /// dropped with the last such view.
+    #[serde(default)]
+    pub secondary_indexes: Vec<String>,
+    #[serde(default)]
+    pub secondary_index_bytes: usize,
 }
 
 impl TableSize {
     pub fn total_bytes(&self) -> usize {
-        self.rows_bytes + self.zset_bytes
+        self.rows_bytes + self.zset_bytes + self.secondary_index_bytes
     }
 
     /// Estimated bytes per row. The headline ratio to watch: it should be a
@@ -1431,7 +1520,9 @@ impl Circuit {
         view.subquery_cache.clear();
         view.last_hash = String::new();
         let root = view.plan.root.clone();
-        self.graphs.insert(id.to_string(), Graph::from_plan(&root));
+        let params = view.params.clone();
+        let graph = self.build_graph(&root, params.as_ref());
+        self.graphs.insert(id.to_string(), graph);
         match self.run_initial_snapshot(id) {
             Some(delta) => self.fan_out(delta),
             None => {
@@ -1644,6 +1735,7 @@ impl Circuit {
             columns: HashMap::new(),
             projection: false,
             missing_fields: BTreeMap::new(),
+            index_defs: HashMap::new(),
         };
 
         for qs in state.queries {
@@ -2201,6 +2293,8 @@ impl Circuit {
                     .retained
                     .as_ref()
                     .map(|f| f.iter().cloned().collect()),
+                secondary_indexes: coll.built_indexes(),
+                secondary_index_bytes: coll.secondary_index_bytes(),
             })
             .collect();
         tables.sort_by(|a, b| b.total_bytes().cmp(&a.total_bytes()));
@@ -4389,6 +4483,7 @@ mod snapshot_and_projection_tests {
                     .collect(),
                 opaque: ["draft".to_string()].into_iter().collect(),
                 columns: ["title".to_string(), "author".to_string()].into_iter().collect(),
+                indexes: vec![crate::circuit::index::IndexDef { name: "thread_author".into(), fields: vec!["author".into()] }],
             },
         );
         assert_eq!(c.link_targets()["thread"].len(), 2);
@@ -4410,6 +4505,7 @@ mod snapshot_and_projection_tests {
         assert!(!c.permissions().contains_key("thread"));
         assert!(!c.link_targets().contains_key("thread"));
         assert!(!c.columns().contains_key("thread"));
+        assert!(c.table_meta("thread").is_none());
         assert!(c.store.get_collection("thread").is_none());
     }
 
@@ -4830,5 +4926,476 @@ mod bounded_window_tests {
             assert_eq!(view_ids(&circuit, "w"), sorted_ids(&live, limit, start));
         }
         assert!(republished > 0, "draining past the slack should have primed the view again");
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    //! Views planned over mirrored indexes against the same views built as
+    //! written: identical membership and deltas through random churn.
+    use super::*;
+    use crate::circuit::index::IndexDef;
+    use crate::operator::plan::{OperatorPlan, OrderSpec, Projection};
+    use crate::operator::predicate::Predicate;
+    use crate::types::Path;
+    use serde_json::{json, Value};
+
+    /// xorshift: deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn def(name: &str, fields: &[&str]) -> IndexDef {
+        IndexDef { name: name.into(), fields: fields.iter().map(|f| f.to_string()).collect() }
+    }
+
+    fn game_indexes() -> Vec<IndexDef> {
+        vec![
+            def("game_database_sort", &["database", "sort_index"]),
+            def("game_database", &["database"]),
+            def("game_owner_db_sort", &["owner", "database", "sort_index"]),
+            def("game_created", &["created_at"]),
+        ]
+    }
+
+    fn meta(indexes: Vec<IndexDef>) -> TableMeta {
+        TableMeta { permission: "true".into(), indexes, ..Default::default() }
+    }
+
+    fn eq(field: &str, value: Value) -> Predicate {
+        Predicate::Eq { field: Path::new(field), value }
+    }
+
+    fn param(name: &str) -> Value {
+        json!({ "$param": name })
+    }
+
+    fn scan() -> OperatorPlan {
+        OperatorPlan::Scan { table: "game".into() }
+    }
+
+    fn filter(input: OperatorPlan, predicate: Predicate) -> OperatorPlan {
+        OperatorPlan::Filter { input: Box::new(input), predicate }
+    }
+
+    fn order(fields: &[(&str, &str)]) -> Option<Vec<OrderSpec>> {
+        Some(fields.iter().map(|(f, d)| OrderSpec { field: Path::new(f), direction: d.to_string() }).collect())
+    }
+
+    fn limit(input: OperatorPlan, limit: usize, start: usize, order_by: Option<Vec<OrderSpec>>) -> OperatorPlan {
+        OperatorPlan::Limit { input: Box::new(input), limit, start, order_by }
+    }
+
+    /// The views under test: plan, params, and whether it should come out
+    /// index-backed.
+    fn views() -> Vec<(&'static str, OperatorPlan, Value, bool)> {
+        let db = filter(scan(), eq("database", param("database")));
+        vec![
+            (
+                "asc",
+                limit(db.clone(), 7, 0, order(&[("sort_index", "ASC"), ("id", "ASC")])),
+                json!({ "database": "game_database:d1" }),
+                true,
+            ),
+            (
+                "asc_deep",
+                limit(db.clone(), 5, 9, order(&[("sort_index", "ASC")])),
+                json!({ "database": "game_database:d2" }),
+                true,
+            ),
+            (
+                "desc",
+                limit(db.clone(), 6, 3, order(&[("sort_index", "DESC")])),
+                json!({ "database": "game_database:d1" }),
+                true,
+            ),
+            ("unordered", limit(db.clone(), 8, 2, None), json!({ "database": "game_database:d3" }), true),
+            (
+                "literal_two_eqs",
+                limit(
+                    filter(filter(scan(), eq("database", json!("game_database:d2"))), eq("owner", param("auth.id"))),
+                    6,
+                    1,
+                    order(&[("sort_index", "ASC")]),
+                ),
+                json!({ "auth": { "id": "user:u1" } }),
+                true,
+            ),
+            (
+                "gated",
+                limit(
+                    filter(
+                        db.clone(),
+                        Predicate::And {
+                            predicates: vec![
+                                Predicate::ParamEq { param: "access".into(), value: json!("account") },
+                                Predicate::True,
+                            ],
+                        },
+                    ),
+                    5,
+                    0,
+                    order(&[("sort_index", "ASC")]),
+                ),
+                json!({ "database": "game_database:d1", "access": "account" }),
+                true,
+            ),
+            (
+                "gate_closed",
+                limit(
+                    filter(db.clone(), Predicate::ParamEq { param: "access".into(), value: json!("account") }),
+                    5,
+                    0,
+                    order(&[("sort_index", "ASC")]),
+                ),
+                json!({ "database": "game_database:d1", "access": "anon" }),
+                true,
+            ),
+            (
+                "projected",
+                limit(
+                    OperatorPlan::Project { input: Box::new(db.clone()), projections: vec![Projection::All] },
+                    6,
+                    0,
+                    order(&[("sort_index", "ASC")]),
+                ),
+                json!({ "database": "game_database:d2" }),
+                true,
+            ),
+            (
+                "ranged_scan",
+                filter(
+                    db.clone(),
+                    Predicate::Gt { field: Path::new("sort_index"), value: json!(10) },
+                ),
+                json!({ "database": "game_database:d1" }),
+                true,
+            ),
+            (
+                "ranged_window",
+                limit(
+                    filter(db.clone(), Predicate::Lt { field: Path::new("sort_index"), value: json!(15) }),
+                    4,
+                    0,
+                    order(&[("sort_index", "ASC")]),
+                ),
+                json!({ "database": "game_database:d3" }),
+                true,
+            ),
+            (
+                "mixed_directions",
+                limit(db.clone(), 5, 0, order(&[("sort_index", "ASC"), ("created_at", "DESC")])),
+                json!({ "database": "game_database:d1" }),
+                true,
+            ),
+            (
+                "id_desc",
+                limit(db.clone(), 5, 0, order(&[("sort_index", "ASC"), ("id", "DESC")])),
+                json!({ "database": "game_database:d1" }),
+                true,
+            ),
+            ("missing_param", limit(db.clone(), 5, 0, order(&[("sort_index", "ASC")])), json!({}), false),
+            ("no_index", limit(scan(), 5, 0, order(&[("title", "ASC")])), json!({}), false),
+        ]
+    }
+
+    fn random_row(rng: &mut Rng) -> Value {
+        let database = match rng.below(10) {
+            0..=2 => json!("game_database:d1"),
+            3..=5 => json!("game_database:d2"),
+            6..=7 => json!("game_database:d3"),
+            8 => Value::Null,
+            _ => json!(7),
+        };
+        let sort_index = match rng.below(12) {
+            0 => Value::Null,
+            1 => json!(rng.below(20) as f64 + 0.5),
+            2 => json!("zz"),
+            _ => json!(rng.below(20)),
+        };
+        let mut row = json!({
+            "database": database,
+            "sort_index": sort_index,
+            "owner": format!("user:u{}", rng.below(3)),
+            "created_at": rng.below(50),
+            "title": format!("t{}", rng.below(30)),
+        });
+        if rng.below(15) == 0 {
+            row.as_object_mut().unwrap().remove("sort_index");
+        }
+        row
+    }
+
+    fn random_change(rng: &mut Rng, ids: u64) -> Change {
+        let id = format!("g{}", rng.below(ids));
+        match rng.below(10) {
+            0..=3 => Change::create("game", &id, random_row(rng)),
+            4..=6 => Change::update("game", &id, random_row(rng)),
+            7 => Change::merge("game", &id, json!({ "title": format!("t{}", rng.below(30)) })),
+            8 => Change::merge("game", &id, json!({ "sort_index": rng.below(20) })),
+            _ => Change::delete("game", &id),
+        }
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// Additions, removals and updates for `id` this step, or nothing when
+    /// either side republished the view whole (a TopK reprime): the views'
+    /// membership is compared after every step regardless.
+    fn comparable(a: &[ViewDelta], b: &[ViewDelta], id: &str) -> bool {
+        !a.iter().chain(b).any(|d| d.query_id == id && d.initial)
+    }
+
+    fn shape(deltas: &[ViewDelta], id: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut out = (Vec::new(), Vec::new(), Vec::new());
+        for d in deltas.iter().filter(|d| d.query_id == id) {
+            out.0.extend(d.additions.iter().cloned());
+            out.1.extend(d.removals.iter().cloned());
+            out.2.extend(d.updates.iter().cloned());
+        }
+        (sorted(out.0), sorted(out.1), sorted(out.2))
+    }
+
+    /// The asc/asc_deep/desc windows computed straight from the rows.
+    fn oracle(circuit: &Circuit, id: &str) -> Vec<String> {
+        use crate::operator::top_k::SortableValue;
+        let (db, limit, start, desc) = match id {
+            "asc" => ("game_database:d1", 7, 0, false),
+            "asc_deep" => ("game_database:d2", 5, 9, false),
+            "desc" => ("game_database:d1", 6, 3, true),
+            _ => return vec![],
+        };
+        let coll = circuit.store.get_collection("game").unwrap();
+        let mut rows: Vec<(SortableValue, String)> = coll
+            .membership()
+            .keys()
+            .filter_map(|key| {
+                let row = circuit.store.get_row_by_key(key);
+                (row.get("database").as_str() == Some(db))
+                    .then(|| (SortableValue::from_value(row.get("sort_index"), desc), key.to_string()))
+            })
+            .collect();
+        rows.sort();
+        sorted(rows.into_iter().skip(start).take(limit).map(|(_, k)| k).collect())
+    }
+
+    fn register_all(circuit: &mut Circuit) {
+        for (id, plan, params, _) in views() {
+            circuit.add_query_with_auth(QueryPlan { id: id.into(), root: plan }, Some(params), None, String::new());
+        }
+    }
+
+    fn assert_same(indexed: &Circuit, plain: &Circuit, context: &str) {
+        for (id, ..) in views() {
+            assert_eq!(
+                sorted(indexed.view_keys(id)),
+                sorted(plain.view_keys(id)),
+                "view {id} diverged {context}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_backed_views_match_the_plan_as_written_through_churn() {
+        let seeds: u64 = std::env::var("IDX_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+        for seed in 1..=seeds {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let ids = 40 + seed * 15;
+            let mut indexed = Circuit::new();
+            let mut plain = Circuit::new();
+            for c in [&mut indexed, &mut plain] {
+                c.store.ensure_collection("game");
+            }
+            indexed.set_table_meta("game", meta(game_indexes()));
+            plain.set_table_meta("game", meta(Vec::new()));
+            for _ in 0..ids {
+                let change = random_change(&mut rng, ids);
+                indexed.store.apply_change(&change);
+                plain.store.apply_change(&change);
+            }
+            register_all(&mut indexed);
+            register_all(&mut plain);
+            for (id, _, _, backed) in views() {
+                assert_eq!(!indexed.view_index_uses(id).is_empty(), backed, "view {id} index choice");
+                assert!(plain.view_index_uses(id).is_empty());
+            }
+            assert_same(&indexed, &plain, &format!("after registration, seed {seed}"));
+
+            for step in 0..400 {
+                let n = 1 + rng.below(4) as usize;
+                let changes: Vec<Change> = (0..n).map(|_| random_change(&mut rng, ids)).collect();
+                let a = indexed.step(ChangeSet { changes: changes.clone() });
+                let b = plain.step(ChangeSet { changes });
+                for (id, ..) in views() {
+                    if comparable(&a, &b, id) {
+                        assert_eq!(shape(&a, id), shape(&b, id), "view {id} delta diverged at step {step}, seed {seed}");
+                    }
+                }
+                // Both sides against the rows themselves, not just each other.
+                for id in ["asc", "asc_deep", "desc"] {
+                    assert_eq!(sorted(plain.view_keys(id)), oracle(&plain, id), "view {id} wrong at step {step}, seed {seed}");
+                }
+                assert_same(&indexed, &plain, &format!("at step {step}, seed {seed}"));
+            }
+        }
+    }
+
+    #[test]
+    fn indexes_defined_and_dropped_upstream_replan_live_views() {
+        let mut rng = Rng(0xDEAD_BEEF);
+        let ids = 80;
+        let mut indexed = Circuit::new();
+        let mut plain = Circuit::new();
+        for c in [&mut indexed, &mut plain] {
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(Vec::new()));
+        }
+        for _ in 0..ids {
+            let change = random_change(&mut rng, ids);
+            indexed.store.apply_change(&change);
+            plain.store.apply_change(&change);
+        }
+        register_all(&mut indexed);
+        register_all(&mut plain);
+        assert!(indexed.view_index_uses("asc").is_empty());
+
+        let churn = |indexed: &mut Circuit, plain: &mut Circuit, rng: &mut Rng, phase: &str| {
+            for step in 0..150 {
+                let changes: Vec<Change> = (0..2).map(|_| random_change(rng, ids)).collect();
+                let a = indexed.step(ChangeSet { changes: changes.clone() });
+                let b = plain.step(ChangeSet { changes });
+                for (id, ..) in views() {
+                    if comparable(&a, &b, id) {
+                        assert_eq!(shape(&a, id), shape(&b, id), "view {id} delta diverged at {phase} step {step}");
+                    }
+                }
+                assert_same(indexed, plain, &format!("{phase} step {step}"));
+            }
+        };
+        churn(&mut indexed, &mut plain, &mut rng, "before any index");
+
+        // Someone runs DEFINE INDEX upstream: the next schema read re-plans.
+        indexed.set_table_meta("game", meta(game_indexes()));
+        assert!(!indexed.view_index_uses("asc").is_empty());
+        assert_same(&indexed, &plain, "right after the index appeared");
+        let built = indexed.store.get_collection("game").unwrap().built_indexes();
+        assert!(built.contains(&"game_database_sort".to_string()), "built: {built:?}");
+        churn(&mut indexed, &mut plain, &mut rng, "with indexes");
+
+        // REMOVE INDEX upstream: views fall back and the index memory goes.
+        indexed.set_table_meta("game", meta(vec![def("game_created", &["created_at"])]));
+        assert!(indexed.view_index_uses("asc").is_empty());
+        assert!(indexed.store.get_collection("game").unwrap().built_indexes().is_empty());
+        assert_same(&indexed, &plain, "right after the index went");
+        churn(&mut indexed, &mut plain, &mut rng, "after the drop");
+    }
+
+    /// Customer scale: 1M games, 422k of them in one database, a scroll of
+    /// windowed registrations over it. `cargo test --release -p ssp --lib
+    /// index_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn index_scale() {
+        let build = |indexes: Vec<IndexDef>| {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(indexes));
+            for i in 0..1_000_000u64 {
+                let db = if i % 100 < 42 { 0 } else { 1 + i % 200 };
+                c.store.apply_change(&Change::create(
+                    "game",
+                    &format!("{i:020}"),
+                    json!({ "database": format!("game_database:{db:020}"), "sort_index": (i * 7919) % 1_000_000, "white": "someone", "black": "else" }),
+                ));
+            }
+            c
+        };
+        let window = |n: usize| QueryPlan {
+            id: format!("w{n}"),
+            root: limit(
+                filter(scan(), eq("database", param("database"))),
+                50,
+                n * 50,
+                order(&[("sort_index", "ASC"), ("id", "ASC")]),
+            ),
+        };
+        let params = json!({ "database": format!("game_database:{:020}", 0) });
+        let rss_mb = || {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+        };
+        let only = std::env::var("IDX_ONLY").ok();
+        for (label, indexes) in [("plain", Vec::new()), ("indexed", vec![def("game_database_sort", &["database", "sort_index"])])] {
+            if only.as_deref().is_some_and(|o| o != label) {
+                continue;
+            }
+            let mut c = build(indexes);
+            let base = rss_mb();
+            let t = Instant::now();
+            for n in 0..20 {
+                let t1 = Instant::now();
+                c.add_query_with_auth(window(n * 40), Some(params.clone()), None, String::new());
+                if n < 2 {
+                    eprintln!("{label}: registration {n} {:?}", t1.elapsed());
+                }
+            }
+            eprintln!("{label}: 20 registrations {:?}", t.elapsed());
+            let t = Instant::now();
+            for step in 0..20u64 {
+                let changes = (0..50u64)
+                    .map(|j| {
+                        Change::create(
+                            "game",
+                            &format!("n{step}_{j}"),
+                            json!({ "database": format!("game_database:{:020}", 0), "sort_index": (step * 50 + j) * 997 % 1_000_000 }),
+                        )
+                    })
+                    .collect();
+                c.step(ChangeSet { changes });
+            }
+            eprintln!("{label}: 20 ingest steps of 50 rows {:?}", t.elapsed());
+            let coll = c.store.get_collection("game").unwrap();
+            eprintln!(
+                "{label}: index bytes {:.1} MB, operator state {:.1} MB, RSS {:.0} MB over the loaded rows",
+                coll.secondary_index_bytes() as f64 / 1e6,
+                c.graphs.values().map(Graph::state_bytes).sum::<usize>() as f64 / 1e6,
+                rss_mb() - base
+            );
+        }
+    }
+
+    #[test]
+    fn unregistering_the_last_reader_releases_the_index() {
+        let mut circuit = Circuit::new();
+        circuit.store.ensure_collection("game");
+        circuit.set_table_meta("game", meta(game_indexes()));
+        for i in 0..20 {
+            circuit.store.apply_change(&Change::create(
+                "game",
+                &format!("g{i}"),
+                json!({ "database": "game_database:d1", "sort_index": i }),
+            ));
+        }
+        let (id, plan, params, _) = views().into_iter().next().unwrap();
+        circuit.add_query_with_auth(QueryPlan { id: id.into(), root: plan }, Some(params), None, String::new());
+        assert_eq!(circuit.view_keys(id).len(), 7);
+        assert!(!circuit.store.get_collection("game").unwrap().built_indexes().is_empty());
+        circuit.remove_query(id);
+        assert!(circuit.store.get_collection("game").unwrap().built_indexes().is_empty());
     }
 }

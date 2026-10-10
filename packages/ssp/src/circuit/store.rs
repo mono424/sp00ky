@@ -1,4 +1,5 @@
 use crate::algebra::{RowKey, Weight, ZSet};
+use crate::circuit::index::{IndexDef, OrderedIndex};
 use crate::circuit::row_codec as codec;
 use crate::circuit::row_table::RowTable;
 use crate::eval::value_ref::ValueRef;
@@ -68,6 +69,42 @@ pub struct Collection {
     /// from the registered plans after a restore.
     #[serde(skip)]
     pub retained: Option<BTreeSet<String>>,
+    /// Secondary indexes mirrored from upstream's `DEFINE INDEX`, by name.
+    /// Like `membership`, each is a function of `rows`: built on the first
+    /// lookup a view plans ([`Self::with_index`]), kept in step by every
+    /// write while it exists, and dropped when no view plans over it any more
+    /// ([`Self::release_indexes_except`]). Never serialized.
+    #[serde(skip)]
+    indexes: IndexSlots,
+}
+
+/// The built indexes behind a lock: a lookup builds one through `&self`
+/// (operators only see the store shared), writes reach them through
+/// `get_mut` without locking. A clone starts empty; the indexes rebuild.
+#[derive(Default)]
+struct IndexSlots(std::sync::Mutex<HashMap<String, OrderedIndex>>);
+
+impl Clone for IndexSlots {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for IndexSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<String> = self.lock().keys().cloned().collect();
+        f.debug_tuple("IndexSlots").field(&names).finish()
+    }
+}
+
+impl IndexSlots {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, OrderedIndex>> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn get_mut(&mut self) -> &mut HashMap<String, OrderedIndex> {
+        self.0.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl Collection {
@@ -87,6 +124,81 @@ impl Collection {
             scratch: Vec::new(),
             retained: None,
             membership: std::sync::OnceLock::new(),
+            indexes: IndexSlots::default(),
+        }
+    }
+
+    /// Run `f` against the index `def` describes, building it from the rows
+    /// first if this collection does not hold it yet (or holds an older
+    /// definition under the same name).
+    pub fn with_index<R>(&self, def: &IndexDef, f: impl FnOnce(&OrderedIndex) -> R) -> R {
+        let mut slots = self.indexes.lock();
+        if slots.get(&def.name).is_some_and(|built| built.def != *def) {
+            slots.remove(&def.name);
+        }
+        let index = slots.entry(def.name.clone()).or_insert_with(|| self.build_index(def));
+        f(index)
+    }
+
+    fn build_index(&self, def: &IndexDef) -> OrderedIndex {
+        let mut index = OrderedIndex::new(def.clone());
+        // Row keys are shared with the membership z-set when it is built
+        // (every live write already shares them), not allocated again.
+        let membership = self.membership.get();
+        let mut seen = HashMap::new();
+        let mut entries = Vec::with_capacity(self.rows.len());
+        let mut key = String::with_capacity(self.name.len() + 32);
+        for (id, row) in self.rows.iter() {
+            key.clear();
+            key.push_str(&self.name);
+            key.push(':');
+            key.push_str(id);
+            let row_key = membership
+                .and_then(|m| m.get_key_value(key.as_str()))
+                .map(|(k, _)| k.clone())
+                .unwrap_or_else(|| RowKey::from(key.as_str()));
+            entries.push((index.key_of_shared(row, &mut seen), row_key));
+        }
+        index.fill(entries);
+        index
+    }
+
+    /// Drop every built index whose name is not in `keep`.
+    pub fn release_indexes_except(&mut self, keep: &BTreeSet<String>) {
+        self.indexes.get_mut().retain(|name, _| keep.contains(name));
+    }
+
+    /// Names of the indexes currently built.
+    pub fn built_indexes(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.indexes.lock().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Approximate heap bytes held by built indexes.
+    pub fn secondary_index_bytes(&self) -> usize {
+        self.indexes.lock().values().map(OrderedIndex::bytes).sum()
+    }
+
+    /// Take the row stored under `id` out of every built index.
+    fn unindex_row(&mut self, id: &str, key: &RowKey) {
+        let slots = self.indexes.get_mut();
+        if slots.is_empty() || !self.rows.contains_key(id) {
+            return;
+        }
+        let row = self.rows.get(id);
+        for index in slots.values_mut() {
+            let values = index.key_of(row);
+            index.remove(values, key.clone());
+        }
+    }
+
+    /// File `row` under `key` in every built index.
+    fn index_row(&mut self, row: &Sp00kyValue, key: &RowKey) {
+        let slots = self.indexes.get_mut();
+        for index in slots.values_mut() {
+            let values = index.key_of(ValueRef::from_value(row));
+            index.insert(values, key.clone());
         }
     }
 
@@ -161,6 +273,8 @@ impl Collection {
     /// the hot path (a checkpoint, an idle timer) and only when
     /// `rows.dead_bytes()` is worth it.
     pub fn compact(&mut self) {
+        // A narrowed projection can drop indexed fields; rebuild on next use.
+        self.indexes.get_mut().clear();
         let decoded: Vec<(String, Sp00kyValue)> = self
             .rows
             .iter()
@@ -258,6 +372,7 @@ impl Collection {
             if let Some(d) = self.rows.digest_of(normalized) {
                 ssp_protocol::snapshot_hash::xor_digest(&mut self.catchup_xor, &d);
             }
+            self.unindex_row(normalized, &key);
             self.rows.remove(normalized);
             self.bump_membership(&key, -1);
             return Applied { key, weight: -1, content_changed: true };
@@ -288,7 +403,9 @@ impl Collection {
             ssp_protocol::snapshot_hash::xor_digest(&mut self.catchup_xor, &d);
         }
         ssp_protocol::snapshot_hash::xor_digest(&mut self.catchup_xor, &incoming);
+        self.unindex_row(normalized, &key);
         self.rows.insert(normalized, &data, &incoming);
+        self.index_row(&data, &key);
 
         let weight = if present { 0 } else { 1 };
         if weight != 0 {

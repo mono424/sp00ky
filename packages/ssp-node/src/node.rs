@@ -1035,6 +1035,8 @@ impl SspNode {
                 "rows_bytes": t.rows_bytes,
                 "index_bytes": t.index_bytes,
                 "zset_bytes": t.zset_bytes,
+                "secondary_indexes": t.secondary_indexes,
+                "secondary_index_bytes": t.secondary_index_bytes,
                 "total_bytes": t.total_bytes(),
                 "bytes_per_row": t.bytes_per_row(),
             })).collect::<Vec<_>>(),

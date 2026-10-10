@@ -452,7 +452,8 @@ See [State persistence](/docs/reference/ssp-api#state-persistence).
 The scheduler reads most of its config from `sp00ky.yml`, and the `SPKY_*` vars
 in the first table below override the corresponding YAML field. The fields
 `ingest_host`, `ingest_port`, `load_balance`, `replica_db_path`, `wal_path`,
-`ssp_poll_interval_ms`, `max_buffer_per_ssp` and `job_tables` are YAML only.
+`ssp_poll_interval_ms` and `job_tables` are YAML only; `max_buffer_per_ssp` also
+answers to `SPKY_MAX_BUFFER_PER_SSP`.
 
 The tables after it are env only and have no YAML equivalent: the admin plane,
 backup storage, the dead-man heartbeat, and the tuning knobs.
@@ -564,6 +565,7 @@ staleness flag are built on.
 | `SPKY_HEALTH_MAX_LAG` | Ingest lag above which `/health` reports `degraded`. Unset means lag never degrades health. | *(unset)* |
 | `SPKY_CLONE_TIMEOUT_SECS` | Ceiling on the initial replica clone. Overrunning it fails startup and exits, rather than leaving the scheduler wedged in `cloning` and answering 503 to every SSP for the life of the container. | `900` |
 | `SPKY_BOOTSTRAP_TIMEOUT_SECS` | How long an SSP may take to bootstrap before the scheduler reaps it. Also half of what the dashboard waits on before calling a restart failed. | `300` |
+| `SPKY_MAX_BUFFER_PER_SSP` | Events the scheduler queues for one SSP while it bootstraps or lags. Past it the queue is dropped and the SSP is told to re-bootstrap, from a fresh registration with an empty queue. Size it for the write rate times the longest bootstrap: 50,000 is five minutes at 166 events/s. | `50000` |
 | `SPKY_CLEAR_VIEWS_ON_START` | Wipe every registered view (`_00_query`) when the scheduler starts. `false` keeps them: the replica clones them, the SSPs re-register them at bootstrap, and clients keep their views across a scheduler restart with no re-registration; the SSP TTL sweep retires rows nobody heartbeats. Leave `true` on tenants with more than one SSP for now (every SSP would compute every view). | `true` |
 | `SPKY_INGEST_TRANSPORT` | `http` (the generated DB events post to `/ingest`) or `changefeed` (the scheduler tails SurrealDB's `CHANGEFEED`; must match the schema deployed with `sync.transport`). See [Sync transport](/docs/reference/config#sync-transport). | `http` |
 | `SPKY_CHANGEFEED_RETENTION` | The schema's `CHANGEFEED` retention, rendered form (`1d`). A cursor older than this minus the margin is a gap: the replica is re-cloned. | `1d` |

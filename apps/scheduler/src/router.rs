@@ -3,7 +3,7 @@ use crate::messages::{RecordOp, RecordUpdate};
 use crate::transport::SspInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// SSP initialization state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -361,7 +361,29 @@ impl SspPool {
     }
 
     /// Mark SSP as bootstrapping
+    /// Mark SSP as bootstrapping: a registration, first or repeated.
+    ///
+    /// The per-SSP buffer starts over. The SSP bootstraps from the snapshot
+    /// frozen for this registration, so whatever was buffered for an
+    /// earlier one is either drained into that snapshot or still in the
+    /// global buffer, and the stale entries would only count toward the cap.
+    /// The overflow flag goes with them: `mark_ready` is otherwise the only
+    /// thing that clears it, and an SSP that re-registers on its first
+    /// heartbeat after becoming ready never gets there. With the flag kept,
+    /// every registration answered that heartbeat with the same 409 and the
+    /// SSP re-bootstrapped forever (whitepawn 2026-10-10: 31 rounds in 15
+    /// minutes behind one genuine overflow during a PGN import).
     pub fn mark_bootstrapping(&mut self, ssp_id: &str) {
+        let dropped = self.message_buffers.remove(ssp_id).map(|b| b.len()).unwrap_or(0);
+        let overflowed = self.buffer_overflowed.remove(ssp_id);
+        if dropped > 0 || overflowed {
+            info!(
+                ssp_id,
+                dropped,
+                overflowed,
+                "New registration: the previous registration's buffer is dropped"
+            );
+        }
         self.ssp_states
             .insert(ssp_id.to_string(), SspState::Bootstrapping);
         self.state_since.insert(ssp_id.to_string(), Instant::now());
@@ -964,6 +986,25 @@ mod tests {
     fn with_ssp(p: &mut SspPool, id: &str) {
         p.update_ssp(id, 0, None, None, "test".to_string());
         p.mark_bootstrapping(id);
+    }
+
+    /// A registration starts the buffer over: the overflow and the entries
+    /// of the previous registration belong to a snapshot this one does not
+    /// bootstrap from.
+    #[test]
+    fn a_new_registration_drops_the_stale_buffer_and_its_overflow() {
+        let mut p = SspPool::new(LoadBalanceStrategy::RoundRobin, 2);
+        with_ssp(&mut p, "ssp-0");
+        assert!(p.buffer_message("ssp-0", update("a")));
+        assert!(p.buffer_message("ssp-0", update("b")));
+        assert!(!p.buffer_message("ssp-0", update("c")), "the third event overflows a buffer of two");
+        assert!(p.has_buffer_overflow("ssp-0"));
+
+        p.mark_bootstrapping("ssp-0");
+        assert!(!p.has_buffer_overflow("ssp-0"));
+        assert_eq!(p.buffer_size("ssp-0"), 0);
+        assert!(p.buffer_message("ssp-0", update("d")), "the new registration has its whole buffer again");
+        assert_eq!(p.buffer_size("ssp-0"), 1);
     }
 
     #[test]

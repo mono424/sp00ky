@@ -1210,6 +1210,36 @@ mod ssp_management_tests {
         assert_eq!(body["table_hashes"]["user"], json!(fresh["user"]));
     }
 
+    /// One genuine overflow must not outlive the registration it happened in.
+    /// whitepawn 2026-10-10: a standby's first bootstrap overflowed the 10k
+    /// buffer during a PGN import, re-registered on the 409, and every
+    /// registration after that got the same 409 on its first heartbeat,
+    /// because nothing but `mark_ready` cleared the flag and a re-registering
+    /// SSP never reaches it. 31 rounds in 15 minutes, the handover failed.
+    #[tokio::test]
+    async fn a_re_registration_after_an_overflow_starts_with_a_clean_buffer() {
+        let h = TestHarness::with_max_buffer(2).await;
+        h.add_bootstrapping_ssp("ssp-1", "http://localhost:9999").await;
+        ingest_users(&h, 3).await;
+        h.fanout.idle().await;
+        assert!(h.ssp_pool.read().await.has_buffer_overflow("ssp-1"));
+        let (status, _) =
+            post_json(h.ssp_router(), "/ssp/heartbeat", &heartbeat_payload("ssp-1")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the overflow is reported once");
+
+        let (status, _) =
+            post_json(h.ssp_router(), "/ssp/register", &register_payload("ssp-1", "http://localhost:9999")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        {
+            let pool = h.ssp_pool.read().await;
+            assert!(!pool.has_buffer_overflow("ssp-1"), "the overflow belonged to the previous registration");
+            assert_eq!(pool.buffer_size("ssp-1"), 0, "so did its buffer");
+        }
+        let (status, _) =
+            post_json(h.ssp_router(), "/ssp/heartbeat", &heartbeat_payload("ssp-1")).await;
+        assert_eq!(status, StatusCode::OK, "a fresh registration owes no 409 for the previous one's overflow");
+    }
+
     #[tokio::test]
     async fn register_empty_ssp_id() {
         let h = TestHarness::new().await;

@@ -748,7 +748,7 @@ and `whole_tables`; the final replay logs `since_verify_ms` and
 ### Message Buffering
 
 While an SSP is bootstrapping, the scheduler buffers incoming messages:
-- Maximum buffer size: 10,000 messages per SSP (configurable via `max_buffer_per_ssp`)
+- Maximum buffer size: 50,000 messages per SSP (`max_buffer_per_ssp` in `sp00ky.yml`, or `SPKY_MAX_BUFFER_PER_SSP`). A registration always starts with an empty buffer, so an overflow is reported once and the re-bootstrap it asks for begins clean
 - Buffer exists both globally (event_buffer) and per-SSP
 - If buffer overflows: SSP marked for re-bootstrap, buffer cleared
 - Heartbeat returns `409 Conflict` when buffer overflow occurs
@@ -904,7 +904,7 @@ ingest_port: 9667
 # SSP polling and buffering (the poll is how the scheduler learns a
 # bootstrapping SSP is ready, so its interval is paid on every restart)
 ssp_poll_interval_ms: 500
-max_buffer_per_ssp: 10000
+max_buffer_per_ssp: 50000
 
 # Snapshot update interval (seconds)
 snapshot_update_interval_secs: 300
@@ -941,8 +941,9 @@ job_tables:
 Every other field (`ingest_host`, `ingest_port`, `load_balance`,
 `heartbeat_*`, `bootstrap_chunk_size`, `bootstrap_timeout_secs`,
 `replica_db_path`, `wal_path`, `ssp_poll_interval_ms`,
-`max_buffer_per_ssp`, `job_tables`) is set via `sp00ky.yml`. There
-is no env-var override path for them.
+`max_buffer_per_ssp`, `job_tables`) is set via `sp00ky.yml`. Only
+`bootstrap_timeout_secs` (`SPKY_BOOTSTRAP_TIMEOUT_SECS`) and `max_buffer_per_ssp`
+(`SPKY_MAX_BUFFER_PER_SSP`) also answer to an environment variable.
 
 ---
 

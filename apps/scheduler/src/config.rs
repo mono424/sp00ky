@@ -95,7 +95,13 @@ impl Default for SchedulerConfig {
             ingest_host: None,
             ingest_port: 9667,
             snapshot_update_interval_secs: 300,
-            max_buffer_per_ssp: 10_000,
+            // Events queued for one SSP while it bootstraps or lags. 10_000
+            // was a minute of a PGN import on whitepawn (166 events/s), and
+            // a standby's first bootstrap took 69 s there (2026-10-10), so
+            // it overflowed and the SSP re-bootstrapped. 50_000 is five
+            // minutes at that rate, ~75 MB of buffered JSON at 1.5 KB a row.
+            // Override with SPKY_MAX_BUFFER_PER_SSP.
+            max_buffer_per_ssp: 50_000,
             // 120 livelocked a real deployment once its tables outgrew what a
             // paged /proxy load can move in two minutes (2026-08-08): timeout →
             // SSP exit → re-register → re-freeze, forever. Override with
@@ -200,6 +206,14 @@ impl SchedulerConfig {
             if let Ok(n) = v.parse::<u64>() {
                 if n > 0 {
                     scheduler_config.bootstrap_timeout_secs = n;
+                }
+            }
+        }
+
+        if let Ok(v) = std::env::var("SPKY_MAX_BUFFER_PER_SSP") {
+            if let Ok(n) = v.parse::<usize>() {
+                if n > 0 {
+                    scheduler_config.max_buffer_per_ssp = n;
                 }
             }
         }

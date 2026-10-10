@@ -173,10 +173,15 @@ fn check_predicate_recursive(
             if actual.is_missing() {
                 return false;
             }
-            let ord = compare_values(actual, ValueRef::from_value(&target));
+            let target = ValueRef::from_value(&target);
+            let ord = compare_values(actual, target);
             match pred {
-                Predicate::Eq { .. } => ord == Ordering::Equal,
-                Predicate::Neq { .. } => ord != Ordering::Equal,
+                // Equality needs the same kind of value, as SurrealDB has it:
+                // `compare_values` is an ordering and folds a type mismatch to
+                // `Equal`, which made `7 = "x"` hold, so a filter on a field
+                // matched every row holding another type there.
+                Predicate::Eq { .. } => ord == Ordering::Equal && same_kind(actual, target),
+                Predicate::Neq { .. } => ord != Ordering::Equal || !same_kind(actual, target),
                 Predicate::Gt { .. } => ord == Ordering::Greater,
                 Predicate::Gte { .. } => ord != Ordering::Less,
                 Predicate::Lt { .. } => ord == Ordering::Less,
@@ -215,6 +220,21 @@ fn check_predicate_recursive(
     }
 }
 
+/// Whether two values are the same kind of value, numbers counting as one
+/// kind (`5 = 5.0`).
+fn same_kind(a: ValueRef<'_>, b: ValueRef<'_>) -> bool {
+    matches!(
+        (a, b),
+        (ValueRef::Missing, ValueRef::Missing)
+            | (ValueRef::Null, ValueRef::Null)
+            | (ValueRef::Bool(_), ValueRef::Bool(_))
+            | (ValueRef::Int(_) | ValueRef::Float(_), ValueRef::Int(_) | ValueRef::Float(_))
+            | (ValueRef::Str(_), ValueRef::Str(_))
+            | (ValueRef::Arr(_), ValueRef::Arr(_))
+            | (ValueRef::Obj(_), ValueRef::Obj(_))
+    )
+}
+
 /// Look up a `$param` reference (e.g. "auth.id", "access") against the
 /// per-registration context. Mirrors the RHS resolution path in
 /// `resolve_predicate_value` but takes the already-extracted param name.
@@ -238,6 +258,26 @@ mod tests {
 
     fn zset(items: &[(&str, i64)]) -> ZSet {
         items.iter().map(|(k, w)| ((*k).into(), *w)).collect()
+    }
+
+    #[test]
+    fn equality_never_holds_across_value_types() {
+        let mut store = Store::new();
+        store.ensure_collection("g");
+        store.apply_change(&Change::create("g", "a", json!({ "db": 7 })));
+        store.apply_change(&Change::create("g", "b", json!({ "db": "game_database:x" })));
+        store.apply_change(&Change::create("g", "c", json!({ "db": { "tb": "game_database" } })));
+        store.apply_change(&Change::create("g", "d", json!({ "db": 5.0 })));
+        let input = zset(&[("g:a", 1), ("g:b", 1), ("g:c", 1), ("g:d", 1)]);
+        let keys = |pred: Predicate| {
+            let mut keys: Vec<String> = Filter::new(pred).snapshot(&[&input], &store, None).keys().map(|k| k.to_string()).collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(Predicate::Eq { field: Path::new("db"), value: json!("game_database:x") }), vec!["g:b"]);
+        assert_eq!(keys(Predicate::Neq { field: Path::new("db"), value: json!("game_database:x") }), vec!["g:a", "g:c", "g:d"]);
+        // Numbers are one kind.
+        assert_eq!(keys(Predicate::Eq { field: Path::new("db"), value: json!(5) }), vec!["g:d"]);
     }
 
     #[test]

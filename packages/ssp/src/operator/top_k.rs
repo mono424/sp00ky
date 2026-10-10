@@ -487,14 +487,18 @@ mod tests {
         };
         let mut rebuilds = 0;
         for round in 0..2_000 {
+            // Alternate mixed churn with phases that only retract, so the
+            // buffer drains on every run whatever order a delta's keys come
+            // out of the map in.
+            let draining = (round / 200) % 2 == 1;
             let mut delta = ZSet::new();
             for _ in 0..(1 + next(6)) {
                 let id = format!("r{}", next(40));
                 let key = format!("g:{id}");
-                if live.contains(&key) && next(2) == 0 {
+                if live.contains(&key) && (draining || next(2) == 0) {
                     delta.insert(key.as_str().into(), -1);
                     live.remove(&key);
-                } else if !live.contains(&key) && !delta.contains_key(key.as_str()) {
+                } else if !draining && !live.contains(&key) && !delta.contains_key(key.as_str()) {
                     store.apply_change(&Change::create("g", &id, json!({ "rank": next(1_000) })));
                     delta.insert(key.as_str().into(), 1);
                     live.insert(key);

@@ -81,3 +81,71 @@ async fn many_ingests_flush_as_one_write_and_a_quiet_flush_writes_nothing() {
     assert_eq!(again, 0, "nothing dirty, nothing written");
     assert_eq!(writes.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn restart_increments_the_durable_counter_and_preserves_legacy_latency() {
+    let (db, raw, _) = setup().await;
+    raw.query("UPDATE _00_query:v1 SET updateCount = 41, materializationP99 = 700.0, lastIngestLatency = 700.0;")
+        .await.unwrap().check().unwrap();
+    let fresh: ViewMetrics = RwLock::new(Default::default());
+    {
+        let mut state = ssp_node::view_metrics::ViewMetricsState::default();
+        state.row_count = 12;
+        state.registration = Some(ssp_node::view_metrics::RegistrationStages { request_ms: 15.0, ..Default::default() });
+        state.dirty = true;
+        fresh.write().await.insert("v1".into(), state);
+    }
+    assert_eq!(flush_view_metrics(&db, &fresh).await, 1);
+    let read = || raw.query("SELECT * FROM ONLY _00_query:v1");
+    let r = read().await.unwrap().take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    assert_eq!(r["updateCount"], 41);
+    assert_eq!(r["materializationP99"], 700.0, "a new registration sample must not erase old ingest evidence");
+    assert_eq!(r["registrationStages"]["request_ms"], 15.0);
+    note_view_metrics(&fresh, vec![13], vec!["v1".into()], 2.0).await;
+    assert_eq!(flush_view_metrics(&db, &fresh).await, 1);
+    let r = read().await.unwrap().take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    assert_eq!(r["updateCount"], 42, "fresh SSP adds to the durable lifetime counter");
+    assert_eq!(r["materializationP99"], 2.0);
+}
+
+#[tokio::test]
+async fn slow_evidence_is_masked_bounded_and_outlives_view_reclamation() {
+    use ssp_node::view_metrics::{persist_slow_registration, slow_registration_evidence, RegistrationStages};
+    let (db, raw, _) = setup().await;
+    let plan: ssp::operator::OperatorPlan = serde_json::from_value(
+        ssp::converter::convert_surql_to_dbsp("SELECT * FROM game WHERE owner = 'super-secret-user' AND title = $secret LIMIT 50").unwrap()
+    ).unwrap();
+    let shape = ssp::allowlist::Shape::of(&plan);
+    for i in 0..105 {
+        let evidence = slow_registration_evidence(&shape, "test-version", &[("game".into(), "owner".into())], i,
+            &RegistrationStages { request_ms: 500.0 + i as f64, ..Default::default() });
+        let text = evidence.to_string();
+        assert!(!text.contains("super-secret-user"));
+        assert!(!text.contains("$secret"));
+        persist_slow_registration(&db, evidence).await.unwrap();
+    }
+    raw.query("DELETE _00_query;").await.unwrap().check().unwrap();
+    // A new DB adapter models the next process; no evidence lives in memory.
+    let restarted = MemDb(raw.clone(), Arc::new(AtomicUsize::new(0)));
+    let r = restarted.query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations", &[]).await.unwrap();
+    let samples = r[0]["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 100);
+    assert_eq!(samples[0]["row_count"], 5);
+    assert_eq!(samples[99]["row_count"], 104);
+}
+
+#[tokio::test]
+async fn concurrent_evidence_appends_preserve_both_writers() {
+    use ssp_node::view_metrics::persist_slow_registration;
+    let (db, raw, _) = setup().await;
+    let a = persist_slow_registration(&db, serde_json::json!({ "kind": "ingest", "at_ms": 1 }));
+    let b = persist_slow_registration(&db, serde_json::json!({ "kind": "registration", "at_ms": 2 }));
+    let (a, b) = tokio::join!(a, b);
+    a.unwrap(); b.unwrap();
+    let r = raw.query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    let samples = r["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 2);
+    assert!(samples.iter().any(|s| s["kind"] == "ingest"));
+    assert!(samples.iter().any(|s| s["kind"] == "registration"));
+}

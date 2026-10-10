@@ -11,6 +11,7 @@ pub mod top_k;
 pub mod index_scan;
 pub mod aggregate;
 pub mod distinct;
+mod witness;
 
 use crate::algebra::ZSet;
 use crate::circuit::store::Store;
@@ -46,6 +47,11 @@ pub trait Operator: Debug + Send + Sync {
         store: &Store,
         ctx: Option<&Sp00kyValue>,
     ) -> ZSet;
+
+    /// Rows whose bodies changed without an input membership delta. Stateful
+    /// joins refresh only these keys before stepping, using their saved old
+    /// join values to move witnesses between index buckets.
+    fn note_content_updates(&mut self, _keys: &[crate::algebra::RowKey]) {}
 
     /// Number of input ports. Scan=0, unary operators=1, Join=2.
     fn arity(&self) -> usize;

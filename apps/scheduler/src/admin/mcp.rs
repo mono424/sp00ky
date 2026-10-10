@@ -159,7 +159,9 @@ pub const TOOLS: &[ToolDef] = &[
             p("hot", "boolean", "Only views updating at least SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC times a second (default 5) as of the last presence sample; every row carries update_rate either way"),
             p("include_expired", "boolean", "Include rows past lastActiveAt + ttl that the sweep has not reclaimed yet"),
         ], read_only = true),
-    tool!("view_get", "One registered view in full: its SurrealQL and params, every subscribing session with its age, materialization percentiles, the SSP serving it with that view's memory footprint, and the other live sessions running the identical query.", "GET", "/views/{key}",
+    tool!("view_history", "Persistent bounded slow registration and ingest evidence: sanitized query shapes, version, cardinality, chosen indexes and request stages. Survives view TTL and SSP restarts; publication backlog is recorded separately in incidents.", "GET", "/views/history",
+        query = &[p("limit", "integer", "Samples to return (default 50, maximum 100)"), p("since", "integer", "Earliest sample, epoch milliseconds"), p("kind", "string", "registration, ingest or ingest_batch")], read_only = true),
+    tool!("view_get", "One registered view in full: its SurrealQL and params, every subscribing session with its age, materialization percentiles, registration/ingest stages, the SSP serving it with that view's memory footprint, and the other live sessions running the identical query.", "GET", "/views/{key}",
         path_params = &[req("key", "string", "The _00_query key as listed by views_list; the _00_query:<key> spelling is accepted too")], read_only = true),
     tool!("logs_recent", "Recent log lines from the scheduler or one SSP (bounded, non-streaming).", "GET", "/logs",
         query = &[

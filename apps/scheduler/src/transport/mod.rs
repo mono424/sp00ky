@@ -10,6 +10,8 @@ pub struct SspInfo {
     pub id: String,
     pub url: String,
     pub version: String,
+    #[serde(default)]
+    pub ingest_batch_limit: usize,
     #[serde(skip, default = "std::time::Instant::now")]
     pub connected_at: Instant,
     #[serde(skip, default = "std::time::Instant::now")]

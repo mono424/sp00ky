@@ -326,6 +326,7 @@ impl TestHarness {
 
     async fn add_ready_ssp(&self, id: &str, url: &str) {
         let ssp_info = SspInfo {
+            ingest_batch_limit: 0,
             id: id.to_string(),
             url: url.to_string(),
             version: "test".to_string(),
@@ -346,6 +347,7 @@ impl TestHarness {
 
     async fn add_bootstrapping_ssp(&self, id: &str, url: &str) {
         let ssp_info = SspInfo {
+            ingest_batch_limit: 0,
             id: id.to_string(),
             url: url.to_string(),
             version: "test".to_string(),
@@ -4117,6 +4119,7 @@ mod admin_plane {
         {
             let mut pool = h.ssp_pool.write().await;
             pool.upsert(SspInfo {
+            ingest_batch_limit: 0,
                 id: "ssp-boot".to_string(),
                 url: "http://10.0.0.9:8667".to_string(),
                 version: "test".to_string(),
@@ -4818,7 +4821,25 @@ mod admin_plane {
         assert!(body["error"].as_str().unwrap().contains("slowest"), "{body}");
     }
 
-    /// All three are reads, so a read-scope agent token must see and be able to
+    #[tokio::test]
+    async fn view_history_requires_auth_and_validates_kind_before_database_access() {
+        let h = TestHarness::new().await;
+        let app = admin_app(&h, Some("pw"));
+        let res = app.clone().oneshot(get("/admin/api/views/history")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let token = breakglass_token(&app, "pw").await;
+        for suffix in ["", "?kind=registration", "?kind=ingest", "?kind=ingest_batch&since=42&limit=200"] {
+            let path = format!("/admin/api/views/history{suffix}");
+            let res = app.clone().oneshot(get_auth(&path, &token)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert!(body_json(res).await["error"].as_str().unwrap().contains("database handle"));
+        }
+        let res = app.oneshot(get_auth("/admin/api/views/history?kind=unknown", &token)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(res).await["error"].as_str().unwrap().contains("ingest_batch"));
+    }
+
+    /// All four are reads, so a read-scope agent token must see and be able to
     /// call every one of them. This is the whole reason they are GETs.
     #[tokio::test]
     async fn a_read_token_can_see_and_call_the_presence_tools() {
@@ -4830,7 +4851,7 @@ mod admin_plane {
         let (_, list) = mcp_call(&app, &read, rpc(1, "tools/list", json!({}))).await;
         let tools = list["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        for expected in ["presence", "views_list", "view_get"] {
+        for expected in ["presence", "views_list", "view_get", "view_history"] {
             assert!(names.contains(&expected), "{expected} missing from {names:?}");
         }
 
@@ -4842,6 +4863,13 @@ mod admin_plane {
         );
         let view_get = tools.iter().find(|t| t["name"] == "view_get").unwrap();
         assert_eq!(view_get["inputSchema"]["required"], json!(["key"]));
+        let history = tools.iter().find(|t| t["name"] == "view_history").unwrap();
+        assert_eq!(history["annotations"]["readOnlyHint"], true);
+        for (name, kind) in [("kind", "string"), ("limit", "integer"), ("since", "integer")] {
+            assert_eq!(history["inputSchema"]["properties"][name]["type"], kind);
+        }
+        let res = app.clone().oneshot(get_auth("/admin/api/views/history?kind=ingest_batch", &read)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "read token reaches the database-backed handler");
 
         // Dispatch really goes through the router, so the tool answers with
         // what the endpoint answers.
@@ -4866,6 +4894,15 @@ mod admin_plane {
             .as_str()
             .unwrap()
             .contains("HTTP 503"));
+        for (id, arguments, expected) in [
+            (4, json!({"kind":"ingest_batch", "since":42, "limit":100}), "HTTP 503"),
+            (5, json!({"kind":"unknown"}), "HTTP 400"),
+        ] {
+            let (_, history) = mcp_call(&app, &read,
+                rpc(id, "tools/call", json!({"name":"view_history", "arguments":arguments}))).await;
+            assert_eq!(history["result"]["isError"], true, "{history}");
+            assert!(history["result"]["content"][0]["text"].as_str().unwrap().contains(expected), "{history}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5406,3 +5443,5 @@ async fn drift_repair_corrects_a_row_deleted_while_it_ran() {
     scheduler::drain_and_apply(&h.event_buffer, &h.replica, &h.wal).await.unwrap();
     assert_eq!(h.replica.read().await.query("SELECT VALUE id FROM puzzle").await.unwrap(), json!(["puzzle:a"]));
 }
+
+mod ingest_batch_tests;

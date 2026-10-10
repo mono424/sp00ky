@@ -14,6 +14,7 @@ use scheduler::{Scheduler, SchedulerStatus};
 
 fn ssp(id: &str) -> SspInfo {
     SspInfo {
+        ingest_batch_limit: 17,
         id: id.to_string(),
         url: format!("http://{id}:8667"),
         version: "test".to_string(),
@@ -89,6 +90,7 @@ async fn a_scheduler_hands_its_replica_and_pool_to_its_successor() {
 
     let pool = green.ssp_pool.read().await;
     assert_eq!(pool.get_state("ssp-0"), Some(&SspState::Ready));
+    assert_eq!(pool.get("ssp-0").unwrap().ingest_batch_limit, 17);
     assert_eq!(pool.get("ssp-0").map(|s| s.url.as_str()), Some("http://ssp-0:8667"));
     drop(pool);
     assert_eq!(green_tracker.get_assignment("q1").await.as_deref(), Some("ssp-0"));

@@ -50,6 +50,7 @@ async fn release_then_commit_carries_events_taken_in_between() {
     {
         let mut pool = blue.ssp_pool.write().await;
         pool.upsert(SspInfo {
+            ingest_batch_limit: 0,
             id: "ssp-0".into(),
             url: "http://127.0.0.1:9".into(),
             version: "test".into(),

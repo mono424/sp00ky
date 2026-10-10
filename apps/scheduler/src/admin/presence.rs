@@ -749,7 +749,8 @@ pub async fn presence(State(state): State<AdminState>) -> Json<Value> {
 const VIEW_FIELDS: &str = "type::string(id) AS id, auth_id, clientId AS client_id, surql, \
      array::len(subscribers ?? []) AS subscriber_count, \
      rowCount AS row_count, updateCount AS update_count, errorCount AS error_count, \
-     registrationTime AS registration_ms, \
+     registrationTime AS registration_ms, registrationStages AS registration_stages, \
+     ingestStages AS ingest_stages, \
      materializationP55 AS p55, materializationP90 AS p90, materializationP99 AS p99, \
      lastIngestLatency AS last_ingest_ms, \
      type::string(createdAt) AS created_at, \
@@ -774,6 +775,43 @@ pub struct ViewsQuery {
     /// Only views updating at least the hot rate as of the last sample.
     hot: Option<bool>,
     include_expired: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+pub struct HistoryQuery {
+    limit: Option<usize>,
+    since: Option<u64>,
+    kind: Option<String>,
+}
+
+/// Bounded slow-operation evidence lives outside `_00_query`, so a TTL sweep
+/// or an SSP restart cannot erase the shape and stages of a past stall.
+pub async fn view_history(
+    State(state): State<AdminState>,
+    Query(params): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if params.kind.as_ref().is_some_and(|k| k != "registration" && k != "ingest" && k != "ingest_batch") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Unknown kind. Use registration, ingest or ingest_batch."));
+    }
+    let Some(db) = state.db() else { return Err(db_unavailable()) };
+    let stored = rows(&db, "SELECT samples FROM ONLY _00_sync_evidence:slow_operations;").await?;
+    let samples = stored.first().and_then(|row| row["samples"].as_array())
+        .map(Vec::as_slice).unwrap_or(&[]);
+    Ok(Json(history_payload(samples, &params, now_ms())))
+}
+
+fn history_payload(stored: &[Value], params: &HistoryQuery, server_time_ms: u64) -> Value {
+    let mut samples: Vec<Value> = stored.iter()
+        .filter(|sample| params.since.map_or(true, |at| sample["at_ms"].as_u64().unwrap_or(0) >= at)
+            && params.kind.as_ref().map_or(true, |kind| sample["kind"].as_str() == Some(kind)))
+        .cloned().collect();
+    samples.sort_by_key(|sample| std::cmp::Reverse(sample["at_ms"].as_u64().unwrap_or(0)));
+    let total = samples.len();
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
+    samples.truncate(limit);
+    json!({ "samples": samples, "total": total, "limit": limit,
+        "capacity": 100, "slow_ms": 250, "server_time_ms": server_time_ms,
+        "measurement": "Registration/ingest request stages; publication queue age and DB transaction timings are separate." })
 }
 
 /// Map a sort name to an `ORDER BY` clause.
@@ -1574,5 +1612,40 @@ mod tests {
     fn canonical_query_id_is_idempotent_on_both_spellings() {
         assert_eq!(canonical_query_id("_00_query:abc"), "abc");
         assert_eq!(canonical_query_id("abc"), "abc");
+    }
+
+    #[test]
+    fn history_payload_filters_inclusively_sorts_newest_and_counts_before_limiting() {
+        let samples = vec![
+            json!({"at_ms": 3, "kind": "ingest_batch"}),
+            json!({"at_ms": 9, "kind": "registration"}),
+            json!({"at_ms": 5, "kind": "ingest_batch"}),
+            json!({"at_ms": 7, "kind": "ingest_batch"}),
+            json!({"kind": "ingest_batch"}),
+        ];
+        let params = HistoryQuery { since: Some(5), kind: Some("ingest_batch".into()), limit: Some(1) };
+        let body = history_payload(&samples, &params, 123);
+        assert_eq!(body["samples"], json!([{"at_ms": 7, "kind": "ingest_batch"}]));
+        assert_eq!(body["total"], 2, "since includes the sample at exactly 5");
+        assert_eq!(body["limit"], 1);
+        assert_eq!(body["server_time_ms"], 123);
+        assert_eq!(body["capacity"], 100);
+        assert_eq!(body["slow_ms"], 250);
+    }
+
+    #[test]
+    fn history_payload_clamps_limits_and_handles_an_empty_ring() {
+        let samples: Vec<_> = (0..150).map(|at| json!({"at_ms": at, "kind": "ingest"})).collect();
+        for (requested, expected) in [(None, 50), (Some(0), 1), (Some(999), 100)] {
+            let body = history_payload(&samples, &HistoryQuery { limit: requested, ..Default::default() }, 0);
+            assert_eq!(body["limit"], expected);
+            assert_eq!(body["samples"].as_array().unwrap().len(), expected);
+            assert_eq!(body["samples"][0]["at_ms"], 149);
+            assert_eq!(body["total"], 150);
+        }
+        let empty = history_payload(&[], &HistoryQuery::default(), 0);
+        assert_eq!(empty["samples"], json!([]));
+        assert_eq!(empty["total"], 0);
+        assert_eq!(empty["limit"], 50);
     }
 }

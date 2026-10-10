@@ -101,7 +101,12 @@ impl SspNode {
                             Some(_) => info!(target: "ssp::policy", table = %table, permission = %meta.permission, "Schema: table definition changed upstream; metadata reloaded"),
                         }
                     }
-                    circuit.set_table_meta(table, meta.clone());
+                    let builds = circuit.set_table_meta_timed(table, meta.clone());
+                    if builds.indexes_built > 0 {
+                        info!(table = %table, index_build_ms = builds.index_build_ms,
+                            indexes_built = builds.indexes_built, rows_indexed = builds.rows_indexed,
+                            "Schema: prewarmed indexes for active views");
+                    }
                     changed = true;
                 }
             }
@@ -176,7 +181,12 @@ impl SspNode {
         for (table, meta) in moved {
             let names: Vec<&str> = meta.indexes.iter().map(|i| i.name.as_str()).collect();
             info!(target: "ssp::policy", table = %table, indexes = ?names, "Schema: indexes changed upstream; views re-planned");
-            circuit.set_table_meta(&table, meta);
+            let builds = circuit.set_table_meta_timed(&table, meta);
+            if builds.indexes_built > 0 {
+                info!(table = %table, index_build_ms = builds.index_build_ms,
+                    indexes_built = builds.indexes_built, rows_indexed = builds.rows_indexed,
+                    "Schema: prewarmed indexes for active views");
+            }
         }
         Ok(true)
     }

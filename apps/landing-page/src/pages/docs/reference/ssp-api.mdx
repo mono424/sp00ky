@@ -114,6 +114,25 @@ This approach is more efficient than chunk pushing because the SSP only fetches 
 
 ---
 
+### POST /ingest/batch
+
+Authenticated ordinary-record ingestion. Body: `{ "records": [ /* /ingest bodies */ ] }`.
+The array must contain 1–128 records and the complete JSON body must be at most
+1 MiB. All records are validated before any source mutation. Supported operations
+are `CREATE`, `UPDATE`, `MERGE` and `DELETE`; `user`, configured job tables and
+`_00_*` tables require the single-record endpoint for their lifecycle effects.
+
+The circuit applies changes in array order, steps affected graphs once and
+reserves one publication slot. The publisher checks all surviving source versions
+before publishing, subject to the existing five-second fallback. Delete and
+recreate sequences restore visible edges after deletion cleanup. `200` acknowledges
+circuit application and enqueueing; publication finishes asynchronously. Invalid
+bodies return `400`, oversized bodies `413`, and readiness or publication admission
+failures `503` before source changes. Retry the complete batch in order.
+
+The scheduler uses this endpoint only after the SSP advertises `ingest_batch_limit`
+in its registration. A missing or zero capability keeps single-record delivery.
+
 ## View Management
 
 ### POST /view/register
@@ -992,6 +1011,9 @@ conservative invalidation when precise dependency tracking is unavailable.
 Additional OpenTelemetry instruments expose `ssp_edge_lock_wait_milliseconds`,
 `ssp_edge_lock_hold_milliseconds`, `ssp_edge_publish_milliseconds`,
 `ssp_edge_transaction_milliseconds`, and `ssp_edge_publish_failures_total`.
+`ssp_ingest_total` counts records; `ssp_ingest_batch_total` counts accepted batch
+requests. `ssp_slow_evidence_dropped_total` counts slow-operation samples skipped
+when all four best-effort evidence writers are occupied.
 Publication includes retries; transaction timing includes conflict retries for
 one planned transaction. Existing per-view ingest timings describe a shared
 circuit step and can include lock wait. They do not measure edge publication.
@@ -1059,3 +1081,22 @@ OpenTelemetry exports `ssp_edge_pending_batches`, `ssp_edge_pending_operations`,
 `ssp_edge_last_success_epoch_milliseconds`, and `ssp_edge_connection_generation`.
 Timeout logs include a bounded statement fingerprint and session generation;
 they do not include the SQL batch or bindings.
+
+### Registration and ingest stages
+
+View metadata on `_00_query` carries optional `registrationStages` and
+`ingestStages`, also exposed as `registration_stages` and `ingest_stages` by the
+scheduler's view inspection API. Older rows may omit these fields.
+
+Registration stages are `request_ms`, `prepare_ms`, `parse_ms`, `lock_wait_ms`,
+`lock_hold_ms`, `index_build_ms`, `indexes_built`, `rows_indexed`, `plan_ms`,
+`snapshot_ms` and `metadata_db_ms`. Cold registrations and warm joins both record
+stages. Lock wait and hold accumulate preparation/read, index-prewarm/read and
+installation/write guards. Parsing, index build, plan and snapshot timings are
+subsets of their containing stages. Warm metadata timing includes its repair
+probe and any repair writes.
+Ingest stages are `request_ms`, `lock_wait_ms`, `lock_hold_ms`, `store_apply_ms`,
+`circuit_step_ms` and `enqueue_ms`. Nested stages overlap their containing totals;
+do not add all fields together. Neither request total includes asynchronous
+publication completion. Slow request history is independent of the view's TTL;
+see [persistent evidence](/docs/reference/scheduler-api#slow-sync-operation-history).

@@ -1,4 +1,5 @@
-use crate::algebra::{ZSet, ZSetOps};
+use super::witness::WitnessState;
+use crate::algebra::ZSet;
 use crate::circuit::store::Store;
 use crate::eval::value_ops::{compare_values, hash_value, resolve_field};
 use crate::eval::value_ref::ValueRef;
@@ -16,29 +17,20 @@ use std::collections::HashMap;
 /// subqueries: the outer scan becomes the left, the inner subquery's plan
 /// becomes the right, and the correlation predicate becomes the join condition.
 ///
-/// DBSP correctness: we maintain Z⁻¹ buffers on both inputs, recompute the
-/// snapshot from accumulated state each step, and differentiate against the
-/// previous output. This is `step = D(threshold(snapshot(I(A), I(B))))` — the
-/// canonical "integrate then threshold then differentiate" pattern, identical
-/// in shape to `Distinct` but over a 2-input join.
+/// Integrated input rows are indexed by join value. A step refreshes only
+/// changed rows and rechecks left rows in the affected witness buckets; an
+/// empty or unrelated delta never recomputes the whole joined snapshot.
 #[derive(Debug)]
 pub struct SemiJoin {
     pub condition: JoinCondition,
-    /// Z⁻¹: accumulated left input state.
-    left_state: ZSet,
-    /// Z⁻¹: accumulated right input state.
-    right_state: ZSet,
-    /// Last emitted thresholded output, used for differentiation.
-    prev_output: ZSet,
+    state: WitnessState,
 }
 
 impl SemiJoin {
     pub fn new(condition: JoinCondition) -> Self {
         Self {
             condition,
-            left_state: HashMap::new(),
-            right_state: HashMap::new(),
-            prev_output: HashMap::new(),
+            state: WitnessState::default(),
         }
     }
 
@@ -100,29 +92,12 @@ impl super::Operator for SemiJoin {
         Self::semi_join(inputs[0], inputs[1], &self.condition, store)
     }
 
-    fn step(
-        &mut self,
-        input_deltas: &[&ZSet],
-        store: &Store,
-        _ctx: Option<&Sp00kyValue>,
-    ) -> ZSet {
-        // I: integrate inputs.
-        self.left_state.add(input_deltas[0]);
-        self.right_state.add(input_deltas[1]);
+    fn step(&mut self, input_deltas: &[&ZSet], store: &Store, _ctx: Option<&Sp00kyValue>) -> ZSet {
+        self.state.step(input_deltas, store, &self.condition, false)
+    }
 
-        // Recompute the semi-join snapshot from accumulated state.
-        let new_output = Self::semi_join(
-            &self.left_state,
-            &self.right_state,
-            &self.condition,
-            store,
-        );
-
-        // D: differentiate against previous output.
-        let delta_out = self.prev_output.diff(&new_output);
-
-        self.prev_output = new_output;
-        delta_out
+    fn note_content_updates(&mut self, keys: &[crate::algebra::RowKey]) {
+        self.state.note_content_updates(keys);
     }
 
     fn arity(&self) -> usize {
@@ -130,15 +105,11 @@ impl super::Operator for SemiJoin {
     }
 
     fn reset(&mut self) {
-        self.left_state.clear();
-        self.right_state.clear();
-        self.prev_output.clear();
+        self.state.reset();
     }
 
     fn state_bytes(&self) -> usize {
-        crate::size::zset_bytes(&self.left_state)
-            + crate::size::zset_bytes(&self.right_state)
-            + crate::size::zset_bytes(&self.prev_output)
+        self.state.state_bytes()
     }
 
     fn evaluate_key(
@@ -154,7 +125,7 @@ impl super::Operator for SemiJoin {
         // `id = id` is the permission intersection wrapper
         // (`SemiJoin(view, perm)`): the right side shares the left key
         // space, so the freshly recomputed input eval is authoritative.
-        // right_state would be stale for weight-0 content updates.
+        // Integrated membership can be stale for weight-0 content updates.
         if self.condition.left_field == Path::new("id")
             && self.condition.right_field == Path::new("id")
         {
@@ -169,19 +140,14 @@ impl super::Operator for SemiJoin {
         if l_field.is_missing() {
             return false;
         }
-        self.right_state.iter().any(|(r_key, &w)| {
-            if w <= 0 {
-                return false;
-            }
-            let r_field = resolve_field(store.get_row_by_key(r_key), &self.condition.right_field);
-            !r_field.is_missing() && compare_values(l_field, r_field) == Ordering::Equal
-        })
+        self.state.has_point_witness(l_field)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algebra::ZSetOps;
     use crate::circuit::store::Change;
     use crate::operator::Operator;
     use crate::types::Path;
@@ -402,16 +368,13 @@ mod tests {
 
         let new_a = zset(&[("threads:1", 1), ("threads:2", 1), ("threads:3", 1)]);
         let new_b = zset(&[("collab:1", 1), ("collab:2", 1)]);
-        let snap_after =
-            SemiJoin::new(condition.clone()).snapshot(&[&new_a, &new_b], &store, None);
+        let snap_after = SemiJoin::new(condition.clone()).snapshot(&[&new_a, &new_b], &store, None);
 
         let expected_delta = snap_before.diff(&snap_after);
 
         // Now compute incrementally — replay the same change.
         let mut sj = SemiJoin::new(condition);
-        sj.left_state = state_a;
-        sj.right_state = state_b;
-        sj.prev_output = snap_before;
+        sj.step(&[&state_a, &state_b], &store, None);
 
         let dl = zset(&[("threads:3", 1)]);
         let dr = zset(&[("collab:2", 1)]);

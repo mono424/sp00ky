@@ -216,6 +216,16 @@ pub fn list_ref_table_for(mode: RefMode, auth_id: &str) -> String {
 
 // --- Ingest API (snake_case wire format) ---
 
+/// Hard admission bounds for a single ordered circuit step. Large records
+/// retain the single-record path; batching never waits to fill a window.
+pub const MAX_INGEST_BATCH_RECORDS: usize = 128;
+pub const MAX_INGEST_BATCH_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestBatchRequest {
+    pub records: Vec<IngestRequest>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequest {
     pub table: String,
@@ -256,6 +266,10 @@ pub struct SspRegistration {
     pub ssp_id: String,
     pub url: String,
     pub version: String,
+    /// Explicit capability: absent on older SSPs, which receive `/ingest`
+    /// one record at a time even during a rolling upgrade.
+    #[serde(default)]
+    pub ingest_batch_limit: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
     /// Blue/green: the id of the live SSP this instance is meant to replace
@@ -657,5 +671,32 @@ pub fn record_id_literal(table: &str, id: &str) -> String {
         id.to_string()
     } else {
         format!("{table}:{id}")
+    }
+}
+
+#[cfg(test)]
+mod ingest_batch_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn old_registration_defaults_to_single_ingest_and_new_capability_roundtrips() {
+        let old: SspRegistration = serde_json::from_value(json!({"ssp_id":"a","url":"http://ssp","version":"old"})).unwrap();
+        assert_eq!(old.ingest_batch_limit, 0);
+        let modern: SspRegistration = serde_json::from_value(json!({
+            "ssp_id":"a","url":"http://ssp","version":"modern","ingest_batch_limit":MAX_INGEST_BATCH_RECORDS
+        })).unwrap();
+        let value = serde_json::to_value(modern).unwrap();
+        assert_eq!(value["ingest_batch_limit"], MAX_INGEST_BATCH_RECORDS);
+        assert!(table_excluded_from_sync("_00_sync_evidence"));
+    }
+
+    #[test]
+    fn batch_uses_existing_single_record_wire_shape() {
+        let body = json!({"records":[{"table":"thread","op":"UPDATE","id":"thread:a","record":{"_00_rv":4}}]});
+        let batch: IngestBatchRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(batch.records[0].id,"thread:a");
+        assert_eq!(batch.records[0].job_assignee,None);
+        assert_eq!(serde_json::to_value(batch).unwrap()["records"][0]["record"],body["records"][0]["record"]);
     }
 }

@@ -525,6 +525,7 @@ async fn handle_register(
 
     // Create SspInfo
     let ssp_info = SspInfo {
+        ingest_batch_limit: request.ingest_batch_limit.min(ssp_protocol::MAX_INGEST_BATCH_RECORDS),
         id: request.ssp_id.clone(),
         url: request.url.clone(),
         version: request.version.clone(),

@@ -6,6 +6,25 @@ use crate::eval::value_ref::ValueRef;
 use crate::types::{make_key, raw_id, Sp00kyValue};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use web_time::Instant;
+
+/// Work spent building mirrored indexes, excluding already-built indexes.
+/// Never persisted: callers use this to distinguish cold builds from lookups.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IndexBuildStats {
+    pub index_build_ms: f64,
+    pub indexes_built: usize,
+    /// Table rows read while building indexes (a row may count in each index).
+    pub rows_indexed: usize,
+}
+
+impl std::ops::AddAssign for IndexBuildStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.index_build_ms += rhs.index_build_ms;
+        self.indexes_built += rhs.indexes_built;
+        self.rows_indexed += rhs.rows_indexed;
+    }
+}
 
 /// Fields every projected row keeps regardless of what the registered plans
 /// reference: the identity and the version the sync layer keys on.
@@ -138,12 +157,36 @@ impl Collection {
     /// first if this collection does not hold it yet (or holds an older
     /// definition under the same name).
     pub fn with_index<R>(&self, def: &IndexDef, f: impl FnOnce(&OrderedIndex) -> R) -> R {
+        self.with_index_timed(def, f).0
+    }
+
+    /// Build an index without reading a range. Repeated calls reuse the same
+    /// index; writes maintain it until its final referencing graph is removed.
+    pub fn prewarm_index(&self, def: &IndexDef) -> IndexBuildStats {
+        self.with_index_timed(def, |_| ()).1
+    }
+
+    fn with_index_timed<R>(
+        &self,
+        def: &IndexDef,
+        f: impl FnOnce(&OrderedIndex) -> R,
+    ) -> (R, IndexBuildStats) {
         let mut slots = self.indexes.lock();
         if slots.get(&def.name).is_some_and(|built| built.def != *def) {
             slots.remove(&def.name);
         }
-        let index = slots.entry(def.name.clone()).or_insert_with(|| self.build_index(def));
-        f(index)
+        let mut stats = IndexBuildStats::default();
+        let index = slots.entry(def.name.clone()).or_insert_with(|| {
+            let started = Instant::now();
+            let built = self.build_index(def);
+            stats = IndexBuildStats {
+                index_build_ms: started.elapsed().as_secs_f64() * 1000.0,
+                indexes_built: 1,
+                rows_indexed: self.rows.len(),
+            };
+            built
+        });
+        (f(index), stats)
     }
 
     fn build_index(&self, def: &IndexDef) -> OrderedIndex {

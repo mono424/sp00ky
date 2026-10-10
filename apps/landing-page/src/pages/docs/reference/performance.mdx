@@ -45,7 +45,7 @@ A flat `SELECT` propagates a write in 3.2 ms p50. Two levels of
 inlined subqueries add about 0.4 ms. p95 stays under 8 ms across all
 three shapes.
 
-## Database byte volume doesn't matter
+## Row size in this benchmark
 
 Hold the row count fixed at 1,000 and grow each row from 110 bytes to
 2 MiB. The same kind of write event always propagates in roughly the
@@ -68,8 +68,8 @@ same time.
 
 Across **four orders of magnitude** of total DB size, end-to-end p50
 hovers between 2.2 and 4.4 ms. The engine maintains views as in-memory
-deltas; the per-event critical path doesn't read the underlying data
-volume.
+deltas. These samples hold row count and query shape fixed; they do not
+measure cold index construction, large source payloads or publication backlog.
 
 ## The real cost driver is row count
 
@@ -111,9 +111,9 @@ stored. A list of 20 propagates in ~3 ms; a list of 30,000 takes
 - Scope by the viewer: `WHERE author = $auth.id`, `WHERE thread =
   $current_thread_id`.
 
-One SSP comfortably holds thousands of small views. When you outgrow
-that, the answer is more SSPs, not bigger ones. The scheduler
-load-balances views across them.
+The scheduler load-balances views across SSPs. Each SSP still holds its
+synced source tables, so adding SSPs spreads view computation but also
+replicates source memory and ingest work. Measure both before scaling out.
 </Note>
 
 ## Big tables: give each list its index
@@ -137,8 +137,8 @@ A windowed list reads its window straight off an index when:
 
 <CodeBlock code={indexedListCode} lang="sql" />
 
-Registering such a window touches the rows it returns, not the table,
-and a write re-reads only that window. Any other filter with equalities
+Once its index is built, registering such a window touches the rows it
+returns, and a write re-reads only that window. Any other filter with equalities
 on an index's leading fields still starts from that index range instead
 of the whole table, an `OR` with such equalities in every branch reads
 one range per branch, and `WHERE id = $id` reads that one record.
@@ -151,6 +151,58 @@ to register without the index and 0.6 s with it (the first window builds
 the index, each one after that takes ~30 µs). The index costs about
 130 bytes per row of the table, is built when a view first needs it, and
 is dropped when the last such view goes.
+
+Restored active views now prewarm the indexes their plans select before the
+SSP reports Ready. Schema changes prewarm replacement indexes before evaluating
+replacement graphs, including a changed definition under the same index name.
+Live registration prewarms under a circuit reader and rechecks the registration
+identity and merge owner under the writer before installing a graph. A first-ever
+index still costs a pass over its table and blocks ingest writers while building;
+prewarming shifts this cost out of snapshot evaluation, rather than removing it.
+Registration metrics report this work separately as `index_build_ms`,
+`indexes_built` and `rows_indexed`.
+
+Rust embedders can call `Circuit::prewarm_query_indexes(&plan, params)` for a
+selected plan, `Circuit::prewarm_active_indexes()` for registered graphs, or
+`Collection::prewarm_index(&definition)` for one index. Each returns
+`IndexBuildStats` (`indexes_built`, `rows_indexed`, `index_build_ms`); already built
+indexes return zero work. `Circuit::set_table_meta_timed` applies schema changes
+and returns the same statistics. Timed registration exposes index build fields
+in `RegTimings`, and `Circuit::step_timed` separates store application from DAG
+stepping with `StepTimings`.
+
+Permission semijoins and antijoins retain keyed witness counts and reverse left
+lookups. Ingest reevaluates affected join keys, including changes to a row body
+whose membership stays the same. Duplicate witnesses and unrelated changes do
+not rescan the left table. Distinct updates only changed keys. These indexes add
+memory proportional to retained input keys; changing a witness shared by many
+left rows still costs work proportional to that affected set.
+
+### Batches and measurements
+
+The scheduler drains already queued ordinary changes into batches of up to 128
+records and 1 MiB, with no wait to fill a batch. An SSP advertises support at
+registration; older SSPs and replay continue receiving individual `/ingest`
+requests. Each batch applies source changes in order and steps affected graphs
+once. Jobs, users and internal lifecycle records use their existing single-row
+paths. Publication waits for every surviving source row, with the existing
+five-second visibility fallback and 16-probe concurrency limit.
+
+Live view details include separate registration and ingest stage timings. The
+same circuit-step measurement is shared by every view affected by that request;
+it is not exclusive CPU time for each view. A batch contributes one materialization
+sample and one update-count increment to each affected view. Publication wait and
+database transaction time remain separate queue and OpenTelemetry measurements.
+
+Successful registration and ingest requests taking at least 250 ms attempt to
+retain sanitized evidence in the
+private `_00_sync_evidence:slow_operations` ring. Evidence writes are best effort,
+with at most four in flight per process and no waiting queue. Requests beyond
+that budget increment `ssp_slow_evidence_dropped_total`. Its newest 100 samples survive view TTL
+cleanup and service restarts, and are available through the scheduler's
+`GET /admin/api/views/history` or MCP `view_history`. Samples include masked query
+shapes and stage timings, without SQL text, bindings, user or session identifiers.
+Use this history together with publication incidents when investigating a stall.
 
 <Note>
 **Define the index your list query needs.** For every list over a big

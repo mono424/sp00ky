@@ -113,9 +113,33 @@ impl Fanout {
         let (done_tx, completed) = tokio::sync::watch::channel(0u64);
         tokio::spawn(async move {
             let mut n = 0u64;
-            while let Some(job) = rx.recv().await {
-                fan_out_event(job.state, job.request, job.operation, job.seq).await;
-                n += 1;
+            let mut pending = None;
+            loop {
+                let job = match pending.take() { Some(job) => job, None => match rx.recv().await {
+                    Some(job) => job, None => break,
+                }};
+                let mut bytes = serde_json::to_vec(&job.request).map_or(usize::MAX, |v| v.len()).saturating_add(14);
+                let can_batch = batchable(&job) && bytes <= ssp_protocol::MAX_INGEST_BATCH_BYTES;
+                let mut jobs = vec![job];
+                if can_batch {
+                    // Drain only what is already queued: no timer and no added latency.
+                    while jobs.len() < ssp_protocol::MAX_INGEST_BATCH_RECORDS {
+                        let Ok(next) = rx.try_recv() else { break };
+                        let size = serde_json::to_vec(&next.request).map_or(usize::MAX, |v| v.len()).saturating_add(1);
+                        if !batchable(&next) || !Arc::ptr_eq(&jobs[0].state.ssp_pool, &next.state.ssp_pool)
+                            || bytes.saturating_add(size) > ssp_protocol::MAX_INGEST_BATCH_BYTES {
+                            pending = Some(next);
+                            break;
+                        }
+                        bytes += size;
+                        jobs.push(next);
+                    }
+                }
+                n += jobs.len() as u64;
+                if jobs.len() == 1 {
+                    let job = jobs.pop().unwrap();
+                    fan_out_event(job.state, job.request, job.operation, job.seq).await;
+                } else { fan_out_batch(jobs).await; }
                 let _ = done_tx.send(n);
             }
         });
@@ -513,6 +537,80 @@ async fn fan_out_event(
     }
 
     info!(seq, "Ingest fanned out to SSPs");
+}
+
+/// Jobs and lifecycle records retain their existing single-event side effects.
+fn batchable(job: &FanoutJob) -> bool {
+    let table = &job.request.table;
+    table != "user" && !table.starts_with("_00_") && !job.state.job_tables.contains(table)
+}
+
+/// Deliver one bounded, ordered group. Legacy SSPs still receive single rows.
+async fn fan_out_batch(jobs: Vec<FanoutJob>) {
+    let state = jobs[0].state.clone();
+    let (requests, updates, ready) = {
+        let mut pool = state.ssp_pool.write().await;
+        let mut requests = Vec::with_capacity(jobs.len());
+        let mut updates = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let mut request = job.request;
+            request.job_assignee = pool.select_job_runner();
+            updates.push(RecordUpdate { table: request.table.clone(), operation: job.operation,
+                record_id: request.id.clone(), data: Some(request.record.clone()), version: job.seq,
+                job_assignee: request.job_assignee.clone() });
+            requests.push(request);
+        }
+        let mut ready = Vec::new();
+        let mut buffered = Vec::new();
+        for ssp in pool.all() {
+            if pool.is_ready(&ssp.id) { ready.push(ssp.clone()); }
+            else { buffered.push(ssp.id.clone()); }
+        }
+        for id in buffered { for update in &updates {
+            if !pool.buffer_message(&id, update.clone()) { warn!(ssp_id = %id, "Buffer overflow; SSP needs re-bootstrap"); }
+        }}
+        (requests, updates, ready)
+    };
+    let mut newly_lagging = Vec::new();
+    let outcomes = futures::future::join_all(ready.into_iter().map(|ssp| {
+        let requests = &requests;
+        let transport = &state.transport;
+        async move {
+            let limit = ssp.ingest_batch_limit.min(ssp_protocol::MAX_INGEST_BATCH_RECORDS);
+            let mut delivered = 0;
+            while delivered < requests.len() {
+                let mut end = if limit > 1 { (delivered + limit).min(requests.len()) } else { delivered + 1 };
+                // Assignment is part of the wire body. Check the exact final envelope,
+                // so even long SSP identifiers cannot turn an admitted group into 413.
+                while end - delivered > 1 && serde_json::to_vec(&ssp_protocol::IngestBatchRequest {
+                    records: requests[delivered..end].to_vec(),
+                }).map_or(true, |body| body.len() > ssp_protocol::MAX_INGEST_BATCH_BYTES) { end -= 1; }
+                let result = if end - delivered > 1 {
+                    transport.post_to_ssp(&ssp.url, "/ingest/batch", &ssp_protocol::IngestBatchRequest {
+                        records: requests[delivered..end].to_vec(),
+                    }).await
+                } else { transport.post_to_ssp(&ssp.url, "/ingest", &requests[delivered]).await };
+                if let Err(error) = result { return (ssp.id, delivered, Some(error)); }
+                delivered = end;
+            }
+            (ssp.id, delivered, None)
+        }
+    })).await;
+    for (id, delivered, error) in outcomes {
+        if let Some(error) = error {
+            error!(ssp_id = %id, %error, undelivered = requests.len() - delivered, "Failed batch delivery");
+            let mut pool = state.ssp_pool.write().await;
+            if pool.mark_lagging(&id) { newly_lagging.push(id.clone()); }
+            // A timeout may have applied the batch: replay remains ordered and idempotent,
+            // just as with /ingest. Never let later rows overtake the failed group.
+            for update in &updates[delivered..] {
+                if !pool.buffer_message(&id, update.clone()) { warn!(ssp_id = %id, "Buffer overflow; SSP needs re-bootstrap"); }
+            }
+        }
+    }
+    for id in newly_lagging {
+        crate::handover::spawn_singleton("lagging-redelivery", redeliver_to_lagging_ssp(state.clone(), id));
+    }
 }
 
 /// The table an event's record id names when it is NOT `table`.

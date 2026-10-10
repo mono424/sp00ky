@@ -1,7 +1,7 @@
 use crate::algebra::{RowKey, ZSet};
 use crate::circuit::graph::Graph;
 use crate::circuit::index::IndexChoice;
-use crate::circuit::store::{Change, ChangeSet, Collection, Operation, Record, Store};
+use crate::circuit::store::{Change, ChangeSet, Collection, IndexBuildStats, Operation, Record, Store};
 use crate::circuit::view::{OutputFormat, View};
 use crate::operator::{OperatorPlan, QueryPlan};
 use crate::types::{make_key, raw_id, Sp00kyValue};
@@ -28,6 +28,10 @@ pub struct RegTimings {
     pub plan_ms: f64,
     /// Milliseconds spent running the initial snapshot evaluation.
     pub snapshot_ms: f64,
+    /// Cold index construction, separate from plan construction and evaluation.
+    pub index_build_ms: f64,
+    pub indexes_built: usize,
+    pub rows_indexed: usize,
 }
 
 /// Elapsed milliseconds since `start`.
@@ -509,6 +513,12 @@ impl Circuit {
     /// link field the new schema no longer has is gone afterwards, so a
     /// schema read at runtime leaves nothing stale behind.
     pub fn set_table_meta(&mut self, table: &str, meta: TableMeta) {
+        self.set_table_meta_timed(table, meta);
+    }
+
+    /// Apply schema metadata, reporting indexes built for existing views before
+    /// their replacement graphs are installed. Unused DDL indexes stay cold.
+    pub fn set_table_meta_timed(&mut self, table: &str, meta: TableMeta) -> IndexBuildStats {
         self.permissions.insert(table.to_string(), meta.permission);
         if meta.link_targets.is_empty() {
             self.link_targets.remove(table);
@@ -522,18 +532,17 @@ impl Circuit {
             self.opaque_fields.insert(table.to_string(), meta.opaque);
         }
         self.columns.insert(table.to_string(), meta.columns);
-        let indexes_changed = self
-            .index_defs
-            .get(table)
-            .map_or(!meta.indexes.is_empty(), |held| *held != meta.indexes);
+        let old_indexes = self.index_defs.get(table).cloned().unwrap_or_default();
+        let indexes_changed = old_indexes != meta.indexes;
         if meta.indexes.is_empty() {
             self.index_defs.remove(table);
         } else {
             self.index_defs.insert(table.to_string(), meta.indexes);
         }
         if indexes_changed {
-            self.replan_table(table);
+            return self.replan_table(table, &old_indexes);
         }
+        IndexBuildStats::default()
     }
 
     /// What [`Self::set_table_meta`] last stored for `table`, or `None` for a
@@ -560,23 +569,62 @@ impl Circuit {
         Graph::from_plan_with(root, &IndexChoice { defs: &self.index_defs, params })
     }
 
+    /// Build only the mirrored indexes this plan will actually use. Hosts may
+    /// run this before taking the circuit writer; they must still keep the
+    /// store stable (e.g. hold a circuit read lock) for the duration of a build.
+    /// No view or dependency is registered here, and no result is published.
+    pub fn prewarm_query_indexes(&self, plan: &QueryPlan, params: Option<&serde_json::Value>) -> IndexBuildStats {
+        let params = params.cloned().map(Sp00kyValue::from);
+        let graph = self.build_graph(&plan.root, params.as_ref());
+        self.prewarm_index_uses(graph.index_uses())
+    }
+
+    /// Ensure indexes selected by all installed graphs exist, for the final
+    /// bootstrap pass before Ready. Several graphs sharing one index build it
+    /// only once; an empty selected range still warms its backing index.
+    pub fn prewarm_active_indexes(&self) -> IndexBuildStats {
+        self.prewarm_index_uses(self.graphs.values().flat_map(Graph::index_uses))
+    }
+
+    fn prewarm_index_uses(&self, uses: impl IntoIterator<Item = (String, String)>) -> IndexBuildStats {
+        let uses: std::collections::BTreeSet<_> = uses.into_iter().collect();
+        let mut stats = IndexBuildStats::default();
+        for (table, name) in uses {
+            let Some(def) = self.index_defs.get(&table).and_then(|defs| defs.iter().find(|def| def.name == name)) else { continue };
+            if let Some(collection) = self.store.get_collection(&table) {
+                stats += collection.prewarm_index(def);
+            }
+        }
+        stats
+    }
+
     /// A table's index definitions changed: rebuild the graphs whose index
     /// choice changes with them. An index-backed graph has the same output as
     /// the plan built as written, so the new graph is primed against the
     /// store and swapped in without touching the view's membership.
-    fn replan_table(&mut self, table: &str) {
+    fn replan_table(&mut self, table: &str, old_indexes: &[crate::circuit::index::IndexDef]) -> IndexBuildStats {
+        let mut stats = IndexBuildStats::default();
         let ids: Vec<String> = self.dependency_map.get(table).cloned().unwrap_or_default();
         for id in ids {
             let Some(view) = self.views.get(&id) else { continue };
             let params = view.params.clone();
             let mut graph = self.build_graph(&view.plan.root, params.as_ref());
-            if self.graphs.get(&id).is_some_and(|old| old.index_uses() == graph.index_uses()) {
+            let index_uses = graph.index_uses();
+            // The same index name can acquire different fields. Its source
+            // binding must change too, even when index_uses has the same names.
+            let definitions_unchanged = index_uses.iter().filter(|(t, _)| t == table).all(|(_, name)| {
+                old_indexes.iter().find(|def| def.name == *name)
+                    == self.index_defs.get(table).and_then(|defs| defs.iter().find(|def| def.name == *name))
+            });
+            if definitions_unchanged && self.graphs.get(&id).is_some_and(|old| old.index_uses() == index_uses) {
                 continue;
             }
+            stats += self.prewarm_index_uses(index_uses);
             Self::prime_graph(&mut graph, &self.store, params.as_ref());
             self.graphs.insert(id, graph);
         }
         self.release_unused_indexes();
+        stats
     }
 
     /// Drop every built index no registered graph reads any more.
@@ -678,6 +726,7 @@ impl Circuit {
 
         // Build the operator DAG
         let graph = self.build_graph(&plan.root, params_sv.as_ref());
+        let index_uses = graph.index_uses();
 
         // Create view state
         let view = View::new(
@@ -706,6 +755,14 @@ impl Circuit {
         }
         self.refresh_retained_fields();
         timings.plan_ms = ms_since(t_plan);
+
+        // Bootstrap and binding callers get the same explicit prewarm as the
+        // server path. Empty/gated windows must not defer their selected index
+        // build until the node is already serving live changes.
+        let index_stats = self.prewarm_index_uses(index_uses);
+        timings.index_build_ms = index_stats.index_build_ms;
+        timings.indexes_built = index_stats.indexes_built;
+        timings.rows_indexed = index_stats.rows_indexed;
 
         // Run initial snapshot evaluation
         let t_snapshot = Instant::now();
@@ -995,6 +1052,16 @@ impl Circuit {
         let num_nodes = graph.node_count();
         let mut node_outputs: Vec<Option<ZSet>> = vec![None; num_nodes];
         let empty_delta: ZSet = HashMap::new();
+
+        // Membership-neutral writes still change join witnesses. Tell stateful
+        // operators which rows changed before stepping any node, while their
+        // saved join keys still describe the previous output.
+        if !content_updates.is_empty() {
+            let changed_keys: Vec<RowKey> = content_updates.values().flatten().cloned().collect();
+            for node in &mut graph.nodes {
+                node.operator.note_content_updates(&changed_keys);
+            }
+        }
 
         // Clone topo order to avoid holding an immutable borrow on graph
         // while we mutably access graph.nodes[..].operator.step()
@@ -2505,6 +2572,44 @@ mod tests {
                 table: table.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn semi_and_anti_join_follow_witness_field_updates_and_batch_recreation() {
+        use crate::operator::plan::JoinCondition;
+
+        let mut circuit = Circuit::new();
+        circuit.load([
+            Record::new("game", "a", json!({ "group": "first" })),
+            Record::new("game", "b", json!({ "group": "second" })),
+            Record::new("grant", "w", json!({ "group": "first" })),
+        ]);
+        let left = Box::new(scan_query("", "game").root);
+        let right = Box::new(scan_query("", "grant").root);
+        let on = JoinCondition { left_field: Path::new("group"), right_field: Path::new("group") };
+        circuit.add_query(QueryPlan {
+            id: "semi".into(),
+            root: OperatorPlan::SemiJoin { left: left.clone(), right: right.clone(), on: on.clone() },
+        }, None, None);
+        circuit.add_query(QueryPlan {
+            id: "anti".into(),
+            root: OperatorPlan::AntiJoin { left, right, on },
+        }, None, None);
+        assert_eq!(circuit.view_keys("semi"), vec!["game:a"]);
+        assert_eq!(circuit.view_keys("anti"), vec!["game:b"]);
+
+        // No membership weight changes, but the same witness now admits b.
+        circuit.step(ChangeSet { changes: vec![Change::update("grant", "w", json!({ "group": "second" }))] });
+        assert_eq!(circuit.view_keys("semi"), vec!["game:b"]);
+        assert_eq!(circuit.view_keys("anti"), vec!["game:a"]);
+
+        // The pair cancels to a zero table delta, with a different join key.
+        circuit.step(ChangeSet { changes: vec![
+            Change::delete("grant", "w"),
+            Change::create("grant", "w", json!({ "group": "first" })),
+        ] });
+        assert_eq!(circuit.view_keys("semi"), vec!["game:a"]);
+        assert_eq!(circuit.view_keys("anti"), vec!["game:b"]);
     }
 
     /// `compute_table_hashes` streams rows through `TableHasher` instead of
@@ -5369,6 +5474,103 @@ mod index_tests {
         assert!(indexed.store.get_collection("game").unwrap().built_indexes().is_empty());
         assert_same(&indexed, &plain, "right after the index went");
         churn(&mut indexed, &mut plain, &mut rng, "after the drop");
+    }
+
+    #[test]
+    fn prewarm_builds_only_selected_indexes_for_empty_sparse_and_hot_ranges() {
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        for i in 0..128 {
+            c.load([Record::new("game", &format!("g{i:03}"), json!({
+                "database": if i < 2 { "game_database:sparse" } else { "game_database:hot" },
+                "sort_index": i,
+            }))]);
+        }
+        let plan = |id: &str| QueryPlan {
+            id: id.into(),
+            root: limit(filter(scan(), eq("database", param("database"))), 50, 0,
+                order(&[("sort_index", "ASC")])),
+        };
+        let empty_params = json!({ "database": "game_database:empty" });
+        let first = c.prewarm_query_indexes(&plan("empty"), Some(&empty_params));
+        assert_eq!((first.indexes_built, first.rows_indexed), (1, 128));
+        assert!(c.view_ids().is_empty(), "prewarming must not register a view");
+        assert_eq!(c.store.get_collection("game").unwrap().built_indexes(), vec!["game_database_sort"]);
+        // Cold construction establishes shared row keys once. Empty and
+        // sparse windows below reuse that backing set and the built index.
+        assert!(c.store.get_collection("game").unwrap().membership_built());
+
+        for (id, db, count) in [("empty", "empty", 0), ("sparse", "sparse", 2), ("hot", "hot", 50)] {
+            let params = json!({ "database": format!("game_database:{db}") });
+            assert_eq!(c.prewarm_query_indexes(&plan(id), Some(&params)), IndexBuildStats::default());
+            let (_, timings) = c.add_query_with_auth_timed(plan(id), Some(params), None, String::new());
+            assert_eq!(timings.indexes_built, 0, "prewarmed registration must not rebuild");
+            assert_eq!(c.view_keys(id).len(), count);
+        }
+        assert_eq!(c.prewarm_active_indexes(), IndexBuildStats::default());
+        c.remove_query("empty");
+        c.remove_query("sparse");
+        assert_eq!(c.store.get_collection("game").unwrap().built_indexes(), vec!["game_database_sort"]);
+        c.remove_query("hot");
+        assert!(c.store.get_collection("game").unwrap().built_indexes().is_empty(), "final view releases the index");
+        assert_eq!(c.prewarm_query_indexes(&plan("again"), Some(&empty_params)).indexes_built, 1);
+    }
+
+    #[test]
+    fn schema_prewarm_reuses_active_indexes_and_rebuilds_changed_definitions() {
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(Vec::new()));
+        for i in 0..16 {
+            c.load([Record::new("game", &format!("g{i}"), json!({
+                "database": "game_database:hot", "sort_index": i, "created_at": 16 - i,
+            }))]);
+        }
+        let plan = QueryPlan {
+            id: "window".into(),
+            root: limit(filter(scan(), eq("database", param("database"))), 5, 0,
+                order(&[("sort_index", "ASC")])),
+        };
+        c.add_query(plan, Some(json!({ "database": "game_database:hot" })), None);
+        let before = sorted(c.view_keys("window"));
+        let builds = c.set_table_meta_timed("game", meta(game_indexes()));
+        assert_eq!((builds.indexes_built, builds.rows_indexed), (1, 16));
+        assert_eq!(sorted(c.view_keys("window")), before);
+        assert_eq!(c.prewarm_active_indexes(), IndexBuildStats::default());
+        assert_eq!(c.set_table_meta_timed("game", meta(game_indexes())), IndexBuildStats::default());
+
+        // Reuse the name with a different definition: the source binding must
+        // be replaced, or it silently rebuilds the obsolete index on a write.
+        let changed = def("game_database_sort", &["database", "sort_index", "created_at"]);
+        let builds = c.set_table_meta_timed("game", meta(vec![changed.clone()]));
+        assert_eq!(builds.indexes_built, 1);
+        c.step(ChangeSet { changes: vec![Change::update("game", "g0", json!({
+            "database": "game_database:hot", "sort_index": 100, "created_at": 0,
+        }))] });
+        assert_eq!(c.store.get_collection("game").unwrap().prewarm_index(&changed), IndexBuildStats::default(),
+            "the graph must keep using the new definition");
+    }
+
+    #[test]
+    fn denied_window_prewarm_does_not_wait_for_the_first_live_change() {
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        c.load([Record::new("game", "a", json!({ "database": "game_database:hot", "sort_index": 1 }))]);
+        let plan = QueryPlan {
+            id: "denied".into(),
+            root: limit(filter(scan(), Predicate::And { predicates: vec![
+                eq("database", param("database")),
+                Predicate::ParamEq { param: "access".into(), value: json!("account") },
+            ] }), 5, 0, order(&[("sort_index", "ASC")])),
+        };
+        let (_, timings) = c.add_query_with_auth_timed(plan, Some(json!({
+            "database": "game_database:hot", "access": "denied",
+        })), None, String::new());
+        assert!(c.view_keys("denied").is_empty());
+        assert_eq!((timings.indexes_built, timings.rows_indexed), (1, 1));
+        assert_eq!(c.prewarm_active_indexes(), IndexBuildStats::default());
     }
 
     /// Customer scale: 1M games, 422k of them in one database, a scroll of

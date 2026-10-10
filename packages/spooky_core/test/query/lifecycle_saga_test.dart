@@ -1,5 +1,6 @@
 import 'package:spooky_core/src/kernel/effects.dart';
 import 'package:spooky_core/src/kernel/events.dart';
+import 'package:spooky_core/src/modules/query_builder.dart' show RelationPlan;
 import 'package:spooky_core/src/query/lifecycle_saga.dart';
 import 'package:spooky_core/src/query/sql.dart' as sql;
 import 'package:spooky_core/src/state/client_state.dart';
@@ -239,6 +240,45 @@ void main() {
       expect(deletedIds(out), ['user:gone'],
           reason: 'a view row written before children were recorded must not '
               'cost the bodies a live query has just been answered with');
+    });
+
+    test('keeps the joined rows a query in state renders, before any answer',
+        () async {
+      final out = await runPure<void>(
+        gcTick,
+        now: now,
+        state: buildState([
+          buildEntry(
+            def: buildDefinition().withRelations([
+              RelationPlan(
+                  alias: 'owner',
+                  table: 'user',
+                  cardinality: 'one',
+                  foreignKeyField: 'owner'),
+            ]),
+            records: [
+              {
+                'id': 'thing:1',
+                'owner': {'id': 'user:a', 'username': 'a'},
+              },
+            ],
+          ),
+        ], [
+          r.setIdentity(primed: true),
+          r.setVersions([('thing:1', 1), ('user:a', 1), ('user:gone', 1)]),
+        ]),
+        handlers: viewHandlers([
+          {
+            'id': '_00_view:list',
+            'ids': [
+              ['thing:1', 1]
+            ],
+            'updatedAt': now,
+          }
+        ]),
+      );
+      expect(deletedIds(out), ['user:gone'],
+          reason: 'a view row from before children were recorded, offline');
     });
 
     test('retires stale unheld view rows and collects what only they named',

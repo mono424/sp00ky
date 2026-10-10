@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import '../kernel/constants.dart';
+import '../modules/query_builder.dart' show RelationPlan;
 import '../types.dart';
 import 'client_state.dart';
 import 'lifecycle.dart';
@@ -150,8 +151,12 @@ List<QueryHash> desiredRegistrations(ClientState s) => [
 
 /// The bodies the orphan collector must keep: internal rows, what a durable
 /// `_00_view` row vouches for ([viewIds], members and subquery children), what
-/// any query in state holds as members or children, and anything a write is
-/// still in flight for.
+/// any query in state holds as members or children or renders as a joined
+/// row, and anything a write is still in flight for.
+///
+/// The joined rows matter before the server has answered: a view row written
+/// before children were recorded names none, and offline nothing fills
+/// `subqueryRemoteArray`, yet the list on screen is showing those rows.
 bool Function(String id) retained(ClientState s, Set<String> viewIds) {
   final held = <String>{};
   for (final e in s.queries.values) {
@@ -161,6 +166,7 @@ bool Function(String id) retained(ClientState s, Set<String> viewIds) {
     for (final (id, _) in e.subqueryRemoteArray) {
       held.add(id);
     }
+    _joinedIds(e.records, e.def.relations, held);
   }
   for (final item in s.outbox) {
     held.add(item.recordId);
@@ -170,6 +176,27 @@ bool Function(String id) retained(ClientState s, Set<String> viewIds) {
   }
   return (id) =>
       id.startsWith('_00_') || viewIds.contains(id) || held.contains(id);
+}
+
+/// The ids of the rows [relations] attached to [rows], at every level.
+void _joinedIds(
+    List<Row> rows, List<RelationPlan> relations, Set<String> out) {
+  for (final relation in relations) {
+    final children = <Row>[];
+    for (final row in rows) {
+      final value = row[relation.alias];
+      if (value is Map<String, dynamic>) {
+        children.add(value);
+      } else if (value is List) {
+        children.addAll(value.whereType<Row>());
+      }
+    }
+    for (final child in children) {
+      final id = child['id'];
+      if (id != null) out.add(id.toString());
+    }
+    _joinedIds(children, relation.relations, out);
+  }
 }
 
 List<QueryHash> evictable(ClientState s, int now) => [

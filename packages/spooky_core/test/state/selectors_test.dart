@@ -10,10 +10,15 @@ QueryLifecycle life({
   QueryPhase phase = QueryPhase.cold,
   RemotePhase remote = RemotePhase.unregistered,
   int fetchDepth = 0,
+  int backgroundDepth = 0,
   bool notified = false,
 }) =>
     QueryLifecycle(
-        phase: phase, remote: remote, fetchDepth: fetchDepth, notified: notified);
+        phase: phase,
+        remote: remote,
+        fetchDepth: fetchDepth,
+        backgroundDepth: backgroundDepth,
+        notified: notified);
 
 QueryEntry e(
   String hash, {
@@ -185,6 +190,18 @@ void main() {
 
     test('fetchingQueryCount counts entries with fetch depth', () {
       final s = buildState([e('a', lifecycle: life(fetchDepth: 2)), e('b')]);
+      expect(sel.fetchingQueryCount(s), 1);
+    });
+
+    test('fetchingQueryCount leaves out background re-verification', () {
+      final s = buildState([
+        e('verifying',
+            lifecycle: life(
+                phase: QueryPhase.cached, fetchDepth: 1, backgroundDepth: 1)),
+        e('downloading',
+            lifecycle: life(
+                phase: QueryPhase.live, fetchDepth: 2, backgroundDepth: 1)),
+      ]);
       expect(sel.fetchingQueryCount(s), 1);
     });
   });

@@ -44,10 +44,10 @@ behind an app-chrome mark that switches to "downloading" or "uploading".
 
 | Accessor | Meaning |
 | --- | --- |
-| `fetchingQueries()` | Queries inside a fetch cycle right now. One subscription on the engine's aggregate count, not one per query. |
+| `fetchingQueries()` | Queries with traffic the user is waiting on: a first registration, or rows to download. One subscription on the engine's aggregate count, not one per query. A query that already shows rows and is only being confirmed by the server (every mounted query after a reload) is left out, although its own `isFetching()` stays true until the server answers. |
 | `pendingMutations()` | Locally committed writes the server has not acknowledged yet. |
 | `isDownloading()` | Fetching for longer than `downloadDelayMs` (200 ms). Off the instant fetching stops. The delay filters the sub-frame fetches a warm cache produces. |
-| `isUploading()` | More than `uploadThreshold` (1) writes queued. |
+| `isUploading()` | More than `uploadThreshold` (0) writes queued for longer than `uploadDelayMs` (150 ms). |
 
 <CodeBlock code={activityCode} lang="tsx" />
 

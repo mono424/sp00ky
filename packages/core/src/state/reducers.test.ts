@@ -247,7 +247,7 @@ describe('bucket switch reducers', () => {
       R.outboxReplace([buildOutboxItem()])
     );
     const id = { table: '_00_query', id: 'new' } as any;
-    const s1 = R.rebindQuery('a', { id, lifecycle: { phase: 'cached', remote: 'unregistered', fetchDepth: 0, notified: false }, remoteArray: [['t:2', 1]], localArray: [] })({ ...s0, dirty: new Set() });
+    const s1 = R.rebindQuery('a', { id, lifecycle: { phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false }, remoteArray: [['t:2', 1]], localArray: [] })({ ...s0, dirty: new Set() });
     const en = s1.queries.get('a')!;
     expect(en.def.id).toBe(id);
     expect(en.lifecycle.phase).toBe('cached');

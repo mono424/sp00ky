@@ -172,9 +172,12 @@ Future<void> registerRemote(Ctx ctx, SagaEnv env, QueryHash hash,
       (remote == RemotePhase.registering && !retry)) {
     return;
   }
+  // A query that already shows rows (cached or live) only re-verifies them
+  // here: the cycle holds `fetching` but is not traffic the user waits on.
+  final background = entry.lifecycle.phase != QueryPhase.cold;
   await ctx(Fx.stateUpdate(r.compose([
     r.applyLifecycle(hash, const RemoteRegisteringEvent()),
-    r.applyLifecycle(hash, const FetchBeginEvent()),
+    r.applyLifecycle(hash, FetchBeginEvent(background: background)),
   ])));
   try {
     final table = listRefTable(env, state);
@@ -252,7 +255,8 @@ Future<void> registerRemote(Ctx ctx, SagaEnv env, QueryHash hash,
   } finally {
     final stillThere = await ctx(Fx.stateRead((s) => s.queries.containsKey(hash)));
     if (stillThere) {
-      await ctx(Fx.stateUpdate(r.applyLifecycle(hash, const FetchEndEvent())));
+      await ctx(Fx.stateUpdate(
+          r.applyLifecycle(hash, FetchEndEvent(background: background))));
     }
   }
 }

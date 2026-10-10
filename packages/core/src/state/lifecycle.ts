@@ -14,6 +14,11 @@ import type { QueryStatus } from '../types';
  * `remote` tracks the server-side registration, `fetchDepth` is the refcount
  * behind `status: 'fetching'`, `notified` says whether subscribers received
  * at least one materialization this registration.
+ *
+ * `backgroundDepth` is the part of `fetchDepth` that re-verifies rows the
+ * query already shows: a registration of a query that is not `cold`. It still
+ * holds `status: 'fetching'` (results are not yet confirmed), but it is not
+ * traffic the user waits on, so the activity indicator leaves it out.
  */
 export type QueryPhase = 'cold' | 'cached' | 'live' | 'view-lost';
 export type RemotePhase = 'unregistered' | 'registering' | 'registered' | 'failed';
@@ -22,6 +27,7 @@ export interface QueryLifecycle {
   readonly phase: QueryPhase;
   readonly remote: RemotePhase;
   readonly fetchDepth: number;
+  readonly backgroundDepth: number;
   readonly notified: boolean;
 }
 
@@ -33,8 +39,8 @@ export type LifecycleEvent =
   | { type: 'remote-registered' }
   | { type: 'remote-failed' }
   | { type: 'remote-dropped' }
-  | { type: 'fetch-begin' }
-  | { type: 'fetch-end' }
+  | { type: 'fetch-begin'; background?: boolean }
+  | { type: 'fetch-end'; background?: boolean }
   | { type: 'notified' }
   | { type: 'bucket-switch'; resolvedBefore: boolean };
 
@@ -46,7 +52,7 @@ export class LifecycleError extends Error {
 }
 
 export function seedLifecycle(resolvedBefore: boolean): QueryLifecycle {
-  return { phase: resolvedBefore ? 'cached' : 'cold', remote: 'unregistered', fetchDepth: 0, notified: false };
+  return { phase: resolvedBefore ? 'cached' : 'cold', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false };
 }
 
 /** Total on every (lifecycle, event) pair the sagas can produce; throws on the rest. */
@@ -70,9 +76,14 @@ export function transition(l: QueryLifecycle, ev: LifecycleEvent): QueryLifecycl
     case 'remote-dropped':
       return { ...l, remote: 'unregistered', notified: false };
     case 'fetch-begin':
-      return { ...l, fetchDepth: l.fetchDepth + 1 };
-    case 'fetch-end':
-      return l.fetchDepth === 0 ? l : { ...l, fetchDepth: l.fetchDepth - 1 };
+      return { ...l, fetchDepth: l.fetchDepth + 1, backgroundDepth: l.backgroundDepth + (ev.background ? 1 : 0) };
+    case 'fetch-end': {
+      if (l.fetchDepth === 0) return l;
+      const fetchDepth = l.fetchDepth - 1;
+      // Never more background cycles than cycles: an unbalanced end clamps.
+      const backgroundDepth = Math.min(fetchDepth, l.backgroundDepth - (ev.background && l.backgroundDepth > 0 ? 1 : 0));
+      return { ...l, fetchDepth, backgroundDepth };
+    }
     case 'notified':
       return l.notified ? l : { ...l, notified: true };
     case 'bucket-switch':
@@ -84,3 +95,5 @@ export const isAuthoritative = (l: QueryLifecycle): boolean => l.phase !== 'cold
 export const hasServerMembership = (l: QueryLifecycle): boolean =>
   l.phase === 'live' || l.phase === 'view-lost';
 export const deriveStatus = (l: QueryLifecycle): QueryStatus => (l.fetchDepth > 0 ? 'fetching' : 'idle');
+/** A fetch cycle the user is waiting on: rows to download, or a first registration. */
+export const isForegroundFetching = (l: QueryLifecycle): boolean => l.fetchDepth > l.backgroundDepth;

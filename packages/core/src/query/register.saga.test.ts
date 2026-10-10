@@ -156,6 +156,24 @@ describe('registerRemote', () => {
     expect(out.dispatched).toEqual([{ type: 'FetchRows' }, { type: 'FetchRows' }, { type: 'SyncOutcome', ok: true }]);
     expect(out.emitted).toContainEqual({ type: 'query:authority', hash: 'a', known: true });
   });
+  it('a cold registration is foreground; a cached or live one is background', async () => {
+    for (const [phase, background] of [['cold', 0], ['cached', 1], ['live', 1]] as const) {
+      const seen: Array<[number, number]> = [];
+      const out = await runPure(registerRemote(env, 'a'), {
+        state: buildState([buildEntry({ def: { hash: 'a' }, lifecycle: { phase } })]),
+        handlers: {
+          'remote.query': (_e: unknown, ctx) => {
+            const l = ctx.state.queries.get('a')!.lifecycle;
+            seen.push([l.fetchDepth, l.backgroundDepth]);
+            return happy();
+          },
+          'local.upsert': () => undefined,
+        },
+      });
+      expect(seen).toEqual([[1, background]]);
+      expect(out.state.queries.get('a')!.lifecycle).toMatchObject({ fetchDepth: 0, backgroundDepth: 0 });
+    }
+  });
   it('guards: missing entry, already registered / failed, registering without retry', async () => {
     const none = await runPure(registerRemote(env, 'zzz'), { state: buildState([]) });
     expect(none.log.filter((x) => x.kind === 'remote.query')).toHaveLength(0);

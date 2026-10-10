@@ -26,7 +26,10 @@ export interface UseSyncActivityOptions {
 }
 
 export interface UseSyncActivity {
-  /** Queries inside a fetch cycle right now (core `fetchingQueryCount`). */
+  /**
+   * Queries with traffic the user waits on (core `fetchingQueryCount`): a
+   * re-registration of a query that already shows rows is not counted.
+   */
   fetchingQueries: Accessor<number>;
   /** Locally committed writes the server has not acknowledged yet. */
   pendingMutations: Accessor<number>;

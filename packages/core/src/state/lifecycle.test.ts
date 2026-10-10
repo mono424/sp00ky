@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { LifecycleEvent, QueryLifecycle, QueryPhase } from './lifecycle';
-import { deriveStatus, hasServerMembership, isAuthoritative, LifecycleError, seedLifecycle, transition } from './lifecycle';
+import { deriveStatus, hasServerMembership, isAuthoritative, isForegroundFetching, LifecycleError, seedLifecycle, transition } from './lifecycle';
 
 const at = (phase: QueryPhase, over: Partial<QueryLifecycle> = {}): QueryLifecycle => ({
   phase,
   remote: 'unregistered',
   fetchDepth: 0,
+  backgroundDepth: 0,
   notified: false,
   ...over,
 });
@@ -33,7 +34,7 @@ describe('transition table (phase axis)', () => {
   });
   it('bucket-switch reseeds and clears fetch depth', () => {
     const l = transition(at('live', { fetchDepth: 3, notified: true }), { type: 'bucket-switch', resolvedBefore: true });
-    expect(l).toEqual({ phase: 'cached', remote: 'unregistered', fetchDepth: 0, notified: false });
+    expect(l).toEqual({ phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false });
   });
 });
 
@@ -63,6 +64,24 @@ describe('remote / fetch / notified axes', () => {
     const same = transition(l, { type: 'fetch-end' });
     expect(same).toBe(l);
   });
+  it('background cycles hold fetching but are not foreground', () => {
+    let l = at('cached');
+    l = transition(l, { type: 'fetch-begin', background: true });
+    expect(deriveStatus(l)).toBe('fetching');
+    expect(isForegroundFetching(l)).toBe(false);
+    l = transition(l, { type: 'fetch-begin' });
+    expect(isForegroundFetching(l)).toBe(true);
+    l = transition(l, { type: 'fetch-end' });
+    expect(l).toMatchObject({ fetchDepth: 1, backgroundDepth: 1 });
+    expect(isForegroundFetching(l)).toBe(false);
+    l = transition(l, { type: 'fetch-end', background: true });
+    expect(l).toMatchObject({ fetchDepth: 0, backgroundDepth: 0 });
+    expect(deriveStatus(l)).toBe('idle');
+  });
+  it('an unbalanced end never leaves more background cycles than cycles', () => {
+    const l = transition(at('live', { fetchDepth: 1, backgroundDepth: 1 }), { type: 'fetch-end' });
+    expect(l).toMatchObject({ fetchDepth: 0, backgroundDepth: 0 });
+  });
   it('notified is idempotent', () => {
     const l = transition(at('live'), { type: 'notified' });
     expect(transition(l, { type: 'notified' })).toBe(l);
@@ -89,6 +108,8 @@ describe('invariants over random event sequences', () => {
     { type: 'remote-dropped' },
     { type: 'fetch-begin' },
     { type: 'fetch-end' },
+    { type: 'fetch-begin', background: true },
+    { type: 'fetch-end', background: true },
     { type: 'notified' },
     { type: 'bucket-switch', resolvedBefore: false },
     { type: 'seed', resolvedBefore: true },
@@ -97,7 +118,7 @@ describe('invariants over random event sequences', () => {
   let seed = 42;
   const rand = () => (seed = (seed * 1664525 + 1013904223) % 2 ** 32) / 2 ** 32;
 
-  it('fetchDepth >= 0, notified only after live-or-cached, view-lost never from cold', () => {
+  it('0 <= backgroundDepth <= fetchDepth, notified only after live-or-cached, view-lost never from cold', () => {
     for (let run = 0; run < 200; run++) {
       let l = seedLifecycle(rand() < 0.5);
       for (let i = 0; i < 25; i++) {
@@ -110,6 +131,8 @@ describe('invariants over random event sequences', () => {
           continue;
         }
         expect(l.fetchDepth).toBeGreaterThanOrEqual(0);
+        expect(l.backgroundDepth).toBeGreaterThanOrEqual(0);
+        expect(l.backgroundDepth).toBeLessThanOrEqual(l.fetchDepth);
         if (ev.type === 'row-missing' && before.phase === 'cold') expect(l.phase).toBe('cold');
         if (l.phase === 'view-lost') expect(before.phase).not.toBe('cold');
       }

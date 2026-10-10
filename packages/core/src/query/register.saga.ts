@@ -151,8 +151,11 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
   if (!entry) return;
   const { remote } = entry.lifecycle;
   if (remote === 'registered' || remote === 'failed' || (remote === 'registering' && !retry)) return;
+  // A query that already shows rows (cached or live) only re-verifies them
+  // here: the cycle holds `fetching` but is not traffic the user waits on.
+  const background = entry.lifecycle.phase !== 'cold';
   yield fx.state.update(
-    R.compose(R.applyLifecycle(hash, { type: 'remote-registering' }), R.applyLifecycle(hash, { type: 'fetch-begin' }))
+    R.compose(R.applyLifecycle(hash, { type: 'remote-registering' }), R.applyLifecycle(hash, { type: 'fetch-begin', background }))
   );
   try {
     const table = listRefTable(env, state);
@@ -221,6 +224,6 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
     }
   } finally {
     const stillThere = (yield fx.state.read((s) => s.queries.has(hash))) as boolean;
-    if (stillThere) yield fx.state.update(R.applyLifecycle(hash, { type: 'fetch-end' }));
+    if (stillThere) yield fx.state.update(R.applyLifecycle(hash, { type: 'fetch-end', background }));
   }
 }

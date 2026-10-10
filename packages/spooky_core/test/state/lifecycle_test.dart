@@ -6,12 +6,14 @@ QueryLifecycle at(
   QueryPhase phase, {
   RemotePhase remote = RemotePhase.unregistered,
   int fetchDepth = 0,
+  int backgroundDepth = 0,
   bool notified = false,
 }) =>
     QueryLifecycle(
       phase: phase,
       remote: remote,
       fetchDepth: fetchDepth,
+      backgroundDepth: backgroundDepth,
       notified: notified,
     );
 
@@ -96,6 +98,29 @@ void main() {
       expect(identical(transition(l, const FetchEndEvent()), l), isTrue);
     });
 
+    test('background cycles hold fetching but are not foreground', () {
+      var l = at(QueryPhase.cached);
+      l = transition(l, const FetchBeginEvent(background: true));
+      expect(deriveStatus(l), QueryStatus.fetching);
+      expect(isForegroundFetching(l), isFalse);
+      l = transition(l, const FetchBeginEvent());
+      expect(isForegroundFetching(l), isTrue);
+      l = transition(l, const FetchEndEvent());
+      expect((l.fetchDepth, l.backgroundDepth), (1, 1));
+      expect(isForegroundFetching(l), isFalse);
+      l = transition(l, const FetchEndEvent(background: true));
+      expect((l.fetchDepth, l.backgroundDepth), (0, 0));
+      expect(deriveStatus(l), QueryStatus.idle);
+    });
+
+    test('an unbalanced end never leaves more background cycles than cycles',
+        () {
+      final l = transition(
+          at(QueryPhase.live, fetchDepth: 1, backgroundDepth: 1),
+          const FetchEndEvent());
+      expect((l.fetchDepth, l.backgroundDepth), (0, 0));
+    });
+
     test('notified is idempotent', () {
       final l = transition(at(QueryPhase.live), const NotifiedEvent());
       expect(identical(transition(l, const NotifiedEvent()), l), isTrue);
@@ -122,6 +147,8 @@ void main() {
       RemoteDroppedEvent(),
       FetchBeginEvent(),
       FetchEndEvent(),
+      FetchBeginEvent(background: true),
+      FetchEndEvent(background: true),
       NotifiedEvent(),
       BucketSwitchEvent(false),
       SeedEvent(true),

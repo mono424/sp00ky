@@ -233,6 +233,35 @@ void main() {
           )
         ]);
 
+    test('a cold registration is foreground; a cached or live one is background',
+        () async {
+      for (final (phase, background) in [
+        (QueryPhase.cold, 0),
+        (QueryPhase.cached, 1),
+        (QueryPhase.live, 1),
+      ]) {
+        final seen = <(int, int)>[];
+        final out = await runPure<void>(
+          (ctx) => registerRemote(ctx, env(), 'a'),
+          state: withQuery(
+              lifecycle: seedLifecycle(false).copyWith(phase: phase)),
+          handlers: defaults(over: {
+            'remote.query': (_, ctx) {
+              final l = ctx.state.queries['a']!.lifecycle;
+              seen.add((l.fetchDepth, l.backgroundDepth));
+              return registerAnswer(
+                primary: [('thing:1', 1)],
+                meta: readyMeta(1),
+              );
+            },
+          }),
+        );
+        expect(seen, [(1, background)], reason: phase.name);
+        final l = out.state.queries['a']!.lifecycle;
+        expect((l.fetchDepth, l.backgroundDepth), (0, 0));
+      }
+    });
+
     test('registers, applies membership and children, flips registered',
         () async {
       final out = await runPure<void>(

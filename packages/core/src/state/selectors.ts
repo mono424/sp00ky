@@ -1,6 +1,6 @@
 import type { PhaseStat, QueryHash, QueryState, QueryStatus, QueryTimings, RecordVersionArray } from '../types';
 import type { ClientState, QueryEntry } from './client-state';
-import { deriveStatus, hasServerMembership, isAuthoritative } from './lifecycle';
+import { deriveStatus, hasServerMembership, isAuthoritative, isForegroundFetching } from './lifecycle';
 import { FETCH_CHUNK } from '../kernel/constants';
 
 /** Pure reads over `ClientState`. Sagas use them through `state.read`. */
@@ -75,8 +75,14 @@ export const hasAckedWrites = (s: ClientState): boolean => s.outbox.some((i) => 
 export const pendingMutationCount = (s: ClientState): number =>
   s.outbox.filter((i) => i.status === 'pending').length;
 
+/**
+ * Queries with traffic the user is waiting on. A re-registration of a query
+ * that already shows rows (every mounted query after a reload) is left out:
+ * it only confirms what the cache painted, and any newer body it finds is
+ * fetched by `fetchRows`, which counts.
+ */
 export const fetchingQueryCount = (s: ClientState): number =>
-  [...s.queries.values()].filter((e) => e.lifecycle.fetchDepth > 0).length;
+  [...s.queries.values()].filter((e) => isForegroundFetching(e.lifecycle)).length;
 
 /** Membership entries whose body is missing or older locally. */
 export function needed(s: ClientState, hash: QueryHash): RecordVersionArray {

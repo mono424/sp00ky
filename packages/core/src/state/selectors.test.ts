@@ -81,6 +81,14 @@ describe('needed / planFetch / settled', () => {
     const s = buildState([e('a', { lifecycle: { fetchDepth: 2 } }), e('b')]);
     expect(S.fetchingQueryCount(s)).toBe(1);
   });
+  it('fetchingQueryCount leaves out background re-verification', () => {
+    const s = buildState([
+      e('verifying', { lifecycle: { phase: 'cached', fetchDepth: 1, backgroundDepth: 1 } }),
+      e('downloading', { lifecycle: { phase: 'live', fetchDepth: 2, backgroundDepth: 1 } }),
+    ]);
+    expect(S.fetchingQueryCount(s)).toBe(1);
+    expect(S.queryStatus(s, 'verifying')).toBe('fetching');
+  });
 });
 
 describe('registration / eviction / ttl', () => {

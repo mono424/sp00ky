@@ -66,8 +66,12 @@ Set<String> unsyncedRecordIds(ClientState s) => {
       for (final w in s.pendingWrites.values) w.recordId,
     };
 
+/// Queries with traffic the user is waiting on. A re-registration of a query
+/// that already shows rows (every mounted query after a restart) is left out:
+/// it only confirms what the cache painted, and any newer body it finds is
+/// fetched by `fetchRows`, which counts.
 int fetchingQueryCount(ClientState s) =>
-    s.queries.values.where((e) => e.lifecycle.fetchDepth > 0).length;
+    s.queries.values.where((e) => isForegroundFetching(e.lifecycle)).length;
 
 /// Membership entries whose body is missing or older locally.
 RecordVersionArray needed(ClientState s, QueryHash hash) {

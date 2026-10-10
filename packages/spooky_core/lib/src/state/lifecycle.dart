@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import '../types.dart' show QueryStatus;
 
 /// The query lifecycle as one explicit machine.
@@ -14,6 +16,11 @@ import '../types.dart' show QueryStatus;
 /// [remote] tracks the server-side registration, [fetchDepth] is the refcount
 /// behind `status: fetching`, and [notified] says whether subscribers received
 /// at least one materialization this registration.
+///
+/// [backgroundDepth] is the part of [fetchDepth] that re-verifies rows the
+/// query already shows: a registration of a query that is not `cold`. It still
+/// holds `status: fetching` (results are not yet confirmed), but it is not
+/// traffic the user waits on, so the activity indicator leaves it out.
 enum QueryPhase { cold, cached, live, viewLost }
 
 enum RemotePhase { unregistered, registering, registered, failed }
@@ -23,30 +30,35 @@ class QueryLifecycle {
     required this.phase,
     required this.remote,
     required this.fetchDepth,
+    this.backgroundDepth = 0,
     required this.notified,
   });
 
   final QueryPhase phase;
   final RemotePhase remote;
   final int fetchDepth;
+  final int backgroundDepth;
   final bool notified;
 
   QueryLifecycle copyWith({
     QueryPhase? phase,
     RemotePhase? remote,
     int? fetchDepth,
+    int? backgroundDepth,
     bool? notified,
   }) =>
       QueryLifecycle(
         phase: phase ?? this.phase,
         remote: remote ?? this.remote,
         fetchDepth: fetchDepth ?? this.fetchDepth,
+        backgroundDepth: backgroundDepth ?? this.backgroundDepth,
         notified: notified ?? this.notified,
       );
 
   @override
   String toString() =>
-      'QueryLifecycle(${phase.name}/${remote.name}, fetchDepth: $fetchDepth, notified: $notified)';
+      'QueryLifecycle(${phase.name}/${remote.name}, fetchDepth: $fetchDepth, '
+      'backgroundDepth: $backgroundDepth, notified: $notified)';
 }
 
 sealed class LifecycleEvent {
@@ -99,13 +111,15 @@ class RemoteDroppedEvent extends LifecycleEvent {
 }
 
 class FetchBeginEvent extends LifecycleEvent {
-  const FetchBeginEvent();
+  const FetchBeginEvent({this.background = false});
+  final bool background;
   @override
   String get type => 'fetch-begin';
 }
 
 class FetchEndEvent extends LifecycleEvent {
-  const FetchEndEvent();
+  const FetchEndEvent({this.background = false});
+  final bool background;
   @override
   String get type => 'fetch-end';
 }
@@ -166,10 +180,19 @@ QueryLifecycle transition(QueryLifecycle l, LifecycleEvent ev) {
       return l.copyWith(remote: RemotePhase.failed);
     case RemoteDroppedEvent():
       return l.copyWith(remote: RemotePhase.unregistered, notified: false);
-    case FetchBeginEvent():
-      return l.copyWith(fetchDepth: l.fetchDepth + 1);
-    case FetchEndEvent():
-      return l.fetchDepth == 0 ? l : l.copyWith(fetchDepth: l.fetchDepth - 1);
+    case FetchBeginEvent(:final background):
+      return l.copyWith(
+        fetchDepth: l.fetchDepth + 1,
+        backgroundDepth: l.backgroundDepth + (background ? 1 : 0),
+      );
+    case FetchEndEvent(:final background):
+      if (l.fetchDepth == 0) return l;
+      final fetchDepth = l.fetchDepth - 1;
+      // Never more background cycles than cycles: an unbalanced end clamps.
+      final backgroundDepth = math.min(fetchDepth,
+          l.backgroundDepth - (background && l.backgroundDepth > 0 ? 1 : 0));
+      return l.copyWith(
+          fetchDepth: fetchDepth, backgroundDepth: backgroundDepth);
     case NotifiedEvent():
       return l.notified ? l : l.copyWith(notified: true);
     case BucketSwitchEvent(:final resolvedBefore):
@@ -184,3 +207,8 @@ bool hasServerMembership(QueryLifecycle l) =>
 
 QueryStatus deriveStatus(QueryLifecycle l) =>
     l.fetchDepth > 0 ? QueryStatus.fetching : QueryStatus.idle;
+
+/// A fetch cycle the user is waiting on: rows to download, or a first
+/// registration.
+bool isForegroundFetching(QueryLifecycle l) =>
+    l.fetchDepth > l.backgroundDepth;

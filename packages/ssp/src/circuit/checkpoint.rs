@@ -502,6 +502,30 @@ mod tests {
         assert!(back.membership().values().all(|w| *w == 1));
     }
 
+    /// Writes the FORMAT 1 fixture the legacy reader is tested against. Run
+    /// once, on a build whose writer still emits FORMAT 1:
+    /// `cargo test -p ssp --lib write_format_one_fixture -- --ignored`
+    #[test]
+    #[ignore = "writes the committed FORMAT 1 fixture; run on purpose"]
+    fn write_format_one_fixture() {
+        let mut coll = collection(&[
+            ("a", json!({ "id": "game:a", "white": "x", "moves": [1, 2, 3], "_00_rv": 4 })),
+            ("b", json!({ "id": "game:b", "meta": { "site": "lichess", "rated": true }, "elo": 1.5 })),
+            ("⟨odd id⟩", json!({ "id": "game:⟨odd id⟩", "nil": null })),
+            ("", json!({ "empty": "id" })),
+        ]);
+        // One row updated once, so the arena carries dead bytes and the file
+        // holds the newer copy only.
+        coll.apply(
+            Operation::Update,
+            "a",
+            Sp00kyValue::from(json!({ "id": "game:a", "white": "y", "moves": [1], "_00_rv": 5 })),
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/circuit/testdata/rows_v1.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes_of(&coll)).unwrap();
+    }
+
     #[test]
     fn written_reports_rows_and_every_byte() {
         let coll = collection(&[("a", json!({ "n": 1 })), ("b", json!({ "n": 2 }))]);

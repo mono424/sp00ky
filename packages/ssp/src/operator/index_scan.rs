@@ -133,12 +133,31 @@ pub struct IndexWindow {
     pub descending: Vec<bool>,
     /// The keys currently in the window, in order.
     window: Vec<RowKey>,
-    primed: bool,
+    /// The table's [`Collection::writes`](crate::circuit::store::Collection::writes)
+    /// when the window was last read; `None` until the first read.
+    read_at: Option<u64>,
 }
 
 impl IndexWindow {
     pub fn new(binding: IndexBinding, limit: usize, offset: usize, descending: Vec<bool>) -> Self {
-        Self { binding, limit, offset, descending, window: Vec::new(), primed: false }
+        Self { binding, limit, offset, descending, window: Vec::new(), read_at: None }
+    }
+
+    fn writes(&self, store: &Store) -> Option<u64> {
+        store.get_collection(&self.binding.table).map(|c| c.writes())
+    }
+
+    /// Re-read the window unless the table took no write since the last
+    /// read, and return the membership change. One step can ask once per
+    /// written row; only the first ask reads.
+    fn refresh(&mut self, store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
+        let writes = self.writes(store);
+        if self.read_at.is_some() && self.read_at == writes {
+            return ZSet::new();
+        }
+        let next = self.read(store, ctx);
+        self.read_at = writes;
+        self.swap_in(next)
     }
 
     /// The window as the index holds it now.
@@ -208,16 +227,10 @@ impl super::Operator for IndexWindow {
         self.read(store, ctx).into_iter().map(|key| (key, 1)).collect()
     }
 
-    fn step(&mut self, input_deltas: &[&ZSet], store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
+    fn step(&mut self, _input_deltas: &[&ZSet], store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
         // The store applied this step's writes, and kept the index in step,
         // before any operator runs: re-reading the window is the delta.
-        let changed = input_deltas.first().is_some_and(|d| !d.is_empty());
-        if self.primed && !changed {
-            return ZSet::new();
-        }
-        self.primed = true;
-        let next = self.read(store, ctx);
-        self.swap_in(next)
+        self.refresh(store, ctx)
     }
 
     fn arity(&self) -> usize {
@@ -226,7 +239,7 @@ impl super::Operator for IndexWindow {
 
     fn reset(&mut self) {
         self.window.clear();
-        self.primed = false;
+        self.read_at = None;
     }
 
     fn collections(&self) -> Vec<String> {
@@ -250,8 +263,7 @@ impl super::Operator for IndexWindow {
         if !self.binding.owns(key) {
             return None;
         }
-        let next = self.read(store, ctx);
-        Some(self.swap_in(next))
+        Some(self.refresh(store, ctx))
     }
 
     fn state_bytes(&self) -> usize {

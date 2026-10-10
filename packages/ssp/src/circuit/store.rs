@@ -76,6 +76,11 @@ pub struct Collection {
     /// ([`Self::release_indexes_except`]). Never serialized.
     #[serde(skip)]
     indexes: IndexSlots,
+    /// Bumped by every write that changed a row (and by `compact`): lets a
+    /// reader that derived something from the rows tell whether it is still
+    /// current without comparing them. Never serialized.
+    #[serde(skip)]
+    writes: u64,
 }
 
 /// The built indexes behind a lock: a lookup builds one through `&self`
@@ -125,6 +130,7 @@ impl Collection {
             retained: None,
             membership: std::sync::OnceLock::new(),
             indexes: IndexSlots::default(),
+            writes: 0,
         }
     }
 
@@ -166,6 +172,11 @@ impl Collection {
     /// Drop every built index whose name is not in `keep`.
     pub fn release_indexes_except(&mut self, keep: &BTreeSet<String>) {
         self.indexes.get_mut().retain(|name, _| keep.contains(name));
+    }
+
+    /// See the `writes` field.
+    pub fn writes(&self) -> u64 {
+        self.writes
     }
 
     /// Names of the indexes currently built.
@@ -275,6 +286,7 @@ impl Collection {
     pub fn compact(&mut self) {
         // A narrowed projection can drop indexed fields; rebuild on next use.
         self.indexes.get_mut().clear();
+        self.writes += 1;
         let decoded: Vec<(String, Sp00kyValue)> = self
             .rows
             .iter()
@@ -375,6 +387,7 @@ impl Collection {
             self.unindex_row(normalized, &key);
             self.rows.remove(normalized);
             self.bump_membership(&key, -1);
+            self.writes += 1;
             return Applied { key, weight: -1, content_changed: true };
         }
 
@@ -406,6 +419,7 @@ impl Collection {
         self.unindex_row(normalized, &key);
         self.rows.insert(normalized, &data, &incoming);
         self.index_row(&data, &key);
+        self.writes += 1;
 
         let weight = if present { 0 } else { 1 };
         if weight != 0 {

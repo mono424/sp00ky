@@ -5404,6 +5404,21 @@ mod index_tests {
                 c.step(ChangeSet { changes });
             }
             eprintln!("{label}: 20 ingest steps of 50 rows {:?}", t.elapsed());
+            let t = Instant::now();
+            for step in 0..10u64 {
+                let changes = (0..250u64)
+                    .map(|j| {
+                        let i = (step * 250 + j) * 100; // i % 100 == 0: in d000
+                        Change::update(
+                            "game",
+                            &format!("{i:020}"),
+                            json!({ "database": format!("game_database:{:020}", 0), "sort_index": (i * 31 + step) % 1_000_000, "white": "someone", "black": "else" }),
+                        )
+                    })
+                    .collect();
+                c.step(ChangeSet { changes });
+            }
+            eprintln!("{label}: 10 update steps of 250 rows {:?}", t.elapsed());
             let coll = c.store.get_collection("game").unwrap();
             eprintln!(
                 "{label}: index bytes {:.1} MB, operator state {:.1} MB, RSS {:.0} MB over the loaded rows",

@@ -334,6 +334,130 @@ describe('shared-query SurrealDB semantics', () => {
       expect(subs).toBe(1);
     });
 
+    /**
+     * The browser's pagehide release, over the path it really takes: a
+     * keepalive POST to `/sql` with a Bearer token, which SurrealDB runs in a
+     * fresh HTTP session of its own.
+     */
+    describe('pagehide release over HTTP', () => {
+      async function beacon(email: string, sql: string): Promise<any[]> {
+        const db = new Surreal();
+        await db.connect(`ws://127.0.0.1:${getTestDbPort()}/rpc`);
+        const tokens: any = await db.signin({
+          namespace: TEST_DB_CONFIG.namespace,
+          database: TEST_DB_CONFIG.database,
+          access: 'user_access',
+          variables: { email },
+        } as any);
+        await db.close();
+        const res = await fetch(`http://127.0.0.1:${getTestDbPort()}/sql`, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'text/plain',
+            'surreal-ns': TEST_DB_CONFIG.namespace,
+            'surreal-db': TEST_DB_CONFIG.database,
+            Authorization: `Bearer ${typeof tokens === 'string' ? tokens : tokens.access}`,
+          },
+          body: sql,
+        });
+        return await res.json();
+      }
+      const sessionId = async (db: Surreal) => (await q(db, `RETURN <string>session::id()`))[0] as string;
+      const expiresInSecs = async () =>
+        (await q(root, `SELECT VALUE duration::secs((lastActiveAt + ttl) - time::now()) FROM ONLY ${ID}`))[0] as number;
+      const subscriberIds = async () => (await q(root, `SELECT VALUE subscribers.id FROM ONLY ${ID}`))[0] as string[];
+      const leave = (sids: string[]) =>
+        `FOR $id IN [${ID}] { LET $_left = fn::query::leave($id, [${sids.map((s) => `'${s}'`).join(', ')}]); };`;
+
+      /** Why `fn::query::leave` takes session ids: the old beacon was inert. */
+      test('an HTTP request is a different session, so unsubscribe released nothing', async () => {
+        const a = await connectAs('alice@test');
+        try {
+          await q(a, `RETURN fn::query::heartbeat(${ID})`);
+          const sidA = await sessionId(a);
+          const [seen] = await beacon('alice@test', `RETURN <string>session::id()`);
+          expect(seen.result).not.toBe(sidA);
+
+          const [res] = await beacon('alice@test', `FOR $id IN [${ID}] { LET $_released = fn::query::unsubscribe($id); };`);
+          expect(res.status).toBe('OK');
+          expect(await subscriberIds()).toEqual([sidA]);
+          expect(await expiresInSecs()).toBeGreaterThan(3500);
+        } finally {
+          await a.close();
+        }
+      });
+
+      test('leave keeps the row and pulls its expiry in to the grace', async () => {
+        const a = await connectAs('alice@test');
+        try {
+          await q(a, `RETURN fn::query::heartbeat(${ID})`);
+          const [res] = await beacon('alice@test', leave([await sessionId(a)]));
+          expect(res.status).toBe('OK');
+          expect(await subscriberIds()).toEqual([]);
+          // Still there for a reload; the TTL sweep takes it after the grace.
+          const left = await expiresInSecs();
+          expect(left).toBeGreaterThan(50);
+          expect(left).toBeLessThanOrEqual(60);
+        } finally {
+          await a.close();
+        }
+      });
+
+      test("a reload's re-registration inside the grace cancels the release", async () => {
+        const a = await connectAs('alice@test');
+        const reload = await connectAs('alice@test');
+        try {
+          await q(a, `RETURN fn::query::heartbeat(${ID})`);
+          await beacon('alice@test', leave([await sessionId(a)]));
+          expect(await expiresInSecs()).toBeLessThanOrEqual(60);
+
+          // Registration and heartbeat both refresh `lastActiveAt`.
+          await q(reload, `RETURN fn::query::heartbeat(${ID})`);
+          expect(await expiresInSecs()).toBeGreaterThan(3500);
+          expect(await subscriberIds()).toEqual([await sessionId(reload)]);
+        } finally {
+          await a.close();
+          await reload.close();
+        }
+      });
+
+      test('a beacon landing after the reload registered changes only its own entry', async () => {
+        const a = await connectAs('alice@test');
+        const reload = await connectAs('alice@test');
+        try {
+          await q(a, `RETURN fn::query::heartbeat(${ID})`);
+          await q(reload, `RETURN fn::query::heartbeat(${ID})`);
+          const [res] = await beacon('alice@test', leave([await sessionId(a)]));
+          expect(res.status).toBe('OK');
+          expect(await subscriberIds()).toEqual([await sessionId(reload)]);
+          expect(await expiresInSecs()).toBeGreaterThan(3500);
+        } finally {
+          await a.close();
+          await reload.close();
+        }
+      });
+
+      test('leave never extends a row that is due sooner, and cannot reach another user', async () => {
+        const a = await connectAs('alice@test');
+        try {
+          await q(a, `RETURN fn::query::heartbeat(${ID})`);
+          const sidA = await sessionId(a);
+
+          await beacon('bob@test', leave([sidA]));
+          expect(await subscriberIds()).toEqual([sidA]);
+          expect(await expiresInSecs()).toBeGreaterThan(3500);
+
+          await q(root, `UPDATE ${ID} SET lastActiveAt = time::now() - 1h + 10s`);
+          await beacon('alice@test', leave([sidA]));
+          expect(await expiresInSecs()).toBeLessThanOrEqual(10);
+          expect(await subscriberIds()).toEqual([]);
+        } finally {
+          await a.close();
+        }
+      });
+    });
+
     test('an anon row is readable without auth', async () => {
       await q(root, `CREATE _00_query:pub SET auth_id = 'anon', ttl = 1h, rowCount = 3;`);
       const anon = new Surreal();

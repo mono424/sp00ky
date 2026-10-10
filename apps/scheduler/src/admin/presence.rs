@@ -18,14 +18,16 @@
 //! A row counts while `lastActiveAt + ttl > time::now()` — the same rule
 //! `fn::query::heartbeat` and the SSP's TTL sweep use, so this plane and the
 //! database can never disagree about what is alive. The filter is not optional:
-//! eager teardown (`fn::query::unsubscribe`) is off by default, so without it
-//! every tab ever opened counts forever.
+//! the browser client never deletes its rows itself, so an expired row stays in
+//! the table until the sweep's next pass reaches it.
 //!
 //! The honest caveat, which the dashboard repeats to the operator: a client
 //! refreshes `lastActiveAt` on a `0.9 * ttl` timer (~9 minutes at the default
-//! `10m`), so a closed tab decays out of these numbers rather than vanishing
-//! from them. That cadence is the resolution floor, and no amount of sampling
-//! here can beat it.
+//! `10m`), so a tab that dies without a word decays out of these numbers rather
+//! than vanishing from them. A browser tab that closes normally sends
+//! `fn::query::leave` from `pagehide`, which pulls its rows' expiry in to a
+//! one-minute grace (kept for a reload of the same tab), so it leaves within
+//! about a minute. A lost beacon falls back to the full TTL.
 //!
 //! # One sampler
 //!

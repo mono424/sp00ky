@@ -37,6 +37,12 @@ export type RemoteConnectionEvent = ConnectionState | 'error';
  */
 const REMOTE_MAX_CONCURRENT_QUERIES = 6;
 
+/**
+ * Session ids a page remembers for its pagehide release. Only the sessions of
+ * the last ttl matter; this many reconnects inside one ttl is a broken network.
+ */
+const MAX_SESSION_IDS = 16;
+
 export class RemoteDatabaseService extends AbstractDatabaseService {
   private config: Sp00kyConfig<any>['database'];
   protected eventType = DatabaseEventTypes.RemoteQuery;
@@ -67,6 +73,17 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
    * returns nothing, on a page that still looks signed in.
    */
   private authToken: string | null = null;
+  /**
+   * Every `session::id()` this page's sockets have had, oldest first.
+   *
+   * The server stamps a view's `subscribers` entry with the session that
+   * registered or heartbeated it, and every socket (an SDK reconnect, a
+   * supervisor revive) is a new session. The pagehide release goes over HTTP,
+   * whose own session id matches none of them, so it names these instead. Kept
+   * for the page, not the socket: a view registered before a reconnect still
+   * carries the old id until its next heartbeat.
+   */
+  private sessionIdsSeen: string[] = [];
 
   constructor(config: Sp00kyConfig<any>['database'], logger: Logger) {
     const events = createDatabaseEventSystem();
@@ -98,6 +115,27 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
     this.reconnectConfig = resolveReconnectConfig(config.reconnect);
     this.queryTimeoutMs = Math.max(0, config.queryTimeoutMs ?? 60_000);
     this.maxConcurrentQueries = REMOTE_MAX_CONCURRENT_QUERIES;
+    this.client.subscribe('connected', () => void this.recordSessionId());
+  }
+
+  /** See {@link sessionIdsSeen}. */
+  sessionIds(): readonly string[] {
+    return this.sessionIdsSeen;
+  }
+
+  /**
+   * Ask the socket that just connected for its session id. Straight to the
+   * SDK: it needs no namespace or identity, so it need not wait behind an
+   * in-flight connect or take a slot from the query queue.
+   */
+  private async recordSessionId(): Promise<void> {
+    try {
+      const [sid] = (await this.client.query('RETURN <string>session::id()')) as unknown[];
+      if (typeof sid !== 'string' || this.sessionIdsSeen.includes(sid)) return;
+      this.sessionIdsSeen = [...this.sessionIdsSeen, sid].slice(-MAX_SESSION_IDS);
+    } catch {
+      // Without it this socket's views fall back to the TTL sweep.
+    }
   }
 
   getConfig(): Sp00kyConfig<any>['database'] {
@@ -116,6 +154,10 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
    *
    * Best-effort by design: no await, no retry, errors swallowed. Every caller
    * must have a server-side fallback that makes a lost beacon a non-event.
+   *
+   * The statement runs in a fresh HTTP session: `session::id()` there is a new
+   * id, not this page's socket's, so anything keyed on it must be passed the
+   * ids from {@link sessionIds} instead.
    */
   beaconSql(sql: string): void {
     try {

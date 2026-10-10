@@ -72,3 +72,42 @@ DEFINE FUNCTION OVERWRITE fn::query::unsubscribe($id: record) -> object {
         }
     };
 };
+
+-- Hand back a page's claim on a view when the page goes away, without tearing
+-- the view down.
+--
+-- Sent by the browser client from `pagehide` as a keepalive HTTP request,
+-- because a WebSocket frame sent during unload is not guaranteed to flush. An
+-- HTTP request runs in a fresh session whose `session::id()` matches no
+-- subscriber entry, which is why `fn::query::unsubscribe` released nothing on
+-- that path: the page passes the WebSocket session ids it held as `$sids`
+-- instead. Naming another session only reaches rows the caller could already
+-- update or delete, so the argument grants nothing the table rule does not.
+--
+-- It never deletes. When nobody else is watching it pulls `lastActiveAt` back
+-- so the row expires one minute from now, and the TTL sweep reclaims it on a
+-- pass after that. A reload of the same tab keeps its query salt and
+-- re-registers onto this very row; registration refreshes `lastActiveAt`, which
+-- cancels the release and keeps the SSP view warm. Deleting here would hand
+-- every reload a cold view. A beacon that lands after the reload's
+-- registration finds the new session's entry and changes nothing but its own.
+--
+-- Never extends: a row already due sooner keeps its expiry.
+DEFINE FUNCTION OVERWRITE fn::query::leave($id: record, $sids: array<string>) -> object {
+    LET $now = time::now();
+    LET $row = (SELECT subscribers, ttl, lastActiveAt FROM ONLY $id);
+    RETURN IF $row = NONE {
+        { leaving: false, remaining: 0 }
+    } ELSE {
+        LET $rest = array::filter($row.subscribers ?? [], |$s|
+            <string>$s.id NOTINSIDE $sids AND <datetime>$s.seenAt + $row.ttl > $now
+        );
+        LET $expiry = $now + 1m - $row.ttl;
+        IF array::len($rest) = 0 AND $expiry < $row.lastActiveAt {
+            UPDATE $id SET subscribers = $rest, lastActiveAt = $expiry;
+        } ELSE {
+            UPDATE $id SET subscribers = $rest;
+        };
+        { leaving: array::len($rest) = 0, remaining: array::len($rest) }
+    };
+};

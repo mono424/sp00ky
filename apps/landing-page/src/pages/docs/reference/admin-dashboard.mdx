@@ -539,8 +539,12 @@ distinct `clientId` counts open tabs, and the row count is registered views.
   A client proves it is still watching by refreshing `lastActiveAt` on a<code>0.9 &times; ttl</code>{' '}
   timer — about nine minutes at the default
   <code>10m</code>. A row counts as live while <code>lastActiveAt + ttl &gt; time::now()</code>, the
-  same rule the TTL sweep uses, so a closed tab *decays* out of these counts over minutes rather
-  than leaving at once. Every row on the Views tab carries its own <code>expires</code> so you can
+  same rule the TTL sweep uses. A browser tab that closes normally hands its rows back on
+  `pagehide`: <code>fn::query::leave</code> pulls their expiry in to one minute, and the sweep
+  removes them after that. The minute is a grace for a reload of the same tab, which re-registers
+  onto the same rows and finds its views still warm. A tab that never sends that release (a crash, a
+  mobile tab killed in the background, a lost request) *decays* out over the full ttl instead.
+  Every row on the Views tab carries its own <code>expires</code> so you can
   see which ones are on the way out. There is no finer signal to be had: the client's WebSocket goes
   to SurrealDB, not to the scheduler, so there is no connection to count.
 </Note>

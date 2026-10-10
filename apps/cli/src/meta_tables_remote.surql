@@ -48,9 +48,10 @@ DEFINE FIELD OVERWRITE clientId ON TABLE _00_query TYPE option<string>;
 -- Who is currently watching this shared incantation: one entry per WebSocket
 -- session, `{ id: <session::id()>, seenAt: <datetime> }`.
 --
--- ADVISORY, not authoritative. It gates only the EAGER release path
--- (`fn::query::unsubscribe`): the last subscriber to leave deletes the row and
--- with it the view and every edge. `lastActiveAt` below remains the SOLE
+-- ADVISORY, not authoritative. It gates only the EAGER release paths: in
+-- `fn::query::unsubscribe` the last subscriber to leave deletes the row and
+-- with it the view and every edge; in `fn::query::leave` (a page going away)
+-- it pulls the row's expiry in to a short grace. `lastActiveAt` below remains the SOLE
 -- authority for the TTL sweep, because a client that crashes never removes its
 -- entry — gating expiry on an empty array would pin a view forever.
 --

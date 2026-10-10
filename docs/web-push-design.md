@@ -27,7 +27,8 @@ push library, no key management. Powerful defaults, few opinions:
 
 - There is no session / presence table. LIVE queries live inside SurrealDB,
   the SSP is HTTP-only, `_00_query.lastActiveAt + ttl` is ~5 min resolution,
-  closed tabs beacon-delete their views. So "push only if the user is not
+  a closed tab's pagehide beacon (`fn::query::leave`) only pulls its views'
+  expiry in to a one-minute grace. So "push only if the user is not
   connected" is impossible server-side. A matching row pushes to every enabled
   subscription of the recipient; the SERVICE WORKER decides whether to show
   (suppress when a visible client exists).

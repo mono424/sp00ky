@@ -2400,7 +2400,9 @@ pub async fn ttl_cleanup_sweep(
     // "nobody is watching". A client that crashes never removes its entry, so
     // gating expiry on emptiness instead would let one dead tab pin a view
     // (and its ~45MB of operator state) forever. The subscriber set only ever
-    // gates the eager release path in `fn::query::unsubscribe`.
+    // gates the eager release paths in `fn::query::unsubscribe` and
+    // `fn::query::leave`; the latter releases through this sweep by pulling
+    // `lastActiveAt` back, so a page's pagehide reaches the view here.
     let rows: Vec<String> = match db
         .query(
             "SELECT VALUE (<string>id + '|' + <string>(auth_id OR '')) \

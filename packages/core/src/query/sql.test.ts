@@ -50,6 +50,24 @@ describe('query sql builders (golden against the previous builders)', () => {
     expect(sql.heartbeatRowGone([{ id: a }])).toBe(false);
     expect(sql.heartbeatRowGone(undefined)).toBe(false);
   });
+  it('the pagehide beacon names the page sessions and inlines only shapes it minted', () => {
+    const a = new RecordId('_00_query', 'a'.repeat(64));
+    const b = new RecordId('_00_query', 'b'.repeat(64));
+    const s1 = 'de81a067-f4bc-4351-a2a3-1ecf06b6305a';
+    const s2 = '8A14ED5A-32B5-4B4E-973D-D2B88860932F';
+    expect(sql.leaveViewsBeacon([a, b], [s1, s2])).toBe(
+      `FOR $id IN [${a}, ${b}] { LET $_left = fn::query::leave($id, ['${s1}', '${s2}']); };`
+    );
+    const digits = new RecordId('_00_query', '1'.repeat(64));
+    expect(sql.leaveViewsBeacon([digits], [s1])).toBe(`FOR $id IN [${digits}] { LET $_left = fn::query::leave($id, ['${s1}']); };`);
+    // Anything else is dropped rather than interpolated.
+    expect(sql.leaveViewsBeacon([a, new RecordId('_00_query', "x']; DELETE user; --"), 'user:1'], [s1, "x'; DELETE user; --"])).toBe(
+      `FOR $id IN [${a}] { LET $_left = fn::query::leave($id, ['${s1}']); };`
+    );
+    // No session ids: the server could not tell this page's entries from a reload's, so send nothing.
+    expect(sql.leaveViewsBeacon([a], [])).toBeNull();
+    expect(sql.leaveViewsBeacon([], [s1])).toBeNull();
+  });
   it('upsertBodiesTx MERGEs each body inside one transaction', () => {
     const { query, vars } = sql.upsertBodiesTx([
       { id: 'thing:1', content: { a: 1 } },

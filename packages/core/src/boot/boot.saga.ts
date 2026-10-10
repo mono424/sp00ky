@@ -118,7 +118,9 @@ export function* versionsPrimed(entries: Array<readonly [string, number]>): Saga
 
 /**
  * The page is going away for good: leave the salt for a reload of this tab,
- * then hand this tab's views back to the server.
+ * then hand this tab's views back to the server. The release is deferred
+ * server-side (`fn::query::leave`), so a reload that re-registers within the
+ * grace finds its views still warm.
  */
 export function* pageHide(): Saga<void> {
   const [salt, saltUserId, ids] = (yield fx.state.read((s) => [

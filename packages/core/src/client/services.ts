@@ -28,6 +28,7 @@ import type { RuntimeEvent } from '../kernel/events';
 import type { ServiceCalls } from '../kernel/effects';
 import { encodeRecordId } from '../utils/index';
 import { sha256Hex } from '../utils/sha256';
+import { leaveViewsBeacon } from '../query/sql';
 import { hashOfEdge, rowOfEdge } from '../utils/edges';
 import { mintMutationId } from '../mutation/mutation-id';
 import { BucketHandle, bucketContentToBlob } from './bucket-handle';
@@ -296,11 +297,8 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
     'auth.consumeEndedImpersonation': () => s.auth.consumeEndedImpersonation(),
     'remote.connect': () => s.remote.connect(),
     'remote.releaseViews': (ids) => {
-      const list = ids
-        .map((id) => String(id))
-        .filter((id) => /^_00_query:[0-9a-f]{64}$/.test(id))
-        .join(', ');
-      if (list) s.remote.beaconSql(`FOR $id IN [${list}] { LET $_released = fn::query::unsubscribe($id); };`);
+      const sql = leaveViewsBeacon(ids, s.remote.sessionIds());
+      if (sql) s.remote.beaconSql(sql);
     },
     'supervisor.start': () => s.connectionSupervisor.start(),
     'tabs.start': (bucketId) => {

@@ -76,6 +76,25 @@ export function heartbeatBatch(ids: ReadonlyArray<RecordId<string>>): { sql: str
 /** A heartbeat answer whose statement matched no row: the view was reclaimed. */
 export const heartbeatRowGone = (result: unknown): boolean => Array.isArray(result) && result.length === 0;
 
+// The SDK escapes an all-digit key as `⟨…⟩`; both forms parse back to the same id.
+const QUERY_ID = /^_00_query:(?:[0-9a-f]{64}|⟨[0-9a-f]{64}⟩)$/;
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The pagehide release: one bare statement for `beaconSql`, which has no params
+ * channel, so ids are inlined. Only shapes the client minted itself get in, a
+ * `_00_query:<sha256>` id and a UUID session id, so nothing else is ever
+ * interpolated. `null` when there is nothing the server could act on: with no
+ * session ids it could not tell this page's entries from anyone else's.
+ */
+export function leaveViewsBeacon(ids: ReadonlyArray<unknown>, sessionIds: ReadonlyArray<string>): string | null {
+  const list = ids.map((id) => String(id)).filter((id) => QUERY_ID.test(id));
+  const sids = sessionIds.filter((sid) => SESSION_ID.test(sid));
+  if (list.length === 0 || sids.length === 0) return null;
+  const sidList = sids.map((sid) => `'${sid}'`).join(', ');
+  return `FOR $id IN [${list.join(', ')}] { LET $_left = fn::query::leave($id, [${sidList}]); };`;
+}
+
 export const bodySelect = (): string => 'SELECT * FROM $ids';
 
 /** Local transaction that MERGEs many fetched bodies. */

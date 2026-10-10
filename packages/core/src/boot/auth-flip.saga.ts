@@ -8,29 +8,44 @@ import { columnsFor } from '../query/env';
 import * as sql from '../query/sql';
 import { encodeRecordId } from '../utils/index';
 import { cleanRecord } from '../utils/parser';
-import { bucketSwitch } from './bucket-switch.saga';
+import { bucketSwitch, rebindQueries } from './bucket-switch.saga';
 
 /**
  * The signed-in principal changed (sign-in, sign-out, boot verification).
- * Identity first (routing and `$auth` for the local SSP), then the bucket,
- * then the salt if the principal really changed, then the verified user row.
+ * Identity first (routing and `$auth` for the local SSP), then the salt if
+ * the principal really changed, then the bucket, then the verified user row.
+ *
+ * The salt goes before the bucket because the switch re-keys every active
+ * query (`rebindQueries`) from the salt it finds. A query's remote id hashes
+ * the salt but not the principal, so re-keyed under the old salt it named the
+ * view the previous principal still held, and the SSP refused it as another
+ * identity's (409 `auth_mismatch`) until that view's TTL ran out. On whitepawn
+ * every impersonation start, stop and token lapse refused a tab's queries for
+ * the 10 minutes of that TTL, each refusal a failed sync round, so the rail
+ * read "Can't reach the server" the whole time.
  */
 export function* authFlip(env: SagaEnv, userId: string | null): Saga<void> {
   const authId = (yield fx.service('auth.sessionAuthId')) as string | null;
   const access = (yield fx.service('auth.access')) as string | null;
   yield fx.state.update(R.setIdentity({ userId }));
   yield fx.service('ssp.setSessionAuth', authId, access);
+  const saltUserId = (yield fx.state.read((s) => s.saltUserId)) as string | null;
+  const resalted = authId !== saltUserId;
+  if (resalted) {
+    const salt = (yield fx.id('salt')) as string;
+    yield fx.state.update(R.setIdentity({ sessionId: salt, saltUserId: authId }));
+    yield fx.service('crdt.setSessionId', salt);
+  }
   const target = bucketIdForUser(userId);
   yield fx.service('hint.write', target);
   yield fx.state.update(R.setIdentity({ pendingBucket: target }));
   const current = (yield fx.service('local.currentBucketId')) as string;
   const release = current === target ? null : ((yield fx.service('local.beginSwitch')) as () => void);
   yield* bucketSwitch(env, target, release);
-  const saltUserId = (yield fx.state.read((s) => s.saltUserId)) as string | null;
-  if (authId !== saltUserId) {
-    const salt = (yield fx.id('salt')) as string;
-    yield fx.state.update(R.setIdentity({ sessionId: salt, saltUserId: authId }));
-    yield fx.service('crdt.setSessionId', salt);
+  // No switch means nothing re-keyed the queries under the new salt.
+  if (resalted && current === target) {
+    yield* rebindQueries();
+    yield fx.dispatch({ type: 'EnsureRegistered' });
   }
   yield* persistVerifiedUser(env);
 }

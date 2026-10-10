@@ -140,9 +140,10 @@ A windowed list reads its window straight off an index when:
 Registering such a window touches the rows it returns, not the table,
 and a write re-reads only that window. Any other filter with equalities
 on an index's leading fields still starts from that index range instead
-of the whole table, and `WHERE id = $id` reads that one record. Full-text,
-vector (`HNSW`, `MTREE`) and `COUNT` indexes are not used; neither are
-ranges or `OR` across fields.
+of the whole table, an `OR` with such equalities in every branch reads
+one range per branch, and `WHERE id = $id` reads that one record.
+Full-text, vector (`HNSW`, `MTREE`) and `COUNT` indexes are not used, and
+range conditions (`<`, `>`) narrow nothing on their own.
 
 Results are identical either way; an index changes only the cost. On a
 1M-row table with 422k rows in one list, 20 scroll windows took 14.6 s

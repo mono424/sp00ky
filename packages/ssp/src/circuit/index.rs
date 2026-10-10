@@ -258,7 +258,8 @@ impl OrderedIndex {
 /// - any other filter holding `id` equal to one record starts from that row
 ///   ([`KeyScan`]), the record key being the index every table has;
 /// - any other filter with equalities on an index's leading fields starts
-///   from that range ([`IndexedScan`]).
+///   from that range ([`IndexedScan`]), and one whose `OR` has such
+///   equalities in every branch starts from one range per branch.
 ///
 /// The last two keep every `Filter` above them.
 ///
@@ -280,6 +281,8 @@ struct Conjuncts<'p> {
     gates: Vec<&'p Predicate>,
     /// `id = operand`: the record key.
     id: Option<&'p Value>,
+    /// The branches of each `OR` that reads rows.
+    ors: Vec<&'p [Predicate]>,
     /// Anything an index cannot answer (ranges, `OR` over fields, `id`, …).
     residual: bool,
 }
@@ -320,6 +323,10 @@ impl IndexChoice<'_> {
                 out.eqs.push((field.as_str(), value));
             }
             other if other.field_roots().is_empty() => out.gates.push(other),
+            Predicate::Or { predicates } => {
+                out.ors.push(predicates);
+                out.residual = true;
+            }
             _ => out.residual = true,
         }
     }
@@ -409,17 +416,70 @@ impl IndexPlanner for IndexChoice<'_> {
         if let Some(key) = conj.id {
             return Some(Box::new(KeyScan { table: table.to_string(), key: key.clone() }));
         }
-        let (def, k) = self
-            .candidates(table)
+        let single = self.best_prefix(table, &conj.eqs, &[]);
+        // An OR with an index prefix in every branch reads one range per
+        // branch. Worth it when each branch narrows at least as far as the
+        // conjunction alone does and on a field of its own: `owner = $a AND
+        // (white = $x OR black = $x)` reads the contact's games, not the
+        // owner's whole library.
+        for branches in &conj.ors {
+            if let Some(bindings) = self.union(table, &conj.eqs, branches, single.map(|(def, k, _)| (def, k))) {
+                return Some(Box::new(IndexedScan::new(bindings)));
+            }
+        }
+        let (def, k, _) = single?;
+        Some(Box::new(IndexedScan::new(vec![Self::binding(table, def, &conj.eqs, Vec::new(), k)])))
+    }
+}
+
+impl IndexChoice<'_> {
+    /// The index with the longest prefix of `eqs`, as `(index, prefix
+    /// length, whether it leads with a field of `local`)`; among equals one
+    /// leading with a `local` field, then the first by name.
+    fn best_prefix<'d>(&'d self, table: &str, eqs: &[(String, &Value)], local: &[String]) -> Option<(&'d IndexDef, usize, bool)> {
+        self.candidates(table)
             .into_iter()
             .map(|def| {
-                let k = def.fields.iter().take_while(|f| conj.eqs.iter().any(|(e, _)| e == *f)).count();
-                (def, k)
+                let k = def.fields.iter().take_while(|f| eqs.iter().any(|(e, _)| e == *f)).count();
+                let leads_local = def.fields.first().is_some_and(|f| local.contains(f));
+                (def, k, leads_local)
             })
-            .filter(|(_, k)| *k > 0)
-            .max_by(|(a, ka), (b, kb)| ka.cmp(kb).then_with(|| b.cmp(a)))?;
-        let binding = Self::binding(table, def, &conj.eqs, Vec::new(), k);
-        Some(Box::new(IndexedScan::new(binding)))
+            .filter(|(_, k, _)| *k > 0)
+            .max_by(|(a, ka, la), (b, kb, lb)| ka.cmp(kb).then(la.cmp(lb)).then_with(|| b.cmp(a)))
+    }
+
+    /// One binding per branch of an `OR`, each branch's equalities taken
+    /// together with the conjunction's, or `None` unless every branch has a
+    /// prefix leading with a field of its own, at least as long as the
+    /// conjunction's own (`single`) and on another index.
+    fn union(
+        &self,
+        table: &str,
+        outer: &[(String, &Value)],
+        branches: &[Predicate],
+        single: Option<(&IndexDef, usize)>,
+    ) -> Option<Vec<IndexBinding>> {
+        let mut bindings = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let conj = self.conjuncts(&[branch])?;
+            if conj.id.is_some() {
+                return None;
+            }
+            let local: Vec<String> = conj.eqs.iter().map(|(f, _)| f.clone()).collect();
+            let mut eqs = conj.eqs;
+            for (field, value) in outer {
+                if !eqs.iter().any(|(f, _)| f == field) {
+                    eqs.push((field.clone(), *value));
+                }
+            }
+            let (def, k, leads_local) = self.best_prefix(table, &eqs, &local)?;
+            let narrower = single.is_none_or(|(held, held_k)| k >= held_k && def != held);
+            if !leads_local || !narrower {
+                return None;
+            }
+            bindings.push(Self::binding(table, def, &eqs, Vec::new(), k));
+        }
+        (!bindings.is_empty()).then_some(bindings)
     }
 }
 

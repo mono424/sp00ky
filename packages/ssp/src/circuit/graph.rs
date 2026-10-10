@@ -344,7 +344,7 @@ impl Graph {
     pub fn index_uses(&self) -> Vec<(String, String)> {
         self.nodes
             .iter()
-            .filter_map(|node| node.operator.index_use())
+            .flat_map(|node| node.operator.index_uses())
             .map(|(table, index)| (table.to_string(), index.to_string()))
             .collect()
     }

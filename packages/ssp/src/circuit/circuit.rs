@@ -4965,6 +4965,7 @@ mod index_tests {
             def("game_owner_db_sort", &["owner", "database", "sort_index"]),
             def("game_created", &["created_at"]),
             def("game_database_sort_created", &["database", "sort_index", "created_at"]),
+            def("game_title", &["title"]),
         ]
     }
 
@@ -5121,13 +5122,51 @@ mod index_tests {
             ),
             ("by_id_other_table", filter(scan(), eq("id", json!("user:g3"))), json!({}), false),
             (
+                // Club scope: one range per collection.
+                "or_databases",
+                limit(
+                    filter(
+                        scan(),
+                        Predicate::Or { predicates: vec![eq("database", json!("game_database:d1")), eq("database", param("database"))] },
+                    ),
+                    6,
+                    2,
+                    order(&[("sort_index", "ASC"), ("created_at", "DESC")]),
+                ),
+                json!({ "database": "game_database:d3" }),
+                true,
+            ),
+            (
+                // Contact scope: the owner's games by either side's name.
+                "owner_or_titles",
+                filter(
+                    filter(scan(), eq("owner", json!("user:u1"))),
+                    Predicate::Or { predicates: vec![eq("title", json!("t1")), eq("title", json!("t2")), eq("title", param("title"))] },
+                ),
+                json!({ "title": "t3" }),
+                true,
+            ),
+            (
+                // A branch with nothing an index answers: no union.
+                "or_unindexable",
+                filter(
+                    scan(),
+                    Predicate::Or {
+                        predicates: vec![eq("title", json!("t1")), Predicate::Gt { field: Path::new("created_at"), value: json!(40) }],
+                    },
+                ),
+                json!({}),
+                false,
+            ),
+            (
                 "id_desc",
                 limit(db.clone(), 5, 0, order(&[("sort_index", "ASC"), ("id", "DESC")])),
                 json!({ "database": "game_database:d1" }),
                 true,
             ),
             ("missing_param", limit(db.clone(), 5, 0, order(&[("sort_index", "ASC")])), json!({}), false),
-            ("no_index", limit(scan(), 5, 0, order(&[("title", "ASC")])), json!({}), false),
+            ("whole_table_by_title", limit(scan(), 5, 3, order(&[("title", "DESC")])), json!({}), true),
+            ("no_index", limit(scan(), 5, 0, order(&[("owner", "ASC")])), json!({}), false),
         ]
     }
 

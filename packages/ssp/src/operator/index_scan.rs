@@ -2,10 +2,12 @@
 //! collection (see [`crate::circuit::index`]).
 //!
 //! - [`IndexedScan`] stands in for a `Scan` under a `Filter` whose equalities
-//!   cover an index's leading fields. It starts a registration from the rows
-//!   in that index range rather than from every row of the table, and passes
-//!   deltas through exactly like `Scan`; the `Filter` above it still checks
-//!   every predicate, so it narrows work and never changes results.
+//!   cover an index's leading fields, or whose `OR` has such equalities in
+//!   every branch (then it reads one range per branch). It starts a
+//!   registration from the rows in those index ranges rather than from every
+//!   row of the table, and passes deltas through exactly like `Scan`; the
+//!   `Filter` above it still checks every predicate, so it narrows work and
+//!   never changes results.
 //! - [`IndexWindow`] stands in for `Limit` over `Filter` over `Scan` when the
 //!   filter is equalities on an index's leading fields and the `ORDER BY` is
 //!   the rest of that index. Its window is read by position in the index: a
@@ -77,21 +79,33 @@ impl IndexBinding {
     }
 }
 
-/// A `Scan` that starts from an index range; see the module docs.
+/// A `Scan` that starts from index ranges (one, or one per `OR` branch);
+/// see the module docs.
 #[derive(Debug)]
 pub struct IndexedScan {
-    pub binding: IndexBinding,
+    pub bindings: Vec<IndexBinding>,
 }
 
 impl IndexedScan {
-    pub fn new(binding: IndexBinding) -> Self {
-        Self { binding }
+    pub fn new(bindings: Vec<IndexBinding>) -> Self {
+        Self { bindings }
+    }
+
+    /// Every row in any of the ranges, once.
+    fn range_keys(&self, store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
+        let mut keys = ZSet::new();
+        for binding in &self.bindings {
+            for (key, _) in binding.range_keys(store, ctx) {
+                keys.insert(key, 1);
+            }
+        }
+        keys
     }
 }
 
 impl super::Operator for IndexedScan {
     fn snapshot(&self, _inputs: &[&ZSet], store: &Store, ctx: Option<&Sp00kyValue>) -> ZSet {
-        self.binding.range_keys(store, ctx)
+        self.range_keys(store, ctx)
     }
 
     fn step(&mut self, input_deltas: &[&ZSet], _store: &Store, _ctx: Option<&Sp00kyValue>) -> ZSet {
@@ -105,19 +119,22 @@ impl super::Operator for IndexedScan {
     fn reset(&mut self) {}
 
     fn collections(&self) -> Vec<String> {
-        vec![self.binding.table.clone()]
+        self.bindings.first().map(|b| vec![b.table.clone()]).unwrap_or_default()
     }
 
     fn initial_input(&self, store: &Store, ctx: Option<&Sp00kyValue>) -> Option<ZSet> {
-        Some(self.binding.range_keys(store, ctx))
+        Some(self.range_keys(store, ctx))
     }
 
-    fn index_use(&self) -> Option<(&str, &str)> {
-        Some((&self.binding.table, &self.binding.def.name))
+    fn index_uses(&self) -> Vec<(&str, &str)> {
+        self.bindings.iter().map(|b| (b.table.as_str(), b.def.name.as_str())).collect()
     }
 
     fn evaluate_key(&self, key: &str, _input_evals: &[bool], store: &Store, _ctx: Option<&Sp00kyValue>) -> bool {
-        store.get_collection(&self.binding.table).is_some_and(|c| c.has_key(key))
+        self.bindings
+            .first()
+            .and_then(|b| store.get_collection(&b.table))
+            .is_some_and(|c| c.has_key(key))
     }
 }
 
@@ -251,8 +268,8 @@ impl super::Operator for IndexWindow {
         Some(ZSet::new())
     }
 
-    fn index_use(&self) -> Option<(&str, &str)> {
-        Some((&self.binding.table, &self.binding.def.name))
+    fn index_uses(&self) -> Vec<(&str, &str)> {
+        vec![(self.binding.table.as_str(), self.binding.def.name.as_str())]
     }
 
     fn evaluate_key(&self, key: &str, _input_evals: &[bool], _store: &Store, _ctx: Option<&Sp00kyValue>) -> bool {

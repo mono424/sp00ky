@@ -73,10 +73,10 @@ pub trait Operator: Debug + Send + Sync {
         None
     }
 
-    /// The `(table, index name)` this operator reads, so the circuit can drop
-    /// an index no registered view plans over any more.
-    fn index_use(&self) -> Option<(&str, &str)> {
-        None
+    /// The `(table, index name)`s this operator reads, so the circuit can
+    /// drop an index no registered view plans over any more.
+    fn index_uses(&self) -> Vec<(&str, &str)> {
+        Vec::new()
     }
 
     /// Membership test for a single key against this operator's CURRENT

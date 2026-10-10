@@ -5468,6 +5468,103 @@ mod index_tests {
         }
     }
 
+    /// WhitePawn's real lists, through the real registration path (converter
+    /// + permission injection), pick the index their migration added.
+    #[test]
+    fn whitepawn_lists_pick_their_indexes() {
+        use crate::service::view::prepare_registration_dbsp;
+        let tables = ["game", "notification", "contact", "player_name", "user"];
+        let mut perms: HashMap<String, String> = tables.iter().map(|t| (t.to_string(), "true".to_string())).collect();
+        perms.insert(
+            "notification".into(),
+            r#"$access IN ["account", "_00_impersonate"] AND recipient = $auth.id"#.into(),
+        );
+        let mut c = Circuit::new();
+        for t in tables {
+            c.store.ensure_collection(t);
+            c.set_table_meta(t, TableMeta { permission: perms[t].clone(), ..Default::default() });
+        }
+        c.set_table_meta(
+            "game",
+            TableMeta {
+                permission: "true".into(),
+                indexes: vec![
+                    def("game_database_sort", &["database", "sort_index"]),
+                    def("game_database_sort_date", &["database", "sort_index", "date"]),
+                    def("game_owner_date", &["owner", "date"]),
+                    def("game_owner_sort_date", &["owner", "sort_index", "date"]),
+                    def("game_white", &["white"]),
+                    def("game_black", &["black"]),
+                ],
+                ..Default::default()
+            },
+        );
+        c.set_table_meta(
+            "notification",
+            TableMeta { permission: perms["notification"].clone(), indexes: vec![def("notification_recipient_updated", &["recipient", "updated_ms"])], ..Default::default() },
+        );
+        c.set_table_meta(
+            "contact",
+            TableMeta { permission: "true".into(), indexes: vec![def("contact_owner_rank", &["owner", "game_count", "display_name"])], ..Default::default() },
+        );
+        let cases: Vec<(&str, &str, Value, Vec<&str>)> = vec![
+            (
+                "filtered_list",
+                "SELECT *, (SELECT id, name FROM player_name WHERE id=$parent.white LIMIT 1)[0] AS white, (SELECT id, name FROM player_name WHERE id=$parent.black LIMIT 1)[0] AS black FROM game WHERE database = $database ORDER BY sort_index asc, date desc, id asc LIMIT 50 START 100;",
+                json!({ "database": "game_database:a" }),
+                vec!["game_database_sort_date"],
+            ),
+            (
+                "game_list",
+                "SELECT * FROM game WHERE database = $database ORDER BY sort_index asc, id asc LIMIT 50 START 50;",
+                json!({ "database": "game_database:a" }),
+                vec!["game_database_sort"],
+            ),
+            (
+                "all_games",
+                "SELECT * FROM game WHERE owner = $owner ORDER BY sort_index asc, date desc, id asc LIMIT 50;",
+                json!({ "owner": "user:u" }),
+                vec!["game_owner_sort_date"],
+            ),
+            (
+                "contact_games",
+                "SELECT * FROM game WHERE owner = $owner AND (white = $p OR black = $p) ORDER BY sort_index asc, date desc, id asc LIMIT 50;",
+                json!({ "owner": "user:u", "p": "player_name:x" }),
+                vec!["game_white", "game_black"],
+            ),
+            (
+                "inbox",
+                "SELECT id, kind, updated_ms FROM notification ORDER BY updated_ms desc LIMIT 50;",
+                json!({ "auth": { "id": "user:u" }, "access": "account" }),
+                vec!["notification_recipient_updated"],
+            ),
+            (
+                "contacts",
+                "SELECT * FROM contact WHERE owner = $owner ORDER BY game_count desc, display_name asc, id asc LIMIT 60 START 60;",
+                json!({ "owner": "user:u" }),
+                vec!["contact_owner_rank"],
+            ),
+        ];
+        let links = HashMap::new();
+        let opaque = HashMap::new();
+        for (id, surql, params, want) in cases {
+            let reg = prepare_registration_dbsp(
+                json!({ "id": id, "surql": surql, "params": params, "clientId": "c", "ttl": "10m", "lastActiveAt": "" }),
+                c.permissions(),
+                &links,
+                &opaque,
+            )
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+            c.add_query_with_auth(reg.plan, reg.safe_params, reg.format, "user:u".into());
+            let mut used: Vec<String> = c.view_index_uses(id).into_iter().map(|(_, i)| i).collect();
+            used.sort();
+            used.dedup();
+            let mut want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+            want.sort();
+            assert_eq!(used, want, "{id}");
+        }
+    }
+
     #[test]
     fn unregistering_the_last_reader_releases_the_index() {
         let mut circuit = Circuit::new();

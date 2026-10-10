@@ -148,9 +148,10 @@ impl Collection {
 
     fn build_index(&self, def: &IndexDef) -> OrderedIndex {
         let mut index = OrderedIndex::new(def.clone());
-        // Row keys are shared with the membership z-set when it is built
-        // (every live write already shares them), not allocated again.
-        let membership = self.membership.get();
+        // Row keys come from the membership z-set, built here if no scan has
+        // yet: every index on the table then shares one allocation per row
+        // (as every live write already does) instead of holding a copy each.
+        let membership = Some(self.membership());
         let mut seen = HashMap::new();
         let mut entries = Vec::with_capacity(self.rows.len());
         let mut key = String::with_capacity(self.name.len() + 32);

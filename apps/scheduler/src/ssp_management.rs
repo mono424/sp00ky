@@ -5,7 +5,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -428,9 +428,23 @@ async fn handle_bootstrap_verify(
 /// out the last drained snapshot instead.
 const PRE_DRAIN_REPLICA_WAIT: Duration = Duration::from_secs(2);
 
+/// What a registration does about the backlog before capturing its hashes.
+enum PreDrain {
+    /// Nothing is buffered and no table is dirty: the persisted snapshot is
+    /// the current one, and there is nothing to wait for.
+    Nothing,
+    /// The replica is busy and no table is dirty: hand out the last drained
+    /// snapshot, the backlog is replayed instead.
+    Busy,
+    /// Drain now.
+    Now,
+}
+
 /// Whether a registration should drain the backlog before capturing its
 /// hashes: yes if the replica's write lock comes free within
-/// [`PRE_DRAIN_REPLICA_WAIT`], and yes regardless if a table is dirty.
+/// [`PRE_DRAIN_REPLICA_WAIT`], and yes regardless if a table is dirty. With
+/// nothing buffered and nothing dirty it does not even queue for the lock,
+/// which a long read (the drift check's table counts) can hold for seconds.
 ///
 /// The drain runs under `drain_lock`. On whitepawn (2026-10-09) it sat 44 s
 /// queued for the replica behind the drift check's table counts: the SSP's
@@ -440,11 +454,21 @@ const PRE_DRAIN_REPLICA_WAIT: Duration = Duration::from_secs(2);
 /// self-consistent, and replays the backlog instead, as a sibling bootstrap
 /// already does. A dirty table is the exception: its persisted hash is wrong
 /// until a drain rehashes it, so that drain waits for the replica.
-async fn pre_drain_now(replica: &Arc<RwLock<Replica>>) -> bool {
-    if tokio::time::timeout(PRE_DRAIN_REPLICA_WAIT, replica.write()).await.is_ok() {
-        return true;
+async fn pre_drain_now(
+    replica: &Arc<RwLock<Replica>>,
+    event_buffer: &Arc<RwLock<VecDeque<BufferedEvent>>>,
+) -> PreDrain {
+    if event_buffer.read().await.is_empty() && replica.read().await.dirty_tables().is_empty() {
+        return PreDrain::Nothing;
     }
-    !replica.read().await.dirty_tables().is_empty()
+    if tokio::time::timeout(PRE_DRAIN_REPLICA_WAIT, replica.write()).await.is_ok() {
+        return PreDrain::Now;
+    }
+    if replica.read().await.dirty_tables().is_empty() {
+        PreDrain::Busy
+    } else {
+        PreDrain::Now
+    }
 }
 
 /// Handle SSP registration — freezes snapshot, returns snapshot_seq, spawns poll task
@@ -562,24 +586,26 @@ async fn handle_register(
                 // still gets a self-consistent (if slightly stale) snapshot —
                 // nothing else can drain while the status stays frozen.
                 info!("Skipping pre-registration drain: sibling SSP bootstrap in flight");
-            } else if !pre_drain_now(&state.replica).await {
-                info!(
-                    waited_ms = PRE_DRAIN_REPLICA_WAIT.as_millis() as u64,
-                    "Skipping pre-registration drain: the replica is busy; handing out the last drained snapshot"
-                );
             } else {
-                let started = std::time::Instant::now();
-                match crate::drain_and_apply(&state.event_buffer, &state.replica, &state.wal)
-                    .await
-                {
-                    Ok(0) => {}
-                    Ok(applied) => info!(
-                        applied,
-                        drain_ms = started.elapsed().as_millis() as u64,
-                        "Drained pending events before handing bootstrap hashes"
+                match pre_drain_now(&state.replica, &state.event_buffer).await {
+                    PreDrain::Nothing => info!("Skipping pre-registration drain: nothing pending"),
+                    PreDrain::Busy => info!(
+                        waited_ms = PRE_DRAIN_REPLICA_WAIT.as_millis() as u64,
+                        "Skipping pre-registration drain: the replica is busy; handing out the last drained snapshot"
                     ),
-                    Err(e) => {
-                        warn!(error = %e, "Pre-registration drain failed; handing out persisted hashes")
+                    PreDrain::Now => {
+                        let started = std::time::Instant::now();
+                        match crate::drain_and_apply(&state.event_buffer, &state.replica, &state.wal).await {
+                            Ok(0) => {}
+                            Ok(applied) => info!(
+                                applied,
+                                drain_ms = started.elapsed().as_millis() as u64,
+                                "Drained pending events before handing bootstrap hashes"
+                            ),
+                            Err(e) => {
+                                warn!(error = %e, "Pre-registration drain failed; handing out persisted hashes")
+                            }
+                        }
                     }
                 }
             }
@@ -626,7 +652,7 @@ async fn handle_register(
             if let Some(pred) = &standby_for {
                 info!(ssp_id = %ssp_id, predecessor = %pred, "SSP registered as standby; it is promoted once caught up");
             }
-            spawn_poll_and_replay(&state, ssp_id, ssp_url, snapshot_seq, generation);
+            spawn_poll_and_replay(&state, ssp_id, ssp_url, snapshot_seq, generation, table_hashes.clone());
 
             (snapshot_seq, table_hashes, standby_for.is_some())
         })
@@ -677,6 +703,7 @@ fn spawn_poll_and_replay(
     ssp_url: String,
     snapshot_seq: u64,
     generation: u64,
+    table_hashes: BTreeMap<String, String>,
 ) {
     let ssp_pool = state.ssp_pool.clone();
     let transport = state.transport.clone();
@@ -705,6 +732,7 @@ fn spawn_poll_and_replay(
             seq_counter,
             reclone_lock,
             changefeed,
+            table_hashes,
         )
         .await;
         if outcome.is_ok() {
@@ -875,6 +903,7 @@ async fn poll_and_replay_ssp(
     seq_counter: Arc<AtomicU64>,
     reclone_lock: Arc<Mutex<()>>,
     changefeed: Arc<maintenance::changefeed::TailerStats>,
+    registration_hashes: BTreeMap<String, String>,
 ) -> Result<()> {
     let poll_interval = std::time::Duration::from_millis(config.ssp_poll_interval_ms);
     let timeout = std::time::Duration::from_secs(config.bootstrap_timeout_secs);
@@ -972,9 +1001,11 @@ async fn poll_and_replay_ssp(
 
         // `replayed` holds exactly these events so far. Here and in Phase 4,
         // an event the SSP rejected is left for the catch-up check to find.
+        let replay_started = std::time::Instant::now();
         replay_in_order(&ssp_id, &ssp_url, generation, &ssp_pool, &transport, &replayed).await?;
 
         info!(
+            ms = replay_started.elapsed().as_millis() as u64,
             "Replayed {} global buffer events to SSP '{}'",
             events_to_replay.len(),
             ssp_id
@@ -1000,7 +1031,14 @@ async fn poll_and_replay_ssp(
             ssp_id
         );
 
+        let replay_started = std::time::Instant::now();
         replay_in_order(&ssp_id, &ssp_url, generation, &ssp_pool, &transport, &buffered).await?;
+        debug!(
+            ms = replay_started.elapsed().as_millis() as u64,
+            "Replayed {} per-SSP buffered events to SSP '{}'",
+            buffered.len(),
+            ssp_id
+        );
     }
 
     // Phase 4b: Verify the SSP's caught-up state at the cut M BEFORE routing any
@@ -1009,10 +1047,18 @@ async fn poll_and_replay_ssp(
     // while we reconstruct and compare. This replaces the old post-replay check,
     // which compared the SSP's live (seq M) hashes against the frozen snapshot
     // (seq N) and so falsely flagged any table written during catch-up.
-    let verified = match verify_catchup_at_m(&ssp_id, &ssp_url, &transport, &replica, &replayed).await {
+    let verified = match verify_catchup_at_m(&ssp_id, &ssp_url, &transport, &replica, &replayed, &registration_hashes).await {
         Ok(true) => {
-            // Passed — clear the consecutive-failure streak.
+            // Passed — clear the consecutive-failure streak. The pool lock's
+            // wait is logged: on whitepawn 41 s went by between the pass
+            // and the final replay with nothing else in between.
+            let lock_started = std::time::Instant::now();
             ssp_pool.write().await.reset_catchup_failures(&ssp_id);
+            info!(
+                ssp_id = %ssp_id,
+                pool_write_ms = lock_started.elapsed().as_millis() as u64,
+                "Catch-up verification recorded"
+            );
             true
         }
         Ok(false) if ssp_pool.read().await.registration_gen(&ssp_id) != generation => {
@@ -1095,8 +1141,10 @@ async fn poll_and_replay_ssp(
     // events keep queueing behind them. Replaying them after `mark_ready` let
     // live deliveries overtake them, and any refusal (a busy SSP's 503
     // included) forced a full re-bootstrap.
+    let verified_at = std::time::Instant::now();
     if verified {
         loop {
+            let lock_started = std::time::Instant::now();
             let pending = {
                 let mut pool = ssp_pool.write().await;
                 if pool.registration_gen(&ssp_id) != generation {
@@ -1123,13 +1171,23 @@ async fn poll_and_replay_ssp(
                 pending
             };
             info!(
+                since_verify_ms = verified_at.elapsed().as_millis() as u64,
+                lock_wait_ms = lock_started.elapsed().as_millis() as u64,
                 "Replaying {} final buffered events to SSP '{}'",
                 pending.len(),
                 ssp_id
             );
+            let replay_started = std::time::Instant::now();
             let rejected =
                 replay_in_order(&ssp_id, &ssp_url, generation, &ssp_pool, &transport, &pending)
                     .await?;
+            info!(
+                ms = replay_started.elapsed().as_millis() as u64,
+                rejected,
+                "Replayed {} final buffered events to SSP '{}'",
+                pending.len(),
+                ssp_id
+            );
             if rejected > 0 {
                 // Past the catch-up check, so nothing else would catch the gap.
                 ssp_pool.write().await.mark_for_resync(&ssp_id);
@@ -1266,9 +1324,11 @@ async fn verify_catchup_at_m(
     transport: &Arc<HttpTransport>,
     replica: &Arc<RwLock<Replica>>,
     replayed: &[RecordUpdate],
+    registration_hashes: &BTreeMap<String, String>,
 ) -> Result<bool> {
     use serde_json::Value;
-    use std::collections::BTreeMap;
+
+    let started = std::time::Instant::now();
 
     // Group replayed events per touched base table, preserving seq order. Skip
     // `_00_*` system tables (scheduler/view bookkeeping, not replicated content).
@@ -1286,30 +1346,7 @@ async fn verify_catchup_at_m(
         return Ok(true);
     }
 
-    // Reconstruct reference@M per touched table (rows@N + replayed events). Keep
-    // the projected rows (not just the hash) so a persistent mismatch can dump
-    // the diverging row's canonical JSON for diagnosis.
-    let mut reference_rows: BTreeMap<String, std::collections::HashMap<String, Value>> =
-        BTreeMap::new();
-    for (table, events) in &per_table {
-        let seed = {
-            let rep = replica.read().await;
-            rep.snapshot_rows(table)
-                .await
-                .with_context(|| format!("snapshot_rows for '{}'", table))?
-        };
-        reference_rows.insert(table.clone(), project_table_rows(table, seed, events));
-    }
-    let reference: BTreeMap<String, String> = reference_rows
-        .iter()
-        .map(|(table, rows)| {
-            (
-                table.clone(),
-                ssp_protocol::snapshot_hash::xor_table_hash(rows.clone().into_iter()),
-            )
-        })
-        .collect();
-
+    let reference = reference_at_m(replica, registration_hashes, &per_table).await?;
     let empty = ssp_protocol::snapshot_hash::xor_acc_to_hex(&ssp_protocol::snapshot_hash::xor_empty());
 
     // Compare against the SSP's catch-up hashes with a bounded retry. The SSP is
@@ -1351,6 +1388,7 @@ async fn verify_catchup_at_m(
         }
 
         mismatches = reference
+            .hashes
             .iter()
             .filter_map(|(table, ref_hash)| {
                 let ssp_hash = ssp_hashes.get(table).cloned().unwrap_or_else(|| empty.clone());
@@ -1363,7 +1401,16 @@ async fn verify_catchup_at_m(
             .collect();
 
         if mismatches.is_empty() {
-            info!(ssp_id = %ssp_id, tables = reference.len(), attempt, "Catch-up verification passed");
+            info!(
+                ssp_id = %ssp_id,
+                tables = reference.hashes.len(),
+                attempt,
+                verify_ms = started.elapsed().as_millis() as u64,
+                rows_read = reference.rows_read,
+                fast_tables = reference.fast_tables,
+                whole_tables = reference.whole_tables,
+                "Catch-up verification passed"
+            );
             return Ok(true);
         }
 
@@ -1378,12 +1425,54 @@ async fn verify_catchup_at_m(
         }
     }
 
-    // Persistent mismatch after every attempt → a real divergence. Pull the
-    // SSP's actual circuit rows and diff them against the scheduler's projection
-    // row-by-row, so the log names the specific missing / extra / differing rows
-    // instead of the old one-sided dump (which showed the scheduler's first N
-    // rows in map order — not necessarily the diverging ones).
-    for (table, sched, ssp_h) in &mismatches {
+    // Persistent mismatch after every attempt. Before calling it a divergence,
+    // rebuild each mismatched table's projection the whole-table way: that is
+    // the reference the incremental one must agree with, and the safety net
+    // against a fault in the fast path, which can then never cause a false
+    // re-bootstrap. A real divergence is then diffed row by row against the
+    // SSP's actual circuit rows, so the log names the specific missing / extra
+    // / differing rows instead of a one-sided dump.
+    let mut confirmed: Vec<(String, String, String, std::collections::HashMap<String, Value>)> = Vec::new();
+    for (table, incremental, ssp_h) in &mismatches {
+        let rows = {
+            let rep = replica.read().await;
+            let seed = rep
+                .snapshot_rows(table)
+                .await
+                .with_context(|| format!("snapshot_rows for '{}'", table))?;
+            project_table_rows(table, seed, &per_table[table])
+        };
+        let whole = hash_projected_rows(&rows);
+        if whole != *incremental {
+            error!(
+                ssp_id = %ssp_id,
+                table = %table,
+                incremental = %incremental,
+                whole = %whole,
+                "Incremental catch-up reference disagrees with the whole-table projection"
+            );
+        }
+        if whole == *ssp_h {
+            error!(
+                ssp_id = %ssp_id,
+                table = %table,
+                "The SSP agrees with the whole-table projection: the incremental reference was wrong, not the SSP"
+            );
+            continue;
+        }
+        confirmed.push((table.clone(), whole, ssp_h.clone(), rows));
+    }
+    if confirmed.is_empty() {
+        warn!(
+            ssp_id = %ssp_id,
+            tables = mismatches.len(),
+            verify_ms = started.elapsed().as_millis() as u64,
+            "Catch-up verification passed on the whole-table projection only"
+        );
+        return Ok(true);
+    }
+
+    for (table, sched, ssp_h, ref_rows) in &confirmed {
         error!(
             ssp_id = %ssp_id,
             table = %table,
@@ -1391,10 +1480,6 @@ async fn verify_catchup_at_m(
             ssp = %ssp_h,
             "Catch-up hash mismatch"
         );
-        let ref_rows = match reference_rows.get(table) {
-            Some(r) => r,
-            None => continue,
-        };
         match fetch_ssp_catchup_rows(transport, ssp_url, table).await {
             Ok((ssp_rows, horizon)) => {
                 if let Some(h) = &horizon {
@@ -1460,10 +1545,172 @@ async fn verify_catchup_at_m(
     }
     error!(
         ssp_id = %ssp_id,
-        mismatches = mismatches.len(),
+        mismatches = confirmed.len(),
+        verify_ms = started.elapsed().as_millis() as u64,
         "SSP catch-up state disagrees with scheduler projection — flagging for re-bootstrap"
     );
     Ok(false)
+}
+
+/// The reference hashes at M for every touched table, and how they were
+/// built.
+struct CatchupReference {
+    hashes: BTreeMap<String, String>,
+    /// Tables folded from the replica's maintained hash and the touched
+    /// rows alone.
+    fast_tables: usize,
+    /// Tables read whole: dirty, or without a maintained hash.
+    whole_tables: usize,
+    /// Rows read from the replica, either way.
+    rows_read: usize,
+}
+
+/// Reconstruct the reference hash at M for every touched table.
+///
+/// The fast path folds the replayed events into the replica's maintained
+/// per-table hash: one batched read of the rows the events touch (their
+/// before-images at N), each XORed out, then each row's final state XORed
+/// in. It needs the maintained hash to be current and the table not dirty;
+/// otherwise the table is read whole and projected, as every table used to
+/// be (15 whole tables, 63 s and a 41 s drop on whitepawn). The seed is
+/// the replica's CURRENT hash, not the one handed out at registration: a
+/// bootstrap-verify can repair a disputed table's cached hash meanwhile,
+/// and the SSP adopts the repaired value. The registration map only trips
+/// a warning when they differ.
+async fn reference_at_m(
+    replica: &Arc<RwLock<Replica>>,
+    registration_hashes: &BTreeMap<String, String>,
+    per_table: &BTreeMap<String, Vec<&RecordUpdate>>,
+) -> Result<CatchupReference> {
+    let mut out = CatchupReference {
+        hashes: BTreeMap::new(),
+        fast_tables: 0,
+        whole_tables: 0,
+        rows_read: 0,
+    };
+    let rep = replica.read().await;
+    for (table, events) in per_table {
+        let current = rep.snapshot_hashes().get(table).cloned();
+        let acc = current
+            .as_deref()
+            .filter(|_| !rep.dirty_tables().contains(table))
+            .and_then(ssp_protocol::snapshot_hash::xor_acc_from_hex);
+        match acc {
+            Some(acc) => {
+                if let Some(at_registration) = registration_hashes.get(table) {
+                    if Some(at_registration) != current.as_ref() {
+                        warn!(
+                            table = %table,
+                            "The table's hash was repaired since registration; verifying against the current one"
+                        );
+                    }
+                }
+                let ids = touched_raw_ids(table, events);
+                let before = rep
+                    .rows_for_hash(table, &ids)
+                    .await
+                    .with_context(|| format!("rows_for_hash for '{}'", table))?;
+                out.rows_read += before.len();
+                let folded = fold_reference(table, acc, &before, events);
+                out.hashes
+                    .insert(table.clone(), ssp_protocol::snapshot_hash::xor_acc_to_hex(&folded));
+                out.fast_tables += 1;
+            }
+            None => {
+                let seed = rep
+                    .snapshot_rows(table)
+                    .await
+                    .with_context(|| format!("snapshot_rows for '{}'", table))?;
+                let rows = project_table_rows(table, seed, events);
+                out.rows_read += rows.len();
+                debug!(table = %table, rows = rows.len(), "Catch-up reference: whole-table projection");
+                out.hashes.insert(table.clone(), hash_projected_rows(&rows));
+                out.whole_tables += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The table hash of a projected `raw_id -> row` map, by reference.
+fn hash_projected_rows(rows: &std::collections::HashMap<String, serde_json::Value>) -> String {
+    let mut acc = ssp_protocol::snapshot_hash::xor_empty();
+    for (raw_id, row) in rows {
+        ssp_protocol::snapshot_hash::xor_digest(
+            &mut acc,
+            &ssp_protocol::snapshot_hash::record_digest(raw_id, row),
+        );
+    }
+    ssp_protocol::snapshot_hash::xor_acc_to_hex(&acc)
+}
+
+/// The raw ids of `table` with an effective replayed event (a Create or
+/// Update carrying data, or a Delete), each once. A data-less Create or
+/// Update changes nothing, so its row need not be read.
+fn touched_raw_ids(table: &str, events: &[&RecordUpdate]) -> Vec<String> {
+    let prefix = format!("{}:", table);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for ev in events {
+        let effective = match ev.operation {
+            RecordOp::Delete => true,
+            RecordOp::Create | RecordOp::Update => ev.data.is_some(),
+        };
+        if !effective {
+            continue;
+        }
+        let raw = ev.record_id.strip_prefix(&prefix).unwrap_or(&ev.record_id);
+        if seen.insert(raw) {
+            out.push(raw.to_string());
+        }
+    }
+    out
+}
+
+/// Fold `events` of one table into its accumulator at N, given the rows@N
+/// of the touched ids (`before`): REPLACE on Create/Update with data, remove
+/// on Delete, nothing for a data-less event, the same semantics as
+/// [`project_table_rows`], so for any seed
+/// `fold_reference(t, acc(seed), before(seed ∩ touched), ev)` equals
+/// `xor_table_hash(project_table_rows(t, seed, ev))`.
+fn fold_reference(
+    table: &str,
+    mut acc: [u8; 32],
+    before: &std::collections::HashMap<String, serde_json::Value>,
+    events: &[&RecordUpdate],
+) -> [u8; 32] {
+    let prefix = format!("{}:", table);
+    // The last effective event per raw id: `Some(row)` leaves that row,
+    // `None` removes it.
+    let mut last: std::collections::HashMap<&str, Option<&serde_json::Value>> = std::collections::HashMap::new();
+    for ev in events {
+        let raw = ev.record_id.strip_prefix(&prefix).unwrap_or(&ev.record_id);
+        match ev.operation {
+            RecordOp::Create | RecordOp::Update => {
+                if let Some(data) = &ev.data {
+                    last.insert(raw, Some(data));
+                }
+            }
+            RecordOp::Delete => {
+                last.insert(raw, None);
+            }
+        }
+    }
+    for (raw, after) in last {
+        if let Some(was) = before.get(raw) {
+            ssp_protocol::snapshot_hash::xor_digest(
+                &mut acc,
+                &ssp_protocol::snapshot_hash::record_digest(raw, was),
+            );
+        }
+        if let Some(now) = after {
+            ssp_protocol::snapshot_hash::xor_digest(
+                &mut acc,
+                &ssp_protocol::snapshot_hash::record_digest(raw, now),
+            );
+        }
+    }
+    acc
 }
 
 /// Catch-up verification re-checks the SSP this many times before treating a
@@ -1781,6 +2028,138 @@ mod catchup_tests {
         let ev = upd("t", RecordOp::Delete, "t:r1", None);
         let got = project_table_hash("t", seed, &[&ev]);
         assert_eq!(got, xor_acc_to_hex(&xor_empty()));
+    }
+
+    /// A tiny xorshift so the test needs no `rand`.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn seed_acc(seed: &[(String, Value)]) -> [u8; 32] {
+        let mut acc = xor_empty();
+        for (id, v) in seed {
+            ssp_protocol::snapshot_hash::xor_digest(&mut acc, &ssp_protocol::snapshot_hash::record_digest(id, v));
+        }
+        acc
+    }
+
+    /// The incremental fold lands on the same hash as the whole-table
+    /// projection for any seed and any run of events: creates, updates with
+    /// and without data, deletes of present and absent rows, repeated ids.
+    #[test]
+    fn fold_reference_matches_the_whole_table_projection() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..200 {
+            let seed_rows = rng.below(50) as usize;
+            let seed: Vec<(String, Value)> = (0..seed_rows)
+                .map(|i| (format!("r{i}"), json!({ "v": rng.below(1000), "round": round })))
+                .collect();
+            let n_events = rng.below(80) as usize;
+            let events: Vec<RecordUpdate> = (0..n_events)
+                .map(|_| {
+                    let id = format!("t:r{}", rng.below(60));
+                    match rng.below(5) {
+                        0 => upd("t", RecordOp::Create, &id, Some(json!({ "v": rng.below(1000) }))),
+                        1 => upd("t", RecordOp::Update, &id, Some(json!({ "v": rng.below(1000), "w": "x" }))),
+                        2 => upd("t", RecordOp::Update, &id, None),
+                        3 => upd("t", RecordOp::Delete, &id, None),
+                        _ => upd("t", RecordOp::Update, &id, Some(json!({ "v": rng.below(3) }))),
+                    }
+                })
+                .collect();
+            let refs: Vec<&RecordUpdate> = events.iter().collect();
+            let whole = project_table_hash("t", seed.clone(), &refs);
+
+            let touched = touched_raw_ids("t", &refs);
+            let before: std::collections::HashMap<String, Value> = seed
+                .iter()
+                .filter(|(id, _)| touched.contains(id))
+                .cloned()
+                .collect();
+            assert_eq!(xor_acc_to_hex(&fold_reference("t", seed_acc(&seed), &before, &refs)), whole, "round {round}");
+            // A superset of before-images (the whole seed) is harmless.
+            let all: std::collections::HashMap<String, Value> = seed.iter().cloned().collect();
+            assert_eq!(xor_acc_to_hex(&fold_reference("t", seed_acc(&seed), &all, &refs)), whole, "round {round} (full seed)");
+        }
+    }
+
+    #[test]
+    fn fold_reference_skips_dataless_events_and_untouched_rows() {
+        let evs = vec![
+            upd("t", RecordOp::Update, "t:a", None),
+            upd("t", RecordOp::Update, "t:b", Some(json!({ "v": 2 }))),
+            upd("t", RecordOp::Delete, "t:c", None),
+            upd("t", RecordOp::Delete, "t:absent", None),
+            upd("t", RecordOp::Create, "t:b", Some(json!({ "v": 3 }))),
+        ];
+        let refs: Vec<&RecordUpdate> = evs.iter().collect();
+        let mut touched = touched_raw_ids("t", &refs);
+        touched.sort();
+        assert_eq!(touched, vec!["absent", "b", "c"], "a data-less update touches nothing; ids once");
+
+        let seed = vec![
+            ("a".to_string(), json!({ "v": 1 })),
+            ("b".to_string(), json!({ "v": 1 })),
+            ("c".to_string(), json!({ "v": 1 })),
+        ];
+        let whole = project_table_hash("t", seed.clone(), &refs);
+        assert_eq!(whole, xor_table_hash(vec![("a".to_string(), json!({ "v": 1 })), ("b".to_string(), json!({ "v": 3 }))]));
+        let before: std::collections::HashMap<String, Value> =
+            seed.iter().filter(|(id, _)| touched.contains(id)).cloned().collect();
+        assert_eq!(xor_acc_to_hex(&fold_reference("t", seed_acc(&seed), &before, &refs)), whole);
+    }
+
+    /// Against a real replica: only the touched rows are read, and the
+    /// result equals the whole-table projection; a dirty table takes the
+    /// whole-table path.
+    #[tokio::test]
+    async fn reference_at_m_reads_only_touched_rows_and_matches_the_projection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let replica = Replica::new(dir.path().join("replica")).await.unwrap();
+        let replica = Arc::new(RwLock::new(replica));
+        {
+            let mut rep = replica.write().await;
+            for i in 0..5 {
+                rep.apply("game", RecordOp::Create, &format!("game:g{i}"), Some(json!({ "name": format!("g{i}") }))).await.unwrap();
+            }
+            rep.apply("game", RecordOp::Create, "game:42", Some(json!({ "name": "numeric" }))).await.unwrap();
+            rep.set_snapshot_state(1, None).await.unwrap();
+        }
+        let hashes = replica.read().await.snapshot_hashes().clone();
+        assert!(hashes["game"].starts_with("x3:"), "{hashes:?}");
+        assert!(replica.read().await.dirty_tables().is_empty());
+
+        let events = vec![
+            upd("game", RecordOp::Create, "game:g9", Some(json!({ "name": "new" }))),
+            upd("game", RecordOp::Update, "game:g1", Some(json!({ "name": "changed" }))),
+            upd("game", RecordOp::Delete, "game:g2", None),
+            upd("game", RecordOp::Update, "game:42", Some(json!({ "name": "numeric id" }))),
+            upd("never", RecordOp::Create, "never:n1", Some(json!({ "name": "first row ever" }))),
+        ];
+        let mut per_table: BTreeMap<String, Vec<&RecordUpdate>> = BTreeMap::new();
+        for ev in &events {
+            per_table.entry(ev.table.clone()).or_default().push(ev);
+        }
+        let reference = reference_at_m(&replica, &hashes, &per_table).await.unwrap();
+        assert_eq!((reference.fast_tables, reference.whole_tables), (1, 1), "never has no hash: whole path");
+        assert_eq!(reference.rows_read, 4, "g1, g2 and 42 read for game (g9 does not exist), never projected to one row");
+        for (table, evs) in &per_table {
+            let seed = replica.read().await.snapshot_rows(table).await.unwrap();
+            assert_eq!(reference.hashes[table], project_table_hash(table, seed, evs), "{table}");
+        }
+
+        replica.write().await.mark_tables_dirty(["game".to_string()]);
+        let reference = reference_at_m(&replica, &hashes, &per_table).await.unwrap();
+        assert_eq!((reference.fast_tables, reference.whole_tables), (0, 2));
     }
 
     #[test]

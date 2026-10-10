@@ -1161,6 +1161,55 @@ mod ssp_management_tests {
         assert!(h.replica.read().await.dirty_tables().is_empty());
     }
 
+    /// Nothing buffered and nothing dirty: the registration does not even
+    /// queue for the replica's write lock, which a long read holds.
+    #[tokio::test]
+    async fn register_with_nothing_pending_does_not_wait_for_the_replica() {
+        let h = TestHarness::new().await;
+        let reader = h.replica.read().await;
+        let started = std::time::Instant::now();
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            post_json(
+                h.ssp_router(),
+                "/ssp/register",
+                &register_payload("ssp-1", "http://localhost:9999"),
+            ),
+        )
+        .await
+        .expect("registration waited for the replica");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "waited {:?} for a lock it had no use for",
+            started.elapsed()
+        );
+        assert_eq!(body["snapshot_seq"].as_u64(), Some(0));
+        drop(reader);
+    }
+
+    /// An empty backlog with a dirty table still drains: the drain is what
+    /// rehashes the table, and the hash handed out has to be right.
+    #[tokio::test]
+    async fn register_rehashes_a_dirty_table_with_an_empty_backlog() {
+        let h = TestHarness::new().await;
+        ingest_users(&h, 1).await;
+        // The first registration drains the backlog; the same SSP registering
+        // again is not a sibling, so its registration drains too.
+        let (status, _) =
+            post_json(h.ssp_router(), "/ssp/register", &register_payload("ssp-1", "http://localhost:9999")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(h.event_buffer.read().await.is_empty());
+        h.replica.write().await.mark_tables_dirty(["user".to_string()]);
+
+        let (status, body) =
+            post_json(h.ssp_router(), "/ssp/register", &register_payload("ssp-1", "http://localhost:9999")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(h.replica.read().await.dirty_tables().is_empty(), "the drain rehashed the dirty table");
+        let fresh = h.replica.read().await.compute_table_hashes().await.unwrap();
+        assert_eq!(body["table_hashes"]["user"], json!(fresh["user"]));
+    }
+
     #[tokio::test]
     async fn register_empty_ssp_id() {
         let h = TestHarness::new().await;
@@ -2251,6 +2300,215 @@ mod bootstrap_protocol_tests {
             version: 1,
             job_assignee: None,
         }
+    }
+
+    fn game_update(id: &str, data: Value) -> scheduler::messages::RecordUpdate {
+        scheduler::messages::RecordUpdate {
+            table: "game".to_string(),
+            operation: scheduler::messages::RecordOp::Update,
+            record_id: id.to_string(),
+            data: Some(data),
+            version: 1,
+            job_assignee: None,
+        }
+    }
+
+    fn game_delete(id: &str) -> scheduler::messages::RecordUpdate {
+        scheduler::messages::RecordUpdate {
+            table: "game".to_string(),
+            operation: scheduler::messages::RecordOp::Delete,
+            record_id: id.to_string(),
+            data: None,
+            version: 1,
+            job_assignee: None,
+        }
+    }
+
+    /// An SSP that folds every `/ingest` it accepts into per-table catch-up
+    /// hashes the way the real circuit does (REPLACE a row, remove on delete,
+    /// digest by raw id), and answers `/info` with them: the first mock that
+    /// lets the scheduler's comparison run for real. `drop_id` names one
+    /// event it acknowledges but does not fold, for the negative case.
+    struct FoldingSsp {
+        addr: String,
+        rows: Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::collections::HashMap<String, Value>>>>,
+        accs: Arc<std::sync::Mutex<std::collections::BTreeMap<String, [u8; 32]>>>,
+        received: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        info_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FoldingSsp {
+        async fn start(drop_id: Option<&'static str>) -> Self {
+            use ssp_protocol::snapshot_hash::{record_digest, xor_acc_to_hex, xor_digest, xor_empty};
+            let rows: Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::collections::HashMap<String, Value>>>> =
+                Default::default();
+            let accs: Arc<std::sync::Mutex<std::collections::BTreeMap<String, [u8; 32]>>> = Default::default();
+            let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let info_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let ingest = {
+                let (rows, accs, received) = (Arc::clone(&rows), Arc::clone(&accs), Arc::clone(&received));
+                move |axum::Json(body): axum::Json<Value>| {
+                    let (rows, accs, received) = (Arc::clone(&rows), Arc::clone(&accs), Arc::clone(&received));
+                    async move {
+                        received.lock().await.push(body.clone());
+                        let table = body["table"].as_str().unwrap().to_string();
+                        let id = body["id"].as_str().unwrap().to_string();
+                        if drop_id == Some(id.as_str()) {
+                            return StatusCode::OK;
+                        }
+                        let raw = id.strip_prefix(&format!("{table}:")).unwrap_or(&id).to_string();
+                        let mut rows = rows.lock().unwrap();
+                        let mut accs = accs.lock().unwrap();
+                        let table_rows = rows.entry(table.clone()).or_default();
+                        let acc = accs.entry(table).or_insert_with(xor_empty);
+                        if let Some(old) = table_rows.remove(&raw) {
+                            xor_digest(acc, &record_digest(&raw, &old));
+                        }
+                        if !body["op"].as_str().unwrap().eq_ignore_ascii_case("DELETE") {
+                            let record = body["record"].clone();
+                            xor_digest(acc, &record_digest(&raw, &record));
+                            table_rows.insert(raw, record);
+                        }
+                        StatusCode::OK
+                    }
+                }
+            };
+            let info = {
+                let (accs, info_calls) = (Arc::clone(&accs), Arc::clone(&info_calls));
+                move || {
+                    let (accs, info_calls) = (Arc::clone(&accs), Arc::clone(&info_calls));
+                    async move {
+                        info_calls.fetch_add(1, Ordering::SeqCst);
+                        let hashes: serde_json::Map<String, Value> = accs
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(t, a)| (t.clone(), Value::String(xor_acc_to_hex(a))))
+                            .collect();
+                        axum::Json(json!([{"status": "ready", "catchup_hashes": hashes}]))
+                    }
+                }
+            };
+            let app = Router::new()
+                .route("/ingest", axum::routing::post(ingest))
+                .route("/info", axum::routing::get(info))
+                .route(
+                    "/health",
+                    axum::routing::get(|| async { axum::Json(json!({"status": "ready"})) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("Failed to bind mock SSP");
+            let addr = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self { addr, rows, accs, received, info_calls }
+        }
+
+        /// What the SSP holds at the registration cut: the rows as the
+        /// replica serves them and the hash the scheduler handed out.
+        fn seed(&self, table: &str, hash: &str, rows: &[(String, Value)]) {
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(table.to_string(), rows.iter().cloned().collect());
+            self.accs.lock().unwrap().insert(
+                table.to_string(),
+                ssp_protocol::snapshot_hash::xor_acc_from_hex(hash).expect("an x3 hash"),
+            );
+        }
+
+        async fn received_ids(&self) -> Vec<String> {
+            self.received.lock().await.iter().map(|b| b["id"].as_str().unwrap().to_string()).collect()
+        }
+    }
+
+    /// Register `ssp_id` at `url` and seed the SSP with the rows and hash the
+    /// registration handed out: a `game` table at the cut.
+    async fn register_folding(h: &TestHarness, ssp: &FoldingSsp, ssp_id: &str) -> u64 {
+        let (status, body) = post_json(
+            h.ssp_router(),
+            "/ssp/register",
+            &json!({"ssp_id": ssp_id, "url": ssp.addr, "version": "test"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let game_hash = body["table_hashes"]["game"].as_str().expect("a hash for game").to_string();
+        assert!(game_hash.starts_with("x3:"), "{game_hash}");
+        assert!(h.replica.read().await.dirty_tables().is_empty(), "the fast path's precondition");
+        let at_cut = h.replica.read().await.snapshot_rows("game").await.unwrap();
+        ssp.seed("game", &game_hash, &at_cut);
+        body["snapshot_seq"].as_u64().unwrap()
+    }
+
+    /// The catch-up check compares the scheduler's incremental reference with
+    /// what an SSP that folded the replay reports: a create, an update, a
+    /// delete and a per-SSP event agree and the SSP goes Ready; an SSP that
+    /// silently drops one replayed event disagrees and is withheld.
+    #[tokio::test]
+    async fn the_catchup_check_compares_against_an_ssp_that_folded_the_replay() {
+        let h = TestHarness::new().await;
+        for id in ["game:g0", "game:g1"] {
+            let (status, _) = post_json(h.ingest_router(), "/ingest", &ingest_payload("game", "CREATE", id)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        h.fanout.idle().await;
+        let ssp = FoldingSsp::start(None).await;
+        let snapshot_seq = register_folding(&h, &ssp, "ssp-fold").await;
+        {
+            let mut buffer = h.event_buffer.write().await;
+            let events = [
+                game_create("game:g2"),
+                game_update("game:g0", json!({"name": "renamed"})),
+                game_delete("game:g1"),
+            ];
+            for (i, update) in events.into_iter().enumerate() {
+                buffer.push_back(BufferedEvent {
+                    seq: snapshot_seq + 1 + i as u64,
+                    update,
+                    received_at: 0,
+                    versionstamp: 0,
+                });
+            }
+        }
+        assert!(h.ssp_pool.write().await.buffer_message("ssp-fold", game_create("game:g3")));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while !h.ssp_pool.read().await.is_ready("ssp-fold") {
+            assert!(std::time::Instant::now() < deadline, "the SSP never went ready");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ssp.info_calls.load(Ordering::SeqCst) >= 1, "the comparison ran");
+        assert!(h.ssp_pool.read().await.pending_resync("ssp-fold").is_none());
+        assert_eq!(ssp.received_ids().await, ["game:g2", "game:g0", "game:g1", "game:g3"]);
+
+        // The negative half: one replayed event acknowledged but not folded.
+        let h = TestHarness::new().await;
+        let (status, _) = post_json(h.ingest_router(), "/ingest", &ingest_payload("game", "CREATE", "game:g0")).await;
+        assert_eq!(status, StatusCode::OK);
+        h.fanout.idle().await;
+        let bad = FoldingSsp::start(Some("game:p2")).await;
+        let snapshot_seq = register_folding(&h, &bad, "ssp-poisoned").await;
+        {
+            let mut buffer = h.event_buffer.write().await;
+            for (i, id) in ["game:p1", "game:p2"].iter().enumerate() {
+                buffer.push_back(BufferedEvent {
+                    seq: snapshot_seq + 1 + i as u64,
+                    update: game_create(id),
+                    received_at: 0,
+                    versionstamp: 0,
+                });
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while h.ssp_pool.read().await.pending_resync("ssp-poisoned").is_none() {
+            assert!(std::time::Instant::now() < deadline, "the divergence was never flagged");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!h.ssp_pool.read().await.is_ready("ssp-poisoned"), "withheld from broadcast");
+        assert!(bad.info_calls.load(Ordering::SeqCst) >= 3, "every attempt was given");
     }
 
     /// Registers `ssp_id` at `url`, then gives it events to replay before its

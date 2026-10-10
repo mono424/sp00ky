@@ -1173,14 +1173,22 @@ impl Replica {
     /// catch-up projection when verifying a rejoining SSP.
     pub async fn snapshot_rows(&self, table: &str) -> Result<Vec<(String, Value)>> {
         let omit = ssp_protocol::omit_clause(self.omit_for(table));
-        let mut response = self
-            .db
-            .query(format!("SELECT *{} FROM {}", omit, table))
-            .await
-            .with_context(|| format!("snapshot_rows: SELECT * FROM {} failed", table))?;
-        let sdk_val: surrealdb::types::Value = response
-            .take(0)
-            .with_context(|| format!("snapshot_rows: take(0) failed for '{}'", table))?;
+        // A table the replica never saw has no rows, which is an answer: the
+        // verifier compares a table whose first rows arrived during catch-up.
+        let mut response = match self.db.query(format!("SELECT *{} FROM {}", omit, table)).await {
+            Ok(r) => r,
+            Err(e) if is_missing_error(&e) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("snapshot_rows: SELECT * FROM {} failed", table)))
+            }
+        };
+        let sdk_val: surrealdb::types::Value = match response.take(0) {
+            Ok(v) => v,
+            Err(e) if is_missing_error(&e) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("snapshot_rows: take(0) failed for '{}'", table)))
+            }
+        };
         let rows: Vec<Value> = match sdk_val.into_json_value() {
             Value::Array(arr) => arr,
             _ => Vec::new(),
@@ -1330,6 +1338,45 @@ impl Replica {
             Value::Null => None,
             other => Some(other),
         }
+    }
+
+    /// The replica's rows for these raw ids of `table`, projected for hashing
+    /// (`hash_pair_for`: opaque fields dropped, id prefix stripped) and keyed
+    /// by raw id. Ids the replica does not hold are absent; a table it never
+    /// saw yields an empty map. One batched read per 500 ids: what the
+    /// catch-up verifier reads instead of the whole table.
+    pub async fn rows_for_hash(
+        &self,
+        table: &str,
+        raw_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Value>> {
+        let omit = ssp_protocol::omit_clause(self.omit_for(table));
+        let query = format!("SELECT *{} FROM $ids.map(|$i| <record> $i)", omit);
+        let mut out = std::collections::HashMap::new();
+        for chunk in raw_ids.chunks(500) {
+            let ids: Vec<String> = chunk.iter().map(|raw| build_thing_id(table, raw)).collect();
+            let mut response = match self.db.query(&query).bind(("ids", ids)).await {
+                Ok(r) => r,
+                Err(e) if is_missing_error(&e) => break,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("rows_for_hash: SELECT {} rows of {} failed", chunk.len(), table)))
+                }
+            };
+            let rows: surrealdb::types::Value = match response.take(0) {
+                Ok(v) => v,
+                Err(e) if is_missing_error(&e) => break,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!("rows_for_hash: take(0) failed for {}", table)))
+                }
+            };
+            for row in rows.into_json_value().as_array().into_iter().flatten() {
+                if let Some((raw, value)) = self.hash_pair_for(table, row.clone()) {
+                    out.insert(raw, value);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The current replica row for `thing_id`, projected for hashing. `None`

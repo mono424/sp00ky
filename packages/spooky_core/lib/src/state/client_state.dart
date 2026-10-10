@@ -42,6 +42,21 @@ class QueryDefinition {
 
   /// The query orders itself, so the render set must not be re-sorted by id.
   final bool hasExplicitOrder;
+
+  QueryDefinition withRelations(List<RelationPlan> relations) =>
+      QueryDefinition(
+        id: id,
+        hash: hash,
+        viewKey: viewKey,
+        surql: surql,
+        params: params,
+        ttl: ttl,
+        ttlMs: ttlMs,
+        tableName: tableName,
+        createdAt: createdAt,
+        relations: relations,
+        hasExplicitOrder: hasExplicitOrder,
+      );
 }
 
 /// What the server's `_00_query` row last said about this view.

@@ -48,9 +48,20 @@ Future<QueryHash> registerLocal(
       : s.registering.contains(hash)
           ? 'pending'
           : 'new'));
-  if (status == 'active') return hash;
-  if (status == 'pending') {
-    await ctx(Fx.stateWait((s) => !s.registering.contains(hash)));
+  if (status != 'new') {
+    if (status == 'pending') {
+      await ctx(Fx.stateWait((s) => !s.registering.contains(hash)));
+    }
+    // The hash ignores the `.related()` plan (the surql already encodes the
+    // shape), so a plan-less first registrant, a preload, would otherwise
+    // leave the joins unresolved for every later subscriber.
+    if (input.relations.isNotEmpty) {
+      final bare = await ctx(Fx.stateRead(
+          (s) => s.queries[hash]?.def.relations.isEmpty ?? false));
+      if (bare) {
+        await ctx(Fx.stateUpdate(r.setRelations(hash, input.relations)));
+      }
+    }
     return hash;
   }
   await ctx(Fx.stateUpdate(r.beginRegistering(hash)));

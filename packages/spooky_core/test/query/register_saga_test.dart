@@ -1,5 +1,6 @@
 import 'package:spooky_core/src/kernel/effects.dart';
 import 'package:spooky_core/src/kernel/events.dart';
+import 'package:spooky_core/src/modules/query_builder.dart' show RelationPlan;
 import 'package:spooky_core/src/query/register_saga.dart';
 import 'package:spooky_core/src/query/sql.dart' as sql;
 import 'package:spooky_core/src/state/client_state.dart';
@@ -91,6 +92,48 @@ void main() {
       );
       expect(second.result, first.result);
       expect(second.ofKind('ssp.register'), isEmpty);
+    });
+
+    test('a plan-less first registration takes the plan of a later one',
+        () async {
+      final owner = RelationPlan(
+          alias: 'owner',
+          table: 'user',
+          cardinality: 'one',
+          foreignKeyField: 'owner');
+      final withPlan = RegisterInput(
+        tableName: input.tableName,
+        surql: input.surql,
+        params: input.params,
+        ttl: input.ttl,
+        relations: [owner],
+      );
+      // A preload registers first and carries no plan.
+      final preload = await runPure<String>(
+        (ctx) => registerLocal(ctx, env(), input),
+        handlers: defaults(),
+      );
+      final hash = preload.result;
+      final settledState = preload.state.copyWith(dirty: const {});
+      final mounted = await runPure<String>(
+        (ctx) => registerLocal(ctx, env(), withPlan),
+        state: settledState,
+        handlers: defaults(),
+      );
+      expect(mounted.result, hash);
+      expect(mounted.ofKind('ssp.register'), isEmpty);
+      expect(mounted.state.queries[hash]!.def.relations, [owner]);
+      expect(mounted.state.dirty, contains(hash),
+          reason: 're-materialize so the joins appear');
+
+      // A plan already there is never replaced by a plan-less registrant.
+      final again = await runPure<String>(
+        (ctx) => registerLocal(ctx, env(), input),
+        state: mounted.state.copyWith(dirty: const {}),
+        handlers: defaults(),
+      );
+      expect(again.state.queries[hash]!.def.relations, [owner]);
+      expect(again.state.dirty, isEmpty);
     });
 
     test('a failing SSP registration clears the in-flight marker and rethrows',

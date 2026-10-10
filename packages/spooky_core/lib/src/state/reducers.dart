@@ -1,4 +1,5 @@
 import '../kernel/constants.dart';
+import '../modules/query_builder.dart' show RelationPlan;
 import '../surreal/value.dart';
 import '../types.dart';
 import 'client_state.dart';
@@ -95,6 +96,16 @@ Reducer commitMembership(
 
 Reducer setLocalArray(QueryHash hash, RecordVersionArray localArray) => (s) {
       final next = _withEntry(s, hash, (e) => e.copyWith(localArray: localArray));
+      return identical(next, s)
+          ? s
+          : next.copyWith(dirty: _addAll(next.dirty, [hash]));
+    };
+
+/// Give a query the `.related()` plan its first registrant did not carry (a
+/// preload), and re-materialize it so the joins appear.
+Reducer setRelations(QueryHash hash, List<RelationPlan> relations) => (s) {
+      final next = _withEntry(
+          s, hash, (e) => e.copyWith(def: e.def.withRelations(relations)));
       return identical(next, s)
           ? s
           : next.copyWith(dirty: _addAll(next.dirty, [hash]));

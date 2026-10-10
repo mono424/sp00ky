@@ -631,12 +631,13 @@ without writing row checkpoints: the directory belongs to its successor.</p>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_JOB_CONFIG</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">&#39;{&quot;job_tables&quot;: {…}}&#39;</span></span>
 <span class="line"></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Restart cache. Cluster mode keeps row checkpoints in &lt;dir&gt;/rows and verifies</span></span>
-<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># them against the scheduler on boot; standalone keeps &lt;dir&gt;/snapshot.json.</span></span>
-<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Unset means memory-only: every start is a full rebuild. See State Persistence.</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># them against the scheduler on boot; a standalone SSP rebuilds from SurrealDB</span></span>
+<span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># on every start. Unset means memory-only. See State Persistence.</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_SNAPSHOT_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">/data/ssp-0</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ARENA_DIR</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">/data/ssp-0/arena</span></span>
-<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ROW_CHECKPOINT_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">1800</span><span style="color:#6A737D;--shiki-dark:#6A737D">      # cluster: rewrite changed tables (0 = only on shutdown/bootstrap)</span></span>
-<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_CHECKPOINT_INTERVAL_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">300</span><span style="color:#6A737D;--shiki-dark:#6A737D">  # standalone: snapshot interval, armed by SNAPSHOT_DIR</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_ROW_CHECKPOINT_SECS</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">300</span><span style="color:#6A737D;--shiki-dark:#6A737D">       # cluster: write changed tables (0 = only on shutdown/bootstrap)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_CHECKPOINT_VERIFY</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">background</span><span style="color:#6A737D;--shiki-dark:#6A737D">  # cluster: verify checkpoint bodies alongside the bootstrap, or `load` before serving</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_SSP_REPAIR_CONCURRENCY</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">4</span><span style="color:#6A737D;--shiki-dark:#6A737D">          # cluster: tables, and ranges within one, repaired at once at a warm bootstrap</span></span>
 <span class="line"></span>
 <span class="line"><span style="color:#6A737D;--shiki-dark:#6A737D"># Optional knobs</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">SPKY_CRDT_CACHE_SIZE</span><span style="color:#D73A49;--shiki-dark:#F97583">=</span><span style="color:#032F62;--shiki-dark:#9ECBFF">10000</span><span style="color:#6A737D;--shiki-dark:#6A737D">       # in-memory CRDT cache capacity</span></span>
@@ -774,42 +775,70 @@ Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.
 <li>On a cold start the SSP <strong>self-bootstraps</strong> by paging every synced table
 through the scheduler’s <code>POST /proxy/query</code> endpoint into its circuit.</li>
 <li><strong>Cluster mode keeps its rows.</strong> With <code>SPKY_SSP_SNAPSHOT_DIR</code> set to a
-writable directory, each table’s rows are written to
-<code>&lt;dir&gt;/rows/&lt;table&gt;.rows</code>, a binary copy of the encoded rows with a checksum
-and the table’s content hash. They are written on graceful shutdown (SIGTERM;
-ingest stops first), after every bootstrap, and every
-<code>SPKY_SSP_ROW_CHECKPOINT_SECS</code> (default 1800, <code>0</code> turns the timer off).
-Only tables whose content changed since they were last written are written
-again, one table at a time.</li>
+writable directory, each table’s rows go to <code>&lt;dir&gt;/rows/</code>: a base image
+<code>&lt;table&gt;.rows</code> (a binary copy of the encoded rows, each row’s head, that is
+its digest, version, id and body pointer, in one region and the bodies in
+another, with a hash over each region and the table’s content hash), and
+after that deltas <code>&lt;table&gt;.NNNNNN.delta</code>, each holding only the rows changed
+since the previous file and a tombstone per row deleted, chained on the
+file before it. A table is written whole again after 64 deltas, when the
+deltas outweigh half the base, or when the base on disk is not the one this
+process extends. Writes happen on graceful shutdown (SIGTERM; ingest stops
+first), two minutes after every bootstrap or promotion, and every
+<code>SPKY_SSP_ROW_CHECKPOINT_SECS</code> (default 300, <code>0</code> turns the timer off). Only
+tables whose content changed since they were last written are written at
+all, one table at a time, and a delta costs the churn rather than the
+table. <code>Row checkpoint written</code> carries <code>full</code>, <code>deltas</code>, <code>tombstones</code>,
+<code>bytes</code>, <code>encode_ms</code> and <code>fsync_ms</code>.</li>
 <li><strong>On boot the rows are loaded before the SSP registers, then verified.</strong>
-A checkpoint file is not read back record by record: its checksum is
-verified in one sequential pass, then the file is mapped read-only as the
+A checkpoint file is not read whole: its heads are read and checked against
+their hash (about 75 bytes a row), the file is mapped read-only as the
 table’s row arena (or adopted into memory where there is no file-backed
-arena) and the index is rebuilt by one walk over the records, decoding
-nothing. The <code>Loaded row checkpoint</code> line carries <code>bytes</code>, <code>mapped</code>,
-<code>verify_ms</code>, <code>index_ms</code> and <code>install_ms</code>; <code>Row checkpoint written</code> carries
-<code>bytes</code>, <code>encode_ms</code> and <code>fsync_ms</code>. The
-scheduler answers the registration with the hash of every table at the cut it
-freezes. A table whose rows hash the same is kept as is. One that differs is
-repaired: the SSP fetches the table’s id-range hashes from the scheduler
-(<code>POST /proxy/ranges</code>, about 1000 rows per range), hashes its own rows over
-the same ranges, and lists <code>(id, _00_rv)</code> only for the ranges that differ.
-It deletes what is gone, fetches the rows that are missing or at another
-version, and re-reads whole any range that still differs (a row changed
-without a new version). A scheduler that serves no ranges for the table gets
-the whole table’s <code>(id, _00_rv)</code> listed instead. A table that still differs,
-has no checkpoint, or fails its checksum is paged in full like a cold start,
-range by range when the scheduler serves ranges. Views are always rebuilt from <code>_00_query</code>
-(<code>Re-registered views</code> logs how many and how long their priming took), their
-memberships are republished to SurrealDB as one batch (<code>Republished restored views</code>), and <code>SSP ready</code> closes the boot with the republish time. The usual
-post-bootstrap integrity check runs over the result, so a stale or corrupt
-checkpoint costs time, never correctness.</li>
+arena), the index is rebuilt by one walk over the heads, and the bodies stay
+on disk until a row is read. Their hash is checked by a pass that starts
+right away and runs while the SSP registers and repairs, streaming each file
+through sequentially, which is also what warms the page cache for the view
+priming that follows (<code>Verified row checkpoint bodies</code>, with <code>files</code>,
+<code>bytes</code>, <code>failed</code> and <code>ms</code>). A table whose bodies fail is dropped and paged
+again by an in-process re-bootstrap. <code>SPKY_SSP_CHECKPOINT_VERIFY=load</code>
+verifies before a table is served instead, reading every file whole at
+boot. The <code>Loaded row checkpoint</code> line carries <code>bytes</code>, <code>bodies_bytes</code>,
+<code>mapped</code>, <code>converted</code>, <code>deltas</code>, <code>deltas_discarded</code>, <code>pending</code>, <code>heads_ms</code>,
+<code>verify_ms</code> and <code>install_ms</code>. The scheduler answers the registration with
+the hash of every table at the cut it freezes. A table whose rows hash the
+same is kept as is. One that differs is repaired: the SSP fetches the
+table’s id-range hashes from the scheduler (<code>POST /proxy/ranges</code>, about 1000
+rows per range), hashes its own rows over the same ranges, and lists
+<code>(id, _00_rv)</code> only for the ranges that differ. It deletes what is gone,
+fetches the rows that are missing or at another version, and re-reads
+whole any range that still differs (a row changed without a new version).
+Tables are repaired <code>SPKY_SSP_REPAIR_CONCURRENCY</code> at a time (default 4),
+with the same concurrency for the listings, fetches and re-reads inside
+one; <code>Warm bootstrap: rows reused</code> carries <code>kept</code>, <code>repaired</code>, <code>paged</code> and
+<code>repair_ms</code>. A scheduler that serves no ranges for the table gets the whole
+table’s <code>(id, _00_rv)</code> listed instead. A table that still differs, has no
+checkpoint, or fails its checks is paged in full like a cold start, range
+by range when the scheduler serves ranges. Views are always rebuilt from
+<code>_00_query</code> (<code>Re-registered views</code> logs how many and how long their priming
+took), their memberships are republished to SurrealDB as one batch
+(<code>Republished restored views</code>), and <code>SSP ready</code> closes the boot with the
+republish time. The usual post-bootstrap integrity check runs over the
+result, so a stale or corrupt checkpoint costs time, never correctness.
+What changed with the lazy verification: until the pass reaches a file, a
+flipped body byte could be served; the scheduler’s hash check cannot catch
+it, since the hash is folded from the digests in the heads. The exposure
+is seconds, and <code>load</code> restores the old guarantee at the old cost.</li>
+<li>Files written before the split layout (sp00ky before canary.303) are
+converted at load, which costs what loading them used to, and rewritten
+whole at the next write. A build from before it refuses the new files and
+pages the table instead.</li>
 <li>The same path runs <strong>in place</strong> when the scheduler forgets the SSP (a
 scheduler restart) or asks for a resync: the rows already in memory are the
 starting point and the process never exits.</li>
-<li>Standalone mode keeps a circuit snapshot at <code>&lt;dir&gt;/snapshot.json</code> instead,
-written every <code>SPKY_SSP_CHECKPOINT_INTERVAL_SECS</code> (default 300) and on
-graceful shutdown. Row bytes live in a sparse-file arena at
+<li>Standalone mode keeps nothing but the arena across restarts: every start
+rebuilds from SurrealDB. Without a scheduler there is no content hash to
+verify a checkpoint against, and listing a table’s ids to reconcile one
+costs as much as the rebuild. Row bytes live in a sparse-file arena at
 <code>SPKY_SSP_ARENA_DIR</code> in both modes.</li>
 <li>With the directory unset or not writable, the SSP logs it once and runs
 memory-only: every start is a full rebuild.</li>

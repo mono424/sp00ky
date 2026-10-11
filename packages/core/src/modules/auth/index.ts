@@ -11,6 +11,7 @@ import { AuthEventTypes, createAuthEventSystem } from './events/index';
 import type { PersistenceClient } from '../../types';
 import { classifySyncError } from '../../utils/error-classification';
 import { encodeRecordId } from '../../utils/index';
+import { RecordId } from 'surrealdb';
 import {
   decodeTokenClaims,
   impersonationFromToken,
@@ -152,7 +153,7 @@ export class AuthService<S extends SchemaStructure> {
    */
   subscribe(cb: (userId: string | null) => void): () => void {
     // Immediate callback
-    cb(this.currentUser?.id || null);
+    cb(this.announcedUserId());
 
     const id = this.events.subscribe(AuthEventTypes.AuthStateChanged, (event) => {
       cb(event.payload);
@@ -197,8 +198,25 @@ export class AuthService<S extends SchemaStructure> {
     }
   }
 
+  /**
+   * The signed-in user as subscribers see it: the raw `table:id` string, the
+   * way the token's `ID` claim spells it. `currentUser.id` is that string while
+   * the session is restored from the token and the server's `RecordId` once
+   * `check()` has answered, and the two must announce as the same user: every
+   * subscriber that compares ids (feature flags, app release) took the switch
+   * for a new principal and reset, so flag-gated UI blinked off and back on a
+   * few seconds into every reload. A `RecordId`'s own `toString()` will not do
+   * either, as it escapes ids like `user:⟨5abc⟩` that the claim spells raw.
+   */
+  private announcedUserId(): string | null {
+    const id = this.currentUser?.id;
+    if (!id) return null;
+    if (typeof id === 'string') return id;
+    return id instanceof RecordId ? encodeRecordId(id as RecordId<string>) : String(id);
+  }
+
   private notifyListeners() {
-    const userId = this.currentUser?.id || null;
+    const userId = this.announcedUserId();
     this.events.emit(AuthEventTypes.AuthStateChanged, userId);
     const impersonation = this.impersonation;
     if (!sameImpersonation(impersonation, this.announcedImpersonation)) {

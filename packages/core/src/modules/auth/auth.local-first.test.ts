@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { RecordId } from 'surrealdb';
 import { AuthService } from './index';
 
 // A SurrealDB record-access JWT carries the access method as `AC` and the
@@ -139,3 +140,30 @@ describe('auth token reaches the transport', () => {
     expect(remote.setAuthToken).toHaveBeenLastCalledWith(null);
   });
 });
+
+describe('the announced user id', () => {
+  // The cached token names the user as a raw string; once check() answers,
+  // currentUser holds the server's RecordId. Subscribers compare ids, so the
+  // two must announce identically or every reload reads as a sign-in switch.
+  it.each([['abc'], ['5onl3w8g9jhnymk3d10p']])(
+    'is the same raw string before and after the server check (user:%s)',
+    async (key) => {
+      const claim = `user:${key}`;
+      const { auth } = makeAuth({
+        token: jwt({ AC: 'account', ID: claim }),
+        query: vi.fn(async () => [{ id: new RecordId('user', key), email: 'x@y' }]),
+      });
+      const seen: (string | null)[] = [];
+      auth.subscribe((uid) => seen.push(uid));
+
+      await auth.restoreSessionFromToken();
+      await auth.check();
+
+      expect(auth.currentUser.id).toBeInstanceOf(RecordId);
+      // A RecordId's toString escapes a key that starts with a digit.
+      expect(seen.filter((v) => v !== null)).toEqual([claim, claim]);
+      expect(seen.every((v) => v === null || typeof v === 'string')).toBe(true);
+    }
+  );
+});
+

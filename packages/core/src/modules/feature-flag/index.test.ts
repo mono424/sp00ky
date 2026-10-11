@@ -1,5 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { RecordId } from 'surrealdb';
 import { FeatureFlagModule } from './index';
+import { AuthService } from '../auth/index';
 
 // vitest runs in the `node` environment here, so there is no localStorage.
 // The module guards every access with `globalThis.localStorage?.`, which keeps
@@ -249,3 +251,48 @@ describe('FeatureFlagModule local overrides', () => {
     expect(() => new FeatureFlagModule(makeDeps().deps)).not.toThrow();
   });
 });
+
+describe('FeatureFlagModule across a reload', () => {
+  // A reload restores the session from the cached token (the id as a string),
+  // then the server check lands the user row (the id as a RecordId) a few
+  // seconds later. Same user: an assigned flag must stay on throughout, not
+  // blink off while the module re-registers its query.
+  it('keeps flags through the server verification of the same user', async () => {
+    const b64 = Buffer.from(JSON.stringify({ AC: 'account', ID: 'user:5abc' })).toString('base64url');
+    const token = `h.${b64}.s`;
+    const store = new Map<string, unknown>([['sp00ky_auth_token', token]]);
+    const persistence = {
+      get: async (k: string) => store.get(k) ?? null,
+      set: async (k: string, v: unknown) => void store.set(k, v),
+      remove: async (k: string) => void store.delete(k),
+    } as any;
+    const remote = {
+      query: async () => [{ id: new RecordId('user', '5abc') }],
+      setAuthToken: () => undefined,
+      getClient: () => ({ authenticate: async () => undefined, invalidate: async () => undefined }),
+    } as any;
+    const silent: any = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    silent.child = () => silent;
+    const auth = new AuthService({} as any, remote, persistence, silent);
+
+    const env = makeDeps();
+    const flags = new FeatureFlagModule({ ...env.deps, auth } as any);
+    flags.init();
+    await auth.restoreSessionFromToken();
+    const clubs = flags.feature('clubs');
+    const seen: (string | undefined)[] = [];
+    clubs.subscribe((s) => seen.push(s.variant));
+    await tick();
+    env.push([{ key: 'clubs', variant: 'on' }]);
+    expect(clubs.variant()).toBe('on');
+    const registrations = env.calls.length;
+
+    await auth.check();
+    await tick();
+
+    expect(clubs.variant()).toBe('on');
+    expect(seen.slice(seen.indexOf('on'))).not.toContain(undefined);
+    expect(env.calls.length).toBe(registrations);
+  });
+});
+

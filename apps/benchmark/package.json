@@ -14,7 +14,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "echo 'no lint configured'",
-    "test": "echo 'no tests'"
+    "test": "pnpm build && node --test dist/metrics/whitepawn*.test.js dist/workload/whitepawn.test.js dist/stack/process.test.js"
   },
   "dependencies": {
     "commander": "^12.1.0",

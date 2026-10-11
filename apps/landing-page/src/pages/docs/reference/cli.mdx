@@ -26,6 +26,46 @@ somewhere else, and `spky <command> --help` for the flags of any single command.
 | `spky query [sql]` | Run SurrealQL once, or open a REPL. `--cloud` targets the deployment, `--json` prints raw JSON instead of a table. |
 | `spky version` | Print version information. |
 
+## Repository performance benchmark
+
+The repository also contains `spooky-bench`, a separate developer tool in
+`apps/benchmark`. Its `whitepawn` suite measures scheduler and SSP bootstrap,
+50-row live windows with related player names, scrolling with twenty retained
+windows, and propagation during steady writes and import bursts. It uses
+deterministic synthetic chess-game libraries and real database changefeeds.
+Measured startup, latency, throughput, memory and backlog results are published
+in the [WhitePawn performance baseline](/docs/reference/performance#whitepawn-benchmark),
+including completed cases and resource-limited tiers.
+
+<CodeBlock code={benchmarkCode} lang="bash" />
+
+`--smoke` runs compact and PGN-heavy 10K-game cases with short load phases.
+`--profile standard` runs 100K compact, 1M compact and 1M PGN-heavy cases. The
+default `large` profile adds 10M compact games. Each case starts a disposable
+SurrealDB container and fresh scheduler/SSP processes; Docker must be running.
+
+The benchmark records registration and publication latency separately and checks
+published root/child references and record versions. Scroll evictions remove
+both published references and durable registration metadata. Bounded checks
+between phases verify the retained registration ids and graph/follower counts.
+Raw reports include CPU, memory, write and readiness samples. Capacity checks
+include games added by load phases and reserve disk and memory headroom.
+Without a smaller measured PGN-heavy case, PGN projections use measured compact
+costs plus payload allowances as a floor, keeping the larger value for each
+resource against the initial PGN estimate. A preflight `resource-limited` result
+records a conservative estimate, not an observed out-of-memory failure, and
+produces a nonzero exit rather than a successful benchmark result.
+
+Use `whitepawn --help` for binary paths, image, readiness timeout and output
+options. The default image is `surrealdb/surrealdb:v3.1.5`.
+`--startup-timeout-secs` bounds startup and publication-readiness waits,
+including propagation probes and load catch-up, at 3,600 seconds per wait by
+default. It is separate from the overall run duration. `--schema` accepts a
+custom source schema compatible with the chess fixture. The repository's
+`apps/benchmark/README.md` describes the
+dataset matrix, load phases, measurements and existing focused benchmark
+suites. This command is invoked with `spooky-bench`, not `spky`.
+
 ## Adding things to a project
 
 | Command | What it does |
@@ -184,6 +224,13 @@ deadline. [Migrations](/docs/schema/migrations)
 </Note>
 
 export const helpCode = `spky --help`;
+
+export const benchmarkCode = `# Run from the repository root with Docker running.
+cargo build --release -p sp00ky-cli -p scheduler -p ssp-server
+pnpm -F @spooky-sync/benchmark build
+pnpm -F @spooky-sync/benchmark test
+node apps/benchmark/dist/index.js whitepawn --smoke
+node apps/benchmark/dist/index.js whitepawn --profile standard`;
 
 export const flagsCode = `spky dev --clean            # rebuild SSP/scheduler state, keep your data
 spky dev --clean-db         # also wipe the database

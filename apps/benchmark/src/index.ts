@@ -9,6 +9,7 @@ import { runJoinSaturation } from "./suites/join-saturation.js";
 import { runViewDensity } from "./suites/view-density.js";
 import { runBacklog } from "./suites/backlog.js";
 import { runIndex } from "./suites/index-rollup.js";
+import { runWhitepawn } from "./suites/whitepawn.js";
 import { log } from "./util/log.js";
 
 function parseIntList(value: string): number[] {
@@ -249,6 +250,43 @@ STACK_OPTS(
     verbose: opts.verbose,
   });
 });
+
+program
+  .command("whitepawn")
+  .description("WhitePawn-style large game libraries, live windows, and changefeed sync")
+  .option("--profile <name>", "standard or large (includes 10M compact games)", "large")
+  .option("--smoke", "10K compact and PGN games with short live-write phases")
+  .option("--spky-bin <path>", "prebuilt spky schema-generator binary")
+  .option("--scheduler-bin <path>", "prebuilt scheduler binary")
+  .option("--ssp-bin <path>", "prebuilt ssp-server binary")
+  .option("--surreal-image <ref>", "SurrealDB image", "surrealdb/surrealdb:v3.1.5")
+  .option("--schema <path>", "custom source schema compatible with the chess fixture")
+  .option("--startup-timeout-secs <n>", "startup and publication-readiness deadline", Number, 3600)
+  .option("--verbose", "stream child process output")
+  .option("--out <dir>", "output directory (default: timestamped results directory)")
+  .action(async (opts) => {
+    if (!["standard", "large"].includes(opts.profile))
+      throw new Error(
+        "WhitePawn profile must be standard or large; use --smoke for smoke validation"
+      );
+    await runWhitepawn({
+      profile: opts.smoke ? "smoke" : opts.profile,
+      outDir:
+        opts.out ??
+        path.join(
+          process.cwd(),
+          "results",
+          `whitepawn-${new Date().toISOString().replace(/[:.]/g, "-")}`
+        ),
+      startupTimeoutSecs: opts.startupTimeoutSecs,
+      spkyBin: opts.spkyBin,
+      schedulerBin: opts.schedulerBin,
+      sspBin: opts.sspBin,
+      surrealImage: opts.surrealImage,
+      schemaPath: opts.schema,
+      verbose: opts.verbose,
+    });
+  });
 
 // Cross-suite rollup
 program

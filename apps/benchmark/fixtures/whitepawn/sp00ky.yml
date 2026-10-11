@@ -1,0 +1,11 @@
+mode: cluster
+slug: whitepawn-benchmark
+schema:
+  schema: ./schema.surql
+sync:
+  transport: changefeed
+  changefeedRetention: 1d
+clientTypes: []
+logLevel:
+  dev: warn
+  cloud: warn

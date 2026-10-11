@@ -8,113 +8,268 @@ import Note from '../../../components/ui/Note.astro';
 import BenchChart from '../../../components/ui/BenchChart.astro';
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
 
-A live query in sp00ky goes from `POST /ingest` to a materialized
-view in single-digit milliseconds. Numbers below are mean of three
-runs from
-[`apps/benchmark/`](https://github.com/mono424/sp00ky/tree/main/apps/benchmark);
-raw samples are in
-[`results/`](https://github.com/mono424/sp00ky/tree/main/results).
+The WhitePawn benchmark measures database writes reaching live, 50-row windows
+through SurrealDB's real changefeed. The completed 100K-game runs published new
+scroll windows in **165–377 ms p50** and isolated mutations in **63–145 ms p50**.
+The tables below preserve each run separately, including resource limits and
+backlog observations. These measurements use the canary.301 engine and precede
+the newer index and batching changes described [below](#big-tables-give-each-list-its-index).
 
-<Note>
-Single host: Apple M3 Max, 14 cores, 36 GiB RAM. SurrealDB v3 in a
-Docker container. Scheduler and SSP run as release binaries on
-loopback. Absolute numbers will shift in production; the deltas
-across rows of each chart are what reflect the engine.
-</Note>
+The [repository benchmark](https://github.com/mono424/sp00ky/tree/main/apps/benchmark)
+also includes direct-ingest microbenchmarks. Their results appear
+[later on this page](#direct-ingest-microbenchmarks), with a different measurement
+boundary.
 
-## A write reaches the view in ~3 ms
+## WhitePawn benchmark
 
-End-to-end. From `POST /ingest` to the moment the SSP's materialized
-view's content hash advances. That's when a reader of the live query
-would actually see the change.
+Measured on **October 11, 2026**: Apple M3 Max, 14 cores, 36 GiB RAM, macOS arm64,
+Node 22.22.3, Docker 29.4.0 with 15.66 GiB available to Docker, and SurrealDB
+**3.1.5**. Each case used a fresh, disk-backed database, one release scheduler and
+one release SSP from package version `0.0.1-canary.301`. Other development
+containers were running on the host, so these
+are local observations on a shared machine.
 
-<BenchChart
-  variant="bar"
-  title="End-to-end latency vs query shape (1k rows, ~1 KiB each)"
-  xLabel="query shape"
-  yLabel="latency (ms)"
-  labels={["plain", "1 subquery", "2 subqueries"]}
-  series={[
-    { label: "p50", values: [3.21, 3.91, 3.58] },
-    { label: "p95", values: [6.62, 7.56, 7.18] }
-  ]}
-  unit="ms"
-/>
+The synthetic fixture has twenty game collections and 256 players; 80% of games
+belong to one collection. Windows project game metadata and both players' names,
+ordered by `sort_index, id`, with tied sort keys. PGN text is stored in the heavy
+fixture but excluded from the projected window. A 100-step scroll trace keeps at
+most twenty registrations and exercises eviction, revisits, collection filters
+and a second subscriber to an identical query.
 
-A flat `SELECT` propagates a write in 3.2 ms p50. Two levels of
-inlined subqueries add about 0.4 ms. p95 stays under 8 ms across all
-three shapes.
+### Completed cases and bootstrap
 
-## Row size in this benchmark
+“Standard” and “large repeat” below identify two separate runs of the **same 100K
+compact case**. Their samples are not pooled. Both larger profiles remained
+incomplete because later tiers failed capacity preflight; the completed 100K
+cases passed final membership and version verification.
 
-Hold the row count fixed at 1,000 and grow each row from 110 bytes to
-2 MiB. The same kind of write event always propagates in roughly the
-same time.
+| Case | Initial games | Serialized JSON bytes | Version metadata records | Result |
+| --- | ---: | ---: | ---: | --- |
+| 10K compact · smoke | 10,000 | 3,208,416 | 10,276 | Passed |
+| 10K PGN · smoke | 10,000 | 15,201,465 | 10,276 | Passed |
+| 100K compact · standard | 100,000 | 31,897,150 | 100,276 | Passed |
+| 100K compact · large repeat | 100,000 | 31,897,150 | 100,276 | Passed |
 
-<BenchChart
-  variant="line"
-  title="End-to-end p50 vs DB size (1,000 rows, growing per-row size)"
-  xLabel="total DB size"
-  yLabel="latency (ms)"
-  labels={["100 KiB", "3 MiB", "30 MiB", "120 MiB", "250 MiB", "500 MiB", "1 GiB"]}
-  series={[
-    { label: "depth-1", values: [3.37, 3.40, 3.85, 3.87, 2.59, 2.21, 2.54] },
-    { label: "depth-3", values: [3.91, 3.72, 4.37, 4.24, 2.87, 2.44, 2.83] }
-  ]}
-  yMin={2}
-  yMax={5}
-  unit="ms"
-/>
+Serialized bytes sum the actual JSON fixture records, including players and
+collections; they are separate from database storage on disk. `_00_version`
+metadata also covers players and collections and is counted before mutations.
+The PGN payload averages about 1.2 KiB per game.
 
-Across **four orders of magnitude** of total DB size, end-to-end p50
-hovers between 2.2 and 4.4 ms. The engine maintains views as in-memory
-deltas. These samples hold row count and query shape fixed; they do not
-measure cold index construction, large source payloads or publication backlog.
+Startup durations are single observations in seconds. Database readiness
+precedes seeding. Backend readiness starts after seeding and includes
+scheduler/SSP startup and the wait
+for an available SSP; it is separate from database and seed time. The individual
+process readiness measurements are included within that backend interval.
 
-## The real cost driver is row count
+| Case | Database ready | Seed | Scheduler ready | SSP ready | Backend ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10K compact · smoke | 2.19 | 1.71 | 0.77 | 0.26 | 2.54 |
+| 10K PGN · smoke | 0.92 | 2.00 | 0.76 | 0.26 | 2.03 |
+| 100K compact · standard | 1.26 | 15.48 | 6.29 | 1.01 | 9.32 |
+| 100K compact · large repeat | 1.42 | 22.17 | 12.42 | 1.79 | 15.72 |
 
-Every event triggers a fresh content hash over the canary view's
-materialized records. That's `O(rows in view)`. So when row count
-grows, latency grows with it. Realistic short rows, ~1 KiB each:
+### Window registration and mutation latency
 
-<BenchChart
-  variant="line"
-  title="End-to-end p50 vs row count (~1 KiB rows)"
-  xLabel="rows in DB"
-  yLabel="latency (ms)"
-  labels={["1k", "5k", "10k", "20k", "30k"]}
-  series={[
-    { label: "depth-1", values: [3.21, 5.92, 9.43, 16.84, 27.03] },
-    { label: "depth-3", values: [3.58, 6.77, 11.04, 20.50, 33.53] }
-  ]}
-  yMin={2}
-  unit="ms"
-/>
+All latency values are **p50 / p95 / p99 in milliseconds**, using nearest-rank
+percentiles. Registration response ends at the scheduler's HTTP response.
+Published readiness starts before that request and ends when committed root and
+child membership and record versions match the expected result. It includes
+response time. Polls run every 10 ms plus database request time.
 
-Roughly **0.8 ms per added 1,000 rows** in the view's result set. A
-1,000-row view propagates in 3 ms. A 30,000-row view propagates in
-27 ms.
+Each case has 99 new scroll registrations and one retained-window hit across
+100 steps; the separate warmup is excluded here.
 
-This is the most important lever for performance. The cost is paid
-per row currently held in a view, not per byte stored in the database.
-A 1 GiB database with small scoped views runs faster than a 30 MiB
-database with one giant view.
+| Case | New registrations | Registration response | Published readiness |
+| --- | ---: | ---: | ---: |
+| 10K compact · smoke | 99 | 15.73 / 21.59 / 26.38 | 55.56 / 83.68 / 203.91 |
+| 10K PGN · smoke | 99 | 15.67 / 22.48 / 91.65 | 54.71 / 81.60 / 110.38 |
+| 100K compact · standard | 99 | 149.12 / 166.40 / 242.86 | 165.33 / 276.59 / 352.62 |
+| 100K compact · large repeat | 99 | 257.62 / 464.33 / 679.90 | 377.36 / 600.39 / 799.54 |
 
-<Note>
-**Keep queries small.** Cost is per row in the view, not per byte
-stored. A list of 20 propagates in ~3 ms; a list of 30,000 takes
-27 ms, and a UI almost never needs that.
+Mutation probes run individually after the previous mutation has settled. Write
+acknowledgement ends at SurrealDB's transaction response. Published readiness
+starts before the write and includes that acknowledgement. Source queries used
+to construct expected results run outside the timed interval.
 
-- Always include `LIMIT`.
-- Paginate on scroll. Views you stop subscribing to stay cached on
-  the SSP for a while, so re-opening them on backscroll is instant.
-- Scope by the viewer: `WHERE author = $auth.id`, `WHERE thread =
-  $current_thread_id`.
+| Case | Probes | Database acknowledgement | Published readiness |
+| --- | ---: | ---: | ---: |
+| 10K compact · smoke | 14 | 2.32 / 6.08 / 6.08 | 61.07 / 77.65 / 77.65 |
+| 10K PGN · smoke | 14 | 2.29 / 5.46 / 5.46 | 58.96 / 79.62 / 79.62 |
+| 100K compact · standard | 140 | 3.09 / 5.45 / 7.84 | 62.91 / 146.99 / 150.40 |
+| 100K compact · large repeat | 140 | 4.71 / 12.61 / 35.08 | 145.04 / 214.51 / 285.02 |
 
-The scheduler load-balances views across SSPs. Each SSP still holds its
-synced source tables, so adding SSPs spreads view computation but also
-replicates source memory and ingest work. Measure both before scaling out.
-</Note>
+The full cases contain twenty probes per category; smoke contains two. No
+registration or mutation samples failed in these completed cases. The category
+breakdown below shows published readiness for the two 100K cases. With only
+fourteen smoke probes, both p95 and p99 select the maximum observed value;
+these short runs provide limited evidence about tail latency.
+
+| Mutation category | Standard: p50 / p95 / p99 ms | Large repeat: p50 / p95 / p99 ms |
+| --- | ---: | ---: |
+| Insert entering a window | 62.91 / 69.08 / 69.15 | 151.71 / 232.00 / 243.30 |
+| Projected-field update | 49.95 / 55.37 / 59.21 | 130.74 / 205.31 / 209.14 |
+| Sort-boundary change | 137.88 / 148.16 / 148.30 | 160.11 / 214.90 / 218.15 |
+| Collection-filter change | 140.88 / 146.09 / 147.34 | 146.73 / 229.12 / 285.02 |
+| Visible-row delete | 139.31 / 150.40 / 151.56 | 154.38 / 192.36 / 197.92 |
+| Joined player-name update | 47.86 / 59.48 / 59.50 | 135.42 / 211.20 / 319.46 |
+| Unrelated collection write | 41.51 / 55.12 / 57.17 | 124.77 / 195.73 / 209.18 |
+
+Unrelated collection writes measure publication to a separate one-row query,
+then verify that the main 50-row window remains unchanged. The unchanged-window
+check is outside the reported latency.
+
+### Write rate and catch-up
+
+Full cases write 3,000 rows at a target of 50 rows/s for 60 seconds, then import
+30,000 rows at a target of 1,000 rows/s for 30 seconds. Imports use 100-row
+transactions with at most four in flight. Smoke runs each phase for two seconds,
+committing 100 and 2,000 rows respectively. All completed cases had zero failed
+load-phase rows.
+
+Throughput counts **committed source rows per write interval**. It does not
+establish the rate at which the SSP publishes them. After writes finish, the
+driver reads expected source windows, then times residual publication catch-up.
+The pipeline can drain while those source queries run, so the two durations
+below must be read together; residual catch-up alone is not total propagation
+delay.
+
+| Case | Steady rows/s | Import rows/s | Steady source check / residual catch-up (s) | Import source check / residual catch-up (s) |
+| --- | ---: | ---: | ---: | ---: |
+| 10K compact · smoke | 49.97 | 999.52 | 0.68 / 0.05 | 0.73 / 24.38 |
+| 10K PGN · smoke | 50.01 | 999.45 | 0.75 / 0.05 | 0.77 / 24.88 |
+| 100K compact · standard | 50.00 | 999.98 | 4.39 / 0.16 | 4.28 / 7.48 |
+| 100K compact · large repeat | 50.00 | 999.98 | 2.82 / 1.65 | 2.66 / 5.47 |
+
+Write acknowledgement under load is shown separately below, in milliseconds.
+Steady samples each commit one row; import samples each commit 100 rows.
+
+| Case | Steady transactions | Steady ACK: p50 / p95 / p99 | Import transactions | Import ACK: p50 / p95 / p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 10K compact · smoke | 100 | 2.70 / 4.50 / 5.14 | 20 | 18.76 / 34.10 / 35.12 |
+| 10K PGN · smoke | 100 | 3.05 / 6.50 / 11.25 | 20 | 23.49 / 30.42 / 38.51 |
+| 100K compact · standard | 3,000 | 3.37 / 11.04 / 22.37 | 300 | 35.31 / 93.42 / 240.20 |
+| 100K compact · large repeat | 3,000 | 5.67 / 23.43 / 48.58 | 300 | 24.02 / 35.40 / 44.09 |
+
+### Memory, CPU and storage
+
+Scheduler/SSP process samples run every 250 ms; database container samples run
+roughly every five seconds plus request time. These are observed peaks over the
+whole case. CPU is the OS `ps` or Docker percentage: 100% represents one core,
+and a process can exceed it. Mean CPU averages those observations and is not a
+per-request CPU cost.
+
+| Case | Process | Samples | Peak RSS / container memory | Mean / peak CPU % |
+| --- | --- | ---: | ---: | ---: |
+| 10K compact · smoke | Scheduler | 183 | 406.77 MiB | 5.69 / 96.00 |
+| 10K compact · smoke | SSP | 180 | 193.19 MiB | 12.12 / 87.60 |
+| 10K compact · smoke | Database | 10 | 646.70 MiB | 87.44 / 110.64 |
+| 10K PGN · smoke | Scheduler | 183 | 594.86 MiB | 5.03 / 87.60 |
+| 10K PGN · smoke | SSP | 180 | 199.53 MiB | 12.42 / 85.30 |
+| 10K PGN · smoke | Database | 10 | 771.70 MiB | 85.23 / 107.02 |
+| 100K compact · standard | Scheduler | 730 | 1.13 GiB | 9.39 / 118.70 |
+| 100K compact · standard | SSP | 706 | 774.78 MiB | 33.80 / 100.00 |
+| 100K compact · standard | Database | 43 | 1.24 GiB | 70.80 / 138.35 |
+| 100K compact · large repeat | Scheduler | 823 | 1.07 GiB | 7.94 / 118.00 |
+| 100K compact · large repeat | SSP | 777 | 771.84 MiB | 29.46 / 100.00 |
+| 100K compact · large repeat | Database | 49 | 1.32 GiB | 80.28 / 212.23 |
+
+The combined database, scheduler and SSP work directory occupied 355.20 MiB
+for 10K compact, 363.82 MiB for 10K PGN, 941.75 MiB for 100K standard and
+940.91 MiB for the 100K repeat. Serialized fixture bytes above do not include
+indexes, changefeeds, replica state or other platform storage.
+
+### Replica and publication backlog
+
+Scheduler telemetry runs every second; SSP information is sampled roughly every
+five seconds. Peak values below can come from different observations. The last
+sample can precede final verification, and successful window verification does
+not prove every queue is empty.
+
+| Case | Scheduler samples | Peak / last pending events | Peak / last sequence lag |
+| --- | ---: | ---: | ---: |
+| 10K compact · smoke | 35 | 12,390 / 12,390 | 12,390 / 12,390 |
+| 10K PGN · smoke | 35 | 12,390 / 12,390 | 12,390 / 12,390 |
+| 100K compact · standard | 149 | 22,444 / 0 | 26,533 / 0 |
+| 100K compact · large repeat | 166 | 16,945 / 0 | 18,945 / 0 |
+
+| Case | SSP observations | Peak publication batches / operations | Peak publication bytes | Oldest pending age (s) | Overloads observed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10K compact · smoke | 6 | 957 / 98,096 | 12.05 MiB | 12.72 | 25 |
+| 10K PGN · smoke | 6 | 957 / 98,099 | 12.05 MiB | 13.13 | 24 |
+| 100K compact · standard | 22 | 957 / 98,098 | 12.05 MiB | 13.66 | 17 |
+| 100K compact · large repeat | 29 | 938 / 96,158 | 11.82 MiB | 8.47 | 21 |
+
+No scheduler sampling errors or parked publication batches were observed. All
+four cases verified the exact nineteen retained registrations at completion,
+with a maximum of twenty during scrolling.
+
+### Graph sharing and memory attribution
+
+With view sharing enabled, adding the identical subscriber kept graph count at
+**17** and increased merged followers from **0 to 1** in every case. A follower
+shares another registration's computation; the graph owner is excluded from the
+follower count. After import, the smoke cases retained sharing, while both 100K
+cases had nineteen independent graphs and zero merged followers. Later memory
+observations include that change in graph sharing.
+
+Expensive memory attribution runs between measured phases. These heap ownership
+estimates are separate from process RSS:
+
+| Case, after import | Shared store | Query/operator state | Total estimate | Graphs / merged followers |
+| --- | ---: | ---: | ---: | ---: |
+| 10K compact · smoke | 6.32 MiB | 46.24 MiB | 52.55 MiB | 18 / 1 |
+| 10K PGN · smoke | 22.62 MiB | 46.24 MiB | 68.86 MiB | 18 / 1 |
+| 100K compact · standard | 99.83 MiB | 492.72 MiB | 592.55 MiB | 19 / 0 |
+| 100K compact · large repeat | 99.83 MiB | 492.72 MiB | 592.55 MiB | 19 / 0 |
+
+### Resource-limited tiers
+
+In these reports, neither 1M case nor the 10M case ran. The standard run excluded
+1M compact on projected host memory and 1M PGN on projected disk, host memory
+and Docker memory. The large run excluded all three larger cases on those
+three checks. Both commands exited nonzero, retaining their completed 100K
+results.
+
+The following are **capacity projections from the large run**, not measured
+consumption or minimum hardware requirements. They scale the completed compact
+case by populated rows, including the 33,000 load inserts, with a 1.25× margin.
+PGN projections also include payload allowances.
+
+| Unrun case | Projected work-directory disk | Projected scheduler + SSP RSS | Projected database memory | Status |
+| --- | ---: | ---: | ---: | --- |
+| 1M compact | 8.92 GiB | 17.74 GiB | 12.86 GiB | Resource-limited |
+| 1M PGN | 12.86 GiB | 19.18 GiB | 13.59 GiB | Resource-limited |
+| 10M compact | 86.64 GiB | 172.30 GiB | 124.94 GiB | Resource-limited |
+
+Capacity checks reserve 5 GiB free disk and cap projected native plus database
+memory at 80% of host RAM, with database memory additionally capped at 80% of
+Docker RAM. The native projection sums individual process peaks, which need
+not occur simultaneously. There are no measured latency or throughput results
+for these excluded tiers.
+
+### Reproduce WhitePawn results
+
+Run from the repository root with Docker running. The default startup and
+publication-readiness deadline is 3,600 seconds per wait. The baseline reports
+observed performance without imposing a latency pass/fail budget.
+
+<CodeBlock code={whitepawnCode} lang="bash" />
+
+Each invocation preserves `run.json`, `samples.json`, `summary.md` and failure
+logs incrementally under `apps/benchmark/results/whitepawn-<timestamp>/`. The
+tables on this page were transcribed from these local report directories:
+
+| Profile | Report directory |
+| --- | --- |
+| Smoke | `whitepawn-2026-10-11T19-09-13-673Z` |
+| Standard | `whitepawn-2026-10-11T19-16-45-049Z` |
+| Large | `whitepawn-2026-10-11T19-21-12-522Z` |
+
+Those raw directories are local outputs and are not published with this site.
+The recorded checkout base was `83273b8c`, with the benchmark changes in the
+working tree. Browser rendering, client transfer, background jobs and multiple
+SSPs are outside this benchmark. See the [CLI reference](/docs/reference/cli#repository-performance-benchmark)
+for profiles and overrides.
 
 ## Big tables: give each list its index
 
@@ -213,7 +368,124 @@ fields make the index. It is the same index SurrealDB wants for the
 same query, so the database's own reads get faster too.
 </Note>
 
-## A single SSP holds thousands of small views
+## Direct-ingest microbenchmarks
+
+The following older measurements begin at `POST /ingest` and bypass database
+write acknowledgement and changefeed transport. They report means of three
+runs from
+[`apps/benchmark/`](https://github.com/mono424/sp00ky/tree/main/apps/benchmark);
+raw samples are in
+[`results/`](https://github.com/mono424/sp00ky/tree/main/results).
+
+These smaller fixtures use different queries and verification probes. Their
+latency and per-view memory figures do not describe WhitePawn's joined,
+windowed workload or its full database-to-publication path.
+
+<Note>
+Single host: Apple M3 Max, 14 cores, 36 GiB RAM. SurrealDB v3 in a
+Docker container. Scheduler and SSP run as release binaries on
+loopback. Absolute numbers will shift in production; the deltas
+across rows of each chart are what reflect the engine.
+</Note>
+
+### A write reaches the view in ~3 ms
+
+From `POST /ingest` to the moment the SSP's in-memory view's content hash
+advances. Durable publication and client visibility are outside this
+measurement.
+
+<BenchChart
+  variant="bar"
+  title="End-to-end latency vs query shape (1k rows, ~1 KiB each)"
+  xLabel="query shape"
+  yLabel="latency (ms)"
+  labels={["plain", "1 subquery", "2 subqueries"]}
+  series={[
+    { label: "p50", values: [3.21, 3.91, 3.58] },
+    { label: "p95", values: [6.62, 7.56, 7.18] }
+  ]}
+  unit="ms"
+/>
+
+A flat `SELECT` propagates a write in 3.2 ms p50. Two levels of
+inlined subqueries add about 0.4 ms. p95 stays under 8 ms across all
+three shapes.
+
+### Byte volume at fixed row count
+
+Hold the row count fixed at 1,000 and grow each row from 110 bytes to
+2 MiB. The same kind of write event always propagates in roughly the
+same time.
+
+<BenchChart
+  variant="line"
+  title="End-to-end p50 vs DB size (1,000 rows, growing per-row size)"
+  xLabel="total DB size"
+  yLabel="latency (ms)"
+  labels={["100 KiB", "3 MiB", "30 MiB", "120 MiB", "250 MiB", "500 MiB", "1 GiB"]}
+  series={[
+    { label: "depth-1", values: [3.37, 3.40, 3.85, 3.87, 2.59, 2.21, 2.54] },
+    { label: "depth-3", values: [3.91, 3.72, 4.37, 4.24, 2.87, 2.44, 2.83] }
+  ]}
+  yMin={2}
+  yMax={5}
+  unit="ms"
+/>
+
+Across **four orders of magnitude** of total DB size, end-to-end p50
+hovers between 2.2 and 4.4 ms. The engine maintains views as in-memory
+deltas. These samples hold row count and query shape fixed; they do not
+measure cold index construction, large source payloads or publication backlog.
+
+### Row-count sweep
+
+Every event triggers a fresh content hash over the canary view's
+materialized records. That's `O(rows in view)`. So when row count
+grows, latency grows with it. Realistic short rows, ~1 KiB each:
+
+<BenchChart
+  variant="line"
+  title="End-to-end p50 vs row count (~1 KiB rows)"
+  xLabel="rows in DB"
+  yLabel="latency (ms)"
+  labels={["1k", "5k", "10k", "20k", "30k"]}
+  series={[
+    { label: "depth-1", values: [3.21, 5.92, 9.43, 16.84, 27.03] },
+    { label: "depth-3", values: [3.58, 6.77, 11.04, 20.50, 33.53] }
+  ]}
+  yMin={2}
+  unit="ms"
+/>
+
+Roughly **0.8 ms per added 1,000 rows** in the view's result set. A
+1,000-row view propagates in 3 ms. A 30,000-row view propagates in
+27 ms.
+
+In this fixture, the size of the materialized result affected latency more
+than source-record byte volume. This sweep does not establish a cost model for
+other query plans; WhitePawn's joined windows have their own operator and
+source-data costs.
+
+<Note>
+**Keep results bounded.** Smaller result sets reduce the data a live query
+must materialize and a client must consume. Measure the actual query shape and
+source table size when sizing a deployment.
+
+- Always include `LIMIT`.
+- Paginate on scroll. Revisiting a retained active window can avoid a new
+  registration; an evicted window needs registration again.
+- Scope by the viewer: `WHERE author = $auth.id`, `WHERE thread =
+  $current_thread_id`.
+
+The scheduler load-balances views across SSPs. Each SSP still holds its
+synced source tables, so adding SSPs spreads view computation but also
+replicates source memory and ingest work. Measure both before scaling out.
+
+The small-view fixture below measures up to 2,000 views on one SSP. That result
+does not establish capacity for other query shapes or multi-SSP deployments.
+</Note>
+
+### A single SSP holds thousands of small views
 
 The other side of the same coin: many small scoped queries are cheap.
 500-row DB, view count swept from 100 to 2,000.
@@ -239,7 +511,7 @@ queries open (a list view, a detail panel, a few subscriptions), that
 is 2,000 views on one SSP, well inside the flat band. The
 architecture rewards "many small views" over "one big view".
 
-## 2,000 events/sec with sub-2 ms p50
+### 2,000 events/sec with sub-2 ms p50
 
 Worker pool of 16 concurrent in-flight `POST /ingest` calls.
 
@@ -263,7 +535,7 @@ events/sec.
 
 ---
 
-## Verify on your own data
+### Verify on your own data
 
 The benchmark ships a verification probe that proves the SSP isn't
 running on a stub. On a 1 GiB DB:
@@ -286,7 +558,7 @@ the seeded count, sampled cache entries are real comment IDs from
 the seeded range, and inserting a new comment grows the cache by
 exactly one with that exact ID present.
 
-## Reproduce
+### Reproduce
 
 ```bash
 # Prerequisites: Docker + cargo build --release -p scheduler -p ssp-server
@@ -315,3 +587,15 @@ export const indexedListCode = `DEFINE INDEX game_list ON game FIELDS database, 
 -- answered from the index, any LIMIT / START
 SELECT * FROM game WHERE database = $database
   ORDER BY sort_index ASC, date DESC, id ASC LIMIT 50 START 100;`;
+
+export const whitepawnCode = `cargo build --release -p sp00ky-cli -p scheduler -p ssp-server
+docker pull surrealdb/surrealdb:v3.1.5
+pnpm -F @spooky-sync/benchmark build
+pnpm -F @spooky-sync/benchmark test
+
+# Two 10K cases, with two-second load phases.
+node apps/benchmark/dist/index.js whitepawn --smoke
+
+# Full load phases; higher tiers run only when capacity checks pass.
+node apps/benchmark/dist/index.js whitepawn --profile standard
+node apps/benchmark/dist/index.js whitepawn --profile large`;

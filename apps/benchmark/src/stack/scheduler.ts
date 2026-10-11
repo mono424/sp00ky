@@ -1,150 +1,104 @@
-import path from "node:path";
-import fs from "node:fs";
-import net from "node:net";
-import { execa, type ResultPromise } from "execa";
-import { waitForHttp } from "../util/wait.js";
-import { log } from "../util/log.js";
-import type { SurrealHandle } from "./surrealdb.js";
+import path from 'node:path';
+import fs from 'node:fs';
+import type { ResultPromise } from 'execa';
+import { log } from '../util/log.js';
+import type { SurrealHandle } from './surrealdb.js';
+import {
+  availablePort,
+  processEnvironment,
+  processWorkDir,
+  startProcess,
+  type ProcessOptions,
+} from './process.js';
 
 export interface SchedulerHandle {
   baseUrl: string;
   pid: number | undefined;
   child: ResultPromise;
+  /** Time from process spawn to /health/ready. */
+  readyMs: number;
   stop: () => Promise<void>;
 }
 
-export interface SchedulerOptions {
+export interface SchedulerOptions extends ProcessOptions {
   /** Path to a prebuilt scheduler binary; if absent we use cargo run --release. */
   binPath?: string;
-  /** Repo root, defaults to apps/benchmark/../.. */
   repoRoot?: string;
-  /** Listen port. Default 9667. */
+  /** Listen port. Default 9667; zero selects an available ephemeral port. */
   port?: number;
-  /** Verbose: pipe scheduler stdout to ours. */
   verbose?: boolean;
-  /** Extra env */
   env?: Record<string, string>;
-  /** Working directory for state (replica db, wal). Default = a temp dir. */
+  /** Caller-owned state directory. An omitted directory is temporary and removed on stop. */
   workDir?: string;
-}
-
-const DEFAULT_PORT = 9667;
-
-function repoRootFromHere(): string {
-  // .../apps/benchmark/dist/stack/scheduler.js → repo root is ../../../..
-  return path.resolve(import.meta.dirname, "../../../..");
-}
-
-async function isPortFree(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const s = net.createServer();
-    s.once("error", () => resolve(false));
-    s.once("listening", () => s.close(() => resolve(true)));
-    s.listen(port, "127.0.0.1");
-  });
 }
 
 export async function startScheduler(
   surreal: SurrealHandle,
-  opts: SchedulerOptions = {},
+  opts: SchedulerOptions = {}
 ): Promise<SchedulerHandle> {
-  const port = opts.port ?? DEFAULT_PORT;
-  if (!(await isPortFree(port))) {
-    throw new Error(
-      `Scheduler port ${port} is in use. Pass --scheduler-port or stop the conflicting process.`,
-    );
-  }
-  const repoRoot = opts.repoRoot ?? repoRootFromHere();
-  const workDir = opts.workDir ?? path.join(process.cwd(), `.bench-scheduler-${Date.now()}`);
-  fs.mkdirSync(workDir, { recursive: true });
-
-  const env: Record<string, string> = {
-    ...process.env,
-    SPKY_DB_WS: surreal.wsUrl,
-    SPKY_DB_NS: surreal.namespace,
-    SPKY_DB_NAME: surreal.database,
-    SPKY_DB_USER: surreal.username,
-    SPKY_DB_PASS: surreal.password,
-    // Scheduler must send `Authorization: Bearer <secret>` to the SSP, and the
-    // SSP requires the header on authenticated routes. Both processes read the
-    // same env var; mismatch → SSP returns 401.
-    SPKY_AUTH_SECRET: opts.env?.SPKY_AUTH_SECRET ?? process.env.SPKY_AUTH_SECRET ?? "bench",
-    RUST_LOG: process.env.RUST_LOG ?? "warn,scheduler=info",
-    ...(opts.env ?? {}),
-  };
-
-  const baseUrl = `http://127.0.0.1:${port}`;
-
-  // Default: prefer workspace target (the canonical Cargo workspace output),
-  // fall back to per-app target, finally fall back to `cargo run --release`.
-  const workspaceBin = path.join(repoRoot, "target/release/scheduler");
-  const perAppBin = path.join(repoRoot, "apps/scheduler/target/release/scheduler");
-  const candidate = opts.binPath ?? (fs.existsSync(workspaceBin) ? workspaceBin : perAppBin);
-
-  const useCargo = !fs.existsSync(candidate);
-  const cmd = useCargo ? "cargo" : candidate;
-  const args = useCargo
-    ? ["run", "--release", "--manifest-path", path.join(repoRoot, "apps/scheduler/Cargo.toml")]
-    : [];
-
-  log.info(`Starting scheduler (${useCargo ? "cargo run" : candidate}) on ${baseUrl}, workDir=${workDir}`);
-
-  const child = execa(cmd, args, {
-    cwd: workDir,
-    env,
-    stdout: opts.verbose ? "inherit" : "ignore",
-    stderr: opts.verbose ? "inherit" : "pipe",
-    reject: false,
-    forceKillAfterDelay: 5_000,
-  });
-
-  // Buffer last bit of stderr in case startup fails
-  let stderrTail = "";
-  if (!opts.verbose && child.stderr) {
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrTail = (stderrTail + chunk.toString()).slice(-4000);
-    });
-  }
-
-  // If the scheduler exits before becoming ready, surface its stderr.
-  let exited = false;
-  child.then((res) => {
-    exited = true;
-    if (res.exitCode && res.exitCode !== 0) {
-      log.error(`Scheduler exited (code=${res.exitCode}). Tail:\n${stderrTail}`);
-    }
-  });
-
+  const port = await availablePort(opts.port ?? 9667, 'Scheduler');
+  const repoRoot = opts.repoRoot ?? path.resolve(import.meta.dirname, '../../../..');
+  const { workDir, cleanup } = processWorkDir(opts.workDir, 'spooky-bench-scheduler-');
   try {
-    // The scheduler clones SurrealDB into its local replica during bootstrap;
-    // for large DBs this can take minutes. Be generous.
-    await waitForHttp(`${baseUrl}/health/ready`, {
-      timeoutMs: 600_000,
-      label: "scheduler /health/ready",
-    });
-  } catch (e) {
-    if (exited) {
-      throw new Error(
-        `Scheduler exited before readiness. Stderr tail:\n${stderrTail}\n\nOriginal: ${(e as Error).message}`,
-      );
+    // The scheduler reads listener settings from this file; there is no port env override.
+    if (opts.port !== undefined || !opts.workDir) {
+      const config = path.join(workDir, 'sp00ky.yml');
+      if (fs.existsSync(config))
+        throw new Error(
+          `Scheduler working directory already contains ${config}; use an empty directory for a configured benchmark port`
+        );
+      fs.writeFileSync(config, `ingest_host: 127.0.0.1\ningest_port: ${port}\n`);
     }
-    throw e;
+    const env = {
+      ...processEnvironment(opts.isolateEnv),
+      ...(opts.isolateEnv
+        ? { SPKY_ADMIN_ENABLED: 'false', SPKY_POOL_ENABLED: 'false', SPKY_POOL_CLOUD: 'false' }
+        : {}),
+      SPKY_DB_URL: surreal.httpUrl,
+      SPKY_DB_WS: surreal.wsUrl,
+      SPKY_DB_NS: surreal.namespace,
+      SPKY_DB_NAME: surreal.database,
+      SPKY_DB_USER: surreal.username,
+      SPKY_DB_PASS: surreal.password,
+      SPKY_AUTH_SECRET:
+        opts.env?.SPKY_AUTH_SECRET ??
+        (opts.isolateEnv ? undefined : process.env.SPKY_AUTH_SECRET) ??
+        'bench',
+      RUST_LOG: process.env.RUST_LOG ?? 'warn,scheduler=info',
+      ...(opts.env ?? {}),
+    };
+    const workspaceBin = path.join(repoRoot, 'target/release/scheduler');
+    const perAppBin = path.join(repoRoot, 'apps/scheduler/target/release/scheduler');
+    const candidate = opts.binPath
+      ? path.resolve(opts.binPath)
+      : fs.existsSync(workspaceBin)
+        ? workspaceBin
+        : perAppBin;
+    if (opts.binPath && !fs.existsSync(candidate))
+      throw new Error(`Scheduler binary not found: ${candidate}`);
+    const useCargo = !fs.existsSync(candidate);
+    const cmd = useCargo ? 'cargo' : candidate;
+    const args = useCargo
+      ? ['run', '--release', '--manifest-path', path.join(repoRoot, 'apps/scheduler/Cargo.toml')]
+      : [];
+    const baseUrl = `http://127.0.0.1:${port}`;
+    log.info(
+      `Starting scheduler (${useCargo ? 'cargo run' : candidate}) on ${baseUrl}, workDir=${workDir}`
+    );
+    const launched = await startProcess({
+      ...opts,
+      label: 'Scheduler',
+      cmd,
+      args,
+      workDir,
+      env,
+      healthUrl: `${baseUrl}/health/ready`,
+      cleanup,
+    });
+    log.info(`Scheduler ready at ${baseUrl}`);
+    return { baseUrl, pid: launched.child.pid, ...launched };
+  } catch (error) {
+    cleanup();
+    throw error;
   }
-
-  log.info(`Scheduler ready at ${baseUrl}`);
-
-  return {
-    baseUrl,
-    pid: child.pid,
-    child,
-    stop: async () => {
-      log.info("Stopping scheduler");
-      try {
-        child.kill("SIGTERM");
-      } catch { /* already gone */ }
-      try {
-        await child;
-      } catch { /* swallow */ }
-    },
-  };
 }

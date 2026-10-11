@@ -22,6 +22,8 @@ playwright-report/
 blob-report/
 
 # Benchmark data
+/results/
+apps/benchmark/results/
 .bench-*/
 coverage/
 

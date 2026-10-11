@@ -1,10 +1,12 @@
 use crate::algebra::{RowKey, Weight, ZSet};
-use crate::circuit::index::{IndexDef, OrderedIndex};
+use crate::circuit::index::{IndexDef, IndexKey, OrderedIndex};
 use crate::circuit::row_codec as codec;
 use crate::circuit::row_table::RowTable;
 use crate::eval::value_ref::ValueRef;
 use crate::types::{make_key, raw_id, Sp00kyValue};
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use web_time::Instant;
 
@@ -25,6 +27,10 @@ impl std::ops::AddAssign for IndexBuildStats {
         self.rows_indexed += rhs.rows_indexed;
     }
 }
+
+/// Rows a stepped index build reads between two checks of its time budget,
+/// and the least one step reads; see [`Collection::build_index_step`].
+pub const INDEX_STEP_ROWS: usize = 512;
 
 /// Fields every projected row keeps regardless of what the registered plans
 /// reference: the identity and the version the sync layer keys on.
@@ -155,7 +161,8 @@ impl Collection {
 
     /// Run `f` against the index `def` describes, building it from the rows
     /// first if this collection does not hold it yet (or holds an older
-    /// definition under the same name).
+    /// definition under the same name), or finishing it if a stepped build
+    /// ([`Self::build_index_step`]) left it part done.
     pub fn with_index<R>(&self, def: &IndexDef, f: impl FnOnce(&OrderedIndex) -> R) -> R {
         self.with_index_timed(def, f).0
     }
@@ -175,18 +182,72 @@ impl Collection {
         if slots.get(&def.name).is_some_and(|built| built.def != *def) {
             slots.remove(&def.name);
         }
+        let started = Instant::now();
         let mut stats = IndexBuildStats::default();
-        let index = slots.entry(def.name.clone()).or_insert_with(|| {
-            let started = Instant::now();
-            let built = self.build_index(def);
-            stats = IndexBuildStats {
-                index_build_ms: started.elapsed().as_secs_f64() * 1000.0,
-                indexes_built: 1,
-                rows_indexed: self.rows.len(),
-            };
-            built
-        });
+        let index = match slots.entry(def.name.clone()) {
+            Entry::Occupied(slot) => slot.into_mut(),
+            Entry::Vacant(slot) => {
+                stats.indexes_built = 1;
+                stats.rows_indexed = self.rows.len();
+                slot.insert(self.build_index(def))
+            }
+        };
+        if !index.is_complete() {
+            stats.rows_indexed += self.fill_pending(index, usize::MAX);
+            stats.indexes_built += 1;
+        }
+        if stats.indexes_built > 0 {
+            stats.index_build_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
         (f(index), stats)
+    }
+
+    /// Advance a stepped build of `def` for about `budget`, starting it if
+    /// this collection does not hold the index yet. Returns whether the index
+    /// is complete, and the work this step did (`indexes_built` counts the
+    /// step that finishes it).
+    ///
+    /// [`Self::with_index`] builds an index in one pass over the table, and a
+    /// host that runs it under its circuit lock holds that lock for the whole
+    /// pass: on a table of 826,719 games whose bodies sit in a checkpoint
+    /// image on disk that was 15.8 s, and every write and registration on the
+    /// SSP waited behind it. A host that calls this in a loop instead, taking
+    /// the lock for one step and releasing it between steps, lets everything
+    /// else in between. Writes in between keep the half-built index correct
+    /// (see [`OrderedIndex::pending`]), and a lookup that meets one finishes
+    /// it first, so nothing ever reads a partial index.
+    ///
+    /// A step reads at least [`INDEX_STEP_ROWS`] rows whatever the budget, so
+    /// a loop always ends. The first step also lists the table's ids, a walk
+    /// over the row heads only.
+    pub fn build_index_step(&self, def: &IndexDef, budget: std::time::Duration) -> (bool, IndexBuildStats) {
+        let mut slots = self.indexes.lock();
+        if slots.get(&def.name).is_some_and(|built| built.def != *def) {
+            slots.remove(&def.name);
+        }
+        let started = Instant::now();
+        let index = slots.entry(def.name.clone()).or_insert_with(|| {
+            let mut fresh = OrderedIndex::new(def.clone());
+            fresh.pending = Some(self.rows.keys().map(SmolStr::new).collect());
+            fresh
+        });
+        index.idle_since = None;
+        let mut stats = IndexBuildStats::default();
+        if index.is_complete() {
+            return (true, stats);
+        }
+        loop {
+            stats.rows_indexed += self.fill_pending(index, INDEX_STEP_ROWS);
+            if index.is_complete() || started.elapsed() >= budget {
+                break;
+            }
+        }
+        let done = index.is_complete();
+        if done {
+            stats.indexes_built = 1;
+        }
+        stats.index_build_ms = started.elapsed().as_secs_f64() * 1000.0;
+        (done, stats)
     }
 
     fn build_index(&self, def: &IndexDef) -> OrderedIndex {
@@ -194,23 +255,66 @@ impl Collection {
         // Row keys come from the membership z-set, built here if no scan has
         // yet: every index on the table then shares one allocation per row
         // (as every live write already does) instead of holding a copy each.
-        let membership = Some(self.membership());
+        let membership = self.membership();
         let mut seen = HashMap::new();
         let mut entries = Vec::with_capacity(self.rows.len());
         let mut key = String::with_capacity(self.name.len() + 32);
         for (id, row) in self.rows.iter() {
-            key.clear();
-            key.push_str(&self.name);
-            key.push(':');
-            key.push_str(id);
-            let row_key = membership
-                .and_then(|m| m.get_key_value(key.as_str()))
-                .map(|(k, _)| k.clone())
-                .unwrap_or_else(|| RowKey::from(key.as_str()));
-            entries.push((index.key_of_shared(row, &mut seen), row_key));
+            entries.push(self.index_entry(&index, Some(membership), id, row, &mut key, &mut seen));
         }
         index.fill(entries);
         index
+    }
+
+    /// Read up to `max_rows` of the rows a stepped build has not read yet into
+    /// `index`. Returns how many ids it took off the list (a row deleted since
+    /// the list was made is taken off and not read).
+    fn fill_pending(&self, index: &mut OrderedIndex, max_rows: usize) -> usize {
+        let Some(pending) = index.pending.as_mut() else { return 0 };
+        let take = pending.len().min(max_rows);
+        let ids = pending.split_off(pending.len() - take);
+        if pending.is_empty() {
+            index.pending = None;
+        }
+        // Share row keys with the membership z-set when a scan has built it,
+        // but never build it here: that is a pass over the whole table in one
+        // go, the very thing a stepped build exists to avoid.
+        let membership = self.membership.get();
+        let mut seen = HashMap::new();
+        let mut entries = Vec::with_capacity(ids.len());
+        let mut key = String::with_capacity(self.name.len() + 32);
+        for id in &ids {
+            if self.rows.contains_key(id) {
+                entries.push(self.index_entry(index, membership, id, self.rows.get(id), &mut key, &mut seen));
+            }
+        }
+        entries.sort_unstable();
+        for (values, row) in entries {
+            index.insert(values, row);
+        }
+        take
+    }
+
+    /// One row's entry in `index`: its indexed values, and its row key shared
+    /// with the membership z-set.
+    fn index_entry<'r>(
+        &self,
+        index: &OrderedIndex,
+        membership: Option<&ZSet>,
+        id: &str,
+        row: ValueRef<'r>,
+        key: &mut String,
+        seen: &mut HashMap<&'r str, SmolStr>,
+    ) -> (IndexKey, RowKey) {
+        key.clear();
+        key.push_str(&self.name);
+        key.push(':');
+        key.push_str(id);
+        let row_key = membership
+            .and_then(|m| m.get_key_value(key.as_str()))
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| RowKey::from(key.as_str()));
+        (index.key_of_shared(row, seen), row_key)
     }
 
     /// Drop the built indexes no graph needs: at once when the schema no
@@ -832,6 +936,127 @@ mod tests {
 
     fn sv(j: serde_json::Value) -> Sp00kyValue {
         Sp00kyValue::from(j)
+    }
+
+    /// xorshift, so the churn below is the same on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn game_row(rng: &mut Rng) -> Sp00kyValue {
+        let database = format!("game_database:{:024}", rng.below(4));
+        // Every scalar kind the index orders, and the field missing outright.
+        let sort = match rng.below(6) {
+            0 => json!(null),
+            1 => json!(format!("s{}", rng.below(50))),
+            2 => json!(rng.below(50) as f64 + 0.5),
+            3 => return sv(json!({ "database": database, "title": "x" })),
+            _ => json!(rng.below(50)),
+        };
+        sv(json!({ "database": database, "sort_index": sort, "title": "x".repeat(rng.below(40) as usize) }))
+    }
+
+    fn churn(c: &mut Collection, rng: &mut Rng, ids: u64, writes: usize) {
+        for _ in 0..writes {
+            let id = format!("g{}", rng.below(ids));
+            match rng.below(10) {
+                0..=1 => {
+                    c.apply(Operation::Delete, &id, Sp00kyValue::Null);
+                }
+                2 => {
+                    let patch = json!({ "sort_index": rng.below(50) });
+                    c.apply(Operation::Merge, &id, sv(patch));
+                }
+                3 if rng.below(20) == 0 => {
+                    // A compaction mid-build: rows are rewritten, the ids a
+                    // stepped build still has to read stay valid.
+                    c.retained = Some(["database", "sort_index"].iter().map(|f| f.to_string()).collect());
+                    c.compact();
+                }
+                _ => {
+                    let row = game_row(rng);
+                    c.apply(Operation::Update, &id, row);
+                }
+            }
+        }
+    }
+
+    fn game_sort() -> IndexDef {
+        IndexDef { name: "game_database_sort".into(), fields: vec!["database".into(), "sort_index".into()] }
+    }
+
+    #[test]
+    fn a_stepped_index_build_matches_a_full_one_through_interleaved_writes() {
+        for seed in 1..=24u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut c = Collection::new("game".to_string());
+            let ids = 2_400;
+            for i in 0..2_000 {
+                let row = game_row(&mut rng);
+                c.apply(Operation::Create, &format!("g{i}"), row);
+            }
+            let def = game_sort();
+            let mut steps = 0;
+            loop {
+                // A zero budget reads the minimum, INDEX_STEP_ROWS rows a step.
+                let (done, stats) = c.build_index_step(&def, std::time::Duration::ZERO);
+                steps += 1;
+                assert_eq!(stats.indexes_built, usize::from(done));
+                if done {
+                    break;
+                }
+                // Writes land between steps, on rows read and not read yet,
+                // and on rows that did not exist when the build started.
+                churn(&mut c, &mut rng, ids, 150);
+            }
+            assert!(steps >= 4, "seed {seed}: the build should take several steps, took {steps}");
+            churn(&mut c, &mut rng, ids, 300);
+            let stepped = c.with_index(&def, |index| {
+                assert!(index.is_complete());
+                index.entries_vec()
+            });
+            assert_eq!(stepped, c.build_index(&def).entries_vec(), "seed {seed}");
+            assert_eq!(c.build_index_step(&def, std::time::Duration::ZERO), (true, IndexBuildStats::default()));
+        }
+    }
+
+    #[test]
+    fn a_lookup_finishes_a_part_built_index_before_reading_it() {
+        let mut rng = Rng(7);
+        let mut c = Collection::new("game".to_string());
+        for i in 0..1_500 {
+            let row = game_row(&mut rng);
+            c.apply(Operation::Create, &format!("g{i}"), row);
+        }
+        let def = game_sort();
+        let (done, first) = c.build_index_step(&def, std::time::Duration::ZERO);
+        assert!(!done);
+        assert_eq!((first.indexes_built, first.rows_indexed), (0, INDEX_STEP_ROWS));
+        churn(&mut c, &mut rng, 1_500, 100);
+        let (entries, stats) = c.with_index_timed(&def, |index| index.entries_vec());
+        assert_eq!(stats.indexes_built, 1, "the lookup finished the build");
+        assert_eq!(stats.rows_indexed, 1_500 - INDEX_STEP_ROWS);
+        assert_eq!(entries, c.build_index(&def).entries_vec());
+        // Finished, it is an ordinary built index from here on.
+        assert_eq!(c.prewarm_index(&def), IndexBuildStats::default());
+    }
+
+    #[test]
+    fn a_stepped_build_of_an_empty_table_completes_at_once() {
+        let c = Collection::new("game".to_string());
+        let (done, stats) = c.build_index_step(&game_sort(), std::time::Duration::ZERO);
+        assert!(done);
+        assert_eq!((stats.indexes_built, stats.rows_indexed), (1, 0));
+        assert_eq!(c.built_indexes(), vec!["game_database_sort".to_string()]);
     }
 
     #[test]

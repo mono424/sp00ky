@@ -12,6 +12,12 @@
 //! positional lookup. A collection builds one only when a view first plans
 //! over it, keeps it in step with every write after that, and drops it when
 //! the last such view goes (see [`super::store::Collection::with_index`]).
+//!
+//! A host can build one a step at a time instead
+//! ([`super::store::Collection::build_index_step`]), so a pass over a large
+//! table never holds the circuit for the whole of it: the index is filled from
+//! a list of the row ids it still has to read, and every write in between
+//! already reaches it.
 
 use std::collections::HashMap;
 
@@ -132,6 +138,16 @@ pub struct OrderedIndex {
     /// Since when no graph has read this index; see
     /// [`super::store::Collection::release_indexes`].
     pub(crate) idle_since: Option<web_time::Instant>,
+    /// While the index is built step by step: the ids of the rows it has not
+    /// read yet. `None` once it holds every row.
+    ///
+    /// A half-built index is correct for every row it HAS read, because every
+    /// write reaches it exactly as it reaches a finished one: the write takes
+    /// out the entry its stored row files under and files the new one. For a
+    /// row not read yet that removal finds nothing and the insert is the
+    /// row's current state, which the read later files again (a no-op in the
+    /// set). A row created meanwhile is not in the list and needs no read.
+    pub(crate) pending: Option<Vec<SmolStr>>,
 }
 
 fn entry_heap(key: &IndexKey, row: &RowKey) -> usize {
@@ -148,7 +164,12 @@ fn entry_heap(key: &IndexKey, row: &RowKey) -> usize {
 impl OrderedIndex {
     pub(crate) fn new(def: IndexDef) -> Self {
         let paths = def.paths();
-        Self { def, paths, entries: BTreeSet::new(), heap: 0, idle_since: None }
+        Self { def, paths, entries: BTreeSet::new(), heap: 0, idle_since: None, pending: None }
+    }
+
+    /// Whether the index holds every row, so a lookup may read it.
+    pub fn is_complete(&self) -> bool {
+        self.pending.is_none()
     }
 
     /// The key `row` files under. `id` is the record key, not a body field,
@@ -215,6 +236,12 @@ impl OrderedIndex {
         self.entries.len()
     }
 
+    /// Every entry in index order, for tests comparing two builds.
+    #[cfg(test)]
+    pub(crate) fn entries_vec(&self) -> Vec<(IndexKey, RowKey)> {
+        self.entries.iter().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -247,7 +274,8 @@ impl OrderedIndex {
     /// plus the row keys and long strings they point at (counted as if
     /// unshared, so an upper bound).
     pub fn bytes(&self) -> usize {
-        self.entries.len() * (std::mem::size_of::<(IndexKey, RowKey)>() + 16) + self.heap
+        let pending = self.pending.as_ref().map_or(0, |ids| ids.capacity() * std::mem::size_of::<SmolStr>());
+        self.entries.len() * (std::mem::size_of::<(IndexKey, RowKey)>() + 16) + self.heap + pending
     }
 }
 

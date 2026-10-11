@@ -29,6 +29,26 @@ use crate::status::SspStatus;
 
 mod ingest_batch;
 
+/// How long a registration holds the circuit read lock for one step of a first
+/// index build before it lets writers in; see the prewarm loop in
+/// `register_view_handler`.
+const INDEX_BUILD_STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Give the executor one turn. tokio's own `yield_now` needs its `rt` feature,
+/// which this crate leaves out so it still builds for wasm32.
+fn yield_now() -> impl std::future::Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+}
+
 /// Everything the migrated handlers need, platform-independent. Constructed
 /// once by the shell and shared with its framework layer.
 pub struct SspNode {
@@ -1735,19 +1755,31 @@ impl SspNode {
 
         let register_start = web_time::Instant::now();
         stages.prepare_ms = request_start.elapsed().as_secs_f64() * 1000.0;
-        // Build a chosen index before taking the exclusive circuit lock. This
-        // still holds a read lock, so a first build is measured separately and
-        // must not be mistaken for an inexpensive reused-index registration.
-        let wait = web_time::Instant::now();
-        {
+        // Build a chosen index before taking the exclusive circuit lock, a
+        // step at a time. One pass under a single read lock held every write
+        // and registration on the SSP for the whole table: a waiting writer
+        // queues every later reader behind it, so on staging the first
+        // heatmap over 826,719 games held the SSP for 15.8 s. Between steps
+        // the lock is free and writes land; they keep the half-built index
+        // correct (`Collection::build_index_step`). A first build is still
+        // measured separately and must not be mistaken for an inexpensive
+        // reused-index registration.
+        loop {
+            let wait = web_time::Instant::now();
             let circuit = self.processor.read().await;
             stages.lock_wait_ms += wait.elapsed().as_secs_f64() * 1000.0;
             let hold = web_time::Instant::now();
-            let built = circuit.prewarm_query_indexes(&data.plan, data.safe_params.as_ref());
+            let (done, built) =
+                circuit.prewarm_query_indexes_step(&data.plan, data.safe_params.as_ref(), INDEX_BUILD_STEP);
+            drop(circuit);
             stages.index_build_ms += built.index_build_ms;
             stages.indexes_built += built.indexes_built;
             stages.rows_indexed += built.rows_indexed;
             stages.lock_hold_ms += hold.elapsed().as_secs_f64() * 1000.0;
+            if done {
+                break;
+            }
+            yield_now().await;
         }
         let wait = web_time::Instant::now();
         let (initial_row_count, initial_state, publication_ready, standby, index_uses) = {

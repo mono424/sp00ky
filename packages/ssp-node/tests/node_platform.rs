@@ -1438,6 +1438,65 @@ async fn an_index_defined_by_hand_upstream_is_mirrored_and_windows_read_it() {
     assert_eq!(keys, vec!["game:g26", "game:g28", "game:n1"]);
 }
 
+// The first window over a large table builds its index. That build used to
+// run in one pass under a single circuit read lock, so a write arriving
+// meanwhile (which needs the write lock) waited for the whole table: on
+// staging, 15.8 s behind one heatmap over 826,719 games. Built a step at a
+// time with the lock released in between, the write lands after about one
+// step while the registration is still building.
+#[tokio::test]
+async fn an_ingest_lands_while_a_window_builds_its_index() {
+    let h = build(HarnessOpts::default()).await;
+    {
+        let mut c = h.node.processor.write().await;
+        c.set_table_meta("game", ssp::circuit::TableMeta {
+            permission: "true".into(),
+            indexes: vec![ssp::circuit::index::IndexDef {
+                name: "game_db_sort".into(),
+                fields: vec!["database".into(), "sort_index".into()],
+            }],
+            ..Default::default()
+        });
+        c.load((0..100_000u64).map(|i| {
+            ssp::circuit::Record::new("game", &format!("g{i}"), json!({
+                "database": format!("game_database:{}", i % 7),
+                "sort_index": (i * 7_919) % 100_000,
+            }))
+        }));
+    }
+    let reg = json!({
+        "id": "v1",
+        "surql": "SELECT * FROM game WHERE database = $database ORDER BY sort_index ASC LIMIT 3",
+        "clientId": "c", "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z",
+        "params": { "database": "game_database:0" }
+    });
+    let started = std::time::Instant::now();
+    let registration = async {
+        let r = h.node.route(authed(Method::Post, "/view/register", reg)).await.unwrap();
+        (r.status, started.elapsed())
+    };
+    let ingest = async {
+        // Wait for the build to be under way, then write into the window.
+        while h.node.processor.read().await.built_indexes().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let row = json!({ "table": "game", "op": "CREATE", "id": "game:n1", "record": { "database": "game_database:0", "sort_index": -1 } });
+        let r = h.node.route(authed(Method::Post, "/ingest", row)).await.unwrap();
+        (r.status, started.elapsed())
+    };
+    let ((reg_status, registered_at), (ingest_status, ingested_at)) = tokio::join!(registration, ingest);
+    assert_eq!((reg_status, ingest_status), (200, 200));
+    assert!(
+        ingested_at * 4 < registered_at,
+        "the ingest landed at {ingested_at:?}, the registration ended at {registered_at:?}"
+    );
+    // Written mid-build, the row is in the window all the same.
+    let mut keys = h.node.processor.read().await.view_keys("v1");
+    keys.sort();
+    assert!(keys.contains(&"game:n1".to_string()), "{keys:?}");
+    assert_eq!(keys.len(), 3);
+}
+
 #[tokio::test]
 async fn admin_reload_requires_auth() {
     let h = build(HarnessOpts::default()).await;

@@ -587,6 +587,35 @@ impl Circuit {
         self.prewarm_index_uses(graph.index_uses())
     }
 
+    /// [`Self::prewarm_query_indexes`] for about `budget` at a time: returns
+    /// whether every index the plan uses is complete, and the work this step
+    /// did. A host loops on it, holding its circuit read lock for one step
+    /// and releasing it in between, so the first build of an index over a
+    /// large table no longer holds back every write and registration for the
+    /// whole pass (see [`Collection::build_index_step`]).
+    pub fn prewarm_query_indexes_step(
+        &self,
+        plan: &QueryPlan,
+        params: Option<&serde_json::Value>,
+        budget: std::time::Duration,
+    ) -> (bool, IndexBuildStats) {
+        let params = params.cloned().map(Sp00kyValue::from);
+        let graph = self.build_graph(&plan.root, params.as_ref());
+        let uses: std::collections::BTreeSet<_> = graph.index_uses().into_iter().collect();
+        let started = Instant::now();
+        let mut stats = IndexBuildStats::default();
+        for (table, name) in uses {
+            let Some(def) = self.index_defs.get(&table).and_then(|defs| defs.iter().find(|def| def.name == name)) else { continue };
+            let Some(collection) = self.store.get_collection(&table) else { continue };
+            let (done, step) = collection.build_index_step(def, budget.saturating_sub(started.elapsed()));
+            stats += step;
+            if !done {
+                return (false, stats);
+            }
+        }
+        (true, stats)
+    }
+
     /// Ensure indexes selected by all installed graphs exist, for the final
     /// bootstrap pass before Ready. Several graphs sharing one index build it
     /// only once; an empty selected range still warms its backing index.
@@ -5570,6 +5599,57 @@ mod index_tests {
     }
 
     #[test]
+    fn a_stepped_prewarm_lets_writes_in_and_registers_without_a_build() {
+        let make = |indexes: Vec<IndexDef>| {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(indexes));
+            c
+        };
+        let mut indexed = make(game_indexes());
+        let mut plain = make(Vec::new());
+        for i in 0..3_000u64 {
+            let record = Record::new("game", &format!("g{i}"), json!({
+                "database": if i % 3 == 0 { "game_database:hot" } else { "game_database:cold" },
+                "sort_index": (i * 7_919) % 3_000,
+            }));
+            indexed.load([record.clone()]);
+            plain.load([record]);
+        }
+        let plan = QueryPlan {
+            id: "w".into(),
+            root: limit(filter(scan(), eq("database", param("database"))), 50, 100,
+                order(&[("sort_index", "ASC"), ("id", "ASC")])),
+        };
+        let params = json!({ "database": "game_database:hot" });
+        let mut steps = 0i64;
+        loop {
+            let (done, _) = indexed.prewarm_query_indexes_step(&plan, Some(&params), std::time::Duration::ZERO);
+            assert!(indexed.view_ids().is_empty(), "prewarming must not register a view");
+            if done {
+                break;
+            }
+            steps += 1;
+            // Between steps a host holds no lock, so writes land: a new row
+            // inside the window, a row moved into the list, one moved out.
+            let changes = vec![
+                Change::create("game", &format!("n{steps}"), json!({ "database": "game_database:hot", "sort_index": 150 + steps })),
+                Change::update("game", &format!("g{}", steps * 3 + 1), json!({ "database": "game_database:hot", "sort_index": 160 })),
+                Change::update("game", &format!("g{}", steps * 3), json!({ "database": "game_database:cold", "sort_index": 0 })),
+            ];
+            indexed.step(ChangeSet { changes: changes.clone() });
+            plain.step(ChangeSet { changes });
+        }
+        assert!(steps >= 4, "the build should take several steps, took {steps}");
+        let (_, timings) = indexed.add_query_with_auth_timed(plan.clone(), Some(params.clone()), None, String::new());
+        assert_eq!(timings.indexes_built, 0, "the stepped prewarm left nothing to build");
+        assert!(!indexed.view_index_uses("w").is_empty(), "the view reads the index");
+        plain.add_query(plan, Some(params), None);
+        assert_eq!(indexed.view_keys("w").len(), 50);
+        assert_eq!(sorted(indexed.view_keys("w")), sorted(plain.view_keys("w")));
+    }
+
+    #[test]
     fn schema_prewarm_reuses_active_indexes_and_rebuilds_changed_definitions() {
         let mut c = Circuit::new();
         c.store.ensure_collection("game");
@@ -5623,6 +5703,54 @@ mod index_tests {
         assert!(c.view_keys("denied").is_empty());
         assert_eq!((timings.indexes_built, timings.rows_indexed), (1, 1));
         assert_eq!(c.prewarm_active_indexes(), IndexBuildStats::default());
+    }
+
+    /// The longest a first index build holds the store, one pass against
+    /// steps: 1M games with a PGN-sized body each. `cargo test --release -p
+    /// ssp --lib stepped_index_build_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn stepped_index_build_scale() {
+        let rows = 1_000_000u64;
+        let pgn = "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 ".repeat(40);
+        let build = || {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(vec![def("game_database_sort", &["database", "sort_index"])]));
+            for i in 0..rows {
+                c.store.apply_change(&Change::create(
+                    "game",
+                    &format!("{i:020}"),
+                    json!({ "database": format!("game_database:{:020}", i % 300), "sort_index": (i * 7919) % rows, "pgn": pgn }),
+                ));
+            }
+            c
+        };
+        let plan = QueryPlan {
+            id: "w".into(),
+            root: limit(filter(scan(), eq("database", param("database"))), 50, 0,
+                order(&[("sort_index", "ASC"), ("id", "ASC")])),
+        };
+        let params = json!({ "database": format!("game_database:{:020}", 0) });
+
+        let c = build();
+        let t = Instant::now();
+        let stats = c.prewarm_query_indexes(&plan, Some(&params));
+        eprintln!("one pass: {:?} held, {} rows", t.elapsed(), stats.rows_indexed);
+
+        let c = build();
+        let budget = std::time::Duration::from_millis(25);
+        let (mut steps, mut longest, t) = (0, std::time::Duration::ZERO, Instant::now());
+        loop {
+            let s = Instant::now();
+            let (done, _) = c.prewarm_query_indexes_step(&plan, Some(&params), budget);
+            longest = longest.max(s.elapsed());
+            steps += 1;
+            if done {
+                break;
+            }
+        }
+        eprintln!("stepped: {steps} steps, longest {longest:?} held, {:?} in all", t.elapsed());
     }
 
     /// Customer scale: 1M games, 422k of them in one database, a scroll of

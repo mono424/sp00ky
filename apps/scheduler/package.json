@@ -1,6 +1,6 @@
 {
   "name": "scheduler",
-  "version": "0.0.1-canary.316",
+  "version": "0.0.1-canary.317",
   "private": true,
   "scripts": {
     "build": "docker buildx build --target scheduler -t mono424/spooky-scheduler:dev -f ../../Dockerfile ../..",

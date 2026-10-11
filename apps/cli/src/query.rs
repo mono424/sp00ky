@@ -326,9 +326,14 @@ fn row_count(n: usize) -> String {
     format!("({} row{})", n, if n == 1 { "" } else { "s" })
 }
 
+/// Widest a table cell gets, in chars. Longer values are cut with `…` and the
+/// table says so; `--json` prints them in full.
+const MAX_CELL_CHARS: usize = 80;
+
 /// Render an array of JSON objects as an aligned ASCII table. Columns are taken
 /// in first-seen order across all rows; missing cells are blank and nested
-/// objects/arrays are shown as compact JSON.
+/// objects/arrays are shown as compact JSON. Every cell stays on one line and
+/// within `MAX_CELL_CHARS`.
 fn render_table(rows: &[Value]) -> String {
     let mut columns: Vec<String> = Vec::new();
     for row in rows {
@@ -346,14 +351,16 @@ fn render_table(rows: &[Value]) -> String {
 
     let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    let mut cut = 0;
     for row in rows {
         let obj = row.as_object();
         let mut line = Vec::with_capacity(columns.len());
         for (i, col) in columns.iter().enumerate() {
-            let cell = obj
+            let (cell, was_cut) = obj
                 .and_then(|o| o.get(col))
-                .map(cell_to_string)
+                .map(|v| fit_cell(&cell_to_string(v)))
                 .unwrap_or_default();
+            cut += usize::from(was_cut);
             let width = cell.chars().count();
             if width > widths[i] {
                 widths[i] = width;
@@ -368,7 +375,7 @@ fn render_table(rows: &[Value]) -> String {
     let header: Vec<String> = columns
         .iter()
         .enumerate()
-        .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+        .map(|(i, c)| pad(c, widths[i]))
         .collect();
     out.push_str(&format!(
         "{}{}{}\n",
@@ -385,13 +392,60 @@ fn render_table(rows: &[Value]) -> String {
         let formatted: Vec<String> = line
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+            .map(|(i, c)| pad(c, widths[i]))
             .collect();
         out.push_str(formatted.join("  ").trim_end());
         out.push('\n');
     }
 
+    if cut > 0 {
+        out.push_str(&format!(
+            "{}({} long value{} cut at {} chars, use --json to see them in full){}\n",
+            DIM,
+            cut,
+            if cut == 1 { "" } else { "s" },
+            MAX_CELL_CHARS,
+            RESET
+        ));
+    }
+
     out
+}
+
+/// Left-align `s` in a column `width` chars wide. Pads by hand because a
+/// `{:<width$}` width above `u16::MAX` panics with "Formatting argument out
+/// of range".
+fn pad(s: &str, width: usize) -> String {
+    let fill = width.saturating_sub(s.chars().count());
+    format!("{}{}", s, " ".repeat(fill))
+}
+
+/// Fit a cell on one table line: control characters are escaped (a raw
+/// newline would split the row) and anything past `MAX_CELL_CHARS` is cut
+/// with `…`. Returns whether the value was cut.
+fn fit_cell(raw: &str) -> (String, bool) {
+    let mut line = String::new();
+    let mut len = 0;
+    for c in raw.chars() {
+        if len > MAX_CELL_CHARS {
+            break;
+        }
+        if c.is_control() {
+            for e in c.escape_default() {
+                line.push(e);
+                len += 1;
+            }
+        } else {
+            line.push(c);
+            len += 1;
+        }
+    }
+    if len <= MAX_CELL_CHARS {
+        return (line, false);
+    }
+    let mut cut: String = line.chars().take(MAX_CELL_CHARS - 1).collect();
+    cut.push('…');
+    (cut, true)
 }
 
 /// Stringify a single cell value: strings as-is, scalars via Display, and
@@ -478,6 +532,62 @@ mod tests {
         assert!(out.contains("{\"k\":1}"));
         // 2 data rows + header + separator.
         assert_eq!(out.lines().count(), 4);
+    }
+
+    #[test]
+    fn render_table_survives_ragged_rows_with_huge_values() {
+        // Shape of an `UPDATE puzzle ...` result: optional fields come back
+        // missing (NONE) or null, so key sets differ per row, and `content`
+        // is far wider than the 65535 limit Rust puts on a format width.
+        let huge = format!("{}\nsecond line", "x".repeat(70_000));
+        let rows: Vec<Value> = (0..70)
+            .map(|i| {
+                let mut row = json!({ "id": format!("puzzle:{i}"), "content": huge, "version": 8 });
+                let obj = row.as_object_mut().unwrap();
+                if i % 2 == 0 {
+                    obj.insert("importing".into(), json!(false));
+                }
+                if i % 3 == 0 {
+                    obj.insert("rating".into(), Value::Null);
+                }
+                if i % 5 == 0 {
+                    obj.insert("tags".into(), json!(["endgame", "pin"]));
+                }
+                row
+            })
+            .collect();
+
+        let out = render_table(&rows);
+        let lines: Vec<&str> = out.lines().collect();
+
+        // Header, separator, one line per row (the newline in `content` does
+        // not split a row), then the note about cut values.
+        assert_eq!(lines.len(), 2 + rows.len() + 1);
+        for col in ["id", "content", "version", "importing", "rating", "tags"] {
+            assert!(lines[0].contains(col), "header misses {col}");
+        }
+        assert!(out.contains("puzzle:69"));
+        assert!(!out.contains(&huge));
+        assert!(lines[2].contains('…'));
+        assert!(lines[2].contains("puzzle:0"));
+        assert!(lines.last().unwrap().contains("--json"));
+        // Every line stays far below the format width limit.
+        assert!(lines.iter().all(|l| l.chars().count() < 1_000));
+    }
+
+    #[test]
+    fn fit_cell_escapes_and_cuts_at_the_limit() {
+        let exact = "a".repeat(MAX_CELL_CHARS);
+        assert_eq!(fit_cell(&exact), (exact.clone(), false));
+
+        let (cut, was_cut) = fit_cell(&"a".repeat(MAX_CELL_CHARS + 1));
+        assert!(was_cut);
+        assert_eq!(cut.chars().count(), MAX_CELL_CHARS);
+        assert!(cut.ends_with('…'));
+
+        assert_eq!(fit_cell("a\nb\tc"), ("a\\nb\\tc".to_string(), false));
+        // Padding past u16::MAX is fine without a format width argument.
+        assert_eq!(pad("x", 70_000).len(), 70_000);
     }
 
     #[test]

@@ -103,6 +103,13 @@ export class AuthService<S extends SchemaStructure> {
   /** Target of an impersonation that just ended, until the client purges its
    *  local bucket (see `consumeEndedImpersonation`). */
   private endedImpersonationTarget: string | null = null;
+  /** The way back to the admin in flight. The Stop button, the session poll,
+   *  a refused renewal and a rejected check can all end an impersonation, and
+   *  they share this one: a second stop running beside the first found the
+   *  admin token already taken and signed the admin out. */
+  private stopping: Promise<void> | null = null;
+  /** A token renewal in flight, which a stop waits out (see `renewImpersonation`). */
+  private renewing: Promise<void> | null = null;
   private impersonationTimers = new ImpersonationTimers({
     current: () => this.impersonation,
     renew: () => this.renewImpersonation(),
@@ -272,9 +279,22 @@ export class AuthService<S extends SchemaStructure> {
    * a full sign-out rather than staying on the target.
    */
   async stopImpersonating(opts: { serverEnded?: boolean } = {}): Promise<void> {
+    if (this.stopping) return this.stopping;
+    if (!this.impersonation) return;
+    this.stopping = this.leaveImpersonation(opts).finally(() => {
+      this.stopping = null;
+    });
+    return this.stopping;
+  }
+
+  private async leaveImpersonation(opts: { serverEnded?: boolean }): Promise<void> {
+    this.impersonationTimers.clear();
+    // A renewal already sent finishes first, so it cannot put the target's
+    // token back on the socket after the admin's (it sees `stopping` and
+    // stands down).
+    await this.renewing?.catch(() => undefined);
     const info = this.impersonation;
     if (!info) return;
-    this.impersonationTimers.clear();
     if (!opts.serverEnded) {
       try {
         await this.remote.query('RETURN fn::_00_impersonate::stop($session)', { session: info.session });
@@ -314,9 +334,22 @@ export class AuthService<S extends SchemaStructure> {
 
   /** Re-sign the impersonation token before it expires. */
   async renewImpersonation(): Promise<void> {
-    if (!this.impersonation) return;
+    if (!this.impersonation || this.stopping) return;
+    const renewal = this.applyRenewal();
+    this.renewing = renewal;
+    try {
+      await renewal;
+    } finally {
+      if (this.renewing === renewal) this.renewing = null;
+    }
+  }
+
+  private async applyRenewal(): Promise<void> {
     const [renewed] = await this.remote.query<[{ token: string }]>('RETURN fn::_00_impersonate::renew()');
     if (!renewed?.token) throw new Error('Impersonation renewal returned no token.');
+    // A stop began while the server was signing: the session is being left,
+    // so a fresh token for it must not go on the socket or into storage.
+    if (this.stopping || !this.impersonation) return;
     this.remote.setAuthToken(renewed.token);
     await this.remote.getClient().authenticate(renewed.token);
     this.token = renewed.token;
@@ -399,6 +432,9 @@ export class AuthService<S extends SchemaStructure> {
     this.isLoading = true;
 
     let token: string | undefined;
+    // Set once the server has accepted the token: from then on a failure is a
+    // failure to read the user row, not a verdict on the session.
+    let accepted = false;
     try {
       token = accessToken || (await this.persistenceClient.get<string>('sp00ky_auth_token')) || undefined;
 
@@ -418,6 +454,7 @@ export class AuthService<S extends SchemaStructure> {
       // `RemoteDatabaseService.setAuthToken`).
       this.remote.setAuthToken(token);
       await this.remote.getClient().authenticate(token);
+      accepted = true;
 
       // Verify the session by fetching the full user record using $auth.id
       const result = await this.remote.query('SELECT * FROM ONLY $auth.id');
@@ -471,6 +508,17 @@ export class AuthService<S extends SchemaStructure> {
           { error, Category: 'sp00ky-client::AuthService::check' },
           'Auth check unreachable; keeping the cached session and retrying later'
         );
+      } else if (accepted && token) {
+        // The server took the token and only the read of the user row failed
+        // (a busy database, a statement error). Signing out here logged an
+        // admin out on the way back from an impersonation while the database
+        // was saturated. Keep the session on the id the token names; the row
+        // arrives with the next check or the app's own user query.
+        this.logger.warn(
+          { error, Category: 'sp00ky-client::AuthService::check' },
+          'Auth check accepted the token but could not read the user; keeping the session'
+        );
+        await this.keepAcceptedSession(token);
       } else {
         this.logger.error(
           { error, stack: (error as Error).stack, Category: 'sp00ky-client::AuthService::check' },
@@ -481,6 +529,18 @@ export class AuthService<S extends SchemaStructure> {
     } finally {
       this.isLoading = false;
     }
+  }
+
+  /** Hold a session the server accepted without its user row: the id comes
+   *  from the token, as on a warm boot. A token naming no user is refused. */
+  private async keepAcceptedSession(token: string): Promise<void> {
+    if (this.isAuthenticated && this.token === token && this.currentUser) return;
+    const { userId } = decodeTokenClaims(token);
+    if (!userId) {
+      await this.rejectToken(token);
+      return;
+    }
+    await this.setSession(token, { id: userId });
   }
 
   /**

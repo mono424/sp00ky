@@ -260,6 +260,28 @@ describe('timers', () => {
     expect(auth.impersonation).toBeNull();
   });
 
+  it('a renewal in flight when stop begins does not put the target back on the socket', async () => {
+    const { auth, server, store } = await signedInAdmin();
+    await auth.impersonate('user:bob', 'support ticket');
+    let releaseRenew!: () => void;
+    const held = new Promise<void>((r) => (releaseRenew = r));
+    const answer = server.query.getMockImplementation()!;
+    server.query.mockImplementation(async (sql: string, vars?: Record<string, unknown>) => {
+      if (sql.includes('fn::_00_impersonate::renew')) await held;
+      return answer(sql, vars);
+    });
+
+    const renewal = auth.renewImpersonation();
+    const stop = auth.stopImpersonating();
+    releaseRenew();
+    await Promise.all([renewal, stop]);
+
+    expect(auth.currentUser.id).toBe('user:alice');
+    expect(auth.token).toBe(ADMIN);
+    expect(server.state.socketToken).toBe(ADMIN);
+    expect(store.get('sp00ky_auth_token')).toBe(ADMIN);
+  });
+
   it('keeps going through network failures on the poll', async () => {
     let calls = 0;
     const host = {

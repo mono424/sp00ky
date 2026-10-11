@@ -1,610 +1,375 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Performance
-description: Measured latency and throughput, what actually drives cost, and how to reproduce the numbers.
+description: How long does a list take to update? Measured examples, simple graphs, and commands to try it yourself.
 ---
 
 import Note from '../../../components/ui/Note.astro';
 import BenchChart from '../../../components/ui/BenchChart.astro';
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import WhitepawnResults from '../../../components/docs/WhitepawnResults.mdx';
 
-The WhitePawn benchmark measures database writes reaching live, 50-row windows
-through SurrealDB's real changefeed. The completed 100K-game runs published new
-scroll windows in **165–377 ms p50** and isolated mutations in **63–145 ms p50**.
-The tables below preserve each run separately, including resource limits and
-backlog observations. These measurements use the canary.301 engine and precede
-the newer index and batching changes described [below](#big-tables-give-each-list-its-index).
+Imagine a chess library with **100,000 games**. You show **50 games at a time**,
+scroll through the library, rename players, and import more games. This page
+shows how long those actions took in our benchmark.
 
-The [repository benchmark](https://github.com/mono424/sp00ky/tree/main/apps/benchmark)
-also includes direct-ingest microbenchmarks. Their results appear
-[later on this page](#direct-ingest-microbenchmarks), with a different measurement
-boundary.
+**“Ready” means the server's published list passed our data checks.** Downloading
+and drawing the list in a browser were outside the test.
 
 ## WhitePawn benchmark
 
-Measured on **October 11, 2026**: Apple M3 Max, 14 cores, 36 GiB RAM, macOS arm64,
-Node 22.22.3, Docker 29.4.0 with 15.66 GiB available to Docker, and SurrealDB
-**3.1.5**. Each case used a fresh, disk-backed database, one release scheduler and
-one release SSP from package version `0.0.1-canary.301`. Other development
-containers were running on the host, so these
-are local observations on a shared machine.
+Here are the results in everyday terms:
 
-The synthetic fixture has twenty game collections and 256 players; 80% of games
-belong to one collection. Windows project game metadata and both players' names,
-ordered by `sort_index, id`, with tied sort keys. PGN text is stored in the heavy
-fixture but excluded from the projected window. A 100-step scroll trace keeps at
-most twenty registrations and exercises eviction, revisits, collection filters
-and a second subscriber to an identical query.
+- **Open a 50-game list:** typically **0.17–0.38 seconds** in a 100,000-game library.
+- **Change a game or player:** typically **0.06–0.15 seconds** until the published
+  result reflected the change.
+- **Import 30,000 games:** **30 seconds** to write them, then **8–12 seconds**
+  to check that the retained lists had caught up.
+- **Start with 100,000 games already seeded:** about **9–16 seconds** until the
+  scheduler and SSP were ready.
 
-### Completed cases and bootstrap
+The two 100,000-game runs use the same dataset. We call them **100K A** and
+**100K B** so you can see how results varied. A ran in the standard profile;
+B repeated the case in the large profile. They ran on a shared development
+machine, and their samples are kept separate.
 
-“Standard” and “large repeat” below identify two separate runs of the **same 100K
-compact case**. Their samples are not pooled. Both larger profiles remained
-incomplete because later tiers failed capacity preflight; the completed 100K
-cases passed final membership and version verification.
+<Note>
+These are **October 11, 2026 measurements of canary.301**, before the newer
+index-building and batching improvements. They are a recorded baseline;
+we have not rerun this workload to measure those improvements yet.
+</Note>
 
-| Case | Initial games | Serialized JSON bytes | Version metadata records | Result |
-| --- | ---: | ---: | ---: | --- |
-| 10K compact · smoke | 10,000 | 3,208,416 | 10,276 | Passed |
-| 10K PGN · smoke | 10,000 | 15,201,465 | 10,276 | Passed |
-| 100K compact · standard | 100,000 | 31,897,150 | 100,276 | Passed |
-| 100K compact · large repeat | 100,000 | 31,897,150 | 100,276 | Passed |
+## Open a list of 50 games
 
-Serialized bytes sum the actual JSON fixture records, including players and
-collections; they are separate from database storage on disk. `_00_version`
-metadata also covers players and collections and is counted before mutations.
-The PGN payload averages about 1.2 KiB per game.
+**Example:** “There are 100,000 games in my library. I scroll to a new page of
+50 games. The server publishes that page in about **0.17 seconds** in run A,
+or **0.38 seconds** in run B.”
 
-Startup durations are single observations in seconds. Database readiness
-precedes seeding. Backend readiness starts after seeding and includes
-scheduler/SSP startup and the wait
-for an available SSP; it is separate from database and seed time. The individual
-process readiness measurements are included within that backend interval.
+The graph also shows two smaller tests. **10K + moves** stores synthetic chess
+move text as well as game metadata; the list itself still requests only the
+small summary and player names.
 
-| Case | Database ready | Seed | Scheduler ready | SSP ready | Backend ready |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 10K compact · smoke | 2.19 | 1.71 | 0.77 | 0.26 | 2.54 |
-| 10K PGN · smoke | 0.92 | 2.00 | 0.76 | 0.26 | 2.03 |
-| 100K compact · standard | 1.26 | 15.48 | 6.29 | 1.01 | 9.32 |
-| 100K compact · large repeat | 1.42 | 22.17 | 12.42 | 1.79 | 15.72 |
+**p50** is the middle result: half the measurements finished within that time.
+**p95** is the time within which 95% finished. A shorter bar means less waiting.
+All values below are in seconds.
 
-### Window registration and mutation latency
+<BenchChart
+  variant="horizontal"
+  title="Time until a new 50-game list was ready"
+  xLabel="seconds"
+  yLabel="dataset"
+  labels={["10K games", "10K + moves", "100K A", "100K B"]}
+  series={[
+    { label: "p50", values: [0.05556, 0.05471, 0.16533, 0.37736] },
+    { label: "p95", values: [0.08368, 0.08160, 0.27659, 0.60039] }
+  ]}
+  unit="s"
+/>
 
-All latency values are **p50 / p95 / p99 in milliseconds**, using nearest-rank
-percentiles. Registration response ends at the scheduler's HTTP response.
-Published readiness starts before that request and ends when committed root and
-child membership and record versions match the expected result. It includes
-response time. Polls run every 10 ms plus database request time.
+Each case scrolled 100 times, with at most twenty lists retained at once.
+There were **99 new registrations** and one visit to an already retained list.
+These times start before registration and include the response and publication
+check; they do not stop at the first HTTP response.
 
-Each case has 99 new scroll registrations and one retained-window hit across
-100 steps; the separate warmup is excluded here.
+## Change a game or rename a player
 
-| Case | New registrations | Registration response | Published readiness |
-| --- | ---: | ---: | ---: |
-| 10K compact · smoke | 99 | 15.73 / 21.59 / 26.38 | 55.56 / 83.68 / 203.91 |
-| 10K PGN · smoke | 99 | 15.67 / 22.48 / 91.65 | 54.71 / 81.60 / 110.38 |
-| 100K compact · standard | 99 | 149.12 / 166.40 / 242.86 | 165.33 / 276.59 / 352.62 |
-| 100K compact · large repeat | 99 | 257.62 / 464.33 / 679.90 | 377.36 / 600.39 / 799.54 |
+**Example:** “I rename a player in a 100,000-game library. The server's list is
+ready with the updated player record in about **0.05 seconds** in run A,
+or **0.14 seconds** in run B.”
 
-Mutation probes run individually after the previous mutation has settled. Write
-acknowledgement ends at SurrealDB's transaction response. Published readiness
-starts before the write and includes that acknowledgement. Source queries used
-to construct expected results run outside the timed interval.
+Other changes take different amounts of work. These are the typical times
+(p50) for three concrete actions:
 
-| Case | Probes | Database acknowledgement | Published readiness |
-| --- | ---: | ---: | ---: |
-| 10K compact · smoke | 14 | 2.32 / 6.08 / 6.08 | 61.07 / 77.65 / 77.65 |
-| 10K PGN · smoke | 14 | 2.29 / 5.46 / 5.46 | 58.96 / 79.62 / 79.62 |
-| 100K compact · standard | 140 | 3.09 / 5.45 / 7.84 | 62.91 / 146.99 / 150.40 |
-| 100K compact · large repeat | 140 | 4.71 / 12.61 / 35.08 | 145.04 / 214.51 / 285.02 |
-
-The full cases contain twenty probes per category; smoke contains two. No
-registration or mutation samples failed in these completed cases. The category
-breakdown below shows published readiness for the two 100K cases. With only
-fourteen smoke probes, both p95 and p99 select the maximum observed value;
-these short runs provide limited evidence about tail latency.
-
-| Mutation category | Standard: p50 / p95 / p99 ms | Large repeat: p50 / p95 / p99 ms |
+| Action | 100K A | 100K B |
 | --- | ---: | ---: |
-| Insert entering a window | 62.91 / 69.08 / 69.15 | 151.71 / 232.00 / 243.30 |
-| Projected-field update | 49.95 / 55.37 / 59.21 | 130.74 / 205.31 / 209.14 |
-| Sort-boundary change | 137.88 / 148.16 / 148.30 | 160.11 / 214.90 / 218.15 |
-| Collection-filter change | 140.88 / 146.09 / 147.34 | 146.73 / 229.12 / 285.02 |
-| Visible-row delete | 139.31 / 150.40 / 151.56 | 154.38 / 192.36 / 197.92 |
-| Joined player-name update | 47.86 / 59.48 / 59.50 | 135.42 / 211.20 / 319.46 |
-| Unrelated collection write | 41.51 / 55.12 / 57.17 | 124.77 / 195.73 / 209.18 |
+| Rename a player | 0.05 s | 0.14 s |
+| Move out of a collection | 0.14 s | 0.15 s |
+| Delete a visible game | 0.14 s | 0.15 s |
 
-Unrelated collection writes measure publication to a separate one-row query,
-then verify that the main 50-row window remains unchanged. The unchanged-window
-check is outside the reported latency.
+The next graph combines all seven kinds of change: insert, edit, reorder, move
+between collections, delete, rename a player, and write to another collection.
+Each full run has **140 measurements**, taken one change at a time.
 
-### Write rate and catch-up
+<BenchChart
+  variant="horizontal"
+  title="Time until a single change passed publication checks"
+  xLabel="seconds"
+  yLabel="run"
+  labels={["100K A", "100K B"]}
+  series={[
+    { label: "p50", values: [0.06291, 0.14504] },
+    { label: "p95", values: [0.14699, 0.21451] }
+  ]}
+  unit="s"
+/>
 
-Full cases write 3,000 rows at a target of 50 rows/s for 60 seconds, then import
-30,000 rows at a target of 1,000 rows/s for 30 seconds. Imports use 100-row
-transactions with at most four in flight. Smoke runs each phase for two seconds,
-committing 100 and 2,000 rows respectively. All completed cases had zero failed
-load-phase rows.
+Saving to the database finishes earlier. For example, run A's typical database
+acknowledgement was **0.003 seconds**, while the published result check took
+**0.063 seconds**. The latter already includes the write time.
 
-Throughput counts **committed source rows per write interval**. It does not
-establish the rate at which the SSP publishes them. After writes finish, the
-driver reads expected source windows, then times residual publication catch-up.
-The pipeline can drain while those source queries run, so the two durations
-below must be read together; residual catch-up alone is not total propagation
-delay.
+## Import 30,000 games
 
-| Case | Steady rows/s | Import rows/s | Steady source check / residual catch-up (s) | Import source check / residual catch-up (s) |
-| --- | ---: | ---: | ---: | ---: |
-| 10K compact · smoke | 49.97 | 999.52 | 0.68 / 0.05 | 0.73 / 24.38 |
-| 10K PGN · smoke | 50.01 | 999.45 | 0.75 / 0.05 | 0.77 / 24.88 |
-| 100K compact · standard | 50.00 | 999.98 | 4.39 / 0.16 | 4.28 / 7.48 |
-| 100K compact · large repeat | 50.00 | 999.98 | 2.82 / 1.65 | 2.66 / 5.47 |
+**Example:** “I start with 100,000 games and import 30,000 more at 1,000 games
+per second. The database accepts all 30,000 in **30 seconds**. After the import
+ends, the benchmark needs about **12 more seconds** in run A, or **8 more
+seconds** in run B, to check the source and confirm the retained lists have
+caught up.”
 
-Write acknowledgement under load is shown separately below, in milliseconds.
-Steady samples each commit one row; import samples each commit 100 rows.
+That extra time has two parts. First the benchmark reads the database to work
+out what each list should contain. Then it waits for the published lists to
+match. Sync continues during both parts.
 
-| Case | Steady transactions | Steady ACK: p50 / p95 / p99 | Import transactions | Import ACK: p50 / p95 / p99 |
-| --- | ---: | ---: | ---: | ---: |
-| 10K compact · smoke | 100 | 2.70 / 4.50 / 5.14 | 20 | 18.76 / 34.10 / 35.12 |
-| 10K PGN · smoke | 100 | 3.05 / 6.50 / 11.25 | 20 | 23.49 / 30.42 / 38.51 |
-| 100K compact · standard | 3,000 | 3.37 / 11.04 / 22.37 | 300 | 35.31 / 93.42 / 240.20 |
-| 100K compact · large repeat | 3,000 | 5.67 / 23.43 / 48.58 | 300 | 24.02 / 35.40 / 44.09 |
+<BenchChart
+  variant="horizontal"
+  title="Checks and remaining wait after the 30,000-game import"
+  xLabel="seconds"
+  yLabel="run"
+  labels={["100K A", "100K B"]}
+  series={[
+    { label: "Source check", values: [4.28472, 2.65608] },
+    { label: "Remaining wait", values: [7.48381, 5.46940] }
+  ]}
+  unit="s"
+/>
 
-### Memory, CPU and storage
+Add the two bars for each run to get the roughly 12- or 8-second confirmation
+time. The remaining-wait bar alone does not measure the whole delay after the
+import. This checks the retained lists, rather than every possible query.
 
-Scheduler/SSP process samples run every 250 ms; database container samples run
-roughly every five seconds plus request time. These are observed peaks over the
-whole case. CPU is the OS `ps` or Docker percentage: 100% represents one core,
-and a process can exceed it. Mean CPU averages those observations and is not a
-per-request CPU cost.
-
-| Case | Process | Samples | Peak RSS / container memory | Mean / peak CPU % |
-| --- | --- | ---: | ---: | ---: |
-| 10K compact · smoke | Scheduler | 183 | 406.77 MiB | 5.69 / 96.00 |
-| 10K compact · smoke | SSP | 180 | 193.19 MiB | 12.12 / 87.60 |
-| 10K compact · smoke | Database | 10 | 646.70 MiB | 87.44 / 110.64 |
-| 10K PGN · smoke | Scheduler | 183 | 594.86 MiB | 5.03 / 87.60 |
-| 10K PGN · smoke | SSP | 180 | 199.53 MiB | 12.42 / 85.30 |
-| 10K PGN · smoke | Database | 10 | 771.70 MiB | 85.23 / 107.02 |
-| 100K compact · standard | Scheduler | 730 | 1.13 GiB | 9.39 / 118.70 |
-| 100K compact · standard | SSP | 706 | 774.78 MiB | 33.80 / 100.00 |
-| 100K compact · standard | Database | 43 | 1.24 GiB | 70.80 / 138.35 |
-| 100K compact · large repeat | Scheduler | 823 | 1.07 GiB | 7.94 / 118.00 |
-| 100K compact · large repeat | SSP | 777 | 771.84 MiB | 29.46 / 100.00 |
-| 100K compact · large repeat | Database | 49 | 1.32 GiB | 80.28 / 212.23 |
-
-The combined database, scheduler and SSP work directory occupied 355.20 MiB
-for 10K compact, 363.82 MiB for 10K PGN, 941.75 MiB for 100K standard and
-940.91 MiB for the 100K repeat. Serialized fixture bytes above do not include
-indexes, changefeeds, replica state or other platform storage.
-
-### Replica and publication backlog
-
-Scheduler telemetry runs every second; SSP information is sampled roughly every
-five seconds. Peak values below can come from different observations. The last
-sample can precede final verification, and successful window verification does
-not prove every queue is empty.
-
-| Case | Scheduler samples | Peak / last pending events | Peak / last sequence lag |
+| Test | Time | Games added | Games/second |
 | --- | ---: | ---: | ---: |
-| 10K compact · smoke | 35 | 12,390 / 12,390 | 12,390 / 12,390 |
-| 10K PGN · smoke | 35 | 12,390 / 12,390 | 12,390 / 12,390 |
-| 100K compact · standard | 149 | 22,444 / 0 | 26,533 / 0 |
-| 100K compact · large repeat | 166 | 16,945 / 0 | 18,945 / 0 |
+| Steady | 60 s | 3,000 | 50 |
+| Import | 30 s | 30,000 | About 1,000 |
 
-| Case | SSP observations | Peak publication batches / operations | Peak publication bytes | Oldest pending age (s) | Overloads observed |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 10K compact · smoke | 6 | 957 / 98,096 | 12.05 MiB | 12.72 | 25 |
-| 10K PGN · smoke | 6 | 957 / 98,099 | 12.05 MiB | 13.13 | 24 |
-| 100K compact · standard | 22 | 957 / 98,098 | 12.05 MiB | 13.66 | 17 |
-| 100K compact · large repeat | 29 | 938 / 96,158 | 11.82 MiB | 8.47 | 21 |
+Both 100K runs had **zero failed writes** in these phases. Imports used 100-game
+transactions, with at most four transactions running at once. The achieved rate
+measures database commits; it does not mean every list updates 1,000 times per
+second. Across these completed runs, the publication queue's sampled peak was
+about 12 MiB. Full queue measurements are in the detailed results below.
 
-No scheduler sampling errors or parked publication batches were observed. All
-four cases verified the exact nineteen retained registrations at completion,
-with a maximum of twenty during scrolling.
+## Start with an existing library
 
-### Graph sharing and memory attribution
+**Example:** “My 100,000 games are already in the database. Starting the
+scheduler and SSP takes about **9 seconds** in run A or **16 seconds** in run B
+before the backend is ready.”
 
-With view sharing enabled, adding the identical subscriber kept graph count at
-**17** and increased merged followers from **0 to 1** in every case. A follower
-shares another registration's computation; the graph owner is excluded from the
-follower count. After import, the smoke cases retained sharing, while both 100K
-cases had nineteen independent graphs and zero merged followers. Later memory
-observations include that change in graph sharing.
+The scheduler reads and distributes changes. The SSP maintains the live query
+results. This graph includes starting both services and waiting for an
+available SSP.
 
-Expensive memory attribution runs between measured phases. These heap ownership
-estimates are separate from process RSS:
+<BenchChart
+  variant="horizontal"
+  title="Backend startup after 100,000 games were seeded"
+  xLabel="seconds"
+  yLabel="run"
+  labels={["100K A", "100K B"]}
+  series={[{ label: "Backend ready", values: [9.32273, 15.72482] }]}
+  unit="s"
+/>
 
-| Case, after import | Shared store | Query/operator state | Total estimate | Graphs / merged followers |
-| --- | ---: | ---: | ---: | ---: |
-| 10K compact · smoke | 6.32 MiB | 46.24 MiB | 52.55 MiB | 18 / 1 |
-| 10K PGN · smoke | 22.62 MiB | 46.24 MiB | 68.86 MiB | 18 / 1 |
-| 100K compact · standard | 99.83 MiB | 492.72 MiB | 592.55 MiB | 19 / 0 |
-| 100K compact · large repeat | 99.83 MiB | 492.72 MiB | 592.55 MiB | 19 / 0 |
+These are single startup observations. Database startup and creating the test
+data are separate: seeding the 100,000 games took about 15 seconds in A and
+22 seconds in B.
 
-### Resource-limited tiers
+## How much memory did it use?
 
-In these reports, neither 1M case nor the 10M case ran. The standard run excluded
-1M compact on projected host memory and 1M PGN on projected disk, host memory
-and Docker memory. The large run excluded all three larger cases on those
-three checks. Both commands exited nonzero, retaining their completed 100K
-results.
+**Example:** “During the 100,000-game test, the scheduler peaked at about
+**1.1 GiB** and the SSP at about **0.76 GiB**. The database container used
+another **1.2–1.3 GiB** at its sampled peak.”
 
-The following are **capacity projections from the large run**, not measured
-consumption or minimum hardware requirements. They scale the completed compact
-case by populated rows, including the 33,000 load inserts, with a 1.25× margin.
-PGN projections also include payload allowances.
+<BenchChart
+  variant="horizontal"
+  title="Highest sampled process memory during each 100K run"
+  xLabel="GiB"
+  yLabel="run"
+  labels={["100K A", "100K B"]}
+  series={[
+    { label: "Scheduler", values: [1.13362, 1.07347] },
+    { label: "SSP", values: [0.75662, 0.75375] }
+  ]}
+  unit="GiB"
+/>
 
-| Unrun case | Projected work-directory disk | Projected scheduler + SSP RSS | Projected database memory | Status |
-| --- | ---: | ---: | ---: | --- |
-| 1M compact | 8.92 GiB | 17.74 GiB | 12.86 GiB | Resource-limited |
-| 1M PGN | 12.86 GiB | 19.18 GiB | 13.59 GiB | Resource-limited |
-| 10M compact | 86.64 GiB | 172.30 GiB | 124.94 GiB | Resource-limited |
+The graph covers the scheduler and SSP; the database is additional. These are
+separate peaks across the whole test and may have occurred at different times.
+The database and replica files occupied about **0.92 GiB on disk** after each
+100K run. CPU, database memory and detailed storage figures are available below.
 
-Capacity checks reserve 5 GiB free disk and cap projected native plus database
-memory at 80% of host RAM, with database memory additionally capped at 80% of
-Docker RAM. The native projection sums individual process peaks, which need
-not occur simultaneously. There are no measured latency or throughput results
-for these excluded tiers.
+Even a 50-row list needs more memory than its fifty displayed rows. The SSP also
+holds source records, indexes and the state used to maintain the query.
 
-### Reproduce WhitePawn results
+## What about one million or ten million games?
 
-Run from the repository root with Docker running. The default startup and
-publication-readiness deadline is 3,600 seconds per wait. The baseline reports
-observed performance without imposing a latency pass/fail budget.
+**We do not have measured results for those sizes.** The benchmark's resource
+checks stopped them before startup on this machine.
+
+- **10,000 games:** completed with and without move text.
+- **100,000 games:** completed twice.
+- **1 million games:** resource-limited, with and without move text; not run.
+- **10 million games:** resource-limited; not run.
+
+The machine had 36 GiB RAM and a 15.66 GiB Docker memory budget. The checks keep
+memory and disk headroom, using smaller completed tests to estimate larger ones.
+A resource-limited result is a capacity estimate, rather than an observed crash.
+The standard and large commands therefore exited nonzero, while retaining their
+successful 100K results.
+
+## Make a large library easier to query
+
+**Example:** “Show the next 50 games from this collection, in their saved order.”
+An index on the collection and sort field lets the engine look up the matching
+range. Think of finding a chapter in a book's index instead of reading every
+page from the beginning.
+
+<CodeBlock code={listCode} lang="sql" />
+
+Here `database` means the game collection. Bind `$database` to its
+`game_database` record. `LIMIT 50` returns fifty rows; `START 100` skips the
+first hundred. The final `id` makes tied sort values deterministic.
+
+Newer releases build a first-use index in short steps so writes can run between
+steps. They also group already queued changes into batches. These changes can
+reduce repeated work, but this page's WhitePawn measurements predate them.
+There is no measured WhitePawn speedup to quote yet.
+
+<details>
+<summary>More about indexes, batching and engine-only measurements</summary>
+
+An indexed window needs equality filters on the index's leading fields, followed
+by matching sort fields. An unrelated filter or a range comparison on its own
+does not get the same shortcut. Full-text, vector and count indexes are not used
+for this list lookup.
+
+A historical [Rust engine experiment](https://github.com/mono424/sp00ky/commit/80ec1dc2c95b4e084f4de1472cd2d27345f79a24)
+registered twenty windows over one million rows in **14.6 seconds without the
+index** and **0.58 seconds with it**, including the first build. The fixture has
+420,000 rows in the selected collection. This measured in-process engine
+registration; it did not include a database changefeed, publication or a browser.
+
+Indexes are built when needed, kept for an hour after their last view leaves,
+and prewarmed for restored active views before the SSP reports ready. Schema
+changes prewarm replacements too. A live first build still scans its table, but
+targets 25 ms per step and releases the circuit between steps. Writes
+keep an unfinished index correct; queries only read it once complete. A separate
+one-million-row test reduced the longest lock hold from 0.88 seconds to 74 ms,
+while the complete build took about twice as long. These are engine observations,
+not the WhitePawn publication times above.
+
+The scheduler batches already queued ordinary changes up to **128 records or
+1 MiB**, without waiting to fill a batch. The SSP applies their source changes
+in order and updates affected query computations once per batch. Older SSPs,
+replay, jobs, users and internal lifecycle records keep their single-record paths.
+
+For implementation details, see [registration and ingest stages](/docs/reference/ssp-api#registration-and-ingest-stages)
+and [batch ingestion](/docs/reference/ssp-api#post-ingestbatch). Rust embedders can
+use `prewarm_query_indexes`, `prewarm_active_indexes`, `prewarm_index` and the
+step-based variants. Their `IndexBuildStats` report index count, rows indexed
+and build time. Query stage timings are shared measurements for affected views,
+rather than exclusive CPU costs for each view.
+
+Slow-operation evidence, publication wait times and queue diagnostics are
+explained in the [SSP API](/docs/reference/ssp-api#publication-isolation-and-latency)
+and [scheduler API](/docs/reference/scheduler-api). Permission-join maintenance
+still costs work proportional to the set of records a changed join key affects.
+
+</details>
+
+## Run it yourself
+
+From the repository root, with Docker running:
 
 <CodeBlock code={whitepawnCode} lang="bash" />
 
-Each invocation preserves `run.json`, `samples.json`, `summary.md` and failure
-logs incrementally under `apps/benchmark/results/whitepawn-<timestamp>/`. The
-tables on this page were transcribed from these local report directories:
+The smoke test runs both 10K datasets and short write phases. Standard attempts
+100K and 1M cases. Large also attempts 10M. Each case gets a fresh, disposable,
+disk-backed SurrealDB 3.1.5 instance and one scheduler/SSP pair.
 
-| Profile | Report directory |
-| --- | --- |
-| Smoke | `whitepawn-2026-10-11T19-09-13-673Z` |
-| Standard | `whitepawn-2026-10-11T19-16-45-049Z` |
-| Large | `whitepawn-2026-10-11T19-21-12-522Z` |
+These commands save `summary.md`, `samples.json` and `run.json` under
+`results/whitepawn-<timestamp>/` in the repository root. Completed results survive a later
+failure. See the [benchmark CLI reference](/docs/reference/cli#repository-performance-benchmark)
+for custom binaries, output paths and the 3,600-second per-wait startup/readiness
+timeout.
 
-Those raw directories are local outputs and are not published with this site.
-The recorded checkout base was `83273b8c`, with the benchmark changes in the
-working tree. Browser rendering, client transfer, background jobs and multiple
-SSPs are outside this benchmark. See the [CLI reference](/docs/reference/cli#repository-performance-benchmark)
-for profiles and overrides.
+## How to read these results
 
-## Big tables: give each list its index
+The WhitePawn tests ran on October 11, 2026 with an Apple M3 Max, 14 cores,
+36 GiB RAM, macOS arm64, Node 22.22.3 and Docker 29.4.0. Other development
+containers were running. The measured release binaries were version
+`0.0.1-canary.301`; SurrealDB was 3.1.5.
 
-A view starts from the rows its filter could match. Without help that is
-every row of the table, so on a table of a million rows each new list
-window costs the SSP a pass over all of them, even for `LIMIT 50`.
+The data is synthetic: twenty collections, 256 players and 80% of games in one
+large collection. Games share sort values, and each list joins the white and
+black player records. The full-move fixture adds about 1.2 KiB of text per game.
 
-The SSP holds the same indexes SurrealDB does. Every plain
-`DEFINE INDEX … FIELDS` on a synced table is mirrored: one applied by
-`spky migrate` or a deploy arrives with the next schema poll, and one
-defined by hand in the SurrealDB console within about a minute. A
-`REMOVE INDEX` is followed the same way.
+Publication checks verify the expected game/player references, parent links and
+required record versions. They do not compare every projected field or prove
+published edge order. Initial `ready` status alone is insufficient. Browser
+rendering, client downloads, production authorization, background jobs and
+multiple SSPs are outside these tests.
 
-A windowed list reads its window straight off an index when:
+<details>
+<summary>Exact numbers, sample counts, CPU, queues and report sources</summary>
 
-- its `WHERE` is equalities (`field = value` or `field = $param`, joined
-  with `AND`) on the index's leading fields, in any order, and
-- its `ORDER BY` is the rest of the index, in order, each field `ASC` or
-  `DESC` as you like. A trailing `id ASC` tiebreaker is free.
+<WhitepawnResults />
 
-<CodeBlock code={indexedListCode} lang="sql" />
+</details>
 
-Once its index is built, registering such a window touches the rows it
-returns, and a write re-reads only that window. Any other filter with equalities
-on an index's leading fields still starts from that index range instead
-of the whole table, an `OR` with such equalities in every branch reads
-one range per branch, and `WHERE id = $id` reads that one record.
-Full-text, vector (`HNSW`, `MTREE`) and `COUNT` indexes are not used, and
-range conditions (`<`, `>`) narrow nothing on their own.
+<details>
+<summary>Older tests that measure the engine without the full sync path</summary>
 
-Results are identical either way; an index changes only the cost. On a
-1M-row table with 422k rows in one list, 20 scroll windows took 14.6 s
-to register without the index and 0.6 s with it (the first window builds
-the index, each one after that takes ~30 µs). The index costs about
-100 bytes per row of the table and is built when a view first needs it.
-It stays for an hour after its last view goes, so the next list opened
-does not pay the build again, and a restarted SSP rebuilds the indexes in
-use before it takes traffic.
+These May 1, 2026 microbenchmarks start at `POST /ingest` and stop when the
+SSP's in-memory result hash changes. They bypass database write acknowledgement
+and changefeed transport, and do not measure durable publication or client
+visibility. They should not be compared directly with the WhitePawn times.
 
-Restored active views now prewarm the indexes their plans select before the
-SSP reports Ready. Schema changes prewarm replacement indexes before evaluating
-replacement graphs, including a changed definition under the same index name.
-Live registration rechecks the registration identity and merge owner under the
-writer before installing a graph. A first-ever index still costs a pass over its
-table, but live registration builds it in steps of about 25 ms, each under a
-circuit reader, and lets go of the circuit in between: writes and other
-registrations land between two steps instead of waiting for the whole pass.
-Writes that land mid-build keep the half-built index correct, and nothing reads
-an index before it is complete. On 1M rows with a PGN-sized body each, the
-longest the build holds the circuit went from 0.88 s (one pass) to 74 ms (the
-first step, which lists the table's ids); the build itself takes about twice
-as long in all. Registration metrics report this work separately as
-`index_build_ms`, `indexes_built` and `rows_indexed`.
-
-Rust embedders can call `Circuit::prewarm_query_indexes(&plan, params)` for a
-selected plan, `Circuit::prewarm_active_indexes()` for registered graphs, or
-`Collection::prewarm_index(&definition)` for one index, each in one pass.
-`Circuit::prewarm_query_indexes_step(&plan, params, budget)` and
-`Collection::build_index_step(&definition, budget)` do the same work in
-steps of about `budget`, for a host that releases its circuit lock between
-steps; they return whether the index is complete alongside the work done. Each returns
-`IndexBuildStats` (`indexes_built`, `rows_indexed`, `index_build_ms`); already built
-indexes return zero work. `Circuit::set_table_meta_timed` applies schema changes
-and returns the same statistics. Timed registration exposes index build fields
-in `RegTimings`, and `Circuit::step_timed` separates store application from DAG
-stepping with `StepTimings`.
-
-Permission semijoins and antijoins retain keyed witness counts and reverse left
-lookups. Ingest reevaluates affected join keys, including changes to a row body
-whose membership stays the same. Duplicate witnesses and unrelated changes do
-not rescan the left table. Distinct updates only changed keys. These indexes add
-memory proportional to retained input keys; changing a witness shared by many
-left rows still costs work proportional to that affected set.
-
-### Batches and measurements
-
-The scheduler drains already queued ordinary changes into batches of up to 128
-records and 1 MiB, with no wait to fill a batch. An SSP advertises support at
-registration; older SSPs and replay continue receiving individual `/ingest`
-requests. Each batch applies source changes in order and steps affected graphs
-once. Jobs, users and internal lifecycle records use their existing single-row
-paths. Publication waits for every surviving source row, with the existing
-five-second visibility fallback and 16-probe concurrency limit.
-
-Live view details include separate registration and ingest stage timings. The
-same circuit-step measurement is shared by every view affected by that request;
-it is not exclusive CPU time for each view. A batch contributes one materialization
-sample and one update-count increment to each affected view. Publication wait and
-database transaction time remain separate queue and OpenTelemetry measurements.
-
-Successful registration and ingest requests taking at least 250 ms attempt to
-retain sanitized evidence in the
-private `_00_sync_evidence:slow_operations` ring. Evidence writes are best effort,
-with at most four in flight per process and no waiting queue. Requests beyond
-that budget increment `ssp_slow_evidence_dropped_total`. Its newest 100 samples survive view TTL
-cleanup and service restarts, and are available through the scheduler's
-`GET /admin/api/views/history` or MCP `view_history`. Samples include masked query
-shapes and stage timings, without SQL text, bindings, user or session identifiers.
-Use this history together with publication incidents when investigating a stall.
-
-<Note>
-**Define the index your list query needs.** For every list over a big
-table, the equality fields of its `WHERE` followed by its `ORDER BY`
-fields make the index. It is the same index SurrealDB wants for the
-same query, so the database's own reads get faster too.
-</Note>
-
-## Direct-ingest microbenchmarks
-
-The following older measurements begin at `POST /ingest` and bypass database
-write acknowledgement and changefeed transport. They report means of three
-runs from
-[`apps/benchmark/`](https://github.com/mono424/sp00ky/tree/main/apps/benchmark);
-raw samples are in
-[`results/`](https://github.com/mono424/sp00ky/tree/main/results).
-
-These smaller fixtures use different queries and verification probes. Their
-latency and per-view memory figures do not describe WhitePawn's joined,
-windowed workload or its full database-to-publication path.
-
-<Note>
-Single host: Apple M3 Max, 14 cores, 36 GiB RAM. SurrealDB v3 in a
-Docker container. Scheduler and SSP run as release binaries on
-loopback. Absolute numbers will shift in production; the deltas
-across rows of each chart are what reflect the engine.
-</Note>
-
-### A write reaches the view in ~3 ms
-
-From `POST /ingest` to the moment the SSP's in-memory view's content hash
-advances. Durable publication and client visibility are outside this
-measurement.
-
-<BenchChart
-  variant="bar"
-  title="End-to-end latency vs query shape (1k rows, ~1 KiB each)"
-  xLabel="query shape"
-  yLabel="latency (ms)"
-  labels={["plain", "1 subquery", "2 subqueries"]}
-  series={[
-    { label: "p50", values: [3.21, 3.91, 3.58] },
-    { label: "p95", values: [6.62, 7.56, 7.18] }
-  ]}
-  unit="ms"
-/>
-
-A flat `SELECT` propagates a write in 3.2 ms p50. Two levels of
-inlined subqueries add about 0.4 ms. p95 stays under 8 ms across all
-three shapes.
-
-### Byte volume at fixed row count
-
-Hold the row count fixed at 1,000 and grow each row from 110 bytes to
-2 MiB. The same kind of write event always propagates in roughly the
-same time.
+For example, a 1,000-row result changed in about 3 ms, while a 30,000-row result
+changed in about 27 ms in the flat-query fixture:
 
 <BenchChart
   variant="line"
-  title="End-to-end p50 vs DB size (1,000 rows, growing per-row size)"
-  xLabel="total DB size"
-  yLabel="latency (ms)"
-  labels={["100 KiB", "3 MiB", "30 MiB", "120 MiB", "250 MiB", "500 MiB", "1 GiB"]}
+  title="Older engine test: time to recompute an in-memory result"
+  xLabel="rows in the result"
+  yLabel="milliseconds"
+  labels={["1K", "5K", "10K", "20K", "30K"]}
+  xValues={[1000, 5000, 10000, 20000, 30000]}
   series={[
-    { label: "depth-1", values: [3.37, 3.40, 3.85, 3.87, 2.59, 2.21, 2.54] },
-    { label: "depth-3", values: [3.91, 3.72, 4.37, 4.24, 2.87, 2.44, 2.83] }
-  ]}
-  yMin={2}
-  yMax={5}
-  unit="ms"
-/>
-
-Across **four orders of magnitude** of total DB size, end-to-end p50
-hovers between 2.2 and 4.4 ms. The engine maintains views as in-memory
-deltas. These samples hold row count and query shape fixed; they do not
-measure cold index construction, large source payloads or publication backlog.
-
-### Row-count sweep
-
-Every event triggers a fresh content hash over the canary view's
-materialized records. That's `O(rows in view)`. So when row count
-grows, latency grows with it. Realistic short rows, ~1 KiB each:
-
-<BenchChart
-  variant="line"
-  title="End-to-end p50 vs row count (~1 KiB rows)"
-  xLabel="rows in DB"
-  yLabel="latency (ms)"
-  labels={["1k", "5k", "10k", "20k", "30k"]}
-  series={[
-    { label: "depth-1", values: [3.21, 5.92, 9.43, 16.84, 27.03] },
-    { label: "depth-3", values: [3.58, 6.77, 11.04, 20.50, 33.53] }
-  ]}
-  yMin={2}
-  unit="ms"
-/>
-
-Roughly **0.8 ms per added 1,000 rows** in the view's result set. A
-1,000-row view propagates in 3 ms. A 30,000-row view propagates in
-27 ms.
-
-In this fixture, the size of the materialized result affected latency more
-than source-record byte volume. This sweep does not establish a cost model for
-other query plans; WhitePawn's joined windows have their own operator and
-source-data costs.
-
-<Note>
-**Keep results bounded.** Smaller result sets reduce the data a live query
-must materialize and a client must consume. Measure the actual query shape and
-source table size when sizing a deployment.
-
-- Always include `LIMIT`.
-- Paginate on scroll. Revisiting a retained active window can avoid a new
-  registration; an evicted window needs registration again.
-- Scope by the viewer: `WHERE author = $auth.id`, `WHERE thread =
-  $current_thread_id`.
-
-The scheduler load-balances views across SSPs. Each SSP still holds its
-synced source tables, so adding SSPs spreads view computation but also
-replicates source memory and ingest work. Measure both before scaling out.
-
-The small-view fixture below measures up to 2,000 views on one SSP. That result
-does not establish capacity for other query shapes or multi-SSP deployments.
-</Note>
-
-### A single SSP holds thousands of small views
-
-The other side of the same coin: many small scoped queries are cheap.
-500-row DB, view count swept from 100 to 2,000.
-
-<BenchChart
-  variant="line"
-  title="End-to-end latency vs number of registered (small) views"
-  xLabel="registered views"
-  yLabel="latency (ms)"
-  labels={["100", "500", "1k", "2k"]}
-  series={[
-    { label: "ingest p50", values: [3.75, 2.72, 3.20, 3.70] },
-    { label: "ingest p95", values: [8.49, 7.22, 6.66, 7.36] }
+    { label: "Flat query", values: [3.21, 5.92, 9.43, 16.84, 27.03] },
+    { label: "Nested query", values: [3.58, 6.77, 11.04, 20.50, 33.53] }
   ]}
   unit="ms"
 />
 
-Latency is essentially flat at 2,000 active views. Memory grows
-linearly at ~16 KiB per added view: 22 MiB → 55 MiB across the sweep.
+Values are means of three per-run p50 measurements, rather than pooled
+percentiles. The [tracked aggregate](https://github.com/mono424/sp00ky/blob/main/results/aggregated.md)
+contains the source data for query shapes, row sizes, view counts and request
+rates. Those small fixtures do not establish capacity for arbitrary queries.
 
-If your application has 100 concurrent users each with ~20 live
-queries open (a list view, a detail panel, a few subscriptions), that
-is 2,000 views on one SSP, well inside the flat band. The
-architecture rewards "many small views" over "one big view".
+<CodeBlock code={legacyCode} lang="bash" />
 
-### 2,000 events/sec with sub-2 ms p50
+</details>
 
-Worker pool of 16 concurrent in-flight `POST /ingest` calls.
+export const listCode = `-- Index: collection first, then the field used to sort.
+DEFINE INDEX game_database_sort ON TABLE game FIELDS database, sort_index;
 
-<BenchChart
-  variant="line"
-  title="Accept latency vs target rate"
-  xLabel="target events/sec"
-  yLabel="latency (ms)"
-  labels={["100", "200", "500", "1k", "2k"]}
-  series={[
-    { label: "p50", values: [2.15, 1.83, 0.83, 0.47, 1.36] },
-    { label: "p95", values: [4.24, 4.14, 2.58, 5.62, 13.98] }
-  ]}
-  unit="ms"
-/>
+-- Read games 101 to 150 from one collection.
+SELECT id, date, result, eco, sort_index
+FROM game
+WHERE database = $database
+ORDER BY sort_index ASC, id ASC
+LIMIT 50 START 100;`;
 
-p50 stays under 2.5 ms across the whole range. Latency drops in the
-mid-band as the worker pool amortises overhead. The system stays well
-under the 100 ms threshold the suite checks against, even at 2k
-events/sec.
-
----
-
-### Verify on your own data
-
-The benchmark ships a verification probe that proves the SSP isn't
-running on a stub. On a 1 GiB DB:
-
-<CodeBlock
-  fileName="$ node apps/benchmark/dist/verify-bootstrap.js --rows 1000 --row-bytes 2000000"
-  lang="text"
-  code={`PASS seeded: 600 comments, 1144.5 MiB total
-PASS stack ready
-PASS registered canary: query="SELECT id FROM comment"
-PASS cache_size matches seed: cache_size=600
-PASS cache holds real comment IDs from seeded range
-PASS post-ingest reflects change: cache_size=601, includes new ID
-ALL CHECKS PASSED`}
-/>
-
-The probe seeds the DB, brings up the stack, registers a `SELECT id
-FROM comment` canary, then asserts the canary's cache size equals
-the seeded count, sampled cache entries are real comment IDs from
-the seeded range, and inserting a new comment grows the cache by
-exactly one with that exact ID present.
-
-### Reproduce
-
-```bash
-# Prerequisites: Docker + cargo build --release -p scheduler -p ssp-server
-pnpm -F @spooky-sync/benchmark build
-
-# Full sweep across both axes plus the secondary suites, 3 runs each.
-node apps/benchmark/dist/run-3x.js
-
-# Single point on the realistic-row axis:
-node apps/benchmark/dist/index.js subquery-depth \\
-  --rows 30000 --row-bytes 900 --ingest-events 30
-
-# Single point on the fat-row axis:
-node apps/benchmark/dist/index.js subquery-depth \\
-  --rows 1000 --row-bytes 2000000 --ingest-events 30
-
-# Verify the SSP is genuinely running on the seeded data:
-node apps/benchmark/dist/verify-bootstrap.js --rows 1000 --row-bytes 2000000
-```
-
-Each suite writes `summary.md`, `samples.json`, and `run.json` into
-`results/<suite>/`. The 3-run aggregate lives at `results/aggregated.md`.
-
-export const indexedListCode = `DEFINE INDEX game_list ON game FIELDS database, sort_index, date;
-
--- answered from the index, any LIMIT / START
-SELECT * FROM game WHERE database = $database
-  ORDER BY sort_index ASC, date DESC, id ASC LIMIT 50 START 100;`;
-
-export const whitepawnCode = `cargo build --release -p sp00ky-cli -p scheduler -p ssp-server
+export const whitepawnCode = `# Build the services and benchmark once.
+cargo build --release -p sp00ky-cli -p scheduler -p ssp-server
 docker pull surrealdb/surrealdb:v3.1.5
 pnpm -F @spooky-sync/benchmark build
-pnpm -F @spooky-sync/benchmark test
 
-# Two 10K cases, with two-second load phases.
+# Quick check: two 10,000-game cases.
 node apps/benchmark/dist/index.js whitepawn --smoke
 
-# Full load phases; higher tiers run only when capacity checks pass.
+# Larger datasets and full-length write phases.
 node apps/benchmark/dist/index.js whitepawn --profile standard
 node apps/benchmark/dist/index.js whitepawn --profile large`;
+
+export const legacyCode = `pnpm -F @spooky-sync/benchmark build
+node apps/benchmark/dist/run-3x.js
+node apps/benchmark/dist/verify-bootstrap.js --rows 1000 --row-bytes 2000000`;

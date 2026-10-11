@@ -1,9 +1,10 @@
 ---
-// Minimal SVG chart component for the performance docs page.
-// Two variants:
+// Minimal chart component for the performance docs page.
+// Three variants:
 //   variant="bar":  categorical bar chart (one bar per row)
 //   variant="line": connected line chart (numeric x axis)
-// Up to two series. Click a legend entry to toggle that series.
+//   variant="horizontal": responsive HTML bars with readable labels and values
+// Up to two series. SVG legends toggle series; horizontal labels are static.
 
 interface Series {
   label: string;
@@ -12,7 +13,7 @@ interface Series {
 }
 
 interface Props {
-  variant: "bar" | "line";
+  variant: "bar" | "line" | "horizontal";
   /** X-axis labels (one per data point). For line charts, also used as numeric tick labels. */
   labels: string[];
   /** Numeric x positions for line charts. Falls back to evenly spaced if omitted. */
@@ -73,6 +74,18 @@ const tickValues = Array.from(
 );
 
 const colors = ["#ffffff", "#a78bfa"]; // primary, soft purple
+const horizontalDataMax = Math.max(...allValues, 0);
+const horizontalMax = Math.max(yMaxProp ?? horizontalDataMax, horizontalDataMax) || 1;
+
+function horizontalValue(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) return "—";
+  return `${value.toFixed(2)}${unit.trim() ? ` ${unit.trim()}` : ""}`;
+}
+
+function horizontalWidth(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return (Math.max(0, value) / horizontalMax) * 100;
+}
 
 function yToPx(v: number): number {
   const range = niceMax - yMin;
@@ -106,6 +119,44 @@ function barX(catIdx: number, seriesIdx: number): { x: number; w: number } {
 }
 ---
 
+{variant === "horizontal" && (
+  <figure class="my-6 bench-horizontal">
+    <figcaption class="bench-horizontal-title">{title}</figcaption>
+    <div class="bench-horizontal-scale">
+      <span>{xLabel}</span>
+      <span>{yLabel} · 0–{horizontalValue(horizontalMax)}</span>
+    </div>
+    <ul class="bench-horizontal-groups" role="list">
+      {labels.map((label, categoryIndex) => (
+        <li class="bench-horizontal-group">
+          <p class="bench-horizontal-category">{label}</p>
+          <dl class="bench-horizontal-series">
+            {series.map((item, seriesIndex) => {
+              const color = item.color ?? colors[seriesIndex] ?? "#fff";
+              const value = item.values[categoryIndex];
+              return (
+                <div class="bench-horizontal-row">
+                  <dt class="bench-horizontal-label">
+                    <span class="bench-horizontal-dot" style={`background: ${color};`} aria-hidden="true" />
+                    {item.label}
+                  </dt>
+                  <dd class="bench-horizontal-measurement">
+                    <span class="bench-horizontal-value">{horizontalValue(value)}</span>
+                    <span class="bench-horizontal-track" aria-hidden="true">
+                      <span class="bench-horizontal-fill" style={`width: ${horizontalWidth(value)}%; background: ${color};`} />
+                    </span>
+                  </dd>
+                </div>
+              );
+            })}
+          </dl>
+        </li>
+      ))}
+    </ul>
+  </figure>
+)}
+
+{variant !== "horizontal" && (
 <figure class="my-6">
   <svg
     viewBox={`0 0 ${W} ${H}`}
@@ -324,6 +375,125 @@ function barX(catIdx: number, seriesIdx: number): { x: number; w: number } {
     {unit && ` (${unit.trim()})`}
   </figcaption>
 </figure>
+)}
+
+<style>
+  .bench-horizontal {
+    min-width: 0;
+    padding: 1.25rem;
+    border: 1px solid #27272a;
+    border-radius: 0.75rem;
+    background: #09090b;
+    color: #e4e4e7;
+  }
+
+  .bench-horizontal-title {
+    margin: 0;
+    color: #fafafa;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    line-height: 1.5;
+  }
+
+  .bench-horizontal-scale {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.25rem 1rem;
+    margin-top: 0.5rem;
+    color: #a1a1aa;
+    font-size: 0.75rem;
+    line-height: 1.5;
+  }
+
+  .bench-horizontal-groups {
+    display: grid;
+    gap: 1.25rem;
+    margin: 1.25rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .bench-horizontal-group {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+  }
+
+  .bench-horizontal-category {
+    margin: 0 0 0.625rem;
+    color: #fafafa;
+    font-size: 0.875rem;
+    font-weight: 600;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  .bench-horizontal-series {
+    display: grid;
+    gap: 0.75rem;
+    margin: 0;
+  }
+
+  .bench-horizontal-row {
+    position: relative;
+    min-width: 0;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+
+  .bench-horizontal-label {
+    margin: 0;
+    padding-right: 7rem;
+    color: #d4d4d8;
+    font-weight: 400;
+    overflow-wrap: anywhere;
+  }
+
+  .bench-horizontal-dot {
+    display: inline-block;
+    width: 0.4375rem;
+    height: 0.4375rem;
+    margin-right: 0.5rem;
+    border-radius: 50%;
+    vertical-align: 0.0625rem;
+  }
+
+  .bench-horizontal-measurement {
+    margin: 0;
+  }
+
+  .bench-horizontal-value {
+    position: absolute;
+    top: 0;
+    right: 0;
+    color: #f4f4f5;
+    font-family: ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .bench-horizontal-track {
+    display: block;
+    height: 0.5rem;
+    margin-top: 0.375rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #27272a;
+  }
+
+  .bench-horizontal-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+  }
+
+  @media (max-width: 480px) {
+    .bench-horizontal {
+      padding: 1rem;
+    }
+  }
+</style>
 
 <script>
   // Click (or Enter/Space) on a legend item toggles that series' visibility.

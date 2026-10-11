@@ -1,0 +1,229 @@
+**Dataset and startup**
+
+
+“Standard” and “large repeat” below identify two separate runs of the **same 100K
+compact case**. Their samples are not pooled. Both larger profiles remained
+incomplete because later tiers failed capacity preflight; the completed 100K
+cases passed final membership and version verification.
+
+| Case | Initial games | Serialized JSON bytes | Version metadata records | Result |
+| --- | ---: | ---: | ---: | --- |
+| 10K games | 10,000 | 3,208,416 | 10,276 | Passed |
+| 10K + moves | 10,000 | 15,201,465 | 10,276 | Passed |
+| 100K A | 100,000 | 31,897,150 | 100,276 | Passed |
+| 100K B | 100,000 | 31,897,150 | 100,276 | Passed |
+
+Serialized bytes sum the actual JSON fixture records, including players and
+collections; they are separate from database storage on disk. `_00_version`
+metadata also covers players and collections and is counted before mutations.
+The PGN payload averages about 1.2 KiB per game.
+
+Startup durations are single observations in seconds. Database readiness
+precedes seeding. Backend readiness starts after seeding and includes
+scheduler/SSP startup and the wait
+for an available SSP; it is separate from database and seed time. The individual
+process readiness measurements are included within that backend interval.
+
+| Case | Database ready | Seed | Scheduler ready | SSP ready | Backend ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10K games | 2.19 | 1.71 | 0.77 | 0.26 | 2.54 |
+| 10K + moves | 0.92 | 2.00 | 0.76 | 0.26 | 2.03 |
+| 100K A | 1.26 | 15.48 | 6.29 | 1.01 | 9.32 |
+| 100K B | 1.42 | 22.17 | 12.42 | 1.79 | 15.72 |
+
+**Window registration and mutation latency**
+
+All latency values are **p50 / p95 / p99 in milliseconds**, using nearest-rank
+percentiles. Registration response ends at the scheduler's HTTP response.
+Published readiness starts before that request and ends when committed root and
+child membership matches and record versions meet the required versions. It includes
+response time. Polls run every 10 ms plus database request time.
+
+Each case has 99 new scroll registrations and one retained-window hit across
+100 steps; the separate warmup is excluded here.
+
+| Case | New registrations | Registration response | Published readiness |
+| --- | ---: | ---: | ---: |
+| 10K games | 99 | 15.73 / 21.59 / 26.38 | 55.56 / 83.68 / 203.91 |
+| 10K + moves | 99 | 15.67 / 22.48 / 91.65 | 54.71 / 81.60 / 110.38 |
+| 100K A | 99 | 149.12 / 166.40 / 242.86 | 165.33 / 276.59 / 352.62 |
+| 100K B | 99 | 257.62 / 464.33 / 679.90 | 377.36 / 600.39 / 799.54 |
+
+Mutation probes run individually after the previous mutation has settled. Write
+acknowledgement ends at SurrealDB's transaction response. Published readiness
+starts before the write and includes that acknowledgement. Source queries used
+to construct expected results run outside the timed interval.
+
+| Case | Probes | Database acknowledgement | Published readiness |
+| --- | ---: | ---: | ---: |
+| 10K games | 14 | 2.32 / 6.08 / 6.08 | 61.07 / 77.65 / 77.65 |
+| 10K + moves | 14 | 2.29 / 5.46 / 5.46 | 58.96 / 79.62 / 79.62 |
+| 100K A | 140 | 3.09 / 5.45 / 7.84 | 62.91 / 146.99 / 150.40 |
+| 100K B | 140 | 4.71 / 12.61 / 35.08 | 145.04 / 214.51 / 285.02 |
+
+The full cases contain twenty probes per category; smoke contains two. No
+registration or mutation samples failed in these completed cases. The category
+breakdown below shows published readiness for the two 100K cases. With only
+fourteen smoke probes, both p95 and p99 select the maximum observed value;
+these short runs provide limited evidence about tail latency.
+
+| Mutation category | Standard: p50 / p95 / p99 ms | Large repeat: p50 / p95 / p99 ms |
+| --- | ---: | ---: |
+| Insert entering a window | 62.91 / 69.08 / 69.15 | 151.71 / 232.00 / 243.30 |
+| Projected-field update | 49.95 / 55.37 / 59.21 | 130.74 / 205.31 / 209.14 |
+| Sort-boundary change | 137.88 / 148.16 / 148.30 | 160.11 / 214.90 / 218.15 |
+| Collection-filter change | 140.88 / 146.09 / 147.34 | 146.73 / 229.12 / 285.02 |
+| Visible-row delete | 139.31 / 150.40 / 151.56 | 154.38 / 192.36 / 197.92 |
+| Joined player-name update | 47.86 / 59.48 / 59.50 | 135.42 / 211.20 / 319.46 |
+| Unrelated collection write | 41.51 / 55.12 / 57.17 | 124.77 / 195.73 / 209.18 |
+
+Unrelated collection writes measure publication to a separate one-row query,
+then verify that the main 50-row window remains unchanged. The unchanged-window
+check is outside the reported latency.
+
+**Write rate and catch-up**
+
+Full cases write 3,000 rows at a target of 50 rows/s for 60 seconds, then import
+30,000 rows at a target of 1,000 rows/s for 30 seconds. Imports use 100-row
+transactions with at most four in flight. Smoke runs each phase for two seconds,
+committing 100 and 2,000 rows respectively. All completed cases had zero failed
+load-phase rows.
+
+Throughput counts **committed source rows per write interval**. It does not
+establish the rate at which the SSP publishes them. After writes finish, the
+driver reads expected source windows, then times residual publication catch-up.
+The pipeline can drain while those source queries run, so the two durations
+below must be read together; residual catch-up alone is not total propagation
+delay.
+
+| Case | Steady rows/s | Import rows/s | Steady source check / residual catch-up (s) | Import source check / residual catch-up (s) |
+| --- | ---: | ---: | ---: | ---: |
+| 10K games | 49.97 | 999.52 | 0.68 / 0.05 | 0.73 / 24.38 |
+| 10K + moves | 50.01 | 999.45 | 0.75 / 0.05 | 0.77 / 24.88 |
+| 100K A | 50.00 | 999.98 | 4.39 / 0.16 | 4.28 / 7.48 |
+| 100K B | 50.00 | 999.98 | 2.82 / 1.65 | 2.66 / 5.47 |
+
+Write acknowledgement under load is shown separately below, in milliseconds.
+Steady samples each commit one row; import samples each commit 100 rows.
+
+| Case | Steady transactions | Steady ACK: p50 / p95 / p99 | Import transactions | Import ACK: p50 / p95 / p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 10K games | 100 | 2.70 / 4.50 / 5.14 | 20 | 18.76 / 34.10 / 35.12 |
+| 10K + moves | 100 | 3.05 / 6.50 / 11.25 | 20 | 23.49 / 30.42 / 38.51 |
+| 100K A | 3,000 | 3.37 / 11.04 / 22.37 | 300 | 35.31 / 93.42 / 240.20 |
+| 100K B | 3,000 | 5.67 / 23.43 / 48.58 | 300 | 24.02 / 35.40 / 44.09 |
+
+**Memory, CPU and storage**
+
+Scheduler/SSP process samples run every 250 ms; database container samples run
+roughly every five seconds plus request time. These are observed peaks over the
+whole case. CPU is the OS `ps` or Docker percentage: 100% represents one core,
+and a process can exceed it. Mean CPU averages those observations and is not a
+per-request CPU cost.
+
+| Case | Process | Samples | Peak RSS / container memory | Mean / peak CPU % |
+| --- | --- | ---: | ---: | ---: |
+| 10K games | Scheduler | 183 | 406.77 MiB | 5.69 / 96.00 |
+| 10K games | SSP | 180 | 193.19 MiB | 12.12 / 87.60 |
+| 10K games | Database | 10 | 646.70 MiB | 87.44 / 110.64 |
+| 10K + moves | Scheduler | 183 | 594.86 MiB | 5.03 / 87.60 |
+| 10K + moves | SSP | 180 | 199.53 MiB | 12.42 / 85.30 |
+| 10K + moves | Database | 10 | 771.70 MiB | 85.23 / 107.02 |
+| 100K A | Scheduler | 730 | 1.13 GiB | 9.39 / 118.70 |
+| 100K A | SSP | 706 | 774.78 MiB | 33.80 / 100.00 |
+| 100K A | Database | 43 | 1.24 GiB | 70.80 / 138.35 |
+| 100K B | Scheduler | 823 | 1.07 GiB | 7.94 / 118.00 |
+| 100K B | SSP | 777 | 771.84 MiB | 29.46 / 100.00 |
+| 100K B | Database | 49 | 1.32 GiB | 80.28 / 212.23 |
+
+The combined database, scheduler and SSP work directory occupied 355.20 MiB
+for 10K compact, 363.82 MiB for 10K PGN, 941.75 MiB for 100K standard and
+940.91 MiB for the 100K repeat. Serialized fixture bytes above do not include
+indexes, changefeeds, replica state or other platform storage.
+
+**Replica and publication backlog**
+
+Scheduler telemetry runs every second; SSP information is sampled roughly every
+five seconds. Peak values below can come from different observations. The last
+sample can precede final verification, and successful window verification does
+not prove every queue is empty.
+
+| Case | Scheduler samples | Peak / last pending events | Peak / last sequence lag |
+| --- | ---: | ---: | ---: |
+| 10K games | 35 | 12,390 / 12,390 | 12,390 / 12,390 |
+| 10K + moves | 35 | 12,390 / 12,390 | 12,390 / 12,390 |
+| 100K A | 149 | 22,444 / 0 | 26,533 / 0 |
+| 100K B | 166 | 16,945 / 0 | 18,945 / 0 |
+
+| Case | SSP observations | Peak publication batches / operations | Peak publication bytes | Oldest pending age (s) | Overloads observed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 10K games | 6 | 957 / 98,096 | 12.05 MiB | 12.72 | 25 |
+| 10K + moves | 6 | 957 / 98,099 | 12.05 MiB | 13.13 | 24 |
+| 100K A | 22 | 957 / 98,098 | 12.05 MiB | 13.66 | 17 |
+| 100K B | 29 | 938 / 96,158 | 11.82 MiB | 8.47 | 21 |
+
+No scheduler sampling errors or parked publication batches were observed. All
+four cases verified the exact nineteen retained registrations at completion,
+with a maximum of twenty during scrolling.
+
+**Graph sharing and memory attribution**
+
+With view sharing enabled, adding the identical subscriber kept graph count at
+**17** and increased merged followers from **0 to 1** in every case. A follower
+shares another registration's computation; the graph owner is excluded from the
+follower count. After import, the smoke cases retained sharing, while both 100K
+cases had nineteen independent graphs and zero merged followers. Later memory
+observations include that change in graph sharing.
+
+Expensive memory attribution runs between measured phases. These heap ownership
+estimates are separate from process RSS:
+
+| Case, after import | Shared store | Query/operator state | Total estimate | Graphs / merged followers |
+| --- | ---: | ---: | ---: | ---: |
+| 10K games | 6.32 MiB | 46.24 MiB | 52.55 MiB | 18 / 1 |
+| 10K + moves | 22.62 MiB | 46.24 MiB | 68.86 MiB | 18 / 1 |
+| 100K A | 99.83 MiB | 492.72 MiB | 592.55 MiB | 19 / 0 |
+| 100K B | 99.83 MiB | 492.72 MiB | 592.55 MiB | 19 / 0 |
+
+**Resource-limited tiers**
+
+In these reports, neither 1M case nor the 10M case ran. The standard run excluded
+1M compact on projected host memory and 1M PGN on projected disk, host memory
+and Docker memory. The large run excluded all three larger cases on those
+three checks. Both commands exited nonzero, retaining their completed 100K
+results.
+
+The following are **capacity projections from the large run**, not measured
+consumption or minimum hardware requirements. They scale the completed compact
+case by populated rows, including the 33,000 load inserts, with a 1.25× margin.
+PGN projections also include payload allowances.
+
+| Unrun case | Projected work-directory disk | Projected scheduler + SSP RSS | Projected database memory | Status |
+| --- | ---: | ---: | ---: | --- |
+| 1M compact | 8.92 GiB | 17.74 GiB | 12.86 GiB | Resource-limited |
+| 1M PGN | 12.86 GiB | 19.18 GiB | 13.59 GiB | Resource-limited |
+| 10M compact | 86.64 GiB | 172.30 GiB | 124.94 GiB | Resource-limited |
+
+Capacity checks reserve 5 GiB free disk and cap projected native plus database
+memory at 80% of host RAM, with database memory additionally capped at 80% of
+Docker RAM. The native projection sums individual process peaks, which need
+not occur simultaneously. There are no measured latency or throughput results
+for these excluded tiers.
+
+
+**Report provenance**
+
+The main page calls the standard 100K case **A** and the large-profile repeat
+**B**. Both have the same initial dataset. Numbers come from these local report
+directories under `apps/benchmark/results/`:
+
+| Profile | Directory |
+| --- | --- |
+| Smoke | `whitepawn-2026-10-11T19-09-13-673Z` |
+| Standard | `whitepawn-2026-10-11T19-16-45-049Z` |
+| Large | `whitepawn-2026-10-11T19-21-12-522Z` |
+
+Raw directories are local outputs and are not published with this site. Each
+contains `run.json`, `samples.json`, `summary.md` and failure logs when applicable.
+The recorded checkout base was `83273b8c`, with benchmark changes in the working
+tree. The benchmark adds no arbitrary latency pass/fail budget.

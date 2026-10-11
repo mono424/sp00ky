@@ -752,15 +752,24 @@ use before it takes traffic.</p>
 <p>Restored active views now prewarm the indexes their plans select before the
 SSP reports Ready. Schema changes prewarm replacement indexes before evaluating
 replacement graphs, including a changed definition under the same index name.
-Live registration prewarms under a circuit reader and rechecks the registration
-identity and merge owner under the writer before installing a graph. A first-ever
-index still costs a pass over its table and blocks ingest writers while building;
-prewarming shifts this cost out of snapshot evaluation, rather than removing it.
-Registration metrics report this work separately as <code>index_build_ms</code>,
-<code>indexes_built</code> and <code>rows_indexed</code>.</p>
+Live registration rechecks the registration identity and merge owner under the
+writer before installing a graph. A first-ever index still costs a pass over its
+table, but live registration builds it in steps of about 25 ms, each under a
+circuit reader, and lets go of the circuit in between: writes and other
+registrations land between two steps instead of waiting for the whole pass.
+Writes that land mid-build keep the half-built index correct, and nothing reads
+an index before it is complete. On 1M rows with a PGN-sized body each, the
+longest the build holds the circuit went from 0.88 s (one pass) to 74 ms (the
+first step, which lists the table’s ids); the build itself takes about twice
+as long in all. Registration metrics report this work separately as
+<code>index_build_ms</code>, <code>indexes_built</code> and <code>rows_indexed</code>.</p>
 <p>Rust embedders can call <code>Circuit::prewarm_query_indexes(&amp;plan, params)</code> for a
 selected plan, <code>Circuit::prewarm_active_indexes()</code> for registered graphs, or
-<code>Collection::prewarm_index(&amp;definition)</code> for one index. Each returns
+<code>Collection::prewarm_index(&amp;definition)</code> for one index, each in one pass.
+<code>Circuit::prewarm_query_indexes_step(&amp;plan, params, budget)</code> and
+<code>Collection::build_index_step(&amp;definition, budget)</code> do the same work in
+steps of about <code>budget</code>, for a host that releases its circuit lock between
+steps; they return whether the index is complete alongside the work done. Each returns
 <code>IndexBuildStats</code> (<code>indexes_built</code>, <code>rows_indexed</code>, <code>index_build_ms</code>); already built
 indexes return zero work. <code>Circuit::set_table_meta_timed</code> applies schema changes
 and returns the same statistics. Timed registration exposes index build fields

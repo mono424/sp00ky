@@ -152,6 +152,16 @@ export interface LocalStore extends LocalCacheEngine {
    */
   scanVersions?(tables: string[]): Promise<Record<string, [string, number][]>>;
   /**
+   * Reset the cached `_00_rv` of every table whose column set (`fingerprints`,
+   * see `columnFingerprints`) changed since the store last recorded it, except
+   * the rows in `keep`, and record the new sets. Returns the tables reset.
+   * For engines that keep bodies across schema changes: a body landed under an
+   * older schema lacks the columns it did not know, at the server's version,
+   * and would never be fetched again. OPTIONAL: an engine that rebuilds its
+   * store on a schema change (SurrealDB) does not need it.
+   */
+  resetChangedTables?(fingerprints: Record<string, string>, keep: Set<string>): Promise<string[]>;
+  /**
    * Circuit snapshot storage, keyed. Lives in the same durable store as the
    * rows (OPFS SQLite), so it is per-bucket by construction, atomic, and
    * readable by follower tabs over the port transport. OPTIONAL: an engine

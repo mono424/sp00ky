@@ -87,6 +87,10 @@ export interface CircuitPrimeContext {
   /** Encoded ids with an unsettled local mutation (their `_00_rv` was bumped
    *  locally and may exceed the server's next version). */
   pendingIds: Set<string>;
+  /** Each table's client column set (`columnFingerprints`). An engine that
+   *  keeps bodies across schema changes resets the versions of a table whose
+   *  set changed before they are read, so its rows are fetched again whole. */
+  columnFingerprints?: Record<string, string>;
   /** Receives every `(id, rv)` the prime put into the circuit, per table, so
    *  the sync layer can skip re-downloading bodies it already has. */
   onVersions?: (table: string, entries: [string, number][]) => void;
@@ -506,6 +510,26 @@ export class StreamProcessorService {
     const alive = () =>
       this.processor === processor && generation === this.stateGeneration && epoch === this.db.epoch;
     const t0 = performance.now();
+
+    // Before anything reads a version: a table whose columns changed since its
+    // bodies were cached reads as stale from here on (see sqlite-column-reset).
+    if (ctx.columnFingerprints && typeof this.db.resetChangedTables === 'function') {
+      try {
+        const reset = await this.db.resetChangedTables(ctx.columnFingerprints, ctx.pendingIds);
+        if (!alive()) return;
+        if (reset.length > 0) {
+          this.logger.info(
+            { tables: reset, Category: 'sp00ky-client::StreamProcessorService::primeFromLocal' },
+            'Columns changed since these rows were cached; they will be fetched again'
+          );
+        }
+      } catch (e) {
+        this.logger.warn(
+          { error: e, Category: 'sp00ky-client::StreamProcessorService::primeFromLocal' },
+          'Column change check failed; cached versions kept'
+        );
+      }
+    }
 
     let restored = false;
     if (

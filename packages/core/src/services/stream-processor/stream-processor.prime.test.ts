@@ -106,6 +106,42 @@ describe('StreamProcessorService.primeFromLocal', () => {
     await expect(service.whenPrimed()).resolves.toBeUndefined();
   });
 
+  it('resets tables whose columns changed BEFORE reading the versions it reports', async () => {
+    const { service, db } = makeService();
+    const order: string[] = [];
+    // The engine zeroes `thing`'s cached versions (a column was added).
+    const reset = vi.fn(async () => {
+      order.push('reset');
+      db.scanVersions.mockImplementation(async (tables: string[]) => {
+        order.push('scan');
+        return Object.fromEntries(tables.map((t) => [t, t === 'thing' ? [['thing:a', 0], ['thing:b', 0]] : [['other:x', 5]]]));
+      });
+      return ['thing'];
+    });
+    (db as any).resetChangedTables = reset;
+    await service.init();
+    const c = { ...ctx(), pendingIds: new Set(['thing:b']), columnFingerprints: { thing: 'layout,title', other: 'title' } };
+    await service.primeFromLocal(c);
+    expect(reset).toHaveBeenCalledWith({ thing: 'layout,title', other: 'title' }, new Set(['thing:b']));
+    expect(order).toEqual(['reset', 'scan']);
+    // Reported as stale, so the fetch plan pulls the bodies again.
+    expect(c.onVersions).toHaveBeenCalledWith('thing', [['thing:a', 0]]);
+  });
+
+  it('keeps priming when the column check fails', async () => {
+    const { service, db } = makeService();
+    (db as any).resetChangedTables = vi.fn(async () => {
+      throw new Error('worker gone');
+    });
+    await service.init();
+    const c = { ...ctx(), columnFingerprints: { thing: 'title' } };
+    await service.primeFromLocal(c);
+    expect(c.onVersions).toHaveBeenCalledWith('thing', [
+      ['thing:a', 1],
+      ['thing:b', 2],
+    ]);
+  });
+
   it('with a snapshot, restores it under the registered views and only fetches what reconcile asks for', async () => {
     const { service, db, received } = makeService({ snapshot: { bytes: new Uint8Array([7]), meta: goodMeta } });
     await service.init();

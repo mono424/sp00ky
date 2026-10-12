@@ -4,14 +4,16 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info};
 
 use crate::db::{connect_http, DbConfig};
 use crate::host::MaintenanceHost;
-use crate::s3::{ensure_bucket, BackupConfig};
+use crate::s3::{ensure_bucket, upload_file, BackupConfig};
 
 /// Max finished (Completed/Failed) jobs to retain in the registry.
 const RECENT_JOB_LIMIT: usize = 50;
@@ -253,35 +255,50 @@ async fn execute_backup(
     //    Note: SurrealDB's native export does NOT include bucket file contents;
     //    only the `DEFINE BUCKET` statements. Backing up bucket-backed files
     //    requires a separate copy step from the bucket's backing store.
-    let tmp = tempfile::NamedTempFile::new().context("Failed to create tempfile for export")?;
-    let tmp_path = tmp.path().to_path_buf();
+    let export = tempfile::NamedTempFile::new().context("Failed to create tempfile for export")?;
 
     let remote = connect_http(db_config)
         .await
         .context("Failed to connect to main SurrealDB for backup export")?;
     remote
-        .export(&tmp_path)
+        .export(export.path())
         .await
         .context("Failed to export main SurrealDB")?;
 
-    // 3. Read & gzip.
-    let raw = std::fs::read(&tmp_path).context("Failed to read exported file")?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&raw).context("Failed to gzip export")?;
-    let compressed = encoder.finish().context("Failed to finalize gzip")?;
-    let size_bytes = compressed.len() as u64;
+    // 3. Gzip file to file. A large project's export is several GB, more than
+    //    the host's memory limit, so it must never be read into RAM whole.
+    let gz = tempfile::NamedTempFile::new().context("Failed to create tempfile for gzip")?;
+    let (src, dst) = (export.path().to_path_buf(), gz.path().to_path_buf());
+    tokio::task::spawn_blocking(move || gzip_file(&src, &dst))
+        .await
+        .context("Gzip task panicked")??;
+    drop(export); // free the larger file's disk before the upload
+    let size_bytes = gz
+        .as_file()
+        .metadata()
+        .context("Failed to stat gzipped export")?
+        .len();
 
-    // 4. Upload to S3.
+    // 4. Upload to S3, one part at a time.
     ensure_bucket(config).await;
     let bucket = config.get_bucket().context("Failed to build S3 bucket client")?;
     let storage_path = format!("{}/{}.surql.gz", job.project_slug, job.backup_id);
-    let resp = bucket
-        .put_object(&storage_path, &compressed)
+    upload_file(&bucket, gz.path(), &storage_path)
         .await
         .context("Failed to upload backup to S3")?;
-    if resp.status_code() != 200 {
-        anyhow::bail!("S3 upload returned status {}", resp.status_code());
-    }
 
     Ok((size_bytes, snapshot_seq, storage_path))
+}
+
+fn gzip_file(src: &Path, dst: &Path) -> Result<()> {
+    let mut input = File::open(src).context("Failed to open exported file")?;
+    let output = File::create(dst).context("Failed to create gzip file")?;
+    let mut encoder = GzEncoder::new(BufWriter::new(output), Compression::default());
+    std::io::copy(&mut input, &mut encoder).context("Failed to gzip export")?;
+    encoder
+        .finish()
+        .context("Failed to finalize gzip")?
+        .flush()
+        .context("Failed to write gzip file")?;
+    Ok(())
 }

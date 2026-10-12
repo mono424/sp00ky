@@ -3,8 +3,10 @@ use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info};
 
@@ -301,30 +303,42 @@ async fn execute_restore(
     let bucket = s3_config
         .get_bucket()
         .context("Failed to build S3 bucket client")?;
-    let storage_path: &str = job.storage_path.as_str();
-    let resp = bucket
-        .get_object(storage_path)
-        .await
-        .with_context(|| format!("Failed to download {} from S3", job.storage_path))?;
-    if resp.status_code() != 200 {
-        anyhow::bail!(
-            "S3 download returned status {} for {}",
-            resp.status_code(),
-            job.storage_path
-        );
+    //    Streamed to disk: a large project's dump does not fit in the host's
+    //    memory limit, packed or unpacked.
+    let gz = tempfile::NamedTempFile::new().context("Failed to create tempfile for download")?;
+    {
+        let mut file = tokio::fs::File::create(gz.path())
+            .await
+            .context("Failed to open download tempfile")?;
+        let status = bucket
+            .get_object_to_writer(job.storage_path.as_str(), &mut file)
+            .await
+            .with_context(|| format!("Failed to download {} from S3", job.storage_path))?;
+        if status != 200 {
+            anyhow::bail!(
+                "S3 download returned status {} for {}",
+                status,
+                job.storage_path
+            );
+        }
+        file.flush().await.context("Failed to write download tempfile")?;
     }
 
-    // 2. Gunzip to a tempfile.
+    // 2. Gunzip file to file.
     let tmp = tempfile::NamedTempFile::new().context("Failed to create tempfile for dump")?;
-    {
-        let compressed: Vec<u8> = resp.bytes().to_vec();
-        let mut decoder = GzDecoder::new(std::io::Cursor::new(compressed));
-        let mut raw = Vec::new();
-        decoder
-            .read_to_end(&mut raw)
-            .context("Failed to decompress S3 artifact")?;
-        std::fs::write(tmp.path(), &raw).context("Failed to write dump tempfile")?;
-    }
+    let (src, dst) = (gz.path().to_path_buf(), tmp.path().to_path_buf());
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let input = File::open(&src).context("Failed to open downloaded dump")?;
+        let mut decoder = GzDecoder::new(BufReader::new(input));
+        let mut output =
+            BufWriter::new(File::create(&dst).context("Failed to create dump tempfile")?);
+        std::io::copy(&mut decoder, &mut output).context("Failed to decompress S3 artifact")?;
+        output.flush().context("Failed to write dump tempfile")?;
+        Ok(())
+    })
+    .await
+    .context("Gunzip task panicked")??;
+    drop(gz);
     let dump_path = tmp.path().to_path_buf();
 
     // 3. Serialize with the backup worker — only one DB-mutating op at a time.

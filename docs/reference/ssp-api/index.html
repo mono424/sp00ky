@@ -109,7 +109,8 @@ in its registration. A missing or zero capability keeps single-record delivery.<
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ttl&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;30s&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;params&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;lastActiveAt&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;2024-01-01T00:00:00Z&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
-<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;format&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;format&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ownerHash&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&quot;</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
 <p><strong>Fields:</strong></p>
 <ul>
@@ -120,12 +121,30 @@ in its registration. A missing or zero capability keeps single-record delivery.<
 <li><code>params</code> (object, optional) - Query parameters</li>
 <li><code>lastActiveAt</code> (string, optional) - ISO 8601 timestamp of last activity</li>
 <li><code>format</code> (string, optional) - Response format</li>
+<li><code>ownerHash</code> (string, optional) - <code>sha256</code> of the registering page’s owner
+secret, computed by <code>fn::query::register</code> from the client’s <code>$config.owner</code>
+(<code>&quot;&quot;</code> when the client sent none). Checked only for anonymous views, see
+<code>409 owner_mismatch</code> below.</li>
 </ul>
 <p><strong>Response:</strong></p>
 <ul>
 <li><code>200 OK</code> - View registered, initial results returned</li>
 <li><code>400 Bad Request</code> - Invalid view registration payload</li>
 <li><code>401 Unauthorized</code> - Missing or invalid authentication</li>
+<li><code>409 Conflict</code> - The id belongs to someone else, and nothing was written:
+<ul>
+<li><code>auth_mismatch</code>: the view is registered under another identity.</li>
+<li><code>owner_mismatch</code>: the view is anonymous (<code>auth_id = &#39;anon&#39;</code>) and its
+<code>_00_query</code> row holds an <code>ownerHash</code> this request does not match. Every
+signed-out visitor shares the identity <code>anon</code> and anonymous view ids are
+readable on <code>_00_list_ref_anon</code>, so the id alone proves nothing; without
+this a guest could join another guest’s view and then delete it. The
+first registration that brings a hash stores it; a row without one (an
+older client) stays joinable. Refused on the cold path too (the view was
+lost but its row was not), where the view built for the request is rolled
+back.</li>
+</ul>
+</li>
 <li><code>403 Forbidden</code> - The query’s shape is not in the query allowlist and
 <code>SPKY_SSP_QUERY_ALLOWLIST=enforce</code>. Body:
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="json"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">{</span></span>
@@ -149,7 +168,9 @@ written <code>state = &#39;materializing&#39;</code> and its edges go to the edg
 batch that commits those <code>_00_list_ref</code> edges also sets <code>state = &#39;ready&#39;</code>, in
 the same transaction, and first deletes any edges the row already had (a full
 publish replaces, never duplicates). A view with no rows is written
-<code>state = &#39;ready&#39;</code> at once. Clients read <code>state</code> next to the edges: <code>ready</code> with
+<code>state = &#39;ready&#39;</code> at once. An anonymous view also gets <code>ownerHash</code> (hidden from
+and frozen for every record user by its field permissions). Clients read
+<code>state</code> next to the edges: <code>ready</code> with
 <code>rowCount 0</code> is a real empty result, <code>materializing</code> is a publish in flight,
 and a missing row means the SSP no longer has the view (they keep their rows
 and re-register). Re-registering a view the SSP already holds only refreshes

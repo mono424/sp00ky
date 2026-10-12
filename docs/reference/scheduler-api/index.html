@@ -159,7 +159,8 @@ object ids). The SSP then lists the whole table.</li>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ttl&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;30s&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;params&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
 <span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;lastActiveAt&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;2024-01-01T00:00:00Z&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
-<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;format&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;format&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#005CC5;--shiki-dark:#79B8FF">null</span><span style="color:#24292E;--shiki-dark:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#005CC5;--shiki-dark:#79B8FF">  &quot;ownerHash&quot;</span><span style="color:#24292E;--shiki-dark:#E1E4E8">: </span><span style="color:#032F62;--shiki-dark:#9ECBFF">&quot;9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&quot;</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre>
 <p><strong>Fields:</strong></p>
 <ul>
@@ -170,6 +171,9 @@ object ids). The SSP then lists the whole table.</li>
 <li><code>params</code> (object, optional) - Query parameters</li>
 <li><code>lastActiveAt</code> (string, optional) - ISO 8601 timestamp of last activity</li>
 <li><code>format</code> (string, optional) - Response format</li>
+<li><code>ownerHash</code> (string, optional) - Proof of ownership for an anonymous view,
+relayed to the SSP and its standbys unchanged. See the SSP’s
+<a href="/docs/reference/ssp-api#post-viewregister"><code>POST /view/register</code></a>.</li>
 </ul>
 <p><strong>Response:</strong></p>
 <ul>
@@ -182,9 +186,11 @@ object ids). The SSP then lists the whole table.</li>
 </li>
 <li><code>400 Bad Request</code> - The SSP rejected the payload (<code>rejected</code>); relayed verbatim</li>
 <li><code>403 Forbidden</code> - The SSP refused the shape under the query allowlist (<code>not_allowlisted</code>); relayed verbatim</li>
-<li><code>409 Conflict</code> - The SSP found the view registered under another identity (<code>auth_mismatch</code>); relayed verbatim</li>
+<li><code>409 Conflict</code> - The SSP found the view registered under another identity (<code>auth_mismatch</code>), or the view is anonymous and the request does not carry its owner’s hash (<code>owner_mismatch</code>); relayed verbatim</li>
 <li><code>503 Service Unavailable</code> - No SSPs available</li>
 </ul>
+<p>A 4xx from the SSP that already holds the view leaves its assignment as it was:
+someone else’s refused registration of a live view does not move or orphan it.</p>
 <p>The SSP’s own verdict is relayed with its status: a 4xx is the client’s problem and reaches it as
 such, not folded into a 500 that reads as an outage. The body is the SSP’s
 <code>{&quot;error&quot;: &quot;...&quot;, &quot;message&quot;: &quot;...&quot;}</code> unchanged. See the SSP’s

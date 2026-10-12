@@ -555,6 +555,11 @@ snapshot still boots, from its rows, and gets one on the next checkpoint.</p>
 <p>To have a screen’s first frame already hold its rows, keep that query open
 from startup (subscribe once, share the latest rows) rather than subscribing
 when the screen mounts.</p>
+<p>Once connected, the client registers its queries with the server concurrently:
+remote reads (registrations, membership reads, row fetches, <code>queryRemote</code>)
+share a pool of <code>DatabaseConfig.maxConcurrentQueries</code> requests on the one
+socket, default 6. Writes from the outbox go one at a time, in order, in a lane
+of their own, so a pending write never waits behind a startup’s registrations.</p>
 <h2 id="push-notifications">Push notifications</h2>
 <p>The <code>spooky_push</code> plugin adds native push: APNs on iOS, FCM on Android, from the
 same <code>push:</code> rules as the web, with no Firebase setup in the app. <code>db.push</code> in

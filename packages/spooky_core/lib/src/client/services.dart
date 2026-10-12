@@ -132,6 +132,11 @@ class RemoteAdapter implements RemotePort {
       _remote.queryStatements(sql, vars);
 
   @override
+  Future<List<StatementResult>> writeStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _remote.writeStatements(sql, vars);
+
+  @override
   Future<String> live(String table,
       void Function(List<String>, List<InlineRow>?) onChange) async {
     // `FETCH out` resolves the edge's target into the notification, so the body

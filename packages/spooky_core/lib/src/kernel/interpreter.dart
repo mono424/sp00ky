@@ -27,7 +27,13 @@ abstract interface class LocalPort {
 
 abstract interface class RemotePort {
   /// Per-statement outcomes, in order. Never throws for a failed statement.
+  /// Reads overlap one another.
   Future<List<StatementResult>> queryStatements(String sql,
+      [Map<String, dynamic>? vars]);
+
+  /// [queryStatements] for a write: starts once every earlier write has
+  /// settled, so writes reach the server one at a time, in issue order.
+  Future<List<StatementResult>> writeStatements(String sql,
       [Map<String, dynamic>? vars]);
 
   /// Subscribe to `LIVE SELECT * FROM <table>`; the callback receives the
@@ -157,8 +163,10 @@ class Interpreter implements Ctx {
         return null as R;
       case LocalEpoch():
         return _adapters.local.epoch as R;
-      case RemoteQuery(:final sql, :final vars, :final timeoutMs):
-        final pending = _adapters.remote.queryStatements(sql, vars);
+      case RemoteQuery(:final sql, :final vars, :final timeoutMs, :final write):
+        final pending = write
+            ? _adapters.remote.writeStatements(sql, vars)
+            : _adapters.remote.queryStatements(sql, vars);
         if (timeoutMs == null) return await pending as R;
         return await pending.timeout(
           Duration(milliseconds: timeoutMs),

@@ -59,6 +59,8 @@ void main() {
       );
       final sent = out.ofKind('remote.query').single as RemoteQuery;
       expect(sent.sql.split(';\n'), hasLength(2));
+      expect(sent.write, isTrue,
+          reason: 'a push must never overlap another on the socket');
       expect(out.state.outbox.map((i) => i.status),
           everyElement(OutboxStatus.acked));
       expect(out.ofKind('local.tx'), hasLength(2));

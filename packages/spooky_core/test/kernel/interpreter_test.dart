@@ -64,6 +64,20 @@ void main() {
         throwsA(isA<Exception>()));
   });
 
+  test('a write takes the write lane, a read the shared pool', () async {
+    final calls = <String>[];
+    final fakes = FakeAdapters(
+      remote: FakeRemotePort((kind, args) => calls.add('$kind ${args.first}')),
+    );
+    final ctx = Interpreter(fakes.build(), FakeHost());
+    await ctx(Fx.remoteWrite('UPDATE thing:1 MERGE {}'));
+    await ctx(Fx.remoteQuery('SELECT * FROM thing'));
+    expect(calls, [
+      'remote.write UPDATE thing:1 MERGE {}',
+      'remote.query SELECT * FROM thing',
+    ]);
+  });
+
   test('a live subscription dispatches its changes as events', () async {
     final fakes = FakeAdapters();
     final host = FakeHost();

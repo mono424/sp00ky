@@ -89,10 +89,10 @@ The defaults need no configuration, but they're tunable:
 <CodeBlock code={reconnectConfigCode} lang="typescript" />
 
 <Note>
-  `queryTimeoutMs` matters more than it looks. Remote queries are serialized, so a single request
-  that never settles would otherwise block every later one — including the health probe, leaving the
-  client wedged while still reporting `healthy`. The deadline turns that into an ordinary network
-  failure that gets retried.
+  `queryTimeoutMs` matters more than it looks. Remote queries share a small pool of slots, so a few
+  requests that never settle would otherwise hold every slot and block every later request, including
+  the health probe, leaving the client wedged while still reporting `healthy`. The deadline turns that
+  into an ordinary network failure that gets retried.
 </Note>
 
 <Note>

@@ -34,6 +34,7 @@ class DatabaseConfig {
     this.store = StoreType.memory,
     this.localDbPath,
     this.token,
+    this.maxConcurrentQueries = 6,
   });
 
   final String? endpoint;
@@ -47,6 +48,12 @@ class DatabaseConfig {
   final String? localDbPath;
 
   final String? token;
+
+  /// Remote reads in flight at once: view registrations, membership reads,
+  /// body fetches, probes and `queryRemote`. The socket multiplexes them by
+  /// request id. Writes (the outbox push) run in a lane of their own, one at a
+  /// time. The default matches the TS client's remote service.
+  final int maxConcurrentQueries;
 }
 
 /// Configuration for the Sp00ky client (TS `Sp00kyConfig`).

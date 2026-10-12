@@ -188,7 +188,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
       _supervisor = ConnectionSupervisor(
         reconnect: remote.connect,
         probe: () async {
-          await remote.query('RETURN true');
+          await remote.probe();
           if (auth.needsVerification) {
             try {
               await auth.check();
@@ -795,6 +795,11 @@ class _StreamUpdateBridge implements StreamUpdateReceiver {
 class _OfflineRemote implements RemotePort {
   @override
   Future<List<StatementResult>> queryStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      Future.error(StateError('No remote endpoint is configured'));
+
+  @override
+  Future<List<StatementResult>> writeStatements(String sql,
           [Map<String, dynamic>? vars]) =>
       Future.error(StateError('No remote endpoint is configured'));
 

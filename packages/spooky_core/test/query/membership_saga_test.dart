@@ -441,7 +441,7 @@ void main() {
           'remote.query': (e, __) {
             calls++;
             final sql = (e as RemoteQuery).sql;
-            if (sql.contains('in IN \$ins')) {
+            if (sql.contains('\$ins->')) {
               // `b`'s `_00_query` row did not come back: suspect.
               return [
                 StatementResult.ok([

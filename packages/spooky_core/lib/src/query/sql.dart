@@ -45,20 +45,25 @@ RecordVersionArray decodeViewIds(Object? raw) {
 
 // ---- remote reads -----------------------------------------------------------
 
+/// A query's primary window edges, read through the graph (`$in->table`). The
+/// `_00_list_ref*` tables have no index on `in`, so `WHERE in = $in` scanned
+/// the whole table, which on the shared `_00_list_ref_anon` is every signed-out
+/// visitor's edges. The edge table's select permission still applies.
 String listRefSelect(String table) =>
-    'SELECT out, version FROM $table WHERE in = \$in AND parent IS NONE';
+    'SELECT out, version FROM \$in->$table WHERE parent IS NONE';
 
 /// A `.related()` query's SUBQUERY child edges. The SSP tags each matched child
 /// edge with `parent`/`parent_rel` at any nesting depth, so `parent IS NOT NONE`
 /// is exactly the complement of [listRefSelect]'s primary window.
 String subqueryListRefSelect(String table) =>
-    'SELECT out, version FROM $table WHERE in = \$in AND parent IS NOT NONE';
+    'SELECT out, version FROM \$in->$table WHERE parent IS NOT NONE';
 
 String queryRowCountSelect() =>
     'SELECT VALUE { rowCount: rowCount, state: state } FROM ONLY \$in';
 
+/// Every edge of many queries in one flat list; `in` names the query.
 String listRefBatchSelect(String table) =>
-    'SELECT in, out, version, parent FROM $table WHERE in IN \$ins';
+    'SELECT in, out, version, parent FROM \$ins->$table';
 
 String queryRowCountBatchSelect() =>
     'SELECT VALUE { id: id, rowCount: rowCount, state: state } FROM \$ins';

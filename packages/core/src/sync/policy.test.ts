@@ -384,14 +384,18 @@ describe('resolveListRefPollInterval', () => {
 
 describe('buildListRefSelect', () => {
   it('substitutes the table name', () => {
-    expect(buildListRefSelect('_00_list_ref')).toContain('FROM _00_list_ref ');
+    expect(buildListRefSelect('_00_list_ref')).toContain('->_00_list_ref ');
     expect(buildListRefSelect('_00_list_ref_user_abc')).toContain(
-      'FROM _00_list_ref_user_abc '
+      '->_00_list_ref_user_abc '
     );
   });
 
-  it('filters by the bound query id', () => {
-    expect(buildListRefSelect('_00_list_ref')).toContain('WHERE in = $in');
+  it('traverses from the bound query id instead of scanning the table', () => {
+    // `_00_list_ref*` has no index on `in`: `FROM table WHERE in = $in` is a
+    // full scan, which on the shared anon table is every visitor's edges.
+    const sql = buildListRefSelect('_00_list_ref');
+    expect(sql).toContain('FROM $in->_00_list_ref ');
+    expect(sql).not.toContain('in = $in');
   });
 
   it('excludes subquery rows via parent IS NONE', () => {
@@ -411,14 +415,14 @@ describe('buildListRefSelect', () => {
 
 describe('buildSubqueryListRefSelect', () => {
   it('substitutes the table name', () => {
-    expect(buildSubqueryListRefSelect('_00_list_ref')).toContain('FROM _00_list_ref ');
+    expect(buildSubqueryListRefSelect('_00_list_ref')).toContain('->_00_list_ref ');
     expect(buildSubqueryListRefSelect('_00_list_ref_user_abc')).toContain(
-      'FROM _00_list_ref_user_abc '
+      '->_00_list_ref_user_abc '
     );
   });
 
-  it('filters by the bound query id', () => {
-    expect(buildSubqueryListRefSelect('_00_list_ref')).toContain('WHERE in = $in');
+  it('traverses from the bound query id', () => {
+    expect(buildSubqueryListRefSelect('_00_list_ref')).toContain('FROM $in->_00_list_ref ');
   });
 
   it('selects ONLY subquery child rows via parent IS NOT NONE', () => {
@@ -611,7 +615,7 @@ describe('recordVersionArraysEqual', () => {
 describe('list_ref poll batching', () => {
   it('reads many queries in one statement and their rowCounts keyed by id', () => {
     expect(buildListRefBatchSelect('_00_list_ref_user_abc')).toBe(
-      'SELECT in, out, version, parent FROM _00_list_ref_user_abc WHERE in IN $ins'
+      'SELECT in, out, version, parent FROM $ins->_00_list_ref_user_abc'
     );
     expect(buildQueryRowCountBatchSelect()).toBe(
       'SELECT VALUE { id: id, rowCount: rowCount, state: state } FROM $ins'

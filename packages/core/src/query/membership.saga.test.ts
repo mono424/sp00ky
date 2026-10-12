@@ -159,7 +159,7 @@ describe('readMembership', () => {
       state: s,
       handlers: {
         'remote.query': (e: any) => {
-          expect(e.sql.startsWith('SELECT out, version FROM _00_list_ref WHERE in = $in')).toBe(true);
+          expect(e.sql.startsWith('SELECT out, version FROM $in->_00_list_ref WHERE parent IS NONE')).toBe(true);
           return [ok([out1('1'), out1('2')]), ok({ rowCount: 2, state: 'ready' }), ok([])];
         },
         'local.upsert': () => undefined,
@@ -217,7 +217,7 @@ describe('readMembership', () => {
       handlers: {
         'remote.query': (e: any) => {
           calls.push(e.sql.split('\n')[0]);
-          if (e.sql.includes('IN $ins')) {
+          if (e.sql.includes('$ins->')) {
             return [
               ok([{ in: qid('a'), out: new RecordId('thing', '1'), version: 1 }, { in: qid('a'), out: new RecordId('child', 'x'), version: 1, parent: qid('a') }]),
               ok([{ id: qid('a'), rowCount: 1, state: 'ready' }]),
@@ -228,7 +228,7 @@ describe('readMembership', () => {
         'local.upsert': () => undefined,
       },
     });
-    expect(calls).toEqual(['SELECT in, out, version, parent FROM _00_list_ref WHERE in IN $ins;', 'SELECT out, version FROM _00_list_ref WHERE in = $in AND parent IS NONE;']);
+    expect(calls).toEqual(['SELECT in, out, version, parent FROM $ins->_00_list_ref;', 'SELECT out, version FROM $in->_00_list_ref WHERE parent IS NONE;']);
     expect(out.state.queries.get('a')!.subqueryRemoteArray).toEqual([['child:x', 1]]);
     expect(out.state.queries.get('b')!.remoteArray).toEqual([['thing:2', 1], ['thing:3', 1]]);
     expect(out.result.changed).toBe(true);
@@ -254,7 +254,7 @@ describe('readMembership', () => {
       handlers: {
         'remote.query': (e: any) => {
           n++;
-          if (e.sql.includes('IN $ins')) return [ok([]), ok([])];
+          if (e.sql.includes('$ins->')) return [ok([]), ok([])];
           throw new Error('offline');
         },
       },
@@ -263,7 +263,7 @@ describe('readMembership', () => {
     expect(n).toBe(3);
     const rereadUnusable = await runPure(readMembership(env, ['a', 'b']), {
       state: s,
-      handlers: { 'remote.query': (e: any) => (e.sql.includes('IN $ins') ? [ok([]), ok([])] : [ok('x'), ok(null), ok(null)]) },
+      handlers: { 'remote.query': (e: any) => (e.sql.includes('$ins->') ? [ok([]), ok([])] : [ok('x'), ok(null), ok(null)]) },
     });
     expect(rereadUnusable.result).toEqual({ changed: false, failed: true });
     const single = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1]] })]);

@@ -215,7 +215,7 @@ describe('createLiveFeed', () => {
     expect(sent).not.toBeNull();
     expect(reg.sql).toBe(sent!.sql);
     expect(reg.vars).toEqual(sent!.vars);
-    expect(reg.sql).toContain('FROM _00_list_ref_user_alice');
+    expect(reg.sql).toContain('FROM $in->_00_list_ref_user_alice');
     expect((reg.vars!.config as any).params.user).toBeInstanceOf(RecordId);
     expect(sub.key).toBe(local.result);
     expect(await queryKey({ surql: input.surql, params: input.params }, 'sess')).toBe(local.result);

@@ -36,13 +36,16 @@ export const readViewRows = (): string => `SELECT * FROM ${VIEW_TABLE}`;
 export const readLegacyViewRows = (): string => `SELECT * FROM ${LEGACY_VIEW_TABLE}`;
 export const countViewRows = (): string => `SELECT count() FROM ${VIEW_TABLE} GROUP ALL`;
 
+// Edges are read through the graph (`$in->table`): the `_00_list_ref*` tables
+// have no index on `in`, so `WHERE in = $in` scanned the whole table, which on
+// the shared `_00_list_ref_anon` is every signed-out visitor's edges.
 export const listRefSelect = (table: string): string =>
-  `SELECT out, version FROM ${table} WHERE in = $in AND parent IS NONE`;
+  `SELECT out, version FROM $in->${table} WHERE parent IS NONE`;
 export const subqueryListRefSelect = (table: string): string =>
-  `SELECT out, version FROM ${table} WHERE in = $in AND parent IS NOT NONE`;
+  `SELECT out, version FROM $in->${table} WHERE parent IS NOT NONE`;
 export const queryRowCountSelect = (): string => 'SELECT VALUE { rowCount: rowCount, state: state } FROM ONLY $in';
 export const listRefBatchSelect = (table: string): string =>
-  `SELECT in, out, version, parent FROM ${table} WHERE in IN $ins`;
+  `SELECT in, out, version, parent FROM $ins->${table}`;
 export const queryRowCountBatchSelect = (): string => 'SELECT VALUE { id: id, rowCount: rowCount, state: state } FROM $ins';
 
 /** The single-query read: edges, meta, subquery children in one request. */

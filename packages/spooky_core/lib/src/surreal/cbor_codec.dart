@@ -7,7 +7,7 @@ import 'value.dart';
 /// SurrealDB's CBOR protocol carries records, datetimes, etc. as custom tags
 /// (mirrors `surrealdb.js`). The JSON-RPC wire could only send a record id as a
 /// plain string, which SurrealDB won't match against a `record<…>` field — so
-/// record-filtered queries (`WHERE database = $db`, list_ref `WHERE in = $in`,
+/// record-filtered queries (`WHERE database = $db`, list_ref `$in->_00_list_ref…`,
 /// `SELECT * FROM $ids`) silently matched nothing. CBOR sends real records.
 ///
 /// On the way OUT we map [RecordId]/[DateTime] to their tagged forms; on the way

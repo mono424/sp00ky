@@ -186,9 +186,18 @@ export const DEFAULT_LIST_REF_POLL_INTERVAL_MS = 500;
  * because the client's `RecordVersionArray` only tracks primary rows;
  * including subquery rows would surface them as spurious "added"
  * diffs every tick.
+ *
+ * Read through the graph (`$in->table`), not `FROM table WHERE in = $in`:
+ * the edge tables have no index on `in`, so the WHERE form is a full table
+ * scan. On a per-user table that is one user's edges; on the shared
+ * `_00_list_ref_anon` it is every signed-out visitor's, on every poll of
+ * every anonymous client. The traversal walks only this view's edge keys
+ * (`GraphEdgeScan` on SurrealDB v3) and the edge table's select permission
+ * still applies to each row it returns. Edges are written with `RELATE`, so
+ * the graph keys always exist.
  */
 export function buildListRefSelect(table: string): string {
-  return `SELECT out, version FROM ${table} WHERE in = $in AND parent IS NONE`;
+  return `SELECT out, version FROM $in->${table} WHERE parent IS NONE`;
 }
 
 /**
@@ -231,7 +240,7 @@ export function buildQueryRowCountSelect(): string {
  * store SEPARATELY from the primary window array.
  */
 export function buildSubqueryListRefSelect(table: string): string {
-  return `SELECT out, version FROM ${table} WHERE in = $in AND parent IS NOT NONE`;
+  return `SELECT out, version FROM $in->${table} WHERE parent IS NOT NONE`;
 }
 
 /**
@@ -239,9 +248,13 @@ export function buildSubqueryListRefSelect(table: string): string {
  * together, split client-side on `parent`. Replaces two selects per query per
  * poll tick, which on a page with 20+ live queries was ~50 serialized round
  * trips per cycle and kept the remote busy full-time.
+ *
+ * Traverses from every id in `$ins` (see {@link buildListRefSelect}); the
+ * result is one flat list of edge rows, and `in` names the query each belongs
+ * to.
  */
 export function buildListRefBatchSelect(table: string): string {
-  return `SELECT in, out, version, parent FROM ${table} WHERE in IN $ins`;
+  return `SELECT in, out, version, parent FROM $ins->${table}`;
 }
 
 /**

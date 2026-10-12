@@ -17,6 +17,15 @@ describe('query sql builders (golden against the previous builders)', () => {
     expect(sql.listRefBatchSelect('t')).toBe(buildListRefBatchSelect('t'));
     expect(sql.queryRowCountBatchSelect()).toBe(buildQueryRowCountBatchSelect());
   });
+  it('reads edges through the graph, byte-identical to spooky_core sql.dart', () => {
+    expect(sql.listRefSelect('_00_list_ref_user_u1')).toBe(
+      'SELECT out, version FROM $in->_00_list_ref_user_u1 WHERE parent IS NONE'
+    );
+    expect(sql.subqueryListRefSelect('_00_list_ref')).toBe(
+      'SELECT out, version FROM $in->_00_list_ref WHERE parent IS NOT NONE'
+    );
+    expect(sql.listRefBatchSelect('_00_list_ref')).toBe('SELECT in, out, version, parent FROM $ins->_00_list_ref');
+  });
   it('composes the single, batch and register requests', () => {
     expect(sql.singleSnapshotSelect('t').split(';\n')).toEqual([
       sql.listRefSelect('t'),

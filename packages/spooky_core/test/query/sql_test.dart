@@ -7,13 +7,13 @@ void main() {
   group('query sql builders', () {
     test('edge and meta selects are byte-identical to the old helpers', () {
       expect(listRefSelect('_00_list_ref_user_u1'),
-          'SELECT out, version FROM _00_list_ref_user_u1 WHERE in = \$in AND parent IS NONE');
+          'SELECT out, version FROM \$in->_00_list_ref_user_u1 WHERE parent IS NONE');
       expect(subqueryListRefSelect('_00_list_ref'),
-          'SELECT out, version FROM _00_list_ref WHERE in = \$in AND parent IS NOT NONE');
+          'SELECT out, version FROM \$in->_00_list_ref WHERE parent IS NOT NONE');
       expect(queryRowCountSelect(),
           'SELECT VALUE { rowCount: rowCount, state: state } FROM ONLY \$in');
       expect(listRefBatchSelect('_00_list_ref'),
-          'SELECT in, out, version, parent FROM _00_list_ref WHERE in IN \$ins');
+          'SELECT in, out, version, parent FROM \$ins->_00_list_ref');
       expect(queryRowCountBatchSelect(),
           'SELECT VALUE { id: id, rowCount: rowCount, state: state } FROM \$ins');
     });

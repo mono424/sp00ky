@@ -16,6 +16,7 @@ export * from './query/sql';
 export { queryHashInput, viewKeyInput, type QueryKeyInput } from './query/hash';
 // `_00_list_ref` table naming and user-id sanitizing (mirrors ssp-protocol).
 export {
+  ANON_LIST_REF_TABLE,
   ANON_USER_ID,
   DEFAULT_REF_MODE,
   bucketIdForUser,

@@ -57,6 +57,32 @@ class RemoteDatabaseService {
 
   void Function()? onHandshake;
 
+  /// Every `session::id()` this client's sockets have had, oldest first.
+  ///
+  /// Each supervisor reconnect is a new session. A view registered before it
+  /// stays registered, so its edges keep naming the socket that registered
+  /// them, and the anonymous LIVE filters on these ids (see `listRefLive`).
+  /// Capped: the SSP restamps an edge whenever its row changes, so an id that
+  /// falls off costs at most the LIVE removal of a row untouched since, which
+  /// the membership poll still catches.
+  List<String> get sessionIds => List.unmodifiable(_sessionIds);
+  final List<String> _sessionIds = [];
+  static const _maxSessionIds = 16;
+
+  /// Ask the socket that just connected for its session id. Straight to the
+  /// client: it needs no identity, so it need not wait in the query queue.
+  Future<void> _recordSessionId() async {
+    try {
+      final result = await _client.query('RETURN <string>session::id()');
+      final sid = result.isEmpty ? null : result.first;
+      if (sid is! String || _sessionIds.contains(sid)) return;
+      _sessionIds.add(sid);
+      if (_sessionIds.length > _maxSessionIds) _sessionIds.removeAt(0);
+    } catch (_) {
+      // The socket now open is matched by `session::id()` itself.
+    }
+  }
+
   /// Completes when the current connect attempt has finished, successfully or
   /// not. Every RPC waits on it.
   ///
@@ -174,6 +200,7 @@ class RemoteDatabaseService {
         await forceClose();
         _checkEpoch(epoch);
       }
+      unawaited(_recordSessionId());
       _logger.info('Connected to remote database');
     } finally {
       // Success or failure: the attempt is over, so held RPCs stop waiting.

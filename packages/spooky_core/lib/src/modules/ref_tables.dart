@@ -14,6 +14,9 @@ const RefMode defaultRefMode = RefMode.dedicated;
 /// `_00_list_ref_anon` table.
 const String anonUserId = 'anon';
 
+/// The one `_00_list_ref` table every signed-out session shares.
+const String anonListRefTable = '_00_list_ref_anon';
+
 final _userIdPattern = RegExp(r'^[A-Za-z0-9_]+$');
 
 /// Sanitize a user id (`"user:abc"` -> `"abc"`). Returns null when the id is
@@ -36,7 +39,7 @@ String listRefTableFor(RefMode mode, Object? userId) {
   // Anonymous clients (flag-enabled) share one dedicated table in both modes —
   // checked before the mode split so it never lands on the per-user or the
   // auth-gated global table. Matches `ssp_protocol::list_ref_table_for`.
-  if (userId == anonUserId) return '_00_list_ref_anon';
+  if (userId == anonUserId) return anonListRefTable;
   if (mode == RefMode.single) return '_00_list_ref';
   final uid = sanitizeUserId(userId);
   return uid != null ? '_00_list_ref_user_$uid' : '_00_list_ref';

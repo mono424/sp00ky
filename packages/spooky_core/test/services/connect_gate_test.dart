@@ -114,7 +114,9 @@ void main() {
       await pumpEventQueue();
 
       expect(signedUp, isTrue);
-      expect(remote.calls, ['connect', 'use', 'signup']);
+      // `query` is the new socket reading its own `session::id()` (the
+      // anonymous LIVE filters on it); it needs no namespace either way.
+      expect(remote.calls, ['connect', 'use', 'query', 'signup']);
     });
 
     test('a failed connect releases the waiters rather than wedging them',

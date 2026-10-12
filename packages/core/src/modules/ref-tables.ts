@@ -22,6 +22,9 @@ export type RefMode = 'single' | 'dedicated';
  */
 export const ANON_USER_ID = 'anon';
 
+/** The one `_00_list_ref` table every signed-out session shares. */
+export const ANON_LIST_REF_TABLE = '_00_list_ref_anon';
+
 /**
  * Default ref-storage mode for this client build. Mirrors the SSP's
  * default (`RefMode::Dedicated`) so cross-session sync works out of the
@@ -81,7 +84,7 @@ export function listRefTableFor(mode: RefMode, userId: unknown): string {
   // Anonymous clients (flag-enabled) share one dedicated table in both modes —
   // checked before the mode split so it never lands on the per-user or the
   // auth-gated global table. Matches `ssp_protocol::list_ref_table_for`.
-  if (userId === ANON_USER_ID) return '_00_list_ref_anon';
+  if (userId === ANON_USER_ID) return ANON_LIST_REF_TABLE;
   if (mode === 'single') return '_00_list_ref';
   const uid = sanitizeUserId(userId);
   return uid ? `_00_list_ref_user_${uid}` : '_00_list_ref';

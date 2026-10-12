@@ -25,16 +25,25 @@ describe('reload salt', () => {
 
   it('a salt left on the way out is taken once, by the same principal', () => {
     leaveReloadSalt('s1', 'user:a');
-    expect(takeReloadSalt('user:a')).toBe('s1');
+    expect(takeReloadSalt('user:a')).toEqual({ salt: 's1', sessionIds: [] });
     // Taken, not read: a tab duplicated from this page finds nothing.
     expect(takeReloadSalt('user:a')).toBeNull();
+  });
+
+  it("the page's socket session ids travel with the salt", () => {
+    // The reloaded page's views keep edges stamped by these sockets, and the
+    // anonymous LIVE only hears sessions it knows.
+    leaveReloadSalt('s1', null, ['sid-1', 'sid-2']);
+    expect(takeReloadSalt(null)).toEqual({ salt: 's1', sessionIds: ['sid-1', 'sid-2'] });
+    (g.sessionStorage as MemoryStorage).setItem('sp00ky:salt', JSON.stringify({ salt: 's2', authId: null, sessionIds: ['ok', 7, null] }));
+    expect(takeReloadSalt(null)).toEqual({ salt: 's2', sessionIds: ['ok'] });
   });
 
   it('another principal, or none, mints a fresh salt', () => {
     leaveReloadSalt('s1', 'user:a');
     expect(takeReloadSalt('user:b')).toBeNull();
     leaveReloadSalt('s2', null);
-    expect(takeReloadSalt(null)).toBe('s2');
+    expect(takeReloadSalt(null)?.salt).toBe('s2');
     leaveReloadSalt('s3', null);
     expect(takeReloadSalt('user:a')).toBeNull();
   });

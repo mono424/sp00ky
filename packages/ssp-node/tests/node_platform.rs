@@ -167,6 +167,8 @@ struct HarnessOpts {
     schedules: bool,
     /// Serve `POST /impersonate/mint`.
     impersonation: bool,
+    /// Route identity-less registrations to the shared `_00_list_ref_anon`.
+    anonymous_live_queries: bool,
 }
 
 impl Default for HarnessOpts {
@@ -181,6 +183,7 @@ impl Default for HarnessOpts {
             circuit_store: None,
             schedules: false,
             impersonation: false,
+            anonymous_live_queries: false,
         }
     }
 }
@@ -296,7 +299,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         crdt_cache: Arc::new(ssp_node::crdt::CrdtCache::new(8, ssp_node::crdt::CrdtAllowList::permissive())),
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
         edge_update_tx: ssp_node::edges::EdgePublisher::default(),
-        anonymous_live_queries: false,
+        anonymous_live_queries: opts.anonymous_live_queries,
         impersonation: opts.impersonation,
         query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(opts.query_allowlist)),
         standalone: true,
@@ -2189,6 +2192,52 @@ async fn re_registration_leaves_a_healthy_view_alone() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     assert_eq!(before, edges().await, "a healthy view must not have its edges republished");
+}
+
+// A signed-out client's LIVE hears only edges whose `clientId` names one of its
+// own sockets. A reconnect re-registers the view under the new socket, but the
+// edges already published keep naming the old one, so the next version bump of
+// a row has to restamp its edge or the client stops hearing that row change.
+#[tokio::test]
+async fn an_anon_edge_takes_the_re_registering_socket_on_its_next_bump() {
+    let h = build(HarnessOpts { anonymous_live_queries: true, ..Default::default() }).await;
+    h.raw_db.query("DEFINE TABLE thread SCHEMALESS PERMISSIONS FOR select FULL;").await.unwrap();
+    h.node.processor.write().await.set_permission("thread", "true");
+    let register = |socket: &str| {
+        json!({
+            "id": "_00_query:v1",
+            "surql": "SELECT * FROM thread",
+            "clientId": socket,
+            "ttl": "30m",
+            "lastActiveAt": "2024-01-01T00:00:00Z",
+            "params": { "auth": { "id": "" } }
+        })
+    };
+    for id in ["thread:1", "thread:2"] {
+        let row = json!({ "table": "thread", "op": "CREATE", "id": id, "record": { "title": "t" } });
+        assert_eq!(h.node.route(authed(Method::Post, "/ingest", row)).await.unwrap().status, 200);
+    }
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", register("socket-1"))).await.unwrap().status, 200);
+    publication_drained(&h).await;
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", register("socket-2"))).await.unwrap().status, 200);
+
+    let bump = json!({ "table": "thread", "op": "UPDATE", "id": "thread:1", "record": { "title": "u" } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", bump)).await.unwrap().status, 200);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    publication_drained(&h).await;
+
+    let stamps: Vec<Value> = h
+        .raw_db
+        .query("SELECT VALUE [<string>out, clientId] FROM _00_list_ref_anon WHERE in = _00_query:v1 ORDER BY out")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(
+        stamps,
+        vec![json!(["thread:1", "socket-2"]), json!(["thread:2", "socket-1"])],
+        "the bumped edge names the socket the view holds now; the untouched one keeps its own"
+    );
 }
 
 // A view registered before its session had an identity is broken twice over:

@@ -38,8 +38,12 @@ export type RemoteConnectionEvent = ConnectionState | 'error';
 const REMOTE_MAX_CONCURRENT_QUERIES = 6;
 
 /**
- * Session ids a page remembers for its pagehide release. Only the sessions of
- * the last ttl matter; this many reconnects inside one ttl is a broken network.
+ * Session ids a page remembers for its pagehide release and its anonymous LIVE
+ * filter. The release only needs the sessions of the last ttl; this many
+ * reconnects inside one ttl is a broken network. The LIVE filter would like
+ * every session that stamped an edge still held, but the SSP restamps an edge
+ * whenever its row changes, so an id that falls off costs at most the LIVE
+ * removal of a row untouched since, which the membership poll still catches.
  */
 const MAX_SESSION_IDS = 16;
 
@@ -82,6 +86,10 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
    * whose own session id matches none of them, so it names these instead. Kept
    * for the page, not the socket: a view registered before a reconnect still
    * carries the old id until its next heartbeat.
+   *
+   * The anonymous LIVE filters on the same ids (see `listRefLive`): its edges
+   * name the socket that registered their view, which may be an earlier one.
+   * A reload hands its ids to the next page with the salt.
    */
   private sessionIdsSeen: string[] = [];
 
@@ -121,6 +129,16 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
   /** See {@link sessionIdsSeen}. */
   sessionIds(): readonly string[] {
     return this.sessionIdsSeen;
+  }
+
+  /**
+   * Take on the session ids of the page this one reloaded from. It kept that
+   * page's salt, so the views it re-registers still carry edges stamped by
+   * those sockets. Older than anything this page has seen, so they go first.
+   */
+  adoptSessionIds(ids: ReadonlyArray<string>): void {
+    const earlier = ids.filter((sid) => typeof sid === 'string' && sid !== '' && !this.sessionIdsSeen.includes(sid));
+    this.sessionIdsSeen = [...earlier, ...this.sessionIdsSeen].slice(-MAX_SESSION_IDS);
   }
 
   /**

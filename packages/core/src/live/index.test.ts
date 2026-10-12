@@ -375,6 +375,29 @@ describe('createLiveFeed', () => {
     await feed.close();
   });
 
+  it("an anonymous feed's LIVE hears only its own sockets, earlier ones included after a reconnect", async () => {
+    const fake = new FakeSurreal();
+    let sid = 0;
+    const answer = fake.answer.bind(fake);
+    fake.answer = (sql, vars) =>
+      sql === 'RETURN <string>session::id()' ? [`sid-${++sid}`] : answer(sql, vars);
+    const feed = feedWith(fake, { token: undefined });
+    const sub = feed.subscribe({ surql: 'SELECT * FROM notification;' }, { onSet: () => {} });
+    await sub.ready;
+    fake.fire('disconnected');
+    fake.fire('connected');
+    await tick(60);
+    const lives = fake.calls.filter((c) => c.sql.startsWith('LIVE SELECT'));
+    expect(lives.map((c) => c.sql)).toEqual([
+      'LIVE SELECT * FROM _00_list_ref_anon WHERE clientId = <string>session::id() OR clientId IN $sids FETCH out',
+      'LIVE SELECT * FROM _00_list_ref_anon WHERE clientId = <string>session::id() OR clientId IN $sids FETCH out',
+    ]);
+    // The view was registered on the first socket and is not re-registered,
+    // so its edges keep naming `sid-1`: the second LIVE must still hear them.
+    expect(lives[1].vars).toEqual({ sids: ['sid-1'] });
+    await feed.close();
+  });
+
   it('heartbeats and re-registers a view the server reclaimed', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {

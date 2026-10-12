@@ -31,6 +31,28 @@ describe('query sql builders (golden against the previous builders)', () => {
       in: id,
     });
   });
+  it('the LIVE on a per-user table is unfiltered; FETCH out only when bodies ride inline', () => {
+    expect(sql.listRefLive('_00_list_ref_user_x', { inlineBodies: true, sessionIds: ['s1'] })).toEqual({
+      sql: 'LIVE SELECT * FROM _00_list_ref_user_x FETCH out',
+    });
+    expect(sql.listRefLive('_00_list_ref', { inlineBodies: false, sessionIds: [] })).toEqual({
+      sql: 'LIVE SELECT * FROM _00_list_ref',
+    });
+  });
+  it("the anon LIVE hears only this client's sockets, current one by session::id()", () => {
+    const sids = ['earlier-1', 'earlier-2'];
+    const live = sql.listRefLive('_00_list_ref_anon', { inlineBodies: true, sessionIds: sids });
+    expect(live.sql).toBe(
+      'LIVE SELECT * FROM _00_list_ref_anon WHERE clientId = <string>session::id() OR clientId IN $sids FETCH out'
+    );
+    expect(live.vars).toEqual({ sids });
+    // A copy: the caller's list keeps growing after the LIVE is sent.
+    expect(live.vars!.sids).not.toBe(sids);
+    expect(sql.listRefLive('_00_list_ref_anon', { inlineBodies: false, sessionIds: [] })).toEqual({
+      sql: 'LIVE SELECT * FROM _00_list_ref_anon WHERE clientId = <string>session::id() OR clientId IN $sids',
+      vars: { sids: [] },
+    });
+  });
   it('view rows and ids', () => {
     expect(sql.viewRecordId('k')).toEqual(new RecordId('_00_view', 'k'));
     expect(sql.viewRow([['t:1', 1]], [['c:1', 2]], true, 5)).toEqual({ ids: [['t:1', 1]], children: [['c:1', 2]], confirmed: true, updatedAt: 5 });

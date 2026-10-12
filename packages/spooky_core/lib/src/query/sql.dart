@@ -1,4 +1,5 @@
 import '../kernel/effects.dart' show StatementResult;
+import '../modules/ref_tables.dart' show anonListRefTable;
 import '../surreal/value.dart';
 import '../types.dart';
 
@@ -69,6 +70,38 @@ String singleSnapshotSelect(String table) =>
 /// The many-query read: all edges plus all metas in one request.
 String batchSnapshotSelect(String table) =>
     '${listRefBatchSelect(table)};\n${queryRowCountBatchSelect()}';
+
+/// The session's one LIVE subscription on its `_00_list_ref` table.
+///
+/// [inlineBodies] adds `FETCH out`, which resolves the edge's target into the
+/// notification so the body arrives with the doorbell.
+///
+/// On the anon table it is filtered to this client's own edges. Every
+/// signed-out session shares that table, so unfiltered each one received (and
+/// the server fetched a body for) every anonymous edge change of every other
+/// session, and the client then dropped all but its own. An edge carries the
+/// `session::id()` of whichever socket last registered its view, which is a
+/// socket of this client but not necessarily the current one: a view stays
+/// registered across a reconnect, so its older edges still name an earlier
+/// socket. [sessionIds] are those earlier sockets. The current one is matched
+/// by `session::id()` itself, which SurrealDB evaluates in the subscriber's own
+/// session, so the filter holds before the client has learned its new id.
+///
+/// The cast is load-bearing: `session::id()` is a uuid, `clientId` a string,
+/// and without it nothing matches. Per-user tables need no filter. Mirrors
+/// `listRefLive` in `packages/core/src/query/sql.ts`.
+({String sql, Map<String, dynamic>? vars}) listRefLive(String table,
+    {required bool inlineBodies, required List<String> sessionIds}) {
+  final join = inlineBodies ? ' FETCH out' : '';
+  if (table != anonListRefTable) {
+    return (sql: 'LIVE SELECT * FROM $table$join', vars: null);
+  }
+  return (
+    sql: 'LIVE SELECT * FROM $table WHERE clientId = <string>session::id() '
+        'OR clientId IN \$sids$join',
+    vars: {'sids': List<String>.of(sessionIds)},
+  );
+}
 
 class RegisterPayload {
   const RegisterPayload({

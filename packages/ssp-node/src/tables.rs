@@ -127,6 +127,13 @@ DEFINE FIELD OVERWRITE parent_rel ON TABLE {tbl} TYPE option<string>;
 /// only reference records the client could already read one-shot (the public
 /// tables are `select WHERE true`). Writes stay SSP-only (root bypasses the
 /// rule). Independent of `RefMode` and never auto-dropped.
+///
+/// Readable by every signed-out session, but not delivered to every one: each
+/// client's LIVE is filtered to edges whose `clientId` names one of its own
+/// sockets (`listRefLive` in both client cores), which is why the edge writer
+/// restamps `clientId` on this table's version bumps. Filtering by permission
+/// instead would hide a reconnected client's own older edges from its
+/// membership reads.
 pub async fn ensure_anon_table(db: &dyn Db) -> Result<()> {
     use std::sync::atomic::Ordering;
     if ENSURED_ANON_TABLE.load(Ordering::Acquire) {

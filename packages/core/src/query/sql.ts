@@ -3,6 +3,7 @@ import type { RecordVersionArray } from '../types';
 import type { Vars } from '../kernel/effects';
 import { surql } from '../utils/surql';
 import type { SealedQuery } from '../utils/surql';
+import { ANON_LIST_REF_TABLE } from '../modules/ref-tables';
 
 /** Every SurrealQL statement the query side sends, as pure builders. */
 
@@ -50,6 +51,39 @@ export const singleSnapshotSelect = (table: string): string =>
 /** The many-query read: all edges + all metas in one request. */
 export const batchSnapshotSelect = (table: string): string =>
   `${listRefBatchSelect(table)};\n${queryRowCountBatchSelect()}`;
+
+/**
+ * The session's one LIVE subscription on its `_00_list_ref` table.
+ *
+ * `inlineBodies` adds `FETCH out`, which resolves the edge's target into the
+ * notification so the body arrives with the doorbell.
+ *
+ * On the anon table it is filtered to this client's own edges. Every
+ * signed-out session shares that table, so unfiltered each one received (and
+ * the server fetched a body for) every anonymous edge change of every other
+ * session, and the client then dropped all but its own. An edge carries the
+ * `session::id()` of whichever socket last registered its view, which is a
+ * socket of this client but not necessarily the current one: a view stays
+ * registered across a reconnect, and a reload keeps its salt and its views,
+ * so their older edges still name an earlier socket. `sessionIds` are those
+ * earlier sockets. The current one is matched by `session::id()` itself,
+ * which SurrealDB evaluates in the subscriber's own session, so the filter
+ * holds before the client has learned its new id.
+ *
+ * The cast is load-bearing: `session::id()` is a uuid, `clientId` a string,
+ * and without it nothing matches. Per-user tables need no filter.
+ */
+export function listRefLive(
+  table: string,
+  opts: { inlineBodies: boolean; sessionIds: ReadonlyArray<string> }
+): { sql: string; vars?: Vars } {
+  const join = opts.inlineBodies ? ' FETCH out' : '';
+  if (table !== ANON_LIST_REF_TABLE) return { sql: `LIVE SELECT * FROM ${table}${join}` };
+  return {
+    sql: `LIVE SELECT * FROM ${table} WHERE clientId = <string>session::id() OR clientId IN $sids${join}`,
+    vars: { sids: [...opts.sessionIds] },
+  };
+}
 
 export interface RegisterPayload {
   id: RecordId<string>;

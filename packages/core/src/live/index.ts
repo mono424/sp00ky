@@ -13,7 +13,8 @@
  *   params, ttl }`, key = sha256(JSON.stringify({ surql, params, sessionId })));
  * - bodies with `SELECT * FROM $ids`;
  * - one `LIVE SELECT * FROM <the user's _00_list_ref table> FETCH out` per
- *   feed, so a changed row usually arrives inline with its edge; an edge whose
+ *   feed (on the shared anon table, filtered to the feed's own edges; see
+ *   `listRefLive`), so a changed row usually arrives inline with its edge; an edge whose
  *   `out` is a bare id (a server that ignores FETCH) costs a body read, one
  *   whose `out` is null (unreadable or deleted row) a membership re-read;
  * - `fn::query::heartbeat` at half the ttl, re-registering a reclaimed view;
@@ -30,6 +31,7 @@ import {
   bodySelect,
   heartbeatBatch,
   heartbeatRowGone,
+  listRefLive,
   registerSelect,
   registerVars,
   singleSnapshotSelect,
@@ -201,6 +203,7 @@ const FLUSH_MS = 10;
 const FETCH_BATCH_MS = 15;
 const REREAD_MS = 50;
 const RELEASE_TIMEOUT_MS = 2_000;
+const MAX_SOCKETS = 16;
 
 interface Edge {
   rid: RecordId;
@@ -381,6 +384,8 @@ class Feed implements LiveFeed {
   private liveStarting: Promise<boolean> | null = null;
   private readonly subs = new Map<string, SubState>();
   private readonly sessionId: string;
+  /** `session::id()` of every socket this feed has had, oldest first. */
+  private sockets: string[] = [];
   private readonly ttl: string;
   private readonly timeoutMs: number;
   private isClosed = false;
@@ -498,10 +503,27 @@ class Feed implements LiveFeed {
       );
     }
     this.db = db;
+    void this.noteSession();
+  }
+
+  /**
+   * Remember the `session::id()` of the socket now open. Views are registered
+   * once and not again after a reconnect, so their edges keep naming the socket
+   * that registered them; the anonymous LIVE has to keep hearing those.
+   */
+  private async noteSession(): Promise<void> {
+    try {
+      const [sid] = await this.q('RETURN <string>session::id()');
+      if (typeof sid !== 'string' || this.sockets.includes(sid)) return;
+      this.sockets = [...this.sockets, sid].slice(-MAX_SOCKETS);
+    } catch {
+      // The socket now open is matched by `session::id()` itself.
+    }
   }
 
   /** After a reconnect: LIVE again, then re-read every view (events in the gap are lost). */
   private async recover(): Promise<void> {
+    void this.noteSession();
     try {
       await this.ensureLive();
       for (const sub of this.subs.values()) if (sub.loaded) this.scheduleReread(sub);
@@ -557,14 +579,18 @@ class Feed implements LiveFeed {
     if (!this.liveStarting) {
       this.liveStarting = (async () => {
         try {
+          const live = (inlineBodies: boolean) =>
+            listRefLive(this.table!, { inlineBodies, sessionIds: this.sockets });
           let id: unknown;
           try {
-            [id] = await this.q(`LIVE SELECT * FROM ${this.table} FETCH out`);
+            const { sql, vars } = live(true);
+            [id] = await this.q(sql, vars);
           } catch (error) {
             // A server that refuses FETCH on LIVE still has the doorbell:
             // bare-id edges fall back to a body read in `onLive`.
             this.report(error);
-            [id] = await this.q(`LIVE SELECT * FROM ${this.table}`);
+            const { sql, vars } = live(false);
+            [id] = await this.q(sql, vars);
           }
           const stream = await this.db!.liveOf(id as never);
           const off = stream.subscribe((message) => this.onLive(message));

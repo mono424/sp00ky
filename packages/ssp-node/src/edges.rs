@@ -954,6 +954,21 @@ pub fn build_edge_batch(
         let auth = format!("LET $aid{idx} = (SELECT VALUE auth_id FROM {from} LIMIT 1)[0]");
         let (cid, aid) = (format!("$cid{idx}"), format!("$aid{idx}"));
 
+        // On the shared anon table an edge's `clientId` is read again after
+        // the write: every signed-out client filters its LIVE to the sockets
+        // it has had (`listRefLive` in both client cores). A view keeps its
+        // edges across a reconnect but takes the new socket's id when it
+        // re-registers, so a version bump restamps the edge with the id its
+        // view holds now. Otherwise an edge would name the socket that created
+        // it for as long as it lived, and a client that no longer counts that
+        // socket would stop hearing the row change. Per-user tables never read
+        // `clientId`, so they skip the extra lookup. `?? clientId` keeps the
+        // old stamp when the view row has none: the field is `TYPE string`,
+        // and a NONE would fail the whole transaction where a version-only
+        // bump never could.
+        let restamp = delta.auth_id == ssp_protocol::ANON_AUTH_ID;
+        let stamp = if restamp { format!(", clientId = {cid} ?? clientId") } else { String::new() };
+
         // A full publish REPLACES the row's edges. Registration, repair and
         // subscriber-attach all snapshot the whole membership, and the
         // `RELATE`s below are bare (no unique index on `in, out`), so
@@ -990,11 +1005,12 @@ pub fn build_edge_batch(
             let version = versions.version_of(id);
             group.updated += 1;
             group.body.push(format!(
-                "UPDATE (SELECT VALUE id FROM {out}<-{list_ref} WHERE in = {from}) SET version = {version} RETURN NONE",
+                "UPDATE (SELECT VALUE id FROM {out}<-{list_ref} WHERE in = {from}) SET version = {version}{stamp} RETURN NONE",
                 list_ref = list_ref,
                 version = version,
                 from = from,
                 out = id,
+                stamp = stamp,
             ));
         }
 
@@ -1056,8 +1072,8 @@ pub fn build_edge_batch(
                     let version = versions.version_of(&item.id);
                     group.updated += 1;
                     group.body.push(format!(
-                        "UPDATE (SELECT VALUE id FROM {id}<-{list_ref} WHERE in = {from}) SET version = {version} RETURN NONE",
-                        list_ref = list_ref, from = from, id = item.id, version = version,
+                        "UPDATE (SELECT VALUE id FROM {id}<-{list_ref} WHERE in = {from}) SET version = {version}{stamp} RETURN NONE",
+                        list_ref = list_ref, from = from, id = item.id, version = version, stamp = stamp,
                     ));
                 }
                 SubqueryOp::Remove => {
@@ -1088,9 +1104,13 @@ pub fn build_edge_batch(
                 .push(format!("UPDATE {from} SET state = 'ready'", from = from));
         }
 
-        // Only a body with a `RELATE` in it needs the view's metadata.
-        if group.body.iter().any(|s| s.starts_with("RELATE ")) {
+        // Only a body with a `RELATE` in it needs the view's metadata, and an
+        // anon body that restamps an edge needs its `clientId`.
+        let relates = group.body.iter().any(|s| s.starts_with("RELATE "));
+        if relates || (restamp && group.updated > 0) {
             group.preamble.push(meta);
+        }
+        if relates {
             group.preamble.push(auth);
         }
 
@@ -1840,6 +1860,53 @@ mod tests {
         assert!(txs.len() > 1);
         assert!(txs.iter().all(|t| t.sql.matches(";\n").count() <= 101));
         assert_eq!(txs.iter().map(|t| t.sql.matches("UPDATE ").count()).sum::<usize>(), 600);
+    }
+
+    #[test]
+    fn an_anon_version_bump_restamps_the_edge_with_its_views_current_client() {
+        // A signed-out client's LIVE hears only edges naming one of its own
+        // sockets. After a reconnect the view holds the new socket's id, and
+        // an edge created before it would otherwise keep the old one forever.
+        let mut d = delta("view:abc", ssp_protocol::ANON_AUTH_ID);
+        d.updates = vec!["game:1".to_string()];
+        d.subquery_items = vec![SubqueryDeltaItem {
+            id: "move:1".to_string(),
+            parent_key: "game:1".to_string(),
+            alias: "moves".to_string(),
+            op: SubqueryOp::Update,
+        }];
+        let b = build_edge_batch(&[&d], RefMode::Dedicated, &ConstV(4));
+        let g = &b.deltas[0];
+        assert_eq!(
+            g.preamble,
+            vec![
+                "LET $from0 = type::record('_00_query', $from0key)".to_string(),
+                "LET $cid0 = (SELECT VALUE clientId FROM $from0 LIMIT 1)[0]".to_string(),
+            ],
+            "the restamp needs the view's clientId and nothing else"
+        );
+        assert_eq!(
+            g.body,
+            vec![
+                "UPDATE (SELECT VALUE id FROM game:1<-_00_list_ref_anon WHERE in = $from0) SET version = 4, clientId = $cid0 ?? clientId RETURN NONE",
+                "UPDATE (SELECT VALUE id FROM move:1<-_00_list_ref_anon WHERE in = $from0) SET version = 4, clientId = $cid0 ?? clientId RETURN NONE",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_per_user_version_bump_skips_the_client_lookup() {
+        // Nothing reads `clientId` on a per-user table; the lookup would be a
+        // subselect per delta for nothing.
+        let mut d = delta("view:abc", "user:a");
+        d.updates = vec!["game:1".to_string()];
+        let b = build_edge_batch(&[&d], RefMode::Dedicated, &ConstV(4));
+        let g = &b.deltas[0];
+        assert_eq!(g.preamble.len(), 1, "{:?}", g.preamble);
+        assert_eq!(
+            g.body,
+            vec!["UPDATE (SELECT VALUE id FROM game:1<-_00_list_ref_user_a WHERE in = $from0) SET version = 4 RETURN NONE"]
+        );
     }
 
     #[test]

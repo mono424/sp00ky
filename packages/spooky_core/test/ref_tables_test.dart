@@ -26,6 +26,8 @@ void main() {
             '_00_list_ref_anon');
         expect(listRefTableFor(RefMode.single, anonUserId),
             '_00_list_ref_anon');
+        // The LIVE builder keys its per-session filter off this constant.
+        expect(anonListRefTable, '_00_list_ref_anon');
       });
 
       test('a real user record "user:anon" is NOT the sentinel', () {

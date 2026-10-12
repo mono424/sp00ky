@@ -28,7 +28,7 @@ import type { RuntimeEvent } from '../kernel/events';
 import type { ServiceCalls } from '../kernel/effects';
 import { encodeRecordId } from '../utils/index';
 import { sha256Hex } from '../utils/sha256';
-import { leaveViewsBeacon } from '../query/sql';
+import { leaveViewsBeacon, listRefLive } from '../query/sql';
 import { hashOfEdge, rowOfEdge } from '../utils/edges';
 import { mintMutationId } from '../mutation/mutation-id';
 import { BucketHandle, bucketContentToBlob } from './bucket-handle';
@@ -63,23 +63,32 @@ const RELOAD_SALT_KEY = 'sp00ky:salt';
  * (which copies sessionStorage) mints its own salt rather than sharing this
  * tab's remote views.
  */
-export function takeReloadSalt(authId: string | null): string | null {
+export function takeReloadSalt(authId: string | null): { salt: string; sessionIds: string[] } | null {
   try {
     if (typeof sessionStorage === 'undefined') return null;
     const raw = sessionStorage.getItem(RELOAD_SALT_KEY);
     if (raw === null) return null;
     sessionStorage.removeItem(RELOAD_SALT_KEY);
-    const left = JSON.parse(raw) as { salt?: unknown; authId?: unknown };
-    return typeof left.salt === 'string' && left.salt !== '' && (left.authId ?? null) === authId ? left.salt : null;
+    const left = JSON.parse(raw) as { salt?: unknown; authId?: unknown; sessionIds?: unknown };
+    if (typeof left.salt !== 'string' || left.salt === '' || (left.authId ?? null) !== authId) return null;
+    const sessionIds = Array.isArray(left.sessionIds) ? left.sessionIds.filter((sid): sid is string => typeof sid === 'string') : [];
+    return { salt: left.salt, sessionIds };
   } catch {
     return null;
   }
 }
 
-/** Leave this page's salt for the next page in this tab; see {@link takeReloadSalt}. */
-export function leaveReloadSalt(salt: string, authId: string | null): void {
+/**
+ * Leave this page's salt for the next page in this tab; see {@link takeReloadSalt}.
+ *
+ * The session ids of this page's sockets go with it. The views the next page
+ * re-registers keep the edges this page's sockets stamped, and the anonymous
+ * LIVE only hears edges stamped by a session it knows (see `listRefLive`).
+ */
+export function leaveReloadSalt(salt: string, authId: string | null, sessionIds: ReadonlyArray<string> = []): void {
   try {
-    if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(RELOAD_SALT_KEY, JSON.stringify({ salt, authId }));
+    if (typeof sessionStorage !== 'undefined')
+      sessionStorage.setItem(RELOAD_SALT_KEY, JSON.stringify({ salt, authId, sessionIds }));
   } catch {
     /* private-mode storage errors: the next page mints a fresh salt */
   }
@@ -255,8 +264,13 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
   const services: ServiceCalls = {
     'hint.read': readBootBucketHint,
     'hint.write': writeBootBucketHint,
-    'salt.take': takeReloadSalt,
-    'salt.leave': leaveReloadSalt,
+    'salt.take': (authId) => {
+      const left = takeReloadSalt(authId);
+      if (!left) return null;
+      s.remote.adoptSessionIds(left.sessionIds);
+      return left.salt;
+    },
+    'salt.leave': (salt, authId) => leaveReloadSalt(salt, authId, s.remote.sessionIds()),
     'local.connect': (bucketId) => s.local.connect(bucketId),
     'local.switchStore': (bucketId) => s.local.switchStore(bucketId),
     'local.beginSwitch': () => s.local.beginSwitch(),
@@ -354,8 +368,8 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
         // trip. The clause is only ever added, never relied on: a server that
         // ignores it, or a row the session cannot read, simply yields no
         // inline row and the fetch path takes over.
-        const join = config.liveInlineBodies ? ' FETCH out' : '';
-        const [uuid] = await s.remote.query<[Uuid]>(`LIVE SELECT * FROM ${table}${join}`);
+        const stmt = listRefLive(table, { inlineBodies: config.liveInlineBodies === true, sessionIds: s.remote.sessionIds() });
+        const [uuid] = await s.remote.query<[Uuid]>(stmt.sql, stmt.vars);
         const live = await s.remote.getClient().liveOf(uuid);
         live.subscribe((message) => {
           if (message.action === 'KILLED') return;

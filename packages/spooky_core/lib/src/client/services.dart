@@ -3,6 +3,7 @@ import 'dart:async';
 import '../kernel/effects.dart';
 import '../kernel/interpreter.dart';
 import '../modules/auth/auth_service.dart';
+import '../query/sql.dart' show listRefLive;
 import '../services/database/connection_supervisor.dart';
 import '../services/database/local_database_service.dart';
 import '../services/database/local_migrator.dart';
@@ -138,8 +139,9 @@ class RemoteAdapter implements RemotePort {
     // clause is only ever added, never relied on: a server that ignores it, or
     // a row the session cannot read, simply yields no inline row and the fetch
     // path takes over.
-    final join = inlineBodies ? ' FETCH out' : '';
-    final (uuid, stream) = await _remote.live('LIVE SELECT * FROM $table$join');
+    final stmt = listRefLive(table,
+        inlineBodies: inlineBodies, sessionIds: _remote.sessionIds);
+    final (uuid, stream) = await _remote.live(stmt.sql, stmt.vars);
     await _liveSub?.cancel();
     _liveSub = stream.listen((message) {
       if (message.action == 'KILLED') return;

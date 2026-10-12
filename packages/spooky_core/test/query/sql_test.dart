@@ -33,6 +33,38 @@ void main() {
       expect((vars['config'] as Map)['id'], id);
     });
 
+    test(
+        'the LIVE on a per-user table is unfiltered; FETCH out only when bodies ride inline',
+        () {
+      final user = listRefLive('_00_list_ref_user_x',
+          inlineBodies: true, sessionIds: ['s1']);
+      expect(user.sql, 'LIVE SELECT * FROM _00_list_ref_user_x FETCH out');
+      expect(user.vars, isNull);
+      final global =
+          listRefLive('_00_list_ref', inlineBodies: false, sessionIds: []);
+      expect(global.sql, 'LIVE SELECT * FROM _00_list_ref');
+      expect(global.vars, isNull);
+    });
+
+    test(
+        "the anon LIVE hears only this client's sockets, current one by session::id()",
+        () {
+      final sids = ['earlier-1', 'earlier-2'];
+      final live = listRefLive('_00_list_ref_anon',
+          inlineBodies: true, sessionIds: sids);
+      expect(live.sql,
+          'LIVE SELECT * FROM _00_list_ref_anon WHERE clientId = <string>session::id() OR clientId IN \$sids FETCH out');
+      expect(live.vars, {'sids': sids});
+      // A copy: the service's list keeps growing after the LIVE is sent.
+      sids.add('later');
+      expect(live.vars!['sids'], ['earlier-1', 'earlier-2']);
+      final bare =
+          listRefLive('_00_list_ref_anon', inlineBodies: false, sessionIds: []);
+      expect(bare.sql,
+          'LIVE SELECT * FROM _00_list_ref_anon WHERE clientId = <string>session::id() OR clientId IN \$sids');
+      expect(bare.vars, {'sids': <String>[]});
+    });
+
     test('view rows and ids', () {
       expect(viewRecordId('k1'), '_00_view:k1');
       final row = viewRow([('t:1', 2)], [('c:1', 3)], true, 99);

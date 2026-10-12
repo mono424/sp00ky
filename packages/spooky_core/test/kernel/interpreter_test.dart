@@ -169,6 +169,7 @@ void main() {
     expect(await ctx(Fx.hash('abc')),
         'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
     expect(await ctx(Fx.id(IdScope.salt)), 'salt-1');
+    expect(await ctx(Fx.id(IdScope.owner)), 'owner-2');
     expect(await ctx(Fx.now()), 1700000000000);
     fakes.advance(5);
     expect(await ctx(Fx.now()), 1700000000005);

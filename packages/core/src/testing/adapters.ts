@@ -78,7 +78,11 @@ export function fakeAdapters(over: {
       clear: (key) => void timers.pending.delete(key),
     },
     clock: { now: () => now },
-    ids: { mutation: () => `_00_pending_mutations:${String(++ids).padStart(13, '0')}_0001_tab`, salt: () => `salt-${++ids}` },
+    ids: {
+      mutation: () => `_00_pending_mutations:${String(++ids).padStart(13, '0')}_0001_tab`,
+      salt: () => `salt-${++ids}`,
+      owner: () => `owner-${++ids}`,
+    },
     hash: sha256Hex,
     services,
   };

@@ -161,7 +161,13 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
     const table = listRefTable(env, state);
     const results = (yield fx.remote.query(
       sql.registerSelect(table),
-      sql.registerVars({ id: entry.def.id, surql: entry.def.surql, params: { ...entry.def.params }, ttl: entry.def.ttl }),
+      sql.registerVars({
+        id: entry.def.id,
+        surql: entry.def.surql,
+        params: { ...entry.def.params },
+        ttl: entry.def.ttl,
+        ...(state.ownerSecret ? { owner: state.ownerSecret } : {}),
+      }),
       env.remoteTimeoutMs
     )) as StatementResult[];
     const stillThere = (yield fx.state.read((s) => s.queries.has(hash))) as boolean;

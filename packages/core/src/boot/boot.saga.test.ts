@@ -43,24 +43,42 @@ describe('boot', () => {
       'releases.init',
     ]);
     expect(svc.calls[1]).toEqual(['local.connect', ['u1']]);
-    expect(out.state).toMatchObject({ bucketId: 'u1', userId: 'user:u1', saltUserId: 'user:u1', sessionId: 'salt-1', localReady: true });
+    expect(out.state).toMatchObject({
+      bucketId: 'u1',
+      userId: 'user:u1',
+      saltUserId: 'user:u1',
+      sessionId: 'salt-1',
+      ownerSecret: 'owner-2',
+      localReady: true,
+    });
     expect(out.dispatched.map((d) => d.type)).toEqual(['WarmBlobs', 'PrimeCircuit', 'AdoptPendingWrites', 'LifecycleTick', 'StartRemote']);
     // The view index is loaded before anything can paint; the first GC waits out the boot.
     expect(out.state.views).toEqual(new Map([['k', ['t:1']]]));
     expect(out.timers.get('gc')).toEqual({ ms: 30_000, event: { type: 'GcTick' } });
     expect(svc.names()).not.toContain('remote.connect');
   });
-  it('a reload keeps the salt its tab left for the same principal', async () => {
+  it('a reload keeps the salt its tab left for the same principal, and the owner secret its views answer to', async () => {
     const svc = fakeServices({
       'hint.read': () => 'u1',
       'auth.restoreSession': async () => 'user:u1',
       'auth.sessionAuthId': () => 'user:u1',
-      'salt.take': () => 'kept-salt',
+      'salt.take': () => ({ salt: 'kept-salt', owner: 'kept-owner' }),
     });
     const out = await runPure(boot(env, { sharedTabs: false }), { handlers: { service: svc.handler, 'local.query': () => [] } });
     expect(svc.calls).toContainEqual(['salt.take', ['user:u1']]);
     expect(svc.calls).toContainEqual(['crdt.setSessionId', ['kept-salt']]);
-    expect(out.state).toMatchObject({ sessionId: 'kept-salt', saltUserId: 'user:u1' });
+    expect(out.state).toMatchObject({ sessionId: 'kept-salt', saltUserId: 'user:u1', ownerSecret: 'kept-owner' });
+    expect(out.log.filter((e) => e.kind === 'id')).toEqual([]);
+  });
+  it('a salt left by a page that kept no owner secret gets a fresh one', async () => {
+    const svc = fakeServices({
+      'hint.read': () => null,
+      'auth.restoreSession': async () => null,
+      'auth.sessionAuthId': () => null,
+      'salt.take': () => ({ salt: 'kept-salt', owner: null }),
+    });
+    const out = await runPure(boot(env, { sharedTabs: false }), { handlers: { service: svc.handler, 'local.query': () => [] } });
+    expect(out.state).toMatchObject({ sessionId: 'kept-salt', ownerSecret: 'owner-1' });
   });
   it('shared tabs: takes the role from the coordinator, or falls back to solo; schemaless engines skip provisioning; anonymous skips session auth', async () => {
     const leader = fakeServices({ 'hint.read': () => null, 'tabs.start': async () => 'leader', 'local.usesSurqlSchema': () => false, 'auth.restoreSession': async () => null, 'auth.sessionAuthId': () => null });
@@ -146,12 +164,17 @@ describe('startRemote / primeCircuit / versionsPrimed / pageHide / warmBlobs', (
     expect(f.state.primed).toBe(true);
     expect(f.emitted).toEqual([expect.objectContaining({ level: 'warn' })]);
   });
-  it('pageHide leaves the salt for a reload before releasing views', async () => {
+  it('pageHide leaves the salt and owner secret for a reload before releasing views', async () => {
     const svc = fakeServices();
-    const s = { ...buildState([buildEntry({ def: { hash: 'a' }, lifecycle: { remote: 'registered' } })]), sessionId: 'salt-1', saltUserId: 'user:u1' };
+    const s = {
+      ...buildState([buildEntry({ def: { hash: 'a' }, lifecycle: { remote: 'registered' } })]),
+      sessionId: 'salt-1',
+      saltUserId: 'user:u1',
+      ownerSecret: 'owner-1',
+    };
     await runPure(pageHide(), { state: s, handlers: { service: svc.handler } });
     expect(svc.calls).toEqual([
-      ['salt.leave', ['salt-1', 'user:u1']],
+      ['salt.leave', ['salt-1', 'user:u1', 'owner-1']],
       ['remote.releaseViews', [[new RecordId('_00_query', 'a')]]],
     ]);
   });

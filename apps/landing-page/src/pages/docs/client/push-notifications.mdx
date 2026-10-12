@@ -281,6 +281,11 @@ const sub = feed.subscribe(query, {
 await feed.idle({ timeoutMs: 5000 });                     // first set loaded, quiet for 300 ms
 await feed.close();                                       // releases the views`} lang="typescript" />
 
+Signed out, a feed's views answer only to the feed: each registration carries a
+secret minted per feed (`ownerSecret`), and the server refuses anyone else's
+registration of that view. Two feeds that share views by passing the same
+`sessionId` must pass the same `ownerSecret` too.
+
 <Note title="Query allowlist">
   With `sync.queryAllowlist` on, the worker's query goes through the same
   allowlist as the app's: write it with the query builder, in a file the

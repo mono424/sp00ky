@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
@@ -49,6 +51,17 @@ class SurrealDuration {
 
 /// UUID v4 with hyphens stripped (matches TS `generateId`).
 String generateId() => _uuid.v4().replaceAll('-', '');
+
+/// 32 random bytes, hex: the secret a client proves it owns its anonymous
+/// views with (`$config.owner` on `fn::query::register`; TS
+/// `mintOwnerSecret`).
+String generateOwnerSecret() {
+  final rng = Random.secure();
+  return [
+    for (var i = 0; i < 32; i++)
+      rng.nextInt(256).toRadixString(16).padLeft(2, '0'),
+  ].join();
+}
 
 /// A fresh `RecordId` for [tableName] with a generated id (TS `generateNewTableId`).
 RecordId generateNewTableId(String tableName) =>

@@ -262,6 +262,22 @@ void main() {
       }
     });
 
+    test("sends the client's owner secret beside params, not inside them",
+        () async {
+      final out = await runPure<void>(
+        (ctx) => registerRemote(ctx, env(), 'a'),
+        state: r.setIdentity(ownerSecret: 'owner-k')(withQuery()),
+        handlers: defaults(over: {
+          'remote.query': (_, __) =>
+              registerAnswer(primary: const [], meta: readyMeta(0)),
+        }),
+      );
+      final sent = out.ofKind('remote.query').first as RemoteQuery;
+      final config = sent.vars!['config'] as Map;
+      expect(config['owner'], 'owner-k');
+      expect((config['params'] as Map).containsKey('owner'), isFalse);
+    });
+
     test('registers, applies membership and children, flips registered',
         () async {
       final out = await runPure<void>(

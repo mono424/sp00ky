@@ -52,6 +52,8 @@ void main() {
       expect(out.state.userId, 'user:u1');
       expect(out.state.sessionId, isNotNull);
       expect(out.state.saltUserId, 'user:u1');
+      expect(out.state.ownerSecret, isNotNull);
+      expect(out.state.ownerSecret, isNot(out.state.sessionId));
       expect(names, contains(ServiceName.sspSetSessionAuth));
       expect(out.state.localReady, isTrue);
       expect(out.dispatched.map((e) => e.type), ['LifecycleTick']);

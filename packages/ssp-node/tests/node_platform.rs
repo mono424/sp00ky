@@ -3195,7 +3195,8 @@ struct SlowRegistrationDb { inner: Arc<dyn Db> }
 #[async_trait::async_trait]
 impl Db for SlowRegistrationDb {
     async fn query(&self, sql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
-        if sql.starts_with("UPSERT type::record($id) SET clientId") {
+        // The cold and warm registration metadata writes.
+        if sql.starts_with("UPSERT type::record($id) SET ") && sql.contains(ssp_node::node::OWNER_GUARD) {
             tokio::time::sleep(Duration::from_millis(275)).await;
         }
         self.inner.query(sql, binds).await
@@ -3361,3 +3362,215 @@ async fn late_empty_identity_metadata_cannot_replace_a_concrete_rebuild() {
 }
 
 mod ingest_batch_tests;
+
+// --- Anonymous view ownership -------------------------------------------------
+//
+// Every signed-out visitor registers as `anon`, and anonymous view ids are
+// world-readable on `_00_list_ref_anon`, so an id plus a matching identity is
+// no proof of anything. A registration onto an existing anonymous row must
+// carry the hash of the secret it was registered with (`OWNER_GUARD`).
+
+/// A node routing identity-less registrations to `anon`, over the shipped
+/// `_00_query` schema (field types and permissions included), with a
+/// readable `thread` table.
+async fn anon_harness(merge_views: bool) -> Harness {
+    let h = build(HarnessOpts { anonymous_live_queries: true, merge_views, ..Default::default() }).await;
+    let meta = include_str!("../../../apps/cli/src/meta_tables_remote.surql");
+    let start = meta.find("DEFINE TABLE OVERWRITE _00_query SCHEMALESS").expect("_00_query block");
+    let end = meta.find("-- SPOOKY LIST REF").expect("end of the _00_query block");
+    h.raw_db.query(&meta[start..end]).await.unwrap().check().unwrap();
+    h.raw_db.query("DEFINE TABLE thread SCHEMALESS PERMISSIONS FOR select FULL;").await.unwrap();
+    h.node.processor.write().await.set_permission("thread", "true");
+    h
+}
+
+fn anon_register(id: &str, socket: &str, owner_hash: Option<&str>) -> Value {
+    let mut body = json!({
+        "id": id,
+        "surql": "SELECT * FROM thread",
+        "clientId": socket,
+        "ttl": "30m",
+        "lastActiveAt": "2024-01-01T00:00:00Z",
+        "params": { "auth": { "id": "" } }
+    });
+    if let Some(hash) = owner_hash {
+        body["ownerHash"] = json!(hash);
+    }
+    body
+}
+
+/// `(ownerHash, clientId, subscriber ids)` of `_00_query:<key>`.
+async fn owner_row(h: &Harness, key: &str) -> (Option<String>, Option<String>, Vec<String>) {
+    let row: Option<Value> = h
+        .raw_db
+        .query(format!("SELECT ownerHash, clientId, subscribers[*].id AS subs FROM ONLY _00_query:{key}"))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let row = row.unwrap_or(Value::Null);
+    let text = |k: &str| row.get(k).and_then(Value::as_str).map(str::to_string);
+    let subs = row
+        .get("subs")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    (text("ownerHash"), text("clientId"), subs)
+}
+
+async fn register_status(h: &Harness, body: Value) -> (u16, Value) {
+    let r = h.node.route(authed(Method::Post, "/view/register", body)).await.unwrap();
+    (r.status, json_of(&r).clone())
+}
+
+#[tokio::test]
+async fn an_anonymous_view_joins_only_with_its_owners_secret() {
+    let h = anon_harness(false).await;
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA", Some("hA"))).await.0, 200);
+    assert_eq!(owner_row(&h, "v1").await, (Some("hA".into()), Some("sA".into()), vec!["sA".into()]));
+
+    // A guest who read the id off `_00_list_ref_anon`, with its own secret or
+    // none: refused, and the row (subscribers, the clientId every later edge
+    // is stamped with) is exactly as it was.
+    for stranger in [Some("hB"), Some(""), None] {
+        let (status, body) = register_status(&h, anon_register("_00_query:v1", "sB", stranger)).await;
+        assert_eq!(status, 409, "{stranger:?}: {body}");
+        assert_eq!(body["code"], "owner_mismatch");
+        assert_eq!(owner_row(&h, "v1").await, (Some("hA".into()), Some("sA".into()), vec!["sA".into()]));
+    }
+
+    // The owner's reconnect (a new socket, the same page secret) still joins.
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA2", Some("hA"))).await.0, 200);
+    assert_eq!(
+        owner_row(&h, "v1").await,
+        (Some("hA".into()), Some("sA2".into()), vec!["sA".into(), "sA2".into()])
+    );
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
+}
+
+/// A row registered before the check (or by a client that sends no secret)
+/// holds no hash and stays joinable. The first registration that brings one
+/// claims it, which is how a reloaded page on a new client adopts the views
+/// its previous page left.
+#[tokio::test]
+async fn an_anonymous_view_without_an_owner_is_claimed_by_the_first_secret() {
+    let h = anon_harness(false).await;
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA", None)).await.0, 200);
+    assert_eq!(owner_row(&h, "v1").await.0, None);
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sB", Some(""))).await.0, 200);
+    assert_eq!(owner_row(&h, "v1").await.0, None);
+
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA2", Some("hA"))).await.0, 200);
+    assert_eq!(owner_row(&h, "v1").await.0.as_deref(), Some("hA"));
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sC", None)).await.0, 409);
+}
+
+/// Every tab of a signed-in user shares that user's views, each with its own
+/// page secret: nothing is stored on such a row, and nothing is checked.
+#[tokio::test]
+async fn a_signed_in_view_stores_no_owner_and_takes_every_tab() {
+    let h = anon_harness(false).await;
+    let tab = |socket: &str, hash: &str| {
+        let mut body = anon_register("_00_query:v1", socket, Some(hash));
+        body["params"] = json!({ "auth": { "id": "user:alice" } });
+        body
+    };
+    assert_eq!(register_status(&h, tab("t1", "h1")).await.0, 200);
+    assert_eq!(register_status(&h, tab("t2", "h2")).await.0, 200);
+    let (hash, _, subs) = owner_row(&h, "v1").await;
+    assert_eq!(hash, None);
+    assert_eq!(subs, vec!["t1".to_string(), "t2".to_string()]);
+}
+
+/// The view is gone from this SSP but its row is not (the SSP that held it
+/// died, and the scheduler placed the next registration here). A stranger
+/// reaching the cold path is refused too, and what it built is rolled back:
+/// no view, no metrics slot, no gauge drift. The owner then registers as
+/// usual.
+#[tokio::test]
+async fn a_stranger_cannot_take_an_anonymous_row_through_a_cold_registration() {
+    let h = anon_harness(false).await;
+    h.raw_db
+        .query(
+            "UPSERT _00_query:v1 SET auth_id = 'anon', ownerHash = 'hA', clientId = 'sA', \
+             surql = 'SELECT * FROM thread', ttl = 30m, lastActiveAt = time::now(), \
+             subscribers = [{ id: 'sA', seenAt: time::now() }]",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let (status, body) = register_status(&h, anon_register("_00_query:v1", "sB", Some("hB"))).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(h.node.processor.read().await.view_count(), 0);
+    assert!(!h.node.view_metrics.read().await.contains_key("v1"));
+    assert_eq!(*h.telemetry_gauge.lock().unwrap(), 0);
+    assert_eq!(owner_row(&h, "v1").await, (Some("hA".into()), Some("sA".into()), vec!["sA".into()]));
+
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA2", Some("hA"))).await.0, 200);
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
+    assert_eq!(owner_row(&h, "v1").await.2, vec!["sA".to_string(), "sA2".to_string()]);
+}
+
+/// The same refusal when the stranger's registration attached to another
+/// view's graph (merging): the rollback detaches it and leaves that graph,
+/// its merge key and its owner alone. It used to `remove_query` the
+/// subscriber's id, which left the subscriber attached, publishing under the
+/// refused id.
+#[tokio::test]
+async fn a_refused_cold_registration_detaches_from_a_shared_graph() {
+    let h = anon_harness(true).await;
+    assert_eq!(register_status(&h, anon_register("_00_query:v0", "s0", Some("h0"))).await.0, 200);
+    h.raw_db
+        .query(
+            "UPSERT _00_query:v1 SET auth_id = 'anon', ownerHash = 'hA', clientId = 'sA', \
+             ttl = 30m, lastActiveAt = time::now(), subscribers = []",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sB", Some("hB"))).await.0, 409);
+    {
+        let circuit = h.node.processor.read().await;
+        assert_eq!(circuit.subscriber_count(), 0, "the refused registration is not left attached");
+        assert!(circuit.registration("v1").is_none());
+        assert!(circuit.registration("v0").is_some(), "the graph it attached to survives");
+        assert_eq!(circuit.graph_count(), 1);
+    }
+
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA", Some("hA"))).await.0, 200);
+    let circuit = h.node.processor.read().await;
+    assert_eq!((circuit.graph_count(), circuit.subscriber_count()), (1, 1), "the owner shares v0's graph");
+}
+
+/// Ownership lives on the row, not in a node's memory, so it holds across a
+/// restart and a blue/green handover. A standby follows registrations
+/// without writing; once promoted it serves views it built from the
+/// predecessor's shadows (or from `_00_query` at boot), and the row the
+/// predecessor wrote still decides who may join them.
+#[tokio::test]
+async fn a_promoted_standby_enforces_the_owner_its_predecessor_stored() {
+    let h = anon_harness(false).await;
+    h.node.edge_update_tx.set_standby(true);
+    // The predecessor's registration, shadowed: computed, nothing written.
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA", Some("hA"))).await.0, 200);
+    assert_eq!(owner_row(&h, "v1").await, (None, None, vec![]));
+    // What the predecessor wrote for it.
+    h.raw_db
+        .query(
+            "UPSERT _00_query:v1 SET auth_id = 'anon', ownerHash = 'hA', clientId = 'sA', \
+             ttl = 30m, lastActiveAt = time::now(), subscribers = [{ id: 'sA', seenAt: time::now() }]",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    h.node.edge_update_tx.set_standby(false);
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sB", Some("hB"))).await.0, 409);
+    assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA2", Some("hA"))).await.0, 200);
+    assert_eq!(owner_row(&h, "v1").await.2, vec!["sA".to_string(), "sA2".to_string()]);
+}

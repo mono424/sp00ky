@@ -93,6 +93,14 @@ export interface RegisterPayload {
   surql: string;
   params: Record<string, unknown>;
   ttl: string;
+  /**
+   * The registering page's secret. `fn::query::register` forwards only its
+   * hash, and the SSP lets a registration onto an existing anonymous view
+   * only with the hash that view was registered with: every signed-out
+   * visitor is `anon`, and anyone can read an anonymous view's id. Kept out
+   * of `params`, which name the computation the SSP shares between views.
+   */
+  owner?: string;
 }
 
 /** Register + read back edges/meta/children in ONE request. */

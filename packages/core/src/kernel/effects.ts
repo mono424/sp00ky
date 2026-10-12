@@ -53,7 +53,7 @@ export type Effect =
   | { kind: 'state.update'; fn: (s: ClientState) => ClientState }
   | { kind: 'state.wait'; until: (s: ClientState) => boolean }
   | { kind: 'now' }
-  | { kind: 'id'; scope: 'mutation' | 'salt' }
+  | { kind: 'id'; scope: IdScope }
   | { kind: 'hash'; input: string }
   | { kind: 'emit'; event: OutEvent }
   | { kind: 'dispatch'; event: RuntimeEvent }
@@ -61,6 +61,9 @@ export type Effect =
   | { kind: 'service'; name: ServiceName; args: unknown[] };
 
 export type EffectKind = Effect['kind'];
+
+/** `mutation`: an outbox row id. `salt`: a query-key salt. `owner`: a page's anonymous-view owner secret. */
+export type IdScope = 'mutation' | 'salt' | 'owner';
 
 /**
  * Calls into the legacy services that are adapters, not state: auth, tabs,
@@ -70,8 +73,9 @@ export type EffectKind = Effect['kind'];
 export interface ServiceCalls {
   'hint.read': () => string | null;
   'hint.write': (bucketId: string) => void;
-  'salt.take': (authId: string | null) => string | null;
-  'salt.leave': (salt: string, authId: string | null) => void;
+  /** The salt (and owner secret) this tab's previous page left, if minted for `authId`. */
+  'salt.take': (authId: string | null) => { salt: string; owner: string | null } | null;
+  'salt.leave': (salt: string, authId: string | null, owner: string | null) => void;
   'local.connect': (bucketId: string) => Promise<void>;
   'local.switchStore': (bucketId: string) => Promise<void>;
   'local.beginSwitch': () => () => void;
@@ -154,7 +158,7 @@ export const fx = {
     wait: (until: (s: ClientState) => boolean): Effect => ({ kind: 'state.wait', until }),
   },
   now: (): Effect => ({ kind: 'now' }),
-  id: (scope: 'mutation' | 'salt'): Effect => ({ kind: 'id', scope }),
+  id: (scope: IdScope): Effect => ({ kind: 'id', scope }),
   hash: (input: string): Effect => ({ kind: 'hash', input }),
   emit: (event: OutEvent): Effect => ({ kind: 'emit', event }),
   dispatch: (event: RuntimeEvent): Effect => ({ kind: 'dispatch', event }),

@@ -81,6 +81,17 @@ pub mod view {
 
         let params = config.get("params").cloned().unwrap_or(json!({}));
 
+        // `sha256` of the registering page's owner secret, '' when it sent
+        // none (an older client, or a boot re-registration, which never writes
+        // the row). Kept out of `params` on purpose: params feed the merge key,
+        // and a per-page value there would stop identical queries sharing a
+        // graph.
+        let owner_hash = config
+            .get("ownerHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         let format = config
             .get("format")
             .or_else(|| config.get("resultFormat"))
@@ -119,11 +130,11 @@ pub mod view {
         // across re-auth / reconnect) instead of the per-connection
         // `session::id()`.
         //
-        // Note: we cannot read this from a top-level `authId` field on
-        // the registration payload because SurrealDB's `http::post`
-        // silently strips object keys that aren't in the runtime's
-        // recognized set for that call site. The `params.auth.id` path
-        // is the only channel that already survives that filtering.
+        // `http::post` forwards every key of the body (checked on 3.0.5 and
+        // 3.1.5). A new top-level key is lost to OUR parsing instead: this
+        // function keeps only the keys it names in `metadata` below, and the
+        // scheduler relays a typed `ssp_protocol::ViewRegisterRequest`. A key
+        // added to `fn::query::register` has to be added in both places.
         let auth_id = safe_params_val
             .get("auth")
             .and_then(|a| a.get("id"))
@@ -164,7 +175,8 @@ pub mod view {
             "params": params,
             "safe_params": safe_params_val,
             "ttl": ttl,
-            "lastActiveAt": last_active_at
+            "lastActiveAt": last_active_at,
+            "ownerHash": owner_hash
         });
 
         Ok(DbspRegistrationData {

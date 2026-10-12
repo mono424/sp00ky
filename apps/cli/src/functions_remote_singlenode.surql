@@ -39,12 +39,20 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
     -- a LET first forces the value into a concrete `string`, which
     -- survives object construction and JSON serialization in
     -- `http::post`.
-    -- NOTE: any extra fields added to $module_config here are silently
-    -- dropped by SurrealDB's `http::post` (only the original recognized
-    -- set survives the call boundary). Auth identity for `_00_query.
-    -- auth_id` propagation must travel through `params.auth.id`, which
-    -- IS preserved, and the SSP extracts it server-side in
-    -- `prepare_registration_dbsp`.
+    -- NOTE: `http::post` sends every key of $module_config. A new key is
+    -- dropped on the far side unless the SSP's `prepare_registration_dbsp`
+    -- (packages/ssp/src/service.rs) and the scheduler's typed
+    -- `ViewRegisterRequest` (packages/ssp-protocol) both name it.
+    --
+    -- Proof of ownership for an anonymous view: the hash of the secret the
+    -- client's page minted (`$config.owner`), never the secret itself. Every
+    -- signed-out visitor shares the identity `anon` and anyone can read an
+    -- anonymous view id, so the SSP lets a registration onto an existing
+    -- anonymous `_00_query` row only with the hash stored there (see the
+    -- `ownerHash` field). '' from a client that sends no secret. Not in
+    -- `params`: those feed the SSP's merge key, and a per-page value there
+    -- would stop identical queries sharing one graph.
+    LET $owner_hash = IF $config.owner { crypto::sha256(<string>$config.owner) } ELSE { '' };
     LET $module_config = {
         id: <string>$config.id,
         surql: <string>$config.surql,
@@ -52,7 +60,8 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
         clientId: <string>session::id(),
         ttl: <string>($config.ttl OR '1h'),
         lastActiveAt: <string>time::now(),
-        format: <string>($config.format OR 'flat')
+        format: <string>($config.format OR 'flat'),
+        ownerHash: $owner_hash
     };
 
     -- Call SSP via HTTP

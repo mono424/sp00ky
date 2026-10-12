@@ -332,6 +332,7 @@ class ClientState {
     required this.sessionId,
     required this.userId,
     required this.saltUserId,
+    this.ownerSecret,
     required this.pendingBucket,
     required this.tabId,
     required this.tabRole,
@@ -355,6 +356,11 @@ class ClientState {
 
   /// The principal the current session salt was minted for.
   final String? saltUserId;
+
+  /// This client's secret, sent with every registration (`$config.owner`).
+  /// An anonymous view answers only to the secret it was registered with, so
+  /// it lives as long as the client's views: a reconnect keeps it.
+  final String? ownerSecret;
 
   /// Latest bucket-switch target; an older switch that wakes up to a newer
   /// target skips.
@@ -394,6 +400,7 @@ class ClientState {
     bool clearUserId = false,
     String? saltUserId,
     bool clearSaltUserId = false,
+    String? ownerSecret,
     String? pendingBucket,
     bool clearPendingBucket = false,
     String? tabId,
@@ -417,6 +424,7 @@ class ClientState {
         sessionId: clearSessionId ? null : (sessionId ?? this.sessionId),
         userId: clearUserId ? null : (userId ?? this.userId),
         saltUserId: clearSaltUserId ? null : (saltUserId ?? this.saltUserId),
+        ownerSecret: ownerSecret ?? this.ownerSecret,
         pendingBucket:
             clearPendingBucket ? null : (pendingBucket ?? this.pendingBucket),
         tabId: tabId ?? this.tabId,

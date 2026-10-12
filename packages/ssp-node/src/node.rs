@@ -193,6 +193,55 @@ fn err_json(status: u16, code: &str, message: impl Into<String>) -> ApiResponse 
     ApiResponse::json(status, json!({ "code": code, "message": message.into() }))
 }
 
+/// What [`OWNER_GUARD`] throws when a registration does not prove it owns an
+/// anonymous view.
+pub const OWNER_MISMATCH: &str = "owner_mismatch";
+
+/// The first SET clause of both registration UPSERTs (cold and warm): proof
+/// that the caller owns the anonymous row it is about to subscribe to.
+///
+/// Every signed-out visitor shares the identity `anon`, and anonymous view ids
+/// are readable by anyone on `_00_list_ref_anon`, so an id and a matching
+/// `auth_id` prove nothing there. Without this a guest could register another
+/// guest's id, land its own session in that row's `subscribers` (which the
+/// `_00_query` permission then honours: it could DELETE the row, and the
+/// delete event unregisters the view) and overwrite `clientId`, which every
+/// later edge of the view is stamped with.
+///
+/// `$ownerHash` is `sha256` of a secret the registering page minted and keeps
+/// for the life of its views (across a reconnect, and across a reload that
+/// keeps its query salt). The first registration that brings one stores it;
+/// after that, an anonymous row answers only to that hash. A row without one
+/// predates this check (or its client) and is joinable as before. The caller
+/// passes '' for a row that is not anonymous, so nothing is stored there:
+/// every tab of a signed-in user shares its views, and each has its own
+/// secret.
+///
+/// A guard inside the write rather than a read before it, so ownership is
+/// decided atomically with the subscription it grants. It is placed first
+/// because SET clauses apply in order: `auth_id` here is the stored identity,
+/// before the warm path's `auth_id ?? $authId` fills a new row. `'anon'` is
+/// [`ssp_protocol::ANON_AUTH_ID`].
+pub const OWNER_GUARD: &str = "ownerHash = IF auth_id = 'anon' AND ownerHash AND ownerHash != $ownerHash \
+                               { THROW 'owner_mismatch' } ELSE { ownerHash OR $ownerHash OR NONE }";
+
+/// The `$ownerHash` binding for a registration under `auth_id`: the hash the
+/// request carried for an anonymous view, '' (store nothing) for any other.
+fn owner_hash_binding(auth_id: &str, metadata: &Value) -> Value {
+    if auth_id != ssp_protocol::ANON_AUTH_ID {
+        return json!("");
+    }
+    json!(metadata.get("ownerHash").and_then(Value::as_str).unwrap_or(""))
+}
+
+fn is_owner_mismatch(e: &crate::ports::DbError) -> bool {
+    e.to_string().contains(OWNER_MISMATCH)
+}
+
+fn owner_mismatch_response() -> ApiResponse {
+    err_json(409, OWNER_MISMATCH, "This anonymous query id belongs to another visitor")
+}
+
 /// `_00_query` rows per metadata query in [`SspNode::republish_restored_views`].
 pub const VIEW_METADATA_BATCH: usize = 100;
 
@@ -1532,9 +1581,13 @@ impl SspNode {
         // `<datetime> + ttl` is valid arithmetic. (`$ttl` the PARAMETER is
         // a string off the register payload, hence the explicit
         // `<duration>` cast on that side only.)
+        //
+        // `OWNER_GUARD` goes first: an anonymous row joins only the page that
+        // owns it, so a guest who read this id off `_00_list_ref_anon` is
+        // refused here instead of being appended to `subscribers`.
         let (stored_auth, row_count, shape, index_uses) = existing_registration
             .unwrap_or_else(|| (auth_id.to_string(), 0, data.shape.clone(), Vec::new()));
-        let stmt = "UPSERT type::record($id) SET clientId = <string>$clientId, \
+        let stmt = ["UPSERT type::record($id) SET ", OWNER_GUARD, ", clientId = <string>$clientId, \
                     auth_id = auth_id ?? <string>$authId, surql = surql ?? <string>$surql, \
                     params = params ?? $params, rowCount = rowCount ?? <int>$rowCount, \
                     state = state ?? <string>$state, \
@@ -1544,14 +1597,15 @@ impl SspNode {
                         array::filter(subscribers ?? [], |$s| \
                             <string>$s.id != $sid \
                             AND <datetime>$s.seenAt + ttl > time::now()), \
-                        { id: $sid, seenAt: time::now() }) RETURN BEFORE";
+                        { id: $sid, seenAt: time::now() }) RETURN BEFORE"].concat();
         let metadata_start = web_time::Instant::now();
         let previous = query_retrying(
-                self.platform.db.as_ref(), stmt,
+                self.platform.db.as_ref(), &stmt,
                 &[
                     ("id", json!(incantation_id)),
                     ("clientId", json!(meta_str("clientId"))),
                     ("sid", json!(meta_str("clientId"))),
+                    ("ownerHash", owner_hash_binding(&stored_auth, &data.metadata)),
                     ("authId", json!(stored_auth)),
                     ("surql", json!(meta_str("sql"))),
                     ("params", data.metadata.get("safe_params").cloned().unwrap_or(Value::Null)),
@@ -1564,6 +1618,14 @@ impl SspNode {
             .await;
         let metadata_created = match previous {
             Ok(rows) => rows.first().map_or(true, |row| row.is_null() || row.as_array().is_some_and(|rows| rows.iter().all(Value::is_null))),
+            Err(e) if is_owner_mismatch(&e) => {
+                warn!(
+                    target: "ssp::policy",
+                    view_id = %incantation_id,
+                    "Refusing to join an anonymous view without its owner's secret"
+                );
+                return Some(owner_mismatch_response());
+            }
             Err(e) => {
                 error!("Failed to update incantation metadata: {}", e);
                 false
@@ -1881,7 +1943,12 @@ impl SspNode {
         // The creating session is also the first subscriber. A warm join may
         // have created the row while this request awaited metadata, so TTL
         // remains max-wins here too and existing watchers are retained.
-        let stmt = "UPSERT type::record($id) SET clientId = <string>$clientId, \
+        //
+        // A cold registration can still meet an existing row: the view went
+        // with an SSP that died, or the circuit lost it while the row stayed.
+        // `OWNER_GUARD` refuses a stranger there too, before this write could
+        // hand them the row; the view built above is then rolled back below.
+        let stmt = ["UPSERT type::record($id) SET ", OWNER_GUARD, ", clientId = <string>$clientId, \
                     auth_id = <string>$authId, surql = <string>$surql, params = $params, \
                     ttl = (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }), \
                     lastActiveAt = <datetime>$lastActiveAt, \
@@ -1892,14 +1959,15 @@ impl SspNode {
                             <string>$s.id != $sid \
                             AND <datetime>$s.seenAt + (IF ttl = NONE OR <duration>$ttl > ttl { <duration>$ttl } ELSE { ttl }) > time::now()), \
                         { id: $sid, seenAt: time::now() }) \
-                    WHERE <string>$authId != '' OR auth_id = NONE OR auth_id = ''";
+                    WHERE <string>$authId != '' OR auth_id = NONE OR auth_id = ''"].concat();
         let metadata_start = web_time::Instant::now();
         if let Err(e) = query_retrying(
-                self.platform.db.as_ref(), stmt,
+                self.platform.db.as_ref(), &stmt,
                 &[
                     ("id", json!(incantation_id)),
                     ("clientId", json!(meta_str("clientId"))),
                     ("sid", json!(meta_str("clientId"))),
+                    ("ownerHash", owner_hash_binding(&auth_id, &data.metadata)),
                     ("authId", json!(auth_id)),
                     ("surql", json!(meta_str("sql"))),
                     ("params", params),
@@ -1912,16 +1980,35 @@ impl SspNode {
             )
             .await
         {
-            error!("Failed to upsert incantation metadata: {}", e);
-            {
+            let refused = is_owner_mismatch(&e);
+            if refused {
+                warn!(
+                    target: "ssp::policy",
+                    view_id = %incantation_id,
+                    "Refusing to register an anonymous view id that belongs to another visitor"
+                );
+            } else {
+                error!("Failed to upsert incantation metadata: {}", e);
+            }
+            // Undo the registration. Detach rather than remove: it may have
+            // attached to another registration's graph (merging), and a
+            // registration that attached to this one meanwhile keeps it.
+            // Nothing was published: the edges wait on `publication_ready`.
+            let rolled_back = {
                 let _publication = self.publication_gate.lock().await;
                 let mut circuit = self.processor.write().await;
-                if publication_ready.as_ref().map_or(true, |ready| ready.is_current()) {
+                let current = publication_ready.as_ref().map_or(true, |ready| ready.is_current());
+                if current {
                     self.edge_update_tx.invalidate_view(&data.plan.id);
-                    circuit.remove_query(&data.plan.id);
+                    circuit.detach_subscriber(&data.plan.id);
                 }
+                current
+            };
+            if rolled_back {
+                self.view_metrics.write().await.remove(&data.plan.id);
+                self.platform.telemetry.gauge_add("view_count", -1);
             }
-            return Some(err_json(500, "db_error", "Database error"));
+            return Some(if refused { owner_mismatch_response() } else { err_json(500, "db_error", "Database error") });
         }
 
         stages.metadata_db_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;

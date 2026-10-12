@@ -281,7 +281,9 @@ class NowEffect extends Effect<int> {
   String get kind => 'now';
 }
 
-enum IdScope { mutation, salt }
+/// `mutation`: an outbox row id. `salt`: a query-key salt. `owner`: the
+/// client's anonymous-view owner secret.
+enum IdScope { mutation, salt, owner }
 
 class IdEffect extends Effect<String> {
   const IdEffect(this.scope);

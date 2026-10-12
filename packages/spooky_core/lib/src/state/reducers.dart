@@ -396,6 +396,7 @@ Reducer setIdentity({
   Object? sessionId = _unset,
   Object? userId = _unset,
   Object? saltUserId = _unset,
+  String? ownerSecret,
   Object? pendingBucket = _unset,
   Object? bucketId = _unset,
   TabRole? tabRole,
@@ -410,6 +411,7 @@ Reducer setIdentity({
           saltUserId:
               identical(saltUserId, _unset) ? null : saltUserId as String?,
           clearSaltUserId: !identical(saltUserId, _unset) && saltUserId == null,
+          ownerSecret: ownerSecret,
           pendingBucket:
               identical(pendingBucket, _unset) ? null : pendingBucket as String?,
           clearPendingBucket:

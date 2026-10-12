@@ -296,6 +296,7 @@ class FakeAdapters {
         mutationId: () =>
             '_00_pending_mutations:${(++_ids).toString().padLeft(13, '0')}_0001_tab',
         saltId: () => 'salt-${++_ids}',
+        ownerSecretId: () => 'owner-${++_ids}',
         hash: sha256Hex,
         services: services,
       );

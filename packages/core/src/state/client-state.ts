@@ -114,6 +114,13 @@ export interface ClientState {
   readonly userId: string | null;
   /** The principal the current session salt was minted for. */
   readonly saltUserId: string | null;
+  /**
+   * This page's secret, sent with every registration (`$config.owner`). An
+   * anonymous view answers only to the secret it was registered with, so it
+   * lives as long as the page's views: a reconnect keeps it, and a reload
+   * that keeps the salt keeps it too.
+   */
+  readonly ownerSecret: string | null;
   /** Latest bucket-switch target; an older switch that wakes up to a newer target skips. */
   readonly pendingBucket: string | null;
   readonly tabId: string;
@@ -167,6 +174,7 @@ export function emptyState(init: { tabId: string }): ClientState {
     sessionId: null,
     userId: null,
     saltUserId: null,
+    ownerSecret: null,
     pendingBucket: null,
     tabId: init.tabId,
     tabRole: 'solo',

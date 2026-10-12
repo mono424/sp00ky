@@ -4,7 +4,7 @@ import type { IngestRecord, StreamUpdate } from '../services/stream-processor/in
 import type { ClientState } from '../state/client-state';
 import type { InlineRow } from '../types';
 import { withTimeout } from '../utils/index';
-import type { Effect, RegisterResult, ServiceCalls, Settled, StatementResult } from './effects';
+import type { Effect, IdScope, RegisterResult, ServiceCalls, Settled, StatementResult } from './effects';
 import type { OutEvent, RuntimeEvent } from './events';
 
 /** The five adapters plus the pure ports, as the interpreter sees them. */
@@ -36,7 +36,7 @@ export interface Adapters {
   };
   timers: { set(key: string, ms: number, fire: () => void): void; clear(key: string): void };
   clock: { now(): number };
-  ids: { mutation(): string; salt(): string };
+  ids: Record<IdScope, () => string>;
   hash(input: string): Promise<string>;
   services: ServiceCalls;
 }
@@ -127,7 +127,7 @@ export function createInterpreter(adapters: Adapters, host: InterpreterHost): In
       case 'now':
         return adapters.clock.now();
       case 'id':
-        return effect.scope === 'mutation' ? adapters.ids.mutation() : adapters.ids.salt();
+        return adapters.ids[effect.scope]();
       case 'hash':
         return adapters.hash(effect.input);
       case 'emit':

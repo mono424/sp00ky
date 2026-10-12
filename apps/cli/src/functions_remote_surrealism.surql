@@ -15,16 +15,18 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
         auth: { id: <string>($auth.id OR '') },
         access: <string>($access OR '')
     });
-    -- Auth identity flows through `params.auth.id` (see the singlenode
-    -- variant note). Extra top-level fields like `authId` get stripped
-    -- by the call boundary in this mode too.
+    -- Auth identity flows through `params.auth.id`, and the anonymous
+    -- view's ownership proof through `ownerHash` (see the singlenode
+    -- variant).
+    LET $owner_hash = IF $config.owner { crypto::sha256(<string>$config.owner) } ELSE { '' };
     LET $module_config = {
         id: <string>$config.id,
         surql: <string>$config.surql,
         params: <string>$params_with_auth,
         clientId: <string>session::id(),
         ttl: <string>($config.ttl OR '1h'),
-        lastActiveAt: <string>time::now()
+        lastActiveAt: <string>time::now(),
+        ownerHash: $owner_hash
     };
 
     -- Call DBSP module directly

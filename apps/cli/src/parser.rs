@@ -88,17 +88,16 @@ pub struct FieldDefinition {
 }
 
 impl FieldDefinition {
-    /// True when the sync machinery never holds this field's VALUE: `-- @nosync`,
-    /// `-- @crdt` or `-- @opaque`. These are excluded from the ingest payload and
-    /// from the replica/circuit row scans, so nothing server-side can evaluate
-    /// them.
+    /// True when the sync machinery never holds this field's VALUE: `-- @nosync`
+    /// or `-- @opaque`. These are excluded from the ingest payload and from the
+    /// replica/circuit row scans, so nothing server-side can evaluate them.
     ///
     /// Deliberately NOT the same as `should_strip`. `should_strip` is also set by
     /// `PERMISSIONS FOR select WHERE false`, which hides a field from the CLIENT
     /// schema while the server keeps the value and the SSP can still filter on it
     /// perfectly well. Conflating the two would reject valid schemas.
     pub fn excluded_from_sync(&self) -> bool {
-        ["nosync", "crdt", "opaque"]
+        ["nosync", "opaque"]
             .iter()
             .any(|name| crate::annotations::has_annotation(&self.annotations, name))
     }
@@ -243,8 +242,8 @@ impl SchemaParser {
     }
 
     /// Reject a schema that asks the server to evaluate a field whose value the
-    /// sync machinery deliberately does not hold (`-- @nosync`, `-- @crdt`,
-    /// `-- @opaque` on a `DEFINE FIELD`).
+    /// sync machinery deliberately does not hold (`-- @nosync` or `-- @opaque`
+    /// on a `DEFINE FIELD`).
     ///
     /// Two placements are rejected:
     ///
@@ -282,7 +281,7 @@ impl SchemaParser {
                     if expression_references_field(expr, field) {
                         problems.push(format!(
                             "  • table '{table_name}': PERMISSIONS FOR {action} references \
-                             '{field}', which is excluded from sync (@nosync/@crdt/@opaque). \
+                             '{field}', which is excluded from sync (@nosync/@opaque). \
                              The sync engine has no value to compare, so this rule matches \
                              NO rows and the whole table reads as empty on every client."
                         ));
@@ -910,17 +909,27 @@ DEFINE FIELD secret_token ON TABLE user TYPE string;
     }
 
     #[test]
-    fn nosync_and_crdt_fields_in_permissions_are_also_rejected() {
-        for annotation in ["-- @nosync", "-- @crdt text"] {
-            let schema = format!(
-                "\
+    fn nosync_fields_in_permissions_are_also_rejected() {
+        let schema = "\
 DEFINE TABLE doc SCHEMAFULL PERMISSIONS FOR select WHERE body != NONE;
-{annotation}
+-- @nosync
 DEFINE FIELD body ON TABLE doc TYPE string;
-"
-            );
-            assert!(parse(&schema).is_err(), "{annotation} should be rejected");
-        }
+";
+        assert!(parse(schema).is_err(), "@nosync should be rejected");
+    }
+
+    #[test]
+    fn a_crdt_text_field_in_permissions_is_allowed() {
+        // A `@crdt` field holds the folded document's plain text and syncs like
+        // any column, so the SSP can evaluate a rule that reads it.
+        parse(
+            "\
+DEFINE TABLE doc SCHEMAFULL PERMISSIONS FOR select WHERE body != NONE;
+-- @crdt text
+DEFINE FIELD body ON TABLE doc TYPE string;
+",
+        )
+        .expect("a CRDT text mirror is an ordinary synced column");
     }
 
     #[test]

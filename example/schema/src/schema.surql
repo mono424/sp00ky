@@ -95,11 +95,13 @@ DEFINE TABLE thread SCHEMAFULL
 
 DEFINE FIELD title ON TABLE thread TYPE string;
 
--- @crdt text
+-- @crdt prosemirror
 -- @cursor
--- Stored as `{ state: bytes, cursors: ... }`. The CRDT manager owns
--- writes — never `db.update({ content: <string> })`.
-DEFINE FIELD content ON TABLE thread TYPE object;
+-- The thread body is a collaborative ProseMirror document. This field holds
+-- its plain text, written by the server whenever it folds the edit log, so it
+-- can be listed, searched and filtered. Edit it with `useCrdtField`; a client
+-- never writes it directly.
+DEFINE FIELD content ON TABLE thread TYPE string;
 
 DEFINE FIELD title_suggestion ON TABLE thread TYPE option<string>;
 

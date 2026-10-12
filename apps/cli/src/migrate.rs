@@ -940,11 +940,14 @@ pub fn apply_internal_schema(
 ) -> Result<()> {
     let step = ui::step("Internal schema");
 
-    // 1. Read source schema + process backends
-    let mut content = fs::read_to_string(schema_input_path).context(format!(
+    // 1. Read source schema (with its `@crdt` expansion) + process backends
+    let raw_content = fs::read_to_string(schema_input_path).context(format!(
         "Failed to read schema file: {:?}",
         schema_input_path
     ))?;
+    let crdt = crate::crdt_schema::expand(&raw_content, crate::crdt_schema::Target::Server)?;
+    crate::crdt_schema::check_deploy_mode(&crdt.parents, mode)?;
+    let mut content = crdt.source();
 
     let mut backend_processor = BackendProcessor::new();
     if let Some(cp) = config_path {
@@ -975,12 +978,6 @@ pub fn apply_internal_schema(
     // 3a. Meta tables (remote)
     ui::detail("meta tables (remote)");
     let mut meta_tables_remote = include_str!("meta_tables_remote.surql").to_string();
-
-    // Substitute the {{CRDT_UPDATE_RULE}} placeholder. Same code path used
-    // by schema_builder.rs and main.rs codegen so the rule renders
-    // consistently.
-    meta_tables_remote =
-        crate::schema_builder::substitute_crdt_update_rule(&meta_tables_remote, &content, &parser);
 
     // `sync:` from the manifest decides the ingest transport. Under the
     // changefeed the meta tables that feed the tail get their clause and the
@@ -1021,6 +1018,17 @@ pub fn apply_internal_schema(
 
     internal_sql.push_str(&meta_tables_remote);
     internal_sql.push('\n');
+
+    // Generated `@crdt` tables, plus the text-mirror guards re-asserted over
+    // whatever the user migrations defined: a record user must never be able
+    // to write a mirror, or it could drift from the folded document.
+    if !crdt.parents.is_empty() {
+        ui::detail(format!("{} CRDT parent table(s)", crdt.parents.len()));
+        internal_sql.push_str(&crdt.generated);
+        internal_sql.push('\n');
+        internal_sql.push_str(&crdt.mirror_defs);
+        internal_sql.push('\n');
+    }
 
     // Scheduling tables (`_00_schedule*`). A separate file so the engine crate
     // can include_str! exactly this DDL in its tests; already all-OVERWRITE, so

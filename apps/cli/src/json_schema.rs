@@ -74,7 +74,9 @@ impl JsonSchemaGenerator {
         // Build reverse relationships
         // For each relationship A.field -> B, create a reverse relationship B.reverse_field -> A[]
         for (from_table, table_schema) in &parser.tables {
-            if table_schema.no_sync {
+            // Generated CRDT log/presence rows are read by the CRDT module, not
+            // through `.related()`: no `thread__crdt_logs` column on the parent.
+            if table_schema.no_sync || crate::crdt_schema::is_generated_table(from_table) {
                 continue;
             }
             for rel in &table_schema.relationships {

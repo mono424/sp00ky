@@ -3,13 +3,14 @@ use crate::backend::{DeployMode, SyncTransport};
 use crate::parser::{FieldDefinition, FieldType, TableSchema};
 use std::collections::BTreeMap;
 
-/// Fields whose value must never enter the sync machinery: `@crdt`, `@nosync`
-/// and `@opaque` on a `DEFINE FIELD`. Excluded from the ingest event payload
+/// Fields whose value must never enter the sync machinery: `@nosync` and
+/// `@opaque` on a `DEFINE FIELD`. (A `@crdt` field is the document's plain
+/// text and syncs like any column; its edit log's bytes are `@opaque`.) Excluded from the ingest event payload
 /// here and from the replica/bootstrap row scans via the `sp00ky:opaque` marker
 /// baked on by `schema_builder::add_opaque_field_markers`. The two must agree —
 /// see the call site for what happens when they don't.
 fn is_excluded_field(field_def: &FieldDefinition) -> bool {
-    ["crdt", "nosync", "opaque"]
+    ["nosync", "opaque"]
         .iter()
         .any(|name| has_annotation(&field_def.annotations, name))
 }
@@ -925,7 +926,7 @@ DEFINE FIELD body ON TABLE doc TYPE string;
             SyncTransport::Http,
         );
 
-        for excluded in ["import_batch", "thumbnail", "body"] {
+        for excluded in ["import_batch", "thumbnail"] {
             assert!(
                 !out.contains(&format!("{excluded}: $after.")),
                 "{excluded} must not be in $plain_after:\n{out}"
@@ -936,6 +937,8 @@ DEFINE FIELD body ON TABLE doc TYPE string;
             );
         }
         assert!(out.contains("title: $after.title"), "got:\n{out}");
+        // A CRDT field is the folded plain text: it syncs.
+        assert!(out.contains("body: $after.body"), "got:\n{out}");
         assert!(
             out.contains("_00_rv: (SELECT VALUE version FROM ONLY _00_version"),
             "the record version must still be stamped:\n{out}"

@@ -143,7 +143,7 @@ fn render(
             }
 
             if !crdt_fields.is_empty() {
-                s.push_str("**CRDT fields** (use `useCrdtField`, not `useQuery`; pair writes with `{ debounced: true }`):\n");
+                s.push_str("**CRDT fields** (edit with `useCrdtField`; the field itself is the server-written plain text, readable in `useQuery` and filters, never written by the client):\n");
                 for (f, variant) in &crdt_fields {
                     s.push_str(&format!("- `{}.{}` (`@crdt {}`)\n", name, f, variant));
                 }

@@ -674,10 +674,11 @@ impl CodeGenerator {
         if let Some(variant) = crdt_variant {
             lines.push("         *".to_string());
             lines.push(format!(
-                "         * `@crdt {}` — collaborative field. Read with `useCrdtField`, never `useQuery`.",
+                "         * `@crdt {}` — collaborative field. Edit it with `useCrdtField`; this column is",
                 variant
             ));
-            lines.push("         * Writes should pass `{ debounced: true }` to `db.update` so rapid keystrokes coalesce.".to_string());
+            lines.push("         * the server-written plain text of the document (readable and filterable,".to_string());
+            lines.push("         * never written by the client).".to_string());
         }
         if is_parent {
             lines.push("         *".to_string());

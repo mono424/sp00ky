@@ -513,7 +513,7 @@ pub fn schema_issues(cfg: &PushConfig, tables: &BTreeMap<String, TableSchema>) -
                 Some(field) if field.excluded_from_sync() => issues.push(Issue::warning(
                     format!("{at}.{where_}"),
                     format!(
-                        "`{seg}` is `@nosync`/`@crdt`/`@opaque` on `{}`: it is stripped from ingested rows, so the rule never sees it",
+                        "`{seg}` is `@nosync`/`@opaque` on `{}`: it is stripped from ingested rows, so the rule never sees it",
                         rule.table
                     ),
                 )),

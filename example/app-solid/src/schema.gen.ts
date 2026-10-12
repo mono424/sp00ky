@@ -160,12 +160,14 @@ export const schema = {
          */
         author: { type: 'string' as const, recordId: true, optional: false },
         /**
-         * `content` — string
+         * `content?` — string
          *
-         * `@crdt text` — collaborative field. Read with `useCrdtField`, never `useQuery`.
-         * Writes should pass `{ debounced: true }` to `db.update` so rapid keystrokes coalesce.
+         * `@crdt prosemirror` — collaborative field. Edit it with `useCrdtField`; this column is
+         * the server-written plain text of the document (readable and filterable,
+         * never written by the client).
          */
-        content: { type: 'string' as const, crdt: 'text' as const, cursor: true, optional: false },
+        content: { type: 'string' as const, crdt: 'prosemirror' as const, cursor: true, optional: true },
+        content__crdt: { type: 'string' as const, optional: true },
         content_suggestion: { type: 'string' as const, optional: true },
         /**
          * `created_at?` — string
@@ -178,6 +180,105 @@ export const schema = {
         title_suggestion: { type: 'string' as const, optional: true },
         comments: { type: 'string' as const, array: true, optional: true },
         share_links: { type: 'string' as const, array: true, optional: true },
+      },
+      primaryKey: ['id'] as const
+    },
+    /**
+     * `thread__crdt_log` table.
+     *
+     * Relationships:
+     * - `doc` → `thread` (one)
+     *
+     * @example
+     * const rows = useQuery(() => db.query('thread__crdt_log').orderBy('id', 'asc').limit(20).build());
+     */
+    {
+      name: 'thread__crdt_log' as const,
+      columns: {
+        /**
+         * `id` — string
+         *
+         * Record ID. Pass the full `'<table>:<id>'` string when reading or writing.
+         */
+        id: { type: 'string' as const, recordId: true, optional: false },
+        /**
+         * `author?` — string
+         *
+         * Record ID. Pass the full `'<table>:<id>'` string when reading or writing.
+         */
+        author: { type: 'string' as const, recordId: true, optional: true },
+        /**
+         * `created_at?` — string
+         *
+         * ISO-8601 datetime string.
+         */
+        created_at: { type: 'string' as const, dateTime: true, optional: true },
+        /**
+         * `data?` — string
+         *
+         * `@opaque` — synced to the client and readable here, but the sync
+         * engine never stores the value server-side. It cannot be used in
+         * `where`, `orderBy`, joins, or table permissions; doing so throws.
+         */
+        data: { type: 'Uint8Array' as const, bytes: true, opaque: true, optional: true },
+        /**
+         * `doc?` — string
+         *
+         * Record ID. Pass the full `'<table>:<id>'` string when reading or writing.
+         */
+        doc: { type: 'string' as const, recordId: true, optional: true },
+        field: { type: 'string' as const, optional: true },
+        nonce: { type: 'string' as const, optional: true },
+        size: { type: 'number' as const, optional: true },
+      },
+      primaryKey: ['id'] as const
+    },
+    /**
+     * `thread__crdt_presence` table.
+     *
+     * Relationships:
+     * - `doc` → `thread` (one)
+     *
+     * @example
+     * const rows = useQuery(() => db.query('thread__crdt_presence').orderBy('id', 'asc').limit(20).build());
+     */
+    {
+      name: 'thread__crdt_presence' as const,
+      columns: {
+        /**
+         * `id` — string
+         *
+         * Record ID. Pass the full `'<table>:<id>'` string when reading or writing.
+         */
+        id: { type: 'string' as const, recordId: true, optional: false },
+        /**
+         * `at?` — string
+         *
+         * ISO-8601 datetime string.
+         */
+        at: { type: 'string' as const, dateTime: true, optional: true },
+        /**
+         * `author?` — string
+         *
+         * Record ID. Pass the full `'<table>:<id>'` string when reading or writing.
+         */
+        author: { type: 'string' as const, recordId: true, optional: true },
+        /**
+         * `doc?` — string
+         *
+         * Record ID. Pass the full `'<table>:<id>'` string when reading or writing.
+         */
+        doc: { type: 'string' as const, recordId: true, optional: true },
+        field: { type: 'string' as const, optional: true },
+        session: { type: 'string' as const, optional: true },
+        /**
+         * `state?` — string
+         *
+         * `@opaque` — synced to the client and readable here, but the sync
+         * engine never stores the value server-side. It cannot be used in
+         * `where`, `orderBy`, joins, or table permissions; doing so throws.
+         */
+        state: { type: 'Uint8Array' as const, bytes: true, opaque: true, optional: true },
       },
       primaryKey: ['id'] as const
     },
@@ -256,6 +357,18 @@ export const schema = {
       cardinality: 'many' as const
     },
     {
+      from: 'thread__crdt_log' as const,
+      field: 'doc' as const,
+      to: 'thread' as const,
+      cardinality: 'one' as const
+    },
+    {
+      from: 'thread__crdt_presence' as const,
+      field: 'doc' as const,
+      to: 'thread' as const,
+      cardinality: 'one' as const
+    },
+    {
       from: 'user' as const,
       field: 'comments' as const,
       to: 'comment' as const,
@@ -285,6 +398,10 @@ export const schema = {
     },
   ],
   backends: {
+  },
+  policy: {
+    queryAllowlist: 'off' as const,
+    impersonation: false as const,
   },
 } as const;
 
@@ -340,11 +457,13 @@ PERMISSIONS FOR select, create, update, delete WHERE true;
 
 DEFINE FIELD title ON TABLE thread TYPE option<string>;
 
--- @crdt text
+-- @crdt prosemirror
 -- @cursor
--- Stored as \`{ state: bytes, cursors: ... }\`. The CRDT manager owns
--- writes — never \`db.update({ content: <string> })\`.
-DEFINE FIELD content ON TABLE thread TYPE option<object> FLEXIBLE;
+-- The thread body is a collaborative ProseMirror document. This field holds
+-- its plain text, written by the server whenever it folds the edit log, so it
+-- can be listed, searched and filtered. Edit it with \`useCrdtField\`; a client
+-- never writes it directly.
+DEFINE FIELD content ON TABLE thread TYPE option<string> DEFAULT '';
 
 DEFINE FIELD title_suggestion ON TABLE thread TYPE option<string>;
 
@@ -415,6 +534,37 @@ DEFINE TABLE collaborates_on SCHEMAFULL TYPE RELATION FROM user TO thread
 PERMISSIONS FOR select, create, update, delete WHERE true;
 
 DEFINE INDEX unique_collab ON TABLE collaborates_on FIELDS in, out UNIQUE;
+
+
+-- ==================================================
+-- Generated by sp00ky for \`@crdt\` fields. Do not edit.
+-- ==================================================
+
+-- \`thread\`: fold stamps
+DEFINE FIELD OVERWRITE content__crdt ON TABLE thread TYPE option<object> FLEXIBLE;
+
+-- \`thread\`: append-only Loro edit log
+DEFINE TABLE OVERWRITE thread__crdt_log SCHEMAFULL PERMISSIONS FULL;
+DEFINE FIELD OVERWRITE doc ON TABLE thread__crdt_log TYPE option<record<thread>>;
+DEFINE FIELD OVERWRITE field ON TABLE thread__crdt_log TYPE option<string>;
+DEFINE FIELD OVERWRITE author ON TABLE thread__crdt_log TYPE option<record>;
+DEFINE FIELD OVERWRITE nonce ON TABLE thread__crdt_log TYPE option<string>;
+-- @opaque
+DEFINE FIELD OVERWRITE data ON TABLE thread__crdt_log TYPE option<bytes>;
+DEFINE FIELD OVERWRITE size ON TABLE thread__crdt_log TYPE option<int>;
+DEFINE FIELD OVERWRITE created_at ON TABLE thread__crdt_log TYPE option<datetime>;
+DEFINE INDEX OVERWRITE thread__crdt_log_doc ON TABLE thread__crdt_log FIELDS doc, field;
+
+-- \`thread\`: per-session presence (cursors)
+DEFINE TABLE OVERWRITE thread__crdt_presence SCHEMAFULL PERMISSIONS FULL;
+DEFINE FIELD OVERWRITE doc ON TABLE thread__crdt_presence TYPE option<record<thread>>;
+DEFINE FIELD OVERWRITE field ON TABLE thread__crdt_presence TYPE option<string>;
+DEFINE FIELD OVERWRITE session ON TABLE thread__crdt_presence TYPE option<string>;
+DEFINE FIELD OVERWRITE author ON TABLE thread__crdt_presence TYPE option<record>;
+-- @opaque
+DEFINE FIELD OVERWRITE state ON TABLE thread__crdt_presence TYPE option<bytes>;
+DEFINE FIELD OVERWRITE at ON TABLE thread__crdt_presence TYPE option<datetime>;
+DEFINE INDEX OVERWRITE thread__crdt_presence_doc ON TABLE thread__crdt_presence FIELDS doc, field;
 
 -- ==================================================
 -- SPOOKY INCANTATION
@@ -502,24 +652,19 @@ DEFINE FIELD errorCount ON TABLE _00_query TYPE option<int> DEFAULT 0 PERMISSION
 
 -- ==================================================
 -- SPOOKY EVENTS
--- Stores create, update, and delete events
+-- The local outbox: one row per create, update and delete not yet pushed.
+--
+-- SCHEMALESS on purpose. The row shape belongs to the client
+-- (packages/core/src/mutation/rows.ts, \`pendingInsert\`), which reads every
+-- shape this table ever had. This used to be SCHEMAFULL with only
+-- id/mutationType/recordId/data, and when the client started writing
+-- \`tableName\`, \`createdAt\`, \`v\` and \`beforeRecord\`, SurrealDB rejected the
+-- unknown fields and failed the whole local write transaction: on the
+-- SurrealDB local engine no create, update or delete could be stored.
 -- ==================================================
 
-DEFINE TABLE _00_pending_mutations SCHEMAFULL
+DEFINE TABLE _00_pending_mutations SCHEMALESS
 PERMISSIONS FOR select, create, update, delete WHERE true;
-
-DEFINE FIELD IF NOT EXISTS id ON _00_pending_mutations TYPE string;
-
-DEFINE FIELD IF NOT EXISTS mutationType ON _00_pending_mutations TYPE string
-PERMISSIONS FOR select, create, update WHERE true;
-
--- The target record ID (for update/delete) - maps to 'id' in the event object
-DEFINE FIELD IF NOT EXISTS recordId ON _00_pending_mutations TYPE option<record>
-PERMISSIONS FOR select, create, update WHERE true;
-
--- The data payload (for create/update)
-DEFINE FIELD IF NOT EXISTS data ON _00_pending_mutations TYPE option<object> FLEXIBLE
-PERMISSIONS FOR select, create, update WHERE true;
 
 -- CRDT state lives inline on the parent record itself (the \`@crdt\`-
 -- annotated field). \`@crdt\`-only fields hold the base64 LoroDoc
@@ -543,6 +688,21 @@ PERMISSIONS FOR select, create, update WHERE true;
 
 DEFINE TABLE _00_user_feature SCHEMALESS
 PERMISSIONS FOR select, create, update, delete WHERE true;
+
+-- ==================================================
+-- SPOOKY APP RELEASE (per-frontend current-version announcements)
+--
+-- Server-written (root-only) release rows, synced DOWN read-only so the
+-- app-release resolver can run its one shared live query
+-- (\`SELECT * FROM _00_app_release\`) on the client. Must be declared here or
+-- the synced rows have no local table to land in (same trap as
+-- _00_user_feature above). SCHEMALESS so a synced row is never dropped on a
+-- field/type mismatch.
+-- ==================================================
+
+DEFINE TABLE _00_app_release SCHEMALESS
+PERMISSIONS FOR select, create, update, delete WHERE true;
+DEFINE FIELD _00_rv ON TABLE _00_app_release TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 DEFINE FIELD _00_rv ON TABLE _00_pending_mutations TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 DEFINE FIELD _00_rv ON TABLE _00_query TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 DEFINE FIELD _00_rv ON TABLE _00_schema TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
@@ -553,6 +713,8 @@ DEFINE FIELD _00_rv ON TABLE comment TYPE int DEFAULT 0 PERMISSIONS FOR select, 
 DEFINE FIELD _00_rv ON TABLE commented_on TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 DEFINE FIELD _00_rv ON TABLE share_link TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 DEFINE FIELD _00_rv ON TABLE thread TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
+DEFINE FIELD _00_rv ON TABLE thread__crdt_log TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
+DEFINE FIELD _00_rv ON TABLE thread__crdt_presence TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 DEFINE FIELD _00_rv ON TABLE user TYPE int DEFAULT 0 PERMISSIONS FOR select, create, update WHERE true;
 
 
@@ -597,6 +759,34 @@ THEN {
 
 -- Table: thread Client Deletion
 DEFINE EVENT OVERWRITE _00_thread_client_delete ON TABLE thread
+WHEN $event = "DELETE"
+THEN {
+    -- No-op for now.
+};
+
+-- Table: thread__crdt_log Client Mutation
+DEFINE EVENT OVERWRITE _00_thread__crdt_log_client_mutation ON TABLE thread__crdt_log
+WHEN $before != $after AND $event != "DELETE"
+THEN {
+    -- No-op for now. Client mutation sync logic moved to DBSP.
+};
+
+-- Table: thread__crdt_log Client Deletion
+DEFINE EVENT OVERWRITE _00_thread__crdt_log_client_delete ON TABLE thread__crdt_log
+WHEN $event = "DELETE"
+THEN {
+    -- No-op for now.
+};
+
+-- Table: thread__crdt_presence Client Mutation
+DEFINE EVENT OVERWRITE _00_thread__crdt_presence_client_mutation ON TABLE thread__crdt_presence
+WHEN $before != $after AND $event != "DELETE"
+THEN {
+    -- No-op for now. Client mutation sync logic moved to DBSP.
+};
+
+-- Table: thread__crdt_presence Client Deletion
+DEFINE EVENT OVERWRITE _00_thread__crdt_presence_client_delete ON TABLE thread__crdt_presence
 WHEN $event = "DELETE"
 THEN {
     -- No-op for now.

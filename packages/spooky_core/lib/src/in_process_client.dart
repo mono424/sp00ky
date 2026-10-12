@@ -26,6 +26,7 @@ import 'mutation/write_saga.dart' as write_saga;
 import 'query/env.dart';
 import 'query/lifecycle_saga.dart' show evictQuery;
 import 'query/register_saga.dart';
+import 'services/database/column_reset.dart' show columnFingerprints;
 import 'services/database/connection_supervisor.dart';
 import 'services/database/local_database_service.dart';
 import 'services/database/remote_database_service.dart';
@@ -142,6 +143,8 @@ class InProcessSp00kyClient extends Sp00kyClient {
       ],
     )
       ..schemaTables = _syncedTables()
+      ..columnSets = columnFingerprints(config.schema,
+          _syncedTables().where((t) => !t.startsWith('_00_')))
       ..onVersions =
           (table, entries) => _runtime.dispatch(VersionsPrimed(entries));
 

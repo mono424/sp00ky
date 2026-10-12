@@ -21,6 +21,7 @@ import { TabsCoordinator, type CoordinatorHooks } from '../services/tabs/coordin
 import type { LeaderSyncHub, SyncForwarder } from '../services/tabs/coordinator';
 import { computeTabsFingerprint, hash53 } from '../services/tabs/protocol';
 import type { SqliteCacheEngine } from '../services/database/sqlite-cache-engine';
+import { columnFingerprints } from '../services/database/sqlite-column-reset';
 import type { BlobCache } from '../services/blobs/index';
 import { MemoryBlobStore, createBlobCache, resolveBlobBudget } from '../services/blobs/index';
 import type { Adapters } from '../kernel/interpreter';
@@ -308,6 +309,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
         tables: [...config.schema.tables.map((t) => t.name), '_00_user_feature', '_00_app_release'],
         schemaHash: String(hash53(config.schemaSurql)),
         pendingIds: new Set(pendingIds),
+        columnFingerprints: columnFingerprints(config.schema.tables),
         onVersions: (_table, entries) => host.dispatch({ type: 'VersionsPrimed', entries }),
       }),
     'ssp.reset': () => s.streamProcessor.reset(),

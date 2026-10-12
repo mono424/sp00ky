@@ -458,19 +458,33 @@ describe('shared-query SurrealDB semantics', () => {
       });
     });
 
-    test('an anon row is readable without auth', async () => {
-      await q(root, `CREATE _00_query:pub SET auth_id = 'anon', ttl = 1h, rowCount = 3;`);
-      const anon = new Surreal();
-      await anon.connect(`ws://127.0.0.1:${getTestDbPort()}/rpc`, {
-        namespace: TEST_DB_CONFIG.namespace,
-        database: TEST_DB_CONFIG.database,
-      });
+    test('an anon row is readable without auth by its own session only', async () => {
+      const connectAnon = async () => {
+        const db = new Surreal();
+        await db.connect(`ws://127.0.0.1:${getTestDbPort()}/rpc`, {
+          namespace: TEST_DB_CONFIG.namespace,
+          database: TEST_DB_CONFIG.database,
+        });
+        return db;
+      };
+      const anon = await connectAnon();
+      const other = await connectAnon();
       try {
+        const [sid] = await q(anon, `RETURN <string>session::id()`);
+        await q(
+          root,
+          `CREATE _00_query:pub SET auth_id = 'anon', ttl = 1h, rowCount = 3,
+                                     subscribers = [{ id: $sid, seenAt: time::now() }];`,
+          { sid }
+        );
         expect((await q(anon, `SELECT VALUE rowCount FROM ONLY _00_query:pub`))[0]).toBe(3);
-        // ...but not another user's row.
+        // Every logged-out visitor is `anon`: another one must not see it...
+        expect((await q(other, `SELECT VALUE rowCount FROM ONLY _00_query:pub`))[0] ?? null).toBeNull();
+        // ...nor another user's row.
         expect((await q(anon, `SELECT VALUE rowCount FROM ONLY ${ID}`))[0] ?? null).toBeNull();
       } finally {
         await anon.close();
+        await other.close();
       }
     });
   });

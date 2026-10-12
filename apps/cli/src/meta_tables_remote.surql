@@ -15,10 +15,30 @@
 -- tab closes, nothing refreshes `lastActiveAt`, the sweep deletes the row AND
 -- every edge, and the surviving tab goes blank.
 --
--- The anon branch mirrors `_00_list_ref_anon` (see ssp-node/src/tables.rs): a
--- logged-out session has `$auth = NONE` and cannot be gated on `$auth.id`, and
--- an anon row only ever describes a query whose results are already reachable
--- through that world-readable table.
+-- Anonymous rows (`auth_id = 'anon'`) belong to the sessions in their
+-- `subscribers`. Every logged-out visitor shares the one `anon` identity, so
+-- the user branch cannot tell them apart, and gating on `auth_id = 'anon'`
+-- alone let any guest list every visitor's views, rewrite them, and DELETE
+-- them (the delete event then tears the SSP view down under its owner). The
+-- SSP appends the registering `session::id()` to `subscribers` on every
+-- registration, so the session that registered a view can read it back and
+-- heartbeat it. A reconnect gets a new session id that is not in the set: its
+-- heartbeat matches no row, the client takes that as a reclaimed view and
+-- re-registers, and the registration adds the new session.
+--
+-- The check reads `session::id()`, which the caller cannot choose. It does not
+-- trust any id the caller passes: anonymous session ids, like anonymous query
+-- ids, are readable by anyone on `_00_list_ref_anon`. Known gap: the SSP's
+-- warm join (`join_registered_view` in ssp-node/src/node.rs) appends any
+-- `anon` session that registers an existing view id, so a guest who reads an
+-- id off `_00_list_ref_anon` can still join that row through
+-- `fn::query::register`. Closing it needs an ownership proof from the client.
+--
+-- The rule is checked against the row after an UPDATE as well as before it,
+-- so an UPDATE that would leave the caller's own session out of `subscribers`
+-- is refused: an anonymous session cannot drop its own entry while others
+-- remain (`fn::query::unsubscribe` / `fn::query::leave` then change nothing
+-- and the TTL sweep reclaims the row, as it always could).
 --
 -- `$auth.id != NONE` guards the cast so the rule evaluates cleanly for an
 -- anonymous caller instead of erroring.
@@ -28,22 +48,39 @@
 -- the sole working teardown is the TTL sweep. The refcount that decides
 -- whether a delete is safe lives in `fn::query::unsubscribe`, not here.
 --
+-- `create` is not granted to anyone. Rows are written only by the SSP (on
+-- `/view/register`, reached through `fn::query::register`), and the SSP
+-- re-registers every row it finds here when it boots, so a planted row would
+-- become a live view built from whatever `surql` and `params` it carried. The
+-- per-field `FOR update NONE` below closes the same door on rows a caller
+-- does own: `params.auth.id` is the identity the SSP injects into permission
+-- predicates at boot, `surql` skips the allowlist there, and `ttl` decides
+-- when the sweep may reclaim the view. Callers keep `subscribers` and a
+-- `lastActiveAt` no later than now, which is all heartbeat, unsubscribe and
+-- leave write.
+--
 -- The SSP runs as root and bypasses all of this.
 -- ==================================================
 
 DEFINE TABLE OVERWRITE _00_query SCHEMALESS
     PERMISSIONS
-      FOR select, create, update, delete
-        WHERE auth_id = 'anon'
-           OR ($auth.id != NONE AND auth_id = <string>$auth.id);
+      FOR select, update, delete
+        WHERE ($auth.id != NONE AND auth_id = <string>$auth.id)
+           OR (auth_id = 'anon' AND subscribers[*].id CONTAINS <string>session::id())
+      FOR create NONE;
 
 -- The raw query string (for re-hydration/debugging)
-DEFINE FIELD OVERWRITE surql ON TABLE _00_query TYPE option<string>;
+DEFINE FIELD OVERWRITE surql ON TABLE _00_query TYPE option<string> PERMISSIONS FOR update NONE;
+
+-- The registration's parameters, with the caller's identity the SSP injects
+-- into permission predicates (`auth.id`, `access`). Written by the SSP only;
+-- see the table rule above.
+DEFINE FIELD OVERWRITE params ON TABLE _00_query PERMISSIONS FOR update NONE;
 
 -- The session that registered most recently. No longer a permission key (see
 -- the table rule above) — kept because every `_00_list_ref` edge copies it off
 -- this row, and for observability.
-DEFINE FIELD OVERWRITE clientId ON TABLE _00_query TYPE option<string>;
+DEFINE FIELD OVERWRITE clientId ON TABLE _00_query TYPE option<string> PERMISSIONS FOR update NONE;
 
 -- Who is currently watching this shared incantation: one entry per WebSocket
 -- session, `{ id: <session::id()>, seenAt: <datetime> }`.
@@ -54,6 +91,9 @@ DEFINE FIELD OVERWRITE clientId ON TABLE _00_query TYPE option<string>;
 -- it pulls the row's expiry in to a short grace. `lastActiveAt` below remains the SOLE
 -- authority for the TTL sweep, because a client that crashes never removes its
 -- entry — gating expiry on an empty array would pin a view forever.
+--
+-- On an anonymous row it is also the access list: only a session named here
+-- can read or write the row (see the table rule above).
 --
 -- Self-pruning: every writer drops entries older than this row's own `ttl` in
 -- the same statement that appends its own, so the array is bounded by the
@@ -71,26 +111,28 @@ DEFINE FIELD OVERWRITE subscribers ON TABLE _00_query TYPE array<object> DEFAULT
 -- connection `session::id()`. Empty string means "no auth recorded",
 -- which is fine for SSP-only registrations and unreadable to any
 -- real authenticated user via the list_ref permission below.
-DEFINE FIELD OVERWRITE auth_id ON TABLE _00_query TYPE string DEFAULT '';
+DEFINE FIELD OVERWRITE auth_id ON TABLE _00_query TYPE string DEFAULT '' PERMISSIONS FOR update NONE;
 
--- For garbage collection (Heartbeat)
-DEFINE FIELD OVERWRITE lastActiveAt ON TABLE _00_query TYPE datetime DEFAULT time::now();
+-- For garbage collection (Heartbeat). A caller may move it to now (heartbeat)
+-- or back (leave), never ahead, which would hold the view past its TTL.
+DEFINE FIELD OVERWRITE lastActiveAt ON TABLE _00_query TYPE datetime DEFAULT time::now()
+    PERMISSIONS FOR update WHERE $value <= time::now();
 
 -- How long this Incantation stays alive without activity
-DEFINE FIELD OVERWRITE ttl ON TABLE _00_query TYPE duration;
+DEFINE FIELD OVERWRITE ttl ON TABLE _00_query TYPE duration PERMISSIONS FOR update NONE;
 
 -- Metrics: lifecycle and per-query observability. The SSP keeps a rolling
 -- window of materialization samples per view and writes the persisted
 -- percentiles on each ingest, so consumers can read them without
 -- re-running the query.
 DEFINE FIELD OVERWRITE createdAt ON TABLE _00_query TYPE datetime DEFAULT time::now() READONLY;
-DEFINE FIELD OVERWRITE registrationTime ON TABLE _00_query TYPE option<float>;
-DEFINE FIELD OVERWRITE materializationP55 ON TABLE _00_query TYPE option<float>;
-DEFINE FIELD OVERWRITE materializationP90 ON TABLE _00_query TYPE option<float>;
-DEFINE FIELD OVERWRITE materializationP99 ON TABLE _00_query TYPE option<float>;
-DEFINE FIELD OVERWRITE lastIngestLatency ON TABLE _00_query TYPE option<float>;
-DEFINE FIELD OVERWRITE updateCount ON TABLE _00_query TYPE int DEFAULT 0;
-DEFINE FIELD OVERWRITE rowCount ON TABLE _00_query TYPE int DEFAULT 0;
+DEFINE FIELD OVERWRITE registrationTime ON TABLE _00_query TYPE option<float> PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE materializationP55 ON TABLE _00_query TYPE option<float> PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE materializationP90 ON TABLE _00_query TYPE option<float> PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE materializationP99 ON TABLE _00_query TYPE option<float> PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE lastIngestLatency ON TABLE _00_query TYPE option<float> PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE updateCount ON TABLE _00_query TYPE int DEFAULT 0 PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE rowCount ON TABLE _00_query TYPE int DEFAULT 0 PERMISSIONS FOR update NONE;
 -- Publish state of the view behind this row, written by the SSP:
 --   'materializing'  the SSP has (re)computed the set and its edges are in
 --                    flight to `_00_list_ref*`;
@@ -100,8 +142,9 @@ DEFINE FIELD OVERWRITE rowCount ON TABLE _00_query TYPE int DEFAULT 0;
 -- NONE = written by a server that predates the marker; clients then fall
 -- back to `rowCount` alone. No DEFAULT on purpose.
 DEFINE FIELD OVERWRITE state ON TABLE _00_query TYPE option<string>
-    ASSERT $value == NONE OR $value IN ['materializing', 'ready'];
-DEFINE FIELD OVERWRITE errorCount ON TABLE _00_query TYPE int DEFAULT 0;
+    ASSERT $value == NONE OR $value IN ['materializing', 'ready']
+    PERMISSIONS FOR update NONE;
+DEFINE FIELD OVERWRITE errorCount ON TABLE _00_query TYPE int DEFAULT 0 PERMISSIONS FOR update NONE;
 
 -- ==================================================
 -- SPOOKY LIST REF

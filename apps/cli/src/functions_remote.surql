@@ -11,6 +11,11 @@
 -- success, and the shared row expired out from under tabs that were still
 -- watching.
 --
+-- An anonymous row is the exception: it answers only to the sessions in its
+-- `subscribers`. A reconnected anonymous session is not one of them until it
+-- registers again, so its heartbeat matches no row, which the client reads as
+-- a reclaimed view and re-registers.
+--
 -- Refreshes the row-level `lastActiveAt` (the TTL sweep's authority) AND
 -- re-stamps this session in `subscribers`, dropping its own previous entry and
 -- everyone else's expired ones in the same atomic statement — so there is no
@@ -83,6 +88,12 @@ DEFINE FUNCTION OVERWRITE fn::query::unsubscribe($id: record) -> object {
 -- that path: the page passes the WebSocket session ids it held as `$sids`
 -- instead. Naming another session only reaches rows the caller could already
 -- update or delete, so the argument grants nothing the table rule does not.
+--
+-- That makes the beacon a no-op for an anonymous page: its fresh HTTP session
+-- is not in the row's `subscribers`, so the row is invisible to it and the TTL
+-- sweep reclaims the view. Trusting the ids passed here instead would let any
+-- visitor expire any other visitor's views, because anonymous session ids are
+-- readable on `_00_list_ref_anon`.
 --
 -- It never deletes. When nobody else is watching it pulls `lastActiveAt` back
 -- so the row expires one minute from now, and the TTL sweep reclaims it on a

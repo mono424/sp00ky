@@ -543,7 +543,9 @@ distinct `clientId` counts open tabs, and the row count is registered views.
   `pagehide`: <code>fn::query::leave</code> pulls their expiry in to one minute, and the sweep
   removes them after that. The minute is a grace for a reload of the same tab, which re-registers
   onto the same rows and finds its views still warm. A tab that never sends that release (a crash, a
-  mobile tab killed in the background, a lost request) *decays* out over the full ttl instead.
+  mobile tab killed in the background, a lost request) *decays* out over the full ttl instead. So
+  does every signed-out tab: an anonymous row answers only to the WebSocket sessions that
+  registered it, and the release goes out as a separate HTTP request.
   Every row on the Views tab carries its own <code>expires</code> so you can
   see which ones are on the way out. There is no finer signal to be had: the client's WebSocket goes
   to SurrealDB, not to the scheduler, so there is no connection to count.

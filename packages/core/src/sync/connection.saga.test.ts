@@ -30,10 +30,21 @@ describe('connectionChanged', () => {
     expect(out.state.sync).toMatchObject({ needsResubscribe: false, lastReconnectRefetchAt: 1000 });
     expect(out.dispatched).toEqual([{ type: 'EnsureRegistered', requireAuth: true }, { type: 'LiveStart' }, { type: 'Drain' }]);
     const burst = await runPure(connectionChanged(env, 'connected'), { state: R.patchSync({ needsResubscribe: true })(out.state), now: 5000 });
-    expect(burst.dispatched).toEqual([]);
-    expect(burst.state.sync.needsResubscribe).toBe(false);
+    expect(burst.dispatched).toEqual([{ type: 'LiveStart' }, { type: 'Drain' }]);
+    expect(burst.state.sync).toMatchObject({ needsResubscribe: false, lastReconnectRefetchAt: 1000 });
     const later = await runPure(connectionChanged(env, 'connected'), { state: R.patchSync({ needsResubscribe: true })(out.state), now: 20_000 });
     expect(later.dispatched).toHaveLength(3);
+  });
+  it('a reconnect inside the cooldown restarts the LIVE the drop killed, keeping the registrations', async () => {
+    const live = R.patchSync({ liveUuid: 'u', liveTable: 't', lastReconnectRefetchAt: 1000 })(
+      buildState([buildEntry({ def: { hash: 'a' }, lifecycle: { remote: 'registered' } })])
+    );
+    const dropped = await runPure(connectionChanged(env, 'disconnected'), { state: live });
+    expect(dropped.state.sync.liveUuid).toBeNull();
+    const back = await runPure(connectionChanged(env, 'connected'), { state: dropped.state, now: 3000 });
+    expect(back.dispatched).toContainEqual({ type: 'LiveStart' });
+    expect(back.dispatched).not.toContainEqual(expect.objectContaining({ type: 'EnsureRegistered' }));
+    expect(back.state.queries.get('a')!.lifecycle.remote).toBe('registered');
   });
 });
 

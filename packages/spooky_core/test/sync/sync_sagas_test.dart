@@ -268,15 +268,44 @@ void main() {
       expect(
           (back.dispatched.first as EnsureRegistered).requireAuth, isTrue);
 
-      // A second reconnect inside the cooldown only clears the flag.
+      // A second reconnect inside the cooldown restarts LIVE and drains, but
+      // does not re-register.
       final burst = await runPure<void>(
         (ctx) => connectionChanged(ctx, env(), ConnectionState.connected),
         state: r.patchSync(needsResubscribe: true)(back.state),
         now: 105000,
         handlers: defaults(),
       );
-      expect(burst.dispatched, isEmpty);
+      expect(burst.dispatched.map((e) => e.type), ['LiveStart', 'Drain']);
       expect(burst.state.sync.needsResubscribe, isFalse);
+      expect(burst.state.sync.lastReconnectRefetchAt, 100000);
+    });
+
+    test(
+        'a reconnect inside the cooldown restarts the LIVE the drop killed, '
+        'keeping the registrations', () async {
+      final dropped = await runPure<void>(
+        (ctx) =>
+            connectionChanged(ctx, env(), ConnectionState.disconnected),
+        state: r.patchSync(
+            liveUuid: 'u',
+            liveTable: 't',
+            lastReconnectRefetchAt: 1000)(buildState([
+          buildEntry(def: buildDefinition(hash: 'a'), lifecycle: registered)
+        ])),
+        handlers: defaults(),
+      );
+      expect(dropped.state.sync.liveUuid, isNull);
+      final back = await runPure<void>(
+        (ctx) => connectionChanged(ctx, env(), ConnectionState.connected),
+        state: dropped.state,
+        now: 3000,
+        handlers: defaults(),
+      );
+      expect(back.dispatched.whereType<LiveStart>(), hasLength(1));
+      expect(back.dispatched.whereType<EnsureRegistered>(), isEmpty);
+      expect(
+          back.state.queries['a']!.lifecycle.remote, RemotePhase.registered);
     });
   });
 

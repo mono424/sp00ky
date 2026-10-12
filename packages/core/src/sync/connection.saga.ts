@@ -11,9 +11,9 @@ import { nextHealth, selfHealDelayMs } from './policy';
 
 /**
  * Transport state changes. A drop invalidates the live query and arms a
- * resubscribe; the next `connected` (outside the burst cooldown) drops every
- * remote registration so `ensureRegistered` rebuilds them behind the
- * `$auth.id` gate, and restarts LIVE.
+ * resubscribe. The next `connected` restarts LIVE and drains the outbox;
+ * outside the burst cooldown it also drops every remote registration so
+ * `ensureRegistered` rebuilds them behind the `$auth.id` gate.
  */
 export function* connectionChanged(env: SagaEnv, connection: ConnectionState): Saga<void> {
   const state = (yield fx.state.read((s) => s)) as ClientState;
@@ -27,18 +27,22 @@ export function* connectionChanged(env: SagaEnv, connection: ConnectionState): S
   const now = (yield fx.now()) as number;
   const last = state.sync.lastReconnectRefetchAt;
   if (last !== null && now - last < RECONNECT_REFETCH_COOLDOWN_MS) {
+    // The cooldown only spares the server a re-registration storm. The views
+    // the last refetch registered are still on the server, but LIVE died with
+    // the socket and nothing else restarts it: skipping it here left the
+    // client on the membership poll until a reconnect outside the window.
     yield fx.state.update(R.patchSync({ needsResubscribe: false }));
-    return;
+  } else {
+    yield fx.state.update(
+      R.compose(
+        R.patchSync({ needsResubscribe: false, lastReconnectRefetchAt: now }),
+        ...[...state.queries.values()]
+          .filter((e) => e.lifecycle.remote !== 'unregistered')
+          .map((e) => R.applyLifecycle(e.def.hash, { type: 'remote-dropped' }))
+      )
+    );
+    yield fx.dispatch({ type: 'EnsureRegistered', requireAuth: true });
   }
-  yield fx.state.update(
-    R.compose(
-      R.patchSync({ needsResubscribe: false, lastReconnectRefetchAt: now }),
-      ...[...state.queries.values()]
-        .filter((e) => e.lifecycle.remote !== 'unregistered')
-        .map((e) => R.applyLifecycle(e.def.hash, { type: 'remote-dropped' }))
-    )
-  );
-  yield fx.dispatch({ type: 'EnsureRegistered', requireAuth: true });
   yield fx.dispatch({ type: 'LiveStart' });
   yield fx.dispatch({ type: 'Drain' });
 }

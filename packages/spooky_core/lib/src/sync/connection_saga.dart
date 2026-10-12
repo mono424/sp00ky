@@ -11,9 +11,9 @@ import 'live_saga.dart' show liveInvalidate;
 import 'policy.dart';
 
 /// Transport state changes. A drop invalidates the live query and arms a
-/// resubscribe; the next `connected` (outside the burst cooldown) drops every
-/// remote registration so `ensureRegistered` rebuilds them behind the
-/// `$auth.id` gate, and restarts LIVE.
+/// resubscribe. The next `connected` restarts LIVE and drains the outbox;
+/// outside the burst cooldown it also drops every remote registration so
+/// `ensureRegistered` rebuilds them behind the `$auth.id` gate.
 Future<void> connectionChanged(
     Ctx ctx, SagaEnv env, ConnectionState connection) async {
   final state = await ctx(Fx.stateRead((s) => s));
@@ -31,16 +31,20 @@ Future<void> connectionChanged(
   final now = await ctx(Fx.now());
   final last = state.sync.lastReconnectRefetchAt;
   if (last != null && now - last < reconnectRefetchCooldownMs) {
+    // The cooldown only spares the server a re-registration storm. The views
+    // the last refetch registered are still on the server, but LIVE died with
+    // the socket and nothing else restarts it: skipping it here left the
+    // client on the membership poll until a reconnect outside the window.
     await ctx(Fx.stateUpdate(r.patchSync(needsResubscribe: false)));
-    return;
+  } else {
+    await ctx(Fx.stateUpdate(r.compose([
+      r.patchSync(needsResubscribe: false, lastReconnectRefetchAt: now),
+      for (final e in state.queries.values)
+        if (e.lifecycle.remote != RemotePhase.unregistered)
+          r.applyLifecycle(e.def.hash, const RemoteDroppedEvent()),
+    ])));
+    await ctx(Fx.dispatch(const EnsureRegistered(requireAuth: true)));
   }
-  await ctx(Fx.stateUpdate(r.compose([
-    r.patchSync(needsResubscribe: false, lastReconnectRefetchAt: now),
-    for (final e in state.queries.values)
-      if (e.lifecycle.remote != RemotePhase.unregistered)
-        r.applyLifecycle(e.def.hash, const RemoteDroppedEvent()),
-  ])));
-  await ctx(Fx.dispatch(const EnsureRegistered(requireAuth: true)));
   await ctx(Fx.dispatch(const LiveStart()));
   await ctx(Fx.dispatch(const Drain()));
 }

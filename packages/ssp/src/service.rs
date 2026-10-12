@@ -533,3 +533,85 @@ mod link_traversal_permission_tests {
         assert_eq!(recs, vec!["job:j1".to_string()], "u1 sees only their own job");
     }
 }
+
+#[cfg(test)]
+mod link_permission_follows_parent_tests {
+    //! A table whose SELECT permission reads its parent through a record link
+    //! (`thread.published = true OR thread.author.id = $auth.id` on `comment`)
+    //! lowers to SemiJoins against the parent table. Publishing or
+    //! unpublishing the parent is a content-only UPDATE of `thread`; the rows
+    //! behind it must still enter and leave a stranger's view.
+    use super::view::prepare_registration_dbsp;
+    use crate::circuit::store::{Change, ChangeSet};
+    use crate::circuit::view::OutputFormat;
+    use crate::circuit::{Circuit, Record};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    const COMMENT_PERM: &str = "thread.published = true OR thread.author.id = $auth.id";
+    const THREAD_PERM: &str = "published = true OR author.id = $auth.id";
+
+    fn thread(published: bool) -> serde_json::Value {
+        json!({ "id": "thread:t1", "author": "user:alice", "published": published })
+    }
+
+    fn comment(id: &str) -> serde_json::Value {
+        json!({ "id": format!("comment:{id}"), "thread": "thread:t1", "content": "hi" })
+    }
+
+    fn circuit() -> Circuit {
+        let mut circuit = Circuit::new();
+        circuit.load(vec![
+            Record::new("thread", "t1", thread(false)),
+            Record::new("comment", "c1", comment("c1")),
+            Record::new("comment", "c2", comment("c2")),
+        ]);
+        circuit
+    }
+
+    fn register(circuit: &mut Circuit, view: &str, user: &str) {
+        let mut perms = HashMap::new();
+        perms.insert("comment".to_string(), COMMENT_PERM.to_string());
+        perms.insert("thread".to_string(), THREAD_PERM.to_string());
+        let mut links: HashMap<String, HashMap<String, String>> = HashMap::new();
+        links.entry("comment".to_string()).or_default().insert("thread".to_string(), "thread".to_string());
+        let payload = json!({
+            "id": view,
+            "surql": "SELECT * FROM comment WHERE thread = $thread;",
+            "params": { "thread": "thread:t1", "auth": { "id": user }, "access": "account" },
+            "clientId": "c", "ttl": "10m", "lastActiveAt": "", "format": "streaming",
+        });
+        let data = prepare_registration_dbsp(payload, &perms, &links, &HashMap::new()).expect("prep");
+        circuit.add_query_with_auth(data.plan, data.safe_params, Some(OutputFormat::Streaming), user.to_string());
+    }
+
+    fn members(circuit: &Circuit, view: &str) -> Vec<String> {
+        let mut recs: Vec<String> =
+            circuit.get_view(view).expect("view").cache.keys().map(|k| k.to_string()).collect();
+        recs.sort();
+        recs
+    }
+
+    #[test]
+    fn author_sees_comments_of_own_unpublished_thread() {
+        let mut c = circuit();
+        register(&mut c, "_00_query:alice", "user:alice");
+        assert_eq!(members(&c, "_00_query:alice"), vec!["comment:c1", "comment:c2"]);
+    }
+
+    #[test]
+    fn stranger_sees_comments_only_while_thread_is_published() {
+        let mut c = circuit();
+        register(&mut c, "_00_query:bob", "user:bob");
+        assert!(members(&c, "_00_query:bob").is_empty(), "unpublished thread hides its comments");
+
+        c.step(ChangeSet { changes: vec![Change::update("thread", "t1", thread(true))] });
+        assert_eq!(members(&c, "_00_query:bob"), vec!["comment:c1", "comment:c2"]);
+
+        c.step(ChangeSet { changes: vec![Change::create("comment", "c3", comment("c3"))] });
+        assert_eq!(members(&c, "_00_query:bob").len(), 3, "a new comment joins while readable");
+
+        c.step(ChangeSet { changes: vec![Change::update("thread", "t1", thread(false))] });
+        assert!(members(&c, "_00_query:bob").is_empty(), "unpublishing removes every comment");
+    }
+}

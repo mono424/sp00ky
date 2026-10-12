@@ -53,6 +53,20 @@ pub trait Operator: Debug + Send + Sync {
     /// join values to move witnesses between index buckets.
     fn note_content_updates(&mut self, _keys: &[crate::algebra::RowKey]) {}
 
+    /// The weight this operator has integrated for `key` on input `port`, for
+    /// operators that keep their inputs (the witness joins). `None` for every
+    /// other operator.
+    ///
+    /// A content update never reaches a join as an input delta: the Scan emits
+    /// nothing for a weight-0 write and a Filter between the table and the
+    /// join drops it. When the new content moves the row across that Filter
+    /// (a parent turning `published`), the join is the only node that holds
+    /// the old membership, so the circuit compares it with `evaluate_key` on
+    /// the input and injects the missing +1/-1 before stepping.
+    fn integrated_input_weight(&self, _port: usize, _key: &str) -> Option<i64> {
+        None
+    }
+
     /// Number of input ports. Scan=0, unary operators=1, Join=2.
     fn arity(&self) -> usize;
 

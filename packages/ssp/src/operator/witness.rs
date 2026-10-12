@@ -139,6 +139,12 @@ impl WitnessState {
         self.content_updates.extend(keys.iter().cloned());
     }
 
+    /// Weight integrated for `key` on input `port` (0 = left, 1 = right).
+    pub(super) fn integrated_weight(&self, port: usize, key: &str) -> i64 {
+        let rows = if port == 0 { &self.left } else { &self.right };
+        rows.get(key).map_or(0, |row| row.weight)
+    }
+
     pub(super) fn has_witness(&self, value: ValueRef<'_>) -> bool {
         if value.is_missing() {
             return false;

@@ -100,6 +100,10 @@ impl super::Operator for SemiJoin {
         self.state.note_content_updates(keys);
     }
 
+    fn integrated_input_weight(&self, port: usize, key: &str) -> Option<i64> {
+        Some(self.state.integrated_weight(port, key))
+    }
+
     fn arity(&self) -> usize {
         2
     }

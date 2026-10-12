@@ -1140,6 +1140,39 @@ impl Circuit {
         // while we mutably access graph.nodes[..].operator.step()
         let topo_order: Vec<usize> = graph.topo_order().to_vec();
 
+        // A content update can move a row across a Filter that feeds a
+        // witness join (`doc.published = true` lowers to a SemiJoin against
+        // `Filter(thread, published = true)`). Neither the Scan nor the Filter
+        // emits anything for a weight-0 write, so without this the join never
+        // learns its parent now matches and every row behind it stays out (or
+        // stays in after an unpublish). Compare each join input's current
+        // membership with what the join holds, before stepping, and inject the
+        // difference as that input's delta.
+        let mut injected: HashMap<usize, Vec<ZSet>> = HashMap::new();
+        for keys in content_updates.values() {
+            for key in keys {
+                let mut node_evals: Vec<bool> = vec![false; num_nodes];
+                for &node_id in &topo_order {
+                    let input_ids = &graph.nodes[node_id].inputs;
+                    let input_evals: Vec<bool> = input_ids.iter().map(|&i| node_evals[i]).collect();
+                    let operator = &graph.nodes[node_id].operator;
+                    for (port, &now) in input_evals.iter().enumerate() {
+                        let Some(held) = operator.integrated_input_weight(port, key) else {
+                            continue;
+                        };
+                        if now != (held > 0) {
+                            let ports = injected
+                                .entry(node_id)
+                                .or_insert_with(|| vec![ZSet::new(); input_evals.len()]);
+                            ports[port].insert(key.clone(), if now { 1 } else { -held });
+                        }
+                    }
+                    node_evals[node_id] =
+                        operator.evaluate_key(key, &input_evals, &self.store, view.params.as_ref());
+                }
+            }
+        }
+
         for &node_id in &topo_order {
             let input_ids = graph.nodes[node_id].inputs.clone();
             let arity = graph.nodes[node_id].operator.arity();
@@ -1151,6 +1184,22 @@ impl Circuit {
                 graph.nodes[node_id]
                     .operator
                     .step(&[delta], &self.store, view.params.as_ref())
+            } else if let Some(extra) = injected.remove(&node_id) {
+                let inputs: Vec<ZSet> = input_ids
+                    .iter()
+                    .zip(extra)
+                    .map(|(&input_id, extra)| {
+                        let mut delta = node_outputs[input_id].clone().unwrap_or_default();
+                        for (key, weight) in extra {
+                            delta.entry(key).or_insert(weight);
+                        }
+                        delta
+                    })
+                    .collect();
+                let inputs: Vec<&ZSet> = inputs.iter().collect();
+                graph.nodes[node_id]
+                    .operator
+                    .step(&inputs, &self.store, view.params.as_ref())
             } else {
                 let inputs: Vec<&ZSet> = input_ids
                     .iter()
@@ -2646,6 +2695,71 @@ mod tests {
                 table: table.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn content_update_moves_a_witness_across_a_filter() {
+        // `doc.published = true` lowers to SemiJoin(log, Filter(thread,
+        // published)). Publishing is a weight-0 UPDATE of `thread`: the Scan
+        // and the Filter emit nothing, so the join used to keep its stale
+        // witness set and the rows behind the parent never moved.
+        use crate::operator::plan::JoinCondition;
+        use crate::operator::predicate::Predicate;
+
+        let published = |flag: bool| {
+            ChangeSet { changes: vec![Change::update("thread", "t1", json!({ "id": "thread:t1", "published": flag }))] }
+        };
+        let pub_thread = OperatorPlan::Filter {
+            input: Box::new(scan_query("", "thread").root),
+            predicate: Predicate::Eq { field: Path::new("published"), value: json!(true) },
+        };
+        let link = JoinCondition { left_field: Path::new("doc"), right_field: Path::new("id") };
+        let semi = OperatorPlan::SemiJoin {
+            left: Box::new(scan_query("", "log").root),
+            right: Box::new(pub_thread.clone()),
+            on: link.clone(),
+        };
+        // The permission intersection wrapper puts the link join on the RIGHT
+        // of an `id = id` join, so the witness change has to travel a level.
+        let nested = OperatorPlan::SemiJoin {
+            left: Box::new(scan_query("", "log").root),
+            right: Box::new(semi.clone()),
+            on: JoinCondition { left_field: Path::new("id"), right_field: Path::new("id") },
+        };
+        let anti = OperatorPlan::AntiJoin {
+            left: Box::new(scan_query("", "log").root),
+            right: Box::new(pub_thread),
+            on: link,
+        };
+
+        let mut circuit = Circuit::new();
+        circuit.load([
+            Record::new("thread", "t1", json!({ "id": "thread:t1", "published": false })),
+            Record::new("log", "r1", json!({ "id": "log:r1", "doc": "thread:t1" })),
+            Record::new("log", "r2", json!({ "id": "log:r2", "doc": "thread:t2" })),
+        ]);
+        for (id, root) in [("semi", semi), ("nested", nested), ("anti", anti)] {
+            circuit.add_query(QueryPlan { id: id.into(), root }, None, None);
+        }
+        assert!(circuit.view_keys("semi").is_empty());
+        assert!(circuit.view_keys("nested").is_empty());
+        assert_eq!(circuit.view_keys("anti"), vec!["log:r1", "log:r2"]);
+
+        circuit.step(published(true));
+        assert_eq!(circuit.view_keys("semi"), vec!["log:r1"]);
+        assert_eq!(circuit.view_keys("nested"), vec!["log:r1"]);
+        assert_eq!(circuit.view_keys("anti"), vec!["log:r2"]);
+
+        // A content update that keeps the parent admitted changes nothing.
+        circuit.step(ChangeSet {
+            changes: vec![Change::update("thread", "t1", json!({ "id": "thread:t1", "published": true, "title": "x" }))],
+        });
+        assert_eq!(circuit.view_keys("nested"), vec!["log:r1"]);
+
+        circuit.step(published(false));
+        assert!(circuit.view_keys("semi").is_empty());
+        assert!(circuit.view_keys("nested").is_empty());
+        assert_eq!(circuit.view_keys("anti"), vec!["log:r1", "log:r2"]);
     }
 
     #[test]

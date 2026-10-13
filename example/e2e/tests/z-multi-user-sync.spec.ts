@@ -6,23 +6,15 @@ import {
   waitForAppReady,
   typeIntoEditor,
   waitForThreadInUpstream,
+  waitForThreadContentInUpstream,
 } from '../fixtures/test-fixtures';
 import type { Page } from '@playwright/test';
 
 // Cross-USER realtime sync. Each test runs with two different accounts
-// (alice and bob), not two sessions of the same account — that case is
-// covered by `z-multi-client-sync.spec.ts`. Cross-user is currently
-// broken at the architecture level: the SSP's `update_all_edges`
-// (apps/ssp/src/lib.rs ~line 2008) writes RELATE rows into
-// `_00_list_ref_user_<delta.auth_id>` where `delta.auth_id` is the
-// VIEW OWNER. So when alice updates a row, the fan-out only touches
-// alice's per-user list_ref; bob — whose registered view depends on
-// the `thread` table and SHOULD include the row per the schema's
-// `published = true` permission — never receives a notification.
-//
-// Each test below is marked `test.fail()` so it documents the broken
-// contract today. Once the SSP fan-out fix lands, removing
-// `test.fail()` should turn every one of these green.
+// (alice and bob), not two sessions of the same account; that case is
+// covered by `z-multi-client-sync.spec.ts`. Bob may read a published
+// thread but not edit it, so his side of the CRDT tests is the read-only
+// editor, which still follows alice's edits and cursor live.
 
 const seedDraftThread = async (
   page: Page,
@@ -47,6 +39,7 @@ const seedDraftThread = async (
     .locator('#create-title')
     .waitFor({ state: 'hidden', timeout: 15_000 });
   await waitForThreadInUpstream(page, title);
+  await waitForThreadContentInUpstream(page, title);
   await navigateToThread(page, title);
 };
 
@@ -75,6 +68,10 @@ const seedPublishedThread = async (
 };
 
 test.describe('Multi-user real-time sync (different accounts)', () => {
+  // Two sign-ins plus a seeded thread whose CRDT content must reach the
+  // server before the other user opens it.
+  test.describe.configure({ timeout: 90_000 });
+
   test('alice publishing a thread makes it visible to bob', async ({ browser }) => {
     // Cross-user fan-out: alice's publish UPDATE goes through the
     // SSP's circuit, which detects the predicate transition via the
@@ -212,25 +209,13 @@ test.describe('Multi-user real-time sync (different accounts)', () => {
   });
 
   test('CRDT body edits propagate from alice to bob on a published thread', async ({ browser }) => {
-    // INCORRECT TEST PREMISE — left as `test.fail()` until rewritten.
-    // The schema (example/schema/src/schema.surql ~thread permissions)
-    // allows UPDATE on a thread only for the author OR users in the
-    // `collaborates_on` relation. `published = true` grants SELECT but
-    // NOT UPDATE. ThreadDetail.tsx::canEdit reflects this — bob's
-    // editor is rendered with `contenteditable="false"`, so the
-    // `.ProseMirror[contenteditable="true"]` selector doesn't match.
-    // To validate cross-user CRDT propagation this test should either
-    // (a) add bob via `collaborates_on` before alice types, or
-    // (b) check for the read-only rendered body text instead of the
-    // editor. The list_ref-driven `applyRow` hook in sp00ky.ts already
-    // forwards parent-row updates into CrdtManager, so collaborator
-    // propagation is wired regardless.
-    test.fail();
+    // Bob can read the published thread (and so its edit log) but not
+    // edit it: his editor is read-only and still follows alice's edits.
     const alice = uniqueUser('alice');
     const bob = uniqueUser('bob');
     const title = 'Cross-User CRDT Thread';
     const seed = 'shared seed';
-    const appended = ' — alice typed';
+    const appended = ' and alice typed';
 
     const ctxA = await browser.newContext();
     const ctxB = await browser.newContext();
@@ -261,7 +246,7 @@ test.describe('Multi-user real-time sync (different accounts)', () => {
         .locator('.ProseMirror[contenteditable="true"]')
         .first();
       const editorB = pageB
-        .locator('.ProseMirror[contenteditable="true"]')
+        .locator('.ProseMirror[contenteditable="false"]')
         .first();
       await expect(editorA).toBeVisible({ timeout: 15_000 });
       await expect(editorB).toBeVisible({ timeout: 15_000 });
@@ -280,13 +265,8 @@ test.describe('Multi-user real-time sync (different accounts)', () => {
   });
 
   test('alice’s cursor and username label are visible to bob on a published thread', async ({ browser }) => {
-    // INCORRECT TEST PREMISE — same as the CRDT-body test above. Bob
-    // can SELECT a published thread but not UPDATE it, so the test's
-    // `.ProseMirror[contenteditable="true"]` selector matches nothing
-    // on bob's side. To validate cursor-label visibility cross-user
-    // the test must (a) add bob to `collaborates_on` first, or (b)
-    // assert against the read-only rendering of remote peers.
-    test.fail();
+    // Presence rows follow the thread's read rule, so bob's read-only
+    // editor renders alice's cursor.
     const alice = uniqueUser('alice');
     const bob = uniqueUser('bob');
     const title = 'Cross-User Cursor Thread';
@@ -304,9 +284,8 @@ test.describe('Multi-user real-time sync (different accounts)', () => {
       const aliceThreadHref = pageA.url();
 
       // Bob loads the thread directly. Going through the home list
-      // first would conflate visibility (test 1) with presence; we
-      // already know visibility is broken, so we navigate directly
-      // by URL to isolate the cursor-presence contract.
+      // first would conflate visibility (test 1) with presence, so we
+      // navigate by URL to isolate the cursor-presence contract.
       await pageB.goto(aliceThreadHref);
       await waitForAppReady(pageB);
 
@@ -314,7 +293,7 @@ test.describe('Multi-user real-time sync (different accounts)', () => {
         .locator('.ProseMirror[contenteditable="true"]')
         .first();
       const editorB = pageB
-        .locator('.ProseMirror[contenteditable="true"]')
+        .locator('.ProseMirror[contenteditable="false"]')
         .first();
       await expect(editorA).toBeVisible({ timeout: 15_000 });
       await expect(editorB).toBeVisible({ timeout: 15_000 });

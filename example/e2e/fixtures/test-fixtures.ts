@@ -171,6 +171,58 @@ export async function waitForThreadInUpstream(
   );
 }
 
+/** Run root SurrealQL against the local upstream and return statement 0's rows. */
+async function upstreamRows<T>(sql: string): Promise<T[]> {
+  const resp = await fetch('http://localhost:8666/sql', {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'surreal-ns': 'main',
+      'surreal-db': 'example',
+      Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
+    },
+    body: sql,
+  });
+  const body = (await resp.json()) as Array<{ result?: T[] }>;
+  return body[0]?.result ?? [];
+}
+
+/**
+ * Poll until the `@crdt` `content` edits of the thread titled `title` have
+ * reached upstream: an edit-log row, or a document the SSP already folded.
+ * The edits travel as their own rows after the thread itself, so a test that
+ * reloads (or opens the thread on another client) right after publishing
+ * waits for this, not just for the thread.
+ */
+export async function waitForThreadContentInUpstream(page: Page, title: string, attempts = 30) {
+  const sql = `SELECT VALUE id FROM thread WHERE title = ${JSON.stringify(title)}
+    AND (count((SELECT id FROM thread__crdt_log WHERE doc = $parent.id)) > 0
+      OR count((SELECT id FROM _00_crdt_doc WHERE doc = $parent.id)) > 0)`;
+  for (let i = 0; i < attempts; i++) {
+    if ((await upstreamRows<string>(sql)).length > 0) return;
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`Content of thread "${title}" never reached upstream after ${attempts * 500}ms.`);
+}
+
+/**
+ * Poll until the server-written plain-text mirror of the thread's `content`
+ * contains every one of `parts`. The mirror is only written by the SSP fold,
+ * which runs once the edit log has been idle for `SPKY_CRDT_FOLD_IDLE_SECS`
+ * (60 s by default; set it low on the SSP for faster runs).
+ */
+export async function waitForThreadMirror(page: Page, title: string, parts: string[], timeoutMs = 120_000) {
+  const sql = `SELECT VALUE content FROM thread WHERE title = ${JSON.stringify(title)}`;
+  const deadline = Date.now() + timeoutMs;
+  let last = '';
+  while (Date.now() < deadline) {
+    last = (await upstreamRows<string>(sql))[0] ?? '';
+    if (parts.every((p) => last.includes(p))) return last;
+    await page.waitForTimeout(1000);
+  }
+  throw new Error(`Mirror of "${title}" never held ${JSON.stringify(parts)}; last: ${JSON.stringify(last)}`);
+}
+
 /**
  * Type into a Tiptap/ProseMirror editor identified by `selector`. The
  * editor is `[contenteditable]`, so `.fill()` doesn't work — we click to

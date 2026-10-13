@@ -5,6 +5,8 @@ import {
   waitForAppReady,
   typeIntoEditor,
   waitForThreadInUpstream,
+  waitForThreadContentInUpstream,
+  waitForThreadMirror,
 } from '../fixtures/test-fixtures';
 
 // Two-client sync tests via the SSP. Both contexts log in as the same
@@ -47,9 +49,14 @@ const seedThread = async (
     .locator('#create-title')
     .waitFor({ state: 'hidden', timeout: 15_000 });
   await waitForThreadInUpstream(page, title);
+  await waitForThreadContentInUpstream(page, title);
 };
 
 test.describe('Multi-client real-time sync', () => {
+  // Two sign-ins plus a seeded thread whose CRDT content must reach the
+  // server before the second client opens it.
+  test.describe.configure({ timeout: 90_000 });
+
   test('thread created on A appears on B without reload', async ({ browser }) => {
     const title = 'Multi A2B Create Thread';
     const ctxA = await browser.newContext();
@@ -154,14 +161,83 @@ test.describe('Multi-client real-time sync', () => {
       await expect(editorA).toContainText(initial, { timeout: 15_000 });
       await expect(editorB).toContainText(initial, { timeout: 15_000 });
 
-      // A appends; LoroSyncPlugin captures each keystroke as a CRDT op
-      // and pushes it through `_00_crdt_op`.
+      // A appends; LoroSyncPlugin captures each keystroke as a CRDT op,
+      // and A's own new ops travel as `thread__crdt_log` rows.
       await editorA.click();
       await pageA.keyboard.press('End');
       await pageA.keyboard.type(appended);
 
       // B's editor applies the op and renders the appended text.
       await expect(editorB).toContainText(appended, { timeout: 30_000 });
+    } finally {
+      await ctxA.close();
+      await ctxB.close();
+    }
+  });
+
+  test('concurrent typing on A and B converges and survives the server fold', async ({ browser }) => {
+    // The fold waits for the edit log to go idle (60 s by default).
+    test.setTimeout(180_000);
+    const title = 'Multi A2B Concurrent Thread';
+    const seed = 'shared seed';
+    const fromA = ' typed on A';
+    const fromB = 'typed on B ';
+    const ctxA = await browser.newContext();
+    const ctxB = await browser.newContext();
+    const pageA = await ctxA.newPage();
+    const pageB = await ctxB.newPage();
+
+    try {
+      await registerUser(pageA, testUser);
+      await registerUser(pageB, testUser);
+
+      await seedThread(pageA, title, seed);
+      await navigateToThread(pageA, title);
+      await navigateToThread(pageB, title);
+
+      const editorA = pageA.locator('.ProseMirror[contenteditable="true"]').first();
+      const editorB = pageB.locator('.ProseMirror[contenteditable="true"]').first();
+      await expect(editorA).toContainText(seed, { timeout: 15_000 });
+      await expect(editorB).toContainText(seed, { timeout: 15_000 });
+
+      // A types at the end and B at the start, at the same time. The old
+      // snapshot push kept whichever client wrote last, so one side's
+      // words were lost server-side.
+      await editorA.click();
+      await pageA.keyboard.press('End');
+      await editorB.click();
+      await pageB.keyboard.press('Home');
+      await Promise.all([pageA.keyboard.type(fromA, { delay: 30 }), pageB.keyboard.type(fromB, { delay: 30 })]);
+
+      for (const editor of [editorA, editorB]) {
+        await expect(editor).toContainText(fromA, { timeout: 30_000 });
+        await expect(editor).toContainText(fromB, { timeout: 30_000 });
+      }
+      // Same document on both sides (remote cursor widgets left out).
+      const docText = (editor: typeof editorA) =>
+        editor.evaluate((el) => {
+          const copy = el.cloneNode(true) as HTMLElement;
+          copy.querySelectorAll('.ProseMirror-loro-cursor').forEach((c) => c.remove());
+          return (copy.textContent ?? '').replace(/\u2060/g, '');
+        });
+      await expect.poll(() => docText(editorB), { timeout: 10_000 }).toBe(await docText(editorA));
+
+      // The server folds both edit streams into one document and mirrors
+      // its text onto the thread row.
+      await waitForThreadMirror(pageA, title, [seed, fromA.trim(), fromB.trim()]);
+
+      // A fresh client opens the folded document with both edits.
+      const ctxC = await browser.newContext();
+      try {
+        const pageC = await ctxC.newPage();
+        await registerUser(pageC, testUser);
+        await navigateToThread(pageC, title);
+        const editorC = pageC.locator('.ProseMirror[contenteditable="true"]').first();
+        await expect(editorC).toContainText(fromA, { timeout: 15_000 });
+        await expect(editorC).toContainText(fromB, { timeout: 15_000 });
+      } finally {
+        await ctxC.close();
+      }
     } finally {
       await ctxA.close();
       await ctxB.close();

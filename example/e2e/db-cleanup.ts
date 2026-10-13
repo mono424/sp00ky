@@ -7,7 +7,9 @@ const SURREAL_PASS = 'root';
 // Tables to clean — application data only.
 // NOT `user` (registerUser handles "already exists").
 // NOT `_00_*` (internal sync tables).
-const TABLES_TO_CLEAN = ['commented_on', 'comment', 'thread', 'job'];
+// The CRDT edit-log and presence tables go with their threads (the fold only
+// drops orphans on its sweep).
+const TABLES_TO_CLEAN = ['commented_on', 'comment', 'thread__crdt_log', 'thread__crdt_presence', 'thread', 'job'];
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;

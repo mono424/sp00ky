@@ -116,8 +116,9 @@ export function ShareDialog(props: ShareDialogProps) {
       // Write through the local mutation queue so `linksQuery` picks up
       // the new row immediately; sync propagates the row to remote where
       // the table-level CREATE rule (thread author only) still gates it.
-      const linkId = new RecordId('share_link', Uuid.v4().toString().replace(/-/g, ''));
-      await db.create(linkId.toString(), {
+      // A plain `table:key` string; see `idString`.
+      const linkId = `share_link:${Uuid.v4().toString().replace(/-/g, '')}`;
+      await db.create(linkId, {
         thread: parseRecordId(props.threadId),
         issuer: parseRecordId(userId),
         jwt,
@@ -125,7 +126,7 @@ export function ShareDialog(props: ShareDialogProps) {
         exp: new Date(expSeconds * 1000),
       });
       // Open the freshly created row, collapsing any other.
-      setExpandedId(linkId.toString());
+      setExpandedId(linkId);
     } catch (e: any) {
       setError(e?.message || 'Failed to create share link.');
     } finally {

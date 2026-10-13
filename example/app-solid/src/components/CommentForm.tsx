@@ -1,7 +1,7 @@
 import type { Accessor} from 'solid-js';
 import { createSignal } from 'solid-js';
 import { useAuth } from '../lib/auth';
-import { RecordId, Uuid, useDb } from '@spooky-sync/client-solid';
+import { Uuid, useDb } from '@spooky-sync/client-solid';
 import type { schema } from '../schema.gen';
 import { ProfilePicture } from './ProfilePicture';
 import { Tooltip } from './Tooltip';
@@ -29,15 +29,17 @@ export function CommentForm(props: CommentFormProps) {
         throw new Error('You must be logged in to post a comment');
       }
 
-      const commentId = new RecordId('comment', Uuid.v4().toString().replace(/-/g, ''));
+      // A plain `table:key` string: `RecordId.toString()` brackets a key that
+      // starts with a digit, and the brackets would end up in the stored id.
+      const commentId = `comment:${Uuid.v4().toString().replace(/-/g, '')}`;
 
-      await db.create(commentId.toString(), {
+      await db.create(commentId, {
         thread: props.thread().id,
         content: content().trim(),
         author: user.id,
       });
 
-      console.log('[CommentForm] Comment created with ID:', commentId.toString());
+      console.log('[CommentForm] Comment created with ID:', commentId);
 
       setContent('');
       props.onCommentAdded?.();

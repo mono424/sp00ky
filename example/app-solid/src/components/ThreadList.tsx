@@ -120,6 +120,7 @@ export function ThreadList() {
         <div class="relative ml-auto" data-sort-menu>
           <Tooltip text="Sort" position="bottom">
           <button
+            aria-label="Sort"
             onMouseDown={() => setSortOpen(!sortOpen())}
             class="inline-flex items-center justify-center w-8 h-8 text-zinc-500 hover:text-white rounded-lg transition-colors duration-150"
           >

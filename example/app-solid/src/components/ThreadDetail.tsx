@@ -12,8 +12,10 @@ import type { schema } from '../schema.gen';
 import { ProfilePicture } from './ProfilePicture';
 import { Tooltip } from './Tooltip';
 import { CollaborativeEditor } from './CollaborativeEditor';
+import { CrdtTextInput } from './CrdtTextInput';
 import { ShareDialog } from './ShareDialog';
 import { Lock, MoreVertical } from 'lucide-solid';
+import { idString } from '../lib/ids';
 
 interface CollaboratorRow {
   relationId: string;
@@ -26,8 +28,7 @@ const parseRecordId = (id: string): RecordId => {
   return new RecordId(id.slice(0, idx), id.slice(idx + 1));
 };
 
-const stringifyId = (v: any): string =>
-  typeof v === 'string' ? v : v instanceof RecordId ? v.toString() : v ? String(v) : '';
+const stringifyId = idString;
 
 const createQuery = (
   db: SyncedDb<typeof schema>,
@@ -248,30 +249,32 @@ export function ThreadDetail() {
     }
   };
 
-  // `content` is `@crdt prosemirror @cursor`: edited through the
-  // collaborative editor, while the column itself holds the server-written
-  // plain text. `title` is a plain `TYPE string` column, edited via a
-  // regular `<input>` and synced through `db.update`.
+  // `content` (`@crdt prosemirror @cursor`) and `title` (`@crdt text`) are
+  // collaborative fields: edited through their Loro documents, while the
+  // columns hold the server-written plain text the lists show.
   const contentCrdtField = useCrdtField(
     'thread',
     () => thread()?.id ? `thread:${params.id}` : undefined,
     'content',
   );
+  const titleCrdtField = useCrdtField(
+    'thread',
+    () => thread()?.id ? `thread:${params.id}` : undefined,
+    'title',
+  );
 
-  // `title` is a regular `TYPE string` column: debounced update through
-  // the normal sync pipeline. `content` edits travel as the CRDT field's own
-  // edit-log rows, so the editor's `onUpdate` has nothing to write.
-  const handleTitleChange = async (newTitle: string) => {
-    const threadData = thread();
-    if (!threadData || !threadData.id || !canEdit()) return;
-    await db.update('thread', threadData.id, { title: newTitle }, { debounced: true });
-  };
+  // Both fields' edits travel as their own edit-log rows, so the editor's
+  // `onUpdate` has nothing to write.
   const handleContentChange = (_newContent: string) => { /* CRDT pushes itself */ };
 
   const handleAcceptTitle = async (suggestion: string) => {
     const threadData = thread();
-    if (!threadData || !threadData.id || !canEdit()) return;
-    await db.update('thread', threadData.id, { title: suggestion, title_suggestion: '' });
+    const field = titleCrdtField();
+    if (!threadData || !threadData.id || !canEdit() || !field) return;
+    // Through the document, like any edit, so it merges with concurrent ones.
+    field.getDoc().getText('title').update(suggestion);
+    field.getDoc().commit();
+    await db.update('thread', threadData.id, { title_suggestion: '' });
   };
 
   const handleDeclineTitle = async () => {
@@ -516,24 +519,17 @@ export function ThreadDetail() {
                         </div>
                       </Show>
 
-                      {/* Title (plain string, editable only for author) */}
-                      <Show
-                        when={canEdit()}
-                        fallback={
-                          <div class="text-2xl font-semibold mb-4 leading-tight">
-                            <p>{threadData().title || 'Untitled'}</p>
-                          </div>
-                        }
-                      >
-                        <input
-                          type="text"
-                          value={threadData().title ?? ''}
-                          onInput={(e) => handleTitleChange(e.currentTarget.value)}
-                          placeholder="Untitled"
-                          maxlength={200}
-                          class="w-full bg-transparent text-2xl font-semibold mb-4 leading-tight outline-none border-none focus:outline-none placeholder-zinc-600"
-                        />
-                      </Show>
+                      {/* Title (collaborative, editable by the author and members) */}
+                      <CrdtTextInput
+                        id="thread-title"
+                        field={titleCrdtField()}
+                        name="title"
+                        fallback={threadData().title ?? ''}
+                        readOnly={!canEdit()}
+                        placeholder="Untitled"
+                        maxLength={200}
+                        class="w-full bg-transparent text-2xl font-semibold mb-4 leading-tight outline-none border-none focus:outline-none placeholder-zinc-600"
+                      />
 
                       {/* Content Suggestion */}
                       <Show when={canEdit() && threadData().content_suggestion}>

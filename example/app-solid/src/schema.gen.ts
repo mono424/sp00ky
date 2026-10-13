@@ -164,7 +164,7 @@ export const schema = {
          *
          * `@crdt prosemirror` — collaborative field. Edit it with `useCrdtField`; this column is
          * the server-written plain text of the document (readable and filterable,
-         * never written by the client).
+         * set by the client only in the create that makes the record).
          */
         content: { type: 'string' as const, crdt: 'prosemirror' as const, cursor: true, optional: true },
         content__crdt: { type: 'string' as const, optional: true },
@@ -176,7 +176,15 @@ export const schema = {
          */
         created_at: { type: 'string' as const, dateTime: true, optional: true },
         published: { type: 'boolean' as const, optional: true },
-        title: { type: 'string' as const, optional: false },
+        /**
+         * `title?` — string
+         *
+         * `@crdt text` — collaborative field. Edit it with `useCrdtField`; this column is
+         * the server-written plain text of the document (readable and filterable,
+         * set by the client only in the create that makes the record).
+         */
+        title: { type: 'string' as const, crdt: 'text' as const, optional: true },
+        title__crdt: { type: 'string' as const, optional: true },
         title_suggestion: { type: 'string' as const, optional: true },
         comments: { type: 'string' as const, array: true, optional: true },
         share_links: { type: 'string' as const, array: true, optional: true },
@@ -455,7 +463,11 @@ DEFINE FIELD share_privkey ON TABLE user TYPE option<string> PERMISSIONS FOR sel
 DEFINE TABLE thread SCHEMAFULL
 PERMISSIONS FOR select, create, update, delete WHERE true;
 
-DEFINE FIELD title ON TABLE thread TYPE option<string>;
+-- @crdt text
+-- The title is collaborative too: edits from several devices merge. The
+-- column holds its text, written by the creating client and then by the
+-- server's fold, so lists can show and sort by it.
+DEFINE FIELD title ON TABLE thread TYPE option<string> DEFAULT '';
 
 -- @crdt prosemirror
 -- @cursor
@@ -510,11 +522,11 @@ DEFINE EVENT comment_created ON TABLE comment WHEN $event = "CREATE" THEN
 -- COLLABORATORS
 -- ##################################################################
 
--- Per-issuer history of share links. Append-only by design — there's no
+-- Per-issuer history of share links. Append-only by design: there's no
 -- way to revoke a JWT once it's out, so the dialog only shows the issuer
--- the links they've made and warns them. Acceptance happens server-side
--- (example/api /share/accept), not via this table; rows here are purely
--- informational.
+-- the links they've made and warns them. The row is also what makes a link
+-- valid: \`share_accept\` below only honours a JWT the thread's author stored
+-- here, unexpired.
 DEFINE TABLE share_link SCHEMAFULL
 PERMISSIONS FOR select, create, update, delete WHERE true;
 
@@ -526,14 +538,16 @@ DEFINE FIELD exp ON TABLE share_link TYPE option<datetime>;
 DEFINE FIELD created_at ON TABLE share_link TYPE option<datetime>;
 DEFINE INDEX unique_share_jti ON TABLE share_link FIELDS jti UNIQUE;
 
--- Only root may CREATE a \`collaborates_on\` edge — the JWT-verifying API
--- endpoint does it on the recipient's behalf after checking the share
--- link's signature against the issuer's \`share_pubkey\`. Author can still
--- kick collaborators off via FOR delete.
+-- Clients may not CREATE a \`collaborates_on\` edge themselves: the
+-- \`share_accept\` event below does it on the recipient's behalf. Author can
+-- still kick collaborators off via FOR delete.
 DEFINE TABLE collaborates_on SCHEMAFULL TYPE RELATION FROM user TO thread
 PERMISSIONS FOR select, create, update, delete WHERE true;
 
 DEFINE INDEX unique_collab ON TABLE collaborates_on FIELDS in, out UNIQUE;
+
+
+
 
 
 -- ==================================================
@@ -542,6 +556,7 @@ DEFINE INDEX unique_collab ON TABLE collaborates_on FIELDS in, out UNIQUE;
 
 -- \`thread\`: fold stamps
 DEFINE FIELD OVERWRITE content__crdt ON TABLE thread TYPE option<object> FLEXIBLE;
+DEFINE FIELD OVERWRITE title__crdt ON TABLE thread TYPE option<object> FLEXIBLE;
 
 -- \`thread\`: append-only Loro edit log
 DEFINE TABLE OVERWRITE thread__crdt_log SCHEMAFULL PERMISSIONS FULL;

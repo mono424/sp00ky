@@ -93,6 +93,10 @@ DEFINE TABLE thread SCHEMAFULL
     FOR delete WHERE $access = "account" AND author.id = $auth.id
 ;
 
+-- @crdt text
+-- The title is collaborative too: edits from several devices merge. The
+-- column holds its text, written by the creating client and then by the
+-- server's fold, so lists can show and sort by it.
 DEFINE FIELD title ON TABLE thread TYPE string;
 
 -- @crdt prosemirror

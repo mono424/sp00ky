@@ -8,6 +8,9 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   otelTransmit: createOtelTransmit('/v1/logs'),
   schema: schema,
   schemaSurql: SURQL_SCHEMA,
+  // Thread titles and bodies are `@crdt` fields: load Loro at startup so the
+  // editors open at once, offline included.
+  crdt: true,
   database: {
     namespace: import.meta.env.VITE_DB_NS || 'main',
     database: import.meta.env.VITE_DB_DB || 'example',

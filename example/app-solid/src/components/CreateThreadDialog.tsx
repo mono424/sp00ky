@@ -6,6 +6,7 @@ import { RecordId } from 'surrealdb';
 import type { CrdtField } from '@spooky-sync/core';
 import type { schema } from '../schema.gen';
 import { createHotkey } from '../lib/keyboard';
+import { idString } from '../lib/ids';
 import { Tooltip } from './Tooltip';
 import { CollaborativeEditor } from './CollaborativeEditor';
 
@@ -24,8 +25,9 @@ export function CreateThreadDialog(props: CreateThreadDialogProps) {
   const [isLoading, setIsLoading] = createSignal(false);
   // A fresh draft document for `content` per dialog open: the editor writes
   // into it before the thread exists, and on submit it is handed to the new
-  // thread's CRDT field, whose first edits it becomes. `title` is a plain
-  // `TYPE string` column, so it ships as the typed text directly.
+  // thread's CRDT field, whose first edits it becomes. `title` is a `@crdt
+  // text` field too: its draft is made on submit from the typed text, which
+  // also goes into the create as the column's initial value.
   const [contentField, setContentField] = createSignal<CrdtField | null>(null);
 
   createEffect(() => {
@@ -57,19 +59,31 @@ export function CreateThreadDialog(props: CreateThreadDialogProps) {
 
       const genId = Uuid.v4().toString().replace(/-/g, '');
       const threadId = `thread:${genId}`;
+      const sp00ky = db.getSp00ky();
+      const titleText = title().trim();
+      const titleField = await sp00ky.createCrdtDraft('thread', 'title');
+      titleField.getDoc().getText('title').insert(0, titleText);
+      titleField.getDoc().commit();
       await db.create(threadId, {
-        title: title().trim(),
-        author: new RecordId('user', user.id.toString().split(':')[1]),
+        title: titleText,
+        author: new RecordId('user', idString(user.id).split(':')[1]),
         active: true,
         published: false,
       });
-      // The draft's edits become the thread's first content edits.
-      const sp00ky = db.getSp00ky();
+      // The drafts' edits become the thread's first title and content edits.
+      // Closing queues them in the outbox (offline it keeps them on the device).
+      await sp00ky.openCrdtField('thread', threadId, 'title', titleField);
       await sp00ky.openCrdtField('thread', threadId, 'content', cField);
-      await sp00ky.closeCrdtField('thread', threadId, 'content');
+      await Promise.all([
+        sp00ky.closeCrdtField('thread', threadId, 'title'),
+        sp00ky.closeCrdtField('thread', threadId, 'content'),
+      ]);
 
-      handleClose();
-      navigate(`/thread/${genId}`);
+      // Straight to the new thread, in place of this form's history entry.
+      // Closing first ran the page's `history.back()` after this navigation,
+      // which landed on the previous page instead.
+      resetForm();
+      navigate(`/thread/${genId}`, { replace: true });
     } catch (err) {
       console.error('Failed to create thread:', err);
       setError(err instanceof Error ? err.message : 'Failed to create thread');
@@ -78,10 +92,14 @@ export function CreateThreadDialog(props: CreateThreadDialogProps) {
     }
   };
 
-  const handleClose = () => {
+  const resetForm = () => {
     setTitle('');
     setContentText('');
     setError('');
+  };
+
+  const handleClose = () => {
+    resetForm();
     props.onClose();
   };
 

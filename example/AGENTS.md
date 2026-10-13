@@ -39,6 +39,11 @@ _(no CRDT, parent, or relationship annotations)_
 
 _(no CRDT, parent, or relationship annotations)_
 
+### `share_accept`
+
+**Record links:**
+- `share_accept.user` → `user`
+
 ### `share_link`
 
 **Record links:**
@@ -47,8 +52,9 @@ _(no CRDT, parent, or relationship annotations)_
 
 ### `thread`
 
-**CRDT fields** (edit with `useCrdtField`; the field itself is the server-written plain text, readable in `useQuery` and filters, never written by the client):
+**CRDT fields** (edit with `useCrdtField`; the field itself is the server-written plain text, readable in `useQuery` and filters; the client sets it only in the `db.create` that makes the record):
 - `thread.content` (`@crdt prosemirror`)
+- `thread.title` (`@crdt text`)
 
 **Parent fields** (auto-populated server-side from auth context — do not write from client code):
 - `thread.author` → `user`
@@ -74,7 +80,7 @@ _(no CRDT, parent, or relationship annotations)_
 
 1. **Run `spky generate` after every schema edit.** Then `spky doctor` to confirm nothing else drifted.
 2. **Record IDs are full strings.** `db.create('thread:abc', {...})`, not `db.create('thread', {id: 'abc'})`. Mint IDs with `new Uuid().toString()`.
-3. **Edit CRDT fields with `useCrdtField(table, () => id, field)`.** The column itself is the server-written plain text: fine to read with `useQuery` for previews and filters (it trails live edits until the server folds the edit log), never written with `db.create` / `db.update`. Bind editors to `useCrdtField(...)()?.getDoc()`.
+3. **Edit CRDT fields with `useCrdtField(table, () => id, field)`.** The column itself is the server-written plain text: fine to read with `useQuery` for previews and filters (it trails live edits until the server folds the edit log). Set it only in the `db.create` that makes the record (its initial text); a later `db.update` keeps the old value. Bind editors to `useCrdtField(...)()?.getDoc()`.
 4. **`@parent` columns are read-only from the client.** They're populated server-side from the auth context.
 5. **`useQuery` factories must end with `.build()`.** A bare builder hangs the hook.
 6. **`db.useRemote(fn)` bypasses the local cache.** Use only for queries the type-safe builder can't express.

@@ -678,7 +678,7 @@ impl CodeGenerator {
                 variant
             ));
             lines.push("         * the server-written plain text of the document (readable and filterable,".to_string());
-            lines.push("         * never written by the client).".to_string());
+            lines.push("         * set by the client only in the create that makes the record).".to_string());
         }
         if is_parent {
             lines.push("         *".to_string());

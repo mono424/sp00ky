@@ -380,9 +380,12 @@ fn rebase_parent_param(rendered: &str, link: &str) -> String {
 // ------------------------------------------------------------------
 
 const MIRROR_TYPE: &str = "string";
-/// A record user never sets the mirror: it keeps what the fold wrote. Root
-/// (the SSP, a backend, an operator) has no `$auth` and writes freely.
-const MIRROR_GUARD: &str = "DEFAULT '' VALUE IF $auth.id != NONE { $before OR '' } ELSE { $value }";
+/// A record user sets the mirror only when creating the record (so a new
+/// record shows its initial text before the first fold); after that it keeps
+/// what the fold wrote. Root (the SSP, a backend, an operator) has no `$auth`
+/// and writes freely.
+const MIRROR_GUARD: &str =
+    "DEFAULT '' VALUE IF $auth.id != NONE AND $before != NONE { $before } ELSE { $value OR '' }";
 
 fn mirror_definition(table: &str, field: &str, define_mode: &str, permissions: Option<&str>) -> String {
     let perms = permissions.map(|p| format!(" {p}")).unwrap_or_default();

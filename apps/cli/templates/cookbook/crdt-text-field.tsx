@@ -44,7 +44,7 @@ export function {{TablePascal}}{{FieldPascal}}Editor(props: { id: string }) {
 }
 
 // Previews read the column like any other. It is the document's text as of the
-// server's last fold, so it trails live edits (about a minute by default).
+// server's last fold, so it trails live edits (a few seconds by default).
 export function {{TablePascal}}{{FieldPascal}}Preview(props: { id: string }) {
   const db = useDb<typeof schema>();
   const result = useQuery(() =>

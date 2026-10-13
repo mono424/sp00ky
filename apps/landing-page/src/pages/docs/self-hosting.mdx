@@ -416,10 +416,10 @@ Read straight from the process environment.
 | `SPKY_SSP_REF_MODE` | `_00_list_ref` storage layout: `dedicated` (per-user tables; works around the SurrealDB v3 LIVE permission gap) or `single` (legacy shared table). Mirrors `refMode` in `sp00ky.yml`. | `dedicated` |
 | `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS` | Window (ms) over which the SSP coalesces query edge-update writes to `_00_list_ref` into one batched transaction, so a burst of view updates lands as a few batched `LIVE` deliveries instead of one transaction per record. `0` disables batching (flush each update immediately). See [Architecture](/docs/reference/architecture#edge-update-batching). | `100` |
 | `SPKY_JOB_CONFIG` | JSON array of the backends the SSP dispatches jobs to: `[{"name":"api","base_url":"http://api:3000","table":"job"}]`, with optional `auth_token` and `timeout` per entry. See [Backends and jobs](#backends-and-jobs). The literal `null` disables the job runner, so pass `[]` for none. | *(unset)* |
-| `SPKY_CRDT_FOLD_IDLE_SECS` | [CRDT fields](/docs/client/crdt#the-server-fold): fold a field's edit log into its canonical document once the log has had no new rows for this long | `60` |
+| `SPKY_CRDT_FOLD_IDLE_SECS` | [CRDT fields](/docs/client/crdt#the-server-fold): fold a field's edit log into its canonical document once the log has had no new rows for this long | `5` |
 | `SPKY_CRDT_FOLD_MAX_ROWS` | ...or once this many log rows are pending, however active the field is | `200` |
 | `SPKY_CRDT_FOLD_MAX_BYTES` | ...or once this many bytes are pending | `262144` |
-| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | Never fold one field more often than this | `30` |
+| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | Never fold one field more often than this | `10` |
 | `SPKY_CRDT_FOLD_WORKERS` | Folds running at once on this SSP | `2` |
 | `SPKY_CRDT_FOLD_TICK_MS` | How often the SSP looks for fields due a fold | `5000` |
 | `SPKY_CRDT_PRESENCE_TTL_SECS` | `@cursor` presence rows older than this are removed by the SSP's periodic sweep | `60` |

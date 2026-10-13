@@ -143,7 +143,7 @@ fn render(
             }
 
             if !crdt_fields.is_empty() {
-                s.push_str("**CRDT fields** (edit with `useCrdtField`; the field itself is the server-written plain text, readable in `useQuery` and filters, never written by the client):\n");
+                s.push_str("**CRDT fields** (edit with `useCrdtField`; the field itself is the server-written plain text, readable in `useQuery` and filters; the client sets it only in the `db.create` that makes the record):\n");
                 for (f, variant) in &crdt_fields {
                     s.push_str(&format!("- `{}.{}` (`@crdt {}`)\n", name, f, variant));
                 }
@@ -201,7 +201,7 @@ fn render(
     s.push_str("## Common gotchas\n\n");
     s.push_str("1. **Run `spky generate` after every schema edit.** Then `spky doctor` to confirm nothing else drifted.\n");
     s.push_str("2. **Record IDs are full strings.** `db.create('thread:abc', {...})`, not `db.create('thread', {id: 'abc'})`. Mint IDs with `new Uuid().toString()`.\n");
-    s.push_str("3. **Edit CRDT fields with `useCrdtField(table, () => id, field)`.** The column itself is the server-written plain text: fine to read with `useQuery` for previews and filters (it trails live edits until the server folds the edit log), never written with `db.create` / `db.update`. Bind editors to `useCrdtField(...)()?.getDoc()`.\n");
+    s.push_str("3. **Edit CRDT fields with `useCrdtField(table, () => id, field)`.** The column itself is the server-written plain text: fine to read with `useQuery` for previews and filters (it trails live edits until the server folds the edit log). Set it only in the `db.create` that makes the record (its initial text); a later `db.update` keeps the old value. Bind editors to `useCrdtField(...)()?.getDoc()`.\n");
     s.push_str("4. **`@parent` columns are read-only from the client.** They're populated server-side from the auth context.\n");
     s.push_str(
         "5. **`useQuery` factories must end with `.build()`.** A bare builder hangs the hook.\n",

@@ -100,15 +100,18 @@ const MAX_WAIT_MS = 2000;
 const PERSIST_DEBOUNCE_MS = 400;
 const PRESENCE_THROTTLE_MS = 250;
 const CLAIM_RETRY_MS = 5000;
-/** How long an open of a field with nothing local waits for the server's
- *  first answer before handing out the (still empty) document. */
-const FIRST_ANSWER_TIMEOUT_MS = 4000;
+/** Longest an open or close waits on the server (the first answer for a
+ *  field with nothing local, the last edits going out) before going on
+ *  without it. Offline it does not wait at all. */
+const SERVER_WAIT_MS = 4000;
 /** Pause after a fold is noticed before checking the published document. */
 const VERIFY_DELAY_MS = 1000;
 
 export class CrdtManager {
   private sessions = new Map<string, Session>();
   private opening = new Map<string, Promise<Session>>();
+  /** Closes still saving their field's local state, by session key. */
+  private saving = new Map<string, Promise<void>>();
   private ports: CrdtPorts | null = null;
   private logger: Logger;
   private peer: `${number}` = randomPeer();
@@ -178,7 +181,7 @@ export class CrdtManager {
         session = await inFlight;
         session.refs++;
       } else {
-        const pending = this.start(key, table, recordId, field, kind, cursor).finally(() => this.opening.delete(key));
+        const pending = this.start(key, table, recordId, field, kind, cursor, !!draft).finally(() => this.opening.delete(key));
         this.opening.set(key, pending);
         session = await pending;
       }
@@ -209,7 +212,8 @@ export class CrdtManager {
   }
 
   /** Close one open. The last close of a field resolves once its unsent
-   *  edits are in the outbox (or are left for a later session, offline). */
+   *  edits are in the outbox, or once they are saved on the device when the
+   *  server does not answer in time (offline: at once). */
   close(table: string, recordId: string, field: string): Promise<void> {
     const s = this.sessions.get(`${table}|${recordId}|${field}`);
     if (!s || --s.refs > 0) return Promise.resolve();
@@ -245,13 +249,18 @@ export class CrdtManager {
     recordId: string,
     field: string,
     kind: CrdtKind,
-    cursor: boolean
+    cursor: boolean,
+    /** Opened with a draft: the record was just created here, so the server
+     *  has nothing for it yet and the open does not wait on it. */
+    fresh = false
   ): Promise<Session> {
     if (!this.ports) throw new Error('CrdtManager: not attached to a client');
     const loro = await loadLoro();
     const doc = new loro.LoroDoc();
     doc.setPeerId(this.peer);
 
+    // A close of this field may still be saving: read what it saves.
+    await this.saving.get(key);
     const local = await this.readLocal(recordId, field);
     if (local.snapshot) this.tryImport(doc, local.snapshot, key);
 
@@ -288,8 +297,9 @@ export class CrdtManager {
 
     // Claimed now, so the first edits do not wait on the round trip.
     void this.ensureClaimed();
-    // First open on this device: start from the published document.
-    if (!local.snapshot) await this.refetchCanonical(session);
+    // First open on this device: start from the published document. Offline
+    // it is read once the connection is back instead of holding the open.
+    if (!local.snapshot && !fresh) await this.serverWait(this.refetchCanonical(session));
 
     session.disposers.push(
       doc.subscribeLocalUpdates(() => {
@@ -315,9 +325,7 @@ export class CrdtManager {
     // two clients doing that at once keep only one of them (with whatever was
     // typed into the other). With nothing local, hand the document out only
     // once the server's rows for it are in.
-    if (!session.handle.hasContent()) {
-      await Promise.race([log.settled, delay(FIRST_ANSWER_TIMEOUT_MS)]);
-    }
+    if (!session.handle.hasContent() && !fresh) await this.serverWait(log.settled);
     await session.ingesting;
     // Edits a previous session made but never sent (closed tab, offline).
     this.scheduleFlush(session, 0);
@@ -340,9 +348,23 @@ export class CrdtManager {
     if (s.verifyTimer) clearTimeout(s.verifyTimer);
     if (s.presenceSent) void this.dropPresence(s);
     if (flush) {
-      await this.persist(s);
-      await this.flush(s);
+      const saved = this.persist(s);
+      this.saving.set(s.key, saved);
+      await saved;
+      if (this.saving.get(s.key) === saved) this.saving.delete(s.key);
+      await this.serverWait(this.flush(s));
     }
+  }
+
+  /**
+   * Wait for server-bound `work`, at most {@link SERVER_WAIT_MS}, and not at
+   * all while disconnected: a remote call made then queues behind the
+   * reconnect for up to the query timeout, and an offline "new thread" form
+   * must not hang on it. The work itself goes on either way.
+   */
+  private serverWait(work: Promise<unknown>): Promise<unknown> {
+    if (this.remote.getStatus() !== 'connected') return Promise.resolve();
+    return Promise.race([work, delay(SERVER_WAIT_MS)]);
   }
 
   // --- receiving ---------------------------------------------------

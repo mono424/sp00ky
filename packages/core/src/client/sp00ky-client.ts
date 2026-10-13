@@ -603,7 +603,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
   }
 
   /** Close a `@crdt` field. The last close resolves once its unsent edits
-   *  are queued in the outbox. */
+   *  are queued in the outbox; offline, once they are saved on the device. */
   closeCrdtField(table: string, recordId: string, field: string): Promise<void> {
     return this.services.crdt.close(table, recordId, field);
   }

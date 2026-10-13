@@ -787,10 +787,10 @@ SPKY_SSP_QUERY_ALLOWLIST=off     # off | warn | enforce: refuse view shapes the 
 SPKY_IMPERSONATION=off           # on: serve /impersonate/* (set from impersonation.enabled)
 
 # @crdt fold: when a field's edit log is folded into its canonical document
-SPKY_CRDT_FOLD_IDLE_SECS=60      # fold once the log has been idle this long
+SPKY_CRDT_FOLD_IDLE_SECS=5       # fold once the log has been idle this long
 SPKY_CRDT_FOLD_MAX_ROWS=200      # ...or once this many rows are pending
 SPKY_CRDT_FOLD_MAX_BYTES=262144  # ...or once this many bytes are pending
-SPKY_CRDT_FOLD_MIN_GAP_SECS=30   # never fold one field more often than this
+SPKY_CRDT_FOLD_MIN_GAP_SECS=10   # never fold one field more often than this
 SPKY_CRDT_FOLD_WORKERS=2         # folds running at once on this SSP
 SPKY_CRDT_FOLD_TICK_MS=5000      # how often to look for due folds
 SPKY_CRDT_PRESENCE_TTL_SECS=60   # presence rows older than this are swept

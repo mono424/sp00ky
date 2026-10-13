@@ -45,7 +45,7 @@ changefeeds like user tables.
 
 | Object | Shape | Written by | Permissions |
 |---|---|---|---|
-| `P.<field>` | `TYPE string DEFAULT ''`, guard `VALUE IF $auth.id != NONE { $before OR '' } ELSE { $value }` | the fold (root) | the author's own field `PERMISSIONS` are kept |
+| `P.<field>` | `TYPE string DEFAULT ''`, guard `VALUE IF $auth.id != NONE AND $before != NONE { $before } ELSE { $value OR '' }` | the creating client (initial text), then the fold (root) | the author's own field `PERMISSIONS` are kept |
 | `P.<field>__crdt` | `option<object>`: `{ rev, upto: { vv, frontiers }, state_hash }` | the fold | same guard: record users keep `$before` |
 | `P__crdt_log` | `doc record<P>`, `field` (ASSERT in P's crdt fields), `author` (server-stamped), `peer` (decimal string, must be owned by `author` in `_00_crdt_peer`; root is trusted), `data bytes` (`@opaque`, <= 256 KiB), `size` (`bytes::len(data)`), `created_at`; index `(doc, field)`; marker `COMMENT 'sp00ky:crdt_log <field>=<kind>,...'` | clients CREATE, the fold DELETEs | select = P's select rule rebased through `doc`; create = P's update rule rebased, and not an impersonation session; update/delete NONE |
 | `P__crdt_presence` (`@cursor` only) | `doc`, `field`, `session`, `author`, `state bytes` (`@opaque`, <= 16 KiB), `at` | each session UPSERTs its own row | select = P's select; create = P's update (no impersonation); update/delete own rows only |
@@ -120,7 +120,11 @@ rule a pure function of the row and the DB check a single record lookup.
    import is idempotent), and the outbox treats "already exists" on a retried
    log CREATE as success (`mutation/push.saga.ts::isRepeatedLogCreate`).
 4. `closeCrdtField` resolves after a final persist and flush, i.e. once unsent
-   edits are in the outbox.
+   edits are in the outbox. Every server wait in open and close is bounded
+   (`SERVER_WAIT_MS`, 4 s) and skipped while the socket is not `connected`, so
+   an offline form never hangs on a peer claim or a snapshot read; the work
+   goes on in the background. A reopen while a close is still saving waits for
+   that save, so it starts from the same local state.
 
 Drafts: `createCrdtDraft(table, field)` returns a detached document; passing
 it to `openCrdtField(..., draft)` imports its ops and adds the draft's own peer
@@ -177,7 +181,9 @@ table (cheap, synchronous) and accumulates per `(log, doc, field)`: rows,
 bytes, last write. A field is **due** when it has pending rows, is past its
 retry time, at least `min_gap` since its last fold, and either idle for
 `idle` or over `max_rows` / `max_bytes`. Each tick starts up to `workers`
-due folds, biggest backlog first.
+due folds, biggest backlog first, and at most one per record: every field's
+fold writes the record (mirror and stamp), so two at once conflict and the
+loser would wait out `min_gap`. A record's other field goes on a later tick.
 
 One fold (`fold.rs`):
 
@@ -228,10 +234,10 @@ loser drops its cache entry). Exactly one node publishes each `rev`.
 
 | Variable | Default |
 |---|---|
-| `SPKY_CRDT_FOLD_IDLE_SECS` | 60 |
+| `SPKY_CRDT_FOLD_IDLE_SECS` | 5 |
 | `SPKY_CRDT_FOLD_MAX_ROWS` | 200 |
 | `SPKY_CRDT_FOLD_MAX_BYTES` | 262144 |
-| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | 30 |
+| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | 10 |
 | `SPKY_CRDT_FOLD_WORKERS` | 2 |
 | `SPKY_CRDT_FOLD_TICK_MS` | 5000 |
 | `SPKY_CRDT_PRESENCE_TTL_SECS` | 60 |

@@ -73,10 +73,13 @@ impl Default for FoldConfig {
     fn default() -> Self {
         Self {
             cache_size: 1024,
-            idle_ms: 60_000,
+            // A short title edit should reach every list within seconds; folds
+            // stay cheap (a delta into a cached document) and `min_gap_ms`
+            // still caps each field at one fold per window.
+            idle_ms: 5_000,
             max_rows: 200,
             max_bytes: 256 * 1024,
-            min_gap_ms: 30_000,
+            min_gap_ms: 10_000,
             workers: 2,
             tick_ms: 5_000,
             sweep_secs: 600,
@@ -193,7 +196,16 @@ impl CrdtFold {
             .collect();
         // Biggest backlog first.
         due.sort_by(|a, b| b.1.rows.cmp(&a.1.rows).then_with(|| a.0.cmp(b.0)));
-        let keys: Vec<DocKey> = due.into_iter().take(free).map(|(k, _)| k.clone()).collect();
+        // One fold per record at a time: every field's fold writes the record
+        // (its mirror and stamp), so two at once conflict and the loser waits
+        // out `min_gap_ms`. The other field goes on a later tick.
+        let mut records: HashSet<&str> = running.iter().map(|k| k.doc.as_str()).collect();
+        let keys: Vec<DocKey> = due
+            .into_iter()
+            .filter(|(k, _)| records.insert(k.doc.as_str()))
+            .take(free)
+            .map(|(k, _)| k.clone())
+            .collect();
         running.extend(keys.iter().cloned());
         keys
     }
@@ -432,5 +444,25 @@ mod tests {
         }
         assert_eq!(fold.take_due(1).len(), 2);
         assert!(fold.take_due(1).is_empty());
+    }
+
+    #[test]
+    fn one_fold_per_record_at_a_time() {
+        let cfg = FoldConfig { idle_ms: 0, min_gap_ms: 0, workers: 4, ..Default::default() };
+        let fold = CrdtFold::new(cfg, "ssp-a");
+        for field in ["title", "content"] {
+            fold.observe("thread__crdt_log", "CREATE", &json!({ "doc": "thread:a", "field": field }), 0);
+        }
+        fold.observe("thread__crdt_log", "CREATE", &json!({ "doc": "thread:b", "field": "title" }), 0);
+        let first = fold.take_due(1);
+        assert_eq!(first.len(), 2, "one field of thread:a and thread:b");
+        assert!(fold.take_due(1).is_empty(), "thread:a's other field waits while one runs");
+        let a = first.into_iter().find(|k| k.doc == "thread:a").unwrap();
+        fold.running.lock().unwrap().remove(&a);
+        fold.record(&a, &FoldOutcome { folded: 1, ..Default::default() }, 1);
+        let next = fold.take_due(1);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].doc, "thread:a");
+        assert_ne!(next[0].field, a.field);
     }
 }

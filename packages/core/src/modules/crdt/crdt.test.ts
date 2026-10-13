@@ -25,16 +25,26 @@ class World {
   peers = new Map<string, string>();
   published = new Map<string, { rev: number; snapshot: Uint8Array; upto?: unknown; state_hash?: string }>();
   online = true;
+  /** Offline remote calls never answer (queued behind a reconnect) instead of failing. */
+  hang = false;
+  /** A slow device store: each local write takes this long (real timers). */
+  storeDelayMs = 0;
   private watchers = new Set<{ table: string; where: Record<string, unknown>; cb: (rows: any[]) => void }>();
 
   client(user: string, store = new Map<string, any>(), logger: any = silent) {
     const local = {
       getById: async (_t: string, id: any) => store.get(String(id)) ?? null,
-      upsert: async (_t: string, id: any, data: any) => void store.set(String(id), structuredClone(data)),
+      upsert: async (_t: string, id: any, data: any) => {
+        const copy = structuredClone(data);
+        if (this.storeDelayMs) await new Promise((resolve) => setTimeout(resolve, this.storeDelayMs));
+        store.set(String(id), copy);
+      },
     } as any;
     const remote = {
       subscribeConnection: () => () => {},
+      getStatus: () => (this.online ? 'connected' : 'disconnected'),
       query: async (sql: string, vars: any) => {
+        if (!this.online && this.hang) return new Promise(() => {});
         if (!this.online) throw new Error('not connected');
         if (sql.startsWith('CREATE')) {
           const owner = this.peers.get(vars.peer);
@@ -184,6 +194,44 @@ describe('CRDT fields', () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(world.log.map((r) => r.peer)).toEqual([oldPeer]);
     expect(world.peers.get(oldPeer)).toBe('user:a');
+  });
+
+  it('open, adopt a draft and close offline without waiting on the server', async () => {
+    const world = new World();
+    world.online = false;
+    world.hang = true;
+    const store = new Map<string, any>();
+    const a = world.client('user:a', store);
+    const draft = await a.manager.createDraft('doc', 'body');
+    draft.getDoc().getText('body').insert(0, 'written offline');
+    draft.getDoc().commit();
+
+    let done = false;
+    void (async () => {
+      const f = await a.manager.open('doc', 'doc:1', 'body', draft);
+      expect(text(f)).toBe('written offline');
+      await a.manager.close('doc', 'doc:1', 'body');
+      done = true;
+    })();
+    await realWait();
+    expect(done).toBe(true);
+    expect(world.log).toHaveLength(0);
+    // Kept on the device, to go out from the next open.
+    expect([...store.values()].some((row) => row.snapshot)).toBe(true);
+  });
+
+  it('a reopen right after a close starts from what the close saved', async () => {
+    vi.useRealTimers();
+    const world = new World();
+    world.storeDelayMs = 30;
+    const a = world.client('user:a');
+    const draft = await a.manager.createDraft('doc', 'body');
+    draft.getDoc().getText('body').insert(0, 'from the form');
+    draft.getDoc().commit();
+    await a.manager.open('doc', 'doc:1', 'body', draft);
+    void a.manager.close('doc', 'doc:1', 'body');
+    const reopened = await a.manager.open('doc', 'doc:1', 'body');
+    expect(text(reopened)).toBe('from the form');
   });
 
   it('never import a row that fails the acceptance rule', async () => {

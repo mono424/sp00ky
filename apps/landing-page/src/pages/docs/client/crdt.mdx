@@ -50,8 +50,8 @@ The annotated column no longer holds anything a client writes. It is the documen
 
 <CodeBlock code={previewCode} lang="tsx" />
 
-- **Never write it.** Leave it out of `db.create` and `db.update` payloads. A client write keeps the old value (a new record starts as `''`), so there is nothing to gain from setting it.
-- **It trails live edits.** The column changes when the server folds, typically within about a minute of the last edit (see [the fold](#the-server-fold)). Inside an open editor you read the live document instead.
+- **Write it only when creating the record.** A `db.create` may set the initial text, so a new record shows it before the first fold (put the same text in the field's draft document). After that a client write keeps the old value; leave the field out of `db.update`.
+- **It trails live edits.** The column changes when the server folds, typically a few seconds after the last edit (at most one fold per field every 10 s by default) (see [the fold](#the-server-fold)). Inside an open editor you read the live document instead.
 - **`prosemirror` renders as lines.** Block nodes (paragraphs, headings, list items) become lines, hard breaks become newlines, and formatting is dropped.
 - **Keep it out of the sync engine with `@opaque`.** Add `-- @opaque` next to `@crdt` when the text is large or sensitive and you never filter on it; see [`@opaque`](/docs/schema#syncing-a-field-without-indexing-it-opaque).
 
@@ -79,9 +79,9 @@ Without Solid, open and close the field on the client yourself. Every open of th
 
 <CodeBlock code={vanillaCode} lang="typescript" />
 
-`closeCrdtField` resolves once the edits not sent yet are handed to the outbox, so awaiting it before navigating away loses nothing.
+`closeCrdtField` resolves once the edits not sent yet are handed to the outbox, so awaiting it before navigating away loses nothing. Offline it resolves at once and the edits stay on the device until the field is next opened online; on a connection that has not noticed it is down it waits at most 4 seconds.
 
-When a device holds nothing for a field yet, the open first fetches the server's published snapshot and waits briefly for the log's first answer, so the editor starts from the real document rather than an empty one. Set `crdt: true` in the [client config](/docs/reference/client-config#crdt) to load the Loro engine at startup instead of on the first open.
+When a device holds nothing for a field yet, the open first fetches the server's published snapshot and waits briefly (at most 4 seconds, not at all offline) for the log's first answer, so the editor starts from the real document rather than an empty one. An open with a draft skips both: the record was just created there. Set `crdt: true` in the [client config](/docs/reference/client-config#crdt) to load the Loro engine at startup instead of on the first open.
 
 ## 4. Create a record with content
 
@@ -167,10 +167,10 @@ The thresholds are SSP environment variables:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SPKY_CRDT_FOLD_IDLE_SECS` | `60` | Fold a field once its log has had no new rows for this long. |
+| `SPKY_CRDT_FOLD_IDLE_SECS` | `5` | Fold a field once its log has had no new rows for this long. |
 | `SPKY_CRDT_FOLD_MAX_ROWS` | `200` | ...or once this many rows are pending, however active it is. |
 | `SPKY_CRDT_FOLD_MAX_BYTES` | `262144` | ...or once this many bytes are pending. |
-| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | `30` | Never fold one field more often than this. |
+| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | `10` | Never fold one field more often than this. |
 | `SPKY_CRDT_FOLD_WORKERS` | `2` | Folds running at once on one SSP. |
 | `SPKY_CRDT_FOLD_TICK_MS` | `5000` | How often the SSP looks for fields due a fold. |
 | `SPKY_CRDT_PRESENCE_TTL_SECS` | `60` | Presence rows older than this are swept. |

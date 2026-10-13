@@ -58,7 +58,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
 ## Common gotchas
 
 - **`useDb()` requires `<typeof schema>`.** Without the generic, all calls fall back to `unknown` and you lose type safety.
-- **A `@crdt` column is the server-written plain text of its document.** Read it with `useQuery` for previews, search and filters (it trails live edits until the server folds, about a minute); edit it only through `useCrdtField`; never put it in a `db.create` / `db.update` payload (a client write keeps the old value).
+- **A `@crdt` column is the server-written plain text of its document.** Read it with `useQuery` for previews, search and filters (it trails live edits until the server folds, a few seconds); edit it only through `useCrdtField`. Set it only in the `db.create` that makes the record (its initial text, so lists show it before the first fold); a later `db.update` keeps the old value.
 - **Generate IDs explicitly.** `const id = new Uuid().toString()`, then `db.create(\`thread:\${id}\`, ...)`. SurrealDB's auto-id only fires on direct DB writes, not through the sync queue.
 - **`useQuery` factories must call `.build()` (or `.all()`, `.first()`, etc.).** A bare `db.query('thread')` is a builder, not a query — `useQuery` will throw or return forever-loading.
 - **Provider is mandatory.** Calling any hook outside `<Sp00kyProvider>` throws.

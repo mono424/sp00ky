@@ -1,6 +1,6 @@
 {
   "name": "@example/project",
-  "version": "0.0.1-canary.326",
+  "version": "0.0.1-canary.327",
   "private": true,
   "description": "Example Sp00ky project",
   "scripts": {

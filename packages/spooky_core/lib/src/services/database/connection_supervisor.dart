@@ -58,8 +58,8 @@ class ConnectionSupervisor {
 
   /// How many consecutive heartbeat failures it takes to tear the socket down.
   ///
-  /// The probe rides the same serialized queue as every other RPC
-  /// (deliberately - see [_beat]), so it cannot tell a WEDGED queue from a
+  /// The probe waits for a slot in the same lanes as every other RPC
+  /// (deliberately - see [_beat]), so it cannot tell a WEDGED lane from a
   /// merely BUSY one. A single slow window (a large sync burst, one heavy app
   /// query) must not force-close a healthy socket, because the resulting
   /// reconnect re-registers every active query a second later: that self-
@@ -260,9 +260,10 @@ class ConnectionSupervisor {
         Duration(milliseconds: _config.heartbeatIntervalMs), () => _beat());
   }
 
-  /// Probe the server end to end. Deliberately goes through the same
-  /// serialized queue every other remote call uses, so a queue wedged behind a
-  /// stuck RPC fails the heartbeat instead of being invisible to it.
+  /// Probe the server end to end. Deliberately goes through the same lanes
+  /// every other remote call uses (`RemoteDatabaseService.probe`), so a lane
+  /// wedged behind a stuck RPC fails the heartbeat instead of being invisible
+  /// to it.
   Future<void> _beat() async {
     _heartbeatTimer = null;
     if (_disposed || _suspended) return;
@@ -288,7 +289,7 @@ class ConnectionSupervisor {
     } catch (e) {
       _heartbeatFailures++;
       if (_heartbeatFailures < failuresBeforeTeardown) {
-        // Inconclusive: the probe shares a queue with ordinary traffic, so this
+        // Inconclusive: the probe shares lanes with ordinary traffic, so this
         // may be a busy window rather than a dead socket. Re-probe soon instead
         // of tearing down a connection that is probably fine.
         _logger.debug(

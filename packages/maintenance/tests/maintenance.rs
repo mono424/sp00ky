@@ -279,6 +279,97 @@ async fn backup_failure_marks_registry() {
 }
 
 // ---------------------------------------------------------------------------
+// Backup upload (wiremock S3)
+// ---------------------------------------------------------------------------
+
+/// Answers the S3 calls `upload_file` makes: initiate, part, complete, plain PUT.
+struct S3Mock;
+
+impl wiremock::Respond for S3Mock {
+    fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let query = req.url.query().unwrap_or("");
+        match req.method.as_str() {
+            "POST" if query.contains("uploads") => wiremock::ResponseTemplate::new(200)
+                .set_body_string(
+                    "<InitiateMultipartUploadResult><Bucket>bk</Bucket>\
+                     <Key>proj/b1.surql.gz</Key><UploadId>up1</UploadId>\
+                     </InitiateMultipartUploadResult>",
+                ),
+            "POST" => wiremock::ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><Key>proj/b1.surql.gz</Key>\
+                 </CompleteMultipartUploadResult>",
+            ),
+            "PUT" => wiremock::ResponseTemplate::new(200).insert_header("ETag", "\"e\""),
+            _ => wiremock::ResponseTemplate::new(204),
+        }
+    }
+}
+
+/// Uploads `len` bytes through `upload_file`; returns each PUT's
+/// (query, body length) in order.
+async fn upload_of(len: usize) -> Vec<(String, usize)> {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(S3Mock)
+        .mount(&server)
+        .await;
+    let config = BackupConfig {
+        s3_endpoint: server.uri(),
+        s3_access_key: "x".into(),
+        s3_secret_key: "x".into(),
+        s3_bucket: "bk".into(),
+        s3_region: "us-east-1".into(),
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), vec![7u8; len]).unwrap();
+
+    let bucket = config.get_bucket().unwrap();
+    maintenance::s3::upload_file(&bucket, file.path(), "proj/b1.surql.gz")
+        .await
+        .unwrap();
+
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .map(|r| (r.url.query().unwrap_or("").to_string(), r.body.len()))
+        .collect()
+}
+
+/// A file under one part is a single plain PUT.
+#[tokio::test]
+async fn upload_small_file_is_one_put() {
+    let puts = upload_of(1024).await;
+    assert_eq!(puts.len(), 1);
+    assert!(!puts[0].0.contains("partNumber"));
+    assert_eq!(puts[0].1, 1024);
+}
+
+/// A big file goes up in CHUNK_SIZE parts, in order, never more than one
+/// part's worth of bytes per request.
+#[tokio::test]
+async fn upload_large_file_is_sequential_parts() {
+    const CHUNK: usize = s3::bucket::CHUNK_SIZE;
+    let puts = upload_of(2 * CHUNK + 1024).await;
+    let sizes: Vec<usize> = puts.iter().map(|p| p.1).collect();
+    assert_eq!(sizes, vec![CHUNK, CHUNK, 1024]);
+    for (i, (query, _)) in puts.iter().enumerate() {
+        assert!(query.contains(&format!("partNumber={}", i + 1)), "{query}");
+    }
+}
+
+/// An exact multiple of CHUNK_SIZE ends without an empty trailing part
+/// (S3 rejects a zero-byte part).
+#[tokio::test]
+async fn upload_exact_multiple_has_no_empty_part() {
+    const CHUNK: usize = s3::bucket::CHUNK_SIZE;
+    let sizes: Vec<usize> = upload_of(2 * CHUNK).await.iter().map(|p| p.1).collect();
+    assert_eq!(sizes, vec![CHUNK, CHUNK]);
+}
+
+// ---------------------------------------------------------------------------
 // Backend health monitor (wiremock)
 // ---------------------------------------------------------------------------
 

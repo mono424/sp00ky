@@ -187,7 +187,12 @@ describe('createLiveFeed', () => {
     const input = (client as any).registerInput('notification', q.innerQuery, '10m');
     const env = defaultEnv(schema);
     const local = await runPure(registerLocal(env, input), {
-      state: { ...emptyState({ tabId: 't' }), sessionId: 'sess', userId: 'user:alice' },
+      state: {
+        ...emptyState({ tabId: 't' }),
+        sessionId: 'sess',
+        userId: 'user:alice',
+        ownerSecret: 'owner-k',
+      },
       handlers: {
         'local.getById': () => null,
         'ssp.register': () => ({
@@ -208,7 +213,7 @@ describe('createLiveFeed', () => {
     });
 
     const fake = new FakeSurreal();
-    const feed = feedWith(fake);
+    const feed = feedWith(fake, { ownerSecret: 'owner-k' });
     const sub = feed.subscribe(q, { onSet: () => {} });
     await sub.ready;
     const reg = fake.calls.find((c) => c.sql.startsWith('fn::query::register'))!;
@@ -409,7 +414,13 @@ describe('createLiveFeed', () => {
       fake.heartbeatGone = true;
       await vi.advanceTimersByTimeAsync(10_000);
       expect(fake.calls.some((c) => c.sql.startsWith('fn::query::heartbeat($id0)'))).toBe(true);
-      expect(fake.calls.filter((c) => c.sql.startsWith('fn::query::register'))).toHaveLength(2);
+      const registers = fake.calls.filter((c) => c.sql.startsWith('fn::query::register'));
+      expect(registers).toHaveLength(2);
+      // The re-registration proves it owns the view with the secret it was
+      // registered with (a fresh one per feed, at least 256 bits).
+      const owners = registers.map((c) => (c.vars!.config as { owner?: string }).owner);
+      expect(owners[0]).toMatch(/^[0-9a-f]{64}$/);
+      expect(owners[1]).toBe(owners[0]);
       await feed.close();
     } finally {
       vi.useRealTimers();

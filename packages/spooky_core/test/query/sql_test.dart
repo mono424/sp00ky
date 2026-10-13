@@ -31,6 +31,18 @@ void main() {
       expect(vars['in'], id);
       expect((vars['config'] as Map)['ttl'], '10m');
       expect((vars['config'] as Map)['id'], id);
+      expect((vars['config'] as Map).containsKey('owner'), isFalse);
+
+      // The owner secret rides beside params, never inside them: params name
+      // the computation the SSP shares between views.
+      final owned = registerVars(RegisterPayload(
+          id: id,
+          surql: 'SELECT 1',
+          params: const {'a': 1},
+          ttl: '10m',
+          owner: 'k'));
+      expect((owned['config'] as Map)['owner'], 'k');
+      expect((owned['config'] as Map)['params'], const {'a': 1});
     });
 
     test(

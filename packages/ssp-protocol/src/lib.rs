@@ -291,6 +291,14 @@ pub struct ViewRegisterRequest {
     pub last_active_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// `sha256` of the registering page's owner secret, computed by
+    /// `fn::query::register` ('' when the client sent none). The SSP stores it
+    /// on an anonymous `_00_query` row and refuses a later registration of
+    /// that id that does not present the same hash. Every relay of this
+    /// request (the scheduler, the standby shadow) must carry it, or the SSP
+    /// reads the owner's own re-registration as a stranger's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,6 +608,28 @@ mod tests {
         assert_eq!(publication.pending_operations, 15);
         assert!(publication.connection.is_none());
         assert!(publication.worst_views.is_empty());
+    }
+
+    /// The scheduler parses `fn::query::register`'s body into this struct and
+    /// re-serializes it for the SSP and its standbys, so a key the struct does
+    /// not name is dropped on the way. `ownerHash` must survive the trip, and a
+    /// body from an older `fn::query::register` (no key) must still parse.
+    #[test]
+    fn view_register_request_relays_the_owner_hash() {
+        let body = serde_json::json!({
+            "id": "_00_query:q", "surql": "SELECT * FROM t", "clientId": "s1",
+            "params": "{}", "ttl": "10m", "lastActiveAt": "now", "format": "flat",
+            "ownerHash": "ab12"
+        });
+        let request: ViewRegisterRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(request.owner_hash.as_deref(), Some("ab12"));
+        assert_eq!(serde_json::to_value(&request).unwrap(), body);
+
+        let mut legacy = body;
+        legacy.as_object_mut().unwrap().remove("ownerHash");
+        let request: ViewRegisterRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(request.owner_hash.is_none());
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
     }
 
     #[test]

@@ -151,7 +151,8 @@ Register a new view (live query) with the SSP.
   "ttl": "30s",
   "params": null,
   "lastActiveAt": "2024-01-01T00:00:00Z",
-  "format": null
+  "format": null,
+  "ownerHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 }
 ```
 
@@ -163,11 +164,26 @@ Register a new view (live query) with the SSP.
 - `params` (object, optional) - Query parameters
 - `lastActiveAt` (string, optional) - ISO 8601 timestamp of last activity
 - `format` (string, optional) - Response format
+- `ownerHash` (string, optional) - `sha256` of the registering page's owner
+  secret, computed by `fn::query::register` from the client's `$config.owner`
+  (`""` when the client sent none). Checked only for anonymous views, see
+  `409 owner_mismatch` below.
 
 **Response:**
 - `200 OK` - View registered, initial results returned
 - `400 Bad Request` - Invalid view registration payload
 - `401 Unauthorized` - Missing or invalid authentication
+- `409 Conflict` - The id belongs to someone else, and nothing was written:
+  - `auth_mismatch`: the view is registered under another identity.
+  - `owner_mismatch`: the view is anonymous (`auth_id = 'anon'`) and its
+    `_00_query` row holds an `ownerHash` this request does not match. Every
+    signed-out visitor shares the identity `anon` and anonymous view ids are
+    readable on `_00_list_ref_anon`, so the id alone proves nothing; without
+    this a guest could join another guest's view and then delete it. The
+    first registration that brings a hash stores it; a row without one (an
+    older client) stays joinable. Refused on the cold path too (the view was
+    lost but its row was not), where the view built for the request is rolled
+    back.
 - `403 Forbidden` - The query's shape is not in the query allowlist and
   `SPKY_SSP_QUERY_ALLOWLIST=enforce`. Body:
   ```json
@@ -193,7 +209,9 @@ written `state = 'materializing'` and its edges go to the edge flusher; the
 batch that commits those `_00_list_ref` edges also sets `state = 'ready'`, in
 the same transaction, and first deletes any edges the row already had (a full
 publish replaces, never duplicates). A view with no rows is written
-`state = 'ready'` at once. Clients read `state` next to the edges: `ready` with
+`state = 'ready'` at once. An anonymous view also gets `ownerHash` (hidden from
+and frozen for every record user by its field permissions). Clients read
+`state` next to the edges: `ready` with
 `rowCount 0` is a real empty result, `materializing` is a publish in flight,
 and a missing row means the SSP no longer has the view (they keep their rows
 and re-register). Re-registering a view the SSP already holds only refreshes

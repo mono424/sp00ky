@@ -21,12 +21,13 @@ import { TabsCoordinator, type CoordinatorHooks } from '../services/tabs/coordin
 import type { LeaderSyncHub, SyncForwarder } from '../services/tabs/coordinator';
 import { computeTabsFingerprint, hash53 } from '../services/tabs/protocol';
 import type { SqliteCacheEngine } from '../services/database/sqlite-cache-engine';
+import { columnFingerprints } from '../services/database/sqlite-column-reset';
 import type { BlobCache } from '../services/blobs/index';
 import { MemoryBlobStore, createBlobCache, resolveBlobBudget } from '../services/blobs/index';
 import type { Adapters } from '../kernel/interpreter';
 import type { RuntimeEvent } from '../kernel/events';
 import type { ServiceCalls } from '../kernel/effects';
-import { encodeRecordId } from '../utils/index';
+import { encodeRecordId, mintOwnerSecret } from '../utils/index';
 import { sha256Hex } from '../utils/sha256';
 import { leaveViewsBeacon, listRefLive } from '../query/sql';
 import { hashOfEdge, rowOfEdge } from '../utils/edges';
@@ -59,20 +60,28 @@ const RELOAD_SALT_KEY = 'sp00ky:salt';
  * query onto the `_00_query` row it already had, which the SSP answers from
  * the live view instead of building a new one.
  *
+ * The page's owner secret travels with it: an anonymous row answers only to
+ * the secret it was registered with, so the next page needs the same one to
+ * rejoin those views. `null` from a page that predates it; the next page then
+ * mints one, and the rows it left (which hold no secret) take the new one.
+ *
  * Taken, not read: the key is absent while a page lives, so a duplicated tab
  * (which copies sessionStorage) mints its own salt rather than sharing this
  * tab's remote views.
  */
-export function takeReloadSalt(authId: string | null): { salt: string; sessionIds: string[] } | null {
+export function takeReloadSalt(
+  authId: string | null
+): { salt: string; sessionIds: string[]; owner: string | null } | null {
   try {
     if (typeof sessionStorage === 'undefined') return null;
     const raw = sessionStorage.getItem(RELOAD_SALT_KEY);
     if (raw === null) return null;
     sessionStorage.removeItem(RELOAD_SALT_KEY);
-    const left = JSON.parse(raw) as { salt?: unknown; authId?: unknown; sessionIds?: unknown };
+    const left = JSON.parse(raw) as { salt?: unknown; authId?: unknown; sessionIds?: unknown; owner?: unknown };
     if (typeof left.salt !== 'string' || left.salt === '' || (left.authId ?? null) !== authId) return null;
     const sessionIds = Array.isArray(left.sessionIds) ? left.sessionIds.filter((sid): sid is string => typeof sid === 'string') : [];
-    return { salt: left.salt, sessionIds };
+    const owner = typeof left.owner === 'string' && left.owner !== '' ? left.owner : null;
+    return { salt: left.salt, sessionIds, owner };
   } catch {
     return null;
   }
@@ -84,11 +93,17 @@ export function takeReloadSalt(authId: string | null): { salt: string; sessionId
  * The session ids of this page's sockets go with it. The views the next page
  * re-registers keep the edges this page's sockets stamped, and the anonymous
  * LIVE only hears edges stamped by a session it knows (see `listRefLive`).
+ * So does the page's owner secret, which those views answer to.
  */
-export function leaveReloadSalt(salt: string, authId: string | null, sessionIds: ReadonlyArray<string> = []): void {
+export function leaveReloadSalt(
+  salt: string,
+  authId: string | null,
+  sessionIds: ReadonlyArray<string> = [],
+  owner: string | null = null
+): void {
   try {
     if (typeof sessionStorage !== 'undefined')
-      sessionStorage.setItem(RELOAD_SALT_KEY, JSON.stringify({ salt, authId, sessionIds }));
+      sessionStorage.setItem(RELOAD_SALT_KEY, JSON.stringify({ salt, authId, sessionIds, owner }));
   } catch {
     /* private-mode storage errors: the next page mints a fresh salt */
   }
@@ -268,9 +283,9 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
       const left = takeReloadSalt(authId);
       if (!left) return null;
       s.remote.adoptSessionIds(left.sessionIds);
-      return left.salt;
+      return { salt: left.salt, owner: left.owner };
     },
-    'salt.leave': (salt, authId) => leaveReloadSalt(salt, authId, s.remote.sessionIds()),
+    'salt.leave': (salt, authId, owner) => leaveReloadSalt(salt, authId, s.remote.sessionIds(), owner),
     'local.connect': (bucketId) => s.local.connect(bucketId),
     'local.switchStore': (bucketId) => s.local.switchStore(bucketId),
     'local.beginSwitch': () => s.local.beginSwitch(),
@@ -294,6 +309,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
         tables: [...config.schema.tables.map((t) => t.name), '_00_user_feature', '_00_app_release'],
         schemaHash: String(hash53(config.schemaSurql)),
         pendingIds: new Set(pendingIds),
+        columnFingerprints: columnFingerprints(config.schema.tables),
         onVersions: (_table, entries) => host.dispatch({ type: 'VersionsPrimed', entries }),
       }),
     'ssp.reset': () => s.streamProcessor.reset(),
@@ -411,7 +427,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
       },
     },
     clock: { now: () => Date.now() },
-    ids: { mutation: () => mintMutationId(s.tabId), salt: mintSalt },
+    ids: { mutation: () => mintMutationId(s.tabId), salt: mintSalt, owner: mintOwnerSecret },
     hash: sha256Hex,
     services,
   };

@@ -188,6 +188,7 @@ Future<void> registerRemote(Ctx ctx, SagaEnv env, QueryHash hash,
         surql: entry.def.surql,
         params: {...entry.def.params},
         ttl: entry.def.ttl,
+        owner: state.ownerSecret,
       )),
       timeoutMs: env.remoteTimeoutMs,
     ));

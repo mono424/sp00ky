@@ -10,7 +10,8 @@
  * - `fn::query::register($config)` plus the membership read-back in one
  *   request (`registerSelect` / `registerVars`, the same builders the full
  *   client's `registerRemote` uses; `$config = { id: _00_query:<key>, surql,
- *   params, ttl }`, key = sha256(JSON.stringify({ surql, params, sessionId })));
+ *   params, ttl, owner }`, key = sha256(JSON.stringify({ surql, params,
+ *   sessionId })), owner = the feed's `ownerSecret`);
  * - bodies with `SELECT * FROM $ids`;
  * - one `LIVE SELECT * FROM <the user's _00_list_ref table> FETCH out` per
  *   feed (on the shared anon table, filtered to the feed's own edges; see
@@ -48,7 +49,13 @@ import { decodeTokenClaims } from '../modules/auth/impersonation';
 import { hashOfEdge, rowOfEdge } from '../utils/edges';
 import { sha256Hex } from '../utils/sha256';
 import { parseQueryParams } from '../utils/parser';
-import { encodeRecordId, parseDuration, parseRecordIdString, withTimeout } from '../utils/index';
+import {
+  encodeRecordId,
+  mintOwnerSecret,
+  parseDuration,
+  parseRecordIdString,
+  withTimeout,
+} from '../utils/index';
 
 export type LiveToken = string | null | undefined;
 /** A token, or a function returning one (called on every connect). */
@@ -92,6 +99,14 @@ export interface LiveFeedOptions {
   ttl?: string;
   /** Salt of the `_00_query` keys. Default: a fresh random id per feed. */
   sessionId?: string;
+  /**
+   * The secret the feed's registrations prove they own their views with
+   * (`$config.owner`): a signed-out feed's view answers only to the secret it
+   * was registered with. Default: a fresh one per feed. Pass the same one
+   * wherever you pass the same `sessionId`, or the second registrant of a
+   * shared anonymous view is refused.
+   */
+  ownerSecret?: string;
   /**
    * The generated schema. Used to type query params (record ids, datetimes)
    * exactly like the full client does before registering. Taken from a query
@@ -384,6 +399,7 @@ class Feed implements LiveFeed {
   private liveStarting: Promise<boolean> | null = null;
   private readonly subs = new Map<string, SubState>();
   private readonly sessionId: string;
+  private readonly ownerSecret: string;
   /** `session::id()` of every socket this feed has had, oldest first. */
   private sockets: string[] = [];
   private readonly ttl: string;
@@ -403,6 +419,7 @@ class Feed implements LiveFeed {
 
   constructor(private readonly options: LiveFeedOptions) {
     this.sessionId = options.sessionId ?? randomId();
+    this.ownerSecret = options.ownerSecret ?? mintOwnerSecret();
     this.ttl = options.ttl ?? '10m';
     this.timeoutMs = options.timeoutMs ?? 15_000;
   }
@@ -804,7 +821,10 @@ class Feed implements LiveFeed {
 
   /** Register (or re-register) a view and read its membership back, in one request. */
   private async register(sub: SubState): Promise<Snapshot> {
-    const results = await this.q(registerSelect(this.table!), registerVars(sub.payload));
+    const results = await this.q(
+      registerSelect(this.table!),
+      registerVars({ ...sub.payload, owner: this.ownerSecret })
+    );
     let snap = snapshotAt(results, 1);
     for (let i = 0; snap && snap.state === 'materializing' && i < MATERIALIZE_RETRIES; i++) {
       await sleep(MATERIALIZE_RETRY_MS);

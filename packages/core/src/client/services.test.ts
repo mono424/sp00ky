@@ -25,7 +25,7 @@ describe('reload salt', () => {
 
   it('a salt left on the way out is taken once, by the same principal', () => {
     leaveReloadSalt('s1', 'user:a');
-    expect(takeReloadSalt('user:a')).toEqual({ salt: 's1', sessionIds: [] });
+    expect(takeReloadSalt('user:a')).toEqual({ salt: 's1', sessionIds: [], owner: null });
     // Taken, not read: a tab duplicated from this page finds nothing.
     expect(takeReloadSalt('user:a')).toBeNull();
   });
@@ -34,9 +34,23 @@ describe('reload salt', () => {
     // The reloaded page's views keep edges stamped by these sockets, and the
     // anonymous LIVE only hears sessions it knows.
     leaveReloadSalt('s1', null, ['sid-1', 'sid-2']);
-    expect(takeReloadSalt(null)).toEqual({ salt: 's1', sessionIds: ['sid-1', 'sid-2'] });
+    expect(takeReloadSalt(null)).toEqual({ salt: 's1', sessionIds: ['sid-1', 'sid-2'], owner: null });
     (g.sessionStorage as MemoryStorage).setItem('sp00ky:salt', JSON.stringify({ salt: 's2', authId: null, sessionIds: ['ok', 7, null] }));
-    expect(takeReloadSalt(null)).toEqual({ salt: 's2', sessionIds: ['ok'] });
+    expect(takeReloadSalt(null)).toEqual({ salt: 's2', sessionIds: ['ok'], owner: null });
+  });
+
+  it("the page's owner secret travels with the salt, so the reloaded page still owns its anonymous views", () => {
+    leaveReloadSalt('s1', null, [], 'secret-1');
+    expect(takeReloadSalt(null)).toEqual({ salt: 's1', sessionIds: [], owner: 'secret-1' });
+    // Gone with the salt: a duplicated tab mints its own.
+    expect(takeReloadSalt(null)).toBeNull();
+    // A different principal re-salts, and the secret is not handed over either.
+    leaveReloadSalt('s2', 'user:a', [], 'secret-2');
+    expect(takeReloadSalt(null)).toBeNull();
+    for (const owner of ['', 7, null]) {
+      (g.sessionStorage as MemoryStorage).setItem('sp00ky:salt', JSON.stringify({ salt: 's3', authId: null, owner }));
+      expect(takeReloadSalt(null)?.owner).toBeNull();
+    }
   });
 
   it('another principal, or none, mints a fresh salt', () => {

@@ -3,6 +3,7 @@ import 'dart:async';
 import '../services/stream_processor/stream_processor_service.dart'
     show IngestRecord;
 import '../state/client_state.dart';
+import '../surreal/value.dart' show generateOwnerSecret;
 import '../types.dart';
 import 'effects.dart';
 import 'events.dart';
@@ -26,7 +27,13 @@ abstract interface class LocalPort {
 
 abstract interface class RemotePort {
   /// Per-statement outcomes, in order. Never throws for a failed statement.
+  /// Reads overlap one another.
   Future<List<StatementResult>> queryStatements(String sql,
+      [Map<String, dynamic>? vars]);
+
+  /// [queryStatements] for a write: starts once every earlier write has
+  /// settled, so writes reach the server one at a time, in issue order.
+  Future<List<StatementResult>> writeStatements(String sql,
       [Map<String, dynamic>? vars]);
 
   /// Subscribe to `LIVE SELECT * FROM <table>`; the callback receives the
@@ -99,6 +106,7 @@ class Adapters {
     required this.now,
     required this.mutationId,
     required this.saltId,
+    this.ownerSecretId = generateOwnerSecret,
     required this.hash,
     required this.services,
   });
@@ -110,6 +118,7 @@ class Adapters {
   final int Function() now;
   final String Function() mutationId;
   final String Function() saltId;
+  final String Function() ownerSecretId;
   final String Function(String) hash;
   final Services services;
 }
@@ -154,8 +163,10 @@ class Interpreter implements Ctx {
         return null as R;
       case LocalEpoch():
         return _adapters.local.epoch as R;
-      case RemoteQuery(:final sql, :final vars, :final timeoutMs):
-        final pending = _adapters.remote.queryStatements(sql, vars);
+      case RemoteQuery(:final sql, :final vars, :final timeoutMs, :final write):
+        final pending = write
+            ? _adapters.remote.writeStatements(sql, vars)
+            : _adapters.remote.queryStatements(sql, vars);
         if (timeoutMs == null) return await pending as R;
         return await pending.timeout(
           Duration(milliseconds: timeoutMs),
@@ -196,9 +207,11 @@ class Interpreter implements Ctx {
       case NowEffect():
         return _adapters.now() as R;
       case IdEffect(:final scope):
-        return (scope == IdScope.mutation
-            ? _adapters.mutationId()
-            : _adapters.saltId()) as R;
+        return switch (scope) {
+          IdScope.mutation => _adapters.mutationId(),
+          IdScope.salt => _adapters.saltId(),
+          IdScope.owner => _adapters.ownerSecretId(),
+        } as R;
       case HashEffect(:final input):
         return _adapters.hash(input) as R;
       case EmitEffect(:final event):

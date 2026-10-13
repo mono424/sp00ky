@@ -39,6 +39,12 @@ describe('query sql builders (golden against the previous builders)', () => {
       config: { id, surql: 's', params: { a: 1 }, ttl: '10m' },
       in: id,
     });
+    // The owner secret rides beside params, never inside them: params name
+    // the computation the SSP shares between views.
+    expect(sql.registerVars({ id, surql: 's', params: { a: 1 }, ttl: '10m', owner: 'k' })).toEqual({
+      config: { id, surql: 's', params: { a: 1 }, ttl: '10m', owner: 'k' },
+      in: id,
+    });
   });
   it('the LIVE on a per-user table is unfiltered; FETCH out only when bodies ride inline', () => {
     expect(sql.listRefLive('_00_list_ref_user_x', { inlineBodies: true, sessionIds: ['s1'] })).toEqual({

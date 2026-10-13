@@ -7,6 +7,7 @@ import '../../surreal/value.dart';
 import '../../types.dart';
 import '../../utils/record_id_utils.dart';
 import '../logger/logger.dart';
+import 'column_reset.dart';
 
 /// Encode a record document to JSON for sqlite storage. `parseParams` coerces
 /// schema-typed fields to Dart objects (record links -> [RecordId], datetimes
@@ -273,6 +274,47 @@ class LocalDatabaseService {
       ];
     }
     return out;
+  }
+
+  /// Reset the cached `_00_rv` of every table whose column set changed since
+  /// it was last recorded, except the rows in [keep], and record [fingerprints].
+  /// Returns the tables reset. See `column_reset.dart`.
+  List<String> resetChangedTables(
+      Map<String, String> fingerprints, Set<String> keep) {
+    Map<String, String>? stored;
+    final raw = kvGet(columnSetsKey);
+    if (raw != null) {
+      try {
+        stored = (jsonDecode(raw) as Map).cast<String, String>();
+      } catch (_) {
+        stored = null;
+      }
+    }
+    if (sameColumnSets(stored, fingerprints)) return const [];
+
+    final withRows = {
+      for (final row in _db.select('SELECT DISTINCT tbl FROM records'))
+        row['tbl'] as String
+    };
+    final changed = changedTables(stored, fingerprints, withRows);
+    tx(() {
+      for (final table in changed) {
+        _db.execute(
+          "UPDATE records SET rv = 0, doc = json_set(doc, '\$._00_rv', 0) "
+          'WHERE tbl = ? AND rv != 0 '
+          'AND id NOT IN (SELECT value FROM json_each(?))',
+          [
+            table,
+            jsonEncode([
+              for (final id in keep)
+                if (extractTablePart(id) == table) id
+            ])
+          ],
+        );
+      }
+      kvSet(columnSetsKey, jsonEncode(fingerprints));
+    });
+    return changed;
   }
 
   // ---- circuit snapshot ------------------------------------------------------

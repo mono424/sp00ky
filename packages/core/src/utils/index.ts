@@ -51,6 +51,17 @@ export function generateId(): string {
   return Uuid.v4().toString().replace(/-/g, '');
 }
 
+/**
+ * 32 random bytes, hex: the secret a page proves it owns its anonymous views
+ * with (`$config.owner` on `fn::query::register`). `getRandomValues` rather
+ * than `randomUUID`, which a page served over plain http does not have.
+ */
+export function mintOwnerSecret(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 export function generateNewTableId<S extends SchemaStructure, T extends TableNames<S>>(
   tableName: T
 ): RecordId {

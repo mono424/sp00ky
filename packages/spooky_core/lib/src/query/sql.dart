@@ -114,6 +114,7 @@ class RegisterPayload {
     required this.surql,
     required this.params,
     required this.ttl,
+    this.owner,
   });
 
   final RecordId id;
@@ -121,11 +122,19 @@ class RegisterPayload {
   final Map<String, dynamic> params;
   final QueryTimeToLive ttl;
 
+  /// The registering client's secret. `fn::query::register` forwards only its
+  /// hash, and the SSP lets a registration onto an existing anonymous view
+  /// only with the hash that view was registered with: every signed-out
+  /// visitor is `anon`, and anyone can read an anonymous view's id. Kept out
+  /// of [params], which name the computation the SSP shares between views.
+  final String? owner;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'surql': surql,
         'params': params,
         'ttl': ttl,
+        if (owner != null) 'owner': owner,
       };
 }
 

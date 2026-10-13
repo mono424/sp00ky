@@ -64,6 +64,20 @@ void main() {
         throwsA(isA<Exception>()));
   });
 
+  test('a write takes the write lane, a read the shared pool', () async {
+    final calls = <String>[];
+    final fakes = FakeAdapters(
+      remote: FakeRemotePort((kind, args) => calls.add('$kind ${args.first}')),
+    );
+    final ctx = Interpreter(fakes.build(), FakeHost());
+    await ctx(Fx.remoteWrite('UPDATE thing:1 MERGE {}'));
+    await ctx(Fx.remoteQuery('SELECT * FROM thing'));
+    expect(calls, [
+      'remote.write UPDATE thing:1 MERGE {}',
+      'remote.query SELECT * FROM thing',
+    ]);
+  });
+
   test('a live subscription dispatches its changes as events', () async {
     final fakes = FakeAdapters();
     final host = FakeHost();
@@ -169,6 +183,7 @@ void main() {
     expect(await ctx(Fx.hash('abc')),
         'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
     expect(await ctx(Fx.id(IdScope.salt)), 'salt-1');
+    expect(await ctx(Fx.id(IdScope.owner)), 'owner-2');
     expect(await ctx(Fx.now()), 1700000000000);
     fakes.advance(5);
     expect(await ctx(Fx.now()), 1700000000005);

@@ -15,6 +15,9 @@ String schemaSha1(String schemaSurql) =>
 /// SQLite stores documents, so application schema changes need no destructive
 /// table migration. Keep cached rows, memberships and queued writes. Rebuild
 /// the circuit using the new schema and reconcile rows through normal sync.
+/// A kept row lacks any column the old schema did not know; the boot prime
+/// resets the versions of such tables so they are fetched again
+/// (`column_reset.dart`).
 class LocalMigrator {
   LocalMigrator(this._local, SpookyLogger logger)
       : _logger = logger.child('LocalMigrator');

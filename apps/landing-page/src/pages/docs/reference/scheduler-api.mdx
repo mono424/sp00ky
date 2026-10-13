@@ -192,7 +192,8 @@ Register a new view (live query) with the scheduler. The scheduler will assign i
   "ttl": "30s",
   "params": null,
   "lastActiveAt": "2024-01-01T00:00:00Z",
-  "format": null
+  "format": null,
+  "ownerHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 }
 ```
 
@@ -204,6 +205,9 @@ Register a new view (live query) with the scheduler. The scheduler will assign i
 - `params` (object, optional) - Query parameters
 - `lastActiveAt` (string, optional) - ISO 8601 timestamp of last activity
 - `format` (string, optional) - Response format
+- `ownerHash` (string, optional) - Proof of ownership for an anonymous view,
+  relayed to the SSP and its standbys unchanged. See the SSP's
+  [`POST /view/register`](/docs/reference/ssp-api#post-viewregister).
 
 **Response:**
 - `200 OK` - View registered and assigned to an SSP
@@ -216,8 +220,11 @@ Register a new view (live query) with the scheduler. The scheduler will assign i
   ```
 - `400 Bad Request` - The SSP rejected the payload (`rejected`); relayed verbatim
 - `403 Forbidden` - The SSP refused the shape under the query allowlist (`not_allowlisted`); relayed verbatim
-- `409 Conflict` - The SSP found the view registered under another identity (`auth_mismatch`); relayed verbatim
+- `409 Conflict` - The SSP found the view registered under another identity (`auth_mismatch`), or the view is anonymous and the request does not carry its owner's hash (`owner_mismatch`); relayed verbatim
 - `503 Service Unavailable` - No SSPs available
+
+A 4xx from the SSP that already holds the view leaves its assignment as it was:
+someone else's refused registration of a live view does not move or orphan it.
 
 The SSP's own verdict is relayed with its status: a 4xx is the client's problem and reaches it as
 such, not folded into a 500 that reads as an outage. The body is the SSP's

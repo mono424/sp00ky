@@ -44,9 +44,12 @@ export function* boot(env: SagaEnv, opts: BootOptions): Saga<void> {
 
   const restoredUserId = (yield fx.service('auth.restoreSession')) as string | null;
   const authId = (yield fx.service('auth.sessionAuthId')) as string | null;
-  // A reload keeps the salt its tab had, so registrations land on warm views.
-  const salt = (((yield fx.service('salt.take', authId)) as string | null) ?? (yield fx.id('salt'))) as string;
-  yield fx.state.update(R.setIdentity({ sessionId: salt, userId: restoredUserId, saltUserId: authId }));
+  // A reload keeps the salt its tab had, so registrations land on warm views,
+  // and the owner secret those views answer to.
+  const left = (yield fx.service('salt.take', authId)) as { salt: string; owner: string | null } | null;
+  const salt = (left?.salt ?? (yield fx.id('salt'))) as string;
+  const ownerSecret = (left?.owner ?? (yield fx.id('owner'))) as string;
+  yield fx.state.update(R.setIdentity({ sessionId: salt, userId: restoredUserId, saltUserId: authId, ownerSecret }));
   yield fx.service('crdt.setSessionId', salt);
   if (restoredUserId) yield fx.service('ssp.setSessionAuth', authId, (yield fx.service('auth.access')) as string | null);
 
@@ -123,12 +126,13 @@ export function* versionsPrimed(entries: Array<readonly [string, number]>): Saga
  * grace finds its views still warm.
  */
 export function* pageHide(): Saga<void> {
-  const [salt, saltUserId, ids] = (yield fx.state.read((s) => [
+  const [salt, saltUserId, ownerSecret, ids] = (yield fx.state.read((s) => [
     s.sessionId,
     s.saltUserId,
+    s.ownerSecret,
     [...s.queries.values()].filter((e) => e.lifecycle.remote === 'registered').map((e) => e.def.id),
-  ])) as [string | null, string | null, unknown[]];
-  if (salt) yield fx.service('salt.leave', salt, saltUserId);
+  ])) as [string | null, string | null, string | null, unknown[]];
+  if (salt) yield fx.service('salt.leave', salt, saltUserId, ownerSecret);
   if (ids.length > 0) yield fx.service('remote.releaseViews', ids);
 }
 

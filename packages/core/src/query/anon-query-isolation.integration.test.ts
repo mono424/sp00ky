@@ -1,8 +1,9 @@
-import { Socket } from 'node:net';
+import { createServer, type Server } from 'node:http';
+import { Socket, type AddressInfo } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { RecordId, Surreal } from 'surrealdb';
 import { liveEndpoint } from '../live/index';
 import {
@@ -27,12 +28,35 @@ import {
  *     surrealdb/surrealdb:v3.1.5 start --user root --pass root --allow-all memory
  *
  * Override the endpoint with SURREAL_IT_ENDPOINT. Skips if unreachable.
+ *
+ * The registration tests also run the shipped `fn::query::register`, whose
+ * `http::post` must reach a stand-in SSP this test serves. SurrealDB reaches it
+ * at SURREAL_IT_CALLBACK_HOST (default `host.docker.internal`, the host as seen
+ * from Docker Desktop); those tests skip when it cannot.
  */
 const endpoint = liveEndpoint(process.env.SURREAL_IT_ENDPOINT ?? 'ws://127.0.0.1:18011');
+const callbackHost = process.env.SURREAL_IT_CALLBACK_HOST ?? 'host.docker.internal';
 const NS = 'it';
 
 const cliSource = (file: string) =>
   readFileSync(fileURLToPath(new URL(`../../../../apps/cli/src/${file}`, import.meta.url)), 'utf8');
+
+/**
+ * The SET clause ssp-node puts first in every registration write, read out of
+ * `packages/ssp-node/src/node.rs` so this test runs the shipped text.
+ */
+function ownerGuard(): string {
+  const src = readFileSync(
+    fileURLToPath(new URL('../../../ssp-node/src/node.rs', import.meta.url)),
+    'utf8'
+  );
+  const m = /pub const OWNER_GUARD: &str = "((?:[^"\\]|\\.)*)";/s.exec(src);
+  if (!m) throw new Error('OWNER_GUARD not found in ssp-node/src/node.rs');
+  // A Rust `\` at a line end drops the newline and the next line's indent.
+  return m[1].replace(/\\\n\s*/g, '');
+}
+
+const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
 
 /** Just the `_00_query` block: the rest of the file needs tables and modules this test does not. */
 function queryTableSchema(): string {
@@ -61,6 +85,18 @@ UPSERT $id SET clientId = $sid, auth_id = $owner, surql = 'SELECT * FROM item',
     array::filter(subscribers ?? [], |$s| <string>$s.id != $sid AND <datetime>$s.seenAt + 1h > time::now()),
     { id: $sid, seenAt: time::now() })`;
 
+/**
+ * What the SSP writes, as root, when a session joins an anonymous view that
+ * already exists (`join_registered_view`), with the shipped ownership guard.
+ */
+const SSP_JOIN = () => `
+UPSERT type::record($id) SET ${ownerGuard()}, clientId = $sid, auth_id = auth_id ?? 'anon',
+  surql = surql ?? 'SELECT * FROM item', params = params ?? { auth: { id: '' }, access: '' },
+  ttl = ttl ?? 1h, lastActiveAt = time::now(), rowCount = rowCount ?? 3, state = state ?? 'ready',
+  subscribers = array::append(
+    array::filter(subscribers ?? [], |$s| <string>$s.id != $sid AND <datetime>$s.seenAt + 1h > time::now()),
+    { id: $sid, seenAt: time::now() })`;
+
 /** A `_00_query:<sha256>` id, the shape the client mints (and the pagehide beacon accepts). */
 const viewId = () =>
   new RecordId('_00_query', createHash('sha256').update(randomUUID()).digest('hex'));
@@ -70,6 +106,13 @@ describe('anonymous _00_query isolation (real SurrealDB)', () => {
   let database = '';
   let reachable = false;
   const open: Surreal[] = [];
+
+  // The stand-in SSP: records what `fn::query::register` posts and answers it
+  // as ssp-node's warm join does (409 `owner_mismatch` when the guard throws).
+  const posted: Array<Record<string, unknown>> = [];
+  let ssp: Server | null = null;
+  let sspUrl = '';
+  let sspReachable: boolean | null = null;
 
   // A plain TCP probe: the SDK never rejects a connect to a refused port.
   beforeAll(async () => {
@@ -84,7 +127,57 @@ describe('anonymous _00_query isolation (real SurrealDB)', () => {
       socket.once('error', () => done(false));
       socket.connect(Number(url.port || 80), url.hostname, () => done(true));
     });
+    ssp = createServer(async (req, res) => {
+      let text = '';
+      for await (const chunk of req) text += chunk;
+      const body = JSON.parse(text) as Record<string, unknown>;
+      posted.push(body);
+      if (body.probe) return void res.writeHead(200).end('null');
+      try {
+        await root.query(SSP_JOIN(), {
+          id: body.id,
+          sid: body.clientId,
+          ownerHash: body.ownerHash ?? '',
+        });
+        res.writeHead(200, { 'content-type': 'application/json' }).end('null');
+      } catch (error) {
+        const refused = String(error).includes('owner_mismatch');
+        res
+          .writeHead(refused ? 409 : 500, { 'content-type': 'application/json' })
+          .end(
+            JSON.stringify({
+              code: refused ? 'owner_mismatch' : 'db_error',
+              message: String(error),
+            })
+          );
+      }
+    });
+    await new Promise<void>((resolve) => ssp!.listen(0, '0.0.0.0', resolve));
+    sspUrl = `http://${callbackHost}:${(ssp.address() as AddressInfo).port}`;
   });
+
+  afterAll(async () => {
+    await new Promise((resolve) => ssp?.close(resolve));
+  });
+
+  /** Load the shipped `fn::query::register` against the stand-in; false when SurrealDB cannot reach it. */
+  async function registerFunctions(): Promise<boolean> {
+    if (sspReachable === null) {
+      sspReachable = await root
+        .query('RETURN http::post($url, { probe: true })', { url: `${sspUrl}/probe` })
+        .then(
+          () => true,
+          () => false
+        );
+    }
+    if (!sspReachable) return false;
+    await root.query(
+      cliSource('functions_remote_singlenode.surql')
+        .replaceAll('{{ENDPOINT}}', sspUrl)
+        .replaceAll('{{SECRET}}', 'it-secret')
+    );
+    return true;
+  }
 
   beforeEach(async () => {
     if (!reachable) return;
@@ -288,6 +381,72 @@ describe('anonymous _00_query isolation (real SurrealDB)', () => {
     // The bystander is still out.
     expect(await heartbeatFound(b, qa)).toBe(false);
     expect(await readBack(b, qa)).toBeNull();
+  });
+
+  it("a guest who read another guest's view id cannot join it through fn::query::register; the owner's reconnect can", async (ctx) => {
+    if (!reachable) ctx.skip();
+    if (!(await registerFunctions())) ctx.skip();
+    const [a, sidA] = await guest();
+    const [b] = await guest();
+    const qa = viewId();
+    const register = (db: Surreal, owner?: string) =>
+      db.query('fn::query::register($config)', {
+        config: {
+          id: qa,
+          surql: 'SELECT * FROM item',
+          params: {},
+          ttl: '1h',
+          ...(owner ? { owner } : {}),
+        },
+      });
+
+    await register(a, 'secret-a');
+    const sent = posted.at(-1)!;
+    expect(sent).toMatchObject({ clientId: sidA, ownerHash: sha256('secret-a') });
+    // Only the hash leaves the database, and never inside `params` (the SSP's
+    // merge key is built from them).
+    expect(JSON.stringify(sent)).not.toContain('secret-a');
+    expect(String(sent.params)).not.toContain(sha256('secret-a'));
+    const before = await row(qa);
+    expect(before?.ownerHash).toBe(sha256('secret-a'));
+
+    // Anonymous view ids are world-readable on `_00_list_ref_anon`. With its
+    // own secret or with none, the stranger's registration is refused, so it
+    // never lands in `subscribers` and its DELETE still matches nothing.
+    await expect(register(b, 'secret-b')).rejects.toThrow();
+    await expect(register(b)).rejects.toThrow();
+    await b.query('DELETE $id', { id: qa });
+    expect(await row(qa)).toEqual(before);
+    expect(await readBack(b, qa)).toBeNull();
+
+    // The owner's reconnect: a new socket, the same page secret.
+    await a.close();
+    const [a2, sidA2] = await guest();
+    expect(await heartbeatFound(a2, qa)).toBe(false);
+    await register(a2, 'secret-a');
+    expect((await row(qa))?.subscribers.map((s: { id: string }) => s.id)).toEqual([sidA, sidA2]);
+    expect(await heartbeatFound(a2, qa)).toBe(true);
+    expect(await readBack(a2, qa)).toEqual({ rowCount: 3, state: 'ready' });
+  });
+
+  it('no caller can read or rewrite the owner hash, not even the owner', async (ctx) => {
+    if (!reachable) ctx.skip();
+    const [g, sidG] = await guest();
+    const qg = viewId();
+    await register(qg, sidG);
+    await root.query(`UPDATE $id SET ownerHash = 'stored'`, { id: qg });
+
+    const [own] = (await g.query('SELECT * FROM ONLY $id', { id: qg })) as [
+      Record<string, unknown>,
+    ];
+    expect(own.subscribers).toBeDefined();
+    expect(own).not.toHaveProperty('ownerHash');
+    for (const set of [`ownerHash = 'mine'`, 'ownerHash = NONE']) {
+      await g.query(`UPDATE $id SET ${set}`, { id: qg });
+      expect((await row(qg))?.ownerHash).toBe('stored');
+    }
+    // The heartbeat still writes what it needs to around the frozen field.
+    expect(await heartbeatFound(g, qg)).toBe(true);
   });
 
   it('the owning guest can still release its view', async (ctx) => {

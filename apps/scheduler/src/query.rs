@@ -44,16 +44,36 @@ impl QueryTracker {
 
     /// Assign a query to an SSP, stamping the registration time. Called on
     /// every registration, sticky ones included, so the stamp always says
-    /// when the client last (re)registered.
-    pub async fn assign(&self, query_id: String, ssp_id: String) {
+    /// when the client last (re)registered. Returns the stamp it wrote.
+    pub async fn assign(&self, query_id: String, ssp_id: String) -> u64 {
+        let at = now_ms();
         let mut assignments = self.assignments.write().await;
-        assignments.insert(query_id, (ssp_id, now_ms()));
+        assignments.insert(query_id, (ssp_id, at));
+        at
     }
 
     /// Get SSP assigned to a query
     pub async fn get_assignment(&self, query_id: &str) -> Option<String> {
         let assignments = self.assignments.read().await;
         assignments.get(query_id).map(|(ssp, _)| ssp.clone())
+    }
+
+    /// The query's `(ssp id, registered at ms)`, for [`Self::restore`].
+    pub async fn record(&self, query_id: &str) -> Option<(String, u64)> {
+        let assignments = self.assignments.read().await;
+        assignments.get(query_id).cloned()
+    }
+
+    /// Put back a record taken with [`Self::record`] over the one an
+    /// [`Self::assign`] stamped `written`, unless a later registration has
+    /// stamped the query since.
+    pub async fn restore(&self, query_id: &str, written: u64, record: (String, u64)) {
+        let mut assignments = self.assignments.write().await;
+        if let Some(current) = assignments.get_mut(query_id) {
+            if current.1 == written {
+                *current = record;
+            }
+        }
     }
 
     /// Unix ms of the query's latest registration.
@@ -177,7 +197,8 @@ async fn register_query(
     // SSP on every call (ssp-0 ↔ ssp-1 ping-pong) and incremented the new
     // SSP's query_count without decrementing the old one, skewing
     // least-queries balancing forever.
-    let previous = state.query_tracker.get_assignment(&query_id).await;
+    let previous_record = state.query_tracker.record(&query_id).await;
+    let previous = previous_record.as_ref().map(|(ssp, _)| ssp.clone());
 
     // `sticky` is true when we reuse the existing assignment — query_count
     // already accounts for this query there, so no increment.
@@ -234,7 +255,7 @@ async fn register_query(
     }
 
     // Assign query to SSP in tracker
-    state.query_tracker.assign(query_id.clone(), ssp_id.clone()).await;
+    let stamped = state.query_tracker.assign(query_id.clone(), ssp_id.clone()).await;
 
     // Send registration to SSP via HTTP POST /view/register. The SSP's own
     // verdict is relayed with its status: a 4xx (400 `rejected`, 403
@@ -266,6 +287,18 @@ async fn register_query(
         }
     };
     if let Some(err) = failure {
+        // A sticky target refusing the request (409 `auth_mismatch` or
+        // `owner_mismatch`: someone else's query id) still serves the view to
+        // its owner, so the assignment and its stamp stay exactly as they
+        // were. Dropping them let a stranger's refused registration orphan a
+        // live view: the owner's next registration was placed afresh on any
+        // SSP, and its teardown found no assignment to forward.
+        if sticky && err.0.is_client_error() {
+            if let Some(record) = previous_record {
+                state.query_tracker.restore(&query_id, stamped, record).await;
+            }
+            return Err(err);
+        }
         // Remove from tracker on failure
         state.query_tracker.unassign(&query_id).await;
         // Decrement query count on failure

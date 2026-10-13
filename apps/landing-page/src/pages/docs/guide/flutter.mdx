@@ -364,6 +364,12 @@ To have a screen's first frame already hold its rows, keep that query open
 from startup (subscribe once, share the latest rows) rather than subscribing
 when the screen mounts.
 
+Once connected, the client registers its queries with the server concurrently:
+remote reads (registrations, membership reads, row fetches, `queryRemote`)
+share a pool of `DatabaseConfig.maxConcurrentQueries` requests on the one
+socket, default 6. Writes from the outbox go one at a time, in order, in a lane
+of their own, so a pending write never waits behind a startup's registrations.
+
 ## Push notifications
 
 The `spooky_push` plugin adds native push: APNs on iOS, FCM on Android, from the

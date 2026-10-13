@@ -93,7 +93,7 @@ Future<void> drain(Ctx ctx, SagaEnv env) async {
     final req = remoteBatch(rows);
     List<StatementResult> results;
     try {
-      results = await ctx(Fx.remoteQuery(req.sql,
+      results = await ctx(Fx.remoteWrite(req.sql,
           vars: req.vars, timeoutMs: env.pushTimeoutMs));
     } catch (error) {
       if (classifySyncError(error) == 'application') {

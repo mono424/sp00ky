@@ -26,6 +26,7 @@ import 'mutation/write_saga.dart' as write_saga;
 import 'query/env.dart';
 import 'query/lifecycle_saga.dart' show evictQuery;
 import 'query/register_saga.dart';
+import 'services/database/column_reset.dart' show columnFingerprints;
 import 'services/database/connection_supervisor.dart';
 import 'services/database/local_database_service.dart';
 import 'services/database/remote_database_service.dart';
@@ -142,6 +143,8 @@ class InProcessSp00kyClient extends Sp00kyClient {
       ],
     )
       ..schemaTables = _syncedTables()
+      ..columnSets = columnFingerprints(config.schema,
+          _syncedTables().where((t) => !t.startsWith('_00_')))
       ..onVersions =
           (table, entries) => _runtime.dispatch(VersionsPrimed(entries));
 
@@ -185,7 +188,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
       _supervisor = ConnectionSupervisor(
         reconnect: remote.connect,
         probe: () async {
-          await remote.query('RETURN true');
+          await remote.probe();
           if (auth.needsVerification) {
             try {
               await auth.check();
@@ -792,6 +795,11 @@ class _StreamUpdateBridge implements StreamUpdateReceiver {
 class _OfflineRemote implements RemotePort {
   @override
   Future<List<StatementResult>> queryStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      Future.error(StateError('No remote endpoint is configured'));
+
+  @override
+  Future<List<StatementResult>> writeStatements(String sql,
           [Map<String, dynamic>? vars]) =>
       Future.error(StateError('No remote endpoint is configured'));
 

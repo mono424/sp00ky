@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:collection';
+import 'dart:math' as math;
 
 import '../../kernel/effects.dart' show StatementResult;
 import '../../surreal/remote_client.dart';
@@ -6,18 +8,30 @@ import '../../types.dart';
 import '../../utils/surql.dart';
 import '../logger/logger.dart';
 
-/// Remote SurrealDB access over a [RemoteSurrealClient], with the serialized
-/// query queue from the JS `AbstractDatabaseService` (prevents overlapping
-/// transactions).
+/// Remote SurrealDB access over a [RemoteSurrealClient].
+///
+/// Requests take slots, like the TS `AbstractDatabaseService` slot limit, but
+/// in two lanes where TS has one pool. Reads share a FIFO pool of
+/// [DatabaseConfig.maxConcurrentQueries]: a SurrealDB socket multiplexes
+/// requests by id, and running them one at a time capped the client at one
+/// request per round trip, so at mobile RTT a startup's registrations arrived
+/// ~250 ms apart and a screen opened afterwards waited behind all of them.
+/// Writes ([writeStatements], the outbox push) run one at a time in issue
+/// order, so one push never overlaps another.
+///
+/// A request holds its slot until the RPC settles, even when its caller has
+/// stopped waiting: a slot is only free when the server is done with it.
 class RemoteDatabaseService {
   RemoteDatabaseService(this._config, this._client, SpookyLogger logger)
-      : _logger = logger.child('RemoteDatabaseService');
+      : _logger = logger.child('RemoteDatabaseService'),
+        _reads = _Lane(math.max(1, _config.maxConcurrentQueries));
 
   final DatabaseConfig _config;
   final RemoteSurrealClient _client;
   final SpookyLogger _logger;
 
-  Future<void> _queryQueue = Future<void>.value();
+  final _Lane _reads;
+  final _Lane _writes = _Lane(1);
 
   /// The token the session last authenticated with, re-applied by [connect] so
   /// a socket rebuilt from scratch comes back authenticated.
@@ -48,8 +62,8 @@ class RemoteDatabaseService {
     await _identityGate?.future;
   }
 
-  // Verification reads bypass the app query queue: that queue may be waiting
-  // for this very transition to finish. They cannot write account cache data.
+  // Verification reads bypass the lanes: every slot may be waiting for this
+  // very transition to finish. They cannot write account cache data.
   Future<List<dynamic>> queryAuthUser() async {
     await _awaitConnect();
     return _client.query(r'SELECT * FROM ONLY $auth.id');
@@ -70,7 +84,7 @@ class RemoteDatabaseService {
   static const _maxSessionIds = 16;
 
   /// Ask the socket that just connected for its session id. Straight to the
-  /// client: it needs no identity, so it need not wait in the query queue.
+  /// client: it needs no identity, so it need not wait for a slot.
   Future<void> _recordSessionId() async {
     try {
       final result = await _client.query('RETURN <string>session::id()');
@@ -209,64 +223,65 @@ class RemoteDatabaseService {
     }
   }
 
-  /// Serialized query: chains onto [_queryQueue] so calls never overlap.
-  Future<List<dynamic>> query(String sql, [Map<String, dynamic>? vars]) {
+  /// Run [rpc] in [lane] behind the identity and connect gates.
+  ///
+  /// The epoch is taken when the call is made, not when its slot comes up: a
+  /// request issued under one account must not run, or answer, under the next.
+  Future<T> _run<T>(_Lane lane, Future<T> Function() rpc) {
     final epoch = _authEpoch;
-    final completer = Completer<List<dynamic>>();
-    _queryQueue = _queryQueue.then((_) async {
-      try {
-        await _awaitIdentity();
-        await _awaitConnect();
-        _checkEpoch(epoch);
-        final result = await _client.query(sql, vars);
-        _checkEpoch(epoch);
-        completer.complete(result);
-      } catch (err) {
-        completer.completeError(err);
-      }
-    }).catchError((Object err) {
-      // The query's own error already reached the caller via `completeError`
-      // above; swallow here only so one failed link can't wedge the serialized
-      // queue for every subsequent query.
-      _logger.debug('Serialized query link failed (already surfaced): $err');
+    return lane.run(() async {
+      await _awaitIdentity();
+      await _awaitConnect();
+      _checkEpoch(epoch);
+      final result = await rpc();
+      _checkEpoch(epoch);
+      return result;
     });
-    return completer.future;
   }
 
-  /// Per-statement outcomes, serialized on the same queue as [query] so the
-  /// supervisor's probe cannot miss a wedged one.
-  ///
-  /// A client that cannot answer per statement (a test fake) falls back to
-  /// [query]: its arity is preserved and a throw becomes one ERR, which is the
-  /// all-or-nothing shape such a client actually has.
+  /// A read, in the shared pool.
+  Future<List<dynamic>> query(String sql, [Map<String, dynamic>? vars]) =>
+      _run(_reads, () => _client.query(sql, vars));
+
+  /// Per-statement outcomes of a read, in the shared pool.
   Future<List<StatementResult>> queryStatements(String sql,
-      [Map<String, dynamic>? vars]) {
-    final RemoteSurrealClient client = _client;
-    if (client is! StatementAwareRemote) {
-      return query(sql, vars).then(
-        (rows) => [for (final row in rows) StatementResult.ok(row)],
-        onError: (Object e) => [StatementResult.err(e.toString())],
-      );
+          [Map<String, dynamic>? vars]) =>
+      _statements(_reads, sql, vars);
+
+  /// Per-statement outcomes of a write, in the write lane: it starts only once
+  /// every write issued before it has settled.
+  Future<List<StatementResult>> writeStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _statements(_writes, sql, vars);
+
+  /// A client that cannot answer per statement (a test fake) answers through
+  /// its plain `query`: its arity is preserved and a throw becomes one ERR,
+  /// which is the all-or-nothing shape such a client actually has.
+  Future<List<StatementResult>> _statements(
+      _Lane lane, String sql, Map<String, dynamic>? vars) {
+    final client = _client;
+    if (client is StatementAwareRemote) {
+      return _run(lane,
+          () => (client as StatementAwareRemote).queryStatements(sql, vars));
     }
-    final epoch = _authEpoch;
-    final completer = Completer<List<StatementResult>>();
-    _queryQueue = _queryQueue.then((_) async {
-      try {
-        await _awaitIdentity();
-        await _awaitConnect();
-        _checkEpoch(epoch);
-        final result =
-            await (client as StatementAwareRemote).queryStatements(sql, vars);
-        _checkEpoch(epoch);
-        completer.complete(result);
-      } catch (err) {
-        completer.completeError(err);
-      }
-    }).catchError((Object err) {
-      _logger.debug('Serialized query link failed (already surfaced): $err');
-    });
-    return completer.future;
+    return _run(lane, () => client.query(sql, vars)).then(
+      (rows) => [for (final row in rows) StatementResult.ok(row)],
+      onError: (Object e) => [StatementResult.err(e.toString())],
+    );
   }
+
+  /// The supervisor's heartbeat: one `RETURN true` through each lane.
+  ///
+  /// A lane held by an RPC that never settles fails it, the way the single
+  /// queue used to, so the supervisor tears the socket down and the close
+  /// fails what was stuck. A write lane wedged that way would otherwise stall
+  /// the outbox while every read still answered. One hung read does not fail
+  /// it: the rest of the pool still moves, and a pool with every slot hung
+  /// does.
+  Future<void> probe() => Future.wait([
+        query('RETURN true'),
+        _run(_writes, () => _client.query('RETURN true')),
+      ]);
 
   Future<T> execute<T>(SealedQuery<T> query,
       [Map<String, dynamic>? vars]) async {
@@ -292,5 +307,35 @@ class RemoteDatabaseService {
     endSessionTransition(_transition);
     _openConnectGate(); // never leave an RPC waiting on a client that is gone
     return _client.close();
+  }
+}
+
+/// At most [capacity] calls at once, admitted in arrival order.
+class _Lane {
+  _Lane(this.capacity);
+
+  final int capacity;
+  int _running = 0;
+  final Queue<Completer<void>> _waiting = Queue();
+
+  Future<T> run<T>(Future<T> Function() body) async {
+    if (_running < capacity) {
+      _running++;
+    } else {
+      final turn = Completer<void>();
+      _waiting.add(turn);
+      // The finishing call hands its slot straight over, so a call arriving
+      // in between cannot take it out of turn.
+      await turn.future;
+    }
+    try {
+      return await body();
+    } finally {
+      if (_waiting.isEmpty) {
+        _running--;
+      } else {
+        _waiting.removeFirst().complete();
+      }
+    }
   }
 }

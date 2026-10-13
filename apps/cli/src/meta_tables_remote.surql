@@ -28,11 +28,11 @@
 --
 -- The check reads `session::id()`, which the caller cannot choose. It does not
 -- trust any id the caller passes: anonymous session ids, like anonymous query
--- ids, are readable by anyone on `_00_list_ref_anon`. Known gap: the SSP's
--- warm join (`join_registered_view` in ssp-node/src/node.rs) appends any
--- `anon` session that registers an existing view id, so a guest who reads an
--- id off `_00_list_ref_anon` can still join that row through
--- `fn::query::register`. Closing it needs an ownership proof from the client.
+-- ids, are readable by anyone on `_00_list_ref_anon`. For the same reason the
+-- SSP does not add a session to an anonymous row on the strength of its id:
+-- the registration must also carry the hash of the owning page's secret (see
+-- `ownerHash` below), or a guest who read an id off `_00_list_ref_anon` could
+-- join that row through `fn::query::register` and then delete it.
 --
 -- The rule is checked against the row after an UPDATE as well as before it,
 -- so an UPDATE that would leave the caller's own session out of `subscribers`
@@ -104,6 +104,21 @@ DEFINE FIELD OVERWRITE clientId ON TABLE _00_query TYPE option<string> PERMISSIO
 -- already accepts arbitrary keys here — pinned by
 -- tests/surrealdb/shared_query_semantics.test.ts.
 DEFINE FIELD OVERWRITE subscribers ON TABLE _00_query TYPE array<object> DEFAULT [];
+
+-- `sha256` of the secret of the page that owns an anonymous row, forwarded by
+-- `fn::query::register` from the client's `$config.owner`. The SSP stores it
+-- with the first registration that brings one and refuses (409
+-- `owner_mismatch`) any later registration of the row that brings another
+-- (`OWNER_GUARD` in ssp-node/src/node.rs), so only the page that minted the
+-- secret, on any of its sockets, can subscribe to the row. A row without one
+-- predates the check and stays joinable. Never set on a signed-in user's row,
+-- which every tab of that user shares.
+--
+-- Hidden and frozen for every caller: knowing the hash would not get anyone
+-- past the SSP (it hashes what the caller sends), but nothing outside the SSP
+-- has a use for it, and a caller who could rewrite it could take the row over.
+DEFINE FIELD OVERWRITE ownerHash ON TABLE _00_query TYPE option<string>
+    PERMISSIONS FOR select NONE, FOR update NONE;
 
 -- The auth user id that registered this query. The SSP propagates it
 -- onto each `_00_list_ref` row so live-query delivery can be gated on

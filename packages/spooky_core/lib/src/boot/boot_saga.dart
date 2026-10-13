@@ -26,11 +26,13 @@ Future<void> boot(Ctx ctx, SagaEnv env) async {
   final restoredUserId =
       await ctx(Fx.service<String?>(ServiceName.authRestoreSession));
   final salt = await ctx(Fx.id(IdScope.salt));
+  final ownerSecret = await ctx(Fx.id(IdScope.owner));
   final authId = await ctx(Fx.service<String?>(ServiceName.authSessionAuthId));
   await ctx(Fx.stateUpdate(r.setIdentity(
     sessionId: salt,
     userId: restoredUserId,
     saltUserId: authId,
+    ownerSecret: ownerSecret,
   )));
   await ctx(Fx.service<void>(ServiceName.crdtSetSessionId, [salt]));
   if (restoredUserId != null) {

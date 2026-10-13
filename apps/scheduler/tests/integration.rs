@@ -1602,6 +1602,78 @@ mod query_tests {
         assert!(h.query_tracker.get_assignment("q2").await.is_none());
     }
 
+    /// An SSP that answers `/view/register` the way ssp-node answers an
+    /// anonymous view: the first owner hash it sees for an id owns it, any
+    /// other is refused 409 `owner_mismatch`.
+    async fn owner_checking_ssp() -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
+        use axum::response::IntoResponse;
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let owners = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, String>::new()));
+        let app = Router::new().route(
+            "/view/register",
+            axum::routing::post({
+                let received = Arc::clone(&received);
+                move |axum::Json(body): axum::Json<Value>| {
+                    let received = Arc::clone(&received);
+                    let owners = Arc::clone(&owners);
+                    async move {
+                        received.lock().await.push(body.clone());
+                        let id = body["id"].as_str().unwrap_or_default().to_string();
+                        let hash = body["ownerHash"].as_str().unwrap_or_default().to_string();
+                        let mut owners = owners.lock().await;
+                        if owners.entry(id).or_insert_with(|| hash.clone()) != &hash {
+                            let refusal = json!({"code": "owner_mismatch", "message": "not yours"});
+                            return (StatusCode::CONFLICT, axum::Json(refusal)).into_response();
+                        }
+                        StatusCode::OK.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (addr, received)
+    }
+
+    /// The scheduler relays `ownerHash` to the SSP (its typed request used to
+    /// drop any key it did not name), and a stranger's refused registration of
+    /// a live view leaves that view's assignment alone. It used to unassign
+    /// it and release its query count, so the owner's next registration was
+    /// placed afresh on any SSP and the view's teardown found nothing to
+    /// forward.
+    #[tokio::test]
+    async fn refused_reregister_keeps_the_owners_assignment() {
+        let (addr, received) = owner_checking_ssp().await;
+        let h = TestHarness::new().await;
+        h.add_ready_ssp("ssp-0", &addr).await;
+        let register = |hash: &str| {
+            json!({"id": "_00_query:q1", "surql": "SELECT * FROM user", "clientId": "c1", "ownerHash": hash})
+        };
+
+        let (status, _) = post_json(h.query_router(), "/view/register", &register("owner")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(received.lock().await[0]["ownerHash"], "owner");
+        let stamped = h.query_tracker.assigned_at_ms("_00_query:q1").await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (status, body) = post_json(h.query_router(), "/view/register", &register("stranger")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the SSP's refusal reaches the caller: {body}");
+        assert_eq!(h.query_tracker.get_assignment("_00_query:q1").await.as_deref(), Some("ssp-0"));
+        assert_eq!(
+            h.query_tracker.assigned_at_ms("_00_query:q1").await,
+            Some(stamped),
+            "the refused registration does not count as one"
+        );
+        assert_eq!(h.ssp_pool.read().await.get("ssp-0").unwrap().query_count, 1);
+
+        let (status, body) = post_json(h.query_router(), "/view/register", &register("owner")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ssp_id"], "ssp-0");
+        assert_eq!(h.ssp_pool.read().await.get("ssp-0").unwrap().query_count, 1);
+    }
+
     #[tokio::test]
     async fn query_unregister_not_found() {
         let h = TestHarness::new().await;

@@ -132,6 +132,11 @@ class RemoteAdapter implements RemotePort {
       _remote.queryStatements(sql, vars);
 
   @override
+  Future<List<StatementResult>> writeStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _remote.writeStatements(sql, vars);
+
+  @override
   Future<String> live(String table,
       void Function(List<String>, List<InlineRow>?) onChange) async {
     // `FETCH out` resolves the edge's target into the notification, so the body
@@ -300,6 +305,17 @@ class ClientServices implements Services {
   Future<void> sspPrime(List<String> pendingIds) async {
     final tables = schemaTables;
     final db = holder.db;
+    // Before anything reads a version: a table whose columns changed since its
+    // bodies were cached reads as stale from here on (see column_reset.dart).
+    try {
+      final reset = db.resetChangedTables(columnSets, pendingIds.toSet());
+      if (reset.isNotEmpty) {
+        logger.info(
+            'Columns changed since these rows were cached; they will be fetched again: $reset');
+      }
+    } catch (e) {
+      logger.warn('Column change check failed; cached versions kept: $e');
+    }
     await ssp.primeFromLocal(
       tables: tables,
       versions: db.scanVersions(tables),
@@ -312,6 +328,10 @@ class ClientServices implements Services {
 
   /// Tables the prime walks, set by the client from its schema.
   List<String> schemaTables = const [];
+
+  /// Each synced table's column set (`columnFingerprints`), set by the client
+  /// from its schema.
+  Map<String, String> columnSets = const {};
 
   /// Where the primed `(id, rv)` pairs go: the runtime's `VersionsPrimed`.
   void Function(String table, List<(String, int)> entries)? onVersions;

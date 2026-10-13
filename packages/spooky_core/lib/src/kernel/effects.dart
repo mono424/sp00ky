@@ -185,10 +185,14 @@ class LocalEpoch extends Effect<int> {
 // ---- remote -----------------------------------------------------------------
 
 class RemoteQuery extends Effect<List<StatementResult>> {
-  const RemoteQuery(this.sql, {this.vars, this.timeoutMs});
+  const RemoteQuery(this.sql, {this.vars, this.timeoutMs, this.write = false});
   final String sql;
   final Map<String, dynamic>? vars;
   final int? timeoutMs;
+
+  /// Runs in the transport's write lane: after every earlier write has
+  /// settled, never alongside another. Reads share a pool and overlap.
+  final bool write;
   @override
   String get kind => 'remote.query';
 }
@@ -281,7 +285,9 @@ class NowEffect extends Effect<int> {
   String get kind => 'now';
 }
 
-enum IdScope { mutation, salt }
+/// `mutation`: an outbox row id. `salt`: a query-key salt. `owner`: the
+/// client's anonymous-view owner secret.
+enum IdScope { mutation, salt, owner }
 
 class IdEffect extends Effect<String> {
   const IdEffect(this.scope);
@@ -386,6 +392,9 @@ abstract final class Fx {
   static Effect<List<StatementResult>> remoteQuery(String sql,
           {Map<String, dynamic>? vars, int? timeoutMs}) =>
       RemoteQuery(sql, vars: vars, timeoutMs: timeoutMs);
+  static Effect<List<StatementResult>> remoteWrite(String sql,
+          {Map<String, dynamic>? vars, int? timeoutMs}) =>
+      RemoteQuery(sql, vars: vars, timeoutMs: timeoutMs, write: true);
   static Effect<String> remoteLive(String table) => RemoteLive(table);
   static Effect<void> remoteKill(String uuid) => RemoteKill(uuid);
 

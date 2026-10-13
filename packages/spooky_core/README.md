@@ -139,6 +139,17 @@ view, never an empty one.
    network half and never drains the outbox: draining against nothing would fail
    in a way the classifier reads as the server rejecting the write, and a
    rejection rolls the write back.
+6. **Writes get their own lane.** The browser runs every remote statement in
+   one pool of 6. Here reads (registrations, membership reads, body fetches,
+   probes, `queryRemote`) share a FIFO pool of
+   `DatabaseConfig.maxConcurrentQueries` (default 6), and a write
+   (`Fx.remoteWrite`, the outbox push) runs alone in a second lane: after every
+   earlier write has settled, never beside another, and never queued behind a
+   backlog of reads. A request keeps its slot until the RPC settles, even past
+   its caller's deadline, so the supervisor's heartbeat
+   (`RemoteDatabaseService.probe`) sends one `RETURN true` through each lane: a
+   write that never answers fails it and forces the reconnect that frees the
+   lane.
 
 Not ported (browser-only): shared tabs, the SQLite-WASM worker and its
 SurrealQL translator, the DevTools window bridge, the OTel exporter. CRDT

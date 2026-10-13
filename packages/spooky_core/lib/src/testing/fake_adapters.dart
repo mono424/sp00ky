@@ -131,6 +131,13 @@ class FakeRemotePort implements RemotePort {
   }
 
   @override
+  Future<List<StatementResult>> writeStatements(String sql,
+      [Map<String, dynamic>? vars]) async {
+    _log('remote.write', [sql, vars]);
+    return answer == null ? const [] : await answer!(sql, vars);
+  }
+
+  @override
   Future<String> live(String table,
       void Function(List<String>, List<InlineRow>?) onChange) async {
     _log('remote.live', [table]);
@@ -296,6 +303,7 @@ class FakeAdapters {
         mutationId: () =>
             '_00_pending_mutations:${(++_ids).toString().padLeft(13, '0')}_0001_tab',
         saltId: () => 'salt-${++_ids}',
+        ownerSecretId: () => 'owner-${++_ids}',
         hash: sha256Hex,
         services: services,
       );

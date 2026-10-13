@@ -30,6 +30,7 @@ import {
   type SqliteTransport,
 } from './sqlite-transport';
 import { PROMOTION_OPEN_OPTIONS } from './sqlite-open';
+import { COLUMNS_ROW_ID, planColumnReset } from './sqlite-column-reset';
 import type { EngineTx, Id, LocalStore, OrderBy, RelationFetch, Row } from './cache-engine';
 import type { EngineStorageDiagnostics } from '../../modules/devtools/storage-info';
 
@@ -898,6 +899,31 @@ export class SqliteCacheEngine implements LocalStore {
       }
     }
     return out;
+  }
+
+  /**
+   * Reset the cached `_00_rv` of every table whose column set changed since
+   * the last boot, so its rows are fetched again whole. See
+   * `sqlite-column-reset.ts`. Returns the tables reset.
+   */
+  async resetChangedTables(fingerprints: Record<string, string>, keep: Set<string>): Promise<string[]> {
+    const { rows } = await this.call<{ rows: { data: unknown }[] }>('exec', {
+      sql: `SELECT data FROM "_00_schema" WHERE id = ?`,
+      bind: [COLUMNS_ROW_ID],
+    });
+    let stored: Record<string, string> | null = null;
+    try {
+      const raw = rows?.[0]?.data;
+      if (typeof raw === 'string') stored = JSON.parse(raw) as Record<string, string>;
+    } catch {
+      stored = null;
+    }
+    const { rows: tables } = await this.call<{ rows: { name: string }[] }>('exec', {
+      sql: `SELECT name FROM sqlite_master WHERE type = 'table'`,
+    });
+    const plan = planColumnReset(stored, fingerprints, new Set((tables ?? []).map((t) => t.name)), keep);
+    if (plan.statements.length > 0) await this.call('batch', plan.statements);
+    return plan.changed;
   }
 
   async getSnapshot(key: string): Promise<StoredSnapshot | null> {

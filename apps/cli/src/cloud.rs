@@ -5613,6 +5613,16 @@ pub(crate) fn push_schema_inner(client: &mut CloudClient, slug: &str, pid: &str)
         bail!("schema file not found: {}", input_path.display());
     }
 
+    // The `@crdt` text mirrors re-asserted with OVERWRITE, as
+    // `apply_internal_schema` does on the VM path: the schema below defines
+    // user fields without it, so a field that existed before it was annotated
+    // would keep its old type and stay writable by clients.
+    let crdt_mirrors = crate::crdt_schema::expand(
+        &std::fs::read_to_string(&input_path).context("failed to read schema")?,
+        crate::crdt_schema::Target::Server,
+    )?
+    .mirror_defs;
+
     let builder_config = crate::schema_builder::SchemaBuilderConfig {
         input_path,
         config_path: Some(config_path.clone()),
@@ -5623,6 +5633,10 @@ pub(crate) fn push_schema_inner(client: &mut CloudClient, slug: &str, pid: &str)
     };
     let mut sql = crate::schema_builder::build_server_schema(&builder_config)
         .context("failed to build schema")?;
+    if !crdt_mirrors.is_empty() {
+        sql.push('\n');
+        sql.push_str(&crdt_mirrors);
+    }
 
     // Append the per-table ingest/versioning events. `build_server_schema`
     // omits them (the VM path applies them separately via

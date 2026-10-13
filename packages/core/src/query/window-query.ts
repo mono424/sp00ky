@@ -70,7 +70,20 @@ function renderIdSetSelect(surql: string, kw: TopLevelClauses, idsParam: string)
     orderBy = ' ' + surql.slice(orderByIndex, Math.min(...ends)).trim();
   }
 
-  return `${selectClause} FROM $${idsParam}${orderBy}`;
+  return `${selectClause} FROM ${idSetSource(selectClause, idsParam, orderBy !== '')}${orderBy}`;
+}
+
+/**
+ * The FROM source for an id-set read. The in-browser SurrealDB (wasm, 3.x)
+ * reads bare record ids without loading them: a field list over them throws
+ * ("Specify a database to use") and an ORDER BY is silently ignored, while a
+ * plain `SELECT *` works. Those read from `(SELECT * FROM $ids)` instead, the
+ * same rows as documents. The SQLite translator accepts both shapes.
+ */
+export function idSetSource(selectClause: string, idsParam: string, ordered = false): string {
+  return !ordered && /^SELECT\s+(VALUE\s+)?\*/i.test(selectClause.trim())
+    ? `$${idsParam}`
+    : `(SELECT * FROM $${idsParam})`;
 }
 
 /**

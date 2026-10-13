@@ -15,7 +15,7 @@ describe('materializeEffect', () => {
   });
   it('surql + ids: id-set rewrite bound to __win; unparseable surql falls back to the raw query', () => {
     const e = materializeEffect({ surql: 'SELECT * FROM thing WHERE a = $a ORDER BY b LIMIT 3', params: { a: 1 } }, ['thing:1']);
-    expect(e).toMatchObject({ kind: 'local.query', sql: 'SELECT * FROM $__win ORDER BY b' });
+    expect(e).toMatchObject({ kind: 'local.query', sql: 'SELECT * FROM (SELECT * FROM $__win) ORDER BY b' });
     if (e.kind !== 'local.query') throw new Error();
     expect(e.vars).toEqual({ a: 1, __win: [new RecordId('thing', '1')] });
     const raw = materializeEffect({ surql: 'RETURN 1', params: {} }, ['thing:1']);

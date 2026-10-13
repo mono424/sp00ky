@@ -556,6 +556,17 @@ describe('create() tx result shaping (fast path parity)', () => {
     expect(outboxRow.mutationType).toBe('create');
     expect(outboxRow.data).toEqual(payload);
   });
+
+  // A raw query with a field list materializes from its id-set as
+  // `FROM (SELECT * FROM $__win)` (the wasm SurrealDB throws on a field list
+  // over bare record ids). This engine reads both shapes the same way.
+  it('reads a field list over a wrapped id-set like the bare one', () => {
+    const ids = ['_00_user_feature:a', '_00_user_feature:b'];
+    const bare = translateSurql('SELECT key, variant FROM $__win', { __win: ids }).ops[0];
+    const wrapped = translateSurql('SELECT key, variant FROM (SELECT * FROM $__win)', { __win: ids }).ops[0];
+    expect(wrapped).toEqual(bare);
+    expect(wrapped).toMatchObject({ kind: 'selectByIds', ids });
+  });
 });
 
 

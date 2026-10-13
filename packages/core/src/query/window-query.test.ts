@@ -12,9 +12,9 @@ describe('scanner edge cases', () => {
     expect(buildWindowMaterialization('SELECT * FROM t LIMIT 5 START')).toBeNull();
   });
   it('matches a keyword at the very start and at the end of the string', () => {
-    expect(buildWindowMaterialization('FROM t LIMIT 5 START 5')).toEqual({ query: ' FROM $__win' });
+    expect(buildWindowMaterialization('FROM t LIMIT 5 START 5')).toEqual({ query: ' FROM (SELECT * FROM $__win)' });
     expect(buildWindowMaterialization('SELECT * FROM t ORDER BY a LIMIT 5 START 5 ORDER')).toEqual({
-      query: 'SELECT * FROM $__win ORDER BY a',
+      query: 'SELECT * FROM (SELECT * FROM $__win) ORDER BY a',
     });
   });
 });
@@ -25,7 +25,7 @@ describe('buildWindowMaterialization', () => {
       'SELECT * FROM game WHERE database = $database ORDER BY sort_index asc, date desc LIMIT 30 START 30;';
     const r = buildWindowMaterialization(surql);
     expect(r).not.toBeNull();
-    expect(r!.query).toBe('SELECT * FROM $__win ORDER BY sort_index asc, date desc');
+    expect(r!.query).toBe('SELECT * FROM (SELECT * FROM $__win) ORDER BY sort_index asc, date desc');
   });
 
   it('returns null for START 0 (offset-free windows still work via the normal re-query)', () => {
@@ -44,7 +44,7 @@ describe('buildWindowMaterialization', () => {
   it('preserves a custom projection', () => {
     const surql = 'SELECT id, white, black FROM game ORDER BY date desc LIMIT 30 START 60;';
     expect(buildWindowMaterialization(surql)!.query).toBe(
-      'SELECT id, white, black FROM $__win ORDER BY date desc'
+      'SELECT id, white, black FROM (SELECT * FROM $__win) ORDER BY date desc'
     );
   });
 
@@ -58,13 +58,13 @@ describe('buildWindowMaterialization', () => {
       'SELECT *, (SELECT * FROM comment WHERE game = $parent.id ORDER BY created_at desc LIMIT 5) AS comments ' +
       'FROM game ORDER BY sort_index asc LIMIT 30 START 90;';
     expect(buildWindowMaterialization(surql)!.query).toBe(
-      'SELECT *, (SELECT * FROM comment WHERE game = $parent.id ORDER BY created_at desc LIMIT 5) AS comments FROM $__win ORDER BY sort_index asc'
+      'SELECT *, (SELECT * FROM comment WHERE game = $parent.id ORDER BY created_at desc LIMIT 5) AS comments FROM (SELECT * FROM $__win) ORDER BY sort_index asc'
     );
   });
 
   it('does not treat a START inside a string literal as the offset', () => {
     const surql = "SELECT * FROM game WHERE note = 'LIMIT 30 START 30' ORDER BY date desc LIMIT 30 START 30;";
     const r = buildWindowMaterialization(surql);
-    expect(r!.query).toBe('SELECT * FROM $__win ORDER BY date desc');
+    expect(r!.query).toBe('SELECT * FROM (SELECT * FROM $__win) ORDER BY date desc');
   });
 });

@@ -59,12 +59,12 @@ describe('buildIdSetPlan', () => {
 describe('buildIdSetSurql', () => {
   it('rewrites a non-offset query to the id-set source, keeping ORDER BY', () => {
     const out = buildIdSetSurql('SELECT * FROM thread WHERE done = false ORDER BY title ASC LIMIT 50;');
-    expect(out?.query).toBe('SELECT * FROM $__win ORDER BY title ASC');
+    expect(out?.query).toBe('SELECT * FROM (SELECT * FROM $__win) ORDER BY title ASC');
   });
 
   it('preserves the projection', () => {
     const out = buildIdSetSurql('SELECT id, title FROM thread WHERE done = false;');
-    expect(out?.query).toBe('SELECT id, title FROM $__win');
+    expect(out?.query).toBe('SELECT id, title FROM (SELECT * FROM $__win)');
   });
 
   it('returns null when there is no top-level FROM to replace', () => {

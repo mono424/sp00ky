@@ -69,7 +69,9 @@ export class SurrealCacheEngine extends LocalDatabaseService implements LocalCac
     if (ids.length === 0) return [];
     const projection =
       opts?.select && opts.select.length > 0 ? ['id', ...opts.select].join(', ') : '*';
-    let sql = `SELECT ${projection} FROM $__ids`;
+    // As documents: over bare record ids the wasm engine throws on a field
+    // list and ignores ORDER BY (see `idSetSource`).
+    let sql = `SELECT ${projection} FROM (SELECT * FROM $__ids)`;
     if (opts?.orderBy && opts.orderBy.length > 0) {
       sql += ` ORDER BY ${opts.orderBy.map(([f, d]) => `${f} ${d}`).join(', ')}`;
     }

@@ -193,13 +193,14 @@ function translateStatement(stmt: string, vars: Record<string, unknown>): SqlOp 
     return { kind: 'getById', id: idOperand(m[3], vars), select: projFields(m[2], !!m[1]), value };
   }
 
-  // SELECT [VALUE] <proj> FROM $arrayParam
-  m = /^SELECT\s+(VALUE\s+)?(.+?)\s+FROM\s+\$(\w+)$/i.exec(head);
+  // SELECT [VALUE] <proj> FROM $arrayParam, or FROM (SELECT * FROM $arrayParam)
+  // (the id-set read's shape for a field list, see `idSetSource`).
+  m = /^SELECT\s+(VALUE\s+)?(.+?)\s+FROM\s+(?:\$(\w+)|\(\s*SELECT\s+\*\s+FROM\s+\$(\w+)\s*\))$/i.exec(head);
   if (m) {
     const value = m[1] ? m[2].trim() : undefined;
     return {
       kind: 'selectByIds',
-      ids: (vars[m[3]] as unknown[]) ?? [],
+      ids: (vars[m[3] ?? m[4]] as unknown[]) ?? [],
       select: projFields(m[2], !!m[1]),
       value,
       limit,

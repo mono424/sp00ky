@@ -1,4 +1,4 @@
-import type { JSX} from 'solid-js';
+import type { JSX } from 'solid-js';
 import { createContext, useContext, createSignal, Show, onCleanup } from 'solid-js';
 import * as jose from 'jose';
 import type { schema } from '../schema.gen';
@@ -21,33 +21,20 @@ export function AuthProvider(props: { children: JSX.Element }) {
   const db = useDb<typeof schema>();
   const [userId, setUserId] = createSignal<string | null>(null);
   const [isInitializing, setIsInitializing] = createSignal(true);
-
-  // Subscribe to auth state
-  const unsubscribe = db.auth.subscribe((uid) => {
-    setUserId(uid);
-    setIsInitializing(false);
-  });
-
-  onCleanup(() => unsubscribe());
-
-  // Only run query after auth is initialized and userId is available
-  const userQuery = useQuery(
-    () => {
-      const currentUserId = userId();
-      if (!currentUserId) {
-        return null;
-      }
-      return db.query('user').where({ id: currentUserId }).one().build();
-    },
-    {
-      enabled: () => userId() !== null,
-    }
+  onCleanup(
+    db.auth.subscribe((uid) => {
+      setUserId(uid);
+      setIsInitializing(false);
+    })
   );
 
-  const user = () => {
-    const data = userQuery.data();
-    return data || null;
-  };
+  // The signed-in user's row, live: a rename or new avatar shows everywhere.
+  // No query while signed out.
+  const userQuery = useQuery(() => {
+    const id = userId();
+    return id ? db.query('user').where({ id }).one().build() : null;
+  });
+  const user = () => userQuery.data() ?? null;
 
   const signIn = async (username: string, password: string) => {
     await db.auth.signIn('account', { username, password });

@@ -1,5 +1,5 @@
-import { Router, Route, A, useNavigate } from '@solidjs/router';
-import { createSignal, Show, createEffect } from 'solid-js';
+import { Router, Route, A, useNavigate, type RouteSectionProps } from '@solidjs/router';
+import { createSignal, Show } from 'solid-js';
 import { Sp00kyProvider } from '@spooky-sync/client-solid';
 import { AuthProvider, useAuth } from './lib/auth';
 import { dbConfig } from './db';
@@ -18,28 +18,17 @@ import { ProfilePicture } from './components/ProfilePicture';
 import { Tooltip } from './components/Tooltip';
 import { GhostMark, Wordmark, SP00KY_URL, SP00KY_REPO_URL } from './components/Brand';
 
-function Layout(props: any) {
+function Layout(props: RouteSectionProps) {
   const auth = useAuth();
   const navigate = useNavigate();
   const { toggle: toggleHelp } = useShortcutsHelp();
-  const [showAuthDialog, setShowAuthDialog] = createSignal(false);
-  const [authMode, setAuthMode] = createSignal<'signin' | 'signup'>('signin');
-
-  createEffect(() => {
-    if (auth.user()) {
-      setShowAuthDialog(false);
-    }
-  });
+  const [authDialog, setAuthDialog] = createSignal<'signin' | 'signup' | null>(null);
 
   createHotkey({ key: '/', shift: true }, () => toggleHelp());
   createHotkey('C', () => navigate('/create-thread'));
   createHotkeySequence(['G', 'H'], () => navigate('/'));
   createHotkeySequence(['G', 'P'], () => navigate('/profile'));
 
-  const openAuth = (mode: 'signin' | 'signup') => {
-    setAuthMode(mode);
-    setShowAuthDialog(true);
-  };
 
   return (
     <div class="min-h-screen bg-zinc-950 text-white font-sans selection:bg-zinc-700 selection:text-white flex flex-col">
@@ -63,13 +52,13 @@ function Layout(props: any) {
               fallback={
                 <div class="flex items-center gap-3">
                   <button
-                    onMouseDown={() => openAuth('signin')}
+                    onMouseDown={() => setAuthDialog('signin')}
                     class="text-sm text-zinc-400 hover:text-white transition-colors duration-150"
                   >
                     Sign in
                   </button>
                   <button
-                    onMouseDown={() => openAuth('signup')}
+                    onMouseDown={() => setAuthDialog('signup')}
                     class="bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white text-sm font-medium px-4 py-1.5 rounded-lg transition-colors duration-150"
                   >
                     Sign up
@@ -83,8 +72,8 @@ function Layout(props: any) {
                   class="flex items-center gap-2 hover:opacity-80 transition-opacity duration-150"
                 >
                   <ProfilePicture
-                    src={() => auth.user()?.profile_picture}
-                    username={() => auth.user()?.username}
+                    path={auth.user()?.profile_picture}
+                    username={auth.user()?.username}
                   />
                 </A>
                 <button
@@ -129,13 +118,13 @@ function Layout(props: any) {
 
                 <div class="flex flex-col gap-3 max-w-sm mx-auto">
                   <button
-                    onMouseDown={() => openAuth('signin')}
+                    onMouseDown={() => setAuthDialog('signin')}
                     class="w-full bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white px-6 py-3 rounded-lg font-medium transition-colors duration-150"
                   >
                     Sign in
                   </button>
                   <button
-                    onMouseDown={() => openAuth('signup')}
+                    onMouseDown={() => setAuthDialog('signup')}
                     class="w-full bg-surface hover:bg-surface-hover text-zinc-300 border border-white/[0.06] px-6 py-3 rounded-lg font-medium transition-colors duration-150"
                   >
                     Create account
@@ -174,11 +163,9 @@ function Layout(props: any) {
         </div>
       </footer>
 
-      <AuthDialog
-        isOpen={showAuthDialog()}
-        onClose={() => setShowAuthDialog(false)}
-        initialMode={authMode()}
-      />
+      <Show when={!auth.userId() && authDialog()} keyed>
+        {(mode) => <AuthDialog initialMode={mode} onClose={() => setAuthDialog(null)} />}
+      </Show>
 
       <PendingMutationsIndicator />
       <ShortcutsHelp />

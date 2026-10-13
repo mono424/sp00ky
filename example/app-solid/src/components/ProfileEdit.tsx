@@ -1,9 +1,10 @@
-import { createSignal, createEffect, Show } from 'solid-js';
+import { createSignal, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { useAuth } from '../lib/auth';
-import { useDb, useFileUpload, useDownloadFile } from '@spooky-sync/client-solid';
+import { useDb, useFileUpload } from '@spooky-sync/client-solid';
 import type { schema } from '../schema.gen';
-import { createHotkey, createHotkeySequence, isInputActive } from '../lib/keyboard';
+import { createHotkey, isInputActive } from '../lib/keyboard';
+import { ProfilePicture } from './ProfilePicture';
 import { Tooltip } from './Tooltip';
 
 export function ProfileEdit() {
@@ -11,7 +12,6 @@ export function ProfileEdit() {
   const auth = useAuth();
   const navigate = useNavigate();
 
-  createHotkeySequence(['G', 'H'], () => navigate('/'));
   createHotkey('Escape', () => {
     if (isInputActive()) {
       (document.activeElement as HTMLElement).blur();
@@ -20,33 +20,14 @@ export function ProfileEdit() {
     }
   }, { ignoreInputs: false });
 
-  // Username form state
-  const [username, setUsername] = createSignal('');
-  const [isLoading, setIsLoading] = createSignal(false);
+  // What the user typed; until then the field shows the current username.
+  const [draft, setDraft] = createSignal<string>();
+  const username = () => draft() ?? auth.user()?.username ?? '';
   const [error, setError] = createSignal('');
   const [success, setSuccess] = createSignal('');
 
-  // Profile picture state
   const fileUpload = useFileUpload<typeof schema>('profile_pictures');
-  const { url: profilePicUrl } = useDownloadFile<typeof schema>(
-    'profile_pictures',
-    () => auth.user()?.profile_picture,
-  );
-
-  let fileInputRef: HTMLInputElement | undefined = undefined;
-
-  // Pre-fill username from current user
-  createEffect(() => {
-    const user = auth.user();
-    if (user?.username) {
-      setUsername(user.username);
-    }
-  });
-
-  const userInitial = () => {
-    const name = auth.user()?.username;
-    return name ? name.charAt(0).toUpperCase() : '?';
-  };
+  let fileInputRef: HTMLInputElement | undefined;
 
   const handleUsernameSubmit = async (e: Event) => {
     e.preventDefault();
@@ -59,19 +40,12 @@ export function ProfileEdit() {
       return;
     }
 
-    setIsLoading(true);
-    try {
-      const user = auth.user();
-      if (!user) throw new Error('Not signed in');
-
-      await db.update('user', user.id, { username: trimmed });
-      setSuccess('Username updated successfully.');
-    } catch (err) {
-      console.error('Failed to update username:', err);
-      setError(err instanceof Error ? err.message : 'Failed to update username');
-    } finally {
-      setIsLoading(false);
-    }
+    const user = auth.user();
+    if (!user) return;
+    // Optimistic: applied locally at once, synced in the background.
+    await db.update('user', user.id, { username: trimmed });
+    setDraft(undefined);
+    setSuccess('Username updated.');
   };
 
   const handleFileSelect = async (e: Event) => {
@@ -119,25 +93,11 @@ export function ProfileEdit() {
       <div class="bg-surface border border-white/[0.06] rounded-xl p-6">
         <h2 class="text-sm font-medium text-zinc-400 mb-4">Profile picture</h2>
         <div class="flex items-center gap-5">
-          <Show
-            when={profilePicUrl()}
-            fallback={
-              <div class="w-20 h-20 rounded-full bg-zinc-800 text-zinc-400 flex items-center justify-center text-2xl font-semibold flex-shrink-0">
-                {userInitial()}
-              </div>
-            }
-          >
-            <img
-              // oxlint-disable-next-line no-non-null-assertion
-              src={profilePicUrl()!}
-              alt="Profile picture"
-              class="w-20 h-20 rounded-full object-cover flex-shrink-0"
-            />
-          </Show>
+          <ProfilePicture path={auth.user()?.profile_picture} username={auth.user()?.username} size="lg" />
           <div class="space-y-2">
             <button
               type="button"
-              onMouseDown={() => fileInputRef.click()}
+              onMouseDown={() => fileInputRef?.click()}
               disabled={fileUpload.isUploading()}
               class="bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -146,7 +106,7 @@ export function ProfileEdit() {
             <p class="text-xs text-zinc-500">JPG, PNG or GIF. Max 5 MB.</p>
           </div>
           <input
-            ref={(el) => fileInputRef = el}
+            ref={fileInputRef}
             type="file"
             accept="image/*"
             class="hidden"
@@ -169,7 +129,7 @@ export function ProfileEdit() {
               type="text"
               value={username()}
               onInput={(e) => {
-                setUsername(e.currentTarget.value);
+                setDraft(e.currentTarget.value);
                 setError('');
                 setSuccess('');
               }}
@@ -194,10 +154,10 @@ export function ProfileEdit() {
           <div class="flex justify-end">
             <button
               type="submit"
-              disabled={isLoading() || !username().trim()}
+              disabled={!username().trim()}
               class="bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white text-sm font-medium px-5 py-2.5 rounded-lg transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isLoading() ? 'Saving...' : 'Save changes'}
+              Save changes
             </button>
           </div>
         </form>

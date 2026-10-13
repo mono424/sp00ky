@@ -18,18 +18,14 @@ interface CollaborativeEditorProps {
   placeholder?: string;
   class?: string;
   editable?: boolean;
+  /** The document's plain text after every change (local or remote). */
   onUpdate?: (text: string) => void;
-  singleLine?: boolean;
   username?: string;
 }
 
 export function CollaborativeEditor(props: CollaborativeEditorProps) {
   let containerRef: HTMLDivElement | undefined;
   let editor: Editor | undefined;
-  let userHasInteracted = false;
-  let lastEmittedText: string | undefined;
-  let suppressOnUpdate = true;
-  let presence: CursorEphemeralStore | undefined;
   let cursorPushTimer: ReturnType<typeof setTimeout> | undefined;
   let cursorUnsub: (() => void) | undefined;
 
@@ -39,25 +35,18 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
     const crdtField = props.field;
     const doc = crdtField.getDoc();
 
-    // Create cursor presence store
+    // This session's cursor, shared with the others through the field's presence.
     const cursorColor = cursorColorFromName(props.username ?? 'Anonymous');
-    presence = new CursorEphemeralStore(doc.peerIdStr);
+    const presence = new CursorEphemeralStore(doc.peerIdStr);
     presence.setLocal({
       user: { name: props.username ?? 'Anonymous', color: cursorColor },
     });
 
-    const presenceRef = presence;
-
     editor = new Editor({
       element: containerRef,
       extensions: [
-        StarterKit.configure({
-          history: false,
-          ...(props.singleLine ? {
-            heading: false, bulletList: false, orderedList: false,
-            blockquote: false, codeBlock: false, horizontalRule: false, hardBreak: false,
-          } : {}),
-        }),
+        // Loro's undo manager replaces ProseMirror's history.
+        StarterKit.configure({ history: false }),
         Placeholder.configure({ placeholder: props.placeholder ?? 'Start typing...' }),
         Extension.create({
           name: 'loroCollaboration',
@@ -71,32 +60,9 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
         }),
       ],
       editable: props.editable !== false,
-      editorProps: {
-        attributes: { class: 'outline-none' },
-        ...(props.singleLine ? {
-          handleKeyDown: (_view: any, event: KeyboardEvent) => {
-            if (event.key === 'Enter') { event.preventDefault(); return true; }
-            return false;
-          },
-        } : {}),
-      },
-      onFocus: () => { userHasInteracted = true; },
-      onUpdate: ({ editor: ed }) => {
-        if (suppressOnUpdate || !userHasInteracted) return;
-        const text = ed.getText();
-        if (text === lastEmittedText) return;
-        lastEmittedText = text;
-        props.onUpdate?.(text);
-      },
+      editorProps: { attributes: { class: 'outline-none' } },
+      onUpdate: ({ editor: ed }) => props.onUpdate?.(ed.getText()),
     });
-
-    lastEmittedText = editor.getText();
-
-    // The editor is mounted and seeded — the user couldn't have typed
-    // anything yet, so it's safe to start emitting onUpdate now. (The old
-    // 200 ms gate was a defensive guard that delayed remote-cursor
-    // delivery in collab sessions for no benefit.)
-    suppressOnUpdate = false;
 
     // Install the cursor plugin via queueMicrotask so it lands in a
     // separate task from the editor's first render — that's all the
@@ -104,7 +70,7 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
     const editorRef = editor;
     queueMicrotask(() => {
       try {
-        const cursorPlugin = LoroEphemeralCursorPlugin(presenceRef, {
+        const cursorPlugin = LoroEphemeralCursorPlugin(presence, {
           user: {
             name: props.username ?? 'Anonymous',
             color: cursorColor,
@@ -119,17 +85,17 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
       }
 
       // Publish local cursor changes as this session's presence.
-      cursorUnsub = presenceRef.subscribeBy((by) => {
+      cursorUnsub = presence.subscribeBy((by) => {
         if (by !== 'local') return;
         if (cursorPushTimer) clearTimeout(cursorPushTimer);
         cursorPushTimer = setTimeout(() => {
-          crdtField.pushCursorState(presenceRef.encodeAll());
+          crdtField.pushCursorState(presence.encodeAll());
         }, 100);
       });
 
       // Import remote cursor state when it arrives
       crdtField.onCursorUpdate = (data: Uint8Array) => {
-        try { presenceRef.apply(data); } catch (e) {
+        try { presence.apply(data); } catch (e) {
           console.warn('[CollaborativeEditor] Failed to apply remote cursor:', e);
         }
       };

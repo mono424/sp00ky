@@ -1,225 +1,173 @@
-import { createSignal, Show, createEffect } from 'solid-js';
+import { createResource, createSignal, onMount, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
-import { useAuth } from '../lib/auth';
 import { Uuid, useDb } from '@spooky-sync/client-solid';
-import { RecordId } from 'surrealdb';
-import type { CrdtField } from '@spooky-sync/core';
 import type { schema } from '../schema.gen';
-import { createHotkey } from '../lib/keyboard';
+import { useAuth } from '../lib/auth';
 import { idString } from '../lib/ids';
-import { Tooltip } from './Tooltip';
+import { createHotkey } from '../lib/keyboard';
 import { CollaborativeEditor } from './CollaborativeEditor';
+import { Tooltip } from './Tooltip';
 
-interface CreateThreadDialogProps {
-  isOpen: boolean;
-  onClose: () => void;
-}
-
-export function CreateThreadDialog(props: CreateThreadDialogProps) {
+export function CreateThreadDialog(props: { onClose: () => void }) {
   const db = useDb<typeof schema>();
   const navigate = useNavigate();
   const auth = useAuth();
   const [title, setTitle] = createSignal('');
   const [contentText, setContentText] = createSignal('');
   const [error, setError] = createSignal('');
-  const [isLoading, setIsLoading] = createSignal(false);
-  // A fresh draft document for `content` per dialog open: the editor writes
-  // into it before the thread exists, and on submit it is handed to the new
-  // thread's CRDT field, whose first edits it becomes. `title` is a `@crdt
-  // text` field too: its draft is made on submit from the typed text, which
-  // also goes into the create as the column's initial value.
-  const [contentField, setContentField] = createSignal<CrdtField | null>(null);
+  const [publishing, setPublishing] = createSignal(false);
+  // A draft document for `content`: the editor writes into it before the
+  // thread exists, and on publish its edits become the thread's first ones.
+  const [contentDraft] = createResource(() => db.getSp00ky().createCrdtDraft('thread', 'content'));
+  const canPublish = () => !!title().trim() && !!contentText().trim() && !publishing();
 
-  createEffect(() => {
-    if (props.isOpen) {
-      setTitle('');
-      setContentText('');
-      setError('');
-      void db.getSp00ky().createCrdtDraft('thread', 'content').then(setContentField);
-    } else {
-      setContentField(null);
-    }
-  });
+  let titleInput: HTMLInputElement | undefined;
+  onMount(() => titleInput?.focus());
+  createHotkey('Escape', () => props.onClose(), { ignoreInputs: false });
 
-  const handleSubmit = async (e: Event) => {
-    e.preventDefault();
-    if (!title().trim() || !contentText().trim() || isLoading()) return;
-
+  const publish = async () => {
+    const draft = contentDraft();
+    const user = auth.user();
+    if (!canPublish() || !draft || !user) return;
     setError('');
-    setIsLoading(true);
-
+    setPublishing(true);
     try {
-      const user = auth.user();
-      if (!user) {
-        throw new Error('You must be logged in to create a thread');
-      }
-
-      const cField = contentField();
-      if (!cField) throw new Error('Editor not ready');
-
-      const genId = Uuid.v4().toString().replace(/-/g, '');
-      const threadId = `thread:${genId}`;
+      const key = Uuid.v4().toString().replace(/-/g, '');
+      const id = `thread:${key}`;
       const sp00ky = db.getSp00ky();
+      // `title` is `@crdt text` too: its document starts from the typed text.
       const titleText = title().trim();
-      const titleField = await sp00ky.createCrdtDraft('thread', 'title');
-      titleField.getDoc().getText('title').insert(0, titleText);
-      titleField.getDoc().commit();
-      await db.create(threadId, {
+      const titleDraft = await sp00ky.createCrdtDraft('thread', 'title');
+      titleDraft.getDoc().getText('title').insert(0, titleText);
+      titleDraft.getDoc().commit();
+      // The create may set a `@crdt` column (later writes go through the
+      // document), so lists show the text before the server's first fold.
+      await db.create(id, {
         title: titleText,
-        author: new RecordId('user', idString(user.id).split(':')[1]),
+        content: contentText().trim(),
+        author: idString(user.id),
         active: true,
         published: false,
       });
       // The drafts' edits become the thread's first title and content edits.
       // Closing queues them in the outbox (offline it keeps them on the device).
-      await sp00ky.openCrdtField('thread', threadId, 'title', titleField);
-      await sp00ky.openCrdtField('thread', threadId, 'content', cField);
+      await sp00ky.openCrdtField('thread', id, 'title', titleDraft);
+      await sp00ky.openCrdtField('thread', id, 'content', draft);
       await Promise.all([
-        sp00ky.closeCrdtField('thread', threadId, 'title'),
-        sp00ky.closeCrdtField('thread', threadId, 'content'),
+        sp00ky.closeCrdtField('thread', id, 'title'),
+        sp00ky.closeCrdtField('thread', id, 'content'),
       ]);
-
       // Straight to the new thread, in place of this form's history entry.
-      // Closing first ran the page's `history.back()` after this navigation,
-      // which landed on the previous page instead.
-      resetForm();
-      navigate(`/thread/${genId}`, { replace: true });
+      navigate(`/thread/${key}`, { replace: true });
     } catch (err) {
       console.error('Failed to create thread:', err);
       setError(err instanceof Error ? err.message : 'Failed to create thread');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const resetForm = () => {
-    setTitle('');
-    setContentText('');
-    setError('');
-  };
-
-  const handleClose = () => {
-    resetForm();
-    props.onClose();
-  };
-
-  let titleInputRef: HTMLInputElement | undefined = undefined;
-
-  // Autofocus title input on open
-  createEffect(() => {
-    if (props.isOpen) {
-      requestAnimationFrame(() => titleInputRef?.focus());
-    }
-  });
-
-  // Escape to close
-  createHotkey('Escape', () => handleClose(), () => ({ enabled: props.isOpen, ignoreInputs: false }));
-
-  // Cmd+Enter to submit
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      e.preventDefault();
-      if (title().trim() && contentText().trim() && !isLoading()) {
-        handleSubmit(e);
-      }
+      setPublishing(false);
     }
   };
 
   return (
-    <Show when={props.isOpen}>
-      <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100] p-4" onMouseDown={handleClose}>
-        <div
-          class="animate-slide-up bg-surface border border-white/[0.06] rounded-xl w-full max-w-2xl shadow-2xl max-h-[90vh] flex flex-col"
-          onMouseDown={(e) => e.stopPropagation()}
-          onKeyDown={handleKeyDown}
-        >
-          {/* Header */}
-          <div class="flex justify-between items-center px-6 pt-6 pb-2 flex-shrink-0">
-            <h2 class="text-lg font-semibold">New thread</h2>
-            <Tooltip text="Close" kbd="Esc">
-              <button
-                onMouseDown={handleClose}
-                class="text-zinc-500 hover:text-white transition-colors duration-150 p-1"
-                aria-label="Close"
-              >
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </Tooltip>
-          </div>
+    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100] p-4" onMouseDown={() => props.onClose()}>
+      <div
+        class="animate-slide-up bg-surface border border-white/[0.06] rounded-xl w-full max-w-2xl shadow-2xl max-h-[90vh] flex flex-col"
+        onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+            e.preventDefault();
+            void publish();
+          }
+        }}
+      >
+        {/* Header */}
+        <div class="flex justify-between items-center px-6 pt-6 pb-2 flex-shrink-0">
+          <h2 class="text-lg font-semibold">New thread</h2>
+          <Tooltip text="Close" kbd="Esc">
+            <button
+              onMouseDown={() => props.onClose()}
+              class="text-zinc-500 hover:text-white transition-colors duration-150 p-1"
+              aria-label="Close"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </Tooltip>
+        </div>
 
-          {/* Content */}
-          <div class="px-6 pb-6 pt-4 overflow-y-auto">
-            <form onSubmit={handleSubmit} class="space-y-4">
-              <div>
-                <div class="flex justify-between items-end mb-1.5">
-                  <label for="create-title" class="text-sm font-medium text-zinc-400">
-                    Title
-                  </label>
-                  <span class="text-xs text-zinc-600">{title().length}/200</span>
-                </div>
-                <input
-                  ref={(el) => titleInputRef = el}
-                  id="create-title"
-                  type="text"
-                  value={title()}
-                  onInput={(e) => setTitle(e.currentTarget.value)}
-                  required
-                  maxlength="200"
-                  class="w-full bg-zinc-950 border border-white/[0.06] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-zinc-600 transition-colors duration-150 placeholder-zinc-600 text-sm"
-                  placeholder="Enter a title"
-                  autocomplete="off"
-                />
+        {/* Content */}
+        <div class="px-6 pb-6 pt-4 overflow-y-auto">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void publish();
+            }}
+            class="space-y-4"
+          >
+            <div>
+              <div class="flex justify-between items-end mb-1.5">
+                <label for="create-title" class="text-sm font-medium text-zinc-400">
+                  Title
+                </label>
+                <span class="text-xs text-zinc-600">{title().length}/200</span>
               </div>
+              <input
+                ref={titleInput}
+                id="create-title"
+                type="text"
+                value={title()}
+                onInput={(e) => setTitle(e.currentTarget.value)}
+                required
+                maxlength="200"
+                class="w-full bg-zinc-950 border border-white/[0.06] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-zinc-600 transition-colors duration-150 placeholder-zinc-600 text-sm"
+                placeholder="Enter a title"
+                autocomplete="off"
+              />
+            </div>
 
-              <div>
-                <label class="block text-sm font-medium text-zinc-400 mb-1.5">Content</label>
-                <Show when={contentField()}>
-                  {(field) => (
-                    <div class="w-full bg-zinc-950 border border-white/[0.06] rounded-lg p-4 focus-within:border-zinc-600 transition-colors duration-150">
-                      <CollaborativeEditor
-                        field={field()}
-                        placeholder="What's on your mind?"
-                        class="text-sm text-white leading-relaxed [&_.ProseMirror]:outline-none [&_.ProseMirror]:min-h-[10rem] [&_.ProseMirror_p.is-editor-empty:first-child::before]:text-zinc-600 [&_.ProseMirror_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty:first-child::before]:float-left [&_.ProseMirror_p.is-editor-empty:first-child::before]:pointer-events-none [&_.ProseMirror_p.is-editor-empty:first-child::before]:h-0"
-                        username={auth.user()?.username}
-                        onUpdate={setContentText}
-                      />
-                    </div>
-                  )}
-                </Show>
-              </div>
-
-              <Show when={error()}>
-                <div class="bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 p-3 text-sm">
-                  {error()}
-                </div>
+            <div>
+              <label class="block text-sm font-medium text-zinc-400 mb-1.5">Content</label>
+              <Show when={contentDraft()}>
+                {(field) => (
+                  <div class="w-full bg-zinc-950 border border-white/[0.06] rounded-lg p-4 focus-within:border-zinc-600 transition-colors duration-150">
+                    <CollaborativeEditor
+                      field={field()}
+                      placeholder="What's on your mind?"
+                      class="text-sm text-white leading-relaxed [&_.ProseMirror]:outline-none [&_.ProseMirror]:min-h-[10rem] [&_.ProseMirror_p.is-editor-empty:first-child::before]:text-zinc-600 [&_.ProseMirror_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)] [&_.ProseMirror_p.is-editor-empty:first-child::before]:float-left [&_.ProseMirror_p.is-editor-empty:first-child::before]:pointer-events-none [&_.ProseMirror_p.is-editor-empty:first-child::before]:h-0"
+                      username={auth.user()?.username}
+                      onUpdate={setContentText}
+                    />
+                  </div>
+                )}
               </Show>
+            </div>
 
-              <div class="flex justify-end gap-3 pt-2">
-                <Tooltip text="Close" kbd="Esc" position="top">
-                  <button
-                    type="button"
-                    onMouseDown={handleClose}
-                    class="px-5 py-2.5 text-sm text-zinc-400 hover:text-white transition-colors duration-150"
-                  >
-                    Cancel
-                  </button>
-                </Tooltip>
-                <Tooltip text="Publish" kbd={`${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+↵`} position="top">
-                  <button
-                    type="submit"
-                    disabled={isLoading() || !title().trim() || !contentText().trim()}
-                    class="bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white px-6 py-2.5 rounded-lg font-medium transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                  >
-                    {isLoading() ? 'Publishing...' : 'Publish'}
-                  </button>
-                </Tooltip>
-              </div>
-            </form>
-          </div>
+            <Show when={error()}>
+              <div class="bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 p-3 text-sm">{error()}</div>
+            </Show>
+
+            <div class="flex justify-end gap-3 pt-2">
+              <Tooltip text="Close" kbd="Esc" position="top">
+                <button
+                  type="button"
+                  onMouseDown={() => props.onClose()}
+                  class="px-5 py-2.5 text-sm text-zinc-400 hover:text-white transition-colors duration-150"
+                >
+                  Cancel
+                </button>
+              </Tooltip>
+              <Tooltip text="Publish" kbd={`${navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+↵`} position="top">
+                <button
+                  type="submit"
+                  disabled={!canPublish()}
+                  class="bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white px-6 py-2.5 rounded-lg font-medium transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+                >
+                  {publishing() ? 'Publishing...' : 'Publish'}
+                </button>
+              </Tooltip>
+            </div>
+          </form>
         </div>
       </div>
-    </Show>
+    </div>
   );
 }

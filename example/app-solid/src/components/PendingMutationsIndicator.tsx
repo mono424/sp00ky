@@ -1,4 +1,4 @@
-import { createSignal, onMount, onCleanup, Show } from 'solid-js';
+import { createSignal, onCleanup, Show } from 'solid-js';
 import { useDb } from '@spooky-sync/client-solid';
 
 export function PendingMutationsIndicator() {
@@ -9,23 +9,21 @@ export function PendingMutationsIndicator() {
   let showTimeout: ReturnType<typeof setTimeout> | undefined;
   let hideTimeout: ReturnType<typeof setTimeout> | undefined;
 
-  onMount(() => {
-    const unsub = db.subscribeToPendingMutations((newCount) => {
-      setCount(newCount);
-      if (newCount > 0) {
-        clearTimeout(hideTimeout);
-        showTimeout = setTimeout(() => setVisible(true), 400);
-      } else {
-        clearTimeout(showTimeout);
-        hideTimeout = setTimeout(() => setVisible(false), 400);
-      }
-    });
-
-    onCleanup(() => {
-      unsub();
+  // Shown only when writes stay queued for a moment (offline, slow server).
+  const unsub = db.subscribeToPendingMutations((newCount) => {
+    setCount(newCount);
+    if (newCount > 0) {
       clearTimeout(hideTimeout);
+      showTimeout = setTimeout(() => setVisible(true), 400);
+    } else {
       clearTimeout(showTimeout);
-    });
+      hideTimeout = setTimeout(() => setVisible(false), 400);
+    }
+  });
+  onCleanup(() => {
+    unsub();
+    clearTimeout(hideTimeout);
+    clearTimeout(showTimeout);
   });
 
   return (

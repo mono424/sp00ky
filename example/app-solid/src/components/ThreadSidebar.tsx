@@ -5,7 +5,7 @@ import { Tooltip } from './Tooltip';
 interface ThreadSidebarProps {
   activeThreadId?: string;
   onNavigate?: (direction: 1 | -1) => void;
-  threads: any[];
+  threads: ReadonlyArray<{ id: string; title?: string | null }>;
   isLoading: boolean;
 }
 

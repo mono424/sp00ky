@@ -1,42 +1,29 @@
-import type { Accessor } from 'solid-js';
-import { Show } from 'solid-js';
-import { useDownloadFile } from '@spooky-sync/client-solid';
-import type { schema } from '../schema.gen';
+import { BucketImage } from '@spooky-sync/client-solid';
 
 const sizeClasses = {
   xs: 'w-7 h-7 text-xs',
   sm: 'w-8 h-8 text-xs',
   md: 'w-10 h-10 text-sm',
+  lg: 'w-20 h-20 text-2xl',
 } as const;
 
+/** A user's avatar from the `profile_pictures` bucket, over their initial. */
 export function ProfilePicture(props: {
-  src: Accessor<string | null | undefined>;
-  username: Accessor<string | null | undefined>;
-  size?: 'xs' | 'sm' | 'md';
+  path: string | null | undefined;
+  username: string | null | undefined;
+  size?: keyof typeof sizeClasses;
 }) {
-  const { url: profilePicUrl } = useDownloadFile<typeof schema>('profile_pictures', props.src);
-
-  const userInitial = () => {
-    return props?.username()?.charAt(0)?.toUpperCase() ?? '?';
-  };
-
-  const classes = () => sizeClasses[props.size ?? 'xs'];
-
   return (
-    <Show
-      when={profilePicUrl()}
+    <BucketImage
+      bucket="profile_pictures"
+      path={props.path}
+      alt=""
+      class={`${sizeClasses[props.size ?? 'xs']} rounded-full overflow-hidden flex-shrink-0`}
       fallback={
-        <div class={`${classes()} rounded-full bg-zinc-800 text-zinc-400 flex items-center justify-center font-semibold flex-shrink-0`}>
-          {userInitial()}
+        <div class="w-full h-full bg-zinc-800 text-zinc-400 flex items-center justify-center font-semibold">
+          {props.username?.charAt(0).toUpperCase() || '?'}
         </div>
       }
-    >
-      <img
-        // oxlint-disable-next-line no-non-null-assertion
-        src={profilePicUrl()!}
-        alt="Profile picture"
-        class={`${classes()} rounded-full object-cover flex-shrink-0`}
-      />
-    </Show>
+    />
   );
 }

@@ -14,7 +14,6 @@
     "@spooky-sync/client-solid": "workspace:*",
     "@spooky-sync/core": "workspace:*",
     "@tanstack/solid-hotkeys": "^0.4.1",
-    "@tanstack/solid-query": "^5.90.10",
     "@tiptap/core": "^2",
     "@tiptap/extension-placeholder": "^2",
     "@tiptap/pm": "^2",
@@ -24,9 +23,7 @@
     "loro-prosemirror": "^0.4.3",
     "lucide-solid": "^0.577.0",
     "qrcode": "^1.5.4",
-    "solid-js": "^1.8.7",
-    "solid-valtio": "^0.2.2",
-    "tiptap-solid": "^1.2.1"
+    "solid-js": "^1.8.7"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -1,4 +1,5 @@
-import { For, Show, createSignal, createEffect, onCleanup } from 'solid-js';
+import { For, Show, createSignal, onCleanup } from 'solid-js';
+import { Dynamic } from 'solid-js/web';
 import { useNavigate } from '@solidjs/router';
 import { useQuery, useDb, createPreload } from '@spooky-sync/client-solid';
 import { createHotkey } from '../lib/keyboard';
@@ -6,6 +7,14 @@ import type { schema } from '../schema.gen';
 import { ProfilePicture } from './ProfilePicture';
 import { ArrowDownAZ, ArrowUpZA, CalendarArrowDown, CalendarArrowUp, Plus } from 'lucide-solid';
 import { Tooltip } from './Tooltip';
+
+const SORTS = [
+  { label: 'A to Z', icon: ArrowDownAZ, field: 'title', dir: 'asc' },
+  { label: 'Z to A', icon: ArrowUpZA, field: 'title', dir: 'desc' },
+  { label: 'Newest', icon: CalendarArrowDown, field: 'created_at', dir: 'desc' },
+  { label: 'Oldest', icon: CalendarArrowUp, field: 'created_at', dir: 'asc' },
+] as const;
+type Sort = (typeof SORTS)[number];
 
 // Scroll the selected thread card into view
 function scrollSelectedIntoView(index: number) {
@@ -17,7 +26,7 @@ export function ThreadList() {
   const db = useDb<typeof schema>();
   const navigate = useNavigate();
 
-  const [sort, setSort] = createSignal('a-z');
+  const [sort, setSort] = createSignal<Sort>(SORTS[0]);
   const [sortOpen, setSortOpen] = createSignal(false);
   const [selectedIndex, setSelectedIndex] = createSignal(-1);
 
@@ -29,52 +38,28 @@ export function ThreadList() {
   document.addEventListener('mousedown', handleClickOutside);
   onCleanup(() => document.removeEventListener('mousedown', handleClickOutside));
 
-  const threadsResult = useQuery(() => {
-    let q = db.query('thread').related('author');
-    if (sort() === 'a-z') {
-      q = q.orderBy('title', 'asc');
-    } else if (sort() === 'z-a') {
-      q = q.orderBy('title', 'desc');
-    } else if (sort() === 'newest') {
-      q = q.orderBy('created_at', 'desc');
-    } else {
-      q = q.orderBy('created_at', 'asc');
-    }
-    return q.limit(10).build();
-  });
+  const threadsResult = useQuery(() =>
+    db.query('thread').related('author').orderBy(sort().field, sort().dir).limit(10).build()
+  );
+  const threads = () => threadsResult.data() ?? [];
 
-  const threads = () => threadsResult.data() || [];
-
-  // Prewarm the home screen: snapshot every visible thread together with its
-  // author and its 10 most-recent comments (each with their author) into the
-  // local cache, mirroring the list's current sort so the same threads are
-  // warmed. Opening any thread then paints its detail instantly from cache
-  // instead of waiting on the network. Snapshot-only — no live view is
-  // registered until the detail actually mounts.
-  createPreload(db, () => {
-    let q = db
+  // Prewarm what opening a row shows: the same ten threads with their newest
+  // comments, so a thread's detail paints from the cache at once.
+  createPreload(db, () =>
+    db
       .query('thread')
       .related('author')
-      .related('comments', (c) =>
-        c.related('author').orderBy('created_at', 'desc').limit(10)
-      );
-    if (sort() === 'a-z') {
-      q = q.orderBy('title', 'asc');
-    } else if (sort() === 'z-a') {
-      q = q.orderBy('title', 'desc');
-    } else if (sort() === 'newest') {
-      q = q.orderBy('created_at', 'desc');
-    } else {
-      q = q.orderBy('created_at', 'asc');
-    }
-    return q.limit(10).build();
-  });
+      .related('comments', (c) => c.related('author').orderBy('created_at', 'desc').limit(10))
+      .orderBy(sort().field, sort().dir)
+      .limit(10)
+      .build()
+  );
 
-  // Reset selection when threads change
-  createEffect(() => {
-    threads();
+  const chooseSort = (next: Sort) => {
+    setSort(next);
+    setSortOpen(false);
     setSelectedIndex(-1);
-  });
+  };
 
   const handleThreadClick = (threadId: string) => {
     navigate(`/thread/${threadId}`);
@@ -124,48 +109,23 @@ export function ThreadList() {
             onMouseDown={() => setSortOpen(!sortOpen())}
             class="inline-flex items-center justify-center w-8 h-8 text-zinc-500 hover:text-white rounded-lg transition-colors duration-150"
           >
-            {sort() === 'a-z' ? (
-              <ArrowDownAZ size={16} />
-            ) : sort() === 'z-a' ? (
-              <ArrowUpZA size={16} />
-            ) : sort() === 'newest' ? (
-              <CalendarArrowDown size={16} />
-            ) : (
-              <CalendarArrowUp size={16} />
-            )}
+            <Dynamic component={sort().icon} size={16} />
           </button>
           </Tooltip>
 
           <Show when={sortOpen()}>
             <div class="absolute right-0 mt-1.5 w-44 bg-surface border border-white/[0.06] rounded-lg shadow-2xl z-50 py-1 animate-fade-in">
-              <button
-                onMouseDown={() => { setSort('a-z'); setSortOpen(false); }}
-                class={`w-full flex items-center gap-2.5 px-3 py-2 text-sm transition-colors duration-150 ${sort() === 'a-z' ? 'text-white bg-surface-hover' : 'text-zinc-400 hover:text-white hover:bg-surface-hover'}`}
-              >
-                <ArrowDownAZ size={16} />
-                A to Z
-              </button>
-              <button
-                onMouseDown={() => { setSort('z-a'); setSortOpen(false); }}
-                class={`w-full flex items-center gap-2.5 px-3 py-2 text-sm transition-colors duration-150 ${sort() === 'z-a' ? 'text-white bg-surface-hover' : 'text-zinc-400 hover:text-white hover:bg-surface-hover'}`}
-              >
-                <ArrowUpZA size={16} />
-                Z to A
-              </button>
-              <button
-                onMouseDown={() => { setSort('newest'); setSortOpen(false); }}
-                class={`w-full flex items-center gap-2.5 px-3 py-2 text-sm transition-colors duration-150 ${sort() === 'newest' ? 'text-white bg-surface-hover' : 'text-zinc-400 hover:text-white hover:bg-surface-hover'}`}
-              >
-                <CalendarArrowDown size={16} />
-                Newest
-              </button>
-              <button
-                onMouseDown={() => { setSort('oldest'); setSortOpen(false); }}
-                class={`w-full flex items-center gap-2.5 px-3 py-2 text-sm transition-colors duration-150 ${sort() === 'oldest' ? 'text-white bg-surface-hover' : 'text-zinc-400 hover:text-white hover:bg-surface-hover'}`}
-              >
-                <CalendarArrowUp size={16} />
-                Oldest
-              </button>
+              <For each={SORTS}>
+                {(option) => (
+                  <button
+                    onMouseDown={() => chooseSort(option)}
+                    class={`w-full flex items-center gap-2.5 px-3 py-2 text-sm transition-colors duration-150 ${sort() === option ? 'text-white bg-surface-hover' : 'text-zinc-400 hover:text-white hover:bg-surface-hover'}`}
+                  >
+                    <option.icon size={16} />
+                    {option.label}
+                  </button>
+                )}
+              </For>
             </div>
           </Show>
         </div>
@@ -206,8 +166,8 @@ export function ThreadList() {
               <div class="flex items-start gap-4">
                 {/* Avatar */}
                 <ProfilePicture
-                  src={() => thread.author?.profile_picture}
-                  username={() => thread.author?.username}
+                  path={thread.author?.profile_picture}
+                  username={thread.author?.username}
                   size="md"
                 />
 

@@ -2,11 +2,11 @@ import type { SyncedDbConfig } from '@spooky-sync/client-solid';
 import { createOtelTransmit } from '@spooky-sync/core/otel';
 import { schema, SURQL_SCHEMA } from './schema.gen';
 
-// Database configuration
 export const dbConfig: SyncedDbConfig<typeof schema> = {
-  logLevel: 'trace',
-  otelTransmit: createOtelTransmit('/v1/logs'),
-  schema: schema,
+  // Full client logs, shipped to the dev stack's collector, in development only.
+  logLevel: import.meta.env.DEV ? 'trace' : 'warn',
+  otelTransmit: import.meta.env.DEV ? createOtelTransmit('/v1/logs') : undefined,
+  schema,
   schemaSurql: SURQL_SCHEMA,
   // Thread titles and bodies are `@crdt` fields: load Loro at startup so the
   // editors open at once, offline included.
@@ -24,6 +24,5 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
     endpoint: import.meta.env.VITE_DB_ENDPOINT || 'ws://localhost:8666/rpc',
     // Under the SQLite engine, anything but 'memory' means the OPFS store.
     store: 'indexeddb',
-    persistenceClient: 'localstorage',
   },
 };

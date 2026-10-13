@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use super::acceptance::{self, Accepted};
+use super::hash;
 use super::mirror::{self, Kind};
 use super::{sql, DocKey, FoldConfig};
 use crate::ports::{Db, DbError};
@@ -168,7 +169,8 @@ pub async fn fold(
         let snapshot = doc.export(ExportMode::Snapshot).map_err(|e| anyhow!("snapshot export: {e}"))?;
         let text = mirror::render(&doc, &key.field, kind);
         let upto = upto_json(&doc);
-        let meta = json!({ "rev": rev + 1, "upto": upto });
+        let state_hash = hash::state_hash(&doc);
+        let meta = json!({ "rev": rev + 1, "upto": upto, "state_hash": state_hash });
         let commit = db
             .query(
                 &sql::commit(&key.field),
@@ -176,7 +178,7 @@ pub async fn fold(
                     ("rev", json!(rev)),
                     ("snapshot", json!(B64.encode(&snapshot))),
                     ("upto", upto),
-                    ("hash", Value::Null),
+                    ("hash", json!(state_hash)),
                     ("text", json!(text)),
                     ("meta", meta),
                 ]),

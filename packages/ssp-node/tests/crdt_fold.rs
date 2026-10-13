@@ -1,7 +1,8 @@
 //! The `@crdt` fold over a real embedded SurrealDB, through the `Db` port:
 //! concurrent edits merge into one snapshot and text mirror, refused rows
 //! never reach the document, rows waiting on predecessors stay, a lease keeps
-//! a second node out, and the sweep rebuilds the tracker after a restart.
+//! a second node out, the published state hash matches a client's merge, and
+//! the sweep rebuilds the tracker after a restart.
 
 use std::sync::Arc;
 
@@ -161,6 +162,12 @@ async fn concurrent_edits_fold_into_one_snapshot_and_mirror() {
     let vv = &parent["content__crdt"]["upto"]["vv"];
     assert_eq!((vv["1"].clone(), vv["2"].clone()), (json!(5), json!(5)));
     assert_eq!(log_rows(&db).await, 0);
+
+    // The published hash is the hash of the document any client merges.
+    let hash = json!(ssp_node::crdt::hash::state_hash(&a));
+    assert_eq!(parent["content__crdt"]["state_hash"], hash);
+    let stored = one(&db, "SELECT VALUE state_hash FROM ONLY type::record('_00_crdt_doc', [thread:t1, 'content'])").await;
+    assert_eq!(stored, hash);
 
     // Later edits fold on top of the published snapshot.
     let before = a.oplog_vv();

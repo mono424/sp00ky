@@ -3,6 +3,7 @@ import * as loro from 'loro-crdt';
 import { LoroDoc } from 'loro-crdt';
 import { check } from './acceptance';
 import { asBytes } from './bytes';
+import { canonicalState, stateHash } from './hash';
 import { CrdtManager, type CrdtPorts } from './index';
 import { renderText } from './mirror';
 
@@ -22,11 +23,11 @@ type Row = { id: string; doc: string; field: string; peer: string; data: Uint8Ar
 class World {
   log: Row[] = [];
   peers = new Map<string, string>();
-  published = new Map<string, { rev: number; snapshot: Uint8Array }>();
+  published = new Map<string, { rev: number; snapshot: Uint8Array; upto?: unknown; state_hash?: string }>();
   online = true;
   private watchers = new Set<{ table: string; where: Record<string, unknown>; cb: (rows: any[]) => void }>();
 
-  client(user: string, store = new Map<string, any>()) {
+  client(user: string, store = new Map<string, any>(), logger: any = silent) {
     const local = {
       getById: async (_t: string, id: any) => store.get(String(id)) ?? null,
       upsert: async (_t: string, id: any, data: any) => void store.set(String(id), structuredClone(data)),
@@ -46,7 +47,7 @@ class World {
         return [[]];
       },
     } as any;
-    const manager = new CrdtManager(schema, local, remote, silent, 300);
+    const manager = new CrdtManager(schema, local, remote, logger, 300);
     const ports: CrdtPorts = {
       watch: async (table, where, cb) => {
         const w = { table, where, cb };
@@ -74,9 +75,28 @@ class World {
   notify() {
     for (const w of this.watchers) w.cb(this.rowsFor(w.table, w.where));
   }
+
+  /** Fold like the SSP: publish `server` as the document and drop the log. */
+  async fold(doc: string, field: string, server: LoroDoc, opts: { rev?: number; hash?: string } = {}) {
+    this.published.set(`${doc}|${field}`, {
+      rev: opts.rev ?? 1,
+      snapshot: server.export({ mode: 'snapshot' }),
+      upto: { vv: Object.fromEntries(server.oplogVersion().toJSON()), frontiers: server.oplogFrontiers() },
+      state_hash: opts.hash ?? (await stateHash(loro, server)),
+    });
+    this.log = this.log.filter((r) => !(r.doc === doc && r.field === field));
+    this.notify();
+  }
 }
 
 const text = (field: { getDoc(): LoroDoc }) => field.getDoc().getText('body').toString();
+
+/** Let real async work (the WebCrypto digest) finish while timers are fake. */
+async function realWait(ms = 50) {
+  vi.useRealTimers();
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  vi.useFakeTimers();
+}
 
 describe('CRDT fields', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -225,6 +245,56 @@ describe('CRDT fields', () => {
     expect(text(fb)).toBe('first words');
   });
 
+  it('a device that missed folded rows catches up from the published document', async () => {
+    const world = new World();
+    const a = world.client('user:a');
+    const b = world.client('user:b');
+    const fa = await a.manager.open('doc', 'doc:1', 'body');
+    fa.getDoc().getText('body').insert(0, 'Hello');
+    fa.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(400);
+    const fb = await b.manager.open('doc', 'doc:1', 'body');
+    expect(text(fb)).toBe('Hello');
+
+    // The server folded in an edit whose row B never received.
+    const server = LoroDoc.fromSnapshot(fa.getDoc().export({ mode: 'snapshot' }));
+    const other = new LoroDoc();
+    other.setPeerId(99);
+    other.import(server.export({ mode: 'update' }));
+    other.getText('body').insert(5, ' world');
+    other.commit();
+    server.import(other.export({ mode: 'update' }));
+    await world.fold('doc:1', 'body', server);
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(text(fb)).toBe('Hello world');
+  });
+
+  it('report a document that differs from the published one at the same version', async () => {
+    const world = new World();
+    const warn = vi.fn();
+    const logger = { ...silent, warn, child: () => logger };
+    const a = world.client('user:a', new Map(), logger);
+    const fa = await a.manager.open('doc', 'doc:1', 'body');
+    fa.getDoc().getText('body').insert(0, 'same ops');
+    fa.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(400);
+    const server = LoroDoc.fromSnapshot(fa.getDoc().export({ mode: 'snapshot' }));
+
+    await world.fold('doc:1', 'body', server, { hash: await stateHash(loro, server) });
+    await vi.advanceTimersByTimeAsync(1100);
+    await realWait();
+    expect(warn).not.toHaveBeenCalled();
+
+    fa.getDoc().getText('body').insert(0, '>');
+    fa.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(400);
+    server.import(fa.getDoc().export({ mode: 'update' }));
+    await world.fold('doc:1', 'body', server, { rev: 2, hash: 'f'.repeat(64) });
+    await vi.advanceTimersByTimeAsync(1100);
+    await realWait();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it('refuse to open a field that is not @crdt', async () => {
     const world = new World();
     const a = world.client('user:a');
@@ -248,6 +318,19 @@ describe('acceptance rule', () => {
     expect(Array.from(asBytes(b.buffer)!)).toEqual([1, 2, 3]);
     expect(Array.from(asBytes([1, 2, 3])!)).toEqual([1, 2, 3]);
     expect(asBytes('nope')).toBeUndefined();
+  });
+});
+
+describe('state hash', () => {
+  it('matches the server fold on the shared vectors', async () => {
+    const fixtures = await import('../../../../ssp-node/tests/fixtures/crdt_state_hash.json');
+    const vectors = (fixtures.default ?? fixtures) as Array<{ name: string; snapshot: string; canonical: string; hash: string }>;
+    expect(vectors.length).toBeGreaterThan(0);
+    for (const v of vectors) {
+      const doc = LoroDoc.fromSnapshot(Uint8Array.from(Buffer.from(v.snapshot, 'base64')));
+      expect(canonicalState(loro, doc), v.name).toBe(v.canonical);
+      expect(await stateHash(loro, doc), v.name).toBe(v.hash);
+    }
   });
 });
 

@@ -13,8 +13,11 @@ bytes = "1"
 # encode the same way, and a minor bump changes which blobs a decoder accepts.
 loro = "=1.11.1"
 lru = "0.12"
+# ECMAScript `Number#toString` digits for the CRDT state hash (see crdt/hash.rs).
+ryu-js = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 # `sync` + `macros` only — both wasm32-safe. NEVER add `rt`, `time`, or `net`
 # here; runtime concerns live behind the port traits.

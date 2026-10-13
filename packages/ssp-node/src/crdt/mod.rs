@@ -19,6 +19,7 @@
 
 pub mod acceptance;
 mod fold;
+pub mod hash;
 pub mod mirror;
 mod sql;
 

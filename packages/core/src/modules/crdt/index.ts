@@ -7,6 +7,7 @@ import { parseRecordIdString } from '../../utils/index';
 import { check } from './acceptance';
 import { asBytes, randomPeer } from './bytes';
 import { CrdtField } from './crdt-field';
+import { stateHash } from './hash';
 import { loadLoro } from './loro-loader';
 import type { CrdtKind } from './mirror';
 
@@ -72,6 +73,11 @@ interface Session {
   local: LocalState;
   /** Log rows already looked at (imported, refused or own). */
   seen: Set<string>;
+  /** Log rows in the latest delivery: when some vanish, the server folded. */
+  present: Set<string>;
+  /** Highest published rev this device's document was checked against. */
+  verifiedRev: number;
+  verifyTimer: ReturnType<typeof setTimeout> | null;
   disposers: Array<() => void>;
   flushTimer: ReturnType<typeof setTimeout> | null;
   firstDirtyAt: number;
@@ -97,6 +103,8 @@ const CLAIM_RETRY_MS = 5000;
 /** How long an open of a field with nothing local waits for the server's
  *  first answer before handing out the (still empty) document. */
 const FIRST_ANSWER_TIMEOUT_MS = 4000;
+/** Pause after a fold is noticed before checking the published document. */
+const VERIFY_DELAY_MS = 1000;
 
 export class CrdtManager {
   private sessions = new Map<string, Session>();
@@ -259,6 +267,9 @@ export class CrdtManager {
       refs: 1,
       local,
       seen: new Set(),
+      present: new Set(),
+      verifiedRev: 0,
+      verifyTimer: null,
       disposers: [],
       flushTimer: null,
       firstDirtyAt: 0,
@@ -326,6 +337,7 @@ export class CrdtManager {
     if (s.flushTimer) clearTimeout(s.flushTimer);
     if (s.persistTimer) clearTimeout(s.persistTimer);
     if (s.presenceTimer) clearTimeout(s.presenceTimer);
+    if (s.verifyTimer) clearTimeout(s.verifyTimer);
     if (s.presenceSent) void this.dropPresence(s);
     if (flush) {
       await this.persist(s);
@@ -337,6 +349,14 @@ export class CrdtManager {
 
   private async ingest(s: Session, rows: Record<string, unknown>[]): Promise<void> {
     const loro = await loadLoro();
+    const ids = new Set(rows.map((row) => String(row.id ?? '')));
+    for (const id of s.present) {
+      if (!ids.has(id)) {
+        this.scheduleVerify(s);
+        break;
+      }
+    }
+    s.present = ids;
     const blobs: Uint8Array[] = [];
     for (const row of rows) {
       const id = String(row.id ?? '');
@@ -391,6 +411,70 @@ export class CrdtManager {
       this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::refetch' }, 'No canonical CRDT document fetched');
     } finally {
       s.refetching = false;
+    }
+  }
+
+  // --- checking against the published document ---------------------
+
+  private scheduleVerify(s: Session): void {
+    if (s.verifyTimer) clearTimeout(s.verifyTimer);
+    s.verifyTimer = setTimeout(() => {
+      s.verifyTimer = null;
+      void this.verify(s);
+    }, VERIFY_DELAY_MS);
+  }
+
+  /**
+   * After a fold: compare this device's document with the one the server
+   * published, at the version the server published. Missing ops (rows this
+   * device never got before they were folded away) are repaired by merging
+   * the published snapshot in. The same ops giving a different state cannot
+   * be merged away; that is logged.
+   */
+  private async verify(s: Session): Promise<void> {
+    type Published = {
+      rev?: number;
+      state_hash?: string;
+      upto?: { vv?: Record<string, number>; frontiers?: { peer: `${number}`; counter: number }[] };
+    };
+    let row: Published | null;
+    try {
+      [row] = await this.remote.query<[Published | null]>(
+        "SELECT rev, upto, state_hash FROM ONLY type::record('_00_crdt_doc', [type::record($doc), $field])",
+        { doc: s.recordId, field: s.field }
+      );
+    } catch {
+      return; // offline: the next fold checks again
+    }
+    const rev = row?.rev ?? 0;
+    const frontiers = row?.upto?.frontiers;
+    if (!row?.state_hash || !frontiers || !row.upto?.vv || rev <= s.verifiedRev || !this.sessions.has(s.key)) return;
+
+    const have = s.doc.oplogVersion().toJSON();
+    const behind = Object.entries(row.upto.vv).some(([peer, end]) => (have.get(peer as `${number}`) ?? 0) < end);
+    if (behind) {
+      this.logger.info({ key: s.key, rev, Category: 'sp00ky-client::CrdtManager::verify' }, 'CRDT document behind the published one; merging it in');
+      await this.refetchCanonical(s);
+      return;
+    }
+    s.verifiedRev = rev;
+    // WebCrypto is missing on insecure origins: nothing to check with there.
+    if (!globalThis.crypto?.subtle) return;
+    const loro = await loadLoro();
+    let fork: LoroDoc | undefined;
+    try {
+      fork = s.doc.forkAt(frontiers);
+      const hash = await stateHash(loro, fork);
+      if (hash !== row.state_hash) {
+        this.logger.warn(
+          { key: s.key, rev, hash, published: row.state_hash, Category: 'sp00ky-client::CrdtManager::verify' },
+          'CRDT document differs from the published one at the same version'
+        );
+      }
+    } catch (e) {
+      this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::verify' }, 'CRDT document check failed');
+    } finally {
+      fork?.free();
     }
   }
 

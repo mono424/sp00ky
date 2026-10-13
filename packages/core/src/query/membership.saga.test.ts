@@ -178,6 +178,29 @@ describe('rows the server takes out of a query', () => {
     expect((await runPure(applySubqueryChildren('a', []), { state: pending, handlers })).log.some((e) => e.kind === 'local.delete')).toBe(false);
     const follower = { ...base, tabRole: 'follower' as const };
     expect((await runPure(applySubqueryChildren('a', []), { state: follower, handlers })).log.some((e) => e.kind === 'local.delete')).toBe(false);
+    const writing = {
+      ...base,
+      pendingWrites: new Map([['k', { key: 'k', table: 'c', recordId: 'c:1', data: {}, before: null, firstAt: 0, mirrorId: null }]]),
+    };
+    expect((await runPure(applySubqueryChildren('a', []), { state: writing, handlers })).log.some((e) => e.kind === 'local.delete')).toBe(false);
+  });
+  it('a leader relays the removal to its followers; a failed local delete keeps the row known', async () => {
+    const base = buildState(
+      [buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'live' }, remoteArray: [['t:1', 1]], subqueryRemoteArray: [['c:1', 1]] })],
+      R.setVersions([['t:1', 1], ['c:1', 1]])
+    );
+    const ok = { 'local.upsert': () => undefined, 'local.delete': () => undefined, 'ssp.ingest': () => undefined };
+    const leader = await runPure(applySubqueryChildren('a', []), { state: { ...base, tabRole: 'leader' as const }, handlers: ok });
+    expect(leader.emitted).toContainEqual({ type: 'tabs:broadcast', message: { type: 'ingest', records: [{ table: 'c', op: 'DELETE', id: 'c:1', record: {} }] } });
+    const failing = {
+      ...ok,
+      'local.delete': () => {
+        throw new Error('locked');
+      },
+    };
+    const out = await runPure(applySubqueryChildren('a', []), { state: base, handlers: failing });
+    expect(out.state.versions.has('c:1')).toBe(true);
+    expect(out.log.some((e) => e.kind === 'ssp.ingest')).toBe(false);
   });
 });
 

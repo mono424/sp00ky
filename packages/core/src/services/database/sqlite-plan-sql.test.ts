@@ -93,6 +93,25 @@ describe('serializeRow / reviveRow round-trip', () => {
     expect([...(back.blob as Uint8Array)]).toEqual([0, 128, 255]);
   });
 
+  // The surrealdb SDK decodes a `bytes` column as an ArrayBuffer, which
+  // JSON.stringify writes as `{}`: synced CRDT log rows (and presence states)
+  // landed with no data, so every other client's edit was refused as empty.
+  it('keeps the bytes of every binary shape: an SDK ArrayBuffer, a view into a larger buffer', () => {
+    const backing = new Uint8Array([9, 9, 1, 2, 250, 9]);
+    const json = serializeRow({
+      id: 'thread__crdt_log:1',
+      data: backing.slice(2, 5).buffer,
+      window: backing.subarray(2, 5),
+      dv: new DataView(backing.buffer, 2, 3),
+      nested: { state: [new Int8Array([1, 2, -6]).buffer] },
+    });
+    const back = reviveRow(json) as any;
+    for (const bytes of [back.data, back.window, back.dv, back.nested.state[0]]) {
+      expect(bytes).toBeInstanceOf(Uint8Array);
+      expect([...bytes]).toEqual([1, 2, 250]);
+    }
+  });
+
   it('serializes RecordId-shaped links to strings and takes the fast parse path otherwise', () => {
     const json = serializeRow({ id: 't:1', author: { tb: 'user', id: 'u1' }, n: 2 });
     expect(reviveRow(json)).toEqual({ id: 't:1', author: 'user:u1', n: 2 });

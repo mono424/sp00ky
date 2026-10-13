@@ -102,7 +102,8 @@ export function pureWriteOpResult(op: SqlOp): unknown {
  * shared {@link resolveRelations} — identical to the SurrealDB backend.
  *
  * Value normalization (JSON round-trip):
- * - `Uint8Array`/bytes → `{ "__u8": <base64> }` (CRDT snapshots survive).
+ * - Bytes in any shape (`Uint8Array`, the SDK's `ArrayBuffer`) →
+ *   `{ "__u8": <base64> }`, read back as `Uint8Array` (CRDT data survives).
  * - Record links / ids → their `table:id` string form (so `json_extract`
  *   comparisons and `IN` matching are consistent). NOTE: link fields therefore
  *   read back as strings, not `RecordId` instances — the one shape difference

@@ -61,16 +61,30 @@ export function scalar(value: unknown): unknown {
 
 export function serializeRow(row: Row): string {
   return JSON.stringify(row, function (this: Record<string, unknown>, k, v) {
-    if (v instanceof Uint8Array) return { __u8: toBase64(v) };
     // `v` has already been through `toJSON()`, and a RecordId's is escaped
     // SurrealQL (`game:⟨476g…⟩`), so key the original value instead.
     const raw = this[k];
     if (raw && typeof raw === 'object') {
+      const bytes = bytesOf(raw);
+      if (bytes) return { __u8: toBase64(bytes) };
       const key = recordIdKey(raw);
       if (key !== null) return key;
     }
     return v;
   });
+}
+
+/**
+ * The bytes of a binary value, whatever shape it arrived in. Rows from the
+ * server carry a `bytes` column as an `ArrayBuffer` (the surrealdb SDK's CBOR
+ * decode), not a `Uint8Array`, and `JSON.stringify` turns an `ArrayBuffer`
+ * into `{}`: every synced CRDT log row and presence state was stored empty.
+ */
+function bytesOf(value: object): Uint8Array | null {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return null;
 }
 
 /**

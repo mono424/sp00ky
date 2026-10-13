@@ -7253,7 +7253,6 @@ dependencies = [
  "futures",
  "hostname",
  "http-body-util",
- "loro",
  "lru",
  "maintenance",
  "opentelemetry",

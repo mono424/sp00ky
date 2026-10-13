@@ -300,3 +300,33 @@ async fn the_sweep_rebuilds_the_tracker_and_drops_orphans() {
     node.sweep(&db).await.unwrap();
     assert_eq!(log_rows(&db).await, 0);
 }
+
+/// Update blobs with a valid header and checksum whose bodies make Loro's
+/// decoder panic (found by fuzzing in the CRDT v2 spike). A client can write
+/// such a row; it must cost a rejection, never the process or the document.
+#[tokio::test]
+async fn hostile_blobs_are_refused_without_taking_the_fold_down() {
+    #[derive(serde::Deserialize)]
+    struct Hostile {
+        peer: String,
+        blob: String,
+    }
+    let hostile: Vec<Hostile> =
+        serde_json::from_str(include_str!("fixtures/crdt_hostile_blobs.json")).unwrap();
+    assert!(!hostile.is_empty());
+
+    let (_raw, db) = setup().await;
+    for h in &hostile {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&h.blob).unwrap();
+        append_raw(&db, "content", &h.peer, &bytes).await;
+    }
+    let a = peer_doc(1);
+    a.get_text("content").insert(0, "still here").unwrap();
+    a.commit();
+    append(&db, "content", 1, &a, &Default::default()).await;
+
+    let out = folder("ssp-a").fold_one(&db, key("content")).await.expect("fold ran");
+    assert_eq!((out.published, out.folded, out.rejected), (true, 1, hostile.len()), "{out:?}");
+    assert_eq!(log_rows(&db).await, 0);
+    assert_eq!(snapshot_text(&db, "content").await, "still here");
+}

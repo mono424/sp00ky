@@ -12,8 +12,20 @@
 //!   checked belongs to the row's author (`_00_crdt_peer`).
 //!
 //! The TypeScript client mirrors this in `packages/core/src/modules/crdt/acceptance.ts`.
+//!
+//! Loro's decoders can PANIC on crafted input that carries a valid checksum
+//! (anyone can recompute it). A raw header check rejects non-update blobs
+//! before any decoding, and every call into Loro on untrusted bytes runs under
+//! `catch_unwind`: a hostile row must cost a rejection, never the process.
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use loro::{EncodedBlobMode, LoroDoc, PeerID, VersionVector};
+
+/// Every Loro blob starts with this magic.
+const MAGIC: &[u8; 4] = b"loro";
+/// Header bytes 20..22 (big-endian) carry the encoding mode; 4 is an update.
+const MODE_UPDATES: u16 = 4;
 
 /// Why a row was refused. Stable strings: they are logged and counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +33,7 @@ pub enum Rejection {
     Empty,
     TooLarge,
     BadPeer,
+    Header,
     Undecodable,
     NotAnUpdate,
     NoOps,
@@ -33,6 +46,7 @@ impl Rejection {
             Rejection::Empty => "empty",
             Rejection::TooLarge => "too_large",
             Rejection::BadPeer => "bad_peer",
+            Rejection::Header => "header",
             Rejection::Undecodable => "undecodable",
             Rejection::NotAnUpdate => "not_an_update",
             Rejection::NoOps => "no_ops",
@@ -58,7 +72,16 @@ pub fn check(blob: &[u8], peer: &str, max_bytes: usize) -> Result<Accepted, Reje
         return Err(Rejection::TooLarge);
     }
     let peer: PeerID = peer.parse().map_err(|_| Rejection::BadPeer)?;
-    let meta = LoroDoc::decode_import_blob_meta(blob, true).map_err(|_| Rejection::Undecodable)?;
+    if blob.len() < 22 || &blob[0..4] != MAGIC {
+        return Err(Rejection::Header);
+    }
+    if u16::from_be_bytes([blob[20], blob[21]]) != MODE_UPDATES {
+        return Err(Rejection::NotAnUpdate);
+    }
+    let meta = match catch_unwind(AssertUnwindSafe(|| LoroDoc::decode_import_blob_meta(blob, true))) {
+        Ok(Ok(meta)) => meta,
+        Ok(Err(_)) | Err(_) => return Err(Rejection::Undecodable),
+    };
     if !matches!(meta.mode, EncodedBlobMode::Updates) {
         return Err(Rejection::NotAnUpdate);
     }
@@ -78,6 +101,34 @@ fn changed_peers<'a>(
     end.iter()
         .filter(move |(peer, end)| **end > start.get(peer).copied().unwrap_or(0))
         .map(|(peer, end)| (*peer, *end))
+}
+
+/// Import `blob` into `doc` without letting a decoder panic escape. `false`
+/// when the import failed or panicked; after a panic `doc` must not be used
+/// again (nor dropped: its drop can abort), so the caller leaks it.
+pub fn import_guarded(doc: &LoroDoc, blob: &[u8]) -> Result<(), ImportFailure> {
+    match catch_unwind(AssertUnwindSafe(|| doc.import(blob))) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => Err(ImportFailure::Error),
+        Err(_) => Err(ImportFailure::Panicked),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportFailure {
+    Error,
+    Panicked,
+}
+
+/// Import an accepted row's blob into a throwaway document first, so a blob
+/// that only panics on import is caught before it touches the real one.
+pub fn trial_import(blob: &[u8]) -> Result<(), ImportFailure> {
+    let scratch = LoroDoc::new();
+    let result = import_guarded(&scratch, blob);
+    if result == Err(ImportFailure::Panicked) {
+        std::mem::forget(scratch);
+    }
+    result
 }
 
 /// True once `doc` holds every op of an accepted row.
@@ -133,7 +184,11 @@ mod tests {
 
         let snapshot = a.export(ExportMode::Snapshot).unwrap();
         assert_eq!(check(&snapshot, "7", 1 << 20).unwrap_err(), Rejection::NotAnUpdate);
-        assert_eq!(check(&[1, 2, 3], "7", 1 << 20).unwrap_err(), Rejection::Undecodable);
+        assert_eq!(check(&[1, 2, 3], "7", 1 << 20).unwrap_err(), Rejection::Header);
+        let mut bad = own.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0xff; // body corrupted, checksum no longer matches
+        assert_eq!(check(&bad, "9", 1 << 20).unwrap_err(), Rejection::Undecodable);
         assert_eq!(check(&[], "7", 1 << 20).unwrap_err(), Rejection::Empty);
         assert_eq!(check(&a_only, "7", 4).unwrap_err(), Rejection::TooLarge);
         assert_eq!(check(&a_only, "not-a-peer", 1 << 20).unwrap_err(), Rejection::BadPeer);

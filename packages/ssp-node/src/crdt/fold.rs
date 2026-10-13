@@ -113,31 +113,40 @@ pub async fn fold(
     let before = doc.oplog_vv();
     let mut accepted: Vec<(&Row, &Accepted)> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
     for row in &rows {
-        match &row.verdict {
-            Ok((bytes, acc)) => {
-                blobs.push(bytes.clone());
-                accepted.push((row, acc));
-            }
-            Err(why) => {
-                warn!(doc = %key.doc, field = %key.field, row = %row.id, reason = why.as_str(), "CRDT log row refused");
-                refused.push(row.id.clone());
+        let reason = match &row.verdict {
+            Err(why) => why.as_str(),
+            // A blob that decodes cleanly can still panic on import: try it on
+            // a throwaway document before it touches the real one.
+            Ok((bytes, acc)) => match acceptance::trial_import(bytes) {
+                Ok(()) => {
+                    accepted.push((row, acc));
+                    continue;
+                }
+                Err(_) => "import_failed",
+            },
+        };
+        warn!(doc = %key.doc, field = %key.field, row = %row.id, reason, "CRDT log row refused");
+        refused.push(row.id.clone());
+    }
+    let mut imported = Vec::with_capacity(accepted.len());
+    for (row, acc) in accepted {
+        let Ok((bytes, _)) = &row.verdict else { continue };
+        match acceptance::import_guarded(&doc, bytes) {
+            Ok(()) => imported.push((row, acc)),
+            Err(acceptance::ImportFailure::Error) => refused.push(row.id.clone()),
+            Err(acceptance::ImportFailure::Panicked) => {
+                // The document may be half-updated and its drop can abort:
+                // leak it, refuse the row, and let the next fold start over
+                // from the published snapshot.
+                std::mem::forget(doc);
+                delete_rows(db, cfg, &[row.id.clone()]).await?;
+                db.query(&sql::release(), &binds(vec![])).await.context("release")?;
+                bail!("CRDT log row {} panicked the document import; refused", row.id);
             }
         }
     }
-    if !blobs.is_empty() && doc.import_batch(&blobs).is_err() {
-        // One bad blob fails the batch: retry one by one and refuse the culprits.
-        accepted.retain(|(row, _)| {
-            let Ok((bytes, _)) = &row.verdict else { return false };
-            if doc.import(bytes).is_ok() {
-                return true;
-            }
-            warn!(doc = %key.doc, row = %row.id, "CRDT log row failed to import");
-            refused.push(row.id.clone());
-            false
-        });
-    }
+    let accepted = imported;
 
     let mut folded = Vec::new();
     let mut kept = 0;

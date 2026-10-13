@@ -17,3 +17,9 @@ members = [
     "packages/pool-core",
     "packages/ssp-node",
 ]
+
+# loro-internal has a debug assertion (diff_calc) that a valid
+# loro-prosemirror document can trip, aborting the process in dev and test
+# builds only. Release builds never compile it in.
+[profile.dev.package.loro-internal]
+debug-assertions = false

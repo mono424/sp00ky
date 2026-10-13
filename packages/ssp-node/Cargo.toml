@@ -9,7 +9,9 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
-loro = "1"
+# Pinned: the fold and the browser (`loro-crdt` 1.11.0) must decode and
+# encode the same way, and a minor bump changes which blobs a decoder accepts.
+loro = "=1.11.1"
 lru = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

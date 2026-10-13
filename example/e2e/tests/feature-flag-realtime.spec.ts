@@ -58,8 +58,8 @@ async function getUserId(username: string): Promise<string> {
 // fire the `_00_user_feature_mutation` ingest event.
 async function setVariant(userId: string, variant: string): Promise<void> {
   await rootSql(
-    `UPSERT _00_user_feature WHERE user = ${userId} AND key = '${FLAG_KEY}' ` +
-      `SET user = ${userId}, key = '${FLAG_KEY}', variant = '${variant}';`
+    `UPSERT _00_user_feature SET user = ${userId}, key = '${FLAG_KEY}', variant = '${variant}' ` +
+      `WHERE user = ${userId} AND key = '${FLAG_KEY}';`
   );
 }
 

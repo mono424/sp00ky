@@ -184,10 +184,10 @@ test.describe.serial('Feature flag permissions', () => {
 
   test('record-token client only sees its own _00_user_feature rows', async () => {
     await rootSql(
-      `UPSERT _00_user_feature WHERE user = ${aliceId} AND key = '${flagKey}' SET user = ${aliceId}, key = '${flagKey}', variant = 'on';`
+      `UPSERT _00_user_feature SET user = ${aliceId}, key = '${flagKey}', variant = 'on' WHERE user = ${aliceId} AND key = '${flagKey}';`
     );
     await rootSql(
-      `UPSERT _00_user_feature WHERE user = ${bobId} AND key = '${flagKey}' SET user = ${bobId}, key = '${flagKey}', variant = 'off';`
+      `UPSERT _00_user_feature SET user = ${bobId}, key = '${flagKey}', variant = 'off' WHERE user = ${bobId} AND key = '${flagKey}';`
     );
 
     const { body: aliceBody } = await recordSql(

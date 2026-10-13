@@ -166,11 +166,9 @@ test.describe.serial('Thread CRUD operations', () => {
     // Local check: input shows the new value immediately.
     await expect(titleInput).toHaveValue(updatedTitle);
 
-    // Title saves are debounced (default 200ms in `db.update({...},
-    // { debounced: true })`) and then flushed through the sync engine.
-    // Gate on upstream rather than waiting blindly — that way a slow
-    // sync round-trip (e.g. `_00_query` storms during the run) doesn't
-    // race the reload below.
+    // The title is a `@crdt text` field: the edit goes out as a log row and
+    // reaches the column with the SSP fold. Gate on upstream rather than
+    // waiting blindly, so the reload below starts from the folded title.
     await waitForThreadInUpstream(page, updatedTitle);
 
     // Persistence check: reload, title survives.

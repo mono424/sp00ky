@@ -176,8 +176,6 @@ test.describe('Multi-client real-time sync', () => {
   });
 
   test('concurrent typing on A and B converges and survives the server fold', async ({ browser }) => {
-    // The fold waits for the edit log to go idle (60 s by default).
-    test.setTimeout(180_000);
     const title = 'Multi A2B Concurrent Thread';
     const seed = 'shared seed';
     const fromA = ' typed on A';

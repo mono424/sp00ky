@@ -126,6 +126,7 @@ export async function signOutUser(page: Page) {
 export async function navigateToThread(page: Page, title: string) {
   await page.goto('/');
   await waitForAppReady(page);
+  await sortHomeNewest(page);
   await expect(page.getByText(title, { exact: true })).toBeVisible({
     timeout: 15_000,
   });
@@ -137,15 +138,27 @@ export async function navigateToThread(page: Page, title: string) {
 }
 
 /**
+ * Show the home list newest first. Its default A-Z order shows ten threads,
+ * so a thread made during the run can sort past the ones earlier specs left.
+ */
+export async function sortHomeNewest(page: Page) {
+  await page.getByRole('button', { name: 'Sort' }).click();
+  await page.getByRole('button', { name: 'Newest' }).click();
+}
+
+/**
  * Poll the upstream SurrealDB SQL endpoint until a thread with `title`
  * appears, or throw after `attempts * 500ms`. Used as a deterministic
  * gate after `Publish` so subsequent UI assertions (home list, sidebar,
  * second-client view) don't race the create-flow's debounced sync-up.
+ * `title` is a `@crdt text` field: a create carries it at once, but a rename
+ * reaches the column only with the SSP fold (after 5 s idle by default), so
+ * the default allows for one.
  */
 export async function waitForThreadInUpstream(
   page: Page,
   title: string,
-  attempts = 30
+  attempts = 60
 ) {
   for (let i = 0; i < attempts; i++) {
     const resp = await fetch('http://localhost:8666/sql', {
@@ -209,7 +222,7 @@ export async function waitForThreadContentInUpstream(page: Page, title: string, 
  * Poll until the server-written plain-text mirror of the thread's `content`
  * contains every one of `parts`. The mirror is only written by the SSP fold,
  * which runs once the edit log has been idle for `SPKY_CRDT_FOLD_IDLE_SECS`
- * (60 s by default; set it low on the SSP for faster runs).
+ * (5 s by default).
  */
 export async function waitForThreadMirror(page: Page, title: string, parts: string[], timeoutMs = 120_000) {
   const sql = `SELECT VALUE content FROM thread WHERE title = ${JSON.stringify(title)}`;

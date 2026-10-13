@@ -7,6 +7,7 @@ import {
   waitForAppReady,
   typeIntoEditor,
   waitForThreadInUpstream,
+  sortHomeNewest,
 } from '../fixtures/test-fixtures';
 
 // Regression guard for "a removed list item comes back".
@@ -36,6 +37,15 @@ const seedThread = async (page: Page, title: string, body: string) => {
   await waitForThreadInUpstream(page, title);
 };
 
+/**
+ * Skip the rest of the test unless a service worker serves the app: an offline
+ * reload needs one, and `vite dev` registers none (`devOptions.enabled: false`).
+ */
+const skipOfflineReloadWithoutServiceWorker = async (page: Page) => {
+  const controlled = await page.evaluate(() => !!navigator.serviceWorker?.controller);
+  test.skip(!controlled, 'an offline reload needs the PWA service worker, which the dev server does not register');
+};
+
 /** Delete the open thread via More options → Delete post (window.confirm). */
 const deleteOpenThread = async (page: Page) => {
   page.once('dialog', (d) => void d.accept());
@@ -63,6 +73,7 @@ test.describe('Removed items stay removed', () => {
 
       await pageA.goto('/');
       await waitForAppReady(pageA);
+      await sortHomeNewest(pageA);
       await expect(pageA.getByText(title, { exact: true })).toBeVisible({ timeout: 20_000 });
 
       // B deletes it. A drops it in realtime (the LIVE `_00_list_ref` DELETE).
@@ -75,6 +86,7 @@ test.describe('Removed items stay removed', () => {
       // The actual regression: go offline, reload. With no network there is
       // nothing to re-derive membership from, so only the durable list can keep
       // the row out.
+      await skipOfflineReloadWithoutServiceWorker(pageA);
       await ctxA.setOffline(true);
       await pageA.reload();
       await waitForAppReady(pageA);
@@ -116,11 +128,15 @@ test.describe('Removed items stay removed', () => {
       await page.getByRole('button', { name: 'Publish' }).click();
       await page.locator('#create-title').waitFor({ state: 'hidden', timeout: 15_000 });
 
-      await expect(page.getByText(title, { exact: true })).toBeVisible({ timeout: 20_000 });
+      // Publishing opens the new thread, rendered from the local store alone.
+      await page.waitForURL(/\/thread\//, { timeout: 10_000 });
+      const titleInput = page.locator('#thread-title');
+      await expect(titleInput).toHaveValue(title, { timeout: 20_000 });
 
+      await skipOfflineReloadWithoutServiceWorker(page);
       await page.reload();
       await waitForAppReady(page);
-      await expect(page.getByText(title, { exact: true })).toBeVisible({ timeout: 20_000 });
+      await expect(titleInput).toHaveValue(title, { timeout: 20_000 });
     } finally {
       await ctx.close();
     }

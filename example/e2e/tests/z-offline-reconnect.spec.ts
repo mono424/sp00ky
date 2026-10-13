@@ -5,6 +5,7 @@ import {
   waitForAppReady,
   typeIntoEditor,
   waitForThreadInUpstream,
+  sortHomeNewest,
 } from '../fixtures/test-fixtures';
 
 // Regression guard for the "stops updating after a while" class of bug.
@@ -50,6 +51,7 @@ test.describe('Offline reconnect', () => {
       await registerUser(pageB, testUser);
       await waitForAppReady(pageA);
       await waitForAppReady(pageB);
+      await sortHomeNewest(pageA);
 
       // Baseline: A is connected and syncing before we break anything.
       await expect

@@ -2441,14 +2441,24 @@ impl SspNode {
         if self.is_standby() {
             return 0;
         }
-        let _publication = self.publication_gate.lock().await;
-        let removed = ttl_cleanup_sweep(
+        // No sweep-wide publication gate. Deleting a `_00_query` row fires its
+        // `_00_dbsp_cleanup` event, which calls this node's `/view/unregister`
+        // (directly, or through the scheduler), and that handler takes the
+        // gate. Held across the DELETE, every expired row waited out the
+        // event's 10 s timeout and failed, so nothing expired was ever deleted
+        // and edge publication starved for as long as the sweep ran: new
+        // registrations stayed `materializing` and a page that had just signed
+        // in sat on its loading screen. The gate is taken per row instead,
+        // after the DELETE, for what the event did not already clean up.
+        let removed = ttl_cleanup_sweep_gated(
             self.platform.db.as_ref(),
             &self.processor,
             self.platform.telemetry.as_ref(),
             self.ref_mode,
+            Some(&self.publication_gate),
         )
         .await;
+        let _publication = self.publication_gate.lock().await;
         self.edge_update_tx.prune_epochs(&*self.processor.read().await);
         removed
     }
@@ -2465,6 +2475,19 @@ pub async fn ttl_cleanup_sweep(
     processor: &Arc<RwLock<Circuit>>,
     telemetry: &dyn Telemetry,
     ref_mode: ssp_protocol::RefMode,
+) -> usize {
+    ttl_cleanup_sweep_gated(db, processor, telemetry, ref_mode, None).await
+}
+
+/// [`ttl_cleanup_sweep`] with the node's publication gate, taken per row
+/// around the cleanup that follows each DELETE (see
+/// `SspNode::ttl_cleanup_sweep` for why never around the DELETE itself).
+pub async fn ttl_cleanup_sweep_gated(
+    db: &dyn Db,
+    processor: &Arc<RwLock<Circuit>>,
+    telemetry: &dyn Telemetry,
+    ref_mode: ssp_protocol::RefMode,
+    gate: Option<&tokio::sync::Mutex<()>>,
 ) -> usize {
     // Drop subscriber entries that have gone stale, so a row that is
     // heartbeated rarely does not accumulate dead sessions between writes.
@@ -2534,7 +2557,7 @@ pub async fn ttl_cleanup_sweep(
             continue;
         }
         let raw = id.strip_prefix("_00_query:").unwrap_or(id).to_string();
-        cleanup_expired_query(db, processor, telemetry, &raw, &auth_id, ref_mode).await;
+        cleanup_expired_query(db, processor, telemetry, &raw, &auth_id, ref_mode, gate).await;
         if !auth_id.is_empty() {
             cleaned.insert(auth_id);
         }
@@ -2563,6 +2586,7 @@ async fn cleanup_expired_query(
     query_id: &str,
     auth_id: &str,
     ref_mode: ssp_protocol::RefMode,
+    gate: Option<&tokio::sync::Mutex<()>>,
 ) {
     let list_ref = crate::tables::list_ref_table(ref_mode, auth_id);
 
@@ -2589,6 +2613,26 @@ async fn cleanup_expired_query(
         return;
     }
 
+    // The row's delete event has usually unregistered the view already. What
+    // follows is for when it could not (no endpoint reachable, a standby
+    // primary), under the publication gate so it cannot interleave with a
+    // registration's publish.
+    let _publication = match gate {
+        Some(g) => Some(g.lock().await),
+        None => None,
+    };
+    // Registered again between the DELETE and the gate: the new registration
+    // owns the view and its edges now.
+    if gate.is_some() {
+        match db.query("SELECT VALUE id FROM ONLY type::record('_00_query', $qid)", &[("qid", json!(query_id))]).await {
+            Ok(r) if r.first().is_some_and(|v| !v.is_null()) => {
+                debug!(query_id = %query_id, "TTL cleanup: re-registered meanwhile, skipping");
+                return;
+            }
+            _ => {}
+        }
+    }
+
     let edge_delete = format!("DELETE type::record('_00_query', $qid)->{list_ref}");
     if let Err(e) = query_retrying(db, &edge_delete, &[("qid", json!(query_id))]).await {
         warn!(query_id = %query_id, error = %e, "TTL cleanup: edge delete failed (retries exhausted)");
@@ -2598,8 +2642,13 @@ async fn cleanup_expired_query(
     // graph may still be serving other registrations of the same computation.
     // Each holder has its own `_00_query` row and so its own `lastActiveAt`,
     // which is what makes per-row expiry the right granularity here.
-    processor.write().await.detach_subscriber(query_id);
-    telemetry.gauge_add("view_count", -1);
+    {
+        let mut circuit = processor.write().await;
+        if circuit.is_registered(query_id) {
+            circuit.detach_subscriber(query_id);
+            telemetry.gauge_add("view_count", -1);
+        }
+    }
     telemetry.counter("ttl_cleanup", 1);
     info!(query_id = %query_id, "TTL cleanup: query expired and removed");
 }

@@ -254,3 +254,45 @@ async fn subscriber_prune_survives_rows_without_a_subscribers_field() {
         "a field-less row must not abort the prune for every other row"
     );
 }
+
+/// Stands in for the row's `_00_dbsp_cleanup` event: deleting a `_00_query`
+/// row calls the node's `/view/unregister`, which takes the publication gate.
+/// While someone else holds the gate the call times out and the DELETE fails,
+/// with the error SurrealDB reports for the event.
+struct EventCallbackDb {
+    inner: MemDb,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[async_trait::async_trait]
+impl Db for EventCallbackDb {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        if surql.contains("DELETE type::record('_00_query'") && self.gate.try_lock().is_err() {
+            return Err(DbError::Query(
+                "Error while processing event _00_dbsp_cleanup: There was an error processing a remote HTTP request"
+                    .to_string(),
+            ));
+        }
+        self.inner.query(surql, binds).await
+    }
+    async fn version(&self) -> Result<String, DbError> {
+        self.inner.version().await
+    }
+}
+
+/// The sweep must not hold the publication gate across the DELETE: the
+/// DELETE's own event needs it. Holding it made every expired row fail, and
+/// starved edge publication while the sweep ran (new views stuck
+/// `materializing`).
+#[tokio::test]
+async fn sweep_does_not_hold_the_gate_across_the_delete() {
+    let (_cdb, raw, _) = setup("never-matches", 0).await;
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    let db = EventCallbackDb { inner: MemDb(Arc::clone(&raw)), gate: Arc::clone(&gate) };
+    let processor = Arc::new(RwLock::new(Circuit::new()));
+    let telemetry = CountingTelemetry::default();
+    let swept =
+        ssp_node::ttl_cleanup_sweep_gated(&db, &processor, &telemetry, ssp_protocol::RefMode::Single, Some(&gate)).await;
+    assert_eq!(swept, 1);
+    assert_eq!(remaining_queries(&raw).await, 0, "the expired row was deleted");
+}

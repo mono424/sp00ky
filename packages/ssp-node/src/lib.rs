@@ -42,7 +42,7 @@ pub mod timers;
 pub use api::{ApiBody, ApiRequest, ApiResponse, Method, RouteId};
 pub use config::NodeConfig;
 pub use http_sql_db::HttpSqlDb;
-pub use node::{ttl_cleanup_sweep, wipe_circuit_and_edges, SspNode};
+pub use node::{ttl_cleanup_sweep, ttl_cleanup_sweep_gated, wipe_circuit_and_edges, SspNode};
 pub use platform::Platform;
 pub use runtime::Runtime;
 pub use status::{error_codes, SspError, SspStatus};

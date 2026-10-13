@@ -906,6 +906,14 @@ impl Circuit {
             if op == Operation::Delete {
                 self.store.stage_deleted_row(&table, &id);
             }
+            // An opaque field never enters the circuit. Most producers already
+            // omit it (the ingest events, the bootstrap `OMIT`), but not every
+            // transport does (a standalone node tailing the changefeed gets
+            // whole rows), so the circuit enforces it for all of them.
+            let mut data = data;
+            if let Some(fields) = self.opaque_fields.get(&table).filter(|f| !f.is_empty()) {
+                strip_opaque(&mut data, fields);
+            }
             let data = if self.monotonic_row_versions
                 && matches!(op, Operation::Create | Operation::Update)
             {
@@ -2680,6 +2688,29 @@ impl Default for Circuit {
     }
 }
 
+/// Remove `fields` (dotted paths, as the `sp00ky:opaque` markers name them)
+/// from a row body.
+fn strip_opaque(row: &mut Sp00kyValue, fields: &std::collections::BTreeSet<String>) {
+    fn strip(value: &mut Sp00kyValue, path: &[&str]) {
+        let Sp00kyValue::Object(map) = value else { return };
+        match path {
+            [] => {}
+            [leaf] => {
+                map.remove(*leaf);
+            }
+            [head, rest @ ..] => {
+                if let Some(next) = map.get_mut(*head) {
+                    strip(next, rest);
+                }
+            }
+        }
+    }
+    for field in fields {
+        let path: Vec<&str> = field.split('.').collect();
+        strip(row, &path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2760,6 +2791,26 @@ mod tests {
         assert!(circuit.view_keys("semi").is_empty());
         assert!(circuit.view_keys("nested").is_empty());
         assert_eq!(circuit.view_keys("anti"), vec!["log:r1", "log:r2"]);
+    }
+
+    #[test]
+    fn opaque_fields_never_enter_the_store() {
+        let mut circuit = Circuit::new();
+        circuit.set_opaque_fields(
+            "log",
+            ["data".to_string(), "meta.secret".to_string()].into_iter().collect(),
+        );
+        circuit.step(ChangeSet {
+            changes: vec![Change::create(
+                "log",
+                "r1",
+                json!({ "id": "log:r1", "doc": "thread:t1", "data": [1, 2, 3], "meta": { "secret": 1, "kept": 2 } }),
+            )],
+        });
+        let row = circuit.store.get_row_by_key("log:r1");
+        assert!(row.get("data").is_missing(), "opaque bytes stripped");
+        assert!(row.get("meta").get("secret").is_missing(), "nested opaque path stripped");
+        assert!(!row.get("doc").is_missing() && !row.get("meta").get("kept").is_missing());
     }
 
     #[test]

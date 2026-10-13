@@ -324,4 +324,58 @@ describe('tabs broker: namespaces', () => {
     // and a is offered leadership of the new bucket.
     expect(a.ofType('become-leader').length).toBeGreaterThan(1);
   });
+
+  it('keeps the port of a leader whose released tab lock means it left the bucket, not that it died', async () => {
+    // The broker's crash detector queues a request on the leader's tab lock;
+    // here it is granted the moment the tab releases it, as on sign-in.
+    const grants: Array<() => void> = [];
+    vi.stubGlobal('navigator', {
+      locks: {
+        request: (_name: string, opts: { ifAvailable?: boolean; steal?: boolean }, cb: (lock: unknown) => unknown) =>
+          new Promise((resolve) => {
+            if (opts.ifAvailable || opts.steal) resolve(cb({}));
+            else grants.push(() => resolve(cb({})));
+          }),
+      },
+    });
+    try {
+      const a = connectTab('tab-a');
+      await ackLeadership(a);
+      expect(grants).toHaveLength(1);
+      grants[0]();
+      await flush();
+      a.send({
+        type: 'hello',
+        tabId: 'tab-a',
+        fingerprint: 'fp-test',
+        bucketId: 'user1',
+        visibility: 'visible',
+        heldLeadership: null,
+      });
+      await flush();
+      expect(a.ofType('become-leader').map((m) => m.leadershipId)).toEqual([1, 2]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('elects the only tab in its new bucket when it signs in alone', async () => {
+    const a = connectTab('tab-a');
+    await ackLeadership(a);
+    a.send({
+      type: 'hello',
+      tabId: 'tab-a',
+      fingerprint: 'fp-test',
+      bucketId: 'user1',
+      visibility: 'visible',
+      heldLeadership: null,
+    });
+    await flush();
+    expect(a.ofType('become-leader').map((m) => m.leadershipId)).toEqual([1, 2]);
+    await ackLeadership(a, 'user1');
+    // Still pinged in the new bucket, so the client's watchdog stays quiet.
+    const pings = a.ofType('ping').length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(a.ofType('ping').length).toBeGreaterThan(pings);
+  });
 });

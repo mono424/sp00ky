@@ -183,7 +183,12 @@ function clearLeader(
   if (tab && opts.demote) {
     post(tab.port, { type: 'demote', brokerInstanceId, leadershipId: leader.leadershipId });
   }
-  if (opts.removeTab && tab) removeTab(ns, leader.tabId, { notifyLeader: false });
+  // Its port stays open: the only caller is the tab-lock monitor, and a lock
+  // released is not always a dead tab. A leader that signs in or out drops
+  // its lock before re-helloing into the new bucket, and closing the port
+  // here swallowed that hello, leaving the tab roleless until its watchdog
+  // reconnected. A dead tab's port is gone anyway.
+  if (opts.removeTab && tab) removeTab(ns, leader.tabId, { notifyLeader: false, closePort: false });
   // Followers must drop their ports; new ones are minted after re-election.
   for (const t of ns.tabs.values()) {
     if (t.tabId !== leader.tabId) {
@@ -250,8 +255,9 @@ function failPromotion(
 /**
  * Fast crash detection: queue a Web Lock request on the leader's tab lock.
  * Locks release the instant their holder's tab dies, so being GRANTED means
- * the leader is gone; release immediately (return from the callback) and
- * re-elect. The leadershipId guard drops stale grants after a normal handoff.
+ * the leader is gone from this bucket (dead, or moved to another bucket on
+ * sign-in/out); release immediately (return from the callback) and re-elect.
+ * The leadershipId guard drops stale grants after a normal handoff.
  */
 function startTabLockMonitor(ns: Namespace, leadershipId: number): void {
   const locks = (navigator as { locks?: LockManager }).locks;
@@ -489,7 +495,6 @@ function handleTabMessage(port: MessagePort, msg: TabToBrokerMessage, ports: rea
       post(port, { type: 'unsupported', brokerInstanceId, reason: 'fingerprint-mismatch' });
       return;
     }
-    const ns = getNamespace(msg.fingerprint, msg.bucketId);
     // Drop stale state for this tab EVERYWHERE first. A re-hello is either a
     // reconnect (same namespace) or a bucket switch (leave old namespace,
     // join the new one); in both cases exactly one entry may remain, and if
@@ -498,6 +503,13 @@ function handleTabMessage(port: MessagePort, msg: TabToBrokerMessage, ports: rea
     for (const other of [...namespaces.values()]) {
       if (other.tabs.has(msg.tabId)) evictTab(other, msg.tabId, 'rehello', { closePort: false });
     }
+    // Only now look the namespace up: evicting the broker's last tab resets it
+    // as idle (all namespaces and the fingerprint dropped), and a namespace
+    // fetched before that would be orphaned, never pinged or found again. A
+    // lone tab signing in lost its leader that way until its watchdog
+    // reconnected.
+    canonicalFingerprint ??= msg.fingerprint;
+    const ns = getNamespace(msg.fingerprint, msg.bucketId);
     const tab: BrokerTab = {
       port,
       tabId: msg.tabId,

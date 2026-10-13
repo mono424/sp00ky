@@ -13,6 +13,8 @@ import type { ClientState, QueryEntry } from '../state/client-state';
 import { isAuthoritative } from '../state/lifecycle';
 import * as R from '../state/reducers';
 import { encodeRecordId } from '../utils/index';
+import { departedIds } from '../state/selectors';
+import { forgetDeparted } from './lifecycle.saga';
 import { planListRefPollChunks, recordVersionArraysEqual } from '../sync/policy';
 import type { SagaEnv } from './env';
 import { listRefTable } from './env';
@@ -86,6 +88,7 @@ export function* applyMembership(
   }
   const wasAuthoritative = isAuthoritative(entry.lifecycle);
   yield fx.state.update(R.commitMembership(hash, remoteArray, meta?.present ?? true));
+  yield* forgetDeparted(hash, departedIds(entry.remoteArray, remoteArray));
   if (!wasAuthoritative) yield fx.emit({ type: 'query:authority', hash, known: true });
   const now = (yield fx.now()) as number;
   try {
@@ -126,6 +129,7 @@ export function* applySubqueryChildren(hash: QueryHash, children: RecordVersionA
   const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
   if (!entry || recordVersionArraysEqual(entry.subqueryRemoteArray, children)) return;
   yield fx.state.update(R.setSubqueryRemoteArray(hash, children));
+  yield* forgetDeparted(hash, departedIds(entry.subqueryRemoteArray, children));
   if (entry.lifecycle.phase !== 'cold') {
     try {
       yield fx.local.upsert(sql.VIEW_TABLE, sql.viewRecordId(entry.def.viewKey), { children }, 'merge');

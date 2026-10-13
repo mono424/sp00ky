@@ -147,6 +147,40 @@ describe('applySubqueryChildren', () => {
   });
 });
 
+describe('rows the server takes out of a query', () => {
+  it('a child nothing else holds is forgotten locally and the query re-renders; a held one stays', async () => {
+    const s = buildState(
+      [
+        buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'live' }, remoteArray: [['t:1', 1]], subqueryRemoteArray: [['c:1', 1], ['c:9', 1]] }),
+        buildEntry({ def: { hash: 'b' }, lifecycle: { phase: 'live' }, remoteArray: [['c:9', 1]] }),
+      ],
+      R.setVersions([['t:1', 1], ['c:1', 1], ['c:9', 1]])
+    );
+    const out = await runPure(applySubqueryChildren('a', []), {
+      state: { ...s, dirty: new Set<string>() },
+      handlers: { 'local.upsert': () => undefined, 'local.delete': () => undefined, 'ssp.ingest': () => undefined },
+    });
+    expect(out.log.filter((e) => e.kind === 'local.delete')).toEqual([expect.objectContaining({ table: 'c', id: 'c:1' })]);
+    expect(out.log.find((e) => e.kind === 'ssp.ingest')).toEqual(
+      expect.objectContaining({ records: [{ table: 'c', op: 'DELETE', id: 'c:1', record: {} }] })
+    );
+    expect(out.state.versions.has('c:1')).toBe(false);
+    expect(out.state.versions.has('c:9')).toBe(true);
+    expect(out.state.dirty.has('a')).toBe(true);
+  });
+  it('a row with a pending local write is kept, and a follower tab never deletes', async () => {
+    const base = buildState(
+      [buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'live' }, remoteArray: [['t:1', 1]], subqueryRemoteArray: [['c:1', 1]] })],
+      R.setVersions([['t:1', 1], ['c:1', 1]])
+    );
+    const handlers = { 'local.upsert': () => undefined, 'local.delete': () => undefined, 'ssp.ingest': () => undefined };
+    const pending = { ...base, outbox: [buildOutboxItem({ recordId: 'c:1' })] };
+    expect((await runPure(applySubqueryChildren('a', []), { state: pending, handlers })).log.some((e) => e.kind === 'local.delete')).toBe(false);
+    const follower = { ...base, tabRole: 'follower' as const };
+    expect((await runPure(applySubqueryChildren('a', []), { state: follower, handlers })).log.some((e) => e.kind === 'local.delete')).toBe(false);
+  });
+});
+
 describe('readMembership', () => {
   const qid = (h: string) => new RecordId('_00_query', h);
   const out1 = (id: string, v = 1) => ({ out: new RecordId('thing', id), version: v });

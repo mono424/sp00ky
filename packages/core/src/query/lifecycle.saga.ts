@@ -5,7 +5,7 @@ import { ACK_GRACE_MS, GC_CHUNK, GC_INTERVAL_MS, TTL_HEARTBEAT_FRACTION, VIEW_RE
 import type { IngestRecord } from '../services/stream-processor/index';
 import type { ClientState, QueryEntry, TabRole } from '../state/client-state';
 import * as R from '../state/reducers';
-import { evictable, retained, shortestTtlMs } from '../state/selectors';
+import { activelyHeld, evictable, retained, shortestTtlMs } from '../state/selectors';
 import type { SagaEnv } from './env';
 import { parseViewIndex, type ViewIndexRow } from './membership';
 import * as sql from './sql';
@@ -123,6 +123,33 @@ export function* gcTick(): Saga<void> {
   } finally {
     yield fx.timer.set('gc', GC_INTERVAL_MS, { type: 'GcTick' });
   }
+}
+
+/**
+ * Forget rows the server just took out of `hash` (its membership or its
+ * subquery children) when nothing live still holds them: delete the local
+ * body and the in-browser circuit's copy, and re-render the query.
+ *
+ * Primary rows already stop rendering once they leave membership, but
+ * subquery children are rendered from the local store (a thread's comments
+ * are read back by the relation), so a comment deleted on another device
+ * stayed on screen until the hourly GC or a reload. Only a leader or solo tab
+ * deletes, and a leader relays it to its followers, as the GC does.
+ */
+export function* forgetDeparted(hash: string, departed: string[]): Saga<void> {
+  if (departed.length === 0) return;
+  const [gone, role] = (yield fx.state.read((s) => {
+    const held = activelyHeld(s);
+    return [departed.filter((id) => !id.startsWith('_00_') && s.versions.has(id) && !held.has(id)), s.tabRole];
+  })) as [string[], TabRole];
+  if (gone.length === 0 || role === 'follower') return;
+  const settled = (yield fx.all(gone.map((id) => fx.local.delete(tableOf(id), id)))) as Settled[];
+  const done = gone.filter((_, j) => settled[j].ok);
+  if (done.length === 0) return;
+  const records: IngestRecord[] = done.map((id) => ({ table: tableOf(id), op: 'DELETE', id, record: {} }));
+  yield fx.state.update(R.compose(R.deleteVersions(done), R.markDirty([hash])));
+  yield fx.ssp.ingest(records);
+  if (role === 'leader') yield fx.emit({ type: 'tabs:broadcast', message: { type: 'ingest', records } });
 }
 
 /**

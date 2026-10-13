@@ -79,6 +79,30 @@ export function retained(s: ClientState): (id: string) => boolean {
   return (id) => id.startsWith('_00_') || known.has(id) || held.has(id);
 }
 
+/**
+ * Ids something live still needs: a mounted query's membership or subquery
+ * children, or a local write not yet settled. Unlike `retained`, durable view
+ * rows of queries nobody runs right now do not count: a row the server just
+ * took out of a live query must stop showing even if an old view named it.
+ */
+export function activelyHeld(s: ClientState): ReadonlySet<string> {
+  const held = new Set<string>();
+  for (const e of s.queries.values()) {
+    for (const [id] of e.remoteArray) held.add(id);
+    for (const [id] of e.subqueryRemoteArray) held.add(id);
+  }
+  for (const item of s.outbox) held.add(item.recordId);
+  for (const write of s.pendingWrites.values()) held.add(write.recordId);
+  return held;
+}
+
+/** Ids of `before` that `after` no longer names. */
+export function departedIds(before: RecordVersionArray, after: RecordVersionArray): string[] {
+  if (before.length === 0) return [];
+  const kept = new Set(after.map(([id]) => id));
+  return before.filter(([id]) => !kept.has(id)).map(([id]) => id);
+}
+
 export const pendingDeleteIds = (s: ClientState): ReadonlySet<string> =>
   new Set(s.outbox.filter((i) => i.type === 'delete').map((i) => i.recordId));
 

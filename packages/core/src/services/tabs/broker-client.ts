@@ -62,7 +62,8 @@ export class TabBrokerClient {
   private helloState: BrokerHello | null = null;
 
   constructor(
-    private workerUrl: URL,
+    /** Starts (or joins) the broker SharedWorker. */
+    private createWorker: () => SharedWorker,
     readonly tabId: TabId,
     private events: BrokerClientEvents,
     private logger: Logger
@@ -88,7 +89,7 @@ export class TabBrokerClient {
       };
       let worker: SharedWorker;
       try {
-        worker = new SharedWorker(this.workerUrl, { type: 'module', name: 'sp00ky-tabs-broker' });
+        worker = this.createWorker();
       } catch (e) {
         reject(e);
         return;

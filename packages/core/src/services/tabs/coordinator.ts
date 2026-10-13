@@ -253,11 +253,19 @@ export class TabsCoordinator {
   ) {
     this.fingerprint = deps.fingerprint;
     this.bucketId = 'anon';
-    // The URL is built HERE (same directory as the worker source) so the
-    // published flat bundle's rewritten './tabs-broker-worker.js' resolves at
-    // the dist top level, exactly like the sqlite worker URL does.
+    // The worker is created HERE (same directory as its source) and in this
+    // exact shape, `new SharedWorker(new URL('./x.ts', import.meta.url))`:
+    // the published flat bundle rewrites the name to './tabs-broker-worker.js'
+    // at the dist top level, like the sqlite worker, and a bundler that builds
+    // core from source (Vite) only compiles a worker written in one expression.
+    // Passing the URL around instead shipped the raw `.ts` file there, which no
+    // browser runs, so every tab fell back to running alone.
     this.broker = new TabBrokerClient(
-      new URL('./tabs-broker-worker.ts', import.meta.url),
+      () =>
+        new SharedWorker(new URL('./tabs-broker-worker.ts', import.meta.url), {
+          type: 'module',
+          name: 'sp00ky-tabs-broker',
+        }),
       deps.tabId,
       {
         onBecomeLeader: (msg) => this.enqueue(() => this.promote(msg)),

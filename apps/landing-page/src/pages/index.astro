@@ -12,7 +12,7 @@ import SiteFooter from '../components/SiteFooter.astro';
 import SyncArchitecture from '../components/SyncArchitecture.astro';
 import { ScrollRevealText } from '../components/ScrollRevealText';
 import NewsletterSignup from '../components/NewsletterSignup';
-import { basePath } from '../config/nav';
+import { basePath, DEMO_URL } from '../config/nav';
 
 const mobileHeroWidths = [480, 768, 940];
 const mobileHeroSources = await Promise.all(
@@ -166,12 +166,14 @@ const mobileHeroSources = await Promise.all(
             <div class="flex flex-col md:flex-row items-stretch min-h-[200px]">
               <div class="relative z-10 flex flex-col justify-between p-8 md:p-10 md:w-[45%]">
                 <div>
-                  <h3 class="text-xl font-semibold text-white/90 mb-2">Experimental Demo</h3>
-                  <p class="text-sm text-white/40 leading-relaxed max-w-[260px]">
-                    Explore a live app built with sp00ky. Powered by CRDTs, file buckets, and real-time sync.
+                  <p class="text-[11px] font-mono uppercase tracking-[0.25em] text-white/35 mb-3">Live demo</p>
+                  <h3 class="text-xl font-semibold text-white/90 mb-2">sp00ky threads</h3>
+                  <p class="text-sm text-white/40 leading-relaxed max-w-[280px]">
+                    A live app built with sp00ky: threads, comments and a collaborative editor, synced in real time
+                    across tabs and devices. Powered by CRDTs, file buckets and local-first sync.
                   </p>
                 </div>
-                <div class="mt-6">
+                <div class="mt-6 flex flex-wrap items-center gap-4">
                   <span class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white/70 rounded-lg border border-white/[0.1] bg-white/[0.04] group-hover:bg-white/[0.08] group-hover:text-white group-hover:border-white/[0.18] transition-all duration-300">
                     Try it now
                     <svg
@@ -184,6 +186,14 @@ const mobileHeroSources = await Promise.all(
                       <path stroke-linecap="round" stroke-linejoin="round" d="M7 17L17 7M17 7H7M17 7v10"></path>
                     </svg>
                   </span>
+                  <a
+                    href={DEMO_URL}
+                    target="_blank"
+                    rel="noopener"
+                    class="text-sm text-white/45 hover:text-white underline decoration-white/20 underline-offset-4 transition-colors duration-300"
+                  >
+                    Open in a new tab
+                  </a>
                 </div>
               </div>
               <div class="relative flex-1 min-h-[160px] md:min-h-0">
@@ -370,10 +380,21 @@ const mobileHeroSources = await Promise.all(
     <SiteFooter />
 
     <!-- Try Out Now fullscreen iframe overlay -->
-    <div id="tryout-overlay" class="fixed inset-0 z-[100] hidden">
+    <div id="tryout-overlay" class="fixed inset-0 z-[100] hidden" data-demo-url={DEMO_URL}>
       <div class="absolute inset-0 bg-black/80 backdrop-blur-sm" id="tryout-backdrop"></div>
       <div class="relative z-10 flex flex-col w-full h-full p-3 md:p-6">
-        <div class="flex justify-end mb-2">
+        <div class="flex justify-end items-center gap-2 mb-2">
+          <a
+            href={DEMO_URL}
+            target="_blank"
+            rel="noopener"
+            class="flex items-center gap-2 px-4 py-2 text-sm font-medium text-text-tertiary hover:text-white bg-white/10 hover:bg-white/20 rounded-lg transition-all duration-200"
+          >
+            <span>Open in new tab</span>
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 17L17 7M17 7H7M17 7v10"></path>
+            </svg>
+          </a>
           <button
             id="tryout-close"
             class="flex items-center gap-2 px-4 py-2 text-sm font-medium text-text-tertiary hover:text-white bg-white/10 hover:bg-white/20 rounded-lg transition-all duration-200"
@@ -388,7 +409,7 @@ const mobileHeroSources = await Promise.all(
         <iframe
           id="tryout-iframe"
           class="flex-1 w-full rounded-xl border border-white/10 bg-black"
-          title="sp00ky Demo"
+          title="sp00ky threads, live demo"
           allowfullscreen
         ></iframe>
         <!-- Shown instead of the iframe while the demo host is unreachable. A
@@ -435,16 +456,15 @@ const mobileHeroSources = await Promise.all(
 
       // Try sp00ky overlay
       //
-      // The demo host is named once, here. `DEMO_ENABLED` is the switch to flip
-      // when the demo cannot be embedded — currently Cloudflare serves a
-      // "Suspected Phishing" interstitial for this hostname, so embedding it
-      // would show every visitor a security warning inside our own page. Flip
-      // back to true once that clears (or once the demo moves to a hostname
-      // with real reputation, which is the durable fix).
-      const DEMO_URL = 'https://threads-example.stg.spky.cloud/';
-      const DEMO_ENABLED = false;
+      // The demo URL comes from `DEMO_URL` in config/nav.ts (`data-demo-url`).
+      // `DEMO_ENABLED` is the switch to flip when the demo cannot be embedded,
+      // for instance if Cloudflare serves a "Suspected Phishing" interstitial
+      // for its hostname again (it did for threads.stg.spky.cloud): embedding
+      // it would show every visitor a security warning inside our own page.
+      const DEMO_ENABLED = true;
 
       const overlay = document.getElementById('tryout-overlay');
+      const DEMO_URL = overlay?.dataset.demoUrl ?? '';
       const iframe = document.getElementById('tryout-iframe') as HTMLIFrameElement;
       const unavailable = document.getElementById('tryout-unavailable');
       const closeBtn = document.getElementById('tryout-close');
@@ -473,7 +493,11 @@ const mobileHeroSources = await Promise.all(
       }
 
       document.querySelectorAll('.try-out-btn').forEach((btn) => {
-        btn.addEventListener('click', openTryout);
+        btn.addEventListener('click', (e) => {
+          // The card's own "Open in a new tab" link opens the demo directly.
+          if ((e.target as HTMLElement).closest('a')) return;
+          openTryout();
+        });
       });
 
       closeBtn?.addEventListener('click', closeTryout);

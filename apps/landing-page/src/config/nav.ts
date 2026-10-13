@@ -1,5 +1,8 @@
 export const basePath = process.env.ASTRO_BASE_PATH || '';
 
+/** The live demo, sp00ky threads (the `example/` app). */
+export const DEMO_URL = 'https://threads-example.stg.spky.cloud/';
+
 /**
  * Sidebar structure, ordered the way a developer learns the product: what it is,
  * how to run it, what to model, what to build, then how to ship and operate it.

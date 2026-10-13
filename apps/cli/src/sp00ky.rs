@@ -291,18 +291,16 @@ pub fn generate_sp00ky_events(
             let field_def = table.fields.get(field_name).unwrap();
             // Skip fields whose value must never enter the sync machinery.
             //
-            // `@crdt`: the value is a raw LoroDoc snapshot (TYPE bytes) and JSON
-            // has no native bytes encoding, so SurrealDB's http::post would
-            // either drop the field or shape-shift it depending on transport.
             // `@nosync`: server-only, also absent from the client schema.
             // `@opaque`: synced to the client (which reads it straight from
             // SurrealDB) but deliberately not held server-side.
             //
-            // In all three cases the SSP's job is membership tracking, not
-            // content storage, so omitting them keeps the payload clean and
-            // saves bandwidth on every keystroke debounce push.
+            // In both cases the SSP's job is membership tracking, not content
+            // storage, so omitting them keeps the payload clean. (A `@crdt`
+            // field is plain text the server writes, and syncs like any other
+            // unless it is also `@opaque`.)
             //
-            // The same three classes get `COMMENT 'sp00ky:opaque'` baked onto
+            // The same classes get `COMMENT 'sp00ky:opaque'` baked onto
             // their DEFINE FIELD (see `schema_builder::add_opaque_field_markers`),
             // which is what makes the scheduler replica and the SSP bootstrap
             // scan omit them too. Both halves are required: skipping here while
@@ -358,9 +356,8 @@ pub fn generate_sp00ky_events(
 
         // --- Versioning Logic ---
         events.push_str("    DELETE _00_version WHERE record_id = $before.id;\n\n");
-        // CRDT and cursor state live inline on the parent row itself, so
-        // there is no sidecar table to clean up here — the row deletion
-        // takes the snapshot with it.
+        // `@crdt` documents are cleaned up by their own `_00_crdt_cleanup`
+        // event (see crdt_schema.rs), log and presence rows by the SSP sweep.
 
         // --- Ingestion Logic ---
         events.push_str("    LET $plain_before = {\n");

@@ -179,7 +179,7 @@ pub mod view {
     }
 
     /// Fail registration when the plan would evaluate a field the circuit does
-    /// not hold (`sp00ky:opaque`: `-- @nosync`, `-- @crdt`, `-- @opaque`).
+    /// not hold (`sp00ky:opaque`: `-- @nosync`, `-- @opaque`).
     ///
     /// Failing loudly here is the whole point. The alternative is not "the query
     /// doesn't work" but "the query returns nothing, forever, with no error":
@@ -201,7 +201,7 @@ pub mod view {
             {
                 return Err(anyhow!(
                     "Field '{table}.{field}' cannot be used in WHERE, ORDER BY, a join, \
-                     or a table permission: it is marked @opaque/@nosync/@crdt, so the sync \
+                     or a table permission: it is marked @opaque/@nosync, so the sync \
                      engine never stores its value and any comparison against it would \
                      silently match nothing"
                 ));

@@ -1395,7 +1395,7 @@ impl CodeGenerator {
             // and has no $session / $auth context to scope against, so blanket
             // `WHERE true` is correct here. The server schema preserves real
             // permissions — see meta_tables_remote.surql for inheritance rules
-            // (e.g. _00_crdt / _00_version follow the linked record's perms).
+            // (e.g. _00_version follows the linked record's perms).
             if trimmed.to_uppercase().starts_with("PERMISSIONS") {
                 let perms = if def_type == "TABLE" {
                     "PERMISSIONS FOR select, create, update, delete WHERE true"

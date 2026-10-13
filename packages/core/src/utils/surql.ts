@@ -120,10 +120,9 @@ export const surql: SurqlHelper = {
     return `UPSERT ONLY $${idVar} REPLACE $${dataVar}`;
   },
 
-  // Use this for sync-down ingestion: the remote payload omits local-only
-  // fields injected by the CLI's local-schema setup (`_00_crdt`,
-  // `_00_cursor`), and REPLACE would wipe them on every round-trip and
-  // break offline reload of CRDT state.
+  // Use this for sync-down ingestion: the remote payload can omit local-only
+  // fields injected by the CLI's local-schema setup, and REPLACE would wipe
+  // them on every round-trip.
   upsertMerge(idVar: string, dataVar: string) {
     return `UPSERT ONLY $${idVar} MERGE $${dataVar}`;
   },

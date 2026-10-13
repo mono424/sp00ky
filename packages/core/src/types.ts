@@ -259,11 +259,11 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
   streamDebounceTime?: number;
   /**
    * Debounce time in milliseconds for syncing collaborative (CRDT) field
-   * changes to the remote database. Local writes happen immediately on
-   * every keystroke (so reload/offline works), but the remote UPSERT is
-   * coalesced over this window. Lower = snappier remote propagation +
-   * more network traffic; higher = less traffic + more lag for other
-   * collaborators. Defaults to 500ms.
+   * edits to the server. Local state is kept on every change (so reload and
+   * offline work), but a field's own new ops go out as one edit-log row per
+   * pause of this length (at most 2 s apart while typing continues).
+   * Lower = snappier propagation and more rows; higher = fewer rows and more
+   * lag for other collaborators. Defaults to 300ms.
    */
   crdtDebounceMs?: number;
   /**

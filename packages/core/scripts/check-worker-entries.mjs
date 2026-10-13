@@ -23,6 +23,7 @@ const ENTRIES = ['pure.js', 'live.js', 'sw.js'];
 const FORBIDDEN_IMPORTS = [
   '@spooky-sync/ssp-wasm',
   '@surrealdb/wasm',
+  '@surrealdb/wasm-native',
   '@sqlite.org/sqlite-wasm',
   'loro-crdt',
   'pino',

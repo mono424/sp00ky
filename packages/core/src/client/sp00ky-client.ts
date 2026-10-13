@@ -223,7 +223,13 @@ export class Sp00kyClient<S extends SchemaStructure> {
     const receiver: StreamUpdateReceiver = { onStreamUpdate: (update) => void this.runtime.dispatch({ type: 'StreamUpdate', update }) };
     s.streamProcessor.addReceiver(receiver);
     s.connectionSupervisor.subscribe((state) => void this.runtime.dispatch({ type: 'ConnectionChanged', state }));
-    s.auth.subscribe((userId) => void this.runtime.dispatch({ type: 'AuthFlip', userId }));
+    // Changes only. The immediate answer here is always "signed out" (nothing
+    // is restored before `init()`), and boot owns the first identity: it opens
+    // the bucket the hint names and announces the restored session itself. As
+    // a flip, that answer switched to the anon bucket while boot was still
+    // opening the user's, so two clients provisioned at once, boot failed, and
+    // a persistent store never got past the provider's fallback on reload.
+    s.auth.subscribe((userId) => void this.runtime.dispatch({ type: 'AuthFlip', userId }), { immediate: false });
     // Whoever is looking at the page should be able to tell, and leave. The
     // app can restyle this, replace it (`mode: 'custom'`, with a fallback if
     // its own never renders) or take the job over entirely (`mode: 'none'`).

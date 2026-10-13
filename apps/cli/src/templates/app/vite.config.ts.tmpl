@@ -10,7 +10,7 @@ export default defineConfig({
     target: 'esnext',
   },
   optimizeDeps: {
-    exclude: ['@surrealdb/wasm', '@spooky-sync/ssp-wasm'],
+    exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@spooky-sync/ssp-wasm'],
     esbuildOptions: {
       target: 'esnext',
     },

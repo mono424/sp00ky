@@ -45,7 +45,7 @@
   "dependencies": {
     "@spooky-sync/query-builder": "workspace:*",
     "@spooky-sync/core": "workspace:*",
-    "@surrealdb/wasm": "^3.0.3",
+    "@surrealdb/wasm": "^3.1.0",
     "surrealdb": "2.1.0"
   },
   "peerDependencies": {

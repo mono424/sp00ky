@@ -78,6 +78,41 @@ describe('Sp00kyClient facade', () => {
     expect(client.liveRetryCount).toBe(0);
   });
 
+  it('a warm boot opens the hinted bucket alone; no anon switch races it', async () => {
+    // A reload of a signed-in tab: the hint names the user's bucket and the
+    // store takes a while to open (IndexedDB). The auth service's signed-out
+    // answer at construction used to dispatch a flip to anon, which switched
+    // stores and provisioned while boot was still connecting.
+    let bucket = 'anon';
+    let opened!: () => void;
+    const { client, a, services } = makeClient({
+      services: {
+        'local.connect': (id: string) => {
+          bucket = id;
+          return new Promise<void>((r) => (opened = r));
+        },
+        'local.currentBucketId': () => bucket,
+        'local.beginSwitch': () => () => {},
+        'local.switchStore': async (id: string) => void (bucket = id),
+      },
+    });
+    const init = client.init();
+    await flush();
+    opened();
+    await init;
+    await flush();
+    expect(a.calls.filter(([n]) => n === 'service.local.connect').map(([, args]) => args)).toEqual([['u1']]);
+    expect(a.names()).not.toContain('service.local.beginSwitch');
+    expect(a.names()).not.toContain('service.local.switchStore');
+    expect(a.names()).not.toContain('service.hint.write');
+    expect(client.state.bucketId).toBe('u1');
+
+    // A real auth change still flips.
+    services.authListeners.forEach((cb) => cb(null));
+    await flush();
+    expect(a.calls.filter(([n]) => n === 'service.local.switchStore').map(([, args]) => args)).toEqual([['anon']]);
+  });
+
   it('queryRaw registers locally and returns the hash before any remote work; subscribers paint from the local store', async () => {
     // Boot loads the view index: `thing:1` is vouched for, `thing:2` is an orphan and stays hidden.
     const stored = (sql: string) =>

@@ -370,8 +370,8 @@ importers:
         specifier: workspace:*
         version: link:../query-builder
       '@surrealdb/wasm':
-        specifier: ^3.0.3
-        version: 3.0.3(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))
+        specifier: ^3.1.0
+        version: 3.1.0(@surrealdb/wasm-native@3.3.4)(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))
       surrealdb:
         specifier: 2.1.0
         version: 2.1.0(tslib@2.8.1)(typescript@5.9.3)
@@ -404,8 +404,8 @@ importers:
         specifier: workspace:*
         version: link:../query-builder
       '@surrealdb/wasm':
-        specifier: ^3.0.3
-        version: 3.0.3(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))
+        specifier: ^3.1.0
+        version: 3.1.0(@surrealdb/wasm-native@3.3.4)(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))
       surrealdb:
         specifier: 2.1.0
         version: 2.1.0(tslib@2.8.1)(typescript@5.9.3)
@@ -456,8 +456,11 @@ importers:
         specifier: 3.53.0-build1
         version: 3.53.0-build1
       '@surrealdb/wasm':
-        specifier: ^3.0.3
-        version: 3.0.3(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))
+        specifier: ^3.1.0
+        version: 3.1.0(@surrealdb/wasm-native@3.3.4)(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))
+      '@surrealdb/wasm-native':
+        specifier: ^3.3.4
+        version: 3.3.4
       blurhash:
         specifier: ^2.0.5
         version: 2.0.5
@@ -2836,9 +2839,13 @@ packages:
       tslib: ^2.6.3
       typescript: ^5.0.0
 
-  '@surrealdb/wasm@3.0.3':
-    resolution: {integrity: sha512-7tUOiQB2eZY80oNKfLvwqZLgANun04ubKXqfanAZmAnwJMB/nKetk7eh6dRd+PFzmLla1Ns2m6Fku+H/DSFjbA==}
+  '@surrealdb/wasm-native@3.3.4':
+    resolution: {integrity: sha512-amTace/Ez3wj/QA9re/wFIs5CcscO0OzWWg3bMkjujMpuhE898/1lf6gB02nOAq0Lv5Q+g7upo8ZB3rkO69K4w==}
+
+  '@surrealdb/wasm@3.1.0':
+    resolution: {integrity: sha512-7NsLFO48K0GQ+FnAdqkvjMUYUdhmN2UWciqgQdsVdLHhDf0QmResckg7sDsFDuOq38rKQMWRr0T7QDmMPC12CQ==}
     peerDependencies:
+      '@surrealdb/wasm-native': ^3.3.0-beta.3
       surrealdb: ^2.0.1
 
   '@swc/core-darwin-arm64@1.15.30':
@@ -11046,8 +11053,11 @@ snapshots:
       typescript: 5.9.3
       uuidv7: 1.0.2
 
-  '@surrealdb/wasm@3.0.3(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))':
+  '@surrealdb/wasm-native@3.3.4': {}
+
+  '@surrealdb/wasm@3.1.0(@surrealdb/wasm-native@3.3.4)(surrealdb@2.1.0(tslib@2.8.1)(typescript@5.9.3))':
     dependencies:
+      '@surrealdb/wasm-native': 3.3.4
       surrealdb: 2.1.0(tslib@2.8.1)(typescript@5.9.3)
 
   '@swc/core-darwin-arm64@1.15.30':

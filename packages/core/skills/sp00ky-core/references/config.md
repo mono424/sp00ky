@@ -9,7 +9,7 @@ interface Sp00kyConfig<S extends SchemaStructure> {
     namespace: string;
     /** SurrealDB database name */
     database: string;
-    /** Local store type: 'memory' (transient) or 'indexeddb' (persistent) */
+    /** Local store type: 'memory' (transient, default) or 'indexeddb' (persistent) */
     store?: 'memory' | 'indexeddb';
     /** Authentication token */
     token?: string;

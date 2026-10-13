@@ -56,6 +56,20 @@ describe('restoreSessionFromToken', () => {
     expect(seen).toContain('user:abc');
   });
 
+  it('reports only changes to a subscriber that opts out of the immediate call', async () => {
+    const { auth } = makeAuth({ token: jwt({ AC: 'account', ID: 'user:abc' }) });
+    const all: (string | null)[] = [];
+    const changes: (string | null)[] = [];
+    auth.subscribe((uid) => all.push(uid));
+    auth.subscribe((uid) => changes.push(uid), { immediate: false });
+    expect(all).toEqual([null]);
+    expect(changes).toEqual([]);
+
+    await auth.restoreSessionFromToken();
+
+    expect(changes).toEqual(['user:abc']);
+  });
+
   it('returns null when there is no token, and when the token carries no id', async () => {
     expect(await makeAuth().auth.restoreSessionFromToken()).toBeNull();
     const noId = makeAuth({ token: jwt({ AC: 'account' }) });

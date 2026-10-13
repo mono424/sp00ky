@@ -150,10 +150,10 @@ export class AuthService<S extends SchemaStructure> {
   /**
    * Subscribe to auth state changes.
    * callback is called immediately with current value and whenever validation status changes.
+   * `immediate: false` skips that first call: only changes are reported.
    */
-  subscribe(cb: (userId: string | null) => void): () => void {
-    // Immediate callback
-    cb(this.announcedUserId());
+  subscribe(cb: (userId: string | null) => void, opts: { immediate?: boolean } = {}): () => void {
+    if (opts.immediate !== false) cb(this.announcedUserId());
 
     const id = this.events.subscribe(AuthEventTypes.AuthStateChanged, (event) => {
       cb(event.payload);

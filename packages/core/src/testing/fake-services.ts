@@ -38,7 +38,22 @@ export function fakeServiceBundle<S extends SchemaStructure>(over: Partial<Servi
     streamProcessor: { addReceiver: (r: unknown) => void receivers.push(r), checkpoint: async () => undefined, dispose: noop } as any,
     migrator: {} as any,
     crdt: { attach: noop, setSessionId: noop, closeAll: noop, dispose: noop, open: async () => 'field', close: async () => {} } as any,
-    auth: { subscribe: (cb: (u: string | null) => void) => (authListeners.push(cb), noop), subscribeImpersonation: () => noop, onBeforeSignOut: () => noop, currentUser: null, isAuthenticated: false, token: null, impersonation: null, eventSystem: { subscribe: noop } } as any,
+    // Mirrors `AuthService.subscribe`: the current (signed-out) identity at
+    // once unless the subscriber opts out, then every change.
+    auth: {
+      subscribe: (cb: (u: string | null) => void, opts: { immediate?: boolean } = {}) => {
+        if (opts.immediate !== false) cb(null);
+        authListeners.push(cb);
+        return noop;
+      },
+      subscribeImpersonation: () => noop,
+      onBeforeSignOut: () => noop,
+      currentUser: null,
+      isAuthenticated: false,
+      token: null,
+      impersonation: null,
+      eventSystem: { subscribe: noop },
+    } as any,
     tabs: null,
     tabsUnsupportedReason: 'test',
     tabId: 'tab-test',

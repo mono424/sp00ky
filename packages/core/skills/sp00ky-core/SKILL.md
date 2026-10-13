@@ -47,7 +47,7 @@ See [references/config.md](references/config.md) for all configuration options.
 Key fields:
 - `database.endpoint` — SurrealDB WebSocket URL
 - `database.namespace` / `database.database` — SurrealDB namespace and database
-- `database.store` — `'indexeddb'` (persistent) or `'memory'` (transient)
+- `database.store` — `'memory'` (transient, the default) or `'indexeddb'` (persistent; needs `@surrealdb/wasm` >= 3.1.0, and Vite apps exclude `@surrealdb/wasm-native` from `optimizeDeps`)
 - `schema` — The `SchemaStructure` object (use `as const satisfies SchemaStructure`)
 - `schemaSurql` — The compiled SURQL schema string for local DB provisioning
 - `logLevel` — `'debug' | 'info' | 'warn' | 'error'`

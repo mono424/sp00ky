@@ -124,8 +124,8 @@ Set `database.store` in your [client config](/docs/reference/client-config):
 
 | Store | Behaviour |
 | --- | --- |
-| `indexeddb` | Survives reloads. What you want in production. |
-| `memory` | Cleared on refresh. Good for tests and ephemeral views. |
+| `indexeddb` | Survives reloads. What you want in production. Needs `@surrealdb/wasm` 3.1+ ([details](/docs/reference/client-config#databasestore)). |
+| `memory` | The default. Cleared on refresh. Good for tests and ephemeral views. |
 
 Reads hit this store first, so a returning user sees their data on the first frame, before any
 network round trip completes.

@@ -87,6 +87,16 @@ export abstract class AbstractDatabaseService {
   }
 
   /**
+   * Resolve once every statement issued before this call has settled: take
+   * every slot (FIFO, so earlier statements go first), then hand them back.
+   * Bounded by {@link queryTimeoutMs}, like the statements it waits on.
+   */
+  protected async drainStatements(): Promise<void> {
+    for (let i = 0; i < this.maxConcurrentQueries; i++) await this.acquireQuerySlot();
+    for (let i = 0; i < this.maxConcurrentQueries; i++) this.releaseQuerySlot();
+  }
+
+  /**
    * Hook run right before a statement is sent, inside its slot. The remote
    * service uses it to hold statements while a connect is in flight, so a
    * query never runs on a socket that is open but has not had its namespace

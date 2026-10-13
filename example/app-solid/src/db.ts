@@ -15,7 +15,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
     namespace: import.meta.env.VITE_DB_NS || 'main',
     database: import.meta.env.VITE_DB_DB || 'example',
     endpoint: import.meta.env.VITE_DB_ENDPOINT || 'ws://localhost:8666/rpc',
-    store: 'memory',
+    store: 'indexeddb',
     persistenceClient: 'localstorage',
   },
 };

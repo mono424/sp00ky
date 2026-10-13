@@ -104,6 +104,8 @@ export class LocalDatabaseService extends AbstractDatabaseService {
   private gate: Promise<void> = Promise.resolve();
   /** The incoming client while a switch is in flight (for unload cleanup). */
   private pendingSwitchClient: Surreal | null = null;
+  /** The open `connect()` started, until it settles. */
+  private opening: Promise<void> | null = null;
 
   constructor(config: Sp00kyConfig<any>['database'], logger: Logger) {
     const events = createDatabaseEventSystem();
@@ -176,6 +178,16 @@ export class LocalDatabaseService extends AbstractDatabaseService {
   }
 
   async connect(bucketId: string = ANON_USER_ID): Promise<void> {
+    const opening = this.openBucket(bucketId);
+    this.opening = opening;
+    try {
+      await opening;
+    } finally {
+      if (this.opening === opening) this.opening = null;
+    }
+  }
+
+  private async openBucket(bucketId: string): Promise<void> {
     const { namespace, database } = this.getConfig();
     const store = this.getConfig().store ?? 'memory';
     this.bucketId = bucketId;
@@ -201,9 +213,16 @@ export class LocalDatabaseService extends AbstractDatabaseService {
    * async chains can detect they're stale.
    *
    * Callers own the drain/rebind choreography (close the gate, quiesce sync +
-   * timers BEFORE calling this; re-provision + rebind AFTER).
+   * timers BEFORE calling this; re-provision + rebind AFTER). Statements that
+   * passed the gate before it closed are let finish before the old client
+   * closes: the engine streams results from its worker, and a client closed
+   * under a statement leaves that statement pending until its deadline, with
+   * every later local statement queued behind it.
    */
   async switchStore(bucketId: string): Promise<void> {
+    // Never overlap the boot open: the switch would close the client `connect`
+    // is still opening, and both would provision a store at once.
+    if (this.opening) await this.opening.catch(() => {});
     if (bucketId === this.bucketId) return;
     const { namespace, database } = this.getConfig();
     const store = this.getConfig().store ?? 'memory';
@@ -212,6 +231,7 @@ export class LocalDatabaseService extends AbstractDatabaseService {
     if (store === 'memory') {
       // mem:// has no per-user persistence; close + reopen the same client
       // yields a fresh empty store, which is exactly the reset we want.
+      await this.drainStatements();
       try {
         await this.client.close();
       } catch {
@@ -241,6 +261,7 @@ export class LocalDatabaseService extends AbstractDatabaseService {
       this.pendingSwitchClient = null;
     }
 
+    await this.drainStatements();
     const old = this.client;
     this.client = next;
     this.bucketId = bucketId;

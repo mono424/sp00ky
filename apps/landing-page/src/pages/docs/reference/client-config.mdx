@@ -30,8 +30,8 @@ The WebSocket URL for your **SurrealDB** instance (e.g., `ws://localhost:8666/rp
 
 #### `database.store`
 
-- `'indexeddb'` (default): Persistent local storage in the browser
-- `'memory'`: Transient in-memory storage (clears on page reload)
+- `'memory'` (default): Transient in-memory storage (clears on page reload)
+- `'indexeddb'`: Persistent local storage in the browser
 
 With `'indexeddb'`, the local store is **bucketed per user**: each account
 gets its own IndexedDB database (`sp00ky-<userId>`, with a shared
@@ -42,6 +42,21 @@ a user's un-pushed offline mutations resume the next time they sign in. See
 [Architecture → Per-User Local Buckets](/docs/reference/architecture#per-user-local-buckets).
 With `'memory'`, an auth change resets the store instead (same isolation,
 no persistence).
+
+`'indexeddb'` on the default SurrealDB engine needs `@surrealdb/wasm` 3.1.0
+or later (the version `@spooky-sync/core` installs). The 3.0.x engine opened
+the store but failed every write with `An IndexedDB error occured: idb error`,
+so each session quietly ran in memory. From 3.1.0 the engine itself ships as
+`@surrealdb/wasm-native`; with Vite, exclude it from dependency pre-bundling
+next to `@surrealdb/wasm`, or the dev server serves `index.html` where the
+`.wasm` file should be:
+
+<CodeBlock code={viteExcludeCode} lang="typescript" fileName="vite.config.ts" />
+
+If a store cannot be opened even after the client drops and recreates it, the
+session runs in memory and logs `falling back to in-memory` at error level;
+the next load tries IndexedDB again. Under `localEngine: 'sqlite'`,
+`'indexeddb'` selects the OPFS-backed SQLite store instead.
 
 #### `logLevel`
 
@@ -180,7 +195,7 @@ export const code2 = `interface SyncedDbConfig<Schema> {
     /** The database name */
     database: string;
 
-    /** The local store type implementation */
+    /** The local store: 'memory' (default) or 'indexeddb' (persistent) */
     store?: 'memory' | 'indexeddb';
 
     /** Authentication token (optional) */
@@ -245,3 +260,9 @@ const dbConfig: SyncedDbConfig<typeof schema> = {
 };
 
 export const db = new SyncedDb<typeof schema>(dbConfig);`;
+
+export const viteExcludeCode = `export default defineConfig({
+  optimizeDeps: {
+    exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@spooky-sync/ssp-wasm'],
+  },
+});`;

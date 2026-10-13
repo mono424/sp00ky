@@ -62,3 +62,89 @@ describe('matchesBucketStore', () => {
     expect(matchesBucketStore('sp00ky', 'sp00ky-anon')).toBe(false);
   });
 });
+
+// A bucket switch that lands while the boot open is still in flight (a reload
+// of a signed-in tab, with IndexedDB slow to open) must wait for it. Run
+// concurrently, the switch closed the client `connect` was opening and both
+// provisioned a store at once, so boot never finished.
+import { vi } from 'vitest';
+import { Surreal } from 'surrealdb';
+import { LocalDatabaseService } from './local';
+
+vi.mock('@surrealdb/wasm', () => ({ createWasmWorkerEngines: () => ({}) }));
+
+describe('LocalDatabaseService open and switch', () => {
+  it('a switch waits for the in-flight connect instead of closing the client it opens', async () => {
+    const opens: Array<{ url: string; done: () => void }> = [];
+    const closed: string[] = [];
+    const urlOf = new WeakMap<object, string>();
+    vi.spyOn(Surreal.prototype, 'connect').mockImplementation(function (this: Surreal, url: string | URL) {
+      urlOf.set(this, String(url));
+      return new Promise<true>((resolve) => opens.push({ url: String(url), done: () => resolve(true) }));
+    });
+    vi.spyOn(Surreal.prototype, 'use').mockResolvedValue({});
+    vi.spyOn(Surreal.prototype, 'close').mockImplementation(async function (this: Surreal) {
+      closed.push(urlOf.get(this) ?? 'placeholder');
+      return true as const;
+    });
+    const logger: any = { trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    logger.child = () => logger;
+    const local = new LocalDatabaseService({ namespace: 'n', database: 'd', store: 'indexeddb' } as any, logger);
+
+    const booting = local.connect('u1');
+    await vi.waitFor(() => expect(opens).toHaveLength(1));
+    const switching = local.switchStore('anon');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(opens.map((o) => o.url)).toEqual(['indxdb://sp00ky-u1']);
+    expect(closed).toEqual([]);
+
+    opens[0].done();
+    await booting;
+    await vi.waitFor(() => expect(opens).toHaveLength(2));
+    expect(opens[1].url).toBe('indxdb://sp00ky-anon');
+    opens[1].done();
+    await switching;
+    expect(closed).toEqual(['indxdb://sp00ky-u1']);
+    expect(local.currentBucketId).toBe('anon');
+    vi.restoreAllMocks();
+  });
+
+  // The engine streams a statement's result from its worker; closing the
+  // client under it left the statement pending until its 30 s deadline, and
+  // every later local statement queued behind it (sign-in hung on "Loading").
+  it.each(['memory', 'indexeddb'] as const)('%s: a switch lets a statement in flight finish before it closes the client', async (store) => {
+    let answer!: (rows: unknown[]) => void;
+    const events: string[] = [];
+    vi.spyOn(Surreal.prototype, 'connect').mockResolvedValue(true);
+    vi.spyOn(Surreal.prototype, 'use').mockResolvedValue({});
+    vi.spyOn(Surreal.prototype, 'query').mockImplementation((() =>
+      new Promise((r) => {
+        answer = (rows) => {
+          events.push('answered');
+          r(rows);
+        };
+      })) as any);
+    vi.spyOn(Surreal.prototype, 'close').mockImplementation(async () => {
+      events.push('close');
+      return true as const;
+    });
+    const logger: any = { trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    logger.child = () => logger;
+    const local = new LocalDatabaseService({ namespace: 'n', database: 'd', store } as any, logger);
+    await local.connect('anon');
+
+    const reading = local.query('SELECT * FROM thing');
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    const release = local.beginSwitch();
+    const switching = local.switchStore('u1');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events).toEqual([]);
+
+    answer([[]]);
+    await reading;
+    await switching;
+    release();
+    expect(events).toEqual(['answered', 'close']);
+    vi.restoreAllMocks();
+  });
+});

@@ -106,11 +106,11 @@ export async function loginUser(page: Page, user: TestUser) {
 
 /**
  * Sign out via the header button. After click the landing screen
- * ("Welcome to Threads") should be visible again.
+ * ("Welcome to sp00ky threads") should be visible again.
  */
 export async function signOutUser(page: Page) {
   await page.getByRole('button', { name: 'Sign out' }).click();
-  await expect(page.getByText('Welcome to Threads'))
+  await expect(page.getByText('Welcome to sp00ky threads'))
     .toBeVisible({ timeout: 10_000 });
 }
 

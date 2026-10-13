@@ -16,6 +16,7 @@ import ProfilePage from './routes/profile';
 import InvitePage from './routes/invite/[jwt]';
 import { ProfilePicture } from './components/ProfilePicture';
 import { Tooltip } from './components/Tooltip';
+import { GhostMark, Wordmark, SP00KY_URL, SP00KY_REPO_URL } from './components/Brand';
 
 function Layout(props: any) {
   const auth = useAuth();
@@ -50,10 +51,10 @@ function Layout(props: any) {
               <a
                 href="/"
                 onClick={(e) => { e.preventDefault(); navigate('/'); }}
-                class="text-xl tracking-tighter hover:opacity-80 transition-opacity duration-150 cursor-pointer lowercase"
-                style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; letter-spacing: -0.04em;"
+                class="text-xl hover:opacity-80 transition-opacity duration-150 cursor-pointer"
+                aria-label="sp00ky threads home"
               >
-                threads.
+                <Wordmark />
               </a>
             </Tooltip>
 
@@ -103,31 +104,30 @@ function Layout(props: any) {
         <Show
           when={auth.userId()}
           fallback={
-            <div class="h-full flex items-center justify-center min-h-[80vh] px-6">
-              <div class="text-center w-full max-w-sm">
+            <div class="h-full flex items-center justify-center min-h-[80vh] px-6 py-12">
+              <div class="text-center w-full max-w-md">
                 {/* Logo mark */}
-                <div class="w-14 h-14 rounded-2xl bg-zinc-800 border border-white/[0.06] flex items-center justify-center mx-auto mb-6">
-                  <svg
-                    class="w-7 h-7 text-zinc-400"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      stroke-width="1.5"
-                      d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 01.865-.501 48.172 48.172 0 003.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z"
-                    />
-                  </svg>
+                <div class="w-16 h-16 rounded-2xl bg-zinc-900 border border-white/[0.06] flex items-center justify-center mx-auto mb-6">
+                  <GhostMark class="w-8 h-8 text-white animate-ghost-float" />
                 </div>
 
-                <h2 class="text-3xl font-semibold mb-2 tracking-tight">Welcome to Threads</h2>
-                <p class="text-zinc-400 text-sm mb-8 max-w-xs mx-auto">
-                  A modern place for conversations. Sign in to join the discussion.
+                <h2 class="text-3xl font-semibold mb-3 tracking-tight">Welcome to sp00ky threads</h2>
+                <p class="text-zinc-400 text-sm mb-6 max-w-sm mx-auto leading-relaxed">
+                  The live demo app for{' '}
+                  <a href={SP00KY_URL} target="_blank" rel="noopener" class="text-zinc-200 hover:text-white underline decoration-white/20 underline-offset-2">
+                    sp00ky
+                  </a>
+                  , local-first sync for SurrealDB. Threads, comments and every keystroke of the shared editor sync
+                  live across tabs and devices, and keep working offline.
                 </p>
 
-                <div class="flex flex-col gap-3">
+                <ul class="flex flex-wrap justify-center gap-2 mb-8 text-xs text-zinc-400">
+                  <li class="px-2.5 py-1 rounded-full border border-white/[0.06] bg-zinc-900">Real-time sync</li>
+                  <li class="px-2.5 py-1 rounded-full border border-white/[0.06] bg-zinc-900">Offline-first</li>
+                  <li class="px-2.5 py-1 rounded-full border border-white/[0.06] bg-zinc-900">Collaborative editing</li>
+                </ul>
+
+                <div class="flex flex-col gap-3 max-w-sm mx-auto">
                   <button
                     onMouseDown={() => openAuth('signin')}
                     class="w-full bg-surface hover:bg-surface-hover border border-white/[0.06] text-zinc-300 hover:text-white px-6 py-3 rounded-lg font-medium transition-colors duration-150"
@@ -141,6 +141,11 @@ function Layout(props: any) {
                     Create account
                   </button>
                 </div>
+
+                <p class="mt-6 text-xs text-zinc-600 max-w-sm mx-auto leading-relaxed">
+                  Accounts here are demo accounts for this app only. What you post is visible to other visitors, so
+                  don't reuse a password or share anything private.
+                </p>
               </div>
             </div>
           }
@@ -148,6 +153,26 @@ function Layout(props: any) {
           <div class="max-w-5xl mx-auto px-6 py-4 min-h-screen">{props.children}</div>
         </Show>
       </main>
+
+      <footer class="border-t border-white/[0.06]">
+        <div class="max-w-5xl mx-auto px-6 py-5 flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-500">
+          <span class="inline-flex items-center gap-2">
+            <GhostMark class="w-3.5 h-3.5 text-zinc-400" />
+            sp00ky threads is a demo of sp00ky, local-first sync for SurrealDB.
+          </span>
+          <span class="flex items-center gap-4">
+            <a href={SP00KY_URL} target="_blank" rel="noopener" class="hover:text-white transition-colors duration-150">
+              sp00ky.cloud
+            </a>
+            <a href={`${SP00KY_URL}/docs`} target="_blank" rel="noopener" class="hover:text-white transition-colors duration-150">
+              Docs
+            </a>
+            <a href={SP00KY_REPO_URL} target="_blank" rel="noopener" class="hover:text-white transition-colors duration-150">
+              GitHub
+            </a>
+          </span>
+        </div>
+      </footer>
 
       <AuthDialog
         isOpen={showAuthDialog()}
@@ -167,26 +192,7 @@ export default function App() {
       config={dbConfig}
       fallback={
         <div class="min-h-screen bg-zinc-950 text-white font-sans flex flex-col items-center justify-center gap-3">
-          <svg
-            class="animate-spin h-5 w-5 text-zinc-400"
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-          >
-            <circle
-              class="opacity-25"
-              cx="12"
-              cy="12"
-              r="10"
-              stroke="currentColor"
-              stroke-width="4"
-            ></circle>
-            <path
-              class="opacity-75"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-            ></path>
-          </svg>
+          <GhostMark class="h-7 w-7 text-zinc-300 animate-ghost-float" />
           <span class="text-sm text-zinc-400">Connecting...</span>
         </div>
       }

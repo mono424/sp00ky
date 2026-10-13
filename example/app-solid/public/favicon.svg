@@ -1,4 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="12" fill="#09090B"/>
-  <text x="32" y="46" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="44" font-weight="700" fill="#fff">T</text>
+  <rect width="64" height="64" rx="14" fill="#09090B"/>
+  <g transform="translate(14 16.25) scale(1.125)">
+    <path fill="#FFFFFF" fill-rule="evenodd" d="M6 10V28L10 24L14 28L18 24L22 28L26 24V10C26 4.47715 21.5228 0 16 0C10.4772 0 6 4.47715 6 10ZM10 8H14V12H10ZM18 8H22V12H18Z"/>
+  </g>
 </svg>

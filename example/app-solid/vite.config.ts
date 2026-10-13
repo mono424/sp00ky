@@ -43,9 +43,9 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.png', 'apple-touch-icon.png'],
       manifest: {
-        name: 'Threads',
-        short_name: 'Threads',
-        description: 'Collaborative offline-first thread app',
+        name: 'sp00ky threads',
+        short_name: 'sp00ky threads',
+        description: 'The live demo app for sp00ky: local-first, real-time sync for SurrealDB',
         theme_color: '#09090B',
         background_color: '#09090B',
         display: 'standalone',

@@ -13,7 +13,7 @@ test.describe.serial('Authentication flows', () => {
     await page.goto('/');
     await waitForAppReady(page);
 
-    await expect(page.getByText('Welcome to Threads')).toBeVisible();
+    await expect(page.getByText('Welcome to sp00ky threads')).toBeVisible();
 
     // Header has both Sign in + Sign up; landing has Sign in + Create
     // account. The header buttons are stable (the landing variants
@@ -35,7 +35,7 @@ test.describe.serial('Authentication flows', () => {
     ).toBeVisible();
 
     // The unauth landing shouldn't be visible anymore.
-    await expect(page.getByText('Welcome to Threads')).not.toBeVisible();
+    await expect(page.getByText('Welcome to sp00ky threads')).not.toBeVisible();
 
     // Persistence check: reload should keep us logged in.
     await page.reload();

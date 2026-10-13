@@ -33,12 +33,17 @@ export default {
           '0%, 100%': { opacity: '1', transform: 'scale(1)' },
           '50%': { opacity: '0.5', transform: 'scale(0.75)' },
         },
+        'ghost-float': {
+          '0%, 100%': { transform: 'translateY(0)' },
+          '50%': { transform: 'translateY(-3px)' },
+        },
       },
       animation: {
         'fade-in': 'fade-in 150ms ease',
         'slide-up': 'slide-up 150ms ease',
         'slide-down': 'slide-down 150ms ease',
         'dot-pulse': 'dot-pulse 1.5s ease-in-out infinite',
+        'ghost-float': 'ghost-float 3s ease-in-out infinite',
       },
     },
   },

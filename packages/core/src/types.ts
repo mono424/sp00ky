@@ -321,7 +321,8 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    * page gets live `useQuery` updates over world-readable tables. Requires the
    * server to be deployed with `anonymousLiveQueries: true` in `sp00ky.yml`
    * (this flag must match it). Defaults to `false`: anonymous clients can read
-   * one-shot but never sync live.
+   * one-shot but never sync live, and a `preload` made while signed out returns
+   * at once rather than wait for membership that never comes.
    */
   enableAnonymousLiveQueries?: boolean;
   /**

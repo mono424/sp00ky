@@ -4,6 +4,7 @@ import 'package:spooky_core/src/boot/bucket_switch_saga.dart';
 import 'package:spooky_core/src/boot/preload_saga.dart';
 import 'package:spooky_core/src/kernel/effects.dart';
 import 'package:spooky_core/src/kernel/events.dart';
+import 'package:spooky_core/src/query/env.dart' show SagaEnv;
 import 'package:spooky_core/src/query/register_saga.dart';
 import 'package:spooky_core/src/query/sql.dart' as sql;
 import 'package:spooky_core/src/state/lifecycle.dart';
@@ -402,10 +403,30 @@ void main() {
       await expectLater(
         runPure<({String hash, bool waited})>(
           (ctx) => preload(ctx, env(), input),
+          state: buildState(const [], [r.setIdentity(userId: 'user:alice')]),
           handlers: defaults(),
         ),
         throwsA(isA<StateError>()),
       );
+      await expectLater(
+        runPure<({String hash, bool waited})>(
+          (ctx) => preload(
+              ctx, SagaEnv(schema: env().schema, anonLive: true), input),
+          handlers: defaults(),
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test(
+        'signed out without anonymous live queries: registers, never waits '
+        '(no membership can reach this session)', () async {
+      final out = await runPure<({String hash, bool waited})>(
+        (ctx) => preload(ctx, env(), input),
+        handlers: defaults(),
+      );
+      expect(out.result.waited, isFalse);
+      expect(out.ofKind('state.wait'), isEmpty);
     });
   });
 }

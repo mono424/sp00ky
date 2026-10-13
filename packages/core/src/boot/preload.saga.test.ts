@@ -21,6 +21,7 @@ describe('preload', () => {
   });
   it('never resolved: waits for settled (membership + bodies + first render), or fails when the registration failed', async () => {
     const hash = await sha256Hex(queryHashInput(input, null));
+    const signedIn = buildState([], R.setIdentity({ userId: 'user:alice' }));
     const settleIt = (ctx: any) => {
       ctx.state = R.compose(
         R.commitMembership(hash, [['thing:1', 1]], true),
@@ -29,10 +30,12 @@ describe('preload', () => {
       )(ctx.state);
     };
     const out = await runPure(preload(env, input), {
+      state: signedIn,
       handlers: { 'local.getById': () => null, 'ssp.register': sspOk, 'state.wait': (_e, ctx) => settleIt(ctx) },
     });
     expect(out.result).toEqual({ hash, waited: true });
     const failed = runPure(preload(env, input), {
+      state: signedIn,
       handlers: {
         'local.getById': () => null,
         'ssp.register': sspOk,
@@ -41,11 +44,37 @@ describe('preload', () => {
     });
     await expect(failed).rejects.toBeInstanceOf(PreloadFailedError);
     const gone = runPure(preload(env, input), {
+      state: signedIn,
       handlers: { 'local.getById': () => null, 'ssp.register': sspOk, 'state.wait': (_e, ctx) => void (ctx.state = R.removeQuery(hash)(ctx.state)) },
     });
     await expect(gone).rejects.toThrow(/could not settle/);
     const already = buildState([buildEntry({ def: { hash }, lifecycle: { phase: 'cached' } })]);
     const cached = await runPure(preload(env, input), { state: already });
     expect(cached.result.waited).toBe(false);
+  });
+  it('signed out without anonymous live queries: registers but never waits, since no membership can reach this session', async () => {
+    const out = await runPure(preload(env, input), {
+      handlers: { 'local.getById': () => null, 'ssp.register': sspOk },
+    });
+    expect(out.result.waited).toBe(false);
+    expect(out.log.filter((e) => e.kind === 'state.wait')).toHaveLength(0);
+    expect(out.log.some((e) => e.kind === 'dispatch' && (e as any).event?.type === 'EnsureRegistered')).toBe(true);
+
+    // With anonymous live queries a signed-out session is sent its membership
+    // on `_00_list_ref_anon`, so it waits like a signed-in one.
+    const hash = await sha256Hex(queryHashInput(input, null));
+    const anon = await runPure(preload(defaultEnv(env.schema, { anonLive: true }), input), {
+      handlers: {
+        'local.getById': () => null,
+        'ssp.register': sspOk,
+        'state.wait': (_e, ctx) =>
+          void (ctx.state = R.compose(
+            R.commitMembership(hash, [['thing:1', 1]], true),
+            R.setVersions([['thing:1', 1]]),
+            R.setRecords(hash, [{ id: 'thing:1' }], true, 1)
+          )(ctx.state)),
+      },
+    });
+    expect(anon.result).toEqual({ hash, waited: true });
   });
 });

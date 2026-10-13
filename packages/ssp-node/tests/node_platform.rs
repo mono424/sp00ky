@@ -169,6 +169,10 @@ struct HarnessOpts {
     impersonation: bool,
     /// Route identity-less registrations to the shared `_00_list_ref_anon`.
     anonymous_live_queries: bool,
+    /// Run the DB with authentication on (the node as root) and guest access,
+    /// so a signed-out session is held to table permissions. Off, the embedded
+    /// DB has no authentication and every session reads everything.
+    guests: bool,
 }
 
 impl Default for HarnessOpts {
@@ -184,6 +188,7 @@ impl Default for HarnessOpts {
             schedules: false,
             impersonation: false,
             anonymous_live_queries: false,
+            guests: false,
         }
     }
 }
@@ -216,7 +221,17 @@ impl ssp_node::CircuitStore for MemStore {
 }
 
 async fn build(opts: HarnessOpts) -> Harness {
-    let raw = Surreal::new::<Mem>(()).await.unwrap();
+    let raw = if opts.guests {
+        let root = || surrealdb::opt::auth::Root { username: "root".into(), password: "root".into() };
+        let config = surrealdb::opt::Config::new()
+            .user(root())
+            .capabilities(surrealdb::opt::capabilities::Capabilities::all().with_guest_access(true));
+        let raw = Surreal::new::<Mem>(config).await.unwrap();
+        raw.signin(root()).await.unwrap();
+        raw
+    } else {
+        Surreal::new::<Mem>(()).await.unwrap()
+    };
     raw.use_ns("test").use_db("test").await.unwrap();
     let raw = Arc::new(raw);
 
@@ -3366,7 +3381,13 @@ mod ingest_batch_tests;
 /// `_00_query` schema (field types and permissions included), with a
 /// readable `thread` table.
 async fn anon_harness(merge_views: bool) -> Harness {
-    let h = build(HarnessOpts { anonymous_live_queries: true, merge_views, ..Default::default() }).await;
+    signed_out_harness(true, merge_views).await
+}
+
+/// [`anon_harness`], with anonymous live queries on or off. Off, an
+/// identity-less registration keeps `auth_id = ''`.
+async fn signed_out_harness(anonymous_live_queries: bool, merge_views: bool) -> Harness {
+    let h = build(HarnessOpts { anonymous_live_queries, merge_views, guests: true, ..Default::default() }).await;
     let meta = include_str!("../../../apps/cli/src/meta_tables_remote.surql");
     let start = meta.find("DEFINE TABLE OVERWRITE _00_query SCHEMALESS").expect("_00_query block");
     let end = meta.find("-- SPOOKY LIST REF").expect("end of the _00_query block");
@@ -3565,4 +3586,83 @@ async fn a_promoted_standby_enforces_the_owner_its_predecessor_stored() {
     assert_eq!(register_status(&h, anon_register("_00_query:v1", "sB", Some("hB"))).await.0, 409);
     assert_eq!(register_status(&h, anon_register("_00_query:v1", "sA2", Some("hA"))).await.0, 200);
     assert_eq!(owner_row(&h, "v1").await.2, vec!["sA".to_string(), "sA2".to_string()]);
+}
+
+// --- A signed-out session reads its own view back --------------------------
+//
+// The client tells "no results" from "edges still flushing" by reading its
+// `_00_query` row's `rowCount` and `state`, over its own socket, under the
+// table's permission. A signed-out page whose row it cannot read never
+// settles and stays on its loading screen.
+
+/// A signed-out session of its own on the harness DB (`Surreal::clone` forks
+/// one; `invalidate` drops root), and its `session::id()`.
+async fn guest_session(h: &Harness) -> (Surreal<MemEngine>, String) {
+    let guest = (*h.raw_db).clone();
+    guest.invalidate().await.unwrap();
+    guest.use_ns("test").use_db("test").await.unwrap();
+    let sid: Option<String> = guest.query("RETURN <string>session::id()").await.unwrap().take(0).unwrap();
+    (guest, sid.expect("a session id"))
+}
+
+/// The client's registration read-back, as `queryRowCountSelect` sends it.
+async fn read_back(db: &Surreal<MemEngine>, key: &str) -> Option<Value> {
+    db.query(format!("SELECT VALUE {{ rowCount: rowCount, state: state }} FROM ONLY _00_query:{key}"))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap()
+}
+
+/// With anonymous live queries off, a signed-out registration is stored with
+/// `auth_id = ''`, not `anon`. The `_00_query` rule admitted only `anon` rows
+/// to their subscribers, so every signed-out page on such a deployment was
+/// refused its own row: its preload never settled ("Connecting..." forever).
+/// Both identity-less spellings answer to the sessions that registered them,
+/// and to nobody else.
+#[tokio::test]
+async fn a_signed_out_session_reads_its_own_view_with_or_without_anonymous_live_queries() {
+    for anonymous_live_queries in [false, true] {
+        let h = signed_out_harness(anonymous_live_queries, false).await;
+        let (owner, sid) = guest_session(&h).await;
+        let (stranger, _) = guest_session(&h).await;
+
+        let (status, body) = register_status(&h, anon_register("_00_query:v1", &sid, Some("hA"))).await;
+        assert_eq!(status, 200, "{body}");
+        publication_drained(&h).await;
+        let stored: Option<String> =
+            h.raw_db.query("SELECT VALUE auth_id FROM ONLY _00_query:v1").await.unwrap().take(0).unwrap();
+        assert_eq!(stored.as_deref(), Some(if anonymous_live_queries { "anon" } else { "" }));
+
+        assert_eq!(
+            read_back(&owner, "v1").await,
+            Some(json!({ "rowCount": 0, "state": "ready" })),
+            "anonymous_live_queries={anonymous_live_queries}: the registering session reads its row"
+        );
+        assert_eq!(read_back(&stranger, "v1").await, None, "anonymous_live_queries={anonymous_live_queries}");
+    }
+}
+
+/// Two signed-out visitors open the same page one after the other. Their
+/// views have different ids (each page salts its own) but compute the same
+/// thing, so with merging the second shares the first one's graph. Each still
+/// gets a row of its own that it alone can read.
+#[tokio::test]
+async fn a_second_signed_out_visitor_reads_its_own_view_of_a_shared_graph() {
+    for anonymous_live_queries in [false, true] {
+        let h = signed_out_harness(anonymous_live_queries, true).await;
+        let (a, sid_a) = guest_session(&h).await;
+        let (b, sid_b) = guest_session(&h).await;
+
+        assert_eq!(register_status(&h, anon_register("_00_query:va", &sid_a, Some("hA"))).await.0, 200);
+        assert_eq!(register_status(&h, anon_register("_00_query:vb", &sid_b, Some("hB"))).await.0, 200);
+        publication_drained(&h).await;
+        assert_eq!(h.node.processor.read().await.graph_count(), 1, "the second view shares the first one's graph");
+
+        let ready = Some(json!({ "rowCount": 0, "state": "ready" }));
+        assert_eq!(read_back(&a, "va").await, ready, "anonymous_live_queries={anonymous_live_queries}");
+        assert_eq!(read_back(&b, "vb").await, ready, "anonymous_live_queries={anonymous_live_queries}");
+        assert_eq!(read_back(&a, "vb").await, None);
+        assert_eq!(read_back(&b, "va").await, None);
+    }
 }

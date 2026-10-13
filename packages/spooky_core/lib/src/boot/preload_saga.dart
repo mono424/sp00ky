@@ -21,14 +21,21 @@ class PreloadFailedError implements Exception {
 /// and every body are local and the first materialization ran. The entry is
 /// evicted like any other query a ttl after it was last watched (or
 /// registered).
+///
+/// A session that cannot be sent membership (signed out, without anonymous
+/// live queries) does not wait either: a view with rows would never settle,
+/// and an app that gates its first paint on a preload stayed on its loading
+/// screen forever.
 Future<({QueryHash hash, bool waited})> preload(
     Ctx ctx, SagaEnv env, RegisterInput input) async {
   final hash = await registerLocal(ctx, env, input);
   final phase =
       await ctx(Fx.stateRead((s) => s.queries[hash]?.lifecycle.phase));
-  if (phase != QueryPhase.cold) return (hash: hash, waited: false);
-  await ctx(
-      Fx.stateWait((s) => settled(s, hash) || settleFailed(s, hash)));
+  final reachable = await ctx(Fx.stateRead((s) => receivesMembership(env, s)));
+  if (phase != QueryPhase.cold || reachable != true) {
+    return (hash: hash, waited: false);
+  }
+  await ctx(Fx.stateWait((s) => settled(s, hash) || settleFailed(s, hash)));
   final failed = await ctx(Fx.stateRead((s) => settleFailed(s, hash)));
   if (failed) throw PreloadFailedError(hash);
   return (hash: hash, waited: true);

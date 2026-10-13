@@ -49,6 +49,15 @@ export function listRefTable(env: SagaEnv, s: ClientState): string {
   return listRefTableFor(env.refMode, userId);
 }
 
+/**
+ * Whether this session can be sent a view's membership at all. A signed-out
+ * session reads edges only from `_00_list_ref_anon`, and only with
+ * `enableAnonymousLiveQueries`: without it the SSP files its views under no
+ * identity in `_00_list_ref`, whose rule shows those edges to no caller. Such
+ * a view can register and report its row count, but never its rows.
+ */
+export const receivesMembership = (env: SagaEnv, s: ClientState): boolean => s.userId !== null || env.anonLive;
+
 export function columnsFor(env: SagaEnv, table: string): Record<string, unknown> | null {
   const found = env.schema.tables.find((t) => t.name === table);
   if (found) return found.columns as Record<string, unknown>;

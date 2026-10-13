@@ -18,6 +18,7 @@ const flush = async (n = 6) => {
 function makeClient(over: Parameters<typeof fakeAdapters>[0] = {}) {
   const services = fakeServiceBundle<any>();
   const a = fakeAdapters({
+    ...over,
     services: {
       'hint.read': () => 'u1',
       'local.usesSurqlSchema': () => false,
@@ -26,7 +27,6 @@ function makeClient(over: Parameters<typeof fakeAdapters>[0] = {}) {
       'remote.connect': () => new Promise(() => {}),
       ...over.services,
     },
-    ...over,
   });
   const runtime = new Runtime({ env: defaultEnv(schema, { materializeDebounceMs: 1 }), adapters: a.adapters, logger: services.logger, tabId: 'tab-test' });
   const client = new Sp00kyClient<any>(config, { services, runtime });
@@ -155,7 +155,10 @@ describe('Sp00kyClient facade', () => {
 
   it('preload: cold waits for membership + bodies; cached returns at once; abort rejects', async () => {
     const edges = [{ out: new RecordId('thing', '1'), version: 1 }];
+    // Signed in: a signed-out session without anonymous live queries is never
+    // sent membership, so its preload does not wait (see `preload`).
     const { client, a } = makeClient({
+      services: { 'auth.restoreSession': async () => 'user:u1', 'auth.sessionAuthId': () => 'user:u1' },
       remote: {
         queryResponses: async (sql: string) => {
           if (sql.startsWith('fn::query::register')) return [ok(null), ok(edges), ok({ rowCount: 1, state: 'ready' }), ok([])];

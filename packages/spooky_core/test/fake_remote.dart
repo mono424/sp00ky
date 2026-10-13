@@ -33,6 +33,11 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
   /// implies a `ready` row of its own size.
   final Map<String, ({int rowCount, String state})> views = {};
 
+  /// `_00_list_ref*` tables whose edges this session may not read, as a guest
+  /// may not read the global `_00_list_ref` (its signed-out edges carry
+  /// `auth_id = ''`). The view's `_00_query` row still answers.
+  final Set<String> hiddenEdgeTables = {};
+
   /// Make mutation pushes fail as a network error, so the write stays queued.
   bool blockMutations = false;
 
@@ -77,16 +82,19 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
   }
 
   @override
-  Future<void> use({required String namespace, required String database}) async {
+  Future<void> use(
+      {required String namespace, required String database}) async {
     usedNamespace = namespace;
   }
 
   @override
   Future<dynamic> authenticate(String token) async => null;
   @override
-  Future<dynamic> signin(Map<String, dynamic> params) async => {'access': 'tok'};
+  Future<dynamic> signin(Map<String, dynamic> params) async =>
+      {'access': 'tok'};
   @override
-  Future<dynamic> signup(Map<String, dynamic> params) async => {'access': 'tok'};
+  Future<dynamic> signup(Map<String, dynamic> params) async =>
+      {'access': 'tok'};
   @override
   Future<void> invalidate() async {}
 
@@ -112,6 +120,12 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
 
   List<(String, int)> _idsOf(String id) =>
       membership[id] ?? defaultMembership ?? const [];
+
+  /// The edge table a `$in->table` / `$ins->table` read names.
+  bool _hidden(String sql) {
+    final m = RegExp(r'->(_00_list_ref\w*)').firstMatch(sql);
+    return m != null && hiddenEdgeTables.contains(m.group(1));
+  }
 
   ({int rowCount, String state})? _viewOf(String id) {
     final explicit = views[id];
@@ -141,6 +155,7 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
       return const StatementResult.ok(null);
     }
     if (sql.startsWith('SELECT out, version FROM')) {
+      if (_hidden(sql)) return const StatementResult.ok(<dynamic>[]);
       final id = vars['in'].toString();
       final subquery = sql.contains('parent IS NOT NONE');
       if (subquery) return const StatementResult.ok(<dynamic>[]);
@@ -149,6 +164,7 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
       ]);
     }
     if (sql.startsWith('SELECT in, out, version, parent FROM')) {
+      if (_hidden(sql)) return const StatementResult.ok(<dynamic>[]);
       final ins = (vars['ins'] as List? ?? const []).map((e) => e.toString());
       return StatementResult.ok([
         for (final id in ins)

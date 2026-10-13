@@ -5,8 +5,6 @@ import * as jose from 'jose';
 import { useAuth } from '../../lib/auth';
 import type { schema } from '../../schema.gen';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3660';
-
 export default function InvitePage() {
   const params = useParams();
   const navigate = useNavigate();
@@ -20,62 +18,33 @@ export default function InvitePage() {
     const jwt = params.jwt;
     if (!userId || !jwt || accepted()) return;
 
-    // Pull the recipient's Surreal session token off the live connection so
-    // the API can identify them. The API uses a separate `Surreal` client
-    // signed in with that token to derive `$auth.id`.
-    let recipientToken: string | undefined;
+    // The link names its thread in `sub`. Whether it is valid is the
+    // database's call, not this decode's.
+    let thread: string;
     try {
-      recipientToken = await db.useRemote(async (s) => s.accessToken);
-    } catch (e: any) {
-      setError(e?.message || 'Could not read session token.');
+      const claims = jose.decodeJwt(jwt);
+      if (typeof claims.sub !== 'string' || !claims.sub.includes(':')) throw new Error('no thread');
+      thread = claims.sub;
+    } catch {
+      setError('This invite link is malformed.');
       return;
     }
 
-    if (!recipientToken) {
-      setError('Missing session token. Try signing in again.');
+    // Accepting is a write the database checks itself: the `share_accept`
+    // event joins this user to the thread only for an unexpired link its
+    // author created, and throws otherwise. No backend involved, so it works
+    // on a deployment that runs none.
+    try {
+      await db.useRemote((s) => s.query('CREATE share_accept SET jwt = $jwt RETURN NONE', { jwt }));
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      setError(/invalid or has expired/.test(msg) ? 'This invite link is invalid or has expired.' : msg);
       return;
     }
 
-    try {
-      const resp = await fetch(`${API_URL}/share/accept`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${recipientToken}`,
-        },
-        body: JSON.stringify({ jwt }),
-      });
-      if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
-        const msg = body?.error || `Server returned ${resp.status}.`;
-        if (resp.status === 401 || resp.status === 403) {
-          setError(`This invite link is invalid or has expired. (${msg})`);
-        } else {
-          setError(msg);
-        }
-        return;
-      }
-      const { thread } = (await resp.json()) as { thread: string };
-
-      // Best-effort sanity decode so we can show a useful error when the
-      // server says one thread but the JWT carries another (shouldn't happen
-      // — they're the same — but cheap to verify).
-      try {
-        const claims = jose.decodeJwt(jwt);
-        if (typeof claims.sub === 'string' && claims.sub !== thread) {
-          console.warn('[invite] thread mismatch', { sub: claims.sub, thread });
-        }
-      } catch {
-        /* ignore decode errors — server already accepted it */
-      }
-
-      setAccepted(true);
-      const suffix = thread.split(':').slice(1).join(':');
-      navigate(`/thread/${suffix}`, { replace: true });
-    } catch (e: any) {
-      console.error('[invite] failed to accept:', e);
-      setError(e?.message || 'Failed to accept invite.');
-    }
+    setAccepted(true);
+    const suffix = thread.split(':').slice(1).join(':');
+    navigate(`/thread/${suffix}`, { replace: true });
   });
 
   return (

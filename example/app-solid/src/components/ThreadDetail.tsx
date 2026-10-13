@@ -325,10 +325,20 @@ export function ThreadDetail() {
               when={thread()}
               fallback={
                 <Show
-                  when={!threadResult.isLoading()}
+                  // "Not found" is a verdict: only once the server has answered
+                  // and nothing is still fetching. `!isLoading()` alone flips on
+                  // the first empty local result, which read as a 404 for a
+                  // thread whose row was still on its way.
+                  when={threadResult.isSettled() && !threadResult.error()}
                   fallback={
                     <div class="bg-surface/50 rounded-xl border border-white/[0.06] p-12 text-center">
-                      <p class="text-zinc-400 font-medium mb-1">Loading thread...</p>
+                      <Show
+                        when={threadResult.error()}
+                        fallback={<p class="text-zinc-400 font-medium mb-1">Loading thread...</p>}
+                      >
+                        <p class="text-zinc-400 font-medium mb-1">Couldn't load this thread</p>
+                        <p class="text-sm text-zinc-600">Retrying in the background.</p>
+                      </Show>
                     </div>
                   }
                 >
@@ -703,6 +713,7 @@ export function ThreadDetail() {
       <Show when={thread()?.id}>
         <ShareDialog
           threadId={thread()!.id}
+          published={!!thread()!.published}
           isOpen={shareOpen()}
           onClose={() => setShareOpen(false)}
         />

@@ -9,6 +9,9 @@ import { Tooltip } from './Tooltip';
 
 interface ShareDialogProps {
   threadId: string;
+  /** Collaborators can only open a published thread (see the thread table's
+   *  SELECT rule in the schema). */
+  published: boolean;
   isOpen: boolean;
   onClose: () => void;
 }
@@ -163,6 +166,11 @@ export function ShareDialog(props: ShareDialogProps) {
                 <p class="text-[12.5px] text-zinc-500 leading-relaxed">
                   Anyone with a link joins as an editor. Links can't be revoked and expire after {SHARE_TTL_DAYS} days.
                 </p>
+                <Show when={!props.published}>
+                  <p class="text-[12.5px] text-amber-300/80 leading-relaxed">
+                    This thread is a draft: people you invite can open it once you publish it.
+                  </p>
+                </Show>
               </div>
               <Tooltip text="Close" kbd="Esc" position="bottom">
                 <button

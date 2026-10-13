@@ -153,11 +153,11 @@ DEFINE EVENT comment_created ON TABLE comment WHEN $event = "CREATE" THEN
 -- COLLABORATORS
 -- ##################################################################
 
--- Per-issuer history of share links. Append-only by design — there's no
+-- Per-issuer history of share links. Append-only by design: there's no
 -- way to revoke a JWT once it's out, so the dialog only shows the issuer
--- the links they've made and warns them. Acceptance happens server-side
--- (example/api /share/accept), not via this table; rows here are purely
--- informational.
+-- the links they've made and warns them. The row is also what makes a link
+-- valid: `share_accept` below only honours a JWT the thread's author stored
+-- here, unexpired.
 DEFINE TABLE share_link SCHEMAFULL
   PERMISSIONS
     FOR select WHERE issuer.id = $auth.id
@@ -172,10 +172,9 @@ DEFINE FIELD exp        ON TABLE share_link TYPE datetime;
 DEFINE FIELD created_at ON TABLE share_link TYPE datetime VALUE time::now();
 DEFINE INDEX unique_share_jti ON TABLE share_link FIELDS jti UNIQUE;
 
--- Only root may CREATE a `collaborates_on` edge — the JWT-verifying API
--- endpoint does it on the recipient's behalf after checking the share
--- link's signature against the issuer's `share_pubkey`. Author can still
--- kick collaborators off via FOR delete.
+-- Clients may not CREATE a `collaborates_on` edge themselves: the
+-- `share_accept` event below does it on the recipient's behalf. Author can
+-- still kick collaborators off via FOR delete.
 DEFINE TABLE collaborates_on SCHEMAFULL TYPE RELATION FROM user TO thread
   PERMISSIONS
     FOR select WHERE true
@@ -185,3 +184,30 @@ DEFINE TABLE collaborates_on SCHEMAFULL TYPE RELATION FROM user TO thread
     FOR update WHERE false;
 
 DEFINE INDEX unique_collab ON TABLE collaborates_on FIELDS in, out UNIQUE;
+
+-- Accepting an invite: the signed-in recipient creates a row carrying the
+-- link's JWT. The event (events run without the caller's permissions) joins
+-- them to the thread when the JWT is a link the thread's author stored in
+-- `share_link` and it has not expired; otherwise it throws and the CREATE
+-- fails with that message. This replaces a backend endpoint, so it works on
+-- a deployment without one (the hosted demo runs no backend).
+-- @nosync
+DEFINE TABLE share_accept SCHEMAFULL
+  PERMISSIONS
+    FOR select WHERE user = $auth.id
+    FOR create WHERE $access = "account"
+    FOR update, delete WHERE false;
+
+DEFINE FIELD user       ON TABLE share_accept TYPE record<user> VALUE $auth.id READONLY;
+DEFINE FIELD jwt        ON TABLE share_accept TYPE string READONLY;
+DEFINE FIELD created_at ON TABLE share_accept TYPE datetime VALUE time::now() READONLY;
+
+DEFINE EVENT accept_invite ON TABLE share_accept WHEN $event = "CREATE" THEN {
+    LET $link = (SELECT thread, exp FROM ONLY share_link WHERE jwt = $after.jwt LIMIT 1);
+    IF $link = NONE OR $link.exp < time::now() {
+        THROW "This invite link is invalid or has expired.";
+    };
+    IF array::len((SELECT VALUE id FROM collaborates_on WHERE in = $after.user AND out = $link.thread)) = 0 {
+        RELATE ($after.user)->collaborates_on->($link.thread);
+    };
+};

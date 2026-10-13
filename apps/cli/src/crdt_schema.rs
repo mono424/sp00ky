@@ -15,7 +15,8 @@
 //!   that reaches clients through ordinary parent sync;
 //! - generates `P__crdt_log` (append-only: CREATE by editors, no UPDATE or
 //!   DELETE) and, for `@cursor` fields, `P__crdt_presence`;
-//! - generates `_00_crdt_doc` (server only, never synced, read one-shot);
+//! - generates `_00_crdt_doc` (server only, never synced, read one-shot) and
+//!   `_00_crdt_peer` (which user owns which Loro peer id);
 //! - generates a cleanup event that drops a parent's canonical docs with it.
 //!
 //! Permissions on the generated tables are the parent's own rules read through
@@ -39,6 +40,9 @@ pub const PRESENCE_SUFFIX: &str = "__crdt_presence";
 pub const META_SUFFIX: &str = "__crdt";
 /// The server-only table holding each document's canonical snapshot.
 pub const DOC_TABLE: &str = "_00_crdt_doc";
+/// Loro peer ids and the user who claimed each. A log row may only carry a
+/// peer its author owns, so nobody can author edits under someone else's id.
+pub const PEER_TABLE: &str = "_00_crdt_peer";
 /// The record link from a generated row to its parent document.
 pub const DOC_LINK: &str = "doc";
 /// Largest single update blob a client may append.
@@ -164,6 +168,7 @@ pub fn expand(source: &str, target: Target) -> Result<Expansion> {
     }
     if target == Target::Server {
         generated.push_str(&doc_table_ddl(&parents));
+        generated.push_str(&peer_table_ddl());
     }
     let mirror_defs = parents
         .iter()
@@ -463,7 +468,7 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
             ("doc", &format!("record<{table}>"), " READONLY"),
             ("field", "string", &format!(" ASSERT $value IN [{field_list}] READONLY")),
             ("author", "option<record>", " VALUE $before OR $auth.id OR $value READONLY"),
-            ("nonce", "string", " ASSERT string::len($value) > 0 AND string::len($value) <= 64 READONLY"),
+            ("peer", "string", &peer_assert()),
             ("@opaque data", "bytes", &format!(" ASSERT bytes::len($value) <= {MAX_DELTA_BYTES} READONLY")),
             ("size", "int", " VALUE bytes::len(data) READONLY"),
             ("created_at", "datetime", " VALUE $before OR time::now() READONLY"),
@@ -542,12 +547,37 @@ fn field_lines(table: &str, target: Target, fields: &[(&str, &str, &str)]) -> St
     s
 }
 
+/// A log row's peer must be one its author claimed in `_00_crdt_peer`; root
+/// (no `$auth`) is trusted. Every op in the row's blob must come from this
+/// peer, which the fold and every client check before importing it (a peer
+/// that is not a decimal u64 fails that check, so no format ASSERT here: the
+/// function names for one differ between SurrealDB 2 and 3).
+fn peer_assert() -> String {
+    format!(
+        " ASSERT string::len($value) <= 20 \
+         AND ($auth.id = NONE OR (SELECT VALUE author FROM ONLY type::record('{PEER_TABLE}', $value)) = $auth.id) READONLY"
+    )
+}
+
 fn client_type(ty: &str) -> String {
     if ty.starts_with("option<") {
         ty.to_string()
     } else {
         format!("option<{ty}>")
     }
+}
+
+fn peer_table_ddl() -> String {
+    format!(
+        "\n-- Loro peer ids, each claimed by one user (ids are random below 2^53)\n\
+         DEFINE TABLE OVERWRITE {PEER_TABLE} SCHEMAFULL\n\
+         \x20 PERMISSIONS\n\
+         \x20   FOR select WHERE author = $auth.id\n\
+         \x20   FOR create WHERE $auth.id != NONE AND $access != \"{IMPERSONATE_ACCESS}\"\n\
+         \x20   FOR update, delete NONE;\n\
+         DEFINE FIELD OVERWRITE author ON TABLE {PEER_TABLE} TYPE record VALUE $before OR $auth.id READONLY;\n\
+         DEFINE FIELD OVERWRITE at ON TABLE {PEER_TABLE} TYPE datetime VALUE $before OR time::now() READONLY;\n"
+    )
 }
 
 fn doc_table_ddl(parents: &[CrdtParent]) -> String {
@@ -685,6 +715,8 @@ DEFINE TABLE collaborates_on TYPE RELATION IN user OUT thread SCHEMAFULL;
         assert!(g.contains("ASSERT $value IN ['content', 'summary'] READONLY"));
         assert!(g.contains("DEFINE TABLE OVERWRITE thread__crdt_presence SCHEMAFULL"));
         assert!(g.contains("DEFINE TABLE OVERWRITE _00_crdt_doc SCHEMAFULL"));
+        assert!(g.contains("DEFINE TABLE OVERWRITE _00_crdt_peer SCHEMAFULL"));
+        assert!(g.contains("type::record('_00_crdt_peer', $value)) = $auth.id) READONLY;"), "{g}");
         assert!(g.contains("(doc.tb() = 'thread' AND (doc.published = true"), "{g}");
         assert!(g.contains("DEFINE EVENT OVERWRITE _00_crdt_cleanup ON TABLE thread"));
         assert_eq!(exp.mirror_defs.matches("DEFINE FIELD OVERWRITE").count(), 2);
@@ -712,6 +744,7 @@ DEFINE TABLE collaborates_on TYPE RELATION IN user OUT thread SCHEMAFULL;
         assert!(g.contains("DEFINE TABLE OVERWRITE thread__crdt_log SCHEMAFULL PERMISSIONS FULL;"));
         assert!(g.contains("DEFINE FIELD OVERWRITE data ON TABLE thread__crdt_log TYPE option<bytes>;"));
         assert!(!g.contains("_00_crdt_doc"));
+        assert!(!g.contains("_00_crdt_peer"));
         assert!(!g.contains("READONLY"));
         assert!(!g.contains("$auth"));
         let mut parser = SchemaParser::new();

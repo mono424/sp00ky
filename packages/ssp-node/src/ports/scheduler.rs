@@ -48,6 +48,12 @@ pub enum TimerKind {
     JobRetry { id: String },
     /// Bootstrap retry with backoff (tables may not exist yet).
     BootstrapRetry { attempt: u32 },
+    /// Start the `@crdt` folds that are due (re-arms every
+    /// `FoldConfig.tick_ms`). See [`crate::crdt`].
+    CrdtFoldTick,
+    /// Rebuild the CRDT fold tracker from the log tables and drop orphaned log
+    /// and stale presence rows (re-arms every `FoldConfig.sweep_secs`).
+    CrdtSweep,
     /// Periodic circuit checkpoint to the `CircuitStore` (re-arms every
     /// `NodeConfig.checkpoint_interval_secs`). Only armed when a non-noop store
     /// is configured — the VM leaves it disabled (its store is noop).

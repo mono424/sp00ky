@@ -4,7 +4,7 @@
 ///
 /// Field set = the historical `apps/ssp` `Config` plus the values that were
 /// previously scattered `std::env::var` reads inside handlers/tasks
-/// (`auth_secret`, `bootstrap_page_size`, `crdt_cache_size`,
+/// (`auth_secret`, `bootstrap_page_size`, `crdt`,
 /// `health_check_interval_secs`). Cluster-mode fields (`scheduler_url`,
 /// `heartbeat_interval_ms`, `advertise_addr`, `register_max_wait_secs`) are
 /// VM-shell concerns — the portable core only consults `scheduler_url` as the
@@ -80,8 +80,8 @@ pub struct NodeConfig {
     /// Rows pulled per bootstrap page (keyset pagination).
     /// Env: `SPKY_SSP_BOOTSTRAP_PAGE_SIZE`, default 200.
     pub bootstrap_page_size: usize,
-    /// In-memory CRDT cache capacity. Env: `SPKY_CRDT_CACHE_SIZE`, default 1024.
-    pub crdt_cache_size: usize,
+    /// `@crdt` fold tuning (`SPKY_CRDT_*` env in the VM shell).
+    pub crdt: crate::crdt::FoldConfig,
     /// Backend health poll cadence (standalone maintenance plane).
     /// Env: `SPKY_HEALTH_CHECK_INTERVAL_SECS`, default 15.
     pub health_check_interval_secs: u64,

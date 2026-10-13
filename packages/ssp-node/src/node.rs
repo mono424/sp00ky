@@ -6,7 +6,7 @@
 //! table falls through to the core — every intermediate commit stays green).
 //!
 //! Migrated so far: `/version`, `/log`, `/reset`, `/job/kill`, `/job/retry`,
-//! `/job/recover`. Still in the VM shell: `/ingest`, `/view/*`, `/crdt/apply`,
+//! `/job/recover`. Still in the VM shell: `/ingest`, `/view/*`,
 //! `/debug/*`, `/health`, `/info`, `/info/text`, `/backends`, `/backup/*`.
 
 use serde::Deserialize;
@@ -89,8 +89,9 @@ pub struct SspNode {
     /// Backend health monitor — standalone mode only (`None` in cluster mode,
     /// where the scheduler owns backend health + `PUT /backends`).
     pub backend_health: Option<Arc<dyn BackendHealth>>,
-    /// Server-side CRDT merge cache (`/crdt/apply`).
-    pub crdt_cache: Arc<crate::crdt::CrdtCache>,
+    /// `@crdt` edit-log tracker and fold (the only writer of canonical
+    /// documents). Fed from ingest, driven by `CrdtFoldTick`/`CrdtSweep`.
+    pub crdt: Arc<crate::crdt::CrdtFold>,
     /// Per-view latency state, keyed by view id.
     pub view_metrics: Arc<crate::view_metrics::ViewMetrics>,
     /// Bounded publication admission and ordered work queue. Reservations
@@ -270,7 +271,6 @@ impl SspNode {
             RouteId::DebugHeartbeat => self.debug_heartbeat_handler(),
             RouteId::DebugCatchupRows { table } => self.debug_catchup_rows_handler(&table).await,
             RouteId::DebugMemory => self.debug_memory_handler().await,
-            RouteId::CrdtApply => self.crdt_apply_handler(&req).await?,
             RouteId::ViewUnregister => self.unregister_view_handler(&req).await?,
             RouteId::ViewRegister => self.register_view_handler(&req).await?,
             RouteId::Ingest => self.ingest_handler(&req).await?,
@@ -926,6 +926,7 @@ impl SspNode {
                 "bootstrap_warnings": bootstrap_warnings,
                 "query_allowlist": query_allowlist,
                 "push": self.push_engine.as_ref().map(|e| serde_json::to_value(e.status()).unwrap_or(Value::Null)),
+                "crdt": self.crdt.info(),
             }
         ]);
         if standby {
@@ -1094,27 +1095,6 @@ impl SspNode {
             ));
         }
         None
-    }
-
-    /// `POST /crdt/apply` — merge a Loro update into `_00_crdt[<field>]`.
-    async fn crdt_apply_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
-        if let Some(gate) = self.ready_gate().await {
-            return Some(gate);
-        }
-        // Writes `_00_crdt`: never from a standby.
-        if self.is_standby() {
-            return self.handover_gate().await;
-        }
-        let Ok(payload) = serde_json::from_slice::<crate::crdt::ApplyRequest>(&req.body) else {
-            return Some(err_json(422, "bad_body", "invalid crdt apply payload"));
-        };
-        match self.crdt_cache.apply(self.platform.db.as_ref(), &payload).await {
-            Ok(resp) => Some(ok_json(json!({ "rev": resp.rev }))),
-            Err(e) => {
-                error!(error = %e, "CRDT apply failed");
-                Some(err_json(400, "crdt_apply_failed", e.to_string()))
-            }
-        }
     }
 
     /// `POST /view/unregister` — remove a view + delete its `_00_list_ref` edges.
@@ -2007,9 +1987,11 @@ impl SspNode {
         }
 
         // Push rules watch synced rows. Spawned: the ingest answer never
-        // waits on a push service.
+        // waits on a push service. A CRDT edit-log row counts toward its
+        // document's next fold.
         if !standby {
             self.observe_push(&payload.table, &payload.op, &payload.id, &payload.record);
+            self.crdt.observe(&payload.table, &payload.op, &payload.record, crate::now_epoch_ms());
         }
 
         // Step the circuit.

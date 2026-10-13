@@ -21,7 +21,6 @@ use tracing::{debug, error, info, warn};
 // Expose modules for use in main.rs and tests
 mod changefeed;
 pub mod adapters;
-pub mod crdt;
 pub mod edge_updates;
 pub mod maintenance_host;
 pub mod metrics;
@@ -65,7 +64,6 @@ pub struct AppState {
     pub ssp_id: String,
     pub scheduler_url: Option<String>,
     pub start_time: std::time::Instant,
-    pub crdt_cache: Arc<crdt::CrdtCache>,
     /// Per-view rolling materialization-latency samples plus running
     /// update/error counters. Persisted onto `_00_query` after each
     /// affected ingest step.
@@ -130,6 +128,25 @@ pub fn heartbeat_view_count(processor: &Arc<RwLock<Circuit>>, last: &mut usize) 
         *last = circuit.view_count();
     }
     *last
+}
+
+/// `@crdt` fold tuning from `SPKY_CRDT_*` (see `ssp_node::crdt::FoldConfig`).
+fn crdt_fold_config() -> ssp_node::crdt::FoldConfig {
+    fn env<T: std::str::FromStr>(name: &str) -> Option<T> {
+        std::env::var(name).ok().and_then(|s| s.parse().ok())
+    }
+    let d = ssp_node::crdt::FoldConfig::default();
+    ssp_node::crdt::FoldConfig {
+        cache_size: env("SPKY_CRDT_CACHE_SIZE").unwrap_or(d.cache_size),
+        idle_ms: env::<u64>("SPKY_CRDT_FOLD_IDLE_SECS").map_or(d.idle_ms, |s| s * 1000),
+        max_rows: env("SPKY_CRDT_FOLD_MAX_ROWS").unwrap_or(d.max_rows),
+        max_bytes: env("SPKY_CRDT_FOLD_MAX_BYTES").unwrap_or(d.max_bytes),
+        min_gap_ms: env::<u64>("SPKY_CRDT_FOLD_MIN_GAP_SECS").map_or(d.min_gap_ms, |s| s * 1000),
+        workers: env::<usize>("SPKY_CRDT_FOLD_WORKERS").filter(|n| *n > 0).unwrap_or(d.workers),
+        tick_ms: env::<u64>("SPKY_CRDT_FOLD_TICK_MS").filter(|n| *n > 0).unwrap_or(d.tick_ms),
+        presence_ttl_secs: env("SPKY_CRDT_PRESENCE_TTL_SECS").unwrap_or(d.presence_ttl_secs),
+        ..d
+    }
 }
 
 pub fn load_config() -> Config {
@@ -212,10 +229,7 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .filter(|n: &usize| *n > 0)
             .unwrap_or(1000),
-        crdt_cache_size: std::env::var("SPKY_CRDT_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024),
+        crdt: crdt_fold_config(),
         health_check_interval_secs: std::env::var("SPKY_HEALTH_CHECK_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -961,10 +975,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     // Clone for scheduler integration
     let processor_for_scheduler = processor_arc.clone();
 
-    let crdt_cache = Arc::new(crdt::CrdtCache::new(
-        config.crdt_cache_size,
-        crdt::allow_list_from_env(),
-    ));
+    let crdt = Arc::new(ssp_node::crdt::CrdtFold::new(config.crdt.clone(), config.ssp_id.clone()));
 
     // Bounded publisher for query edges. New bursts debounce for the configured
     // window; queued work then drains without a delay per item. Failed views
@@ -1051,7 +1062,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         start_epoch_ms: ssp_node::now_epoch_ms(),
         bootstrap_warnings: Arc::new(RwLock::new(Vec::new())),
         backend_health: node_backend_health,
-        crdt_cache: crdt_cache.clone(),
+        crdt: crdt.clone(),
         view_metrics: view_metrics.clone(),
         edge_update_tx: edge_update_tx.clone(),
         anonymous_live_queries: config.anonymous_live_queries,
@@ -1165,7 +1176,6 @@ pub async fn run_server() -> anyhow::Result<()> {
         ssp_id: config.ssp_id.clone(),
         scheduler_url: config.scheduler_url.clone(),
         start_time: std::time::Instant::now(),
-        crdt_cache,
         view_metrics,
         ref_mode: config.ref_mode,
         anonymous_live_queries: config.anonymous_live_queries,
@@ -1453,6 +1463,22 @@ pub async fn run_server() -> anyhow::Result<()> {
             .await;
         info!(interval_secs = config.schema_poll_secs, "Schema poll timer armed");
     }
+
+    // `@crdt` fold: due folds are started every tick, the sweep rebuilds the
+    // tracker (nothing was observed before this process started) and drops
+    // orphaned log and stale presence rows. Both re-armed by the dispatcher.
+    platform
+        .scheduler
+        .schedule(
+            ssp_node::TimerKind::CrdtFoldTick,
+            ssp_node::now_epoch_ms() + config.crdt.tick_ms,
+        )
+        .await;
+    platform
+        .scheduler
+        .schedule(ssp_node::TimerKind::CrdtSweep, ssp_node::now_epoch_ms() + 10_000)
+        .await;
+    info!(tick_ms = config.crdt.tick_ms, "CRDT fold timers armed");
 
     // Per-view metrics: noted in memory on ingest, flushed to `_00_query` here
     // (TimerKind::ViewMetricsFlush), re-armed by the dispatcher.

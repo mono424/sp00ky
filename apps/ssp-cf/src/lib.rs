@@ -380,6 +380,8 @@ impl SspNodeDo {
         let sched = &node.platform.scheduler;
         sched.schedule(TimerKind::TtlCleanup, now_epoch_ms() + 60_000).await;
         sched.schedule(TimerKind::ViewMetricsFlush, now_epoch_ms() + 2000).await;
+        sched.schedule(TimerKind::CrdtFoldTick, now_epoch_ms() + 5000).await;
+        sched.schedule(TimerKind::CrdtSweep, now_epoch_ms() + 10_000).await;
         sched.schedule(TimerKind::JobRecoverySweep, now_epoch_ms()).await;
 
         *self.node.borrow_mut() = Some(node);
@@ -426,9 +428,9 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         start_epoch_ms: now_epoch_ms(),
         bootstrap_warnings: Arc::new(RwLock::new(Vec::new())),
         backend_health: None,
-        crdt_cache: Arc::new(ssp_node::crdt::CrdtCache::new(
-            8,
-            ssp_node::crdt::CrdtAllowList::permissive(),
+        crdt: Arc::new(ssp_node::crdt::CrdtFold::new(
+            ssp_node::crdt::FoldConfig::default(),
+            cfg.ssp_id.clone(),
         )),
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
         edge_update_tx,

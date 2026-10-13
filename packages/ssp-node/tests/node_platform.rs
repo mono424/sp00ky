@@ -296,7 +296,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         start_epoch_ms: ssp_node::now_epoch_ms().saturating_sub(5000),
         bootstrap_warnings: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         backend_health,
-        crdt_cache: Arc::new(ssp_node::crdt::CrdtCache::new(8, ssp_node::crdt::CrdtAllowList::permissive())),
+        crdt: Arc::new(ssp_node::crdt::CrdtFold::new(ssp_node::crdt::FoldConfig::default(), "test-ssp")),
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),
         edge_update_tx: ssp_node::edges::EdgePublisher::default(),
         anonymous_live_queries: opts.anonymous_live_queries,
@@ -607,14 +607,6 @@ async fn debug_deps_reports_empty_store() {
     let r = h.node.route(authed(Method::Get, "/debug/deps", Value::Null)).await.unwrap();
     assert_eq!(r.status, 200);
     assert_eq!(json_of(&r)["view_count"], 0);
-}
-
-#[tokio::test]
-async fn crdt_apply_gated_when_not_ready() {
-    let h = build(HarnessOpts { status: SspStatus::Bootstrapping, ..Default::default() }).await;
-    let body = json!({ "table": "t", "record_id": "t:1", "field": "f", "update": "", "peer": "1" });
-    let r = h.node.route(authed(Method::Post, "/crdt/apply", body)).await.unwrap();
-    assert_eq!(r.status, 503);
 }
 
 #[tokio::test]
@@ -2934,7 +2926,7 @@ async fn a_standby_computes_but_writes_nothing() {
     // Its own writers are off.
     assert_eq!(h.node.flush_view_metrics().await, 0);
     assert_eq!(h.node.ttl_cleanup_sweep().await, 0);
-    for path in ["/reset", "/admin/reload", "/crdt/apply"] {
+    for path in ["/reset", "/admin/reload"] {
         let r = h.node.route(authed(Method::Post, path, json!({}))).await.unwrap();
         assert_eq!((r.status, &json_of(&r)["code"]), (503, &json!("standby")), "{path}");
     }

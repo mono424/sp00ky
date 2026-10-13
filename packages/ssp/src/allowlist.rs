@@ -624,15 +624,16 @@ pub enum Decision {
     Refused { reason: String },
 }
 
-/// Shapes the sync core registers on its own behalf (`_00_app_release`,
-/// `_00_user_feature`) are always admitted: they scan only synced meta tables,
-/// which no app query can reach.
+/// Shapes the sync core registers on its own behalf are always admitted:
+/// `_00_app_release` / `_00_user_feature` (synced meta tables no app query can
+/// reach) and a `@crdt` field's edit log or presence rows (generated tables
+/// whose rows the parent's own permission already gates).
 pub fn is_builtin(shape: &Shape) -> bool {
     let tables = shape.tables();
     !tables.is_empty()
-        && tables
-            .iter()
-            .all(|t| ssp_protocol::SYNCED_META_TABLES.contains(&t.as_str()))
+        && tables.iter().all(|t| {
+            ssp_protocol::SYNCED_META_TABLES.contains(&t.as_str()) || ssp_protocol::is_crdt_aux_table(t)
+        })
 }
 
 /// Decide whether `shape` may register. `columns` is the per-table column set
@@ -785,6 +786,18 @@ mod tests {
             decide(&compiled, &s, &HashMap::new()),
             Decision::Refused { .. }
         ));
+        for surql in [
+            "SELECT * FROM thread__crdt_log WHERE doc = $doc AND field = $field",
+            "SELECT * FROM thread__crdt_presence WHERE doc = $doc AND field = $field",
+        ] {
+            assert_eq!(
+                decide(&compiled, &shape(surql), &HashMap::new()),
+                Decision::Allowed(Allowed::Builtin),
+                "{surql}"
+            );
+        }
+        let s = shape("SELECT * FROM thread WHERE id IN (SELECT VALUE doc FROM thread__crdt_log)");
+        assert!(matches!(decide(&compiled, &s, &HashMap::new()), Decision::Refused { .. }));
     }
 
     #[test]

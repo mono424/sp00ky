@@ -291,8 +291,10 @@ impl SspNode {
         };
         let materialization_ms = waiting.elapsed().as_secs_f64() * 1000.0;
         if !standby {
+            let now = crate::now_epoch_ms();
             for row in &payload.records {
                 self.observe_push(&row.table, &row.op, &row.id, &row.record);
+                self.crdt.observe(&row.table, &row.op, &row.record, now);
             }
         }
         self.platform

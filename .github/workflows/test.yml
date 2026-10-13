@@ -58,7 +58,7 @@ jobs:
       - name: Core and wire protocol regressions
         run: cargo test --locked -p ssp -p ssp-protocol --lib
       - name: Portable node regressions
-        run: cargo test --locked -p ssp-node --lib --test node_platform --test view_metrics_flush
+        run: cargo test --locked -p ssp-node --lib --test node_platform --test view_metrics_flush --test crdt_fold
       - name: Scheduler delivery and handover regressions
         run: cargo test --locked -p scheduler --lib --test integration --test handover --test handover_two_step
       - name: Native SSP adapter builds

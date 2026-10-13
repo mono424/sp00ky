@@ -78,7 +78,6 @@ pub enum RouteId {
     DebugMemory,
     ViewRegister,
     ViewUnregister,
-    CrdtApply,
     Reset,
     /// Re-scan the DB schema + reload data into a fresh circuit (picks up
     /// tables/permissions defined after the last bootstrap). Authed.
@@ -129,7 +128,6 @@ impl RouteId {
             (Get, ["debug", "memory"]) => RouteId::DebugMemory,
             (Post, ["view", "register"]) => RouteId::ViewRegister,
             (Post, ["view", "unregister"]) => RouteId::ViewUnregister,
-            (Post, ["crdt", "apply"]) => RouteId::CrdtApply,
             (Post, ["reset"]) => RouteId::Reset,
             (Post, ["admin", "reload"]) => RouteId::Reload,
             (Post, ["job", "kill"]) => RouteId::JobKill,

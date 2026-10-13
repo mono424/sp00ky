@@ -10,7 +10,6 @@ use tower::ServiceExt;
 
 use ssp::circuit::view::OutputFormat;
 use ssp::circuit::{Circuit, Record};
-use ssp_server::crdt::{CrdtAllowList, CrdtCache};
 use ssp_server::metrics::Metrics;
 use ssp_server::{create_app, AppState, SharedDb, SspStatus};
 
@@ -53,7 +52,7 @@ struct TestHarness {
     job_dispatcher: Arc<ssp_node::jobs::JobDispatcher>,
     job_queue_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<JobEntry>>>,
     db: SharedDb,
-    crdt_cache: Arc<CrdtCache>,
+    crdt: Arc<ssp_node::crdt::CrdtFold>,
     start_time: std::time::Instant,
 }
 
@@ -128,7 +127,7 @@ impl TestHarness {
             job_dispatcher,
             job_queue_rx: Arc::new(tokio::sync::Mutex::new(rx)),
             db,
-            crdt_cache: Arc::new(CrdtCache::new(64, CrdtAllowList::default())),
+            crdt: Arc::new(ssp_node::crdt::CrdtFold::new(ssp_node::crdt::FoldConfig::default(), "test-ssp")),
             start_time: std::time::Instant::now(),
         }
     }
@@ -150,7 +149,6 @@ impl TestHarness {
             ssp_id: "test-ssp".to_string(),
             scheduler_url: None,
             start_time: self.start_time,
-            crdt_cache: Arc::clone(&self.crdt_cache),
             view_metrics: Arc::clone(&view_metrics),
             ref_mode: ssp_protocol::RefMode::Single,
             surrealdb_version: String::new(),
@@ -188,7 +186,7 @@ impl TestHarness {
                     backend_health: None,
                     // Share the circuit-adjacent state with the shell so a
                     // migrated handler and a shell handler see the same view set.
-                    crdt_cache: Arc::clone(&self.crdt_cache),
+                    crdt: Arc::clone(&self.crdt),
                     view_metrics: Arc::clone(&view_metrics),
                     edge_update_tx: edge_update_tx.clone(),
                     anonymous_live_queries: false,
@@ -1331,7 +1329,7 @@ mod db_integration_tests {
             job_dispatcher,
             job_queue_rx: Arc::new(tokio::sync::Mutex::new(rx)),
             db,
-            crdt_cache: Arc::new(CrdtCache::new(64, CrdtAllowList::default())),
+            crdt: Arc::new(ssp_node::crdt::CrdtFold::new(ssp_node::crdt::FoldConfig::default(), "test-ssp")),
             start_time: std::time::Instant::now(),
         }
     }

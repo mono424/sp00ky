@@ -74,8 +74,9 @@ pub fn define_str_is_nosync(define_table: &str) -> bool {
 
 /// Marker baked into the `COMMENT` of a `DEFINE FIELD` whose VALUE must never
 /// enter the sync machinery — the field-level counterpart of
-/// [`NOSYNC_TABLE_COMMENT`]. The CLI emits it for all three exclusion classes
-/// (`-- @nosync`, `-- @crdt` and `-- @opaque` on a field), because the runtime
+/// [`NOSYNC_TABLE_COMMENT`]. The CLI emits it for both exclusion classes
+/// (`-- @nosync` and `-- @opaque` on a field, the latter including a CRDT edit
+/// log's update bytes), because the runtime
 /// treatment is identical in every case: the value is never held in the
 /// scheduler replica, never held in an SSP circuit row, and therefore never
 /// part of an integrity hash.
@@ -155,6 +156,44 @@ pub fn omit_clause(fields: &BTreeSet<String>) -> String {
         " OMIT {}",
         fields.iter().cloned().collect::<Vec<_>>().join(", ")
     )
+}
+
+/// Marker on the `DEFINE TABLE` of a generated CRDT edit log
+/// (`<parent>__crdt_log`): `COMMENT 'sp00ky:crdt_log content=prosemirror,summary=text'`.
+/// It names the parent's `@crdt` fields and each one's document kind, which
+/// the SSP fold needs to render the parent's plain-text mirror.
+pub const CRDT_LOG_COMMENT: &str = "sp00ky:crdt_log";
+/// Suffix of a generated CRDT edit log table.
+pub const CRDT_LOG_SUFFIX: &str = "__crdt_log";
+/// Suffix of a generated CRDT presence table.
+pub const CRDT_PRESENCE_SUFFIX: &str = "__crdt_presence";
+
+/// True for the tables the CLI generates for `@crdt` fields.
+pub fn is_crdt_aux_table(table: &str) -> bool {
+    table.ends_with(CRDT_LOG_SUFFIX) || table.ends_with(CRDT_PRESENCE_SUFFIX)
+}
+
+/// The `field -> kind` map of a CRDT edit log, read out of its `DEFINE TABLE`
+/// string (as returned by `INFO FOR DB`). `None` when the marker is absent.
+/// Field names that are not plain identifiers are dropped: the fold
+/// interpolates them into an `UPDATE ... SET <field> = ...`.
+pub fn crdt_log_fields(define_table: &str) -> Option<BTreeMap<String, String>> {
+    let start = define_table.find(CRDT_LOG_COMMENT)? + CRDT_LOG_COMMENT.len();
+    let rest = &define_table[start..];
+    let end = rest.find(['\'', '"']).unwrap_or(rest.len());
+    let fields = rest[..end]
+        .split(',')
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(field, kind)| is_identifier(field.trim()) && is_identifier(kind.trim()))
+        .map(|(field, kind)| (field.trim().to_string(), kind.trim().to_string()))
+        .collect();
+    Some(fields)
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// `_00_*` meta tables that DO participate in sync: server-written rows the
@@ -510,6 +549,30 @@ pub struct SspHeartbeat {
     /// Absent on older SSPs. Older schedulers ignore this additional field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication: Option<PublicationMetrics>,
+}
+
+#[cfg(test)]
+mod crdt_marker_tests {
+    use super::*;
+
+    #[test]
+    fn reads_fields_and_kinds_from_the_table_comment() {
+        let define = "DEFINE TABLE thread__crdt_log TYPE NORMAL SCHEMAFULL COMMENT 'sp00ky:crdt_log content=prosemirror,summary=text' PERMISSIONS FOR select WHERE true";
+        let fields = crdt_log_fields(define).unwrap();
+        assert_eq!(fields.get("content").map(String::as_str), Some("prosemirror"));
+        assert_eq!(fields.get("summary").map(String::as_str), Some("text"));
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn unmarked_tables_and_unsafe_names_are_rejected() {
+        assert!(crdt_log_fields("DEFINE TABLE thread SCHEMAFULL").is_none());
+        let fields = crdt_log_fields("DEFINE TABLE t COMMENT \"sp00ky:crdt_log a=text,b c=text,d=pro-se\"").unwrap();
+        assert_eq!(fields.keys().collect::<Vec<_>>(), vec!["a"]);
+        assert!(is_crdt_aux_table("thread__crdt_log"));
+        assert!(is_crdt_aux_table("thread__crdt_presence"));
+        assert!(!is_crdt_aux_table("thread"));
+    }
 }
 
 #[cfg(test)]

@@ -130,6 +130,29 @@ impl Runtime {
                     .schedule(TimerKind::SchemaPoll, now_epoch_ms() + node.schema_poll_secs * 1000)
                     .await;
             }
+            TimerKind::CrdtFoldTick => {
+                // A standby only follows; its predecessor folds.
+                if !node.is_standby() && *node.status.read().await == SspStatus::Ready {
+                    node.crdt.tick(
+                        std::sync::Arc::clone(&node.platform.db),
+                        node.platform.spawner.as_ref(),
+                        now_epoch_ms(),
+                    );
+                }
+                sched
+                    .schedule(TimerKind::CrdtFoldTick, now_epoch_ms() + node.crdt.config().tick_ms)
+                    .await;
+            }
+            TimerKind::CrdtSweep => {
+                if !node.is_standby() && *node.status.read().await == SspStatus::Ready {
+                    if let Err(e) = node.crdt.sweep(node.platform.db.as_ref()).await {
+                        tracing::warn!(error = %e, "CRDT sweep failed; retrying at the next one");
+                    }
+                }
+                sched
+                    .schedule(TimerKind::CrdtSweep, now_epoch_ms() + node.crdt.config().sweep_secs * 1000)
+                    .await;
+            }
             TimerKind::CircuitCheckpoint => {
                 // Filled in step 4 (checkpoint triggers). Re-arm only if enabled.
                 if let Some(secs) = node.checkpoint_interval_secs {

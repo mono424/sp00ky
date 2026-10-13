@@ -226,9 +226,9 @@ fn build_node(
         start_epoch_ms: ssp_node::now_epoch_ms(),
         bootstrap_warnings: Arc::new(RwLock::new(Vec::new())),
         backend_health: None,
-        crdt_cache: Arc::new(ssp_node::crdt::CrdtCache::new(
-            8,
-            ssp_node::crdt::CrdtAllowList::permissive(),
+        crdt: Arc::new(ssp_node::crdt::CrdtFold::new(
+            ssp_node::crdt::FoldConfig::default(),
+            "portable-ssp",
         )),
         view_metrics: Arc::new(RwLock::new(HashMap::new())),
         edge_update_tx,

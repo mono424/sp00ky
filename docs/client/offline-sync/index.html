@@ -255,7 +255,7 @@ stop();"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24 24" stroke=
 
 
 
-<table><thead><tr><th>Store</th><th>Behaviour</th></tr></thead><tbody><tr><td><code>indexeddb</code></td><td>Survives reloads. What you want in production.</td></tr><tr><td><code>memory</code></td><td>Cleared on refresh. Good for tests and ephemeral views.</td></tr></tbody></table>
+<table><thead><tr><th>Store</th><th>Behaviour</th></tr></thead><tbody><tr><td><code>indexeddb</code></td><td>Survives reloads. What you want in production. Needs <code>@surrealdb/wasm</code> 3.1+ (<a href="/docs/reference/client-config#databasestore">details</a>).</td></tr><tr><td><code>memory</code></td><td>The default. Cleared on refresh. Good for tests and ephemeral views.</td></tr></tbody></table>
 <p>Reads hit this store first, so a returning user sees their data on the first frame, before any
 network round trip completes.</p>
 <h2 id="preloading">Preloading</h2>

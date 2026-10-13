@@ -67,9 +67,9 @@ component.
 | --- | --- |
 | `data()` | Current rows, or `undefined` before the first result. |
 | `error()` | The last error, if the query failed. |
-| `isLoading()` | `true` until there is anything to show. |
-| `isFetching()` | `true` while a fetch is in flight, including refreshes. |
-| `isSettled()` | `true` once the query has a server-confirmed result. Use this, not `isLoading`, to decide "the list really is empty". |
+| `isLoading()` | `true` until there is anything to show, or until the server has confirmed an empty result. |
+| `isFetching()` | `true` while a fetch is in flight, including refreshes, and until every row the server named is downloaded and shown. |
+| `isSettled()` | `true` once the query has a server-confirmed result and all its rows are shown. Use this, not `isLoading`, to decide "the list really is empty" or "this record does not exist". |
 
 <Note>
   The Solid 2 binding (`@spooky-sync/client-solid2`) sharpens these: `isLoading()` is true only on a

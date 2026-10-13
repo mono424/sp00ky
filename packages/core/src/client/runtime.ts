@@ -7,9 +7,9 @@ import type { Lane, Saga } from '../kernel/saga';
 import { runSaga } from '../kernel/saga';
 import type { ClientState } from '../state/client-state';
 import { emptyState } from '../state/client-state';
-import { deriveStatus, isAuthoritative } from '../state/lifecycle';
+import { isAuthoritative } from '../state/lifecycle';
 import * as R from '../state/reducers';
-import { fetchingQueryCount, pendingMutationCount } from '../state/selectors';
+import { fetchingQueryCount, pendingMutationCount, queryStatus } from '../state/selectors';
 import type { SagaEnv } from '../query/env';
 import { route } from './router';
 
@@ -152,7 +152,7 @@ export class Runtime {
     for (const [hash, subs] of this.statusSubs) {
       const entry = next.queries.get(hash);
       if (!entry) continue;
-      const status = deriveStatus(entry.lifecycle);
+      const status = queryStatus(next, hash) ?? 'idle';
       if (this.lastStatus.get(hash) === status) continue;
       this.lastStatus.set(hash, status);
       for (const cb of subs) this.safely(() => cb(status));
@@ -255,7 +255,7 @@ export class Runtime {
     this.statusSubs.set(hash, set);
     const entry = this.stateValue.queries.get(hash);
     if (entry) {
-      const status = deriveStatus(entry.lifecycle);
+      const status = queryStatus(this.stateValue, hash) ?? 'idle';
       this.lastStatus.set(hash, status);
       if (options.immediate) this.safely(() => cb(status));
     }

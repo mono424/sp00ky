@@ -217,17 +217,41 @@ export function useQuery<
       { immediate: true }
     );
 
+    // A result that is empty and stays empty (a new account's list) produces
+    // no second callback above, so `isFetched` also follows the server: once
+    // its membership for the query is known and no fetch is in flight, the
+    // (possibly empty) result is the answer. Without this the hook sat in
+    // `isLoading()` until a reload.
+    let known = false;
+    let idle = false;
+    const settleFromServer = () => {
+      if (known && idle && myRun === runId) setIsFetched(true);
+    };
+
     // Mirror the query's fetch status so the UI can show a "loading more"
     // state while the sync engine pulls missing records in the background.
     const unsubStatus = sp00ky.subscribeQueryStatus(
       hash,
-      (status) => setIsFetching(status === 'fetching'),
+      (status) => {
+        setIsFetching(status === 'fetching');
+        idle = status === 'idle';
+        settleFromServer();
+      },
+      { immediate: true }
+    );
+    const unsubAuthority = sp00ky.subscribeQueryAuthority(
+      hash,
+      (k) => {
+        known = k;
+        settleFromServer();
+      },
       { immediate: true }
     );
 
     const teardown = () => {
       unsub();
       unsubStatus();
+      unsubAuthority();
     };
 
     // Superseded while awaiting subscribe()? Don't leak — tear down immediately.

@@ -77,6 +77,19 @@ describe('needed / planFetch / settled', () => {
     expect(S.settleFailed(s, 'a')).toBe(false);
     expect(S.settleFailed(R.applyLifecycle('a', { type: 'remote-failed' })(s), 'a')).toBe(true);
   });
+  it('queryStatus stays fetching until a live query is settled', () => {
+    const base = e('a', { lifecycle: { ...live, notified: true }, remoteArray: [['thing:1', 1]] });
+    const s = { ...buildState([base], R.setVersions([['thing:1', 1]])), dirty: new Set<string>() };
+    expect(S.queryStatus(s, 'a')).toBe('idle');
+    // Membership in, body still downloading (registration already ended its cycle).
+    expect(S.queryStatus(R.setVersions([['thing:1', 0]])(s), 'a')).toBe('fetching');
+    // Body landed, not yet shown to subscribers.
+    expect(S.queryStatus(R.markDirty(['a'])(s), 'a')).toBe('fetching');
+    // A cold query with no fetch in flight has nothing to wait for.
+    expect(S.queryStatus(buildState([e('c', { lifecycle: { phase: 'cold' } })]), 'c')).toBe('idle');
+    expect(S.queryStatus(R.applyLifecycle('a', { type: 'fetch-begin' })(s), 'a')).toBe('fetching');
+    expect(S.queryStatus(s, 'missing')).toBeUndefined();
+  });
   it('fetchingQueryCount counts entries with fetch depth', () => {
     const s = buildState([e('a', { lifecycle: { fetchDepth: 2 } }), e('b')]);
     expect(S.fetchingQueryCount(s)).toBe(1);

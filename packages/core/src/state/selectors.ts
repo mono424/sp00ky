@@ -12,9 +12,21 @@ export const activeHashes = (s: ClientState): QueryHash[] => [...s.queries.keys(
 export const hashesForTable = (s: ClientState, table: string): QueryHash[] =>
   [...s.queries].filter(([, e]) => e.def.tableName === table).map(([h]) => h);
 
+/**
+ * The status subscribers see. `fetching` while a fetch cycle is in flight,
+ * and also while a live query is not yet `settled`: the server's membership
+ * is in but its rows are still downloading or not yet shown. Registration
+ * ends its cycle as soon as membership is applied and the body fetch starts
+ * its own a moment later, so the fetch count alone read `idle` in between,
+ * and a binding that settles on "membership known and idle" told the app a
+ * row did not exist while it was on its way (a by-id screen showed "not
+ * found" for a moment, or for as long as the bodies took).
+ */
 export const queryStatus = (s: ClientState, hash: QueryHash): QueryStatus | undefined => {
   const e = s.queries.get(hash);
-  return e ? deriveStatus(e.lifecycle) : undefined;
+  if (!e) return undefined;
+  if (deriveStatus(e.lifecycle) === 'fetching') return 'fetching';
+  return e.lifecycle.phase === 'live' && !settled(s, hash) ? 'fetching' : 'idle';
 };
 
 export interface Overlay {

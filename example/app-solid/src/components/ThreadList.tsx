@@ -6,7 +6,6 @@ import type { schema } from '../schema.gen';
 import { ProfilePicture } from './ProfilePicture';
 import { ArrowDownAZ, ArrowUpZA, CalendarArrowDown, CalendarArrowUp, Plus } from 'lucide-solid';
 import { Tooltip } from './Tooltip';
-import { loroPreview } from '../lib/crdt-text';
 
 // Scroll the selected thread card into view
 function scrollSelectedIntoView(index: number) {
@@ -233,12 +232,10 @@ export function ThreadList() {
                     {thread.title || 'Untitled'}
                   </h2>
 
-                  {/* Content preview — `content` is `@crdt @cursor`, so the
-                      stored value is `{ state, cursors }`; loroPreview
-                      decodes the LoroDoc snapshot to a plain string for
-                      list display. */}
+                  {/* Content preview: a `@crdt` column holds the document's
+                      plain text, written by the server on every fold. */}
                   <p class="text-sm text-zinc-500 line-clamp-2 leading-relaxed">
-                    {loroPreview(thread.content)}
+                    {thread.content}
                   </p>
                 </div>
               </div>

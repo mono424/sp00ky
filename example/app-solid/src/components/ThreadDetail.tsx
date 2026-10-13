@@ -13,7 +13,6 @@ import { ProfilePicture } from './ProfilePicture';
 import { Tooltip } from './Tooltip';
 import { CollaborativeEditor } from './CollaborativeEditor';
 import { ShareDialog } from './ShareDialog';
-import { loroPreview } from '../lib/crdt-text';
 import { Lock, MoreVertical } from 'lucide-solid';
 
 interface CollaboratorRow {
@@ -249,21 +248,19 @@ export function ThreadDetail() {
     }
   };
 
-  // `content` is `@crdt @cursor` and goes through the collaborative
-  // editor. `title` is a plain `TYPE string` column — edited via a
-  // regular `<input>` and synced through `db.update`, so no CrdtField is
-  // needed for it.
+  // `content` is `@crdt prosemirror @cursor`: edited through the
+  // collaborative editor, while the column itself holds the server-written
+  // plain text. `title` is a plain `TYPE string` column, edited via a
+  // regular `<input>` and synced through `db.update`.
   const contentCrdtField = useCrdtField(
     'thread',
     () => thread()?.id ? `thread:${params.id}` : undefined,
     'content',
   );
 
-  // `title` is a regular `TYPE string` column — debounced update through
-  // the normal sync pipeline. `content` is `@crdt @cursor`; the editor's
-  // CrdtField drives `pushToRemote` for that one, so the editor's
-  // `onUpdate` is a no-op (calling `db.update` would race the snapshot
-  // push and SurrealDB would reject a string against the object column).
+  // `title` is a regular `TYPE string` column: debounced update through
+  // the normal sync pipeline. `content` edits travel as the CRDT field's own
+  // edit-log rows, so the editor's `onUpdate` has nothing to write.
   const handleTitleChange = async (newTitle: string) => {
     const threadData = thread();
     if (!threadData || !threadData.id || !canEdit()) return;
@@ -577,7 +574,7 @@ export function ThreadDetail() {
                         when={contentCrdtField()}
                         fallback={
                           <div class="text-[15px] text-zinc-300 leading-relaxed min-h-[120px]">
-                            <p class="whitespace-pre-wrap">{loroPreview(threadData().content)}</p>
+                            <p class="whitespace-pre-wrap">{threadData().content}</p>
                           </div>
                         }
                       >

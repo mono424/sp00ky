@@ -228,7 +228,7 @@ export const schema = {
          */
         doc: { type: 'string' as const, recordId: true, optional: true },
         field: { type: 'string' as const, optional: true },
-        nonce: { type: 'string' as const, optional: true },
+        peer: { type: 'string' as const, optional: true },
         size: { type: 'number' as const, optional: true },
       },
       primaryKey: ['id'] as const
@@ -548,7 +548,7 @@ DEFINE TABLE OVERWRITE thread__crdt_log SCHEMAFULL PERMISSIONS FULL;
 DEFINE FIELD OVERWRITE doc ON TABLE thread__crdt_log TYPE option<record<thread>>;
 DEFINE FIELD OVERWRITE field ON TABLE thread__crdt_log TYPE option<string>;
 DEFINE FIELD OVERWRITE author ON TABLE thread__crdt_log TYPE option<record>;
-DEFINE FIELD OVERWRITE nonce ON TABLE thread__crdt_log TYPE option<string>;
+DEFINE FIELD OVERWRITE peer ON TABLE thread__crdt_log TYPE option<string>;
 -- @opaque
 DEFINE FIELD OVERWRITE data ON TABLE thread__crdt_log TYPE option<bytes>;
 DEFINE FIELD OVERWRITE size ON TABLE thread__crdt_log TYPE option<int>;

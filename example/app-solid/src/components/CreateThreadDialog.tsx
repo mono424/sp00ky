@@ -3,7 +3,7 @@ import { useNavigate } from '@solidjs/router';
 import { useAuth } from '../lib/auth';
 import { Uuid, useDb } from '@spooky-sync/client-solid';
 import { RecordId } from 'surrealdb';
-import { CrdtField } from '@spooky-sync/core';
+import type { CrdtField } from '@spooky-sync/core';
 import type { schema } from '../schema.gen';
 import { createHotkey } from '../lib/keyboard';
 import { Tooltip } from './Tooltip';
@@ -22,22 +22,18 @@ export function CreateThreadDialog(props: CreateThreadDialogProps) {
   const [contentText, setContentText] = createSignal('');
   const [error, setError] = createSignal('');
   const [isLoading, setIsLoading] = createSignal(false);
-  // Fresh CRDT-backed doc for `content` per dialog open. The LoroDoc
-  // accumulates ProseMirror state via LoroSyncPlugin; on submit we
-  // snapshot it and hand the bytes straight to `db.create`. `title` is a
-  // plain `TYPE string` column (no `@crdt`) so it ships as the typed
-  // text directly — no LoroDoc ceremony.
+  // A fresh draft document for `content` per dialog open: the editor writes
+  // into it before the thread exists, and on submit it is handed to the new
+  // thread's CRDT field, whose first edits it becomes. `title` is a plain
+  // `TYPE string` column, so it ships as the typed text directly.
   const [contentField, setContentField] = createSignal<CrdtField | null>(null);
 
   createEffect(() => {
     if (props.isOpen) {
-      // `content` is `@crdt @cursor` → cursors=true, on-disk shape is
-      // `{ state, cursors }` — matched by `extractSnapshot` on the
-      // receiving end.
-      setContentField(new CrdtField('content', true));
       setTitle('');
       setContentText('');
       setError('');
+      void db.getSp00ky().createCrdtDraft('thread', 'content').then(setContentField);
     } else {
       setContentField(null);
     }
@@ -63,13 +59,14 @@ export function CreateThreadDialog(props: CreateThreadDialogProps) {
       const threadId = `thread:${genId}`;
       await db.create(threadId, {
         title: title().trim(),
-        // `content` is `@crdt @cursor` — wrap in `{ state, cursors }`. No
-        // collaborators yet during a draft, so we set just `state`.
-        content: { state: cField.exportSnapshot() },
         author: new RecordId('user', user.id.toString().split(':')[1]),
         active: true,
         published: false,
       });
+      // The draft's edits become the thread's first content edits.
+      const sp00ky = db.getSp00ky();
+      await sp00ky.openCrdtField('thread', threadId, 'content', cField);
+      await sp00ky.closeCrdtField('thread', threadId, 'content');
 
       handleClose();
       navigate(`/thread/${genId}`);

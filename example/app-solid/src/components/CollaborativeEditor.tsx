@@ -10,12 +10,11 @@ import {
   undo,
   redo,
 } from 'loro-prosemirror';
-import { cursorColorFromName, textToHtml, type CrdtField } from '@spooky-sync/core';
+import { cursorColorFromName, type CrdtField } from '@spooky-sync/core';
 import { keymap } from '@tiptap/pm/keymap';
 
 interface CollaborativeEditorProps {
   field: CrdtField;
-  content?: string;
   placeholder?: string;
   class?: string;
   editable?: boolean;
@@ -39,8 +38,6 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
 
     const crdtField = props.field;
     const doc = crdtField.getDoc();
-    const hasCrdtState = crdtField.hasContent();
-    const fallback = props.content;
 
     // Create cursor presence store
     const cursorColor = cursorColorFromName(props.username ?? 'Anonymous');
@@ -93,11 +90,6 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
       },
     });
 
-    // Seed content if LoroDoc was empty
-    if (!hasCrdtState && fallback && editor.getText().length === 0) {
-      editor.commands.setContent(textToHtml(fallback));
-    }
-
     lastEmittedText = editor.getText();
 
     // The editor is mounted and seeded — the user couldn't have typed
@@ -126,7 +118,7 @@ export function CollaborativeEditor(props: CollaborativeEditorProps) {
         console.warn('[CollaborativeEditor] Failed to add cursor plugin:', e);
       }
 
-      // Sync cursor state: push local cursor changes to _00_cursor.
+      // Publish local cursor changes as this session's presence.
       cursorUnsub = presenceRef.subscribeBy((by) => {
         if (by !== 'local') return;
         if (cursorPushTimer) clearTimeout(cursorPushTimer);

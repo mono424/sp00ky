@@ -15,16 +15,23 @@
 -- tab closes, nothing refreshes `lastActiveAt`, the sweep deletes the row AND
 -- every edge, and the surviving tab goes blank.
 --
--- Anonymous rows (`auth_id = 'anon'`) belong to the sessions in their
--- `subscribers`. Every logged-out visitor shares the one `anon` identity, so
--- the user branch cannot tell them apart, and gating on `auth_id = 'anon'`
--- alone let any guest list every visitor's views, rewrite them, and DELETE
--- them (the delete event then tears the SSP view down under its owner). The
--- SSP appends the registering `session::id()` to `subscribers` on every
--- registration, so the session that registered a view can read it back and
--- heartbeat it. A reconnect gets a new session id that is not in the set: its
--- heartbeat matches no row, the client takes that as a reclaimed view and
--- re-registers, and the registration adds the new session.
+-- Anonymous rows belong to the sessions in their `subscribers`. A signed-out
+-- registration is stored as `auth_id = 'anon'` when the deployment has
+-- `anonymousLiveQueries` on, and as `auth_id = ''` (no identity) when it has
+-- it off; both spellings are anonymous here. Every logged-out visitor shares
+-- the one `anon` identity, so the user branch cannot tell them apart, and
+-- gating on `auth_id = 'anon'` alone let any guest list every visitor's views,
+-- rewrite them, and DELETE them (the delete event then tears the SSP view down
+-- under its owner). The SSP appends the registering `session::id()` to
+-- `subscribers` on every registration, so the session that registered a view
+-- can read it back and heartbeat it. A reconnect gets a new session id that
+-- is not in the set: its heartbeat matches no row, the client takes that as a
+-- reclaimed view and re-registers, and the registration adds the new session.
+--
+-- Admitting only `'anon'` locked every signed-out page of a deployment without
+-- `anonymousLiveQueries` out of its own row: its `rowCount` read-back came
+-- back NONE, so the client could never tell an empty view from one still
+-- flushing and its preload never settled ("Connecting..." forever).
 --
 -- The check reads `session::id()`, which the caller cannot choose. It does not
 -- trust any id the caller passes: anonymous session ids, like anonymous query
@@ -32,7 +39,14 @@
 -- SSP does not add a session to an anonymous row on the strength of its id:
 -- the registration must also carry the hash of the owning page's secret (see
 -- `ownerHash` below), or a guest who read an id off `_00_list_ref_anon` could
--- join that row through `fn::query::register` and then delete it.
+-- join that row through `fn::query::register` and then delete it. An `''`
+-- row needs no such proof: its edges go to `_00_list_ref` stamped
+-- `auth_id = ''`, which that table's rule shows to no caller, so its id (a
+-- hash salted per page) never leaves the page that registered it. An `''` row
+-- can also be a signed-in user's view registered before its session had an
+-- identity; that session reads it back the same way until its re-registration
+-- rebuilds the view under the user (`discard_view_without_identity` in
+-- ssp-node/src/node.rs).
 --
 -- The rule is checked against the row after an UPDATE as well as before it,
 -- so an UPDATE that would leave the caller's own session out of `subscribers`
@@ -66,7 +80,7 @@ DEFINE TABLE OVERWRITE _00_query SCHEMALESS
     PERMISSIONS
       FOR select, update, delete
         WHERE ($auth.id != NONE AND auth_id = <string>$auth.id)
-           OR (auth_id = 'anon' AND subscribers[*].id CONTAINS <string>session::id())
+           OR (auth_id IN ['anon', ''] AND subscribers[*].id CONTAINS <string>session::id())
       FOR create NONE;
 
 -- The raw query string (for re-hydration/debugging)

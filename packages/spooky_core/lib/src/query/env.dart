@@ -47,6 +47,14 @@ String listRefTable(SagaEnv env, ClientState s) {
   return listRefTableFor(env.refMode, userId);
 }
 
+/// Whether this session can be sent a view's membership at all. A signed-out
+/// session reads edges only from `_00_list_ref_anon`, and only with
+/// anonymous live queries on: without them the SSP files its views under no
+/// identity in `_00_list_ref`, whose rule shows those edges to no caller. Such
+/// a view can register and report its row count, but never its rows.
+bool receivesMembership(SagaEnv env, ClientState s) =>
+    s.userId != null || env.anonLive;
+
 /// The declared columns of [table], or null when the schema does not know it.
 /// Internal `_00_*` tables are known-and-empty: their rows are stored whole.
 Map<String, ColumnSchema>? columnsFor(SagaEnv env, String table) {

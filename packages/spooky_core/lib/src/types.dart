@@ -99,7 +99,9 @@ class Sp00kyConfig {
   /// client gets live `query().stream()` updates over world-readable tables.
   /// Requires the server deployed with `anonymousLiveQueries: true` in
   /// `sp00ky.yml` (this flag must match it). Defaults to false: anonymous
-  /// clients can read one-shot (`queryRemote`) but never sync live.
+  /// clients can read one-shot (`queryRemote`) but never sync live, and a
+  /// `preload` made while signed out returns at once rather than wait for
+  /// membership that never comes.
   final bool enableAnonymousLiveQueries;
 
   /// Surface sustained sync failures as a `degraded` health status the app can

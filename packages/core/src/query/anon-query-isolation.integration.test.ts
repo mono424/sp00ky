@@ -449,6 +449,37 @@ describe('anonymous _00_query isolation (real SurrealDB)', () => {
     expect(await heartbeatFound(g, qg)).toBe(true);
   });
 
+  // Without `anonymousLiveQueries` the SSP stores a signed-out registration
+  // with no identity at all (`auth_id = ''`). The rule admitted only `'anon'`
+  // rows to their subscribers, so such a page could not read its own row back
+  // and its preload never settled.
+  it("a signed-out view stored with no identity (anonymous live queries off) answers to its own session, and to nobody else", async (ctx) => {
+    if (!reachable) ctx.skip();
+    const [a, sidA] = await guest();
+    const [b] = await guest();
+    const [u] = await member('alice');
+    const qa = viewId();
+    await register(qa, sidA, '');
+    expect((await row(qa))?.auth_id).toBe('');
+
+    expect(await readBack(a, qa)).toEqual({ rowCount: 3, state: 'ready' });
+    expect(await heartbeatFound(a, qa)).toBe(true);
+
+    const before = await row(qa);
+    for (const other of [b, u]) {
+      expect(await readBack(other, qa)).toBeNull();
+      expect(await heartbeatFound(other, qa)).toBe(false);
+      expect(await other.query('SELECT id FROM _00_query')).toEqual([[]]);
+      await other.query('DELETE $id', { id: qa });
+    }
+    expect(await row(qa)).toEqual(before);
+
+    expect(await a.query('RETURN fn::query::unsubscribe($id)', { id: qa })).toEqual([
+      { released: true, remaining: 0 },
+    ]);
+    expect(await row(qa)).toBeUndefined();
+  });
+
   it('the owning guest can still release its view', async (ctx) => {
     if (!reachable) ctx.skip();
     const [a, sidA] = await guest();

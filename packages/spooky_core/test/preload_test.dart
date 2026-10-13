@@ -22,6 +22,26 @@ void main() {
   late FakeRemote remote;
   late InProcessSp00kyClient client;
 
+  // Signed out, so the server sends membership only with anonymous live
+  // queries on; these clients have them unless a test says otherwise.
+  Future<InProcessSp00kyClient> start({bool anonLive = true}) async {
+    final c = InProcessSp00kyClient(
+      Sp00kyConfig(
+        database: const DatabaseConfig(
+            endpoint: 'ws://x', namespace: 't', database: 't'),
+        schema: schema,
+        schemaSurql: schemaSurql,
+        persistenceClient: MemoryPersistenceClient(),
+        refSyncIntervalMs: 3600000,
+        enableAnonymousLiveQueries: anonLive,
+      ),
+      remoteClient: remote,
+    );
+    await c.init();
+    await settle();
+    return c;
+  }
+
   setUp(() async {
     remote = FakeRemote();
     remote.records['thread:a'] = {
@@ -30,19 +50,7 @@ void main() {
       '_00_rv': 1,
     };
     remote.defaultMembership = [('thread:a', 1)];
-    client = InProcessSp00kyClient(
-      Sp00kyConfig(
-        database: const DatabaseConfig(
-            endpoint: 'ws://x', namespace: 't', database: 't'),
-        schema: schema,
-        schemaSurql: schemaSurql,
-        persistenceClient: MemoryPersistenceClient(),
-        refSyncIntervalMs: 3600000,
-      ),
-      remoteClient: remote,
-    );
-    await client.init();
-    await settle();
+    client = await start();
   });
   tearDown(() => client.close());
 
@@ -70,6 +78,21 @@ void main() {
     await client.preload('SELECT * FROM thread', const {});
     expect(remote.queries.length, sent,
         reason: 'an entry that already exists needs no round trip');
+  });
+
+  test(
+      'signed out without anonymous live queries, a cold preload returns '
+      'at once: no membership can reach the session, so waiting would hang',
+      () async {
+    // As on the server: a guest may not read the global `_00_list_ref`, so
+    // the view reports one row and never shows it.
+    remote.hiddenEdgeTables.add('_00_list_ref');
+    final signedOut = await start(anonLive: false);
+    addTearDown(signedOut.close);
+    await signedOut.preload(
+        'SELECT * FROM thread', const {}).timeout(const Duration(seconds: 2));
+    expect(signedOut.state.queries, hasLength(1),
+        reason: 'it is still registered, for when the session signs in');
   });
 
   test('a preload whose registration fails reports rather than hanging',

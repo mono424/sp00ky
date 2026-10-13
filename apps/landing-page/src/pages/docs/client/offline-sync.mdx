@@ -141,6 +141,7 @@ navigate to and the next screen paints instantly.
 | --- | --- |
 | Resolved before on this device | Resolves at once; the rows are already in the local store. |
 | Never resolved | Resolves once the server's membership and every record are local. Pass `signal` to abort the wait. |
+| Signed out, without `enableAnonymousLiveQueries` | Resolves at once. The server sends a signed-out session membership only with anonymous live queries on, so there is nothing to wait for. |
 
 A preloaded query stays registered (and live) until a ttl after nothing has mounted it; a view
 that mounts the same query simply attaches to it.

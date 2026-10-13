@@ -36,7 +36,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   - `db.update(table, id, payload, options?)` — `options.debounced` coalesces updates; with `flushOnHide` (default `true`) a pending patch survives a reload or closed tab.
   - `db.delete(table, idOrSelector)`.
   - `db.query(table)` — returns a `QueryBuilder`. Chain `.related()`, `.orderBy()`, `.limit()`, etc., end with `.build()`.
-  - `db.preload(query, options?)` — registers the query without subscribing. Resolved before on this device: returns instantly. Never resolved: awaits the server's membership and every record. `options.signal` aborts a cold wait; `refresh`/`staleTime` are ignored. Evicted a ttl after registration unless a view mounts the same query.
+  - `db.preload(query, options?)` — registers the query without subscribing. Resolved before on this device: returns instantly. Never resolved: awaits the server's membership and every record. Signed out without `enableAnonymousLiveQueries`: returns instantly (no membership is ever sent to that session). `options.signal` aborts a cold wait; `refresh`/`staleTime` are ignored. Evicted a ttl after registration unless a view mounts the same query.
   - `db.run(backend, route, payload)` — call a backend RPC route.
   - `db.bucket(name)` — get a `BucketHandle` for file storage.
   - `db.remoteQuery(sql, vars?)` — one-shot remote read through the client's queued, connect-gated path (skips cache).

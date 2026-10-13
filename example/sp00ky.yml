@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://sp00ky.cloud/schema/sp00ky.schema.json
 mode: singlenode # "singlenode", "cluster", or "surrealism"
 cloudApi: https://api-stg.sp00ky.cloud # override Sp00ky Cloud API endpoint
-slug: threads
+slug: threads-example
 surrealdb:
   hosting: external
   endpoint: wss://sp00ky-demo-06fm9vpfdltobduaregfd8ddfo.aws-euw1.surreal.cloud

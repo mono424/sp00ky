@@ -142,6 +142,14 @@ export class Sp00kyClient<S extends SchemaStructure> {
         this.runtime.subscribe(hash, cb, options),
     };
     const remoteRegisterPort = { enqueueDownEvent: () => void this.runtime.dispatch({ type: 'EnsureRegistered' }) };
+    // CRDT edit logs ride ordinary queries and the ordinary outbox.
+    s.crdt.attach({
+      watch: async (table, where, onRows) => {
+        const { hash } = await (this.query as any)(table, {}).where(where).build().run();
+        return this.runtime.subscribe(hash, onRows, { immediate: true });
+      },
+      create: (id, data) => this.create(id, data),
+    });
     this.featureFlags = new FeatureFlagModule<S>({ dataModule: liveQueryPort, sync: remoteRegisterPort, auth: s.auth, logger: s.logger });
     this.appReleases = new AppReleaseModule<S>({ dataModule: liveQueryPort, sync: remoteRegisterPort, auth: s.auth, logger: s.logger });
     this.webPush = new WebPushModule({

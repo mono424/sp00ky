@@ -80,6 +80,22 @@ describe('drain', () => {
     expect(out.dispatched.at(-1)).toEqual({ type: 'SyncOutcome', ok: true, error: undefined });
   });
 
+  it('a CRDT edit-log CREATE that finds its row already there is acked, any other duplicate rolls back', async () => {
+    const logEnv = defaultEnv({ tables: [{ name: 'thing', columns: {} }, { name: 'doc__crdt_log', columns: {} }] } as any, { outboxBatchSize: 2 });
+    const out = await runPure(drain(logEnv), {
+      state: stateWith([1, 2]),
+      handlers: {
+        'local.query': (e: any) =>
+          e.sql === 'SELECT * FROM $ids'
+            ? [[pendingRow(1, 'create', { tableName: 'doc__crdt_log', recordId: 'doc__crdt_log:1' }), pendingRow(2)]]
+            : [],
+        'remote.query': () => [err('Database record `doc__crdt_log:1` already exists'), err('Database record `thing:2` already exists')],
+      },
+    });
+    expect(out.state.outbox.find((i) => i.id === '_00_pending_mutations:m1')?.status).toBe('acked');
+    expect(out.state.outbox.some((i) => i.id === '_00_pending_mutations:m2')).toBe(false);
+  });
+
   it('transport failures keep the tail queued behind a backoff timer (thrown, or a network ERR mid-batch, or a short result list)', async () => {
     const thrown = await runPure(drain(env), {
       state: stateWith([1, 2]),

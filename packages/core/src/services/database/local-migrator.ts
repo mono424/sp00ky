@@ -17,10 +17,11 @@ export const sha1 = async (str: string): Promise<string> => {
 
 /**
  * Local-only state a schema change must not throw away: the outbox, the
- * failed-mutation tray and debounced patches not yet in the outbox. Cached
- * rows refill from the server; these exist nowhere else.
+ * failed-mutation tray, debounced patches not yet in the outbox and CRDT
+ * documents with edits not yet sent. Cached rows refill from the server;
+ * these exist nowhere else.
  */
-const KEPT_TABLES = ['_00_pending_mutations', '_00_failed_mutations', '_00_pending_writes'] as const;
+const KEPT_TABLES = ['_00_pending_mutations', '_00_failed_mutations', '_00_pending_writes', '_00_crdt_local'] as const;
 
 export class LocalMigrator {
   private logger: Logger;
@@ -59,6 +60,7 @@ export class LocalMigrator {
       DEFINE TABLE IF NOT EXISTS _00_pending_mutations SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
       DEFINE TABLE IF NOT EXISTS _00_pending_writes SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
       DEFINE TABLE IF NOT EXISTS _00_blob SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
+      DEFINE TABLE IF NOT EXISTS _00_crdt_local SCHEMALESS PERMISSIONS FOR select, create, update, delete WHERE true;
     `;
     const fullSchema = schemaSurql + '\n' + systemSchema;
 

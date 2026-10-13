@@ -1,463 +1,533 @@
 import type { SchemaStructure } from '@spooky-sync/query-builder';
+import type { LoroDoc } from 'loro-crdt';
+import { RecordId } from 'surrealdb';
 import type { LocalStore, RemoteDatabaseService } from '../../services/database/index';
 import type { Logger } from '../../services/logger/index';
-import type { Uuid } from 'surrealdb';
+import { parseRecordIdString } from '../../utils/index';
+import { check } from './acceptance';
+import { asBytes, randomPeer } from './bytes';
 import { CrdtField } from './crdt-field';
 import { loadLoro } from './loro-loader';
-import { parseRecordIdString } from '../../utils/index';
+import type { CrdtKind } from './mirror';
 
 export { CrdtField, cursorColorFromName, CURSOR_COLORS } from './crdt-field';
 
 /**
- * CrdtManager manages active CrdtField instances and their sync channels.
+ * Collaborative (`@crdt`) fields.
  *
- * Collaborative state lives in two dedicated tables (defined in
- * `apps/cli/src/meta_tables_remote.surql`):
- *   - `_00_crdt`   { record_id, field, state } — one row per (record, field)
- *   - `_00_cursor` { record_id, session_id, field, state } — one row per
- *                    (record, session, field)
+ * Each open field is a Loro document. The client never sends the document,
+ * only its own edits: every batch of local edits becomes one row of the
+ * generated `<table>__crdt_log` table, written through the ordinary outbox
+ * (so it survives offline, reloads and retries), and every client receives
+ * the other rows through an ordinary query and merges them. Nobody writes the
+ * canonical state but the SSP, which folds the log into `_00_crdt_doc` and the
+ * parent field's plain text (see `packages/ssp-node/src/crdt`).
  *
- * Splitting them off the parent row is what makes offline edits mergeable:
- * each (record, field) gets its own row, so concurrent offline writes don't
- * collide on the parent's last-write-wins semantics.
+ * A row is imported only if it passes the acceptance rule the fold applies
+ * (`./acceptance`), so this tab and the server always hold the same ops.
  *
- * Cross-browser delivery still rides the parent table's existing LIVE feed
- * to avoid SurrealDB v3 LIVE bugs around dereference-based permission rules
- * (issues 3602, 4026). On every meta UPSERT the writer also bumps the
- * parent's `_00_rv` (a no-op assignment); that fires the parent's LIVE
- * feed, and the receiver pulls the matching `_00_crdt` / `_00_cursor` rows
- * via subquery. Permission inheritance happens server-side via
- * `record_id.id != NONE` (SELECT) and `fn::can_update_record` (UPDATE).
+ * Edits carry this tab's Loro peer id, claimed for the signed-in user in
+ * `_00_crdt_peer` before the first row is sent; the database refuses a row
+ * whose peer its author does not own. A tab picks a fresh peer per session.
+ * Offline, edits stay local (and in the local snapshot) until the claim and
+ * the outbox can go through.
  */
+
+/** The runtime pieces the manager needs from the client facade. */
+export interface CrdtPorts {
+  /** Register a query on `table` filtered by `where` and follow its rows. */
+  watch(table: string, where: Record<string, unknown>, onRows: (rows: Record<string, unknown>[]) => void): Promise<() => void>;
+  /** Optimistic create through the outbox. */
+  create(id: string, data: Record<string, unknown>): Promise<unknown>;
+}
+
+/** Local-only state of one field: the merged document and own unsent edits. */
+interface LocalState {
+  snapshot?: Uint8Array;
+  /** Server fold this snapshot includes (for the canonical refetch). */
+  rev: number;
+  /** Every peer this device edited the field under, and how far its ops
+   *  are already in the outbox. */
+  peers: Record<string, { enqueued: number }>;
+}
+
+interface Session {
+  key: string;
+  table: string;
+  recordId: string;
+  field: string;
+  kind: CrdtKind;
+  cursor: boolean;
+  doc: LoroDoc;
+  handle: CrdtField;
+  refs: number;
+  local: LocalState;
+  /** Log rows already looked at (imported, refused or own). */
+  seen: Set<string>;
+  disposers: Array<() => void>;
+  flushTimer: ReturnType<typeof setTimeout> | null;
+  firstDirtyAt: number;
+  persistTimer: ReturnType<typeof setTimeout> | null;
+  flushing: Promise<void> | null;
+  refetching: boolean;
+  presenceTimer: ReturnType<typeof setTimeout> | null;
+  presencePending: Uint8Array | null;
+}
+
+const LOCAL_TABLE = '_00_crdt_local';
+const LOG_SUFFIX = '__crdt_log';
+const PRESENCE_SUFFIX = '__crdt_presence';
+/** Longest a burst of typing waits before its edits go out. */
+const MAX_WAIT_MS = 2000;
+const PERSIST_DEBOUNCE_MS = 400;
+const PRESENCE_THROTTLE_MS = 250;
+const CLAIM_RETRY_MS = 5000;
+
 export class CrdtManager {
-  private fields = new Map<string, CrdtField>();
-  // One LIVE subscription per parent table (e.g. "thread" → uuid).
-  private liveByTable = new Map<string, Uuid>();
-  // Coalesces concurrent first-time subscribes for the same table. Stamped with
-  // the connection generation it started under, so a restart after a drop can
-  // tell a reusable in-flight attempt from a doomed one.
-  private pendingLive = new Map<string, { promise: Promise<void>; generation: number }>();
-  // Tables whose LIVE died with a dropped socket, awaiting the next `connected`
-  // to be re-subscribed. Held separately because `liveByTable` is cleared on the
-  // drop (those uuids belong to a session that no longer exists).
-  private staleTables = new Set<string>();
-  // Bumped on every socket drop. A LIVE registration that started under an
-  // older generation is discarded rather than recorded, so a drop landing
-  // mid-registration can't leave a uuid from a dead session in `liveByTable`.
-  private connectionGeneration = 0;
-  private connectionUnsubscribes: Array<() => void> = [];
+  private sessions = new Map<string, Session>();
+  private opening = new Map<string, Promise<Session>>();
+  private ports: CrdtPorts | null = null;
   private logger: Logger;
-  // SurrealDB session id, used as the per-session key inside `_00_cursor`.
-  private sessionId: string = '';
+  private peer: `${number}` = randomPeer();
+  /** The current peer's claim: settled once the database holds it for us. */
+  private claim: Promise<boolean> | null = null;
+  private claimRetry: ReturnType<typeof setTimeout> | null = null;
+  private connectionUnsubscribes: Array<() => void> = [];
 
   constructor(
     private schema: SchemaStructure,
     private local: LocalStore,
     private remote: RemoteDatabaseService,
     logger: Logger,
-    private debounceMs: number = 500,
+    private debounceMs: number = 300
   ) {
     this.logger = logger.child({ service: 'CrdtManager' });
-    this.subscribeToReconnect();
-  }
-
-  /**
-   * Re-establish table LIVEs after a socket drop.
-   *
-   * A LIVE subscription lives and dies with its WebSocket session, and
-   * `ensureTableSubscription` is memoized on `liveByTable` — so without this,
-   * the first reconnect leaves CRDT realtime permanently dead: the map still
-   * holds a uuid for a subscription the server has forgotten, so every later
-   * `open()` short-circuits and no LIVE is ever re-issued.
-   *
-   * Both drop events matter: the SDK publishes `reconnecting` (not
-   * `disconnected`) when it intends to recover on its own, and `disconnected`
-   * only once it has given up.
-   */
-  private subscribeToReconnect(): void {
-    const onDrop = () => {
-      this.connectionGeneration++;
-      for (const table of this.liveByTable.keys()) this.staleTables.add(table);
-      // In-flight registrations count too: they'd otherwise complete against
-      // the dead session and be silently dropped by the generation guard.
-      for (const table of this.pendingLive.keys()) this.staleTables.add(table);
-      // No KILL: the server-side subscriptions are already gone, and these
-      // uuids would resolve against the new session.
-      this.liveByTable.clear();
-    };
     this.connectionUnsubscribes.push(
-      this.remote.subscribeConnection('reconnecting', onDrop),
-      this.remote.subscribeConnection('disconnected', onDrop),
       this.remote.subscribeConnection('connected', () => {
-        const tables = Array.from(this.staleTables);
-        this.staleTables.clear();
-        for (const table of tables) {
-          // Only resurrect tables that still have an open field — a drop can
-          // outlive the editor that needed the feed.
-          if (!this.hasOpenFieldFor(table)) continue;
-          void this.ensureTableSubscription(table);
-        }
+        for (const s of this.sessions.values()) this.scheduleFlush(s, 0);
       })
     );
   }
 
-  /** Stop observing transport events. Separate from {@link closeAll}, which also
-   *  runs on a bucket switch where the manager keeps being used. */
+  /** Hand over the runtime ports. Called once by the client facade. */
+  attach(ports: CrdtPorts): void {
+    this.ports = ports;
+  }
+
+  /**
+   * A new signed-in identity (boot, sign-in, sign-out): edits from here on
+   * belong to it, under a peer it claims. Edits already made stay with the
+   * peer they were made under.
+   */
+  setSessionId(_salt: string): void {
+    this.peer = randomPeer();
+    this.claim = null;
+    for (const s of this.sessions.values()) s.doc.setPeerId(this.peer);
+  }
+
   dispose(): void {
-    for (const off of this.connectionUnsubscribes) {
+    for (const off of this.connectionUnsubscribes.splice(0)) {
       try {
         off();
       } catch {
         /* ignore */
       }
     }
-    this.connectionUnsubscribes = [];
-    this.staleTables.clear();
-  }
-
-  private hasOpenFieldFor(table: string): boolean {
-    const prefix = `${table}:`;
-    return Array.from(this.fields.keys()).some((k) => k.startsWith(prefix));
-  }
-
-  /** Set the session id that scopes this client's cursor entries. Must be
-   *  called before `open()` for cursors to be pushed under a stable key.
-   *  Passed in from `sp00ky.ts` at boot (it already fetches `session::id()`
-   *  for the data-module salt). */
-  setSessionId(sessionId: string): void {
-    this.sessionId = sessionId;
+    if (this.claimRetry) clearTimeout(this.claimRetry);
   }
 
   /**
-   * Open a CRDT field for collaborative editing.
-   *
-   * @param table - Table name
-   * @param recordId - Full record ID (e.g., "thread:abc")
-   * @param field - Field name (e.g., "title", "content")
-   * @param fallbackText - Current plain text from the record, used to seed the
-   *                       LoroDoc if no CRDT state exists yet (migration path)
+   * Open a collaborative field. Every open of the same field shares one
+   * document; close each open with {@link close}.
    */
-  async open(
-    table: string,
-    recordId: string,
-    field: string,
-    fallbackText?: string,
-  ): Promise<CrdtField> {
-    this.assertCrdtField(table, field);
-    const cursorsEnabled = this.fieldHasCursor(table, field);
-    const key = this.makeKey(table, recordId, field);
-    let crdtField = this.fields.get(key);
-
-    if (crdtField) {
-      return crdtField;
+  async open(table: string, recordId: string, field: string, _fallbackText?: string): Promise<CrdtField> {
+    const { kind, cursor } = this.fieldSpec(table, field);
+    const key = `${table}|${recordId}|${field}`;
+    const existing = this.sessions.get(key);
+    if (existing) {
+      existing.refs++;
+      return existing.handle;
     }
-
-    // Read the snapshot directly off the parent row. `@crdt`-only fields
-    // hold the base64 snapshot inline; `@crdt @cursor` fields hold a
-    // `{ state, cursors }` object so we drill into `.state`. The query
-    // always selects the local row — sync-down already populated it
-    // (the snapshot is a column on the parent, not a sidecar table) so
-    // there is no separate fetch on the happy path.
-    let initialCrdtState: Uint8Array | undefined;
-    try {
-      const [result] = await this.local.query<[unknown]>(
-        `SELECT VALUE ${field} FROM ONLY $id`,
-        { id: parseRecordIdString(recordId) },
-      );
-      const snapshot = this.extractSnapshot(result, cursorsEnabled);
-      if (snapshot) initialCrdtState = snapshot;
-    } catch (e) {
-      this.logger.info(
-        { error: String(e), recordId, field, Category: 'sp00ky-client::CrdtManager::open' },
-        'No existing CRDT state found in local cache (continuing with empty doc)'
-      );
+    const inFlight = this.opening.get(key);
+    if (inFlight) {
+      const s = await inFlight;
+      s.refs++;
+      return s.handle;
     }
-
-    // Load loro lazily (usually already resolved — the client preloads it at
-    // startup when `config.crdt` is on).
-    const { LoroDoc } = await loadLoro();
-    crdtField = new CrdtField(field, cursorsEnabled, LoroDoc, initialCrdtState, this.logger);
-    crdtField.startSync(this.local, this.remote, recordId, this.sessionId, this.debounceMs);
-    this.fields.set(key, crdtField);
-
-    this.logger.info(
-      { key, hasInitialState: !!initialCrdtState, hasFallback: !!fallbackText, Category: 'sp00ky-client::CrdtManager::open' },
-      'CrdtField opened'
-    );
-
-    // Fire-and-forget: the LIVE subscription receives *future* updates;
-    // the initial snapshot is already in hand. `ensureTableSubscription`
-    // coalesces concurrent calls via `pendingLive`, so this is safe.
-    void this.ensureTableSubscription(table);
-
-    // Local was empty — a fresh device, a memory-backed local DB after
-    // reload, or a record that hasn't been sync'd locally yet. Pull the
-    // parent row from remote and dispatch its CRDT field; otherwise the
-    // editor sits empty until the parent's LIVE feed happens to fire.
-    if (!initialCrdtState) {
-      void this.fetchAndDispatchRow(table, recordId);
-    }
-
-    return crdtField;
+    const pending = this.start(key, table, recordId, field, kind, cursor).finally(() => this.opening.delete(key));
+    this.opening.set(key, pending);
+    return (await pending).handle;
   }
 
   close(table: string, recordId: string, field: string): void {
-    const key = this.makeKey(table, recordId, field);
-    const crdtField = this.fields.get(key);
-    if (crdtField) {
-      crdtField.stopSync();
-      this.fields.delete(key);
-    }
-
-    // If no fields on this table remain open, tear down the table-wide LIVE.
-    if (!this.hasOpenFieldFor(table)) {
-      this.killTableSubscription(table);
-      // Also drop any pending post-reconnect restart for it.
-      this.staleTables.delete(table);
-    }
-
-    this.logger.debug(
-      { key, Category: 'sp00ky-client::CrdtManager::close' },
-      'CrdtField closed'
-    );
+    const s = this.sessions.get(`${table}|${recordId}|${field}`);
+    if (!s || --s.refs > 0) return;
+    void this.stop(s, true);
   }
 
-  /**
-   * Close every open field + table LIVE. Fields flush a final remote push by
-   * default; pass `{ flush: false }` on a bucket switch, where that flush
-   * would push the previous user's snapshot under the next user's session.
-   */
+  /** Close every field. `flush: false` (a bucket switch) drops unsent edits
+   *  from this session's memory; they stay in the local snapshot of the
+   *  bucket they belong to. */
   closeAll(options: { flush?: boolean } = {}): void {
-    for (const [_, field] of this.fields) {
-      field.stopSync(options);
-    }
-    this.fields.clear();
-    for (const table of Array.from(this.liveByTable.keys())) {
-      this.killTableSubscription(table);
-    }
-    // Nothing is open any more, so nothing should be resurrected on the next
-    // reconnect; `open()` will re-subscribe on demand.
-    this.staleTables.clear();
+    for (const s of [...this.sessions.values()]) void this.stop(s, options.flush ?? true);
   }
 
-  /** Ensure a single `LIVE SELECT * FROM <table>` is running, shared across
-   *  every open CrdtField on `table`. */
-  private async ensureTableSubscription(table: string): Promise<void> {
-    if (this.liveByTable.has(table)) return;
+  // ------------------------------------------------------------------
 
-    // Registering a LIVE takes two round-trips, so a socket drop can land
-    // mid-flight. The generation stamp is what keeps that honest: a registration
-    // that started before the drop must never record its uuid, because this
-    // method short-circuits on `liveByTable` and that stale entry (pointing at a
-    // session the server has forgotten) would block every future restart.
-    const generation = this.connectionGeneration;
-
-    const pending = this.pendingLive.get(table);
-    if (pending) {
-      if (pending.generation === generation) return pending.promise;
-      // A registration from before the drop is still settling. It will discard
-      // itself; wait it out, then register fresh on the new socket.
-      await pending.promise.catch(() => {});
-      if (this.liveByTable.has(table)) return;
-      if (generation !== this.connectionGeneration) return;
-      // Another caller may have won the race to re-register during that await;
-      // join it rather than opening a second LIVE on the same table.
-      const successor = this.pendingLive.get(table);
-      if (successor && successor.generation === generation) return successor.promise;
-    }
-
-    const start = (async () => {
-      try {
-        const [uuid] = await this.remote.query<[Uuid]>(
-          `LIVE SELECT * FROM ${table}`,
-        );
-
-        if (generation !== this.connectionGeneration) {
-          this.logger.debug(
-            { table, Category: 'sp00ky-client::CrdtManager::ensureTableSubscription' },
-            'Socket dropped while registering LIVE; discarding it'
-          );
-          return;
-        }
-
-        const subscription = await this.remote.getClient().liveOf(uuid);
-        subscription.subscribe((message) => {
-          if (message.action === 'KILLED') return;
-          if (message.action !== 'CREATE' && message.action !== 'UPDATE') return;
-          this.dispatchRow(table, message.value as Record<string, unknown>);
-        });
-
-        if (generation !== this.connectionGeneration) return;
-
-        this.liveByTable.set(table, uuid);
-        this.logger.info(
-          { table, Category: 'sp00ky-client::CrdtManager::ensureTableSubscription' },
-          'LIVE SELECT started'
-        );
-      } catch (e) {
-        this.logger.warn(
-          { error: e, table, Category: 'sp00ky-client::CrdtManager::ensureTableSubscription' },
-          'Failed to start LIVE SELECT'
-        );
-      }
-    })();
-
-    this.pendingLive.set(table, { promise: start, generation });
-    try {
-      await start;
-    } finally {
-      this.pendingLive.delete(table);
-    }
-  }
-
-  /** Apply a parent-row payload from a non-LIVE source (e.g. the
-   *  list_ref-driven sync engine, when the cross-user LIVE on the
-   *  parent table is filtered out by the SurrealDB cross-session
-   *  permission gap). Same semantics as the internal `dispatchRow`. */
-  applyRow(table: string, row: Record<string, unknown>): void {
-    this.dispatchRow(table, row);
-  }
-
-  /** Dispatch a parent-row LIVE event to every open CrdtField on that
-   *  record. Each open field reads its slice of the row directly — the
-   *  CRDT snapshot is a column on the parent now, so there is no
-   *  follow-up subquery. */
-  private dispatchRow(table: string, row: Record<string, unknown>): void {
-    const id = row.id != null ? String(row.id) : '';
-    if (!id) return;
-
-    const rowKeyPrefix = `${table}:${id}:`;
-    for (const [key, crdtField] of this.fields) {
-      if (!key.startsWith(rowKeyPrefix)) continue;
-      const fieldName = key.slice(rowKeyPrefix.length);
-      const cursorsEnabled = this.fieldHasCursor(table, fieldName);
-      const slice = row[fieldName];
-      const snapshot = this.extractSnapshot(slice, cursorsEnabled);
-      if (snapshot) crdtField.importRemote(snapshot);
-
-      if (cursorsEnabled && slice && typeof slice === 'object') {
-        const cursors = (slice as { cursors?: unknown }).cursors;
-        if (cursors && typeof cursors === 'object') {
-          for (const [sid, blob] of Object.entries(cursors as Record<string, unknown>)) {
-            if (sid === this.sessionId) continue;
-            if (typeof blob === 'string' && blob.length > 0) {
-              crdtField.importRemoteCursor(blob);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /** One-shot remote fetch for a row whose CRDT field hasn't synced
-   *  locally yet (fresh device, memory-backed local DB after reload, …).
-   *  Used by `open()` when the local read came up empty. Subsequent
-   *  cross-browser updates ride `dispatchRow` via the parent LIVE feed. */
-  private async fetchAndDispatchRow(table: string, id: string): Promise<void> {
-    try {
-      const recordId = parseRecordIdString(id);
-      const [row] = await this.remote.query<[Record<string, unknown> | null]>(
-        `SELECT * FROM ONLY $id`,
-        { id: recordId },
-      );
-      if (!row || typeof row !== 'object') return;
-      this.dispatchRow(table, row as Record<string, unknown>);
-    } catch (e) {
-      this.logger.warn(
-        { error: e, table, id, Category: 'sp00ky-client::CrdtManager::fetchAndDispatchRow' },
-        'Failed to fetch parent row for CRDT hydration'
+  private fieldSpec(table: string, field: string): { kind: CrdtKind; cursor: boolean } {
+    const t = this.schema.tables.find((x) => x.name === table);
+    if (!t) throw new Error(`CrdtManager: unknown table '${table}'`);
+    const col = (t.columns as Record<string, any>)[field];
+    if (!col) throw new Error(`CrdtManager: unknown field '${table}.${field}'`);
+    if (!col.crdt) {
+      throw new Error(
+        `CrdtManager: '${table}.${field}' is not a CRDT field. Add \`-- @crdt text\` or \`-- @crdt prosemirror\` above its DEFINE FIELD and re-run \`spky generate\`.`
       );
     }
+    const kind: CrdtKind = col.crdt === 'prosemirror' ? 'prosemirror' : 'text';
+    return { kind, cursor: !!col.cursor };
   }
 
-  /** Schema lookup: does `<table>.<field>` carry a `@cursor` annotation?
-   *  Determines the on-disk shape (plain snapshot vs. `{ state, cursors }`). */
-  private fieldHasCursor(table: string, field: string): boolean {
-    const tableSchema = this.schema.tables.find((t) => t.name === table);
-    return !!tableSchema?.columns[field]?.cursor;
-  }
+  private async start(
+    key: string,
+    table: string,
+    recordId: string,
+    field: string,
+    kind: CrdtKind,
+    cursor: boolean
+  ): Promise<Session> {
+    if (!this.ports) throw new Error('CrdtManager: not attached to a client');
+    const loro = await loadLoro();
+    const doc = new loro.LoroDoc();
+    doc.setPeerId(this.peer);
 
-  /** Pull the LoroDoc snapshot bytes out of a row slice. For `@crdt`-only
-   *  the slice IS the snapshot (Uint8Array); for `@crdt @cursor` it's
-   *  `{ state, cursors }` where `state` carries the snapshot bytes. */
-  private extractSnapshot(value: unknown, cursorsEnabled: boolean): Uint8Array | undefined {
-    const asBytes = (v: unknown): Uint8Array | undefined => {
-      if (v instanceof Uint8Array) return v.length > 0 ? v : undefined;
-      // SurrealDB ferries bytes through several shapes depending on
-      // transport and on whether the field is a top-level `bytes` column
-      // or bytes nested inside a FLEXIBLE object. Round-tripping bytes
-      // through `option<object> FLEXIBLE` (the `@crdt @cursor` shape) in
-      // particular comes back as a plain `number[]` from the local WASM
-      // DB and as `Uint8Array` from the remote WS engine. Normalize all
-      // recognized variants here so the receiving CrdtField doesn't care.
-      if (v instanceof ArrayBuffer) return new Uint8Array(v);
-      if (ArrayBuffer.isView(v)) {
-        const view = v as ArrayBufferView;
-        return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-      }
-      if (Array.isArray(v) && v.length > 0 && v.every((n) => typeof n === 'number')) {
-        return Uint8Array.from(v as number[]);
-      }
-      return undefined;
+    const local = await this.readLocal(recordId, field);
+    if (local.snapshot) this.tryImport(doc, local.snapshot, key);
+
+    const session: Session = {
+      key,
+      table,
+      recordId,
+      field,
+      kind,
+      cursor,
+      doc,
+      handle: undefined as unknown as CrdtField,
+      refs: 1,
+      local,
+      seen: new Set(),
+      disposers: [],
+      flushTimer: null,
+      firstDirtyAt: 0,
+      persistTimer: null,
+      flushing: null,
+      refetching: false,
+      presenceTimer: null,
+      presencePending: null,
     };
+    session.handle = new CrdtField(table, recordId, field, kind, cursor, doc, {
+      pushPresence: (state) => this.pushPresence(session, state),
+    });
+    this.sessions.set(key, session);
 
-    if (cursorsEnabled) {
-      if (value && typeof value === 'object' && !(value instanceof Uint8Array)) {
-        return asBytes((value as { state?: unknown }).state);
+    // First open on this device: start from the published document.
+    if (!local.snapshot) await this.refetchCanonical(session);
+
+    session.disposers.push(
+      doc.subscribeLocalUpdates(() => {
+        // Remember every peer that made edits here: a later identity change
+        // swaps the peer, and these ops must still go out under this one.
+        session.local.peers[this.peer] ??= { enqueued: 0 };
+        this.scheduleFlush(session);
+        this.schedulePersist(session);
+      })
+    );
+    const ports = this.ports;
+    session.disposers.push(
+      await ports.watch(`${table}${LOG_SUFFIX}`, { doc: recordId, field }, (rows) => this.ingest(session, rows))
+    );
+    if (cursor) {
+      session.disposers.push(
+        await ports.watch(`${table}${PRESENCE_SUFFIX}`, { doc: recordId, field }, (rows) => this.ingestPresence(session, rows))
+      );
+    }
+    // Edits a previous session made but never sent (closed tab, offline).
+    this.scheduleFlush(session, 0);
+    this.logger.debug({ key, peer: this.peer, Category: 'sp00ky-client::CrdtManager::open' }, 'CRDT field opened');
+    return session;
+  }
+
+  private async stop(s: Session, flush: boolean): Promise<void> {
+    this.sessions.delete(s.key);
+    for (const off of s.disposers.splice(0)) {
+      try {
+        off();
+      } catch {
+        /* ignore */
       }
-      return undefined;
     }
-    return asBytes(value);
+    if (s.flushTimer) clearTimeout(s.flushTimer);
+    if (s.persistTimer) clearTimeout(s.persistTimer);
+    if (s.presenceTimer) clearTimeout(s.presenceTimer);
+    if (flush) {
+      await this.persist(s);
+      await this.flush(s);
+    }
   }
 
-  private killTableSubscription(table: string): void {
-    const uuid = this.liveByTable.get(table);
-    if (uuid) {
-      // We're tearing down: KILL on an already-dead/closed LIVE throws, and the
-      // subscription may have ended on its own, so the failure is expected and
-      // safe to drop.
-      this.remote.query('KILL $uuid', { uuid }).catch((err) => {
-        this.logger.debug(
-          { err, table, Category: 'sp00ky-client::CrdtManager::killTableSubscription' },
-          'KILL of table LIVE failed (already closed?)'
-        );
+  // --- receiving ---------------------------------------------------
+
+  private async ingest(s: Session, rows: Record<string, unknown>[]): Promise<void> {
+    const loro = await loadLoro();
+    const blobs: Uint8Array[] = [];
+    for (const row of rows) {
+      const id = String(row.id ?? '');
+      if (!id || s.seen.has(id)) continue;
+      s.seen.add(id);
+      const blob = asBytes(row.data);
+      const verdict = check(loro, blob, row.peer == null ? undefined : String(row.peer));
+      if (!verdict.ok) {
+        this.logger.debug({ row: id, reason: verdict.reason, Category: 'sp00ky-client::CrdtManager::ingest' }, 'CRDT log row refused');
+        continue;
+      }
+      blobs.push(blob!);
+    }
+    if (blobs.length === 0) return;
+    let pending = false;
+    for (const blob of blobs) {
+      const status = this.tryImport(s.doc, blob, s.key);
+      if (status?.pending) pending = true;
+    }
+    this.schedulePersist(s);
+    // Ops depending on rows that were folded away before this device saw
+    // them: the published snapshot holds those predecessors.
+    if (pending) void this.refetchCanonical(s);
+  }
+
+  private tryImport(doc: LoroDoc, blob: Uint8Array, key: string): { pending: boolean } | null {
+    try {
+      const status = doc.import(blob);
+      return { pending: !!status.pending && status.pending.size > 0 };
+    } catch (e) {
+      this.logger.warn({ key, error: String(e), Category: 'sp00ky-client::CrdtManager::import' }, 'CRDT import failed');
+      return null;
+    }
+  }
+
+  private async refetchCanonical(s: Session): Promise<void> {
+    if (s.refetching) return;
+    s.refetching = true;
+    try {
+      const [row] = await this.remote.query<[{ rev?: number; snapshot?: unknown } | null]>(
+        "SELECT rev, snapshot FROM ONLY type::record('_00_crdt_doc', [type::record($doc), $field])",
+        { doc: s.recordId, field: s.field }
+      );
+      const snapshot = asBytes(row?.snapshot);
+      if (snapshot) {
+        this.tryImport(s.doc, snapshot, s.key);
+        s.local.rev = Math.max(s.local.rev, row?.rev ?? 0);
+        this.schedulePersist(s);
+      }
+    } catch (e) {
+      // Offline or no published document yet: the log rows still arrive.
+      this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::refetch' }, 'No canonical CRDT document fetched');
+    } finally {
+      s.refetching = false;
+    }
+  }
+
+  // --- sending -----------------------------------------------------
+
+  private scheduleFlush(s: Session, delay = this.debounceMs): void {
+    const now = Date.now();
+    if (!s.flushTimer) s.firstDirtyAt = now;
+    else clearTimeout(s.flushTimer);
+    const wait = Math.max(0, Math.min(delay, s.firstDirtyAt + MAX_WAIT_MS - now));
+    s.flushTimer = setTimeout(() => {
+      s.flushTimer = null;
+      void this.flush(s);
+    }, wait);
+  }
+
+  private async flush(s: Session): Promise<void> {
+    if (s.flushing) return s.flushing;
+    s.flushing = this.sendOwnEdits(s).finally(() => {
+      s.flushing = null;
+    });
+    return s.flushing;
+  }
+
+  /** Send every own peer's ops that are not in the outbox yet, one row per
+   *  peer. Only the peer's own ops travel (`updates-in-range`): a plain
+   *  `from: version` export would carry ops imported from others too, and
+   *  the acceptance rule refuses such a row. */
+  private async sendOwnEdits(s: Session): Promise<void> {
+    const vv = s.doc.oplogVersion();
+    const own = new Set([...Object.keys(s.local.peers), this.peer]);
+    const due = [...own]
+      .map((peer) => ({ peer, end: vv.get(peer as `${number}`) ?? 0, from: s.local.peers[peer]?.enqueued ?? 0 }))
+      .filter((p) => p.end > p.from);
+    if (due.length === 0 || !this.ports) return;
+    if (!(await this.ensureClaimed())) {
+      this.retryLater(s);
+      return;
+    }
+    for (const { peer, end, from } of due) {
+      if (peer !== this.peer && !(await this.claimPeer(peer as `${number}`))) continue;
+      const data = s.doc.export({
+        mode: 'updates-in-range',
+        spans: [{ id: { peer: peer as `${number}`, counter: from }, len: end - from }],
       });
-      this.liveByTable.delete(table);
+      try {
+        await this.ports.create(`${s.table}${LOG_SUFFIX}:${rowKey()}`, {
+          doc: s.recordId,
+          field: s.field,
+          peer,
+          data,
+        });
+      } catch (e) {
+        this.logger.warn({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::flush' }, 'Queueing CRDT edits failed');
+        this.retryLater(s);
+        return;
+      }
+      s.local.peers[peer] = { enqueued: end };
+    }
+    await this.persist(s);
+  }
+
+  private retryLater(s: Session): void {
+    if (this.sessions.get(s.key) === s) this.scheduleFlush(s, CLAIM_RETRY_MS);
+  }
+
+  /** Claim this session's peer once; a failure (offline, signed out) is retried. */
+  private ensureClaimed(): Promise<boolean> {
+    if (!this.claim) {
+      const peer = this.peer;
+      this.claim = this.claimPeer(peer).then((ok) => {
+        if (!ok && this.peer === peer) this.claim = null;
+        return ok;
+      });
+    }
+    return this.claim;
+  }
+
+  private async claimPeer(peer: `${number}`): Promise<boolean> {
+    try {
+      // A refused CREATE (signed out, impersonating) answers with no row.
+      const [created] = await this.remote.query<[unknown[]]>("CREATE type::record('_00_crdt_peer', $peer) RETURN id", { peer });
+      return Array.isArray(created) && created.length > 0;
+    } catch (e) {
+      if (!/already exists/i.test(String(e))) return false;
+      // Ours from an earlier claim (only its owner can read it), or taken.
+      try {
+        const [owner] = await this.remote.query<[unknown]>(
+          "SELECT VALUE author FROM ONLY type::record('_00_crdt_peer', $peer)",
+          { peer }
+        );
+        if (owner != null) return true;
+      } catch {
+        return false;
+      }
+      this.logger.error({ peer, Category: 'sp00ky-client::CrdtManager::claim' }, 'CRDT peer id taken by another user');
+      if (peer === this.peer) this.setSessionId('');
+      return false;
     }
   }
 
-  private makeKey(table: string, recordId: string, field: string): string {
-    return `${table}:${recordId}:${field}`;
+  // --- local state -------------------------------------------------
+
+  private localId(recordId: string, field: string): RecordId {
+    return new RecordId(LOCAL_TABLE, `${recordId}|${field}`);
   }
 
-  /**
-   * Throws if `<table>.<field>` is not annotated `@crdt` in the schema. Catches
-   * typos, removed annotations, and stale schema codegen at the call site instead
-   * of silently producing a non-CRDT writer.
-   */
-  private assertCrdtField(table: string, field: string): void {
-    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(field)) {
-      throw new Error(
-        `openCrdtField: refusing unsafe field identifier '${field}' — must match [a-zA-Z_][a-zA-Z0-9_]*`
-      );
+  private async readLocal(recordId: string, field: string): Promise<LocalState> {
+    try {
+      const row = await this.local.getById(LOCAL_TABLE, this.localId(recordId, field));
+      if (row) {
+        return {
+          snapshot: asBytes(row.snapshot),
+          rev: Number(row.rev ?? 0),
+          peers: (row.peers as LocalState['peers']) ?? {},
+        };
+      }
+    } catch (e) {
+      this.logger.debug({ error: String(e), Category: 'sp00ky-client::CrdtManager::readLocal' }, 'No local CRDT state');
     }
-    const tableSchema = this.schema.tables.find((t) => t.name === table);
-    if (!tableSchema) {
-      throw new Error(
-        `openCrdtField: unknown table '${table}'. Available: ${this.schema.tables.map((t) => t.name).join(', ')}`
+    return { rev: 0, peers: {} };
+  }
+
+  private schedulePersist(s: Session): void {
+    if (s.persistTimer) return;
+    s.persistTimer = setTimeout(() => {
+      s.persistTimer = null;
+      void this.persist(s);
+    }, PERSIST_DEBOUNCE_MS);
+  }
+
+  /** Save the merged document. Another tab may have saved too: merge with
+   *  its snapshot rather than overwrite it, and keep the further of the two
+   *  outbox marks per peer. */
+  private async persist(s: Session): Promise<void> {
+    try {
+      const stored = await this.readLocal(s.recordId, s.field);
+      if (stored.snapshot) this.tryImport(s.doc, stored.snapshot, s.key);
+      for (const [peer, mark] of Object.entries(stored.peers)) {
+        const mine = s.local.peers[peer]?.enqueued ?? 0;
+        if (mark.enqueued > mine) s.local.peers[peer] = { enqueued: mark.enqueued };
+      }
+      s.local.rev = Math.max(s.local.rev, stored.rev);
+      s.local.snapshot = s.doc.export({ mode: 'snapshot' });
+      await this.local.upsert(
+        LOCAL_TABLE,
+        this.localId(s.recordId, s.field),
+        { doc: s.recordId, field: s.field, snapshot: s.local.snapshot, rev: s.local.rev, peers: s.local.peers },
+        'replace'
       );
+    } catch (e) {
+      this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::persist' }, 'Saving local CRDT state failed');
     }
-    const column = tableSchema.columns[field];
-    if (!column) {
-      throw new Error(
-        `openCrdtField: '${table}.${field}' is not in the schema. Available fields: ${Object.keys(tableSchema.columns).join(', ')}`
+  }
+
+  // --- presence ----------------------------------------------------
+
+  private pushPresence(s: Session, state: Uint8Array): void {
+    s.presencePending = state;
+    if (s.presenceTimer) return;
+    s.presenceTimer = setTimeout(() => {
+      s.presenceTimer = null;
+      const data = s.presencePending;
+      s.presencePending = null;
+      if (data) void this.sendPresence(s, data);
+    }, PRESENCE_THROTTLE_MS);
+  }
+
+  /** Presence is the latest state only: no outbox, no offline queue. */
+  private async sendPresence(s: Session, state: Uint8Array): Promise<void> {
+    if (!(await this.ensureClaimed())) return;
+    try {
+      await this.remote.query(
+        `UPSERT type::record($table, [$doc, $field, $session]) SET doc = type::record($doc), field = $field, session = $session, state = $state RETURN NONE`,
+        { table: `${s.table}${PRESENCE_SUFFIX}`, doc: s.recordId, field: s.field, session: this.peer, state }
       );
+    } catch (e) {
+      this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::presence' }, 'Presence update failed');
     }
-    if (!column.crdt) {
-      throw new Error(
-        `openCrdtField: '${table}.${field}' is not annotated '@crdt' in the schema. ` +
-          `Add '-- @crdt text' above the field's DEFINE FIELD and regenerate the client schema.`
-      );
+  }
+
+  private ingestPresence(s: Session, rows: Record<string, unknown>[]): void {
+    for (const row of rows) {
+      if (String(row.session ?? '') === this.peer) continue;
+      const state = asBytes(row.state);
+      if (state) s.handle.deliverPresence(state);
     }
   }
 }
+
+function rowKey(): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Kept for callers that parse record ids next to CRDT fields.
+export { parseRecordIdString };

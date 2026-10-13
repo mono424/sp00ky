@@ -81,7 +81,7 @@
     "@surrealdb/wasm": "^3.0.3",
     "blurhash": "^2.0.5",
     "fast-json-patch": "^3.1.1",
-    "loro-crdt": "^1.5.6",
+    "loro-crdt": "1.11.0",
     "pino": "^10.1.0",
     "surrealdb": "2.1.0"
   },

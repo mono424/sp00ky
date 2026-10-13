@@ -68,6 +68,14 @@ export function* refreshFailedCount(): Saga<void> {
 const ERR = (r: StatementResult | undefined): string | null => (r && r.status === 'ERR' ? r.error : null);
 
 /**
+ * A CRDT edit-log row (`<table>__crdt_log`) is written once and never changes,
+ * so a CREATE retried after its first attempt committed (and only the answer
+ * was lost) finds it already there: that is a success, not a rejection.
+ */
+const isRepeatedLogCreate = (row: { mutationType: string; tableName: string }, err: string): boolean =>
+  row.mutationType === 'create' && row.tableName.endsWith('__crdt_log') && /already exists/i.test(err);
+
+/**
  * Drain the outbox: one serial lane, FIFO, up to `outboxBatchSize` statements
  * per request, per-statement outcome. Accepted rows are acked (they stay in
  * the overlay until membership names them), rejected rows are rolled back,
@@ -127,7 +135,7 @@ export function* drain(env: SagaEnv): Saga<void> {
         break;
       }
       const err = ERR(r);
-      if (err === null) {
+      if (err === null || isRepeatedLogCreate(row, err)) {
         const del = deletePendingRow(row.id);
         try {
           yield fx.local.query(del.sql, del.vars);

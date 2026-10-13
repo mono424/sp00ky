@@ -161,7 +161,7 @@ export function createServices<S extends SchemaStructure>(config: Sp00kyConfig<S
   streamProcessor.configureCircuitPersistence(config.persistCircuit ?? config.localEngine === 'sqlite', config.circuitCheckpointMs);
   streamProcessor.configureProjection(config.circuitProjection ?? true);
   const migrator = new LocalMigrator(local, logger);
-  const crdt = new CrdtManager(config.schema, local, remote, logger, config.crdtDebounceMs ?? 500);
+  const crdt = new CrdtManager(config.schema, local, remote, logger, config.crdtDebounceMs ?? 300);
   const auth = new AuthService(config.schema, remote, persistence, logger);
   const tabId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `tab_${Math.random().toString(36).slice(2)}`;
   return {

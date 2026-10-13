@@ -37,7 +37,7 @@ export function fakeServiceBundle<S extends SchemaStructure>(over: Partial<Servi
     persistence: { set: async () => undefined, get: async () => null, remove: async () => undefined },
     streamProcessor: { addReceiver: (r: unknown) => void receivers.push(r), checkpoint: async () => undefined, dispose: noop } as any,
     migrator: {} as any,
-    crdt: { closeAll: noop, dispose: noop, open: async () => 'field', close: noop } as any,
+    crdt: { attach: noop, setSessionId: noop, closeAll: noop, dispose: noop, open: async () => 'field', close: noop } as any,
     auth: { subscribe: (cb: (u: string | null) => void) => (authListeners.push(cb), noop), subscribeImpersonation: () => noop, onBeforeSignOut: () => noop, currentUser: null, isAuthenticated: false, token: null, impersonation: null, eventSystem: { subscribe: noop } } as any,
     tabs: null,
     tabsUnsupportedReason: 'test',

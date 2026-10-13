@@ -72,6 +72,8 @@ const SYSTEM_TABLES = [
   // asks for the ids it found in OPFS), so it has to exist up front like the
   // rest — otherwise the very first reconcile throws and the cache runs cold.
   '_00_blob',
+  // CRDT documents per open field, with edits not yet in the outbox.
+  '_00_crdt_local',
   // Server-written, synced-down meta tables (see meta_tables_client.surql).
   // DEFINE is a noop on this engine, so without seeding them here their synced
   // rows have no local table to land in: feature flags silently fall back to

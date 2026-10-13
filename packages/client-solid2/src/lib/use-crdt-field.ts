@@ -2,11 +2,14 @@ import { createEffect, createSignal, type Accessor } from 'solid-js';
 import { useDb } from './context';
 import type { CrdtField } from '@spooky-sync/core';
 
+/**
+ * Open a `@crdt` field of the record `recordId()` names, for an editor to bind
+ * to (`field()?.getDoc()`). Re-opens when the id changes; closes on cleanup.
+ */
 export function useCrdtField(
   table: string,
   recordId: () => string | undefined,
-  field: string,
-  fallbackText?: () => string | undefined
+  field: string
 ): Accessor<CrdtField | null> {
   const db = useDb();
   const [crdtField, setCrdtField] = createSignal<CrdtField | null>(null, { ownedWrite: true });
@@ -24,9 +27,8 @@ export function useCrdtField(
       }
       const sp00ky = db.getSp00ky();
       let superseded = false;
-      const text = fallbackText?.();
       sp00ky
-        .openCrdtField(table, id, field, text)
+        .openCrdtField(table, id, field)
         .then((cf) => {
           if (!superseded) {
             setCrdtField(cf);

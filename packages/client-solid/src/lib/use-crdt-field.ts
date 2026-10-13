@@ -2,11 +2,14 @@ import { createEffect, createSignal, onCleanup, useContext, type Accessor } from
 import { Sp00kyContext } from './context';
 import type { CrdtField } from '@spooky-sync/core';
 
+/**
+ * Open a `@crdt` field of the record `recordId()` names, for an editor to bind
+ * to (`field()?.getDoc()`). Re-opens when the id changes; closes on cleanup.
+ */
 export function useCrdtField(
   table: string,
   recordId: () => string | undefined,
   field: string,
-  fallbackText?: () => string | undefined,
 ): Accessor<CrdtField | null> {
   const db = useContext(Sp00kyContext);
   if (!db) {
@@ -35,9 +38,8 @@ export function useCrdtField(
     if (!id) return;
 
     const sp00ky = db.getSp00ky();
-    const text = fallbackText?.();
     sp00ky
-      .openCrdtField(table, id, field, text)
+      .openCrdtField(table, id, field)
       .then((cf) => {
         if (currentId === id) {
           setCrdtField(cf);

@@ -33,10 +33,18 @@ export { CrdtField, cursorColorFromName, CURSOR_COLORS } from './crdt-field';
  * the outbox can go through.
  */
 
+/** A followed query: stop following it, and know when the server answered. */
+export interface Watch {
+  stop: () => void;
+  /** Resolves once the server's membership for the query is known and its
+   *  rows have landed locally (never rejects; may never resolve offline). */
+  settled: Promise<void>;
+}
+
 /** The runtime pieces the manager needs from the client facade. */
 export interface CrdtPorts {
   /** Register a query on `table` filtered by `where` and follow its rows. */
-  watch(table: string, where: Record<string, unknown>, onRows: (rows: Record<string, unknown>[]) => void): Promise<() => void>;
+  watch(table: string, where: Record<string, unknown>, onRows: (rows: Record<string, unknown>[]) => void): Promise<Watch>;
   /** Optimistic create through the outbox. */
   create(id: string, data: Record<string, unknown>): Promise<unknown>;
 }
@@ -72,6 +80,10 @@ interface Session {
   refetching: boolean;
   presenceTimer: ReturnType<typeof setTimeout> | null;
   presencePending: Uint8Array | null;
+  /** This session wrote a presence row (removed again on close). */
+  presenceSent: boolean;
+  /** The latest import of delivered rows (chained, so awaiting it awaits all). */
+  ingesting: Promise<void>;
 }
 
 const LOCAL_TABLE = '_00_crdt_local';
@@ -82,6 +94,9 @@ const MAX_WAIT_MS = 2000;
 const PERSIST_DEBOUNCE_MS = 400;
 const PRESENCE_THROTTLE_MS = 250;
 const CLAIM_RETRY_MS = 5000;
+/** How long an open of a field with nothing local waits for the server's
+ *  first answer before handing out the (still empty) document. */
+const FIRST_ANSWER_TIMEOUT_MS = 4000;
 
 export class CrdtManager {
   private sessions = new Map<string, Session>();
@@ -139,30 +154,58 @@ export class CrdtManager {
   /**
    * Open a collaborative field. Every open of the same field shares one
    * document; close each open with {@link close}.
+   *
+   * `draft` (from {@link createDraft}) hands over edits made before the record
+   * existed: they are merged in and sent like this tab's own.
    */
-  async open(table: string, recordId: string, field: string, _fallbackText?: string): Promise<CrdtField> {
+  async open(table: string, recordId: string, field: string, draft?: CrdtField): Promise<CrdtField> {
     const { kind, cursor } = this.fieldSpec(table, field);
     const key = `${table}|${recordId}|${field}`;
-    const existing = this.sessions.get(key);
-    if (existing) {
-      existing.refs++;
-      return existing.handle;
+    let session = this.sessions.get(key);
+    if (session) {
+      session.refs++;
+    } else {
+      const inFlight = this.opening.get(key);
+      if (inFlight) {
+        session = await inFlight;
+        session.refs++;
+      } else {
+        const pending = this.start(key, table, recordId, field, kind, cursor).finally(() => this.opening.delete(key));
+        this.opening.set(key, pending);
+        session = await pending;
+      }
     }
-    const inFlight = this.opening.get(key);
-    if (inFlight) {
-      const s = await inFlight;
-      s.refs++;
-      return s.handle;
-    }
-    const pending = this.start(key, table, recordId, field, kind, cursor).finally(() => this.opening.delete(key));
-    this.opening.set(key, pending);
-    return (await pending).handle;
+    if (draft) this.adopt(session, draft.getDoc());
+    return session.handle;
   }
 
-  close(table: string, recordId: string, field: string): void {
+  /**
+   * A detached document for a field of a record that does not exist yet (a
+   * "new thread" form). Nothing is sent; pass it to {@link open} once the
+   * record is created and its edits become the record's first ones.
+   */
+  async createDraft(table: string, field: string): Promise<CrdtField> {
+    const { kind, cursor } = this.fieldSpec(table, field);
+    const loro = await loadLoro();
+    return new CrdtField(table, '', field, kind, cursor, new loro.LoroDoc(), { pushPresence: () => {} });
+  }
+
+  private adopt(s: Session, draft: LoroDoc): void {
+    const peers = [...draft.oplogVersion().toJSON().keys()];
+    if (peers.length === 0) return;
+    this.tryImport(s.doc, draft.export({ mode: 'update' }), s.key);
+    // The draft's ops carry its own peer: claim and send them under it.
+    for (const peer of peers) s.local.peers[String(peer)] ??= { enqueued: 0 };
+    this.schedulePersist(s);
+    this.scheduleFlush(s, 0);
+  }
+
+  /** Close one open. The last close of a field resolves once its unsent
+   *  edits are in the outbox (or are left for a later session, offline). */
+  close(table: string, recordId: string, field: string): Promise<void> {
     const s = this.sessions.get(`${table}|${recordId}|${field}`);
-    if (!s || --s.refs > 0) return;
-    void this.stop(s, true);
+    if (!s || --s.refs > 0) return Promise.resolve();
+    return this.stop(s, true);
   }
 
   /** Close every field. `flush: false` (a bucket switch) drops unsent edits
@@ -224,12 +267,16 @@ export class CrdtManager {
       refetching: false,
       presenceTimer: null,
       presencePending: null,
+      presenceSent: false,
+      ingesting: Promise.resolve(),
     };
     session.handle = new CrdtField(table, recordId, field, kind, cursor, doc, {
       pushPresence: (state) => this.pushPresence(session, state),
     });
     this.sessions.set(key, session);
 
+    // Claimed now, so the first edits do not wait on the round trip.
+    void this.ensureClaimed();
     // First open on this device: start from the published document.
     if (!local.snapshot) await this.refetchCanonical(session);
 
@@ -243,14 +290,24 @@ export class CrdtManager {
       })
     );
     const ports = this.ports;
-    session.disposers.push(
-      await ports.watch(`${table}${LOG_SUFFIX}`, { doc: recordId, field }, (rows) => this.ingest(session, rows))
-    );
+    const log = await ports.watch(`${table}${LOG_SUFFIX}`, { doc: recordId, field }, (rows) => {
+      session.ingesting = session.ingesting.then(() => this.ingest(session, rows));
+    });
+    session.disposers.push(log.stop);
     if (cursor) {
-      session.disposers.push(
-        await ports.watch(`${table}${PRESENCE_SUFFIX}`, { doc: recordId, field }, (rows) => this.ingestPresence(session, rows))
+      const presence = await ports.watch(`${table}${PRESENCE_SUFFIX}`, { doc: recordId, field }, (rows) =>
+        this.ingestPresence(session, rows)
       );
+      session.disposers.push(presence.stop);
     }
+    // An editor binding an empty document creates its root structure, and
+    // two clients doing that at once keep only one of them (with whatever was
+    // typed into the other). With nothing local, hand the document out only
+    // once the server's rows for it are in.
+    if (!session.handle.hasContent()) {
+      await Promise.race([log.settled, delay(FIRST_ANSWER_TIMEOUT_MS)]);
+    }
+    await session.ingesting;
     // Edits a previous session made but never sent (closed tab, offline).
     this.scheduleFlush(session, 0);
     this.logger.debug({ key, peer: this.peer, Category: 'sp00ky-client::CrdtManager::open' }, 'CRDT field opened');
@@ -269,6 +326,7 @@ export class CrdtManager {
     if (s.flushTimer) clearTimeout(s.flushTimer);
     if (s.persistTimer) clearTimeout(s.persistTimer);
     if (s.presenceTimer) clearTimeout(s.presenceTimer);
+    if (s.presenceSent) void this.dropPresence(s);
     if (flush) {
       await this.persist(s);
       await this.flush(s);
@@ -506,13 +564,38 @@ export class CrdtManager {
     if (!(await this.ensureClaimed())) return;
     try {
       await this.remote.query(
-        `UPSERT type::record($table, [$doc, $field, $session]) SET doc = type::record($doc), field = $field, session = $session, state = $state RETURN NONE`,
-        { table: `${s.table}${PRESENCE_SUFFIX}`, doc: s.recordId, field: s.field, session: this.peer, state }
+        // One row per session and field, keyed by a plain identifier (an array
+        // key does not survive the client's record-id handling). `$session`
+        // is a protected SurrealDB variable: the session id binds as `$sid`.
+        `UPSERT type::record($table, $key) SET doc = type::record($doc), field = $field, session = $sid, state = $state RETURN NONE`,
+        {
+          table: `${s.table}${PRESENCE_SUFFIX}`,
+          key: presenceKey(this.peer, s.field, s.recordId),
+          doc: s.recordId,
+          field: s.field,
+          sid: this.peer,
+          state,
+        }
       );
+      s.presenceSent = true;
     } catch (e) {
       this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::presence' }, 'Presence update failed');
     }
   }
+
+  /** Remove this session's cursor when the field closes; the server's TTL
+   *  sweep covers a tab that never gets here. */
+  private async dropPresence(s: Session): Promise<void> {
+    try {
+      await this.remote.query(`DELETE type::record($table, $key) RETURN NONE`, {
+        table: `${s.table}${PRESENCE_SUFFIX}`,
+        key: presenceKey(this.peer, s.field, s.recordId),
+      });
+    } catch (e) {
+      this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::presence' }, 'Presence removal failed');
+    }
+  }
+
 
   private ingestPresence(s: Session, rows: Record<string, unknown>[]): void {
     for (const row of rows) {
@@ -521,6 +604,16 @@ export class CrdtManager {
       if (state) s.handle.deliverPresence(state);
     }
   }
+}
+
+/** `p<session>_<field>_<record key>`, letters, digits and `_` only. */
+function presenceKey(session: string, field: string, recordId: string): string {
+  const key = recordId.slice(recordId.indexOf(':') + 1).replace(/[^A-Za-z0-9_]/g, '_');
+  return `p${session}_${field}_${key}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function rowKey(): string {

@@ -6,10 +6,9 @@ export type ValueType = 'string' | 'number' | 'boolean' | 'null' | 'json' | 'Uin
 /**
  * Column metadata defining the type and optionality of a field
  */
-/**
- * CRDT types supported by Sp00ky's Loro integration
- */
-export type CrdtType = 'text' | 'map' | 'list' | 'counter';
+/** Document shape of a `-- @crdt <kind>` field: a plain `LoroText`, or a
+ *  loro-prosemirror tree. The column itself holds the server-written text. */
+export type CrdtType = 'text' | 'prosemirror';
 
 export interface ColumnSchema {
   readonly type: ValueType;

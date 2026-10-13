@@ -52,7 +52,7 @@ class World {
         const w = { table, where, cb };
         this.watchers.add(w);
         cb(this.rowsFor(table, where));
-        return () => this.watchers.delete(w);
+        return { stop: () => void this.watchers.delete(w), settled: Promise.resolve() };
       },
       create: async (id, data: any) => {
         const owner = this.peers.get(data.peer);
@@ -205,6 +205,24 @@ describe('CRDT fields', () => {
     await vi.advanceTimersByTimeAsync(10);
     const reopened = await a.manager.open('doc', 'doc:1', 'body');
     expect(reopened).not.toBe(x);
+  });
+
+  it('adopt a draft made before the record existed and send it under the draft peer', async () => {
+    const world = new World();
+    const a = world.client('user:a');
+    const b = world.client('user:b');
+    const draft = await a.manager.createDraft('doc', 'body');
+    draft.getDoc().getText('body').insert(0, 'first words');
+    draft.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(world.log).toHaveLength(0);
+
+    const f = await a.manager.open('doc', 'doc:1', 'body', draft);
+    expect(text(f)).toBe('first words');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(world.log.map((r) => r.peer)).toEqual([draft.getDoc().peerIdStr]);
+    const fb = await b.manager.open('doc', 'doc:1', 'body');
+    expect(text(fb)).toBe('first words');
   });
 
   it('refuse to open a field that is not @crdt', async () => {

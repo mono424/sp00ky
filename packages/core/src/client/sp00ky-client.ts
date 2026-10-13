@@ -146,7 +146,22 @@ export class Sp00kyClient<S extends SchemaStructure> {
     s.crdt.attach({
       watch: async (table, where, onRows) => {
         const { hash } = await (this.query as any)(table, {}).where(where).build().run();
-        return this.runtime.subscribe(hash, onRows, { immediate: true });
+        const stopRows = this.runtime.subscribe(hash, onRows, { immediate: true });
+        let known = false;
+        let idle = false;
+        let done!: () => void;
+        const settled = new Promise<void>((resolve) => (done = resolve));
+        const check = () => known && idle && done();
+        const stopAuthority = this.runtime.subscribeAuthority(hash, (k) => ((known = k), check()), { immediate: true });
+        const stopStatus = this.runtime.subscribeStatus(hash, (st) => ((idle = st === 'idle'), check()), { immediate: true });
+        return {
+          stop: () => {
+            stopRows();
+            stopAuthority();
+            stopStatus();
+          },
+          settled,
+        };
       },
       create: (id, data) => this.create(id, data),
     });
@@ -575,12 +590,22 @@ export class Sp00kyClient<S extends SchemaStructure> {
     return this.appReleases.release(app, options);
   }
 
-  async openCrdtField(table: string, recordId: string, field: string, fallbackText?: string): Promise<CrdtField> {
-    return this.services.crdt.open(table, recordId, field, fallbackText);
+  /** Open a `@crdt` field for editing. `draft` (from {@link createCrdtDraft})
+   *  hands over edits made before the record existed. */
+  async openCrdtField(table: string, recordId: string, field: string, draft?: CrdtField): Promise<CrdtField> {
+    return this.services.crdt.open(table, recordId, field, draft);
   }
 
-  closeCrdtField(table: string, recordId: string, field: string): void {
-    this.services.crdt.close(table, recordId, field);
+  /** A detached `@crdt` document for a record not created yet; see
+   *  {@link openCrdtField}. */
+  async createCrdtDraft(table: string, field: string): Promise<CrdtField> {
+    return this.services.crdt.createDraft(table, field);
+  }
+
+  /** Close a `@crdt` field. The last close resolves once its unsent edits
+   *  are queued in the outbox. */
+  closeCrdtField(table: string, recordId: string, field: string): Promise<void> {
+    return this.services.crdt.close(table, recordId, field);
   }
 
   bucket<B extends BucketNames<S>>(name: B): BucketHandle {

@@ -1662,17 +1662,7 @@ fn filter_schema_for_client(content: &str, parser: &SchemaParser) -> Result<Stri
                         target
                     );
                     pop_attached_annotations(&mut result);
-                    while i < lines.len() {
-                        if let Some(idx) = lines[i].find(';') {
-                            let after_semicolon = &lines[i][idx + 1..];
-                            if !after_semicolon.trim().is_empty() {
-                                result.push(after_semicolon.to_string());
-                            }
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
+                    i = skip_statement(&lines, i, &mut result);
                     continue;
                 }
             }
@@ -1692,18 +1682,7 @@ fn filter_schema_for_client(content: &str, parser: &SchemaParser) -> Result<Stri
                                 field_name, table_name
                             );
                             pop_attached_annotations(&mut result);
-                            while i < lines.len() {
-                                if let Some(idx) = lines[i].find(';') {
-                                    // Check if there is content after the semicolon
-                                    let after_semicolon = &lines[i][idx + 1..];
-                                    if !after_semicolon.trim().is_empty() {
-                                        result.push(after_semicolon.to_string());
-                                    }
-                                    i += 1;
-                                    break;
-                                }
-                                i += 1;
-                            }
+                            i = skip_statement(&lines, i, &mut result);
                             continue;
                         }
                     }
@@ -1785,6 +1764,49 @@ fn strip_value_clause(stmt: &str) -> String {
         out.push_str(tail);
     }
     out
+}
+
+/// Skip the statement that starts on `lines[start]`, keeping anything after
+/// its terminating `;` on the same line. Returns the next line to read.
+///
+/// The terminating `;` is the first one outside `{ }` blocks, string literals
+/// and line comments: a multi-statement `DEFINE EVENT ... THEN { LET ...; IF
+/// ... { THROW ...; }; }` ends at its LAST `;`. Stopping at the first one left
+/// the rest of the event body in the client schema, where the local database
+/// ran it as top-level statements at startup (a bare THROW failed the init).
+fn skip_statement(lines: &[&str], start: usize, result: &mut Vec<String>) -> usize {
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    for (li, line) in lines.iter().enumerate().skip(start) {
+        let mut chars = line.char_indices().peekable();
+        while let Some((at, ch)) = chars.next() {
+            if let Some(q) = quote {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '-' if matches!(chars.peek(), Some((_, '-'))) => break,
+                '/' if matches!(chars.peek(), Some((_, '/'))) => break,
+                '#' => break,
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                ';' if depth <= 0 => {
+                    let rest = &line[at + 1..];
+                    if !rest.trim().is_empty() {
+                        result.push(rest.to_string());
+                    }
+                    return li + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    lines.len()
 }
 
 /// Make a DEFINE FIELD line nullable by wrapping its TYPE in option<>
@@ -3833,6 +3855,30 @@ mod client_schema_value_strip_tests {
         let mut parser = SchemaParser::new();
         parser.parse_file(src).unwrap();
         filter_schema_for_client(src, &parser).unwrap()
+    }
+
+    #[test]
+    fn nosync_table_drops_a_multi_statement_event_whole() {
+        // The event body holds several `;`. Stopping at the first one left the
+        // rest in the client schema, where the local database ran a bare THROW
+        // at startup and never came up.
+        let out = client_schema(
+            "DEFINE TABLE note SCHEMAFULL PERMISSIONS FULL;\n\
+             -- @nosync\n\
+             DEFINE TABLE accept SCHEMAFULL PERMISSIONS FULL;\n\
+             DEFINE FIELD jwt ON TABLE accept TYPE string;\n\
+             DEFINE EVENT go ON TABLE accept WHEN $event = \"CREATE\" THEN {\n\
+                 LET $x = (SELECT * FROM note WHERE id = 'a;b' LIMIT 1);\n\
+                 IF $x = NONE {\n\
+                     THROW \"no; really\";\n\
+                 };\n\
+             };\n\
+             DEFINE TABLE after SCHEMAFULL PERMISSIONS FULL;\n",
+        );
+        assert!(!out.contains("THROW"), "event body must be gone:\n{out}");
+        assert!(!out.contains("LET $x"), "event body must be gone:\n{out}");
+        assert!(out.contains("DEFINE TABLE after"), "the next statement survives:\n{out}");
+        assert!(out.contains("DEFINE TABLE note"), "{out}");
     }
 
     #[test]

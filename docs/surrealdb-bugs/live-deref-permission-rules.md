@@ -34,8 +34,4 @@ The dereference-through-`thread.published` is the trigger.
 
 ## Workaround
 
-CRDT cross-browser delivery doesn't subscribe to its own LIVE on `_00_crdt` / `_00_cursor`. Instead it rides the parent table's LIVE feed: on every CRDT meta-row UPSERT the writer also bumps the parent's `_00_rv` (a no-op assignment that triggers the parent's existing LIVE). Receivers detect the parent-row LIVE event and pull matching `_00_crdt` / `_00_cursor` rows via subquery against the parent's id. Permission inheritance is enforced server-side via `record_id.id != NONE` and `fn::can_update_record`, both of which avoid the dereference-permission shape.
-
-**Files changed:**
-- `packages/core/src/modules/crdt/index.ts` — module-level comment documents the indirection; LIVE subscription is on the parent table, not the CRDT/cursor tables themselves. See `CrdtManager.liveByTable`.
-- Schema-side: permission rules on `_00_crdt` / `_00_cursor` use `record_id.id != NONE` (presence check) rather than dereferenced predicates.
+CRDT v2 no longer relies on this: a field's edits are rows of a generated `<table>__crdt_log` table that reach clients through the normal view pipeline (SSP views and `_00_list_ref`) like any synced table, with permissions rebased onto the parent through the row's `doc` link. The old `_00_crdt` / `_00_cursor` meta rows, the parent `_00_rv` bump and `fn::can_update_record` are gone (see `docs/crdt-v2.md`).

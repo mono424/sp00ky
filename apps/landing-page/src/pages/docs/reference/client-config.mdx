@@ -81,12 +81,20 @@ sync) repaints affected views once per window instead of row-by-row.
 Lower values feel snappier; higher values reduce re-render thrash on
 bursty writes. Defaults to `50`.
 
+#### `crdt`
+
+Load the `loro-crdt` engine at startup (as a separate chunk) so the first
+[CRDT field](/docs/client/crdt) opens without waiting for it. Off by default:
+Loro is then only fetched when a field is first opened, which keeps it out of
+apps that never edit one. Defaults to `false`.
+
 #### `crdtDebounceMs`
 
-Window (ms) used to coalesce CRDT field UPSERTs to upstream. Local
-writes are applied to the LoroDoc immediately on every keystroke
-(so reload and offline work), but the remote `_00_crdt` UPSERT is
-debounced. Defaults to `500`.
+Quiet window (ms) after the last local edit of a [CRDT field](/docs/client/crdt)
+before the tab sends its new edits as one edit-log row through the outbox.
+Edits apply to the local Loro document at once; a burst of typing is sent at
+the latest 2 s after it started, whatever this is set to. Lower values reach
+other editors sooner and create more rows. Defaults to `300`.
 
 #### `refSyncIntervalMs`
 
@@ -188,7 +196,10 @@ export const code2 = `interface SyncedDbConfig<Schema> {
   /** Debounce window for outgoing DBSP stream updates (default: 50ms) */
   streamDebounceTime?: number;
 
-  /** Debounce window for CRDT field UPSERTs to upstream (default: 500ms) */
+  /** Preload the Loro engine at startup for CRDT fields (default: false) */
+  crdt?: boolean;
+
+  /** Quiet window before a CRDT field's edits are sent (default: 300ms) */
   crdtDebounceMs?: number;
 
   /**

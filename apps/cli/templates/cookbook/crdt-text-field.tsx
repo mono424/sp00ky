@@ -1,36 +1,54 @@
 // Recipe: crdt-text-field
-// Wire a CRDT text column (`{{table}}.{{field}}` annotated `-- @crdt text` in the schema)
-// to a textarea. Concurrent edits from multiple clients merge via Loro.
+// A collaborative textarea for `{{table}}.{{field}}`, declared in the schema as
+//
+//   -- @crdt text
+//   DEFINE FIELD {{field}} ON TABLE {{table}} TYPE string;
+//
+// The editor binds to the field's Loro document. Each client sends only its own
+// edits (rows of the generated `{{table}}__crdt_log` table, through the outbox)
+// and merges everyone else's as they sync; the server folds them into the
+// canonical document. The `{{field}}` column itself is the server-written plain
+// text: render it for previews, never write it with `db.create` / `db.update`.
 
-import { useDb, useQuery, useCrdtField } from '@spooky-sync/client-solid';
+import { createEffect, createSignal, onCleanup, Show } from 'solid-js';
+import { useCrdtField, useDb, useQuery } from '@spooky-sync/client-solid';
 import { schema } from '../schema.gen';
 
 export function {{TablePascal}}{{FieldPascal}}Editor(props: { id: string }) {
-  const db = useDb<typeof schema>();
+  // 3 arguments: table, a reactive record id, field. Reopens when the id changes.
+  const field = useCrdtField('{{table}}', () => props.id, '{{field}}');
+  const [text, setText] = createSignal('');
 
-  // Pull the surrounding row so we know the field is loaded.
-  const rowResult = useQuery(() =>
-    db.query('{{table}}').where({ id: props.id } as any).build()
-  );
-  const row = () => rowResult.data()?.[0];
+  // Follow the document: local and remote edits alike re-render the textarea.
+  createEffect(() => {
+    const doc = field()?.getDoc();
+    if (!doc) return;
+    const loroText = doc.getText('{{field}}');
+    setText(loroText.toString());
+    onCleanup(doc.subscribe(() => setText(loroText.toString())));
+  });
 
-  // Bind the CRDT field. All four args take accessor functions for SolidJS tracking.
-  const field = useCrdtField(
-    '{{table}}',
-    () => row()?.id,
-    '{{field}}',
-    () => row()?.{{field}}
-  );
-
-  const handleInput = async (e: InputEvent) => {
-    const next = (e.currentTarget as HTMLTextAreaElement).value;
-    const r = row();
-    if (!r?.id) return;
-    // `debounced` coalesces rapid keystrokes into a single mutation.
-    await db.update('{{table}}', r.id, { {{field}}: next }, { debounced: true });
+  const handleInput = (e: InputEvent & { currentTarget: HTMLTextAreaElement }) => {
+    const doc = field()?.getDoc();
+    if (!doc) return;
+    // Diff into the document rather than replacing it, so concurrent edits merge.
+    doc.getText('{{field}}').update(e.currentTarget.value);
+    doc.commit();
   };
 
   return (
-    <textarea value={field.value() ?? ''} onInput={handleInput} />
+    <Show when={field()} fallback={<p>Loading...</p>}>
+      <textarea value={text()} onInput={handleInput} />
+    </Show>
   );
+}
+
+// Previews read the column like any other. It is the document's text as of the
+// server's last fold, so it trails live edits (about a minute by default).
+export function {{TablePascal}}{{FieldPascal}}Preview(props: { id: string }) {
+  const db = useDb<typeof schema>();
+  const result = useQuery(() =>
+    db.query('{{table}}').where({ id: props.id } as any).build()
+  );
+  return <p>{result.data()?.[0]?.{{field}}}</p>;
 }

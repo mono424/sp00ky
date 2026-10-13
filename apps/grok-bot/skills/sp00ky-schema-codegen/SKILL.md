@@ -19,7 +19,7 @@ Edit the `.surql` schema referenced by `sp00ky.yml`. Never hand-edit generated `
 
 ## Annotations that trip agents
 
-- **@crdt text** — UI must use the CRDT field hook with debounced writes.
+- **@crdt text / @crdt prosemirror** (+ optional `@cursor`): field must be `TYPE string` with no VALUE/ASSERT. Generates `<table>__crdt_log` (and `__crdt_presence`); the column becomes server-written plain text. UI edits through `useCrdtField`, never `db.update`.
 - **@parent** — filled server-side from auth. Do not write from the client.
 - **Record links** — store full record ids (`user:…`, `thread:…`).
 

@@ -397,6 +397,7 @@ Get entity information for this SSP (no authentication required).
     "circuit_tables": { "thread": 12, "user": 3 },
     "circuit_hashes": { "thread": "ab12…", "user": "cd34…" },
     "bootstrap_warnings": [],
+    "crdt": { "pending_fields": 1, "pending_rows": 14, "running": 0, "folds": 37, "rows_folded": 912, "rows_rejected": 0, "leases_lost": 0, "errors": 0 },
     "query_allowlist": {
       "mode": "warn",
       "loaded_at_epoch_ms": 1757923200000,
@@ -418,6 +419,11 @@ whose SurrealQL did not compile, the decision `counters` since start
 `enforce`), and the last 20 misses in `last_refused`. The list is reloaded at
 every Ready transition, whenever a `_00_query_allowlist` row changes, and at
 most once per 5 s after a miss.
+
+`crdt` reports the [CRDT field](/docs/client/crdt) fold on this SSP:
+`pending_fields` and `pending_rows` waiting for a fold, folds `running` now,
+and counters since start (`folds`, `rows_folded`, `rows_rejected` for log rows
+that failed the acceptance rule, `leases_lost` to another SSP, `errors`).
 
 `push` is the [Web Push](/docs/client/push-notifications) engine's status
 (same shape as the scheduler's `/health` `push` block) on a standalone SSP,
@@ -545,7 +551,7 @@ curl -X POST http://localhost:8667/log \
 ## Other endpoints
 
 The routes above are the ones you call by hand. The rest of the surface exists
-for the scheduler, the dashboard and the CRDT client. All of them require the
+for the scheduler and the dashboard. All of them require the
 bearer; only `/health`, `/info`, `/info/text` and `/version` are public.
 
 | Endpoint | Purpose |
@@ -554,7 +560,6 @@ bearer; only `/health`, `/info`, `/info/text` and `/version` are public.
 | `POST /job/kill` | Cancel one outbox job: aborts it in flight if this SSP owns it, otherwise flags it so it fails at dequeue |
 | `POST /job/retry` | Reset a terminal job to `pending` and re-admit it. Refused with `409 not_terminal` while it is still running |
 | `POST /job/recover` | Claim a `pending` job the recovery sweep found orphaned |
-| `POST /crdt/apply` | Apply a Loro update to a `@crdt` field |
 | `GET /debug/heartbeat` | The last heartbeat sequence this SSP observed, used by the end-to-end latency probe |
 | `GET /debug/catchup-rows/:table` | Row counts for one table, for drift diagnosis |
 | `GET /debug/memory` | Circuit memory breakdown |
@@ -754,8 +759,6 @@ SPKY_SSP_CHECKPOINT_VERIFY=background  # cluster: verify checkpoint bodies along
 SPKY_SSP_REPAIR_CONCURRENCY=4          # cluster: tables, and ranges within one, repaired at once at a warm bootstrap
 
 # Optional knobs
-SPKY_CRDT_CACHE_SIZE=10000       # in-memory CRDT cache capacity
-SPKY_CRDT_FIELDS='{"thread": ["content"]}'  # override @crdt detection
 SPKY_SSP_BOOTSTRAP_PAGE_SIZE=500 # rows pulled per /proxy/query page
 SPKY_SSP_ARENA_SEGMENT_MB=64     # arena segment size (default: 64)
 SPKY_SSP_MEMORY_LIMIT_MB=1024    # memory ceiling reported for load balancing
@@ -764,6 +767,16 @@ SPKY_SSP_VIEW_METRICS_FLUSH_MS=2000 # view metrics flush interval (default: 2000
 SPKY_SSP_ANON_LIVE_QUERIES=false # allow LIVE queries with no auth context
 SPKY_SSP_QUERY_ALLOWLIST=off     # off | warn | enforce: refuse view shapes the app does not ship
 SPKY_IMPERSONATION=off           # on: serve /impersonate/* (set from impersonation.enabled)
+
+# @crdt fold: when a field's edit log is folded into its canonical document
+SPKY_CRDT_FOLD_IDLE_SECS=60      # fold once the log has been idle this long
+SPKY_CRDT_FOLD_MAX_ROWS=200      # ...or once this many rows are pending
+SPKY_CRDT_FOLD_MAX_BYTES=262144  # ...or once this many bytes are pending
+SPKY_CRDT_FOLD_MIN_GAP_SECS=30   # never fold one field more often than this
+SPKY_CRDT_FOLD_WORKERS=2         # folds running at once on this SSP
+SPKY_CRDT_FOLD_TICK_MS=5000      # how often to look for due folds
+SPKY_CRDT_PRESENCE_TTL_SECS=60   # presence rows older than this are swept
+SPKY_CRDT_CACHE_SIZE=1024        # hot documents kept in memory between folds
 ```
 
 ### Scheduler Integration

@@ -44,7 +44,8 @@ registration go through the same normaliser inside the SSP, so there is exactly 
 "same shape".
 
 The SDK's own registrations over `_00_app_release` and `_00_user_feature` (release announcements,
-feature flags) are built in and always admitted. Raw reads that never become synced views
+feature flags), and over the `<table>__crdt_log` and `<table>__crdt_presence` tables generated for
+[CRDT fields](/docs/client/crdt), are built in and always admitted. Raw reads that never become synced views
 (`useRemote`, `remoteQuery`, `queryRaw`) are not allowlisted at all; see
 [Client side](#client-side).
 

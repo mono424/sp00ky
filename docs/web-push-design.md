@@ -37,8 +37,9 @@ push library, no key management. Powerful defaults, few opinions:
   (singlenode), like `schedule-core`.
 - Ingest is per row. No transaction object, no before-image on UPDATE (the
   changefeed's `INCLUDE ORIGINAL` patch is discarded), DELETE carries the
-  before-image read from the replica. `@opaque`/`@crdt`/`@nosync` fields are
-  stripped, `@nosync` tables never arrive.
+  before-image read from the replica. `@opaque`/`@nosync` fields are
+  stripped (a `@crdt` field is its plain-text mirror and arrives like any
+  column), `@nosync` tables never arrive.
 - The same row can be ingested more than once (changefeed look-back, retry
   re-poll, 1 s rewind on restart, WAL replay). Drift repair re-emits old rows
   through `ingest_event(.., 0)`: those must NEVER push (host passes

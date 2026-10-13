@@ -135,7 +135,7 @@ The server connects to the Sp00ky DevTools browser extension (when an app tab is
 
 ## Generated docs in `schema.gen.ts`
 
-Every regenerated `schema.gen.ts` carries JSDoc on each table and column. Tables list their relationships and a `useQuery` example; columns marked `@crdt` get a "use `useCrdtField` and `{ debounced: true }`" hint inline; `@parent` columns get a "auto-populated server-side, do not write" hint.
+Every regenerated `schema.gen.ts` carries JSDoc on each table and column. Tables list their relationships and a `useQuery` example; columns marked `@crdt` get an "edit it with `useCrdtField`; this column is the server-written plain text" hint inline; `@parent` columns get a "auto-populated server-side, do not write" hint.
 
 Both your IDE's hover-docs and an agent's read of the file pick this up automatically. Nothing to wire up.
 

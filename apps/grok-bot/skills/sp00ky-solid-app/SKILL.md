@@ -21,7 +21,7 @@ For Solid 2 bindings, follow `client-solid2` AGENTS.md (`createQuery`, `<Loading
 
 ## Mutations
 
-`db.create('table:id', payload)`, `db.update`, `db.delete` — optimistic. Mint ids as full record strings. CRDT fields: CRDT hook + debounced writes.
+`db.create('table:id', payload)`, `db.update`, `db.delete` are optimistic. Mint ids as full record strings. CRDT fields: edit through `useCrdtField(table, () => id, field)` and its `getDoc()`; never put them in a create/update payload (the column is server-written plain text, fine to read for previews).
 
 ## When stuck
 

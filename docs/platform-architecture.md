@@ -10,7 +10,7 @@ Status: **phases 0–3 landed + handler migration underway** (`packages/ssp-node
 with `SspNode::route`, VM adapters, timer dispatcher, wasm gate). Migrated
 routes: `/version`, `/log`, `/reset`, `/job/kill|retry|recover` — they already
 compile for wasm32. Remaining in the shell: `/ingest`, `/view/*`,
-`/crdt/apply`, `/debug/*`, `/health`, `/info`, `/backends`, `/backup/*`.
+`/debug/*`, `/health`, `/info`, `/backends`, `/backup/*`.
 
 ---
 

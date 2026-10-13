@@ -201,7 +201,7 @@ fn render(
     s.push_str("## Common gotchas\n\n");
     s.push_str("1. **Run `spky generate` after every schema edit.** Then `spky doctor` to confirm nothing else drifted.\n");
     s.push_str("2. **Record IDs are full strings.** `db.create('thread:abc', {...})`, not `db.create('thread', {id: 'abc'})`. Mint IDs with `new Uuid().toString()`.\n");
-    s.push_str("3. **CRDT fields need `useCrdtField`.** Reading them via `useQuery` returns the last raw merged value, not a reactive Loro doc.\n");
+    s.push_str("3. **Edit CRDT fields with `useCrdtField(table, () => id, field)`.** The column itself is the server-written plain text: fine to read with `useQuery` for previews and filters (it trails live edits until the server folds the edit log), never written with `db.create` / `db.update`. Bind editors to `useCrdtField(...)()?.getDoc()`.\n");
     s.push_str("4. **`@parent` columns are read-only from the client.** They're populated server-side from the auth context.\n");
     s.push_str(
         "5. **`useQuery` factories must end with `.build()`.** A bare builder hangs the hook.\n",
@@ -217,10 +217,10 @@ fn render(
 
     s.push_str("## Cookbook recipes\n\n");
     s.push_str("Render a parameterized snippet for any of these:\n\n");
-    s.push_str("- `spky scaffold live-list --table <table>` — reactive list view\n");
-    s.push_str("- `spky scaffold optimistic-mutation --table <table>` — create-record form\n");
-    s.push_str("- `spky scaffold crdt-text-field --table <table> --field <field>` — collaborative editor\n\n");
-    s.push_str("Run `spky scaffold list` for the full index, or read `node_modules/@spooky-sync/cli/templates/cookbook/INDEX.md`.\n");
+    s.push_str("- `spky recipe live-list --table <table>`: reactive list view\n");
+    s.push_str("- `spky recipe optimistic-mutation --table <table>`: create-record form\n");
+    s.push_str("- `spky recipe crdt-text-field --table <table> --field <field>`: collaborative textarea for a `@crdt text` field\n\n");
+    s.push_str("Run `spky recipe list` for the full index, or read `node_modules/@spooky-sync/cli/templates/cookbook/INDEX.md`.\n");
 
     s
 }

@@ -39,20 +39,19 @@ _(no CRDT, parent, or relationship annotations)_
 
 _(no CRDT, parent, or relationship annotations)_
 
+### `share_link`
+
+**Record links:**
+- `share_link.issuer` → `user`
+- `share_link.thread` → `thread`
+
 ### `thread`
 
-**CRDT fields** (use `useCrdtField`, not `useQuery`; pair writes with `{ debounced: true }`):
-- `thread.content` (`@crdt text`)
-- `thread.title` (`@crdt text`)
+**CRDT fields** (edit with `useCrdtField`; the field itself is the server-written plain text, readable in `useQuery` and filters, never written by the client):
+- `thread.content` (`@crdt prosemirror`)
 
 **Parent fields** (auto-populated server-side from auth context — do not write from client code):
 - `thread.author` → `user`
-
-### `thread_invite`
-
-**Record links:**
-- `thread_invite.created_by` → `user`
-- `thread_invite.thread` → `thread`
 
 ### `user`
 
@@ -75,7 +74,7 @@ _(no CRDT, parent, or relationship annotations)_
 
 1. **Run `spky generate` after every schema edit.** Then `spky doctor` to confirm nothing else drifted.
 2. **Record IDs are full strings.** `db.create('thread:abc', {...})`, not `db.create('thread', {id: 'abc'})`. Mint IDs with `new Uuid().toString()`.
-3. **CRDT fields need `useCrdtField`.** Reading them via `useQuery` returns the last raw merged value, not a reactive Loro doc.
+3. **Edit CRDT fields with `useCrdtField(table, () => id, field)`.** The column itself is the server-written plain text: fine to read with `useQuery` for previews and filters (it trails live edits until the server folds the edit log), never written with `db.create` / `db.update`. Bind editors to `useCrdtField(...)()?.getDoc()`.
 4. **`@parent` columns are read-only from the client.** They're populated server-side from the auth context.
 5. **`useQuery` factories must end with `.build()`.** A bare builder hangs the hook.
 6. **`db.useRemote(fn)` bypasses the local cache.** Use only for queries the type-safe builder can't express.
@@ -93,8 +92,8 @@ spky doctor --json     # structured diagnostics — parse-and-grep ready
 
 Render a parameterized snippet for any of these:
 
-- `spky scaffold live-list --table <table>` — reactive list view
-- `spky scaffold optimistic-mutation --table <table>` — create-record form
-- `spky scaffold crdt-text-field --table <table> --field <field>` — collaborative editor
+- `spky recipe live-list --table <table>`: reactive list view
+- `spky recipe optimistic-mutation --table <table>`: create-record form
+- `spky recipe crdt-text-field --table <table> --field <field>`: collaborative textarea for a `@crdt text` field
 
-Run `spky scaffold list` for the full index, or read `node_modules/@spooky-sync/cli/templates/cookbook/INDEX.md`.
+Run `spky recipe list` for the full index, or read `node_modules/@spooky-sync/cli/templates/cookbook/INDEX.md`.

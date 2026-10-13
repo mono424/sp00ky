@@ -1,37 +1,258 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: CRDT fields
-description: Collaborative text fields backed by Loro, multiple people editing one field without conflicts.
+description: Collaborative text fields backed by Loro. Clients send only their own edits, the server folds them into one canonical document, and the field itself stays plain, queryable text.
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
 import Experimental from '../../../components/ui/Experimental.astro';
-import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
 import PropTable from '../../../components/ui/PropTable.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
 
-export const schemaCode = `-- @crdt text
-DEFINE FIELD title ON TABLE thread TYPE string
-    ASSERT $value != NONE AND string::len($value) > 0;
+<Experimental>
+  CRDT fields are experimental. The API may change between canary releases.
+</Experimental>
+
+Two users. Same thread. Both typing at the same time.
+
+With a normal database, somebody's changes get silently overwritten. Locking makes the UX terrible. Server-side merging is a nightmare for character-level edits.
+
+**CRDTs fix this.** A Conflict-free Replicated Data Type guarantees that any two replicas merge automatically, no matter what order edits arrive in. Every peer converges on the same result.
+
+Sp00ky uses [Loro](https://loro.dev) under the hood. You annotate a field, and you get real-time collaborative editing with cursor presence. Each client sends only its own edits, through the same outbox and sync pipeline as every other write. The server folds those edits into the canonical document and writes the field back as plain text, so lists, search and filters keep working on it.
+
+## 1. Annotate your schema
+
+Put `-- @crdt <kind>` above a `TYPE string` field, and `-- @cursor` if you want remote cursors:
+
+<CodeBlock code={schemaCode} lang="sql" fileName="schema/src/schema.surql" />
+
+| Annotation | What you get |
+|---|---|
+| `@crdt prosemirror` | A [loro-prosemirror](https://www.npmjs.com/package/loro-prosemirror) tree. For rich text in ProseMirror-based editors (TipTap, Milkdown, ...). |
+| `@crdt text` | One `LoroText` named after the field. For plain-text inputs. `@crdt` alone means `text`. |
+| `@cursor` | Per-session presence for the field, so editors can show each other's cursors. |
+
+The rules, all checked by `spky generate`:
+
+- The field must be `TYPE string` (or `option<string>`) with no `VALUE` or `ASSERT` clause. The server owns its value.
+- Top-level fields only, and not on `TYPE RELATION` tables.
+- The `surrealism` deploy mode is refused: the fold runs in the SSP, and that mode has none.
+- The names `<table>__crdt_log`, `<table>__crdt_presence`, `_00_crdt_doc` and fields ending in `__crdt` are reserved.
+
+Then run `spky generate` and apply the schema (`spky migrate` / `spky deploy`). Who may read a document's edits, and who may write them, is exactly who may read and update the record: the generated tables reuse the parent table's `select` and `update` permissions.
+
+## 2. The field is plain text
+
+The annotated column no longer holds anything a client writes. It is the document's plain text, written by the server each time it folds the edit log. Read it like any other column: render it in a list, search it, filter or order on it.
+
+<CodeBlock code={previewCode} lang="tsx" />
+
+- **Never write it.** Leave it out of `db.create` and `db.update` payloads. A client write keeps the old value (a new record starts as `''`), so there is nothing to gain from setting it.
+- **It trails live edits.** The column changes when the server folds, typically within about a minute of the last edit (see [the fold](#the-server-fold)). Inside an open editor you read the live document instead.
+- **`prosemirror` renders as lines.** Block nodes (paragraphs, headings, list items) become lines, hard breaks become newlines, and formatting is dropped.
+- **Keep it out of the sync engine with `@opaque`.** Add `-- @opaque` next to `@crdt` when the text is large or sensitive and you never filter on it; see [`@opaque`](/docs/schema#syncing-a-field-without-indexing-it-opaque).
+
+Each fold also writes `<field>__crdt` on the record, a stamp of the folded version (its `rev` and the Loro version it covers). You don't need to read it.
+
+<Warning title="No migration from text or from older canaries">
+  Annotating a field that already holds text does not import that text: the document starts empty, and the first fold after someone edits replaces the column with the document's text. CRDT state written by earlier canaries (inline snapshots on the record) is not read either.
+</Warning>
+
+## 3. Open the field
+
+`useCrdtField` opens the field's document, keeps it syncing, and closes it on cleanup. It reopens when the record id changes.
+
+<CodeBlock code={hookCode} lang="typescript" />
+
+<PropTable props={[
+  { name: 'table', type: 'string', default: '-', desc: 'Table name' },
+  { name: 'recordId', type: '() => string | undefined', default: '-', desc: 'Reactive getter for the record id. The hook reopens when it changes and waits while it is undefined.' },
+  { name: 'field', type: 'string', default: '-', desc: 'The `@crdt` field name' },
+]} />
+
+It returns an accessor that is `null` until the field is open, then a `CrdtField`. It must live inside a `<Sp00kyProvider>`, and has the same shape in `@spooky-sync/client-solid` and `@spooky-sync/client-solid2`.
+
+Without Solid, open and close the field on the client yourself. Every open of the same field in a tab shares one document, so pair each open with a close:
+
+<CodeBlock code={vanillaCode} lang="typescript" />
+
+`closeCrdtField` resolves once the edits not sent yet are handed to the outbox, so awaiting it before navigating away loses nothing.
+
+When a device holds nothing for a field yet, the open first fetches the server's published snapshot and waits briefly for the log's first answer, so the editor starts from the real document rather than an empty one. Set `crdt: true` in the [client config](/docs/reference/client-config#crdt) to load the Loro engine at startup instead of on the first open.
+
+## 4. Create a record with content
+
+A "new thread" form needs an editor before the record exists. Give it a draft:
+
+<CodeBlock code={draftCode} lang="typescript" />
+
+`createCrdtDraft` returns a detached `CrdtField` that sends nothing. Passing it to `openCrdtField` after `db.create` merges its edits into the record's document, where they go out as the record's first edits. The example app's [`CreateThreadDialog.tsx`](https://github.com/mono424/sp00ky/blob/main/example/app-solid/src/components/CreateThreadDialog.tsx) does exactly this.
+
+## 5. Bind an editor
+
+`CrdtField.getDoc()` returns a standard Loro `LoroDoc`.
+
+### `prosemirror` fields
+
+Loro ships ProseMirror plugins in [`loro-prosemirror`](https://www.npmjs.com/package/loro-prosemirror), so any editor built on ProseMirror works:
+
+| Editor | Why pick it |
+|---|---|
+| [TipTap](https://tiptap.dev) | Most popular. Headless, extensible, great DX. |
+| [Milkdown](https://milkdown.dev) | Plugin-driven Markdown editor on ProseMirror. |
+| [Novel](https://novel.sh) | Notion-style block editor. |
+| [ProseMirror](https://prosemirror.net) | Full control, no abstractions. |
+
+A minimal TipTap editor. Disable TipTap's own history and let `LoroUndoPlugin` handle undo, so undo only ever reverts your own edits:
+
+<CodeBlock code={tiptapCode} lang="typescript" />
+
+Show the plain-text column while the field opens:
+
+<CodeBlock code={showCode} lang="tsx" />
+
+For a full-featured version with cursor presence, single-line mode and a placeholder, see [`CollaborativeEditor.tsx`](https://github.com/mono424/sp00ky/blob/main/example/app-solid/src/components/CollaborativeEditor.tsx) in the example app.
+
+### `text` fields
+
+The document holds one `LoroText` named after the field. Bind it to an input by diffing into it, so concurrent edits merge instead of replacing each other:
+
+<CodeBlock code={textCode} lang="tsx" />
+
+`spky recipe crdt-text-field --table <table> --field <field>` renders this as a ready-made component.
+
+## 6. Cursors (`@cursor`)
+
+A `@cursor` field carries one presence blob per editing session. The `CrdtField` moves the bytes; what they mean is up to the editor. With TipTap, `loro-prosemirror`'s `CursorEphemeralStore` and `LoroEphemeralCursorPlugin` do the drawing:
+
+<CodeBlock code={cursorCode} lang="typescript" />
+
+Presence is the latest state only: it is not queued offline, it is sent at most every 250 ms, and a session's row is removed when its field closes (the SSP sweeps rows a crashed tab left behind once they are older than the presence TTL).
+
+## The CrdtField API
+
+<CodeBlock code={apiCode} lang="typescript" />
+
+<CodeBlock code={helpersCode} lang="typescript" />
+
+## How it syncs
+
+Nothing about a CRDT field bypasses the sync pipeline. For a table with `@crdt` fields, `spky generate` adds:
+
+| Table | Holds | Written by |
+|---|---|---|
+| `<table>__crdt_log` | Append-only edit log: one row per batch of one client's edits (`doc`, `field`, `author`, `peer`, `data`, `size`, `created_at`). | Clients create rows (where the parent's `update` rule allows), the SSP deletes them once folded. No updates. |
+| `<table>__crdt_presence` | One presence row per session and field (`@cursor` only). | Each session its own row. |
+| `_00_crdt_doc` | The canonical snapshot of each (record, field), with its `rev`. | The SSP only. Never synced: a device reads it on demand, when it opens a field it holds nothing for, or when log rows depend on edits already folded away. |
+| `_00_crdt_peer` | Which user owns which Loro peer id. | Clients claim ids, nobody changes or deletes them. |
+
+**Up.** Typing changes the tab's local Loro document right away. After a pause of 300 ms (`crdtDebounceMs`, and at most 2 s into a burst), the tab exports only its own new operations as one Loro update and creates one `<table>__crdt_log` row through the ordinary outbox, so edits survive offline, reloads and retries like any other write. Each tab edits under a random Loro peer id that it claims for the signed-in user in `_00_crdt_peer`; the database refuses a log row whose peer the writer does not own.
+
+**Down.** An open field is an ordinary query on its log rows, so other clients' edits arrive through the normal sync pipeline on the same SurrealDB connection, with no extra LIVE query, and are merged into the open document.
+
+**The acceptance rule.** Before any client or the server imports a log row, it checks that the blob is a Loro update (not a snapshot), at most 256 KiB, and that every operation in it was made by the row's `peer`. A row that fails never enters any document, anywhere, so a client cannot inject edits under someone else's name or replace history with a crafted snapshot.
+
+**Locally.** The device keeps its merged document and how far each of its peers' edits got into the outbox in `_00_crdt_local`. Edits made offline, or just before a reload, are sent later under the peer they were made with. Signing out does not send them under the next user: they wait in the old account's local store.
+
+### The server fold
+
+The SSP is the only writer of the canonical document. To keep its CPU flat it folds rarely: a field is folded once its log has been idle for a while, or once enough rows or bytes are pending, and never more often than a minimum gap. A fold takes a lease on the field's `_00_crdt_doc` row, imports the accepted log rows into the snapshot, writes the new snapshot and the record's plain-text column in one transaction, and then deletes the rows it folded. Several SSPs in a cluster are safe: the lease and a compare-and-swap on `rev` mean exactly one of them publishes each version.
+
+Nothing waits on a fold. A late fold only delays the plain-text column and the snapshot new devices start from; live editors exchange edits through the log directly.
+
+The thresholds are SSP environment variables:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SPKY_CRDT_FOLD_IDLE_SECS` | `60` | Fold a field once its log has had no new rows for this long. |
+| `SPKY_CRDT_FOLD_MAX_ROWS` | `200` | ...or once this many rows are pending, however active it is. |
+| `SPKY_CRDT_FOLD_MAX_BYTES` | `262144` | ...or once this many bytes are pending. |
+| `SPKY_CRDT_FOLD_MIN_GAP_SECS` | `30` | Never fold one field more often than this. |
+| `SPKY_CRDT_FOLD_WORKERS` | `2` | Folds running at once on one SSP. |
+| `SPKY_CRDT_FOLD_TICK_MS` | `5000` | How often the SSP looks for fields due a fold. |
+| `SPKY_CRDT_PRESENCE_TTL_SECS` | `60` | Presence rows older than this are swept. |
+| `SPKY_CRDT_CACHE_SIZE` | `1024` | Hot documents kept in memory between folds. |
+
+Self-hosted, set them on the SSP process ([Self-hosting](/docs/self-hosting)). On Sp00ky Cloud, set them for the `ssp` role in [`deployment.env`](/docs/cloud/deploying#infrastructure-environment-variables). The SSP's `/info` reports fold counters under `crdt` ([SSP API](/docs/reference/ssp-api#get-info)).
+
+## Limitations
+
+- **Two kinds.** `text` and `prosemirror`. The plain-text column renders those shapes only.
+- **The column trails the editor.** List previews update when the server folds, also for your own edits.
+- **Every fold rewrites the record.** The column and its `__crdt` stamp are an update of the parent row, so `VALUE time::now()` fields such as `updated_at` move on each fold, and the row syncs to everyone watching it.
+- **Impersonation is read-only here.** An [impersonation](/docs/client/impersonation) session cannot write edits or presence.
+- **JavaScript clients only.** The Dart client (`spooky_core`, Flutter) throws `UnimplementedError` for CRDT fields.
+- **API may change** while experimental.
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Define your schema" href="/docs/schema" description="Every annotation, including @opaque for large text." />
+  <LinkCard title="Mutations" href="/docs/client/mutations" description="The outbox that carries CRDT edits like every other write." />
+  <LinkCard title="Self-hosting" href="/docs/self-hosting" description="Run the SSP that folds the edit logs, and tune it." />
+</CardGrid>
+
+export const schemaCode = `DEFINE TABLE thread SCHEMAFULL
+  PERMISSIONS
+    FOR select WHERE published = true OR author = $auth.id
+    FOR create, update, delete WHERE author = $auth.id;
+
+-- @crdt prosemirror
+-- @cursor
+DEFINE FIELD content ON TABLE thread TYPE string;
 
 -- @crdt text
-DEFINE FIELD content ON TABLE thread TYPE string
-    ASSERT $value != NONE AND string::len($value) > 0;`;
+DEFINE FIELD summary ON TABLE thread TYPE option<string>;`;
 
-export const hookCode = `const titleField = useCrdtField(
-  'thread',
-  () => thread()?.id,    // reactive record ID
-  'title',
-  () => thread()?.title  // fallback for pre-CRDT records
-);`;
+export const previewCode = `// The column is the document's plain text: query it like any other.
+const threads = useQuery(() =>
+  db.query('thread').orderBy('created_at', 'desc').limit(20).build()
+);
+
+<For each={threads.data() ?? []}>
+  {(thread) => <p class="line-clamp-2">{thread.content}</p>}
+</For>`;
+
+export const hookCode = `import { useCrdtField } from '@spooky-sync/client-solid';
+
+const content = useCrdtField('thread', () => thread()?.id, 'content');
+// content() is null while the field opens, then a CrdtField`;
+
+export const vanillaCode = `const field = await client.openCrdtField('thread', 'thread:abc', 'content');
+bindEditor(field.getDoc());
+
+// later, when the editor goes away
+await client.closeCrdtField('thread', 'thread:abc', 'content');`;
+
+export const draftCode = `import { Uuid, useDb } from '@spooky-sync/client-solid';
+import type { CrdtField } from '@spooky-sync/core';
+
+const db = useDb<typeof schema>();
+const sp00ky = db.getSp00ky();
+
+// 1. A detached document the editor writes into before the record exists.
+const draft: CrdtField = await sp00ky.createCrdtDraft('thread', 'content');
+// ... render <CollaborativeEditor field={draft} /> and let the user type ...
+
+// 2. On submit, create the record. Leave \`content\` out: the server owns it.
+const id = 'thread:' + Uuid.v4().toString().replace(/-/g, '');
+await db.create(id, { title, author, published: false });
+
+// 3. Hand the draft over. Its edits become the record's first edits.
+await sp00ky.openCrdtField('thread', id, 'content', draft);
+await sp00ky.closeCrdtField('thread', id, 'content');`;
 
 export const tiptapCode = `import { onMount, onCleanup } from 'solid-js';
 import { Editor, Extension } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import { LoroSyncPlugin, LoroUndoPlugin, undo, redo } from 'loro-prosemirror';
-import { textToHtml, type CrdtField } from '@spooky-sync/core';
 import { keymap } from '@tiptap/pm/keymap';
+import type { CrdtField } from '@spooky-sync/core';
 
-export function CollaborativeEditor(props: { field: CrdtField; content?: string }) {
+export function CollaborativeEditor(props: { field: CrdtField }) {
   let ref: HTMLDivElement | undefined;
   let editor: Editor | undefined;
 
@@ -52,149 +273,73 @@ export function CollaborativeEditor(props: { field: CrdtField; content?: string 
         }),
       ],
     });
-
-    // Seed the doc for records that existed before CRDT was enabled
-    if (!props.field.hasContent() && props.content) {
-      editor.commands.setContent(textToHtml(props.content));
-    }
   });
 
   onCleanup(() => editor?.destroy());
   return <div ref={ref} />;
 }`;
 
-export const providerCode = `import { Sp00kyProvider } from '@spooky-sync/client-solid';
-import { dbConfig } from './db';
+export const showCode = `const content = useCrdtField('thread', () => thread()?.id, 'content');
 
-<Sp00kyProvider config={dbConfig}>
-  {/* useCrdtField must be called inside this provider */}
-</Sp00kyProvider>`;
+<Show when={content()} fallback={<p class="whitespace-pre-wrap">{thread()?.content}</p>}>
+  {(field) => <CollaborativeEditor field={field()} />}
+</Show>`;
+
+export const textCode = `const field = useCrdtField('note', () => props.id, 'summary');
+const [value, setValue] = createSignal('');
+
+// Follow the document: local and remote edits alike re-render the input.
+createEffect(() => {
+  const doc = field()?.getDoc();
+  if (!doc) return;
+  const text = doc.getText('summary');
+  setValue(text.toString());
+  onCleanup(doc.subscribe(() => setValue(text.toString())));
+});
+
+const onInput = (e: InputEvent & { currentTarget: HTMLTextAreaElement }) => {
+  const doc = field()?.getDoc();
+  if (!doc) return;
+  doc.getText('summary').update(e.currentTarget.value); // minimal diff
+  doc.commit();
+};
+
+<textarea value={value()} onInput={onInput} />`;
+
+export const cursorCode = `import { CursorEphemeralStore, LoroEphemeralCursorPlugin } from 'loro-prosemirror';
+import { cursorColorFromName } from '@spooky-sync/core';
+
+const doc = field.getDoc();
+const user = { name: username, color: cursorColorFromName(username) };
+const presence = new CursorEphemeralStore(doc.peerIdStr);
+presence.setLocal({ user });
+
+// Draw remote cursors: add this plugin next to LoroSyncPlugin.
+const cursorPlugin = LoroEphemeralCursorPlugin(presence, { user });
+
+// Send: publish the local cursor whenever it moves.
+const stop = presence.subscribeBy((by) => {
+  if (by === 'local') field.pushCursorState(presence.encodeAll());
+});
+
+// Receive: every other session's presence bytes.
+field.onCursorUpdate = (data) => presence.apply(data);`;
 
 export const apiCode = `import type { CrdtField } from '@spooky-sync/core';
 
-const field: CrdtField = titleField();
+const field: CrdtField = content();
 
-field.getDoc();                // LoroDoc - the underlying Loro document
-field.hasContent();            // boolean - true once saved CRDT state has loaded
-field.pushCursorState(bytes);  // Promise<void> - broadcast local cursor
-field.onCursorUpdate = (data) => { /* remote cursor bytes */ };`;
+field.getDoc();                 // LoroDoc: bind your editor to it
+field.hasContent();             // true once the document holds anything
+field.pushCursorState(bytes);   // publish this session's presence (\`@cursor\` only)
+field.onCursorUpdate = (bytes) => { /* another session's presence */ };
+// A blob that arrives before you set onCursorUpdate is replayed when you do.
 
-export const helpersCode = `import { cursorColorFromName, CURSOR_COLORS, textToHtml } from '@spooky-sync/core';
+// On the client (useDb().getSp00ky() in Solid):
+client.openCrdtField(table, recordId, field, draft?);  // Promise<CrdtField>
+client.closeCrdtField(table, recordId, field);         // Promise<void>
+client.createCrdtDraft(table, field);                  // Promise<CrdtField>`;
 
-const color = cursorColorFromName('ada');  // deterministic per-user color
-const html = textToHtml('hello\\nworld');  // plain text -> HTML paragraphs`;
+export const helpersCode = `import { cursorColorFromName, CURSOR_COLORS } from '@spooky-sync/core';
 
-<Experimental>
-  CRDT Fields are experimental. The API may change between canary releases.
-</Experimental>
-
-Two users. Same thread. Both typing at the same time.
-
-With a normal database, somebody's changes get silently overwritten. Locking makes the UX terrible. Server-side merging is a nightmare for character-level edits.
-
-**CRDTs fix this.** A Conflict-free Replicated Data Type guarantees that any two replicas merge automatically, no matter what order edits arrive in. No central authority. No conflicts. Every peer converges on the same result.
-
-Sp00ky uses [Loro](https://loro.dev) under the hood. You add a comment to your schema, and you get real-time collaborative editing with cursor presence. That's it.
-
-## 1. Annotate your schema
-
-Add `-- @crdt text` above any field:
-
-<CodeBlock
-  code={schemaCode}
-  lang="sql"
-/>
-
-Then run `spky` to regenerate.
-
-| Type | What it does |
-|---|---|
-| `text` | Character-level text merging with full editor support |
-
-<Note>
-  SurrealDB ignores the comment. Sp00ky's parser picks it up and wires everything for you. Today only `text` has built-in `CrdtField` wiring; for `map`/`list`/`counter` containers you can call `field.getDoc()` and drive the underlying [Loro](https://loro.dev) APIs directly.
-</Note>
-
-## 2. Get the CrdtField
-
-`useCrdtField` gives you a reactive `CrdtField`. It loads existing CRDT state, starts syncing, and rebinds when the record ID changes.
-
-<CodeBlock
-  code={hookCode}
-  lang="typescript"
-/>
-
-<PropTable props={[
-  { name: 'table', type: 'string', default: '-', desc: 'Table name' },
-  { name: 'recordIdAccessor', type: '() => string | undefined', default: '-', desc: 'Reactive getter for the record ID. Hook rebinds when it changes.' },
-  { name: 'field', type: 'string', default: '-', desc: 'The CRDT-enabled field name' },
-  { name: 'fallbackAccessor', type: '() => string | undefined', default: '-', desc: 'Current plain text value. Seeds the editor for pre-CRDT records.' },
-]} />
-
-<Note>
-  Must live inside a `<Sp00kyProvider>`.
-</Note>
-
-<CodeBlock
-  code={providerCode}
-  lang="typescript"
-/>
-
-## 3. Pick an editor
-
-`CrdtField.getDoc()` returns a standard [Loro](https://loro.dev) `LoroDoc`. Loro ships ProseMirror plugins via [`loro-prosemirror`](https://www.npmjs.com/package/loro-prosemirror), so any editor built on ProseMirror works out of the box:
-
-| Editor | Why pick it |
-|---|---|
-| [TipTap](https://tiptap.dev) | Most popular. Headless, extensible, great DX. |
-| [Milkdown](https://milkdown.dev) | Plugin-driven Markdown editor on ProseMirror. |
-| [Novel](https://novel.sh) | Notion-style block editor. |
-| [ProseMirror](https://prosemirror.net) | Full control, no abstractions. |
-
-Not using ProseMirror? You can still use the `LoroDoc` directly with any editor that supports external state. Call `doc.getText('field')` to read, subscribe to changes, and import/export snapshots yourself.
-
-### TipTap example
-
-Here's a minimal collaborative editor using TipTap + Loro. Disable TipTap's built-in history and let `LoroUndoPlugin` handle undo/redo so it works correctly across peers.
-
-<CodeBlock
-  code={tiptapCode}
-  lang="typescript"
-/>
-
-For a full-featured version with cursor presence, single-line mode, and placeholder support, see [`CollaborativeEditor.tsx`](https://github.com/mono424/sp00ky/blob/main/example/app-solid/src/components/CollaborativeEditor.tsx) in the example app.
-
-## 4. Go deeper (optional)
-
-Building a custom editor, or wiring `map`/`list`/`counter`? Use the `CrdtField` API directly:
-
-<CodeBlock
-  code={apiCode}
-  lang="typescript"
-/>
-
-`getDoc()` gives you a standard `LoroDoc`. Plug in any Loro-compatible binding.
-
-For cursor presence in a custom editor:
-- **Push:** Call `pushCursorState(encoded)` when the local cursor moves
-- **Receive:** Set `field.onCursorUpdate = (data) => { ... }` to get remote cursors. The latest pending update is replayed when you attach the callback.
-
-### Helpers
-
-<CodeBlock
-  code={helpersCode}
-  lang="typescript"
-/>
-
-## Under the hood
-
-CRDT state lives **inline** on the same row as the rest of your record: a `@crdt`-only field stores the snapshot bytes directly, and a `@crdt @cursor` field stores `{ state, cursors }` so each session's cursor blob sits next to the snapshot. There is no separate `_00_crdt` sidecar table.
-
-When `useCrdtField` mounts, the `CrdtManager` ensures a single `LIVE SELECT * FROM <table>` is open for that table (shared across every open field on that table), imports the existing snapshot, and pushes local changes back debounced at `crdtDebounceMs` (default 500 ms, configurable on `Sp00kyConfig`). Cross-user propagation also rides the list_ref sync path so updates arrive even when SurrealDB's cross-session LIVE-permission gap drops the parent-table notification (see [Architecture](/docs/reference/architecture)).
-
-## Limitations
-
-- **`text`** has ready-made ProseMirror integration. `map`/`list`/`counter` work via `getDoc()` and the Loro API directly.
-- **SolidJS only.** Flutter and Vanilla don't have `useCrdtField` yet.
-- **Needs live queries.** Without `LIVE SELECT`, edits reconcile on reload.
-- **API may change** while experimental.
+const color = cursorColorFromName('ada');  // a stable color per user name`;

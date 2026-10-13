@@ -31,7 +31,7 @@ one-command deploys.
 - [Offline & sync health](https://sp00ky.cloud/docs/client/offline-sync): Your app already works offline. This page is about showing the user what's going on, and tuning what gets cached.
 - [Feature flags](https://sp00ky.cloud/docs/client/feature-flags): Define a flag, target users with rules or a rollout percentage, and read it reactively in your app.
 - [File buckets](https://sp00ky.cloud/docs/client/buckets): Upload, download and isolate files per user, declared in your schema like any other resource.
-- [CRDT fields](https://sp00ky.cloud/docs/client/crdt): Collaborative text fields backed by Loro, multiple people editing one field without conflicts.
+- [CRDT fields](https://sp00ky.cloud/docs/client/crdt): Collaborative text fields backed by Loro. Clients send only their own edits, the server folds them into one canonical document, and the field itself stays plain, queryable text.
 
 ### Framework Guides
 

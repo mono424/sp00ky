@@ -38,8 +38,8 @@ table or field is generated and synced.
 | --- | --- | --- |
 | `-- @nosync` | above a `DEFINE TABLE` or `DEFINE FIELD` | Server-only table or field. Excluded from sync entirely (see below). |
 | `-- @opaque` | above a `DEFINE FIELD` | Field is synced to the client but never stored by the sync engine, so it can't be filtered or ordered on (see below). |
-| `-- @crdt text` | above a `DEFINE FIELD` | Marks a collaborative text field backed by a Loro CRDT. See [CRDT fields](/docs/client/crdt). |
-| `-- @cursor` | above a `DEFINE FIELD` (with `@crdt`) | Stores per-session cursors alongside the CRDT snapshot. |
+| `-- @crdt text` / `-- @crdt prosemirror` | above a `DEFINE FIELD ... TYPE string` | Collaborative field backed by a Loro document. Edits travel through a generated edit log; the field itself holds the server-written plain text (see below). |
+| `-- @cursor` | above a `DEFINE FIELD` (with `@crdt`) | Adds per-session presence (remote cursors) for that field, in a generated `<table>__crdt_presence` table. |
 | `-- @parent` | suffix on a `DEFINE FIELD ... TYPE record<...>` | Marks the parent side of a relationship; written automatically from the auth context, never by client code. |
 
 <CodeBlock code={annotationsCode} lang="sql" />
@@ -113,6 +113,30 @@ An `@opaque` field is:
   instead of erroring.
 </Warning>
 
+### Collaborative fields (`@crdt`, `@cursor`)
+
+Put `-- @crdt prosemirror` (a rich-text tree for ProseMirror-based editors) or `-- @crdt text` (one plain
+`LoroText`) above a `TYPE string` field, and add `-- @cursor` for remote cursors. Clients edit the field
+through [`useCrdtField`](/docs/client/crdt), never with `db.update`.
+
+<CodeBlock code={crdtCode} lang="sql" />
+
+For each table with `@crdt` fields, `spky generate` and `spky migrate` add:
+
+- **`<table>__crdt_log`**, an append-only log of each client's edits. Clients create rows where the
+  table's `update` rule allows (rebased through the row's `doc` link), read them where its `select` rule
+  allows, and never change or delete them.
+- **`<table>__crdt_presence`** (only with `@cursor`), one row per editing session and field.
+- **`_00_crdt_doc`** and **`_00_crdt_peer`**, internal: the canonical snapshot the SSP folds the log into,
+  and which user owns which Loro peer id.
+- **`<field>__crdt`** on the table itself, the version stamp each fold writes.
+
+The annotated field becomes the document's **plain text**, written by the server on every fold; a client
+write leaves it unchanged. It is an ordinary synced column: render it, filter and order on it, or add `@opaque`
+to keep the text out of the sync engine. The field must be `TYPE string` (or `option<string>`) with no
+`VALUE` or `ASSERT`, sit on a top-level field of a non-relation table, and the `surrealism` deploy mode
+refuses it. See [CRDT fields](/docs/client/crdt) for the client API and how the fold works.
+
 ## Next
 
 <CardGrid>
@@ -160,13 +184,21 @@ DEFINE FIELD created_at ON TABLE user TYPE datetime
 
 DEFINE INDEX unique_username ON TABLE user FIELDS username UNIQUE;`;
 
-export const annotationsCode = `-- @crdt text                       -- collaborative text field (Loro CRDT)
+export const annotationsCode = `-- @crdt prosemirror
+-- @cursor
 DEFINE FIELD content ON TABLE thread TYPE string;
 
 DEFINE FIELD author ON TABLE thread TYPE record<user>; -- @parent
 
 -- @nosync
 DEFINE TABLE audit_log SCHEMALESS;`;
+
+export const crdtCode = `-- @crdt prosemirror
+-- @cursor
+DEFINE FIELD content ON TABLE thread TYPE string;
+
+-- @crdt text
+DEFINE FIELD summary ON TABLE thread TYPE option<string>;`;
 
 export const nosyncCode = `-- @nosync
 DEFINE TABLE audit_log SCHEMALESS;

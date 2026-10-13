@@ -45,7 +45,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   - `db.pendingMutationCount`, `db.subscribeToPendingMutations(cb)`.
 - **`useQuery(() => db.query(...).build())`** — reactive query. Returns `{ data, status, error, ... }` accessors. The factory function is tracked, so passing reactive params (signals) re-runs the query.
 - **`createPreload(() => db.query(...).build(), options?)`** — reactive, fire-and-forget prewarm (same overloads/`enabled` as `useQuery`, plus `signal`). Registers a query the user is likely to open next (e.g. a list row's detail). For blocking first-load, use the `Sp00kyProvider` `preload` prop instead.
-- **`useCrdtField(table, () => recordId, field, () => valueAccessor)`** — wires a CRDT text field to a Loro doc. Pair with `db.update(table, id, { [field]: newValue }, { debounced: true })` so rapid keystrokes don't flood the queue. *All four arguments take accessor functions where reactive — that's deliberate, for SolidJS tracking.*
+- **`useCrdtField(table, () => recordId, field)`**: opens a `@crdt` field and returns an accessor that is `null` until it is open, then a `CrdtField`. Bind the editor to `field()?.getDoc()` (a `LoroDoc`: `loro-prosemirror` plugins for `@crdt prosemirror`, `doc.getText(field)` for `@crdt text`); edits sync themselves, so there is no `db.update` for them. Reopens when the id changes, closes on cleanup. To give a not-yet-created record content, use `db.getSp00ky().createCrdtDraft(table, field)`, then after `db.create` call `openCrdtField(table, id, field, draft)` and `await closeCrdtField(...)`. Only the record id is an accessor.
 - **`useImpersonation()`**: `{ impersonation, isImpersonating, stop }` for admin impersonation started from the DevTools (`impersonation.enabled` in sp00ky.yml). The client already renders its own warning bar with a Stop button; use the hook only for extras, such as hiding destructive actions while impersonating, or pass `{ rendersBanner: true }` when the app draws its own banner under `impersonationBanner: { mode: 'custom' }`. See `/docs/client/impersonation`.
 - **`useFileUpload()`** / **`useDownloadFile()`** — bucket helpers; the upload result includes the storage path you write into a record column. `useDownloadFile` reads through the durable OPFS blob cache (options `{ cache, persist, pin, revalidate }`), so images survive a reload and paint offline; `refetch()` bypasses every layer.
 
@@ -58,7 +58,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
 ## Common gotchas
 
 - **`useDb()` requires `<typeof schema>`.** Without the generic, all calls fall back to `unknown` and you lose type safety.
-- **CRDT fields are not regular columns.** Don't read or write them via `useQuery` — read with `useCrdtField`, write via `db.update` with `{ debounced: true }`.
+- **A `@crdt` column is the server-written plain text of its document.** Read it with `useQuery` for previews, search and filters (it trails live edits until the server folds, about a minute); edit it only through `useCrdtField`; never put it in a `db.create` / `db.update` payload (a client write keeps the old value).
 - **Generate IDs explicitly.** `const id = new Uuid().toString()`, then `db.create(\`thread:\${id}\`, ...)`. SurrealDB's auto-id only fires on direct DB writes, not through the sync queue.
 - **`useQuery` factories must call `.build()` (or `.all()`, `.first()`, etc.).** A bare `db.query('thread')` is a builder, not a query — `useQuery` will throw or return forever-loading.
 - **Provider is mandatory.** Calling any hook outside `<Sp00kyProvider>` throws.

@@ -23,6 +23,11 @@ E2E impact:
 - `z-multi-user-sync.spec.ts` "alice publishing…" and "unpublishing
   …" already passed via the #47 evaluate_key fix and continue to.
 
+(Superseded for CRDT: since CRDT v2 edits and cursors are rows of generated
+`<table>__crdt_log` / `<table>__crdt_presence` tables that sync like any
+other table, and `CrdtManager.applyRow` is gone; see `docs/crdt-v2.md`. The
+paragraph below is kept as history.)
+
 For CRDT body / cursor sync over the same race, `sp00ky.ts` now
 subscribes the CrdtManager to `syncEngine.events`'s
 `SYNC_REMOTE_DATA_INGESTED`, forwarding each ingested parent row

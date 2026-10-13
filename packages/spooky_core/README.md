@@ -142,7 +142,9 @@ view, never an empty one.
 
 Not ported (browser-only): shared tabs, the SQLite-WASM worker and its
 SurrealQL translator, the DevTools window bridge, the OTel exporter. CRDT
-collaborative fields are still deferred (the seam is in place).
+collaborative fields are still deferred: `openCrdtField` / `closeCrdtField`
+throw `UnimplementedError` until the TS client's edit-log protocol is ported
+(`docs/crdt-v2.md` at the repo root).
 
 The blob cache is ported with files on disk in place of OPFS
 (`Sp00kyConfig.blobCache.directory`; in-memory without one). Its manifest is

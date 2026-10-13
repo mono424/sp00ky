@@ -1,4 +1,4 @@
-//! `spky scaffold <recipe>` — emit a parameterized cookbook recipe.
+//! `spky recipe <recipe>`: emit a parameterized cookbook recipe.
 //!
 //! Recipes are framework-level patterns that an agent can drop into any
 //! sp00ky-backed app. Templates are embedded in the binary via `include_str!`
@@ -31,7 +31,7 @@ pub fn run(
         "optimistic-mutation" => OPTIMISTIC_MUTATION,
         "crdt-text-field" => CRDT_TEXT_FIELD,
         other => bail!(
-            "unknown recipe `{}` — run `spky scaffold list` to see available recipes",
+            "unknown recipe `{}`: run `spky recipe list` to see available recipes",
             other
         ),
     };

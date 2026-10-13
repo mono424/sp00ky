@@ -297,7 +297,7 @@ A key of `when` is a field path, its value one of:
 
 <CodeBlock code={ymlPushMore} lang="yaml" />
 
-What a deploy does with it: `spky migrate` and `spky deploy` store the block, normalized, in `_00_push_config:default` (unchanged blocks are not rewritten), and the engine picks it up within 30 seconds, no restart. A block that fails validation is not stored and the previous rules stay. `spky lint` checks every rule, including against your schema: a table that does not exist or is `@nosync`, a field path the table does not define, and a field that is `@opaque`, `@crdt` or `@nosync` (stripped from what the engine sees) are reported. `spky push sync` stores the block (and the native credentials) without a deploy, and `spky push status` shows what is stored, each native provider included. See [`spky push`](/docs/reference/cli#web-push).
+What a deploy does with it: `spky migrate` and `spky deploy` store the block, normalized, in `_00_push_config:default` (unchanged blocks are not rewritten), and the engine picks it up within 30 seconds, no restart. A block that fails validation is not stored and the previous rules stay. `spky lint` checks every rule, including against your schema: a table that does not exist or is `@nosync`, a field path the table does not define, and a field that is `@opaque` or `@nosync` (stripped from what the engine sees) are reported. A `@crdt` field is plain text to the engine and can be matched like any column. `spky push sync` stores the block (and the native credentials) without a deploy, and `spky push status` shows what is stored, each native provider included. See [`spky push`](/docs/reference/cli#web-push).
 
 ## Machine pools
 

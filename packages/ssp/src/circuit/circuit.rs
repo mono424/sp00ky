@@ -2763,6 +2763,13 @@ mod tests {
             on: link,
         };
 
+        // View keys come back in hash order.
+        let keys = |c: &Circuit, view: &str| {
+            let mut k = c.view_keys(view);
+            k.sort();
+            k
+        };
+
         let mut circuit = Circuit::new();
         circuit.load([
             Record::new("thread", "t1", json!({ "id": "thread:t1", "published": false })),
@@ -2772,25 +2779,25 @@ mod tests {
         for (id, root) in [("semi", semi), ("nested", nested), ("anti", anti)] {
             circuit.add_query(QueryPlan { id: id.into(), root }, None, None);
         }
-        assert!(circuit.view_keys("semi").is_empty());
-        assert!(circuit.view_keys("nested").is_empty());
-        assert_eq!(circuit.view_keys("anti"), vec!["log:r1", "log:r2"]);
+        assert!(keys(&circuit, "semi").is_empty());
+        assert!(keys(&circuit, "nested").is_empty());
+        assert_eq!(keys(&circuit, "anti"), vec!["log:r1", "log:r2"]);
 
         circuit.step(published(true));
-        assert_eq!(circuit.view_keys("semi"), vec!["log:r1"]);
-        assert_eq!(circuit.view_keys("nested"), vec!["log:r1"]);
-        assert_eq!(circuit.view_keys("anti"), vec!["log:r2"]);
+        assert_eq!(keys(&circuit, "semi"), vec!["log:r1"]);
+        assert_eq!(keys(&circuit, "nested"), vec!["log:r1"]);
+        assert_eq!(keys(&circuit, "anti"), vec!["log:r2"]);
 
         // A content update that keeps the parent admitted changes nothing.
         circuit.step(ChangeSet {
             changes: vec![Change::update("thread", "t1", json!({ "id": "thread:t1", "published": true, "title": "x" }))],
         });
-        assert_eq!(circuit.view_keys("nested"), vec!["log:r1"]);
+        assert_eq!(keys(&circuit, "nested"), vec!["log:r1"]);
 
         circuit.step(published(false));
-        assert!(circuit.view_keys("semi").is_empty());
-        assert!(circuit.view_keys("nested").is_empty());
-        assert_eq!(circuit.view_keys("anti"), vec!["log:r1", "log:r2"]);
+        assert!(keys(&circuit, "semi").is_empty());
+        assert!(keys(&circuit, "nested").is_empty());
+        assert_eq!(keys(&circuit, "anti"), vec!["log:r1", "log:r2"]);
     }
 
     #[test]

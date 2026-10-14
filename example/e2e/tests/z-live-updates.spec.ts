@@ -6,6 +6,7 @@ import {
   typeIntoEditor,
   waitForThreadInUpstream,
   waitForThreadContentInUpstream,
+  sortHomeNewest,
   type TestUser,
 } from '../fixtures/test-fixtures';
 
@@ -236,5 +237,43 @@ test('an invite link makes the recipient a collaborator whose title edits reach 
     await expect(pb.getByText('This invite link is invalid or has expired.')).toBeVisible({ timeout: 20_000 });
   } finally {
     await close();
+  }
+});
+
+// A related row (here a thread's author) changing must re-render every list
+// that embeds it. It used to stay stale until something else re-rendered the
+// list, and the old picture's file is deleted on upload, so the card went blank.
+test('a new profile picture shows in the home list and the thread without a reload', async ({ browser }) => {
+  const a = uniqueUser('live_av');
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  try {
+    await registerUser(page, a);
+    const title = `Avatar ${Date.now()}`;
+    const id = await createThread(page, title, 'body', false);
+    // The header's avatar is the reference: every other place must show the same image.
+    const loaded = (scope: ReturnType<Page['locator']>) => scope.locator('img[decoding="async"]').first();
+    const sameAsHeader = async (scope: ReturnType<Page['locator']>) => {
+      const header = page.locator('header');
+      await expect(loaded(header)).toHaveCSS('opacity', '1', { timeout: 15_000 });
+      const src = await loaded(header).getAttribute('src');
+      await expect(loaded(scope)).toHaveAttribute('src', src ?? 'missing', { timeout: 15_000 });
+      await expect(loaded(scope)).toHaveCSS('opacity', '1', { timeout: 15_000 });
+    };
+    await page.goto('/profile');
+    for (const file of ['avatar-red.png', 'avatar-blue.png']) {
+      await page.locator('input[type="file"]').setInputFiles(`fixtures/${file}`);
+      await expect(loaded(page.locator('header'))).toHaveCSS('opacity', '1', { timeout: 15_000 });
+      // In-app navigation only: home, then the thread.
+      await page.getByRole('link', { name: 'sp00ky threads home' }).click();
+      await sortHomeNewest(page);
+      await sameAsHeader(page.locator('[data-thread-index]').filter({ hasText: title }));
+      await page.locator('[data-thread-index]').filter({ hasText: title }).click();
+      await sameAsHeader(page.locator('article'));
+      await page.locator('header a[href="/profile"]').click();
+    }
+    void id;
+  } finally {
+    await ctx.close();
   }
 });

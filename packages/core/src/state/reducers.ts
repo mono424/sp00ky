@@ -325,7 +325,8 @@ export const clearMembershipDirty =
 
 // ---- versions --------------------------------------------------------------
 
-/** Record local body versions; dirties every query whose membership names one of them. */
+/** Record local body versions; dirties every query whose membership or
+ *  related rows (subquery children, e.g. a thread's author) name one of them. */
 export const setVersions =
   (entries: ReadonlyArray<readonly [string, number]>): Reducer =>
   (s) => {
@@ -341,7 +342,8 @@ export const setVersions =
     if (changed.size === 0) return s;
     const dirty: QueryHash[] = [];
     for (const [hash, entry] of s.queries) {
-      if (entry.remoteArray.some(([id]) => changed.has(id)) || entry.localArray.some(([id]) => changed.has(id))) {
+      const names = (rows: RecordVersionArray) => rows.some(([id]) => changed.has(id));
+      if (names(entry.remoteArray) || names(entry.localArray) || names(entry.subqueryRemoteArray)) {
         dirty.push(hash);
       }
     }

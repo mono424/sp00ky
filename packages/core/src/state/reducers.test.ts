@@ -175,10 +175,12 @@ describe('versions', () => {
       e('a', { remoteArray: [['thing:1', 1]] }),
       e('b', { localArray: [['thing:2', 1]] }),
       e('c'),
+      // A related row (a thread's author): a new body must re-render the list.
+      e('d', { subqueryRemoteArray: [['user:1', 1]] }),
     ]);
     expect(R.setVersions([])(s0)).toBe(s0);
-    const s1 = R.setVersions([['thing:1', 1], ['thing:2', 1], ['thing:9', 1]])(s0);
-    expect([...s1.dirty].sort()).toEqual(['a', 'b']);
+    const s1 = R.setVersions([['thing:1', 1], ['thing:2', 1], ['thing:9', 1], ['user:1', 2]])(s0);
+    expect([...s1.dirty].sort()).toEqual(['a', 'b', 'd']);
     expect(R.setVersions([['thing:1', 1]])(s1)).toBe(s1);
     const s2 = R.deleteVersions(['thing:9', 'nope'])(s1);
     expect(s2.versions.has('thing:9')).toBe(false);

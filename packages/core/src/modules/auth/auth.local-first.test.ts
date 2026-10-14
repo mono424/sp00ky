@@ -181,3 +181,48 @@ describe('the announced user id', () => {
   );
 });
 
+
+describe('signIn and signUp', () => {
+  function makeSigning() {
+    let connect!: () => void;
+    const connected = new Promise<void>((resolve) => (connect = resolve));
+    const sent: string[] = [];
+    const token = jwt({ AC: 'account', ID: 'user:abc' });
+    const remote = {
+      query: vi.fn(async () => [[{ id: new RecordId('user', 'abc') }]]),
+      setAuthToken: vi.fn(),
+      whenConnected: vi.fn(() => connected),
+      getClient: () => ({
+        signin: vi.fn(async () => (sent.push('signin'), { access: token })),
+        signup: vi.fn(async () => (sent.push('signup'), { access: token })),
+        authenticate: vi.fn(async () => undefined),
+        invalidate: vi.fn(async () => undefined),
+      }),
+    } as any;
+    const persistence = { get: vi.fn(async () => null), set: vi.fn(async () => undefined), remove: vi.fn(async () => undefined) } as any;
+    const params = { username: {}, password: {} };
+    const schema = { access: { account: { signIn: { params }, signup: { params } } } } as any;
+    const logger = silentLogger();
+    return { auth: new AuthService(schema, remote, persistence, logger), connect, sent, logger };
+  }
+
+  it('wait for a connect in flight: a socket without its namespace refuses them', async () => {
+    for (const call of ['signIn', 'signUp'] as const) {
+      const { auth, connect, sent } = makeSigning();
+      const done = auth[call]('account' as never, { username: 'u', password: 'secret' } as never).catch(() => undefined);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(sent).toEqual([]);
+      connect();
+      await done;
+      expect(sent).toEqual([call === 'signIn' ? 'signin' : 'signup']);
+    }
+  });
+
+  it('never log the password', async () => {
+    const { auth, connect, logger } = makeSigning();
+    connect();
+    await auth.signUp('account' as never, { username: 'u', password: 'hunter2' } as never).catch(() => undefined);
+    const logged = JSON.stringify([...logger.info.mock.calls, ...logger.debug.mock.calls]);
+    expect(logged).not.toContain('hunter2');
+  });
+});

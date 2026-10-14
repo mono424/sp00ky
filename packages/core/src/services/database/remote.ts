@@ -259,6 +259,12 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
     }
   }
 
+  /** Resolve once no connect is in flight, for calls that go to the SDK
+   *  client directly (sign-in, sign-up) and so skip `beforeQuery`. */
+  whenConnected(): Promise<void> {
+    return this.beforeQuery();
+  }
+
   /**
    * Hold statements while a connect is in flight.
    *

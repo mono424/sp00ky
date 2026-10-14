@@ -658,11 +658,17 @@ export class AuthService<S extends SchemaStructure> {
       );
     }
 
+    // Parameter names only: the values hold the password (and whatever else
+    // the app signs up with), and logs may leave the device.
     this.logger.info(
-      { accessName, runtimeParams, Category: 'sp00ky-client::AuthService::signUp' },
+      { accessName, params: Object.keys(runtimeParams), Category: 'sp00ky-client::AuthService::signUp' },
       'Attempting signup'
     );
 
+    // Straight to the SDK client, so wait out a connect in flight: on a socket
+    // without its namespace yet the call fails with "There is no namespace
+    // and/or database selected" (a sign-up right after the page loaded).
+    await this.remote.whenConnected();
     const { access } = await this.remote.getClient().signup({
       access: accessName,
       variables: runtimeParams,
@@ -704,6 +710,7 @@ export class AuthService<S extends SchemaStructure> {
       'Attempting signin'
     );
 
+    await this.remote.whenConnected(); // see signUp
     const { access } = await this.remote.getClient().signin({
       access: accessName,
       variables: runtimeParams,

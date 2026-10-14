@@ -42,8 +42,14 @@
   /** Preload the Loro engine at startup for CRDT fields (default: false) */
   crdt?: boolean;
 
-  /** Quiet window before a CRDT field's edits are sent (default: 300ms) */
+  /** Wait before the first edit after a quiet spell is sent (default: 50ms) */
   crdtDebounceMs?: number;
+
+  /** Shortest gap between two sends of one CRDT field while typing (default: 200ms) */
+  crdtSendIntervalMs?: number;
+
+  /** Carry changed rows on the LIVE notification instead of fetching them (default: false) */
+  liveInlineBodies?: boolean;
 
   /**
    * Cadence (ms) for the `_00_list_ref` poll that catches cross-session
@@ -106,8 +112,14 @@
 <span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  /** Preload the Loro engine at startup for CRDT fields (default: false) */</span></span>
 <span class="line"><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">  crdt</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">?:</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> boolean</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
 <span class="line"></span>
-<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  /** Quiet window before a CRDT field's edits are sent (default: 300ms) */</span></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  /** Wait before the first edit after a quiet spell is sent (default: 50ms) */</span></span>
 <span class="line"><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">  crdtDebounceMs</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">?:</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> number</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  /** Shortest gap between two sends of one CRDT field while typing (default: 200ms) */</span></span>
+<span class="line"><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">  crdtSendIntervalMs</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">?:</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> number</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
+<span class="line"></span>
+<span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  /** Carry changed rows on the LIVE notification instead of fetching them (default: false) */</span></span>
+<span class="line"><span style="--shiki-light:#E36209;--shiki-dark:#FFAB70">  liveInlineBodies</span><span style="--shiki-light:#D73A49;--shiki-dark:#F97583">?:</span><span style="--shiki-light:#005CC5;--shiki-dark:#79B8FF"> boolean</span><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">;</span></span>
 <span class="line"></span>
 <span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">  /**</span></span>
 <span class="line"><span style="--shiki-light:#6A737D;--shiki-dark:#6A737D">   * Cadence (ms) for the `_00_list_ref` poll that catches cross-session</span></span>
@@ -246,11 +258,23 @@ bursty writes. Defaults to <code>50</code>.</p>
 Loro is then only fetched when a field is first opened, which keeps it out of
 apps that never edit one. Defaults to <code>false</code>.</p>
 <h4 id="crdtdebouncems"><code>crdtDebounceMs</code></h4>
-<p>Quiet window (ms) after the last local edit of a <a href="/docs/client/crdt">CRDT field</a>
-before the tab sends its new edits as one edit-log row through the outbox.
-Edits apply to the local Loro document at once; a burst of typing is sent at
-the latest 2 s after it started, whatever this is set to. Lower values reach
-other editors sooner and create more rows. Defaults to <code>300</code>.</p>
+<p>How long (ms) the first edit to a <a href="/docs/client/crdt">CRDT field</a> after a
+quiet spell waits before the tab sends it, so a burst of keystrokes travels as
+one edit-log row through the outbox. Edits apply to the local Loro document at
+once. Defaults to <code>50</code>.</p>
+<h4 id="crdtsendintervalms"><code>crdtSendIntervalMs</code></h4>
+<p>The shortest gap (ms) between two edit-log rows of one CRDT field. While
+someone keeps typing, their edits go out on this cadence instead of waiting
+for a pause, so other editors see the text a few hundred ms behind, not
+seconds. Lower values reach other editors sooner and create more rows (the
+SSP folds them into the document either way). Defaults to <code>200</code>.</p>
+<h4 id="liveinlinebodies"><code>liveInlineBodies</code></h4>
+<p>Carry a changed row’s body on the client’s LIVE notification (<code>FETCH out</code>)
+instead of fetching it afterwards, which saves one round trip between another
+device’s write and this screen. A row joining a view is committed from the
+notification either way; with this on, nothing else has to be read before it
+renders. The cost is wire bytes: each notification carries its own copy of
+the row, once per view that holds it. Defaults to <code>false</code>.</p>
 <h4 id="refsyncintervalms"><code>refSyncIntervalMs</code></h4>
 <p>Base cadence (ms) for the <code>_00_list_ref</code> poll that catches cross-session
 UPDATEs that the SurrealDB v3 LIVE-permission gap drops. Defaults

@@ -30,7 +30,7 @@ import type { ServiceCalls } from '../kernel/effects';
 import { encodeRecordId, mintOwnerSecret } from '../utils/index';
 import { sha256Hex } from '../utils/sha256';
 import { leaveViewsBeacon, listRefLive } from '../query/sql';
-import { hashOfEdge, rowOfEdge } from '../utils/edges';
+import { deltaOfEdge, hashOfEdge, rowOfEdge } from '../utils/edges';
 import { mintMutationId } from '../mutation/mutation-id';
 import { BucketHandle, bucketContentToBlob, bucketSettings } from './bucket-handle';
 
@@ -176,7 +176,7 @@ export function createServices<S extends SchemaStructure>(config: Sp00kyConfig<S
   streamProcessor.configureCircuitPersistence(config.persistCircuit ?? config.localEngine === 'sqlite', config.circuitCheckpointMs);
   streamProcessor.configureProjection(config.circuitProjection ?? true);
   const migrator = new LocalMigrator(local, logger);
-  const crdt = new CrdtManager(config.schema, local, remote, logger, config.crdtDebounceMs ?? 300);
+  const crdt = new CrdtManager(config.schema, local, remote, logger, config.crdtDebounceMs ?? 50, config.crdtSendIntervalMs ?? 200);
   const auth = new AuthService(config.schema, remote, persistence, logger);
   const tabId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `tab_${Math.random().toString(36).slice(2)}`;
   return {
@@ -395,7 +395,8 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
           // that was actually deleted the join yields nothing anyway. Landing
           // a body there would only ever write back what is going away.
           const row = message.action === 'DELETE' ? null : rowOfEdge(message.value);
-          onChange([hash], row ? [row] : undefined);
+          const delta = deltaOfEdge(message.action, message.value);
+          onChange([hash], row ? [row] : undefined, delta ? [delta] : undefined);
         });
         return String(uuid);
       },

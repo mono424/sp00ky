@@ -18,6 +18,10 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   // Web Locks are missing.
   localEngine: 'sqlite',
   sharedTabs: true,
+  // A changed row rides in on its LIVE notification instead of costing a
+  // body fetch: one round trip less between another device's edit (a CRDT
+  // log row, a comment) and this screen.
+  liveInlineBodies: true,
   // Profile pictures are an r2 bucket: their files go through the SSP.
   files: {
     endpoint: import.meta.env.VITE_SPKY_FILES_ENDPOINT || 'http://localhost:8667',

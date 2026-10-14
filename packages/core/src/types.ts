@@ -258,14 +258,20 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    */
   streamDebounceTime?: number;
   /**
-   * Debounce time in milliseconds for syncing collaborative (CRDT) field
-   * edits to the server. Local state is kept on every change (so reload and
-   * offline work), but a field's own new ops go out as one edit-log row per
-   * pause of this length (at most 2 s apart while typing continues).
-   * Lower = snappier propagation and more rows; higher = fewer rows and more
-   * lag for other collaborators. Defaults to 300ms.
+   * How long in milliseconds the first edit to a collaborative (CRDT) field
+   * after a quiet spell waits before it goes out, so a burst of keystrokes
+   * travels as one edit-log row. Local state is kept on every change (so
+   * reload and offline work). Defaults to 50ms.
    */
   crdtDebounceMs?: number;
+  /**
+   * The shortest gap in milliseconds between two edit-log rows of one CRDT
+   * field: while someone keeps typing, their edits go out on this cadence
+   * instead of waiting for a pause. Lower = other collaborators see the text
+   * sooner and more rows are written; higher = fewer rows and more lag.
+   * Defaults to 200ms.
+   */
+  crdtSendIntervalMs?: number;
   /**
    * Enable collaborative CRDT fields. When `true`, the `loro-crdt` engine is
    * preloaded at client startup (fetched as a separate chunk on page load) so
@@ -299,15 +305,16 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    * back for it.
    *
    * The client holds exactly one live subscription, on its `_00_list_ref`
-   * table, and today it is a doorbell: the notification is reduced to the
-   * query hash and the row is then pulled with `SELECT * FROM $ids`. The edge
+   * table. Without this, the notification names the row and the client then
+   * pulls it with `SELECT * FROM $ids`. The edge
    * is a real graph edge, so `FETCH out` makes SurrealDB resolve the row into
    * the notification and the body fetch disappears.
    *
    * The push stays advisory: the body is landed exactly the way a fetched body
    * is (store write, circuit ingest, version recorded), so a notification the
-   * server drops costs nothing but the old round trip. Membership is still
-   * read back; only the body fetch is saved.
+   * server drops costs nothing but the old round trip. A row joining a live
+   * view is committed to membership from the notification either way (no
+   * re-read); with this on, the body fetch is saved as well.
    *
    * Default `false`. The cost is wire bytes: one edit bumps the edge in every
    * view holding the row, and under `FETCH` each of those notifications
@@ -540,6 +547,18 @@ export interface InlineRow {
   id: string;
   version: number;
   record: Record<string, unknown>;
+}
+
+/**
+ * A row that joined a query's view, or moved to a newer version, as one LIVE
+ * notification on `_00_list_ref` reports it: the edge's `out` and `version`.
+ * The client commits it to the query's membership straight away instead of
+ * re-reading the edges (see `sync/live.saga.ts`).
+ */
+export interface EdgeDelta {
+  hash: QueryHash;
+  id: string;
+  version: number;
 }
 
 // Flat array format: [[record-id, version], [record-id, version], ...]

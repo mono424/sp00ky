@@ -1,4 +1,4 @@
-import type { ConnectionState, InlineRow, QueryHash, QueryStatus, SyncHealth } from '../types';
+import type { ConnectionState, EdgeDelta, InlineRow, QueryHash, QueryStatus, SyncHealth } from '../types';
 import type { StreamUpdate } from '../services/stream-processor/index';
 
 /**
@@ -36,7 +36,7 @@ export type RuntimeEvent =
   | { type: 'ConnectionChanged'; state: ConnectionState }
   | { type: 'StreamUpdate'; update: StreamUpdate }
   | { type: 'LiveStart' }
-  | { type: 'LiveChange'; hashes: QueryHash[]; rows?: InlineRow[] }
+  | { type: 'LiveChange'; hashes: QueryHash[]; rows?: InlineRow[]; deltas?: EdgeDelta[] }
   | { type: 'TabRole'; role: 'solo' | 'leader' | 'follower' }
   | { type: 'TabMessage'; message: unknown };
 

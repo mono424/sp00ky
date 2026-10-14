@@ -2,7 +2,7 @@ import { Duration } from 'surrealdb';
 import type { LocalStore } from '../services/database/cache-engine';
 import type { IngestRecord, StreamUpdate } from '../services/stream-processor/index';
 import type { ClientState } from '../state/client-state';
-import type { InlineRow } from '../types';
+import type { EdgeDelta, InlineRow } from '../types';
 import { withTimeout } from '../utils/index';
 import type { Effect, IdScope, RegisterResult, ServiceCalls, Settled, StatementResult } from './effects';
 import type { OutEvent, RuntimeEvent } from './events';
@@ -17,7 +17,7 @@ export interface Adapters {
      * changed query hashes, plus the changed rows themselves when the
      * subscription was opened with the body joined on (`liveInlineBodies`).
      */
-    live(table: string, onChange: (hashes: string[], rows?: InlineRow[]) => void): Promise<string>;
+    live(table: string, onChange: (hashes: string[], rows?: InlineRow[], deltas?: EdgeDelta[]) => void): Promise<string>;
     kill(uuid: string): Promise<void>;
   };
   ssp: {
@@ -81,7 +81,7 @@ export function createInterpreter(adapters: Adapters, host: InterpreterHost): In
           : pending;
       }
       case 'remote.live':
-        return adapters.remote.live(effect.table, (hashes, rows) => host.dispatch({ type: 'LiveChange', hashes, rows }));
+        return adapters.remote.live(effect.table, (hashes, rows, deltas) => host.dispatch({ type: 'LiveChange', hashes, rows, deltas }));
       case 'remote.kill':
         return adapters.remote.kill(effect.uuid);
       case 'ssp.register': {

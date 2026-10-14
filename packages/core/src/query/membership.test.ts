@@ -6,9 +6,11 @@ import {
   isResolvedBefore,
   metaFromRow,
   parseViewRow,
+  rebaseRead,
   snapshotFromSingle,
   snapshotsFromBatch,
   suspectHashes,
+  withDeltas,
 } from './membership';
 
 describe('durable view row', () => {
@@ -114,5 +116,36 @@ describe('snapshots', () => {
     const nullCount = new Map([['q', { primary: [], subquery: [], meta: { present: true, rowCount: null, state: 'ready' as const } }]]);
     expect(suspectHashes(nullCount, new Map([['q', 3]]), 0)).toEqual([]);
     expect(suspectHashes(nullCount, new Map(), 0)).toEqual([]);
+  });
+});
+
+describe('withDeltas', () => {
+  it('adds a joining row and moves a held one to a newer version', () => {
+    const held: Array<[string, number]> = [['t:1', 1], ['t:2', 1]];
+    expect(withDeltas(held, [{ id: 't:3', version: 1 }, { id: 't:2', version: 4 }])).toEqual([['t:1', 1], ['t:2', 4], ['t:3', 1]]);
+  });
+  it('hands back the held set itself when nothing moves', () => {
+    const held: Array<[string, number]> = [['t:1', 5]];
+    expect(withDeltas(held, [{ id: 't:1', version: 5 }, { id: 't:1', version: 2 }])).toBe(held);
+    expect(withDeltas(held, [])).toBe(held);
+  });
+});
+
+describe('rebaseRead', () => {
+  it('is the read itself when state did not move while it was in flight', () => {
+    const before: Array<[string, number]> = [['t:1', 1]];
+    const read: Array<[string, number]> = [['t:2', 1]];
+    expect(rebaseRead(read, before, before)).toBe(read);
+  });
+  it('keeps a row that joined (or moved) after the read was sent', () => {
+    const before: Array<[string, number]> = [['t:1', 1]];
+    const now: Array<[string, number]> = [['t:1', 3], ['t:2', 1]];
+    // The server answered before either change.
+    expect(rebaseRead([['t:1', 1]], before, now)).toEqual([['t:1', 3], ['t:2', 1]]);
+    // ...or after them: nothing is doubled or moved back.
+    expect(rebaseRead([['t:1', 4], ['t:2', 2]], before, now)).toEqual([['t:1', 4], ['t:2', 2]]);
+  });
+  it('drops a row that left in the meantime', () => {
+    expect(rebaseRead([['t:1', 1], ['t:2', 1]], [['t:1', 1], ['t:2', 1]], [['t:2', 1]])).toEqual([['t:2', 1]]);
   });
 });

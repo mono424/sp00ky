@@ -1,4 +1,4 @@
-import type { QueryHash, RecordVersionArray, ServerViewMeta } from '../types';
+import type { EdgeDelta, QueryHash, RecordVersionArray, ServerViewMeta } from '../types';
 import type { Saga } from '../kernel/saga';
 import type { Settled, StatementResult } from '../kernel/effects';
 import { fx } from '../kernel/effects';
@@ -22,6 +22,8 @@ import * as sql from './sql';
 import {
   FAILED,
   decideMembershipOutcome,
+  rebaseRead,
+  withDeltas,
   snapshotFromSingle,
   snapshotsFromBatch,
   suspectHashes,
@@ -149,9 +151,40 @@ const stmt = (results: unknown, i: number): unknown => {
 };
 
 /**
+ * Commit LIVE edge deltas (rows joining a view, or moving to a newer
+ * version) straight to membership, without re-reading the edges: the
+ * notification already says what the read would. Returns the hashes it
+ * settled; any other change still goes through {@link readMembership}.
+ *
+ * Only for a query whose membership is known and current (`live`, not
+ * materializing, no view-lost recovery pending): before that the read decides
+ * what the set is. Removals are never applied here, so a view whose edges
+ * are being rewritten never loses (and garbage-collects) bodies mid-rewrite.
+ * Nor for a query with a `LIMIT`: a row joining it pushes another out, and
+ * rendering the joiner before the read removes the leaver would show one row
+ * too many (the id-set render drops the `LIMIT`).
+ */
+export function* applyEdgeDeltas(deltas: EdgeDelta[]): Saga<Set<QueryHash>> {
+  const settled = new Set<QueryHash>();
+  const byHash = new Map<QueryHash, EdgeDelta[]>();
+  for (const d of deltas) byHash.set(d.hash, [...(byHash.get(d.hash) ?? []), d]);
+  for (const [hash, list] of byHash) {
+    const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
+    if (!entry || entry.lifecycle.phase !== 'live' || entry.serverState === 'materializing' || entry.viewLostRetryAt !== null) continue;
+    if (entry.def.plan ? entry.def.plan.limit != null : /\bLIMIT\b/i.test(entry.def.surql)) continue;
+    const next = withDeltas(entry.remoteArray, list);
+    // Never empty, so always applied.
+    if (next !== entry.remoteArray) yield* applyMembership(hash, next);
+    settled.add(hash);
+  }
+  return settled;
+}
+
+/**
  * Read the server membership of many queries in as few round trips as the
- * row budget allows, then apply each changed set. This is the ONLY place a
- * server id-set enters state: registration, the poll, LIVE dirt and view-lost
+ * row budget allows, then apply each changed set. Every server id-set enters
+ * state here, except the rows LIVE reports joining (see
+ * {@link applyEdgeDeltas}): registration, the poll, LIVE dirt and view-lost
  * recovery all come through here.
  */
 export function* readMembership(
@@ -226,9 +259,10 @@ export function* readMembership(
   for (const [hash, snap] of snapshots) {
     const current = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
     if (!current) continue;
+    const primary = rebaseRead(snap.primary, byHash.get(hash)!.remoteArray, current.remoteArray);
     const metaChanged = current.serverState !== (snap.meta.present ? snap.meta.state : null);
-    if (!recordVersionArraysEqual(snap.primary, current.remoteArray) || metaChanged || current.lifecycle.phase === 'cold' || current.lifecycle.phase === 'cached') {
-      const outcome = yield* applyMembership(hash, snap.primary, snap.meta);
+    if (!recordVersionArraysEqual(primary, current.remoteArray) || metaChanged || current.lifecycle.phase === 'cold' || current.lifecycle.phase === 'cached') {
+      const outcome = yield* applyMembership(hash, primary, snap.meta);
       if (outcome === 'applied') changed = true;
       if (outcome === 'ignored' && snap.meta.present && snap.meta.state === 'materializing') stillMaterializing.push(hash);
     }

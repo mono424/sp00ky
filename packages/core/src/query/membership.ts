@@ -104,6 +104,39 @@ export function decideMembershipOutcome(input: MembershipDecisionInput): Members
   return knownEmpty ? 'applied' : 'ignored';
 }
 
+/**
+ * Commit LIVE edge deltas onto a held id-set: each names a row that joined
+ * (or moved to a newer version). Returns `held` itself when nothing moves.
+ */
+export function withDeltas(held: RecordVersionArray, deltas: ReadonlyArray<{ id: string; version: number }>): RecordVersionArray {
+  const next = new Map(held);
+  let moved = false;
+  for (const { id, version } of deltas) {
+    if ((next.get(id) ?? -1) >= version) continue;
+    next.set(id, version);
+    moved = true;
+  }
+  return moved ? Array.from(next.entries()) : held;
+}
+
+/**
+ * A membership read answers for the moment the server ran it, which may be
+ * before a LIVE delta that was committed while the read was in flight. Carry
+ * what changed in state since the read was sent (`before` -> `now`) over onto
+ * the read, so a late answer never takes back a row that just joined.
+ */
+export function rebaseRead(read: RecordVersionArray, before: RecordVersionArray, now: RecordVersionArray): RecordVersionArray {
+  if (before === now) return read;
+  const was = new Map(before);
+  const is = new Map(now);
+  const out = new Map(read);
+  for (const [id] of before) if (!is.has(id)) out.delete(id);
+  for (const [id, version] of now) {
+    if (version > (was.get(id) ?? -1) && version > (out.get(id) ?? -1)) out.set(id, version);
+  }
+  return Array.from(out.entries());
+}
+
 // ---- list_ref snapshots ------------------------------------------------------
 
 /**

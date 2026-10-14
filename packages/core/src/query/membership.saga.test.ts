@@ -4,7 +4,7 @@ import { runPure } from '../testing/run-pure';
 import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import * as R from '../state/reducers';
 import { defaultEnv } from './env';
-import { applyMembership, applySubqueryChildren, markMembershipDirty, readDirtyMembership, readMembership, recoverLostView } from './membership.saga';
+import { applyEdgeDeltas, applyMembership, applySubqueryChildren, markMembershipDirty, readDirtyMembership, readMembership, recoverLostView } from './membership.saga';
 import type { StatementResult } from '../kernel/effects';
 
 const env = defaultEnv({ tables: [] } as any);
@@ -403,5 +403,77 @@ describe('dirty helpers', () => {
     });
     expect(stuck.state.membershipDirty.size).toBe(2);
     expect(stuck.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
+  });
+});
+
+describe('applyEdgeDeltas', () => {
+  const handlers = { 'local.upsert': () => undefined };
+  const live = (over: Record<string, unknown> = {}) =>
+    buildEntry({ def: { hash: 'a', viewKey: 'vk' }, lifecycle: { phase: 'live', remote: 'registered' }, remoteArray: [['t:1', 1]], ...over });
+
+  it('commits a joining row to a live view without reading the edges', async () => {
+    const out = await runPure(applyEdgeDeltas([{ hash: 'a', id: 't:2', version: 1 }, { hash: 'a', id: 't:1', version: 3 }]), {
+      state: buildState([live()]),
+      handlers,
+    });
+    expect([...out.result]).toEqual(['a']);
+    expect(out.state.queries.get('a')!.remoteArray).toEqual([['t:1', 3], ['t:2', 1]]);
+    expect(out.log.some((e) => e.kind === 'remote.query')).toBe(false);
+    // The durable view row follows, and the bodies are asked for.
+    expect(out.log.filter((e) => e.kind === 'local.upsert')).toHaveLength(1);
+    expect(out.dispatched).toContainEqual({ type: 'FetchRows' });
+  });
+
+  it('takes the fast path for a planned query with no LIMIT too', async () => {
+    const out = await runPure(applyEdgeDeltas([{ hash: 'a', id: 't:2', version: 1 }]), {
+      state: buildState([live({ def: { hash: 'a', viewKey: 'vk', plan: { table: 't' } } })]),
+      handlers,
+    });
+    expect([...out.result]).toEqual(['a']);
+  });
+
+  it('settles a delta it already holds without writing anything', async () => {
+    const out = await runPure(applyEdgeDeltas([{ hash: 'a', id: 't:1', version: 1 }]), { state: buildState([live()]) });
+    expect([...out.result]).toEqual(['a']);
+    expect(out.log.some((e) => e.kind === 'local.upsert')).toBe(false);
+  });
+
+  it('leaves to the read a view whose membership is not known and current', async () => {
+    const deltas = [{ hash: 'a', id: 't:2', version: 1 }];
+    for (const entry of [
+      live({ lifecycle: { phase: 'cold' } }),
+      live({ lifecycle: { phase: 'cached' } }),
+      live({ lifecycle: { phase: 'view-lost' } }),
+      live({ serverState: 'materializing' }),
+      live({ viewLostRetryAt: 9_000 }),
+      // A bounded view: the row this one pushes out must leave in the same render.
+      live({ def: { hash: 'a', surql: 'SELECT * FROM t ORDER BY at DESC LIMIT 10' } }),
+      live({ def: { hash: 'a', plan: { table: 't', limit: 10 } } }),
+    ]) {
+      const out = await runPure(applyEdgeDeltas(deltas), { state: buildState([entry]) });
+      expect(out.result.size).toBe(0);
+      expect(out.state.queries.get('a')!.remoteArray).toEqual([['t:1', 1]]);
+    }
+    expect((await runPure(applyEdgeDeltas([{ hash: 'zz', id: 't:2', version: 1 }]), { state: buildState([live()]) })).result.size).toBe(0);
+  });
+});
+
+describe('readMembership after a LIVE delta', () => {
+  const qid = (h: string) => new RecordId('_00_query', h);
+  it('a read sent before a row joined does not take it back', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', id: qid('a') }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1]], serverState: 'ready' })]);
+    const out = await runPure(readMembership(env, ['a']), {
+      state: s,
+      handlers: {
+        // The server answers for the moment it ran the read; the delta lands
+        // while the answer travels back.
+        'remote.query': (_e: any, ctx: any) => {
+          ctx.state = R.commitMembership('a', [['thing:1', 1], ['thing:2', 1]], true)(ctx.state);
+          return [ok([{ out: new RecordId('thing', '1'), version: 1 }]), ok({ rowCount: 1, state: 'ready' }), ok([])];
+        },
+        'local.upsert': () => undefined,
+      },
+    });
+    expect(out.state.queries.get('a')!.remoteArray).toEqual([['thing:1', 1], ['thing:2', 1]]);
   });
 });

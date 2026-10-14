@@ -109,8 +109,16 @@ rule a pure function of the row and the DB check a single record lookup.
 `packages/core/src/modules/crdt/index.ts`, `CrdtManager`.
 
 1. Local edits apply to the tab's `LoroDoc` immediately;
-   `subscribeLocalUpdates` schedules a flush (debounce `crdtDebounceMs`,
-   default 300 ms, max wait 2 s from the first dirty edit) and a local persist.
+   `subscribeLocalUpdates` schedules a flush and a local persist. The flush
+   is a throttle, not a trailing debounce: the first edit after a quiet spell
+   goes out `crdtDebounceMs` later (default 50 ms), and while edits keep
+   coming one row goes out every `crdtSendIntervalMs` (default 200 ms). An
+   armed flush is never pushed back. (The old 300 ms debounce with a 2 s max
+   wait meant a peer saw nothing while someone typed, then 2 s at once.) A
+   flush asked for while one is running runs right after it. The `enqueued`
+   marks reach the local store with the debounced persist, not after every
+   send: a persist exports the whole document, and a crash in between only
+   re-sends rows.
 2. A flush exports, per own peer with unsent ops, only that peer's ops:
    `export({ mode: 'updates-in-range', spans: [{ id: { peer, counter: enqueued }, len }] })`.
    A plain `from: vv` export would include imported foreign ops and fail rule 4.
@@ -138,9 +146,22 @@ view, membership via `_00_list_ref`, bodies fetched once). No table LIVE, no
 echo filter: own rows import as no-ops. Rows are processed once per id
 (`seen`), checked with the acceptance rule, then imported.
 
+A new log row reaches an open field on the edge's LIVE `CREATE`, which core
+commits to the view's membership straight away (`applyEdgeDeltas` in
+`query/membership.saga.ts`) instead of re-reading the edges; with
+`liveInlineBodies` the row's body rides on the same notification, so nothing
+is read before it renders. Measured at the hosted demo's round trip from the
+US west coast (~320 ms, `example/e2e/bench/crdt-latency`): one edit went from
+1.5 s to 0.55 s, the lag behind someone typing from 2.1 s median (3.2 s worst)
+to 0.8 s (1.1 s), and a first open from 2.0 s to 1.2 s. What is left is the
+write's round trip, the SSP's edge publish window (100 ms on VM SSPs) and the
+50 ms materialize debounce.
+
 Cold open (nothing in `_00_crdt_local`): read the published snapshot from
-`_00_crdt_doc` once; if the document is still empty, wait (up to 4 s) for the
-log query to settle before handing it out. Without the wait two editors binding an empty
+`_00_crdt_doc` once, in parallel with registering the log query (each is a
+round trip, and Loro holds ops whose predecessors have not arrived yet); if
+the document is still empty, wait (up to 4 s) for the log query to settle
+before handing it out. Without the wait two editors binding an empty
 document at once each create the prosemirror root and one of them loses its
 text. An import that reports pending ops (they depend on rows folded away
 before this device saw them) triggers another snapshot read.

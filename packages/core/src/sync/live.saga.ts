@@ -1,17 +1,18 @@
-import type { InlineRow, QueryHash } from '../types';
+import type { EdgeDelta, InlineRow, QueryHash } from '../types';
 import type { Saga } from '../kernel/saga';
 import { fx } from '../kernel/effects';
 import type { ClientState } from '../state/client-state';
 import * as R from '../state/reducers';
 import type { SagaEnv } from '../query/env';
 import { listRefTable } from '../query/env';
-import { markMembershipDirty } from '../query/membership.saga';
+import { applyEdgeDeltas, markMembershipDirty } from '../query/membership.saga';
 import { landChunk } from '../query/fetch.saga';
 
 /**
- * LIVE on the session's `_00_list_ref` table. An event marks its query's
- * membership dirty and the batched re-read decides; followers get the same
- * dirt relayed by the leader.
+ * LIVE on the session's `_00_list_ref` table. A row joining a live view is
+ * committed straight from its edge; any other event marks its query's
+ * membership dirty and the batched re-read decides. Followers get the dirt
+ * relayed by the leader.
  *
  * When the subscription was opened with the body joined on
  * (`liveInlineBodies`) the event ALSO carries the changed row. That is an
@@ -45,8 +46,12 @@ export function* liveInvalidate(): Saga<void> {
   yield fx.state.update(R.patchSync({ liveUuid: null, liveTable: null }));
 }
 
-/** One or more edges of these queries changed on the server. */
-export function* liveChange(env: SagaEnv, hashes: QueryHash[], rows?: InlineRow[]): Saga<void> {
+/**
+ * One or more edges of these queries changed on the server. A row joining a
+ * live view (`deltas`) is committed at once; anything else marks the query
+ * dirty for the batched re-read.
+ */
+export function* liveChange(env: SagaEnv, hashes: QueryHash[], rows?: InlineRow[], deltas?: EdgeDelta[]): Saga<void> {
   const [known, role, streak] = (yield fx.state.read((s) => [hashes.filter((h) => s.queries.has(h)), s.tabRole, s.sync.pollIdleStreak])) as [
     QueryHash[],
     ClientState['tabRole'],
@@ -73,7 +78,11 @@ export function* liveChange(env: SagaEnv, hashes: QueryHash[], rows?: InlineRow[
   // Before marking membership dirty: recording the version here is what makes
   // the re-read's `planFetch` find nothing left to pull for this row.
   if (rows && rows.length > 0) yield* landInlineRows(env, rows);
-  yield* markMembershipDirty(known);
+  // The edge says what a re-read would: commit it, and spare the round trip
+  // that used to sit between every remote edit and its render.
+  const settled = deltas && deltas.length > 0 ? yield* applyEdgeDeltas(deltas.filter((d) => known.includes(d.hash))) : new Set<QueryHash>();
+  const dirty = known.filter((h) => !settled.has(h));
+  if (dirty.length > 0) yield* markMembershipDirty(dirty);
   if (role === 'leader') yield fx.emit({ type: 'tabs:broadcast', message: { type: 'membership-dirty', hashes: known } });
 }
 

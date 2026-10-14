@@ -80,9 +80,14 @@ interface Session {
   verifyTimer: ReturnType<typeof setTimeout> | null;
   disposers: Array<() => void>;
   flushTimer: ReturnType<typeof setTimeout> | null;
-  firstDirtyAt: number;
+  /** When the armed flush timer fires. */
+  flushDueAt: number;
+  /** When this session last sent edits (0: not yet). */
+  lastSentAt: number;
   persistTimer: ReturnType<typeof setTimeout> | null;
   flushing: Promise<void> | null;
+  /** A flush asked for while one was running: it runs once that one is done. */
+  flushQueued: Promise<void> | null;
   refetching: boolean;
   presenceTimer: ReturnType<typeof setTimeout> | null;
   presencePending: Uint8Array | null;
@@ -99,8 +104,6 @@ interface Session {
 const LOCAL_TABLE = '_00_crdt_local';
 const LOG_SUFFIX = '__crdt_log';
 const PRESENCE_SUFFIX = '__crdt_presence';
-/** Longest a burst of typing waits before its edits go out. */
-const MAX_WAIT_MS = 2000;
 const PERSIST_DEBOUNCE_MS = 400;
 const PRESENCE_THROTTLE_MS = 250;
 const CLAIM_RETRY_MS = 5000;
@@ -129,7 +132,10 @@ export class CrdtManager {
     private local: LocalStore,
     private remote: RemoteDatabaseService,
     logger: Logger,
-    private debounceMs: number = 300
+    /** First edit after a quiet spell: wait this long to batch the burst. */
+    private debounceMs: number = 50,
+    /** Shortest gap between two sends of one field, while edits keep coming. */
+    private sendIntervalMs: number = 200
   ) {
     this.logger = logger.child({ service: 'CrdtManager' });
     this.connectionUnsubscribes.push(
@@ -289,9 +295,11 @@ export class CrdtManager {
       verifyTimer: null,
       disposers: [],
       flushTimer: null,
-      firstDirtyAt: 0,
+      flushDueAt: 0,
+      lastSentAt: 0,
       persistTimer: null,
       flushing: null,
+      flushQueued: null,
       refetching: false,
       presenceTimer: null,
       presencePending: null,
@@ -309,9 +317,11 @@ export class CrdtManager {
 
     // Claimed now, so the first edits do not wait on the round trip.
     void this.ensureClaimed();
-    // First open on this device: start from the published document. Offline
-    // it is read once the connection is back instead of holding the open.
-    if (!local.snapshot && !fresh) await this.serverWait(this.refetchCanonical(session));
+    // First open on this device: start from the published document. Read at
+    // the same time as the log query below registers, not before it: each is
+    // a round trip, and the import order does not matter (ops whose
+    // predecessors are still missing wait inside Loro until they arrive).
+    const canonical = !local.snapshot && !fresh ? this.refetchCanonical(session) : null;
 
     session.disposers.push(
       doc.subscribeLocalUpdates(() => {
@@ -323,20 +333,22 @@ export class CrdtManager {
       })
     );
     const ports = this.ports;
-    const log = await ports.watch(`${table}${LOG_SUFFIX}`, { doc: recordId, field }, (rows) => {
+    const logWatch = ports.watch(`${table}${LOG_SUFFIX}`, { doc: recordId, field }, (rows) => {
       session.ingesting = session.ingesting.then(() => this.ingest(session, rows));
     });
+    const presenceWatch = cursor
+      ? ports.watch(`${table}${PRESENCE_SUFFIX}`, { doc: recordId, field }, (rows) => this.ingestPresence(session, rows))
+      : null;
+    const [log, presence] = await Promise.all([logWatch, presenceWatch]);
     session.disposers.push(log.stop);
+    if (presence) session.disposers.push(presence.stop);
     void log.settled.then(() => {
       session.logSettled = true;
       void session.ingesting.then(() => this.checkLoaded(session));
     });
-    if (cursor) {
-      const presence = await ports.watch(`${table}${PRESENCE_SUFFIX}`, { doc: recordId, field }, (rows) =>
-        this.ingestPresence(session, rows)
-      );
-      session.disposers.push(presence.stop);
-    }
+    // Offline the published document is read once the connection is back
+    // instead of holding the open.
+    if (canonical) await this.serverWait(canonical);
     // An editor binding an empty document creates its root structure, and
     // two clients doing that at once keep only one of them (with whatever was
     // typed into the other). With nothing local, hand the document out only
@@ -527,19 +539,37 @@ export class CrdtManager {
 
   // --- sending -----------------------------------------------------
 
-  private scheduleFlush(s: Session, delay = this.debounceMs): void {
+  /**
+   * Arm the send. Edits go out on a steady cadence while they keep coming:
+   * the first one after a quiet spell waits `debounceMs` (one row for the
+   * burst), later ones at least `sendIntervalMs` after the previous send. An
+   * armed timer is never pushed back, so continuous typing cannot hold the
+   * edits; it is only brought forward (`delay`, e.g. 0 on reconnect).
+   */
+  private scheduleFlush(s: Session, delay?: number): void {
     const now = Date.now();
-    if (!s.flushTimer) s.firstDirtyAt = now;
-    else clearTimeout(s.flushTimer);
-    const wait = Math.max(0, Math.min(delay, s.firstDirtyAt + MAX_WAIT_MS - now));
+    const due = delay !== undefined ? now + delay : Math.max(now + this.debounceMs, s.lastSentAt + this.sendIntervalMs);
+    if (s.flushTimer) {
+      if (s.flushDueAt <= due) return;
+      clearTimeout(s.flushTimer);
+    }
+    s.flushDueAt = due;
     s.flushTimer = setTimeout(() => {
       s.flushTimer = null;
       void this.flush(s);
-    }, wait);
+    }, due - now);
   }
 
-  private async flush(s: Session): Promise<void> {
-    if (s.flushing) return s.flushing;
+  /** Send what is unsent. A call while a send runs queues one more after it,
+   *  so edits made during that send are not left waiting for the next edit. */
+  private flush(s: Session): Promise<void> {
+    if (s.flushing) {
+      s.flushQueued ??= s.flushing.then(() => {
+        s.flushQueued = null;
+        return this.flush(s);
+      });
+      return s.flushQueued;
+    }
     s.flushing = this.sendOwnEdits(s).finally(() => {
       s.flushing = null;
     });
@@ -557,6 +587,7 @@ export class CrdtManager {
       .map((peer) => ({ peer, end: vv.get(peer as `${number}`) ?? 0, from: s.local.peers[peer]?.enqueued ?? 0 }))
       .filter((p) => p.end > p.from);
     if (due.length === 0 || !this.ports) return;
+    s.lastSentAt = Date.now();
     if (!(await this.ensureClaimed())) {
       this.retryLater(s);
       return;
@@ -581,7 +612,12 @@ export class CrdtManager {
       }
       s.local.peers[peer] = { enqueued: end };
     }
-    await this.persist(s);
+    // The outbox marks reach the device with the next persist. An open field
+    // sends every few hundred ms while typing, and a persist exports the whole
+    // document, so it rides the persist debounce; a crash in between only
+    // re-sends rows, which import as no-ops. A closing field saves now.
+    if (this.sessions.get(s.key) === s) this.schedulePersist(s);
+    else await this.persist(s);
   }
 
   private retryLater(s: Session): void {

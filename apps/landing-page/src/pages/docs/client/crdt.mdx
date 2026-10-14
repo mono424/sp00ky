@@ -149,7 +149,7 @@ Nothing about a CRDT field bypasses the sync pipeline. For a table with `@crdt` 
 | `_00_crdt_doc` | The canonical snapshot of each (record, field), with its `rev`. | The SSP only. Never synced: a device reads it on demand, when it opens a field it holds nothing for, or when log rows depend on edits already folded away. |
 | `_00_crdt_peer` | Which user owns which Loro peer id. | Clients claim ids, nobody changes or deletes them. |
 
-**Up.** Typing changes the tab's local Loro document right away. After a pause of 300 ms (`crdtDebounceMs`, and at most 2 s into a burst), the tab exports only its own new operations as one Loro update and creates one `<table>__crdt_log` row through the ordinary outbox, so edits survive offline, reloads and retries like any other write. Each tab edits under a random Loro peer id that it claims for the signed-in user in `_00_crdt_peer`; the database refuses a log row whose peer the writer does not own.
+**Up.** Typing changes the tab's local Loro document right away. 50 ms after the first keystroke (`crdtDebounceMs`), and then every 200 ms for as long as the typing goes on (`crdtSendIntervalMs`), the tab exports only its own new operations as one Loro update and creates one `<table>__crdt_log` row through the ordinary outbox, so edits survive offline, reloads and retries like any other write. Each tab edits under a random Loro peer id that it claims for the signed-in user in `_00_crdt_peer`; the database refuses a log row whose peer the writer does not own.
 
 **Down.** An open field is an ordinary query on its log rows, so other clients' edits arrive through the normal sync pipeline on the same SurrealDB connection, with no extra LIVE query, and are merged into the open document.
 

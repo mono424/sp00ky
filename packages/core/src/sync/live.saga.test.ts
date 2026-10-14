@@ -6,6 +6,7 @@ import * as R from '../state/reducers';
 import { defaultEnv } from '../query/env';
 import { liveChange, liveInvalidate, liveStart } from './live.saga';
 import { rowOfEdge } from '../client/services';
+import { deltaOfEdge } from '../utils/edges';
 
 const env = defaultEnv({ tables: [] } as any);
 
@@ -174,5 +175,55 @@ describe('liveChange with the body joined on', () => {
     expect(out.log.filter((e) => e.kind === 'local.execute')).toHaveLength(0);
     expect(out.state.versions.size).toBe(0);
     expect([...out.state.membershipDirty]).toEqual(['a']);
+  });
+});
+
+describe('deltaOfEdge', () => {
+  const q = new RecordId('_00_query', 'a');
+  const rid = new RecordId('thread__crdt_log', 'x1');
+  it('reads a joining row off a CREATE or UPDATE, with or without the body joined on', () => {
+    expect(deltaOfEdge('CREATE', { in: q, out: rid, version: 2 })).toEqual({ hash: 'a', id: 'thread__crdt_log:x1', version: 2 });
+    expect(deltaOfEdge('UPDATE', { in: q, out: { id: rid, data: 'b' }, version: 3 })).toEqual({ hash: 'a', id: 'thread__crdt_log:x1', version: 3 });
+  });
+  it('leaves everything else to the re-read', () => {
+    // A row leaving, or a view's edges being rewritten.
+    expect(deltaOfEdge('DELETE', { in: q, out: rid, version: 2 })).toBeNull();
+    // A subquery child.
+    expect(deltaOfEdge('CREATE', { in: q, out: rid, version: 2, parent: new RecordId('thread', 't') })).toBeNull();
+    // Nothing to place: no version, no target, a target the session may not read, no query.
+    expect(deltaOfEdge('CREATE', { in: q, out: rid })).toBeNull();
+    expect(deltaOfEdge('CREATE', { in: q, out: null, version: 2 })).toBeNull();
+    expect(deltaOfEdge('CREATE', { in: q, out: 'thread__crdt_log:x1', version: 2 })).toBeNull();
+    expect(deltaOfEdge('CREATE', { out: rid, version: 2 })).toBeNull();
+  });
+});
+
+describe('liveChange with edge deltas', () => {
+  const live = (hash: string) =>
+    buildEntry({ def: { hash, viewKey: `vk-${hash}` }, lifecycle: { phase: 'live', remote: 'registered' }, remoteArray: [['t:1', 1]] });
+
+  it('commits a row joining a live view at once, with no re-read', async () => {
+    const out = await runPure(liveChange(env, ['a'], undefined, [{ hash: 'a', id: 't:2', version: 1 }]), {
+      state: { ...buildState([live('a')]), tabRole: 'leader' },
+      handlers: { 'local.upsert': () => undefined },
+    });
+    expect(out.state.queries.get('a')!.remoteArray).toEqual([['t:1', 1], ['t:2', 1]]);
+    expect(out.state.membershipDirty.size).toBe(0);
+    expect(out.timers.has('membership')).toBe(false);
+    // Other tabs still hear about it.
+    expect(out.emitted).toContainEqual({ type: 'tabs:broadcast', message: { type: 'membership-dirty', hashes: ['a'] } });
+  });
+
+  it('re-reads what it could not settle, and ignores deltas for unknown queries', async () => {
+    const cold = buildEntry({ def: { hash: 'b' }, lifecycle: { phase: 'cold' } });
+    const out = await runPure(
+      liveChange(env, ['a', 'b'], undefined, [
+        { hash: 'b', id: 't:2', version: 1 },
+        { hash: 'zz', id: 't:9', version: 1 },
+      ]),
+      { state: buildState([live('a'), cold]) }
+    );
+    expect([...out.state.membershipDirty].sort()).toEqual(['a', 'b']);
+    expect(out.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
   });
 });

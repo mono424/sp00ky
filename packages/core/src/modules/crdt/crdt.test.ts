@@ -36,6 +36,8 @@ class World {
     for (const go of this.held.splice(0)) go();
   }
   private watchers = new Set<{ table: string; where: Record<string, unknown>; cb: (rows: any[]) => void }>();
+  /** Every query a client registered, in order. */
+  watched: string[] = [];
 
   client(user: string, store = new Map<string, any>(), logger: any = silent) {
     const local = {
@@ -64,9 +66,10 @@ class World {
         return [[]];
       },
     } as any;
-    const manager = new CrdtManager(schema, local, remote, logger, 300);
+    const manager = new CrdtManager(schema, local, remote, logger);
     const ports: CrdtPorts = {
       watch: async (table, where, cb) => {
+        this.watched.push(table);
         const w = { table, where, cb };
         this.watchers.add(w);
         if (this.slow) {
@@ -158,17 +161,60 @@ describe('CRDT fields', () => {
     expect(text(fb)).toBe(text(fa));
   });
 
-  it('a burst of typing goes out after the pause, or after the max wait at the latest', async () => {
+  it('while typing continues, edits go out on a steady cadence instead of waiting for a pause', async () => {
     const world = new World();
     const a = world.client('user:a');
     const f = await a.manager.open('doc', 'doc:1', 'body');
-    for (let i = 0; i < 10; i++) {
+    // A key every 50 ms for a second: a trailing debounce would send nothing
+    // until the typing stopped. The first edit goes out after 50 ms, the rest
+    // every 200 ms.
+    for (let i = 0; i < 20; i++) {
       f.getDoc().getText('body').insert(i, 'x');
       f.getDoc().commit();
-      await vi.advanceTimersByTimeAsync(250);
+      await vi.advanceTimersByTimeAsync(50);
+      if (i === 0) expect(world.log).toHaveLength(1);
     }
-    expect(world.log.length).toBeGreaterThanOrEqual(1);
-    expect(world.log.length).toBeLessThan(10);
+    expect(world.log.length).toBeGreaterThanOrEqual(4);
+    expect(world.log.length).toBeLessThanOrEqual(6);
+    await vi.advanceTimersByTimeAsync(300);
+    const copy = new LoroDoc();
+    for (const row of world.log) copy.import(row.data);
+    expect(copy.getText('body').toString()).toBe('x'.repeat(20));
+  });
+
+  it('edits made while a send waits on the server go out right after it', async () => {
+    const world = new World();
+    const a = world.client('user:a');
+    const f = await a.manager.open('doc', 'doc:1', 'body');
+    world.slow = true;
+    // A fresh peer: the next send claims it first, and that claim hangs.
+    a.manager.setSessionId('');
+    f.getDoc().getText('body').insert(0, 'a');
+    f.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(100);
+    f.getDoc().getText('body').insert(1, 'b');
+    f.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(300);
+    world.slow = false;
+    world.release();
+    await vi.advanceTimersByTimeAsync(10);
+    const copy = new LoroDoc();
+    for (const row of world.log) copy.import(row.data);
+    expect(copy.getText('body').toString()).toBe('ab');
+  });
+
+  it('a first open reads the published document while its log query registers, not before', async () => {
+    const world = new World();
+    world.slow = true;
+    const a = world.client('user:a');
+    const opening = a.manager.open('doc', 'doc:1', 'body');
+    await vi.advanceTimersByTimeAsync(0);
+    // The published-document read is still out, and the log query is already registered.
+    expect(world.watched).toEqual(['doc__crdt_log']);
+    world.slow = false;
+    world.release();
+    await vi.advanceTimersByTimeAsync(10);
+    expect((await opening).isLoaded()).toBe(true);
   });
 
   it('send nothing until the peer is claimed, then everything at once', async () => {

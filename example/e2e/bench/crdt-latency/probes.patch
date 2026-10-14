@@ -1,0 +1,301 @@
+diff --git a/packages/core/src/client/services.ts b/packages/core/src/client/services.ts
+index bf6102468..f13af18c6 100644
+--- a/packages/core/src/client/services.ts
++++ b/packages/core/src/client/services.ts
+@@ -33,6 +33,7 @@ import { leaveViewsBeacon, listRefLive } from '../query/sql';
+ import { deltaOfEdge, hashOfEdge, rowOfEdge } from '../utils/edges';
+ import { mintMutationId } from '../mutation/mutation-id';
+ import { BucketHandle, bucketContentToBlob, bucketSettings } from './bucket-handle';
++import { btrace } from '../utils/bench-trace';
+ 
+ const LAST_BUCKET_KEY = 'sp00ky:last_bucket';
+ 
+@@ -384,12 +385,13 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
+         // trip. The clause is only ever added, never relied on: a server that
+         // ignores it, or a row the session cannot read, simply yields no
+         // inline row and the fetch path takes over.
+-        const stmt = listRefLive(table, { inlineBodies: config.liveInlineBodies === true, sessionIds: s.remote.sessionIds() });
++        const stmt = listRefLive(table, { inlineBodies: config.liveInlineBodies === true || (globalThis as any).__liveInline === true, sessionIds: s.remote.sessionIds() });
+         const [uuid] = await s.remote.query<[Uuid]>(stmt.sql, stmt.vars);
+         const live = await s.remote.getClient().liveOf(uuid);
+         live.subscribe((message) => {
+           if (message.action === 'KILLED') return;
+           const hash = hashOfEdge(message.value);
++          btrace('live', { action: message.action, hash, out: String((message.value as any)?.out ?? '') });
+           if (!hash) return;
+           // Not on DELETE: that edge is a row leaving the view, and for a row
+           // that was actually deleted the join yields nothing anyway. Landing
+@@ -417,6 +419,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
+           key,
+           setTimeout(() => {
+             timers.delete(key);
++            btrace('timer', { key, ms });
+             fire();
+           }, ms)
+         );
+diff --git a/packages/core/src/kernel/interpreter.ts b/packages/core/src/kernel/interpreter.ts
+index f8cbd6907..d38bcd79c 100644
+--- a/packages/core/src/kernel/interpreter.ts
++++ b/packages/core/src/kernel/interpreter.ts
+@@ -1,4 +1,5 @@
+ import { Duration } from 'surrealdb';
++import { btrace } from '../utils/bench-trace';
+ import type { LocalStore } from '../services/database/cache-engine';
+ import type { IngestRecord, StreamUpdate } from '../services/stream-processor/index';
+ import type { ClientState } from '../state/client-state';
+@@ -59,6 +60,17 @@ export type Interpreter = (effect: Effect, ctx?: RunContext) => Promise<unknown>
+ /** Effects become adapter calls here and nowhere else. */
+ export function createInterpreter(adapters: Adapters, host: InterpreterHost): Interpreter {
+   const interpret: Interpreter = async (effect, ctx) => {
++    const k = effect.kind;
++    if (!(k.startsWith('local.') || k.startsWith('ssp.') || k === 'service')) return interpretInner(effect, ctx);
++    const t0 = performance.now();
++    try {
++      return await interpretInner(effect, ctx);
++    } finally {
++      const e = effect as any;
++      btrace('fx', { k, what: String(e.name ?? e.sql ?? e.table ?? e.query ?? e.plan?.queryHash ?? '').replace(/\s+/g, ' ').slice(0, 90), ms: performance.now() - t0 });
++    }
++  };
++  const interpretInner: Interpreter = async (effect, ctx) => {
+     switch (effect.kind) {
+       case 'local.query':
+         return adapters.local.query(effect.sql, effect.vars, effect.epoch === undefined ? undefined : { epoch: effect.epoch });
+diff --git a/packages/core/src/modules/crdt/index.ts b/packages/core/src/modules/crdt/index.ts
+index 963007c74..06d9a2e23 100644
+--- a/packages/core/src/modules/crdt/index.ts
++++ b/packages/core/src/modules/crdt/index.ts
+@@ -10,6 +10,7 @@ import { CrdtField } from './crdt-field';
+ import { stateHash } from './hash';
+ import { loadLoro } from './loro-loader';
+ import type { CrdtKind } from './mirror';
++import { btrace } from '../../utils/bench-trace';
+ 
+ export { CrdtField, cursorColorFromName, CURSOR_COLORS } from './crdt-field';
+ 
+@@ -269,6 +270,7 @@ export class CrdtManager {
+     fresh = false
+   ): Promise<Session> {
+     if (!this.ports) throw new Error('CrdtManager: not attached to a client');
++    btrace('crdt:open:start', { key });
+     const loro = await loadLoro();
+     const doc = new loro.LoroDoc();
+     doc.setPeerId(this.peer);
+@@ -276,6 +278,7 @@ export class CrdtManager {
+     // A close of this field may still be saving: read what it saves.
+     await this.saving.get(key);
+     const local = await this.readLocal(recordId, field);
++    btrace('crdt:open:readLocal', { key, bytes: local.snapshot?.length ?? 0 });
+     if (local.snapshot) this.tryImport(doc, local.snapshot, key);
+ 
+     const session: Session = {
+@@ -328,6 +331,7 @@ export class CrdtManager {
+         // Remember every peer that made edits here: a later identity change
+         // swaps the peer, and these ops must still go out under this one.
+         session.local.peers[this.peer] ??= { enqueued: 0 };
++        btrace('crdt:local', { key: session.key });
+         this.scheduleFlush(session);
+         this.schedulePersist(session);
+       })
+@@ -342,7 +346,9 @@ export class CrdtManager {
+     const [log, presence] = await Promise.all([logWatch, presenceWatch]);
+     session.disposers.push(log.stop);
+     if (presence) session.disposers.push(presence.stop);
++    btrace('crdt:open:watch', { key });
+     void log.settled.then(() => {
++      btrace('crdt:open:logSettled', { key });
+       session.logSettled = true;
+       void session.ingesting.then(() => this.checkLoaded(session));
+     });
+@@ -355,6 +361,7 @@ export class CrdtManager {
+     // once the server's rows for it are in.
+     if (!session.handle.hasContent() && !fresh) await this.serverWait(log.settled);
+     await session.ingesting;
++    btrace('crdt:open:done', { key, loaded: session.handle.isLoaded() });
+     // Edits a previous session made but never sent (closed tab, offline).
+     this.scheduleFlush(session, 0);
+     this.logger.debug({ key, peer: this.peer, Category: 'sp00ky-client::CrdtManager::open' }, 'CRDT field opened');
+@@ -407,6 +414,7 @@ export class CrdtManager {
+       }
+     }
+     s.present = ids;
++    btrace('crdt:rows', { key: s.key, n: rows.length, fresh: rows.filter((r) => !s.seen.has(String(r.id ?? ''))).map((r) => String(r.id)) });
+     const blobs: Uint8Array[] = [];
+     for (const row of rows) {
+       const id = String(row.id ?? '');
+@@ -422,10 +430,12 @@ export class CrdtManager {
+     }
+     if (blobs.length === 0) return;
+     let pending = false;
++    const t0 = performance.now();
+     for (const blob of blobs) {
+       const status = this.tryImport(s.doc, blob, s.key);
+       if (status?.pending) pending = true;
+     }
++    btrace('crdt:imported', { key: s.key, n: blobs.length, ms: performance.now() - t0, pending });
+     this.checkLoaded(s);
+     this.schedulePersist(s);
+     // Ops depending on rows that were folded away before this device saw
+@@ -588,6 +598,7 @@ export class CrdtManager {
+       .filter((p) => p.end > p.from);
+     if (due.length === 0 || !this.ports) return;
+     s.lastSentAt = Date.now();
++    btrace('crdt:flush', { key: s.key, due: due.map((d) => d.end - d.from) });
+     if (!(await this.ensureClaimed())) {
+       this.retryLater(s);
+       return;
+@@ -598,8 +609,10 @@ export class CrdtManager {
+         mode: 'updates-in-range',
+         spans: [{ id: { peer: peer as `${number}`, counter: from }, len: end - from }],
+       });
++      const rid = `${s.table}${LOG_SUFFIX}:${rowKey()}`;
++      btrace('crdt:enqueue', { key: s.key, rid, bytes: data.length });
+       try {
+-        await this.ports.create(`${s.table}${LOG_SUFFIX}:${rowKey()}`, {
++        await this.ports.create(rid, {
+           doc: s.recordId,
+           field: s.field,
+           peer,
+@@ -611,6 +624,7 @@ export class CrdtManager {
+         return;
+       }
+       s.local.peers[peer] = { enqueued: end };
++      btrace('crdt:enqueued', { key: s.key, rid });
+     }
+     // The outbox marks reach the device with the next persist. An open field
+     // sends every few hundred ms while typing, and a persist exports the whole
+@@ -693,6 +707,7 @@ export class CrdtManager {
+    *  its snapshot rather than overwrite it, and keep the further of the two
+    *  outbox marks per peer. */
+   private async persist(s: Session): Promise<void> {
++    const t0 = performance.now();
+     try {
+       const stored = await this.readLocal(s.recordId, s.field);
+       if (stored.snapshot) this.tryImport(s.doc, stored.snapshot, s.key);
+@@ -701,13 +716,16 @@ export class CrdtManager {
+         if (mark.enqueued > mine) s.local.peers[peer] = { enqueued: mark.enqueued };
+       }
+       s.local.rev = Math.max(s.local.rev, stored.rev);
++      const tExp = performance.now();
+       s.local.snapshot = s.doc.export({ mode: 'snapshot' });
++      const tUp = performance.now();
+       await this.local.upsert(
+         LOCAL_TABLE,
+         this.localId(s.recordId, s.field),
+         { doc: s.recordId, field: s.field, snapshot: s.local.snapshot, rev: s.local.rev, peers: s.local.peers },
+         'replace'
+       );
++      btrace('crdt:persist', { key: s.key, bytes: s.local.snapshot.length, readMs: tExp - t0, exportMs: tUp - tExp, writeMs: performance.now() - tUp });
+     } catch (e) {
+       this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::persist' }, 'Saving local CRDT state failed');
+     }
+@@ -729,6 +747,7 @@ export class CrdtManager {
+   /** Presence is the latest state only: no outbox, no offline queue. */
+   private async sendPresence(s: Session, state: Uint8Array): Promise<void> {
+     if (!(await this.ensureClaimed())) return;
++    btrace('crdt:presence', { key: s.key, bytes: state.length });
+     try {
+       await this.remote.query(
+         // One row per session and field, keyed by a plain identifier (an array
+diff --git a/packages/core/src/mutation/push.saga.ts b/packages/core/src/mutation/push.saga.ts
+index c256e6a58..792fc6ea3 100644
+--- a/packages/core/src/mutation/push.saga.ts
++++ b/packages/core/src/mutation/push.saga.ts
+@@ -1,4 +1,5 @@
+ import type { Saga } from '../kernel/saga';
++import { btrace } from '../utils/bench-trace';
+ import type { StatementResult } from '../kernel/effects';
+ import { fx } from '../kernel/effects';
+ import { ACK_GRACE_MS, backoffMs } from '../kernel/constants';
+@@ -105,7 +106,9 @@ export function* drain(env: SagaEnv): Saga<void> {
+     const req = remoteBatch(rows);
+     let results: StatementResult[];
+     try {
++      btrace('push:send', { ids: rows.map((r) => String(r.recordId)) });
+       const raw = (yield fx.remote.query(req.sql, req.vars, env.pushTimeoutMs)) as unknown;
++      btrace('push:done', { ids: rows.map((r) => String(r.recordId)) });
+       // A response without statement results is a transport fault: nothing
+       // ran, everything stays queued (handled as `!r` below).
+       results = Array.isArray(raw) ? (raw as StatementResult[]) : [];
+diff --git a/packages/core/src/query/fetch.saga.ts b/packages/core/src/query/fetch.saga.ts
+index 077e5737b..b9d8f7635 100644
+--- a/packages/core/src/query/fetch.saga.ts
++++ b/packages/core/src/query/fetch.saga.ts
+@@ -1,4 +1,5 @@
+ import type { RecordId } from 'surrealdb';
++import { btrace } from '../utils/bench-trace';
+ import type { Saga } from '../kernel/saga';
+ import type { Settled, StatementResult } from '../kernel/effects';
+ import { fx } from '../kernel/effects';
+@@ -34,6 +35,7 @@ export function* fetchRows(env: SagaEnv): Saga<void> {
+     yield fx.state.update(R.compose(...plan.hashes.map((h) => R.applyLifecycle(h, { type: 'fetch-begin' }))));
+     let failed = 0;
+     try {
++      btrace('fetch:send', { ids: plan.chunks.flat().map(String) });
+       const results = (yield fx.all(
+         plan.chunks.map((ids) => fx.remote.query(sql.bodySelect(), { ids: ids.map(parseRecordIdString) }, env.remoteTimeoutMs))
+       )) as Settled[];
+@@ -44,7 +46,9 @@ export function* fetchRows(env: SagaEnv): Saga<void> {
+           failed++;
+           continue;
+         }
++        btrace('fetch:recv', { ids: plan.chunks[i].map(String) });
+         const landed = yield* landChunk(env, plan.chunks[i], first.result as Array<Record<string, unknown>>, plan.versions, state, epoch);
++        btrace('fetch:landed', { ids: plan.chunks[i].map(String) });
+         if (!landed) failed++;
+       }
+     } finally {
+diff --git a/packages/core/src/query/membership.saga.ts b/packages/core/src/query/membership.saga.ts
+index d1c57a318..73047d4bb 100644
+--- a/packages/core/src/query/membership.saga.ts
++++ b/packages/core/src/query/membership.saga.ts
+@@ -1,4 +1,5 @@
+ import type { EdgeDelta, QueryHash, RecordVersionArray, ServerViewMeta } from '../types';
++import { btrace } from '../utils/bench-trace';
+ import type { Saga } from '../kernel/saga';
+ import type { Settled, StatementResult } from '../kernel/effects';
+ import { fx } from '../kernel/effects';
+@@ -205,7 +206,9 @@ export function* readMembership(
+       ? single(byHash.get(chunk[0])!)
+       : fx.remote.query(sql.batchSnapshotSelect(table), { ins: chunk.map((h) => byHash.get(h)!.def.id) }, env.remoteTimeoutMs)
+   );
++  btrace('member:send', { hashes: chunks.flat().map(String) });
+   const results = (yield fx.all(requests)) as Settled[];
++  btrace('member:recv', { hashes: chunks.flat().map(String) });
+ 
+   const snapshots = new Map<QueryHash, ListRefSnapshot>();
+   let failed = false;
+diff --git a/packages/core/src/services/database/database.ts b/packages/core/src/services/database/database.ts
+index bf7eb7887..00facc914 100644
+--- a/packages/core/src/services/database/database.ts
++++ b/packages/core/src/services/database/database.ts
+@@ -5,6 +5,7 @@ import type {
+   DatabaseEventTypes} from './events/index';
+ import type { SealedQuery } from '../../utils/surql';
+ import { withTimeout } from '../../utils/index';
++import { btrace } from '../../utils/bench-trace';
+ 
+ export abstract class AbstractDatabaseService {
+   protected client: Surreal;
+@@ -138,10 +139,13 @@ export abstract class AbstractDatabaseService {
+   }
+ 
+   private async runStatement<T>(query: string, vars: Record<string, unknown> | undefined, dispatch: () => Promise<T>): Promise<T> {
++    const queuedAt = performance.now();
+     await this.acquireQuerySlot();
++    const btKind = this.constructor.name;
+     try {
+       await this.beforeQuery();
+       const startTime = performance.now();
++      btrace('stmt:start', { kind: btKind, q: query.slice(0, 160), waitMs: startTime - queuedAt, inFlight: this.inFlightQueries, queued: this.queryWaiters.length });
+       try {
+         // Trace: the finished statement is logged at debug by the client,
+         // from the query event below. This line is for a statement that hangs.
+@@ -154,6 +158,7 @@ export abstract class AbstractDatabaseService {
+         // retry rather than rolling the mutation back.
+         const result = await withTimeout(dispatch(), this.queryTimeoutMs, () => this.timeoutError(query));
+         const duration = performance.now() - startTime;
++        btrace('stmt:end', { kind: btKind, q: query.slice(0, 160), ms: duration });
+ 
+         this.events.emit(this.eventType, {
+           query,

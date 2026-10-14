@@ -5,6 +5,10 @@ import type { CrdtField } from '@spooky-sync/core';
 /**
  * Open a `@crdt` field of the record `recordId()` names, for an editor to bind
  * to (`field()?.getDoc()`). Re-opens when the id changes; closes on cleanup.
+ *
+ * The accessor stays `null` until the field is loaded (`CrdtField.isLoaded`):
+ * this device had the document, or the server answered. Until then show the
+ * column's text instead of binding an editor to a document still arriving.
  */
 export function useCrdtField(
   table: string,
@@ -27,14 +31,19 @@ export function useCrdtField(
       }
       const sp00ky = db.getSp00ky();
       let superseded = false;
+      let offLoaded = () => {};
       sp00ky
         .openCrdtField(table, id, field)
         .then((cf) => {
-          if (!superseded) {
-            setCrdtField(cf);
-          } else {
+          if (superseded) {
             sp00ky.closeCrdtField(table, id, field);
+            return;
           }
+          // Handed out once loaded (`CrdtField.isLoaded`): an empty document
+          // before the server answered is "not arrived yet", not "empty".
+          offLoaded = cf.onLoaded(() => {
+            if (!superseded) setCrdtField(cf);
+          });
         })
         .catch((err) => {
           // Silent rejections here leave the consumer's `Show when={field()}`
@@ -47,6 +56,7 @@ export function useCrdtField(
         });
       return () => {
         superseded = true;
+        offLoaded();
         if (crdtField()) {
           sp00ky.closeCrdtField(table, id, field);
           setCrdtField(null);

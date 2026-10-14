@@ -29,6 +29,12 @@ class World {
   hang = false;
   /** A slow device store: each local write takes this long (real timers). */
   storeDelayMs = 0;
+  /** A connected but slow server: reads and the log's first answer wait for `release()`. */
+  slow = false;
+  private held: Array<() => void> = [];
+  release() {
+    for (const go of this.held.splice(0)) go();
+  }
   private watchers = new Set<{ table: string; where: Record<string, unknown>; cb: (rows: any[]) => void }>();
 
   client(user: string, store = new Map<string, any>(), logger: any = silent) {
@@ -44,6 +50,7 @@ class World {
       subscribeConnection: () => () => {},
       getStatus: () => (this.online ? 'connected' : 'disconnected'),
       query: async (sql: string, vars: any) => {
+        if (this.slow) await new Promise<void>((go) => this.held.push(go));
         if (!this.online && this.hang) return new Promise(() => {});
         if (!this.online) throw new Error('not connected');
         if (sql.startsWith('CREATE')) {
@@ -62,6 +69,15 @@ class World {
       watch: async (table, where, cb) => {
         const w = { table, where, cb };
         this.watchers.add(w);
+        if (this.slow) {
+          const settled = new Promise<void>((go) =>
+            this.held.push(() => {
+              cb(this.rowsFor(table, where));
+              go();
+            })
+          );
+          return { stop: () => void this.watchers.delete(w), settled };
+        }
         cb(this.rowsFor(table, where));
         return { stop: () => void this.watchers.delete(w), settled: Promise.resolve() };
       },
@@ -218,6 +234,46 @@ describe('CRDT fields', () => {
     expect(world.log).toHaveLength(0);
     // Kept on the device, to go out from the next open.
     expect([...store.values()].some((row) => row.snapshot)).toBe(true);
+  });
+
+  it('a field is loaded once the server answers, and at once with a local copy or a draft', async () => {
+    const world = new World();
+    const server = new LoroDoc();
+    server.getText('body').insert(0, 'from the server');
+    server.commit();
+    await world.fold('doc:1', 'body', server);
+    world.slow = true;
+    const store = new Map<string, any>();
+    const a = world.client('user:a', store);
+    const opening = a.manager.open('doc', 'doc:1', 'body');
+    await vi.advanceTimersByTimeAsync(9000);
+    const f = await opening;
+    // Handed out after the bounded wait, but empty only because nothing came.
+    expect(text(f)).toBe('');
+    expect(f.isLoaded()).toBe(false);
+    let loaded = 0;
+    f.onLoaded(() => loaded++);
+    world.release();
+    await realWait();
+    expect(text(f)).toBe('from the server');
+    expect(f.isLoaded()).toBe(true);
+    expect(loaded).toBe(1);
+    await a.manager.close('doc', 'doc:1', 'body');
+
+    // This device has it now: loaded before the server says anything.
+    const again = await (async () => {
+      const opening2 = a.manager.open('doc', 'doc:1', 'body');
+      await vi.advanceTimersByTimeAsync(9000);
+      return opening2;
+    })();
+    expect(again.isLoaded()).toBe(true);
+    world.release();
+
+    const draft = await a.manager.createDraft('doc', 'body');
+    draft.getDoc().getText('body').insert(0, 'new');
+    draft.getDoc().commit();
+    const fresh = await a.manager.open('doc', 'doc:2', 'body', draft);
+    expect(fresh.isLoaded()).toBe(true);
   });
 
   it('a reopen right after a close starts from what the close saved', async () => {

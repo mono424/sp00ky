@@ -90,6 +90,10 @@ interface Session {
   presenceSent: boolean;
   /** The latest import of delivered rows (chained, so awaiting it awaits all). */
   ingesting: Promise<void>;
+  /** The server answered the published-document read (with a row or none). */
+  canonicalAnswered: boolean;
+  /** The log watch delivered the server's first answer. */
+  logSettled: boolean;
 }
 
 const LOCAL_TABLE = '_00_crdt_local';
@@ -130,7 +134,11 @@ export class CrdtManager {
     this.logger = logger.child({ service: 'CrdtManager' });
     this.connectionUnsubscribes.push(
       this.remote.subscribeConnection('connected', () => {
-        for (const s of this.sessions.values()) this.scheduleFlush(s, 0);
+        for (const s of this.sessions.values()) {
+          this.scheduleFlush(s, 0);
+          // Opened while the server could not answer: read it now.
+          if (!s.handle.isLoaded() && !s.canonicalAnswered) void this.refetchCanonical(s);
+        }
       })
     );
   }
@@ -289,10 +297,14 @@ export class CrdtManager {
       presencePending: null,
       presenceSent: false,
       ingesting: Promise.resolve(),
+      canonicalAnswered: false,
+      logSettled: false,
     };
     session.handle = new CrdtField(table, recordId, field, kind, cursor, doc, {
       pushPresence: (state) => this.pushPresence(session, state),
     });
+    // Known from the start: this device's copy, or a record just created here.
+    if (local.snapshot || fresh) session.handle.markLoaded();
     this.sessions.set(key, session);
 
     // Claimed now, so the first edits do not wait on the round trip.
@@ -315,6 +327,10 @@ export class CrdtManager {
       session.ingesting = session.ingesting.then(() => this.ingest(session, rows));
     });
     session.disposers.push(log.stop);
+    void log.settled.then(() => {
+      session.logSettled = true;
+      void session.ingesting.then(() => this.checkLoaded(session));
+    });
     if (cursor) {
       const presence = await ports.watch(`${table}${PRESENCE_SUFFIX}`, { doc: recordId, field }, (rows) =>
         this.ingestPresence(session, rows)
@@ -398,10 +414,17 @@ export class CrdtManager {
       const status = this.tryImport(s.doc, blob, s.key);
       if (status?.pending) pending = true;
     }
+    this.checkLoaded(s);
     this.schedulePersist(s);
     // Ops depending on rows that were folded away before this device saw
     // them: the published snapshot holds those predecessors.
     if (pending) void this.refetchCanonical(s);
+  }
+
+  /** Mark the field loaded once its content arrived, or the server answered
+   *  both reads (the published document and the log) with nothing. */
+  private checkLoaded(s: Session): void {
+    if (s.handle.hasContent() || (s.canonicalAnswered && s.logSettled)) s.handle.markLoaded();
   }
 
   private tryImport(doc: LoroDoc, blob: Uint8Array, key: string): { pending: boolean } | null {
@@ -428,6 +451,8 @@ export class CrdtManager {
         s.local.rev = Math.max(s.local.rev, row?.rev ?? 0);
         this.schedulePersist(s);
       }
+      s.canonicalAnswered = true;
+      this.checkLoaded(s);
     } catch (e) {
       // Offline or no published document yet: the log rows still arrive.
       this.logger.debug({ key: s.key, error: String(e), Category: 'sp00ky-client::CrdtManager::refetch' }, 'No canonical CRDT document fetched');

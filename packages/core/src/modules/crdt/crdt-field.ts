@@ -34,6 +34,8 @@ export interface CrdtFieldHost {
 export class CrdtField {
   private _onCursorUpdate: ((data: Uint8Array) => void) | null = null;
   private pendingCursorUpdate: Uint8Array | null = null;
+  private loaded = false;
+  private loadedListeners = new Set<() => void>();
 
   constructor(
     readonly table: string,
@@ -52,6 +54,42 @@ export class CrdtField {
   /** Whether the document holds anything yet (local state or edits). */
   hasContent(): boolean {
     return this.doc.oplogVersion().length() > 0;
+  }
+
+  /**
+   * Whether the document is known: this device had it, it was handed a draft,
+   * or the server answered (with content, or that it has none yet). Until then
+   * an empty document means "not loaded", not "empty": show the column's text
+   * instead, and do not bind an editor (an editor binding an empty document
+   * creates structure that competes with the real one).
+   */
+  isLoaded(): boolean {
+    return this.loaded;
+  }
+
+  /** Runs `cb` once the field is loaded (at once if it already is). Returns
+   *  an unsubscribe. */
+  onLoaded(cb: () => void): () => void {
+    if (this.loaded) {
+      cb();
+      return () => {};
+    }
+    this.loadedListeners.add(cb);
+    return () => this.loadedListeners.delete(cb);
+  }
+
+  /** @internal The manager calls this when the document became known. */
+  markLoaded(): void {
+    if (this.loaded) return;
+    this.loaded = true;
+    for (const cb of [...this.loadedListeners]) {
+      try {
+        cb();
+      } catch {
+        /* a listener's failure is its own */
+      }
+    }
+    this.loadedListeners.clear();
   }
 
   /** Publish this session's presence (an `EphemeralStore` encoding, e.g. the

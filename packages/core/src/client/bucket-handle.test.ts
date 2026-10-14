@@ -115,3 +115,81 @@ describe('BucketHandle', () => {
     expect(calls.some(([s]) => s === 'RETURN f"files:/pre/".list();')).toBe(true);
   });
 });
+
+describe('r2 buckets (files with the SSP)', () => {
+  function fakeSsp(files: Record<string, string> = {}) {
+    const requests: Array<{ method: string; url: string; auth: string | null; body: unknown }> = [];
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      const headers = (init.headers ?? {}) as Record<string, string>;
+      requests.push({ method: init.method ?? 'GET', url, auth: headers.Authorization ?? null, body: init.body });
+      const key = decodeURIComponent(new URL(url).pathname.replace(/^\/bucket\/[^/]+\//, ''));
+      const json = (status: number, value: unknown) => new Response(JSON.stringify(value), { status });
+      if (headers.Authorization !== 'Bearer tok') return json(401, { error: 'invalid or expired token' });
+      switch (init.method) {
+        case 'PUT':
+          files[key] = typeof init.body === 'string' ? init.body : 'bytes';
+          return json(200, { ok: true });
+        case 'GET':
+          return key in files ? new Response(files[key], { status: 200 }) : json(404, { error: 'no such file' });
+        case 'DELETE':
+          delete files[key];
+          return json(200, { ok: true });
+        default: {
+          const op = JSON.parse(String(init.body));
+          if (op.op === 'exists') return json(200, key in files);
+          if (op.op === 'head') return json(200, key in files ? { key: `/${key}`, size: files[key].length } : null);
+          if (!(key in files)) return json(404, { error: 'no such file' });
+          files[op.target] = files[key];
+          if (op.op === 'rename') delete files[key];
+          return json(200, { ok: true });
+        }
+      }
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return { requests, files };
+  }
+
+  const remote = (token: string | null = 'tok') => ({ getAuthToken: () => token, query: vi.fn() }) as any;
+  const r2 = (r = remote()) =>
+    new BucketHandle('pics', r, null, { backend: 'r2', files: { endpoint: 'https://app.db.example/' }, blurhash: false });
+
+  it('reads and writes over HTTP with the session token, never the database socket', async () => {
+    const { requests, files } = fakeSsp();
+    const db = remote();
+    const h = r2(db);
+    await h.put('u1/a b.png', 'PNG');
+    expect(files['u1/a b.png']).toBe('PNG');
+    expect(requests[0]).toMatchObject({ method: 'PUT', url: 'https://app.db.example/bucket/pics/u1/a%20b.png', auth: 'Bearer tok' });
+    expect(await ((await h.get('u1/a b.png')) as Blob).text()).toBe('PNG');
+    expect(await h.get('missing.png')).toBeNull();
+    expect(await h.exists('u1/a b.png')).toBe(true);
+    expect(await h.head('u1/a b.png')).toEqual({ key: '/u1/a b.png', size: 3 });
+    await h.copy('u1/a b.png', 'u1/c.png');
+    await h.rename('u1/c.png', 'u1/d.png');
+    expect(Object.keys(files).sort()).toEqual(['u1/a b.png', 'u1/d.png']);
+    await expect(h.copy('nope.png', 'x.png')).rejects.toThrow(/no file/);
+    await h.delete('u1/a b.png');
+    expect(await h.exists('u1/a b.png')).toBe(false);
+    await expect(h.list()).rejects.toThrow(/listing/);
+    expect(db.query).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces refusals and a missing endpoint as errors', async () => {
+    fakeSsp({ 'a.png': 'x' });
+    await expect(r2(remote(null)).get('a.png')).rejects.toThrow(/401.*invalid or expired token/);
+    const noEndpoint = new BucketHandle('pics', remote(), null, { backend: 'r2', files: {} });
+    await expect(noEndpoint.get('a.png')).rejects.toThrow(/files\.endpoint/);
+    vi.unstubAllGlobals();
+  });
+
+  it('a bucket without backend r2 keeps using the database', async () => {
+    const db = { getAuthToken: () => 'tok', query: vi.fn(async () => ['content']) } as any;
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const h = new BucketHandle('pics', db, null, { files: { endpoint: 'https://app.db.example' } });
+    expect(await h.get('a.png')).toBe('content');
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+});

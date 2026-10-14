@@ -222,6 +222,12 @@ export class RemoteDatabaseService extends AbstractDatabaseService {
     this.authToken = token;
   }
 
+  /** The token the session is signed in with (or the configured one), for
+   *  calls that leave the socket: `r2` bucket files go to the SSP over HTTP. */
+  getAuthToken(): string | null {
+    return this.authToken ?? this.getConfig().token ?? null;
+  }
+
   /** Resolved reconnect tunables; the supervisor reads its own knobs here. */
   getReconnectConfig(): Required<ReconnectConfig> {
     return this.reconnectConfig;

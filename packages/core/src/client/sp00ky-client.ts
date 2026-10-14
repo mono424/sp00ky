@@ -54,7 +54,7 @@ import { preload } from '../boot/preload.saga';
 import { DEGRADE_AFTER_FAILURES, OUTBOX_BATCH_SIZE, PUSH_TIMEOUT_MS } from '../kernel/constants';
 import { Runtime } from './runtime';
 import { createAdapters, createServices, createTabsCoordinator, type ServiceHost, type Services } from './services';
-import { BucketHandle } from './bucket-handle';
+import { BucketHandle, bucketSettings } from './bucket-handle';
 import { ImpersonationBanner } from '../modules/auth/impersonation-banner';
 import type { LeaderSyncHub, SyncForwarder } from '../services/tabs/coordinator';
 
@@ -615,7 +615,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
   }
 
   bucket<B extends BucketNames<S>>(name: B): BucketHandle {
-    return new BucketHandle(name, this.services.remote, this.services.blobs, { blurhash: this.config.blurhash, logger: this.services.logger });
+    return new BucketHandle(name, this.services.remote, this.services.blobs, bucketSettings(this.config, name, this.services.logger));
   }
 
   getBlobCacheStats() {

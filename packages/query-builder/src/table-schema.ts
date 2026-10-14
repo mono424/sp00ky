@@ -155,6 +155,8 @@ export interface BucketDefinitionSchema {
   readonly maxSize?: number;
   readonly allowedExtensions?: readonly string[];
   readonly pathPrefixAuth?: boolean;
+  /** `'r2'`: the files live with the SSP, not in SurrealDB (`BACKEND "r2"`). */
+  readonly backend?: 'r2';
 }
 
 // ============================================================================

@@ -32,7 +32,7 @@ import { sha256Hex } from '../utils/sha256';
 import { leaveViewsBeacon, listRefLive } from '../query/sql';
 import { hashOfEdge, rowOfEdge } from '../utils/edges';
 import { mintMutationId } from '../mutation/mutation-id';
-import { BucketHandle, bucketContentToBlob } from './bucket-handle';
+import { BucketHandle, bucketContentToBlob, bucketSettings } from './bucket-handle';
 
 const LAST_BUCKET_KEY = 'sp00ky:last_bucket';
 
@@ -157,7 +157,7 @@ export function createServices<S extends SchemaStructure>(config: Sp00kyConfig<S
   const local = createLocalEngine(config.localEngine, config.database, logger, { shared: tabsSupport.supported });
   const remote = new RemoteDatabaseService(config.database, logger);
   const connectionSupervisor = new ConnectionSupervisor(remote, logger);
-  const rawBucket = (name: string) => new BucketHandle(name, remote, null, { blurhash: config.blurhash, logger });
+  const rawBucket = (name: string) => new BucketHandle(name, remote, null, bucketSettings(config, name, logger));
   const blobs = createBlobCache({
     local,
     namespace: ANON_USER_ID,

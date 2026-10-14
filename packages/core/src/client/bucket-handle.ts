@@ -34,6 +34,143 @@ export interface BucketPutResult {
 interface BucketHandleSettings {
   blurhash?: BlurhashSetting;
   logger?: { warn: (obj: unknown, msg?: string) => void };
+  /** The bucket's backend as generated (`'r2'`: files live with the SSP). */
+  backend?: string;
+  /** {@link Sp00kyConfig.files}: where `r2` bucket files are read and written. */
+  files?: { endpoint?: string };
+}
+
+/** A handle's settings from the client config and the bucket's generated schema. */
+export function bucketSettings(
+  config: { blurhash?: BlurhashSetting; files?: { endpoint?: string }; schema: { buckets?: readonly { name: string; backend?: string }[] } },
+  name: string,
+  logger: { warn: (obj: unknown, msg?: string) => void }
+): BucketHandleSettings {
+  const backend = config.schema.buckets?.find((b) => b.name === name)?.backend;
+  return { blurhash: config.blurhash, logger, backend, files: config.files };
+}
+
+/** Where a bucket's bytes go: SurrealDB itself, or the SSP for `r2` buckets. */
+interface BucketIo {
+  put(path: string, content: string | Uint8Array | Blob): Promise<void>;
+  /** The file, or null when it does not exist. */
+  get(path: string): Promise<unknown>;
+  delete(path: string): Promise<void>;
+  exists(path: string): Promise<boolean>;
+  head(path: string): Promise<Record<string, unknown>>;
+  copy(sourcePath: string, targetPath: string): Promise<void>;
+  rename(sourcePath: string, targetPath: string): Promise<void>;
+  list(prefix: string): Promise<string[]>;
+}
+
+/** `f"bucket:/path"` statements over the database connection. */
+function surrealIo(bucket: string, remote: RemoteDatabaseService): BucketIo {
+  const file = (path: string) => `f"${bucket}:/${path}"`;
+  return {
+    async put(path, content) {
+      await remote.query(`RETURN ${file(path)}.put($content);`, { content });
+    },
+    async get(path) {
+      const [result] = await remote.query<[unknown]>(`RETURN ${file(path)}.get();`);
+      return result;
+    },
+    async delete(path) {
+      await remote.query(`RETURN ${file(path)}.delete();`);
+    },
+    async exists(path) {
+      const [result] = await remote.query<[boolean]>(`RETURN ${file(path)}.exists();`);
+      return result;
+    },
+    async head(path) {
+      const [result] = await remote.query<[Record<string, unknown>]>(`RETURN ${file(path)}.head();`);
+      return result;
+    },
+    async copy(sourcePath, targetPath) {
+      await remote.query(`RETURN ${file(sourcePath)}.copy($target);`, { target: targetPath });
+    },
+    async rename(sourcePath, targetPath) {
+      await remote.query(`RETURN ${file(sourcePath)}.rename($target);`, { target: targetPath });
+    },
+    async list(prefix) {
+      const [result] = await remote.query<[string[]]>(`RETURN ${file(prefix)}.list();`);
+      return result;
+    },
+  };
+}
+
+/**
+ * `BACKEND "r2"` buckets: the SSP keeps the files (R2 on Cloudflare, a
+ * directory under `spky dev`) and serves them at `/bucket/<name>/<key>`,
+ * after asking SurrealDB, as the signed-in user, whether the bucket's
+ * PERMISSIONS clause allows it. The request carries the session's token.
+ */
+function sspIo(bucket: string, remote: RemoteDatabaseService, endpoint: string | undefined): BucketIo {
+  const base = () => {
+    if (!endpoint) {
+      throw new Error(
+        `Bucket '${bucket}' is stored with the SSP (BACKEND "r2"): set \`files.endpoint\` in the client config to the SSP's URL.`
+      );
+    }
+    return endpoint.replace(/\/+$/, '');
+  };
+  const url = (path: string) =>
+    `${base()}/bucket/${encodeURIComponent(bucket)}/${path
+      .split('/')
+      .filter(Boolean)
+      .map(encodeURIComponent)
+      .join('/')}`;
+  const send = async (method: string, path: string, body?: BodyInit, contentType?: string): Promise<Response> => {
+    const headers: Record<string, string> = {};
+    const token = remote.getAuthToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (contentType) headers['Content-Type'] = contentType;
+    const response = await fetch(url(path), { method, headers, body, credentials: 'omit' });
+    if (!response.ok && response.status !== 404) {
+      let message = response.statusText;
+      try {
+        message = ((await response.json()) as { error?: string }).error ?? message;
+      } catch {
+        // Not JSON: keep the status text.
+      }
+      throw new Error(`Bucket '${bucket}' ${method} ${path} failed (${response.status}): ${message}`);
+    }
+    return response;
+  };
+  const op = async <T>(path: string, body: Record<string, unknown>): Promise<T | null> => {
+    const response = await send('POST', path, JSON.stringify(body), 'application/json');
+    if (response.status === 404) return null;
+    return (await response.json()) as T;
+  };
+  const missing = (path: string) => new Error(`Bucket '${bucket}': no file at ${path}`);
+  return {
+    async put(path, content) {
+      const type = content instanceof Blob ? content.type : undefined;
+      await send('PUT', path, content as BodyInit, type || 'application/octet-stream');
+    },
+    async get(path) {
+      const response = await send('GET', path);
+      return response.status === 404 ? null : await response.blob();
+    },
+    async delete(path) {
+      await send('DELETE', path);
+    },
+    async exists(path) {
+      return (await op<boolean>(path, { op: 'exists' })) ?? false;
+    },
+    async head(path) {
+      return (await op<Record<string, unknown>>(path, { op: 'head' })) as Record<string, unknown>;
+    },
+    async copy(sourcePath, targetPath) {
+      if ((await op(sourcePath, { op: 'copy', target: targetPath })) === null) throw missing(sourcePath);
+    },
+    async rename(sourcePath, targetPath) {
+      if ((await op(sourcePath, { op: 'rename', target: targetPath })) === null) throw missing(sourcePath);
+    },
+    async list() {
+      // SurrealDB refuses `list` to record users; the SSP does too.
+      throw new Error(`Bucket '${bucket}': listing is not available (BACKEND "r2")`);
+    },
+  };
 }
 
 /**
@@ -45,13 +182,20 @@ interface BucketHandleSettings {
 const missingBlurhash = new Set<string>();
 
 export class BucketHandle {
+  private io: BucketIo;
+
   constructor(
     private bucketName: string,
-    private remote: RemoteDatabaseService,
+    remote: RemoteDatabaseService,
     /** Absent on the raw handle the cache itself reads through. */
     private blobs?: BlobCache | null,
     private settings?: BucketHandleSettings
-  ) {}
+  ) {
+    this.io =
+      settings?.backend === 'r2'
+        ? sspIo(bucketName, remote, settings.files?.endpoint)
+        : surrealIo(bucketName, remote);
+  }
 
   /** Effective blurhash setting: per-call option > client config > default ON. */
   private resolveBlurhash(option?: BlurhashSetting): BlurhashEncodeOptions | null {
@@ -73,7 +217,7 @@ export class BucketHandle {
         ? encodeImageToBlurhash(content, encodeOptions)
         : Promise.resolve(null);
 
-    await this.remote.query(`RETURN f"${this.bucketName}:/${path}".put($content);`, { content });
+    await this.io.put(path, content);
     // A path can be overwritten, so anything cached under it is now wrong.
     await this.blobs?.invalidate({ bucket: this.bucketName, path });
 
@@ -84,9 +228,7 @@ export class BucketHandle {
       hash = await hashPromise;
       if (hash) {
         const sidecar = blurhashSidecarPath(path);
-        await this.remote.query(`RETURN f"${this.bucketName}:/${sidecar}".put($content);`, {
-          content: hash,
-        });
+        await this.io.put(sidecar, hash);
         await this.blobs?.invalidate({ bucket: this.bucketName, path: sidecar });
         missingBlurhash.delete(`${this.bucketName}:${path}`);
       }
@@ -128,10 +270,7 @@ export class BucketHandle {
   }
 
   async get(path: string): Promise<unknown> {
-    const [result] = await this.remote.query<[unknown]>(
-      `RETURN f"${this.bucketName}:/${path}".get();`
-    );
-    return result;
+    return this.io.get(path);
   }
 
   /**
@@ -174,14 +313,14 @@ export class BucketHandle {
   }
 
   async delete(path: string): Promise<void> {
-    await this.remote.query(`RETURN f"${this.bucketName}:/${path}".delete();`);
+    await this.io.delete(path);
     await this.blobs?.invalidate({ bucket: this.bucketName, path });
     // Symmetry with put: an image's blurhash sidecar dies with it. Best-effort,
     // the sidecar may simply not exist.
     if (isImagePath(path)) {
       const sidecar = blurhashSidecarPath(path);
       try {
-        await this.remote.query(`RETURN f"${this.bucketName}:/${sidecar}".delete();`);
+        await this.io.delete(sidecar);
         await this.blobs?.invalidate({ bucket: this.bucketName, path: sidecar });
       } catch {
         // Nothing to clean up.
@@ -191,37 +330,23 @@ export class BucketHandle {
   }
 
   async exists(path: string): Promise<boolean> {
-    const [result] = await this.remote.query<[boolean]>(
-      `RETURN f"${this.bucketName}:/${path}".exists();`
-    );
-    return result;
+    return this.io.exists(path);
   }
 
   async head(path: string): Promise<Record<string, unknown>> {
-    const [result] = await this.remote.query<[Record<string, unknown>]>(
-      `RETURN f"${this.bucketName}:/${path}".head();`
-    );
-    return result;
+    return this.io.head(path);
   }
 
   async copy(sourcePath: string, targetPath: string): Promise<void> {
-    await this.remote.query(`RETURN f"${this.bucketName}:/${sourcePath}".copy($target);`, {
-      target: targetPath,
-    });
+    await this.io.copy(sourcePath, targetPath);
   }
 
   async rename(sourcePath: string, targetPath: string): Promise<void> {
-    await this.remote.query(`RETURN f"${this.bucketName}:/${sourcePath}".rename($target);`, {
-      target: targetPath,
-    });
+    await this.io.rename(sourcePath, targetPath);
   }
 
   async list(prefix?: string): Promise<string[]> {
-    const p = prefix ?? '';
-    const [result] = await this.remote.query<[string[]]>(
-      `RETURN f"${this.bucketName}:/${p}".list();`
-    );
-    return result;
+    return this.io.list(prefix ?? '');
   }
 }
 

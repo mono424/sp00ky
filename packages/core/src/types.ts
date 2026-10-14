@@ -372,6 +372,14 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    */
   blurhash?: boolean | { componentX?: number; componentY?: number };
   /**
+   * Buckets declared `BACKEND "r2"` keep their files with the SSP (R2 on
+   * Cloudflare, a directory under `spky dev`) instead of in SurrealDB, which
+   * on Surreal Cloud can only hold memory buckets. `endpoint` is the SSP's
+   * URL: `spky dev` and `spky deploy` hand it to Vite as
+   * `VITE_SPKY_FILES_ENDPOINT`.
+   */
+  files?: { endpoint?: string };
+  /**
    * Deadline (ms) for a single outgoing mutation push. Tighter than
    * {@link Sp00kyConfig.database.queryTimeoutMs} because the up-queue drains
    * one mutation at a time behind an `isSyncingUp` flag: a push that never

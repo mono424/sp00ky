@@ -17,6 +17,18 @@ deployment:
 export const codePersistentBucket = `DEFINE BUCKET IF NOT EXISTS uploads BACKEND "file:/buckets/uploads"
   PERMISSIONS WHERE $auth.id != NONE;`;
 
+export const codeR2Bucket = `DEFINE BUCKET IF NOT EXISTS profile_pictures BACKEND "r2"
+  PERMISSIONS WHERE $action NOT IN ['put'] OR $auth.id != NONE
+  COMMENT 'sp00ky:maxSize=5242880';`;
+
+export const codeR2Client = `export const dbConfig: SyncedDbConfig<typeof schema> = {
+  schema,
+  schemaSurql: SURQL_SCHEMA,
+  // Where r2 bucket files are read and written: the SSP.
+  files: { endpoint: import.meta.env.VITE_SPKY_FILES_ENDPOINT },
+  database: { /* ... */ },
+};`;
+
 export const code10 = `DEFINE BUCKET IF NOT EXISTS profile_pictures BACKEND "memory"
   PERMISSIONS WHERE
     $action NOT IN ['put']
@@ -214,6 +226,46 @@ match.
   storage above that is billed per GB-month. See
   [Deploying → Bucket Storage](/docs/cloud/deploying#bucket-storage).
 
+## R2 storage (any database)
+
+A SurrealDB bucket keeps its files wherever its server can, and some servers
+can only keep them in memory: **Surreal Cloud allows only the memory
+backend**, so files there vanish when the database restarts while the rows
+pointing at them stay. Declare such a bucket `BACKEND "r2"` and the SSP keeps
+the files instead:
+
+<CodeBlock
+  code={codeR2Bucket}
+  lang="sql"
+/>
+
+- **On the free plan (Cloudflare)**, `spky deploy` asks for an R2 bucket bound
+  to the project's SSP Worker, and bakes the Worker's URL into the frontend
+  build as `VITE_SPKY_FILES_ENDPOINT`.
+- **Locally**, `spky dev` keeps the files in the SSP's data directory and sets
+  `VITE_SPKY_FILES_ENDPOINT` to the local SSP.
+- **The client** reads and writes the files over HTTP at
+  `<endpoint>/bucket/<name>/<path>` with the signed-in user's token. Pass the
+  endpoint in the client config; the bucket API (`put`, `read`, `url`,
+  `BucketImage`, ...) is unchanged.
+
+<CodeBlock
+  code={codeR2Client}
+  lang="ts"
+/>
+
+**Permissions** stay SurrealDB's: the bucket's `PERMISSIONS` clause becomes
+`fn::_00_bucket::<name>($action, $file, $target)`, and the SSP calls it as the
+requesting user before every operation, so `$auth`, `$action`, `$file` and
+`$target` mean what they mean in the clause. Two differences from a SurrealDB
+bucket: the clause runs with the user's table permissions (SurrealDB evaluates
+a bucket clause with them off), and signed-out requests are refused. Listing
+an `r2` bucket is refused, as SurrealDB refuses it to record users.
+
+`spky bucket backend <name> r2` switches an existing bucket. The R2 backend is
+served by the free plan's Cloudflare SSP; on other plans use a
+[persistent](#persistent-storage) `file:` backend.
+
 ## CLI: Adding a Bucket
 
 The fastest way to add a bucket is with the CLI:
@@ -340,6 +392,6 @@ await bucket.evict('old.png');  // drop locally, leave the remote file alone`}
 
 ## Current Limitations
 
-- **Memory or disk**: a bucket is either in memory (lost on restart) or on the project's [persistent volume](#persistent-storage). Object-store backends (S3 and the like) are planned.
+- **Memory, disk or R2**: a bucket is in memory (lost on restart), on the project's [persistent volume](#persistent-storage), or in [R2](#r2-storage-any-database) behind the SSP. S3 and other object stores are planned.
 - **No streaming**: Files are uploaded and downloaded as complete blobs. No chunked upload or progress tracking yet.
 - **No transactions**: Bucket operations do not participate in database transactions.

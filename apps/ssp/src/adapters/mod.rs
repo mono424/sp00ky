@@ -8,6 +8,7 @@
 mod backend_health;
 mod db;
 mod http;
+mod object_store;
 mod scheduler;
 mod spawn;
 mod telemetry;
@@ -15,6 +16,7 @@ mod telemetry;
 pub use backend_health::MaintenanceBackendHealth;
 pub use db::SurrealSdkDb;
 pub use http::ReqwestHttp;
+pub use object_store::DirObjectStore;
 pub use scheduler::TokioScheduler;
 pub use spawn::TokioSpawner;
 pub use telemetry::OtelTelemetry;

@@ -25,14 +25,20 @@ use wasm_bindgen_futures::spawn_local;
 use worker::*;
 
 use ssp::circuit::Circuit;
+use ssp_node::bucket::BucketService;
 use ssp_node::ports::{
     CancelWatch, CircuitStore, CircuitStoreError, HttpClient, HttpError, LocalBoxFuture,
-    OutboundRequest, OutboundResponse, ResumePoint, Scheduler, Spawner, TimerKind,
+    ObjectMeta, ObjectStore, ObjectStoreError, OutboundRequest, OutboundResponse, ResumePoint,
+    Scheduler, Spawner, StoredObject, TimerKind,
 };
 use ssp_node::{
     now_epoch_ms, ApiBody, HttpSqlDb, Method as ApiMethod, NoopTelemetry, Platform, Runtime,
     SspNode, SspStatus, TimerMux,
 };
+
+/// The R2 binding holding the files of `BACKEND "r2"` buckets, bound by the
+/// control plane when the project declares one.
+const FILES_BINDING: &str = "SPKY_FILES";
 
 const CIRCUIT_BLOB_KEY: &str = "ssp:circuit_blob";
 const RESUME_POINT_KEY: &str = "ssp:resume_point";
@@ -187,6 +193,84 @@ fn map_method(m: ApiMethod) -> Method {
         ApiMethod::Put => Method::Put,
         ApiMethod::Delete => Method::Delete,
     }
+}
+
+/// `ObjectStore` over an R2 binding: the files of `BACKEND "r2"` buckets.
+struct R2Store(Bucket);
+
+fn r2_err(e: worker::Error) -> ObjectStoreError {
+    ObjectStoreError::Transport(e.to_string())
+}
+
+fn r2_meta(object: &Object) -> ObjectMeta {
+    ObjectMeta {
+        size: object.size(),
+        content_type: object.http_metadata().content_type,
+        updated_epoch_ms: Some(object.uploaded().as_millis()),
+    }
+}
+
+#[async_trait(?Send)]
+impl ObjectStore for R2Store {
+    async fn get(&self, key: &str) -> std::result::Result<Option<StoredObject>, ObjectStoreError> {
+        let Some(object) = self.0.get(key).execute().await.map_err(r2_err)? else {
+            return Ok(None);
+        };
+        let meta = r2_meta(&object);
+        let Some(body) = object.body() else { return Ok(None) };
+        let bytes = body.bytes().await.map_err(r2_err)?;
+        Ok(Some(StoredObject { meta, body: bytes.into() }))
+    }
+
+    async fn head(&self, key: &str) -> std::result::Result<Option<ObjectMeta>, ObjectStoreError> {
+        Ok(self.0.head(key).await.map_err(r2_err)?.as_ref().map(r2_meta))
+    }
+
+    async fn put(&self, key: &str, body: bytes::Bytes, content_type: &str) -> std::result::Result<(), ObjectStoreError> {
+        self.0
+            .put(key, body.to_vec())
+            .http_metadata(HttpMetadata { content_type: Some(content_type.to_string()), ..Default::default() })
+            .execute()
+            .await
+            .map_err(r2_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> std::result::Result<(), ObjectStoreError> {
+        self.0.delete(key).await.map_err(r2_err)
+    }
+}
+
+/// `/bucket/*` (see `ssp_node::bucket`), answered by this isolate itself: no
+/// node state is involved, and going through the Durable Object would queue
+/// every upload behind ingest on its single thread.
+async fn bucket_route(mut req: Request, env: &Env) -> Result<Response> {
+    if req.method() == Method::Options {
+        return to_worker_response(BucketService::preflight());
+    }
+    let Ok(files) = env.bucket(FILES_BINDING) else {
+        return Response::error("no R2 bucket bound to this SSP (SPKY_FILES)", 501);
+    };
+    let Some(method) = map_incoming_method(&req.method()) else {
+        return Response::error("method not allowed", 405);
+    };
+    let var = |k: &str| env.var(k).map(|v| v.to_string()).unwrap_or_default();
+    let service = BucketService::new(
+        Arc::new(R2Store(files)),
+        Arc::new(CfHttp),
+        var("SPKY_DB_URL"),
+        var("SPKY_DB_NS"),
+        var("SPKY_DB_DB"),
+    );
+    let bearer = req
+        .headers()
+        .get("Authorization")
+        .ok()
+        .flatten()
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let body = req.bytes().await.unwrap_or_default();
+    let api_req = ssp_node::ApiRequest { method, path: req.path(), bearer, body: body.into() };
+    to_worker_response(service.handle(api_req).await)
 }
 
 fn map_incoming_method(m: &Method) -> Option<ApiMethod> {
@@ -460,6 +544,7 @@ fn to_worker_response(resp: ssp_node::ApiResponse) -> Result<Response> {
     let (content_type, bytes) = match resp.body {
         ApiBody::Json(v) => ("application/json".to_string(), v.to_string().into_bytes()),
         ApiBody::Text { content_type, body } => (content_type.to_string(), body.into_bytes()),
+        ApiBody::Bytes { content_type, body } => (content_type, body.to_vec()),
     };
     let mut builder = ResponseBuilder::new().with_status(resp.status);
     for (name, value) in &resp.headers {
@@ -475,6 +560,9 @@ fn to_worker_response(resp: ssp_node::ApiResponse) -> Result<Response> {
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    if BucketService::handles(&req.path()) {
+        return bucket_route(req, &env).await;
+    }
     let name = req
         .headers()
         .get("X-Spooky-Project")

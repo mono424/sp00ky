@@ -287,8 +287,9 @@ where
     match node.route(api_req).await {
         Some(resp) => {
             let (content_type, body_bytes) = match resp.body {
-                ApiBody::Json(v) => ("application/json".to_string(), v.to_string()),
-                ApiBody::Text { content_type, body } => (content_type.to_string(), body),
+                ApiBody::Json(v) => ("application/json".to_string(), Bytes::from(v.to_string())),
+                ApiBody::Text { content_type, body } => (content_type.to_string(), Bytes::from(body)),
+                ApiBody::Bytes { content_type, body } => (content_type, body),
             };
             let mut builder = Response::builder().status(resp.status);
             for (name, value) in &resp.headers {
@@ -296,7 +297,7 @@ where
             }
             builder
                 .header(hyper::header::CONTENT_TYPE, content_type)
-                .body(Full::new(Bytes::from(body_bytes)))
+                .body(Full::new(body_bytes))
                 .unwrap_or_else(|_| status_only(500))
         }
         None => status_only(404),

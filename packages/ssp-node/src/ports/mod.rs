@@ -15,6 +15,7 @@ mod backend_health;
 mod circuit_store;
 mod db;
 mod http;
+mod object_store;
 mod scheduler;
 mod spawn;
 mod telemetry;
@@ -26,6 +27,7 @@ pub use circuit_store::{CircuitStore, CircuitStoreError, NoopCircuitStore, Resum
 pub use circuit_store::DiskCircuitStore;
 pub use db::{Db, DbConnection, DbError};
 pub use http::{CancelHandle, CancelWatch, HttpClient, HttpError, OutboundRequest, OutboundResponse};
+pub use object_store::{MemoryObjectStore, ObjectMeta, ObjectStore, ObjectStoreError, StoredObject};
 pub use scheduler::{Scheduler, TimerKind};
 pub use spawn::{LocalBoxFuture, Spawner};
 pub use telemetry::{NoopTelemetry, Telemetry};

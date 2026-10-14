@@ -1215,9 +1215,9 @@ dependencies = [
 
 [[package]]
 name = "loro"
-version = "1.13.6"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "221b567f34e3a7b38d05345b17797a7ca252d28e1fae479b4bb55c1a19616ddc"
+checksum = "e63def75cde167dbc652d21bc6f56e2dc44ce90a5332eb900c42c51ad0e5ed46"
 dependencies = [
  "enum-as-inner 0.6.1",
  "generic-btree",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "push-core"
-version = "0.0.1-canary.313"
+version = "0.0.1-canary.330"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2009,6 +2009,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "schedule-core"
@@ -2247,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.0.1-canary.313"
+version = "0.0.1-canary.330"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2275,9 +2281,10 @@ dependencies = [
 
 [[package]]
 name = "ssp-cf"
-version = "0.0.1-canary.313"
+version = "0.0.1-canary.330"
 dependencies = [
  "async-trait",
+ "bytes",
  "console_error_panic_hook",
  "getrandom 0.3.4",
  "serde",
@@ -2295,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-node"
-version = "0.0.1-canary.313"
+version = "0.0.1-canary.330"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2305,9 +2312,11 @@ dependencies = [
  "loro",
  "lru",
  "push-core",
+ "ryu-js",
  "schedule-core",
  "serde",
  "serde_json",
+ "sha2",
  "ssp",
  "ssp-protocol",
  "thiserror 2.0.18",
@@ -2318,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-protocol"
-version = "0.0.1-canary.313"
+version = "0.0.1-canary.330"
 dependencies = [
  "blake3",
  "serde",

@@ -104,6 +104,9 @@ pub struct AppState {
     /// Cluster row checkpoints, for the write a promotion out of standby
     /// schedules (see `node_fallback`). `None` standalone or without a dir.
     pub row_checkpoints: Option<Arc<warm::RowCheckpoints>>,
+    /// Files of `BACKEND "r2"` buckets (`/bucket/*`, see `ssp_node::bucket`),
+    /// kept under `SPKY_BUCKET_DIR`. `None` when that is unset.
+    pub buckets: Option<Arc<ssp_node::bucket::BucketService>>,
 }
 
 // --- Request/Response DTOs ---
@@ -749,6 +752,9 @@ pub fn create_app(state: AppState) -> Router {
 /// (`/version`, `/log`, `/reset`, `/job/*`). Auth and CORS for these routes
 /// live in `SspNode::route` — this shim only shuffles bytes.
 async fn node_fallback(State(state): State<AppState>, req: Request) -> Response {
+    if ssp_node::bucket::BucketService::handles(req.uri().path()) {
+        return bucket_route(&state, req).await;
+    }
     let method = match *req.method() {
         axum::http::Method::GET => ssp_node::Method::Get,
         axum::http::Method::POST => ssp_node::Method::Post,
@@ -788,17 +794,73 @@ async fn node_fallback(State(state): State<AppState>, req: Request) -> Response 
             for (name, value) in &resp.headers {
                 builder = builder.header(*name, value);
             }
-            let (content_type, body_bytes) = match resp.body {
-                ssp_node::ApiBody::Json(v) => ("application/json", v.to_string()),
-                ssp_node::ApiBody::Text { content_type, body } => (content_type, body),
-            };
-            builder
-                .header(axum::http::header::CONTENT_TYPE, content_type)
-                .body(axum::body::Body::from(body_bytes))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            api_response(builder, resp.body)
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn api_response(builder: axum::http::response::Builder, body: ssp_node::ApiBody) -> Response {
+    let (content_type, body) = match body {
+        ssp_node::ApiBody::Json(v) => ("application/json".to_string(), axum::body::Body::from(v.to_string())),
+        ssp_node::ApiBody::Text { content_type, body } => (content_type.to_string(), axum::body::Body::from(body)),
+        ssp_node::ApiBody::Bytes { content_type, body } => (content_type, axum::body::Body::from(body)),
+    };
+    builder
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `/bucket/*`: files of `r2` buckets (see `ssp_node::bucket`). Public routes
+/// (the caller's own SurrealDB token decides), so they sit outside the node's
+/// bearer check.
+async fn bucket_route(state: &AppState, req: Request) -> Response {
+    let respond = |resp: ssp_node::ApiResponse| {
+        let mut builder = Response::builder().status(resp.status);
+        for (name, value) in &resp.headers {
+            builder = builder.header(*name, value);
+        }
+        api_response(builder, resp.body)
+    };
+    if req.method() == axum::http::Method::OPTIONS {
+        return respond(ssp_node::bucket::BucketService::preflight());
+    }
+    let Some(buckets) = state.buckets.as_ref() else {
+        return (StatusCode::NOT_IMPLEMENTED, "no bucket storage configured (SPKY_BUCKET_DIR)").into_response();
+    };
+    let method = match *req.method() {
+        axum::http::Method::GET => ssp_node::Method::Get,
+        axum::http::Method::POST => ssp_node::Method::Post,
+        axum::http::Method::PUT => ssp_node::Method::Put,
+        axum::http::Method::DELETE => ssp_node::Method::Delete,
+        _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    };
+    let path = req.uri().path().to_string();
+    let bearer = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+    let body = match axum::body::to_bytes(req.into_body(), ssp_node::bucket::DEFAULT_MAX_UPLOAD_BYTES + 1).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    respond(buckets.handle(ssp_node::ApiRequest { method, path, bearer, body }).await)
+}
+
+/// The `r2` bucket service over `SPKY_BUCKET_DIR`, or `None` when unset.
+fn bucket_service(config: &Config, platform: &ssp_node::Platform) -> Option<Arc<ssp_node::bucket::BucketService>> {
+    let dir = std::env::var("SPKY_BUCKET_DIR").ok().filter(|d| !d.trim().is_empty())?;
+    info!(dir = %dir, "Serving r2 bucket files from a directory");
+    Some(Arc::new(ssp_node::bucket::BucketService::new(
+        Arc::new(adapters::DirObjectStore::new(dir)),
+        Arc::clone(&platform.http),
+        config.db_addr.clone(),
+        config.db_ns.clone(),
+        config.db_db.clone(),
+    )))
 }
 
 
@@ -1188,6 +1250,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         node: Arc::clone(&node),
         route_options,
         row_checkpoints: row_checkpoints.clone(),
+        buckets: bucket_service(&config, &platform),
     };
 
     let publication_for_heartbeat = state.edge_update_tx.clone();

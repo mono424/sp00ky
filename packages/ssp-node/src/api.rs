@@ -40,6 +40,8 @@ pub struct ApiResponse {
 pub enum ApiBody {
     Json(serde_json::Value),
     Text { content_type: &'static str, body: String },
+    /// Raw bytes, e.g. a bucket file (`crate::bucket`).
+    Bytes { content_type: String, body: Bytes },
 }
 
 impl ApiResponse {

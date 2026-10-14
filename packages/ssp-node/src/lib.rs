@@ -21,6 +21,7 @@
 pub mod allowlist_state;
 pub mod api;
 pub mod bootstrap;
+pub mod bucket;
 pub mod config;
 pub mod db_retry;
 pub mod crdt;

@@ -2830,12 +2830,29 @@ impl BackendProcessor {
         // never rewrite it here. We only warn when the authored backend is
         // inconsistent with the storage setting so the mismatch is visible.
         let storage_enabled = config.bucket_storage_gb().is_some();
+        let external_db = matches!(
+            config.surrealdb,
+            Some(SurrealDbConfig::Full { hosting: Some(HostingMode::External), .. })
+        );
         for path_str in &config.buckets {
             let bucket_path = base_dir.join(path_str);
             let bucket_content = fs::read_to_string(&bucket_path)
                 .context(format!("Failed to read bucket file: {:?}", bucket_path))?;
             for (bucket_name, backend) in detect_bucket_backends(&bucket_content) {
-                if storage_enabled && backend.eq_ignore_ascii_case("memory") {
+                if external_db && backend.eq_ignore_ascii_case("memory") {
+                    // An external DB we don't manage keeps memory buckets in
+                    // process memory: every file is gone after its next
+                    // restart, while the rows that point at them stay.
+                    // Surreal Cloud allows no other backend (no global
+                    // bucket, `file:` is denied).
+                    crate::ui::warn(format!(
+                        "Bucket '{}' uses the memory backend on an external SurrealDB; \
+                         its files are lost whenever that database restarts. Host the \
+                         database on Sp00ky Cloud with deployment.storage.sizeGB for \
+                         persistent files.",
+                        bucket_name
+                    ));
+                } else if storage_enabled && backend.eq_ignore_ascii_case("memory") {
                     crate::ui::warn(format!(
                         "Bucket '{}' uses the memory backend; files won't persist. \
                          Run `spky bucket backend {} persistent` to store them on disk.",

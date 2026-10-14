@@ -1955,6 +1955,9 @@ fn start_ssp(spec: &SspLaunchSpec, step: Option<&ui::Step>) -> Result<LogTailGua
                 anon_live,
                 "-e".into(),
                 "SPKY_LOG_FORMAT=compact".into(),
+                // Files of `BACKEND "r2"` buckets, on the data mount.
+                "-e".into(),
+                "SPKY_BUCKET_DIR=/data/buckets".into(),
             ];
             if spec.cluster {
                 args.push("-e".into());
@@ -2001,6 +2004,8 @@ fn start_ssp(spec: &SspLaunchSpec, step: Option<&ui::Step>) -> Result<LogTailGua
                 .env("SPKY_SSP_REF_MODE", &spec.ref_mode)
                 .env("SPKY_SSP_ANON_LIVE_QUERIES", &spec.anon_live)
                 .env("SPKY_LOG_FORMAT", "compact")
+                // Files of `BACKEND "r2"` buckets.
+                .env("SPKY_BUCKET_DIR", spec.data_dir.join("buckets"))
                 // The container Dockerfile binds 0.0.0.0:8667; on host we need
                 // the same port reachable from frontend dev servers and
                 // (optionally) the docker-side scheduler.
@@ -2571,6 +2576,12 @@ fn build_spky_dev_vars(
         ("SPKY_DB_USER".into(), resolved_surreal.username_literal()),
         ("SPKY_DB_PASS".into(), resolved_surreal.password_literal()),
         ("SPKY_SSP_ADDR".into(), format!("localhost:{}", SSP_PORT)),
+        // Where the client reads and writes `BACKEND "r2"` bucket files: the
+        // SSP (`/bucket/*`). Vite exposes only `VITE_*` to the browser.
+        (
+            "VITE_SPKY_FILES_ENDPOINT".into(),
+            format!("http://localhost:{}", SSP_PORT),
+        ),
     ];
     if *mode == DeployMode::Cluster {
         vars.push((

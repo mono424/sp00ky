@@ -153,6 +153,28 @@ fn derive_db_ws_endpoint(api_url: &str, slug: &str) -> Option<String> {
     }
 }
 
+/// The free plan's SSP Worker, where the client reads and writes `r2` bucket
+/// files (the control plane attaches it as `{slug}.db.<app domain>`).
+/// api-stg.sp00ky.cloud → https://{slug}.db.stg.spky.cloud
+/// api.sp00ky.cloud → https://{slug}.db.spky.cloud
+fn derive_cf_ssp_url(api_url: &str, slug: &str) -> Option<String> {
+    let host = api_url
+        .strip_prefix("https://")
+        .or(api_url.strip_prefix("http://"))?
+        .split('/')
+        .next()?;
+    if let Some(stage) = host
+        .strip_prefix("api-")
+        .and_then(|h| h.strip_suffix(".sp00ky.cloud"))
+    {
+        Some(format!("https://{}.db.{}.spky.cloud", slug, stage))
+    } else if host.ends_with(".sp00ky.cloud") {
+        Some(format!("https://{}.db.spky.cloud", slug))
+    } else {
+        None
+    }
+}
+
 /// Derive the upload URL for large files (bypasses Cloudflare proxy).
 /// Converts "https://api-stg.sp00ky.cloud" → "https://upload-stg.spky.cloud"
 /// Falls back to the API URL if no upload domain can be derived.
@@ -2042,6 +2064,7 @@ fn deploy_static_frontend_cloudflare(
     db_endpoint: Option<&str>,
     db_ns: Option<&str>,
     db_db: Option<&str>,
+    files_endpoint: Option<&str>,
 ) -> Result<()> {
     let deploy = frontend_app
         .deploy
@@ -2073,6 +2096,12 @@ fn deploy_static_frontend_cloudflare(
         }
         if db_ns.is_some() || db_db.is_some() {
             println!("  DB ns/db: {}/{}", db_ns.unwrap_or("-"), db_db.unwrap_or("-"));
+        }
+        // `r2` bucket files go through the SSP Worker. A value the caller
+        // exported (a custom domain) wins.
+        if let Some(files) = files_endpoint.filter(|_| std::env::var_os("VITE_SPKY_FILES_ENDPOINT").is_none()) {
+            cmd.env("VITE_SPKY_FILES_ENDPOINT", files);
+            println!("  Files endpoint: {}", files);
         }
         let status = cmd
             .stdout(std::process::Stdio::inherit())
@@ -2900,6 +2929,7 @@ pub fn deploy(
             .get("database")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let files_endpoint = derive_cf_ssp_url(&client.base_url, &slug);
         deploy_static_frontend_cloudflare(
             &client,
             &pid,
@@ -2910,6 +2940,7 @@ pub fn deploy(
             db_endpoint.as_deref(),
             db_ns.as_deref(),
             db_db.as_deref(),
+            files_endpoint.as_deref(),
         )?;
         } else {
         let frontend_deploy = frontend_app
@@ -3252,6 +3283,14 @@ pub fn deploy(
         .cloned()
         .collect();
 
+    let r2_buckets = crate::bucket::r2_bucket_names(&config, config_dir);
+    if !r2_buckets.is_empty() && platform != "cloudflare" {
+        crate::ui::warn(format!(
+            "Bucket(s) {} use the r2 backend, which only the free plan's Cloudflare SSP \
+             serves; on this plan use a file backend with deployment.storage.sizeGB.",
+            r2_buckets.join(", ")
+        ));
+    }
     let deploy_body = serde_json::json!({
         // Machine pools: ceilings and machine shapes, enforced control-plane side.
         // An older control plane simply ignores the key.
@@ -3285,6 +3324,9 @@ pub fn deploy(
         // `_00_list_ref` — signed-out sessions got no rows and no realtime, with
         // nothing logged on either side.
         "anonymous_live_queries": config.resolved_anonymous_live_queries(),
+        // `BACKEND "r2"` buckets: the control plane binds an R2 bucket to the
+        // SSP Worker (`SPKY_FILES`), which serves their files.
+        "r2_buckets": r2_buckets,
         // Partial deploy: control plane merges these apps over the previous
         // deployment instead of treating them as the complete desired set.
         "partial": is_partial,
@@ -3764,6 +3806,19 @@ fn report_version_skew(
 #[cfg(test)]
 mod version_skew_tests {
     use super::*;
+
+    #[test]
+    fn cf_ssp_url_follows_the_api_stage() {
+        assert_eq!(
+            derive_cf_ssp_url("https://api-stg.sp00ky.cloud", "threads-example").as_deref(),
+            Some("https://threads-example.db.stg.spky.cloud")
+        );
+        assert_eq!(
+            derive_cf_ssp_url("https://api.sp00ky.cloud/", "app").as_deref(),
+            Some("https://app.db.spky.cloud")
+        );
+        assert_eq!(derive_cf_ssp_url("http://localhost:8080", "app"), None);
+    }
     use std::collections::HashMap;
 
     fn versions(pairs: &[(&str, &str)]) -> HashMap<String, (String, String)> {

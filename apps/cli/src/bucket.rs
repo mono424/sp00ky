@@ -630,17 +630,21 @@ pub fn set_backend(
         Some(t) => t.to_lowercase(),
         None => Select::new(
             "Backend for this bucket:",
-            vec!["persistent".to_string(), "memory".to_string()],
+            vec!["persistent".to_string(), "memory".to_string(), R2_BACKEND.to_string()],
         )
-        .with_help_message("persistent = file backend on the storage volume; memory = in-RAM")
+        .with_help_message(
+            "persistent = file backend on the storage volume; memory = in-RAM; \
+             r2 = served by the SSP from R2 (any database, Surreal Cloud included)",
+        )
         .prompt()?,
     };
 
     let new_backend = match target.as_str() {
         "memory" => "memory".to_string(),
         "persistent" | "file" => crate::backend::bucket_backend_path(&name),
+        R2_BACKEND => R2_BACKEND.to_string(),
         other => bail!(
-            "Unknown backend '{}'. Use 'memory' or 'persistent'.",
+            "Unknown backend '{}'. Use 'memory', 'persistent' or 'r2'.",
             other
         ),
     };
@@ -679,9 +683,108 @@ pub fn set_backend(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+/// `BACKEND "r2"`: the SSP keeps the files (R2 on Cloudflare, a directory
+/// elsewhere, see `ssp_node::bucket`) and serves them over HTTP, so they
+/// survive on databases that can only hold memory buckets (Surreal Cloud).
+pub const R2_BACKEND: &str = "r2";
+
+/// Names of the `r2` buckets among the project's bucket files.
+pub fn r2_bucket_names(config: &crate::backend::Sp00kyConfig, base_dir: &Path) -> Vec<String> {
+    config
+        .buckets
+        .iter()
+        .filter_map(|path| fs::read_to_string(base_dir.join(path)).ok())
+        .flat_map(|content| crate::backend::detect_bucket_backends(&content))
+        .filter(|(_, backend)| backend.eq_ignore_ascii_case(R2_BACKEND))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The bucket definitions as the database gets them. SurrealDB knows no `r2`
+/// backend: such a bucket is defined there as a memory bucket (file pointers
+/// like `type::file(...)` need it to exist; it holds no files) and its
+/// PERMISSIONS clause becomes `fn::_00_bucket::<name>($action, $file,
+/// $target)`, which the SSP calls as the requesting user before each file
+/// operation. Every other bucket passes through unchanged.
+pub fn expand_r2_buckets(content: &str) -> String {
+    let block_re = Regex::new(
+        r#"(?is)(DEFINE\s+BUCKET\s+(?:OVERWRITE\s+|IF\s+NOT\s+EXISTS\s+)?(\w+)\s+BACKEND\s+)"r2"([^;]*);"#,
+    )
+    .expect("bucket regex");
+    let mut functions = Vec::new();
+    let expanded = block_re.replace_all(content, |c: &regex::Captures| {
+        functions.push(r2_permission_function(&c[2], &c[3]));
+        format!(r#"{}"memory"{};"#, &c[1], &c[3])
+    });
+    if functions.is_empty() {
+        return content.to_string();
+    }
+    let mut out = expanded.into_owned();
+    out.push_str("\n\n-- r2 buckets: their PERMISSIONS clauses, called by the SSP as the user.\n");
+    for function in functions {
+        out.push_str(&function);
+        out.push('\n');
+    }
+    out
+}
+
+/// `fn::_00_bucket::<name>` from the text after a bucket's backend
+/// (`PERMISSIONS ... COMMENT '...'`). No clause means NONE, as for SurrealDB.
+fn r2_permission_function(name: &str, rest: &str) -> String {
+    let clause_re = Regex::new(
+        r#"(?is)\bPERMISSIONS\s+(.*?)\s*(?:\bCOMMENT\s+(?:'[^']*'|"[^"]*")\s*)?$"#,
+    )
+    .expect("permissions regex");
+    let clause = clause_re
+        .captures(rest.trim())
+        .map(|c| c[1].trim().to_string())
+        .unwrap_or_default();
+    let where_re = Regex::new(r"(?is)^WHERE\s+(.+)$").expect("where regex");
+    let expr = if clause.eq_ignore_ascii_case("full") {
+        "true".to_string()
+    } else if let Some(c) = where_re.captures(&clause) {
+        format!("!!({})", c[1].trim())
+    } else {
+        "false".to_string()
+    };
+    format!(
+        "DEFINE FUNCTION OVERWRITE fn::_00_bucket::{name}($action: string, $file: any, $target: any) {{\n    RETURN {expr};\n}} PERMISSIONS FULL;"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2_buckets_become_memory_buckets_plus_a_permission_function() {
+        let src = r#"DEFINE BUCKET IF NOT EXISTS pics BACKEND "r2"
+  PERMISSIONS WHERE
+    $action NOT IN ['put']
+    OR string::ends_with(file::key($file), '.png')
+  COMMENT 'sp00ky:maxSize=5242880';
+DEFINE BUCKET open BACKEND "R2" PERMISSIONS FULL;
+DEFINE BUCKET shut BACKEND "r2";
+DEFINE BUCKET plain BACKEND "memory" PERMISSIONS FULL;
+"#;
+        let out = expand_r2_buckets(src);
+        assert!(out.contains(r#"DEFINE BUCKET IF NOT EXISTS pics BACKEND "memory""#));
+        assert!(out.contains("COMMENT 'sp00ky:maxSize=5242880';"));
+        assert!(!out.to_lowercase().contains(r#""r2""#));
+        assert!(out.contains(
+            "DEFINE FUNCTION OVERWRITE fn::_00_bucket::pics($action: string, $file: any, $target: any) {\n    RETURN !!($action NOT IN ['put']\n    OR string::ends_with(file::key($file), '.png'));\n} PERMISSIONS FULL;"
+        ));
+        assert!(out.contains("fn::_00_bucket::open($action: string, $file: any, $target: any) {\n    RETURN true;"));
+        assert!(out.contains("fn::_00_bucket::shut($action: string, $file: any, $target: any) {\n    RETURN false;"));
+        assert!(!out.contains("fn::_00_bucket::plain"));
+        assert!(out.contains(r#"DEFINE BUCKET plain BACKEND "memory" PERMISSIONS FULL;"#));
+    }
+
+    #[test]
+    fn content_without_r2_buckets_is_untouched() {
+        let src = "DEFINE BUCKET a BACKEND \"memory\" PERMISSIONS NONE;\n";
+        assert_eq!(expand_r2_buckets(src), src);
+    }
     use tempfile::TempDir;
 
     // ── parse_size ───────────────────────────────────────────────────────

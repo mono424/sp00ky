@@ -363,7 +363,7 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
     // Bucket definitions
     if !backend_processor.bucket_schema.is_empty() {
         content.push('\n');
-        content.push_str(&backend_processor.bucket_schema);
+        content.push_str(&crate::bucket::expand_r2_buckets(&backend_processor.bucket_schema));
     }
 
     // Remote functions — only when include_functions is true

@@ -295,6 +295,9 @@ impl JsonSchemaGenerator {
                 if bucket.path_prefix_auth {
                     obj.insert("pathPrefixAuth".to_string(), Value::Bool(true));
                 }
+                if bucket.backend.eq_ignore_ascii_case(crate::bucket::R2_BACKEND) {
+                    obj.insert("backend".to_string(), Value::String(crate::bucket::R2_BACKEND.to_string()));
+                }
                 Value::Object(obj)
             })
             .collect();

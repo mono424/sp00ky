@@ -533,6 +533,9 @@ impl CodeGenerator {
                                 {
                                     tables_lines.push(format!("      pathPrefixAuth: {},", auth));
                                 }
+                                if let Some(serde_json::Value::String(backend)) = obj.get("backend") {
+                                    tables_lines.push(format!("      backend: '{}' as const,", backend));
+                                }
                                 tables_lines.push("    },".to_string());
                             } else if let serde_json::Value::String(s) = bucket {
                                 // Backwards compat: plain string bucket

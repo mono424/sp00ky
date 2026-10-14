@@ -403,6 +403,7 @@ export const schema = {
       name: 'profile_pictures' as const,
       maxSize: 5242880,
       allowedExtensions: ['jpg', 'jpeg', 'png', 'gif'] as const,
+      backend: 'r2' as const,
     },
   ],
   backends: {

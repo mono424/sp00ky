@@ -4,7 +4,12 @@
 -- before the file exists), so do not add a `file::head($file).size` predicate:
 -- it reads the size of the file already at that key, which lets any first
 -- upload through and blocks legitimate overwrites.
-DEFINE BUCKET IF NOT EXISTS profile_pictures BACKEND "memory"
+--
+-- BACKEND "r2": the SSP keeps the files (R2 on Cloudflare, a directory under
+-- `spky dev`) and checks this PERMISSIONS clause with SurrealDB, as the user,
+-- before every read and write. The demo's database is Surreal Cloud, which
+-- only has memory buckets: those lose every file when the database restarts.
+DEFINE BUCKET IF NOT EXISTS profile_pictures BACKEND "r2"
   PERMISSIONS WHERE
     $action NOT IN ['put']
     OR (

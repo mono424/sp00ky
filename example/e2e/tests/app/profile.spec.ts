@@ -18,6 +18,7 @@ import {
   headerAvatarSrc,
   expectPicture,
   withoutReload,
+  upstream,
 } from '../../fixtures/app';
 
 test.describe.configure({ timeout: 150_000 });
@@ -44,6 +45,31 @@ test.describe('profile', () => {
       await goHome(bob);
       await expect(card(bob, title)).toContainText(renamed, { timeout: 20_000 });
     });
+  });
+
+  // A user who arrives after the upload has nothing cached: the list and the
+  // thread must fetch the picture from the server. On the hosted demo this
+  // broke unnoticed: its database kept files in memory and lost them on a
+  // restart, while every other test watched uploads live from devices that
+  // already held the bytes.
+  test('a picture reaches users who arrive later, its bytes kept by the SSP rather than SurrealDB', async ({ device, track }) => {
+    const alice = await deviceFor(device, uniqueUser('alice'), 'signup');
+    const title = uniqueTitle('Later');
+    track(await createThread(alice, title, 'pictured'));
+    await setPublished(alice, true);
+    await openProfile(alice);
+    await uploadAvatar(alice, 'avatar-red.png');
+    await headerAvatarSrc(alice);
+
+    const dave = await deviceFor(device, uniqueUser('dave'), 'signup');
+    await goHome(dave);
+    await expect(card(dave, title)).toBeVisible({ timeout: 20_000 });
+    await expectPicture(card(dave, title));
+    await openFromHome(dave, title);
+    await expectPicture(dave.locator('article'));
+
+    // `BACKEND "r2"`: SurrealDB defines the bucket but holds none of its files.
+    expect(await upstream('RETURN file::list("profile_pictures");')).toEqual([]);
   });
 
   test('a new profile picture shows live on every device and for other users', async ({ device, track }) => {

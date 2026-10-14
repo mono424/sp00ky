@@ -18,6 +18,10 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
   // Web Locks are missing.
   localEngine: 'sqlite',
   sharedTabs: true,
+  // Profile pictures are an r2 bucket: their files go through the SSP.
+  files: {
+    endpoint: import.meta.env.VITE_SPKY_FILES_ENDPOINT || 'http://localhost:8667',
+  },
   database: {
     namespace: import.meta.env.VITE_DB_NS || 'main',
     database: import.meta.env.VITE_DB_DB || 'example',

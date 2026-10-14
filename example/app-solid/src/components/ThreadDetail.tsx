@@ -34,7 +34,7 @@ export function ThreadDetail() {
   const [commentFilter, setCommentFilter] = createSignal<'all' | 'mine'>('all');
   const [shareOpen, setShareOpen] = createSignal(false);
   const [menuOpen, setMenuOpen] = createSignal(false);
-  const me = () => idString(auth.user()?.id);
+  const me = () => auth.userId() ?? '';
 
   // The thread with its author and newest comments, live.
   const threadResult = useQuery(() =>

@@ -68,7 +68,10 @@ export function AuthProvider(props: { children: JSX.Element }) {
   const authValue: AuthContextType = {
     userId,
     user,
-    isLoading: () => isInitializing() || (!!userId() && userQuery.isLoading()),
+    // Only until the session is known. The user's own row is not waited for:
+    // ids come from `userId()`, and the name and avatar fill in when the row
+    // arrives, so a slow server never blanks the whole app.
+    isLoading: isInitializing,
     signIn,
     signUp,
     signOut,

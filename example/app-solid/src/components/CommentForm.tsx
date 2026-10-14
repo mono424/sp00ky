@@ -2,7 +2,6 @@ import { createSignal, Show } from 'solid-js';
 import { Uuid, useDb } from '@spooky-sync/client-solid';
 import type { schema } from '../schema.gen';
 import { useAuth } from '../lib/auth';
-import { idString } from '../lib/ids';
 import { ProfilePicture } from './ProfilePicture';
 import { Tooltip } from './Tooltip';
 
@@ -15,14 +14,14 @@ export function CommentForm(props: { threadId: string }) {
 
   const submit = async () => {
     const text = content().trim();
-    const user = auth.user();
-    if (!text || !user) return;
+    const me = auth.userId();
+    if (!text || !me) return;
     // Optimistic: the comment shows at once and syncs in the background. A
     // plain `table:key` id (see `idString`).
     await db.create(`comment:${Uuid.v4().toString().replace(/-/g, '')}`, {
       thread: props.threadId,
       content: text,
-      author: idString(user.id),
+      author: me,
     });
     setContent('');
   };

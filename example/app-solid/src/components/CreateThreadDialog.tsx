@@ -3,7 +3,6 @@ import { useNavigate } from '@solidjs/router';
 import { Uuid, useDb } from '@spooky-sync/client-solid';
 import type { schema } from '../schema.gen';
 import { useAuth } from '../lib/auth';
-import { idString } from '../lib/ids';
 import { createHotkey } from '../lib/keyboard';
 import { CollaborativeEditor } from './CollaborativeEditor';
 import { Tooltip } from './Tooltip';
@@ -27,8 +26,8 @@ export function CreateThreadDialog(props: { onClose: () => void }) {
 
   const publish = async () => {
     const draft = contentDraft();
-    const user = auth.user();
-    if (!canPublish() || !draft || !user) return;
+    const me = auth.userId();
+    if (!canPublish() || !draft || !me) return;
     setError('');
     setPublishing(true);
     try {
@@ -45,7 +44,7 @@ export function CreateThreadDialog(props: { onClose: () => void }) {
       await db.create(id, {
         title: titleText,
         content: contentText().trim(),
-        author: idString(user.id),
+        author: me,
         active: true,
         published: false,
       });

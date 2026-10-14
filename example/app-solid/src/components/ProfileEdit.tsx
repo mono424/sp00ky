@@ -40,10 +40,10 @@ export function ProfileEdit() {
       return;
     }
 
-    const user = auth.user();
-    if (!user) return;
+    const me = auth.userId();
+    if (!me) return;
     // Optimistic: applied locally at once, synced in the background.
-    await db.update('user', user.id, { username: trimmed });
+    await db.update('user', me, { username: trimmed });
     setDraft(undefined);
     setSuccess('Username updated.');
   };
@@ -57,16 +57,16 @@ export function ProfileEdit() {
     input.value = '';
     fileUpload.clearError();
 
-    const user = auth.user();
-    if (!user) return;
+    const me = auth.userId();
+    if (!me) return;
 
     const ext = file.name.split('.').pop() || 'png';
     const path = `${crypto.randomUUID()}.${ext}`;
-    const oldPath = user.profile_picture;
+    const oldPath = auth.user()?.profile_picture;
 
     await fileUpload.upload(path, file);
     if (!fileUpload.error()) {
-      await db.update('user', user.id, { profile_picture: path });
+      await db.update('user', me, { profile_picture: path });
       if (oldPath) {
         await fileUpload.remove(oldPath);
       }

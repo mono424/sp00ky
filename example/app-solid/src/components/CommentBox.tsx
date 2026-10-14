@@ -14,7 +14,7 @@ export function CommentBox(props: { comment: AugmentedComment }) {
   const db = useDb<typeof schema>();
   const auth = useAuth();
 
-  const isMine = () => !!auth.user() && idString(auth.user()?.id) === idString(props.comment.author?.id);
+  const isMine = () => !!auth.userId() && auth.userId() === idString(props.comment.author?.id);
 
   return (
     <div class="group flex gap-3 py-4 hover:bg-surface/20 -mx-2 px-2 rounded-xl transition-colors duration-150">

@@ -68,7 +68,7 @@ export function ShareDialog(props: ShareDialogProps) {
     setIsCreating(true);
     setError(null);
     try {
-      const userId = idString(auth.user()?.id);
+      const userId = auth.userId();
       if (!userId) throw new Error('Not authenticated.');
 
       // Read the private key from the synced local user row — the

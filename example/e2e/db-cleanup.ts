@@ -11,10 +11,14 @@ const SURREAL_PASS = 'root';
 // drops orphans on its sweep).
 const TABLES_TO_CLEAN = ['commented_on', 'comment', 'thread__crdt_log', 'thread__crdt_presence', 'thread', 'job'];
 
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 500;
+// Rows go in small batches, each retried: one `DELETE thread` over a whole run's
+// threads is a long transaction (every delete fires the sync events) and kept
+// losing write conflicts to the SSP's own background writes.
+const BATCH = 50;
+const MAX_RETRIES = 8;
+const RETRY_DELAY_MS = 300;
 
-async function execSql(sql: string): Promise<void> {
+async function execSql(sql: string): Promise<unknown[]> {
   const response = await fetch(SURREAL_SQL_URL, {
     method: 'POST',
     headers: {
@@ -37,23 +41,36 @@ async function execSql(sql: string): Promise<void> {
       throw new Error(result.result);
     }
   }
+  return results.map((r: { result: unknown }) => r.result);
+}
+
+/** Delete up to `BATCH` rows of `table`; how many there were before. */
+async function deleteBatch(table: string): Promise<number> {
+  const [ids] = (await execSql(`SELECT VALUE id FROM ${table} LIMIT ${BATCH};`)) as unknown[][];
+  if (!ids?.length) return 0;
+  await execSql(`DELETE (SELECT VALUE id FROM ${table} LIMIT ${BATCH});`);
+  return ids.length;
 }
 
 export async function cleanDatabase(): Promise<void> {
   for (const table of TABLES_TO_CLEAN) {
     let lastError: Error | undefined;
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        await execSql(`DELETE ${table};`);
-        lastError = undefined;
-        break;
-      } catch (err) {
-        lastError = err as Error;
-        if (attempt < MAX_RETRIES) {
-          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
+    for (;;) {
+      let removed = 0;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          removed = await deleteBatch(table);
+          lastError = undefined;
+          break;
+        } catch (err) {
+          lastError = err as Error;
+          if (attempt < MAX_RETRIES) {
+            await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
+          }
         }
       }
+      if (lastError || removed === 0) break;
     }
 
     if (lastError) {

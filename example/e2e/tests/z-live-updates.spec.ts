@@ -262,8 +262,13 @@ test('a new profile picture shows in the home list and the thread without a relo
     };
     await page.goto('/profile');
     for (const file of ['avatar-red.png', 'avatar-blue.png']) {
+      const header = page.locator('header');
+      const before = (await loaded(header).count()) ? await loaded(header).getAttribute('src') : null;
       await page.locator('input[type="file"]').setInputFiles(`fixtures/${file}`);
-      await expect(loaded(page.locator('header'))).toHaveCSS('opacity', '1', { timeout: 15_000 });
+      // The header must show the new picture before it serves as the reference:
+      // until the upload lands it still shows the previous one, fully loaded.
+      if (before) await expect(loaded(header)).not.toHaveAttribute('src', before, { timeout: 15_000 });
+      await expect(loaded(header)).toHaveCSS('opacity', '1', { timeout: 15_000 });
       // In-app navigation only: home, then the thread.
       await page.getByRole('link', { name: 'sp00ky threads home' }).click();
       await sortHomeNewest(page);

@@ -375,7 +375,7 @@ fn authed(method: Method, path: &str, body: Value) -> ApiRequest {
 fn json_of(resp: &ApiResponse) -> &Value {
     match &resp.body {
         ApiBody::Json(v) => v,
-        ApiBody::Text { .. } => panic!("expected JSON body"),
+        ApiBody::Text { .. } | ApiBody::Bytes { .. } => panic!("expected JSON body"),
     }
 }
 

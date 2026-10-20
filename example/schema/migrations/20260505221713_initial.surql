@@ -1,8 +1,16 @@
 -- Migration: initial
 -- Created: 2026-05-05T22:17:14.302133+00:00
+--
+-- SECURITY (edited 2026-10-20): the original generated `DEFINE ACCESS account`
+-- carried `WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY
+-- '[REDACTED]'` — SurrealDB's redaction placeholder, not a real key. Applying
+-- that set the signing key to the literal string "[REDACTED]", so anyone could
+-- forge a token for any user. The clause was removed so SurrealDB mints a
+-- random key on apply. If you applied the old version to a real database, see
+-- docs/security/redacted-jwt-signing-key.md to rotate.
 
 -- Added
-DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD SIGNUP { RETURN (CREATE ONLY user SET username = $username, password = crypto::argon2::generate($password), share_pubkey = $share_pubkey, share_privkey = $share_privkey) } SIGNIN (SELECT * FROM user WHERE username = $username AND crypto::argon2::compare(password, $password)) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 4w2d;
+DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD SIGNUP { RETURN (CREATE ONLY user SET username = $username, password = crypto::argon2::generate($password), share_pubkey = $share_pubkey, share_privkey = $share_privkey) } SIGNIN (SELECT * FROM user WHERE username = $username AND crypto::argon2::compare(password, $password)) DURATION FOR TOKEN 15m, FOR SESSION 4w2d;
 DEFINE BUCKET OVERWRITE profile_pictures BACKEND 'memory' PERMISSIONS WHERE $action NOTINSIDE ['put'] OR file::head($file).size <= 5242880 AND (string::ends_with(file::key($file), '.jpg') OR string::ends_with(file::key($file), '.jpeg') OR string::ends_with(file::key($file), '.png') OR string::ends_with(file::key($file), '.gif'));
 DEFINE TABLE OVERWRITE _00_list_ref TYPE ANY SCHEMALESS PERMISSIONS FOR select WHERE clientId = <string> session::id(), FOR create, update, delete NONE;
 DEFINE TABLE OVERWRITE _00_module_state TYPE ANY SCHEMALESS PERMISSIONS FULL;

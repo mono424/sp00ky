@@ -4,7 +4,8 @@ import type { Saga } from '../kernel/saga';
 import { fx } from '../kernel/effects';
 import type { QueryEntry } from '../state/client-state';
 import * as R from '../state/reducers';
-import { overlay, vouched } from '../state/selectors';
+import { needed, overlay, vouched } from '../state/selectors';
+import { isAnswered } from '../state/lifecycle';
 import type { Overlay } from '../state/selectors';
 import { isWindowed, materializeEffect, rowKey, rowsEqual, rowsFromResult } from './materialize';
 import { buildRenderIds, paintsCold, resolveMembership } from './render-set';
@@ -17,12 +18,15 @@ const NONE: ReadonlySet<string> = new Set();
  * only writer of `records`. Runs on the `mat:<hash>` dedupe lane whenever the
  * query is dirty. Before the server has answered (`cold`) only bodies some
  * durable view vouches for paint (see `paintsCold`).
+ *
+ * Also the only place a query becomes answered (see `QueryLifecycle`): the
+ * authority flip is emitted here, after the rows it vouches for.
  */
 export function* materialize(hash: QueryHash): Saga<void> {
-  const [entry, ov, known] = (yield fx.state.read((s) => {
+  const [entry, ov, known, complete] = (yield fx.state.read((s) => {
     const e = s.queries.get(hash);
-    return [e, overlay(s), e?.lifecycle.phase === 'cold' ? vouched(s) : NONE];
-  })) as [QueryEntry | undefined, Overlay, ReadonlySet<string>];
+    return [e, overlay(s), e?.lifecycle.phase === 'cold' ? vouched(s) : NONE, needed(s, hash).length === 0];
+  })) as [QueryEntry | undefined, Overlay, ReadonlySet<string>, boolean];
   if (!entry) return;
   const t0 = (yield fx.now()) as number;
   const isWindow = isWindowed(entry.def.surql);
@@ -54,10 +58,18 @@ export function* materialize(hash: QueryHash): Saga<void> {
   if (!current) return;
   const t1 = (yield fx.now()) as number;
   const changed = !rowsEqual(rows, current.records);
+  // These rows answer the query when they drew a known membership with no
+  // body of a server set still to download, and that membership is still
+  // the one in state. A server set applied, or a bucket switch, while the
+  // read was out dirtied the query again: the next render answers instead.
+  const answered =
+    complete && entry.lifecycle.phase !== 'cold' && current.lifecycle.phase !== 'cold' && current.remoteArray === entry.remoteArray;
   yield fx.state.update(
-    R.compose(R.setRecords(hash, rows, changed, t1 - t0), changed ? R.stampUpdated(hash, t1) : (s) => s)
+    R.compose(R.setRecords(hash, rows, changed, t1 - t0, answered), changed ? R.stampUpdated(hash, t1) : (s) => s)
   );
   if (changed) yield fx.emit({ type: 'query:records', hash, records: rows });
+  // After the rows: a subscriber told "known" must already hold them.
+  if (answered && !isAnswered(current.lifecycle)) yield fx.emit({ type: 'query:authority', hash, known: true });
 }
 
 /**

@@ -318,7 +318,9 @@ export class DevToolsService implements StreamUpdateReceiver {
         // the panel: is the server's set known, has a non-empty one been seen
         // this session, how many empty reads were ignored.
         membershipKnown: q.config.membershipKnown === true,
-        authoritative: q.config.membershipKnown === true,
+        // What the bindings' `isAuthoritative()` reads: the known set's rows
+        // are painted, not just the set read.
+        authoritative: q.answered === true,
         viewLost: q.viewLost === true,
         serverState: q.serverState ?? null,
         // Detailed per-phase processing-time breakdown (SSP sub-phases, local/

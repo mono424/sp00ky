@@ -70,24 +70,31 @@ export type CreateQueryResult<TData> = {
   /** True while a fetch cycle is in flight (registration, a sync round). */
   isFetching: Accessor<boolean>;
   /**
-   * True once server membership is known for this identity: a registration or
-   * poll landed, or the durable membership of a previous session was read on
-   * boot. From then on `data()` is the server's answer, not a cache guess.
-   * Latched until the identity changes (or a bucket switch resets it).
+   * True once `data()` holds the rendered rows of a known membership for
+   * this identity: the server's answer (once its rows are local), or the
+   * membership an earlier session left on this device. Knowing the set is
+   * not enough: right after a sign-in re-seed, on boot, or while a server
+   * answer's rows still download, the set is known but `data()` is not
+   * painted yet, and this stays false. From then on `data()` is an answer, not
+   * a cache guess. Latched until the identity changes (or a bucket switch
+   * resets it).
    */
   isAuthoritative: Accessor<boolean>;
   /** Whether `data()` currently holds anything: rows for a list, a row for `one()`. */
   hasData: Accessor<boolean>;
   /**
-   * The server answered and the answer is "no rows". The signal to render an
+   * `isAuthoritative()` and the answer is "no rows". The signal to render an
    * empty state on; a bare `!hasData()` cannot tell empty from not-yet-loaded.
    */
   isEmpty: Accessor<boolean>;
   /**
-   * True once server membership is known AND no fetch cycle is in flight.
-   * While settled, results are authoritative: a windowed query returning fewer
-   * rows than its LIMIT really is the end of the list. Not monotonic: a later
-   * sync round re-enters `isFetching`; latch it if a verdict must stick.
+   * True once `isAuthoritative()` AND no fetch cycle is in flight. While
+   * settled, `data()` is the answer: a windowed query returning fewer rows
+   * than its LIMIT really is the end of the list, and a missing row is
+   * missing. The registration that re-confirms a cached answer after a reload
+   * or sign-in is a fetch cycle, so while it runs this waits for the server;
+   * with nothing in flight (offline) a cached answer settles. Not monotonic: a
+   * later sync round re-enters `isFetching`; latch it if a verdict must stick.
    */
   isSettled: Accessor<boolean>;
 };
@@ -252,25 +259,6 @@ export function createQuery<
             })
           );
 
-          // Mirror whether the server's membership is known. This is the
-          // channel that ends a cold load for a query whose honest answer is
-          // zero rows: the core emits no second `[]` for it, but it does flip
-          // authority once the registration (or a poll) has landed. A flip
-          // back to false is a bucket switch (a different principal), whose
-          // rebind also empties the rows, so the paint latch goes with it.
-          addCleanup(
-            sp00ky.subscribeQueryAuthority(
-              hash,
-              (known) => {
-                if (disposed || myRun !== runId) return;
-                setIsAuthoritative(known);
-                if (known) wakeReady();
-                else setHasPainted(false);
-              },
-              { immediate: true }
-            )
-          );
-
           addCleanup(
             sp00ky.subscribe(
               hash,
@@ -299,6 +287,29 @@ export function createQuery<
                   }
                 });
                 sp00ky.reportFrontendTiming(hash, performance.now() - t0);
+              },
+              { immediate: true }
+            )
+          );
+
+          // Mirror whether the rows of a known membership are painted. This
+          // is the channel that ends a cold load for a query whose honest
+          // answer is zero rows: the core emits no second `[]` for it, but it
+          // does flip authority once the render of the known set ran, always
+          // after the rows that render emitted, so `data()` is current when
+          // this reads true (subscribed after the rows so the immediate
+          // deliveries keep that order too). A flip back to false is a bucket
+          // switch (a different principal): what is on screen is the previous
+          // one's until the new store's render replaces it, so the paint
+          // latch goes with it.
+          addCleanup(
+            sp00ky.subscribeQueryAuthority(
+              hash,
+              (known) => {
+                if (disposed || myRun !== runId) return;
+                setIsAuthoritative(known);
+                if (known) wakeReady();
+                else setHasPainted(false);
               },
               { immediate: true }
             )

@@ -158,9 +158,9 @@ describe('dropImpersonatedBucket', () => {
 });
 
 describe('rebindQueries', () => {
-  it('re-seeds from the new store, rebuilds the local view (tolerating failures), emits authority flips', async () => {
+  it('re-seeds from the new store, rebuilds the local view (tolerating failures), withdraws authority it held', async () => {
     const s = R.compose(
-      R.putQuery(buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'live' } })),
+      R.putQuery(buildEntry({ def: { hash: 'a' }, lifecycle: { phase: 'live', answered: true }, records: [{ id: 't:9' }] })),
       R.putQuery(buildEntry({ def: { hash: 'b' }, lifecycle: { phase: 'cold' } }))
     )({ ...buildState(), sessionId: 's' });
     const out = await runPure(rebindQueries(), {
@@ -177,11 +177,13 @@ describe('rebindQueries', () => {
       },
     });
     expect(out.state.queries.get('a')!.lifecycle.phase).toBe('cold');
-    expect(out.state.queries.get('b')!.lifecycle.phase).toBe('cached');
-    expect(out.emitted.filter((e) => e.type === 'query:authority')).toEqual([
-      { type: 'query:authority', hash: 'a', known: false },
-      { type: 'query:authority', hash: 'b', known: true },
-    ]);
+    expect(out.state.queries.get('b')!.lifecycle).toMatchObject({ phase: 'cached', answered: false });
+    // `b` found a durable view, but its rows are not painted until the
+    // render: announcing "known" here is what let an app read the empty
+    // `records` of a re-seed as "the user has none" and create a duplicate.
+    expect(out.emitted.filter((e) => e.type === 'query:authority')).toEqual([{ type: 'query:authority', hash: 'a', known: false }]);
+    expect(out.state.queries.get('a')!.records).toEqual([{ id: 't:9' }]);
+    expect([...out.state.dirty].sort()).toEqual(['a', 'b']);
     expect(out.emitted.some((e) => e.type === 'log')).toBe(true);
   });
 });

@@ -94,10 +94,10 @@ first real result lands. `<Loading>` is Solid 2's renamed `<Suspense>`.
 | `error()` | Registration or sync error (e.g. SSP 503 during bootstrap). Never thrown into the render tree; the sync scheduler retries underneath. |
 | `isLoading()` | Cold first load only: nothing has painted for this identity, the server has not answered, and registration has not failed. A paint from the local cache ends it without the server; the server answering with zero rows ends it without rows. Re-arms only when the query identity changes. |
 | `isFetching()` | The sync engine is pulling records for this query (registration, a sync round). Re-enters on later rounds. |
-| `isAuthoritative()` | Server membership is known for this identity: a registration or poll landed, or a previous session's membership was read on boot. From here `data()` is the server's answer, not a cache guess. Latched until the identity changes. |
+| `isAuthoritative()` | `data()` holds the rendered rows of a known membership for this identity: the server's answer (once its rows are local), or the membership a previous session left on this device. Knowing the set is not enough: right after a sign-in or on boot it is known before its rows are painted, and this stays false until they are. From here `data()` is an answer, not a cache guess. Latched until the identity changes. |
 | `hasData()` | `data()` holds something: rows for a list, a row for `.one()`. |
 | `isEmpty()` | Authoritative **and** no data: the server said "no rows". Render empty states on this, never on a bare `!hasData()`. |
-| `isSettled()` | Authoritative **and** idle — the gate a windowed list needs before trusting a short result as the end of the list. Not monotonic (a later sync round re-enters `isFetching`); latch it when a verdict must stick. |
+| `isSettled()` | Authoritative **and** idle: the gate a windowed list needs before trusting a short result as the end of the list, and the gate for "create it if it is missing". The re-registration that confirms a cached answer after a reload or sign-in counts as fetching. Not monotonic (a later sync round re-enters `isFetching`); latch it when a verdict must stick. |
 
 A query that painted cached rows is therefore **not loading** while the server is still catching
 up, and a list that is merely waiting for the server is **not empty**. Gates built on

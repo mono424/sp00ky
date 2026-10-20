@@ -15,6 +15,17 @@ import type { QueryStatus } from '../types';
  * behind `status: 'fetching'`, `notified` says whether subscribers received
  * at least one materialization this registration.
  *
+ * `answered` says subscribers have been handed the rows of a known membership
+ * (the server's, or the durable one of an earlier session) at least once:
+ * a materialization ran past `cold`, with no body of a server set still to
+ * download, and the membership it drew was still the one in state when it
+ * committed. Only a re-seed (a new entry, a bucket switch) clears it, so a
+ * reconnect or a lost view does not send a painted query back to loading.
+ * It is what the bindings' `isAuthoritative()` mirrors (see `isAnswered`):
+ * a `cached` seed or a freshly applied server set alone is not enough,
+ * because `records` is still empty (or stale) until `materialize` paints, and
+ * "known and empty" read in that beat made apps create rows that existed.
+ *
  * `backgroundDepth` is the part of `fetchDepth` that re-verifies rows the
  * query already shows: a registration of a query that is not `cold`. It still
  * holds `status: 'fetching'` (results are not yet confirmed), but it is not
@@ -29,6 +40,7 @@ export interface QueryLifecycle {
   readonly fetchDepth: number;
   readonly backgroundDepth: number;
   readonly notified: boolean;
+  readonly answered: boolean;
 }
 
 export type LifecycleEvent =
@@ -41,7 +53,7 @@ export type LifecycleEvent =
   | { type: 'remote-dropped' }
   | { type: 'fetch-begin'; background?: boolean }
   | { type: 'fetch-end'; background?: boolean }
-  | { type: 'notified' }
+  | { type: 'notified'; answered?: boolean }
   | { type: 'bucket-switch'; resolvedBefore: boolean };
 
 export class LifecycleError extends Error {
@@ -52,7 +64,14 @@ export class LifecycleError extends Error {
 }
 
 export function seedLifecycle(resolvedBefore: boolean): QueryLifecycle {
-  return { phase: resolvedBefore ? 'cached' : 'cold', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false };
+  return {
+    phase: resolvedBefore ? 'cached' : 'cold',
+    remote: 'unregistered',
+    fetchDepth: 0,
+    backgroundDepth: 0,
+    notified: false,
+    answered: false,
+  };
 }
 
 /** Total on every (lifecycle, event) pair the sagas can produce; throws on the rest. */
@@ -84,14 +103,23 @@ export function transition(l: QueryLifecycle, ev: LifecycleEvent): QueryLifecycl
       const backgroundDepth = Math.min(fetchDepth, l.backgroundDepth - (ev.background && l.backgroundDepth > 0 ? 1 : 0));
       return { ...l, fetchDepth, backgroundDepth };
     }
-    case 'notified':
-      return l.notified ? l : { ...l, notified: true };
+    case 'notified': {
+      // A cold render is a guess from the local store, never an answer.
+      const answered = l.answered || (ev.answered === true && l.phase !== 'cold');
+      return l.notified && answered === l.answered ? l : { ...l, notified: true, answered };
+    }
     case 'bucket-switch':
       return { ...seedLifecycle(ev.resolvedBefore), fetchDepth: 0 };
   }
 }
 
+/** Membership is known (server set or durable seed); its rows may not be painted yet. */
 export const isAuthoritative = (l: QueryLifecycle): boolean => l.phase !== 'cold';
+/**
+ * Subscribers hold the rows of a known membership: what the authority channel
+ * (`subscribeQueryAuthority`, the bindings' `isAuthoritative()`) reports.
+ */
+export const isAnswered = (l: QueryLifecycle): boolean => l.answered;
 export const hasServerMembership = (l: QueryLifecycle): boolean =>
   l.phase === 'live' || l.phase === 'view-lost';
 export const deriveStatus = (l: QueryLifecycle): QueryStatus => (l.fetchDepth > 0 ? 'fetching' : 'idle');

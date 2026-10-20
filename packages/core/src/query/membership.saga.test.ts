@@ -72,7 +72,7 @@ describe('applyMembership', () => {
     expect(out.result).toBe('ignored');
     expect(out.state.queries.get('a')!).toMatchObject({ viewLostCount: 0, viewLostRetryAt: null });
   });
-  it('applied: commits, writes the view row, flips authority once, releases acked items, asks for bodies', async () => {
+  it('applied: commits, writes the view row, releases acked items, asks for bodies; authority waits for the render', async () => {
     const s = buildState(
       [buildEntry({ def: { hash: 'a', viewKey: 'vk' }, lifecycle: { phase: 'cold' }, subqueryRemoteArray: [['c:1', 1]] })],
       R.outboxReplace([buildOutboxItem({ id: 'm', recordId: 't:1', status: 'acked', ackedAt: 1 })])
@@ -81,7 +81,10 @@ describe('applyMembership', () => {
     expect(out.result).toBe('applied');
     expect(out.state.queries.get('a')!.lifecycle.phase).toBe('live');
     expect(out.state.outbox).toEqual([]);
-    expect(out.emitted).toEqual([{ type: 'query:authority', hash: 'a', known: true }]);
+    // The set is known, but no row of it is painted: `materialize` flips authority.
+    expect(out.emitted).toEqual([]);
+    expect(out.state.queries.get('a')!.lifecycle.answered).toBe(false);
+    expect(out.state.dirty.has('a')).toBe(true);
     expect(out.log.find((e) => e.kind === 'local.upsert')).toEqual({
       kind: 'local.upsert',
       table: '_00_view',

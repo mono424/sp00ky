@@ -10,7 +10,6 @@ import {
   backoffMs,
 } from '../kernel/constants';
 import type { ClientState, QueryEntry } from '../state/client-state';
-import { isAuthoritative } from '../state/lifecycle';
 import * as R from '../state/reducers';
 import { encodeRecordId } from '../utils/index';
 import { departedIds } from '../state/selectors';
@@ -88,10 +87,10 @@ export function* applyMembership(
     yield fx.timer.set(`view-lost:${hash}`, delay, { type: 'RecoverLostView', hash });
     return outcome;
   }
-  const wasAuthoritative = isAuthoritative(entry.lifecycle);
   yield fx.state.update(R.commitMembership(hash, remoteArray, meta?.present ?? true));
   yield* forgetDeparted(hash, departedIds(entry.remoteArray, remoteArray));
-  if (!wasAuthoritative) yield fx.emit({ type: 'query:authority', hash, known: true });
+  // No authority flip here: the set is known but its rows are not painted
+  // yet (bodies may still be on their way). `materialize` flips it once they are.
   const now = (yield fx.now()) as number;
   try {
     yield fx.local.upsert(

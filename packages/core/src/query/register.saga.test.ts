@@ -154,7 +154,8 @@ describe('registerRemote', () => {
     expect(req.sql.startsWith('fn::query::register($config);')).toBe(true);
     expect(req.vars.config).toMatchObject({ surql: entry.def.surql, ttl: '10m' });
     expect(out.dispatched).toEqual([{ type: 'FetchRows' }, { type: 'FetchRows' }, { type: 'SyncOutcome', ok: true }]);
-    expect(out.emitted).toContainEqual({ type: 'query:authority', hash: 'a', known: true });
+    // Authority follows the render of these rows, not the registration.
+    expect(out.emitted.some((ev) => ev.type === 'query:authority')).toBe(false);
   });
   it('a cold registration is foreground; a cached or live one is background', async () => {
     for (const [phase, background] of [['cold', 0], ['cached', 1], ['live', 1]] as const) {

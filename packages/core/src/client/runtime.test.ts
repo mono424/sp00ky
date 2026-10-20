@@ -6,6 +6,7 @@ import { fx } from '../kernel/effects';
 import type { Saga } from '../kernel/saga';
 import * as R from '../state/reducers';
 import { Runtime } from './runtime';
+import { rebindQueries } from '../boot/bucket-switch.saga';
 
 const env = defaultEnv({ tables: [] } as any, { materializeDebounceMs: 5 });
 const noop = () => {};
@@ -87,6 +88,45 @@ describe('Runtime state hooks', () => {
     await tick();
     expect(seen).toEqual([[{ id: 'thing:1' }]]);
     expect(rt.state.dirty.has('q')).toBe(false);
+  });
+  it('the bucket-switch window: a re-seeded query never reads "known and idle" before its rows are painted', async () => {
+    // A sign-in: the query was registered in the anon bucket (cold, nothing
+    // painted), then the switch re-seeds it from the user's durable view.
+    // Before the fix the re-seed announced authority with `records` still
+    // empty, so a binding's `isSettled() && !row` held for a beat and the app
+    // created a row the user already had.
+    const { a, rt } = make(
+      {
+        local: {
+          getById: async () => ({ ids: [['thing:1', 1]], confirmed: true }),
+          select: async (plan: any) => (plan.ids ?? []).map((id: any) => ({ id: `${id.table}:${id.id}` })),
+        },
+      },
+      { ...buildState([buildEntry({ def: { hash: 'q', plan: { table: 'thing' } as any } })]), sessionId: 's' }
+    );
+    // What a binding derives `isSettled()` and `data()` from.
+    let known = false;
+    let idle = false;
+    let rows: unknown[] = [];
+    const verdicts: string[] = [];
+    const look = () => {
+      if (known && idle) verdicts.push(rows.length > 0 ? 'settled with rows' : 'settled empty');
+    };
+    rt.subscribe('q', (r) => ((rows = r), look()), { immediate: true });
+    rt.subscribeAuthority('q', (k) => ((known = k), look()), { immediate: true });
+    rt.subscribeStatus('q', (st) => ((idle = st === 'idle'), look()), { immediate: true });
+
+    await rt.run(rebindQueries());
+    expect(rt.state.queries.get('q')!.lifecycle).toMatchObject({ phase: 'cached', fetchDepth: 0, answered: false });
+    expect(idle).toBe(true);
+    expect(known).toBe(false);
+
+    a.timers.fire('mat:q');
+    await tick();
+    await tick();
+    expect(rows).toEqual([{ id: 'thing:1' }]);
+    expect(known).toBe(true);
+    expect(verdicts).toEqual(['settled with rows']);
   });
   it('status and authority subscriptions fire on transitions, immediate delivers the current value', async () => {
     const { rt } = make({}, buildState([buildEntry({ def: { hash: 'q' } })]));

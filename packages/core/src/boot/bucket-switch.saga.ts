@@ -3,7 +3,7 @@ import type { Saga } from '../kernel/saga';
 import type { RegisterResult } from '../kernel/effects';
 import { fx } from '../kernel/effects';
 import type { ClientState, QueryEntry } from '../state/client-state';
-import { seedLifecycle, isAuthoritative } from '../state/lifecycle';
+import { seedLifecycle, isAnswered } from '../state/lifecycle';
 import * as R from '../state/reducers';
 import { ANON_USER_ID, bucketIdForUser } from '../modules/ref-tables';
 import type { SagaEnv } from '../query/env';
@@ -126,8 +126,11 @@ export function* rebindQueries(): Saga<void> {
     }
     const lifecycle = seedLifecycle(isResolvedBefore(view));
     yield fx.state.update(R.rebindQuery(entry.def.hash, { id: new RecordId('_00_query', hash), lifecycle, remoteArray: view?.ids ?? [], localArray }));
-    if (isAuthoritative(entry.lifecycle) !== isAuthoritative(lifecycle)) {
-      yield fx.emit({ type: 'query:authority', hash: entry.def.hash, known: isAuthoritative(lifecycle) });
+    // A re-seed is never answered, not even from a durable view: subscribers
+    // still hold the previous store's rows until `materialize` paints the new
+    // store's, and only that render flips authority back on.
+    if (isAnswered(entry.lifecycle)) {
+      yield fx.emit({ type: 'query:authority', hash: entry.def.hash, known: false });
     }
   }
 }

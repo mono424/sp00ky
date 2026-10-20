@@ -97,6 +97,79 @@ describe('materialize', () => {
   });
 });
 
+describe('materialize answers the query', () => {
+  const plan = { table: 'thing' } as any;
+  const byIds = { 'local.select': (e: any) => (e.plan.ids ?? []).map((id: any) => ({ id: `${id.table}:${id.id}` })) };
+  const authority = (out: { emitted: Array<{ type: string }> }) => out.emitted.filter((e) => e.type === 'query:authority');
+
+  it('a cached re-seed: rows first, then authority; the next render flips nothing', async () => {
+    // The bucket-switch window: a durable view was found, `records` is not
+    // painted yet. Authority comes from this render, after the rows.
+    const s = R.markDirty(['a'])(
+      buildState([buildEntry({ def: { hash: 'a', plan }, lifecycle: { phase: 'cached' }, remoteArray: [['thing:1', 1]] })])
+    );
+    const out = await runPure(materialize('a'), { state: s, handlers: byIds });
+    expect(out.state.queries.get('a')!.lifecycle).toMatchObject({ phase: 'cached', notified: true, answered: true });
+    expect(out.emitted).toEqual([
+      { type: 'query:records', hash: 'a', records: [{ id: 'thing:1' }] },
+      { type: 'query:authority', hash: 'a', known: true },
+    ]);
+    const again = await runPure(materialize('a'), { state: R.markDirty(['a'])(out.state), handlers: byIds });
+    expect(again.emitted).toEqual([]);
+  });
+
+  it('a known empty set answers without a rows emission', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', plan }, lifecycle: { phase: 'live' }, remoteArray: [] })]);
+    const out = await runPure(materialize('a'), { state: s, handlers: byIds });
+    expect(out.emitted).toEqual([{ type: 'query:authority', hash: 'a', known: true }]);
+  });
+
+  it('a cold render never answers', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', plan } })], R.reloadViews(new Map([['v', ['thing:1']]])));
+    const out = await runPure(materialize('a'), { state: s, handlers: { 'local.select': () => [{ id: 'thing:1' }] } });
+    expect(out.state.queries.get('a')!.lifecycle).toMatchObject({ notified: true, answered: false });
+    expect(authority(out)).toEqual([]);
+  });
+
+  it('a server set whose bodies are still downloading is not an answer yet', async () => {
+    const s = buildState(
+      [buildEntry({ def: { hash: 'a', plan }, lifecycle: { phase: 'live' }, remoteArray: [['thing:1', 1], ['thing:2', 1]] })],
+      R.setVersions([['thing:1', 1]])
+    );
+    const out = await runPure(materialize('a'), { state: s, handlers: byIds });
+    expect(out.state.queries.get('a')!.lifecycle.answered).toBe(false);
+    expect(authority(out)).toEqual([]);
+    const landed = await runPure(materialize('a'), { state: R.setVersions([['thing:2', 1]])(out.state), handlers: byIds });
+    expect(landed.state.queries.get('a')!.lifecycle.answered).toBe(true);
+    expect(authority(landed)).toEqual([{ type: 'query:authority', hash: 'a', known: true }]);
+  });
+
+  it('a membership replaced while the read was out does not answer: the next render does', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', plan }, lifecycle: { phase: 'cached' }, remoteArray: [['thing:1', 1]] })]);
+    const out = await runPure(materialize('a'), {
+      state: s,
+      handlers: {
+        'local.select': (e: any, ctx) => {
+          ctx.state = R.rebindQuery('a', { id: new RecordId('_00_query', 'b'), lifecycle: { phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false, answered: false }, remoteArray: [['thing:2', 1]], localArray: [] })(ctx.state);
+          return byIds['local.select'](e);
+        },
+      },
+    });
+    expect(out.state.queries.get('a')!.lifecycle.answered).toBe(false);
+    expect(authority(out)).toEqual([]);
+  });
+
+  it('after a rebind, a new store that renders nothing clears what the old principal painted', async () => {
+    const s = buildState([buildEntry({ def: { hash: 'a', plan }, lifecycle: { phase: 'live', answered: true }, remoteArray: [['thing:1', 1]], records: [{ id: 'thing:1' }] })]);
+    const rebound = R.rebindQuery('a', { id: new RecordId('_00_query', 'b'), lifecycle: { phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false, answered: false }, remoteArray: [], localArray: [] })(s);
+    const out = await runPure(materialize('a'), { state: rebound, handlers: byIds });
+    expect(out.emitted).toEqual([
+      { type: 'query:records', hash: 'a', records: [] },
+      { type: 'query:authority', hash: 'a', known: true },
+    ]);
+  });
+});
+
 describe('streamUpdate', () => {
   it('takes the local id-set (dirtying the query) and records ingest timings; unknown hashes are ignored', async () => {
     const s = buildState([buildEntry({ def: { hash: 'a' } })]);

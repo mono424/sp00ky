@@ -7,7 +7,7 @@ import type { Lane, Saga } from '../kernel/saga';
 import { runSaga } from '../kernel/saga';
 import type { ClientState } from '../state/client-state';
 import { emptyState } from '../state/client-state';
-import { isAuthoritative } from '../state/lifecycle';
+import { isAnswered } from '../state/lifecycle';
 import * as R from '../state/reducers';
 import { fetchingQueryCount, pendingMutationCount, queryStatus } from '../state/selectors';
 import type { SagaEnv } from '../query/env';
@@ -274,7 +274,7 @@ export class Runtime {
     this.authoritySubs.set(hash, set);
     if (options.immediate) {
       const entry = this.stateValue.queries.get(hash);
-      if (entry) this.safely(() => cb(isAuthoritative(entry.lifecycle)));
+      if (entry) this.safely(() => cb(isAnswered(entry.lifecycle)));
     }
     return () => {
       set.delete(cb);

@@ -83,10 +83,10 @@ import { Loading } from 'solid-js';
 | `error()` | Registration/sync error (e.g. SSP 503 during bootstrap). Never thrown into the render tree; the sync scheduler retries underneath. |
 | `isLoading()` | Cold first load only: nothing painted for this identity yet, server not heard, no error. A cached paint ends it; so does the server answering with zero rows. |
 | `isFetching()` | Sync engine is pulling records for this query. |
-| `isAuthoritative()` | Server membership is known for this identity (registration/poll landed, or a previous session's membership was read on boot). Latched until the identity changes. |
+| `isAuthoritative()` | `data()` holds the rendered rows of a known membership for this identity: the server's answer (once its rows are local) or the membership a previous session left on this device. A known set whose rows are not painted yet (right after a sign-in or on boot) does not count. Latched until the identity changes. |
 | `hasData()` | `data()` holds rows (or the `.one()` row). |
 | `isEmpty()` | Authoritative AND no data — the server said "no rows". Render empty states on this. |
-| `isSettled()` | Authoritative AND idle — windowed lists may trust a short result as the true end of the list. Re-enters on later sync rounds; latch it for a sticky verdict. |
+| `isSettled()` | Authoritative AND idle: windowed lists may trust a short result as the true end of the list, and a missing row is missing. The re-registration that confirms a cached answer counts as fetching. Re-enters on later sync rounds; latch it for a sticky verdict. |
 
 Options: `{ enabled?: () => boolean, deregisterOnCleanup?: boolean }` — both as in client-solid.
 

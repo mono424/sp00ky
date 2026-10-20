@@ -42,10 +42,10 @@ Returns `{ data, ready, error, isLoading, isFetching, isAuthoritative, hasData, 
 - `data()` — non-suspending; `[]`/`null` before first result, keyed-reconciled live rows after.
 - `ready()` — suspending read for `<Loading fallback={...}>` (Solid 2's renamed Suspense).
 - `error()` — registration failure (SSP 503 NOT_READY etc.); never thrown into the tree, sync retries underneath.
-- `isAuthoritative()` — server membership known for this identity (latched until it changes).
+- `isAuthoritative()`: `data()` holds the rendered rows of a known membership (server answer, or a previous session's on this device); not before they are painted, e.g. right after sign-in. Latched until the identity changes.
 - `hasData()` — `data()` holds rows / the `.one()` row.
 - `isEmpty()` — authoritative AND no data: the server said "no rows". Empty states go on this, never on `!hasData()`.
-- `isSettled()` — authoritative AND not fetching; gate windowed-list end detection on this. Latch it for a sticky verdict.
+- `isSettled()`: authoritative AND not fetching; gate windowed-list end detection and create-if-missing on this (re-confirming a cached answer counts as fetching). Latch it for a sticky verdict.
 - Options: `enabled?: () => boolean`, `deregisterOnCleanup?: boolean`.
 - `useQuery` is a deprecated alias of `createQuery`.
 

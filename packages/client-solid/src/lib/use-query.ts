@@ -218,8 +218,9 @@ export function useQuery<
     );
 
     // A result that is empty and stays empty (a new account's list) produces
-    // no second callback above, so `isFetched` also follows the server: once
-    // its membership for the query is known and no fetch is in flight, the
+    // no second callback above, so `isFetched` also follows the engine: once
+    // the rows of a known membership are painted (authority, which the core
+    // flips only after it delivered them) and no fetch is in flight, the
     // (possibly empty) result is the answer. Without this the hook sat in
     // `isLoading()` until a reload.
     let known = false;

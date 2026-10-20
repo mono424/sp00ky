@@ -79,6 +79,14 @@ describe('query reducers', () => {
     expect(s2.queries.get('a')!.telemetry.phaseSamples.localFetch).toEqual([12]);
   });
 
+  it('setRecords answers a query only when told to, and never a cold one', () => {
+    const cold = buildState([e('a')]);
+    expect(R.setRecords('a', [], false, null, true)(cold).queries.get('a')!.lifecycle.answered).toBe(false);
+    const cached = buildState([e('a', { lifecycle: { phase: 'cached' } })]);
+    expect(R.setRecords('a', [], false, null)(cached).queries.get('a')!.lifecycle).toMatchObject({ notified: true, answered: false });
+    expect(R.setRecords('a', [], false, null, true)(cached).queries.get('a')!.lifecycle).toMatchObject({ notified: true, answered: true });
+  });
+
   it('sample windows are capped', () => {
     let s = buildState([e('a')]);
     for (let i = 0; i < 105; i++) s = R.recordPhase('a', 'localFetch', i)(s);
@@ -249,12 +257,14 @@ describe('bucket switch reducers', () => {
       R.outboxReplace([buildOutboxItem()])
     );
     const id = { table: '_00_query', id: 'new' } as any;
-    const s1 = R.rebindQuery('a', { id, lifecycle: { phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false }, remoteArray: [['t:2', 1]], localArray: [] })({ ...s0, dirty: new Set() });
+    const s1 = R.rebindQuery('a', { id, lifecycle: { phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false, answered: false }, remoteArray: [['t:2', 1]], localArray: [] })({ ...s0, dirty: new Set() });
     const en = s1.queries.get('a')!;
     expect(en.def.id).toBe(id);
     expect(en.lifecycle.phase).toBe('cached');
     expect(en.remoteArray).toEqual([['t:2', 1]]);
-    expect(en.records).toEqual([]);
+    // What subscribers still hold: the next render diffs against it, so a new
+    // store that renders `[]` is a change they hear about.
+    expect(en.records).toEqual([{ id: 't:1' }]);
     expect(en.serverState).toBeNull();
     expect(en.registerAttempts).toBe(0);
     expect(s1.dirty.has('a')).toBe(true);

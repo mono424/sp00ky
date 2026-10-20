@@ -706,6 +706,12 @@ export interface QueryState {
    * always emits at least once even when its records are unchanged — otherwise
    * an empty re-registered window would never notify and stay "loading". */
   syncNotified?: boolean;
+  /**
+   * Subscribers hold the rows of a known membership (see `QueryLifecycle`'s
+   * `answered`): what the authority channel and the bindings'
+   * `isAuthoritative()` report. Ephemeral.
+   */
+  answered?: boolean;
   /** Timer for TTL expiration. */
   ttlTimer: NodeJS.Timeout | null;
   /** TTL duration in milliseconds. */
@@ -798,9 +804,12 @@ export interface QueryTimings {
 export type QueryUpdateCallback = (records: Record<string, any>[]) => void;
 export type QueryStatusCallback = (status: QueryStatus) => void;
 /**
- * Observer for a query's authority flips: `true` once server membership is
- * known for it (registration, poll, durable seed), `false` when it is reset
- * (bucket switch). What the bindings' `isAuthoritative()` mirrors.
+ * Observer for a query's authority flips: `true` once subscribers hold the
+ * rendered rows of a known membership (a server answer whose bodies are
+ * local, or the durable membership of an earlier session), delivered after
+ * the rows that vouch for it; `false` when it is reset (bucket switch). Knowing the set is
+ * not enough: a `cached` re-seed or a just-applied server set has no rows
+ * painted yet. What the bindings' `isAuthoritative()` mirrors.
  */
 export type QueryAuthorityCallback = (known: boolean) => void;
 export type MutationCallback = (mutations: MutationEvent[]) => void;

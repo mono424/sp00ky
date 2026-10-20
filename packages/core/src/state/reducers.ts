@@ -153,8 +153,13 @@ export const setSubqueryRemoteArray =
     return withView(next, entry.def.viewKey, vouchedIds(entry.remoteArray, subqueryRemoteArray));
   };
 
+/**
+ * Commit a materialization. `answered`: it drew a known membership with no
+ * body still to download, and that membership is still current (see
+ * `QueryLifecycle`).
+ */
 export const setRecords =
-  (hash: QueryHash, records: ReadonlyArray<Row>, changed: boolean, materializeMs: number | null): Reducer =>
+  (hash: QueryHash, records: ReadonlyArray<Row>, changed: boolean, materializeMs: number | null, answered = false): Reducer =>
   (s) => {
     const next = withEntry(s, hash, (e) => {
       const prev = e.telemetry.phaseSamples.localFetch ?? [];
@@ -171,7 +176,7 @@ export const setRecords =
         ...e,
         records: changed ? records : e.records,
         telemetry,
-        lifecycle: transition(e.lifecycle, { type: 'notified' }),
+        lifecycle: transition(e.lifecycle, { type: 'notified', answered }),
       };
     });
     return next === s ? s : { ...next, dirty: withoutAll(next.dirty, [hash]) };
@@ -454,7 +459,13 @@ export const setIdentity =
   ): Reducer =>
   (s) => ({ ...s, ...patch });
 
-/** Re-home a query after a bucket switch: new store, same hash, fresh sync state. */
+/**
+ * Re-home a query after a bucket switch: new store, same hash, fresh sync state.
+ * `records` is kept: it is what subscribers were last handed, and the next
+ * render diffs against it. Blanking it here (without telling anyone) let a
+ * new store that renders `[]` read as unchanged, so the previous principal's
+ * rows stayed on screen under an authority flip that vouched for them.
+ */
 export const rebindQuery =
   (
     hash: QueryHash,
@@ -468,7 +479,6 @@ export const rebindQuery =
       remoteArray: next.remoteArray,
       localArray: next.localArray,
       subqueryRemoteArray: [],
-      records: [],
       serverState: null,
       lastHeartbeatAt: null,
       lastPolledAt: null,

@@ -217,6 +217,7 @@ export function toQueryState(e: QueryEntry): QueryState {
     viewLost: l.phase === 'view-lost',
     serverState: e.serverState,
     syncNotified: l.notified,
+    answered: l.answered,
     ttlTimer: null,
     ttlDurationMs: e.def.ttlMs,
     lastHeartbeatAt: e.lastHeartbeatAt ?? undefined,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { LifecycleEvent, QueryLifecycle, QueryPhase } from './lifecycle';
-import { deriveStatus, hasServerMembership, isAuthoritative, isForegroundFetching, LifecycleError, seedLifecycle, transition } from './lifecycle';
+import { deriveStatus, hasServerMembership, isAnswered, isAuthoritative, isForegroundFetching, LifecycleError, seedLifecycle, transition } from './lifecycle';
 
 const at = (phase: QueryPhase, over: Partial<QueryLifecycle> = {}): QueryLifecycle => ({
   phase,
@@ -8,6 +8,7 @@ const at = (phase: QueryPhase, over: Partial<QueryLifecycle> = {}): QueryLifecyc
   fetchDepth: 0,
   backgroundDepth: 0,
   notified: false,
+  answered: false,
   ...over,
 });
 
@@ -33,8 +34,48 @@ describe('transition table (phase axis)', () => {
     expect(transition(at('view-lost'), { type: 'row-missing' }).phase).toBe('view-lost');
   });
   it('bucket-switch reseeds and clears fetch depth', () => {
-    const l = transition(at('live', { fetchDepth: 3, notified: true }), { type: 'bucket-switch', resolvedBefore: true });
-    expect(l).toEqual({ phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false });
+    const l = transition(at('live', { fetchDepth: 3, notified: true, answered: true }), { type: 'bucket-switch', resolvedBefore: true });
+    expect(l).toEqual({ phase: 'cached', remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0, notified: false, answered: false });
+  });
+});
+
+describe('answered', () => {
+  it('a seed is never answered, not even a cached one: its rows are not painted yet', () => {
+    expect(seedLifecycle(true)).toMatchObject({ phase: 'cached', answered: false });
+    expect(isAnswered(seedLifecycle(true))).toBe(false);
+    expect(isAuthoritative(seedLifecycle(true))).toBe(true);
+  });
+  it('only a render of a known membership answers; a cold render is a guess', () => {
+    expect(transition(at('cold'), { type: 'notified', answered: true }).answered).toBe(false);
+    expect(transition(at('cached'), { type: 'notified' }).answered).toBe(false);
+    expect(transition(at('cached'), { type: 'notified', answered: false })).toMatchObject({ notified: true, answered: false });
+    for (const p of ['cached', 'live', 'view-lost'] as const) {
+      expect(transition(at(p), { type: 'notified', answered: true })).toMatchObject({ notified: true, answered: true });
+    }
+  });
+  it('latched through membership, a reconnect and a lost view; cleared by a re-seed', () => {
+    let l = transition(at('cached'), { type: 'notified', answered: true });
+    l = transition(l, { type: 'membership-applied', present: true });
+    expect(l).toMatchObject({ phase: 'live', answered: true });
+    l = transition(l, { type: 'notified', answered: false });
+    expect(l.answered).toBe(true);
+    l = transition(l, { type: 'remote-dropped' });
+    expect(l).toMatchObject({ notified: false, answered: true });
+    l = transition(l, { type: 'row-missing' });
+    expect(l).toMatchObject({ phase: 'view-lost', answered: true });
+    expect(transition(l, { type: 'bucket-switch', resolvedBefore: true }).answered).toBe(false);
+    expect(transition(l, { type: 'seed', resolvedBefore: true }).answered).toBe(false);
+  });
+  it('a server set applied to a cold query is not an answer until its render', () => {
+    const l = transition(at('cold'), { type: 'membership-applied', present: true });
+    expect(l).toMatchObject({ phase: 'live', answered: false });
+    expect(isAuthoritative(l)).toBe(true);
+    expect(isAnswered(l)).toBe(false);
+  });
+  it('an unchanged notified keeps identity', () => {
+    const l = transition(at('live'), { type: 'notified', answered: true });
+    expect(transition(l, { type: 'notified', answered: true })).toBe(l);
+    expect(transition(l, { type: 'notified' })).toBe(l);
   });
 });
 
@@ -111,6 +152,7 @@ describe('invariants over random event sequences', () => {
     { type: 'fetch-begin', background: true },
     { type: 'fetch-end', background: true },
     { type: 'notified' },
+    { type: 'notified', answered: true },
     { type: 'bucket-switch', resolvedBefore: false },
     { type: 'seed', resolvedBefore: true },
   ];
@@ -135,6 +177,7 @@ describe('invariants over random event sequences', () => {
         expect(l.backgroundDepth).toBeLessThanOrEqual(l.fetchDepth);
         if (ev.type === 'row-missing' && before.phase === 'cold') expect(l.phase).toBe('cold');
         if (l.phase === 'view-lost') expect(before.phase).not.toBe('cold');
+        if (l.answered) expect(l.phase).not.toBe('cold');
       }
     }
   });

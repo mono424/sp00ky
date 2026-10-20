@@ -755,6 +755,26 @@ pub fn strip_dbsp_cleanup_event(content: &str) -> String {
     .into_owned()
 }
 
+/// The default body of `fn::sp00ky::session_live()` in
+/// `meta_tables_remote.surql`, which `apply_session_guard` replaces.
+pub const SESSION_GUARD_DEFAULT: &str = "RETURN true; -- sp00ky:sessionGuard";
+
+/// Put the manifest's `sessionGuard` expression in as the body of
+/// `fn::sp00ky::session_live()`. The `== true` makes anything but a plain
+/// `true` (NONE from a missing field, a string) refuse the session, where a
+/// bare non-bool would fail the function's `-> bool`. `None` leaves the
+/// default, which keeps every session live.
+pub fn apply_session_guard(meta_tables_remote: &str, guard: Option<&str>) -> String {
+    match guard {
+        Some(expr) => meta_tables_remote.replacen(
+            SESSION_GUARD_DEFAULT,
+            &format!("RETURN ({expr}) == true; -- sp00ky:sessionGuard (sp00ky.yml)"),
+            1,
+        ),
+        None => meta_tables_remote.to_string(),
+    }
+}
+
 /// Insert/merge the `sp00ky:nosync` marker into a single `DEFINE TABLE`
 /// statement string.
 fn inject_nosync_comment(stmt: &str) -> String {
@@ -1500,5 +1520,51 @@ mod impersonation_tests {
         assert!(short.validate().is_err());
         let inverted = ImpersonationConfig { max_duration: Some("5m".into()), ..enabled() };
         assert!(inverted.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_guard_tests {
+    use super::*;
+    use crate::backend::Sp00kyConfig;
+
+    const META: &str = include_str!("meta_tables_remote.surql");
+    const GUARD: &str = "$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch";
+
+    fn guard_from(yaml: &str) -> Option<String> {
+        serde_yaml::from_str::<Sp00kyConfig>(yaml).expect("yaml parse").session_guard()
+    }
+
+    /// The shipped default is what `apply_session_guard` looks for: an edit to
+    /// that line would otherwise ship every app's guard as a silent no-op.
+    #[test]
+    fn shipped_meta_tables_carry_the_default_body_once() {
+        assert_eq!(META.matches(SESSION_GUARD_DEFAULT).count(), 1);
+        assert!(META.contains("DEFINE FUNCTION OVERWRITE fn::sp00ky::session_live() -> bool {"));
+    }
+
+    #[test]
+    fn a_configured_guard_replaces_the_default_body() {
+        let sql = apply_session_guard(META, Some(GUARD));
+        assert!(!sql.contains(SESSION_GUARD_DEFAULT));
+        assert!(sql.contains(&format!("RETURN ({GUARD}) == true;")));
+        // Only the body: the rules that ask the guard are untouched.
+        assert_eq!(
+            sql.matches("fn::sp00ky::session_live()").count(),
+            META.matches("fn::sp00ky::session_live()").count()
+        );
+    }
+
+    #[test]
+    fn no_guard_keeps_every_session_live() {
+        assert_eq!(apply_session_guard(META, None), META);
+    }
+
+    #[test]
+    fn session_guard_is_read_from_the_manifest() {
+        assert_eq!(guard_from(&format!("name: demo\nsessionGuard: \"{GUARD}\"\n")).as_deref(), Some(GUARD));
+        assert_eq!(guard_from("name: demo\nsessionGuard: \"  $auth.live = true; \"\n").as_deref(), Some("$auth.live = true"));
+        assert_eq!(guard_from("name: demo\nsessionGuard: \"  \"\n"), None);
+        assert_eq!(guard_from("name: demo\n"), None);
     }
 }

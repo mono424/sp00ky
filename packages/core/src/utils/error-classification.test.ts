@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifySyncError } from './error-classification';
+import { classifySyncError, isRefusedSessionError } from './error-classification';
 
 describe('classifySyncError', () => {
   it('classifies surreal ConnectionUnavailableError as network', () => {
@@ -50,5 +50,23 @@ describe('classifySyncError', () => {
   it('handles non-Error values', () => {
     expect(classifySyncError('connection reset')).toBe('network');
     expect(classifySyncError('boom')).toBe('application');
+  });
+});
+
+describe('isRefusedSessionError', () => {
+  it.each([
+    'There was a problem with authentication',
+    'An error occurred: There was a problem with authentication: this session has ended, sign in again',
+    'The session has expired',
+  ])('takes %j as a refused session', (message) => {
+    expect(isRefusedSessionError(new Error(message))).toBe(true);
+  });
+
+  it.each([
+    'There was a problem with the database: Invalid token',
+    'There was a problem with the underlying connection',
+    'Permission denied',
+  ])('does not take %j as one', (message) => {
+    expect(isRefusedSessionError(new Error(message))).toBe(false);
   });
 });

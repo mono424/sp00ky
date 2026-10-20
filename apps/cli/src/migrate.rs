@@ -979,6 +979,14 @@ pub fn apply_internal_schema(
     ui::detail("meta tables (remote)");
     let mut meta_tables_remote = include_str!("meta_tables_remote.surql").to_string();
 
+    // `sessionGuard:` from the manifest becomes `fn::sp00ky::session_live()`.
+    let session_guard = crate::backend::session_guard_for(config_path);
+    if let Some(guard) = &session_guard {
+        ui::detail(format!("session guard: {guard}"));
+    }
+    meta_tables_remote =
+        crate::schema_builder::apply_session_guard(&meta_tables_remote, session_guard.as_deref());
+
     // `sync:` from the manifest decides the ingest transport. Under the
     // changefeed the meta tables that feed the tail get their clause and the
     // `_00_dbsp_cleanup` event is removed (a `_00_query` DELETE reaches the

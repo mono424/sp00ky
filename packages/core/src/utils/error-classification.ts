@@ -51,3 +51,15 @@ export function classifySyncError(error: unknown): 'network' | 'application' {
 
   return 'application';
 }
+
+/**
+ * Whether the server refused the SESSION rather than the statement: its own
+ * wording for a token it will not accept ("There was a problem with
+ * authentication"), which is also what an app's AUTHENTICATE clause and
+ * sp00ky's session guard throw, and a session past its `DURATION FOR SESSION`.
+ */
+export function isRefusedSessionError(error: unknown): boolean {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return message.includes('problem with authentication') || message.includes('session has expired');
+}

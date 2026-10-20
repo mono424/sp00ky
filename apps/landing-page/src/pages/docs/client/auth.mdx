@@ -58,6 +58,28 @@ DEFINE TABLE stream_presence SCHEMAFULL
              WHERE user = $auth.id AND role = 'admin') )
     FOR create, update, delete WHERE false;`;
 
+export const codeGuardYml = `# sp00ky.yml
+sessionGuard: "$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch"`;
+
+export const codeGuardSchema = `-- Stamped by your backend (as root) when the password is reset.
+DEFINE FIELD session_epoch ON TABLE user TYPE option<int>
+  PERMISSIONS FOR select WHERE false, FOR create, update WHERE false;
+
+-- Refuse old tokens on every new connection...
+DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD
+  -- SIGNUP / SIGNIN / WITH JWT as before
+  AUTHENTICATE {
+    IF !fn::sp00ky::session_live() {
+      THROW "There was a problem with authentication: this session has ended, sign in again";
+    };
+    RETURN $auth;
+  };
+
+-- ...and on your own tables, for sockets that are already open.
+DEFINE TABLE OVERWRITE note SCHEMAFULL PERMISSIONS
+  FOR select, create, update, delete
+    WHERE owner = $auth.id AND fn::sp00ky::session_live();`;
+
 export const code2 = `await db.auth.signOut();`;
 
 export const code1 = `import { createSignal, onCleanup } from 'solid-js';
@@ -188,6 +210,46 @@ and the filter is re-evaluated incrementally as data changes.
   (fail-closed), so a client can never receive rows an unrepresentable rule was
   meant to guard.
 </Warning>
+
+## Ending Sessions (Session Guard)
+
+SurrealDB checks a token only when a connection authenticates. A WebSocket that
+signed in before a password reset keeps its identity for as long as it stays
+open, even though your `AUTHENTICATE` clause would refuse that token on the next
+connection. The **session guard** is how you end such a session for sync: a
+SurrealQL expression over `$auth` (re-read on every check) and `$token` (the
+claims the session signed in with).
+
+<CodeBlock
+  code={codeGuardYml}
+  lang="yaml"
+/>
+
+`spky migrate` makes it the body of `fn::sp00ky::session_live()`, and every
+sp00ky-owned rule that admits a signed-in user asks it: the per-user edge
+tables, `_00_query` and `fn::query::register`. SurrealDB evaluates those rules
+again for every live notification, so a session the guard turns down receives
+nothing from the next change on, without reconnecting. Its next registration is
+refused with "There was a problem with authentication". The web client answers
+that, and every reconnect, by checking the token again, which signs the device
+out once your `AUTHENTICATE` clause refuses it.
+
+The guard runs like a permission clause, with permissions off, so it may read a
+field the user cannot. Call it from your own rules as well, so an open socket
+cannot read or write your tables directly either. Live queries are not affected:
+the SSP reads the call as `true`, because what it builds reaches a client only
+through the guarded edge tables.
+
+<CodeBlock
+  code={codeGuardSchema}
+  lang="sql"
+/>
+
+<Note>
+  Unset, every session stays live, exactly as before. Anything but `true`
+  refuses, so a guard that reads a missing field ends every session: keep the
+  `= NONE` branch for accounts that never reset.
+</Note>
 
 ## Third-Party Providers
 

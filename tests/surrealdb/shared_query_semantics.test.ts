@@ -205,9 +205,14 @@ describe('shared-query SurrealDB semantics', () => {
     const ID = '_00_query:shared';
 
     beforeAll(async () => {
-      // Only the _00_query block; the rest of the file defines tables this
-      // test does not need.
+      // Only the session guard (the _00_query rule's user branch asks it) and
+      // the _00_query block; the rest of the file defines tables this test
+      // does not need.
       const meta = read('meta_tables_remote.surql');
+      await q(
+        root,
+        meta.slice(meta.indexOf('-- SPOOKY SESSION GUARD'), meta.indexOf('-- SPOOKY INCANTATION'))
+      );
       const start = meta.indexOf('DEFINE TABLE OVERWRITE _00_query');
       const end = meta.indexOf('-- SPOOKY LIST REF');
       await q(root, meta.slice(start, end));

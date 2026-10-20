@@ -42,6 +42,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `refMode` | `dedicated` \| `single` | `dedicated` | Storage layout for the SSP's `_00_list_ref` table. `dedicated` gives each user their own table and works around a SurrealDB v3 LIVE-permission gap. |
 | `sync` | object | `{ transport: http, queryAllowlist: off }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`, see [Sync transport](#sync-transport); and whether the SSP refuses query shapes the app does not ship: `queryAllowlist`, see [Query allowlist](#query-allowlist). |
 | `impersonation` | object | `{ enabled: false }` | Lets admins act as other users from the DevTools. See [Impersonation](#impersonation). |
+| `sessionGuard` | string | (none) | SurrealQL expression over `$auth` and `$token` that decides whether a signed-in session may still sync, so an open WebSocket from before a password reset stops syncing. Applied by `spky migrate`. See [Ending sessions](/docs/client/auth#ending-sessions-session-guard). |
 | `apps` | map | `{}` | Your frontend and backend services. See [Apps](#apps) below. |
 | `pools` | map | `{}` | Machine pools: machines that run one backend's jobs while there is work. See [Machine pools](#machine-pools). |
 | `machines` | map | `{}` | Dedicated machines: one Hetzner VM of its own per always-on backend. See [Dedicated machines](#dedicated-machines). |

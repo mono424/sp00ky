@@ -515,6 +515,16 @@ pub struct Sp00kyConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub anonymous_live_queries: Option<bool>,
+    /// The app's session guard: a SurrealQL expression over `$auth` and
+    /// `$token` that says whether a signed-in session may still sync, e.g.
+    /// `$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch`.
+    /// Becomes the body of `fn::sp00ky::session_live()`, which every
+    /// sp00ky-owned rule that admits a user by `$auth.id` asks, so a socket
+    /// that authenticated before (say) a password reset stops syncing without
+    /// reconnecting. Unset: every session is live. See the SESSION GUARD
+    /// block in `meta_tables_remote.surql`.
+    #[serde(default, rename = "sessionGuard", skip_serializing_if = "Option::is_none")]
+    pub session_guard: Option<String>,
     /// How row changes reach the scheduler (`sync.transport`) and the
     /// `CHANGEFEED` retention that goes with the `changefeed` transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1015,6 +1025,20 @@ impl Sp00kyConfig {
     pub fn resolved_anonymous_live_queries(&self) -> bool {
         self.anonymous_live_queries.unwrap_or(false)
     }
+
+    /// `sessionGuard`, trimmed of whitespace and a trailing `;`. `None` when
+    /// unset or blank.
+    pub fn session_guard(&self) -> Option<String> {
+        let guard = self.session_guard.as_deref()?.trim().trim_end_matches(';').trim();
+        (!guard.is_empty()).then(|| guard.to_string())
+    }
+}
+
+/// `sessionGuard` from the manifest at `config_path`, if any.
+pub fn session_guard_for(config_path: Option<&Path>) -> Option<String> {
+    config_path
+        .filter(|p| p.exists())
+        .and_then(|p| load_config(p).session_guard())
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

@@ -155,6 +155,34 @@ pub async fn ensure_anon_table(db: &dyn Db) -> Result<()> {
     Ok(())
 }
 
+/// `fn::sp00ky::session_live()` with its default body, defined only where the
+/// internal schema has not defined it yet. The per-user tables below ask it,
+/// and a rule calling a function that does not exist denies every row: an SSP
+/// running ahead of `spky migrate` would otherwise blank every signed-in view.
+/// `IF NOT EXISTS` never replaces the app's guard; the next migrate replaces
+/// this default (`DEFINE FUNCTION OVERWRITE` in `meta_tables_remote.surql`).
+pub const SESSION_GUARD_DEFAULT_DDL: &str =
+    "DEFINE FUNCTION IF NOT EXISTS fn::sp00ky::session_live() -> bool { RETURN true; } PERMISSIONS FULL;";
+
+/// DDL for one user's `_00_list_ref_user_<uid>` table, led by the guard's
+/// default. Readable only by that user, and only while the app's session guard
+/// holds for the reading session: SurrealDB re-evaluates the rule for every
+/// LIVE notification with the subscriber's `$auth` and `$token`, so a socket
+/// the app ended (say, one that authenticated before a password reset) stops
+/// receiving edges without reconnecting. See the SESSION GUARD block in
+/// `meta_tables_remote.surql`.
+pub fn user_list_ref_ddl(tbl: &str, uid: &str) -> String {
+    format!(
+        "{guard}\
+         DEFINE TABLE OVERWRITE {tbl} SCHEMALESS \
+         PERMISSIONS FOR select WHERE $auth.id = user:{uid} AND fn::sp00ky::session_live(), \
+                     FOR create, update WHERE false, \
+                     FOR delete WHERE false;{fields}",
+        guard = SESSION_GUARD_DEFAULT_DDL,
+        fields = list_ref_fields(tbl),
+    )
+}
+
 /// Issue idempotent `DEFINE TABLE OVERWRITE` + field DDL for the per-user
 /// `_00_list_ref_user_<id>` table. No-op in `RefMode::Single`, and when
 /// `auth_id` doesn't sanitize cleanly (falls back to the global table, logged
@@ -202,15 +230,7 @@ pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Re
     }
 
     let tbl = format!("_00_list_ref_user_{}", uid);
-    let ddl = format!(
-        "DEFINE TABLE OVERWRITE {tbl} SCHEMALESS \
-         PERMISSIONS FOR select WHERE $auth.id = user:{uid}, \
-                     FOR create, update WHERE false, \
-                     FOR delete WHERE false;{fields}",
-        tbl = tbl,
-        uid = uid,
-        fields = list_ref_fields(&tbl),
-    );
+    let ddl = user_list_ref_ddl(&tbl, &uid);
     // Retried: this DDL is issued from `/view/register`, and a registration
     // burst has every client defining its own table against the same catalog
     // at once. `db_retry`'s own doc names `_00_list_ref_*` as a hot row for

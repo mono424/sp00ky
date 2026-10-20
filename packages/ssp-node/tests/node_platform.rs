@@ -3389,6 +3389,10 @@ async fn anon_harness(merge_views: bool) -> Harness {
 async fn signed_out_harness(anonymous_live_queries: bool, merge_views: bool) -> Harness {
     let h = build(HarnessOpts { anonymous_live_queries, merge_views, guests: true, ..Default::default() }).await;
     let meta = include_str!("../../../apps/cli/src/meta_tables_remote.surql");
+    // The session guard first: the `_00_query` rule's user branch asks it.
+    let guard = meta.find("-- SPOOKY SESSION GUARD").expect("session guard block");
+    let guard_end = meta.find("-- SPOOKY INCANTATION").expect("end of the session guard block");
+    h.raw_db.query(&meta[guard..guard_end]).await.unwrap().check().unwrap();
     let start = meta.find("DEFINE TABLE OVERWRITE _00_query SCHEMALESS").expect("_00_query block");
     let end = meta.find("-- SPOOKY LIST REF").expect("end of the _00_query block");
     h.raw_db.query(&meta[start..end]).await.unwrap().check().unwrap();

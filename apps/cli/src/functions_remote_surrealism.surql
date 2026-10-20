@@ -10,6 +10,15 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
     -- predicate. Predicates like `published = true OR $access = "account"
     -- AND author.id = $auth.id` evaluate to "only published rows" if
     -- $access is missing — invisible-by-default for record-access users.
+    --
+    -- A session the app's session guard has ended registers nothing (see the
+    -- singlenode variant).
+    IF $auth.id != NONE {
+        LET $guard = (SELECT live FROM ONLY _00_session_guard:probe);
+        IF $guard != NONE AND $guard.live != true {
+            THROW "There was a problem with authentication: this session has ended, sign in again";
+        };
+    };
     LET $params_in = $config.params OR {};
     LET $params_with_auth = object::extend($params_in, {
         auth: { id: <string>($auth.id OR '') },

@@ -2375,7 +2375,10 @@ fn run_codegen(
     println!("  + Appended base meta_tables.surql");
 
     if matches!(output_format, OutputFormat::Surql) {
-        let meta_tables_remote = meta_tables_remote_raw;
+        let meta_tables_remote = schema_builder::apply_session_guard(
+            meta_tables_remote_raw,
+            backend::session_guard_for(config_path).as_deref(),
+        );
         content.push('\n');
         content.push_str(&meta_tables_remote);
         println!("  + Appended meta_tables_remote.surql");

@@ -9,7 +9,8 @@ import type { Logger } from '../../services/logger/index';
 export * from './events/index';
 import { AuthEventTypes, createAuthEventSystem } from './events/index';
 import type { PersistenceClient } from '../../types';
-import { classifySyncError } from '../../utils/error-classification';
+import { classifySyncError, isRefusedSessionError } from '../../utils/error-classification';
+import { DatabaseEventTypes } from '../../services/database/events/index';
 import { encodeRecordId } from '../../utils/index';
 import { RecordId } from 'surrealdb';
 import {
@@ -52,6 +53,13 @@ export type SignOutHook = (ctx: SignOutContext) => Promise<void> | void;
 
 /** Upper bound on the before-sign-out hooks, so a dead socket never holds a sign-out. */
 export const SIGN_OUT_HOOK_TIMEOUT_MS = 2_000;
+
+/**
+ * Floor between two session re-checks started by refused statements. A
+ * refused session fails every statement at once, and a check that keeps the
+ * session (the server was unreachable) must not be re-run by each of them.
+ */
+export const REFUSAL_RECHECK_MIN_MS = 30_000;
 
 // Helper to pretty print types
 type Prettify<T> = {
@@ -111,6 +119,11 @@ export class AuthService<S extends SchemaStructure> {
   private stopping: Promise<void> | null = null;
   /** A token renewal in flight, which a stop waits out (see `renewImpersonation`). */
   private renewing: Promise<void> | null = null;
+  /** The session re-check in flight (see `watchSession`), shared by every trigger. */
+  private reverifying: Promise<void> | null = null;
+  /** When a refused statement last started a re-check. */
+  private lastRefusalCheckAt = Number.NEGATIVE_INFINITY;
+  private watchingSession = false;
   private impersonationTimers = new ImpersonationTimers({
     current: () => this.impersonation,
     renew: () => this.renewImpersonation(),
@@ -141,6 +154,60 @@ export class AuthService<S extends SchemaStructure> {
 
   async init() {
     await this.check();
+    this.watchSession();
+  }
+
+  /**
+   * Check the session again whenever the socket comes back, and whenever the
+   * server refuses a statement because of the session.
+   *
+   * The server judges a token only when a socket authenticates: the SDK
+   * replays `authenticate` on its own reconnects, `RemoteDatabaseService` on a
+   * socket it rebuilds. When the replay is refused (the app ended the session,
+   * say with a password reset) the SDK drops to an anonymous session, and the
+   * supervisor swallows the rebuild's error, so the socket reports `connected`
+   * while this service still announces the user. Every view registered from
+   * then on carried no identity: the page looked signed in and showed nothing
+   * of the user's. `check()` applies the token again and signs out when the
+   * server refuses it.
+   *
+   * A socket that never reconnects is ended by the app's session guard
+   * (`fn::sp00ky::session_live`) instead: its heartbeats stop finding rows,
+   * and the re-registration that follows is refused with "There was a problem
+   * with authentication", which starts a check here too.
+   */
+  private watchSession(): void {
+    if (this.watchingSession) return;
+    this.watchingSession = true;
+    this.remote.subscribeConnection('connected', () => this.reverify());
+    this.remote.getEvents().subscribe(DatabaseEventTypes.RemoteQuery, (event) => {
+      const { success, error } = event.payload;
+      if (success || !isRefusedSessionError(error ?? '')) return;
+      const now = Date.now();
+      if (now - this.lastRefusalCheckAt < REFUSAL_RECHECK_MIN_MS) return;
+      this.lastRefusalCheckAt = now;
+      this.reverify();
+    });
+  }
+
+  /** One `check()` for every trigger that lands while it runs. */
+  private reverify(): void {
+    if (!this.isAuthenticated || this.reverifying) return;
+    this.reverifying = (async () => {
+      // A rebuilt socket reports `connected` before its namespace and token
+      // are applied: check against the finished handshake.
+      await this.remote.whenConnected();
+      if (this.isAuthenticated) await this.check();
+    })()
+      .catch((error) => {
+        this.logger.warn(
+          { error, Category: 'sp00ky-client::AuthService::reverify' },
+          'Session re-check failed'
+        );
+      })
+      .finally(() => {
+        this.reverifying = null;
+      });
   }
 
   getAccessDefinition<Name extends keyof S['access']>(name: Name): AccessDefinition | undefined {

@@ -169,6 +169,31 @@ fn intersect_with_permission(view: OperatorPlan, perm: OperatorPlan) -> Operator
     }
 }
 
+/// The app's session guard as a table rule calls it (the SESSION GUARD block
+/// in `apps/cli/src/meta_tables_remote.surql`).
+pub const SESSION_GUARD_CALL: &str = "fn::sp00ky::session_live()";
+
+/// Read the session guard as `true`. It says whether the READING session may
+/// still sync, which is not a property of any row: the SSP folds a rule into a
+/// view on behalf of a registration, and the view reaches a session only
+/// through the `_00_list_ref*` tables, whose own rules ask the guard on every
+/// read and every LIVE notification. Left in, the call would not lower and the
+/// registration of every view over the table would be refused.
+///
+/// As an `AND` operand it is dropped, since the converter cannot parse a bare
+/// `true` that leads an expression; anywhere else it becomes `true`.
+fn without_session_guard(raw: &str) -> std::borrow::Cow<'_, str> {
+    lazy_static::lazy_static! {
+        static ref GUARD_AND: regex::Regex =
+            regex::Regex::new(r"(?i)fn::sp00ky::session_live\(\)\s+AND\s+|\s+AND\s+fn::sp00ky::session_live\(\)")
+                .expect("static regex");
+    }
+    if !raw.contains(SESSION_GUARD_CALL) {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    std::borrow::Cow::Owned(GUARD_AND.replace_all(raw, "").replace(SESSION_GUARD_CALL, "true"))
+}
+
 fn build_injection(
     table: &str,
     perms: &HashMap<String, String>,
@@ -186,6 +211,8 @@ fn build_injection(
             ));
         }
     };
+    let guarded = without_session_guard(raw);
+    let raw = guarded.trim();
 
     if raw.eq_ignore_ascii_case("true") {
         return Ok(None);
@@ -509,6 +536,32 @@ mod tests {
         let perms = perms_with(&[("thread", "author.id = $auth.id")]);
         let err = inject_permissions(&mut plan, &perms, None).unwrap_err();
         assert!(err.to_string().contains("$auth"));
+    }
+
+    /// An app that puts the session guard on its own SELECT rule gets the view
+    /// it would get without the call, not a refused registration.
+    #[test]
+    fn session_guard_call_folds_as_true() {
+        let params = json!({"auth": {"id": "user:a"}});
+        let lowered = |perm: &str| {
+            let mut plan = OperatorPlan::Scan {
+                table: "game".into(),
+            };
+            inject_permissions(&mut plan, &perms_with(&[("game", perm)]), Some(&params))
+                .unwrap_or_else(|e| panic!("`{perm}` must lower: {e}"));
+            serde_json::to_value(&plan).unwrap()
+        };
+        let plain = lowered("owner = $auth.id");
+        assert_eq!(lowered("owner = $auth.id AND fn::sp00ky::session_live()"), plain);
+        assert_eq!(lowered("fn::sp00ky::session_live() AND owner = $auth.id"), plain);
+        assert_eq!(
+            lowered("fn::sp00ky::session_live()"),
+            serde_json::to_value(OperatorPlan::Scan {
+                table: "game".into()
+            })
+            .unwrap(),
+            "a rule that is only the guard admits every row the view selects"
+        );
     }
 
     #[test]

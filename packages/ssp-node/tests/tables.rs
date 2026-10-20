@@ -148,3 +148,48 @@ async fn drop_orphaned_removes_only_dead_owners() {
     assert!(table_exists(&raw, &tables::list_ref_table(RefMode::Dedicated, "user:live")).await);
     assert!(!table_exists(&raw, &tables::list_ref_table(RefMode::Dedicated, "user:dead")).await);
 }
+
+async fn returns(raw: &Surreal<MemEngine>, surql: &str) -> Value {
+    raw.query(surql)
+        .await
+        .unwrap()
+        .take::<surrealdb::types::Value>(0)
+        .unwrap()
+        .into_json_value()
+}
+
+/// The per-user edge table asks the app's session guard, and an SSP that runs
+/// ahead of `spky migrate` defines its default so the rule never names a
+/// function that does not exist (that would deny every signed-in edge).
+#[tokio::test]
+async fn per_user_table_asks_the_session_guard_and_brings_its_default() {
+    let (db, raw) = mem().await;
+    let tbl = tables::list_ref_table(RefMode::Dedicated, "user:guarded");
+    tables::ensure_user_tables(db.as_ref(), RefMode::Dedicated, "user:guarded")
+        .await
+        .unwrap();
+
+    let info = returns(&raw, "INFO FOR DB").await;
+    let rule = info["tables"][&tbl].as_str().unwrap_or_default().to_string();
+    // SurrealDB renders the literal id back as `(user:guarded)`.
+    assert!(
+        rule.contains("FOR select WHERE $auth.id = (user:guarded) AND fn::sp00ky::session_live(),"),
+        "per-user rule must ask the guard: {rule}"
+    );
+    assert_eq!(returns(&raw, "RETURN fn::sp00ky::session_live()").await, Value::Bool(true));
+}
+
+/// The default never replaces a guard the internal schema already defined.
+#[tokio::test]
+async fn per_user_table_keeps_the_apps_session_guard() {
+    let (db, raw) = mem().await;
+    raw.query("DEFINE FUNCTION fn::sp00ky::session_live() -> bool { RETURN false; } PERMISSIONS FULL;")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    tables::ensure_user_tables(db.as_ref(), RefMode::Dedicated, "user:guarded_app")
+        .await
+        .unwrap();
+    assert_eq!(returns(&raw, "RETURN fn::sp00ky::session_live()").await, Value::Bool(false));
+}

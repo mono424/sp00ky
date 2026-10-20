@@ -1,4 +1,54 @@
 -- ==================================================
+-- SPOOKY SESSION GUARD
+-- Whether the CALLING session may still sync, decided by the app.
+--
+-- SurrealDB checks a record-access token when a session authenticates and
+-- never again: a WebSocket that authenticated before a password reset keeps
+-- its `$auth` for as long as it stays open, whatever the access method's
+-- AUTHENTICATE clause would now say about its token. The guard is how an app
+-- ends such a session for sync. Every rule below that admits a signed-in
+-- session by `$auth.id` also asks `fn::sp00ky::session_live()`, and so do the
+-- per-user `_00_list_ref_user_<id>` tables the SSP defines
+-- (ssp-node/src/tables.rs). SurrealDB evaluates a table rule again for every
+-- LIVE notification, with the subscriber's `$auth` and `$token`, so a session
+-- the guard turns down receives nothing from the next change on, without
+-- having to reconnect.
+--
+-- The body is `sessionGuard` from sp00ky.yml: a SurrealQL expression over
+-- `$auth` (the row, re-read on every evaluation) and `$token` (the claims the
+-- session authenticated with), for example
+--     sessionGuard: "$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch"
+-- `spky migrate` puts it in place of the marked `RETURN true` below
+-- (`schema_builder::apply_session_guard`); without one every session is live,
+-- as before the guard existed. Anything but `true` refuses.
+--
+-- It runs where a PERMISSIONS clause runs, with permissions off, so it can read
+-- a field the caller cannot (a hidden `session_epoch`). Called from a statement
+-- the caller runs itself it would see such a field as NONE and let a stale
+-- session through, which is why `fn::query::register` asks the probe below
+-- instead of calling it. An app may call it from its own table rules too: the
+-- SSP reads it as `true` when it folds a table's SELECT rule into a view
+-- (ssp/src/permission_inject.rs), because the view reaches clients through
+-- the guarded edge tables.
+-- ==================================================
+DEFINE FUNCTION OVERWRITE fn::sp00ky::session_live() -> bool {
+    RETURN true; -- sp00ky:sessionGuard
+} PERMISSIONS FULL;
+
+-- The guard, asked from a caller's own statement. `live` is readable only where
+-- the guard holds, and a field rule is evaluated with permissions off, so
+-- `SELECT live FROM ONLY _00_session_guard:probe` answers `{ live: true }` to a
+-- live session and `{ live: NONE }` to one the guard refuses. A missing row
+-- answers NONE, which `fn::query::register` lets through: a database the probe
+-- never reached behaves as it did before the guard instead of refusing every
+-- registration. Re-written by the internal schema on every migrate.
+DEFINE TABLE OVERWRITE _00_session_guard SCHEMALESS
+    PERMISSIONS FOR select FULL, FOR create, update, delete NONE;
+DEFINE FIELD OVERWRITE live ON TABLE _00_session_guard TYPE bool
+    PERMISSIONS FOR select WHERE fn::sp00ky::session_live(), FOR create, update NONE;
+UPSERT _00_session_guard:probe SET live = true;
+
+-- ==================================================
 -- SPOOKY INCANTATION
 -- The Registry of active Live Queries (Incantations).
 --
@@ -57,6 +107,11 @@
 -- `$auth.id != NONE` guards the cast so the rule evaluates cleanly for an
 -- anonymous caller instead of erroring.
 --
+-- The user branch also asks the session guard (top of this file): a socket the
+-- app has ended can no longer read its user's rows or heartbeat them, so its
+-- heartbeat comes back empty and the client re-registers, which
+-- `fn::query::register` refuses with an authentication error.
+--
 -- `delete` is granted deliberately: the row DELETE is the only trigger wired
 -- to `/view/unregister` (see the _00_dbsp_cleanup event below), so without it
 -- the sole working teardown is the TTL sweep. The refcount that decides
@@ -79,7 +134,7 @@
 DEFINE TABLE OVERWRITE _00_query SCHEMALESS
     PERMISSIONS
       FOR select, update, delete
-        WHERE ($auth.id != NONE AND auth_id = <string>$auth.id)
+        WHERE ($auth.id != NONE AND auth_id = <string>$auth.id AND fn::sp00ky::session_live())
            OR (auth_id IN ['anon', ''] AND subscribers[*].id CONTAINS <string>session::id())
       FOR create NONE;
 
@@ -191,9 +246,10 @@ DEFINE FIELD OVERWRITE errorCount ON TABLE _00_query TYPE int DEFAULT 0 PERMISSI
 -- that user has registered, regardless of which connection wrote
 -- them. The client still filters in-memory by registered queryId
 -- (see `Sp00kySync.handleRemoteListRefChange`), so cross-session
--- entries it doesn't care about are dropped after delivery.
+-- entries it doesn't care about are dropped after delivery. A session the
+-- app's session guard has ended (top of this file) receives none.
 DEFINE TABLE OVERWRITE _00_list_ref SCHEMALESS
-    PERMISSIONS FOR select WHERE auth_id = <string>$auth.id;
+    PERMISSIONS FOR select WHERE auth_id = <string>$auth.id AND fn::sp00ky::session_live();
 
 DEFINE FIELD OVERWRITE in ON TABLE _00_list_ref TYPE record;
 

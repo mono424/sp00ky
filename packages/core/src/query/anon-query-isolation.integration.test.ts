@@ -58,14 +58,18 @@ function ownerGuard(): string {
 
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
 
-/** Just the `_00_query` block: the rest of the file needs tables and modules this test does not. */
+/**
+ * Just the session guard (its rule's user branch asks it) and the `_00_query`
+ * block: the rest of the file needs tables and modules this test does not.
+ */
 function queryTableSchema(): string {
   const meta = cliSource('meta_tables_remote.surql');
+  const guard = meta.indexOf('-- SPOOKY SESSION GUARD');
   const start = meta.indexOf('DEFINE TABLE OVERWRITE _00_query SCHEMALESS');
   const end = meta.indexOf('-- SPOOKY LIST REF');
-  if (start < 0 || end < start)
+  if (guard < 0 || start < guard || end < start)
     throw new Error('_00_query block not found in meta_tables_remote.surql');
-  return meta.slice(start, end);
+  return meta.slice(guard, meta.indexOf('-- SPOOKY INCANTATION')) + meta.slice(start, end);
 }
 
 const ACCESS = `

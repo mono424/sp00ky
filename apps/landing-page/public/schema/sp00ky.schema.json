@@ -216,6 +216,11 @@
       "description": "Enable realtime sync for unauthenticated (anonymous) clients. When true, the SSP materializes anonymous query registrations into a world-readable `_00_list_ref_anon` table so logged-out visitors get live updates. Defaults to false (anonymous clients can read one-shot but never sync live).",
       "default": false
     },
+    "sessionGuard": {
+      "type": "string",
+      "description": "SurrealQL expression over `$auth` and `$token` that says whether a signed-in session may still sync, e.g. `$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch`. Becomes `fn::sp00ky::session_live()`, which sp00ky's edge tables, `_00_query` and `fn::query::register` ask, so a WebSocket that signed in before a password reset stops syncing without reconnecting. Unset: every session is live.",
+      "examples": ["$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch"]
+    },
     "sync": {
       "$ref": "#/$defs/syncConfig"
     },

@@ -13,6 +13,19 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
     -- `$auth.id` references in the registered table's SELECT predicate
     -- per-user. Without this, predicates that reference $auth fail closed
     -- (Predicate::False) at packages/ssp/src/policy.rs:184-194.
+    --
+    -- A signed-in session the app's session guard has ended registers
+    -- nothing (`fn::sp00ky::session_live` in meta_tables_remote.surql). It is
+    -- asked through the probe row because this body runs as the caller, where
+    -- the guard could not read a hidden field. The wording is SurrealDB's own
+    -- for a refused token, which the clients answer by re-checking the session
+    -- and signing the device out.
+    IF $auth.id != NONE {
+        LET $guard = (SELECT live FROM ONLY _00_session_guard:probe);
+        IF $guard != NONE AND $guard.live != true {
+            THROW "There was a problem with authentication: this session has ended, sign in again";
+        };
+    };
     LET $params_in = $config.params OR {};
     -- Inject both `$auth.id` and `$access` so the SSP's permission
     -- evaluator can substitute either when applying the table's SELECT

@@ -2810,6 +2810,25 @@ fn handle_lint(config_path: &Path) -> Result<()> {
         println!("  Validated push config ({}).", push_sync::summary(&config.push()));
     }
 
+    // 4d. Security: no migration may carry the redacted-key placeholder. A
+    // `DEFINE ACCESS ... KEY '[REDACTED]'` sets the JWT signing key to the
+    // literal string "[REDACTED]", letting anyone forge a token for any user.
+    {
+        let migrations_dir = base_dir.join(&schema.migrations);
+        if migrations_dir.exists() {
+            for m in migrate::scan_migrations(&migrations_dir).unwrap_or_default() {
+                if let Ok(sql) = fs::read_to_string(&m.path) {
+                    if let Err(e) = migrate::check_no_redacted_key(
+                        &sql,
+                        &format!("{}_{}", m.version, m.name),
+                    ) {
+                        errors.push(format!("{e}"));
+                    }
+                }
+            }
+        }
+    }
+
     // 5. Print results
     if !warnings.is_empty() {
         println!();

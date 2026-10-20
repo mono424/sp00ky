@@ -206,42 +206,53 @@ fn ensure_semicolon(stmt: &str) -> String {
     }
 }
 
-/// SurrealDB's `INFO` output scrubs JWT **signing** keys to the literal
-/// `[REDACTED]`. A schema round-tripped through the DB (which we do to get a
-/// canonical form for diffing) therefore loses the `{{JWT_PRIVATE_KEY}}`
-/// placeholder the source used in `DEFINE ACCESS ... WITH ISSUER KEY '...'`.
-/// Left as-is, `migrate create` writes `[REDACTED]` into the generated
-/// migration — a value that's meaningless to apply and reads like a leaked key.
+/// SurrealDB's `INFO` output scrubs JWT keys to the literal `[REDACTED]`: the
+/// **issuer** (signing) key always, and a **symmetric verify** key (HS256/512)
+/// too. A schema round-tripped through the DB (which we do to get a canonical
+/// form for diffing) therefore loses whatever the source used for those keys.
 ///
-/// This restores the original token from `source_sql` (matched per access by
-/// name) so the migration keeps the placeholder. No-op when nothing was
-/// redacted or the source has no matching access. Only the signing key is ever
-/// redacted by SurrealDB; the verify (`KEY`) is returned verbatim.
+/// Writing `[REDACTED]` into a generated migration is not merely ugly — it is a
+/// security hole: applying `WITH JWT ... KEY '[REDACTED]'` sets the signing key
+/// to the 10-byte string `[REDACTED]`, and anyone can then forge a valid session
+/// token for any record user. So for each `DEFINE ACCESS` we:
+///
+/// - restore a redacted key from the matching source access when the source
+///   defines it explicitly (a literal or a `{{VAULT}}` placeholder), keeping the
+///   author's intent; otherwise
+/// - **strip the generated clause** — the whole `WITH JWT ...` when its verify
+///   key was redacted and the source has none (SurrealDB had auto-generated a
+///   random key), or just the `WITH ISSUER KEY '...'` segment when only the
+///   issuer was generated. Re-applying the stripped statement makes SurrealDB
+///   mint a fresh random key, which is exactly what the source asked for.
+///
+/// The result never contains `[REDACTED]`. Asymmetric verify keys (EdDSA/RS
+/// public) are returned verbatim by SurrealDB and are left untouched.
 pub fn restore_redacted_keys(extracted: &str, source_sql: &str) -> String {
     if !extracted.contains("[REDACTED]") {
         return extracted.to_string();
     }
 
-    // access name -> signing-key literal (placeholder or value) from the source.
-    // Strip comment-only lines first: a `;` inside prose (e.g. "KEY = public;
-    // ISSUER KEY = private") would otherwise fragment split_statements.
+    // access name -> (verify-key literal, issuer-key literal) from the source,
+    // either as a literal or a `{{VAULT}}` placeholder. Strip comment-only lines
+    // first: a `;` inside prose (e.g. "KEY = public; ISSUER KEY = private")
+    // would otherwise fragment split_statements.
     let source_code: String = source_sql
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut signing: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    type KeyPair = (Option<String>, Option<String>);
+    let mut source_keys: std::collections::HashMap<String, KeyPair> =
+        std::collections::HashMap::new();
     for stmt in split_statements(&source_code) {
         if let Some(key) = extract_statement_key(&stmt) {
             if key.kind == "ACCESS" {
-                if let Some(tok) = signing_key_literal(&stmt) {
-                    signing.insert(key.identity, tok);
-                }
+                source_keys.insert(
+                    key.identity,
+                    (verify_key_literal(&stmt), signing_key_literal(&stmt)),
+                );
             }
         }
-    }
-    if signing.is_empty() {
-        return extracted.to_string();
     }
 
     let restored: Vec<String> = split_statements(extracted)
@@ -251,16 +262,142 @@ pub fn restore_redacted_keys(extracted: &str, source_sql: &str) -> String {
                 return stmt;
             }
             match extract_statement_key(&stmt) {
-                Some(key) if key.kind == "ACCESS" => match signing.get(&key.identity) {
-                    Some(tok) => stmt.replace("'[REDACTED]'", &format!("'{}'", tok)),
-                    None => stmt,
-                },
+                Some(key) if key.kind == "ACCESS" => {
+                    let (src_verify, src_issuer) = source_keys
+                        .get(&key.identity)
+                        .cloned()
+                        .unwrap_or((None, None));
+                    sanitize_access_jwt(&stmt, src_verify.as_deref(), src_issuer.as_deref())
+                }
                 _ => stmt,
             }
         })
         .collect();
 
     restored.join("\n")
+}
+
+/// Repair the redacted JWT key(s) in a single `DEFINE ACCESS` statement.
+///
+/// Restores each redacted key from the source when available, else removes the
+/// generated clause so SurrealDB regenerates a random key on apply. The returned
+/// statement is guaranteed free of `[REDACTED]` inside the JWT clause. See
+/// [`restore_redacted_keys`] for why.
+fn sanitize_access_jwt(stmt: &str, src_verify: Option<&str>, src_issuer: Option<&str>) -> String {
+    const RED: &str = "'[REDACTED]'";
+    let low = stmt.to_ascii_lowercase();
+
+    // Two slots can be redacted: the verify `KEY '...'` and the signing
+    // `ISSUER KEY '...'`. The issuer sits to the right of the verify key, so a
+    // `[REDACTED]` before `ISSUER` is the verify slot and one at/after it is the
+    // issuer slot. (A redacted verify slot only happens for symmetric keys.)
+    let issuer_pos = low.find("issuer");
+    let verify_region_end = issuer_pos.unwrap_or(stmt.len());
+    let verify_redacted = stmt[..verify_region_end].contains(RED);
+    let issuer_redacted = issuer_pos.is_some_and(|i| stmt[i..].contains(RED));
+
+    // A redacted verify key with no source replacement means SurrealDB generated
+    // a random key: the whole `WITH JWT ...` clause must go so a fresh random key
+    // is minted on apply. Only the `WITH JWT` form can be stripped safely; for
+    // any other shape (e.g. `TYPE JWT`) leave it for the lint/apply guard.
+    if verify_redacted && src_verify.is_none() {
+        return strip_with_jwt_clause(stmt, &low).unwrap_or_else(|| stmt.to_string());
+    }
+
+    let mut out = stmt.to_string();
+
+    // Issuer slot first (rightmost), so the verify slot's offset stays valid.
+    if issuer_redacted {
+        match src_issuer {
+            Some(tok) => {
+                if let Some(at) = out.rfind(RED) {
+                    out.replace_range(at..at + RED.len(), &format!("'{}'", tok));
+                }
+            }
+            // No source issuer: drop the `[WITH] ISSUER KEY '[REDACTED]'` segment.
+            // SurrealDB mirrors the verify key as the issuer on apply.
+            None => out = remove_issuer_segment(&out),
+        }
+    }
+
+    // Verify slot (reached only when it carries a source replacement).
+    if verify_redacted {
+        if let Some(tok) = src_verify {
+            if let Some(at) = out.find(RED) {
+                out.replace_range(at..at + RED.len(), &format!("'{}'", tok));
+            }
+        }
+    }
+
+    // Fail-safe: never ship a `[REDACTED]`. If one slipped through, drop the
+    // whole `WITH JWT` clause (or leave it for the guard if it can't be found).
+    if out.contains(RED) {
+        return strip_with_jwt_clause(stmt, &low).unwrap_or(out);
+    }
+    collapse_spaces(&out)
+}
+
+/// Remove the whole `WITH JWT ...` clause from a `DEFINE ACCESS` statement,
+/// leaving the surrounding clauses intact so SurrealDB mints a fresh random key
+/// on apply. Returns `None` when the statement has no `WITH JWT` clause.
+///
+/// `low` is `stmt` lowercased (byte-aligned, ASCII keywords). The clause runs
+/// from `WITH JWT` up to the next top-level keyword (AUTHENTICATE / DURATION /
+/// COMMENT) or end of statement. SIGNIN/SIGNUP blocks sit before `WITH JWT` and
+/// AUTHENTICATE after it, so scanning forward can't stray into them.
+fn strip_with_jwt_clause(stmt: &str, low: &str) -> Option<String> {
+    let jwt_start = low.find("with jwt")?;
+    let clause_end = [" authenticate", " duration", " comment"]
+        .iter()
+        .filter_map(|kw| low[jwt_start..].find(kw).map(|r| jwt_start + r))
+        .min()
+        .unwrap_or(stmt.len());
+    Some(collapse_spaces(&format!(
+        "{} {}",
+        stmt[..jwt_start].trim_end(),
+        stmt[clause_end..].trim_start()
+    )))
+}
+
+/// Remove the `[WITH] ISSUER KEY '[REDACTED]'` segment from a statement.
+fn remove_issuer_segment(stmt: &str) -> String {
+    let low = stmt.to_ascii_lowercase();
+    let Some(iss) = low.find("issuer") else {
+        return stmt.to_string();
+    };
+    const RED: &str = "'[REDACTED]'";
+    let Some(red_rel) = stmt[iss..].find(RED) else {
+        return stmt.to_string();
+    };
+    let seg_end = iss + red_rel + RED.len();
+    let before = stmt[..iss].trim_end();
+    let seg_start = if before.to_ascii_lowercase().ends_with("with") {
+        before.len() - "with".len()
+    } else {
+        iss
+    };
+    let mut out = stmt.to_string();
+    out.replace_range(seg_start..seg_end, "");
+    collapse_spaces(&out)
+}
+
+/// Collapse runs of spaces (left by excising an inner clause) to a single space,
+/// and tidy a space before a trailing `;`.
+fn collapse_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch == ' ' {
+            if !prev_space {
+                out.push(ch);
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+            out.push(ch);
+        }
+    }
+    out.replace(" ;", ";").trim_end().to_string()
 }
 
 /// Extract the JWT signing-key string literal from a `DEFINE ACCESS` statement:
@@ -287,6 +424,28 @@ fn signing_key_literal(access_stmt: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the JWT **verify** key literal from a `DEFINE ACCESS` statement: the
+/// value after `ALGORITHM <alg> KEY '...'`, searched only in the region before
+/// any `ISSUER` so the issuer's own `KEY` can't be mistaken for it. Returns
+/// `None` for the JWKS (`URL ...`) form or when no verify key is declared.
+fn verify_key_literal(access_stmt: &str) -> Option<String> {
+    let code: String = access_stmt
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = code.to_ascii_lowercase();
+    let alg = lower.find("algorithm")?;
+    let region_end = lower[alg..].find("issuer").map_or(code.len(), |r| alg + r);
+    let region = &code[alg..region_end];
+    let region_low = &lower[alg..region_end];
+    let k = region_low.find("key")?;
+    let after = region[k + "key".len()..].trim_start();
+    let q = after.strip_prefix('\'')?;
+    let end = q.find('\'')?;
+    Some(q[..end].to_string())
 }
 
 /// Normalize a schema SQL string through an ephemeral SurrealDB instance.
@@ -482,13 +641,68 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_redacted_keys_unknown_access_left_alone() {
-        // No matching access in source → can't restore; leave the value as-is
-        // rather than guess (the diff/remove path handles a vanished access).
-        let extracted = "DEFINE ACCESS other ON DATABASE TYPE RECORD WITH ISSUER KEY '[REDACTED]';";
+    fn test_restore_redacted_keys_unknown_access_issuer_stripped() {
+        // No matching access in source → nothing to restore, but we must never
+        // ship `[REDACTED]`. With only the issuer redacted (asymmetric verify),
+        // drop the issuer segment so SurrealDB re-mints it on apply.
+        let extracted = "DEFINE ACCESS other ON DATABASE TYPE RECORD WITH JWT ALGORITHM EDDSA KEY '{{PUB}}' WITH ISSUER KEY '[REDACTED]';";
         let source =
             "DEFINE ACCESS account ON DATABASE TYPE RECORD WITH ISSUER KEY '{{JWT_PRIVATE_KEY}}';";
         let out = restore_redacted_keys(extracted, source);
-        assert!(out.contains("[REDACTED]"), "got: {out}");
+        assert!(!out.contains("[REDACTED]"), "got: {out}");
+        assert!(!out.to_uppercase().contains("ISSUER"), "got: {out}");
+        assert!(out.contains("ALGORITHM EDDSA KEY '{{PUB}}'"), "got: {out}");
+    }
+
+    #[test]
+    fn test_restore_redacted_keys_strips_generated_clause() {
+        // The reported bug: source `DEFINE ACCESS` has NO `WITH JWT` clause, so
+        // SurrealDB auto-generated a random HS512 key that INFO then redacts.
+        // Both the verify KEY and the ISSUER KEY come back `[REDACTED]`. With no
+        // source key to restore, the whole generated clause must be dropped so a
+        // fresh random key is minted on apply — never written as `[REDACTED]`.
+        let extracted = "DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD SIGNUP { RETURN 1 } SIGNIN (SELECT * FROM user) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 4w2d;";
+        let source = "DEFINE ACCESS account ON DATABASE TYPE RECORD\n  SIGNUP { RETURN 1 }\n  SIGNIN (SELECT * FROM user)\n  DURATION FOR TOKEN 15m, FOR SESSION 30d;";
+        let out = restore_redacted_keys(extracted, source);
+        assert!(!out.contains("[REDACTED]"), "got: {out}");
+        assert!(!out.to_uppercase().contains("JWT"), "got: {out}");
+        // Surrounding clauses survive.
+        assert!(out.contains("SIGNIN (SELECT * FROM user)"), "got: {out}");
+        assert!(out.contains("DURATION FOR TOKEN 15m"), "got: {out}");
+    }
+
+    #[test]
+    fn test_restore_redacted_keys_restores_symmetric_verify_key() {
+        // Symmetric key supplied as a vault placeholder: SurrealDB redacts BOTH
+        // the verify KEY and the mirrored ISSUER KEY. The verify slot is restored
+        // from source; the issuer (no source counterpart) is dropped so SurrealDB
+        // mirrors the verify key again.
+        let extracted = "DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m;";
+        let source = "DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user) WITH JWT ALGORITHM HS512 KEY '{{JWT_SECRET}}' DURATION FOR TOKEN 15m;";
+        let out = restore_redacted_keys(extracted, source);
+        assert!(!out.contains("[REDACTED]"), "got: {out}");
+        assert!(out.contains("ALGORITHM HS512 KEY '{{JWT_SECRET}}'"), "got: {out}");
+        assert!(!out.to_uppercase().contains("ISSUER"), "got: {out}");
+    }
+
+    #[test]
+    fn test_restore_redacted_keys_never_emits_redacted() {
+        // Whatever the shape, a restored schema fed to the migration writer must
+        // never contain the literal `[REDACTED]`.
+        let cases = [
+            // no source clause → strip
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNIN (SELECT 1) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m;",
+             "DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNIN (SELECT 1) DURATION FOR TOKEN 15m;"),
+            // asymmetric with placeholders → restore
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT ALGORITHM EDDSA KEY '{{PUB}}' WITH ISSUER KEY '[REDACTED]';",
+             "DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT ALGORITHM EDDSA KEY '{{PUB}}' WITH ISSUER KEY '{{PRIV}}';"),
+            // clause followed by AUTHENTICATE block
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE { RETURN $auth } DURATION FOR TOKEN 1h;",
+             "DEFINE ACCESS a ON DATABASE TYPE RECORD AUTHENTICATE { RETURN $auth } DURATION FOR TOKEN 1h;"),
+        ];
+        for (extracted, source) in cases {
+            let out = restore_redacted_keys(extracted, source);
+            assert!(!out.contains("[REDACTED]"), "extracted={extracted}\n got: {out}");
+        }
     }
 }

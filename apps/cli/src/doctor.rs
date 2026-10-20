@@ -112,6 +112,8 @@ pub fn run(emit_json: bool, project_dir: &Path, treat_warn_as_ok: bool) -> Resul
         checks.push(check_migrations_dir(cfg, project_dir));
         // 5. Leftover client-recurring fields on an outbox schema
         checks.extend(check_legacy_recurring_fields(cfg, project_dir));
+        // 5b. Security: migrations carrying the redacted-key placeholder
+        checks.push(check_redacted_access_keys(cfg, project_dir));
     }
 
     // 6. Docker availability — warn (not fail). Local-dev users only need
@@ -304,6 +306,41 @@ fn check_legacy_recurring_fields(cfg: &Sp00kyConfig, project_dir: &Path) -> Vec<
         ));
     }
     checks
+}
+
+/// A migration carrying `KEY '[REDACTED]'` is a forgeable-token hazard: applying
+/// it sets the JWT signing key to the literal string "[REDACTED]", so anyone can
+/// forge a session token for any record user. Fails hard — this is a live
+/// security bug, not a style nit.
+fn check_redacted_access_keys(cfg: &Sp00kyConfig, project_dir: &Path) -> Check {
+    let resolved = crate::backend::ResolvedSchema::from_config(&cfg.schema);
+    let dir = project_dir.join(&resolved.migrations);
+    if !dir.exists() {
+        return Check::pass("access-keys", None);
+    }
+    let mut offenders = Vec::new();
+    for m in crate::migrate::scan_migrations(&dir).unwrap_or_default() {
+        if let Ok(sql) = fs::read_to_string(&m.path) {
+            if crate::migrate::check_no_redacted_key(&sql, "").is_err() {
+                offenders.push(format!("{}_{}", m.version, m.name));
+            }
+        }
+    }
+    if offenders.is_empty() {
+        Check::pass("access-keys", Some("no redacted JWT keys".to_string()))
+    } else {
+        Check::fail(
+            "access-keys",
+            "remove the `WITH JWT ... KEY '[REDACTED]'` clause (SurrealDB then generates a \
+             random key) or supply an explicit key / {{VAULT}} placeholder, then \
+             `spky migrate create` to regenerate; rotate the key on any DB already deployed",
+            format!(
+                "migration(s) {} apply a DEFINE ACCESS with KEY '[REDACTED]' — this sets the \
+                 JWT signing key to the literal \"[REDACTED]\", allowing forged tokens",
+                offenders.join(", ")
+            ),
+        )
+    }
 }
 
 fn check_docker() -> Check {

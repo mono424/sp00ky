@@ -1008,6 +1008,54 @@ staleness flag are built on.</p>
 
 
 <table><thead><tr><th style="text-align:left">Variable</th><th style="text-align:left">Description</th><th style="text-align:left">Default</th></tr></thead><tbody><tr><td style="text-align:left"><code>SPKY_HEARTBEAT_INTERVAL_SECS</code></td><td style="text-align:left">Seconds between probe cycles. <code>0</code> disables the probe.</td><td style="text-align:left"><code>30</code></td></tr><tr><td style="text-align:left"><code>SPKY_HEARTBEAT_TIMEOUT_SECS</code></td><td style="text-align:left">Deadline for one cycle. Clamped below the interval so a cycle always finishes before the next tick.</td><td style="text-align:left"><code>25</code></td></tr><tr><td style="text-align:left"><code>SPKY_HEARTBEAT_FAIL_THRESHOLD</code></td><td style="text-align:left">Consecutive failed cycles before the alert fires</td><td style="text-align:left"><code>3</code></td></tr><tr><td style="text-align:left"><code>SPKY_HEARTBEAT_PING_URL</code></td><td style="text-align:left">Dead-man URL pinged after each successful cycle, for an external uptime monitor</td><td style="text-align:left"><em>(unset)</em></td></tr><tr><td style="text-align:left"><code>SPKY_ALERT_WEBHOOK_URL</code></td><td style="text-align:left">Webhook posted to when the probe crosses the failure threshold and again when it recovers</td><td style="text-align:left"><em>(unset)</em></td></tr><tr><td style="text-align:left"><code>SPKY_HEALTH_MAX_HEARTBEAT_AGE_SECS</code></td><td style="text-align:left">How stale the last successful probe may be before <code>/health</code> degrades. Floored at <code>3 x interval + timeout</code>, so a smaller value has no effect.</td><td style="text-align:left"><em>(computed)</em></td></tr></tbody></table>
+<h4 id="surrealdb-websocket-watchdog">SurrealDB WebSocket watchdog</h4>
+<p>Each cycle the scheduler opens a new WebSocket to SurrealDB and waits for the
+upgrade. A cycle counts as wedged when <code>/health</code> answers but the upgrade gets
+no response at all, the SurrealDB 3.x state where open sockets keep working
+and no new client can connect. A database that is down is left to the control
+plane. Needs a plain <code>http://</code> or <code>ws://</code> <code>SPKY_DB_URL</code>; restarts need the
+Sp00ky Cloud link, without it the watchdog only reports.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th style="text-align:left">Variable</th><th style="text-align:left">Description</th><th style="text-align:left">Default</th></tr></thead><tbody><tr><td style="text-align:left"><code>SPKY_SURREAL_WS_WATCHDOG_INTERVAL_SECS</code></td><td style="text-align:left">Seconds between probe cycles. <code>0</code> disables the watchdog.</td><td style="text-align:left"><code>30</code></td></tr><tr><td style="text-align:left"><code>SPKY_SURREAL_WS_WATCHDOG_TIMEOUT_SECS</code></td><td style="text-align:left">How long one upgrade may take before the cycle counts as wedged. Clamped below the interval.</td><td style="text-align:left"><code>10</code></td></tr><tr><td style="text-align:left"><code>SPKY_SURREAL_WS_WATCHDOG_INCIDENT_AFTER</code></td><td style="text-align:left">Wedged cycles in a row before the <code>ws_accept_wedge</code> admin incident opens, so one slow upgrade on an overloaded database is not recorded as a wedge. Clamped to <code>1</code> through the fail threshold, so a restart is always recorded on an open incident.</td><td style="text-align:left"><code>2</code></td></tr><tr><td style="text-align:left"><code>SPKY_SURREAL_WS_WATCHDOG_FAIL_THRESHOLD</code></td><td style="text-align:left">Wedged cycles in a row before the watchdog asks Sp00ky Cloud to restart SurrealDB</td><td style="text-align:left"><code>3</code></td></tr><tr><td style="text-align:left"><code>SPKY_SURREAL_WS_WATCHDOG_COOLDOWN_SECS</code></td><td style="text-align:left">Minimum seconds between two restart requests</td><td style="text-align:left"><code>900</code></td></tr><tr><td style="text-align:left"><code>SPKY_SURREAL_WS_WATCHDOG_RESTART</code></td><td style="text-align:left"><code>0</code>, <code>false</code>, <code>off</code> or <code>no</code> = report only, never restart</td><td style="text-align:left"><code>true</code></td></tr></tbody></table>
 <h4 id="tuning">Tuning</h4>
 
 

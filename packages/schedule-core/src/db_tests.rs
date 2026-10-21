@@ -3668,3 +3668,95 @@ async fn a_schedule_that_cannot_be_planned_does_not_ask_for_a_sweep() {
     h.engine.tick_pass().await.unwrap();
     assert_eq!(h.engine.next_wake(Utc::now()).await.unwrap(), None);
 }
+
+// --- the admin surface --------------------------------------------------------
+
+/// A fired schedule job, an application job with two failed attempts, and a
+/// finished one, in an outbox table the retention row lists.
+async fn admin_harness() -> (Harness, MemDb) {
+    let h = harness().await;
+    h.define_schedule("nightly", every_5m_job()).await;
+    h.engine.tick_pass().await.unwrap();
+    h.set("UPDATE _00_schedule:nightly SET next_fire_at = time::now() - 1s").await;
+    assert_eq!(h.engine.tick_pass().await.unwrap().spawned, 1);
+    h.set(
+        "UPSERT _00_retention:default SET job_tables = ['job', 'not a table']; \
+         CREATE job:app_failed SET path = '/mail', status = 'failed', \
+             errors = [{ message: 'timeout' }, { message: 'HTTP 500' }]; \
+         CREATE job:app_done SET path = '/mail', status = 'success';",
+    )
+    .await;
+    let db = MemDb(Arc::clone(&h.raw));
+    (h, db)
+}
+
+#[tokio::test]
+async fn admin_lists_jobs_with_their_origin_and_totals() {
+    use crate::admin::{self, JobsQuery};
+    let (_h, db) = admin_harness().await;
+
+    let page = admin::list_jobs(&db, &JobsQuery::default()).await.unwrap();
+    assert_eq!(page["returned"], 3, "{page}");
+    assert_eq!(page["totals"]["counts"]["pending"], 1, "{page}");
+    assert_eq!(page["totals"]["counts"]["failed"], 1, "{page}");
+    assert_eq!(page["totals"]["blind"], false);
+    assert_eq!(page["tables"].as_array().unwrap().len(), 1, "an unlisted name is not a table");
+    let jobs = page["jobs"].as_array().unwrap();
+    let scheduled = jobs.iter().find(|j| j["origin"]["kind"] == "schedule").expect("schedule job");
+    assert_eq!(scheduled["origin"]["schedule"], "nightly", "the back-link resolved: {scheduled}");
+    let failed = jobs.iter().find(|j| j["key"] == "app_failed").unwrap();
+    assert_eq!(failed["attempts"], 2);
+    assert_eq!(failed["last_error"]["message"], "HTTP 500");
+    assert!(failed.get("errors").is_none(), "the history is on the detail only");
+
+    let apps = JobsQuery { origin: Some("app".into()), ..Default::default() };
+    let page = admin::list_jobs(&db, &apps).await.unwrap();
+    assert_eq!(page["returned"], 2, "{page}");
+    assert_eq!(page["filtered"], true);
+    assert_eq!(page["totals"]["counts"]["pending"], 1, "totals do not move with the filter");
+
+    let missing = JobsQuery { table: Some("other".into()), ..Default::default() };
+    assert_eq!(admin::list_jobs(&db, &missing).await.unwrap_err().status, 404);
+}
+
+#[tokio::test]
+async fn admin_job_detail_keeps_the_history_and_clear_spares_live_work() {
+    use crate::admin::{self, ClearBody};
+    let (_h, db) = admin_harness().await;
+
+    let detail = admin::job_detail(&db, "job:app_failed").await.unwrap();
+    assert_eq!(detail["job"]["errors"].as_array().unwrap().len(), 2, "{detail}");
+    assert_eq!(detail["job"]["origin"]["kind"], "app");
+    assert_eq!(admin::job_detail(&db, "user:alice").await.unwrap_err().status, 404, "not an outbox table");
+    assert_eq!(admin::job_detail(&db, "job:gone").await.unwrap_err().status, 404);
+
+    let out = admin::jobs_clear(&db, &ClearBody::default()).await.unwrap();
+    assert_eq!(out["total"], 2, "the failed and the finished job: {out}");
+    let left = admin::list_jobs(&db, &Default::default()).await.unwrap();
+    assert_eq!(left["returned"], 1, "the pending job stays: {left}");
+}
+
+#[tokio::test]
+async fn admin_schedule_actions_follow_the_engine_rules() {
+    use crate::admin;
+    let (h, db) = admin_harness().await;
+
+    let list = admin::list_schedules(&db).await.unwrap();
+    assert_eq!(list["schedules"][0]["name"], "nightly");
+    let detail = admin::schedule_detail(&db, "nightly").await.unwrap();
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 1, "{detail}");
+    assert_eq!(admin::schedule_detail(&db, "nope").await.unwrap_err().status, 404);
+
+    admin::set_paused(&db, "nightly", true).await.unwrap();
+    assert_eq!(admin::trigger(&db, "nightly").await.unwrap_err().status, 409, "a paused schedule cannot fire");
+    admin::set_paused(&db, "nightly", false).await.unwrap();
+    let fired = admin::trigger(&db, "nightly").await.unwrap();
+    assert!(fired["triggered_at"].is_string(), "{fired}");
+    assert_eq!(
+        h.one_bool("SELECT VALUE trigger_requested_at != NONE FROM ONLY _00_schedule:nightly").await,
+        Some(true)
+    );
+
+    let runs = admin::list_runs(&db, &Default::default()).await.unwrap();
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 0, "a job schedule has no workflow runs");
+}

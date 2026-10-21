@@ -190,10 +190,19 @@ pub async fn rows(
 ///
 /// The admin listings assemble their queries as text because the surrounding
 /// CLI queries do, and their filters are user-supplied. One escaper for the
-/// whole plane, matching `apps/cli/src/flag.rs::esc`, so no reader can end up
-/// with a weaker one than its neighbour.
-pub fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
+/// whole plane, the one `schedule_core::admin` builds its statements with, so
+/// no reader can end up with a weaker one than its neighbour.
+pub use schedule_core::admin::esc;
+
+/// The shared job, schedule and workflow surface (`schedule_core::admin`)
+/// over this plane's root handle.
+pub fn core_db(state: &AdminState) -> Result<crate::schedule_engine::SharedDb, ApiError> {
+    state.db().map(crate::schedule_engine::SharedDb).ok_or_else(db_unavailable)
+}
+
+/// A `schedule_core::admin` failure as this plane answers it.
+pub fn core_error(e: schedule_core::admin::AdminError) -> ApiError {
+    api_error(StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY), e.message)
 }
 
 /// The signed-in session, extracted by [`require_session`] and attached to the

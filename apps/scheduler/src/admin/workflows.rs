@@ -9,6 +9,9 @@
 //! the scheduler feeds every connected dashboard through a broadcast channel,
 //! and it only runs while someone is watching. Ten open browser tabs cost the
 //! database exactly what one does, and a closed tab costs it nothing.
+//!
+//! The queries and actions are `schedule_core::admin`, shared with the SSP
+//! node's admin API; this file adds the poller and the engine it runs over.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,318 +21,50 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::Json;
+use axum::{Extension, Json};
 use futures::stream::{self, Stream, StreamExt};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
 use maintenance::db::ReconnectingDb;
+use schedule_core::admin::{self as core, ReleaseBody, RunsQuery};
+use schedule_core::ScheduleEngine;
 
-use super::{api_error, db_unavailable, esc, rows, AdminState, ApiError};
+use super::{core_db, core_error, db_unavailable, rows, AdminState, ApiError, CurrentSession};
 
 /// How often the shared poller re-reads the run tables while anyone is
 /// watching. Matches `spky workflows watch`.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Cap on `?limit=`, so one request cannot ask the database for everything.
-const MAX_LIMIT: usize = 500;
-const DEFAULT_LIMIT: usize = 50;
-
-const RUN_FIELDS: &str = "type::string(id) AS id, workflow_name, schedule_name, status, \
-     kill_requested, error, trigger, retry_count, \
-     type::string(rerun_of) AS rerun_of, \
-     type::string(created_at) AS created_at, \
-     type::string(updated_at) AS updated_at, \
-     type::string(finished_at) AS finished_at";
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RunsQuery {
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Filter by the owning schedule rather than the workflow name. A schedule
-    /// can drive a workflow whose name differs from its own, so the two are not
-    /// interchangeable.
-    #[serde(default)]
-    pub schedule: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    /// Only the reruns of one run, for the provenance panel on its page.
-    #[serde(default)]
-    pub rerun_of: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-fn runs_surql(q: &RunsQuery) -> String {
-    let mut filters = Vec::new();
-    if let Some(name) = q.name.as_ref().filter(|s| !s.is_empty()) {
-        filters.push(format!("workflow_name = '{}'", esc(name)));
-    }
-    if let Some(schedule) = q.schedule.as_ref().filter(|s| !s.is_empty()) {
-        filters.push(format!("schedule_name = '{}'", esc(schedule)));
-    }
-    if let Some(status) = q.status.as_ref().filter(|s| !s.is_empty()) {
-        filters.push(format!("status = '{}'", esc(status)));
-    }
-    if let Some(src) = q.rerun_of.as_ref().filter(|s| !s.is_empty()) {
-        // `rerun_of` is a record link; compare its string form so the caller
-        // can pass the id exactly as the list handed it out.
-        filters.push(format!("type::string(rerun_of) = '{}'", esc(src)));
-    }
-    let where_clause = if filters.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {} ", filters.join(" AND "))
-    };
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    format!("SELECT {RUN_FIELDS} FROM _00_workflow_run {where_clause}ORDER BY created_at DESC LIMIT {limit};")
-}
-
 pub async fn list_runs(
     State(state): State<AdminState>,
     Query(q): Query<RunsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-    let runs = rows(&db, &runs_surql(&q)).await?;
-    Ok(Json(json!({ "runs": runs })))
+    core::list_runs(&core_db(&state)?, &q).await.map(Json).map_err(core_error)
 }
 
 pub async fn run_detail(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-
-    // The path segment arrives percent-decoded by axum; escaping it here is
-    // what keeps it a string literal rather than SurrealQL.
-    let run = rows(
-        &db,
-        &format!(
-            "SELECT {RUN_FIELDS}, dag, input, target_table \
-             FROM _00_workflow_run WHERE type::string(id) = '{}' LIMIT 1;",
-            esc(&id)
-        ),
-    )
-    .await?
-    .into_iter()
-    .next();
-
-    let Some(run) = run else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            format!(
-                "No workflow run '{}'. A successful run leaves no rows behind on a schedule \
-                 with `history: failures-only`.",
-                id
-            ),
-        ));
-    };
-
-    let steps = rows(
-        &db,
-        &format!(
-            // `started_at` is when the step's job was created; `created_at` is
-            // when the ROW was made, which for a step deep in a DAG is the run's
-            // own start. Plotting the latter draws every dependent step from
-            // +0ms, so the timeline needs both: the truth, and the fallback for
-            // rows written before `started_at` was stamped.
-            "SELECT step, depends_on, status, job_id, output, error, \
-             dispatch_attempts, \
-             type::string(created_at) AS created_at, \
-             type::string(started_at) AS started_at, \
-             type::string(finished_at) AS finished_at \
-             FROM _00_step_run WHERE type::string(workflow_run) = '{}';",
-            esc(&id)
-        ),
-    )
-    .await?;
-
-    Ok(Json(json!({ "run": run, "steps": steps })))
+    // The path segment arrives percent-decoded by axum; the shared query
+    // escapes it into a string literal.
+    core::run_detail(&core_db(&state)?, &id).await.map(Json).map_err(core_error)
 }
 
-const SCHEDULE_FIELDS: &str = "name, kind, cron, every_ms, timezone, paused, config_disabled, \
-     concurrency, max_retries, retry_strategy, timeout, target_table, path, \
-     for_each, for_each_key, history_mode, last_run_status, last_error, \
-     type::string(next_fire_at) AS next_fire_at, \
-     type::string(last_fire_at) AS last_fire_at, \
-     type::string(last_run_at) AS last_run_at, \
-     type::string(created_at) AS created_at, \
-     type::string(updated_at) AS updated_at";
-
-pub async fn list_schedules(
-    State(state): State<AdminState>,
-) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-    let schedules = rows(
-        &db,
-        &format!("SELECT {SCHEDULE_FIELDS} FROM _00_schedule ORDER BY name;"),
-    )
-    .await?;
-    Ok(Json(json!({ "schedules": schedules })))
+pub async fn list_schedules(State(state): State<AdminState>) -> Result<Json<Value>, ApiError> {
+    core::list_schedules(&core_db(&state)?).await.map(Json).map_err(core_error)
 }
 
-/// One schedule, plus its recent runs and a success/failure tally.
-///
-/// The tally comes from `_00_run_rollup`, which the engine maintains as hourly
-/// buckets precisely so this kind of view does not have to count rows that
-/// retention has already pruned.
+/// One schedule, plus its recent runs, an hourly success/failure tally and the
+/// keys it has quarantined.
 pub async fn schedule_detail(
     State(state): State<AdminState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-
-    let schedule = rows(
-        &db,
-        &format!(
-            "SELECT {SCHEDULE_FIELDS} FROM _00_schedule WHERE name = '{}' LIMIT 1;",
-            esc(&name)
-        ),
-    )
-    .await?
-    .into_iter()
-    .next();
-
-    let Some(schedule) = schedule else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            format!("No schedule named '{}'", name),
-        ));
-    };
-
-    let runs = rows(
-        &db,
-        &format!(
-            "SELECT type::string(id) AS id, schedule_name, key, kind, status, trigger, job_id, \
-             type::string(workflow_run) AS workflow_run, error, \
-             type::string(fire_at) AS fire_at, \
-             type::string(created_at) AS created_at, \
-             type::string(finished_at) AS finished_at \
-             FROM _00_schedule_run WHERE schedule_name = '{}' \
-             ORDER BY created_at DESC LIMIT 25;",
-            esc(&name)
-        ),
-    )
-    .await?;
-
-    let rollup = schedule_tally(&db, &name, 48).await?;
-
-    // The keys this schedule has stopped firing. Empty for a schedule that
-    // never set `quarantineAfter`, since nothing writes the row without it.
-    let quarantined = rows(
-        &db,
-        &format!(
-            "SELECT key, consecutive_failures, type::string(quarantined_at) AS quarantined_at \
-             FROM _00_schedule_key WHERE schedule_name = '{}' AND quarantined_at != NONE \
-             AND consecutive_failures > 0;",
-            esc(&name)
-        ),
-    )
-    .await?;
-
-    Ok(Json(json!({
-        "schedule": schedule,
-        "runs": runs,
-        "rollup": rollup,
-        "quarantined": quarantined,
-    })))
-}
-
-/// The outcome counters a run can land in, in the order the rollup and the
-/// dashboard render them.
-pub const RUN_OUTCOMES: [&str; 5] = ["success", "failed", "skipped", "replaced", "killed"];
-
-/// The hourly outcome tally for a schedule: the rollup plus the runs that have
-/// not been pruned yet.
-///
-/// `_00_run_rollup` is folded by the prune pass alone - deliberately, so the
-/// counts are a by-product of work already being done. The cost is that a
-/// bucket only becomes true once retention has swept it, and retention is
-/// routinely asymmetric: an app that keeps successes for 30m and failures for
-/// the 30d default has every bucket reading `failed: 0` for a month while the
-/// schedule is visibly failing. That is the most misleading direction the
-/// number could be wrong in, and both `spky schedules get` and the dashboard
-/// read it.
-///
-/// Counting the survivors and adding them is exact rather than approximate: a
-/// run row is either still present or it was folded when pruned, never both.
-async fn schedule_tally(
-    db: &Arc<ReconnectingDb>,
-    name: &str,
-    limit: usize,
-) -> Result<Vec<Value>, ApiError> {
-    let statuses = RUN_OUTCOMES
-        .map(|s| format!("'{s}'"))
-        .join(", ");
-    let pruned = rows(
-        db,
-        &format!(
-            "SELECT type::string(bucket) AS bucket, success, failed, skipped, replaced, killed \
-             FROM _00_run_rollup WHERE scope = 'schedule' AND name = '{}';",
-            esc(name)
-        ),
-    )
-    .await?;
-    // `time::floor` to the same hour the prune pass buckets by, so a bucket
-    // that is half pruned and half live adds up instead of splitting in two.
-    let live = rows(
-        db,
-        &format!(
-            "SELECT type::string(time::floor(fire_at, 1h)) AS bucket, status, count() AS n \
-             FROM _00_schedule_run \
-             WHERE schedule_name = '{}' AND status IN [{statuses}] \
-             GROUP BY bucket, status;",
-            esc(name)
-        ),
-    )
-    .await?;
-
-    Ok(merge_tally(&pruned, &live, limit))
-}
-
-/// Fold the pruned counters and the surviving rows into one set of hourly
-/// buckets. Split out from [`schedule_tally`] so the arithmetic that decides
-/// what an operator reads is testable without a database.
-fn merge_tally(pruned: &[Value], live: &[Value], limit: usize) -> Vec<Value> {
-    let mut buckets: std::collections::BTreeMap<String, [i64; 5]> =
-        std::collections::BTreeMap::new();
-    for row in pruned {
-        let Some(bucket) = row["bucket"].as_str() else {
-            continue;
-        };
-        let slot = buckets.entry(bucket.to_string()).or_default();
-        for (i, outcome) in RUN_OUTCOMES.iter().enumerate() {
-            slot[i] += row[*outcome].as_i64().unwrap_or(0);
-        }
-    }
-    for row in live {
-        let (Some(bucket), Some(status)) = (row["bucket"].as_str(), row["status"].as_str()) else {
-            continue;
-        };
-        let Some(i) = RUN_OUTCOMES.iter().position(|o| *o == status) else {
-            continue;
-        };
-        buckets.entry(bucket.to_string()).or_default()[i] += row["n"].as_i64().unwrap_or(0);
-    }
-
-    buckets
-        .into_iter()
-        .rev()
-        .take(limit)
-        .map(|(bucket, c)| {
-            json!({
-                "bucket": bucket,
-                "success": c[0],
-                "failed": c[1],
-                "skipped": c[2],
-                "replaced": c[3],
-                "killed": c[4],
-            })
-        })
-        .collect()
+    core::schedule_detail(&core_db(&state)?, &name).await.map(Json).map_err(core_error)
 }
 
 // =============================================================
@@ -394,9 +129,7 @@ impl WorkflowWatcher {
                 }
 
                 let handle = db.handle();
-                let query = format!(
-                    "SELECT {RUN_FIELDS} FROM _00_workflow_run ORDER BY created_at DESC LIMIT {DEFAULT_LIMIT};"
-                );
+                let query = RunsQuery::default().surql();
                 let runs: Vec<Value> = match handle.query(&query).await.and_then(|mut r| r.take(0)) {
                     Ok(v) => v,
                     Err(e) => {
@@ -428,7 +161,7 @@ pub async fn stream_runs(
 
     // Seed the stream with the current state, so a fresh client paints
     // immediately instead of waiting for the first change.
-    let initial = rows(&db, &runs_surql(&RunsQuery::default())).await?;
+    let initial = rows(&db, &RunsQuery::default().surql()).await?;
     let (rx, guard) = state.workflows.subscribe(db);
 
     let first = stream::iter(vec![Ok::<_, Infallible>(
@@ -464,25 +197,6 @@ pub async fn stream_runs(
 // Actions
 // ---------------------------------------------------------------------------
 
-use axum::Extension;
-use schedule_core::{ids, ScheduleEngine, WorkflowOpError};
-
-use super::CurrentSession;
-
-fn parse_run_id(id: &str) -> Result<ids::Ref, ApiError> {
-    match ids::Ref::parse(id) {
-        Some(r) if r.table == ids::WORKFLOW_RUN => Ok(r),
-        Some(r) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("'{}' is a {} record, not a workflow run", id, r.table),
-        )),
-        None => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!("'{}' is not a record id", id),
-        )),
-    }
-}
-
 /// A per-request engine over the admin plane's shared root handle. Cheap to
 /// build, and it means an operator action runs through exactly the code the
 /// 5s sweep runs, rather than a hand-written imitation of it.
@@ -495,49 +209,17 @@ fn engine(state: &AdminState) -> Result<ScheduleEngine, ApiError> {
     ))
 }
 
-fn op_error(e: WorkflowOpError) -> ApiError {
-    match e {
-        WorkflowOpError::NotFound(id) => {
-            api_error(StatusCode::NOT_FOUND, format!("No workflow run {id}"))
-        }
-        WorkflowOpError::BadDag(msg) => {
-            api_error(StatusCode::UNPROCESSABLE_ENTITY, format!("Frozen DAG is invalid: {msg}"))
-        }
-        WorkflowOpError::Db(err) => {
-            let unknown_field = err
-                .downcast_ref::<schedule_core::ScheduleDbError>()
-                .map(|d| d.is_unknown_field())
-                .unwrap_or_else(|| err.to_string().contains("found no field"));
-            if unknown_field {
-                api_error(
-                    StatusCode::CONFLICT,
-                    "The schedule tables predate this action; run `spky deploy` to migrate them",
-                )
-            } else {
-                api_error(StatusCode::BAD_GATEWAY, format!("Database error: {err:#}"))
-            }
-        }
-        // Everything else is a state the operator can read and act on.
-        other => api_error(StatusCode::CONFLICT, other.to_string()),
-    }
-}
-
 /// `POST /admin/api/workflows/runs/:id/cancel`
 pub async fn cancel_run(
     State(state): State<AdminState>,
     Extension(CurrentSession(session)): Extension<CurrentSession>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let run = parse_run_id(&id)?;
-    let out = engine(&state)?
-        .cancel_workflow(&run)
-        .await
-        .map_err(op_error)?;
-    tracing::info!(run = %run, status = %out.status, by = %session.subject, "Workflow run cancelled from the dashboard");
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({ "run": out.run.as_string(), "status": out.status })),
-    ))
+    // A malformed id is a 400 whether or not the database is up yet.
+    core::parse_run_id(&id).map_err(core_error)?;
+    let out = core::cancel_run(&engine(&state)?, &id).await.map_err(core_error)?;
+    tracing::info!(run = %id, status = %out["status"], by = %session.subject, "Workflow run cancelled from the dashboard");
+    Ok((StatusCode::ACCEPTED, Json(out)))
 }
 
 /// `POST /admin/api/workflows/runs/:id/rerun`
@@ -546,16 +228,11 @@ pub async fn rerun_run(
     Extension(CurrentSession(session)): Extension<CurrentSession>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let run = parse_run_id(&id)?;
-    let out = engine(&state)?
-        .rerun_workflow(&run, chrono::Utc::now())
-        .await
-        .map_err(op_error)?;
-    tracing::info!(source = %run, run = %out.run, by = %session.subject, "Workflow rerun from the dashboard");
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "run": out.run.as_string(), "rerun_of": out.rerun_of.as_string() })),
-    ))
+    // A malformed id is a 400 whether or not the database is up yet.
+    core::parse_run_id(&id).map_err(core_error)?;
+    let out = core::rerun_run(&engine(&state)?, &id).await.map_err(core_error)?;
+    tracing::info!(source = %id, run = %out["run"], by = %session.subject, "Workflow rerun from the dashboard");
+    Ok((StatusCode::CREATED, Json(out)))
 }
 
 /// `POST /admin/api/workflows/runs/:id/retry`
@@ -564,39 +241,11 @@ pub async fn retry_run(
     Extension(CurrentSession(session)): Extension<CurrentSession>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let run = parse_run_id(&id)?;
-    let out = engine(&state)?
-        .retry_workflow(&run)
-        .await
-        .map_err(op_error)?;
-    tracing::info!(run = %run, retry_count = out.retry_count, reset = ?out.reset, by = %session.subject, "Workflow retried from the dashboard");
-    Ok(Json(json!({
-        "run": out.run.as_string(),
-        "retry_count": out.retry_count,
-        "reset": out.reset,
-        "kept": out.kept,
-    })))
-}
-
-/// `_00_schedule:⟨name⟩`, the same literal the CLI writes. The ⟨⟩ form quotes
-/// any key, which matters because schedule names routinely carry hyphens (a
-/// bare `_00_schedule:game-sync` parses as a subtraction).
-fn schedule_literal(name: &str) -> String {
-    format!("_00_schedule:⟨{}⟩", name.replace('⟩', ""))
-}
-
-async fn load_schedule(db: &Arc<ReconnectingDb>, name: &str) -> Result<Value, ApiError> {
-    rows(
-        db,
-        &format!(
-            "SELECT name, paused, config_disabled FROM _00_schedule WHERE name = '{}' LIMIT 1;",
-            esc(name)
-        ),
-    )
-    .await?
-    .into_iter()
-    .next()
-    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("No schedule named '{name}'")))
+    // A malformed id is a 400 whether or not the database is up yet.
+    core::parse_run_id(&id).map_err(core_error)?;
+    let out = core::retry_run(&engine(&state)?, &id).await.map_err(core_error)?;
+    tracing::info!(run = %id, retry_count = %out["retry_count"], reset = %out["reset"], by = %session.subject, "Workflow retried from the dashboard");
+    Ok(Json(out))
 }
 
 async fn set_paused(
@@ -605,15 +254,9 @@ async fn set_paused(
     name: &str,
     paused: bool,
 ) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-    load_schedule(&db, name).await?;
-    rows(
-        &db,
-        &format!("UPDATE {} SET paused = {};", schedule_literal(name), paused),
-    )
-    .await?;
+    let out = core::set_paused(&core_db(state)?, name, paused).await.map_err(core_error)?;
     tracing::info!(schedule = %name, paused, by = %session.0.subject, "Schedule pause state changed from the dashboard");
-    Ok(Json(json!({ "name": name, "paused": paused })))
+    Ok(Json(out))
 }
 
 /// `POST /admin/api/schedules/:name/pause`
@@ -646,20 +289,12 @@ pub async fn schedule_release(
     Path(name): Path<String>,
     Json(body): Json<ReleaseBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-    load_schedule(&db, &name).await?;
-    let row = schedule_core::ids::schedule_key(&name, &body.key);
-    rows(&db, &schedule_core::sql::release_schedule_key(&row)).await?;
+    let out = core::release_key(&core_db(&state)?, &name, &body.key).await.map_err(core_error)?;
     tracing::info!(
         schedule = %name, key = %body.key, by = %session.0.subject,
         "Schedule key released from the dashboard"
     );
-    Ok(Json(json!({ "name": name, "key": body.key, "released": true })))
-}
-
-#[derive(Deserialize)]
-pub struct ReleaseBody {
-    pub key: String,
+    Ok(Json(out))
 }
 
 /// `POST /admin/api/schedules/:name/trigger`
@@ -668,167 +303,7 @@ pub async fn schedule_trigger(
     Extension(CurrentSession(session)): Extension<CurrentSession>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let db = state.db().ok_or_else(db_unavailable)?;
-    let schedule = load_schedule(&db, &name).await?;
-    // Pause wins over a queued trigger in the engine (`SELECT_TRIGGERED`
-    // requires `paused = false`), so accepting one here would queue a fire
-    // that silently never happens.
-    if schedule["paused"].as_bool() == Some(true) {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            format!("Schedule '{name}' is paused; resume it before triggering"),
-        ));
-    }
-    if schedule["config_disabled"].as_bool() == Some(true) {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            format!("Schedule '{name}' is disabled in its config; enable it and run `spky schedules sync`"),
-        ));
-    }
-    let updated = rows(
-        &db,
-        &format!(
-            "UPDATE {} SET trigger_requested_at = time::now() RETURN type::string(trigger_requested_at) AS trigger_requested_at;",
-            schedule_literal(&name)
-        ),
-    )
-    .await?;
-    let at = updated
-        .first()
-        .and_then(|r| r["trigger_requested_at"].as_str())
-        .map(str::to_string);
+    let out = core::trigger(&core_db(&state)?, &name).await.map_err(core_error)?;
     tracing::info!(schedule = %name, by = %session.subject, "Schedule triggered from the dashboard");
-    Ok(Json(json!({ "name": name, "triggered_at": at })))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_ids_must_be_workflow_runs() {
-        assert_eq!(parse_run_id("_00_workflow_run:abc").unwrap().key, "abc");
-        assert_eq!(parse_run_id("_00_workflow_run:⟨a-b⟩").unwrap().key, "a-b");
-        assert_eq!(parse_run_id("_00_schedule:abc").unwrap_err().0, StatusCode::BAD_REQUEST);
-        assert_eq!(parse_run_id("nonsense").unwrap_err().0, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn op_errors_map_to_statuses() {
-        assert_eq!(op_error(WorkflowOpError::NotFound("x".into())).0, StatusCode::NOT_FOUND);
-        assert_eq!(op_error(WorkflowOpError::BadDag("cycle".into())).0, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(op_error(WorkflowOpError::NotTerminal { status: "running".into() }).0, StatusCode::CONFLICT);
-        assert_eq!(op_error(WorkflowOpError::Conflict).0, StatusCode::CONFLICT);
-        let behind = op_error(WorkflowOpError::Db(anyhow::anyhow!("found no field `retry_count`")));
-        assert_eq!(behind.0, StatusCode::CONFLICT);
-        assert!(behind.1["error"].as_str().unwrap().contains("spky deploy"));
-        assert_eq!(op_error(WorkflowOpError::Db(anyhow::anyhow!("boom"))).0, StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
-    fn schedule_literals_quote_hyphens() {
-        assert_eq!(schedule_literal("game-sync"), "_00_schedule:⟨game-sync⟩");
-        assert_eq!(schedule_literal("a⟩b"), "_00_schedule:⟨ab⟩");
-    }
-
-    #[test]
-    fn rerun_of_filter_compares_the_string_form() {
-        let sql = runs_surql(&RunsQuery { rerun_of: Some("_00_workflow_run:x".into()), ..Default::default() });
-        assert!(sql.contains("type::string(rerun_of) = '_00_workflow_run:x'"), "{sql}");
-    }
-
-    #[test]
-    fn runs_surql_without_filters_has_no_where_clause() {
-        let q = RunsQuery::default();
-        let sql = runs_surql(&q);
-        assert!(!sql.contains("WHERE"), "{sql}");
-        assert!(sql.contains(&format!("LIMIT {DEFAULT_LIMIT}")), "{sql}");
-    }
-
-    #[test]
-    fn runs_surql_combines_filters_and_escapes_them() {
-        let q = RunsQuery {
-            name: Some("o'brien".into()),
-            status: Some("running".into()),
-            limit: Some(5),
-            ..Default::default()
-        };
-        let sql = runs_surql(&q);
-        assert!(sql.contains("workflow_name = 'o\\'brien'"), "{sql}");
-        assert!(sql.contains("status = 'running'"), "{sql}");
-        assert!(sql.contains("AND"), "{sql}");
-        assert!(sql.contains("LIMIT 5"), "{sql}");
-    }
-
-    #[test]
-    fn runs_surql_clamps_the_limit() {
-        let sql = runs_surql(&RunsQuery {
-            limit: Some(100_000),
-            ..Default::default()
-        });
-        assert!(sql.contains(&format!("LIMIT {MAX_LIMIT}")), "{sql}");
-
-        let sql = runs_surql(&RunsQuery { limit: Some(0), ..Default::default() });
-        assert!(sql.contains("LIMIT 1"), "{sql}");
-    }
-
-    #[test]
-    fn empty_filter_strings_are_ignored() {
-        let sql = runs_surql(&RunsQuery {
-            name: Some(String::new()),
-            status: Some(String::new()),
-            ..Default::default()
-        });
-        assert!(!sql.contains("WHERE"), "{sql}");
-    }
-
-    #[test]
-    fn a_half_pruned_bucket_adds_up_instead_of_splitting() {
-        // Asymmetric retention is the whole point: this hour's successes are
-        // already pruned and folded, its failures are not. Neither source
-        // alone is the truth; their sum is.
-        let pruned = vec![json!({
-            "bucket": "2026-09-20T06:00:00Z",
-            "success": 140, "failed": 0, "skipped": 30, "replaced": 0, "killed": 0
-        })];
-        let live = vec![
-            json!({"bucket": "2026-09-20T06:00:00Z", "status": "failed", "n": 20}),
-            json!({"bucket": "2026-09-20T06:00:00Z", "status": "success", "n": 2}),
-        ];
-        let out = merge_tally(&pruned, &live, 48);
-        assert_eq!(out.len(), 1, "one bucket, not two: {out:?}");
-        assert_eq!(out[0]["failed"], 20, "the failures an operator never saw");
-        assert_eq!(out[0]["success"], 142);
-        assert_eq!(out[0]["skipped"], 30);
-    }
-
-    #[test]
-    fn buckets_come_back_newest_first_and_capped() {
-        let pruned: Vec<Value> = (0..4)
-            .map(|h| json!({
-                "bucket": format!("2026-09-20T0{h}:00:00Z"),
-                "success": 1, "failed": 0, "skipped": 0, "replaced": 0, "killed": 0
-            }))
-            .collect();
-        let out = merge_tally(&pruned, &[], 2);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0]["bucket"], "2026-09-20T03:00:00Z");
-        assert_eq!(out[1]["bucket"], "2026-09-20T02:00:00Z");
-    }
-
-    #[test]
-    fn a_bucket_with_only_live_rows_still_appears() {
-        // The hour a schedule started failing has nothing pruned yet.
-        let live = vec![json!({"bucket": "2026-09-20T07:00:00Z", "status": "failed", "n": 3})];
-        let out = merge_tally(&[], &live, 48);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["failed"], 3);
-        assert_eq!(out[0]["success"], 0);
-    }
-
-    #[test]
-    fn a_running_run_is_not_an_outcome() {
-        let live = vec![json!({"bucket": "2026-09-20T07:00:00Z", "status": "running", "n": 9})];
-        assert!(merge_tally(&[], &live, 48).is_empty());
-    }
+    Ok(Json(out))
 }

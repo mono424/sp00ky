@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod admin_mcp;
 pub mod admin_session;
 pub mod impersonation;
 pub mod range_hash;

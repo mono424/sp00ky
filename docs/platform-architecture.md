@@ -12,6 +12,14 @@ routes: `/version`, `/log`, `/reset`, `/job/kill|retry|recover` — they already
 compile for wasm32. Remaining in the shell: `/ingest`, `/view/*`,
 `/debug/*`, `/health`, `/info`, `/backends`, `/backup/*`.
 
+> **Superseded in part by [`cloudflare-native.md`](cloudflare-native.md)
+> (2026-10-20).** Cloudflare becomes the default for all new projects, not only
+> the free tier. The scheduler's duties move into the SSP Durable Object
+> (cloudflare-native.md §4), the DO gets a durable ingest WAL and a chunked
+> snapshot (§5), and phase 5 below is replaced by that document's spikes and
+> implementation order (§11, §12). The ports and the event-driven core
+> described here stay the foundation.
+
 ---
 
 ## 1. Why a platform boundary

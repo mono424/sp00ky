@@ -108,17 +108,38 @@ struct Pending {
     last_fold_ms: u64,
     /// Lease lost or fold failed: leave this field alone until then.
     retry_at_ms: u64,
+    /// Folds of this field that failed in a row; spaces the retries out.
+    failures: u32,
 }
+
+/// Longest wait between retries of a field whose fold keeps failing.
+const MAX_FAILURE_BACKOFF_MS: u64 = 10 * 60 * 1000;
 
 impl Pending {
     fn due(&self, cfg: &FoldConfig, now: u64) -> bool {
-        self.rows > 0
-            && now >= self.retry_at_ms
-            && now.saturating_sub(self.last_fold_ms) >= cfg.min_gap_ms
-            && (now.saturating_sub(self.last_write_ms) >= cfg.idle_ms
-                || self.rows >= cfg.max_rows
-                || self.bytes >= cfg.max_bytes)
+        self.rows > 0 && now >= self.due_at(cfg)
     }
+
+    /// The earliest moment [`Pending::due`] can hold, `u64::MAX` with nothing
+    /// to fold. Pure: no row arriving in between is assumed.
+    fn due_at(&self, cfg: &FoldConfig) -> u64 {
+        if self.rows == 0 {
+            return u64::MAX;
+        }
+        let full = self.rows >= cfg.max_rows || self.bytes >= cfg.max_bytes;
+        let settled = if full { 0 } else { self.last_write_ms.saturating_add(cfg.idle_ms) };
+        self.retry_at_ms
+            .max(self.last_fold_ms.saturating_add(cfg.min_gap_ms))
+            .max(settled)
+    }
+}
+
+/// Retry delay after the `failures`-th fold failure in a row: `min_gap_ms`,
+/// doubling, capped at [`MAX_FAILURE_BACKOFF_MS`]. A fold that fails on every
+/// attempt then costs a few wakes an hour instead of one per gap.
+fn failure_backoff_ms(cfg: &FoldConfig, failures: u32) -> u64 {
+    let doubled = cfg.min_gap_ms.saturating_mul(1u64 << failures.saturating_sub(1).min(16));
+    doubled.min(MAX_FAILURE_BACKOFF_MS.max(cfg.min_gap_ms))
 }
 
 /// Counters surfaced on `/info`.
@@ -210,6 +231,27 @@ impl CrdtFold {
         keys
     }
 
+    /// When the next `CrdtFoldTick` has work: `None` with nothing pending or
+    /// running. A running fold asks for a look one `tick_ms` later, since its
+    /// outcome (more rows, a lost lease) decides what comes next.
+    pub fn next_due_ms(&self, now_ms: u64) -> Option<u64> {
+        let running = self.running.lock().expect("running lock").clone();
+        let pending = self
+            .pending
+            .lock()
+            .expect("pending lock")
+            .iter()
+            .filter(|(key, _)| !running.contains(*key))
+            .map(|(_, p)| p.due_at(&self.cfg))
+            .min()
+            .filter(|at| *at != u64::MAX);
+        let after_running = (!running.is_empty()).then(|| now_ms.saturating_add(self.cfg.tick_ms));
+        match (pending, after_running) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Start the folds that are due (`TimerKind::CrdtFoldTick`).
     pub fn tick(self: &Arc<Self>, db: Arc<dyn Db>, spawner: &dyn Spawner, now_ms: u64) {
         for key in self.take_due(now_ms) {
@@ -243,9 +285,10 @@ impl CrdtFold {
             }
             Err(e) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                warn!(doc = %key.doc, field = %key.field, error = %e, "CRDT fold failed");
+                warn!(doc = %key.doc, field = %key.field, error = %format!("{e:#}"), "CRDT fold failed");
                 if let Some(p) = self.pending.lock().expect("pending lock").get_mut(&key) {
-                    p.retry_at_ms = now + self.cfg.min_gap_ms;
+                    p.failures = p.failures.saturating_add(1);
+                    p.retry_at_ms = now + failure_backoff_ms(&self.cfg, p.failures);
                 }
                 None
             }
@@ -271,6 +314,7 @@ impl CrdtFold {
         entry.bytes = if entry.rows == 0 { 0 } else { entry.bytes };
         entry.last_fold_ms = now;
         entry.retry_at_ms = 0;
+        entry.failures = 0;
         if outcome.more {
             entry.rows = entry.rows.max(self.cfg.max_rows);
         } else if removed == 0 {
@@ -397,6 +441,40 @@ mod tests {
 
     fn row(size: u64) -> Value {
         json!({ "doc": "thread:t1", "field": "content", "size": size })
+    }
+
+    #[test]
+    fn next_due_is_when_take_due_would_first_fold() {
+        let cfg = FoldConfig { idle_ms: 1000, max_rows: 3, min_gap_ms: 500, tick_ms: 5000, workers: 4, ..Default::default() };
+        let fold = CrdtFold::new(cfg, "ssp-a");
+        assert_eq!(fold.next_due_ms(0), None, "nothing pending, nothing to wake for");
+
+        fold.observe("thread__crdt_log", "CREATE", &row(10), 1_000);
+        assert_eq!(fold.next_due_ms(1_200), Some(2_000), "idle window ends at 2 s");
+        assert!(fold.take_due(1_999).is_empty());
+        assert_eq!(fold.take_due(2_000), vec![key()]);
+
+        // Running: look again one tick later.
+        assert_eq!(fold.next_due_ms(2_000), Some(7_000));
+        fold.running.lock().unwrap().clear();
+        fold.record(&key(), &FoldOutcome { folded: 1, ..Default::default() }, 2_000);
+        assert_eq!(fold.next_due_ms(2_000), None, "folded clean, back to idle");
+
+        // A full batch only waits out the minimum gap.
+        for t in [2_100, 2_200, 2_300] {
+            fold.observe("thread__crdt_log", "CREATE", &row(10), t);
+        }
+        assert_eq!(fold.next_due_ms(2_300), Some(2_500));
+    }
+
+    #[test]
+    fn a_fold_that_keeps_failing_backs_off_exponentially_up_to_a_cap() {
+        let cfg = FoldConfig { min_gap_ms: 10_000, ..Default::default() };
+        assert_eq!(failure_backoff_ms(&cfg, 1), 10_000);
+        assert_eq!(failure_backoff_ms(&cfg, 2), 20_000);
+        assert_eq!(failure_backoff_ms(&cfg, 3), 40_000);
+        assert_eq!(failure_backoff_ms(&cfg, 10), MAX_FAILURE_BACKOFF_MS);
+        assert_eq!(failure_backoff_ms(&cfg, u32::MAX), MAX_FAILURE_BACKOFF_MS);
     }
 
     #[test]

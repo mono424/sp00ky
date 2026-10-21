@@ -14,7 +14,7 @@
 //! the lazily-built node), Storage ops are `&self`, and the DO is registered as
 //! a SQLite-backed class by the control plane.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +36,8 @@ use ssp_node::{
     SspNode, SspStatus, TimerMux,
 };
 
+mod log;
+
 /// The R2 binding holding the files of `BACKEND "r2"` buckets, bound by the
 /// control plane when the project declares one.
 const FILES_BINDING: &str = "SPKY_FILES";
@@ -56,7 +58,7 @@ impl HttpClient for CfHttp {
     async fn send(
         &self,
         req: OutboundRequest,
-        _cancel: Option<CancelWatch>,
+        cancel: Option<CancelWatch>,
     ) -> std::result::Result<OutboundResponse, HttpError> {
         let headers = Headers::new();
         if let Some(bearer) = &req.bearer {
@@ -86,13 +88,37 @@ impl HttpClient for CfHttp {
 
         let wreq = Request::new_with_init(&req.url, &init)
             .map_err(|e| HttpError::Transport(e.to_string()))?;
-        let mut resp = Fetch::Request(wreq)
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
-        let status = resp.status_code();
-        let body = resp.text().await.map_err(|e| HttpError::Transport(e.to_string()))?;
-        Ok(OutboundResponse { status, body })
+
+        // The timeout and the cancel watch both abort the fetch, so a hung DB
+        // or backend cannot hold the request (or a bootstrap) open forever.
+        // Cancel wins a tie, as the port contract asks.
+        let controller = AbortController::default();
+        let signal = controller.signal();
+        let exchange = async {
+            let mut resp = Fetch::Request(wreq).send_with_signal(&signal).await?;
+            let status = resp.status_code();
+            let body = resp.text().await?;
+            Ok::<_, worker::Error>(OutboundResponse { status, body })
+        };
+        let cancelled = async {
+            match cancel {
+                Some(mut watch) => watch.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let timeout = req.timeout;
+        tokio::select! {
+            biased;
+            _ = cancelled => {
+                controller.abort();
+                Err(HttpError::Cancelled)
+            }
+            result = exchange => result.map_err(|e| HttpError::Transport(e.to_string())),
+            _ = Delay::from(timeout) => {
+                controller.abort();
+                Err(HttpError::Timeout(timeout))
+            }
+        }
     }
 }
 
@@ -153,20 +179,99 @@ impl CircuitStore for CfCircuitStore {
 }
 
 /// `Scheduler` over the DO's single `alarm()`. Pending timers live in one
-/// in-memory [`TimerMux`]; the earliest deadline arms the alarm. Timers are NOT
-/// persisted — eviction drops them, and bootstrap/on_timer re-arm the periodic
-/// sweeps on the next wake.
+/// [`TimerMux`], written through to the DO's SQLite on every change and read
+/// back in `DO::new`, so a timer survives eviction. The platform alarm is set
+/// only when the earliest deadline changes and deleted when nothing is
+/// pending: an idle object then has no alarm and is evicted.
 struct CfScheduler {
     mux: Rc<RefCell<TimerMux>>,
     storage: Rc<Storage>,
+    /// Deadline the platform alarm is set to, `None` when none is set.
+    armed_at: Cell<Option<u64>>,
+}
+
+const META_TABLE: &str = "CREATE TABLE IF NOT EXISTS ssp_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)";
+const META_TIMERS: &str = "timers";
+const META_ARMED_AT: &str = "armed_at";
+
+fn meta_get(storage: &Storage, key: &str) -> Option<String> {
+    let rows: Vec<serde_json::Value> = storage
+        .sql()
+        .exec("SELECT v FROM ssp_meta WHERE k = ?", vec![key.into()])
+        .and_then(|cursor| cursor.to_array())
+        .ok()?;
+    rows.first()?.get("v")?.as_str().map(String::from)
+}
+
+fn meta_put(storage: &Storage, key: &str, value: Option<&str>) {
+    let sql = storage.sql();
+    let result = match value {
+        Some(v) => sql.exec("INSERT OR REPLACE INTO ssp_meta (k, v) VALUES (?, ?)", vec![key.into(), v.into()]),
+        None => sql.exec("DELETE FROM ssp_meta WHERE k = ?", vec![key.into()]),
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, key, "persisting DO metadata failed");
+    }
 }
 
 impl CfScheduler {
+    /// Load the timers and the armed deadline a previous instance left.
+    fn restore(storage: Rc<Storage>) -> Self {
+        if let Err(e) = storage.sql().exec(META_TABLE, None) {
+            tracing::warn!(error = %e, "creating ssp_meta failed; timers will not survive eviction");
+        }
+        let mux = meta_get(&storage, META_TIMERS)
+            .and_then(|json| serde_json::from_str::<TimerMux>(&json).ok())
+            .unwrap_or_default();
+        let armed_at = meta_get(&storage, META_ARMED_AT).and_then(|v| v.parse().ok());
+        Self { mux: Rc::new(RefCell::new(mux)), storage, armed_at: Cell::new(armed_at) }
+    }
+
+    fn persist_timers(&self) {
+        match serde_json::to_string(&*self.mux.borrow()) {
+            Ok(json) => meta_put(&self.storage, META_TIMERS, Some(&json)),
+            Err(e) => tracing::warn!(error = %e, "serializing timers failed"),
+        }
+    }
+
+    /// The alarm just fired, so the platform no longer holds one.
+    fn alarm_consumed(&self) {
+        self.armed_at.set(None);
+        meta_put(&self.storage, META_ARMED_AT, None);
+    }
+
+    /// Fired timers leave the mux; `on_timer` re-adds what it re-arms.
+    fn take_due(&self, now: u64) -> Vec<TimerKind> {
+        let due = self.mux.borrow_mut().pop_due(now);
+        if !due.is_empty() {
+            self.persist_timers();
+        }
+        due
+    }
+
     async fn rearm_alarm(&self) {
         let next = self.mux.borrow().next_deadline();
-        if let Some(at) = next {
-            let offset = (at as i64 - now_epoch_ms() as i64).max(0);
-            let _ = self.storage.set_alarm(offset).await;
+        match next {
+            None => {
+                if self.armed_at.get().is_some() {
+                    let _ = self.storage.delete_alarm().await;
+                    self.armed_at.set(None);
+                    meta_put(&self.storage, META_ARMED_AT, None);
+                    tracing::debug!("alarm deleted: no timer pending");
+                }
+            }
+            Some(at) if self.armed_at.get() != Some(at) => {
+                let offset = (at as i64 - now_epoch_ms() as i64).max(0);
+                match self.storage.set_alarm(offset).await {
+                    Ok(()) => {
+                        self.armed_at.set(Some(at));
+                        meta_put(&self.storage, META_ARMED_AT, Some(&at.to_string()));
+                        tracing::debug!(in_ms = offset, "alarm set");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "setting the alarm failed"),
+                }
+            }
+            Some(_) => {}
         }
     }
 }
@@ -175,11 +280,22 @@ impl CfScheduler {
 impl Scheduler for CfScheduler {
     async fn schedule(&self, kind: TimerKind, at_epoch_ms: u64) {
         self.mux.borrow_mut().schedule(kind, at_epoch_ms);
+        self.persist_timers();
         self.rearm_alarm().await;
     }
     async fn cancel(&self, kind: &TimerKind) {
+        let had = self.mux.borrow().len();
         self.mux.borrow_mut().cancel(kind);
-        self.rearm_alarm().await;
+        if self.mux.borrow().len() != had {
+            self.persist_timers();
+            self.rearm_alarm().await;
+        }
+    }
+    async fn ensure(&self, kind: TimerKind, at_epoch_ms: u64) {
+        if self.mux.borrow_mut().schedule_min(kind, at_epoch_ms) {
+            self.persist_timers();
+            self.rearm_alarm().await;
+        }
     }
     async fn sleep(&self, dur: Duration) {
         Delay::from(dur).await;
@@ -346,31 +462,41 @@ pub struct SspNodeDo {
     state: State,
     env: Env,
     storage: Rc<Storage>,
-    mux: Rc<RefCell<TimerMux>>,
+    scheduler: Arc<CfScheduler>,
     node: RefCell<Option<Arc<SspNode>>>,
     runtime: RefCell<Option<Runtime>>,
+    /// Single flight for the cold build: a DB fetch opens the input gate, so a
+    /// second request would otherwise build (and hold in memory) a second
+    /// circuit while the first is still bootstrapping.
+    boot: tokio::sync::Mutex<()>,
 }
+
+/// Longest wait between bootstrap retries.
+const MAX_BOOTSTRAP_BACKOFF_MS: u64 = 60_000;
 
 impl DurableObject for SspNodeDo {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
-        console_log!("[ssp-cf] DO::new");
+        log::init(env.var("SPKY_LOG").ok().map(|v| v.to_string()));
         let storage = Rc::new(state.storage());
+        let scheduler = Arc::new(CfScheduler::restore(storage.clone()));
+        tracing::debug!(timers = scheduler.mux.borrow().len(), "DO::new");
         Self {
             state,
             env,
             storage,
-            mux: Rc::new(RefCell::new(TimerMux::new())),
+            scheduler,
             node: RefCell::new(None),
             runtime: RefCell::new(None),
+            boot: tokio::sync::Mutex::new(()),
         }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         self.ensure_ready().await;
-        let node = match self.node.borrow().as_ref() {
-            Some(n) => n.clone(),
-            None => return Response::error("node init failed", 500),
+        let (node, runtime) = match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
+            (Some(n), Some(r)) => (n, r),
+            _ => return Response::error("node init failed", 500),
         };
 
         let Some(method) = map_incoming_method(&req.method()) else {
@@ -387,38 +513,57 @@ impl DurableObject for SspNodeDo {
 
         let api_req = ssp_node::ApiRequest {
             method,
-            path,
+            path: path.clone(),
             bearer,
             body: body.into_bytes().into(),
         };
 
-        match node.route(api_req).await {
+        let routed = node.route(api_req).await;
+        // Arm what the request made pending (dirty metrics, CRDT rows, a new
+        // view's expiry, outbox rows); nothing when it changed nothing.
+        runtime.after_request(&path).await;
+        match routed {
             Some(resp) => to_worker_response(resp),
             None => Response::error("not found", 404),
         }
     }
 
     async fn alarm(&self) -> Result<Response> {
+        self.scheduler.alarm_consumed();
         self.ensure_ready().await;
         let runtime = match self.runtime.borrow().as_ref() {
             Some(r) => r.clone(),
             None => return Response::ok("not ready"),
         };
-        let due = self.mux.borrow_mut().pop_due(now_epoch_ms());
-        for kind in due {
-            runtime.on_timer(kind).await;
+        for kind in self.scheduler.take_due(now_epoch_ms()) {
+            tracing::debug!(?kind, "timer fired");
+            match kind {
+                TimerKind::BootstrapRetry { attempt } => {
+                    // The wake itself may just have built the node Ready.
+                    if *runtime.node().status.read().await != SspStatus::Ready {
+                        runtime.bootstrap().await;
+                        self.after_bootstrap(&runtime, attempt).await;
+                    }
+                }
+                other => runtime.on_timer(other).await,
+            }
         }
+        self.scheduler.rearm_alarm().await;
         Response::ok("ok")
     }
 }
 
 impl SspNodeDo {
-    /// Build + bootstrap the node on first wake (or after eviction). Idempotent.
+    /// Build + bootstrap the node on first wake (or after eviction). Idempotent
+    /// and single-flight.
     async fn ensure_ready(&self) {
         if self.node.borrow().is_some() {
             return;
         }
-        console_log!("[ssp-cf] ensure_ready: building node");
+        let _boot = self.boot.lock().await;
+        if self.node.borrow().is_some() {
+            return;
+        }
         let cfg = read_config(&self.env).unwrap_or(NodeConfigCf {
             db_url: String::new(),
             db_ns: String::new(),
@@ -445,31 +590,35 @@ impl SspNodeDo {
         let platform = Platform {
             db: Arc::new(db),
             http,
-            scheduler: Arc::new(CfScheduler {
-                mux: self.mux.clone(),
-                storage: self.storage.clone(),
-            }),
+            scheduler: self.scheduler.clone(),
             spawner: Arc::new(CfSpawner),
             telemetry: Arc::new(NoopTelemetry),
             circuit_store: Arc::new(CfCircuitStore { storage: self.storage.clone() }),
         };
 
-        console_log!("[ssp-cf] node built, bootstrapping (db_url_set={})", !cfg.db_url.is_empty());
+        tracing::info!(db_url_set = !cfg.db_url.is_empty(), "building node");
         let node = Arc::new(build_node(platform, &cfg));
-        let runtime = Runtime::new(node.clone());
+        let runtime = Runtime::on_demand(node.clone());
         runtime.bootstrap().await;
-        console_log!("[ssp-cf] bootstrap done");
-
-        // Arm the periodic sweeps (each re-arms itself thereafter via on_timer).
-        let sched = &node.platform.scheduler;
-        sched.schedule(TimerKind::TtlCleanup, now_epoch_ms() + 60_000).await;
-        sched.schedule(TimerKind::ViewMetricsFlush, now_epoch_ms() + 2000).await;
-        sched.schedule(TimerKind::CrdtFoldTick, now_epoch_ms() + 5000).await;
-        sched.schedule(TimerKind::CrdtSweep, now_epoch_ms() + 10_000).await;
-        sched.schedule(TimerKind::JobRecoverySweep, now_epoch_ms()).await;
-
         *self.node.borrow_mut() = Some(node);
-        *self.runtime.borrow_mut() = Some(runtime);
+        *self.runtime.borrow_mut() = Some(runtime.clone());
+        self.after_bootstrap(&runtime, 0).await;
+    }
+
+    /// Ready: arm what the node has pending. Failed: retry with backoff
+    /// (1 s, 2 s, 4 s, ... up to a minute) instead of staying failed until
+    /// eviction, which is what a failed bootstrap did before.
+    async fn after_bootstrap(&self, runtime: &Runtime, attempt: u32) {
+        if *runtime.node().status.read().await == SspStatus::Ready {
+            tracing::info!(attempt, "bootstrap complete");
+            runtime.after_boot().await;
+            return;
+        }
+        let delay = (1000u64 << attempt.min(16)).min(MAX_BOOTSTRAP_BACKOFF_MS);
+        tracing::warn!(attempt, retry_in_ms = delay, "bootstrap failed; retrying");
+        self.scheduler
+            .schedule(TimerKind::BootstrapRetry { attempt: attempt + 1 }, now_epoch_ms() + delay)
+            .await;
     }
 }
 
@@ -570,7 +719,12 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .flatten()
         .unwrap_or_else(|| "default".to_string());
     let ns = env.durable_object("SSP_NODE")?;
-    let stub = ns.id_from_name(&name)?.get_stub()?;
+    let id = ns.id_from_name(&name)?;
+    // Place the object near its database: from the US every Hetzner round trip
+    // cost ~175 ms and Ready missed its budget; near the DB it is ~22 ms
+    // (spike S1). A hint only applies when the object is first created.
+    let hint = env.var("SPKY_DO_LOCATION_HINT").map(|v| v.to_string()).unwrap_or_default();
+    let stub = if hint.is_empty() { id.get_stub()? } else { id.get_stub_with_location_hint(&hint)? };
     // Surface DO errors to the client (they don't show in `wrangler tail` on
     // the parent script) so failures are diagnosable.
     match stub.fetch_with_request(req).await {

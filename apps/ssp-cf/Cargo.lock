@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "push-core"
-version = "0.0.1-canary.330"
+version = "0.0.1-canary.334"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.0.1-canary.330"
+version = "0.0.1-canary.334"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-cf"
-version = "0.0.1-canary.330"
+version = "0.0.1-canary.334"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2294,6 +2294,7 @@ dependencies = [
  "ssp-protocol",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",
@@ -2302,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-node"
-version = "0.0.1-canary.330"
+version = "0.0.1-canary.334"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2327,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-protocol"
-version = "0.0.1-canary.330"
+version = "0.0.1-canary.334"
 dependencies = [
  "blake3",
  "serde",
@@ -2531,6 +2532,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2540,12 +2551,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

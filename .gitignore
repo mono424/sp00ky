@@ -31,3 +31,6 @@ coverage/
 scripts/push-e2e/web/core
 scripts/push-e2e/web/live/sw.bundle.js
 scripts/push-e2e/project/.sp00ky/
+
+# wrangler dev local state
+.wrangler/

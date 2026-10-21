@@ -19,10 +19,12 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "macros"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 tracing = "0.1"
+# JSON log lines to the Workers console (src/log.rs); about +93 KB gzip.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
 console_error_panic_hook = "0.1"
 
 ssp = { path = "../../packages/ssp" }

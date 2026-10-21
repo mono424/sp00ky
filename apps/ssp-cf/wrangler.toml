@@ -1,6 +1,8 @@
 name = "ssp-cf"
 main = "build/worker/shim.mjs"
-compatibility_date = "2024-09-23"
+# 2026-10-01 or later: pending service-binding / RPC calls keep the DO alive
+# without a connected client.
+compatibility_date = "2026-10-01"
 
 # One Durable Object class = the SSP node. One instance per project (keyed by
 # the X-Spooky-Project header in the top-level fetch handler).
@@ -8,9 +10,15 @@ compatibility_date = "2024-09-23"
 name = "SSP_NODE"
 class_name = "SspNodeDo"
 
+# SQLite-backed, as the control plane registers it (timers and metadata live
+# in the object's SQLite).
 [[migrations]]
 tag = "v1"
-new_classes = ["SspNodeDo"]
+new_sqlite_classes = ["SspNodeDo"]
+
+# Workers Logs + automatic tracing (the JSON lines from src/log.rs).
+[observability]
+enabled = true
 
 # Non-secret config. The DB stays EXTERNAL — this points at SurrealDB Cloud (or
 # any HTTP-RPC SurrealDB). The node talks to it via HttpSqlDb over fetch.
@@ -19,6 +27,11 @@ SPKY_DB_URL = "https://REPLACE-ME.surreal.cloud"
 SPKY_DB_NS = "spooky"
 SPKY_DB_DB = "spooky"
 SPKY_SSP_ID = "cf-ssp"
+# error | warn | info | debug | trace
+SPKY_LOG = "info"
+# Optional: place the Durable Object near the database (e.g. "weur" for a
+# Hetzner-hosted DB). Only applies when the object is first created.
+SPKY_DO_LOCATION_HINT = ""
 
 # Secrets (set with `wrangler secret put ...`, never commit):
 #   SPKY_DB_AUTH      full Authorization header value, e.g. "Bearer <jwt>"

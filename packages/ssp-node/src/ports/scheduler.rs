@@ -79,6 +79,16 @@ pub trait Scheduler: MaybeSendSync {
 
     async fn cancel(&self, kind: &TimerKind);
 
+    /// Make sure `kind` fires no later than `at_epoch_ms`: schedule it when it
+    /// is not pending, move it earlier when it is pending later, and leave an
+    /// earlier deadline alone. Demand arming uses this so a request or a boot
+    /// never postpones a timer that is already due (which cost a second alarm
+    /// in the Cloudflare idle spike). The default replaces, which is what
+    /// `schedule` does; adapters that can see their pending set override it.
+    async fn ensure(&self, kind: TimerKind, at_epoch_ms: u64) {
+        self.schedule(kind, at_epoch_ms).await;
+    }
+
     /// Bounded in-request sleep (commit-wait backoff, bootstrap retry pause).
     /// NOT for periodic work — that's `schedule` + re-arm.
     async fn sleep(&self, dur: std::time::Duration);

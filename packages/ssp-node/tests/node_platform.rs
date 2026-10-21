@@ -1088,6 +1088,78 @@ async fn on_timer_job_recovery_rearms_when_standalone() {
 }
 
 #[tokio::test]
+async fn on_demand_ttl_cleanup_arms_at_the_earliest_expiry_and_not_without_views() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts { ref_mode: ssp_protocol::RefMode::Single, ..Default::default() }).await;
+    let rt = Runtime::on_demand(Arc::clone(&h.node));
+
+    // No view: the sweep runs and nothing is re-armed, so an idle node sleeps.
+    rt.on_timer(TimerKind::TtlCleanup).await;
+    assert!(
+        !h.scheduled.lock().unwrap().contains(&TimerKind::TtlCleanup),
+        "no view, no TTL timer"
+    );
+
+    // A live view: armed (at its expiry; the mock only records the kind).
+    h.raw_db
+        .query("CREATE _00_query:live SET auth_id = '', clientId = 'c', ttl = 10m, lastActiveAt = time::now(), surql = 'x', params = {};")
+        .await
+        .unwrap();
+    rt.on_timer(TimerKind::TtlCleanup).await;
+    assert!(
+        h.scheduled.lock().unwrap().contains(&TimerKind::TtlCleanup),
+        "a live view arms the TTL sweep"
+    );
+}
+
+#[tokio::test]
+async fn on_demand_sweeps_without_work_do_not_rearm() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://b")], ..Default::default() }).await;
+    let rt = Runtime::on_demand(Arc::clone(&h.node));
+    for kind in [
+        TimerKind::ViewMetricsFlush,
+        TimerKind::CrdtFoldTick,
+        TimerKind::CrdtSweep,
+        TimerKind::JobRecoverySweep,
+    ] {
+        rt.on_timer(kind).await;
+    }
+    assert!(
+        h.scheduled.lock().unwrap().is_empty(),
+        "clean metrics, no CRDT work, no pending jobs: nothing armed, got {:?}",
+        h.scheduled.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn on_demand_job_recovery_rearms_while_a_job_is_pending() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://b")], ..Default::default() }).await;
+    h.raw_db
+        .query("CREATE job:j1 SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now(), updated_at = time::now();")
+        .await
+        .unwrap();
+    Runtime::on_demand(Arc::clone(&h.node)).on_timer(TimerKind::JobRecoverySweep).await;
+    assert!(
+        h.scheduled.lock().unwrap().contains(&TimerKind::JobRecoverySweep),
+        "a pending job keeps the recovery sweep armed"
+    );
+}
+
+#[tokio::test]
+async fn periodic_policy_keeps_the_fixed_cadence() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts::default()).await;
+    let rt = Runtime::new(Arc::clone(&h.node));
+    rt.on_timer(TimerKind::ViewMetricsFlush).await;
+    rt.on_timer(TimerKind::CrdtSweep).await;
+    let scheduled = h.scheduled.lock().unwrap().clone();
+    assert!(scheduled.contains(&TimerKind::ViewMetricsFlush));
+    assert!(scheduled.contains(&TimerKind::CrdtSweep));
+}
+
+#[tokio::test]
 async fn bootstrap_restore_evict_mutate_catches_up_to_full_rebuild() {
     // Headline test for the generic runtime seam: a snapshot restore + `_00_rv`
     // catch-up must converge to EXACTLY the same circuit content as a cold full

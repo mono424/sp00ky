@@ -688,7 +688,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 
 | Phase | Work | Done when |
 |---|---|---|
-| 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour |
+| 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
 | 2 | Durable ingest WAL (§5.3), jobs routed without the circuit | no user write fails during a forced cold start |
 | 3 | Chunked snapshot, validity check, skip republish, IngestVerify (§5.4) | Ready p95 <= 1.5 s at 20 MB |
 | 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project |

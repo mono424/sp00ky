@@ -32,6 +32,23 @@ impl TimerMux {
         }
     }
 
+    /// Schedule `kind` at `at_epoch_ms` unless it is already pending at or
+    /// before that time (the `Scheduler::ensure` contract). Returns whether
+    /// the table changed.
+    pub fn schedule_min(&mut self, kind: TimerKind, at_epoch_ms: u64) -> bool {
+        match self.entries.iter_mut().find(|(k, _)| *k == kind) {
+            Some(entry) if entry.1 <= at_epoch_ms => false,
+            Some(entry) => {
+                entry.1 = at_epoch_ms;
+                true
+            }
+            None => {
+                self.entries.push((kind, at_epoch_ms));
+                true
+            }
+        }
+    }
+
     pub fn cancel(&mut self, kind: &TimerKind) {
         self.entries.retain(|(k, _)| k != kind);
     }
@@ -79,6 +96,17 @@ mod tests {
         mux.schedule(TimerKind::TtlCleanup, 2000);
         assert_eq!(mux.len(), 1);
         assert_eq!(mux.next_deadline(), Some(2000));
+    }
+
+    #[test]
+    fn schedule_min_never_postpones_a_pending_timer() {
+        let mut mux = TimerMux::new();
+        assert!(mux.schedule_min(TimerKind::TtlCleanup, 1000), "absent: added");
+        assert!(!mux.schedule_min(TimerKind::TtlCleanup, 5000), "later: kept at 1000");
+        assert_eq!(mux.next_deadline(), Some(1000));
+        assert!(mux.schedule_min(TimerKind::TtlCleanup, 500), "earlier: moved");
+        assert_eq!(mux.next_deadline(), Some(500));
+        assert!(!mux.schedule_min(TimerKind::TtlCleanup, 500), "same: unchanged");
     }
 
     #[test]

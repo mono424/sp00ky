@@ -296,8 +296,11 @@ Phase 3b (2026-10-21):
   credential and sends the token (SurrealDB runs Argon2 for every Basic
   request: 53 ms of DB CPU, about 130 ms per query from the DO); the TTL, job
   and CRDT timers are armed in the background after Ready; bootstrap pages
-  1000 rows as the VM SSP does (3.1's keyset pager rescans from the first key,
-  so 200-row pages made the rebuild quadratic).
+  are sized by bytes (10 rows first, then about 1 MB per page, up to 1000
+  rows; 3.1's keyset pager rescans from the first key, so 200-row pages made
+  the rebuild quadratic). A fixed 1000 rows (canary.338) broke talktobolo,
+  whose `asset` rows carry images as `bytes`: the page timed out and
+  overflowed the isolate's 128 MB.
 - **View state is not snapshotted, on purpose.** Restored view caches are only
   correct if they match row images taken at the same instant (ours are per
   table, written at different times) and if publication is durable (the edge
@@ -769,7 +772,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 |---|---|---|
 | 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
 | 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
-| 3 | Table images + journal warm start, delta images, segmented arena (§5.4); IngestVerify | Ready p95 <= 1.5 s at 20 MB. **Done 2026-10-21, released in canary.338:** on Cloudflare the DO is Ready 0.32 s into a warm start at 25 MB (full rebuild 5.7 to 6.9 s). IngestVerify is open |
+| 3 | Table images + journal warm start, delta images, segmented arena (§5.4); IngestVerify | Ready p95 <= 1.5 s at 20 MB. **Done 2026-10-21, released in canary.338/.339:** on Cloudflare the DO is Ready 0.32 s into a warm start at 25 MB (full rebuild 5.7 to 6.9 s). IngestVerify is open |
 | 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project |
 | 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |
 | 6 | Doorbell server + client, poll cap (§9) | remote queries per idle minute about 1 |

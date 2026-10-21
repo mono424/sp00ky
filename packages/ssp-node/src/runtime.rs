@@ -88,6 +88,11 @@ impl Runtime {
             runtime.arm_crdt_fold().await;
         }));
         self.arm_schedule_sweep_now().await;
+        if self.node.push_engine.is_some() {
+            // Loads the push config, publishes the VAPID key, sweeps missed
+            // messages, then arms itself by the engine's next wake.
+            self.node.platform.scheduler.ensure(TimerKind::PushTick, now_epoch_ms()).await;
+        }
     }
 
     /// A sweep right away, when this node runs the schedule engine: it plans
@@ -255,6 +260,10 @@ impl Runtime {
                                     tracing::debug!(?report, "schedule sweep");
                                 }
                             }
+                            // No schedule was ever deployed: nothing to sweep.
+                            Err(e) if format!("{e:#}").contains("does not exist") => {
+                                tracing::debug!(error = %e, "schedule sweep: no schedule tables");
+                            }
                             Err(e) => {
                                 tracing::error!(error = %e, "schedule sweep failed");
                             }
@@ -270,6 +279,18 @@ impl Runtime {
                                 .await;
                         }
                         TimerPolicy::OnDemand => self.arm_schedule_sweep_on_demand(engine).await,
+                    }
+                }
+            }
+            TimerKind::PushTick => {
+                if let Some(engine) = node.push_engine.as_ref() {
+                    if *node.status.read().await == SspStatus::Ready {
+                        engine.tick().await;
+                    }
+                    if self.policy == TimerPolicy::OnDemand {
+                        if let Some(at) = engine.next_wake_ms().await {
+                            sched.ensure(TimerKind::PushTick, at.max(now_epoch_ms() + 1_000)).await;
+                        }
                     }
                 }
             }

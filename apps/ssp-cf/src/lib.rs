@@ -124,6 +124,70 @@ impl HttpClient for CfHttp {
     }
 }
 
+/// `push_core::PushHttp` over `fetch`: Web Push, FCM (and its OAuth token)
+/// and APNs, whose HTTP/2 the platform's fetch speaks (spike S7). The body
+/// is raw bytes (an encrypted Web Push payload is not JSON).
+struct CfPushHttp;
+
+/// Longest a single push request may take.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[async_trait(?Send)]
+impl push_core::PushHttp for CfPushHttp {
+    async fn post(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> std::result::Result<(u16, String), String> {
+        let h = Headers::new();
+        for (k, v) in &headers {
+            h.set(k, v).map_err(|e| e.to_string())?;
+        }
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(h)
+            .with_body(Some(js_sys::Uint8Array::from(&body[..]).into()));
+        let req = Request::new_with_init(url, &init).map_err(|e| e.to_string())?;
+        let controller = AbortController::default();
+        let signal = controller.signal();
+        let exchange = async {
+            let mut resp = Fetch::Request(req).send_with_signal(&signal).await?;
+            let status = resp.status_code();
+            let text = resp.text().await.unwrap_or_default();
+            Ok::<_, worker::Error>((status, text))
+        };
+        tokio::select! {
+            biased;
+            result = exchange => result.map_err(|e| e.to_string()),
+            _ = Delay::from(PUSH_TIMEOUT) => {
+                controller.abort();
+                Err(format!("timed out after {}s", PUSH_TIMEOUT.as_secs()))
+            }
+        }
+    }
+}
+
+/// The push engine, as a standalone VM SSP builds it, over fetch. On demand:
+/// the runtime ticks it when there is work (`TimerKind::PushTick`).
+fn build_push_engine(env: &Env, db: Arc<dyn ssp_node::ports::Db>) -> Arc<push_core::PushEngine> {
+    let get = |k: &str| {
+        env.secret(k)
+            .map(|v| v.to_string())
+            .or_else(|_| env.var(k).map(|v| v.to_string()))
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let opts = push_core::EngineOptions::from_env(get);
+    let keys = push_core::PushEngine::keys_from_env(get);
+    Arc::new(push_core::PushEngine::new(
+        Arc::new(ssp_node::schedules::PortDb(db)),
+        Arc::new(CfPushHttp),
+        keys,
+        opts,
+    ))
+}
+
 /// `Spawner` over `wasm_bindgen_futures::spawn_local`.
 struct CfSpawner;
 impl Spawner for CfSpawner {
@@ -633,7 +697,8 @@ impl SspNodeDo {
         };
 
         tracing::info!(db_url_set = !cfg.db_url.is_empty(), "building node");
-        let (node, job_rx) = build_node(platform, &cfg);
+        let push_engine = build_push_engine(&self.env, Arc::clone(&platform.db));
+        let (node, job_rx) = build_node(platform, &cfg, push_engine);
         let node = Arc::new(node);
         if let Some(job_rx) = job_rx {
             // Outbox jobs run in this object, as on a standalone VM SSP: the
@@ -959,6 +1024,7 @@ fn compact_for_inbox(path: &str, body: &[u8]) -> std::result::Result<(&'static s
 fn build_node(
     platform: Platform,
     cfg: &NodeConfigCf,
+    push_engine: Arc<push_core::PushEngine>,
 ) -> (SspNode, Option<tokio::sync::mpsc::Receiver<ssp_node::jobs::JobEntry>>) {
     let (job_queue_tx, job_rx) = tokio::sync::mpsc::channel(64);
     let edge_update_tx = ssp_node::edges::EdgePublisher::default();
@@ -1011,7 +1077,7 @@ fn build_node(
         // on-demand runtime arms each sweep for the engine's next wake, so a
         // project without schedules never sets an alarm for them.
         schedule_engine,
-        push_engine: None,
+        push_engine: Some(push_engine),
         ttl_cleanup_interval_secs: 60,
         // Off: a 15 s alarm would keep the Durable Object from ever
         // hibernating. Registrations naming an unknown table still refresh.

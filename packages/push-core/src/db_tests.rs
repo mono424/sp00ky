@@ -1814,3 +1814,59 @@ fn engine_futures_are_send() {
     }
     let _ = check;
 }
+
+#[tokio::test]
+async fn next_wake_follows_trailing_throttles_and_scheduled_messages() {
+    let h = harness(
+        r#"
+rules:
+  dm:
+    table: message
+    to: recipient
+    topic: "dm:{{conversation | key}}"
+    throttle: 30s
+    notification: { title: "{{text}}" }
+"#,
+    )
+    .await;
+    h.device("user:bob", "https://push.example/bob", "").await;
+    assert_eq!(h.engine.next_wake_ms().await, None, "nothing waits");
+
+    // A second row inside the throttle gap waits as a trailing push.
+    for (i, text) in ["one", "two"].iter().enumerate() {
+        h.write_and_observe(
+            &format!("CREATE message:w{i} SET recipient = user:bob, conversation = conversation:c1, text = '{text}'"),
+            Op::Create,
+        )
+        .await;
+    }
+    h.http.take();
+    let now = h.clock.load(Ordering::SeqCst);
+    let wake = h.engine.next_wake_ms().await.expect("trailing push pending");
+    assert!(wake > now && wake <= now + 30_000, "{wake} vs {now}");
+    h.advance(30_000);
+    h.engine.tick().await;
+    assert_eq!(h.http.take().len(), 1);
+    assert_eq!(h.engine.next_wake_ms().await, None, "trailing push sent");
+
+    // A message scheduled an hour out wakes the host for it.
+    h.write_and_observe(
+        "CREATE _00_push_message:later CONTENT { to: ['user:bob'], notification: { title: 'Later' }, send_at: time::now() + 1h }",
+        Op::Create,
+    )
+    .await;
+    let wake = h.engine.next_wake_ms().await.expect("scheduled message");
+    let hour = now_ms() + 3_600_000;
+    assert!(wake.abs_diff(hour) < 60_000, "{wake} vs {hour}");
+}
+
+#[tokio::test]
+async fn next_wake_is_none_while_push_is_switched_off() {
+    let h = harness("enabled: false").await;
+    h.write_and_observe(
+        "CREATE _00_push_message:x CONTENT { to: ['user:bob'], notification: { title: 'x' }, send_at: time::now() + 1h }",
+        Op::Create,
+    )
+    .await;
+    assert_eq!(h.engine.next_wake_ms().await, None);
+}

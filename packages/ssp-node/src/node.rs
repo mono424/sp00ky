@@ -2328,6 +2328,13 @@ impl SspNode {
         self.platform.spawner.spawn(Box::pin(async move {
             engine.observe(change).await;
         }));
+        // A throttled or failed send waits for a tick. A periodic shell ticks
+        // every second anyway; an on-demand one has no tick unless armed.
+        let at = crate::now_epoch_ms() + 1_000;
+        let sched = Arc::clone(&self.platform.scheduler);
+        self.platform.spawner.spawn(Box::pin(async move {
+            sched.ensure(crate::TimerKind::PushTick, at).await;
+        }));
     }
 
     // --- Timer-driven sweeps (invoked from Runtime::on_timer) ----------------

@@ -1898,6 +1898,63 @@ impl PushEngine {
 
     // ── Periodic work ────────────────────────────────────────────────────
 
+    /// When [`Self::tick`] next has work, in epoch milliseconds, for a host
+    /// that ticks on demand instead of every second (a Durable Object that
+    /// should sleep): a retry or a trailing throttle coming due, or a message
+    /// the sweep would pick up (scheduled, missed, or stuck sending; never
+    /// sooner than the sweep's own cadence, so a message that stays pending
+    /// cannot spin the host). `None` while nothing waits, and while push
+    /// cannot send at all.
+    pub async fn next_wake_ms(&self) -> Option<u64> {
+        if !(self.can_send() && self.loaded().config.enabled) {
+            return None;
+        }
+        let mut next: Option<u64> = None;
+        let mut take = |at: u64| next = Some(next.map_or(at, |n: u64| n.min(at)));
+        let last_sweep = {
+            let st = self.state();
+            for retry in &st.retries {
+                take(retry.due_ms);
+            }
+            for slot in st.throttles.values().filter(|s| s.pending.is_some()) {
+                take(slot.last_sent_ms.map_or(0, |t| t + slot.gap_ms));
+            }
+            if self.keys.is_some() && !st.vapid_published {
+                take(st.last_vapid_check_ms.map_or(0, |t| t + self.opts.vapid_recheck_ms));
+            }
+            st.last_sweep_ms
+        };
+        if let Some(due) = self.next_message_due_ms().await {
+            take(due.max(last_sweep.map_or(0, |t| t + self.opts.sweep_ms)));
+        }
+        next
+    }
+
+    /// The earliest time the message sweep would act on a row, read in one
+    /// round trip (NONE without the table).
+    async fn next_message_due_ms(&self) -> Option<u64> {
+        let sql = format!(
+            "LET $spky_tables = (INFO FOR DB).tables; \
+             RETURN IF $spky_tables._00_push_message {{ \
+               LET $due = time::min(array::flatten([ \
+                 (SELECT VALUE send_at FROM _00_push_message WHERE status = 'pending' AND send_at != NONE), \
+                 (SELECT VALUE created_at + {stale}ms FROM _00_push_message WHERE status = 'pending' AND send_at = NONE), \
+                 (SELECT VALUE (claimed_at ?? created_at) + {stuck}ms FROM _00_push_message WHERE status = 'sending') \
+               ])); \
+               IF $due {{ time::millis($due) }} ELSE {{ NONE }} \
+             }} ELSE {{ NONE }};",
+            stale = self.opts.stale_pending_ms,
+            stuck = self.opts.stuck_sending_ms,
+        );
+        match self.db.query(&sql, &[]).await {
+            Ok(answers) => answers.into_iter().last().and_then(|v| v.as_i64()).map(|ms| ms.max(0) as u64),
+            Err(e) => {
+                debug!(target: "push", error = %e, "reading the next message due failed");
+                None
+            }
+        }
+    }
+
     /// Periodic work, call every ~1 s: publish VAPID params until done, reload
     /// config every 30 s (hash short-circuit), flush due trailing throttles,
     /// retry failed sends, send due and missed messages every 5 s, prune every

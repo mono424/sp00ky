@@ -32,6 +32,7 @@ console_error_panic_hook = "0.1"
 ssp = { path = "../../packages/ssp" }
 ssp-protocol = { path = "../../packages/ssp-protocol" }
 ssp-node = { path = "../../packages/ssp-node" }
+push-core = { path = "../../packages/push-core" }
 
 # ssp → ulid → rand → getrandom: JS backend on wasm32 (see .cargo/config.toml).
 getrandom = { version = "0.3", features = ["wasm_js"] }

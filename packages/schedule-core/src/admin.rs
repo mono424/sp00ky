@@ -106,11 +106,9 @@ fn is_missing_table(message: &str) -> bool {
     m.contains("table") && m.contains("does not exist")
 }
 
+/// The engine's clock: `std::time` panics on wasm32, chrono's does not.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
 fn nonempty(value: &Option<String>) -> Option<&str> {

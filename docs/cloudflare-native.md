@@ -423,11 +423,25 @@ an idle project still sets no alarm:
   than the sweep's cadence); `TimerKind::PushTick` is armed at boot and a
   second after the node hands the engine a change. The outbound path must
   allow `*.push.apple.com`.
-- **Admin (open):** the scheduler's admin is axum and not portable. A small
-  `packages/admin-core` over `ApiRequest` covers overview, views, jobs
-  (list, kill, retry, clear), schedules (pause, resume, trigger) and logs. The
-  dashboard assets ship in the project script; auth is an HMAC-derived admin
-  token minted by the control plane.
+- **Admin (built 2026-10-21):** the SSP node serves `/admin/api`
+  (`packages/ssp-node/src/admin.rs`) over `ApiRequest`, with no separate
+  admin-core package: the job, schedule and workflow answers are
+  `schedule_core::admin` and the MCP tool table and protocol are
+  `ssp_protocol::admin_mcp`, both shared with the scheduler, which now calls
+  them too. Sessions are the shared signed tokens
+  (`ssp_protocol::admin_session`), so a token either host mints verifies on
+  the other; the node's bearer (`SPKY_AUTH_SECRET`) is a full session for the
+  control plane; break-glass (`SPKY_ADMIN_PASSWORD`) and roster login
+  (`Db::signin_record`, then `_00_admin`) work as on the scheduler. Served:
+  config, session, me, logout, tokens, MCP, overview, backends, jobs (list,
+  detail, clear, kill, retry), schedules (list, detail, pause, resume,
+  trigger, release) and workflow runs (list, detail, cancel, rerun, retry).
+  Nothing samples in the background: answers are read on request and the
+  overview's job totals are cached for 10 s. Views, presence, incidents,
+  logs, backups and the restart actions need a scheduler and answer 501 with
+  the reason; the dashboard polls jobs and runs where `config.streams` is
+  false and hides those pages. Still open: shipping the dashboard assets in
+  the project script and the control plane minting the admin password.
 
 Found on the way: SurrealDB 3.1's JSON RPC parses a string variable shaped
 like a record id, datetime or uuid into one, so a scheduled run could not
@@ -795,7 +809,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 | 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
 | 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
 | 3 | Table images + journal warm start, delta images, segmented arena (§5.4); IngestVerify | Ready p95 <= 1.5 s at 20 MB. **Done 2026-10-21, released in canary.338/.339:** on Cloudflare the DO is Ready 0.32 s into a warm start at 25 MB (full rebuild 5.7 to 6.9 s). IngestVerify is open |
-| 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project. **Jobs, schedules and push built 2026-10-21** (on demand, smoke-tested under workerd); admin-core and the e2e gate are open |
+| 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project. **Jobs, schedules, push and the admin API built 2026-10-21** (on demand, smoke-tested under workerd). E2e gate: the app suite passes 21/21 and every older spec passes alone, but the full 42-test run fails from about test 32 on because the DO resets at the 128 MB isolate limit with ~400 registered views (§14) |
 | 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |
 | 6 | Doorbell server + client, poll cap (§9) | remote queries per idle minute about 1 |
 | 7 | Ingest transports (`async` + changefeed backstop as the Cloudflare default) + conformance suite in CI as `spky doctor db` (§8) | suite green on SurrealDB 3.x; run against Earth when available |
@@ -831,3 +845,6 @@ work:
 | `catch_up_from_db` and `load_schema` run 2 + 2T sequential queries | `packages/ssp-node/src/bootstrap.rs`, `runtime.rs` | 5.3 s Ready from a US-placed DO against Hetzner (S1) | **`load_schema` fixed 2026-10-21:** two round trips. `catch_up_from_db` is no longer on the Cloudflare path (the warm start re-reads by id) |
 | `HeapArena` is one `Vec<u8>`; an adopted image doubles on its first append | `packages/ssp` arena (wasm path) | 3x memory peak after a restore; risks the 128 MB isolate limit | segmented arena on wasm, like `MmapArena::from_images` |
 | The free-plan staging SurrealDB is gone: `CF_FREE_SURREAL_URL` (`surreal-cftest.stg.spky.cloud`, spooky-cloud `sst.config.ts`) answers 404 on `/rpc`, `/sql`, `/health` | staging control plane | free projects without their own `surrealdb_url` cannot bootstrap | restore or remove the shared fallback in spooky-cloud |
+| The SSP DO resets at the 128 MB isolate limit with about 400 registered views and only about 130 rows, roughly 250 KB per view (found 2026-10-21 by the full threads e2e run; `durableObjectsPeriodicGroups.max.memoryUsageBytes` climbs to 120-136 MB, `exceededMemoryErrors` stays 0) | per-view state in the SSP circuit on wasm | every realtime test from about test 32 on times out while the DO restarts every few minutes; a real project with many tabs would see the same | measure a view's heap natively (`/debug/memory`), cut what a view holds, and cap or shed views per DO |
+| A preload that never settled blocked an offline reload forever | `packages/core/src/boot/preload.saga.ts` | an app gating its first paint on a preload stayed on its loading screen offline | **fixed 2026-10-21** (returns when `navigator.onLine` is false); the Dart port still waits |
+| The shared free-plan SurrealDB (v3.1.5) deadlocked under e2e load: every thread in a futex wait, `/health` hanging | staging `free-surreal`, no healthcheck or autoheal | every free project down until a manual `docker restart` | a healthcheck plus autoheal on `free-surreal` in spooky-cloud `sst.config.ts` |

@@ -975,6 +975,7 @@ fn build_node(
         true,
     ));
     let has_jobs = !job_config.job_tables.is_empty();
+    let schedule_engine = ssp_node::schedules::build_engine(true, Arc::clone(&platform.db), job_control.clone());
     let node = SspNode {
         publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
@@ -1006,10 +1007,10 @@ fn build_node(
         impersonation: cfg.impersonation,
         query_allowlist: Arc::new(ssp_node::allowlist_state::QueryAllowlist::new(cfg.query_allowlist)),
         standalone: true,
-        // No schedule engine on Workers: this shell drops `_job_rx`, so there is
-        // no runner to execute anything a fired schedule would spawn. Scheduling
-        // is VM/singlenode + cluster only until that changes.
-        schedule_engine: None,
+        // Declarative schedules and workflows, as on a standalone VM SSP. The
+        // on-demand runtime arms each sweep for the engine's next wake, so a
+        // project without schedules never sets an alarm for them.
+        schedule_engine,
         push_engine: None,
         ttl_cleanup_interval_secs: 60,
         // Off: a 15 s alarm would keep the Durable Object from ever

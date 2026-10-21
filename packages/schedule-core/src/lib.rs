@@ -29,7 +29,7 @@ mod db_tests;
 pub use cron::{FireSpec, FireSpecError};
 pub use dag::{DagError, StepStatus, WorkflowDag};
 pub use db::{ScheduleDb, ScheduleDbError};
-pub use engine::{EngineConfig, ScheduleEngine, TickReport};
+pub use engine::{EngineConfig, ScheduleEngine, TickReport, RUN_POLL_SECS};
 pub use kill::{JobKill, NoopJobKill};
 pub use spec::{Concurrency, OnFailure, ScheduleKind, ScheduleSpec, StepDef, WorkflowDef};
 pub use workflow::{CancelOutcome, RerunOutcome, RetryOutcome, WorkflowOpError};

@@ -17,7 +17,7 @@ use surrealdb::engine::local::{Db as MemEngine, Mem};
 use surrealdb::Surreal;
 
 use crate::db::{ScheduleDb, ScheduleDbError};
-use crate::engine::{stamp, EngineConfig, ScheduleEngine};
+use crate::engine::{stamp, EngineConfig, ScheduleEngine, RUN_POLL_SECS};
 use crate::ids;
 use crate::kill::{JobKill, NoopJobKill};
 
@@ -3614,4 +3614,57 @@ async fn a_schedule_without_a_budget_never_quarantines() {
     let report = h.engine.tick_pass().await.unwrap();
     assert_eq!(report.spawned, 2, "opt-in only: an upgrade changes no firing behaviour");
     assert!(report.quarantined.is_empty());
+}
+
+#[tokio::test]
+async fn next_wake_is_none_without_schedules_and_now_for_an_unplanned_one() {
+    // No schedule table at all: a project that never deployed one.
+    let db = Surreal::new::<Mem>(()).await.unwrap();
+    db.use_ns("test").use_db("test").await.unwrap();
+    let bare = ScheduleEngine::new(
+        Arc::new(MemDb(Arc::new(db))),
+        Arc::new(RecordingKill::default()) as Arc<dyn JobKill>,
+        EngineConfig::default(),
+    );
+    assert_eq!(bare.next_wake(Utc::now()).await.unwrap(), None);
+
+    let h = harness().await;
+    assert_eq!(h.engine.next_wake(Utc::now()).await.unwrap(), None, "tables but no schedule");
+    h.define_schedule("nightly", every_5m_job()).await;
+    let now = Utc::now();
+    assert_eq!(h.engine.next_wake(now).await.unwrap(), Some(now), "unplanned: sweep now");
+}
+
+#[tokio::test]
+async fn next_wake_follows_the_planned_fire_and_polls_while_a_run_is_active() {
+    let h = harness().await;
+    h.define_schedule("nightly", every_5m_job()).await;
+    h.engine.tick_pass().await.unwrap();
+    let now = Utc::now();
+    let wake = h.engine.next_wake(now).await.unwrap().expect("planned");
+    assert!(wake > now && wake <= now + Duration::minutes(5) + Duration::seconds(1), "{wake} vs {now}");
+
+    // Fire it: the run is active until its job finishes, and is polled for
+    // the heal pass even once the schedule itself is paused.
+    h.set("UPDATE _00_schedule:nightly SET next_fire_at = time::now() - 1s").await;
+    assert_eq!(h.engine.tick_pass().await.unwrap().fired, 1);
+    h.set("UPDATE _00_schedule:nightly SET paused = true").await;
+    let wake = h.engine.next_wake(now).await.unwrap().expect("polled");
+    assert_eq!(wake, now + Duration::seconds(RUN_POLL_SECS));
+
+    // Nothing running and nothing planned: nothing to wake for.
+    h.set("UPDATE _00_schedule_run SET status = 'success'").await;
+    assert_eq!(h.engine.next_wake(now).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_schedule_that_cannot_be_planned_does_not_ask_for_a_sweep() {
+    let h = harness().await;
+    h.define_schedule(
+        "broken",
+        json!({ "kind": "job", "cron": "not a cron", "target_table": "job", "path": "/x" }),
+    )
+    .await;
+    h.engine.tick_pass().await.unwrap();
+    assert_eq!(h.engine.next_wake(Utc::now()).await.unwrap(), None);
 }

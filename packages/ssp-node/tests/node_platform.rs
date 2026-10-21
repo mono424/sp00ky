@@ -4164,3 +4164,39 @@ async fn replay_hands_a_pending_job_the_rebuild_already_loaded_to_the_runner() {
     h.node.replay_notices(vec![notice]).await.unwrap();
     assert!(h.job_rx.lock().await.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn on_demand_schedule_sweeps_follow_the_engines_next_wake() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://backend")], schedules: true, ..Default::default() }).await;
+    h.raw_db.query(SCHEDULE_TABLES).await.expect("scheduling schema");
+    let rt = Runtime::on_demand(Arc::clone(&h.node));
+    let sweeps = |h: &Harness| h.scheduled.lock().unwrap().iter().filter(|k| **k == TimerKind::ScheduleSweep).count();
+
+    // Nothing scheduled: a sweep does not arm the next one.
+    rt.on_timer(TimerKind::ScheduleSweep).await;
+    assert_eq!(sweeps(&h), 0, "no schedules, no wake");
+
+    // A deploy adds one and reloads the node: the reload arms a sweep, which
+    // plans it and arms the next for its fire time.
+    h.raw_db
+        .query(
+            "DEFINE TABLE job SCHEMALESS; \
+             CREATE _00_schedule:nightly CONTENT { name: 'nightly', kind: 'job', \
+             every_ms: 300000, target_table: 'job', path: '/cleanup' }",
+        )
+        .await
+        .unwrap();
+    rt.after_request("/admin/reload").await;
+    assert_eq!(sweeps(&h), 1, "reload arms a sweep");
+    rt.on_timer(TimerKind::ScheduleSweep).await;
+    assert_eq!(sweeps(&h), 2, "the planned fire arms the next sweep");
+    let planned: Option<String> = h
+        .raw_db
+        .query("RETURN <string>(SELECT VALUE next_fire_at FROM ONLY _00_schedule:nightly)")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert!(planned.is_some(), "the sweep planned the schedule");
+}

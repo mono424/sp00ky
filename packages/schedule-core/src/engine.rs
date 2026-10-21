@@ -153,6 +153,12 @@ pub(crate) struct Fold<'a> {
 /// scan; firing and healing do need it.
 const PRUNE_INTERVAL_SECS: i64 = 60;
 
+/// How often [`ScheduleEngine::next_wake`] asks for a sweep while a run is
+/// active. A finished job normally advances its run at once
+/// (`observe_job_terminal`); the sweep's heal pass is the backstop for a lost
+/// completion event, so it can be slower than a fixed-interval ticker's 5 s.
+pub const RUN_POLL_SECS: i64 = 30;
+
 /// Rows deleted per prune statement. Small on purpose: on a synced table each
 /// deleted row fires the generated `_00_<t>_delete` event, which POSTs the record
 /// to `/ingest` — the cost per row is a network round-trip, not a b-tree write.
@@ -289,6 +295,40 @@ impl ScheduleEngine {
         self.prune_pass(now, &mut report).await?;
 
         Ok(report)
+    }
+
+    /// When this engine next has work, for a host that arms its sweep on
+    /// demand instead of ticking (a Durable Object that should sleep): `now`
+    /// for an unplanned or triggered schedule, at most [`RUN_POLL_SECS`] out
+    /// while a run is active, else the earliest planned fire. `None` when
+    /// nothing is scheduled. Only the clock can move a planned fire earlier,
+    /// so a host must also sweep after anything that writes `_00_schedule`
+    /// (a deploy, an operator trigger).
+    pub async fn next_wake(&self, now: DateTime<Utc>) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let answer = self.db.query(sql::NEXT_WAKE, &[]).await?;
+        let Some(state) = answer.into_iter().last().filter(|v| v.is_object()) else {
+            return Ok(None);
+        };
+        let present = |key: &str| state.get(key).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        if present("now") {
+            return Ok(Some(now));
+        }
+        let next = state
+            .get("next")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc));
+        let poll = present("running").then(|| now + Duration::seconds(RUN_POLL_SECS));
+        Ok(match (next, poll) {
+            (Some(n), Some(p)) => Some(n.min(p)),
+            (n, p) => n.or(p),
+        })
+    }
+
+    /// [`Self::next_wake`] from the current time, in epoch milliseconds, for
+    /// a host that keeps its timers as plain numbers.
+    pub async fn next_wake_epoch_ms(&self) -> anyhow::Result<Option<u64>> {
+        Ok(self.next_wake(Utc::now()).await?.map(|t| t.timestamp_millis().max(0) as u64))
     }
 
     // -- planning -----------------------------------------------------------

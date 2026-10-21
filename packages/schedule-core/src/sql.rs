@@ -1448,3 +1448,19 @@ mod tests {
         assert!(PRUNE_WORKFLOW_RUNS.contains("ORDER BY finished_at ASC"));
     }
 }
+
+/// What [`crate::ScheduleEngine::next_wake`] reads, in one round trip: a
+/// schedule that needs a sweep now (unplanned and not refused, so a bad cron
+/// cannot keep a host awake; or an operator trigger waiting), the earliest planned fire, and whether any run is active. NONE
+/// when the project has no schedule table (nothing was ever deployed).
+pub const NEXT_WAKE: &str = "\
+LET $spky_tables = (INFO FOR DB).tables; \
+RETURN IF $spky_tables._00_schedule { { \
+  now: (SELECT VALUE id FROM _00_schedule WHERE paused = false \
+    AND ((next_fire_at = NONE AND config_disabled = false AND last_error = NONE) \
+    OR trigger_requested_at != NONE) LIMIT 1), \
+  next: time::min(SELECT VALUE next_fire_at FROM _00_schedule \
+    WHERE paused = false AND config_disabled = false AND next_fire_at != NONE), \
+  running: IF $spky_tables._00_schedule_run { \
+    (SELECT VALUE id FROM _00_schedule_run WHERE status = 'running' LIMIT 1) } ELSE { [] } \
+} } ELSE { NONE };";

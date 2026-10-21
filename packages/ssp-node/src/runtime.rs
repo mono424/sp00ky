@@ -23,6 +23,11 @@ use crate::ports::CircuitStoreError;
 use crate::status::SspStatus;
 use crate::{now_epoch_ms, SspNode, TimerKind};
 
+/// The least gap between on-demand schedule sweeps.
+const ON_DEMAND_SWEEP_MIN_GAP_MS: u64 = 2_000;
+/// Retry after an on-demand probe of the DB failed.
+const ON_DEMAND_RETRY_MS: u64 = 60_000;
+
 /// How the portable sweeps re-arm themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimerPolicy {
@@ -82,6 +87,31 @@ impl Runtime {
             }
             runtime.arm_crdt_fold().await;
         }));
+        self.arm_schedule_sweep_now().await;
+    }
+
+    /// A sweep right away, when this node runs the schedule engine: it plans
+    /// what a deploy added and then arms itself by `next_wake`.
+    async fn arm_schedule_sweep_now(&self) {
+        if self.node.schedule_engine.is_some() {
+            self.node.platform.scheduler.ensure(TimerKind::ScheduleSweep, now_epoch_ms()).await;
+        }
+    }
+
+    /// On demand: the next sweep when the engine next has work, at least
+    /// `ON_DEMAND_SWEEP_MIN_GAP_MS` out so a schedule that keeps asking for
+    /// "now" cannot spin; none when nothing is scheduled.
+    async fn arm_schedule_sweep_on_demand(&self, engine: &schedule_core::ScheduleEngine) {
+        let floor = now_epoch_ms() + ON_DEMAND_SWEEP_MIN_GAP_MS;
+        let at = match engine.next_wake_epoch_ms().await {
+            Ok(Some(at)) => at.max(floor),
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "reading the next schedule wake failed; retrying");
+                now_epoch_ms() + ON_DEMAND_RETRY_MS
+            }
+        };
+        self.node.platform.scheduler.ensure(TimerKind::ScheduleSweep, at).await;
     }
 
     /// Arm what a request just made pending: dirty view metrics, newly logged
@@ -104,6 +134,10 @@ impl Runtime {
             sched
                 .ensure(TimerKind::CrdtSweep, now_epoch_ms() + node.crdt.config().sweep_secs * 1000)
                 .await;
+        }
+        // A deploy reloads the node: it may have added or changed schedules.
+        if path == "/admin/reload" {
+            self.arm_schedule_sweep_now().await;
         }
         let registered = path.starts_with("/view/register");
         let ingested = path.starts_with("/ingest") && !node.job_config.job_tables.is_empty();
@@ -226,12 +260,17 @@ impl Runtime {
                             }
                         }
                     }
-                    sched
-                        .schedule(
-                            TimerKind::ScheduleSweep,
-                            now_epoch_ms() + SCHEDULE_SWEEP_INTERVAL_SECS * 1000,
-                        )
-                        .await;
+                    match self.policy {
+                        TimerPolicy::Periodic => {
+                            sched
+                                .schedule(
+                                    TimerKind::ScheduleSweep,
+                                    now_epoch_ms() + SCHEDULE_SWEEP_INTERVAL_SECS * 1000,
+                                )
+                                .await;
+                        }
+                        TimerPolicy::OnDemand => self.arm_schedule_sweep_on_demand(engine).await,
+                    }
                 }
             }
             TimerKind::TtlCleanup => {

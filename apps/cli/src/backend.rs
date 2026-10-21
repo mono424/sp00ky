@@ -2885,7 +2885,8 @@ impl BackendProcessor {
                 } else if !storage_enabled && backend.starts_with("file:") {
                     crate::ui::warn(format!(
                         "Bucket '{}' uses a file backend but deployment.storage.sizeGB \
-                         is unset; no volume is mounted and files land on ephemeral storage.",
+                         is unset; no volume is mounted and files land on ephemeral storage \
+                         (on the free plan's shared database they are kept on its volume).",
                         bucket_name
                     ));
                 }

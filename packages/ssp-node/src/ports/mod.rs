@@ -17,6 +17,7 @@ mod db;
 mod http;
 mod object_store;
 mod scheduler;
+mod snapshot_store;
 mod spawn;
 mod telemetry;
 
@@ -29,6 +30,7 @@ pub use db::{Db, DbConnection, DbError};
 pub use http::{CancelHandle, CancelWatch, HttpClient, HttpError, OutboundRequest, OutboundResponse};
 pub use object_store::{MemoryObjectStore, ObjectMeta, ObjectStore, ObjectStoreError, StoredObject};
 pub use scheduler::{Scheduler, TimerKind};
+pub use snapshot_store::{MemorySnapshotStore, SnapshotMeta, SnapshotStore, TableImage};
 pub use spawn::{LocalBoxFuture, Spawner};
 pub use telemetry::{NoopTelemetry, Telemetry};
 

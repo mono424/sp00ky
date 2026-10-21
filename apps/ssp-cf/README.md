@@ -50,6 +50,12 @@ the object's SQLite (`ssp_inbox`), answered `200 {"status":"queued"}`, and
 replayed by their records' current DB state once the node is Ready
 (`docs/cloudflare-native.md` §5.3).
 
+A cold object starts warm: it keeps one FORMAT 2 image per table in its
+SQLite (`snap_table`, `snap_part`), rewritten by a checkpoint shortly after
+boot and after changes, and on wake reads the images and re-reads from the DB
+only the records noticed since (§5.4). A deploy (new node version) or a
+schema change rebuilds from the DB once.
+
 ## Build / deploy (needs toolchain)
 
 ```sh
@@ -62,4 +68,4 @@ wrangler deploy
 
 ## Open
 
-The remaining phases (chunked snapshots, jobs, schedules, push, doorbell) are tracked in `docs/cloudflare-native.md` §12.
+The remaining phases (delta images, jobs, schedules, push, doorbell) are tracked in `docs/cloudflare-native.md` §12.

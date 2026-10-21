@@ -175,15 +175,24 @@ impl SspNode {
 }
 
 /// The current rows for `ids` (`table:key` strings), keyed by id. A record the
-/// DB no longer has is simply absent.
-async fn fetch_current(
+/// DB no longer has is simply absent. `_00_rv` comes from the `_00_version`
+/// ledger where there is one, as the bootstrap reads it: the row's own field
+/// is not kept current there.
+pub(crate) async fn fetch_current(
     db: &dyn crate::ports::Db,
     ids: &[String],
     omit: &str,
 ) -> anyhow::Result<HashMap<String, Value>> {
-    let sql = format!("LET $records = array::map($ids, |$i| type::record($i)); SELECT *{omit} FROM $records;");
+    let select = format!("SELECT *{omit} FROM $records");
+    let sql = |select: &str| format!("LET $records = array::map($ids, |$i| type::record($i)); {select};");
     let ids_json = Value::Array(ids.iter().cloned().map(Value::String).collect());
-    let results = match db.query(&sql, &[("ids", ids_json)]).await {
+    let durable = sql(&ssp_protocol::with_durable_row_versions(&select));
+    let results = match db.query(&durable, &[("ids", ids_json.clone())]).await {
+        // No ledger on this database: the row's field is the version.
+        Err(e) if e.to_string().contains("_00_version") => db.query(&sql(&select), &[("ids", ids_json)]).await,
+        other => other,
+    };
+    let results = match results {
         Ok(results) => results,
         // A table nobody wrote since it was dropped: nothing is current.
         Err(e) if e.to_string().contains("does not exist") => return Ok(HashMap::new()),

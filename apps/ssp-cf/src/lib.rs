@@ -27,9 +27,9 @@ use worker::*;
 use ssp::circuit::Circuit;
 use ssp_node::bucket::BucketService;
 use ssp_node::ports::{
-    CancelWatch, CircuitStore, CircuitStoreError, HttpClient, HttpError, LocalBoxFuture,
-    ObjectMeta, ObjectStore, ObjectStoreError, OutboundRequest, OutboundResponse, ResumePoint,
-    Scheduler, Spawner, StoredObject, TimerKind,
+    CancelWatch, HttpClient, HttpError, LocalBoxFuture, NoopCircuitStore, ObjectMeta,
+    ObjectStore, ObjectStoreError, OutboundRequest, OutboundResponse, Scheduler, Spawner,
+    StoredObject, TimerKind,
 };
 use ssp_node::{
     now_epoch_ms, ApiBody, HttpSqlDb, Method as ApiMethod, NoopTelemetry, Platform, Runtime,
@@ -37,13 +37,15 @@ use ssp_node::{
 };
 
 mod log;
+mod snapshot;
 
 /// The R2 binding holding the files of `BACKEND "r2"` buckets, bound by the
 /// control plane when the project declares one.
 const FILES_BINDING: &str = "SPKY_FILES";
 
-const CIRCUIT_BLOB_KEY: &str = "ssp:circuit_blob";
-const RESUME_POINT_KEY: &str = "ssp:resume_point";
+/// Where the JSON circuit snapshot used to live (Durable Object KV), removed
+/// on boot: the row images in SQLite (`snapshot.rs`) replaced it.
+const LEGACY_SNAPSHOT_KEYS: [&str; 2] = ["ssp:circuit_blob", "ssp:resume_point"];
 
 // ---------------------------------------------------------------------------
 // Port adapters
@@ -127,54 +129,6 @@ struct CfSpawner;
 impl Spawner for CfSpawner {
     fn spawn(&self, fut: LocalBoxFuture) {
         spawn_local(fut);
-    }
-}
-
-/// `CircuitStore` over DO storage: one JSON blob + resume point. `worker` 0.8
-/// Storage ops take `&self`, so a shared `Rc<Storage>` suffices (no RefCell).
-struct CfCircuitStore {
-    storage: Rc<Storage>,
-}
-
-#[async_trait(?Send)]
-impl CircuitStore for CfCircuitStore {
-    async fn save(
-        &self,
-        blob: &str,
-        point: &ResumePoint,
-    ) -> std::result::Result<(), CircuitStoreError> {
-        self.storage
-            .put(CIRCUIT_BLOB_KEY, blob)
-            .await
-            .map_err(|e| CircuitStoreError::Transport(e.to_string()))?;
-        self.storage
-            .put(RESUME_POINT_KEY, point)
-            .await
-            .map_err(|e| CircuitStoreError::Transport(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn load(&self) -> std::result::Result<(String, ResumePoint), CircuitStoreError> {
-        // 0.8 `get` returns Ok(None) for a missing key — that's a cold start.
-        let blob: String = self
-            .storage
-            .get(CIRCUIT_BLOB_KEY)
-            .await
-            .map_err(|e| CircuitStoreError::Transport(e.to_string()))?
-            .ok_or(CircuitStoreError::NotFound)?;
-        let point: ResumePoint = self
-            .storage
-            .get(RESUME_POINT_KEY)
-            .await
-            .map_err(|e| CircuitStoreError::Transport(e.to_string()))?
-            .ok_or(CircuitStoreError::NotFound)?;
-        Ok((blob, point))
-    }
-
-    async fn clear(&self) -> std::result::Result<(), CircuitStoreError> {
-        let _ = self.storage.delete(CIRCUIT_BLOB_KEY).await;
-        let _ = self.storage.delete(RESUME_POINT_KEY).await;
-        Ok(())
     }
 }
 
@@ -473,6 +427,8 @@ pub struct SspNodeDo {
     inbox_len: Cell<u64>,
     /// Single flight for draining the inbox.
     drain: tokio::sync::Mutex<()>,
+    /// Table images + journal for the warm start.
+    snapshot: snapshot::CfSnapshot,
 }
 
 /// The routes a database event calls. They are acknowledged durably even
@@ -482,8 +438,34 @@ fn is_notice_route(path: &str) -> bool {
     matches!(path, "/ingest" | "/ingest/batch" | "/view/unregister")
 }
 
+/// Change notices in arrival order. `applied = 0` rows are the inbox (accepted,
+/// not yet in the circuit); applied rows are the journal a warm start re-reads
+/// after the table images, kept until every image covers them.
 const INBOX_TABLE: &str = "CREATE TABLE IF NOT EXISTS ssp_inbox \
-    (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, body TEXT NOT NULL)";
+    (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, body TEXT NOT NULL, \
+     applied INTEGER NOT NULL DEFAULT 0)";
+/// The column phase 2 (canary.337) did not have; fails harmlessly once added.
+const INBOX_APPLIED_COLUMN: &str = "ALTER TABLE ssp_inbox ADD COLUMN applied INTEGER NOT NULL DEFAULT 0";
+
+/// Bytes of table images one checkpoint event writes (at least one table):
+/// the writes hold the object's responses until they are on disk (spike S1:
+/// about 0.4 s for 20 MiB in one event).
+const CHECKPOINT_BUDGET_BYTES: u64 = 4 << 20;
+/// A checkpoint runs this long after the first change since the last one
+/// (later changes never postpone it: an evicted object's alarm wakes a fresh
+/// instance, whose own arming must not push a due checkpoint out)...
+const CHECKPOINT_AFTER_CHANGE_MS: u64 = 30_000;
+/// ...and this soon after a bootstrap, while the circuit is in memory: a cold
+/// rebuild has no images yet, a warm start has caught some tables up.
+const CHECKPOINT_AFTER_BOOT_MS: u64 = 2_000;
+/// Retry after a failed checkpoint.
+const CHECKPOINT_RETRY_MS: u64 = 60_000;
+/// Applied journal rows kept at most. Past it (checkpoints keep failing) the
+/// snapshot is dropped with them, and the next cold start rebuilds.
+const MAX_JOURNAL_ROWS: u64 = 200_000;
+/// A snapshot older than this rebuilds (writes that bypass the events are
+/// not in the journal).
+const MAX_SNAPSHOT_AGE_SECS: u64 = 7 * 24 * 3600;
 
 /// Rows read per drain pass.
 const DRAIN_PAGE: usize = 200;
@@ -496,7 +478,7 @@ const MAX_BOOTSTRAP_BACKOFF_MS: u64 = 60_000;
 fn inbox_count(storage: &Storage) -> u64 {
     storage
         .sql()
-        .exec("SELECT COUNT(*) AS n FROM ssp_inbox", None)
+        .exec("SELECT COUNT(*) AS n FROM ssp_inbox WHERE applied = 0", None)
         .and_then(|c| c.to_array::<serde_json::Value>())
         .ok()
         .and_then(|rows| rows.first().and_then(|r| r.get("n")).and_then(serde_json::Value::as_u64))
@@ -516,7 +498,12 @@ impl DurableObject for SspNodeDo {
         if let Err(e) = storage.sql().exec(INBOX_TABLE, None) {
             tracing::error!(error = %e, "creating ssp_inbox failed");
         }
+        let _ = storage.sql().exec(INBOX_APPLIED_COLUMN, None);
+        if let Err(e) = storage.sql().exec(snapshot::TABLES, None) {
+            tracing::error!(error = %e, "creating the snapshot tables failed");
+        }
         let inbox_len = Cell::new(inbox_count(&storage));
+        let snapshot = snapshot::CfSnapshot { storage: storage.clone() };
         tracing::debug!(timers = scheduler.mux.borrow().len(), inbox = inbox_len.get(), "DO::new");
         Self {
             state,
@@ -528,6 +515,7 @@ impl DurableObject for SspNodeDo {
             boot: tokio::sync::Mutex::new(()),
             inbox_len,
             drain: tokio::sync::Mutex::new(()),
+            snapshot,
         }
     }
 
@@ -587,11 +575,12 @@ impl DurableObject for SspNodeDo {
                 TimerKind::BootstrapRetry { attempt } => {
                     // The wake itself may just have built the node Ready.
                     if *runtime.node().status.read().await != SspStatus::Ready {
-                        runtime.bootstrap().await;
+                        runtime.bootstrap_with(Some(&self.snapshot)).await;
                         self.after_bootstrap(&runtime, attempt).await;
                     }
                 }
                 TimerKind::IngestReplay => self.drain_inbox().await,
+                TimerKind::CircuitCheckpoint => self.checkpoint().await,
                 other => runtime.on_timer(other).await,
             }
         }
@@ -640,13 +629,16 @@ impl SspNodeDo {
             scheduler: self.scheduler.clone(),
             spawner: Arc::new(CfSpawner),
             telemetry: Arc::new(NoopTelemetry),
-            circuit_store: Arc::new(CfCircuitStore { storage: self.storage.clone() }),
+            circuit_store: Arc::new(NoopCircuitStore),
         };
 
         tracing::info!(db_url_set = !cfg.db_url.is_empty(), "building node");
         let node = Arc::new(build_node(platform, &cfg));
         let runtime = Runtime::on_demand(node.clone());
-        runtime.bootstrap().await;
+        for key in LEGACY_SNAPSHOT_KEYS {
+            let _ = self.storage.delete(key).await;
+        }
+        runtime.bootstrap_with(Some(&self.snapshot)).await;
         *self.node.borrow_mut() = Some(node);
         *self.runtime.borrow_mut() = Some(runtime.clone());
         self.after_bootstrap(&runtime, 0).await;
@@ -659,6 +651,8 @@ impl SspNodeDo {
         if *runtime.node().status.read().await == SspStatus::Ready {
             tracing::info!(attempt, "bootstrap complete");
             runtime.after_boot().await;
+            // Images for the next cold start (only the tables that moved).
+            self.arm_checkpoint(CHECKPOINT_AFTER_BOOT_MS).await;
             if self.inbox_len.get() > 0 {
                 self.drain_inbox().await;
             }
@@ -687,13 +681,37 @@ impl SspNodeDo {
             return json_response(401, serde_json::json!({ "code": "unauthorized" }));
         }
         let body = req.bytes().await.unwrap_or_default();
+        let (kind, stored) = match compact_for_inbox(&path, &body) {
+            Ok(v) => v,
+            Err(e) => return json_response(400, serde_json::json!({ "code": "invalid_notice", "message": e })),
+        };
+        let queued_ahead = self.inbox_len.get() > 0;
+        // Journaled first, applied or not: a warm start re-reads what was
+        // noticed after its images, so every notice has to be on disk.
+        let seq = match self
+            .storage
+            .sql()
+            .exec(
+                "INSERT INTO ssp_inbox (kind, body) VALUES (?, ?) RETURNING seq",
+                vec![kind.into(), stored.into()],
+            )
+            .and_then(|c| c.to_array::<serde_json::Value>())
+        {
+            Ok(rows) => rows.first().and_then(|r| r.get("seq")).and_then(serde_json::Value::as_i64).unwrap_or(0),
+            Err(e) => {
+                // Not stored, so not acknowledged: the DB event fails and the
+                // client retries the write.
+                tracing::error!(error = %e, "journaling a change notice failed");
+                return json_response(503, serde_json::json!({ "code": "inbox_unavailable" }));
+            }
+        };
 
         let ready = match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
             (Some(node), Some(runtime)) => Some((node, runtime)),
             _ => None,
         };
         if let Some((node, runtime)) = ready {
-            if self.inbox_len.get() == 0 && *node.status.read().await == SspStatus::Ready {
+            if !queued_ahead && *node.status.read().await == SspStatus::Ready {
                 let api_req = ssp_node::ApiRequest {
                     method: ApiMethod::Post,
                     path: path.clone(),
@@ -702,34 +720,87 @@ impl SspNodeDo {
                 };
                 match node.route(api_req).await {
                     // A full publication queue or a restarting circuit: keep it
-                    // instead of failing the write.
+                    // queued instead of failing the write.
                     Some(resp) if resp.status >= 500 => {}
                     Some(resp) => {
+                        // Applied, or refused for what it is (a retry would
+                        // get the same answer): nothing left to replay.
+                        self.mark_applied(seq);
                         runtime.after_request(&path).await;
+                        self.arm_checkpoint(CHECKPOINT_AFTER_CHANGE_MS).await;
                         return to_worker_response(resp);
                     }
-                    None => return Response::error("not found", 404),
+                    None => {
+                        self.mark_applied(seq);
+                        return Response::error("not found", 404);
+                    }
                 }
             }
         }
 
-        let (kind, stored) = match compact_for_inbox(&path, &body) {
-            Ok(v) => v,
-            Err(e) => return json_response(400, serde_json::json!({ "code": "invalid_notice", "message": e })),
-        };
-        if let Err(e) = self.storage.sql().exec(
-            "INSERT INTO ssp_inbox (kind, body) VALUES (?, ?)",
-            vec![kind.into(), stored.into()],
-        ) {
-            // Not stored, so not acknowledged: the DB event fails and the
-            // client retries the write.
-            tracing::error!(error = %e, "queuing a change notice failed");
-            return json_response(503, serde_json::json!({ "code": "inbox_unavailable" }));
-        }
         self.inbox_len.set(self.inbox_len.get() + 1);
         // Wake as soon as possible: bootstrap (if cold), then replay.
         self.scheduler.ensure(TimerKind::IngestReplay, now_epoch_ms()).await;
         json_response(200, serde_json::json!({ "status": "queued" }))
+    }
+
+    fn mark_applied(&self, seq: i64) {
+        if let Err(e) = self
+            .storage
+            .sql()
+            .exec("UPDATE ssp_inbox SET applied = 1 WHERE seq = ?", vec![seq.into()])
+        {
+            tracing::warn!(error = %e, seq, "marking a notice applied failed");
+        }
+    }
+
+    /// Checkpoint within `delay_ms`, keeping an earlier deadline.
+    async fn arm_checkpoint(&self, delay_ms: u64) {
+        self.scheduler.ensure(TimerKind::CircuitCheckpoint, now_epoch_ms() + delay_ms).await;
+    }
+
+    /// Write the table images that moved, a byte budget per event, and come
+    /// back right away while more are left.
+    async fn checkpoint(&self) {
+        let Some(node) = self.node.borrow().clone() else { return };
+        match node.checkpoint_step(&self.snapshot, CHECKPOINT_BUDGET_BYTES).await {
+            Ok(report) if report.remaining > 0 => {
+                tracing::info!(?report, "checkpoint: more tables to write");
+                self.scheduler.ensure(TimerKind::CircuitCheckpoint, now_epoch_ms()).await;
+            }
+            Ok(report) => {
+                if report.skipped.is_some() || !report.written.is_empty() {
+                    tracing::info!(?report, "checkpoint");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "checkpoint failed; retrying");
+                self.scheduler
+                    .ensure(TimerKind::CircuitCheckpoint, now_epoch_ms() + CHECKPOINT_RETRY_MS)
+                    .await;
+            }
+        }
+        self.bound_journal();
+    }
+
+    /// The journal only shrinks when checkpoints succeed. If they keep
+    /// failing, drop the snapshot along with the oldest rows rather than grow
+    /// without bound; the next cold start then rebuilds from the DB.
+    fn bound_journal(&self) {
+        let sql = self.storage.sql();
+        let applied = sql
+            .exec("SELECT COUNT(*) AS n FROM ssp_inbox WHERE applied = 1", None)
+            .and_then(|c| c.to_array::<serde_json::Value>())
+            .ok()
+            .and_then(|rows| rows.first().and_then(|r| r.get("n")).and_then(serde_json::Value::as_u64))
+            .unwrap_or(0);
+        if applied <= MAX_JOURNAL_ROWS {
+            return;
+        }
+        tracing::warn!(applied, "journal over its bound; dropping the snapshot");
+        use ssp_node::SnapshotStore as _;
+        let _ = self.snapshot.clear();
+        let _ = sql.exec("DELETE FROM ssp_inbox WHERE applied = 1", None);
     }
 
     /// Replay the inbox in order, single flight (a second caller waits, so a
@@ -752,7 +823,10 @@ impl SspNodeDo {
             let rows: Vec<serde_json::Value> = match self
                 .storage
                 .sql()
-                .exec(&format!("SELECT seq, kind, body FROM ssp_inbox ORDER BY seq LIMIT {DRAIN_PAGE}"), None)
+                .exec(
+                    &format!("SELECT seq, kind, body FROM ssp_inbox WHERE applied = 0 ORDER BY seq LIMIT {DRAIN_PAGE}"),
+                    None,
+                )
                 .and_then(|c| c.to_array())
             {
                 Ok(rows) => rows,
@@ -807,12 +881,18 @@ impl SspNodeDo {
                 return;
             }
             if let Some(seq) = done_through {
-                if let Err(e) = self.storage.sql().exec("DELETE FROM ssp_inbox WHERE seq <= ?", vec![seq.into()]) {
-                    tracing::warn!(error = %e, "trimming ssp_inbox failed");
+                // Kept as the journal until a checkpoint covers them.
+                if let Err(e) = self
+                    .storage
+                    .sql()
+                    .exec("UPDATE ssp_inbox SET applied = 1 WHERE seq <= ? AND applied = 0", vec![seq.into()])
+                {
+                    tracing::warn!(error = %e, "marking replayed notices failed");
                     return;
                 }
             }
             runtime.after_request("/ingest").await;
+            self.arm_checkpoint(CHECKPOINT_AFTER_CHANGE_MS).await;
         }
     }
 
@@ -911,8 +991,9 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         schema_watch: Default::default(),
         view_metrics_flush_ms: 2000,
         bootstrap_page_size: 200,
-        checkpoint_interval_secs: Some(300),
-        max_snapshot_age_secs: 3600,
+        // The JSON `CircuitStore` path is off; the shell writes table images.
+        checkpoint_interval_secs: None,
+        max_snapshot_age_secs: MAX_SNAPSHOT_AGE_SECS,
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }
 }

@@ -340,10 +340,33 @@ impl Runtime {
     /// Errors flip status to `Failed`; the shell's `BootstrapRetry` timer (or a
     /// DO's next `fetch`) drives the retry.
     pub async fn bootstrap(&self) {
+        self.bootstrap_with(None).await
+    }
+
+    /// [`Self::bootstrap`], first trying a warm start from `snapshot`'s table
+    /// images ([`crate::snapshot`]). An unusable snapshot falls back to the
+    /// usual path; a database failure part-way through resets the circuit and
+    /// fails the bootstrap, so the retry starts clean.
+    pub async fn bootstrap_with(&self, snapshot: Option<&dyn crate::ports::SnapshotStore>) {
         let node = &self.node;
         *node.status.write().await = SspStatus::Bootstrapping;
         match async {
-            self.bootstrap_inner().await?;
+            let warm = match snapshot {
+                Some(store) => {
+                    node.apply_circuit_policy().await;
+                    match node.warm_bootstrap(store, node.max_snapshot_age_secs).await {
+                        Ok(report) => report.is_some(),
+                        Err(e) => {
+                            *node.processor.write().await = Circuit::new();
+                            return Err(e.context("warm start"));
+                        }
+                    }
+                }
+                None => false,
+            };
+            if !warm {
+                self.bootstrap_inner().await?;
+            }
             node.republish_restored_views().await
         }.await {
             Ok(()) => {

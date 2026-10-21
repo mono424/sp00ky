@@ -31,6 +31,7 @@ pub mod jobs;
 pub mod handover;
 pub mod node;
 pub mod replay;
+pub mod snapshot;
 pub mod platform;
 pub mod ports;
 pub mod status;
@@ -52,7 +53,7 @@ pub use ports::{
     ArtifactError, ArtifactMeta, ArtifactStore, CancelHandle, CancelWatch, CircuitStore,
     CircuitStoreError, Db, DbConnection, DbError, HttpClient, HttpError, MaybeSendSync, NoopCircuitStore,
     NoopTelemetry, OutboundRequest, OutboundResponse, ResumePoint, Scheduler, Spawner, Telemetry,
-    TimerKind,
+    TimerKind, MemorySnapshotStore, SnapshotMeta, SnapshotStore, TableImage,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use ports::DiskCircuitStore;

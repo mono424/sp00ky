@@ -63,7 +63,19 @@ pub async fn probe_schema(db: &dyn Db) -> anyhow::Result<Option<SchemaProbe>> {
     Ok(read_probe(db).await?.0)
 }
 
-async fn read_probe(db: &dyn Db) -> anyhow::Result<(Option<SchemaProbe>, bool)> {
+pub(crate) async fn read_probe(db: &dyn Db) -> anyhow::Result<(Option<SchemaProbe>, bool)> {
+    // One round trip: `_00_schema_state` is only read when it exists, because
+    // a statement on a missing table fails the whole request on SurrealDB 3.
+    let batched = format!(
+        "LET $spky_info = {INFO_FOR_DB}; RETURN $spky_info; \
+         IF $spky_info.tables._00_schema_state {{ {SCHEMA_STATE_QUERY} }} ELSE {{ [] }};"
+    );
+    if let Ok(answers) = db.query(&batched, &[]).await {
+        if let (Some(info), Some(state)) = (answers.get(1), answers.get(2)) {
+            let has_versions = info.get("tables").and_then(|v| v.get("_00_version")).is_some();
+            return Ok((SchemaProbe::parse(info, state), has_versions));
+        }
+    }
     let info = q1(db, INFO_FOR_DB).await.context("INFO FOR DB")?;
     let has_versions = info.get("tables").and_then(|v| v.get("_00_version")).is_some();
     // Absent until the CLI first applies its schema: that is "no rows".
@@ -77,14 +89,18 @@ async fn read_probe(db: &dyn Db) -> anyhow::Result<(Option<SchemaProbe>, bool)> 
 /// rather than failing the load: a missing link map degrades reverse-link
 /// edges, it does not corrupt row content.
 pub async fn load_table_meta(db: &dyn Db, table: &str, define: &str) -> TableMeta {
-    let permission = extract_select_permission_text(define);
-    let info = match q1(db, &format!("INFO FOR TABLE {}", table)).await {
-        Ok(info) => info,
+    match q1(db, &format!("INFO FOR TABLE {}", table)).await {
+        Ok(info) => table_meta_from_info(define, &info),
         Err(e) => {
             warn!(target: "ssp::policy", table = %table, error = %e, "INFO FOR TABLE failed; skipping link map");
-            return TableMeta { permission, ..TableMeta::default() };
+            TableMeta { permission: extract_select_permission_text(define), ..TableMeta::default() }
         }
-    };
+    }
+}
+
+/// [`load_table_meta`] from an `INFO FOR TABLE` answer already in hand.
+fn table_meta_from_info(define: &str, info: &Value) -> TableMeta {
+    let permission = extract_select_permission_text(define);
     let link_targets = info
         .get("fields")
         .and_then(|f| f.as_object())
@@ -102,9 +118,9 @@ pub async fn load_table_meta(db: &dyn Db, table: &str, define: &str) -> TableMet
     TableMeta {
         permission,
         link_targets,
-        opaque: ssp_protocol::opaque_fields_from_info(&info),
-        columns: ssp_protocol::columns_from_info(&info),
-        indexes: indexes_from_info(&info),
+        opaque: ssp_protocol::opaque_fields_from_info(info),
+        columns: ssp_protocol::columns_from_info(info),
+        indexes: indexes_from_info(info),
     }
 }
 
@@ -133,8 +149,19 @@ pub async fn load_schema(db: &dyn Db) -> anyhow::Result<LoadedSchema> {
     let (probe, has_versions) = read_probe(db).await?;
     let mut tables = BTreeMap::new();
     if let Some(probe) = &probe {
-        for (table, define) in &probe.synced {
-            tables.insert(table.clone(), load_table_meta(db, table, define).await);
+        // Every table's `INFO FOR TABLE` in one round trip (a cold start used
+        // to pay one per table, sequentially); one by one if the batch fails.
+        let surql: String = probe.synced.keys().map(|t| format!("INFO FOR TABLE {t};")).collect();
+        let answers = match surql.is_empty() {
+            true => Vec::new(),
+            false => db.query(&surql, &[]).await.unwrap_or_default(),
+        };
+        for (i, (table, define)) in probe.synced.iter().enumerate() {
+            let meta = match answers.get(i).filter(|info| info.is_object()) {
+                Some(info) => table_meta_from_info(define, info),
+                None => load_table_meta(db, table, define).await,
+            };
+            tables.insert(table.clone(), meta);
         }
     }
     Ok(LoadedSchema {
@@ -271,53 +298,86 @@ pub async fn rebuild_from_db(
 
     // 2. Page each table's rows into the circuit store.
     for (table, meta) in &schema.tables {
-        let omit = &meta.opaque;
-        let mut record_count = 0usize;
-        let mut after_id: Option<String> = None;
-        loop {
-            let query = bootstrap_page_query(table, page_size, after_id.as_deref(), omit);
-            let query = if has_versions {
-                ssp_protocol::with_durable_row_versions(&query)
-            } else { query };
-            let result = q1(db, &query)
-            .await
-            .with_context(|| format!("page-query {table}"))?;
-            let rows: Vec<Value> = match result {
-                Value::Array(arr) => arr,
-                _ => vec![],
-            };
-            let n = rows.len();
-            if n == 0 {
-                break;
-            }
-            let next_after = rows
-                .last()
-                .and_then(|row| row.get("id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let records: Vec<Record> = rows
-                .into_iter()
-                .filter_map(|row| {
-                    let id = row.get("id")?.as_str()?.to_string();
-                    Some(Record::new(table, &id, row))
-                })
-                .collect();
-            processor.write().await.load(records);
-            record_count += n;
-            if n < page_size {
-                break;
-            }
-            match next_after {
-                Some(id) => after_id = Some(id),
-                None => break,
-            }
-        }
-        info!(table = %table, records = record_count, "Loaded table data");
+        load_table_rows(db, processor, table, meta, page_size, has_versions).await?;
     }
 
-    // 3. Re-register persisted views from _00_query. A missing table (virgin
-    //    DB — e.g. a fresh ephemeral host) means "no persisted views", not a
-    //    bootstrap failure.
+    // 3. Re-register persisted views from _00_query.
+    register_views_from_db(db, processor).await;
+
+    // `Circuit::load` folds every row into the catch-up accumulators as it
+    // goes, so nothing is re-seeded here. Debug builds prove it.
+    #[cfg(debug_assertions)]
+    {
+        let mut circuit = processor.write().await;
+        let maintained = circuit.compute_catchup_hashes();
+        circuit.reseed_catchup_hashes();
+        assert_eq!(
+            maintained,
+            circuit.compute_catchup_hashes(),
+            "catch-up accumulators drifted from the rows during the rebuild"
+        );
+    }
+    Ok(())
+}
+
+/// Page one table's rows from upstream into the circuit store.
+pub(crate) async fn load_table_rows(
+    db: &dyn Db,
+    processor: &Arc<RwLock<Circuit>>,
+    table: &str,
+    meta: &TableMeta,
+    page_size: usize,
+    has_versions: bool,
+) -> anyhow::Result<usize> {
+    let omit = &meta.opaque;
+    let mut record_count = 0usize;
+    let mut after_id: Option<String> = None;
+    loop {
+        let query = bootstrap_page_query(table, page_size, after_id.as_deref(), omit);
+        let query = if has_versions {
+            ssp_protocol::with_durable_row_versions(&query)
+        } else { query };
+        let result = q1(db, &query)
+        .await
+        .with_context(|| format!("page-query {table}"))?;
+        let rows: Vec<Value> = match result {
+            Value::Array(arr) => arr,
+            _ => vec![],
+        };
+        let n = rows.len();
+        if n == 0 {
+            break;
+        }
+        let next_after = rows
+            .last()
+            .and_then(|row| row.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let records: Vec<Record> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row.get("id")?.as_str()?.to_string();
+                Some(Record::new(table, &id, row))
+            })
+            .collect();
+        processor.write().await.load(records);
+        record_count += n;
+        if n < page_size {
+            break;
+        }
+        match next_after {
+            Some(id) => after_id = Some(id),
+            None => break,
+        }
+    }
+    info!(table = %table, records = record_count, "Loaded table data");
+    Ok(record_count)
+}
+
+/// Re-register persisted views from `_00_query` and build the indexes they
+/// plan over. A missing table (virgin DB, e.g. a fresh ephemeral host) means
+/// "no persisted views", not a bootstrap failure.
+pub(crate) async fn register_views_from_db(db: &dyn Db, processor: &Arc<RwLock<Circuit>>) {
     let views = match q1(db, "SELECT * FROM _00_query").await {
         Ok(Value::Array(arr)) => arr,
         Ok(_) => vec![],
@@ -339,21 +399,6 @@ pub async fn rebuild_from_db(
         info!(index_build_ms = builds.index_build_ms, indexes_built = builds.indexes_built,
             rows_indexed = builds.rows_indexed, "Prewarmed remaining active indexes before Ready");
     }
-
-    // `Circuit::load` folds every row into the catch-up accumulators as it
-    // goes, so nothing is re-seeded here. Debug builds prove it.
-    #[cfg(debug_assertions)]
-    {
-        let mut circuit = processor.write().await;
-        let maintained = circuit.compute_catchup_hashes();
-        circuit.reseed_catchup_hashes();
-        assert_eq!(
-            maintained,
-            circuit.compute_catchup_hashes(),
-            "catch-up accumulators drifted from the rows during the rebuild"
-        );
-    }
-    Ok(())
 }
 
 /// The `_00_query` columns a persisted view is rebuilt from.

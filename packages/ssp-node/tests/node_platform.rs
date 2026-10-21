@@ -3846,3 +3846,200 @@ async fn a_second_signed_out_visitor_reads_its_own_view_of_a_shared_graph() {
         assert_eq!(read_back(&b, "va").await, None);
     }
 }
+
+#[tokio::test]
+async fn schema_load_is_two_round_trips_whatever_the_table_count() {
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db
+        .query(
+            "DEFINE TABLE a SCHEMALESS PERMISSIONS FOR select FULL;
+             DEFINE TABLE b SCHEMALESS PERMISSIONS FOR select FULL;
+             DEFINE TABLE c SCHEMAFULL PERMISSIONS FOR select FULL;
+             DEFINE FIELD owner ON c TYPE option<record<a>>;
+             DEFINE TABLE _00_schema_state SCHEMALESS;",
+        )
+        .await
+        .unwrap();
+    h.db_queries.store(0, Ordering::SeqCst);
+    let schema = ssp_node::bootstrap::load_schema(h.node.platform.db.as_ref()).await.unwrap();
+    assert_eq!(h.db_queries.load(Ordering::SeqCst), 2, "probe + one INFO FOR TABLE batch");
+    assert!(schema.probe.is_some());
+    assert_eq!(schema.tables.keys().map(String::as_str).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+    assert_eq!(schema.tables["c"].link_targets.get("owner").map(String::as_str), Some("a"));
+}
+
+#[tokio::test]
+async fn schema_load_reads_a_db_the_cli_never_touched() {
+    // No `_00_schema_state`: the batched probe must not fail the request.
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db.query("DEFINE TABLE a SCHEMALESS PERMISSIONS FOR select FULL;").await.unwrap();
+    h.db_queries.store(0, Ordering::SeqCst);
+    let schema = ssp_node::bootstrap::load_schema(h.node.platform.db.as_ref()).await.unwrap();
+    assert_eq!(h.db_queries.load(Ordering::SeqCst), 2);
+    assert!(schema.tables.contains_key("a"));
+}
+
+#[tokio::test]
+async fn replay_takes_row_versions_from_the_ledger() {
+    let h = build(HarnessOpts::default()).await;
+    // The row's own field is stale; the ledger holds the version.
+    h.raw_db
+        .query(
+            "CREATE thread:v SET _00_rv = 1, title = 'v';
+             CREATE _00_version SET record_id = thread:v, version = 7;",
+        )
+        .await
+        .unwrap();
+    let notice = ssp_protocol::IngestRequest {
+        table: "thread".into(),
+        op: "UPDATE".into(),
+        id: "thread:v".into(),
+        record: Value::Null,
+        job_assignee: None,
+    };
+    h.node.replay_notices(vec![notice.clone()]).await.unwrap();
+    assert_eq!(h.node.processor.read().await.stored_rv("thread", "thread:v"), Some(7));
+    // And it is current from then on.
+    let again = h.node.replay_notices(vec![notice]).await.unwrap();
+    assert_eq!(again.current, 1, "{again:?}");
+}
+
+fn notice(table: &str, id: &str) -> ssp_protocol::IngestRequest {
+    ssp_protocol::IngestRequest {
+        table: table.into(),
+        op: "UPDATE".into(),
+        id: id.into(),
+        record: Value::Null,
+        job_assignee: None,
+    }
+}
+
+/// A node bootstrapped from the DB, checkpointed into a fresh store.
+async fn checkpointed() -> (Harness, ssp_node::MemorySnapshotStore) {
+    let h = build(HarnessOpts { status: SspStatus::Bootstrapping, ..HarnessOpts::default() }).await;
+    h.raw_db
+        .query(
+            "DEFINE TABLE thread SCHEMALESS PERMISSIONS FOR select FULL;
+             DEFINE TABLE note SCHEMALESS PERMISSIONS FOR select FULL;
+             CREATE thread:a SET _00_rv = 1, title = 'a1';
+             CREATE thread:b SET _00_rv = 1, title = 'b1';
+             CREATE thread:c SET _00_rv = 1, title = 'c1';",
+        )
+        .await
+        .unwrap();
+    ssp_node::Runtime::new(Arc::clone(&h.node)).bootstrap().await;
+    assert_eq!(*h.node.status.read().await, SspStatus::Ready);
+    let store = ssp_node::MemorySnapshotStore::default();
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert_eq!(report.written, vec!["note".to_string(), "thread".to_string()], "{report:?}");
+    assert_eq!(report.remaining, 0);
+    assert!(store.meta().is_some());
+    (h, store)
+}
+
+use ssp_node::SnapshotStore as _;
+
+#[tokio::test]
+async fn warm_start_reads_the_images_and_rereads_only_what_the_journal_noticed() {
+    let (h, store) = checkpointed().await;
+    // Written while the node was gone; the journal noticed each one.
+    h.raw_db
+        .query(
+            "UPDATE thread:a SET _00_rv = 2, title = 'a2';
+             DELETE thread:b;
+             CREATE thread:d SET _00_rv = 1, title = 'd1';",
+        )
+        .await
+        .unwrap();
+    store.journal(vec![notice("thread", "thread:a"), notice("thread", "thread:b")], true);
+    store.journal(vec![notice("thread", "thread:d"), notice("thread", "thread:a")], false);
+
+    *h.node.processor.write().await = Circuit::new();
+    h.db_queries.store(0, Ordering::SeqCst);
+    let report = h.node.warm_bootstrap(&store, 3600).await.unwrap().expect("usable snapshot");
+    assert_eq!((report.tables_from_images, report.tables_from_db), (2, 0), "{report:?}");
+    assert_eq!((report.noticed, report.caught_up, report.deleted), (3, 2, 1), "{report:?}");
+    // Schema (2) + one catch-up read (a ledger probe may add one) + _00_query:
+    // no table was paged.
+    assert!(h.db_queries.load(Ordering::SeqCst) <= 5, "{}", h.db_queries.load(Ordering::SeqCst));
+
+    let circuit = h.node.processor.read().await;
+    assert_eq!(circuit.record("thread", "thread:a").unwrap()["title"], "a2");
+    assert!(!circuit.contains("thread", "thread:b"));
+    assert_eq!(circuit.record("thread", "thread:c").unwrap()["title"], "c1");
+    assert_eq!(circuit.record("thread", "thread:d").unwrap()["title"], "d1");
+}
+
+#[tokio::test]
+async fn bootstrap_with_a_snapshot_goes_ready_without_paging_tables() {
+    let (h, store) = checkpointed().await;
+    *h.node.processor.write().await = Circuit::new();
+    let rt = ssp_node::Runtime::new(Arc::clone(&h.node));
+    rt.bootstrap_with(Some(&store)).await;
+    assert_eq!(*h.node.status.read().await, SspStatus::Ready);
+    assert_eq!(h.node.processor.read().await.record("thread", "thread:c").unwrap()["title"], "c1");
+}
+
+#[tokio::test]
+async fn a_schema_change_makes_the_snapshot_unusable() {
+    let (h, store) = checkpointed().await;
+    h.raw_db.query("DEFINE TABLE late SCHEMALESS PERMISSIONS FOR select FULL;").await.unwrap();
+    assert!(h.node.warm_bootstrap(&store, 3600).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_old_or_foreign_snapshot_is_unusable() {
+    let (h, store) = checkpointed().await;
+    let fresh = store.meta().unwrap();
+    let mut old = fresh.clone();
+    old.saved_at_epoch_ms -= 3_601_000;
+    store.set_meta(&old).unwrap();
+    assert!(h.node.warm_bootstrap(&store, 3600).await.unwrap().is_none(), "older than the limit");
+    let mut foreign = fresh;
+    foreign.node_version = "0.0.0-other".into();
+    store.set_meta(&foreign).unwrap();
+    assert!(h.node.warm_bootstrap(&store, 3600).await.unwrap().is_none(), "another node version");
+}
+
+#[tokio::test]
+async fn checkpoint_rewrites_only_moved_tables_and_trims_the_journal() {
+    let (h, store) = checkpointed().await;
+    let seq = store.journal(vec![notice("thread", "thread:a")], true);
+    // The node applies the change the journal recorded.
+    h.raw_db.query("UPDATE thread:a SET _00_rv = 2, title = 'a2';").await.unwrap();
+    h.node.replay_notices(vec![notice("thread", "thread:a")]).await.unwrap();
+    store.journal(vec![notice("thread", "thread:c")], false);
+
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert_eq!(report.written, vec!["thread".to_string()], "note did not move: {report:?}");
+    // The pending row is not covered, so it is kept for the next warm start.
+    assert_eq!(report.trimmed_through, Some(seq));
+    assert_eq!(store.journal_len(), 1);
+    let images = store.images().unwrap();
+    assert!(images.iter().all(|i| i.covered_seq == seq), "{images:?}");
+}
+
+#[tokio::test]
+async fn checkpoint_waits_for_a_circuit_behind_upstreams_schema() {
+    let (h, store) = checkpointed().await;
+    h.raw_db
+        .query("UPDATE thread:a SET _00_rv = 2, title = 'a2'; DEFINE TABLE late SCHEMALESS PERMISSIONS FOR select FULL;")
+        .await
+        .unwrap();
+    h.node.replay_notices(vec![notice("thread", "thread:a")]).await.unwrap();
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert_eq!(report.skipped, Some("circuit schema behind upstream"));
+    assert!(report.written.is_empty());
+}
+
+#[tokio::test]
+async fn a_checkpoint_with_nothing_moved_reads_nothing_and_trims() {
+    let (h, store) = checkpointed().await;
+    let seq = store.journal(vec![notice("_00_query", "_00_query:x")], true);
+    h.db_queries.store(0, Ordering::SeqCst);
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert!(report.written.is_empty(), "{report:?}");
+    assert_eq!(h.db_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(report.trimmed_through, Some(seq));
+    assert_eq!(store.journal_len(), 0);
+}

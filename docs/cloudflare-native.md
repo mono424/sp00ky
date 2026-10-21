@@ -239,32 +239,57 @@ change. Job rows replay through `/ingest` like other rows (a job the circuit
 has not seen arrives as CREATE, which is what pickup keys on); routing them
 without the circuit is part of phase 4, when jobs run in the object.
 
-### 5.4 Snapshot: chunked FORMAT 2 in DO SQLite
+### 5.4 Warm start: table images in DO SQLite
 
-The FORMAT 2 checkpoint (`packages/ssp/src/circuit/checkpoint.rs`: binary
-records, `read_image` adopts bytes as a `HeapArena`, per-table XOR hash, delta
-chains) is the right format; its doc already names the Durable Object case.
+First cut built in phase 3 (2026-10-21): `packages/ssp-node/src/snapshot.rs`
+(`SspNode::warm_bootstrap`, `SspNode::checkpoint_step`), the `SnapshotStore`
+port (`ports/snapshot_store.rs`), and its SQLite adapter
+(`apps/ssp-cf/src/snapshot.rs`). It replaces the single JSON blob in DO KV,
+which was never armed and, with the `_00_version` gate, never used.
 
-- **Tables:** `snap_part(tbl, image_id, seq, part, bytes)` with 1 MiB parts
-  (the per-row limit is 2 MB), `snap_manifest(tbl, image_id, last_seq, xor)`,
-  `snap_views(part, bytes)`, `snap_meta(wal_covered_seq, schema_hash, format,
-  saved_at)`.
-- **Write:** `write_collection` / `write_delta` into a chunking writer that
-  flushes a part per MiB, so peak memory is the store plus 1 MiB. Rebase rules
-  come from `apps/ssp/src/warm.rs` (`MAX_DELTAS`, `deltas_outweigh`). One
-  table's parts and manifest are written in one synchronous burst, so they
-  commit together. Checkpoint only after the edge publisher drains
-  (`edges.rs` `wait_drained`) and the inbox (§5.3) is empty.
-- **Read:** concatenate parts and call `read_image`. The delta path needs a
-  byte-based `read_table_bytes(base, deltas)`; `read_table` / `absorb_delta`
-  (`checkpoint.rs` ~820-930) take file paths today and are gated off wasm.
-- **Views:** `Circuit::save_views()` (state without the store) and
-  `Circuit::restore_parts(views, store)`, so restoring does not re-prime every
-  view.
-- **Port:** `CircuitStore2 { save_table, load_tables, save_views, ... }`,
-  implemented by the DO (SQLite) and the VM SSP (disk), replacing the
-  single-blob `CircuitStore`. The VM standalone SSP gains a sound warm start
-  too, since it has the same `_00_version` problem.
+- **Tables:** `snap_table(tbl, image_id, covered_seq, xor, bytes)` and
+  `snap_part(tbl, image_id, part, data)` with 1 MiB parts (a row holds at most
+  2 MB); the meta (format, node version, schema fingerprint, ledger flag,
+  `saved_at`) in `ssp_meta`. One FORMAT 2 image per synced table
+  (`packages/ssp/src/circuit/checkpoint.rs` `write_collection` / `read_image`).
+- **Journal:** `ssp_inbox` keeps every notice, applied or not (§5.3). Each
+  image records `covered_seq`, the highest seq such that it and every notice
+  before it is applied, read under the circuit lock at the moment the image
+  is written. The journal is trimmed to the lowest coverage.
+- **Write:** `checkpoint_step` rewrites only the tables whose catch-up hash
+  moved, streaming the image into parts, 4 MiB per alarm event (at least one
+  table); an unchanged table moves its coverage, and when nothing moved no DB
+  read happens at all. It only writes while the circuit holds upstream's
+  current schema (two reads), so an image is never stamped with a newer
+  fingerprint than its rows. Armed 2 s after a bootstrap and 30 s after the
+  first change, earliest deadline first: the alarm of an evicted object wakes
+  a fresh instance, whose own arming must not postpone a due checkpoint.
+- **Read:** the parts go straight into one buffer sized from the manifest and
+  `read_image` adopts it. Then every record the journal noticed after a
+  table's image is re-read by id from the DB (ledger versions included,
+  `replay::fetch_current`), the persisted views are registered from
+  `_00_query`, and the restored views are republished, as after a rebuild.
+- **Validity:** format, node version (any deploy rebuilds once), schema
+  fingerprint, ledger flag and age (7 days). Anything else rebuilds.
+- **Schema load batched for both paths:** the probe (`INFO FOR DB` plus
+  `_00_schema_state`) is one round trip and every `INFO FOR TABLE` another,
+  instead of 2 + T sequential queries.
+
+Measured under local workerd against SurrealDB 3.1.5 with 50k rows (a 25 MB
+image): cold rebuild 5.2 s, warm start 0.16 s. Three notices accepted by a
+cold object were re-read and applied by the warm start (two updated, one
+deleted); a schema change while evicted rebuilt; a canary.337 inbox with a
+queued notice was migrated and applied.
+
+Not done yet (phase 3b):
+- **Delta images** (`write_delta` plus a byte-based `absorb_delta`, gated off
+  wasm today): a three-row change still rewrites the whole table, which holds
+  the object's responses for about 0.5 s per 20 MiB (S1, below).
+- **Segmented wasm arena:** an adopted image still doubles on its first
+  append (S1, below).
+- **View state in the snapshot**, to skip re-registration and
+  `republish_restored_views` on a warm start.
+- **Measure on Cloudflare** (Ready p95 at 20 MB, the phase 3 gate).
 
 **From spike S1** (measured on Cloudflare):
 - **Stream parts, never materialize them.** Read the cursor part by part into
@@ -282,17 +307,6 @@ chains) is the right format; its doc already names the Durable Object case.
   image as segment 0 and append into fixed-size segments, as
   `MmapArena::from_images` already does natively. Until then a circuit of
   N MB can need about 3N MB at the first ingest after a restore.
-
-**Validity** replaces the `_00_version` gate: the format matches, the schema
-probe hash matches (`bootstrap.rs:66`, one round trip), the journal is
-continuous (`wal_covered_seq + 1 >= min(seq)` over `ssp_inbox`), and the
-snapshot is younger than 7 days or the changefeed cursor is inside retention.
-Phase 2 deletes a notice once it is applied, and one applied inline is never
-stored; phase 3 keeps every compact notice in `ssp_inbox`, marked applied,
-until a checkpoint covers it. A warm load then replays the notices after
-`wal_covered_seq` by current DB state (§5.3), which is correct however old the
-snapshot is, and skips `republish_restored_views` (`node.rs:503-540`, 3.5 s for 33 views on
-whitepawn), which only runs after a full rebuild.
 
 **Remaining divergence** is repaired, not prevented:
 - Rolled-back transactions after the post: `TimerKind::IngestVerify`, armed
@@ -721,7 +735,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 |---|---|---|
 | 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
 | 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
-| 3 | Chunked snapshot, validity check, skip republish, IngestVerify (§5.4) | Ready p95 <= 1.5 s at 20 MB |
+| 3 | Table images + journal warm start (§5.4), then deltas, segmented arena, view state, IngestVerify | Ready p95 <= 1.5 s at 20 MB. **First cut done 2026-10-21** (warm start 0.16 s vs 5.2 s cold at 25 MB under local workerd); the rest and the Cloudflare measurement are open |
 | 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project |
 | 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |
 | 6 | Doorbell server + client, poll cap (§9) | remote queries per idle minute about 1 |
@@ -755,6 +769,6 @@ work:
 | `RETURN` inside `BEGIN ... COMMIT` commits the transaction, also on 3.1.5 and 3.3.4 | SurrealDB | rollback probes and any generated SurrealQL with an early `RETURN` | never emit `RETURN` before a `THROW` inside a transaction |
 | Over HTTP `/rpc` each request has its own `session::id()` | SurrealDB | HTTP-engine clients pile up `_00_query` subscriber entries | §9 open item |
 | `wrangler delete` leaves container applications and registry images behind | Cloudflare | images count against the 50 GB account limit | delete container apps and images explicitly at teardown (control-plane doc 21 §8) |
-| `catch_up_from_db` and `load_schema` run 2 + 2T sequential queries | `packages/ssp-node/src/bootstrap.rs`, `runtime.rs` | 5.3 s Ready from a US-placed DO against Hetzner (S1) | batch into two multi-statement requests; store table metas with the snapshot |
+| `catch_up_from_db` and `load_schema` run 2 + 2T sequential queries | `packages/ssp-node/src/bootstrap.rs`, `runtime.rs` | 5.3 s Ready from a US-placed DO against Hetzner (S1) | **`load_schema` fixed 2026-10-21:** two round trips. `catch_up_from_db` is no longer on the Cloudflare path (the warm start re-reads by id) |
 | `HeapArena` is one `Vec<u8>`; an adopted image doubles on its first append | `packages/ssp` arena (wasm path) | 3x memory peak after a restore; risks the 128 MB isolate limit | segmented arena on wasm, like `MmapArena::from_images` |
 | The free-plan staging SurrealDB is gone: `CF_FREE_SURREAL_URL` (`surreal-cftest.stg.spky.cloud`, spooky-cloud `sst.config.ts`) answers 404 on `/rpc`, `/sql`, `/health` | staging control plane | free projects without their own `surrealdb_url` cannot bootstrap | restore or remove the shared fallback in spooky-cloud |

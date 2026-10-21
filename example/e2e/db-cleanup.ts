@@ -1,8 +1,4 @@
-const SURREAL_SQL_URL = 'http://localhost:8666/sql';
-const SURREAL_NS = 'main';
-const SURREAL_DB = 'example';
-const SURREAL_USER = 'root';
-const SURREAL_PASS = 'root';
+import { UPSTREAM, upstreamHeaders } from './fixtures/target';
 
 // Tables to clean — application data only.
 // NOT `user` (registerUser handles "already exists").
@@ -19,14 +15,9 @@ const MAX_RETRIES = 8;
 const RETRY_DELAY_MS = 300;
 
 async function execSql(sql: string): Promise<unknown[]> {
-  const response = await fetch(SURREAL_SQL_URL, {
+  const response = await fetch(UPSTREAM.url, {
     method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'surreal-ns': SURREAL_NS,
-      'surreal-db': SURREAL_DB,
-      Authorization: 'Basic ' + btoa(`${SURREAL_USER}:${SURREAL_PASS}`),
-    },
+    headers: upstreamHeaders(),
     body: sql,
   });
 
@@ -65,6 +56,12 @@ export async function cleanDatabase(): Promise<void> {
           break;
         } catch (err) {
           lastError = err as Error;
+          // A table the project does not have (the outbox of a dev-only
+          // backend on a cloud deployment) has nothing to clean.
+          if (/does not exist/.test(lastError.message)) {
+            lastError = undefined;
+            break;
+          }
           if (attempt < MAX_RETRIES) {
             await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * attempt));
           }

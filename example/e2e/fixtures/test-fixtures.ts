@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test';
 import { test as base, expect } from '@playwright/test';
+import { UPSTREAM, upstreamHeaders } from './target';
 
 export interface TestUser {
   username: string;
@@ -161,15 +162,9 @@ export async function waitForThreadInUpstream(
   attempts = 60
 ) {
   for (let i = 0; i < attempts; i++) {
-    const resp = await fetch('http://localhost:8666/sql', {
+    const resp = await fetch(UPSTREAM.url, {
       method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'surreal-ns': 'main',
-        'surreal-db': 'example',
-        Authorization:
-          'Basic ' + Buffer.from('root:root').toString('base64'),
-      },
+      headers: upstreamHeaders(),
       body: 'SELECT id, title FROM thread',
     });
     const body = (await resp.json()) as Array<{
@@ -186,14 +181,9 @@ export async function waitForThreadInUpstream(
 
 /** Run root SurrealQL against the local upstream and return statement 0's rows. */
 async function upstreamRows<T>(sql: string): Promise<T[]> {
-  const resp = await fetch('http://localhost:8666/sql', {
+  const resp = await fetch(UPSTREAM.url, {
     method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'surreal-ns': 'main',
-      'surreal-db': 'example',
-      Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
-    },
+    headers: upstreamHeaders(),
     body: sql,
   });
   const body = (await resp.json()) as Array<{ result?: T[] }>;

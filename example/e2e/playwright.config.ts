@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test';
+import { BASE_URL, REMOTE } from './fixtures/target';
 
 export default defineConfig({
   testDir: './tests',
@@ -11,14 +12,15 @@ export default defineConfig({
     : [['html', { open: 'on-failure' }]],
 
   use: {
-    baseURL: 'http://localhost:3006',
+    baseURL: BASE_URL,
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
     actionTimeout: 15_000,
   },
 
-  webServer: [
+  // A deployed project (E2E_BASE_URL) brings its own servers.
+  webServer: REMOTE ? [] : [
     {
       command: 'bash scripts/start-db.sh',
       url: 'http://localhost:8666/health',

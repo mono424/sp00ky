@@ -5,19 +5,15 @@
  */
 import { expect, test as base, type Locator, type Page } from '@playwright/test';
 import { uniqueUser, waitForAppReady, typeIntoEditor, type TestUser } from './test-fixtures';
+import { UPSTREAM, upstreamHeaders } from './target';
 
 export { expect, uniqueUser, type TestUser };
 
 /** Root SurrealQL against the local upstream; the rows of statement 0. */
 export async function upstream<T = unknown>(sql: string): Promise<T[]> {
-  const resp = await fetch('http://localhost:8666/sql', {
+  const resp = await fetch(UPSTREAM.url, {
     method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'surreal-ns': 'main',
-      'surreal-db': 'example',
-      Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
-    },
+    headers: upstreamHeaders(),
     body: sql,
   });
   const body = (await resp.json()) as Array<{ result?: T[] }>;

@@ -24,7 +24,11 @@ export class PreloadFailedError extends Error {
  * A session that cannot be sent membership (signed out, without anonymous
  * live queries) does not wait either: a view with rows would never settle,
  * and an app that gates its first paint on a preload showed its loading
- * screen forever, signed-out landing page included.
+ * screen forever, signed-out landing page included. Nor does an offline
+ * device: the membership it waits for cannot arrive before the network does,
+ * and an app reloaded offline before its preload ever settled stayed on its
+ * loading screen. It paints from what is local instead, and the query fills in
+ * once the registration lands.
  */
 export function* preload(env: SagaEnv, input: RegisterInput): Saga<{ hash: QueryHash; waited: boolean }> {
   const hash = yield* registerLocal(env, input);
@@ -33,6 +37,7 @@ export function* preload(env: SagaEnv, input: RegisterInput): Saga<{ hash: Query
     boolean,
   ];
   if (phase !== 'cold' || !reachable) return { hash, waited: false };
+  if ((yield fx.service('net.offline')) as boolean) return { hash, waited: false };
   yield fx.state.wait((s) => settled(s, hash) || settleFailed(s, hash));
   const failed = (yield fx.state.read((s) => settleFailed(s, hash))) as boolean;
   if (failed) throw new PreloadFailedError(hash);

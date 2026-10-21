@@ -9,6 +9,11 @@ import { preload, PreloadFailedError } from './preload.saga';
 const env = defaultEnv({ tables: [{ name: 'thing', columns: {} }] } as any);
 const input = { tableName: 'thing', surql: 'SELECT * FROM thing', params: {}, ttl: '10m' as const };
 const sspOk = () => ({ localArray: [], timings: { parseMs: 0, planMs: 0, snapshotMs: 0, wallMs: 0 } });
+/** The `service` handler for an online device: `net.offline` answers false. */
+const online = (offline = false) => (e: any) => {
+  if (e.name === 'net.offline') return offline;
+  throw new Error(`unexpected service ${e.name}`);
+};
 
 describe('preload', () => {
   it('resolved before: returns without waiting and with no remote effect', async () => {
@@ -31,7 +36,7 @@ describe('preload', () => {
     };
     const out = await runPure(preload(env, input), {
       state: signedIn,
-      handlers: { 'local.getById': () => null, 'ssp.register': sspOk, 'state.wait': (_e, ctx) => settleIt(ctx) },
+      handlers: { 'local.getById': () => null, 'ssp.register': sspOk, service: online(), 'state.wait': (_e, ctx) => settleIt(ctx) },
     });
     expect(out.result).toEqual({ hash, waited: true });
     const failed = runPure(preload(env, input), {
@@ -39,13 +44,14 @@ describe('preload', () => {
       handlers: {
         'local.getById': () => null,
         'ssp.register': sspOk,
+        service: online(),
         'state.wait': (_e, ctx) => void (ctx.state = R.applyLifecycle(hash, { type: 'remote-failed' })(ctx.state)),
       },
     });
     await expect(failed).rejects.toBeInstanceOf(PreloadFailedError);
     const gone = runPure(preload(env, input), {
       state: signedIn,
-      handlers: { 'local.getById': () => null, 'ssp.register': sspOk, 'state.wait': (_e, ctx) => void (ctx.state = R.removeQuery(hash)(ctx.state)) },
+      handlers: { 'local.getById': () => null, 'ssp.register': sspOk, service: online(), 'state.wait': (_e, ctx) => void (ctx.state = R.removeQuery(hash)(ctx.state)) },
     });
     await expect(gone).rejects.toThrow(/could not settle/);
     const already = buildState([buildEntry({ def: { hash }, lifecycle: { phase: 'cached' } })]);
@@ -67,6 +73,7 @@ describe('preload', () => {
       handlers: {
         'local.getById': () => null,
         'ssp.register': sspOk,
+        service: online(),
         'state.wait': (_e, ctx) =>
           void (ctx.state = R.compose(
             R.commitMembership(hash, [['thing:1', 1]], true),
@@ -76,5 +83,14 @@ describe('preload', () => {
       },
     });
     expect(anon.result).toEqual({ hash, waited: true });
+  });
+  it('offline: registers but never waits, so a reload without a network paints from what is local', async () => {
+    const signedIn = buildState([], R.setIdentity({ userId: 'user:alice' }));
+    const out = await runPure(preload(env, input), {
+      state: signedIn,
+      handlers: { 'local.getById': () => null, 'ssp.register': sspOk, service: online(true) },
+    });
+    expect(out.result.waited).toBe(false);
+    expect(out.log.filter((e) => e.kind === 'state.wait')).toHaveLength(0);
   });
 });

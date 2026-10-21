@@ -331,6 +331,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
       if (sql) s.remote.beaconSql(sql);
     },
     'supervisor.start': () => s.connectionSupervisor.start(),
+    'net.offline': () => typeof navigator !== 'undefined' && navigator.onLine === false,
     'tabs.start': (bucketId) => {
       if (!s.tabs) throw new Error('shared tabs unavailable');
       return s.tabs.start(bucketId);

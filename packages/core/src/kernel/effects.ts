@@ -100,6 +100,8 @@ export interface ServiceCalls {
   'auth.currentUser': () => Record<string, unknown> | null;
   'auth.consumeEndedImpersonation': () => string | null;
   'remote.connect': () => Promise<void>;
+  /** The platform reports no network at all (a browser's `navigator.onLine === false`). */
+  'net.offline': () => boolean;
   'remote.releaseViews': (ids: unknown[]) => void;
   'supervisor.start': () => void;
   'tabs.start': (bucketId: string) => Promise<'solo' | 'leader' | 'follower'>;

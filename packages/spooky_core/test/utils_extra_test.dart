@@ -112,6 +112,9 @@ void main() {
       expect(classifySyncError(StateError('bad data')), 'application');
       expect(classifySyncError('permission denied'), 'application');
       for (final message in [
+        // Verbatim from SurrealDB 3.3.4: a record user running a statement
+        // it may not.
+        'IAM error: Not enough permissions to perform this action',
         "Couldn't coerce value for field `title` of `item:1`: "
             'Expected `string` but found `1`',
         // An app's own event: its endpoint, its THROW, its business.

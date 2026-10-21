@@ -60,6 +60,8 @@ describe('classifySyncError', () => {
 
   it.each([
     'Permission denied',
+    // Verbatim from SurrealDB 3.3.4: a record user running a statement it may not.
+    'IAM error: Not enough permissions to perform this action',
     'There was a problem with the database: record already exists',
     'Parse error: unexpected token',
     "Couldn't coerce value for field `title` of `item:1`: Expected `string` but found `1`",

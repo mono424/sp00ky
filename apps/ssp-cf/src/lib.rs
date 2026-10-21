@@ -650,7 +650,11 @@ impl SspNodeDo {
     async fn after_bootstrap(&self, runtime: &Runtime, attempt: u32) {
         if *runtime.node().status.read().await == SspStatus::Ready {
             tracing::info!(attempt, "bootstrap complete");
-            runtime.after_boot().await;
+            // Arming the TTL, job and CRDT timers reads the DB; none of it is
+            // needed to answer, and awaiting it held the first request after a
+            // cold start for about 0.4 s (measured on Cloudflare).
+            let armer = runtime.clone();
+            spawn_local(async move { armer.after_boot().await });
             // Images for the next cold start (only the tables that moved).
             self.arm_checkpoint(CHECKPOINT_AFTER_BOOT_MS).await;
             if self.inbox_len.get() > 0 {
@@ -990,7 +994,11 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         schema_poll_secs: 0,
         schema_watch: Default::default(),
         view_metrics_flush_ms: 2000,
-        bootstrap_page_size: 200,
+        // As the VM SSP: SurrealDB 3.1 rescans a table from its first key for
+        // every keyset page, so the page count makes a rebuild quadratic (200
+        // rows took 39 s for 50k rows from Cloudflare to Hetzner). 1000 keeps
+        // pages about 1 MB.
+        bootstrap_page_size: 1000,
         // The JSON `CircuitStore` path is off; the shell writes table images.
         checkpoint_interval_secs: None,
         max_snapshot_age_secs: MAX_SNAPSHOT_AGE_SECS,

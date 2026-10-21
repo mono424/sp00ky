@@ -32,10 +32,17 @@ pub struct HttpSqlDb {
     rpc_url: String,
     version_url: String,
     /// Full `Authorization` header value, e.g. `"Basic <b64>"` (local root) or
-    /// `"Bearer <jwt>"` (SurrealDB Cloud token). The caller owns credential
-    /// encoding + refresh; keeping it opaque keeps this adapter wasm-clean (no
-    /// base64/crypto deps).
+    /// `"Bearer <jwt>"` (SurrealDB Cloud token).
     authorization: String,
+    /// The user and password of a `Basic` credential. SurrealDB verifies a
+    /// Basic password with Argon2 on every request (53 ms of DB CPU each on
+    /// the staging host, about 100 ms of latency per query from a Durable
+    /// Object), so the adapter signs in with them once and sends the token.
+    basic: Option<(String, String)>,
+    /// The token of that sign-in; `None` before it and after an auth error.
+    session: std::sync::Mutex<Option<String>>,
+    /// Sign-in was refused: stay on the Basic credential.
+    signin_refused: std::sync::atomic::AtomicBool,
     ns: String,
     db: String,
     timeout: Duration,
@@ -60,11 +67,15 @@ impl HttpSqlDb {
         } else {
             base.to_string()
         };
+        let authorization = authorization.into();
         Self {
             http,
             rpc_url: format!("{base}/rpc"),
             version_url: format!("{base}/version"),
-            authorization: authorization.into(),
+            basic: basic_credentials(&authorization),
+            session: std::sync::Mutex::new(None),
+            signin_refused: std::sync::atomic::AtomicBool::new(false),
+            authorization,
             ns: ns.into(),
             db: db.into(),
             timeout: DEFAULT_TIMEOUT,
@@ -76,7 +87,7 @@ impl HttpSqlDb {
         self
     }
 
-    fn request(&self, surql: &str, binds: &[(&str, Value)]) -> OutboundRequest {
+    fn request(&self, surql: &str, binds: &[(&str, Value)], authorization: &str) -> OutboundRequest {
         let vars: Map<String, Value> = binds
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
@@ -92,7 +103,7 @@ impl HttpSqlDb {
             bearer: None,
             headers: vec![
                 ("Accept".to_string(), "application/json".to_string()),
-                ("Authorization".to_string(), self.authorization.clone()),
+                ("Authorization".to_string(), authorization.to_string()),
                 ("surreal-ns".to_string(), self.ns.clone()),
                 ("surreal-db".to_string(), self.db.clone()),
             ],
@@ -100,6 +111,88 @@ impl HttpSqlDb {
             timeout: self.timeout,
         }
     }
+
+    /// The header to send: a session token when a Basic credential could
+    /// sign in, the configured header otherwise.
+    async fn authorization(&self) -> String {
+        let Some((user, pass)) = &self.basic else {
+            return self.authorization.clone();
+        };
+        if self.signin_refused.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.authorization.clone();
+        }
+        if let Some(token) = self.session.lock().unwrap().clone() {
+            return format!("Bearer {token}");
+        }
+        match self.signin(user, pass).await {
+            Some(token) => {
+                *self.session.lock().unwrap() = Some(token.clone());
+                format!("Bearer {token}")
+            }
+            None => self.authorization.clone(),
+        }
+    }
+
+    /// Sign in over RPC as a root user, then as a namespace user, then as a
+    /// database user (the levels a Basic credential can name). A refusal at
+    /// every level keeps the Basic credential for good; a transport failure
+    /// only for this request.
+    async fn signin(&self, user: &str, pass: &str) -> Option<String> {
+        let levels = [
+            json!({ "user": user, "pass": pass }),
+            json!({ "ns": self.ns, "user": user, "pass": pass }),
+            json!({ "ns": self.ns, "db": self.db, "user": user, "pass": pass }),
+        ];
+        for params in levels {
+            let req = OutboundRequest {
+                method: Method::Post,
+                url: self.rpc_url.clone(),
+                bearer: None,
+                headers: vec![("Accept".to_string(), "application/json".to_string())],
+                json_body: Some(json!({ "id": 1, "method": "signin", "params": [params] })),
+                timeout: self.timeout,
+            };
+            let resp = self.http.send(req, None).await.ok()?;
+            let body: Value = serde_json::from_str(&resp.body).unwrap_or(Value::Null);
+            if let Some(token) = body.get("result").and_then(Value::as_str) {
+                return Some(token.to_string());
+            }
+        }
+        tracing::warn!("signing in with the Basic credential was refused; sending it on every request");
+        self.signin_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+
+    async fn send_query(&self, surql: &str, binds: &[(&str, Value)], authorization: &str) -> Result<Vec<Value>, DbError> {
+        let resp = self
+            .http
+            .send(self.request(surql, binds, authorization), None)
+            .await
+            .map_err(|e| DbError::Transport(e.to_string()))?;
+        if resp.status == 401 || resp.status == 403 {
+            return Err(DbError::Auth(format!(
+                "HTTP {}: {}",
+                resp.status, resp.body
+            )));
+        }
+        if resp.status >= 400 {
+            return Err(DbError::Transport(format!(
+                "HTTP {}: {}",
+                resp.status, resp.body
+            )));
+        }
+        parse_rpc_response(&resp.body)
+    }
+}
+
+/// The user and password inside a `Basic <base64>` header.
+fn basic_credentials(authorization: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let encoded = authorization.strip_prefix("Basic ")?.trim();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
 }
 
 /// Parse a SurrealDB HTTP-RPC response body into one flattened value per
@@ -174,24 +267,17 @@ fn is_generic_tx_error(msg: &str) -> bool {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl Db for HttpSqlDb {
     async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
-        let resp = self
-            .http
-            .send(self.request(surql, binds), None)
-            .await
-            .map_err(|e| DbError::Transport(e.to_string()))?;
-        if resp.status == 401 || resp.status == 403 {
-            return Err(DbError::Auth(format!(
-                "HTTP {}: {}",
-                resp.status, resp.body
-            )));
+        let authorization = self.authorization().await;
+        match self.send_query(surql, binds, &authorization).await {
+            // The token expired or the server restarted with a new key: sign
+            // in again and retry once.
+            Err(DbError::Auth(_)) if authorization.starts_with("Bearer ") && self.basic.is_some() => {
+                self.session.lock().unwrap().take();
+                let authorization = self.authorization().await;
+                self.send_query(surql, binds, &authorization).await
+            }
+            other => other,
         }
-        if resp.status >= 400 {
-            return Err(DbError::Transport(format!(
-                "HTTP {}: {}",
-                resp.status, resp.body
-            )));
-        }
-        parse_rpc_response(&resp.body)
     }
 
     /// `RETURN surrealdb::version()` is a parse error on every 3.x tested
@@ -378,6 +464,93 @@ mod tests {
                 body: self.reply.1.clone(),
             })
         }
+    }
+
+    /// A SurrealDB stand-in: `signin` hands out `tok<n>` (or refuses), a
+    /// query answers 401 for any token but the current one.
+    struct SigninHttp {
+        log: std::sync::Mutex<Vec<String>>,
+        issued: std::sync::atomic::AtomicUsize,
+        refuse: bool,
+    }
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl HttpClient for SigninHttp {
+        async fn send(
+            &self,
+            req: OutboundRequest,
+            _cancel: Option<crate::ports::CancelWatch>,
+        ) -> Result<crate::ports::OutboundResponse, crate::ports::HttpError> {
+            use std::sync::atomic::Ordering;
+            let body = req.json_body.unwrap_or(Value::Null);
+            let auth = req.headers.iter().find(|(k, _)| k == "Authorization").map(|(_, v)| v.clone());
+            let reply = |status, body: String| Ok(crate::ports::OutboundResponse { status, body });
+            if body["method"] == "signin" {
+                self.log.lock().unwrap().push("signin".into());
+                if self.refuse || body["params"][0]["pass"] != "pw" {
+                    return reply(200, r#"{"id":1,"error":{"code":-32000,"message":"There was a problem with authentication"}}"#.into());
+                }
+                let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
+                return reply(200, format!(r#"{{"id":1,"result":"tok{n}"}}"#));
+            }
+            let auth = auth.unwrap_or_default();
+            self.log.lock().unwrap().push(auth.clone());
+            let current = format!("Bearer tok{}", self.issued.load(Ordering::SeqCst));
+            if auth == current || auth.starts_with("Basic ") {
+                return reply(200, r#"{"id":1,"result":[{"status":"OK","result":1}]}"#.into());
+            }
+            reply(401, "InvalidToken".into())
+        }
+    }
+
+    fn signin_db(refuse: bool) -> (Arc<SigninHttp>, HttpSqlDb) {
+        use base64::Engine as _;
+        let http = Arc::new(SigninHttp {
+            log: std::sync::Mutex::new(Vec::new()),
+            issued: std::sync::atomic::AtomicUsize::new(0),
+            refuse,
+        });
+        let basic = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("root:pw"));
+        (http.clone(), HttpSqlDb::new(http, "https://db.example", "ns", "db", basic))
+    }
+
+    #[tokio::test]
+    async fn a_basic_credential_signs_in_once_and_sends_the_token() {
+        let (http, db) = signin_db(false);
+        db.query("RETURN 1", &[]).await.unwrap();
+        db.query("RETURN 1", &[]).await.unwrap();
+        assert_eq!(*http.log.lock().unwrap(), vec!["signin", "Bearer tok1", "Bearer tok1"]);
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_signs_in_again_and_retries_once() {
+        let (http, db) = signin_db(false);
+        db.query("RETURN 1", &[]).await.unwrap();
+        // The server forgets the token (expiry, restart with a new key).
+        http.issued.store(5, std::sync::atomic::Ordering::SeqCst);
+        db.query("RETURN 1", &[]).await.unwrap();
+        assert_eq!(
+            *http.log.lock().unwrap(),
+            vec!["signin", "Bearer tok1", "Bearer tok1", "signin", "Bearer tok6"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_signin_keeps_the_basic_credential() {
+        let (http, db) = signin_db(true);
+        db.query("RETURN 1", &[]).await.unwrap();
+        db.query("RETURN 1", &[]).await.unwrap();
+        let log = http.log.lock().unwrap();
+        // Three levels tried once, then Basic on every request.
+        assert_eq!(log.iter().filter(|l| *l == "signin").count(), 3);
+        assert_eq!(log.iter().filter(|l| l.starts_with("Basic ")).count(), 2);
+    }
+
+    #[test]
+    fn only_a_basic_header_has_credentials() {
+        assert_eq!(basic_credentials("Basic cm9vdDpyb290"), Some(("root".into(), "root".into())));
+        assert_eq!(basic_credentials("Bearer abc"), None);
+        assert_eq!(basic_credentials("Basic !!"), None);
     }
 
     #[test]

@@ -321,6 +321,38 @@ impl Db for HttpSqlDb {
         }
         Ok(parse_version_body(&resp.body))
     }
+
+    /// RPC `signin` with `ac`, on a request of its own: HTTP RPC keeps no
+    /// session, so this never changes what the node's queries run as.
+    async fn signin_record(&self, access: &str, vars: Value) -> Result<Option<String>, DbError> {
+        let mut params = match vars {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert("ns".into(), json!(self.ns));
+        params.insert("db".into(), json!(self.db));
+        params.insert("ac".into(), json!(access));
+        let req = OutboundRequest {
+            method: Method::Post,
+            url: self.rpc_url.clone(),
+            bearer: None,
+            headers: vec![("Accept".to_string(), "application/json".to_string())],
+            json_body: Some(json!({ "id": 1, "method": "signin", "params": [Value::Object(params)] })),
+            timeout: self.timeout,
+        };
+        let resp = self.http.send(req, None).await.map_err(|e| DbError::Transport(e.to_string()))?;
+        if resp.status >= 500 {
+            return Err(DbError::Transport(format!("HTTP {}: {}", resp.status, resp.body)));
+        }
+        let body: Value = serde_json::from_str(&resp.body).unwrap_or(Value::Null);
+        // 3.x answers a bare token; an access with refresh tokens answers
+        // `{ token, refresh }`.
+        let result = body.get("result");
+        let token = result
+            .and_then(Value::as_str)
+            .or_else(|| result.and_then(|r| r.get("token")).and_then(Value::as_str));
+        Ok(token.map(str::to_string))
+    }
 }
 
 /// `GET /version` answers `surrealdb-3.3.4`. Report the bare semver, as the SDK

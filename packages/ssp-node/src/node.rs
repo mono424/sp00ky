@@ -136,6 +136,8 @@ pub struct SspNode {
     /// DB event → ingest → broadcast → circuit-step latency. std Mutex on
     /// purpose: held for nanoseconds, never across an await.
     pub last_heartbeat_seen: Arc<std::sync::Mutex<Option<(u64, u64)>>>,
+    /// The admin API's settings and memory (`crate::admin`).
+    pub admin: crate::admin::AdminState,
 }
 
 /// Standalone job-recovery sweep cadence + staleness windows (were shell consts).
@@ -292,6 +294,10 @@ impl SspNode {
     /// [`Self::route`] with host-supplied options (values a shell reads from
     /// its environment, which the core never does).
     pub async fn route_with(&self, req: ApiRequest, opts: &crate::handover::RouteOptions) -> Option<ApiResponse> {
+        // The admin API authenticates its own sessions (`crate::admin`).
+        if crate::admin::is_admin_path(&req.path) {
+            return Some(self.admin_route(&req).await);
+        }
         let route = RouteId::match_path(req.method, &req.path)?;
 
         // Bearer auth, identical to the shell middleware it replaces: the
@@ -599,7 +605,7 @@ impl SspNode {
     /// - `pending`/queued (or `processing` owned elsewhere): set a kill flag
     ///   the runner honors at dequeue.
     /// - `success`/`failed`: idempotent no-op.
-    async fn job_kill_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
+    pub(crate) async fn job_kill_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
         // A standby runs no jobs and writes nothing. A retired SSP still may:
         // its in-flight jobs run to completion and stay cancellable.
         if self.is_standby() {
@@ -664,7 +670,7 @@ impl SspNode {
     /// `POST /job/retry` — re-run a terminal (`failed`/`success`) job. Resets
     /// the row and re-enqueues a fresh `JobEntry` directly, because a plain
     /// `UPDATE` would not re-trigger the CREATE-gated ingest path.
-    async fn job_retry_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
+    pub(crate) async fn job_retry_handler(&self, req: &ApiRequest) -> Option<ApiResponse> {
         // A new execution is a new claim: not on a standby or a retired SSP.
         if let Some(refused) = self.handover_gate().await {
             return Some(refused);
@@ -910,7 +916,7 @@ impl SspNode {
 
     /// Build the single-entity `/info` array (shared by `/info` and
     /// `/info/text`).
-    async fn info_value(&self) -> Value {
+    pub(crate) async fn info_value(&self) -> Value {
         let status_str = Self::status_str(*self.status.read().await);
         let circuit = self.processor.read().await;
 

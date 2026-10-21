@@ -71,6 +71,16 @@ export function currentMode(): Mode {
   return mode;
 }
 
+/** Whether the host pushes live streams (`/jobs/stream`, `/workflows/stream`). */
+export function streamsAvailable(): boolean {
+  return mode.config?.streams !== false;
+}
+
+/** Whether the API is served by a project's SSP rather than a scheduler. */
+export function servedByNode(): boolean {
+  return mode.config?.host === 'ssp';
+}
+
 export function normalizeEndpoint(raw: string): string {
   const trimmed = raw.trim().replace(/\/+$/, '');
   if (!trimmed) return '';

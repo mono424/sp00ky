@@ -433,6 +433,7 @@ struct NodeConfigCf {
     anonymous_live_queries: bool,
     impersonation: bool,
     query_allowlist: ssp::allowlist::Mode,
+    admin: ssp_node::admin::AdminSettings,
 }
 
 fn read_config(env: &Env) -> Result<NodeConfigCf> {
@@ -449,6 +450,11 @@ fn read_config(env: &Env) -> Result<NodeConfigCf> {
             if v.is_empty() { "cf-ssp".to_string() } else { v }
         },
         job_config: var("SPKY_JOB_CONFIG"),
+        admin: ssp_node::admin::AdminSettings {
+            password: Some(secret("SPKY_ADMIN_PASSWORD")).filter(|p| !p.is_empty()),
+            access: Some(var("SPKY_ADMIN_ACCESS")).filter(|a| !a.is_empty()),
+            project_slug: Some(var("SPKY_PROJECT_SLUG")).filter(|s| !s.is_empty()),
+        },
         // Must match the client's `refMode` (sp00ky.yml). Default Dedicated —
         // core's default (see ssp-node config.rs) and the common case; a
         // client/node mismatch wedges cross-session sync (views never register).
@@ -608,6 +614,12 @@ impl DurableObject for SspNodeDo {
             .flatten()
             .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
         let body = req.text().await.unwrap_or_default();
+        // The admin API reads its filters from the query string; every other
+        // route ignores it, and its path is what timers key on.
+        let path = match req.url().ok().and_then(|u| u.query().map(str::to_string)) {
+            Some(q) if ssp_node::admin::is_admin_path(&path) && !q.is_empty() => format!("{path}?{q}"),
+            _ => path,
+        };
 
         let api_req = ssp_node::ApiRequest {
             method,
@@ -676,6 +688,7 @@ impl SspNodeDo {
             anonymous_live_queries: false,
             impersonation: false,
             query_allowlist: ssp::allowlist::Mode::Off,
+            admin: Default::default(),
         });
 
         let http: Arc<dyn HttpClient> = Arc::new(CfHttp);
@@ -1027,6 +1040,7 @@ fn build_node(
     push_engine: Arc<push_core::PushEngine>,
 ) -> (SspNode, Option<tokio::sync::mpsc::Receiver<ssp_node::jobs::JobEntry>>) {
     let (job_queue_tx, job_rx) = tokio::sync::mpsc::channel(64);
+    let admin_settings = cfg.admin.clone();
     let edge_update_tx = ssp_node::edges::EdgePublisher::default();
     let job_config = Arc::new(ssp_node::jobs::JobConfig::from_json(&cfg.job_config));
     let job_control = ssp_node::jobs::JobControl::new();
@@ -1093,6 +1107,7 @@ fn build_node(
         checkpoint_interval_secs: None,
         max_snapshot_age_secs: MAX_SNAPSHOT_AGE_SECS,
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        admin: ssp_node::admin::AdminState::new(admin_settings),
     };
     (node, has_jobs.then_some(job_rx))
 }
@@ -1119,6 +1134,10 @@ fn to_worker_response(resp: ssp_node::ApiResponse) -> Result<Response> {
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if BucketService::handles(&req.path()) {
         return bucket_route(req, &env).await;
+    }
+    // A browser's preflight for the admin API needs no Durable Object.
+    if req.method() == Method::Options && ssp_node::admin::is_admin_path(&req.path()) {
+        return to_worker_response(ssp_node::admin::preflight());
     }
     let name = req
         .headers()

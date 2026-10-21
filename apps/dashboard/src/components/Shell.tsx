@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createSignal, onCleanup, type JSX } from 'solid-js';
 import { A, useLocation } from '@solidjs/router';
+import { servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
@@ -59,7 +60,11 @@ export function Shell(props: {
   const location = useLocation();
   const [open, setOpen] = createSignal(false);
 
-  const links = (): NavLink[] => [
+  // Pages only a scheduler can fill: an SSP serving the API alone has no
+  // presence sampler, incident log, log ring or backups.
+  const clusterOnly = new Set(['/views', '/backups', '/incidents', '/logs']);
+  const links = (): NavLink[] => allLinks().filter((l) => !servedByNode() || !clusterOnly.has(l.href));
+  const allLinks = (): NavLink[] => [
     { href: '/', label: 'Overview' },
     {
       href: '/ssps',

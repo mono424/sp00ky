@@ -173,6 +173,8 @@ struct HarnessOpts {
     /// so a signed-out session is held to table permissions. Off, the embedded
     /// DB has no authentication and every session reads everything.
     guests: bool,
+    /// `SPKY_ADMIN_PASSWORD`: offer a break-glass admin login.
+    admin_password: Option<&'static str>,
 }
 
 impl Default for HarnessOpts {
@@ -189,6 +191,7 @@ impl Default for HarnessOpts {
             impersonation: false,
             anonymous_live_queries: false,
             guests: false,
+            admin_password: None,
         }
     }
 }
@@ -335,6 +338,10 @@ async fn build(opts: HarnessOpts) -> Harness {
         checkpoint_interval_secs: None,
         max_snapshot_age_secs: 3600,
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        admin: ssp_node::admin::AdminState::new(ssp_node::admin::AdminSettings {
+            password: opts.admin_password.map(str::to_string),
+            ..Default::default()
+        }),
     };
 
     // A dummy second receiver is not creatable from one channel; keep the real
@@ -4199,4 +4206,107 @@ async fn on_demand_schedule_sweeps_follow_the_engines_next_wake() {
         .take(0)
         .unwrap();
     assert!(planned.is_some(), "the sweep planned the schedule");
+}
+
+// --- Admin API (`/admin/api`) --------------------------------------------------
+
+async fn admin(h: &Harness, method: Method, path: &str, bearer: Option<&str>, body: Value) -> (u16, Value) {
+    let resp = h.node.route(req(method, path, bearer, body)).await.expect("an admin route always answers");
+    let body = match &resp.body {
+        ApiBody::Json(v) => v.clone(),
+        _ => Value::Null,
+    };
+    assert!(resp.headers.iter().any(|(k, v)| *k == "Access-Control-Allow-Origin" && v == "*"));
+    (resp.status, body)
+}
+
+#[tokio::test]
+async fn admin_sessions_scopes_and_revocation() {
+    let h = build(HarnessOpts { admin_password: Some("glass"), ..Default::default() }).await;
+
+    let (status, config) = admin(&h, Method::Get, "/admin/api/config", None, Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(config["breakglass_available"], true);
+    assert_eq!(config["host"], "ssp");
+    assert_eq!(admin(&h, Method::Get, "/admin/api/me", None, Value::Null).await.0, 401);
+
+    // The node's own bearer is a full session: the control plane's way in.
+    let (_, me) = admin(&h, Method::Get, "/admin/api/me", Some(SECRET), Value::Null).await;
+    assert_eq!(me["mode"], "node");
+
+    assert_eq!(admin(&h, Method::Post, "/admin/api/session", None, json!({ "password": "nope" })).await.0, 401);
+    let (status, login) = admin(&h, Method::Post, "/admin/api/session", None, json!({ "password": "glass" })).await;
+    assert_eq!(status, 200, "{login}");
+    let session = login["token"].as_str().unwrap().to_string();
+    let (_, me) = admin(&h, Method::Get, "/admin/api/me", Some(&session), Value::Null).await;
+    assert_eq!(me["mode"], "breakglass");
+
+    // A read-only MCP token reads, cannot write, and cannot mint.
+    let (status, minted) =
+        admin(&h, Method::Post, "/admin/api/tokens", Some(&session), json!({ "label": "agent", "scope": "read" })).await;
+    assert_eq!(status, 201, "{minted}");
+    let agent = minted["token"].as_str().unwrap().to_string();
+    assert_eq!(admin(&h, Method::Get, "/admin/api/schedules", Some(&agent), Value::Null).await.0, 200);
+    assert_eq!(admin(&h, Method::Post, "/admin/api/jobs/clear", Some(&agent), json!({})).await.0, 403);
+    let (_, tools) = admin(
+        &h,
+        Method::Post,
+        "/admin/api/mcp",
+        Some(&agent),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await;
+    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"jobs_list") && !names.contains(&"job_kill") && !names.contains(&"ssp_restart"), "{names:?}");
+    let (_, called) = admin(
+        &h,
+        Method::Post,
+        "/admin/api/mcp",
+        Some(&agent),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "schedules_list" } }),
+    )
+    .await;
+    assert_eq!(called["result"]["isError"], false, "{called}");
+
+    // Logout revokes the token it was sent with.
+    assert_eq!(admin(&h, Method::Post, "/admin/api/logout", Some(&session), Value::Null).await.0, 204);
+    assert_eq!(admin(&h, Method::Get, "/admin/api/me", Some(&session), Value::Null).await.0, 401);
+
+    // What only a cluster has says so.
+    let (status, body) = admin(&h, Method::Get, "/admin/api/presence", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 501);
+    assert!(body["error"].as_str().unwrap().contains("scheduler"), "{body}");
+}
+
+#[tokio::test]
+async fn admin_lists_and_kills_jobs_through_the_node() {
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://backend")], ..Default::default() }).await;
+    h.raw_db.query("UPSERT _00_retention:default SET job_tables = ['job']").await.unwrap();
+    insert_job(&h.raw_db, "a", "pending").await;
+    insert_job(&h.raw_db, "b", "failed").await;
+
+    let (status, page) = admin(&h, Method::Get, "/admin/api/jobs?status=pending", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["returned"], 1, "{page}");
+    assert_eq!(page["jobs"][0]["origin"]["kind"], "app");
+    assert_eq!(page["totals"]["counts"]["failed"], 1, "{page}");
+
+    let (status, killed) = admin(&h, Method::Post, "/admin/api/jobs/job%3Aa/kill", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 200, "{killed}");
+    assert_eq!(job_status(&h.raw_db, "a").await.as_deref(), Some("failed"));
+    let (status, refused) = admin(&h, Method::Post, "/admin/api/jobs/job%3Aa/kill", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 200, "a terminal job's kill is a no-op: {refused}");
+    let (status, retried) = admin(&h, Method::Post, "/admin/api/jobs/job%3Ab/retry", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 200, "{retried}");
+    assert_eq!(job_status(&h.raw_db, "b").await.as_deref(), Some("pending"), "a retry resets the row");
+    let (status, refused) = admin(&h, Method::Post, "/admin/api/jobs/job%3Ab/retry", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 409);
+    assert!(refused["error"].as_str().unwrap().contains("pending"), "an admin error, not a node one: {refused}");
+
+    let (status, overview) = admin(&h, Method::Get, "/admin/api/overview", Some(SECRET), Value::Null).await;
+    assert_eq!(status, 200, "{overview}");
+    assert_eq!(overview["ssps"].as_array().unwrap().len(), 1);
+    assert_eq!(overview["backends"][0]["tables"], json!(["job"]));
+    assert_eq!(overview["jobs"]["counts"]["failed"], 1, "{overview}");
+    assert_eq!(overview["jobs"]["counts"]["pending"], 1, "{overview}");
 }

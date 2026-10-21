@@ -18,6 +18,7 @@
 //!
 //! See `docs/platform-architecture.md` for the full design.
 
+pub mod admin;
 pub mod allowlist_state;
 pub mod api;
 pub mod bootstrap;

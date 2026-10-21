@@ -1,6 +1,6 @@
 import { For, Show, createSignal, onCleanup, onMount } from 'solid-js';
 import { A, useNavigate } from '@solidjs/router';
-import { openStream } from '../api/client';
+import { api, openStream, streamsAvailable } from '../api/client';
 import { Empty, PageHead, Panel, Pill, ReasonLine, StatusDot } from '../components/Chrome';
 import { elapsed, relativeStamp } from '../lib/format';
 import { runTone } from '../lib/status';
@@ -16,6 +16,9 @@ import type { WorkflowRun } from '../api/types';
  * second, and an idle dashboard costs it nothing at all — the poller stops when
  * the last subscriber leaves.
  */
+/** How often runs are re-read where the host has no stream. */
+const POLL_MS = 3000;
+
 export function Workflows() {
   const navigate = useNavigate();
   const [runs, setRuns] = createSignal<WorkflowRun[]>([]);
@@ -24,6 +27,29 @@ export function Workflows() {
   const [filter, setFilter] = createSignal('');
 
   onMount(() => {
+    // A host without streams (an SSP serving the API alone) is polled.
+    if (!streamsAvailable()) {
+      let cancelled = false;
+      const load = async () => {
+        const res = await api.getResult<{ runs: WorkflowRun[] }>('/workflows/runs');
+        if (cancelled) return;
+        if (res.ok) {
+          setRuns(res.value.runs ?? []);
+          setConnected(true);
+          setError(null);
+        } else {
+          setConnected(false);
+          setError(res.message);
+        }
+      };
+      void load();
+      const timer = setInterval(load, POLL_MS);
+      onCleanup(() => {
+        cancelled = true;
+        clearInterval(timer);
+      });
+      return;
+    }
     const close = openStream('/workflows/stream', {
       onOpen: () => {
         setConnected(true);

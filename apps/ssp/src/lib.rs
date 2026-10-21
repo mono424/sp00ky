@@ -1141,6 +1141,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         schema_poll_secs: config.schema_poll_secs,
         schema_watch: Default::default(),
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        admin: Default::default(),
     });
     let runtime = ssp_node::Runtime::new(node.clone());
 

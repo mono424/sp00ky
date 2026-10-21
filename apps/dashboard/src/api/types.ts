@@ -27,6 +27,14 @@ export interface ServerConfig {
    * would simply stop it.
    */
   supervised?: boolean;
+  /**
+   * Who serves this API: a scheduler, or a project's SSP where no scheduler
+   * runs (a Cloudflare project). An SSP serves jobs, schedules, workflows and
+   * backends, and answers the cluster-only pages with 501.
+   */
+  host?: 'scheduler' | 'ssp';
+  /** False when the host has no live streams: pages poll instead. */
+  streams?: boolean;
 }
 
 export interface LoginResponse {

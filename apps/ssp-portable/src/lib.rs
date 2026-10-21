@@ -249,6 +249,7 @@ fn build_node(
         checkpoint_interval_secs,
         max_snapshot_age_secs: 3600,
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        admin: Default::default(),
     });
     let runtime = Runtime::new(node.clone());
     (node, runtime)

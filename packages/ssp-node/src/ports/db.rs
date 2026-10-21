@@ -63,4 +63,14 @@ pub trait Db: MaybeSendSync {
     fn connection(&self) -> DbConnection {
         DbConnection::Unknown
     }
+
+    /// Sign in as a record user through `access` (an app's `DEFINE ACCESS
+    /// ... TYPE RECORD`) with `vars` (`{ username, password }` or the like),
+    /// on a session of its own: never the handle the node queries with.
+    /// `Ok(Some(token))` accepted, `Ok(None)` refused, `Err` when the
+    /// database could not be asked. The admin API's roster login.
+    async fn signin_record(&self, access: &str, vars: serde_json::Value) -> Result<Option<String>, DbError> {
+        let _ = (access, vars);
+        Err(DbError::Transport("this database adapter cannot sign in record users".into()))
+    }
 }

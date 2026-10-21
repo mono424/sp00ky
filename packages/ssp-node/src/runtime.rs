@@ -141,7 +141,8 @@ impl Runtime {
                 .await;
         }
         // A deploy reloads the node: it may have added or changed schedules.
-        if path == "/admin/reload" {
+        // An operator's pause, trigger or workflow action changes the next wake.
+        if path == "/admin/reload" || crate::admin::touches_schedules(path) {
             self.arm_schedule_sweep_now().await;
         }
         let registered = path.starts_with("/view/register");

@@ -9,7 +9,7 @@ import {
   type JSX,
 } from 'solid-js';
 import { A, useNavigate, useParams } from '@solidjs/router';
-import { api, openStream } from '../api/client';
+import { api, openStream, streamsAvailable } from '../api/client';
 import {
   Bento,
   Chips,
@@ -209,7 +209,8 @@ export function Jobs() {
    * two-sources-at-once version has.
    */
   createEffect(() => {
-    if (filtered()) {
+    // A host without streams (an SSP serving the API alone) is polled.
+    if (filtered() || !streamsAvailable()) {
       setConnected(false);
       const path = query();
       let cancelled = false;

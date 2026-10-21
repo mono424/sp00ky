@@ -75,6 +75,7 @@ OutboxItem buildOutboxItem({
   OutboxStatus status = OutboxStatus.pending,
   int? ackedAt,
   int attempts = 0,
+  bool inDoubt = false,
 }) =>
     OutboxItem(
       id: id,
@@ -84,6 +85,7 @@ OutboxItem buildOutboxItem({
       status: status,
       ackedAt: ackedAt,
       attempts: attempts,
+      inDoubt: inDoubt,
     );
 
 /// A state holding [entries], with `dirty` cleared (as after materialization).

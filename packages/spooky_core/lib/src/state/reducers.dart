@@ -344,6 +344,17 @@ Reducer outboxBumpAttempts(String id) => (s) {
       return s.copyWith(outbox: outbox);
     };
 
+/// Mark items whose last push may have committed although no answer came
+/// back.
+Reducer outboxMarkInDoubt(Iterable<String> ids) => (s) {
+      final marked = ids.toSet();
+      if (!s.outbox.any((i) => marked.contains(i.id) && !i.inDoubt)) return s;
+      return s.copyWith(outbox: [
+        for (final i in s.outbox)
+          marked.contains(i.id) && !i.inDoubt ? i.copyWith(inDoubt: true) : i
+      ]);
+    };
+
 /// Drop acked items older than [graceMs] (membership never named them).
 Reducer outboxPruneAcked(int now, int graceMs) => (s) {
       final stale = s.outbox

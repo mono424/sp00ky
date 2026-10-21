@@ -72,6 +72,8 @@ const ERR = (r: StatementResult | undefined): string | null => (r && r.status ==
  * A CRDT edit-log row (`<table>__crdt_log`) is written once and never changes,
  * so a CREATE retried after its first attempt committed (and only the answer
  * was lost) finds it already there: that is a success, not a rejection.
+ * `remoteBatch` already makes such a CREATE a no-op on the server; this covers
+ * a row the user may create but not read back, where that check cannot see it.
  */
 const isRepeatedLogCreate = (row: { mutationType: string; tableName: string }, err: string): boolean =>
   row.mutationType === 'create' && row.tableName.endsWith('__crdt_log') && /already exists/i.test(err);
@@ -84,6 +86,14 @@ const isRepeatedLogCreate = (row: { mutationType: string; tableName: string }, e
  * The server stops a batch at its first failed statement (`remoteBatch`), so
  * the rows after a rejection are sent again at once, and a re-sent row behind
  * a retryable failure never ran before, so it cannot read "already exists".
+ *
+ * A request that throws a transport error (the push timeout, a dropped
+ * socket) may still have committed on the server, and so may one sent by a
+ * session that died before its answer. Those rows are marked in doubt
+ * (`OutboxItem.inDoubt`, every row loaded from the store is), and their
+ * re-sent CREATE accepts the row already on the server when it holds what the
+ * CREATE would write, instead of failing "already exists" and rolling back a
+ * write the server kept.
  */
 export function* drain(env: SagaEnv): Saga<void> {
   for (;;) {
@@ -106,12 +116,12 @@ export function* drain(env: SagaEnv): Saga<void> {
     }
     if (rows.length === 0) continue;
 
-    const req = remoteBatch(rows);
+    const req = remoteBatch(rows, new Set(batch.filter((i) => i.inDoubt).map((i) => i.id)));
     let results: StatementResult[];
     try {
       const raw = (yield fx.remote.query(req.sql, req.vars, env.pushTimeoutMs)) as unknown;
-      // A response without statement results is a transport fault: nothing
-      // ran, everything stays queued (handled as `!r` below).
+      // A response without statement results is a transport fault: every
+      // row stays queued, in doubt (handled as `!r` below).
       results = Array.isArray(raw) ? (raw as StatementResult[]) : [];
     } catch (error) {
       if (classifySyncError(error) === 'application') {
@@ -121,8 +131,9 @@ export function* drain(env: SagaEnv): Saga<void> {
         yield fx.dispatch({ type: 'SyncOutcome', ok: false, error });
         continue;
       }
+      // No answer: the server may have committed any prefix of the batch.
       const attempts = batch.find((i) => i.id === rows[0].id)!.attempts;
-      yield fx.state.update(R.outboxBumpAttempts(rows[0].id));
+      yield fx.state.update(R.compose(R.outboxMarkInDoubt(rows.map((row) => row.id)), R.outboxBumpAttempts(rows[0].id)));
       yield fx.dispatch({ type: 'SyncOutcome', ok: false, error });
       yield fx.timer.set('outbox', backoffMs(attempts), { type: 'Drain' });
       return;
@@ -134,7 +145,9 @@ export function* drain(env: SagaEnv): Saga<void> {
       const row = rows[i];
       const r = results[i];
       if (!r) {
-        // Statements after a transport-level cut: they never ran.
+        // Statements after a transport-level cut: no answer says whether
+        // they ran, so they are in doubt.
+        yield fx.state.update(R.outboxMarkInDoubt(rows.slice(i).map((unanswered) => unanswered.id)));
         cutAt = i;
         break;
       }

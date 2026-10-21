@@ -212,7 +212,9 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
           if (records[id] != null) records[id]!
       ]);
     }
+    // `LET $wasN = ...; IF ... { CREATE ... }` is an in-doubt CREATE.
     if (sql.startsWith('CREATE ONLY') ||
+        sql.startsWith(r'LET $was') ||
         sql.startsWith('UPDATE') ||
         sql.startsWith('DELETE')) {
       if (blockMutations) {

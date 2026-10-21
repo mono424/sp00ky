@@ -29,7 +29,11 @@ Local writes are applied optimistically (row + outbox entry in one local
 transaction), rendered through the outbox overlay, and drained to the remote in
 FIFO batches. Each statement of a batch commits on its own, but the server stops
 the batch at its first failed statement (`remoteBatch` chains them), so no write
-reaches the server ahead of an earlier one that failed. Server membership arrives through one batched edge read (registration,
+reaches the server ahead of an earlier one that failed. A batch whose answer is
+lost (it threw a transport error, or its rows were loaded from the store after a
+restart) is in doubt (`OutboxItem.inDoubt`): re-sent, an in-doubt CREATE checks
+the row already on the server and is a no-op when it holds what the CREATE
+writes. Server membership arrives through one batched edge read (registration,
 poll, LIVE dirt) and bodies are fetched once across all queries. Rows are always
 re-materialized from state, never patched in place.
 

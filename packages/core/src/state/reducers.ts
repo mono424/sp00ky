@@ -408,6 +408,15 @@ export const outboxBumpAttempts =
     return { ...s, outbox };
   };
 
+/** Mark items whose last push may have committed although no answer came back. */
+export const outboxMarkInDoubt =
+  (ids: readonly string[]): Reducer =>
+  (s) => {
+    const marked = new Set(ids);
+    if (!s.outbox.some((i) => marked.has(i.id) && !i.inDoubt)) return s;
+    return { ...s, outbox: s.outbox.map((i) => (marked.has(i.id) && !i.inDoubt ? { ...i, inDoubt: true } : i)) };
+  };
+
 /** Drop acked items older than `graceMs` (membership never named them). */
 export const outboxPruneAcked =
   (now: number, graceMs: number): Reducer =>

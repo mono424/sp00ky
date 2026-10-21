@@ -109,6 +109,11 @@ export function hydrateRowData(row: PendingMutationRow, columns: Record<string, 
   }
 }
 
+/**
+ * A row read back from the store at boot, bucket switch or leader takeover.
+ * The session that queued it may have sent it and died before the answer (a
+ * closed tab, a killed app, a lost leader), so its outcome is in doubt.
+ */
 export const toOutboxItem = (row: PendingMutationRow): OutboxItem => ({
   id: row.id,
   type: row.mutationType,
@@ -117,6 +122,7 @@ export const toOutboxItem = (row: PendingMutationRow): OutboxItem => ({
   status: 'pending',
   ackedAt: null,
   attempts: 0,
+  inDoubt: true,
 });
 
 /**
@@ -291,7 +297,40 @@ export interface RemoteBatch {
  */
 export const BATCH_SKIPPED = 'sp00ky: not run, an earlier statement in this batch failed';
 
-function remoteStatement(row: PendingMutationRow, i: number, vars: Vars): string {
+/** A CRDT edit-log row (`<table>__crdt_log`): written once under a fresh id, never changed. */
+const isLogTable = (table: string): boolean => table.endsWith('__crdt_log');
+
+/**
+ * Which fields of the row already on the server must equal the payload of the
+ * CREATE at `i` for that row to count as this CREATE's own earlier commit, or
+ * `null` when the CREATE must not tolerate an existing row at all.
+ *
+ * Only a CREATE whose outcome is in doubt tolerates one: elsewhere "already
+ * exists" means someone else holds the id, a rejection as before. The check
+ * is every payload field except those a later in-doubt row of the same
+ * record, which may have committed in the same lost round, could have changed
+ * since; those rows run again after it and set them anyway. A later in-doubt
+ * DELETE or CREATE of the record may have replaced the row, so then existence
+ * is all that is checked. Rows that are not in doubt never ran.
+ *
+ * A CRDT log row's id is fresh and the row immutable, so its existence is
+ * proof enough, in doubt or not.
+ */
+function matchFields(rows: ReadonlyArray<PendingMutationRow>, i: number, inDoubt: ReadonlySet<string>): string[] | null {
+  const row = rows[i];
+  if (isLogTable(row.tableName)) return [];
+  if (!inDoubt.has(row.id)) return null;
+  const changed = new Set<string>();
+  for (const later of rows.slice(i + 1)) {
+    if (later.recordId !== row.recordId || !inDoubt.has(later.id)) continue;
+    if (later.mutationType !== 'update') return [];
+    for (const key of Object.keys(later.data ?? {})) changed.add(key);
+  }
+  return Object.keys(row.data ?? {}).filter((key) => !changed.has(key));
+}
+
+function remoteStatement(rows: ReadonlyArray<PendingMutationRow>, i: number, vars: Vars, inDoubt: ReadonlySet<string>): string {
+  const row = rows[i];
   vars[`id${i}`] = parseRecordIdString(row.recordId);
   switch (row.mutationType) {
     case 'create': {
@@ -300,7 +339,13 @@ function remoteStatement(row: PendingMutationRow, i: number, vars: Vars): string
         vars[`d${i}_${key}`] = data[key];
         return `${key} = $d${i}_${key}`;
       });
-      return `CREATE ONLY $id${i} SET ${sets.join(', ')}`;
+      const create = `CREATE ONLY $id${i} SET ${sets.join(', ')}`;
+      const match = matchFields(rows, i, inDoubt);
+      if (!match) return create;
+      // The CREATE runs unless the row is there and matches; on a mismatch it
+      // fails with SurrealDB's own "already exists", a rejection as before.
+      const differs = [`($was${i} = NONE)`, ...match.map((key) => `($was${i}.${key} != $d${i}_${key})`)];
+      return `LET $was${i} = (SELECT * FROM ONLY $id${i}); IF ${differs.join(' OR ')} { ${create} }`;
     }
     case 'update':
       vars[`data${i}`] = row.data ?? {};
@@ -323,12 +368,19 @@ function remoteStatement(row: PendingMutationRow, i: number, vars: Vars): string
  * re-sent CREATE then read "already exists", was taken for a rejection and
  * rolled back locally while the server kept the row. Acking them instead
  * would have let a later write land before an earlier one it may depend on.
+ *
+ * The chain cannot help when the answer itself is lost: the request may have
+ * committed any prefix of the batch. Rows named in `inDoubt` (mutation ids)
+ * are such rows. An UPDATE MERGE or a DELETE is safe to run twice, a CREATE
+ * is not, so an in-doubt CREATE checks the row already there first (see
+ * `matchFields`) and is a no-op when it is its own: the batch goes on in
+ * order, with no "already exists" to cut it.
  */
-export function remoteBatch(rows: ReadonlyArray<PendingMutationRow>): RemoteBatch {
+export function remoteBatch(rows: ReadonlyArray<PendingMutationRow>, inDoubt: ReadonlySet<string> = new Set()): RemoteBatch {
   const vars: Vars = {};
-  const stmts = rows.map((row, i) => {
+  const stmts = rows.map((_, i) => {
     const guard = i === 0 ? '' : `IF !$ok${i - 1} { THROW "${BATCH_SKIPPED}" }; `;
-    return `LET $ok${i} = { ${guard}${remoteStatement(row, i, vars)}; true }`;
+    return `LET $ok${i} = { ${guard}${remoteStatement(rows, i, vars, inDoubt)}; true }`;
   });
   return { sql: stmts.join(';\n'), vars };
 }

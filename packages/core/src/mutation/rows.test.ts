@@ -60,6 +60,8 @@ describe('parsePendingRow', () => {
       status: 'pending',
       ackedAt: null,
       attempts: 0,
+      // A row read back from the store may have been sent by a session that died.
+      inDoubt: true,
     });
     expect(rows.loadPendingRows()).toBe('SELECT * FROM _00_pending_mutations ORDER BY id ASC');
     expect(rows.loadFailedRows()).toBe('SELECT * FROM _00_failed_mutations ORDER BY failedAt ASC');
@@ -161,6 +163,44 @@ describe('remoteBatch', () => {
       data3: {},
     });
     expect(rows.remoteBatch([{ id: 'm', mutationType: 'create', recordId: 'thing:9', tableName: 'thing', createdAt: 0, v: 2 }]).sql).toBe('LET $ok0 = { CREATE ONLY $id0 SET ; true }');
+  });
+
+  it('an in-doubt CREATE is a no-op when the server row matches every field no later in-doubt row of it may have changed', () => {
+    const row = (id: string, mutationType: rows.PendingMutationRow['mutationType'], recordId: string, data?: Record<string, unknown>): rows.PendingMutationRow => ({
+      id,
+      mutationType,
+      recordId,
+      tableName: recordId.split(':')[0],
+      data,
+      createdAt: 0,
+      v: 2,
+    });
+    const was = (i: number, ...keys: string[]) =>
+      `LET $was${i} = (SELECT * FROM ONLY $id${i}); IF ${[`($was${i} = NONE)`, ...keys.map((k) => `($was${i}.${k} != $d${i}_${k})`)].join(' OR ')} { CREATE ONLY $id${i} SET ${['a', 'b']
+        .map((k) => `${k} = $d${i}_${k}`)
+        .join(', ')} }`;
+    const statement = (sql: string, i: number) => sql.split(';\n')[i].replace(/^LET \$ok\d+ = \{ (IF !\$ok\d+ \{ THROW "[^"]+" \}; )?/, '').replace(/; true \}$/, '');
+    const batch = [
+      row('m1', 'create', 'thing:1', { a: 1, b: 1 }),
+      row('m2', 'update', 'thing:1', { b: 2 }),
+      row('m3', 'create', 'thing:2', { a: 1, b: 1 }),
+      row('m4', 'update', 'thing:2', { a: 2 }), // not in doubt: it never ran
+      row('m5', 'create', 'thing:3', { a: 1, b: 1 }),
+      row('m6', 'delete', 'thing:3'),
+      row('m7', 'create', 'thing:4', { a: 1, b: 1 }),
+      row('m8', 'update', 'thing:9', { a: 2 }), // another record
+      row('m9', 'update', 'thing:1'), // no payload: changes nothing
+    ];
+    const { sql } = rows.remoteBatch(batch, new Set(['m1', 'm2', 'm3', 'm5', 'm6', 'm8', 'm9']));
+    expect(statement(sql, 0)).toBe(was(0, 'a')); // b may be m2's
+    expect(statement(sql, 2)).toBe(was(2, 'a', 'b'));
+    expect(statement(sql, 4)).toBe(was(4)); // m6 may have deleted it and something else re-created it
+    expect(statement(sql, 6)).toBe('CREATE ONLY $id6 SET a = $d6_a, b = $d6_b'); // not in doubt: strict
+    // A CRDT log row's id is fresh and the row immutable: existence is proof, in doubt or not.
+    expect(statement(rows.remoteBatch([row('l', 'create', 'doc__crdt_log:1', { a: 1, b: 1 })]).sql, 0)).toBe(was(0));
+    expect(statement(rows.remoteBatch([row('e', 'create', 'thing:5')], new Set(['e'])).sql, 0)).toBe(
+      'LET $was0 = (SELECT * FROM ONLY $id0); IF ($was0 = NONE) { CREATE ONLY $id0 SET  }'
+    );
   });
 });
 

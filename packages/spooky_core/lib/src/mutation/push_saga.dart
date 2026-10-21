@@ -68,6 +68,14 @@ Future<void> refreshFailedCount(Ctx ctx) async {
 /// ([remoteBatch]), so the rows after a rejection are sent again at once, and
 /// a re-sent row behind a retryable failure never ran before, so it cannot
 /// read "already exists".
+///
+/// A request that throws a transport error (the push timeout, a dropped
+/// socket) may still have committed on the server, and so may one sent by a
+/// run that died before its answer. Those rows are marked in doubt
+/// ([OutboxItem.inDoubt], every row loaded from the store is), and their
+/// re-sent CREATE accepts the row already on the server when it holds what
+/// the CREATE would write, instead of failing "already exists" and rolling
+/// back a write the server kept.
 Future<void> drain(Ctx ctx, SagaEnv env) async {
   // A client with no endpoint has nothing to push to. Draining anyway would
   // fail every statement in a way the classifier reads as a rejection, and a
@@ -93,7 +101,10 @@ Future<void> drain(Ctx ctx, SagaEnv env) async {
     }
     if (rows.isEmpty) continue;
 
-    final req = remoteBatch(rows);
+    final req = remoteBatch(rows, inDoubt: {
+      for (final i in batch)
+        if (i.inDoubt) i.id
+    });
     List<StatementResult> results;
     try {
       results = await ctx(Fx.remoteWrite(req.sql,
@@ -112,9 +123,13 @@ Future<void> drain(Ctx ctx, SagaEnv env) async {
         await ctx(Fx.dispatch(SyncOutcome(false, error)));
         continue;
       }
+      // No answer: the server may have committed any prefix of the batch.
       final attempts =
           batch.firstWhere((i) => i.id == rows.first.id).attempts;
-      await ctx(Fx.stateUpdate(r.outboxBumpAttempts(rows.first.id)));
+      await ctx(Fx.stateUpdate(r.compose([
+        r.outboxMarkInDoubt(rows.map((row) => row.id)),
+        r.outboxBumpAttempts(rows.first.id),
+      ])));
       await ctx(Fx.dispatch(SyncOutcome(false, error)));
       await ctx(Fx.timerSet('outbox', backoffMs(attempts), const Drain()));
       return;
@@ -126,7 +141,10 @@ Future<void> drain(Ctx ctx, SagaEnv env) async {
       final row = rows[i];
       final res = i < results.length ? results[i] : null;
       if (res == null) {
-        // Statements after a transport-level cut: they never ran.
+        // Statements after a transport-level cut: no answer says whether
+        // they ran, so they are in doubt.
+        await ctx(Fx.stateUpdate(r.outboxMarkInDoubt(
+            rows.skip(i).map((unanswered) => unanswered.id))));
         cutAt = i;
         break;
       }

@@ -54,6 +54,7 @@ void main() {
       expect(row.v, 2);
       expect(toOutboxItem(row).status, OutboxStatus.pending);
       expect(toOutboxItem(row).table, 'thing');
+      expect(toOutboxItem(row).inDoubt, isTrue);
     });
 
     test('tolerates legacy rows and rejects unreplayable ones', () {
@@ -172,6 +173,59 @@ void main() {
       expect(batch.vars['d0_x'], 1);
       expect(batch.vars['data1'], {'y': 2});
       expect((batch.vars['id2'] as RecordId).id, 'c');
+    });
+
+    test(
+        'an in-doubt CREATE is a no-op when the server row matches every '
+        'field no later in-doubt row of it may have changed', () {
+      PendingMutationRow row(String id, MutationEventType type,
+              String recordId, [Map<String, dynamic>? data]) =>
+          PendingMutationRow(
+            id: id,
+            mutationType: type,
+            recordId: recordId,
+            tableName: 'thing',
+            data: data,
+            createdAt: 0,
+            v: 2,
+          );
+      String was(int i, List<String> keys, [String sets = '']) =>
+          'LET \$was$i = (SELECT * FROM ONLY \$id$i); IF ${[
+            '(\$was$i = NONE)',
+            for (final k in keys) '(\$was$i.$k != \$d${i}_$k)',
+          ].join(' OR ')} { CREATE ONLY \$id$i SET '
+          '${sets.isEmpty ? 'a = \$d${i}_a, b = \$d${i}_b' : sets} }';
+      String statement(String sql, int i) => sql
+          .split(';\n')[i]
+          .replaceFirst(
+              RegExp(r'^LET \$ok\d+ = \{ (IF !\$ok\d+ \{ THROW "[^"]+" \}; )?'),
+              '')
+          .replaceFirst(RegExp(r'; true \}$'), '');
+      final c = MutationEventType.create;
+      final u = MutationEventType.update;
+      final batch = remoteBatch([
+        row('m1', c, 'thing:1', {'a': 1, 'b': 1}),
+        row('m2', u, 'thing:1', {'b': 2}),
+        row('m3', c, 'thing:2', {'a': 1, 'b': 1}),
+        row('m4', u, 'thing:2', {'a': 2}), // not in doubt: it never ran
+        row('m5', c, 'thing:3', {'a': 1, 'b': 1}),
+        row('m6', MutationEventType.delete, 'thing:3'),
+        row('m7', c, 'thing:4', {'a': 1, 'b': 1}),
+        row('m8', u, 'thing:9', {'a': 2}), // another record
+        row('m9', u, 'thing:1'), // no payload: changes nothing
+        row('m10', c, 'thing:5'),
+      ], inDoubt: {
+        'm1', 'm2', 'm3', 'm5', 'm6', 'm8', 'm9', 'm10'
+      });
+      expect(statement(batch.sql, 0), was(0, ['a'])); // b may be m2's
+      expect(statement(batch.sql, 2), was(2, ['a', 'b']));
+      // m6 may have deleted it and something else re-created it.
+      expect(statement(batch.sql, 4), was(4, []));
+      expect(statement(batch.sql, 6),
+          'CREATE ONLY \$id6 SET a = \$d6_a, b = \$d6_b'); // strict
+      expect(statement(batch.sql, 9),
+          'LET \$was9 = (SELECT * FROM ONLY \$id9); IF (\$was9 = NONE) '
+          '{ CREATE ONLY \$id9 SET  }');
     });
   });
 

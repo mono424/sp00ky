@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { UPSTREAM, UPSTREAM_ORIGIN } from '../fixtures/target';
 
 /**
  * Permission negative tests for the built-in feature flag tables.
@@ -25,10 +26,10 @@ import { test, expect } from '@playwright/test';
  * pattern as `waitForThreadInUpstream` in `test-fixtures.ts`).
  */
 
-const SURREAL_URL = 'http://localhost:8666';
-const NS = 'main';
-const DB = 'example';
-const ROOT_AUTH = 'Basic ' + Buffer.from('root:root').toString('base64');
+const SURREAL_URL = UPSTREAM_ORIGIN;
+const NS = UPSTREAM.ns;
+const DB = UPSTREAM.db;
+const ROOT_AUTH = UPSTREAM.authorization;
 
 async function rootSql(query: string): Promise<unknown> {
   const resp = await fetch(`${SURREAL_URL}/sql`, {

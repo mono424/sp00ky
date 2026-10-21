@@ -2,7 +2,8 @@
  * What the suite runs against. Local dev by default; a deployed project when
  * E2E_BASE_URL is set (then no local servers start), with the database the
  * tests inspect and clean given by E2E_DB_URL (the `/sql` endpoint),
- * E2E_DB_NS, E2E_DB_DB and E2E_DB_AUTH (a full Authorization header value).
+ * E2E_DB_NS, E2E_DB_DB and E2E_DB_AUTH (a full Authorization header value),
+ * and the sync node by E2E_SSP_URL.
  */
 // The package has no Node types; Playwright runs this under Node.
 declare const process: { env: Record<string, string | undefined> };
@@ -16,6 +17,12 @@ export const UPSTREAM = {
   db: process.env.E2E_DB_DB || 'example',
   authorization: process.env.E2E_DB_AUTH || 'Basic ' + btoa('root:root'),
 };
+
+/** The database's origin, for `/signup` and `/sql` built by hand. */
+export const UPSTREAM_ORIGIN = UPSTREAM.url.replace(/\/sql$/, '');
+
+/** The sync node (SSP), whose `/info` is public. */
+export const SSP_URL = process.env.E2E_SSP_URL || 'http://localhost:8667';
 
 /** Headers for a root `/sql` request against the upstream database. */
 export function upstreamHeaders(): Record<string, string> {

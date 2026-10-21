@@ -1,4 +1,5 @@
 import { test, expect, uniqueUser, registerUser } from '../fixtures/test-fixtures';
+import { UPSTREAM, upstreamHeaders } from '../fixtures/target';
 
 // Regression guard for #40: when a user record is DELETEd upstream,
 // the schema's `_00_user_delete` event fires the SSP ingest with
@@ -7,15 +8,10 @@ import { test, expect, uniqueUser, registerUser } from '../fixtures/test-fixture
 // tables accumulate forever, and the `INFO FOR DB` output (plus
 // every cluster snapshot) keeps growing.
 
-const ROOT_HEADERS = {
-  Accept: 'application/json',
-  'surreal-ns': 'main',
-  'surreal-db': 'example',
-  Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
-};
+const ROOT_HEADERS = upstreamHeaders();
 
 async function rootQuery<T = unknown>(body: string): Promise<T> {
-  const resp = await fetch('http://localhost:8666/sql', {
+  const resp = await fetch(UPSTREAM.url, {
     method: 'POST',
     headers: ROOT_HEADERS,
     body,

@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Browser } from '@playwright/test';
+import { UPSTREAM, upstreamHeaders } from '../fixtures/target';
 import {
   registerUser,
   loginUser,
@@ -25,14 +26,9 @@ test.afterEach(async () => {
 });
 
 async function upstream<T>(sql: string): Promise<T[]> {
-  const resp = await fetch('http://localhost:8666/sql', {
+  const resp = await fetch(UPSTREAM.url, {
     method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'surreal-ns': 'main',
-      'surreal-db': 'example',
-      Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
-    },
+    headers: upstreamHeaders(),
     body: sql,
   });
   const body = (await resp.json()) as Array<{ result?: T[] }>;

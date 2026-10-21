@@ -1,3 +1,4 @@
+import { UPSTREAM, upstreamHeaders } from '../fixtures/target';
 import {
   test,
   expect,
@@ -88,14 +89,9 @@ test.describe.serial('Thread CRUD operations', () => {
     // upstream first decouples the round-trip check from UI timing.
     let upstreamSeen = false;
     for (let i = 0; i < 30 && !upstreamSeen; i++) {
-      const resp = await fetch('http://localhost:8666/sql', {
+      const resp = await fetch(UPSTREAM.url, {
         method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'surreal-ns': 'main',
-          'surreal-db': 'example',
-          Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
-        },
+        headers: upstreamHeaders(),
         body: 'SELECT id, title FROM thread',
       });
       const body = (await resp.json()) as Array<{ result?: Array<{ title?: string }> }>;
@@ -208,14 +204,9 @@ test.describe.serial('Thread CRUD operations', () => {
     // sub-query, which has a separate reactivity story.
     let upstreamSeen = false;
     for (let i = 0; i < 30 && !upstreamSeen; i++) {
-      const resp = await fetch('http://localhost:8666/sql', {
+      const resp = await fetch(UPSTREAM.url, {
         method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'surreal-ns': 'main',
-          'surreal-db': 'example',
-          Authorization: 'Basic ' + Buffer.from('root:root').toString('base64'),
-        },
+        headers: upstreamHeaders(),
         body: 'SELECT id, content FROM comment',
       });
       const body = (await resp.json()) as Array<{ result?: Array<{ content?: string }> }>;

@@ -1,4 +1,5 @@
 import { test, expect, uniqueUser, registerUser } from '../fixtures/test-fixtures';
+import { SSP_URL } from '../fixtures/target';
 
 // Smoke test for `refMode: single` (the legacy shared `_00_list_ref`).
 // Requires the stack to be running with `SPKY_SSP_REF_MODE=single`
@@ -40,7 +41,7 @@ async function detectRefMode(): Promise<'single' | 'dedicated' | 'unknown'> {
   // endpoint (no auth). Probing it directly keeps the test from
   // having to read sp00ky.yml.
   try {
-    const resp = await fetch('http://localhost:8667/info');
+    const resp = await fetch(`${SSP_URL}/info`);
     if (!resp.ok) return 'unknown';
     const body = (await resp.json()) as Array<{ ref_mode?: string }>;
     const mode = body?.[0]?.ref_mode;

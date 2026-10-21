@@ -1,3 +1,4 @@
+import { UPSTREAM, UPSTREAM_ORIGIN } from '../fixtures/target';
 import {
   test,
   expect,
@@ -24,10 +25,10 @@ import {
  * `data-testid` elements.
  */
 
-const SURREAL_URL = 'http://localhost:8666';
-const NS = 'main';
-const DB = 'example';
-const ROOT_AUTH = 'Basic ' + Buffer.from('root:root').toString('base64');
+const SURREAL_URL = UPSTREAM_ORIGIN;
+const NS = UPSTREAM.ns;
+const DB = UPSTREAM.db;
+const ROOT_AUTH = UPSTREAM.authorization;
 const FLAG_KEY = 'demo'; // matches FeatureFlagDemo's useFeatureFlag('demo')
 
 async function rootSql(query: string): Promise<unknown> {

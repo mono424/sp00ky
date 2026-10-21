@@ -5,6 +5,7 @@ import 'package:spooky_core/src/mutation/push_saga.dart';
 import 'package:spooky_core/src/mutation/rows.dart';
 import 'package:spooky_core/src/state/client_state.dart';
 import 'package:spooky_core/src/state/reducers.dart' as r;
+import 'package:spooky_core/src/surreal/value.dart';
 import 'package:spooky_core/src/testing/build.dart';
 import 'package:spooky_core/src/testing/run_pure.dart';
 import 'package:spooky_core/src/types.dart';
@@ -69,11 +70,14 @@ void main() {
       expect(out.dispatched.whereType<SyncOutcome>().single.ok, isTrue);
     });
 
-    test('a rejected statement rolls back only that row', () async {
+    test(
+        'a rejected statement rolls back only that row; the rows the server '
+        'skipped after it go out again at once', () async {
       final docs = {
         '$pendingTable:m1': pendingDoc('m1'),
         '$pendingTable:m2': pendingDoc('m2', recordId: 'thing:2'),
       };
+      final pushed = <List<String>>[];
       final out = await runPure<void>(
         (ctx) => drain(ctx, env()),
         state: buildState([], [
@@ -84,16 +88,35 @@ void main() {
         ]),
         handlers: defaults(over: {
           'local.get': storeWith(docs),
-          'remote.query': (_, __) => [
-                const StatementResult.err('permission denied'),
-                const StatementResult.ok(null),
-              ],
+          'remote.query': (e, __) {
+            final vars = (e as RemoteQuery).vars!;
+            pushed.add([
+              for (final k in vars.keys)
+                if (RegExp(r'^id\d+$').hasMatch(k))
+                  '${(vars[k] as RecordId).id}'
+            ]);
+            return pushed.length == 1
+                ? const [
+                    StatementResult.err('permission denied'),
+                    StatementResult.err('An error occurred: $batchSkipped'),
+                  ]
+                : const [StatementResult.ok(null)];
+          },
         }),
       );
+      expect(pushed, [
+        ['1', '2'],
+        ['2'],
+      ]);
       expect(out.state.outbox.map((i) => i.id), ['$pendingTable:m2']);
       expect(out.state.outbox.single.status, OutboxStatus.acked);
+      expect(out.state.outbox.single.attempts, 0);
       expect(out.state.failedCount, 1);
-      expect(out.emitted.whereType<MutationRolledBackEvent>(), hasLength(1));
+      expect(out.emitted.whereType<MutationRolledBackEvent>().single.mutationId,
+          '$pendingTable:m1');
+      expect(out.timers['outbox'], isNull);
+      expect(out.dispatched.whereType<SyncOutcome>().map((o) => o.ok),
+          everyElement(isTrue));
     });
 
     test('a transient server state keeps the tail queued instead of dropping it',

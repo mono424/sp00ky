@@ -286,29 +286,49 @@ export interface RemoteBatch {
 }
 
 /**
- * Many outbox rows as ONE multi-statement request. Statement i answers row i.
- * Each statement is its own transaction on the server, as before.
+ * What a statement of a `remoteBatch` throws instead of running, because an
+ * earlier statement in the same request failed.
+ */
+export const BATCH_SKIPPED = 'sp00ky: not run, an earlier statement in this batch failed';
+
+function remoteStatement(row: PendingMutationRow, i: number, vars: Vars): string {
+  vars[`id${i}`] = parseRecordIdString(row.recordId);
+  switch (row.mutationType) {
+    case 'create': {
+      const data = row.data ?? {};
+      const sets = Object.keys(data).map((key) => {
+        vars[`d${i}_${key}`] = data[key];
+        return `${key} = $d${i}_${key}`;
+      });
+      return `CREATE ONLY $id${i} SET ${sets.join(', ')}`;
+    }
+    case 'update':
+      vars[`data${i}`] = row.data ?? {};
+      return `UPDATE $id${i} MERGE $data${i}`;
+    case 'delete':
+      return `DELETE $id${i}`;
+  }
+}
+
+/**
+ * Many outbox rows as ONE multi-statement request. Statement i answers row i
+ * and is its own transaction on the server, as before, but the statements are
+ * chained: statement i binds `$ok<i>` only when it commits, and statement i+1
+ * throws `BATCH_SKIPPED` without touching anything unless `$ok<i>` is bound
+ * (a LET lives for one request only). So the server stops at the first
+ * failure: everything before it is committed, nothing after it ran.
+ *
+ * Without the chain, statements after a failed one ran anyway. A retryable
+ * failure at i left the rows after i queued although they had committed; the
+ * re-sent CREATE then read "already exists", was taken for a rejection and
+ * rolled back locally while the server kept the row. Acking them instead
+ * would have let a later write land before an earlier one it may depend on.
  */
 export function remoteBatch(rows: ReadonlyArray<PendingMutationRow>): RemoteBatch {
   const vars: Vars = {};
   const stmts = rows.map((row, i) => {
-    const rid = parseRecordIdString(row.recordId);
-    vars[`id${i}`] = rid;
-    switch (row.mutationType) {
-      case 'create': {
-        const data = row.data ?? {};
-        const sets = Object.keys(data).map((key) => {
-          vars[`d${i}_${key}`] = data[key];
-          return `${key} = $d${i}_${key}`;
-        });
-        return `CREATE ONLY $id${i} SET ${sets.join(', ')}`;
-      }
-      case 'update':
-        vars[`data${i}`] = row.data ?? {};
-        return `UPDATE $id${i} MERGE $data${i}`;
-      case 'delete':
-        return `DELETE $id${i}`;
-    }
+    const guard = i === 0 ? '' : `IF !$ok${i - 1} { THROW "${BATCH_SKIPPED}" }; `;
+    return `LET $ok${i} = { ${guard}${remoteStatement(row, i, vars)}; true }`;
   });
   return { sql: stmts.join(';\n'), vars };
 }

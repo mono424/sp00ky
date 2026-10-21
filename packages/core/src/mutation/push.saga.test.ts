@@ -6,11 +6,18 @@ import * as R from '../state/reducers';
 import { defaultEnv } from '../query/env';
 import { drain, loadOutbox, refreshFailedCount, rollback } from './push.saga';
 import type { StatementResult } from '../kernel/effects';
-import type { PendingMutationRow } from './rows';
+import { BATCH_SKIPPED, type PendingMutationRow } from './rows';
 
 const env = defaultEnv({ tables: [{ name: 'thing', columns: {} }] } as any, { outboxBatchSize: 2 });
 const ok = (result: unknown = null): StatementResult => ({ status: 'OK', result });
 const err = (error: string): StatementResult => ({ status: 'ERR', error });
+/** What SurrealDB answers for a chained statement whose predecessor failed. */
+const skipped = (): StatementResult => err(`An error occurred: ${BATCH_SKIPPED}`);
+/** The row numbers a pushed batch carries, from its `$id<i>` vars. */
+const pushedRows = (vars: Record<string, unknown>) =>
+  Object.keys(vars)
+    .filter((k) => /^id\d+$/.test(k))
+    .map((k) => String((vars[k] as RecordId).id));
 const pendingRow = (n: number, type: PendingMutationRow['mutationType'] = 'create', extra: Partial<PendingMutationRow> = {}) => ({
   id: `_00_pending_mutations:m${n}`,
   mutationType: type,
@@ -56,7 +63,10 @@ describe('drain', () => {
         },
       },
     });
-    expect(pushed).toEqual(['CREATE ONLY $id0 SET a = $d0_a;\nCREATE ONLY $id1 SET a = $d1_a', 'CREATE ONLY $id0 SET a = $d0_a']);
+    expect(pushed).toEqual([
+      `LET $ok0 = { CREATE ONLY $id0 SET a = $d0_a; true };\nLET $ok1 = { IF !$ok0 { THROW "${BATCH_SKIPPED}" }; CREATE ONLY $id1 SET a = $d1_a; true }`,
+      'LET $ok0 = { CREATE ONLY $id0 SET a = $d0_a; true }',
+    ]);
     expect(out.state.outbox.every((i) => i.status === 'acked' && i.ackedAt === 500)).toBe(true);
     expect(out.log.filter((e) => e.kind === 'local.query' && (e as any).sql === 'DELETE $mid')).toHaveLength(3);
     expect(out.emitted.filter((e) => e.type === 'mutation:settled')).toHaveLength(3);
@@ -64,34 +74,49 @@ describe('drain', () => {
     expect(out.dispatched.filter((d) => d.type === 'SyncOutcome')).toEqual([{ type: 'SyncOutcome', ok: true, error: undefined }, { type: 'SyncOutcome', ok: true, error: undefined }]);
   });
 
-  it('a rejected statement rolls back only that row; the rest of the batch is acked', async () => {
+  it('a rejected statement rolls back only that row; the rows the server skipped after it go out again at once', async () => {
+    const pushed: string[][] = [];
     const out = await runPure(drain(env), {
-      state: stateWith([1, 2]),
+      state: stateWith([1, 2, 3]),
       handlers: {
-        'local.query': (e: any) => (e.sql === 'SELECT * FROM $ids' ? [[pendingRow(1), pendingRow(2)]] : []),
-        'remote.query': () => [err('permission denied'), ok()],
+        'local.query': (e: any) =>
+          e.sql === 'SELECT * FROM $ids' ? [e.vars.ids.map((id: RecordId) => pendingRow(Number(String(id.id).slice(1))))] : [],
+        'remote.query': (e: any) => {
+          pushed.push(pushedRows(e.vars));
+          return pushed.length === 1 ? [err('permission denied'), skipped()] : e.sql.split(';\n').map(() => ok());
+        },
         'local.execute': () => undefined,
         'ssp.ingest': () => undefined,
       },
     });
-    expect(out.state.outbox.map((i) => [i.id, i.status])).toEqual([['_00_pending_mutations:m2', 'acked']]);
+    expect(pushed).toEqual([['1', '2'], ['2', '3']]);
+    expect(out.state.outbox.map((i) => [i.id, i.status, i.attempts])).toEqual([
+      ['_00_pending_mutations:m2', 'acked', 0],
+      ['_00_pending_mutations:m3', 'acked', 0],
+    ]);
     expect(out.state.failedCount).toBe(1);
-    expect(out.emitted).toContainEqual(expect.objectContaining({ type: 'mutation:rolled-back', mutationId: '_00_pending_mutations:m1', error: 'permission denied' }));
-    expect(out.dispatched.at(-1)).toEqual({ type: 'SyncOutcome', ok: true, error: undefined });
+    expect(out.emitted.filter((e) => e.type === 'mutation:rolled-back')).toEqual([
+      expect.objectContaining({ mutationId: '_00_pending_mutations:m1', error: 'permission denied' }),
+    ]);
+    expect(out.timers.has('outbox')).toBe(false);
+    expect(out.dispatched.filter((d) => d.type === 'SyncOutcome').every((d: any) => d.ok)).toBe(true);
   });
 
   it('a CRDT edit-log CREATE that finds its row already there is acked, any other duplicate rolls back', async () => {
     const logEnv = defaultEnv({ tables: [{ name: 'thing', columns: {} }, { name: 'doc__crdt_log', columns: {} }] } as any, { outboxBatchSize: 2 });
+    const logRow = pendingRow(1, 'create', { tableName: 'doc__crdt_log', recordId: 'doc__crdt_log:1' });
+    let calls = 0;
     const out = await runPure(drain(logEnv), {
       state: stateWith([1, 2]),
       handlers: {
         'local.query': (e: any) =>
-          e.sql === 'SELECT * FROM $ids'
-            ? [[pendingRow(1, 'create', { tableName: 'doc__crdt_log', recordId: 'doc__crdt_log:1' }), pendingRow(2)]]
-            : [],
-        'remote.query': () => [err('Database record `doc__crdt_log:1` already exists'), err('Database record `thing:2` already exists')],
+          e.sql === 'SELECT * FROM $ids' ? [[logRow, pendingRow(2)].filter((r) => e.vars.ids.some((id: RecordId) => r.id.endsWith(String(id.id))))] : [],
+        // The duplicate log row still stops the chain on the server: row 2 goes again on its own.
+        'remote.query': () =>
+          ++calls === 1 ? [err('Database record `doc__crdt_log:1` already exists'), skipped()] : [err('Database record `thing:2` already exists')],
       },
     });
+    expect(calls).toBe(2);
     expect(out.state.outbox.find((i) => i.id === '_00_pending_mutations:m1')?.status).toBe('acked');
     expect(out.state.outbox.some((i) => i.id === '_00_pending_mutations:m2')).toBe(false);
   });

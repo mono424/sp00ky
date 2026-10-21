@@ -143,7 +143,14 @@ describe('remoteBatch', () => {
       { id: 'm3', mutationType: 'delete', recordId: 'thing:3', tableName: 'thing', createdAt: 0, v: 2 },
       { id: 'm4', mutationType: 'update', recordId: 'thing:4', tableName: 'thing', createdAt: 0, v: 2 },
     ]);
-    expect(sql).toBe('CREATE ONLY $id0 SET a = $d0_a;\nUPDATE $id1 MERGE $data1;\nDELETE $id2;\nUPDATE $id3 MERGE $data3');
+    // Chained: each statement runs only if the one before it committed.
+    const skip = `IF !$ok0 { THROW "${rows.BATCH_SKIPPED}" }; `;
+    expect(sql.split(';\n')).toEqual([
+      'LET $ok0 = { CREATE ONLY $id0 SET a = $d0_a; true }',
+      `LET $ok1 = { ${skip}UPDATE $id1 MERGE $data1; true }`,
+      `LET $ok2 = { ${skip.replace('$ok0', '$ok1')}DELETE $id2; true }`,
+      `LET $ok3 = { ${skip.replace('$ok0', '$ok2')}UPDATE $id3 MERGE $data3; true }`,
+    ]);
     expect(vars).toEqual({
       id0: rid('thing', '1'),
       d0_a: 1,
@@ -153,7 +160,7 @@ describe('remoteBatch', () => {
       id3: rid('thing', '4'),
       data3: {},
     });
-    expect(rows.remoteBatch([{ id: 'm', mutationType: 'create', recordId: 'thing:9', tableName: 'thing', createdAt: 0, v: 2 }]).sql).toBe('CREATE ONLY $id0 SET ');
+    expect(rows.remoteBatch([{ id: 'm', mutationType: 'create', recordId: 'thing:9', tableName: 'thing', createdAt: 0, v: 2 }]).sql).toBe('LET $ok0 = { CREATE ONLY $id0 SET ; true }');
   });
 });
 

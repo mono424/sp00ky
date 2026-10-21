@@ -15,6 +15,7 @@ import type { OutEvent } from '../kernel/events';
 import type { StatementResult } from '../kernel/effects';
 import { mintMutationId } from './mutation-id';
 import { drain } from './push.saga';
+import { BATCH_SKIPPED } from './rows';
 import { write } from './write.saga';
 
 /**
@@ -59,7 +60,8 @@ function ingestPost(): string {
     .replace('{}', String(EVENT_TIMEOUT_SECS));
 }
 
-type SinkMode = 'ok' | '500' | '503' | 'hang';
+/** `flap` answers the next post 503, then switches itself back to `ok`. */
+type SinkMode = 'ok' | '500' | '503' | 'hang' | 'flap';
 
 /** Plays the scheduler's `/ingest` (and an app's own third-party endpoint). */
 function startSink(): Promise<{ server: Server; port: number; mode: { current: SinkMode }; hits: string[] }> {
@@ -69,6 +71,12 @@ function startSink(): Promise<{ server: Server; port: number; mode: { current: S
     req.resume();
     hits.push(`${req.method} ${req.url} ${mode.current}`);
     if (mode.current === 'hang') return; // never answers; SurrealDB's TIMEOUT fires
+    if (mode.current === 'flap') {
+      mode.current = 'ok';
+      res.writeHead(503);
+      res.end();
+      return;
+    }
     if (mode.current === 'ok') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{}');
@@ -196,14 +204,18 @@ describe('a write refused by a failed ingest post is retried, not rolled back (r
   const localRow = async (id: RecordId<string>) =>
     ((await local.query('SELECT * FROM ONLY $id', { id })) as [Record<string, unknown> | null])[0] ?? null;
   const rolledBack = (emitted: OutEvent[]) => emitted.filter((e) => e.type === 'mutation:rolled-back');
+  const rid = (recordId: string) => new RecordId('item', recordId.slice('item:'.length));
   const setEndpoint = (url: string) =>
     remote.query(`DEFINE PARAM OVERWRITE $sp00ky_endpoint VALUE '${url}' PERMISSIONS NONE`);
 
-  /** Queue a create locally, the way `db.create` does, and return the state with it in the outbox. */
-  async function queueCreate(recordId: string): Promise<ClientState> {
-    const created = await run(write(env, { kind: 'create', recordId, data: { title: recordId } }), buildState());
-    expect(created.state.outbox).toHaveLength(1);
-    return created.state;
+  /** Queue creates locally, the way `db.create` does, and return the state with them in the outbox. */
+  async function queueCreate(...recordIds: string[]): Promise<ClientState> {
+    let state = buildState();
+    for (const recordId of recordIds) {
+      state = (await run(write(env, { kind: 'create', recordId, data: { title: recordId } }), state)).state;
+    }
+    expect(state.outbox).toHaveLength(recordIds.length);
+    return state;
   }
 
   it.for([
@@ -240,6 +252,44 @@ describe('a write refused by a failed ingest post is retried, not rolled back (r
     expect(landed.emitted).toContainEqual(expect.objectContaining({ type: 'mutation:settled', recordId: `item:outage_${failure}` }));
     expect(landed.state.outbox.filter((i) => i.status === 'pending')).toEqual([]);
     expect(await remoteRow(id)).toMatchObject({ title: `item:outage_${failure}` });
+  });
+
+  it('an ingest post that fails once mid-batch: the batch stops there, then every write lands once', { timeout: 30_000 }, async (ctx) => {
+    if (!reachable) ctx.skip();
+    const tag = Math.random().toString(36).slice(2, 8);
+    const [a, b] = [`item:flap_a_${tag}`, `item:flap_b_${tag}`];
+    const state = await queueCreate(a, b);
+    const errorsBefore = statementErrors.length;
+
+    // The first post (item a's) answers 503, every later one 200. Statements
+    // used to run independently, so b committed while a was refused, stayed
+    // queued behind a's cut, and its re-sent CREATE then failed "already
+    // exists" and was rolled back locally while the server kept the row.
+    await setEndpoint(sinkUrl);
+    sink.mode.current = 'flap';
+    const cut = await run(drain(env), state);
+    const seen = statementErrors.slice(errorsBefore);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toMatch(/Error while processing event _00_item_mutation: .*503 Service Unavailable/);
+    expect(seen[1]).toContain(BATCH_SKIPPED);
+    expect(rolledBack(cut.emitted)).toEqual([]);
+    expect(cut.state.outbox.map((i) => [i.recordId, i.status])).toEqual([
+      [a, 'pending'],
+      [b, 'pending'],
+    ]);
+    expect(await remoteRow(rid(a))).toBeNull();
+    expect(await remoteRow(rid(b))).toBeNull();
+
+    const landed = await run(drain(env), cut.state);
+    expect(statementErrors.slice(errorsBefore + 2)).toEqual([]);
+    expect(rolledBack(landed.emitted)).toEqual([]);
+    expect(landed.emitted.filter((e) => e.type === 'mutation:settled').map((e: any) => e.recordId)).toEqual([a, b]);
+    expect(landed.state.outbox.filter((i) => i.status === 'pending')).toEqual([]);
+    expect(landed.state.failedCount).toBe(0);
+    for (const id of [a, b]) {
+      expect(await remoteRow(rid(id))).toMatchObject({ title: id });
+      expect(await localRow(rid(id))).toMatchObject({ title: id });
+    }
   });
 
   it.for([

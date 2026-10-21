@@ -64,7 +64,10 @@ Future<void> refreshFailedCount(Ctx ctx) async {
 /// statements per request, per-statement outcome. Accepted rows are acked (they
 /// stay in the overlay until membership names them), rejected rows are rolled
 /// back, a transport failure leaves the unsent tail queued behind a backoff
-/// timer.
+/// timer. The server stops a batch at its first failed statement
+/// ([remoteBatch]), so the rows after a rejection are sent again at once, and
+/// a re-sent row behind a retryable failure never ran before, so it cannot
+/// read "already exists".
 Future<void> drain(Ctx ctx, SagaEnv env) async {
   // A client with no endpoint has nothing to push to. Draining anyway would
   // fail every statement in a way the classifier reads as a rejection, and a
@@ -144,6 +147,9 @@ Future<void> drain(Ctx ctx, SagaEnv env) async {
         )));
         continue;
       }
+      // An earlier statement in this batch was rejected, so this one never
+      // ran: the next round sends it again.
+      if (res.error?.contains(batchSkipped) ?? false) break;
       if (classifySyncError(res.error) == 'network') {
         cutAt = i;
         break;

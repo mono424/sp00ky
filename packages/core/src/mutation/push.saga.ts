@@ -19,6 +19,7 @@ import {
   planRevert,
   remoteBatch,
   toOutboxItem,
+  BATCH_SKIPPED,
   FAILED_TABLE,
   type PendingMutationRow,
 } from './rows';
@@ -80,6 +81,9 @@ const isRepeatedLogCreate = (row: { mutationType: string; tableName: string }, e
  * per request, per-statement outcome. Accepted rows are acked (they stay in
  * the overlay until membership names them), rejected rows are rolled back,
  * a transport failure leaves the unsent tail queued behind a backoff timer.
+ * The server stops a batch at its first failed statement (`remoteBatch`), so
+ * the rows after a rejection are sent again at once, and a re-sent row behind
+ * a retryable failure never ran before, so it cannot read "already exists".
  */
 export function* drain(env: SagaEnv): Saga<void> {
   for (;;) {
@@ -147,6 +151,9 @@ export function* drain(env: SagaEnv): Saga<void> {
         yield fx.emit({ type: 'tabs:broadcast', message: { type: 'mutation-settled', mutationId: row.id, recordId: row.recordId, eventType: row.mutationType } });
         continue;
       }
+      // An earlier statement in this batch was rejected (or was a repeated
+      // log row), so this one never ran: the next round sends it again.
+      if (err.includes(BATCH_SKIPPED)) break;
       if (classifySyncError(new Error(err)) === 'network') {
         cutAt = i;
         break;

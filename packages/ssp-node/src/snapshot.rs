@@ -13,10 +13,12 @@
 //! journal (an import straight into SurrealDB) are not seen until the
 //! snapshot's age limit forces a rebuild, or an `/admin/reload`.
 //!
-//! [`SspNode::checkpoint_step`] keeps the images current: it rewrites the
-//! tables whose catch-up hash moved, a byte budget at a time (each step holds
-//! the host's storage for its writes), and trims the journal once every
-//! table's image covers a position.
+//! [`SspNode::checkpoint_step`] keeps the images current: for each table whose
+//! catch-up hash moved it appends a delta (the rows changed and removed since
+//! the table's watermark) to the table's chain, or writes a new base once the
+//! deltas outweigh it, a byte budget at a time (each step holds the host's
+//! storage for its writes), and trims the journal once every table's chain
+//! covers a position.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -37,8 +39,21 @@ pub const SNAPSHOT_FORMAT: u32 = 1;
 /// Images are only read back by the node version that wrote them.
 pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Writes one checkpoint file of a table.
+type WriteFile<'a> = dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<checkpoint::Written> + 'a;
+
 /// Records re-read per query during the catch-up.
 const CATCH_UP_CHUNK: usize = 500;
+
+/// Deltas on one base before the next write is a new base (each delta is a
+/// file to read back at the next warm start).
+pub const MAX_DELTAS: u32 = 16;
+
+/// The rule `apps/ssp/src/warm.rs` follows: rebase once the deltas would make
+/// up more than a third of what a warm start reads.
+fn deltas_outweigh(base_bytes: u64, delta_bytes: u64) -> bool {
+    delta_bytes * 2 > base_bytes
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WarmReport {
@@ -52,8 +67,10 @@ pub struct WarmReport {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CheckpointReport {
-    /// Tables whose image was rewritten.
+    /// Tables whose chain got a file.
     pub written: Vec<String>,
+    /// Of those, the ones that got a delta rather than a new base.
+    pub deltas: usize,
     pub bytes: u64,
     /// Tables still to write (the byte budget ran out).
     pub remaining: usize,
@@ -104,14 +121,19 @@ impl SspNode {
         let mut covered: HashMap<String, i64> = HashMap::new();
         for (table, table_meta) in &schema.tables {
             let loaded = images.get(table).and_then(|image| {
-                let bytes = store
-                    .read_image(image)
+                let (base, deltas) = store
+                    .read_files(image)
                     .map_err(|e| tracing::warn!(table = %table, error = %format!("{e:#}"), "reading a table image failed"))
                     .ok()?;
-                let (coll, _) = checkpoint::read_image(bytes)
+                // Sets the table's watermark at the chain's end, so the next
+                // checkpoint of it can be a delta.
+                let (coll, end) = checkpoint::read_table_bytes(base, deltas)
                     .map_err(|e| tracing::warn!(table = %table, error = %e, "unreadable table image"))
                     .ok()?;
-                let sound = coll.name == *table && xor_acc_to_hex(&coll.catchup_xor) == image.xor;
+                let sound = coll.name == *table
+                    && end.image_id == image.image_id
+                    && end.seq == image.seq
+                    && xor_acc_to_hex(&coll.catchup_xor) == image.xor;
                 sound.then_some((coll, image.covered_seq))
             });
             match loaded {
@@ -253,10 +275,9 @@ impl SspNode {
                 _ => dirty.push((table, xor)),
             }
         }
+        let mut marks = Vec::new();
         let mut iter = dirty.into_iter();
         for (table, xor) in iter.by_ref() {
-            let image_id = checkpoint::fresh_image_id();
-            let image = TableImage { table: table.clone(), image_id, covered_seq: covered, xor, bytes: 0 };
             let fresh;
             let coll = match circuit.store.collections.get(table) {
                 Some(coll) => coll,
@@ -265,9 +286,37 @@ impl SspNode {
                     &fresh
                 }
             };
-            let bytes = store.write_image(&image, &mut |out| {
-                checkpoint::write_collection(coll, image_id, out).map(|_| ())
+            // A delta when the table's watermark is this chain's end: the
+            // table was read from it or last written into it. Every write is
+            // marked below, and a cleared or replaced table has no watermark.
+            let tip = images.get(table).filter(|image| {
+                coll.rows.persisted().is_some()
+                    && image.seq < MAX_DELTAS
+                    && !deltas_outweigh(image.base_bytes, image.delta_bytes)
+            });
+            let prev_xor = tip.and_then(|image| ssp_protocol::snapshot_hash::xor_acc_from_hex(&image.xor));
+            let (image, mut write): (TableImage, Box<WriteFile<'_>>) =
+                match (tip, prev_xor) {
+                    (Some(tip), Some(prev_xor)) => {
+                        let (base, seq) = (tip.image_id, tip.seq + 1);
+                        let image = TableImage { seq, covered_seq: covered, xor, ..tip.clone() };
+                        (image, Box::new(move |out| checkpoint::write_delta(coll, base, seq, prev_xor, out)))
+                    }
+                    _ => {
+                        let image_id = checkpoint::fresh_image_id();
+                        let image = TableImage { table: table.clone(), image_id, seq: 0, covered_seq: covered, xor, ..TableImage::default() };
+                        (image, Box::new(move |out| checkpoint::write_collection(coll, image_id, out)))
+                    }
+                };
+            let mut mark = None;
+            let bytes = store.write_file(&image, &mut |out| {
+                mark = Some(write(out)?.mark);
+                Ok(())
             })?;
+            if let (Some(mark), true) = (mark, circuit.store.collections.contains_key(table)) {
+                marks.push((table.clone(), mark));
+            }
+            report.deltas += usize::from(image.seq > 0);
             report.written.push(table.clone());
             report.bytes += bytes;
             if report.bytes >= budget_bytes {
@@ -276,6 +325,16 @@ impl SspNode {
         }
         report.remaining = iter.count();
         drop(circuit);
+        // The files are in place: what they hold is persisted. A mark of a
+        // table cleared since is refused, and that table's next file is a base.
+        if !marks.is_empty() {
+            let mut circuit = self.processor.write().await;
+            for (table, mark) in marks {
+                if let Some(coll) = circuit.store.collections.get_mut(&table) {
+                    coll.rows.mark_persisted(mark);
+                }
+            }
+        }
 
         for table in images.keys().filter(|t| !schema.tables.contains_key(*t)) {
             store.drop_image(table)?;

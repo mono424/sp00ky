@@ -3916,7 +3916,19 @@ fn notice(table: &str, id: &str) -> ssp_protocol::IngestRequest {
 
 /// A node bootstrapped from the DB, checkpointed into a fresh store.
 async fn checkpointed() -> (Harness, ssp_node::MemorySnapshotStore) {
+    checkpointed_with(0).await
+}
+
+/// [`checkpointed`] with `extra` more thread rows, for a base that is not
+/// dwarfed by a delta's framing.
+async fn checkpointed_with(extra: usize) -> (Harness, ssp_node::MemorySnapshotStore) {
     let h = build(HarnessOpts { status: SspStatus::Bootstrapping, ..HarnessOpts::default() }).await;
+    if extra > 0 {
+        h.raw_db
+            .query(format!("FOR $i IN 0..{extra} {{ CREATE type::record('thread', 'x' + <string>$i) SET _00_rv = 1, title = 'filler'; }};"))
+            .await
+            .unwrap();
+    }
     h.raw_db
         .query(
             "DEFINE TABLE thread SCHEMALESS PERMISSIONS FOR select FULL;
@@ -4042,4 +4054,81 @@ async fn a_checkpoint_with_nothing_moved_reads_nothing_and_trims() {
     assert_eq!(h.db_queries.load(Ordering::SeqCst), 0);
     assert_eq!(report.trimmed_through, Some(seq));
     assert_eq!(store.journal_len(), 0);
+}
+
+async fn change(h: &Harness, surql: &str, ids: &[&str]) {
+    h.raw_db.query(surql).await.unwrap();
+    let notices = ids.iter().map(|id| notice("thread", id)).collect();
+    h.node.replay_notices(notices).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_change_after_a_checkpoint_is_written_as_a_delta_and_reads_back() {
+    let (h, store) = checkpointed_with(300).await;
+    change(&h, "UPDATE thread:a SET _00_rv = 2, title = 'a2'; DELETE thread:b;", &["thread:a", "thread:b"]).await;
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert_eq!((report.written.len(), report.deltas), (1, 1), "{report:?}");
+    let image = store.images().unwrap().into_iter().find(|i| i.table == "thread").unwrap();
+    assert_eq!(image.seq, 1);
+    assert!(image.delta_bytes < image.base_bytes, "{image:?}");
+
+    // Read back from the chain (no journal: everything is in the files), then
+    // extend the chain the warm start loaded.
+    store.trim_journal(i64::MAX).unwrap();
+    *h.node.processor.write().await = Circuit::new();
+    let warm = h.node.warm_bootstrap(&store, 3600).await.unwrap().expect("usable");
+    assert_eq!(warm.tables_from_images, 2);
+    {
+        let circuit = h.node.processor.read().await;
+        assert_eq!(circuit.record("thread", "thread:a").unwrap()["title"], "a2");
+        assert!(!circuit.contains("thread", "thread:b"));
+        assert_eq!(circuit.record("thread", "thread:c").unwrap()["title"], "c1");
+    }
+    change(&h, "CREATE thread:e SET _00_rv = 1, title = 'e1';", &["thread:e"]).await;
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert_eq!(report.deltas, 1, "{report:?}");
+    let image = store.images().unwrap().into_iter().find(|i| i.table == "thread").unwrap();
+    assert_eq!(image.seq, 2);
+    *h.node.processor.write().await = Circuit::new();
+    h.node.warm_bootstrap(&store, 3600).await.unwrap().expect("usable");
+    assert_eq!(h.node.processor.read().await.record("thread", "thread:e").unwrap()["title"], "e1");
+}
+
+#[tokio::test]
+async fn deltas_that_outweigh_the_base_rebase_it() {
+    let (h, store) = checkpointed().await;
+    let base_id = store.images().unwrap().into_iter().find(|i| i.table == "thread").unwrap().image_id;
+    // Rewrite every row a few times: the deltas soon carry more than the base.
+    let mut rebased = false;
+    for round in 2..8 {
+        change(
+            &h,
+            &format!("UPDATE thread SET _00_rv = {round}, title = 'r{round}';"),
+            &["thread:a", "thread:b", "thread:c"],
+        )
+        .await;
+        h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+        let image = store.images().unwrap().into_iter().find(|i| i.table == "thread").unwrap();
+        if image.image_id != base_id {
+            assert_eq!(image.seq, 0);
+            rebased = true;
+            break;
+        }
+    }
+    assert!(rebased, "a chain whose deltas outweigh its base gets a new base");
+    *h.node.processor.write().await = Circuit::new();
+    h.node.warm_bootstrap(&store, 3600).await.unwrap().expect("usable");
+    assert!(h.node.processor.read().await.record("thread", "thread:a").unwrap()["title"].as_str().unwrap().starts_with('r'));
+}
+
+#[tokio::test]
+async fn a_rebuilt_table_gets_a_base_not_a_delta() {
+    let (h, store) = checkpointed().await;
+    // A rebuild (reload, schema change) loses the watermark.
+    *h.node.processor.write().await = Circuit::new();
+    ssp_node::Runtime::new(Arc::clone(&h.node)).bootstrap().await;
+    change(&h, "UPDATE thread:a SET _00_rv = 2, title = 'a2';", &["thread:a"]).await;
+    let report = h.node.checkpoint_step(&store, u64::MAX).await.unwrap();
+    assert_eq!((report.written.len(), report.deltas), (1, 0), "{report:?}");
+    assert_eq!(store.images().unwrap().into_iter().find(|i| i.table == "thread").unwrap().seq, 0);
 }

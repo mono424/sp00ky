@@ -1,10 +1,11 @@
-//! [`SnapshotStore`] over the Durable Object's SQLite: one FORMAT 2 image per
-//! table in 1 MiB parts (a row holds at most 2 MB), the snapshot meta in
+//! [`SnapshotStore`] over the Durable Object's SQLite: one FORMAT 2 chain per
+//! table (a base and its deltas, each file in 1 MiB parts: a row holds at most
+//! 2 MB), the snapshot meta in
 //! `ssp_meta`, and the change journal, which is the inbox (`ssp_inbox`) with
 //! its applied rows kept until every image covers them.
 //!
-//! All of it is synchronous SQLite, so one table's parts, its manifest row and
-//! the removal of its previous image are written in one event with no await
+//! All of it is synchronous SQLite, so a file's parts, its manifest row and
+//! the removal of a replaced chain are written in one event with no await
 //! between them, and the Durable Object commits them together.
 
 use std::io;
@@ -20,11 +21,12 @@ const PART: usize = 1 << 20;
 
 pub const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS snap_table (
-        tbl TEXT PRIMARY KEY, image_id TEXT NOT NULL, covered_seq INTEGER NOT NULL,
-        xor TEXT NOT NULL, bytes INTEGER NOT NULL);
+        tbl TEXT PRIMARY KEY, image_id TEXT NOT NULL, seq INTEGER NOT NULL,
+        covered_seq INTEGER NOT NULL, xor TEXT NOT NULL,
+        base_bytes INTEGER NOT NULL, delta_bytes INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS snap_part (
-        tbl TEXT NOT NULL, image_id TEXT NOT NULL, part INTEGER NOT NULL, data BLOB NOT NULL,
-        PRIMARY KEY (tbl, image_id, part));";
+        tbl TEXT NOT NULL, image_id TEXT NOT NULL, seq INTEGER NOT NULL, part INTEGER NOT NULL,
+        data BLOB NOT NULL, PRIMARY KEY (tbl, image_id, seq, part));";
 
 const META_KEY: &str = "snapshot";
 
@@ -48,11 +50,12 @@ fn text(row: &serde_json::Value, key: &str) -> String {
     row.get(key).and_then(serde_json::Value::as_str).unwrap_or_default().to_string()
 }
 
-/// `Write` that cuts the stream into `PART`-sized rows of one image.
+/// `Write` that cuts the stream into `PART`-sized rows of one file.
 struct PartWriter<'a> {
     sql: &'a SqlStorage,
     tbl: &'a str,
     image_id: &'a str,
+    seq: u32,
     part: i64,
     buf: Vec<u8>,
     total: u64,
@@ -63,8 +66,14 @@ impl PartWriter<'_> {
         let view = js_sys::Uint8Array::from(&self.buf[..upto]);
         self.sql
             .exec_raw(
-                "INSERT OR REPLACE INTO snap_part (tbl, image_id, part, data) VALUES (?, ?, ?, ?)",
-                vec![self.tbl.into(), self.image_id.into(), (self.part as f64).into(), view.into()],
+                "INSERT OR REPLACE INTO snap_part (tbl, image_id, seq, part, data) VALUES (?, ?, ?, ?, ?)",
+                vec![
+                    self.tbl.into(),
+                    self.image_id.into(),
+                    (self.seq as f64).into(),
+                    (self.part as f64).into(),
+                    view.into(),
+                ],
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.part += 1;
@@ -113,66 +122,66 @@ impl SnapshotStore for CfSnapshot {
 
     fn images(&self) -> anyhow::Result<Vec<TableImage>> {
         let sql = self.storage.sql();
-        Ok(rows(&sql, "SELECT tbl, image_id, covered_seq, xor, bytes FROM snap_table", vec![])?
+        Ok(rows(&sql, "SELECT tbl, image_id, seq, covered_seq, xor, base_bytes, delta_bytes FROM snap_table", vec![])?
             .iter()
             .filter_map(|r| {
                 Some(TableImage {
                     table: text(r, "tbl"),
                     image_id: text(r, "image_id").parse().ok()?,
+                    seq: int(r, "seq") as u32,
                     covered_seq: int(r, "covered_seq"),
                     xor: text(r, "xor"),
-                    bytes: int(r, "bytes") as u64,
+                    base_bytes: int(r, "base_bytes") as u64,
+                    delta_bytes: int(r, "delta_bytes") as u64,
                 })
             })
             .collect())
     }
 
-    /// Parts copied straight into one buffer sized from the manifest: one copy
-    /// out of SQLite, no regrowth, and `read_image` adopts the buffer as the
-    /// table's arena (spike S1).
-    fn read_image(&self, image: &TableImage) -> anyhow::Result<Vec<u8>> {
-        let mut buf: Vec<u8> = Vec::with_capacity(image.bytes as usize);
-        let cursor = self
-            .storage
-            .sql()
-            .exec(
-                "SELECT data FROM snap_part WHERE tbl = ? AND image_id = ? ORDER BY part",
-                vec![image.table.clone().into(), image.image_id.to_string().into()],
-            )
-            .map_err(err)?;
-        let key = wasm_bindgen::JsValue::from_str("data");
-        for row in cursor {
-            let row = row.map_err(err)?;
-            let data = js_sys::Reflect::get(&row, &key).map_err(|e| err(format!("{e:?}")))?;
-            let part = js_sys::Uint8Array::new(&data.unchecked_into::<js_sys::ArrayBuffer>());
-            let n = part.length() as usize;
-            if buf.len() + n > buf.capacity() {
-                anyhow::bail!("image parts of {} exceed the manifest's {} bytes", image.table, image.bytes);
+    /// Each file's parts copied straight into one buffer sized from its
+    /// parts: one copy out of SQLite, no regrowth, and the base buffer becomes
+    /// the table's arena (spike S1).
+    fn read_files(&self, image: &TableImage) -> anyhow::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+        let sql = self.storage.sql();
+        let image_id = image.image_id.to_string();
+        let sizes = rows(
+            &sql,
+            "SELECT seq, SUM(length(data)) AS n FROM snap_part WHERE tbl = ? AND image_id = ? GROUP BY seq ORDER BY seq",
+            vec![image.table.clone().into(), image_id.clone().into()],
+        )?;
+        let mut files = Vec::with_capacity(sizes.len());
+        for (expected, row) in sizes.iter().enumerate() {
+            let seq = int(row, "seq");
+            if seq != expected as i64 {
+                anyhow::bail!("chain of {} is missing file {expected}", image.table);
             }
-            // Safety: exactly `n` bytes go into spare capacity checked above,
-            // and the length moves only after the copy.
-            unsafe {
-                part.raw_copy_to_ptr(buf.as_mut_ptr().add(buf.len()));
-                buf.set_len(buf.len() + n);
-            }
+            files.push(read_file(&sql, &image.table, &image_id, seq, int(row, "n") as usize)?);
         }
-        if buf.len() as u64 != image.bytes {
-            anyhow::bail!("image of {} has {} of {} bytes", image.table, buf.len(), image.bytes);
+        if files.len() != image.seq as usize + 1 {
+            anyhow::bail!("chain of {} has {} files, the manifest {}", image.table, files.len(), image.seq + 1);
         }
-        Ok(buf)
+        let base = files.remove(0);
+        Ok((base, files))
     }
 
-    fn write_image(
+    fn write_file(
         &self,
         image: &TableImage,
         write: &mut dyn FnMut(&mut dyn io::Write) -> io::Result<()>,
     ) -> anyhow::Result<u64> {
         let sql = self.storage.sql();
         let image_id = image.image_id.to_string();
+        if image.seq > 0 {
+            let current = self.images()?.into_iter().find(|i| i.table == image.table);
+            if !current.is_some_and(|c| c.image_id == image.image_id && c.seq + 1 == image.seq) {
+                anyhow::bail!("delta {} does not extend {}'s chain", image.seq, image.table);
+            }
+        }
         let mut out = PartWriter {
             sql: &sql,
             tbl: &image.table,
             image_id: &image_id,
+            seq: image.seq,
             part: 0,
             buf: Vec::with_capacity(PART + 64 * 1024),
             total: 0,
@@ -180,29 +189,44 @@ impl SnapshotStore for CfSnapshot {
         let written = write(&mut out).and_then(|_| out.finish());
         if let Err(e) = written {
             let _ = sql.exec(
-                "DELETE FROM snap_part WHERE tbl = ? AND image_id = ?",
-                vec![image.table.clone().into(), image_id.clone().into()],
+                "DELETE FROM snap_part WHERE tbl = ? AND image_id = ? AND seq = ?",
+                vec![image.table.clone().into(), image_id.clone().into(), (image.seq as i64).into()],
             );
             return Err(err(e));
         }
-        let total = out.total;
-        sql.exec(
-            "INSERT OR REPLACE INTO snap_table (tbl, image_id, covered_seq, xor, bytes) VALUES (?, ?, ?, ?, ?)",
-            vec![
-                image.table.clone().into(),
-                image_id.clone().into(),
-                image.covered_seq.into(),
-                image.xor.clone().into(),
-                (total as i64).into(),
-            ],
-        )
-        .map_err(err)?;
-        sql.exec(
-            "DELETE FROM snap_part WHERE tbl = ? AND image_id != ?",
-            vec![image.table.clone().into(), image_id.into()],
-        )
-        .map_err(err)?;
-        Ok(total)
+        let total = out.total as i64;
+        if image.seq == 0 {
+            sql.exec(
+                "INSERT OR REPLACE INTO snap_table (tbl, image_id, seq, covered_seq, xor, base_bytes, delta_bytes) \
+                 VALUES (?, ?, 0, ?, ?, ?, 0)",
+                vec![
+                    image.table.clone().into(),
+                    image_id.clone().into(),
+                    image.covered_seq.into(),
+                    image.xor.clone().into(),
+                    total.into(),
+                ],
+            )
+            .map_err(err)?;
+            sql.exec(
+                "DELETE FROM snap_part WHERE tbl = ? AND image_id != ?",
+                vec![image.table.clone().into(), image_id.into()],
+            )
+            .map_err(err)?;
+        } else {
+            sql.exec(
+                "UPDATE snap_table SET seq = ?, covered_seq = ?, xor = ?, delta_bytes = delta_bytes + ? WHERE tbl = ?",
+                vec![
+                    (image.seq as i64).into(),
+                    image.covered_seq.into(),
+                    image.xor.clone().into(),
+                    total.into(),
+                    image.table.clone().into(),
+                ],
+            )
+            .map_err(err)?;
+        }
+        Ok(total as u64)
     }
 
     fn set_covered(&self, table: &str, covered_seq: i64) -> anyhow::Result<()> {
@@ -262,4 +286,35 @@ impl SnapshotStore for CfSnapshot {
             .map_err(err)?;
         Ok(())
     }
+}
+
+/// One file of a chain, into a buffer of exactly `bytes`.
+fn read_file(sql: &SqlStorage, tbl: &str, image_id: &str, seq: i64, bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(bytes);
+    let cursor = sql
+        .exec(
+            "SELECT data FROM snap_part WHERE tbl = ? AND image_id = ? AND seq = ? ORDER BY part",
+            vec![tbl.into(), image_id.into(), seq.into()],
+        )
+        .map_err(err)?;
+    let key = wasm_bindgen::JsValue::from_str("data");
+    for row in cursor {
+        let row = row.map_err(err)?;
+        let data = js_sys::Reflect::get(&row, &key).map_err(|e| err(format!("{e:?}")))?;
+        let part = js_sys::Uint8Array::new(&data.unchecked_into::<js_sys::ArrayBuffer>());
+        let n = part.length() as usize;
+        if buf.len() + n > buf.capacity() {
+            anyhow::bail!("parts of {tbl} file {seq} exceed {bytes} bytes");
+        }
+        // Safety: exactly `n` bytes go into spare capacity checked above, and
+        // the length moves only after the copy.
+        unsafe {
+            part.raw_copy_to_ptr(buf.as_mut_ptr().add(buf.len()));
+            buf.set_len(buf.len() + n);
+        }
+    }
+    if buf.len() != bytes {
+        anyhow::bail!("{tbl} file {seq} has {} of {bytes} bytes", buf.len());
+    }
+    Ok(buf)
 }

@@ -82,14 +82,25 @@ pub trait Arena: std::fmt::Debug + Send + Sync {
     fn clear(&mut self);
 }
 
-/// In-memory arena: one growable byte buffer.
+/// Bytes one heap segment grows to before appends move to the next.
+const HEAP_SEGMENT_BYTES: usize = 4 << 20;
+
+/// In-memory arena: a chain of byte buffers.
 ///
-/// A single segment is enough here because nothing needs to unmap or reclaim
-/// address space; segmentation only earns its keep against a file-backed
-/// implementation, which can then drop a whole segment at once.
+/// One growable buffer used to be enough, but a buffer adopted from a
+/// checkpoint image is exactly as long as the image, so the first append
+/// after a restore reallocated it to twice the table's size (spike S1: a 50 MB
+/// image took the Durable Object from 54.5 to 154.4 MiB, against a 128 MB
+/// ceiling). An adopted image is therefore a sealed segment that is never
+/// written into, and appends go to segments that grow geometrically up to
+/// `HEAP_SEGMENT_BYTES`, then start the next one: growth costs at most one
+/// segment's worth, not the table's. Spans are offsets within a segment, so
+/// a segment reallocating while it grows moves nothing a slot holds.
 #[derive(Debug, Default)]
 pub struct HeapArena {
-    buf: Vec<u8>,
+    segs: Vec<Vec<u8>>,
+    /// The leading segments that are adopted images.
+    sealed: usize,
     live: u64,
     dead: u64,
 }
@@ -101,29 +112,52 @@ impl HeapArena {
 
     pub fn with_capacity(bytes: usize) -> Self {
         Self {
-            buf: Vec::with_capacity(bytes),
-            live: 0,
-            dead: 0,
+            segs: vec![Vec::with_capacity(bytes)],
+            ..Self::default()
         }
     }
 
     /// An arena over bytes that already hold records: a checkpoint image
-    /// adopted as is. `live` is the part a slot references; the rest (the
-    /// image's framing) is accounted dead from the start, and the next
-    /// compaction drops it.
+    /// adopted as is, as segment 0. `live` is the part a slot references; the
+    /// rest (the image's framing) is accounted dead from the start, and the
+    /// next compaction drops it.
     pub fn from_buf(buf: Vec<u8>, live: u64) -> Self {
         let dead = (buf.len() as u64).saturating_sub(live);
-        Self { buf, live, dead }
+        Self { segs: vec![buf], sealed: 1, live, dead }
+    }
+
+    /// Segments held, sealed ones included.
+    pub fn segment_count(&self) -> usize {
+        self.segs.len()
+    }
+
+    /// The segment the next append writes into, opened when the last one is
+    /// sealed or full.
+    fn writable(&mut self, incoming: usize) -> usize {
+        let open = self.segs.len() > self.sealed
+            && self.segs.last().is_some_and(|seg| seg.is_empty() || seg.len() + incoming <= HEAP_SEGMENT_BYTES);
+        if !open {
+            self.segs.push(Vec::new());
+        }
+        self.segs.len() - 1
     }
 }
 
 impl Arena for HeapArena {
     fn append(&mut self, bytes: &[u8]) -> Span {
-        let off = self.buf.len() as u32;
-        self.buf.extend_from_slice(bytes);
+        let idx = self.writable(bytes.len());
+        let seg = &mut self.segs[idx];
+        let needed = seg.len() + bytes.len();
+        if needed > seg.capacity() {
+            // Double, but not past the segment size (one record may be).
+            let target = (seg.capacity() * 2).clamp(needed, HEAP_SEGMENT_BYTES.max(needed));
+            seg.reserve_exact(target - seg.len());
+        }
+        let off = seg.len() as u32;
+        seg.extend_from_slice(bytes);
         self.live += bytes.len() as u64;
         Span {
-            seg: 0,
+            seg: idx as u16,
             off,
             len: bytes.len() as u32,
         }
@@ -132,7 +166,10 @@ impl Arena for HeapArena {
     fn get(&self, span: Span) -> &[u8] {
         let start = span.off as usize;
         let end = start.saturating_add(span.len as usize);
-        self.buf.get(start..end).unwrap_or(&[])
+        self.segs
+            .get(span.seg as usize)
+            .and_then(|seg| seg.get(start..end))
+            .unwrap_or(&[])
     }
 
     fn free(&mut self, span: Span) {
@@ -155,18 +192,24 @@ impl Arena for HeapArena {
     }
 
     fn capacity_bytes(&self) -> u64 {
-        self.buf.capacity() as u64
+        self.segs.iter().map(|seg| seg.capacity() as u64).sum()
     }
 
     fn end_cursor(&self) -> Cursor {
-        Cursor {
-            seg: 0,
-            off: self.buf.len() as u32,
+        match self.segs.last() {
+            None => Cursor::default(),
+            // The next append opens a segment after the image.
+            Some(_) if self.segs.len() <= self.sealed => Cursor { seg: self.segs.len() as u16, off: 0 },
+            Some(seg) => Cursor {
+                seg: (self.segs.len() - 1) as u16,
+                off: seg.len() as u32,
+            },
         }
     }
 
     fn clear(&mut self) {
-        self.buf.clear();
+        self.segs.clear();
+        self.sealed = 0;
         self.live = 0;
         self.dead = 0;
     }
@@ -626,6 +669,40 @@ mod tests {
                 len: u32::MAX
             })
             .is_empty());
+    }
+
+    /// An adopted image is never grown: the first append after a restore
+    /// opens a segment instead of doubling the table (spike S1).
+    #[test]
+    fn an_adopted_image_is_not_regrown_by_appends() {
+        let image = vec![7u8; 1 << 20];
+        let mut a = HeapArena::from_buf(image, 1 << 20);
+        let before = a.capacity_bytes();
+        assert_eq!(a.end_cursor(), Cursor { seg: 1, off: 0 });
+        let s = a.append(b"new row");
+        assert_eq!(s.seg, 1);
+        assert_eq!(a.get(s), b"new row");
+        assert_eq!(a.get(Span { seg: 0, off: 10, len: 3 }), &[7, 7, 7]);
+        assert!(a.capacity_bytes() < before + 64, "grew by {}", a.capacity_bytes() - before);
+        assert!(Span { seg: 0, off: 9, len: 1 }.start() < s.start());
+    }
+
+    #[test]
+    fn heap_segments_cap_their_growth() {
+        let mut a = HeapArena::new();
+        let row = vec![1u8; 100 * 1024];
+        let spans: Vec<Span> = (0..100).map(|_| a.append(&row)).collect();
+        assert!(a.segment_count() >= 3, "{} segments", a.segment_count());
+        assert!(a.capacity_bytes() <= 10 * 1024 * 1024 + 2 * HEAP_SEGMENT_BYTES as u64);
+        for w in spans.windows(2) {
+            assert!(w[0].start() < w[1].start(), "append order is total");
+        }
+        assert!(spans.iter().all(|s| a.get(*s).len() == row.len()));
+        // A record larger than a segment still fits, alone.
+        let big = vec![2u8; HEAP_SEGMENT_BYTES + 1];
+        let s = a.append(&big);
+        assert_eq!(a.get(s).len(), big.len());
+        assert_eq!(a.end_cursor(), Cursor { seg: s.seg, off: big.len() as u32 });
     }
 
     #[test]

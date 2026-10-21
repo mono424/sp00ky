@@ -89,7 +89,6 @@
 use crate::circuit::arena::ImageRef;
 use crate::circuit::arena::{Arena, HeapArena};
 use crate::circuit::row_codec::{self as codec, FieldDict, RECORD_FORMAT};
-#[cfg(not(target_arch = "wasm32"))]
 use crate::circuit::row_table::AbsorbInto;
 pub use crate::circuit::row_table::CheckpointMark;
 use crate::circuit::row_table::{IndexedHeads, RowTable};
@@ -837,7 +836,6 @@ pub fn load_table(
 }
 
 /// Where a chain of files stands: what the next delta has to declare.
-#[cfg(not(target_arch = "wasm32"))]
 struct Chain {
     name: String,
     image_id: ImageId,
@@ -846,7 +844,6 @@ struct Chain {
     field_names: Vec<String>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Chain {
     fn from_base(image: &Image<'_>) -> Self {
         Self {
@@ -902,7 +899,6 @@ impl Chain {
 /// Absorb one checked delta into `rows`, extend the dictionary and fold the
 /// hash. `Err` when the rows do not add up to what the delta declares, in
 /// which case the index was already changed.
-#[cfg(not(target_arch = "wasm32"))]
 fn absorb_delta(
     rows: &mut RowTable,
     xor: &mut [u8; XOR_LEN],
@@ -922,6 +918,53 @@ fn absorb_delta(
         return Err(invalid("rows do not add up to the delta's stored catch-up hash"));
     }
     Ok(())
+}
+
+/// Where a chain read by [`read_table_bytes`] ends: what the next delta has
+/// to declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainEnd {
+    pub image_id: ImageId,
+    pub seq: u32,
+    pub xor: [u8; XOR_LEN],
+}
+
+/// A base image and its deltas, all in memory: what a host whose files are
+/// not paths loads (a Durable Object keeps them in SQLite). The base buffer
+/// becomes the arena's sealed first segment, as in [`read_image`]; delta
+/// records are copied in after it. Every delta must chain onto the one
+/// before; one that does not fails the whole load, and the caller reads the
+/// table from its source instead. The table's watermark is set at the end, so
+/// the next checkpoint can be a delta of this chain.
+pub fn read_table_bytes(base: Vec<u8>, deltas: Vec<Vec<u8>>) -> Result<(Collection, ChainEnd), CheckpointError> {
+    if parse_identity(&base)?.format != FORMAT {
+        return Err(invalid("not a current-format base image"));
+    }
+    let header = parse_header(&base)?;
+    if header.seq != 0 {
+        return Err(invalid("a delta where the base image belongs"));
+    }
+    let mut chain = Chain::from_base(&header);
+    let ix = index_parsed(&base, header)?;
+    if blake3::hash(&base[ix.bodies.clone()]).as_bytes() != &ix.bodies_hash {
+        return Err(invalid("bodies checksum mismatch"));
+    }
+    let image_id = ix.image_id;
+    let mut xor = ix.stored_xor;
+    let live = ix.heads.live;
+    let (name, dict, index) = (ix.name, ix.dict, ix.heads.index);
+    let mut rows = RowTable::from_parts(dict, index, Box::new(HeapArena::from_buf(base, live)));
+    for delta in deltas {
+        let image = chain.check(&delta)?;
+        if blake3::hash(&delta[image.bodies.clone()]).as_bytes() != &image.bodies_hash {
+            return Err(invalid("delta bodies checksum mismatch"));
+        }
+        absorb_delta(&mut rows, &mut xor, &delta, &image, AbsorbInto::Copy)?;
+        chain.advance(&image);
+    }
+    rows.set_persisted_at_end();
+    let end = ChainEnd { image_id, seq: chain.seq, xor };
+    Ok((Collection::from_rows(name, rows, xor), end))
 }
 
 /// [`load_table`] on the heap: every file is read whole and its bodies
@@ -2034,6 +2077,58 @@ mod tests {
             deltas.push(path);
         }
         (base, deltas)
+    }
+
+    /// The in-memory reader takes the same chain the file reader does, and
+    /// leaves the table ready for its next delta.
+    #[test]
+    fn a_chain_reads_back_from_memory_and_extends() {
+        let mut coll = collection(&[("a", json!({ "v": 1 })), ("b", json!({ "v": 1 })), ("c", json!({ "v": 1 }))]);
+        let mut base = Vec::new();
+        let written = write_collection(&coll, ID, &mut base).unwrap();
+        assert!(coll.rows.mark_persisted(written.mark));
+        let mut prev = coll.catchup_xor;
+        let mut deltas = Vec::new();
+        let steps: [&dyn Fn(&mut Collection); 2] = [
+            &|c| {
+                c.apply(Operation::Update, "a", Sp00kyValue::from(json!({ "v": 2 })));
+                c.apply(Operation::Delete, "b", Sp00kyValue::Null);
+            },
+            &|c| {
+                c.apply(Operation::Create, "d", Sp00kyValue::from(json!({ "v": 4 })));
+            },
+        ];
+        for (i, step) in steps.iter().enumerate() {
+            step(&mut coll);
+            let mut out = Vec::new();
+            let written = write_delta(&coll, ID, (i + 1) as u32, prev, &mut out).unwrap();
+            assert!(coll.rows.mark_persisted(written.mark));
+            prev = coll.catchup_xor;
+            deltas.push(out);
+        }
+
+        let (mut back, end) = read_table_bytes(base.clone(), deltas.clone()).unwrap();
+        assert_eq!(end, ChainEnd { image_id: ID, seq: 2, xor: coll.catchup_xor });
+        assert_eq!(back.catchup_xor, coll.catchup_xor);
+        assert_eq!(back.rows.len(), 3);
+        assert_eq!(back.get_row("a").get("v").as_i64(), Some(2));
+        assert!(!back.rows.contains_key("b"));
+        assert_eq!(back.get_row("d").get("v").as_i64(), Some(4));
+
+        // The watermark is at the end: the next delta carries only new work.
+        back.apply(Operation::Update, "c", Sp00kyValue::from(json!({ "v": 3 })));
+        let mut third = Vec::new();
+        let written = write_delta(&back, ID, 3, end.xor, &mut third).unwrap();
+        assert_eq!(written.rows, 1);
+        deltas.push(third);
+        let (again, end) = read_table_bytes(base.clone(), deltas.clone()).unwrap();
+        assert_eq!(end.seq, 3);
+        assert_eq!(again.catchup_xor, back.catchup_xor);
+        assert_eq!(again.get_row("c").get("v").as_i64(), Some(3));
+
+        // A broken link fails the load instead of returning a stale table.
+        deltas.remove(1);
+        assert!(read_table_bytes(base, deltas).is_err());
     }
 
     fn heap() -> crate::circuit::arena::ArenaBacking {

@@ -64,6 +64,29 @@ fn root_auth() -> String {
     format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("root:root"))
 }
 
+/// `version()` reads `GET /version` (`surrealdb-3.3.4`): the old
+/// `RETURN surrealdb::version()` is a parse error on every 3.x tested.
+#[tokio::test]
+async fn version_reads_the_servers_version_route() {
+    let http: Arc<dyn HttpClient> = Arc::new(ReqwestHttp(reqwest::Client::new()));
+    let probe = HttpSqlDb::new(http.clone(), base_url(), "test", "test", root_auth())
+        .with_timeout(Duration::from_millis(800));
+    if probe.query("RETURN 1;", &[]).await.is_err() {
+        eprintln!("SKIP: no SurrealDB at {} (start docker to run this)", base_url());
+        return;
+    }
+    let version = probe.version().await.expect("GET /version");
+    assert!(
+        version.split('.').count() == 3 && version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "bare semver expected, got {version:?}"
+    );
+
+    // A credential the server refuses must not break it: the route is public.
+    let stale = HttpSqlDb::new(http, base_url(), "test", "test", "Bearer stale")
+        .with_timeout(Duration::from_millis(800));
+    assert_eq!(stale.version().await.expect("GET /version without auth"), version);
+}
+
 #[tokio::test]
 async fn rebuild_from_external_surreal_over_http_rpc() {
     let http: Arc<dyn HttpClient> = Arc::new(ReqwestHttp(reqwest::Client::new()));

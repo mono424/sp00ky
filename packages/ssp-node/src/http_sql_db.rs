@@ -12,6 +12,8 @@
 //! same flattened-JSON convention the SDK adapter produces). The response is
 //! `{"result":[{"status":"OK"|"ERR","result":<data>}, ...]}`, one entry per
 //! statement; we return each statement's `result`, matching the `Db` contract.
+//! [`Db::version`] reads `GET {base}/version` instead, which answers plain text
+//! (`surrealdb-3.3.4`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +30,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct HttpSqlDb {
     http: Arc<dyn HttpClient>,
     rpc_url: String,
+    version_url: String,
     /// Full `Authorization` header value, e.g. `"Basic <b64>"` (local root) or
     /// `"Bearer <jwt>"` (SurrealDB Cloud token). The caller owns credential
     /// encoding + refresh; keeping it opaque keeps this adapter wasm-clean (no
@@ -60,6 +63,7 @@ impl HttpSqlDb {
         Self {
             http,
             rpc_url: format!("{base}/rpc"),
+            version_url: format!("{base}/version"),
             authorization: authorization.into(),
             ns: ns.into(),
             db: db.into(),
@@ -190,13 +194,44 @@ impl Db for HttpSqlDb {
         parse_rpc_response(&resp.body)
     }
 
+    /// `RETURN surrealdb::version()` is a parse error on every 3.x tested
+    /// (3.1.5, 3.3.4), so ask the server's own `/version` route instead. It
+    /// needs no credentials, and a stale one turns it into a 401 ("There was a
+    /// problem with authentication"), so none is sent.
     async fn version(&self) -> Result<String, DbError> {
-        let rows = self.query("RETURN surrealdb::version();", &[]).await?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "unknown".to_string()))
+        let req = OutboundRequest {
+            method: Method::Get,
+            url: self.version_url.clone(),
+            bearer: None,
+            headers: Vec::new(),
+            json_body: None,
+            timeout: self.timeout,
+        };
+        let resp = self
+            .http
+            .send(req, None)
+            .await
+            .map_err(|e| DbError::Transport(e.to_string()))?;
+        if resp.status >= 400 {
+            return Err(DbError::Transport(format!(
+                "HTTP {}: {}",
+                resp.status, resp.body
+            )));
+        }
+        Ok(parse_version_body(&resp.body))
+    }
+}
+
+/// `GET /version` answers `surrealdb-3.3.4`. Report the bare semver, as the SDK
+/// adapter (`apps/ssp/src/adapters/db.rs`) does, so `/info` reads the same on
+/// either adapter.
+fn parse_version_body(body: &str) -> String {
+    let body = body.trim();
+    let version = body.strip_prefix("surrealdb-").unwrap_or(body);
+    if version.is_empty() {
+        "unknown".to_string()
+    } else {
+        version.to_string()
     }
 }
 
@@ -275,6 +310,73 @@ mod tests {
             _cancel: Option<crate::ports::CancelWatch>,
         ) -> Result<crate::ports::OutboundResponse, crate::ports::HttpError> {
             unreachable!("not called in url-normalization test")
+        }
+    }
+
+    #[tokio::test]
+    async fn version_reads_get_version_not_a_query() {
+        let http = Arc::new(RecordingHttp {
+            seen: std::sync::Mutex::new(Vec::new()),
+            reply: (200, "surrealdb-3.3.4".to_string()),
+        });
+        let db = HttpSqlDb::new(http.clone(), "wss://x.surreal.cloud/", "ns", "db", "Bearer t");
+        let v = db.version().await.unwrap();
+        assert_eq!(v, "3.3.4");
+        let seen = http.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (method, url, body, auth) = &seen[0];
+        assert_eq!(*method, Method::Get);
+        assert_eq!(url, "https://x.surreal.cloud/version");
+        assert!(!body, "GET /version carries no body");
+        assert_eq!(*auth, None, "a stale token would turn /version into a 401");
+    }
+
+    #[tokio::test]
+    async fn version_surfaces_http_errors() {
+        let http = Arc::new(RecordingHttp {
+            seen: std::sync::Mutex::new(Vec::new()),
+            reply: (502, "bad gateway".to_string()),
+        });
+        let db = HttpSqlDb::new(http, "http://localhost:8000", "ns", "db", "Basic z");
+        let err = db.version().await.unwrap_err();
+        assert!(matches!(err, DbError::Transport(ref m) if m.contains("502")), "{err:?}");
+    }
+
+    #[test]
+    fn parses_version_body() {
+        assert_eq!(parse_version_body("surrealdb-3.3.4"), "3.3.4");
+        assert_eq!(parse_version_body("surrealdb-3.1.5\n"), "3.1.5");
+        assert_eq!(parse_version_body("3.0.0"), "3.0.0");
+        assert_eq!(parse_version_body(""), "unknown");
+    }
+
+    type Seen = (Method, String, bool, Option<String>);
+
+    struct RecordingHttp {
+        seen: std::sync::Mutex<Vec<Seen>>,
+        reply: (u16, String),
+    }
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl HttpClient for RecordingHttp {
+        async fn send(
+            &self,
+            req: OutboundRequest,
+            _cancel: Option<crate::ports::CancelWatch>,
+        ) -> Result<crate::ports::OutboundResponse, crate::ports::HttpError> {
+            let auth = req
+                .headers
+                .iter()
+                .find(|(k, _)| k == "Authorization")
+                .map(|(_, v)| v.clone());
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.method, req.url, req.json_body.is_some(), auth));
+            Ok(crate::ports::OutboundResponse {
+                status: self.reply.0,
+                body: self.reply.1.clone(),
+            })
         }
     }
 

@@ -42,11 +42,35 @@ const _networkErrorPatterns = [
   'specify a database',
 ];
 
+/// A write SurrealDB refused because sp00ky's OWN ingest post failed: every
+/// synced table's `_00_<table>_mutation` / `_00_<table>_delete` event posts to
+/// the scheduler or SSP inside the write's transaction
+/// (`sp00ky.rs::ingest_post`), so a scheduler that is down, slow past the
+/// event TIMEOUT, or answering 5xx aborts the write. That is an outage, not
+/// the mutation's fault, and it clears on its own; classified `application`
+/// it was rolled back and discarded.
+///
+/// Wording on SurrealDB 3.1.5 and 3.3.4 (the event name may be nested inside
+/// an app event that wrote to a synced table):
+///   "Error while processing event _00_item_mutation: There was an error
+///    processing a remote HTTP request: error sending request for url (...)"
+///    (refused connection or TIMEOUT), "...: 503 Service Unavailable" (5xx),
+///   "Error while processing event _00_item_mutation: failed to lookup
+///    address information: ..." (DNS).
+///
+/// Only `_00_` events count: an app's own event posting to its own endpoint
+/// stays `application`, as does a 4xx from `/ingest` other than 408/429 (a
+/// malformed or oversized payload, a secret mismatch), which no retry fixes
+/// and which would otherwise hold the outbox's serial lane forever.
+final _sp00kyEventPostFailed = RegExp(
+    r'error while processing event _00_[^:\s]*: (?:there was an error processing a remote http request: (?:error sending request|5\d\d\b|408\b|429\b)|failed to lookup address information)');
+
 /// Classify a sync error as recoverable (`network`) or terminal
 /// (`application`). Faithful port of TS `classifySyncError`.
 String classifySyncError(Object? error) {
   final message =
       (error is Error ? error.toString() : error.toString()).toLowerCase();
+  if (_sp00kyEventPostFailed.hasMatch(message)) return 'network';
   for (final pattern in _networkErrorPatterns) {
     if (message.contains(pattern)) {
       return 'network';

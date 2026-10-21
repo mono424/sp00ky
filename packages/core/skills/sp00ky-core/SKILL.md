@@ -129,7 +129,9 @@ Use `debounced` option for frequent updates (e.g., live typing):
 
 A push the server rejects (permission, validation) is rolled back locally
 (create, update and delete) and moved to the `_00_failed_mutations` tray in the
-same local transaction. Network errors never do this; they retry. Inspect and
+same local transaction. Network errors never do this; they retry, and so does a
+write the server refused only because sp00ky's own ingest post to the scheduler
+failed (down, past its timeout, or answering 5xx). Inspect and
 act on the tray with `db.failedMutationCount`, `db.subscribeToFailedMutations(cb)`,
 `db.listFailedMutations()`, `db.retryFailedMutation(id)` (a fresh optimistic
 write) and `db.discardFailedMutation(id)`.

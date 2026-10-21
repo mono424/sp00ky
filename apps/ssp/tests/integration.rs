@@ -156,6 +156,7 @@ impl TestHarness {
             edge_update_tx: edge_update_tx.clone(),
             backend_health: None,
             shared_backend_configs: None,
+            buckets: None,
             platform: {
                 // Timer receiver dropped: tests never dispatch on_timer.
                 let (platform, _timer_rx) =

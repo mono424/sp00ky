@@ -187,7 +187,9 @@ describe('session guard ends sync for an open socket (real SurrealDB)', () => {
     const seen: unknown[] = [];
     const [id] = (await db.query('LIVE SELECT * FROM _00_list_ref_user_alice')) as [unknown];
     const stream = await db.liveOf(id as never);
-    stream.subscribe((message: { action: string; value: unknown }) => {
+    // Typed by the SDK (`LiveMessage`), not a narrower hand-written shape:
+    // the hand-written one failed `tsc` and so the core Test job.
+    stream.subscribe((message) => {
       if (message.action !== 'KILLED') seen.push(message.value);
     });
     return seen;

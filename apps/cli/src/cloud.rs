@@ -175,6 +175,31 @@ fn derive_cf_ssp_url(api_url: &str, slug: &str) -> Option<String> {
     }
 }
 
+/// The shared free-plan SurrealDB the control plane points a free (Cloudflare)
+/// project at when sp00ky.yml names no database of its own:
+/// `https://api-stg.sp00ky.cloud` -> `wss://surreal-free.stg.spky.cloud`.
+/// `SP00KY_CLOUD_FREE_DB` overrides it.
+fn derive_cf_shared_db_url(api_url: &str) -> Option<String> {
+    if let Ok(url) = std::env::var("SP00KY_CLOUD_FREE_DB") {
+        return Some(url);
+    }
+    let host = api_url
+        .strip_prefix("https://")
+        .or(api_url.strip_prefix("http://"))?
+        .split('/')
+        .next()?;
+    if let Some(stage) = host
+        .strip_prefix("api-")
+        .and_then(|h| h.strip_suffix(".sp00ky.cloud"))
+    {
+        Some(format!("wss://surreal-free.{}.spky.cloud", stage))
+    } else if host.ends_with(".sp00ky.cloud") {
+        Some("wss://surreal-free.spky.cloud".to_string())
+    } else {
+        None
+    }
+}
+
 /// Derive the upload URL for large files (bypasses Cloudflare proxy).
 /// Converts "https://api-stg.sp00ky.cloud" → "https://upload-stg.spky.cloud"
 /// Falls back to the API URL if no upload domain can be derived.
@@ -2915,20 +2940,26 @@ pub fn deploy(
     if let Some((frontend_name, frontend_app)) = config.frontend().filter(|_| frontend_selected) {
         if platform == "cloudflare" {
         // Free plan: static SPA on Cloudflare Workers Static Assets. Bake the
-        // external SurrealDB endpoint the SPA connects to directly. No manifest —
-        // the control plane's free deploy path publishes the uploaded assets.
-        let db_endpoint = surrealdb_manifest
-            .get("endpoint")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let db_ns = surrealdb_manifest
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let db_db = surrealdb_manifest
-            .get("database")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // SurrealDB endpoint the SPA connects to directly. No manifest — the
+        // control plane's free deploy path publishes the uploaded assets.
+        //
+        // Without a database of its own the project lives on the shared free
+        // DB, in the namespace named after its slug (the control plane
+        // enforces that, whatever namespace the manifest carries), database
+        // `main`. Before this the SPA got no endpoint at all on that path.
+        let shared_db = matches!(resolved_surreal.hosting, HostingMode::Cloud);
+        let manifest_str = |k: &str| {
+            surrealdb_manifest.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+        let (db_endpoint, db_ns, db_db) = if shared_db {
+            (
+                derive_cf_shared_db_url(&client.base_url),
+                Some(slug.clone()),
+                Some("main".to_string()),
+            )
+        } else {
+            (manifest_str("endpoint"), manifest_str("namespace"), manifest_str("database"))
+        };
         let files_endpoint = derive_cf_ssp_url(&client.base_url, &slug);
         deploy_static_frontend_cloudflare(
             &client,
@@ -3818,6 +3849,19 @@ mod version_skew_tests {
             Some("https://app.db.spky.cloud")
         );
         assert_eq!(derive_cf_ssp_url("http://localhost:8080", "app"), None);
+    }
+
+    #[test]
+    fn shared_free_db_url_follows_the_api_stage() {
+        assert_eq!(
+            derive_cf_shared_db_url("https://api-stg.sp00ky.cloud").as_deref(),
+            Some("wss://surreal-free.stg.spky.cloud")
+        );
+        assert_eq!(
+            derive_cf_shared_db_url("https://api.sp00ky.cloud/").as_deref(),
+            Some("wss://surreal-free.spky.cloud")
+        );
+        assert_eq!(derive_cf_shared_db_url("http://localhost:8080"), None);
     }
     use std::collections::HashMap;
 

@@ -25,69 +25,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// How a session was established. Surfaced to the UI so a break-glass session
-/// can be visibly flagged: it means the roster was bypassed, which the person
-/// looking at the screen should know.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionMode {
-    /// Signed in as a user on the `_00_admin` roster.
-    Roster,
-    /// Signed in with `SPKY_ADMIN_PASSWORD`.
-    Breakglass,
-    /// A long-lived token minted for an MCP client. Cannot mint further
-    /// tokens; otherwise an ordinary bearer.
-    Mcp,
-}
-
-impl SessionMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            SessionMode::Roster => "roster",
-            SessionMode::Breakglass => "breakglass",
-            SessionMode::Mcp => "mcp",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "roster" => Some(SessionMode::Roster),
-            "breakglass" => Some(SessionMode::Breakglass),
-            "mcp" => Some(SessionMode::Mcp),
-            _ => None,
-        }
-    }
-}
-
-/// What a session may do. Enforced in one place, the bearer middleware: a
-/// `Read` session can only make `GET` requests, so a read-only MCP token
-/// handed to an agent cannot restart anything however it phrases the call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Scope {
-    Read,
-    Full,
-}
-
-impl Scope {
-    fn as_str(self) -> &'static str {
-        match self {
-            Scope::Read => "read",
-            Scope::Full => "full",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "read" => Some(Scope::Read),
-            "full" => Some(Scope::Full),
-            _ => None,
-        }
-    }
-}
+// One token format for every host of the admin API (the scheduler and the SSP
+// node): `ssp_protocol::admin_session`.
+pub use ssp_protocol::admin_session::{Scope, SessionMode};
+use ssp_protocol::admin_session as signed;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -121,9 +64,9 @@ impl SessionStore {
     pub fn new(ttl: Duration, secret: Option<&str>) -> Arc<Self> {
         let backend = match secret.filter(|s| !s.is_empty()) {
             Some(secret) => Backend::Signed {
-                // Derive rather than use the secret directly, so a session key
-                // never equals the bearer that SSPs present to the scheduler.
-                key: hmac_sha256(secret.as_bytes(), b"spky-admin-session"),
+                // Derived, so a session key never equals the bearer that SSPs
+                // present to the scheduler.
+                key: signed::session_key(secret),
                 revoked: Mutex::new(HashSet::new()),
             },
             None => Backend::Map(Mutex::new(HashMap::new())),
@@ -176,25 +119,17 @@ impl SessionStore {
                 token
             }
             Backend::Signed { key, .. } => {
-                let exp = epoch_secs() + ttl.as_secs();
                 // A nonce so two logins by the same subject in the same second
-                // do not share a token (and so revoking one does not revoke
-                // the other). Newlines never appear in a subject or label
-                // because both are single-line identifiers; the claim order
-                // is part of the token format and must not change.
+                // do not share a token (and revoking one keeps the other).
                 let nonce = uuid::Uuid::new_v4().simple().to_string();
-                let claims = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}",
-                    subject.replace('\n', " "),
-                    label.replace('\n', " "),
-                    mode.as_str(),
-                    exp,
-                    nonce,
-                    scope.as_str()
-                );
-                let payload = base64_url_encode(claims.as_bytes());
-                let sig = base64_url_encode(&hmac_sha256(key, payload.as_bytes()));
-                format!("{payload}.{sig}")
+                let claims = signed::Claims {
+                    subject,
+                    label,
+                    mode,
+                    scope,
+                    expires_at_secs: epoch_secs() + ttl.as_secs(),
+                };
+                signed::mint(key, &claims, &nonce)
             }
         }
     }
@@ -214,42 +149,17 @@ impl SessionStore {
                 }
             }
             Backend::Signed { key, revoked } => {
-                let (payload, sig) = token.split_once('.')?;
-                let expected = base64_url_encode(&hmac_sha256(key, payload.as_bytes()));
-                if !constant_time_eq(sig.as_bytes(), expected.as_bytes()) {
-                    return None;
-                }
-                let claims = base64_url_decode(payload)?;
-                let claims = String::from_utf8(claims).ok()?;
-                let mut parts = claims.split('\n');
-                let subject = parts.next()?.to_string();
-                let label = parts.next()?.to_string();
-                let mode = SessionMode::parse(parts.next()?)?;
-                let exp: u64 = parts.next()?.parse().ok()?;
-                let _nonce = parts.next()?;
-                // Tokens minted before scopes existed carry five claims; they
-                // were all full sessions.
-                let scope = match parts.next() {
-                    Some(s) => Scope::parse(s)?,
-                    None => Scope::Full,
-                };
                 let now = epoch_secs();
-                if exp <= now {
-                    return None;
-                }
-                if revoked
-                    .lock()
-                    .expect("revocation set poisoned")
-                    .contains(token)
-                {
+                let claims = signed::verify(key, token, now)?;
+                if revoked.lock().expect("revocation set poisoned").contains(token) {
                     return None;
                 }
                 Some(Session {
-                    subject,
-                    label,
-                    mode,
-                    scope,
-                    expires_at: Instant::now() + Duration::from_secs(exp - now),
+                    subject: claims.subject,
+                    label: claims.label,
+                    mode: claims.mode,
+                    scope: claims.scope,
+                    expires_at: Instant::now() + Duration::from_secs(claims.expires_at_secs - now),
                 })
             }
         }
@@ -322,15 +232,10 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     out
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
+#[cfg(test)]
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+#[cfg(test)]
 fn base64_url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
@@ -352,6 +257,7 @@ fn base64_url_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
 fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> { B64.iter().position(|&b| b == c).map(|p| p as u32) };
     let bytes = input.as_bytes();

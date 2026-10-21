@@ -164,6 +164,63 @@ void main() {
       expect(out.state.outbox.single.attempts, 1);
       expect(out.timers['outbox']!.ms, 500);
       expect(out.state.failedCount, 0);
+      // No answer: the server may have committed it.
+      expect(out.state.outbox.single.inDoubt, isTrue);
+    });
+
+    test(
+        'a push whose answer was lost goes out again with CREATEs that accept '
+        'their own earlier commit', () async {
+      final docs = {
+        '$pendingTable:m1': pendingDoc('m1'),
+        '$pendingTable:m2': pendingDoc('m2', recordId: 'thing:2'),
+      };
+      final pushed = <String>[];
+      Object? push(Effect<Object?> e, PureContext _) {
+        pushed.add((e as RemoteQuery).sql);
+        // The server ran the batch; the answer never came back.
+        if (pushed.length == 1) {
+          throw StateError('Remote request timed out after 15000ms');
+        }
+        return const [StatementResult.ok(null), StatementResult.ok(null)];
+      }
+
+      final lost = await runPure<void>(
+        (ctx) => drain(ctx, env()),
+        state: buildState([], [
+          r.outboxReplace([
+            buildOutboxItem(id: '$pendingTable:m1'),
+            buildOutboxItem(id: '$pendingTable:m2', recordId: 'thing:2'),
+          ]),
+        ]),
+        handlers: defaults(over: {
+          'local.get': storeWith(docs),
+          'remote.query': push,
+        }),
+      );
+      expect(lost.state.outbox.map((i) => i.inDoubt), [true, true]);
+      expect(lost.timers['outbox']!.ms, 500);
+      final again = await runPure<void>(
+        (ctx) => drain(ctx, env()),
+        state: lost.state,
+        handlers: defaults(over: {
+          'local.get': storeWith(docs),
+          'remote.query': push,
+        }),
+      );
+      String tolerant(int i) =>
+          'LET \$was$i = (SELECT * FROM ONLY \$id$i); '
+          'IF (\$was$i = NONE) OR (\$was$i.title != \$d${i}_title) '
+          '{ CREATE ONLY \$id$i SET title = \$d${i}_title }';
+      expect(pushed.first, isNot(contains(r'$was')));
+      expect(pushed.last.split(';\n'), [
+        'LET \$ok0 = { ${tolerant(0)}; true }',
+        'LET \$ok1 = { IF !\$ok0 { THROW "$batchSkipped" }; '
+            '${tolerant(1)}; true }',
+      ]);
+      expect(again.emitted.whereType<MutationRolledBackEvent>(), isEmpty);
+      expect(again.state.outbox.map((i) => i.status),
+          everyElement(OutboxStatus.acked));
     });
 
     test('a short result list is a cut: the rest stays queued', () async {
@@ -186,6 +243,8 @@ void main() {
       );
       expect(out.state.outbox.map((i) => i.status),
           [OutboxStatus.acked, OutboxStatus.pending]);
+      // No answer says whether the second one ran.
+      expect(out.state.outbox.map((i) => i.inDoubt), [false, true]);
       expect(out.timers['outbox'], isNotNull);
       expect(out.dispatched.whereType<SyncOutcome>().single.ok, isFalse);
     });
@@ -365,6 +424,8 @@ void main() {
       expect(out.state.outbox.map((i) => i.id),
           ['$pendingTable:m1', '$pendingTable:m2'],
           reason: 'the drain order is id order');
+      expect(out.state.outbox.map((i) => i.inDoubt), everyElement(isTrue),
+          reason: 'a run that died mid-push may have sent them');
       expect(out.emitted.whereType<MutationRolledBackEvent>(), hasLength(1));
       expect(out.dispatched.whereType<Drain>(), hasLength(1));
     });

@@ -252,6 +252,10 @@ void main() {
       final s3 = r.outboxBumpAttempts('m1')(s2);
       expect(s3.outbox[0].attempts, 1);
       expect(identical(r.outboxBumpAttempts('nope')(s3), s3), isTrue);
+      final doubt = r.outboxMarkInDoubt(['m1', 'nope'])(s3);
+      expect(doubt.outbox[0].inDoubt, isTrue);
+      expect(doubt.outbox[0].attempts, 1);
+      expect(identical(r.outboxMarkInDoubt(['m1'])(doubt), doubt), isTrue);
       final s4 = r.outboxRemove('m1')(s3);
       expect(s4.outbox, isEmpty);
       expect(s4.dirty.contains('a'), isTrue);

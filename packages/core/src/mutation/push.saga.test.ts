@@ -133,6 +133,8 @@ describe('drain', () => {
     });
     expect(thrown.state.outbox.map((i) => i.status)).toEqual(['pending', 'pending']);
     expect(thrown.state.outbox[0].attempts).toBe(1);
+    // No answer: the server may have committed any of them.
+    expect(thrown.state.outbox.map((i) => i.inDoubt)).toEqual([true, true]);
     expect(thrown.timers.get('outbox')).toEqual({ ms: 500, event: { type: 'Drain' } });
     expect(thrown.dispatched).toEqual([{ type: 'SyncOutcome', ok: false, error: new Error('socket closed') }]);
     const mid = await runPure(drain(env), {
@@ -140,12 +142,14 @@ describe('drain', () => {
       handlers: { 'local.query': () => [[pendingRow(1), pendingRow(2)]], 'remote.query': () => [ok(), err('connection reset')] },
     });
     expect(mid.state.outbox.map((i) => [i.status, i.attempts])).toEqual([['acked', 0], ['pending', 1]]);
+    // A failed statement did not commit, so its row is not in doubt.
+    expect(mid.state.outbox[1].inDoubt).toBeUndefined();
     expect(mid.timers.get('outbox')!.ms).toBe(500);
     const short = await runPure(drain(env), {
       state: stateWith([1, 2]),
       handlers: { 'local.query': () => [[pendingRow(1), pendingRow(2)]], 'remote.query': () => [ok()] },
     });
-    expect(short.state.outbox.map((i) => i.status)).toEqual(['acked', 'pending']);
+    expect(short.state.outbox.map((i) => [i.status, i.inDoubt])).toEqual([['acked', undefined], ['pending', true]]);
     const undefinedRows = await runPure(drain(env), { state: stateWith([1]), handlers: { 'local.query': () => undefined } });
     expect(undefinedRows.state.outbox).toEqual([]);
     const notArray = await runPure(drain(env), {
@@ -153,6 +157,37 @@ describe('drain', () => {
       handlers: { 'local.query': () => [[pendingRow(1)]], 'remote.query': () => 'nope' },
     });
     expect(notArray.timers.has('outbox')).toBe(true);
+  });
+
+  it('a push whose answer was lost goes out again with CREATEs that accept their own earlier commit', async () => {
+    const pushed: string[] = [];
+    const rowsOf = (e: any) => [e.vars.ids.map((id: RecordId) => pendingRow(Number(String(id.id).slice(1))))];
+    const out = await runPure(drain(env), {
+      state: stateWith([1, 2]),
+      handlers: {
+        'local.query': (e: any) => (e.sql === 'SELECT * FROM $ids' ? rowsOf(e) : []),
+        'remote.query': (e: any) => {
+          pushed.push(e.sql);
+          // The server ran the batch; the answer never came back.
+          if (pushed.length === 1) throw new Error('Remote request timed out after 15000ms');
+          return [ok(), ok()];
+        },
+      },
+    });
+    expect(out.timers.get('outbox')).toEqual({ ms: 500, event: { type: 'Drain' } });
+    const again = await runPure(drain(env), {
+      state: out.state,
+      handlers: {
+        'local.query': (e: any) => (e.sql === 'SELECT * FROM $ids' ? rowsOf(e) : []),
+        'remote.query': (e: any) => (pushed.push(e.sql), [ok(), ok()]),
+      },
+    });
+    const tolerant = (i: number) =>
+      `LET $was${i} = (SELECT * FROM ONLY $id${i}); IF ($was${i} = NONE) OR ($was${i}.a != $d${i}_a) { CREATE ONLY $id${i} SET a = $d${i}_a }`;
+    expect(pushed[0]).not.toContain('$was');
+    expect(pushed[1]).toBe(`LET $ok0 = { ${tolerant(0)}; true };\nLET $ok1 = { IF !$ok0 { THROW "${BATCH_SKIPPED}" }; ${tolerant(1)}; true }`);
+    expect(again.emitted.filter((e) => e.type === 'mutation:rolled-back')).toEqual([]);
+    expect(again.state.outbox.map((i) => i.status)).toEqual(['acked', 'acked']);
   });
 
   it('a request rejected as a whole with an application error rolls back the head and continues', async () => {

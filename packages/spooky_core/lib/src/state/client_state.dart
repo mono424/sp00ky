@@ -217,6 +217,7 @@ class OutboxItem {
     required this.status,
     required this.ackedAt,
     required this.attempts,
+    this.inDoubt = false,
   });
 
   final String id;
@@ -227,10 +228,18 @@ class OutboxItem {
   final int? ackedAt;
   final int attempts;
 
+  /// A request carrying this row may have committed without the answer
+  /// reaching this client: it threw a transport error, or the row was loaded
+  /// from the store, so a run that died mid-push may have sent it. Its CREATE
+  /// then accepts the row already on the server when that row holds what it
+  /// would write (see `remoteBatch`).
+  final bool inDoubt;
+
   OutboxItem copyWith({
     OutboxStatus? status,
     int? ackedAt,
     int? attempts,
+    bool? inDoubt,
   }) =>
       OutboxItem(
         id: id,
@@ -240,6 +249,7 @@ class OutboxItem {
         status: status ?? this.status,
         ackedAt: ackedAt ?? this.ackedAt,
         attempts: attempts ?? this.attempts,
+        inDoubt: inDoubt ?? this.inDoubt,
       );
 }
 

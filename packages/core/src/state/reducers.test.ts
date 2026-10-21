@@ -208,6 +208,9 @@ describe('outbox', () => {
     const s3 = R.outboxBumpAttempts('m1')(s2);
     expect(s3.outbox[0].attempts).toBe(1);
     expect(R.outboxBumpAttempts('nope')(s3)).toBe(s3);
+    const doubt = R.outboxMarkInDoubt(['m1', 'nope'])(s3);
+    expect(doubt.outbox[0]).toMatchObject({ id: 'm1', inDoubt: true, attempts: 1 });
+    expect(R.outboxMarkInDoubt(['m1'])(doubt)).toBe(doubt);
     const s4 = R.outboxRemove('m1')(s3);
     expect(s4.outbox).toEqual([]);
     expect(s4.dirty.has('a')).toBe(true);

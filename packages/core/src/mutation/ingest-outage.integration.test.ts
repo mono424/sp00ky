@@ -14,7 +14,7 @@ import type { ClientState } from '../state/client-state';
 import type { OutEvent } from '../kernel/events';
 import type { StatementResult } from '../kernel/effects';
 import { mintMutationId } from './mutation-id';
-import { drain } from './push.saga';
+import { drain, loadOutbox } from './push.saga';
 import { BATCH_SKIPPED } from './rows';
 import { write } from './write.saga';
 
@@ -182,7 +182,12 @@ describe('a write refused by a failed ingest post is retried, not rolled back (r
     vi.unstubAllGlobals();
   });
 
-  const run = (saga: Generator<any, any, any>, state: ClientState) =>
+  /**
+   * With `loseAnswer` the push reaches the server and commits, then the client
+   * sees the push timeout instead of the answer (a slow server, a socket that
+   * dropped on the way back).
+   */
+  const run = (saga: Generator<any, any, any>, state: ClientState, opts: { loseAnswer?: boolean } = {}) =>
     runPure(saga, {
       state,
       now: Date.now(),
@@ -192,6 +197,7 @@ describe('a write refused by a failed ingest post is retried, not rolled back (r
         'remote.query': async (e: any) => {
           const results = (await remote.queryResponses(e.sql, e.vars)) as StatementResult[];
           for (const r of results) if (r.status === 'ERR') statementErrors.push(r.error);
+          if (opts.loseAnswer) throw new Error(`Remote request timed out after ${e.timeoutMs}ms`);
           return results;
         },
         'ssp.ingest': () => undefined,
@@ -216,6 +222,16 @@ describe('a write refused by a failed ingest post is retried, not rolled back (r
     }
     expect(state.outbox).toHaveLength(recordIds.length);
     return state;
+  }
+
+  /**
+   * The outbox of `state`, loaded again from the local store the way a
+   * restarted client does (without what other tests left in the store).
+   */
+  async function reloaded(state: ClientState): Promise<ClientState> {
+    const ids = new Set(state.outbox.map((i) => i.id));
+    const loaded = (await run(loadOutbox(env), { ...buildState(), tabId: state.tabId })).state;
+    return { ...loaded, outbox: loaded.outbox.filter((i) => ids.has(i.id)) };
   }
 
   it.for([
@@ -290,6 +306,72 @@ describe('a write refused by a failed ingest post is retried, not rolled back (r
       expect(await remoteRow(rid(id))).toMatchObject({ title: id });
       expect(await localRow(rid(id))).toMatchObject({ title: id });
     }
+  });
+
+  it.for([['in the same session'], ['after a restart']] as const)(
+    'a push whose answer is lost after the server committed, re-sent %s: nothing rolls back, every write lands once',
+    { timeout: 30_000 },
+    async ([when], ctx) => {
+      if (!reachable) ctx.skip();
+      await setEndpoint(sinkUrl);
+      sink.mode.current = 'ok';
+      const tag = Math.random().toString(36).slice(2, 8);
+      const [a, b] = [`item:lost_a_${tag}`, `item:lost_b_${tag}`];
+      let state = await queueCreate(a, b);
+      // Edited before the push: the batch carries a's CREATE and then its UPDATE.
+      state = (await run(write(env, { kind: 'update', recordId: a, data: { title: 'edited' } }), state)).state;
+      const [errorsBefore, postsBefore] = [statementErrors.length, sink.hits.length];
+
+      const lost = await run(drain(env), state, { loseAnswer: true });
+      expect(statementErrors.slice(errorsBefore)).toEqual([]);
+      expect(sink.hits.length - postsBefore).toBe(3); // the server ran CREATE a, CREATE b, UPDATE a
+      expect(await remoteRow(rid(a))).toMatchObject({ title: 'edited' });
+      expect(await remoteRow(rid(b))).toMatchObject({ title: b });
+      expect(rolledBack(lost.emitted)).toEqual([]);
+      expect(lost.state.outbox.map((i) => [i.recordId, i.status, i.inDoubt])).toEqual([
+        [a, 'pending', true],
+        [b, 'pending', true],
+        [a, 'pending', true],
+      ]);
+
+      // The re-sent CREATEs used to fail "already exists" and roll back: the
+      // local rows deleted, two false entries in the tray, the server keeping both.
+      const retry = when === 'after a restart' ? await reloaded(lost.state) : lost.state;
+      const landed = await run(drain(env), retry);
+      expect(statementErrors.slice(errorsBefore)).toEqual([]);
+      expect(rolledBack(landed.emitted)).toEqual([]);
+      expect(landed.state.failedCount).toBe(retry.failedCount);
+      expect(landed.emitted.filter((e) => e.type === 'mutation:settled').map((e: any) => e.recordId)).toEqual([a, b, a]);
+      expect(landed.state.outbox.filter((i) => i.status === 'pending')).toEqual([]);
+      // Once: the re-send changed nothing on the server, so no event fired again.
+      expect(sink.hits.length - postsBefore).toBe(3);
+      expect(await remoteRow(rid(a))).toMatchObject({ title: 'edited' });
+      expect(await remoteRow(rid(b))).toMatchObject({ title: b });
+      expect(await localRow(rid(a))).toMatchObject({ title: 'edited' });
+      expect(await localRow(rid(b))).toMatchObject({ title: b });
+    }
+  );
+
+  it('an in-doubt CREATE whose id someone else holds with other content still rolls back', { timeout: 30_000 }, async (ctx) => {
+    if (!reachable) ctx.skip();
+    await setEndpoint(sinkUrl);
+    sink.mode.current = 'ok';
+    const recordId = `item:taken_${Math.random().toString(36).slice(2, 8)}`;
+    await remote.query('CREATE ONLY $id SET title = "theirs"', { id: rid(recordId) });
+    const state = await queueCreate(recordId);
+    const errorsBefore = statementErrors.length;
+
+    const lost = await run(drain(env), state, { loseAnswer: true });
+    expect(lost.state.outbox).toEqual([expect.objectContaining({ recordId, inDoubt: true })]);
+    const res = await run(drain(env), lost.state);
+    expect(statementErrors.slice(errorsBefore)).toEqual([
+      expect.stringMatching(/already exists/),
+      expect.stringMatching(/already exists/),
+    ]);
+    expect(rolledBack(res.emitted)).toEqual([expect.objectContaining({ recordId, error: expect.stringMatching(/already exists/) })]);
+    expect(res.state.outbox).toEqual([]);
+    expect(await remoteRow(rid(recordId))).toMatchObject({ title: 'theirs' });
+    expect(await localRow(rid(recordId))).toBeNull();
   });
 
   it.for([

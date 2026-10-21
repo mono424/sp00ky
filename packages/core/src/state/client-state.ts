@@ -79,6 +79,14 @@ export interface OutboxItem {
   readonly status: OutboxStatus;
   readonly ackedAt: number | null;
   readonly attempts: number;
+  /**
+   * A request carrying this row may have committed without the answer
+   * reaching this client: it threw a transport error, or the row was loaded
+   * from the store, so a session that died mid-push may have sent it. Its
+   * CREATE then accepts the row already on the server when that row holds
+   * what it would write (see `remoteBatch`). Absent means false.
+   */
+  readonly inDoubt?: boolean;
 }
 
 export type TabRole = 'solo' | 'leader' | 'follower';

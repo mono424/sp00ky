@@ -49,7 +49,10 @@ back.
 acked (kept in the overlay until membership names them), rejected rows are
 rolled back and moved to `_00_failed_mutations` in the same transaction that
 deletes the pending row, a transport cut leaves the tail queued behind a
-backoff. The tray is exposed as `failedMutationCount`,
+backoff. A push whose answer never came (timeout, dropped socket, a session
+that died mid-push) may have committed, so its rows are in doubt: re-sent, an
+in-doubt CREATE that finds a matching row of its own on the server is a no-op
+instead of an "already exists" rollback. The tray is exposed as `failedMutationCount`,
 `subscribeToFailedMutations`, `listFailedMutations`, `retryFailedMutation`
 and `discardFailedMutation`.
 

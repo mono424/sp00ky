@@ -239,6 +239,9 @@ PendingMutationRow hydrateRowData(
   }
 }
 
+/// A row read back from the store at boot or bucket switch. The run that
+/// queued it may have sent it and died before the answer (a killed app), so
+/// its outcome is in doubt.
 OutboxItem toOutboxItem(PendingMutationRow row) => OutboxItem(
       id: row.id,
       type: row.mutationType,
@@ -247,6 +250,7 @@ OutboxItem toOutboxItem(PendingMutationRow row) => OutboxItem(
       status: OutboxStatus.pending,
       ackedAt: null,
       attempts: 0,
+      inDoubt: true,
     );
 
 /// Outbox rows in drain order. Lexicographic id order is chronological order.
@@ -346,8 +350,38 @@ List<LocalOp> planDeferredOutboxRowTx(WritePlanInput input) => [
 const batchSkipped =
     'sp00ky: not run, an earlier statement in this batch failed';
 
-String _remoteStatement(
-    PendingMutationRow row, int i, Map<String, dynamic> vars) {
+/// Which fields of the row already on the server must equal the payload of
+/// the CREATE at [i] for that row to count as this CREATE's own earlier
+/// commit, or `null` when the CREATE must not tolerate an existing row.
+///
+/// Only a CREATE whose outcome is in doubt tolerates one: elsewhere "already
+/// exists" means someone else holds the id, a rejection as before. The check
+/// is every payload field except those a later in-doubt row of the same
+/// record, which may have committed in the same lost round, could have
+/// changed since; those rows run again after it and set them anyway. A later
+/// in-doubt DELETE or CREATE of the record may have replaced the row, so then
+/// existence is all that is checked. Rows that are not in doubt never ran.
+List<String>? _matchFields(
+    List<PendingMutationRow> rows, int i, Set<String> inDoubt) {
+  final row = rows[i];
+  if (!inDoubt.contains(row.id)) return null;
+  final changed = <String>{};
+  for (final later in rows.skip(i + 1)) {
+    if (later.recordId != row.recordId || !inDoubt.contains(later.id)) {
+      continue;
+    }
+    if (later.mutationType != MutationEventType.update) return const [];
+    changed.addAll(later.data?.keys ?? const <String>[]);
+  }
+  return [
+    for (final key in (row.data ?? const <String, dynamic>{}).keys)
+      if (!changed.contains(key)) key
+  ];
+}
+
+String _remoteStatement(List<PendingMutationRow> rows, int i,
+    Map<String, dynamic> vars, Set<String> inDoubt) {
+  final row = rows[i];
   vars['id$i'] = parseRecordIdString(row.recordId);
   switch (row.mutationType) {
     case MutationEventType.create:
@@ -357,7 +391,17 @@ String _remoteStatement(
         vars['d${i}_$key'] = data[key];
         sets.add('$key = \$d${i}_$key');
       }
-      return 'CREATE ONLY \$id$i SET ${sets.join(', ')}';
+      final create = 'CREATE ONLY \$id$i SET ${sets.join(', ')}';
+      final match = _matchFields(rows, i, inDoubt);
+      if (match == null) return create;
+      // The CREATE runs unless the row is there and matches; on a mismatch it
+      // fails with SurrealDB's own "already exists", a rejection as before.
+      final differs = [
+        '(\$was$i = NONE)',
+        for (final key in match) '(\$was$i.$key != \$d${i}_$key)',
+      ];
+      return 'LET \$was$i = (SELECT * FROM ONLY \$id$i); '
+          'IF ${differs.join(' OR ')} { $create }';
     case MutationEventType.update:
       vars['data$i'] = row.data ?? const <String, dynamic>{};
       return 'UPDATE \$id$i MERGE \$data$i';
@@ -378,15 +422,23 @@ String _remoteStatement(
 /// the re-sent CREATE then read "already exists", was taken for a rejection
 /// and rolled back locally while the server kept the row. Acking them instead
 /// would have let a later write land before an earlier one it may depend on.
+///
+/// The chain cannot help when the answer itself is lost: the request may have
+/// committed any prefix of the batch. Rows named in [inDoubt] (mutation ids)
+/// are such rows. An UPDATE MERGE or a DELETE is safe to run twice, a CREATE
+/// is not, so an in-doubt CREATE checks the row already there first (see
+/// [_matchFields]) and is a no-op when it is its own: the batch goes on in
+/// order, with no "already exists" to cut it.
 ({String sql, Map<String, dynamic> vars}) remoteBatch(
-    List<PendingMutationRow> rows) {
+    List<PendingMutationRow> rows,
+    {Set<String> inDoubt = const {}}) {
   final vars = <String, dynamic>{};
   final stmts = <String>[];
   for (var i = 0; i < rows.length; i++) {
     final guard =
         i == 0 ? '' : 'IF !\$ok${i - 1} { THROW "$batchSkipped" }; ';
-    stmts.add(
-        'LET \$ok$i = { $guard${_remoteStatement(rows[i], i, vars)}; true }');
+    final statement = _remoteStatement(rows, i, vars, inDoubt);
+    stmts.add('LET \$ok$i = { $guard$statement; true }');
   }
   return (sql: stmts.join(';\n'), vars: vars);
 }

@@ -320,7 +320,27 @@ pub async fn rebuild_from_db(
     Ok(())
 }
 
-/// Page one table's rows from upstream into the circuit store.
+/// Bytes a bootstrap page aims at: enough rows to amortize the round trip,
+/// few enough that a page of large rows stays far from a Durable Object's
+/// 128 MB (1000 rows of a table holding file bodies overflowed it).
+const PAGE_TARGET_BYTES: usize = 1 << 20;
+/// Rows of the first page, before the table's row size is known: a `bytes`
+/// field arrives as a JSON array of numbers, so one image row can be
+/// megabytes.
+const FIRST_PAGE_ROWS: usize = 10;
+const MIN_PAGE_ROWS: usize = 1;
+
+/// The next page's row count: what fits `PAGE_TARGET_BYTES` at the last
+/// page's average row size, within `[MIN_PAGE_ROWS, max_rows]`.
+fn next_page_rows(rows: usize, bytes: usize, max_rows: usize) -> usize {
+    let per_row = (bytes / rows.max(1)).max(1);
+    (PAGE_TARGET_BYTES / per_row).clamp(MIN_PAGE_ROWS, max_rows.max(MIN_PAGE_ROWS))
+}
+
+/// Page one table's rows from upstream into the circuit store. Pages are
+/// sized by bytes, at most `page_size` rows (SurrealDB 3.1 rescans a table
+/// from its first key for every keyset page, so small rows want few, large
+/// pages); a page that times out is retried smaller.
 pub(crate) async fn load_table_rows(
     db: &dyn Db,
     processor: &Arc<RwLock<Circuit>>,
@@ -332,14 +352,21 @@ pub(crate) async fn load_table_rows(
     let omit = &meta.opaque;
     let mut record_count = 0usize;
     let mut after_id: Option<String> = None;
+    let mut limit = FIRST_PAGE_ROWS.min(page_size.max(1));
     loop {
-        let query = bootstrap_page_query(table, page_size, after_id.as_deref(), omit);
+        let query = bootstrap_page_query(table, limit, after_id.as_deref(), omit);
         let query = if has_versions {
             ssp_protocol::with_durable_row_versions(&query)
         } else { query };
-        let result = q1(db, &query)
-        .await
-        .with_context(|| format!("page-query {table}"))?;
+        let result = match q1(db, &query).await {
+            Ok(result) => result,
+            Err(e) if limit > MIN_PAGE_ROWS && format!("{e:#}").contains("timeout") => {
+                limit = (limit / 4).max(MIN_PAGE_ROWS);
+                warn!(table = %table, rows = limit, "page query timed out; retrying smaller pages");
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("page-query {table}")),
+        };
         let rows: Vec<Value> = match result {
             Value::Array(arr) => arr,
             _ => vec![],
@@ -348,6 +375,7 @@ pub(crate) async fn load_table_rows(
         if n == 0 {
             break;
         }
+        let bytes: usize = rows.iter().map(|row| row.to_string().len()).sum();
         let next_after = rows
             .last()
             .and_then(|row| row.get("id"))
@@ -362,9 +390,10 @@ pub(crate) async fn load_table_rows(
             .collect();
         processor.write().await.load(records);
         record_count += n;
-        if n < page_size {
+        if n < limit {
             break;
         }
+        limit = next_page_rows(n, bytes, page_size);
         match next_after {
             Some(id) => after_id = Some(id),
             None => break,
@@ -640,5 +669,21 @@ mod tests {
         assert_eq!(parse_link_target("DEFINE FIELD owner ON t TYPE record<user>"), Some("user".into()));
         assert_eq!(parse_link_target("DEFINE FIELD x ON t TYPE record<a | b>"), None);
         assert_eq!(parse_link_target("DEFINE FIELD x ON t TYPE string"), None);
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    #[test]
+    fn pages_aim_at_a_megabyte_within_the_row_cap() {
+        // 500-byte rows: the cap.
+        assert_eq!(next_page_rows(100, 100 * 500, 1000), 1000);
+        // 50 KB rows (file bodies): about 20 rows.
+        assert_eq!(next_page_rows(100, 100 * 50_000, 1000), 20);
+        // Rows over the target go one per page.
+        assert_eq!(next_page_rows(10, 10 * 5_000_000, 1000), 1);
+        assert_eq!(next_page_rows(0, 0, 1000), 1000);
     }
 }

@@ -403,24 +403,37 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
             let body = req.json_body.unwrap();
-            let surql = body["params"][0].as_str().unwrap().to_string();
-            let vars = body["params"][1].clone();
+            let sent = body["params"][0].as_str().unwrap().to_string();
+            // HttpSqlDb sends its binds as `LET $name = <json>;` lines ahead of
+            // the query, and SurrealDB answers every statement.
+            let mut vars = serde_json::Map::new();
+            let mut lets = Vec::new();
+            let mut surql = String::new();
+            for line in sent.lines() {
+                match line.strip_prefix("LET $").and_then(|l| l.split_once(" = ")) {
+                    Some((name, value)) => {
+                        vars.insert(name.into(), serde_json::from_str(value.trim_end_matches(';')).unwrap());
+                        lets.push(json!({ "status": "OK", "result": null }));
+                    }
+                    None => surql.push_str(line),
+                }
+            }
+            let vars = Value::Object(vars);
             self.calls.lock().unwrap().push((surql.clone(), vars.clone()));
+            let answer = |statement: Value| {
+                let mut results = lets.clone();
+                results.push(statement);
+                json!({ "id": 1, "result": results }).to_string()
+            };
             if auth != "Bearer good" {
                 return Ok(OutboundResponse { status: 401, body: "InvalidToken".into() });
             }
             if surql.contains("fn::_00_bucket::nope") {
                 let msg = "The function 'fn::_00_bucket::nope' does not exist";
-                return Ok(OutboundResponse {
-                    status: 200,
-                    body: json!({ "id": 1, "result": [{ "status": "ERR", "result": msg }] }).to_string(),
-                });
+                return Ok(OutboundResponse { status: 200, body: answer(json!({ "status": "ERR", "result": msg })) });
             }
             let allowed = vars["action"] != "delete";
-            Ok(OutboundResponse {
-                status: 200,
-                body: json!({ "id": 1, "result": [{ "status": "OK", "result": allowed }] }).to_string(),
-            })
+            Ok(OutboundResponse { status: 200, body: answer(json!({ "status": "OK", "result": allowed })) })
         }
     }
 

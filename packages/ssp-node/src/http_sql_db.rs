@@ -87,15 +87,27 @@ impl HttpSqlDb {
         self
     }
 
+    /// The binds go in as `LET` statements ahead of the query, not as RPC
+    /// variables. SurrealDB's JSON RPC parses a string variable that looks
+    /// like a record id, datetime or uuid into one (`"job:x"` became a record,
+    /// which a `job_id: option<string>` field refused), while a quoted string in
+    /// SurrealQL stays a string, which is what the SDK the VM shell uses sends
+    /// too. `serde_json` writes raw UTF-8 and only `\"`, `\\`, `\n`-style and
+    /// `\u00XX` escapes, all of which SurrealQL reads the same.
     fn request(&self, surql: &str, binds: &[(&str, Value)], authorization: &str) -> OutboundRequest {
-        let vars: Map<String, Value> = binds
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), v.clone()))
-            .collect();
+        let mut query = String::with_capacity(surql.len() + 64 * binds.len());
+        for (name, value) in binds {
+            query.push_str("LET $");
+            query.push_str(name);
+            query.push_str(" = ");
+            query.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "NONE".into()));
+            query.push_str(";\n");
+        }
+        query.push_str(surql);
         let envelope = json!({
             "id": 1,
             "method": "query",
-            "params": [surql, Value::Object(vars)],
+            "params": [query, Value::Object(Map::new())],
         });
         OutboundRequest {
             method: Method::Post,
@@ -181,7 +193,10 @@ impl HttpSqlDb {
                 resp.status, resp.body
             )));
         }
-        parse_rpc_response(&resp.body)
+        // Drop the results of the `LET`s `request` put ahead of the query.
+        let mut results = parse_rpc_response(&resp.body)?;
+        results.drain(..binds.len().min(results.len()));
+        Ok(results)
     }
 }
 
@@ -544,6 +559,42 @@ mod tests {
         // Three levels tried once, then Basic on every request.
         assert_eq!(log.iter().filter(|l| *l == "signin").count(), 3);
         assert_eq!(log.iter().filter(|l| l.starts_with("Basic ")).count(), 2);
+    }
+
+    struct EchoHttp {
+        query: std::sync::Mutex<String>,
+    }
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl HttpClient for EchoHttp {
+        async fn send(
+            &self,
+            req: OutboundRequest,
+            _cancel: Option<crate::ports::CancelWatch>,
+        ) -> Result<crate::ports::OutboundResponse, crate::ports::HttpError> {
+            let body = req.json_body.unwrap_or(Value::Null);
+            *self.query.lock().unwrap() = body["params"][0].as_str().unwrap_or_default().to_string();
+            assert_eq!(body["params"][1], json!({}), "no RPC variables");
+            Ok(crate::ports::OutboundResponse {
+                status: 200,
+                body: r#"{"id":1,"result":[{"status":"OK","result":null},{"status":"OK","result":null},{"status":"OK","result":"the answer"}]}"#.into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn binds_travel_as_let_statements_whose_results_are_dropped() {
+        let http = Arc::new(EchoHttp { query: std::sync::Mutex::new(String::new()) });
+        let db = HttpSqlDb::new(http.clone(), "https://db.example", "ns", "db", "Bearer t");
+        let out = db
+            .query("RETURN $id", &[("id", json!("job:x")), ("c", json!({ "s": "a\"b", "n": 1 }))])
+            .await
+            .unwrap();
+        assert_eq!(out, vec![json!("the answer")]);
+        assert_eq!(
+            *http.query.lock().unwrap(),
+            "LET $id = \"job:x\";\nLET $c = {\"n\":1,\"s\":\"a\\\"b\"};\nRETURN $id"
+        );
     }
 
     #[test]

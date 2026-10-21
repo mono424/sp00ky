@@ -281,15 +281,49 @@ cold object were re-read and applied by the warm start (two updated, one
 deleted); a schema change while evicted rebuilt; a canary.337 inbox with a
 queued notice was migrated and applied.
 
-Not done yet (phase 3b):
-- **Delta images** (`write_delta` plus a byte-based `absorb_delta`, gated off
-  wasm today): a three-row change still rewrites the whole table, which holds
-  the object's responses for about 0.5 s per 20 MiB (S1, below).
-- **Segmented wasm arena:** an adopted image still doubles on its first
-  append (S1, below).
-- **View state in the snapshot**, to skip re-registration and
-  `republish_restored_views` on a warm start.
-- **Measure on Cloudflare** (Ready p95 at 20 MB, the phase 3 gate).
+Phase 3b (2026-10-21):
+- **Delta images:** a table whose watermark is the end of its stored chain
+  gets a delta (`write_delta`: rows changed and ids removed since), a new base
+  after 16 deltas or once the deltas would outweigh half the base. A table
+  read from its chain or just written into it has that watermark; a rebuilt,
+  cleared or replaced one gets a base. `checkpoint::read_table_bytes` reads a
+  chain from memory on every target and checks each link. Locally a two-row
+  change on the 25 MB table wrote 768 bytes instead of 25 MB.
+- **Segmented heap arena:** an adopted image is a sealed segment 0 and appends
+  go to segments that grow up to 4 MiB, so the first write after a warm start
+  no longer doubles the table (S1, below).
+- **Cheaper DB round trips:** `HttpSqlDb` signs in once with a Basic
+  credential and sends the token (SurrealDB runs Argon2 for every Basic
+  request: 53 ms of DB CPU, about 130 ms per query from the DO); the TTL, job
+  and CRDT timers are armed in the background after Ready; bootstrap pages
+  1000 rows as the VM SSP does (3.1's keyset pager rescans from the first key,
+  so 200-row pages made the rebuild quadratic).
+- **View state is not snapshotted, on purpose.** Restored view caches are only
+  correct if they match row images taken at the same instant (ours are per
+  table, written at different times) and if publication is durable (the edge
+  publisher's queue is in memory), so skipping re-registration and
+  `republish_restored_views` would trade correctness for a cost that is small
+  at the sizes the DO hosts. Views are re-registered from `_00_query` and
+  re-primed from the loaded rows.
+
+**Measured on Cloudflare** (2026-10-21; worker `spike-warm-ssp`, deleted
+after; DO with the `weur` hint next to the staging shared SurrealDB 3.1.5;
+50k rows, a 25 MB image; client in San Jose; each warm round a fresh deploy,
+so a fresh isolate and object instance):
+
+| | Before the round-trip fixes | After |
+|---|---|---|
+| Warm start, Ready inside the DO | 403 ms | **321 ms** |
+| Warm start, DO invocation wall / CPU | 730 to 1000 ms / 104 to 193 ms | 604 to 928 ms / 104 to 161 ms |
+| Warm start, client cold minus hot request (25 rounds before, 12 after) | p50 0.75 s, p95 0.95 s, one 7.9 s outlier | p50 0.67 s, p95 0.90 s, max 0.97 s |
+| Full rebuild (no images), DO wall | 36.5 s (9.6 s with 1000-row pages) | **5.7 to 6.9 s** |
+| Checkpoint of the 25 MB base, DO wall / CPU | 0.8 to 0.9 s / 200 to 300 ms | |
+
+The phase 3 gate (Ready at most 1.5 s p95 for 20 MB) passes with room: the
+DO is Ready in about a third of a second, and the rest of a first request is
+the client's distance to the DO. The 7.9 s outlier (one of 25) was not
+reproduced in the 27 rounds after it. Still open: IngestVerify for
+divergence, and the window pager for rebuilds of large tables.
 
 **From spike S1** (measured on Cloudflare):
 - **Stream parts, never materialize them.** Read the cursor part by part into
@@ -735,7 +769,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 |---|---|---|
 | 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
 | 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
-| 3 | Table images + journal warm start (§5.4), then deltas, segmented arena, view state, IngestVerify | Ready p95 <= 1.5 s at 20 MB. **First cut done 2026-10-21** (warm start 0.16 s vs 5.2 s cold at 25 MB under local workerd); the rest and the Cloudflare measurement are open |
+| 3 | Table images + journal warm start, delta images, segmented arena (§5.4); IngestVerify | Ready p95 <= 1.5 s at 20 MB. **Done 2026-10-21, released in canary.338:** on Cloudflare the DO is Ready 0.32 s into a warm start at 25 MB (full rebuild 5.7 to 6.9 s). IngestVerify is open |
 | 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project |
 | 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |
 | 6 | Doorbell server + client, poll cap (§9) | remote queries per idle minute about 1 |

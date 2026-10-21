@@ -25,6 +25,11 @@
 //! the watchdog asks Sp00ky Cloud to recreate the `surrealdb` role (the same
 //! request as `spky restart db`), then waits `cooldown_secs` before it may ask
 //! again. Without the cloud link it only reports.
+//!
+//! The admin incident opens only after `incident_after` wedged cycles in a
+//! row (never later than the restart). One upgrade that overran the timeout
+//! while SurrealDB was overloaded, followed by a healthy probe, is not a
+//! wedge; recording each of those buried the real ones in the history.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -43,6 +48,8 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Wedged cycles in a row before a restart is requested.
     pub fail_threshold: u32,
+    /// Wedged cycles in a row before the admin incident opens.
+    pub incident_after: u32,
     /// Minimum gap between two restart requests.
     pub cooldown_secs: u64,
     /// False = report only, never restart.
@@ -58,13 +65,17 @@ impl Config {
                 .unwrap_or(default)
         }
         let interval_secs = num("SPKY_SURREAL_WS_WATCHDOG_INTERVAL_SECS", 30u64);
+        let fail_threshold = num("SPKY_SURREAL_WS_WATCHDOG_FAIL_THRESHOLD", 3u32).max(1);
         Self {
             interval_secs,
             // The cycle must finish before the next tick.
             timeout_secs: num("SPKY_SURREAL_WS_WATCHDOG_TIMEOUT_SECS", 10u64)
                 .max(1)
                 .min(interval_secs.saturating_sub(1).max(1)),
-            fail_threshold: num("SPKY_SURREAL_WS_WATCHDOG_FAIL_THRESHOLD", 3u32).max(1),
+            fail_threshold,
+            // A restart request must always find its incident open.
+            incident_after: num("SPKY_SURREAL_WS_WATCHDOG_INCIDENT_AFTER", 2u32)
+                .clamp(1, fail_threshold),
             cooldown_secs: num("SPKY_SURREAL_WS_WATCHDOG_COOLDOWN_SECS", 900u64),
             restart: std::env::var("SPKY_SURREAL_WS_WATCHDOG_RESTART")
                 .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
@@ -152,6 +163,36 @@ pub fn restart_due(
     cfg.restart
         && consecutive_wedged >= cfg.fail_threshold
         && since_last_restart.is_none_or(|d| d >= Duration::from_secs(cfg.cooldown_secs))
+}
+
+/// A change to the `ws_accept_wedge` admin incident.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IncidentChange {
+    Open,
+    Recovered,
+}
+
+/// What one cycle does to the incident. `consecutive_wedged` already counts
+/// this cycle. Opening waits for `incident_after` wedged cycles in a row, and
+/// never past `fail_threshold`, so a restart request is always recorded on an
+/// open incident. Only a healthy upgrade closes it: an unavailable database
+/// or a restart reset leaves it open.
+pub fn incident_change(
+    verdict: &Verdict,
+    consecutive_wedged: u32,
+    incident_open: bool,
+    cfg: &Config,
+) -> Option<IncidentChange> {
+    match verdict {
+        Verdict::Healthy if incident_open => Some(IncidentChange::Recovered),
+        Verdict::Wedged
+            if !incident_open
+                && consecutive_wedged >= cfg.incident_after.min(cfg.fail_threshold) =>
+        {
+            Some(IncidentChange::Open)
+        }
+        _ => None,
+    }
 }
 
 fn now_epoch_ms() -> u64 {
@@ -250,6 +291,7 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
         interval_secs = cfg.interval_secs,
         timeout_secs = cfg.timeout_secs,
         fail_threshold = cfg.fail_threshold,
+        incident_after = cfg.incident_after,
         cooldown_secs = cfg.cooldown_secs,
         restart,
         "SurrealDB WebSocket watchdog started"
@@ -289,17 +331,6 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
                         STATS.last_upgrade_ms.store(ms, Ordering::Relaxed);
                     }
                     STATS.last_ok_epoch_ms.store(now_epoch_ms(), Ordering::Relaxed);
-                    if incident_open {
-                        info!("SurrealDB accepts WebSockets again");
-                        crate::admin::incidents::emit(
-                            "surrealdb",
-                            "ws_accept_wedge",
-                            "recovered",
-                            "SurrealDB accepts new WebSocket connections again",
-                            None,
-                        );
-                        incident_open = false;
-                    }
                     wedged = 0;
                     debug!(?probe, "SurrealDB WebSocket probe ok");
                 }
@@ -317,19 +348,33 @@ pub fn spawn(db_url: &str, cfg: Config, cloud: Option<CloudLink>) {
                         timeout_secs = cfg.timeout_secs,
                         "SurrealDB answers HTTP but a new WebSocket got no upgrade response"
                     );
-                    if !incident_open {
-                        incident_open = true;
-                        crate::admin::incidents::emit(
-                            "surrealdb",
-                            "ws_accept_wedge",
-                            "open",
-                            "SurrealDB answers HTTP but no new WebSocket can connect",
-                            None,
-                        );
-                    }
                 }
             }
             STATS.consecutive_wedged.store(wedged, Ordering::Relaxed);
+            match incident_change(&verdict, wedged, incident_open, &cfg) {
+                Some(IncidentChange::Open) => {
+                    incident_open = true;
+                    crate::admin::incidents::emit(
+                        "surrealdb",
+                        "ws_accept_wedge",
+                        "open",
+                        "SurrealDB answers HTTP but no new WebSocket can connect",
+                        None,
+                    );
+                }
+                Some(IncidentChange::Recovered) => {
+                    info!("SurrealDB accepts WebSockets again");
+                    crate::admin::incidents::emit(
+                        "surrealdb",
+                        "ws_accept_wedge",
+                        "recovered",
+                        "SurrealDB accepts new WebSocket connections again",
+                        None,
+                    );
+                    incident_open = false;
+                }
+                None => {}
+            }
 
             if !restart_due(wedged, &cfg, last_restart.map(|t| t.elapsed())) {
                 continue;
@@ -373,7 +418,59 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn cfg() -> Config {
-        Config { interval_secs: 30, timeout_secs: 2, fail_threshold: 3, cooldown_secs: 900, restart: true }
+        Config {
+            interval_secs: 30,
+            timeout_secs: 2,
+            fail_threshold: 3,
+            incident_after: 2,
+            cooldown_secs: 900,
+            restart: true,
+        }
+    }
+
+    /// Feed verdicts through the loop's counting (restart left out) and
+    /// collect the incident events, tagged with the cycle they fired on.
+    fn incidents(cfg: &Config, verdicts: &[Verdict]) -> Vec<(usize, IncidentChange)> {
+        let (mut wedged, mut open, mut out) = (0u32, false, Vec::new());
+        for (i, v) in verdicts.iter().enumerate() {
+            wedged = if *v == Verdict::Wedged { wedged + 1 } else { 0 };
+            if let Some(change) = incident_change(v, wedged, open, cfg) {
+                open = change == IncidentChange::Open;
+                out.push((i, change));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn one_slow_upgrade_opens_no_incident() {
+        use Verdict::*;
+        assert!(incidents(&cfg(), &[Wedged, Healthy, Wedged, Unavailable, Healthy]).is_empty());
+    }
+
+    #[test]
+    fn two_wedged_cycles_open_and_a_healthy_one_closes() {
+        use Verdict::*;
+        assert_eq!(
+            incidents(&cfg(), &[Wedged, Wedged, Wedged, Unavailable, Healthy, Healthy]),
+            vec![(1, IncidentChange::Open), (4, IncidentChange::Recovered)]
+        );
+    }
+
+    #[test]
+    fn incident_is_open_by_the_restart_cycle() {
+        // Even when misconfigured past the restart threshold, the incident
+        // opens on the cycle that requests the restart, not after it.
+        let c = Config { incident_after: 9, ..cfg() };
+        assert_eq!(incident_change(&Verdict::Wedged, 2, false, &c), None);
+        assert_eq!(incident_change(&Verdict::Wedged, 3, false, &c), Some(IncidentChange::Open));
+        assert!(restart_due(3, &c, None));
+        // A wedge after the restart reset keeps the one incident, no reopen.
+        assert_eq!(incident_change(&Verdict::Wedged, 1, true, &c), None);
+        assert_eq!(incident_change(&Verdict::Unavailable, 0, true, &c), None);
+        // incident_after 1 is the old behaviour.
+        let first = Config { incident_after: 1, ..cfg() };
+        assert_eq!(incident_change(&Verdict::Wedged, 1, false, &first), Some(IncidentChange::Open));
     }
 
     #[test]

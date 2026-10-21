@@ -562,6 +562,24 @@ staleness flag are built on.
 | `SPKY_ALERT_WEBHOOK_URL` | Webhook posted to when the probe crosses the failure threshold and again when it recovers | *(unset)* |
 | `SPKY_HEALTH_MAX_HEARTBEAT_AGE_SECS` | How stale the last successful probe may be before `/health` degrades. Floored at `3 x interval + timeout`, so a smaller value has no effect. | *(computed)* |
 
+#### SurrealDB WebSocket watchdog
+
+Each cycle the scheduler opens a new WebSocket to SurrealDB and waits for the
+upgrade. A cycle counts as wedged when `/health` answers but the upgrade gets
+no response at all, the SurrealDB 3.x state where open sockets keep working
+and no new client can connect. A database that is down is left to the control
+plane. Needs a plain `http://` or `ws://` `SPKY_DB_URL`; restarts need the
+Sp00ky Cloud link, without it the watchdog only reports.
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SPKY_SURREAL_WS_WATCHDOG_INTERVAL_SECS` | Seconds between probe cycles. `0` disables the watchdog. | `30` |
+| `SPKY_SURREAL_WS_WATCHDOG_TIMEOUT_SECS` | How long one upgrade may take before the cycle counts as wedged. Clamped below the interval. | `10` |
+| `SPKY_SURREAL_WS_WATCHDOG_INCIDENT_AFTER` | Wedged cycles in a row before the `ws_accept_wedge` admin incident opens, so one slow upgrade on an overloaded database is not recorded as a wedge. Clamped to `1` through the fail threshold, so a restart is always recorded on an open incident. | `2` |
+| `SPKY_SURREAL_WS_WATCHDOG_FAIL_THRESHOLD` | Wedged cycles in a row before the watchdog asks Sp00ky Cloud to restart SurrealDB | `3` |
+| `SPKY_SURREAL_WS_WATCHDOG_COOLDOWN_SECS` | Minimum seconds between two restart requests | `900` |
+| `SPKY_SURREAL_WS_WATCHDOG_RESTART` | `0`, `false`, `off` or `no` = report only, never restart | `true` |
+
 #### Tuning
 
 | Variable | Description | Default |

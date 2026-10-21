@@ -103,6 +103,13 @@ void main() {
       for (final message in const [
         'Transaction conflict: Resource busy',
         'Specify a namespace to use',
+        // sp00ky's own ingest event could not post to the scheduler (down,
+        // past its TIMEOUT, 5xx): an outage, not the mutation's fault.
+        'Error while processing event _00_thing_mutation: There was an error '
+            'processing a remote HTTP request: error sending request for url '
+            '(http://scheduler:9667/ingest)',
+        'Error while processing event _00_thing_mutation: There was an error '
+            'processing a remote HTTP request: 503 Service Unavailable',
       ]) {
         final out = await runPure<void>(
           (ctx) => drain(ctx, env()),

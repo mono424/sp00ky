@@ -81,9 +81,60 @@ void main() {
       expect(classifySyncError('Specify a namespace to use'), 'network');
       expect(classifySyncError('Specify a database to use'), 'network');
     });
+    test('a failed sp00ky ingest post is network, so it is retried', () {
+      // Verbatim from SurrealDB 3.1.5 and 3.3.4: the write was refused because
+      // sp00ky's own ingest event could not reach the scheduler / SSP.
+      const prefix = 'Error while processing event _00_item_mutation: '
+          'There was an error processing a remote HTTP request: ';
+      for (final message in [
+        // Refused connection and a post past the event TIMEOUT read the same.
+        '${prefix}error sending request for url (http://scheduler:9667/ingest)',
+        '${prefix}500 Internal Server Error',
+        '${prefix}502 Bad Gateway',
+        '${prefix}503 Service Unavailable',
+        '${prefix}408 Request Timeout',
+        '${prefix}429 Too Many Requests',
+        'Error while processing event _00_item_delete: There was an error '
+            'processing a remote HTTP request: error sending request for url '
+            '(http://host.docker.internal:50466/ingest)',
+        'Error while processing event _00_item_mutation: failed to lookup '
+            'address information: Name or service not known',
+        // An app event that wrote to a synced table carries the inner event.
+        'Error while processing event app_fanout: Error while processing '
+            'event _00_b_mutation: There was an error processing a remote HTTP '
+            'request: 503 Service Unavailable',
+      ]) {
+        expect(classifySyncError(Exception(message)), 'network',
+            reason: message);
+      }
+    });
     test('everything else is application', () {
       expect(classifySyncError(StateError('bad data')), 'application');
       expect(classifySyncError('permission denied'), 'application');
+      for (final message in [
+        "Couldn't coerce value for field `title` of `item:1`: "
+            'Expected `string` but found `1`',
+        // An app's own event: its endpoint, its THROW, its business.
+        'Error while processing event notify_crm: There was an error '
+            'processing a remote HTTP request: 500 Internal Server Error',
+        'Error while processing event notify_crm: There was an error '
+            'processing a remote HTTP request: error sending request for url '
+            '(http://crm.example/hook)',
+        'Error while processing event cf_guard: An error occurred: '
+            'conformance guard: write refused',
+        // A THROW inside a sp00ky event is not a failed post.
+        'Error while processing event _00_item_mutation: An error occurred: inner',
+        // A 4xx from /ingest no retry fixes.
+        'Error while processing event _00_item_mutation: There was an error '
+            'processing a remote HTTP request: 400 Bad Request',
+        'Error while processing event _00_item_mutation: There was an error '
+            'processing a remote HTTP request: 401 Unauthorized',
+        'Error while processing event _00_item_mutation: There was an error '
+            'processing a remote HTTP request: 413 Payload Too Large',
+      ]) {
+        expect(classifySyncError(Exception(message)), 'application',
+            reason: message);
+      }
     });
   });
 

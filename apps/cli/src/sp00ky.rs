@@ -45,9 +45,13 @@ fn is_sub_path(field_name: &str) -> bool {
 /// SurrealDB 3.1.5, including that a genuine connection error still surfaces as
 /// a statement error, so a refused ingest keeps aborting the write as before.
 ///
-/// A timeout reads as `"...exceeded the timeout: 10s"`, which the client's
-/// `classifySyncError` already matches as `network` — so a queued write is
-/// retried rather than rolled back and discarded.
+/// On SurrealDB 3.1.5 and 3.3.4 a timeout and a refused connection both read
+/// `"Error while processing event _00_<table>_mutation: There was an error
+/// processing a remote HTTP request: error sending request for url (...)"`,
+/// and a 5xx reads `"...remote HTTP request: 503 Service Unavailable"`. The
+/// client's `classifySyncError` (TS and Dart) matches that wording for `_00_`
+/// events as `network`, so a queued write is retried rather than rolled back
+/// and discarded. Keep the event names `_00_`-prefixed for that reason.
 fn ingest_post() -> String {
     format!(
         "    SELECT * FROM http::post($sp00ky_endpoint + '/ingest', $payload, {{ \"Authorization\": \"Bearer \" + $sp00ky_secret }}) TIMEOUT {}s;\n",

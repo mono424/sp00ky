@@ -92,12 +92,18 @@ impl SspNode {
                 let present = circuit.contains(&table, &id);
                 match current.remove(&id) {
                     Some(row) => {
+                        // Job pickup keys on a pending CREATE. A job created
+                        // while the node was cold is already in a rebuilt
+                        // circuit, so it goes through as one; the dispatcher's
+                        // claim on `pending` keeps it to a single run.
+                        let pending_job = self.job_config.job_tables.contains_key(&table)
+                            && row.get("status").and_then(Value::as_str) == Some("pending");
                         let rv = row.get("_00_rv").and_then(Value::as_i64);
-                        if present && rv.is_some() && circuit.stored_rv(&table, &id) >= rv {
+                        if !pending_job && present && rv.is_some() && circuit.stored_rv(&table, &id) >= rv {
                             report.current += 1;
                             continue;
                         }
-                        let op = if present { "UPDATE" } else { "CREATE" };
+                        let op = if present && !pending_job { "UPDATE" } else { "CREATE" };
                         changes.push(IngestRequest { table: table.clone(), op: op.into(), id, record: row, job_assignee: None });
                         report.ingested += 1;
                     }

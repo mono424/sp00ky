@@ -4132,3 +4132,35 @@ async fn a_rebuilt_table_gets_a_base_not_a_delta() {
     assert_eq!((report.written.len(), report.deltas), (1, 0), "{report:?}");
     assert_eq!(store.images().unwrap().into_iter().find(|i| i.table == "thread").unwrap().seq, 0);
 }
+
+#[tokio::test]
+async fn replay_hands_a_pending_job_the_rebuild_already_loaded_to_the_runner() {
+    // A job created while the node was cold: the rebuild reads the row, then
+    // the queued notice replays. Pickup keys on CREATE, so replay must not read
+    // the row as merely current.
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://backend")], ..Default::default() }).await;
+    h.raw_db
+        .query("CREATE job:cold SET status = 'pending', path = '/run', payload = {}, _00_rv = 1;")
+        .await
+        .unwrap();
+    h.node.processor.write().await.load([ssp::circuit::Record::new(
+        "job",
+        "job:cold",
+        json!({ "id": "job:cold", "status": "pending", "path": "/run", "payload": {}, "_00_rv": 1 }),
+    )]);
+    let notice = ssp_protocol::IngestRequest {
+        table: "job".into(),
+        op: "CREATE".into(),
+        id: "job:cold".into(),
+        record: Value::Null,
+        job_assignee: None,
+    };
+    h.node.replay_notices(vec![notice.clone()]).await.unwrap();
+    let job = h.job_rx.lock().await.try_recv().expect("pending job enqueued by replay");
+    assert_eq!(job.id, "job:cold");
+
+    // A job that is no longer pending is not picked up again.
+    h.raw_db.query("UPDATE job:cold SET status = 'success';").await.unwrap();
+    h.node.replay_notices(vec![notice]).await.unwrap();
+    assert!(h.job_rx.lock().await.try_recv().is_err());
+}

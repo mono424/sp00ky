@@ -633,7 +633,25 @@ impl SspNodeDo {
         };
 
         tracing::info!(db_url_set = !cfg.db_url.is_empty(), "building node");
-        let node = Arc::new(build_node(platform, &cfg));
+        let (node, job_rx) = build_node(platform, &cfg);
+        let node = Arc::new(node);
+        if let Some(job_rx) = job_rx {
+            // Outbox jobs run in this object, as on a standalone VM SSP: the
+            // runner is a task on this isolate, each job an HTTP call to its
+            // backend. A job in flight when the object is evicted runs again
+            // (at least once): the recovery sweep re-admits it.
+            node.job_dispatcher.preload_policies().await;
+            let runner = ssp_node::jobs::JobRunner::new(
+                job_rx,
+                Arc::clone(&node.platform.db),
+                Arc::clone(&node.platform.http),
+                Arc::clone(&node.platform.scheduler),
+                Arc::clone(&node.platform.spawner),
+                Arc::clone(&node.job_dispatcher),
+            );
+            spawn_local(runner.run());
+            tracing::info!(tables = node.job_config.job_tables.len(), "job runner started");
+        }
         let runtime = Runtime::on_demand(node.clone());
         for key in LEGACY_SNAPSHOT_KEYS {
             let _ = self.storage.delete(key).await;
@@ -934,11 +952,15 @@ fn compact_for_inbox(path: &str, body: &[u8]) -> std::result::Result<(&'static s
     Ok(("ingest", serde_json::to_string(&compact).map_err(|e| e.to_string())?))
 }
 
-fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
-    // `_job_rx` is dropped: there is no runner on Workers. The dispatcher
-    // notices the closed channel on its first send and latches itself off, so
-    // it never issues a drain query on a host that could not run the result.
-    let (job_queue_tx, _job_rx) = tokio::sync::mpsc::channel(64);
+/// The node, and the job queue's receiver when the project has job tables
+/// (the caller runs a `JobRunner` on it). Without job tables the receiver is
+/// dropped: the dispatcher notices the closed channel on its first send and
+/// latches itself off, so it never issues a drain query nothing would run.
+fn build_node(
+    platform: Platform,
+    cfg: &NodeConfigCf,
+) -> (SspNode, Option<tokio::sync::mpsc::Receiver<ssp_node::jobs::JobEntry>>) {
+    let (job_queue_tx, job_rx) = tokio::sync::mpsc::channel(64);
     let edge_update_tx = ssp_node::edges::EdgePublisher::default();
     let job_config = Arc::new(ssp_node::jobs::JobConfig::from_json(&cfg.job_config));
     let job_control = ssp_node::jobs::JobControl::new();
@@ -952,7 +974,8 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         cfg.ssp_id.clone(),
         true,
     ));
-    SspNode {
+    let has_jobs = !job_config.job_tables.is_empty();
+    let node = SspNode {
         publication_gate: Arc::new(tokio::sync::Mutex::new(())),
         platform,
         status: Arc::new(RwLock::new(SspStatus::Bootstrapping)),
@@ -1003,7 +1026,8 @@ fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {
         checkpoint_interval_secs: None,
         max_snapshot_age_secs: MAX_SNAPSHOT_AGE_SECS,
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
-    }
+    };
+    (node, has_jobs.then_some(job_rx))
 }
 
 fn to_worker_response(resp: ssp_node::ApiResponse) -> Result<Response> {

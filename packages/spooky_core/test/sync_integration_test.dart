@@ -108,7 +108,7 @@ void main() {
     await client.dispatch(const Drain());
     await settle();
     expect(client.pendingMutationCount, 0);
-    expect(remote.queries.any((q) => q.startsWith('CREATE ONLY')), isTrue);
+    expect(remote.queries.any((q) => q.contains('CREATE ONLY')), isTrue);
   });
 
   test('a query paints from the durable view row on the next boot', () async {

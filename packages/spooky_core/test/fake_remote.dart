@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:spooky_core/spooky_core.dart';
 import 'package:spooky_core/src/kernel/effects.dart' show StatementResult;
+import 'package:spooky_core/src/mutation/rows.dart' show batchSkipped;
 import 'package:spooky_core/src/surreal/remote_client.dart'
     show StatementAwareRemote;
 
@@ -112,11 +113,24 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
       [Map<String, dynamic>? vars]) async {
     queries.add(sql);
     if (offline) throw StateError('connection refused');
-    return [
-      for (final statement in sql.split(';\n'))
-        _answer(statement.trim(), vars ?? const {})
-    ];
+    final out = <StatementResult>[];
+    for (final statement in sql.split(';\n')) {
+      // An outbox push (`remoteBatch`) chains its statements: one whose
+      // predecessor failed throws instead of running.
+      final pushed = _pushed.firstMatch(statement.trim());
+      if (pushed == null) {
+        out.add(_answer(statement.trim(), vars ?? const {}));
+      } else if (pushed.group(1) != null && !out.last.isOk) {
+        out.add(const StatementResult.err('An error occurred: $batchSkipped'));
+      } else {
+        out.add(_answer(pushed.group(2)!, vars ?? const {}));
+      }
+    }
+    return out;
   }
+
+  static final _pushed =
+      RegExp(r'^LET \$ok\d+ = \{ (IF [^}]*\}; )?(.*); true \}$');
 
   List<(String, int)> _idsOf(String id) =>
       membership[id] ?? defaultMembership ?? const [];

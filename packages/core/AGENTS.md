@@ -27,7 +27,9 @@ Sp00kyClient<S>  ── facade: every method = one saga run, selector or subscri
 
 Local writes are applied optimistically (row + outbox entry in one local
 transaction), rendered through the outbox overlay, and drained to the remote in
-batches. Server membership arrives through one batched edge read (registration,
+FIFO batches. Each statement of a batch commits on its own, but the server stops
+the batch at its first failed statement (`remoteBatch` chains them), so no write
+reaches the server ahead of an earlier one that failed. Server membership arrives through one batched edge read (registration,
 poll, LIVE dirt) and bodies are fetched once across all queries. Rows are always
 re-materialized from state, never patched in place.
 

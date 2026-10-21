@@ -162,10 +162,12 @@ void main() {
         row(MutationEventType.update, 'b', {'y': 2}),
         row(MutationEventType.delete, 'c'),
       ]);
+      // Chained: each statement runs only if the one before it committed.
+      String skip(int prev) => 'IF !\$ok$prev { THROW "$batchSkipped" }; ';
       expect(batch.sql.split(';\n'), [
-        'CREATE ONLY \$id0 SET x = \$d0_x',
-        'UPDATE \$id1 MERGE \$data1',
-        'DELETE \$id2',
+        'LET \$ok0 = { CREATE ONLY \$id0 SET x = \$d0_x; true }',
+        'LET \$ok1 = { ${skip(0)}UPDATE \$id1 MERGE \$data1; true }',
+        'LET \$ok2 = { ${skip(1)}DELETE \$id2; true }',
       ]);
       expect(batch.vars['d0_x'], 1);
       expect(batch.vars['data1'], {'y': 2});

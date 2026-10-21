@@ -392,31 +392,53 @@ Consequences:
 
 ## 6. Standalone parity inside the SSP DO
 
-The VM standalone SSP already runs jobs, schedules and push itself
-(`apps/ssp/src/lib.rs` ~960-1035). The Cloudflare shell wires the same pieces:
+The VM standalone SSP runs jobs, schedules and push itself
+(`apps/ssp/src/lib.rs` ~960-1035). The Cloudflare shell wires the same pieces,
+built in phase 4 (2026-10-21), and every one of them is ticked on demand so
+an idle project still sets no alarm:
 
-- **Jobs:** keep `job_rx` (today dropped at `lib.rs:480`, so the dispatcher
-  latches closed), spawn `JobRunner` (`packages/ssp-node/src/jobs/runner.rs`)
-  and call `preload_policies()`. Dispatch to Worker backends over a service
-  binding / `dispatcher.get(name)` (in-process, no public hop), to Container
-  backends through their Durable Object, to VM backends over HTTPS. Evicted
-  mid-request jobs run at least once, the documented guarantee.
-- **Schedules and workflows:** `ssp_node::schedules::build_engine`
-  (`schedules.rs:79`) on DO alarms. Cloudflare Workflows are not available
-  inside Workers for Platforms namespaces, and alarms keep VM parity. Build
-  schedule-core without the `tz` feature or measure the size cost.
-- **Push:** a `CfPushHttp` implementation of `push_core::PushHttp` over fetch
-  sends APNs, FCM HTTP v1 and Web Push directly. Spike S7 showed that Worker
-  and Durable Object `fetch()` reach APNs over HTTP/2 (APNs refuses HTTP/1.x,
-  yet `fetch` gets Apple's parsed answer with an `apns-id`; warm p50 21 ms from
-  a Worker, 76 ms from a DO). The APNs provider JWT (ES256) is signed with
-  WebCrypto. No relay and no push container; the outbound path must allow
-  `*.push.apple.com`.
-- **Admin:** the scheduler's admin is axum and not portable. A small
+- **Jobs (built):** when `SPKY_JOB_CONFIG` names job tables the shell preloads
+  the job policies and runs a `JobRunner` on the object's isolate; each job is
+  an HTTP call to its backend over fetch. Evicted mid-request jobs run at
+  least once: the on-demand recovery sweep re-admits them. Replay hands a
+  pending job row to the job path as a CREATE even when a rebuild already
+  loaded it (pickup keys on a pending CREATE; the claim on `pending` keeps it
+  to one run). Dispatch to Worker backends over a service binding or the
+  SSP's Dynamic Worker loader comes with phase 5; until then a backend is any
+  HTTPS endpoint.
+- **Schedules and workflows (built):** `ssp_node::schedules::build_engine` on
+  DO alarms. Instead of a 5 s sweep, `ScheduleEngine::next_wake` (one round
+  trip) says when the engine next has work: now for an unplanned or triggered
+  schedule (a refused cron does not count), every 30 s while a run is active
+  (the heal pass; a finished job normally advances its run at once), else the
+  earliest planned fire, or never. The runtime sweeps at boot and after
+  `/admin/reload` (a deploy may add schedules). Cloudflare Workflows are not
+  available inside Workers for Platforms namespaces, and alarms keep VM
+  parity.
+- **Push (built):** `CfPushHttp` sends Web Push, FCM HTTP v1 and APNs over
+  fetch (spike S7: APNs' HTTP/2 works, warm p50 76 ms from a DO); the VAPID
+  key derives from `SPKY_AUTH_SECRET`. `PushEngine::next_wake_ms` replaces the
+  one-second ticker: retries and trailing throttles in memory, plus the
+  earliest scheduled, missed or stuck message (one round trip, never sooner
+  than the sweep's cadence); `TimerKind::PushTick` is armed at boot and a
+  second after the node hands the engine a change. The outbound path must
+  allow `*.push.apple.com`.
+- **Admin (open):** the scheduler's admin is axum and not portable. A small
   `packages/admin-core` over `ApiRequest` covers overview, views, jobs
   (list, kill, retry, clear), schedules (pause, resume, trigger) and logs. The
   dashboard assets ship in the project script; auth is an HMAC-derived admin
   token minted by the control plane.
+
+Found on the way: SurrealDB 3.1's JSON RPC parses a string variable shaped
+like a record id, datetime or uuid into one, so a scheduled run could not
+spawn (`job_id: "job:sch_..."` arrived as a record). `HttpSqlDb` now sends its
+binds as `LET` statements, where a quoted string stays a string, as the SDK
+the VM shell uses sends them.
+
+Smoke-tested under local workerd against SurrealDB 3.1.5 with a local backend
+and Web Push endpoint: jobs ingested cold and warm ran; an every-10s schedule
+fired every 10 s and its runs ended `success`; direct push messages, including
+one whose event was missed, were delivered encrypted and ended `sent`.
 
 ## 7. Backends: four first-class languages
 
@@ -773,7 +795,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 | 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
 | 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
 | 3 | Table images + journal warm start, delta images, segmented arena (§5.4); IngestVerify | Ready p95 <= 1.5 s at 20 MB. **Done 2026-10-21, released in canary.338/.339:** on Cloudflare the DO is Ready 0.32 s into a warm start at 25 MB (full rebuild 5.7 to 6.9 s). IngestVerify is open |
-| 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project |
+| 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project. **Jobs, schedules and push built 2026-10-21** (on demand, smoke-tested under workerd); admin-core and the e2e gate are open |
 | 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |
 | 6 | Doorbell server + client, poll cap (§9) | remote queries per idle minute about 1 |
 | 7 | Ingest transports (`async` + changefeed backstop as the Cloudflare default) + conformance suite in CI as `spky doctor db` (§8) | suite green on SurrealDB 3.x; run against Earth when available |

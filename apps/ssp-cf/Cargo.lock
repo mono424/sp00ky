@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "push-core"
-version = "0.0.1-canary.338"
+version = "0.0.1-canary.339"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.0.1-canary.338"
+version = "0.0.1-canary.339"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-cf"
-version = "0.0.1-canary.338"
+version = "0.0.1-canary.339"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-node"
-version = "0.0.1-canary.338"
+version = "0.0.1-canary.339"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-protocol"
-version = "0.0.1-canary.338"
+version = "0.0.1-canary.339"
 dependencies = [
  "blake3",
  "serde",

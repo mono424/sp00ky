@@ -195,22 +195,49 @@ per hour) and was never evicted. Three rules the spike added:
 
 ### 5.3 Durable ingest through the output gate
 
-`/ingest`, `/ingest/batch` and `/view/unregister` are handled before
-`ensure_ready`:
+Built in phase 2 (`apps/ssp-cf/src/lib.rs` `accept_notice` / `drain_inbox`,
+`packages/ssp-node/src/replay.rs`). `/ingest`, `/ingest/batch` and
+`/view/unregister` are handled before `ensure_ready`:
 
-1. Check the bearer.
-2. `INSERT INTO wal(seq, kind, body, at)`. The output gate holds the response
-   until the write is durable, so the 200 is a durable acknowledgement.
-3. If the node is Ready and the WAL is drained, apply inline through the
-   existing ingest handler. Otherwise make sure a bootstrap alarm is set and
-   return `200 {"status":"queued"}`.
-4. Job-table rows route immediately through `route_pending_job`
-   (`node.rs:2058-2074`), without the circuit.
+1. Check the bearer (401 otherwise) and parse the body (400 otherwise).
+2. If the node is Ready and the inbox is empty, apply inline through the
+   existing handlers. A 5xx there (full publication queue, restarting
+   circuit) falls through to step 3 instead of failing the write.
+3. Otherwise `INSERT INTO ssp_inbox(seq, kind, body)`, arm `IngestReplay` now
+   and return `200 {"status":"queued"}`. The output gate holds the response
+   until the row is on disk, so the 200 is a durable acknowledgement. Row
+   notices are stored without their record bodies (`compact_notice`), a few
+   dozen bytes each.
 
-Replay goes in order through `node/ingest_batch.rs`. `/view/register` waits for
-Ready and an empty WAL. The event timeout drops from 10 s to 3 s on
-Cloudflare because the acknowledgement is a local SQLite write. Result: no user
-write fails because the SSP was cold or busy publishing.
+Replay does not re-run the queued events. A notice only says "this record
+changed", so `SspNode::replay_notices` reads the noticed records from the DB
+and ingests their current state: CREATE or UPDATE with the DB row, DELETE
+(with the circuit's body as the before-image) when the row is gone, nothing
+when the circuit already holds the DB's `_00_rv`. That is safe against the
+ways a raw replay goes wrong: an older event landing after a rebuild already
+read the newer row (the circuit would stamp it newer and regress it), an event
+from a transaction that rolled back after its post, and one record noticed
+many times. Side-effect tables (`table_excluded_from_sync`, direct pushes) and
+`/view/unregister` replay as they came, in order.
+
+The drain runs after a Ready bootstrap, on the `IngestReplay` alarm, and
+before any other route (so `/view/register` sees every accepted notice). It is
+single flight and pages 200 rows at a time; rows are deleted only after their
+replay succeeded. A 4xx from a replayed notice drops that notice with a
+warning (a retry would get the same answer, and it must not block the queue);
+anything else keeps the rows and retries in 5 s. Applying a row twice is a
+no-op, so a crash between replay and delete is harmless.
+
+Measured under local workerd against SurrealDB 3.1.5 (2026-10-21): a cold
+object answers `queued` in 4 to 30 ms; notices survive an eviction while the
+DB is unreachable; a bootstrap that times out retries with backoff and the
+inbox drains on the next alarm with no client request.
+
+Open: the event timeout can drop from 10 s to 3 s on Cloudflare (the
+acknowledgement is a local SQLite write), which is a CLI and control-plane
+change. Job rows replay through `/ingest` like other rows (a job the circuit
+has not seen arrives as CREATE, which is what pickup keys on); routing them
+without the circuit is part of phase 4, when jobs run in the object.
 
 ### 5.4 Snapshot: chunked FORMAT 2 in DO SQLite
 
@@ -227,7 +254,7 @@ chains) is the right format; its doc already names the Durable Object case.
   come from `apps/ssp/src/warm.rs` (`MAX_DELTAS`, `deltas_outweigh`). One
   table's parts and manifest are written in one synchronous burst, so they
   commit together. Checkpoint only after the edge publisher drains
-  (`edges.rs` `wait_drained`), then delete WAL rows up to `wal_covered_seq`.
+  (`edges.rs` `wait_drained`) and the inbox (§5.3) is empty.
 - **Read:** concatenate parts and call `read_image`. The delta path needs a
   byte-based `read_table_bytes(base, deltas)`; `read_table` / `absorb_delta`
   (`checkpoint.rs` ~820-930) take file paths today and are gated off wasm.
@@ -257,10 +284,14 @@ chains) is the right format; its doc already names the Durable Object case.
   N MB can need about 3N MB at the first ingest after a restore.
 
 **Validity** replaces the `_00_version` gate: the format matches, the schema
-probe hash matches (`bootstrap.rs:66`, one round trip), the WAL is continuous
-(`wal_covered_seq + 1 >= min(wal.seq)`), and the snapshot is younger than
-7 days or the changefeed cursor is inside retention. Then replay the WAL and
-skip `republish_restored_views` (`node.rs:503-540`, 3.5 s for 33 views on
+probe hash matches (`bootstrap.rs:66`, one round trip), the journal is
+continuous (`wal_covered_seq + 1 >= min(seq)` over `ssp_inbox`), and the
+snapshot is younger than 7 days or the changefeed cursor is inside retention.
+Phase 2 deletes a notice once it is applied, and one applied inline is never
+stored; phase 3 keeps every compact notice in `ssp_inbox`, marked applied,
+until a checkpoint covers it. A warm load then replays the notices after
+`wal_covered_seq` by current DB state (§5.3), which is correct however old the
+snapshot is, and skips `republish_restored_views` (`node.rs:503-540`, 3.5 s for 33 views on
 whitepawn), which only runs after a full rebuild.
 
 **Remaining divergence** is repaired, not prevented:
@@ -689,7 +720,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 | Phase | Work | Done when |
 |---|---|---|
 | 1 | §5.1 fixes, persisted + demand-armed timers (§5.2) | idle DO sets 0 alarms/hour. **Code done 2026-10-21** (`Runtime::on_demand`, persisted `CfScheduler`, single-flight bootstrap with retry, fetch timeouts, JSON logs, location hint; smoke-tested under local workerd). Needs an ssp-cf release and the control-plane bits: compatibility date, observability, `SPKY_DO_LOCATION_HINT` |
-| 2 | Durable ingest WAL (§5.3), jobs routed without the circuit | no user write fails during a forced cold start |
+| 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
 | 3 | Chunked snapshot, validity check, skip republish, IngestVerify (§5.4) | Ready p95 <= 1.5 s at 20 MB |
 | 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project |
 | 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |

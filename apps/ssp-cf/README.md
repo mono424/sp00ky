@@ -44,6 +44,12 @@ uploads the wasm bundle published by `.github/workflows/ssp-cf-publish.yml`).
 It is intentionally **not** a member of the root cargo workspace (its own empty
 `[workspace]` in `Cargo.toml` detaches it).
 
+Change notices (`/ingest`, `/ingest/batch`, `/view/unregister`) never fail
+because the object is cold, bootstrapping or busy publishing: they are kept in
+the object's SQLite (`ssp_inbox`), answered `200 {"status":"queued"}`, and
+replayed by their records' current DB state once the node is Ready
+(`docs/cloudflare-native.md` §5.3).
+
 ## Build / deploy (needs toolchain)
 
 ```sh
@@ -56,5 +62,4 @@ wrangler deploy
 
 ## Open
 
-The remaining phases (durable ingest WAL, chunked snapshots, jobs, schedules,
-push, doorbell) are tracked in `docs/cloudflare-native.md` §12.
+The remaining phases (chunked snapshots, jobs, schedules, push, doorbell) are tracked in `docs/cloudflare-native.md` §12.

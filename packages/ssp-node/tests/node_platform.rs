@@ -1148,6 +1148,110 @@ async fn on_demand_job_recovery_rearms_while_a_job_is_pending() {
 }
 
 #[tokio::test]
+async fn replay_ingests_current_state_not_the_queued_events() {
+    let h = build(HarnessOpts::default()).await;
+    let ingest = |table: &str, op: &str, id: &str, record: Value| {
+        authed(Method::Post, "/ingest", json!({ "table": table, "op": op, "id": id, "record": record }))
+    };
+    // What the circuit held before going cold.
+    for (id, rv, title) in [("thread:a", 1, "old"), ("thread:b", 1, "bye"), ("thread:d", 3, "same")] {
+        let r = h.node.route(ingest("thread", "CREATE", id, json!({ "id": id, "_00_rv": rv, "title": title }))).await.unwrap();
+        assert_eq!(r.status, 200, "seed {id}");
+    }
+    // What the DB holds now: `a` moved on, `b` is gone, `d` is unchanged, and
+    // `c` never committed (its transaction rolled back after the post).
+    h.raw_db
+        .query("CREATE thread:a SET _00_rv = 2, title = 'new'; CREATE thread:d SET _00_rv = 3, title = 'same';")
+        .await
+        .unwrap();
+
+    let notice = |op: &str, id: &str| ssp_protocol::IngestRequest {
+        table: "thread".into(),
+        op: op.into(),
+        id: id.into(),
+        record: Value::Null,
+        job_assignee: None,
+    };
+    let report = h
+        .node
+        .replay_notices(vec![
+            notice("UPDATE", "thread:a"),
+            notice("DELETE", "thread:b"),
+            notice("CREATE", "thread:c"),
+            notice("UPDATE", "thread:d"),
+            notice("UPDATE", "thread:a"),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(report.notices, 5);
+    assert_eq!((report.ingested, report.deleted, report.current), (1, 1, 1), "{report:?}");
+
+    let c = h.node.processor.read().await;
+    assert_eq!(c.record("thread", "thread:a").unwrap()["title"], "new", "a takes the DB's current state");
+    assert_eq!(c.stored_rv("thread", "thread:a"), Some(2));
+    assert!(!c.contains("thread", "thread:b"), "b deleted");
+    assert!(!c.contains("thread", "thread:c"), "a rolled-back notice adds nothing");
+    assert_eq!(c.record("thread", "thread:d").unwrap()["title"], "same");
+}
+
+#[tokio::test]
+async fn replay_twice_is_a_no_op() {
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db.query("CREATE thread:x SET _00_rv = 1, title = 'x';").await.unwrap();
+    let notices = || {
+        vec![ssp_protocol::IngestRequest {
+            table: "thread".into(),
+            op: "CREATE".into(),
+            id: "thread:x".into(),
+            record: Value::Null,
+            job_assignee: None,
+        }]
+    };
+    assert_eq!(h.node.replay_notices(notices()).await.unwrap().ingested, 1);
+    let second = h.node.replay_notices(notices()).await.unwrap();
+    assert_eq!((second.ingested, second.current), (0, 1), "{second:?}");
+}
+
+#[tokio::test]
+async fn replay_drops_a_refused_notice_and_applies_the_rest() {
+    let h = build(HarnessOpts::default()).await;
+    h.raw_db.query("CREATE thread:y SET _00_rv = 1, title = 'y';").await.unwrap();
+    let notices = vec![
+        // Replayed as it came and refused (400): a retry would get the same.
+        ssp_protocol::IngestRequest {
+            table: "_00_query_allowlist".into(),
+            op: "BOGUS".into(),
+            id: "_00_query_allowlist:1".into(),
+            record: json!({}),
+            job_assignee: None,
+        },
+        ssp_protocol::IngestRequest {
+            table: "thread".into(),
+            op: "CREATE".into(),
+            id: "thread:y".into(),
+            record: Value::Null,
+            job_assignee: None,
+        },
+    ];
+    let report = h.node.replay_notices(notices).await.unwrap();
+    assert_eq!((report.as_is, report.ingested), (1, 1), "{report:?}");
+}
+
+#[test]
+fn compact_notice_drops_row_bodies_but_keeps_side_effect_ones() {
+    use ssp_node::replay::compact_notice;
+    let n = |table: &str| ssp_protocol::IngestRequest {
+        table: table.into(),
+        op: "CREATE".into(),
+        id: format!("{table}:1"),
+        record: json!({ "big": "body" }),
+        job_assignee: None,
+    };
+    assert_eq!(compact_notice(n("thread")).record, Value::Null);
+    assert_eq!(compact_notice(n("_00_query_allowlist")).record, json!({ "big": "body" }));
+}
+
+#[tokio::test]
 async fn periodic_policy_keeps_the_fixed_cadence() {
     use ssp_node::Runtime;
     let h = build(HarnessOpts::default()).await;

@@ -54,6 +54,10 @@ pub enum TimerKind {
     /// Rebuild the CRDT fold tracker from the log tables and drop orphaned log
     /// and stale presence rows (re-arms every `FoldConfig.sweep_secs`).
     CrdtSweep,
+    /// Replay the change notices a host accepted while it could not apply
+    /// them (see [`crate::replay`]). Shell-driven: armed when a notice is
+    /// queued and re-armed with backoff while replay fails.
+    IngestReplay,
     /// Periodic circuit checkpoint to the `CircuitStore` (re-arms every
     /// `NodeConfig.checkpoint_interval_secs`). Only armed when a non-noop store
     /// is configured — the VM leaves it disabled (its store is noop).

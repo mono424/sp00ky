@@ -2579,6 +2579,14 @@ impl Circuit {
         Some(serde_json::Value::from(coll.get_row(id).to_owned_value()))
     }
 
+    /// The `_00_rv` the store holds for a record, `None` when it holds the
+    /// record without one or not at all. Replay compares it with the DB's
+    /// current version to skip records the circuit already has.
+    pub fn stored_rv(&self, table: &str, id: &str) -> Option<i64> {
+        // Ids arrive as `table:key` or bare keys; the row index holds keys.
+        self.store.collections.get(table)?.rows.rv_of(crate::types::raw_id(id))
+    }
+
     /// Highest `_00_rv` currently folded into each table's rows (`-1` when a
     /// table has no versioned row). This is the resume-point a `CircuitStore`
     /// snapshot carries: on a warm restart, catch-up loads only rows whose

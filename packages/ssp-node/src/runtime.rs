@@ -175,7 +175,8 @@ impl Runtime {
     /// Host-specific kinds (`DbResignin`, `BackendHealth` — they need the
     /// non-wasm `maintenance` crate) are NOT handled here; the shell's drain
     /// loop keeps those inline. One-shot kinds (`DelayedJob`, `JobRetry`,
-    /// `BootstrapRetry`) are driven directly by their originators, not here.
+    /// `BootstrapRetry`, `IngestReplay`) are driven directly by their
+    /// originators, not here.
     pub async fn on_timer(&self, kind: TimerKind) {
         let node = &self.node;
         let sched = &node.platform.scheduler;

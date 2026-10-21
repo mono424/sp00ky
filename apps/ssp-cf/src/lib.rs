@@ -469,10 +469,43 @@ pub struct SspNodeDo {
     /// second request would otherwise build (and hold in memory) a second
     /// circuit while the first is still bootstrapping.
     boot: tokio::sync::Mutex<()>,
+    /// Change notices accepted but not yet applied (rows in `ssp_inbox`).
+    inbox_len: Cell<u64>,
+    /// Single flight for draining the inbox.
+    drain: tokio::sync::Mutex<()>,
 }
+
+/// The routes a database event calls. They are acknowledged durably even
+/// while the node cannot apply them, so a user's write never fails because
+/// the SSP is cold, bootstrapping or busy publishing.
+fn is_notice_route(path: &str) -> bool {
+    matches!(path, "/ingest" | "/ingest/batch" | "/view/unregister")
+}
+
+const INBOX_TABLE: &str = "CREATE TABLE IF NOT EXISTS ssp_inbox \
+    (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, body TEXT NOT NULL)";
+
+/// Rows read per drain pass.
+const DRAIN_PAGE: usize = 200;
+/// Wait before retrying a replay that failed.
+const REPLAY_RETRY_MS: u64 = 5_000;
 
 /// Longest wait between bootstrap retries.
 const MAX_BOOTSTRAP_BACKOFF_MS: u64 = 60_000;
+
+fn inbox_count(storage: &Storage) -> u64 {
+    storage
+        .sql()
+        .exec("SELECT COUNT(*) AS n FROM ssp_inbox", None)
+        .and_then(|c| c.to_array::<serde_json::Value>())
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| r.get("n")).and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
+}
+
+fn json_response(status: u16, body: serde_json::Value) -> Result<Response> {
+    Ok(Response::from_json(&body)?.with_status(status))
+}
 
 impl DurableObject for SspNodeDo {
     fn new(state: State, env: Env) -> Self {
@@ -480,7 +513,11 @@ impl DurableObject for SspNodeDo {
         log::init(env.var("SPKY_LOG").ok().map(|v| v.to_string()));
         let storage = Rc::new(state.storage());
         let scheduler = Arc::new(CfScheduler::restore(storage.clone()));
-        tracing::debug!(timers = scheduler.mux.borrow().len(), "DO::new");
+        if let Err(e) = storage.sql().exec(INBOX_TABLE, None) {
+            tracing::error!(error = %e, "creating ssp_inbox failed");
+        }
+        let inbox_len = Cell::new(inbox_count(&storage));
+        tracing::debug!(timers = scheduler.mux.borrow().len(), inbox = inbox_len.get(), "DO::new");
         Self {
             state,
             env,
@@ -489,11 +526,21 @@ impl DurableObject for SspNodeDo {
             node: RefCell::new(None),
             runtime: RefCell::new(None),
             boot: tokio::sync::Mutex::new(()),
+            inbox_len,
+            drain: tokio::sync::Mutex::new(()),
         }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
+        let path = req.path();
+        if req.method() == Method::Post && is_notice_route(&path) {
+            return self.accept_notice(req, path).await;
+        }
         self.ensure_ready().await;
+        // A registration must see what was accepted before it.
+        if self.inbox_len.get() > 0 {
+            self.drain_inbox().await;
+        }
         let (node, runtime) = match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
             (Some(n), Some(r)) => (n, r),
             _ => return Response::error("node init failed", 500),
@@ -502,7 +549,6 @@ impl DurableObject for SspNodeDo {
         let Some(method) = map_incoming_method(&req.method()) else {
             return Response::error("method not allowed", 405);
         };
-        let path = req.path();
         let bearer = req
             .headers()
             .get("Authorization")
@@ -545,6 +591,7 @@ impl DurableObject for SspNodeDo {
                         self.after_bootstrap(&runtime, attempt).await;
                     }
                 }
+                TimerKind::IngestReplay => self.drain_inbox().await,
                 other => runtime.on_timer(other).await,
             }
         }
@@ -612,6 +659,9 @@ impl SspNodeDo {
         if *runtime.node().status.read().await == SspStatus::Ready {
             tracing::info!(attempt, "bootstrap complete");
             runtime.after_boot().await;
+            if self.inbox_len.get() > 0 {
+                self.drain_inbox().await;
+            }
             return;
         }
         let delay = (1000u64 << attempt.min(16)).min(MAX_BOOTSTRAP_BACKOFF_MS);
@@ -620,6 +670,184 @@ impl SspNodeDo {
             .schedule(TimerKind::BootstrapRetry { attempt: attempt + 1 }, now_epoch_ms() + delay)
             .await;
     }
+
+    /// A database event's call. Applied right away when the node is Ready and
+    /// nothing is queued ahead of it; otherwise stored durably (the output
+    /// gate holds the 200 until the write is on disk) and replayed once the
+    /// node can take it. Either way the user's transaction commits.
+    async fn accept_notice(&self, mut req: Request, path: String) -> Result<Response> {
+        let secret = self.env.secret("SPKY_AUTH_SECRET").map(|s| s.to_string()).unwrap_or_default();
+        let bearer = req
+            .headers()
+            .get("Authorization")
+            .ok()
+            .flatten()
+            .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+        if secret.is_empty() || bearer.as_deref() != Some(secret.as_str()) {
+            return json_response(401, serde_json::json!({ "code": "unauthorized" }));
+        }
+        let body = req.bytes().await.unwrap_or_default();
+
+        let ready = match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
+            (Some(node), Some(runtime)) => Some((node, runtime)),
+            _ => None,
+        };
+        if let Some((node, runtime)) = ready {
+            if self.inbox_len.get() == 0 && *node.status.read().await == SspStatus::Ready {
+                let api_req = ssp_node::ApiRequest {
+                    method: ApiMethod::Post,
+                    path: path.clone(),
+                    bearer,
+                    body: body.clone().into(),
+                };
+                match node.route(api_req).await {
+                    // A full publication queue or a restarting circuit: keep it
+                    // instead of failing the write.
+                    Some(resp) if resp.status >= 500 => {}
+                    Some(resp) => {
+                        runtime.after_request(&path).await;
+                        return to_worker_response(resp);
+                    }
+                    None => return Response::error("not found", 404),
+                }
+            }
+        }
+
+        let (kind, stored) = match compact_for_inbox(&path, &body) {
+            Ok(v) => v,
+            Err(e) => return json_response(400, serde_json::json!({ "code": "invalid_notice", "message": e })),
+        };
+        if let Err(e) = self.storage.sql().exec(
+            "INSERT INTO ssp_inbox (kind, body) VALUES (?, ?)",
+            vec![kind.into(), stored.into()],
+        ) {
+            // Not stored, so not acknowledged: the DB event fails and the
+            // client retries the write.
+            tracing::error!(error = %e, "queuing a change notice failed");
+            return json_response(503, serde_json::json!({ "code": "inbox_unavailable" }));
+        }
+        self.inbox_len.set(self.inbox_len.get() + 1);
+        // Wake as soon as possible: bootstrap (if cold), then replay.
+        self.scheduler.ensure(TimerKind::IngestReplay, now_epoch_ms()).await;
+        json_response(200, serde_json::json!({ "status": "queued" }))
+    }
+
+    /// Replay the inbox in order, single flight (a second caller waits, so a
+    /// registration after it sees every accepted notice). Ingest notices are
+    /// applied by their records' current DB state (`SspNode::replay_notices`),
+    /// view unregisters as they came. A failure keeps the rows and retries.
+    async fn drain_inbox(&self) {
+        let _drain = self.drain.lock().await;
+        let (node, runtime) = match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
+            (Some(n), Some(r)) => (n, r),
+            _ => return,
+        };
+        loop {
+            // Recounted from disk each pass: notices keep arriving while a
+            // replay awaits the DB.
+            self.inbox_len.set(inbox_count(&self.storage));
+            if self.inbox_len.get() == 0 || *node.status.read().await != SspStatus::Ready {
+                return;
+            }
+            let rows: Vec<serde_json::Value> = match self
+                .storage
+                .sql()
+                .exec(&format!("SELECT seq, kind, body FROM ssp_inbox ORDER BY seq LIMIT {DRAIN_PAGE}"), None)
+                .and_then(|c| c.to_array())
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "reading ssp_inbox failed");
+                    return;
+                }
+            };
+            let mut done_through: Option<i64> = None;
+            let mut notices: Vec<ssp_protocol::IngestRequest> = Vec::new();
+            let mut failed = false;
+            for row in &rows {
+                let seq = row.get("seq").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let kind = row.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+                let body = row.get("body").and_then(serde_json::Value::as_str).unwrap_or("");
+                if kind == "unregister" {
+                    // Keep order: whatever was noticed before it lands first.
+                    if !notices.is_empty() && self.replay(&node, std::mem::take(&mut notices)).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                    let api_req = ssp_node::ApiRequest {
+                        method: ApiMethod::Post,
+                        path: "/view/unregister".into(),
+                        bearer: Some(node.auth_secret.clone()),
+                        body: body.as_bytes().to_vec().into(),
+                    };
+                    match node.route(api_req).await {
+                        Some(resp) if resp.status < 500 => {}
+                        _ => {
+                            failed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    match serde_json::from_str::<Vec<ssp_protocol::IngestRequest>>(body) {
+                        Ok(mut batch) => notices.append(&mut batch),
+                        Err(e) => tracing::warn!(error = %e, seq, "dropping an unreadable inbox row"),
+                    }
+                }
+                done_through = Some(seq);
+            }
+            if !failed && !notices.is_empty() && self.replay(&node, notices).await.is_err() {
+                failed = true;
+            }
+            if failed {
+                // Rows already applied are replayed again next time, which is
+                // a no-op for ingest notices and for unregisters.
+                self.scheduler
+                    .ensure(TimerKind::IngestReplay, now_epoch_ms() + REPLAY_RETRY_MS)
+                    .await;
+                return;
+            }
+            if let Some(seq) = done_through {
+                if let Err(e) = self.storage.sql().exec("DELETE FROM ssp_inbox WHERE seq <= ?", vec![seq.into()]) {
+                    tracing::warn!(error = %e, "trimming ssp_inbox failed");
+                    return;
+                }
+            }
+            runtime.after_request("/ingest").await;
+        }
+    }
+
+    async fn replay(&self, node: &SspNode, notices: Vec<ssp_protocol::IngestRequest>) -> std::result::Result<(), ()> {
+        match node.replay_notices(notices).await {
+            Ok(report) => {
+                tracing::info!(?report, "replayed queued change notices");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "replaying queued change notices failed; retrying");
+                Err(())
+            }
+        }
+    }
+}
+
+/// What the inbox keeps of a notice: `ingest` rows hold the compact notices
+/// (record bodies dropped, replay reads the DB again), `unregister` rows the
+/// request as it came.
+fn compact_for_inbox(path: &str, body: &[u8]) -> std::result::Result<(&'static str, String), String> {
+    use ssp_node::replay::compact_notice;
+    let notices: Vec<ssp_protocol::IngestRequest> = match path {
+        "/view/unregister" => {
+            let text = std::str::from_utf8(body).map_err(|e| e.to_string())?;
+            serde_json::from_str::<serde_json::Value>(text).map_err(|e| e.to_string())?;
+            return Ok(("unregister", text.to_string()));
+        }
+        "/ingest/batch" => {
+            serde_json::from_slice::<ssp_protocol::IngestBatchRequest>(body).map_err(|e| e.to_string())?.records
+        }
+        _ => vec![serde_json::from_slice::<ssp_protocol::IngestRequest>(body).map_err(|e| e.to_string())?],
+    };
+    let compact: Vec<_> = notices.into_iter().map(compact_notice).collect();
+    Ok(("ingest", serde_json::to_string(&compact).map_err(|e| e.to_string())?))
 }
 
 fn build_node(platform: Platform, cfg: &NodeConfigCf) -> SspNode {

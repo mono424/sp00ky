@@ -30,6 +30,7 @@ pub mod http_sql_db;
 pub mod jobs;
 pub mod handover;
 pub mod node;
+pub mod replay;
 pub mod platform;
 pub mod ports;
 pub mod status;

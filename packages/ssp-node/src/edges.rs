@@ -53,6 +53,21 @@ impl RecordVersions for CapturedVersions {
     fn version_of(&self, key: &str) -> i64 { self.0.get(key).copied().unwrap_or(1) }
 }
 
+/// Publications whose source rows were not all visible after the 5 s wait.
+static SOURCE_WAIT_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Log a source wait that hit its cap: the first one, then every hundredth.
+/// Each one held a publication 5 s; on Cloudflare a round of them also keeps
+/// probes polling against the object's few concurrent connections.
+fn note_source_wait_timeout(rows: &[(String, i64)]) {
+    let n = SOURCE_WAIT_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 100 == 0 {
+        let table = rows.first().and_then(|(id, _)| id.split_once(':')).map(|(t, _)| t).unwrap_or_default();
+        warn!(target: "ssp::edges", total = n, rows = rows.len(), table = %table,
+            "publication source wait timed out; publishing anyway");
+    }
+}
+
 /// The production publication boundary: capture only the required versions,
 /// then release the circuit before database calls, retries and orphan probes.
 pub async fn write_deltas_unlocked(
@@ -682,10 +697,13 @@ impl EdgePublisher {
                         if waits.iter().all(Option::is_none) { std::task::Poll::Ready(()) }
                         else { std::task::Poll::Pending }
                     });
-                    tokio::select! {
-                        _ = cancel.notified() => {},
-                        _ = scheduler.sleep(Duration::from_secs(5)) => {},
-                        _ = all_visible => {},
+                    let timed_out = tokio::select! {
+                        _ = cancel.notified() => false,
+                        _ = scheduler.sleep(Duration::from_secs(5)) => true,
+                        _ = all_visible => false,
+                    };
+                    if timed_out {
+                        note_source_wait_timeout(&rows);
                     }
                     ready.store(true, std::sync::atomic::Ordering::Release);
                     queue.wake.notify_one();

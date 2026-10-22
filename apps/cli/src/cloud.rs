@@ -6196,6 +6196,21 @@ pub(crate) fn push_schema_inner(client: &mut CloudClient, slug: &str, pid: &str)
     sql.push('\n');
     sql.push_str(&crate::push_sync::upsert_sql(&push_spec));
 
+    // Schedules, workflows, retention and job policies, as
+    // `apply_internal_schema` syncs them on the VM path. The proxy only
+    // applies SQL, so this is the read-free form of `schedule_sync::sync`.
+    let mut processor = backend::BackendProcessor::new();
+    processor.process(&config_path)?;
+    let (schedule_sql, schedule_error) =
+        crate::schedule_sync::sync_sql(&config, &processor, config_dir)?;
+    if let Some(e) = schedule_error {
+        crate::ui::warn(format!(
+            "schedules not synced: {e:#} (`spky lint` shows it; the policies still are)"
+        ));
+    }
+    sql.push('\n');
+    sql.push_str(&schedule_sql);
+
     println!("Pushing schema for '{}' ({} bytes)...", slug, sql.len());
     client
         .post(

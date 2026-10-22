@@ -266,6 +266,60 @@ pub fn sync(
     Ok(report)
 }
 
+/// Everything [`sync`] writes, as one idempotent SQL batch for a deploy that
+/// cannot read the database first: a Cloudflare project, whose schema goes
+/// through the control plane's schema proxy. The retention policy, the job
+/// policies and the job indexes, then each schedule upserted only when its stored
+/// `spec_hash` differs (so an unchanged one keeps its `next_fire_at`), then the
+/// sweep of every schedule no longer declared.
+///
+/// Returns the SQL and, separately, the error of a schedule that does not
+/// resolve. Then the batch carries the policies but no schedule statements and
+/// no sweep, so one bad entry never deletes the others (like [`sync`], which
+/// skips the schedules and keeps the policies).
+pub fn sync_sql(
+    config: &Sp00kyConfig,
+    processor: &BackendProcessor,
+    base_dir: &Path,
+) -> Result<(String, Option<anyhow::Error>)> {
+    let mut sql = String::new();
+    let r = config.resolved_retention()?;
+    let mut tables = crate::schema_builder::outbox_tables(processor);
+    tables.sort();
+    tables.dedup();
+    sql.push_str(&retention_patch_sql(&r, &tables)?);
+    sql.push('\n');
+    for (table, concurrency) in declared_job_limits(config) {
+        sql.push_str(&job_policy_upsert_sql(&table, concurrency));
+        sql.push('\n');
+    }
+    for table in &tables {
+        sql.push_str(&job_index_sql(table));
+        sql.push('\n');
+    }
+
+    let rows = match resolve_rows(config, processor, base_dir) {
+        Ok(rows) => rows,
+        Err(e) => return Ok((sql, Some(e))),
+    };
+    let mut declared = Vec::new();
+    for (name, spec) in &rows {
+        let hash = checksum_str(&serde_json::to_string(spec)?);
+        let id = record_literal(name);
+        sql.push_str(&format!(
+            "IF (SELECT VALUE spec_hash FROM {id})[0] != '{hash}' {{ UPSERT {id} MERGE {patch}; UPDATE {id} SET next_fire_at = NONE{cleared}; }};\n",
+            patch = merge_patch(spec, &hash)?,
+            cleared = cleared_fields(spec),
+        ));
+        declared.push(name.as_str());
+    }
+    sql.push_str(&format!(
+        "DELETE _00_schedule WHERE name NOT IN {};\n",
+        serde_json::to_string(&declared)?
+    ));
+    Ok((sql, None))
+}
+
 /// Write the project's retention policy and the list of outbox tables the engine may
 /// sweep to `_00_retention:default`.
 ///
@@ -775,5 +829,58 @@ mod job_policy_sync_tests {
     #[test]
     fn the_table_name_is_quoted() {
         assert!(job_policy_upsert_sql("stats_job", 2).contains("_00_job_policy:⟨stats_job⟩"));
+    }
+}
+
+#[cfg(test)]
+mod sync_sql_tests {
+    use super::*;
+
+    const SPEC: &str = "openapi: 3.0.0\ninfo: { title: api, version: '1' }\npaths:\n  /spookify:\n    post:\n      responses:\n        '200': { description: ok }\n";
+    const OUTBOX: &str = "DEFINE TABLE job SCHEMAFULL;\nDEFINE FIELD path ON TABLE job TYPE string;\n";
+
+    fn project(schedule_route: &str) -> (tempfile::TempDir, Sp00kyConfig, BackendProcessor) {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("openapi.yml"), SPEC).unwrap();
+        std::fs::write(dir.path().join("job.surql"), OUTBOX).unwrap();
+        let yml = format!(
+            "apps:\n  api:\n    type: backend\n    spec: ./openapi.yml\n    worker: {{ entry: ./i.ts }}\n    method: {{ type: outbox, table: job, schema: ./job.surql, concurrency: 2 }}\nschedules:\n  nightly:\n    every: 5m\n    backend: api\n    route: {schedule_route}\n"
+        );
+        let path = dir.path().join("sp00ky.yml");
+        std::fs::write(&path, yml).unwrap();
+        let config = crate::backend::load_config(&path);
+        let mut processor = BackendProcessor::new();
+        processor.process(&path).unwrap();
+        (dir, config, processor)
+    }
+
+    /// The read-free batch a Cloudflare deploy pushes: the policies, each
+    /// schedule guarded by its hash, and the sweep of undeclared schedules.
+    #[test]
+    fn writes_policies_guarded_schedules_and_the_sweep() {
+        let (dir, config, processor) = project("/spookify");
+        let (sql, err) = sync_sql(&config, &processor, dir.path()).unwrap();
+        assert!(err.is_none(), "{err:?}");
+        assert!(sql.contains("UPSERT _00_retention:default MERGE"), "{sql}");
+        assert!(sql.contains("UPSERT _00_job_policy:⟨job⟩ MERGE { concurrency: 2 };"), "{sql}");
+        assert!(sql.contains("idx_job_dispatch"), "{sql}");
+        assert!(
+            sql.contains("IF (SELECT VALUE spec_hash FROM _00_schedule:⟨nightly⟩)[0] != '"),
+            "{sql}"
+        );
+        assert!(sql.contains("UPSERT _00_schedule:⟨nightly⟩ MERGE"), "{sql}");
+        assert!(sql.contains("SET next_fire_at = NONE"), "{sql}");
+        assert!(sql.ends_with("DELETE _00_schedule WHERE name NOT IN [\"nightly\"];\n"), "{sql}");
+    }
+
+    /// One schedule that does not resolve: the policies still go out, but no
+    /// schedule statement and no sweep, which would delete the good ones.
+    #[test]
+    fn a_bad_schedule_keeps_the_policies_and_skips_the_sweep() {
+        let (dir, config, processor) = project("/nope");
+        let (sql, err) = sync_sql(&config, &processor, dir.path()).unwrap();
+        assert!(err.is_some());
+        assert!(sql.contains("_00_job_policy"), "{sql}");
+        assert!(!sql.contains("_00_schedule"), "{sql}");
     }
 }

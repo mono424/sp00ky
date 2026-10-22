@@ -399,6 +399,7 @@ pub fn add_api(
             concurrency: None,
         }),
         run_on: None,
+        worker: None,
         image: None,
         ports: Vec::new(),
         args: Vec::new(),

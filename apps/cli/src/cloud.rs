@@ -2168,6 +2168,210 @@ fn deploy_static_frontend_cloudflare(
     Ok(())
 }
 
+/// esbuild release Worker backends are bundled with, pinned so the same source
+/// always gives the same bundle (and bundle hash).
+const WORKER_ESBUILD_VERSION: &str = "0.27.5";
+
+/// `npx` arguments that bundle a Worker backend's entry into one ESM module.
+/// `node:*` and `cloudflare:*` imports stay external for workerd to resolve;
+/// each `textModules` glob's extension is imported as a string.
+fn worker_esbuild_args(
+    entry: &std::path::Path,
+    outfile: &std::path::Path,
+    worker: &backend::WorkerDeployConfig,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--yes".into(),
+        format!("esbuild@{}", WORKER_ESBUILD_VERSION),
+        entry.to_string_lossy().to_string(),
+        "--bundle".into(),
+        "--format=esm".into(),
+        "--platform=neutral".into(),
+        "--conditions=workerd,worker,browser".into(),
+        "--main-fields=module,main".into(),
+        "--external:node:*".into(),
+        "--external:cloudflare:*".into(),
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for ext in worker
+        .text_modules
+        .iter()
+        .filter_map(|g| backend::text_module_extension(g))
+    {
+        if !seen.contains(&ext) {
+            seen.push(ext);
+            args.push(format!("--loader:.{}=text", ext));
+        }
+    }
+    args.push(format!("--outfile={}", outfile.to_string_lossy()));
+    args
+}
+
+/// Where esbuild runs for a Worker backend: the nearest directory above its
+/// entry that holds a package.json (its app dir), else the project root.
+fn worker_app_dir(entry: &std::path::Path, config_dir: &std::path::Path) -> std::path::PathBuf {
+    entry
+        .ancestors()
+        .skip(1)
+        .take_while(|d| d.starts_with(config_dir))
+        .find(|d| d.join("package.json").is_file())
+        .unwrap_or(config_dir)
+        .to_path_buf()
+}
+
+/// Free/Cloudflare Worker backend: bundle the entry with esbuild and upload the
+/// bundle (`PUT /worker-backends/{name}?hash=`). The control plane ships it with
+/// the project's SSP Worker, which loads it as a Dynamic Worker. Returns the
+/// bundle's sha256 (hex), which names this version of the code.
+fn deploy_worker_backend_cloudflare(
+    client: &CloudClient,
+    pid: &str,
+    slug: &str,
+    name: &str,
+    worker: &backend::WorkerDeployConfig,
+    config_dir: &std::path::Path,
+) -> Result<String> {
+    use sha2::Digest;
+
+    let entry = config_dir.join(&worker.entry);
+    if !entry.is_file() {
+        bail!(
+            "Worker backend '{}': entry not found: {}",
+            name,
+            entry.display()
+        );
+    }
+    let app_dir = worker_app_dir(&entry, config_dir);
+    let outfile = std::env::temp_dir().join(format!("sp00ky-{}-{}-worker.js", slug, name));
+    let _ = fs::remove_file(&outfile);
+
+    println!(
+        "  Bundling Worker backend '{}' ({}) with esbuild {}...",
+        name,
+        worker.entry,
+        WORKER_ESBUILD_VERSION
+    );
+    let status = std::process::Command::new("npx")
+        .args(worker_esbuild_args(&entry, &outfile, worker))
+        .current_dir(&app_dir)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("Failed to run esbuild (is Node.js with npx installed?)")?;
+    if !status.success() {
+        bail!("Bundling Worker backend '{}' failed", name);
+    }
+
+    let data = fs::read(&outfile)
+        .context(format!("Failed to read the bundle of Worker backend '{}'", name))?;
+    let _ = fs::remove_file(&outfile);
+    let hash = hex::encode(sha2::Sha256::digest(&data));
+    println!(
+        "  Uploading Worker backend '{}' ({:.1}KB)...",
+        name,
+        data.len() as f64 / 1024.0
+    );
+    let url = format!(
+        "{}/v1/projects/{}/worker-backends/{}?hash={}",
+        upload_base_url(&client.base_url),
+        pid,
+        name,
+        hash
+    );
+    match ureq::put(&url)
+        .set("Authorization", &format!("Bearer {}", client.token))
+        .set("Content-Type", "application/javascript")
+        .send_bytes(&data)
+    {
+        Ok(_) => {}
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            bail!(
+                "Worker backend upload failed for '{}' (HTTP {}): {}",
+                name,
+                code,
+                body
+            );
+        }
+        Err(ureq::Error::Transport(t)) => {
+            bail!("Worker backend upload failed for '{}': {}", name, t);
+        }
+    }
+    Ok(hash)
+}
+
+/// A Worker backend's runtime env: the `SPKY_*` base, then its own `env`
+/// (vault included), which wins. Sent as an object, not `KEY=VAL` strings.
+fn worker_backend_env(
+    spky_vars: &[String],
+    user_env: &[String],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut env = std::collections::BTreeMap::new();
+    for entry in spky_vars.iter().chain(user_env) {
+        if let Some((k, v)) = entry.split_once('=') {
+            env.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+    env.into_iter().collect()
+}
+
+/// One `worker_backends` entry of the deploy body.
+fn build_worker_backend_manifest(
+    name: &str,
+    hash: &str,
+    worker: &backend::WorkerDeployConfig,
+    env: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let workflows: Vec<serde_json::Value> = worker
+        .workflows
+        .iter()
+        .map(|w| serde_json::json!({ "binding": w.binding, "class": w.class }))
+        .collect();
+    serde_json::json!({
+        "name": name,
+        "hash": hash,
+        "compatibility_date": worker.resolved_compatibility_date(),
+        "compatibility_flags": worker.compatibility_flags,
+        "cpu_ms": worker.cpu_ms,
+        "ai": worker.ai,
+        "workflows": workflows,
+        "expose": worker.expose,
+        "env": env,
+    })
+}
+
+/// Free (Cloudflare): SPKY_JOB_CONFIG for the SSP Worker, one entry per outbox
+/// backend it can dispatch to. A Worker backend's jobs go to `worker://<name>`,
+/// which the SSP Worker serves in-isolate; any other backend needs a public
+/// `baseUrl` the Worker can reach, and is skipped without one.
+fn cloudflare_job_config(config: &backend::Sp00kyConfig) -> serde_json::Value {
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for (name, app) in config.backends() {
+        let Some(m) = &app.method else { continue };
+        if !matches!(m.method_type, crate::backend::MethodType::Outbox) {
+            continue;
+        }
+        let Some(table) = m.table.as_ref() else { continue };
+        let base_url = if app.worker.is_some() {
+            // A devOnly Worker backend is never bundled, so nothing serves it.
+            if !app.deploys() {
+                continue;
+            }
+            format!("worker://{}", name)
+        } else if let Some(url) = &app.base_url {
+            url.clone()
+        } else {
+            continue;
+        };
+        entries.push(serde_json::json!({
+            "name": name,
+            "base_url": base_url,
+            "table": table,
+        }));
+    }
+    serde_json::json!(entries)
+}
+
 pub fn deploy(
     upgrade: bool,
     clean: bool,
@@ -2282,6 +2486,8 @@ pub fn deploy(
         project_registry(&mut client, &pid)
     };
     let mut external_backends: Vec<serde_json::Value> = Vec::new();
+    // Free (Cloudflare): backends that run as Dynamic Workers in the SSP Worker.
+    let mut worker_backends: Vec<serde_json::Value> = Vec::new();
 
     for (name, app_config) in config.backends() {
         // devOnly apps are local-only (started by `spky dev`); never deployed.
@@ -2308,6 +2514,26 @@ pub fn deploy(
                 println!("  Skipping backend '{}' (not in --only)", name);
                 continue;
             }
+        }
+
+        // Worker backend on a Cloudflare project: bundled and uploaded, no
+        // Docker image. Checked before `deploy`, which a Worker backend need
+        // not have.
+        if let Some(worker) = &app_config.worker {
+            if platform == "cloudflare" {
+                let hash =
+                    deploy_worker_backend_cloudflare(&client, &pid, &slug, name, worker, config_dir)?;
+                let user_env = resolve_env_for_deploy(&app_config.env, config_dir, &mut client, &pid);
+                let env = worker_backend_env(&build_spky_cloud_vars(&config), &user_env);
+                worker_backends.push(build_worker_backend_manifest(name, &hash, worker, env));
+                println!("  Worker backend '{}' ready for deployment.", name);
+                continue;
+            }
+            crate::ui::warn(format!(
+                "Backend '{}' sets `worker`, which only a Cloudflare project runs; \
+                 it deploys from its Dockerfile here.",
+                name
+            ));
         }
 
         let deploy = match &app_config.deploy {
@@ -3225,26 +3451,12 @@ pub fn deploy(
         .and_then(|c| c.resolved(DeployEnv::Cloud));
 
     // Free (Cloudflare): assemble SPKY_JOB_CONFIG from outbox backends so the
-    // SSP Worker can dispatch jobs to the (self-hosted) backends. base_url must
-    // be a public URL the Worker can reach; backends without one are skipped.
-    let mut ssp_job_config = serde_json::Value::Null;
-    if platform == "cloudflare" {
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        for (name, app) in config.backends() {
-            let Some(m) = &app.method else { continue };
-            if !matches!(m.method_type, crate::backend::MethodType::Outbox) {
-                continue;
-            }
-            if let (Some(table), Some(base_url)) = (m.table.as_ref(), app.base_url.as_ref()) {
-                entries.push(serde_json::json!({
-                    "name": name,
-                    "base_url": base_url,
-                    "table": table,
-                }));
-            }
-        }
-        ssp_job_config = serde_json::json!(entries);
-    }
+    // SSP Worker can dispatch jobs to them (see `cloudflare_job_config`).
+    let ssp_job_config = if platform == "cloudflare" {
+        cloudflare_job_config(&config)
+    } else {
+        serde_json::Value::Null
+    };
 
     // Per-role env for the infra containers (`deployment.env` in sp00ky.yml).
     // Omitted when unset so the control plane keeps the previous setting, the
@@ -3295,7 +3507,7 @@ pub fn deploy(
             r2_buckets.join(", ")
         ));
     }
-    let deploy_body = serde_json::json!({
+    let mut deploy_body = serde_json::json!({
         // Machine pools: ceilings and machine shapes, enforced control-plane side.
         // An older control plane simply ignores the key.
         "pools": crate::pool_config::cloud_pool_manifests(&config),
@@ -3335,6 +3547,12 @@ pub fn deploy(
         // deployment instead of treating them as the complete desired set.
         "partial": is_partial,
     });
+    // Free plan: Worker backends the SSP Worker loads (code uploaded above by
+    // hash). Omitted when there are none, so a control plane that predates
+    // them sees the body it always did.
+    if !worker_backends.is_empty() {
+        deploy_body["worker_backends"] = serde_json::json!(worker_backends);
+    }
 
     // The body carries every backend's env with vault values resolved, so it
     // never goes to stdout (terminal scrollback, CI logs). A debugging dump is
@@ -9313,5 +9531,134 @@ mod cloud_surreal_tests {
         .expect("database-level login")
         .to_string();
         assert!(err.contains("'database'-level"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod worker_backend_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn worker(yaml: &str) -> backend::WorkerDeployConfig {
+        serde_yaml::from_str(yaml).expect("worker yaml")
+    }
+
+    #[test]
+    fn esbuild_args_are_pinned_and_map_text_globs_to_loaders() {
+        let w = worker("entry: ./src/index.ts\ntextModules: [\"**/*.surql\", \"prompts/*.md\", \"other/*.surql\"]\n");
+        let args = worker_esbuild_args(Path::new("/p/src/index.ts"), Path::new("/tmp/out.js"), &w);
+        let esbuild = format!("esbuild@{}", WORKER_ESBUILD_VERSION);
+        assert_eq!(
+            args,
+            vec![
+                "--yes",
+                esbuild.as_str(),
+                "/p/src/index.ts",
+                "--bundle",
+                "--format=esm",
+                "--platform=neutral",
+                "--conditions=workerd,worker,browser",
+                "--main-fields=module,main",
+                "--external:node:*",
+                "--external:cloudflare:*",
+                "--loader:.surql=text",
+                "--loader:.md=text",
+                "--outfile=/tmp/out.js",
+            ]
+        );
+        // An exact version, never a range or a tag.
+        assert!(WORKER_ESBUILD_VERSION.split('.').all(|p| p.parse::<u32>().is_ok()));
+    }
+
+    #[test]
+    fn app_dir_is_the_nearest_package_json_inside_the_project() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("apps/api/src")).unwrap();
+        let entry = root.join("apps/api/src/index.ts");
+        assert_eq!(worker_app_dir(&entry, root), root);
+        std::fs::write(root.join("apps/api/package.json"), "{}").unwrap();
+        assert_eq!(worker_app_dir(&entry, root), root.join("apps/api"));
+    }
+
+    #[test]
+    fn job_config_sends_worker_backends_to_worker_urls() {
+        let config: backend::Sp00kyConfig = serde_yaml::from_str(
+            "\
+apps:
+  api:
+    type: backend
+    spec: a.yml
+    method: { type: outbox, table: job, schema: a.surql }
+    worker: { entry: i.ts }
+  hosted:
+    type: backend
+    spec: b.yml
+    baseUrl: https://hosted.example.com
+    method: { type: outbox, table: job_hosted, schema: b.surql }
+  nourl:
+    type: backend
+    spec: c.yml
+    method: { type: outbox, table: job_nourl, schema: c.surql }
+  local:
+    type: backend
+    scope: devOnly
+    method: { type: outbox, table: job_local, schema: d.surql }
+    worker: { entry: d.ts }
+",
+        )
+        .unwrap();
+        assert_eq!(
+            cloudflare_job_config(&config),
+            serde_json::json!([
+                { "name": "api", "base_url": "worker://api", "table": "job" },
+                { "name": "hosted", "base_url": "https://hosted.example.com", "table": "job_hosted" },
+            ])
+        );
+    }
+
+    /// The field names are a contract with the control plane.
+    #[test]
+    fn manifest_shape() {
+        let w = worker(
+            "\
+entry: ./src/index.ts
+compatibilityFlags: [nodejs_compat]
+cpuMs: 300000
+ai: AI
+workflows: [{ binding: INGEST, class: IngestMaterial }]
+expose: [/llm/*]
+",
+        );
+        let env = worker_backend_env(
+            &["SPKY_ENV=cloud".into(), "SPKY_DB_NS=t".into()],
+            &["APP_ORIGIN=https://t.example".into(), "SPKY_DB_NS=override".into(), "EQ=a=b".into()],
+        );
+        assert_eq!(
+            build_worker_backend_manifest("api", "abc123", &w, env),
+            serde_json::json!({
+                "name": "api",
+                "hash": "abc123",
+                "compatibility_date": backend::DEFAULT_WORKER_COMPATIBILITY_DATE,
+                "compatibility_flags": ["nodejs_compat"],
+                "cpu_ms": 300000,
+                "ai": "AI",
+                "workflows": [{ "binding": "INGEST", "class": "IngestMaterial" }],
+                "expose": ["/llm/*"],
+                "env": {
+                    "APP_ORIGIN": "https://t.example",
+                    "EQ": "a=b",
+                    "SPKY_DB_NS": "override",
+                    "SPKY_ENV": "cloud",
+                },
+            })
+        );
+
+        let bare = build_worker_backend_manifest("api", "h", &worker("entry: i.ts\n"), Default::default());
+        assert_eq!(bare["cpu_ms"], serde_json::Value::Null);
+        assert_eq!(bare["ai"], serde_json::Value::Null);
+        assert_eq!(bare["workflows"], serde_json::json!([]));
+        assert_eq!(bare["expose"], serde_json::json!([]));
+        assert_eq!(bare["env"], serde_json::json!({}));
     }
 }

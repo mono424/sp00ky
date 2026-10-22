@@ -115,10 +115,17 @@ app.openapi(spookifyRoute, async (c) => {
       database: process.env.SPKY_DB_NAME || 'example',
     });
 
-    await db.signin({
+    // A VM backend gets a root login; a Worker backend on the shared free DB
+    // gets its project's namespace owner (SPKY_DB_LEVEL=namespace).
+    const credentials = {
       username: process.env.SPKY_DB_USER || 'root',
       password: process.env.SPKY_DB_PASS || 'root',
-    });
+    };
+    await db.signin(
+      process.env.SPKY_DB_LEVEL === 'namespace'
+        ? { ...credentials, namespace: process.env.SPKY_DB_NS || 'main' }
+        : credentials
+    );
 
     // 1. Query the record
     // db.query returns Promise<T>. For one statement, T should be [ResultType]

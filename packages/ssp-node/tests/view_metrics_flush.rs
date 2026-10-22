@@ -256,3 +256,68 @@ async fn a_failing_row_stays_dirty_without_holding_back_its_batch() {
     assert_eq!(map["w2"].update_count, 3, "with its ingests");
     assert!(!map["w1"].dirty);
 }
+
+/// Never answers: every request times out, as the shared staging DB did for
+/// two minutes on 2026-10-22.
+struct SilentDb(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Db for SilentDb {
+    async fn query(&self, _surql: &str, _binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(DbError::Transport("timeout after 30s".into()))
+    }
+    async fn version(&self) -> Result<String, DbError> {
+        Ok("silent".into())
+    }
+}
+
+// Retrying each view of a batch after a 30 s timeout held the Cloudflare
+// alarm, and every timer behind it, for minutes while the DB stalled.
+#[tokio::test]
+async fn a_database_that_does_not_answer_gets_one_request_and_every_view_stays_dirty() {
+    let (_, raw, _) = setup().await;
+    let n = 2 * ssp_node::node::VIEW_METRICS_FLUSH_BATCH + 7;
+    let metrics = views(&raw, n).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert_eq!(flush_view_metrics(&SilentDb(Arc::clone(&calls)), &metrics).await, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no per-view retries against a DB that does not answer");
+    let map = metrics.read().await;
+    assert!(map.values().all(|st| st.dirty && st.update_count == 3), "all kept, with their counts");
+}
+
+/// Refuses one row's statement, then stops answering.
+struct BadRowThenSilentDb(MemDb, &'static str, std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl Db for BadRowThenSilentDb {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        if self.2.load(Ordering::SeqCst) {
+            return Err(DbError::Transport("timeout after 30s".into()));
+        }
+        if binds.iter().any(|(_, v)| v.as_str() == Some(self.1)) {
+            if binds.len() < 20 {
+                // The bad row on its own: from now on the DB is gone.
+                self.2.store(true, Ordering::SeqCst);
+            }
+            return Err(DbError::Query("Found NONE for field `rowCount`".into()));
+        }
+        self.0.query(surql, binds).await
+    }
+    async fn version(&self) -> Result<String, DbError> {
+        Ok("mem".into())
+    }
+}
+
+#[tokio::test]
+async fn a_database_that_stops_answering_during_the_per_view_retry_ends_the_flush() {
+    let (db, raw, _) = setup().await;
+    let n = ssp_node::node::VIEW_METRICS_FLUSH_BATCH + 5;
+    let metrics = views(&raw, n).await;
+    let db = BadRowThenSilentDb(db, "_00_query:w2", std::sync::atomic::AtomicBool::new(false));
+    let written = flush_view_metrics(&db, &metrics).await;
+    let map = metrics.read().await;
+    let dirty = map.values().filter(|st| st.dirty).count();
+    assert_eq!(written + dirty, n, "every view either written or kept: {written} + {dirty}");
+    assert!(map["w2"].dirty && map["w2"].update_count == 3);
+}

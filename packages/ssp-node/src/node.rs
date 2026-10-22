@@ -2888,28 +2888,56 @@ pub async fn flush_view_metrics(
     let seq = VIEW_METRICS_FLUSH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let flush = format!("{}-{seq}", crate::now_epoch_ms());
     let mut written = 0usize;
-    for chunk in snapshots.chunks(VIEW_METRICS_FLUSH_BATCH) {
-        if write_view_metrics(db, &flush, chunk).await.is_ok() {
-            written += chunk.len();
-            continue;
+    for (n, chunk) in snapshots.chunks(VIEW_METRICS_FLUSH_BATCH).enumerate() {
+        let e = match write_view_metrics(db, &flush, chunk).await {
+            Ok(()) => {
+                written += chunk.len();
+                continue;
+            }
+            Err(e) => e,
+        };
+        if matches!(e, crate::ports::DbError::Transport(_)) {
+            // The database did not answer (a timeout, a 5xx): another request
+            // would not either. Retrying each view of a batch after a 30 s
+            // timeout held the Cloudflare alarm, and every timer behind it,
+            // for minutes while the shared DB stalled (2026-10-22).
+            let left = &snapshots[n * VIEW_METRICS_FLUSH_BATCH..];
+            keep_view_metrics_dirty(view_metrics, left).await;
+            warn!(target: "ssp::view_metrics", error = %e, views = left.len(), "Failed to persist per-view metrics; kept for the next flush");
+            break;
         }
-        // Some rows may have landed: `$flush` keeps their counts from doubling.
-        for snapshot in chunk {
+        // A statement the database refused: find the row, one view at a
+        // time. Some rows may have landed: `$flush` keeps their counts from doubling.
+        for (i, snapshot) in chunk.iter().enumerate() {
             match write_view_metrics(db, &flush, std::slice::from_ref(snapshot)).await {
                 Ok(()) => written += 1,
                 Err(e) => {
-                    // Left dirty for the next flush: the sample is still in memory.
-                    let mut map = view_metrics.write().await;
-                    let state = map.entry(snapshot.view_id.clone()).or_default();
-                    state.update_count = state.update_count.saturating_add(snapshot.update_count);
-                    state.dirty = true;
+                    let transport = matches!(e, crate::ports::DbError::Transport(_));
+                    let kept = if transport { &chunk[i..] } else { std::slice::from_ref(snapshot) };
+                    keep_view_metrics_dirty(view_metrics, kept).await;
                     warn!(target: "ssp::view_metrics", error = %e,
                         view_id = %crate::edges::format_incantation_id(&snapshot.view_id), "Failed to persist per-view metrics");
+                    if transport {
+                        let rest = snapshots.get((n + 1) * VIEW_METRICS_FLUSH_BATCH..).unwrap_or(&[]);
+                        keep_view_metrics_dirty(view_metrics, rest).await;
+                        return written;
+                    }
                 }
             }
         }
     }
     written
+}
+
+/// Put `snapshots` back as dirty, with their ingest counts: the next flush
+/// writes them.
+async fn keep_view_metrics_dirty(view_metrics: &crate::view_metrics::ViewMetrics, snapshots: &[ViewMetricsSnapshot]) {
+    let mut map = view_metrics.write().await;
+    for snapshot in snapshots {
+        let state = map.entry(snapshot.view_id.clone()).or_default();
+        state.update_count = state.update_count.saturating_add(snapshot.update_count);
+        state.dirty = true;
+    }
 }
 
 fn valid_record_id(id: &str) -> bool {

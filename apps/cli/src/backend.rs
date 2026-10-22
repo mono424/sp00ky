@@ -3192,11 +3192,14 @@ impl BackendProcessor {
             if app.app_type != AppType::Backend {
                 continue;
             }
-            // devOnly backends are local-only host processes (e.g. the LiveKit SFU
-            // run via `dev: "livekit-server …"`); they carry no spec/method/schema
-            // to apply, matching AppConfig::validate's devOnly early-return. Without
-            // this skip, process_backend bails "missing 'method' field".
-            if app.scope == AppScope::DevOnly {
+            // devOnly backends are usually local-only host processes (e.g. the
+            // LiveKit SFU run via `dev: "livekit-server …"`) with no spec/method/
+            // schema to apply, matching AppConfig::validate's devOnly early-return.
+            // One that does declare an outbox `method` and a `spec` (the example's
+            // `api`) is a real job backend in dev: skipping it left its outbox
+            // without the ingest events and platform fields, so every job waited
+            // for the recovery sweep (30-60 s) and ran without a lease.
+            if app.scope == AppScope::DevOnly && (app.method.is_none() || app.spec.is_none()) {
                 continue;
             }
             // A backend with no `method` is a direct-HTTP service (e.g. the
@@ -3742,6 +3745,35 @@ apps:
             !p.schema_appends.contains("livekit"),
             "skipped devOnly backend must not contribute schema"
         );
+    }
+
+    /// A devOnly backend that DOES declare an outbox (the example's `api`) is a
+    /// job backend in dev: its outbox schema must be processed, or the table gets
+    /// no ingest events and its jobs wait for the recovery sweep.
+    #[test]
+    fn devonly_backend_with_an_outbox_is_processed() {
+        let yaml = "\
+slug: t
+surrealdb:
+  namespace: main
+  database: main
+apps:
+  api:
+    type: backend
+    scope: devOnly
+    spec: ./openapi.yml
+    method: { type: outbox, table: job, schema: ./outbox.surql }
+";
+        let (dir, path) = write_config(yaml);
+        std::fs::write(dir.path().join("outbox.surql"), "DEFINE TABLE job SCHEMAFULL;\n").unwrap();
+        std::fs::write(
+            dir.path().join("openapi.yml"),
+            "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths: {}\n",
+        )
+        .unwrap();
+        let mut p = BackendProcessor::new();
+        p.process(&path).expect("processed");
+        assert!(p.schema_appends.contains("DEFINE TABLE job"), "{}", p.schema_appends);
     }
 
     /// A `type: backend` with no `method` is a direct-HTTP / deploy-only service

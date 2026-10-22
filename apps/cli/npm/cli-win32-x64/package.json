@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/cli-win32-x64",
-  "version": "0.0.1-canary.345",
+  "version": "0.0.1-canary.346",
   "description": "Windows x64 binary for @spooky-sync/cli",
   "license": "MIT",
   "os": [

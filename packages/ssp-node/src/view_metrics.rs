@@ -35,6 +35,11 @@ pub struct RegistrationStages {
     pub plan_ms: f64,
     pub snapshot_ms: f64,
     pub metadata_db_ms: f64,
+    /// Defining the caller's per-user tables (part of `prepare_ms`).
+    pub tables_ms: f64,
+    /// Checking whether the view was registered without an identity, and
+    /// discarding it when it was (part of `prepare_ms`).
+    pub identity_ms: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

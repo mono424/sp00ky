@@ -149,3 +149,110 @@ async fn concurrent_evidence_appends_preserve_both_writers() {
     assert!(samples.iter().any(|s| s["kind"] == "ingest"));
     assert!(samples.iter().any(|s| s["kind"] == "registration"));
 }
+
+/// Replays a request that "lost" a write conflict after it had landed, the
+/// way SurrealDB can fail one statement of many while the rest commit.
+struct ConflictOnceDb(MemDb, std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl Db for ConflictOnceDb {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        let out = self.0.query(surql, binds).await?;
+        if surql.contains("metricsFlush") && !self.1.swap(true, Ordering::SeqCst) {
+            return Err(DbError::Query(
+                "Transaction conflict: Resource busy: . This transaction can be retried".into(),
+            ));
+        }
+        Ok(out)
+    }
+    async fn version(&self) -> Result<String, DbError> {
+        Ok("mem".into())
+    }
+}
+
+async fn views(raw: &Surreal<MemEngine>, n: usize) -> ViewMetrics {
+    let metrics: ViewMetrics = RwLock::new(Default::default());
+    for i in 0..n {
+        raw.query(format!("CREATE _00_query:w{i} SET rowCount = 0, updateCount = 0;")).await.unwrap().check().unwrap();
+        for _ in 0..3 {
+            note_view_metrics(&metrics, vec![i], vec![format!("w{i}")], 4.0).await;
+        }
+    }
+    metrics
+}
+
+async fn update_counts(raw: &Surreal<MemEngine>) -> Vec<i64> {
+    let v = raw
+        .query("SELECT VALUE updateCount FROM _00_query WHERE id != _00_query:v1 ORDER BY id")
+        .await
+        .unwrap()
+        .take::<surrealdb::types::Value>(0)
+        .unwrap()
+        .into_json_value();
+    v.as_array().unwrap().iter().map(|c| c.as_i64().unwrap()).collect()
+}
+
+// Cloudflare 2026-10-22: one UPDATE per dirty view made a flush of ~300 views
+// 300 sequential round trips, 2.5 to 7 s per alarm.
+#[tokio::test]
+async fn a_flush_of_many_views_writes_them_in_batches() {
+    let (db, raw, writes) = setup().await;
+    let n = 2 * ssp_node::node::VIEW_METRICS_FLUSH_BATCH + 7;
+    let metrics = views(&raw, n).await;
+    assert_eq!(flush_view_metrics(&db, &metrics).await, n);
+    assert_eq!(writes.load(Ordering::SeqCst), 3, "{n} views, three requests");
+    let counts = update_counts(&raw).await;
+    assert_eq!(counts.len(), n);
+    assert!(counts.iter().all(|c| *c == 3), "every view counts its three ingests: {counts:?}");
+    let rows = raw.query("SELECT VALUE rowCount FROM ONLY _00_query:w5").await.unwrap()
+        .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
+    assert_eq!(rows, 5);
+}
+
+// A batch sent again after a write conflict re-runs the statements that had
+// already landed; their ingests must still count once.
+#[tokio::test]
+async fn a_retried_batch_counts_each_ingest_once() {
+    let (db, raw, _) = setup().await;
+    let metrics = views(&raw, 10).await;
+    let flaky = ConflictOnceDb(db, std::sync::atomic::AtomicBool::new(false));
+    assert_eq!(flush_view_metrics(&flaky, &metrics).await, 10);
+    assert_eq!(update_counts(&raw).await, vec![3; 10]);
+
+    // The next flush is a new one: its increments land on top.
+    for i in 0..10 {
+        note_view_metrics(&metrics, vec![i], vec![format!("w{i}")], 4.0).await;
+    }
+    assert_eq!(flush_view_metrics(&flaky, &metrics).await, 10);
+    assert_eq!(update_counts(&raw).await, vec![4; 10]);
+}
+
+/// Refuses every request that writes `bad`'s row, as a row whose statement
+/// keeps failing would.
+struct OneBadRowDb(MemDb, &'static str);
+
+#[async_trait::async_trait]
+impl Db for OneBadRowDb {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+        if binds.iter().any(|(_, v)| v.as_str() == Some(self.1)) {
+            return Err(DbError::Query("Found NONE for field `rowCount`".into()));
+        }
+        self.0.query(surql, binds).await
+    }
+    async fn version(&self) -> Result<String, DbError> {
+        Ok("mem".into())
+    }
+}
+
+#[tokio::test]
+async fn a_failing_row_stays_dirty_without_holding_back_its_batch() {
+    let (db, raw, _) = setup().await;
+    let metrics = views(&raw, 6).await;
+    let db = OneBadRowDb(db, "_00_query:w2");
+    assert_eq!(flush_view_metrics(&db, &metrics).await, 5);
+    assert_eq!(update_counts(&raw).await, vec![3, 3, 0, 3, 3, 3]);
+    let map = metrics.read().await;
+    assert!(map["w2"].dirty, "kept for the next flush");
+    assert_eq!(map["w2"].update_count, 3, "with its ingests");
+    assert!(!map["w1"].dirty);
+}

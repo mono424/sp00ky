@@ -1246,6 +1246,18 @@ impl SspNode {
     /// read them (`_00_list_ref` is gated `auth_id = $auth.id`) and nothing
     /// would ever clean them up once the row is rebuilt under a real identity.
     async fn discard_view_without_identity(&self, view_id: &str) -> bool {
+        // Nearly every join meets a view that has its identity. Checked before
+        // the gate: the publisher holds it for a whole round of edge writes,
+        // and taking it here put every signed-in warm join behind publication
+        // (registrations of 5 to 8 s on Cloudflare under load, 2026-10-22).
+        // Checked again under the gate below.
+        let without_identity = {
+            let circuit = self.processor.read().await;
+            matches!(circuit.registration(view_id), Some((_, auth)) if auth.is_empty())
+        };
+        if !without_identity {
+            return false;
+        }
         let _publication = self.publication_gate.lock().await;
         let stale_table = {
             let mut circuit = self.processor.write().await;
@@ -1770,11 +1782,13 @@ impl SspNode {
         let standby = self.is_standby();
 
         // Lazy-define per-user tables (idempotent; no-op in Single mode).
+        let tables_start = web_time::Instant::now();
         let tables = if standby {
             Ok(())
         } else {
             crate::tables::ensure_user_tables(self.platform.db.as_ref(), self.ref_mode, &auth_id).await
         };
+        stages.tables_ms = tables_start.elapsed().as_secs_f64() * 1000.0;
         if let Err(e) = tables {
             // `?` (Debug) prints the whole anyhow chain; `%` showed only the
             // outer context and hid the database's actual reason.
@@ -1802,9 +1816,11 @@ impl SspNode {
         // which is harder to notice than the blank page it renders today.
         // Discard it instead and let the cold path below rebuild it with this
         // registration's own, correctly injected plan.
+        let identity_start = web_time::Instant::now();
         let identity_upgrade = view_existed
             && !auth_id.is_empty()
             && self.discard_view_without_identity(&data.plan.id).await;
+        stages.identity_ms = identity_start.elapsed().as_secs_f64() * 1000.0;
 
         let meta_str = |k: &str| data.metadata.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -2076,6 +2092,7 @@ impl SspNode {
 
         // Job routing.
         if let Some(backend_info) = self.job_config.job_tables.get(&payload.table).filter(|_| !standby).cloned() {
+            self.job_dispatcher.note_job_row();
             let is_assigned =
                 self.standalone || payload.job_assignee.as_deref() == Some(self.ssp_id.as_str());
 
@@ -2762,62 +2779,129 @@ pub async fn note_view_metrics(
     }
 }
 
-/// Write every dirty view's metrics to its `_00_query` row, one retried
-/// UPDATE each, and clear the dirty marks. Returns how many rows were written.
-/// Same statement and columns as the old per-ingest write, so the row shape is
-/// preserved, with registration/ingest stages added (registration still writes `rowCount`
-/// synchronously, so first paint does not wait on this).
+/// Dirty views one [`flush_view_metrics`] request writes.
+pub const VIEW_METRICS_FLUSH_BATCH: usize = 50;
+
+/// Tells one flush from every other (see [`view_metrics_statement`]).
+static VIEW_METRICS_FLUSH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a flush writes for one dirty view.
+struct ViewMetricsSnapshot {
+    view_id: String,
+    row_count: usize,
+    update_count: u64,
+    last_ingest_ms: f64,
+    percentiles: Option<(f64, f64, f64)>,
+    registration: Option<crate::view_metrics::RegistrationStages>,
+    ingest: Option<crate::view_metrics::IngestStages>,
+}
+
+/// One view's `_00_query` statement, its bindings suffixed with `i` so a batch
+/// can carry many. Every statement of a flush shares `$flush`, and
+/// `updateCount` grows only on a row that has not seen it yet: a batch that
+/// lost a write conflict is sent again whole, and the statements that had
+/// already landed must not count their ingests twice.
+fn view_metrics_statement(i: usize, snapshot: &ViewMetricsSnapshot) -> (String, Vec<(String, Value)>) {
+    let (p55, p90, p99) = match snapshot.percentiles {
+        Some(t) => (json!(t.0), json!(t.1), json!(t.2)),
+        None => (Value::Null, Value::Null, Value::Null),
+    };
+    let sql = format!(
+        "UPDATE type::record($id_{i}) SET \
+         rowCount = <int>$rows_{i}, \
+         updateCount = (IF metricsFlush = $flush {{ updateCount }} ELSE {{ (updateCount ?? 0) + <int>$updates_{i} }}), \
+         metricsFlush = $flush, \
+         lastIngestLatency = (IF $updates_{i} > 0 {{ <float>$latency_{i} }} ELSE {{ lastIngestLatency }}), \
+         materializationP55 = $p55_{i} ?? materializationP55, materializationP90 = $p90_{i} ?? materializationP90, \
+         materializationP99 = $p99_{i} ?? materializationP99, \
+         registrationStages = $registration_{i} ?? registrationStages, ingestStages = $ingest_{i} ?? ingestStages \
+         RETURN NONE;\n"
+    );
+    let binds = vec![
+        (format!("id_{i}"), json!(crate::edges::format_incantation_id(&snapshot.view_id))),
+        (format!("rows_{i}"), json!(snapshot.row_count as i64)),
+        (format!("updates_{i}"), json!(snapshot.update_count as i64)),
+        (format!("latency_{i}"), json!(snapshot.last_ingest_ms)),
+        (format!("p55_{i}"), p55),
+        (format!("p90_{i}"), p90),
+        (format!("p99_{i}"), p99),
+        (format!("registration_{i}"), json!(snapshot.registration)),
+        (format!("ingest_{i}"), json!(snapshot.ingest)),
+    ];
+    (sql, binds)
+}
+
+/// Run `snapshots` as one multi-statement request. Each `UPDATE` is its own
+/// transaction, so a conflict on one row loses no other row's write.
+async fn write_view_metrics(db: &dyn Db, flush: &str, snapshots: &[ViewMetricsSnapshot]) -> Result<(), crate::ports::DbError> {
+    let mut sql = String::new();
+    let mut binds = vec![("flush".to_string(), json!(flush))];
+    for (i, snapshot) in snapshots.iter().enumerate() {
+        let (stmt, b) = view_metrics_statement(i, snapshot);
+        sql.push_str(&stmt);
+        binds.extend(b);
+    }
+    let binds: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    query_retrying(db, &sql, &binds).await.map(|_| ())
+}
+
+/// Write every dirty view's metrics to its `_00_query` row and clear the dirty
+/// marks. Returns how many rows were written. Same columns as the old
+/// per-ingest write, so the row shape is preserved, with registration/ingest
+/// stages added (registration still writes `rowCount` synchronously, so first
+/// paint does not wait on this).
+///
+/// [`VIEW_METRICS_FLUSH_BATCH`] views per request. One request per view put
+/// 300 sequential round trips into every flush on Cloudflare (2.5 to 7 s per
+/// alarm, holding the TTL sweep, the CRDT fold and the inbox replay behind
+/// it). A batch that still fails is retried a view at a time, so one bad row
+/// keeps only itself dirty.
 pub async fn flush_view_metrics(
     db: &dyn Db,
     view_metrics: &crate::view_metrics::ViewMetrics,
 ) -> usize {
-    let snapshots: Vec<_> = {
+    let snapshots: Vec<ViewMetricsSnapshot> = {
         let mut map = view_metrics.write().await;
         map.iter_mut()
             .filter(|(_, st)| st.dirty)
             .map(|(view_id, st)| {
                 st.dirty = false;
-                (view_id.clone(), st.row_count, std::mem::take(&mut st.update_count), st.last_ingest_ms, st.percentiles(), st.registration.clone(), st.ingest.clone())
+                ViewMetricsSnapshot {
+                    view_id: view_id.clone(),
+                    row_count: st.row_count,
+                    update_count: std::mem::take(&mut st.update_count),
+                    last_ingest_ms: st.last_ingest_ms,
+                    percentiles: st.percentiles(),
+                    registration: st.registration.clone(),
+                    ingest: st.ingest.clone(),
+                }
             })
             .collect()
     };
+    if snapshots.is_empty() {
+        return 0;
+    }
+    let seq = VIEW_METRICS_FLUSH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let flush = format!("{}-{seq}", crate::now_epoch_ms());
     let mut written = 0usize;
-    for (view_id, row_count, update_count, last_ingest_ms, percentiles, registration, ingest) in snapshots {
-        let incantation_id = crate::edges::format_incantation_id(&view_id);
-        let (p55, p90, p99) = match percentiles {
-            Some(t) => (json!(t.0), json!(t.1), json!(t.2)),
-            None => (Value::Null, Value::Null, Value::Null),
-        };
-        let stmt = "UPDATE type::record($id) SET \
-            rowCount = <int>$rowCount, updateCount = (updateCount ?? 0) + <int>$updateCount, \
-            lastIngestLatency = (IF $updateCount > 0 { <float>$lastIngestLatency } ELSE { lastIngestLatency }), \
-            materializationP55 = $p55 ?? materializationP55, materializationP90 = $p90 ?? materializationP90, materializationP99 = $p99 ?? materializationP99, \
-            registrationStages = $registration ?? registrationStages, ingestStages = $ingest ?? ingestStages";
-        match query_retrying(
-            db,
-            stmt,
-            &[
-                ("id", json!(incantation_id)),
-                ("rowCount", json!(row_count as i64)),
-                ("updateCount", json!(update_count as i64)),
-                ("lastIngestLatency", json!(last_ingest_ms)),
-                ("p55", p55),
-                ("p90", p90),
-                ("p99", p99),
-                ("registration", json!(registration)),
-                ("ingest", json!(ingest)),
-            ],
-        )
-        .await
-        {
-            Ok(_) => written += 1,
-            Err(e) => {
-                // Left dirty for the next flush: the sample is still in memory.
-                let mut map = view_metrics.write().await;
-                let state = map.entry(view_id).or_default();
-                state.update_count = state.update_count.saturating_add(update_count);
-                state.dirty = true;
-                warn!(target: "ssp::view_metrics", error = %e, view_id = %incantation_id, "Failed to persist per-view metrics");
+    for chunk in snapshots.chunks(VIEW_METRICS_FLUSH_BATCH) {
+        if write_view_metrics(db, &flush, chunk).await.is_ok() {
+            written += chunk.len();
+            continue;
+        }
+        // Some rows may have landed: `$flush` keeps their counts from doubling.
+        for snapshot in chunk {
+            match write_view_metrics(db, &flush, std::slice::from_ref(snapshot)).await {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    // Left dirty for the next flush: the sample is still in memory.
+                    let mut map = view_metrics.write().await;
+                    let state = map.entry(snapshot.view_id.clone()).or_default();
+                    state.update_count = state.update_count.saturating_add(snapshot.update_count);
+                    state.dirty = true;
+                    warn!(target: "ssp::view_metrics", error = %e,
+                        view_id = %crate::edges::format_incantation_id(&snapshot.view_id), "Failed to persist per-view metrics");
+                }
             }
         }
     }

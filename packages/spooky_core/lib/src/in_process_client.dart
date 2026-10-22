@@ -77,6 +77,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
   bool _initialized = false;
   bool sessionTransitioning = false;
   bool _closed = false;
+  bool _offline = false;
   Future<void>? _initializing;
   Future<void>? _checkpoint;
   Timer? _checkpointTimer;
@@ -145,6 +146,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
       ..schemaTables = _syncedTables()
       ..columnSets = columnFingerprints(config.schema,
           _syncedTables().where((t) => !t.startsWith('_00_')))
+      ..offline = (() => _offline)
       ..onVersions =
           (table, entries) => _runtime.dispatch(VersionsPrimed(entries));
 
@@ -287,6 +289,16 @@ class InProcessSp00kyClient extends Sp00kyClient {
           .catchError((Object e) => _logger.warn('Auth retry deferred: $e')));
     _runtime.dispatch(const HeartbeatNow());
   }
+
+  /// The host's network went away (`true`) or came back (`false`).
+  ///
+  /// The core cannot see connectivity, so the app reports it: in Flutter, from
+  /// a connectivity plugin, before the first `preload` so a launch without a
+  /// network reads the right value. While offline, a `preload` that never
+  /// settled on this device returns at once instead of waiting on membership
+  /// that cannot arrive. Coming back online does not reconnect by itself; call
+  /// [wake] for that.
+  void setOffline(bool offline) => _offline = offline;
 
   /// The host is going away for good: hand this client's views back rather than
   /// leaving them to expire by TTL.

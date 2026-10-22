@@ -25,7 +25,12 @@ class PreloadFailedError implements Exception {
 /// A session that cannot be sent membership (signed out, without anonymous
 /// live queries) does not wait either: a view with rows would never settle,
 /// and an app that gates its first paint on a preload stayed on its loading
-/// screen forever.
+/// screen forever. Nor does an offline device: the membership it waits for
+/// cannot arrive before the network does, and an app started offline before
+/// its preload ever settled stayed on its loading screen. It paints from what
+/// is local instead, and the query fills in once the registration lands. The
+/// core cannot see connectivity, so offline means the host said so through
+/// `Sp00kyClient.setOffline`.
 Future<({QueryHash hash, bool waited})> preload(
     Ctx ctx, SagaEnv env, RegisterInput input) async {
   final hash = await registerLocal(ctx, env, input);
@@ -35,6 +40,8 @@ Future<({QueryHash hash, bool waited})> preload(
   if (phase != QueryPhase.cold || reachable != true) {
     return (hash: hash, waited: false);
   }
+  final offline = await ctx(Fx.service<bool?>(ServiceName.netOffline));
+  if (offline == true) return (hash: hash, waited: false);
   await ctx(Fx.stateWait((s) => settled(s, hash) || settleFailed(s, hash)));
   final failed = await ctx(Fx.stateRead((s) => settleFailed(s, hash)));
   if (failed) throw PreloadFailedError(hash);

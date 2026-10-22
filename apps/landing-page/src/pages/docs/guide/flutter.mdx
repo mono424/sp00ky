@@ -38,6 +38,23 @@ BucketImage(
 // Or the bytes, for anything that is not an <img>:
 final Uint8List? pdf = await client.bucket('exports').read('report.pdf');`;
 
+export const connectivityCode = `// connectivity_plus here; any source of the same signal works
+bool none(List<ConnectivityResult> r) =>
+    r.every((c) => c == ConnectivityResult.none);
+
+client.setOffline(none(await Connectivity().checkConnectivity()));
+Connectivity().onConnectivityChanged.listen((r) {
+  client.setOffline(none(r));
+  if (!none(r)) client.wake();
+});
+
+// and from your WidgetsBindingObserver
+@override
+void didChangeAppLifecycleState(AppLifecycleState state) {
+  if (state == AppLifecycleState.resumed) client.wake();
+  if (state == AppLifecycleState.paused) client.checkpoint();
+}`;
+
 export const code4 = `# Recommended: drive from sp00ky.yml's clientTypes entries
 spky generate
 
@@ -363,6 +380,15 @@ snapshot still boots, from its rows, and gets one on the next checkpoint.
 To have a screen's first frame already hold its rows, keep that query open
 from startup (subscribe once, share the latest rows) rather than subscribing
 when the screen mounts.
+
+The core cannot see the device's connectivity or lifecycle, so the app reports
+both. `client.setOffline(true)` makes a `preload` that never resolved on this
+device return at once instead of waiting for the server, so an app that holds
+its first screen on a preload still opens when launched without a network.
+Report it before the first `preload`. `client.wake()` on a resume or a returning
+network reconnects at once instead of waiting out the backoff:
+
+<CodeBlock code={connectivityCode} lang="dart" />
 
 Once connected, the client registers its queries with the server concurrently:
 remote reads (registrations, membership reads, row fetches, `queryRemote`)

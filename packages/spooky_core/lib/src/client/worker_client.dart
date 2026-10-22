@@ -37,6 +37,9 @@ class WorkerSp00kyClient extends Sp00kyClient {
   Future<void>? _closing;
   final _ready = Completer<void>();
   bool _closed = false;
+  // Kept here as well: a host reports connectivity at launch, often before the
+  // worker's port exists, and a command sent then is dropped.
+  bool _offline = false;
   int _epoch = 0;
   int _nextId = 0;
   final _pending = <int, Completer<dynamic>>{};
@@ -87,6 +90,7 @@ class WorkerSp00kyClient extends Sp00kyClient {
   void _receive(dynamic event) {
     if (event is SendPort) {
       _port = event;
+      if (_offline) _send(const OfflineCommand(true));
       if (!_ready.isCompleted) _ready.complete();
     } else if (event is WorkerResult) {
       final pending = _pending.remove(event.id);
@@ -288,6 +292,11 @@ class WorkerSp00kyClient extends Sp00kyClient {
   Future<void> detach() => _call(DetachCommand());
   @override
   void wake() => _send(WakeCommand());
+  @override
+  void setOffline(bool offline) {
+    _offline = offline;
+    _send(OfflineCommand(offline));
+  }
   @override
   void Function() subscribeToPendingMutations(void Function(int) cb) =>
       _listen('pending', cb, pendingMutationCount, true);
@@ -539,6 +548,8 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
           result = await client.discardFailedMutation(command.mutationId);
         case WakeCommand():
           client.wake();
+        case OfflineCommand command:
+          client.setOffline(command.offline);
         case TimingCommand command:
           client.reportFrontendTiming(command.hash, command.milliseconds);
           queryState(command.hash);

@@ -27,6 +27,7 @@ abstract class Sp00kyClient {
   Future<void> close();
   Future<void> checkpoint();
   void wake();
+  void setOffline(bool offline);
   Future<void> detach();
   Future<ClientState> inspectState();
   Future<String> queryRaw(String sql, Map<String, dynamic> params,

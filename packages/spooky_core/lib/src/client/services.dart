@@ -366,6 +366,14 @@ class ClientServices implements Services {
   @override
   Future<void> remoteConnect() async => remote?.connect();
 
+  /// What the host last passed to `Sp00kyClient.setOffline`, set by the
+  /// client; online until bound.
+  bool Function() offline = _online;
+  static bool _online() => false;
+
+  @override
+  bool netOffline() => offline();
+
   @override
   void remoteReleaseViews(List<Object?> ids) {
     final r = remote;

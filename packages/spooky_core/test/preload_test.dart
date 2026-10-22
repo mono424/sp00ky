@@ -103,4 +103,16 @@ void main() {
       throwsA(isA<PreloadFailedError>()),
     );
   });
+
+  test(
+      'with the host reporting no network, a cold preload returns at once '
+      'and paints from what is local', () async {
+    remote.offline = true;
+    client.setOffline(true);
+    await client
+        .preload('SELECT * FROM thread', const {'x': 2})
+        .timeout(const Duration(seconds: 2));
+    expect(client.state.queries, hasLength(1),
+        reason: 'it is still registered, for when the network returns');
+  });
 }

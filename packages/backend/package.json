@@ -31,7 +31,8 @@
     "surrealdb",
     "workflows",
     "durable",
-    "cloudflare"
+    "cloudflare",
+    "tanstack-intent"
   ],
   "license": "MIT",
   "repository": {

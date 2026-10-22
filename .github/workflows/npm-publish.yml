@@ -196,6 +196,20 @@ jobs:
         continue-on-error: true
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
+      # 8. Build and publish @spooky-sync/backend (no workspace deps). Non-fatal
+      # for the same reason as query-allowlist: the first publish of a new
+      # package is manual (OIDC trusted publishing cannot create one).
+      - name: Set version (backend)
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/backend/package.json > tmp.json && mv tmp.json packages/backend/package.json
+
+      - name: Build backend
+        run: pnpm --filter @spooky-sync/backend build
+
+      - name: Publish backend
+        working-directory: packages/backend
+        continue-on-error: true
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
   build-cli-binaries:
     needs: [prepare, validate-versions]
     strategy:

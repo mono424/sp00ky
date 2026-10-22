@@ -2172,9 +2172,33 @@ fn deploy_static_frontend_cloudflare(
 /// always gives the same bundle (and bundle hash).
 const WORKER_ESBUILD_VERSION: &str = "0.27.5";
 
+/// Node's built-in modules (`module.builtinModules` of Node 22, without the
+/// `_`-prefixed internals). Under `nodejs_compat` the Workers runtime resolves
+/// them without the `node:` prefix too, so the bundle keeps them as imports.
+const NODE_BUILTIN_MODULES: &[&str] = &[
+    "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns",
+    "dns/promises", "domain", "events", "fs", "fs/promises", "http", "http2", "https",
+    "inspector", "inspector/promises", "module", "net", "os", "path", "path/posix",
+    "path/win32", "perf_hooks", "process", "punycode", "querystring", "readline",
+    "readline/promises", "repl", "stream", "stream/consumers", "stream/promises",
+    "stream/web", "string_decoder", "sys", "timers", "timers/promises", "tls",
+    "trace_events", "tty", "url", "util", "util/types", "v8", "vm", "wasi",
+    "worker_threads", "zlib",
+];
+
+/// True when the flags turn on the runtime's Node.js compatibility layer.
+fn worker_has_nodejs_compat(worker: &backend::WorkerDeployConfig) -> bool {
+    worker
+        .compatibility_flags
+        .iter()
+        .any(|f| f == "nodejs_compat" || f == "nodejs_compat_v2")
+}
+
 /// `npx` arguments that bundle a Worker backend's entry into one ESM module.
-/// `node:*` and `cloudflare:*` imports stay external for workerd to resolve;
-/// each `textModules` glob's extension is imported as a string.
+/// `node:*` and `cloudflare:*` imports stay external for workerd to resolve,
+/// and so do bare Node builtins (`buffer`) under `nodejs_compat`; each
+/// `textModules` glob's extension is imported as a string.
 fn worker_esbuild_args(
     entry: &std::path::Path,
     outfile: &std::path::Path,
@@ -2192,6 +2216,9 @@ fn worker_esbuild_args(
         "--external:node:*".into(),
         "--external:cloudflare:*".into(),
     ];
+    if worker_has_nodejs_compat(worker) {
+        args.extend(NODE_BUILTIN_MODULES.iter().map(|m| format!("--external:{}", m)));
+    }
     let mut seen: Vec<&str> = Vec::new();
     for ext in worker
         .text_modules
@@ -2205,6 +2232,45 @@ fn worker_esbuild_args(
     }
     args.push(format!("--outfile={}", outfile.to_string_lossy()));
     args
+}
+
+/// The modules esbuild reported as `Could not resolve "<module>"`, in order,
+/// without repeats.
+fn esbuild_unresolved_imports(stderr: &str) -> Vec<String> {
+    let mut modules: Vec<String> = Vec::new();
+    for rest in stderr.split("Could not resolve \"").skip(1) {
+        if let Some((module, _)) = rest.split_once('"') {
+            if !modules.iter().any(|m| m == module) {
+                modules.push(module.to_string());
+            }
+        }
+    }
+    modules
+}
+
+/// The deploy error for a failed bundle: names each unresolved import, with
+/// the way out for a Node builtin.
+fn worker_bundle_error(name: &str, worker: &backend::WorkerDeployConfig, stderr: &str) -> String {
+    let unresolved = esbuild_unresolved_imports(stderr);
+    if unresolved.is_empty() {
+        return format!("Bundling Worker backend '{}' failed", name);
+    }
+    let hint = if worker_has_nodejs_compat(worker) {
+        "Import Node builtins as `node:<name>`, or drop the dependency that imports it."
+    } else {
+        "Import Node builtins as `node:<name>` and add `nodejs_compat` to worker.compatibilityFlags, \
+         or drop the dependency that imports it."
+    };
+    format!(
+        "Bundling Worker backend '{}' failed: could not resolve {}. {}",
+        name,
+        unresolved
+            .iter()
+            .map(|m| format!("\"{}\"", m))
+            .collect::<Vec<_>>()
+            .join(", "),
+        hint
+    )
 }
 
 /// Where esbuild runs for a Worker backend: the nearest directory above its
@@ -2251,15 +2317,18 @@ fn deploy_worker_backend_cloudflare(
         worker.entry,
         WORKER_ESBUILD_VERSION
     );
-    let status = std::process::Command::new("npx")
+    // stderr is captured (and echoed) to name the imports esbuild could not resolve.
+    let output = std::process::Command::new("npx")
         .args(worker_esbuild_args(&entry, &outfile, worker))
         .current_dir(&app_dir)
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
+        .stderr(std::process::Stdio::piped())
+        .output()
         .context("Failed to run esbuild (is Node.js with npx installed?)")?;
-    if !status.success() {
-        bail!("Bundling Worker backend '{}' failed", name);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprint!("{}", stderr);
+    if !output.status.success() {
+        bail!("{}", worker_bundle_error(name, worker, &stderr));
     }
 
     let data = fs::read(&outfile)
@@ -9568,6 +9637,71 @@ mod worker_backend_tests {
         );
         // An exact version, never a range or a tag.
         assert!(WORKER_ESBUILD_VERSION.split('.').all(|p| p.parse::<u32>().is_ok()));
+    }
+
+    /// Under `nodejs_compat` the runtime resolves bare builtins (`buffer`) as
+    /// well as `node:buffer`, so both spellings stay imports in the bundle.
+    #[test]
+    fn nodejs_compat_keeps_bare_node_builtins_external() {
+        let entry = Path::new("/p/src/index.ts");
+        let out = Path::new("/tmp/out.js");
+        let without = worker_esbuild_args(entry, out, &worker("entry: i.ts\n"));
+        assert!(!without.iter().any(|a| a == "--external:buffer"));
+
+        for flag in ["nodejs_compat", "nodejs_compat_v2"] {
+            let w = worker(&format!(
+                "entry: i.ts\ncompatibilityFlags: [{flag}]\ntextModules: [\"**/*.surql\"]\n"
+            ));
+            let args = worker_esbuild_args(entry, out, &w);
+            let externals: Vec<&str> = args
+                .iter()
+                .filter_map(|a| a.strip_prefix("--external:"))
+                .collect();
+            assert_eq!(externals[..2], ["node:*", "cloudflare:*"]);
+            assert_eq!(externals[2..], *NODE_BUILTIN_MODULES);
+            for m in ["assert", "async_hooks", "buffer", "crypto", "events", "fs/promises", "path",
+                "process", "stream", "string_decoder", "url", "util", "zlib"]
+            {
+                assert!(externals.contains(&m), "{m} missing");
+            }
+            // Builtins sit between the fixed flags and the loaders/outfile.
+            assert_eq!(args[args.len() - 2], "--loader:.surql=text");
+            assert_eq!(args[args.len() - 1], "--outfile=/tmp/out.js");
+        }
+    }
+
+    #[test]
+    fn unresolved_imports_fail_with_the_module_and_a_hint() {
+        let stderr = "\
+\u{2718} [ERROR] Could not resolve \"buffer\"
+
+    node_modules/legacy/index.js:1:23:
+      1 \u{2502} import { Buffer } from \"buffer\";
+
+  The package \"buffer\" wasn't found on the file system but is built into node.
+
+\u{2718} [ERROR] Could not resolve \"left-pad\"
+
+\u{2718} [ERROR] Could not resolve \"buffer\"
+
+3 errors
+";
+        assert_eq!(esbuild_unresolved_imports(stderr), vec!["buffer", "left-pad"]);
+
+        let plain = worker("entry: i.ts\n");
+        let err = worker_bundle_error("api", &plain, stderr);
+        assert!(err.contains("could not resolve \"buffer\", \"left-pad\""), "{err}");
+        assert!(err.contains("`node:<name>`") && err.contains("nodejs_compat"), "{err}");
+        assert!(err.contains("drop the dependency"), "{err}");
+
+        let compat = worker("entry: i.ts\ncompatibilityFlags: [nodejs_compat]\n");
+        let err = worker_bundle_error("api", &compat, stderr);
+        assert!(!err.contains("add `nodejs_compat`"), "{err}");
+
+        assert_eq!(
+            worker_bundle_error("api", &plain, "some other failure"),
+            "Bundling Worker backend 'api' failed"
+        );
     }
 
     #[test]

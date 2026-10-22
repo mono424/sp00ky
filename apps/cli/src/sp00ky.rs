@@ -123,8 +123,21 @@ pub(crate) fn push_message_events(post_ingest: bool) -> String {
     out
 }
 
+/// The `_00_dbsp_cleanup` event's body under the http transport: the
+/// `/view/unregister` call, bounded like [`ingest_post`]. It runs inside the
+/// transaction that deleted the `_00_query` row (the TTL sweep's, usually),
+/// so an unbounded post let a call that never reached the SSP hold that
+/// transaction, and on Cloudflare the alarm running the sweep, open (canary.347
+/// threads-e2e, 2026-10-22). `$result` is never read, so the shape is inert.
+pub(crate) fn unregister_post() -> String {
+    format!(
+        "let $payload = {{ id: <string>$before.id }};\n    let $result = (SELECT * FROM http::post($sp00ky_endpoint + '/view/unregister', $payload, {{ \"Authorization\": \"Bearer \" + $sp00ky_secret }}) TIMEOUT {}s);",
+        EVENT_HTTP_TIMEOUT_SECS
+    )
+}
+
 /// Bound for the HTTP calls a DB event makes inside the user's transaction
-/// (`/ingest` here, `/view/unregister` in `migrate.rs`). The scheduler
+/// (`/ingest` here, `/view/unregister` in [`unregister_post`]). The scheduler
 /// acknowledges as soon as the event is durable (WAL flush + buffer) and no
 /// longer waits for the SSP fan-out, so a healthy ack is milliseconds; this
 /// only has to be clear of a slow flush, not of a slow SSP.

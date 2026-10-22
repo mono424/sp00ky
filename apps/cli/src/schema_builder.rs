@@ -392,9 +392,7 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
         && !sync.is_changefeed()
     {
         let unregister_call = "let $result = mod::dbsp::unregister_view(<string>$before.id);";
-        let unregister_http =
-            "let $payload = { id: <string>$before.id };\n    let $result = http::post($sp00ky_endpoint + '/view/unregister', $payload, { \"Authorization\": \"Bearer \" + $sp00ky_secret });";
-        content = content.replace(unregister_call, unregister_http);
+        content = content.replace(unregister_call, &crate::sp00ky::unregister_post());
     }
 
     Ok(content)
@@ -1203,6 +1201,56 @@ DEFINE FIELD meta.secret ON TABLE user
             .find("DEFINE EVENT OVERWRITE _00_push_message_ingest ON TABLE _00_push_message")
             .expect("direct-push ingest event in the free-plan schema");
         assert!(table < event);
+    }
+
+    // `fn::query::register` posts to the SSP while the client waits on it.
+    // Unbounded, a post that never arrived held the registration for the
+    // client's whole 60 s query timeout (canary.347).
+    #[test]
+    fn the_register_function_bounds_its_post_like_the_events() {
+        let sql = build_remote_functions_schema(
+            &DeployMode::Singlenode,
+            "https://ssp.example",
+            "s3cret",
+            &Default::default(),
+        );
+        assert!(
+            sql.contains(&format!(
+                "SELECT * FROM http::post('https://ssp.example/view/register', $module_config, {{ \"Authorization\": \"Bearer s3cret\" }}) TIMEOUT {}s;",
+                crate::sp00ky::EVENT_HTTP_TIMEOUT_SECS
+            )),
+            "fn::query::register must bound its post with EVENT_HTTP_TIMEOUT_SECS"
+        );
+    }
+
+    // The `_00_query` delete event calls `/view/unregister` inside the
+    // deleting transaction. Unbounded, a call that never reached the SSP held
+    // that transaction, and on Cloudflare the alarm running the TTL sweep,
+    // open (canary.347). Bounded like the `/ingest` events.
+    #[test]
+    fn the_unregister_call_of_the_query_delete_event_is_bounded() {
+        let path = write_tmp_schema("DEFINE TABLE thread SCHEMAFULL;\n");
+        let config = SchemaBuilderConfig {
+            input_path: path.clone(),
+            config_path: None,
+            mode: DeployMode::Singlenode,
+            endpoint: None,
+            secret: None,
+            include_functions: false,
+        };
+        let sql = build_server_schema(&config).unwrap();
+        std::fs::remove_file(&path).ok();
+        let start = sql
+            .find("DEFINE EVENT OVERWRITE _00_dbsp_cleanup ON TABLE _00_query")
+            .expect("the query delete event");
+        let event = &sql[start..start + sql[start..].find("\n};").unwrap()];
+        assert!(
+            event.contains(&format!(
+                "(SELECT * FROM http::post($sp00ky_endpoint + '/view/unregister', $payload, {{ \"Authorization\": \"Bearer \" + $sp00ky_secret }}) TIMEOUT {}s)",
+                crate::sp00ky::EVENT_HTTP_TIMEOUT_SECS
+            )),
+            "{event}"
+        );
     }
 }
 

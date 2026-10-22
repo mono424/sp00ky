@@ -77,8 +77,13 @@ DEFINE FUNCTION OVERWRITE fn::query::register($config: object) {
         ownerHash: $owner_hash
     };
 
-    -- Call SSP via HTTP
-    http::post('{{ENDPOINT}}/view/register', $module_config, { "Authorization": "Bearer {{SECRET}}" });
+    -- Call SSP via HTTP, bounded like the event posts
+    -- (`sp00ky::EVENT_HTTP_TIMEOUT_SECS`): unbounded, a post that never
+    -- reached the SSP held the client's registration for its whole 60 s query
+    -- timeout before it retried (canary.347 on Cloudflare). A registration
+    -- that times out here still completes on the SSP, and the client's retry
+    -- joins it warm. The client reads only the statement status.
+    SELECT * FROM http::post('{{ENDPOINT}}/view/register', $module_config, { "Authorization": "Bearer {{SECRET}}" }) TIMEOUT 10s;
 };
 
 -- Stack/version discovery as a callable function. Returns the full entity

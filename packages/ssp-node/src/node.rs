@@ -995,6 +995,7 @@ impl SspNode {
                 // 128 MB counts), `null` off wasm. Public like the rest of
                 // `/info`, so memory growth shows without the admin secret.
                 "linear_memory_bytes": linear_memory_bytes(),
+                "publication": publication_summary(&self.edge_update_tx.snapshot()),
                 "last_heartbeat_seconds_ago": null,
                 "circuit_tables": circuit_tables,
                 "circuit_hashes": circuit_hashes,
@@ -2781,6 +2782,19 @@ pub async fn note_view_metrics(
     for (view_id, row_count) in view_ids.into_iter().zip(row_counts) {
         map.entry(view_id).or_default().note_ingest(row_count, materialization_time_ms);
     }
+}
+
+/// The edge publication queue for `/info`: how much is waiting and for how
+/// long, so a view whose membership reaches clients late shows where it waits.
+/// No query ids (public route).
+fn publication_summary(m: &ssp_protocol::PublicationMetrics) -> Value {
+    json!({
+        "pending_batches": m.pending_batches,
+        "pending_operations": m.pending_operations,
+        "oldest_age_ms": m.oldest_age_ms,
+        "parked_batches": m.parked_batches,
+        "last_success_ms_ago": m.last_success_at_ms.map(|at| crate::now_epoch_ms().saturating_sub(at)),
+    })
 }
 
 /// Dirty views one [`flush_view_metrics`] request writes.

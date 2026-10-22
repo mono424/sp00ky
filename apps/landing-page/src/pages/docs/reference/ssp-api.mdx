@@ -413,6 +413,7 @@ Get entity information for this SSP (no authentication required).
     "version": "0.0.1-canary.66",
     "uptime_seconds": 3204,
     "linear_memory_bytes": 23527424,
+    "publication": { "pending_batches": 0, "pending_operations": 0, "oldest_age_ms": 0, "parked_batches": 0, "last_success_ms_ago": 1200 },
     "circuit_tables": { "thread": 12, "user": 3 },
     "circuit_hashes": { "thread": "ab12…", "user": "cd34…" },
     "bootstrap_warnings": [],
@@ -442,6 +443,11 @@ most once per 5 s after a miss.
 `linear_memory_bytes` is the SSP's wasm linear memory on Cloudflare (`null`
 on a VM). It only grows, so it is the most the node ever held at once, and it
 is what counts against a Durable Object's 128 MB.
+
+`publication` is the queue of membership edges waiting to be written to the
+database: batches and operations pending, how long the oldest has waited,
+batches parked after a failed write (retried in 5 s), and how long ago a write
+last succeeded. A view whose rows reach clients late shows up here first.
 
 `crdt` reports the [CRDT field](/docs/client/crdt) fold on this SSP:
 `pending_fields` and `pending_rows` waiting for a fold, folds `running` now,

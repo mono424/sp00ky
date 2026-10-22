@@ -195,8 +195,17 @@ test.describe('Multi-client real-time sync', () => {
 
       const editorA = pageA.locator('.ProseMirror[contenteditable="true"]').first();
       const editorB = pageB.locator('.ProseMirror[contenteditable="true"]').first();
-      await expect(editorA).toContainText(seed, { timeout: 15_000 });
-      await expect(editorB).toContainText(seed, { timeout: 15_000 });
+      // The document's text, remote cursor widgets left out: a cursor's
+      // username label renders inline, so with the other client's caret
+      // inside a word the editor's text read "typed o⁠e2e_testuser⁠n A".
+      const docText = (editor: typeof editorA) =>
+        editor.evaluate((el) => {
+          const copy = el.cloneNode(true) as HTMLElement;
+          copy.querySelectorAll('.ProseMirror-loro-cursor').forEach((c) => c.remove());
+          return (copy.textContent ?? '').replace(/\u2060/g, '');
+        });
+      await expect.poll(() => docText(editorA), { timeout: 15_000 }).toContain(seed);
+      await expect.poll(() => docText(editorB), { timeout: 15_000 }).toContain(seed);
 
       // A types at the end and B at the start, at the same time. The old
       // snapshot push kept whichever client wrote last, so one side's
@@ -207,15 +216,6 @@ test.describe('Multi-client real-time sync', () => {
       await pageB.keyboard.press('Home');
       await Promise.all([pageA.keyboard.type(fromA, { delay: 30 }), pageB.keyboard.type(fromB, { delay: 30 })]);
 
-      // The document's text, remote cursor widgets left out: a cursor's
-      // username label renders inline, so with the other client's caret
-      // inside a word the editor's text read "typed o⁠e2e_testuser⁠n A".
-      const docText = (editor: typeof editorA) =>
-        editor.evaluate((el) => {
-          const copy = el.cloneNode(true) as HTMLElement;
-          copy.querySelectorAll('.ProseMirror-loro-cursor').forEach((c) => c.remove());
-          return (copy.textContent ?? '').replace(/\u2060/g, '');
-        });
       for (const editor of [editorA, editorB]) {
         await expect.poll(() => docText(editor), { timeout: 30_000 }).toContain(fromA);
         await expect.poll(() => docText(editor), { timeout: 30_000 }).toContain(fromB);
@@ -234,8 +234,9 @@ test.describe('Multi-client real-time sync', () => {
         await registerUser(pageC, testUser);
         await navigateToThread(pageC, title);
         const editorC = pageC.locator('.ProseMirror[contenteditable="true"]').first();
-        await expect(editorC).toContainText(fromA, { timeout: 15_000 });
-        await expect(editorC).toContainText(fromB, { timeout: 15_000 });
+        // A and B are still connected, so their cursors show here too.
+        await expect.poll(() => docText(editorC), { timeout: 15_000 }).toContain(fromA);
+        await expect.poll(() => docText(editorC), { timeout: 15_000 }).toContain(fromB);
       } finally {
         await ctxC.close();
       }

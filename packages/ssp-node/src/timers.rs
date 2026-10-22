@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// How long past its time an armed alarm may stay unfired before
 /// [`TimerMux::alarm_to_arm`] sets it again.
-pub const ALARM_LOST_AFTER_MS: u64 = 30_000;
+pub const ALARM_LOST_AFTER_MS: u64 = 15_000;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TimerMux {

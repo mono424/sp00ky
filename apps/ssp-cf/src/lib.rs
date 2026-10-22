@@ -354,6 +354,15 @@ impl CfScheduler {
         meta_put(&self.storage, META_ARMED_AT, None);
     }
 
+    /// Set the platform alarm from the handler itself as it finishes, even
+    /// when a request already set it during the run: on threads-e2e an alarm
+    /// set by another request while the handler ran never fired, and the
+    /// object went 35 s without one (2026-10-22, canary.346).
+    async fn rearm_from_handler(&self) {
+        self.armed_at.set(None);
+        self.rearm_alarm().await;
+    }
+
     /// Fired timers leave the mux; `on_timer` re-adds what it re-arms.
     fn take_due(&self, now: u64) -> Vec<TimerKind> {
         let due = self.mux.borrow_mut().pop_due(now);
@@ -657,6 +666,8 @@ const MAX_BOOTSTRAP_BACKOFF_MS: u64 = 60_000;
 /// this long it lets go, and an idle project is still evicted. Alarms do not
 /// extend it, so open tabs that only heartbeat do not keep it forever.
 const AWAKE_AFTER_REQUEST_MS: u64 = 5 * 60_000;
+/// While awake, how often the keep-awake timer checks the alarm is armed.
+const AWAKE_ALARM_CHECK_MS: u64 = 5_000;
 
 fn inbox_count(storage: &Storage) -> u64 {
     storage
@@ -786,7 +797,7 @@ impl DurableObject for SspNodeDo {
                 other => runtime.on_timer(other).await,
             }
         }
-        self.scheduler.rearm_alarm().await;
+        self.scheduler.rearm_from_handler().await;
         Response::ok("ok")
     }
 }
@@ -997,13 +1008,17 @@ impl SspNodeDo {
         }
         let until = Rc::clone(&self.awake_until);
         let running = Rc::clone(&self.awake_timer);
+        let scheduler = Arc::clone(&self.scheduler);
         spawn_local(async move {
             loop {
                 let left = until.get().saturating_sub(now_epoch_ms());
                 if left == 0 {
                     break;
                 }
-                Delay::from(Duration::from_millis(left)).await;
+                Delay::from(Duration::from_millis(left.min(AWAKE_ALARM_CHECK_MS))).await;
+                // Awake anyway: make sure a pending timer has an alarm that
+                // will fire, without waiting for a request to notice.
+                scheduler.rearm_alarm().await;
             }
             running.set(false);
         });

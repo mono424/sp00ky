@@ -153,6 +153,8 @@ A workflow is a DAG of steps, where each step calls a backend route and can read
 
 Every step is an ordinary atomic job, so the whole [jobs](/docs/jobs) lifecycle applies per step: retries, timeouts, `spky jobs` visibility, kill, and crash recovery. A workflow adds the ordering, the data passing, and the run-level view.
 
+For multi-step logic inside one backend, with loops, sleeps or waiting for an event, written as code rather than declared here, see [Durable workflows](/docs/backend/durable-workflows) (`step.do`).
+
 <CodeBlock code={quickstartCode} lang="yaml" />
 
 That declaration describes this shape:

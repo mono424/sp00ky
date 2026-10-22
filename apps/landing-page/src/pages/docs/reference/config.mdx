@@ -78,12 +78,21 @@ A `type: backend` app with a `worker:` block is a [Worker backend](/docs/backend
 | `textModules` | glob[] | `[]` | Files imported as strings, e.g. `["**/*.surql"]`. Each glob must end in an extension, and the extension is what counts. |
 | `cpuMs` | number | Cloudflare's default | CPU time per request in ms, `1` to `300000`. |
 | `ai` | string | (none) | Env binding name for Workers AI, e.g. `AI`. The backend calls `env.AI.run(...)`. |
-| `workflows` | `{ binding, class }[]` | `[]` | Cloudflare Workflows. `env.<binding>` starts the `class`, which must be exported from `entry`. |
+| `workflows` | `{ binding, class }[]` | `[]` | Cloudflare Workflows (Cloudflare only). `env.<binding>` starts the `class`, which must be exported from `entry`. For workflows that run on every host, use the backend's own [`workflows`](#workflows-durable-workflows). |
 | `expose` | string[] | `[]` | Paths served publicly on the project host `https://<slug>.<domain>`. Each starts with `/`; a trailing `*` matches a prefix. Everything else is reachable only through jobs. |
 
 <CodeBlock code={ymlWorker} lang="yaml" />
 
 Rules `spky lint` and `spky deploy` enforce: `hosting: external` and `runOn` are refused with `worker`; binding names (`ai` and every workflow `binding`) must differ; `entry` must exist; the backend's name must be lowercase letters, digits, `-` or `_`. `spky lint` warns when an `expose` pattern covers a path in the OpenAPI spec (that job route would be public too), and when the manifest can only deploy to VMs.
+
+#### `workflows`: durable workflows
+
+A backend may list durable workflow classes (`@spooky-sync/backend`): Cloudflare Workflows' API
+(`step.do`, `step.sleep`, `step.waitForEvent`) on sp00ky's own job engine, on every host. Each entry
+is `{ binding, class }`: `env.<binding>` starts the exported `class`. The backend needs an outbox
+`method` with a `table`, where the workflow's runs go as jobs; `spky dev` and `spky deploy` inject
+its name as `SPKY_OUTBOX_TABLE`. Bindings are letters, digits and `_`, and must differ from
+`worker.ai` and `worker.workflows`. See [Durable workflows](/docs/backend/durable-workflows).
 
 #### `scope`: where an app runs
 

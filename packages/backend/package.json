@@ -14,7 +14,10 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "AGENTS.md",
+    "skills"
   ],
   "sideEffects": false,
   "scripts": {

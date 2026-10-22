@@ -15,6 +15,10 @@ app.use(logger());
 // CORS for the dev port.
 app.use('/*', cors({ origin: '*', allowHeaders: ['Authorization', 'Content-Type'], allowMethods: ['POST', 'OPTIONS'] }));
 
+// Liveness, outside the auth gate: the deploy healthcheck, and on a Cloudflare
+// project an `expose`d route when the api runs as a Worker backend.
+app.get('/health', (c) => c.text('ok'));
+
 // Static-secret bearer auth gates every route. (Invite links are accepted
 // in the database itself: see `share_accept` in the schema.)
 app.use(

@@ -506,6 +506,10 @@ pub struct SspNodeDo {
     drain: tokio::sync::Mutex<()>,
     /// Table images + journal for the warm start.
     snapshot: snapshot::CfSnapshot,
+    /// Until when the keep-awake timer holds the object in memory, and
+    /// whether that timer is running (see [`AWAKE_AFTER_REQUEST_MS`]).
+    awake_until: Rc<Cell<u64>>,
+    awake_timer: Rc<Cell<bool>>,
 }
 
 /// The routes a database event calls. They are acknowledged durably even
@@ -552,6 +556,17 @@ const REPLAY_RETRY_MS: u64 = 5_000;
 /// Longest wait between bootstrap retries.
 const MAX_BOOTSTRAP_BACKOFF_MS: u64 = 60_000;
 
+/// How long the object stays in memory after a request while it serves views.
+/// With no timer pending, Cloudflare hibernates an object 10 s after its last
+/// event, and the next request builds the node again: images, every view
+/// re-registered and republished (95 views took 1.5 s, 341 took 9 s on
+/// threads-e2e, 2026-10-22, while every request waited). A pause of ten
+/// seconds between a user's actions or between test specs was enough. A
+/// pending timer makes the object non-hibernateable; without requests for
+/// this long it lets go, and an idle project is still evicted. Alarms do not
+/// extend it, so open tabs that only heartbeat do not keep it forever.
+const AWAKE_AFTER_REQUEST_MS: u64 = 5 * 60_000;
+
 fn inbox_count(storage: &Storage) -> u64 {
     storage
         .sql()
@@ -593,6 +608,8 @@ impl DurableObject for SspNodeDo {
             inbox_len,
             drain: tokio::sync::Mutex::new(()),
             snapshot,
+            awake_until: Rc::new(Cell::new(0)),
+            awake_timer: Rc::new(Cell::new(false)),
         }
     }
 
@@ -649,6 +666,7 @@ impl DurableObject for SspNodeDo {
         // Arm what the request made pending (dirty metrics, CRDT rows, a new
         // view's expiry, outbox rows); nothing when it changed nothing.
         runtime.after_request(&path).await;
+        self.stay_awake();
         match routed {
             Some(resp) => to_worker_response(resp),
             None => Response::error("not found", 404),
@@ -852,6 +870,7 @@ impl SspNodeDo {
                         self.mark_applied(seq);
                         runtime.after_request(&path).await;
                         self.arm_checkpoint(CHECKPOINT_AFTER_CHANGE_MS).await;
+                        self.stay_awake();
                         return to_worker_response(resp);
                     }
                     None => {
@@ -865,7 +884,38 @@ impl SspNodeDo {
         self.inbox_len.set(self.inbox_len.get() + 1);
         // Wake as soon as possible: bootstrap (if cold), then replay.
         self.scheduler.ensure(TimerKind::IngestReplay, now_epoch_ms()).await;
+        self.stay_awake();
         json_response(200, serde_json::json!({ "status": "queued" }))
+    }
+
+    /// Hold the object in memory for [`AWAKE_AFTER_REQUEST_MS`] past this
+    /// request while the node serves views. One timer task at a time: it
+    /// sleeps to the deadline, and again while requests keep moving it. A
+    /// node without views lets the object hibernate as before.
+    fn stay_awake(&self) {
+        let serving = self.node.borrow().as_ref().is_some_and(|node| {
+            // Busy (a writer holds it): it is serving, so stay.
+            node.processor.try_read().map_or(true, |circuit| circuit.view_count() > 0)
+        });
+        if !serving {
+            return;
+        }
+        self.awake_until.set(now_epoch_ms() + AWAKE_AFTER_REQUEST_MS);
+        if self.awake_timer.replace(true) {
+            return;
+        }
+        let until = Rc::clone(&self.awake_until);
+        let running = Rc::clone(&self.awake_timer);
+        spawn_local(async move {
+            loop {
+                let left = until.get().saturating_sub(now_epoch_ms());
+                if left == 0 {
+                    break;
+                }
+                Delay::from(Duration::from_millis(left)).await;
+            }
+            running.set(false);
+        });
     }
 
     /// Whether an unregister is still in the inbox (accepted while the node

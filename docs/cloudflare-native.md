@@ -383,6 +383,18 @@ Consequences:
   the snapshot so `INFO FOR TABLE` is not needed when the probe hash matches.
 - An idle project's next request pays the same cold start as after a deploy
   (17 of 20 natural evictions also started a fresh isolate).
+- **Hibernation is not only for idle projects.** With no timer, I/O or
+  `waitUntil` pending, Cloudflare hibernates an object 10 s after its last
+  event, and the shell holds nothing between requests, so a 10 s pause in a
+  busy project dropped the node. The next request rebuilt it from the images
+  and re-registered and republished every view (95 views 1.5 s, 341 views
+  9 s on threads-e2e, 2026-10-22), mid e2e run, between two specs. While the
+  node holds views, a request now arms a keep-awake timer for 5 minutes
+  (`AWAKE_AFTER_REQUEST_MS`); alarms do not extend it, so an idle project
+  still lets go and is evicted.
+- **Answer latency is the parent worker's `wallTime`.** The object's own
+  `wallTime` for a request also covers work it spawned (a `/ingest` read 5 s
+  while the DB event got its answer in 54 ms at p95).
 - **Timing method:** `Date.now()` does not advance while code runs on
   Cloudflare (`setTimeout(0)` does not move it either; only real I/O does), so
   in-process span timing cannot measure CPU phases. Use the invocation's

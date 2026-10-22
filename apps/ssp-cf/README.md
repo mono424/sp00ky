@@ -23,7 +23,10 @@ bootstrap retries with 1 s to 60 s backoff through `TimerKind::BootstrapRetry`).
 
 Timers run on demand (`Runtime::on_demand`): a sweep is armed only while it has
 work, the alarm is deleted when nothing is pending, and timers survive eviction
-in the object's SQLite. An idle project sets no alarm and is evicted. Design and
+in the object's SQLite. An idle project sets no alarm and is evicted. While the
+node holds views, each request keeps the object in memory for 5 minutes (a
+pending timer), so a short pause does not hibernate it and rebuild the node on
+the next request. Design and
 measurements: [`docs/cloudflare-native.md`](../../docs/cloudflare-native.md) §5.
 
 ## Variables

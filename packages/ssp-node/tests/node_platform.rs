@@ -1154,6 +1154,44 @@ async fn on_demand_job_recovery_rearms_while_a_job_is_pending() {
     );
 }
 
+// A project with a job table probed for pending jobs after EVERY ingest, one
+// DB query per row whatever its table (Cloudflare, 2026-10-22). Only an ingest
+// into a job table can leave a job row behind.
+#[tokio::test]
+async fn on_demand_probes_for_jobs_only_after_a_job_table_ingest() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://b")], ..Default::default() }).await;
+    h.raw_db
+        .query("CREATE job:j1 SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now(), updated_at = time::now();")
+        .await
+        .unwrap();
+    let runtime = Runtime::on_demand(Arc::clone(&h.node));
+    let ingest = |table: &str, op: &str, id: &str, record: Value| {
+        authed(Method::Post, "/ingest", json!({ "table": table, "op": op, "id": id, "record": record }))
+    };
+    let armed = || h.scheduled.lock().unwrap().contains(&TimerKind::JobRecoverySweep);
+
+    let r = h.node.route(ingest("thread", "CREATE", "thread:a", json!({ "id": "thread:a" }))).await.unwrap();
+    assert_eq!(r.status, 200);
+    let before = h.db_queries.load(Ordering::SeqCst);
+    runtime.after_request("/ingest").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.db_queries.load(Ordering::SeqCst), before, "a thread row cannot leave a job behind");
+    assert!(!armed());
+
+    let r = h.node
+        .route(ingest("job", "UPDATE", "job:j1", json!({ "id": "job:j1", "status": "processing" })))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200);
+    runtime.after_request("/ingest").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !armed() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    })
+    .await
+    .expect("a job-table ingest probes and arms the recovery sweep");
+}
+
 #[tokio::test]
 async fn replay_ingests_current_state_not_the_queued_events() {
     let h = build(HarnessOpts::default()).await;
@@ -2549,6 +2587,29 @@ async fn an_authenticated_re_registration_rebuilds_a_view_with_no_identity() {
     let c = h.node.processor.read().await;
     assert_eq!(c.view_count(), 1);
     assert_eq!(c.graph_count(), 1);
+}
+
+// A warm join of a view that has its identity never needed the publication
+// gate, but took it before looking: every signed-in join waited out the
+// publisher's whole round of edge writes (registrations of 5 to 8 s on
+// Cloudflare under load, 2026-10-22).
+#[tokio::test]
+async fn a_warm_join_does_not_wait_for_publication() {
+    let h = thread_harness().await;
+    let r = h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    publication_drained(&h).await;
+
+    let gate = Arc::clone(&h.node.publication_gate);
+    let _publishing = gate.lock().await;
+    let mut second = thread_register("_00_query:v1");
+    second["clientId"] = json!("tab-b");
+    let r = tokio::time::timeout(Duration::from_secs(2), h.node.route(authed(Method::Post, "/view/register", second)))
+        .await
+        .expect("a warm join must not wait for the publication gate")
+        .unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+    assert_eq!(h.node.processor.read().await.view_count(), 1);
 }
 
 // The guard the adoption above must not weaken: one concrete identity may never

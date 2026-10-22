@@ -1121,8 +1121,10 @@ scheduler's view inspection API. Older rows may omit these fields.
 
 Registration stages are `request_ms`, `prepare_ms`, `parse_ms`, `lock_wait_ms`,
 `lock_hold_ms`, `index_build_ms`, `indexes_built`, `rows_indexed`, `plan_ms`,
-`snapshot_ms` and `metadata_db_ms`. Cold registrations and warm joins both record
-stages. Lock wait and hold accumulate preparation/read, index-prewarm/read and
+`snapshot_ms`, `metadata_db_ms`, `tables_ms` and `identity_ms`. Cold
+registrations and warm joins both record stages. `tables_ms` (defining the
+caller's per-user tables) and `identity_ms` (checking for, and discarding, a
+view registered without an identity) are parts of `prepare_ms`. Lock wait and hold accumulate preparation/read, index-prewarm/read and
 installation/write guards. Parsing, index build, plan and snapshot timings are
 subsets of their containing stages. Warm metadata timing includes its repair
 probe and any repair writes.

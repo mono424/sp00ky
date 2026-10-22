@@ -180,6 +180,8 @@ pub struct JobDispatcher {
     ssp_id: String,
     /// No scheduler in front of us: skip the cluster count and the claim CAS.
     standalone: bool,
+    /// An ingest touched a job table since the last [`Self::take_job_rows_noticed`].
+    job_rows_noticed: std::sync::atomic::AtomicBool,
 }
 
 impl JobDispatcher {
@@ -204,7 +206,19 @@ impl JobDispatcher {
             job_config,
             ssp_id,
             standalone,
+            job_rows_noticed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// An ingest touched a job table: the on-demand runtime probes for
+    /// pending rows after the request (see `Runtime::after_request`).
+    pub fn note_job_row(&self) {
+        self.job_rows_noticed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a job table was ingested since the last call, clearing it.
+    pub fn take_job_rows_noticed(&self) -> bool {
+        self.job_rows_noticed.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This node's SSP id, stamped onto a row as its lease owner. The runner needs it

@@ -146,7 +146,9 @@ impl Runtime {
             self.arm_schedule_sweep_now().await;
         }
         let registered = path.starts_with("/view/register");
-        let ingested = path.starts_with("/ingest") && !node.job_config.job_tables.is_empty();
+        // Only an ingest into a job table can leave a job row behind. Probing
+        // after every ingest cost one DB query per row of any table.
+        let ingested = path.starts_with("/ingest") && node.job_dispatcher.take_job_rows_noticed();
         if registered || ingested {
             let runtime = self.clone();
             node.platform.spawner.spawn(Box::pin(async move {

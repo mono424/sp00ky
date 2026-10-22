@@ -2432,11 +2432,17 @@ fn cloudflare_job_config(config: &backend::Sp00kyConfig) -> serde_json::Value {
         } else {
             continue;
         };
-        entries.push(serde_json::json!({
+        // The backend's own bearer check runs unchanged: the job request
+        // carries `auth.token` as on a VM (`spky dev` does the same).
+        let mut entry = serde_json::json!({
             "name": name,
             "base_url": base_url,
             "table": table,
-        }));
+        });
+        if let Some(token) = app.auth.as_ref().and_then(|a| a.token.clone()) {
+            entry["auth_token"] = serde_json::json!(token);
+        }
+        entries.push(entry);
     }
     serde_json::json!(entries)
 }
@@ -9725,6 +9731,7 @@ apps:
     spec: a.yml
     method: { type: outbox, table: job, schema: a.surql }
     worker: { entry: i.ts }
+    auth: { type: token, token: shh }
   hosted:
     type: backend
     spec: b.yml
@@ -9745,7 +9752,7 @@ apps:
         assert_eq!(
             cloudflare_job_config(&config),
             serde_json::json!([
-                { "name": "api", "base_url": "worker://api", "table": "job" },
+                { "name": "api", "base_url": "worker://api", "table": "job", "auth_token": "shh" },
                 { "name": "hosted", "base_url": "https://hosted.example.com", "table": "job_hosted" },
             ])
         );

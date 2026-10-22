@@ -134,7 +134,11 @@ view, never an empty one.
    dies: a closed socket (a revive loop on backoff, forever), a half-open one (a
    heartbeat with a two-failure budget forces the teardown), and a wake signal.
    The core is framework-agnostic, so the app calls `client.wake()` - in Flutter,
-   from `AppLifecycleState.resumed`.
+   from `AppLifecycleState.resumed`. Connectivity is the app's to report too:
+   the browser's `net.offline` reads `navigator.onLine`, here the `netOffline`
+   service answers whatever the app last passed to `client.setOffline` (online
+   until then), and while it is true a cold `preload` returns at once instead of
+   waiting on membership that cannot arrive.
 5. **Local-only mode.** With no endpoint configured the client never starts the
    network half and never drains the outbox: draining against nothing would fail
    in a way the classifier reads as the server rejecting the write, and a

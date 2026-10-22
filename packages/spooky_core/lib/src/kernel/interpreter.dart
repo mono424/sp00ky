@@ -85,6 +85,12 @@ abstract interface class Services {
   Map<String, dynamic>? authCurrentUser();
 
   Future<void> remoteConnect();
+
+  /// The host reports no network at all (TS `net.offline`, a browser's
+  /// `navigator.onLine === false`). The core cannot see connectivity, so this
+  /// is whatever the app last passed to `Sp00kyClient.setOffline`: online until
+  /// it says otherwise.
+  bool netOffline();
   void remoteReleaseViews(List<Object?> ids);
   void supervisorStart();
 
@@ -279,6 +285,8 @@ class Interpreter implements Ctx {
         return s.authCurrentUser();
       case ServiceName.remoteConnect:
         await s.remoteConnect();
+      case ServiceName.netOffline:
+        return s.netOffline();
       case ServiceName.remoteReleaseViews:
         s.remoteReleaseViews((args[0] as List).cast<Object?>());
       case ServiceName.supervisorStart:

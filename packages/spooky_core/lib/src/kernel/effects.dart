@@ -352,6 +352,7 @@ enum ServiceName {
   authToken,
   authCurrentUser,
   remoteConnect,
+  netOffline,
   remoteReleaseViews,
   supervisorStart,
   crdtSetSessionId,

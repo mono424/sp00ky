@@ -245,6 +245,8 @@ class FakeServices implements Services {
   @override
   Future<void> remoteConnect() async => _call(ServiceName.remoteConnect);
   @override
+  bool netOffline() => _call(ServiceName.netOffline) as bool? ?? false;
+  @override
   void remoteReleaseViews(List<Object?> ids) =>
       _call(ServiceName.remoteReleaseViews, [ids]);
   @override

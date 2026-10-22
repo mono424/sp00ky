@@ -428,5 +428,20 @@ void main() {
       expect(out.result.waited, isFalse);
       expect(out.ofKind('state.wait'), isEmpty);
     });
+
+    test(
+        'offline: registers but never waits, so a launch without a network '
+        'paints from what is local', () async {
+      final out = await runPure<({String hash, bool waited})>(
+        (ctx) => preload(ctx, env(), input),
+        state: buildState(const [], [r.setIdentity(userId: 'user:alice')]),
+        handlers: defaults(over: {
+          'service': services({ServiceName.netOffline: () => true}),
+        }),
+      );
+      expect(out.result.waited, isFalse);
+      expect(out.ofKind('ssp.register'), hasLength(1));
+      expect(out.ofKind('state.wait'), isEmpty);
+    });
   });
 }

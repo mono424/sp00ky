@@ -22,6 +22,7 @@ enum WorkerOp {
   inspect,
   checkpoint,
   wake,
+  offline,
   detach,
   deregister,
   timing,
@@ -189,6 +190,13 @@ final class WakeCommand extends WorkerCommand {
   const WakeCommand();
   @override
   WorkerOp get op => WorkerOp.wake;
+}
+
+final class OfflineCommand extends WorkerCommand {
+  const OfflineCommand(this.offline);
+  final bool offline;
+  @override
+  WorkerOp get op => WorkerOp.offline;
 }
 
 final class DetachCommand extends WorkerCommand {

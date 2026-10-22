@@ -381,6 +381,14 @@ impl JsonSchemaGenerator {
             if field_def.should_strip {
                 continue;
             }
+            // A sub-path field (`errors[*]`, `settings.theme`) types part of a
+            // value its parent field already carries; it is no property of the
+            // record. As one, it became the TypeScript column `errors[*]: ...`,
+            // which does not compile, for every outbox table made from the
+            // `spky api add` template. Same rule as `sp00ky::is_sub_path`.
+            if field_name.contains('[') || field_name.contains('.') {
+                continue;
+            }
 
             let field_schema = self.generate_field_schema(&field_def.field_type);
 
@@ -666,6 +674,34 @@ DEFINE FIELD mixed ON TABLE game TYPE record<player_name> | record<game>;
         assert!(props.get("owner").unwrap().get("x-record-ref").is_none());
         // Two different record targets are ambiguous: no ref.
         assert!(props.get("mixed").unwrap().get("x-record-ref").is_none());
+    }
+
+    /// The `spky api add` outbox template defines `errors[*]`; as a property
+    /// it became the uncompilable TS column `errors[*]: ...`.
+    #[test]
+    fn sub_path_fields_are_not_properties() {
+        let schema = r#"
+DEFINE TABLE job SCHEMAFULL;
+DEFINE FIELD errors ON TABLE job TYPE array<object> DEFAULT [];
+DEFINE FIELD OVERWRITE errors[*] ON TABLE job TYPE object FLEXIBLE;
+DEFINE FIELD settings ON TABLE job TYPE option<object>;
+DEFINE FIELD settings.theme ON TABLE job TYPE option<string>;
+"#;
+        let mut parser = SchemaParser::new();
+        parser.parse_file(schema).unwrap();
+        let js = JsonSchemaGenerator::new().generate(&parser);
+        let props = js
+            .definitions
+            .get("job")
+            .and_then(|d| d.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("job properties");
+        assert!(props.contains_key("errors") && props.contains_key("settings"), "{props:?}");
+        assert!(
+            !props.keys().any(|k| k.contains('[') || k.contains('.')),
+            "sub-path fields leaked: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -982,7 +982,31 @@ pub fn build_edge_batch(
 ) -> EdgeBatch {
     let mut batch = EdgeBatch::default();
 
+    // A row's version bump is written once per view: by the LAST delta of
+    // that view in the batch that bumps it. Every bump in a batch sets the
+    // same version (`versions` has one per key), so an earlier one is either
+    // rewritten by the last or undone by a removal in between, and a removal
+    // followed by a re-add writes the version in its `RELATE`. A publication
+    // round carries the deltas of many ingests, and a title being edited
+    // bumps the thread in every view holding it on every fold: transactions
+    // of 500 statements repeating the same bumps took 5-7 s each on
+    // threads-e2e (canary.348), and the queue fell 9,000 operations and 100 s
+    // behind while the DB answered other queries fast. The superseded delta
+    // writes nothing for that row
+    // and is not retried for it; the delta carrying the bump is, with a
+    // version at least as new.
+    let mut last_bump: HashMap<String, HashMap<&str, usize>> = HashMap::new();
     for (idx, delta) in deltas.iter().enumerate() {
+        let bumps = last_bump.entry(ssp::canonical_query_id(&delta.query_id)).or_default();
+        let subquery = delta.subquery_items.iter().filter(|i| i.op == SubqueryOp::Update).map(|i| &i.id);
+        for id in delta.updates.iter().chain(subquery) {
+            bumps.insert(id.as_str(), idx);
+        }
+    }
+
+    for (idx, delta) in deltas.iter().enumerate() {
+        let view_bumps = &last_bump[&ssp::canonical_query_id(&delta.query_id)];
+        let superseded = |id: &str| view_bumps.get(id).is_some_and(|&last| last != idx);
         let mut group = DeltaStatements {
             delta: idx,
             idempotent: delta.initial || (delta.additions.is_empty()
@@ -1096,6 +1120,9 @@ pub fn build_edge_batch(
                 error!(target: "ssp::edges", record_id = %id, view_id = %delta.query_id, "Invalid record ID - skipping edge update");
                 continue;
             }
+            if superseded(id) {
+                continue;
+            }
             let version = versions.version_of(id);
             group.updated += 1;
             group.body.push(format!(
@@ -1163,6 +1190,9 @@ pub fn build_edge_batch(
                     )));
                 }
                 SubqueryOp::Update => {
+                    if superseded(&item.id) {
+                        continue;
+                    }
                     let version = versions.version_of(&item.id);
                     group.updated += 1;
                     group.body.push(format!(
@@ -1953,6 +1983,71 @@ mod tests {
         assert!(txs.len() > 1);
         assert!(txs.iter().all(|t| t.sql.matches(";\n").count() <= 101));
         assert_eq!(txs.iter().map(|t| t.sql.matches("UPDATE ").count()).sum::<usize>(), 600);
+    }
+
+    fn bump(query_id: &str, id: &str) -> ViewDelta {
+        let mut d = delta(query_id, "user:a");
+        d.updates.push(id.into());
+        d
+    }
+
+    #[test]
+    fn a_rounds_repeated_bumps_of_a_row_write_it_once_per_view() {
+        // A round carries many ingests' deltas; a title being edited bumps
+        // its thread in every view on every fold.
+        let mut first = bump("view:a", "thread:1");
+        first.updates.push("thread:2".into());
+        let round = [first, bump("view:b", "thread:1"), bump("_00_query:a", "thread:1"), bump("view:a", "thread:1")];
+        let refs: Vec<&ViewDelta> = round.iter().collect();
+        let batch = build_edge_batch(&refs, RefMode::Single, &ConstV(7));
+        let updates: Vec<(usize, &String)> = batch.deltas.iter()
+            .flat_map(|g| g.body.iter().map(move |s| (g.delta, s))).collect();
+        assert_eq!(updates, vec![
+            (0, &"UPDATE (SELECT VALUE id FROM thread:2<-_00_list_ref WHERE in = $from0) SET version = 7 RETURN NONE".to_string()),
+            (1, &"UPDATE (SELECT VALUE id FROM thread:1<-_00_list_ref WHERE in = $from1) SET version = 7 RETURN NONE".to_string()),
+            (3, &"UPDATE (SELECT VALUE id FROM thread:1<-_00_list_ref WHERE in = $from3) SET version = 7 RETURN NONE".to_string()),
+        ], "view:a's thread:1 is bumped once, by its last delta (both spellings are one view); view:b keeps its own");
+        assert_eq!(batch.updated(), 3);
+        let txs = plan_transactions(&batch, MAX_TX_STATEMENTS);
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].deltas, vec![0, 1, 3], "a delta with nothing left to write is not sent at all");
+    }
+
+    #[test]
+    fn a_bump_superseded_across_a_removal_leaves_the_removal_in_force() {
+        let mut removal = delta("view:a", "user:a");
+        removal.removals.push("thread:1".into());
+        let mut child = delta("view:a", "user:a");
+        child.subquery_items.push(SubqueryDeltaItem {
+            id: "thread:1".into(), parent_key: "user:1".into(), alias: "threads".into(), op: SubqueryOp::Update,
+        });
+        let round = [bump("view:a", "thread:1"), removal, child];
+        let refs: Vec<&ViewDelta> = round.iter().collect();
+        let statements = build_edge_batch(&refs, RefMode::Single, &ConstV(2)).statements();
+        let body: Vec<&String> = statements.iter().filter(|s| !s.starts_with("LET ")).collect();
+        assert_eq!(body, vec![
+            "DELETE (SELECT VALUE id FROM thread:1<-_00_list_ref WHERE in = $from1)",
+            "UPDATE (SELECT VALUE id FROM thread:1<-_00_list_ref WHERE in = $from2) SET version = 2 RETURN NONE",
+        ], "the bump before the removal is dropped, the one after it (a no-op on a deleted edge) is kept");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_bump_is_not_retried_but_the_delta_carrying_it_is() {
+        struct Fails;
+        #[async_trait::async_trait]
+        impl Db for Fails {
+            async fn query(&self, _: &str, _: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+                Err(DbError::Query("Transaction conflict: Resource busy".into()))
+            }
+            async fn version(&self) -> Result<String, DbError> { Ok("test".into()) }
+        }
+        let (mut earlier, mut carrier) = (bump("view:a", "thread:1"), bump("view:a", "thread:1"));
+        earlier.result_hash = "earlier".into();
+        carrier.result_hash = "carrier".into();
+        let left = write_deltas_with_versions(&Fails, vec![earlier, carrier], &ConstV(3), RefMode::Single,
+            &crate::ports::NoopTelemetry).await;
+        let held: Vec<&str> = left.iter().map(|d| d.result_hash.as_str()).collect();
+        assert_eq!(held, vec!["carrier"]);
     }
 
     #[test]

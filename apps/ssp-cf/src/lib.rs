@@ -95,7 +95,15 @@ impl HttpClient for CfHttp {
             init.with_body(body_js);
         }
 
-        let wreq = Request::new_with_init(&req.url, &init)
+        // A job for a Worker backend (`worker://<name>/<path>`) never touches
+        // the network: host.mjs loads that backend's Dynamic Worker and calls
+        // its fetch. The backend sees an ordinary https URL with the job path.
+        let backend = worker_backend_target(&req.url);
+        let url = match &backend {
+            Some((name, path)) => format!("https://{name}.worker.spky.internal{path}"),
+            None => req.url.clone(),
+        };
+        let wreq = Request::new_with_init(&url, &init)
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
         // The timeout and the cancel watch both abort the fetch, so a hung DB
@@ -104,7 +112,10 @@ impl HttpClient for CfHttp {
         let controller = AbortController::default();
         let signal = controller.signal();
         let exchange = async {
-            let mut resp = Fetch::Request(wreq).send_with_signal(&signal).await?;
+            let mut resp = match &backend {
+                Some((name, _)) => worker_backend_fetch(name, &wreq).await?,
+                None => Fetch::Request(wreq).send_with_signal(&signal).await?,
+            };
             let status = resp.status_code();
             let body = resp.text().await?;
             Ok::<_, worker::Error>(OutboundResponse { status, body })
@@ -129,6 +140,44 @@ impl HttpClient for CfHttp {
             }
         }
     }
+}
+
+/// The backend name and path of a `worker://<name>/<path>` job URL (the
+/// `base_url` the CLI writes into `SPKY_JOB_CONFIG` for a Worker backend).
+fn worker_backend_target(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("worker://")?;
+    let (name, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    (!name.is_empty()).then(|| (name.to_string(), path.to_string()))
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// `globalThis.__spkyBackends.fetch`, installed by host.mjs.
+    #[wasm_bindgen(catch, js_namespace = __spkyBackends, js_name = fetch)]
+    fn spky_backend_fetch(
+        name: &str,
+        request: &web_sys::Request,
+    ) -> std::result::Result<js_sys::Promise, wasm_bindgen::JsValue>;
+}
+
+/// Run a job request on a Worker backend through host.mjs.
+async fn worker_backend_fetch(name: &str, req: &Request) -> worker::Result<Response> {
+    use wasm_bindgen::JsCast;
+    let promise = spky_backend_fetch(name, req.inner()).map_err(|e| {
+        Error::JsError(format!(
+            "Worker backend `{name}` is unreachable: this ssp-cf build was uploaded without host.mjs ({e:?})"
+        ))
+    })?;
+    let value = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|e| Error::JsError(format!("Worker backend `{name}` failed: {e:?}")))?;
+    let resp: web_sys::Response = value
+        .dyn_into()
+        .map_err(|_| Error::JsError(format!("Worker backend `{name}` did not answer with a Response")))?;
+    Ok(Response::from(resp))
 }
 
 /// `push_core::PushHttp` over `fetch`: Web Push, FCM (and its OAuth token)

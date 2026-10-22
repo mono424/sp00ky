@@ -1,0 +1,16 @@
+{
+  "name": "@spooky-sync/ssp-cf-host",
+  "private": true,
+  "description": "Bundles host.mjs, the ssp-cf main module that loads a project's Worker backends. Not a pnpm workspace package (apps/* matches one level only).",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild host.mjs --bundle --format=esm --platform=neutral --external:cloudflare:* --external:./index.js --external:./backends.mjs --outfile=../build/host.mjs",
+    "test": "node --test host.test.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/dynamic-workflows": "0.1.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

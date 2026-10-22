@@ -64,6 +64,23 @@ jobs:
         working-directory: apps/ssp-cf
         run: worker-build --release
 
+      - name: Setup Node.js
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+
+      # host.mjs is the main module once a project has Worker backends: it
+      # loads them as Dynamic Workers and hands everything else to index.js.
+      - name: Build the Worker backend host
+        if: steps.guard.outputs.skip != 'true'
+        working-directory: apps/ssp-cf/js
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run build
+          test -f ../build/host.mjs
+
       - name: Publish to control-plane registry
         if: steps.guard.outputs.skip != 'true'
         env:
@@ -75,6 +92,7 @@ jobs:
           BUNDLE_DIR="apps/ssp-cf/build"
           test -f "$BUNDLE_DIR/index.js" || { echo "missing $BUNDLE_DIR/index.js"; exit 1; }
           test -f "$BUNDLE_DIR/index_bg.wasm" || { echo "missing $BUNDLE_DIR/index_bg.wasm"; exit 1; }
+          test -f "$BUNDLE_DIR/host.mjs" || { echo "missing $BUNDLE_DIR/host.mjs"; exit 1; }
 
           # Base64 the bundle into the JSON payload the admin endpoint expects
           # (matches spooky-cloud/scripts/publish-ssp-wasm.sh). The wasm is
@@ -82,15 +100,15 @@ jobs:
           # --arg` ("jq: Argument list too long"), so build the JSON in python,
           # reading the files directly instead of through the shell arg vector.
           PAYLOAD="$(mktemp)"
-          python3 - "$VERSION" "$BUNDLE_DIR/index.js" "$BUNDLE_DIR/index_bg.wasm" "$PAYLOAD" <<'PY'
+          python3 - "$VERSION" "$BUNDLE_DIR/index.js" "$BUNDLE_DIR/index_bg.wasm" "$BUNDLE_DIR/host.mjs" "$PAYLOAD" <<'PY'
           import sys, base64, json
-          version, js_path, wasm_path, out = sys.argv[1:5]
-          with open(js_path, "rb") as f:
-              js_b64 = base64.b64encode(f.read()).decode()
-          with open(wasm_path, "rb") as f:
-              wasm_b64 = base64.b64encode(f.read()).decode()
+          version, js_path, wasm_path, host_path, out = sys.argv[1:6]
+          def b64(path):
+              with open(path, "rb") as f:
+                  return base64.b64encode(f.read()).decode()
           with open(out, "w") as f:
-              json.dump({"version": version, "index_js_b64": js_b64, "index_wasm_b64": wasm_b64}, f)
+              json.dump({"version": version, "index_js_b64": b64(js_path),
+                         "index_wasm_b64": b64(wasm_path), "host_js_b64": b64(host_path)}, f)
           PY
 
           echo "Publishing ssp-cf '$VERSION' -> $SPOOKY_API_URL"

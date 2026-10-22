@@ -264,6 +264,10 @@ jobs:
   publish-cli-platform-packages:
     needs: [prepare, build-cli-binaries]
     strategy:
+      # One platform failing (npm answered 503 on a 7 MB upload for hours on
+      # 2026-10-22) must not cancel the others: each publish is independent,
+      # and a cancelled one is just one more to redo.
+      fail-fast: false
       matrix:
         package:
           - cli-linux-x64
@@ -305,7 +309,15 @@ jobs:
 
       - name: Publish platform package
         working-directory: apps/cli/npm/${{ matrix.package }}
-        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+        # Idempotent, so a rerun finishes a half-done release: npm can answer
+        # 503 to a PUT it has already stored, and publishing over it is a 403.
+        run: |
+          NAME=$(jq -r .name package.json)
+          if npm view "$NAME@${{ needs.prepare.outputs.version }}" version >/dev/null 2>&1; then
+            echo "$NAME@${{ needs.prepare.outputs.version }} is already published; skipping"
+          else
+            npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+          fi
 
   publish-cli:
     needs: [prepare, publish-cli-platform-packages]
@@ -358,4 +370,10 @@ jobs:
 
       - name: Publish CLI
         working-directory: apps/cli
-        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+        # Idempotent for the same reason as the platform packages.
+        run: |
+          if npm view "@spooky-sync/cli@${{ needs.prepare.outputs.version }}" version >/dev/null 2>&1; then
+            echo "@spooky-sync/cli@${{ needs.prepare.outputs.version }} is already published; skipping"
+          else
+            npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+          fi

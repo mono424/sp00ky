@@ -4281,6 +4281,10 @@ apps:
         cfg("apps:\n  api:\n    type: backend\n    spec: a.yml\n    method: { type: outbox, table: job, schema: a.surql }\n    worker: { entry: i.ts }\n")
             .validate_manifest()
             .expect("no deploy block, no baseUrl");
+        // `deploy.timeout` is how a Worker backend sets its job timeout.
+        cfg("apps:\n  api:\n    type: backend\n    spec: a.yml\n    method: { type: outbox, table: job, schema: a.surql }\n    worker: { entry: i.ts }\n    deploy: { timeout: 120, timeoutOverridable: true }\n")
+            .validate_manifest()
+            .expect("a deploy block with only a timeout");
 
         let no_spec = cfg("apps:\n  api:\n    type: backend\n    method: { type: outbox, table: job, schema: a.surql }\n    worker: { entry: i.ts }\n");
         let err = no_spec.validate_manifest().unwrap_err().to_string();

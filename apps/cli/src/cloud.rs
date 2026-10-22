@@ -2442,6 +2442,17 @@ fn cloudflare_job_config(config: &backend::Sp00kyConfig) -> serde_json::Value {
         if let Some(token) = app.auth.as_ref().and_then(|a| a.token.clone()) {
             entry["auth_token"] = serde_json::json!(token);
         }
+        // The request timeout is `deploy.timeout`, the key a VM deploy and
+        // `spky dev` read, so one setting covers all three. Without it the
+        // runner aborts the call at its 10 s default.
+        if let Some(deploy) = &app.deploy {
+            if let Some(timeout) = deploy.timeout {
+                entry["timeout"] = serde_json::json!(timeout);
+            }
+            if let Some(overridable) = deploy.timeout_overridable {
+                entry["timeout_overridable"] = serde_json::json!(overridable);
+            }
+        }
         entries.push(entry);
     }
     serde_json::json!(entries)
@@ -9732,6 +9743,7 @@ apps:
     method: { type: outbox, table: job, schema: a.surql }
     worker: { entry: i.ts }
     auth: { type: token, token: shh }
+    deploy: { timeout: 120, timeoutOverridable: true }
   hosted:
     type: backend
     spec: b.yml
@@ -9752,7 +9764,10 @@ apps:
         assert_eq!(
             cloudflare_job_config(&config),
             serde_json::json!([
-                { "name": "api", "base_url": "worker://api", "table": "job", "auth_token": "shh" },
+                {
+                    "name": "api", "base_url": "worker://api", "table": "job", "auth_token": "shh",
+                    "timeout": 120, "timeout_overridable": true,
+                },
                 { "name": "hosted", "base_url": "https://hosted.example.com", "table": "job_hosted" },
             ])
         );

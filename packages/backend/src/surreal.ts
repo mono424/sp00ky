@@ -85,6 +85,13 @@ function primaryError(messages: string[]): string {
   );
 }
 
+const CONFLICT_RETRIES = 4;
+
+/** SurrealDB's wording for a transaction that lost a write race (as `ssp-node`'s `is_write_conflict`). */
+export function isConflict(message: string): boolean {
+  return /write conflict|transaction conflict|can be retried|resource busy/i.test(message);
+}
+
 export function httpQuery(config: DbConfig, fetchImpl: typeof fetch = (...a) => fetch(...a)): Query {
   const url = rpcUrl(config.url);
   const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
@@ -137,7 +144,7 @@ export function httpQuery(config: DbConfig, fetchImpl: typeof fetch = (...a) => 
     return undefined;
   };
 
-  const run = async (sql: string, vars: Record<string, unknown>, retried: boolean): Promise<unknown[]> => {
+  const run = async (sql: string, vars: Record<string, unknown>, retried: boolean, conflicts = 0): Promise<unknown[]> => {
     const names = Object.keys(vars);
     const lets = names.map((k) => `LET $${k} = ${literal(vars[k])};\n`).join('');
     const r = await rpc('query', [lets + sql], await authorization());
@@ -157,7 +164,15 @@ export function httpQuery(config: DbConfig, fetchImpl: typeof fetch = (...a) => 
     const failed = results.filter((s) => s.status !== 'OK').map((s) => String(s.result));
     if (failed.length > 0) {
       if (failed.some((m) => m.includes('spky:fenced'))) throw new FencedError();
-      throw new QueryError(primaryError(failed), failed);
+      const primary = primaryError(failed);
+      // A lost optimistic-concurrency race (a `sendEvent` committing on the
+      // instance row at the same moment) rolled the whole request back: run it
+      // again. Every statement here is safe to repeat (fenced, keyed, CAS).
+      if (isConflict(primary) && conflicts < CONFLICT_RETRIES) {
+        await new Promise((r) => setTimeout(r, 20 * 2 ** conflicts + Math.random() * 20));
+        return run(sql, vars, retried, conflicts + 1);
+      }
+      throw new QueryError(primary, failed);
     }
     return results.map((s) => s.result);
   };

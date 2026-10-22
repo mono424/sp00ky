@@ -47,10 +47,18 @@ export {
   type ExecutionContextLike,
   type WorkflowClass,
   type Store,
+  type StepRow,
+  type InstanceRow,
+  type Claim,
+  type Finish,
+  type NewInstance,
+  type Progress,
+  type StoredEvent,
+  type StoredError,
   type RunOptions,
   type RunResult,
 } from './engine';
-export { SurrealStore, httpQuery, dbConfigFromEnv, QueryError, type Query, type DbConfig } from './surreal';
+export { SurrealStore, httpQuery, dbConfigFromEnv, isConflict, rpcUrl, QueryError, type Query, type DbConfig } from './surreal';
 export { MemoryStore, type MemoryJob, type MemoryInstance } from './memory';
 
 // =============================================================

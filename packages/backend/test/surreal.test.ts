@@ -15,6 +15,7 @@ import {
   SurrealStore,
   WorkflowEntrypoint,
   httpQuery,
+  rpcUrl,
   withWorkflows,
   type Query,
   type StepRow,
@@ -23,6 +24,41 @@ import {
 } from '../src/index';
 
 const URL_ = process.env.SPKY_TEST_SURREAL_URL;
+
+describe('httpQuery', () => {
+  /** A fake /rpc endpoint: answers each request with the next queued body. */
+  const fakeFetch = (bodies: unknown[], seen: any[] = []) =>
+    (async (_url: any, init: any) => {
+      seen.push(JSON.parse(init.body));
+      return new Response(JSON.stringify(bodies.shift()), { status: 200 });
+    }) as typeof fetch;
+
+  it('normalizes the endpoint and sends binds as LET statements', async () => {
+    expect(rpcUrl('ws://db:8000/rpc')).toBe('http://db:8000/rpc');
+    expect(rpcUrl('https://db.example.com/')).toBe('https://db.example.com/rpc');
+    const seen: any[] = [];
+    const q = httpQuery(
+      { url: 'http://db', ns: 'n', db: 'd' },
+      fakeFetch([{ result: [{ status: 'OK', result: null }, { status: 'OK', result: 7 }] }], seen),
+    );
+    expect(await q('RETURN $x;', { x: 'user:abc' })).toEqual([7]);
+    expect(seen[0].params[0]).toBe('LET $x = "user:abc";\nRETURN $x;');
+  });
+
+  it('retries a request that lost a write race, and reports a fence', async () => {
+    const conflict = { result: [{ status: 'ERR', result: 'Transaction conflict: Resource busy. This transaction can be retried' }] };
+    const q = httpQuery(
+      { url: 'http://db', ns: 'n', db: 'd' },
+      fakeFetch([conflict, conflict, { result: [{ status: 'OK', result: 'ok' }] }]),
+    );
+    expect(await q('UPDATE x:1 SET a = 1;')).toEqual(['ok']);
+    const fenced = httpQuery(
+      { url: 'http://db', ns: 'n', db: 'd' },
+      fakeFetch([{ result: [{ status: 'ERR', result: 'An error occurred: spky:fenced' }] }]),
+    );
+    await expect(fenced('x')).rejects.toBeInstanceOf(FencedError);
+  });
+});
 const root = (p: string) => fileURLToPath(new URL(`../../../${p}`, import.meta.url));
 
 describe.skipIf(!URL_)('SurrealStore on SurrealDB', () => {

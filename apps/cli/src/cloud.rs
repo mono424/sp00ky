@@ -6187,15 +6187,15 @@ pub(crate) fn push_schema_inner(client: &mut CloudClient, slug: &str, pid: &str)
     sql.push('\n');
     sql.push_str(&events);
 
-    // The client's view lifecycle functions. The control plane seeds only the
-    // ones that call the SSP (`fn::query::register`, `fn::spooky::info`) and
-    // an old `fn::query::heartbeat`; without `fn::query::leave` every page's
-    // pagehide release failed, and its views stayed registered for their full
-    // TTL. On threads-e2e (canary.349) the SSP held 500-600 views for a few
-    // open pages and fanned every published-thread edit out to all of them.
-    // These hold no credentials, and this push lands after the seed.
+    // The client's functions: the view lifecycle ones (without
+    // `fn::query::leave` every page's pagehide release failed and its views
+    // stayed registered for their full TTL; on threads-e2e, canary.349, the SSP
+    // held 500-600 views for a few open pages) and the ones that call the SSP,
+    // with `{{ENDPOINT}}`/`{{SECRET}}` for the control plane to fill in. An
+    // older control plane re-seeds register, heartbeat and info after the
+    // apply, so this is never worse there.
     sql.push('\n');
-    sql.push_str(crate::schema_builder::COMMON_REMOTE_FUNCTIONS);
+    sql.push_str(&crate::schema_builder::cloudflare_remote_functions());
 
     // The `push:` block, stored the way `apply_internal_schema` stores it on
     // the VM path (`_00_push_config:default`). Not part of

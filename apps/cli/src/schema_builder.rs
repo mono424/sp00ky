@@ -22,6 +22,26 @@ pub struct SchemaBuilderConfig {
 /// carries them too, since they hold no credentials.
 pub const COMMON_REMOTE_FUNCTIONS: &str = include_str!("functions_remote.surql");
 
+/// The functions a free (Cloudflare) project's schema push carries: the common
+/// `_00_query` lifecycle functions and the singlenode ones that call the SSP
+/// (`fn::query::register`, `fn::spooky::info`, `fn::job::kill`/`retry`), with
+/// `{{ENDPOINT}}` and `{{SECRET}}` left in. The control plane holds both values
+/// and fills them in before applying, so the SSP's secret never reaches the
+/// CLI, and a record user cannot read it from a function body (a `$sp00ky_*`
+/// param would be unreadable to the function itself, as it must be
+/// `PERMISSIONS NONE`). No params: the control plane defines those.
+///
+/// Impersonation is left out: its signing key derives from the secret, which
+/// this side does not have, and a key derived from the placeholder would be
+/// public.
+pub fn cloudflare_remote_functions() -> String {
+    format!(
+        "{}\n{}",
+        COMMON_REMOTE_FUNCTIONS,
+        include_str!("functions_remote_singlenode.surql")
+    )
+}
+
 /// Build ONLY the remote functions SQL (heartbeat + mode-specific functions
 /// with endpoint/secret substitution).  Used by `dev.rs` to apply functions
 /// separately with Docker-internal URLs.
@@ -1729,5 +1749,26 @@ mod idempotent_push_tests {
     fn applying_twice_changes_nothing() {
         let once = idempotent_push_sql("DEFINE TABLE a;\nDEFINE INDEX i ON a FIELDS x;");
         assert_eq!(idempotent_push_sql(&once), once);
+    }
+}
+
+#[cfg(test)]
+mod cloudflare_functions_tests {
+    use super::cloudflare_remote_functions;
+
+    /// The control plane fills the placeholders; nothing here may carry a
+    /// credential, read a `$sp00ky_*` param, or define impersonation.
+    #[test]
+    fn carries_placeholders_and_no_credentials() {
+        let sql = cloudflare_remote_functions();
+        for f in ["fn::query::register", "fn::query::heartbeat", "fn::query::leave", "fn::query::unsubscribe", "fn::spooky::info"] {
+            assert!(sql.contains(f), "missing {f}");
+        }
+        assert!(sql.contains("'{{ENDPOINT}}/view/register'"), "register calls the placeholder endpoint");
+        assert!(sql.contains("Bearer {{SECRET}}"));
+        assert!(!sql.contains("$sp00ky_secret") && !sql.contains("$sp00ky_endpoint"));
+        assert!(!sql.contains("DEFINE PARAM"));
+        assert!(!sql.contains("fn::_00_impersonate::") && !sql.contains("DEFINE ACCESS"));
+        assert!(!sql.contains("{{IMPERSONATION_KEY}}"));
     }
 }

@@ -99,6 +99,8 @@ interface Session {
   canonicalAnswered: boolean;
   /** The log watch delivered the server's first answer. */
   logSettled: boolean;
+  /** The second published-document read of a first open (see `recheckCanonical`). */
+  recheck: Promise<void> | null;
 }
 
 const LOCAL_TABLE = '_00_crdt_local';
@@ -307,6 +309,7 @@ export class CrdtManager {
       ingesting: Promise.resolve(),
       canonicalAnswered: false,
       logSettled: false,
+      recheck: null,
     };
     session.handle = new CrdtField(table, recordId, field, kind, cursor, doc, {
       pushPresence: (state) => this.pushPresence(session, state),
@@ -342,9 +345,11 @@ export class CrdtManager {
     const [log, presence] = await Promise.all([logWatch, presenceWatch]);
     session.disposers.push(log.stop);
     if (presence) session.disposers.push(presence.stop);
-    void log.settled.then(() => {
+    void log.settled.then(async () => {
       session.logSettled = true;
-      void session.ingesting.then(() => this.checkLoaded(session));
+      await session.ingesting;
+      await this.recheckCanonical(session, canonical);
+      this.checkLoaded(session);
     });
     // Offline the published document is read once the connection is back
     // instead of holding the open.
@@ -355,6 +360,7 @@ export class CrdtManager {
     // once the server's rows for it are in.
     if (!session.handle.hasContent() && !fresh) await this.serverWait(log.settled);
     await session.ingesting;
+    if (session.logSettled) await this.serverWait(this.recheckCanonical(session, canonical));
     // Edits a previous session made but never sent (closed tab, offline).
     this.scheduleFlush(session, 0);
     this.logger.debug({ key, peer: this.peer, Category: 'sp00ky-client::CrdtManager::open' }, 'CRDT field opened');
@@ -471,6 +477,28 @@ export class CrdtManager {
     } finally {
       s.refetching = false;
     }
+  }
+
+  /**
+   * A first open reads the published document and the log at the same time,
+   * and a fold landing between the two hides the field from both: it
+   * publishes its snapshot, then deletes the rows the log query was about to
+   * return, after the published-document read came back empty. Nothing seen
+   * means nothing to verify, so the editor stayed empty until the next edit
+   * (a second device opening a just-created thread, under e2e load). Once the
+   * log has answered, a field that is still empty reads the published
+   * document again: the fold that took its rows committed before deleting
+   * them. Once per open; `first` is the first read (null with a local copy or
+   * a draft, which need none).
+   */
+  private recheckCanonical(s: Session, first: Promise<void> | null): Promise<void> {
+    if (!first) return Promise.resolve();
+    s.recheck ??= (async () => {
+      await first;
+      await s.ingesting;
+      if (!s.handle.hasContent()) await this.refetchCanonical(s);
+    })();
+    return s.recheck;
   }
 
   // --- checking against the published document ---------------------

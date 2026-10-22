@@ -31,6 +31,8 @@ class World {
   storeDelayMs = 0;
   /** A connected but slow server: reads and the log's first answer wait for `release()`. */
   slow = false;
+  /** Only the log's first answer waits for `release()`; reads answer at once. */
+  slowLog = false;
   private held: Array<() => void> = [];
   release() {
     for (const go of this.held.splice(0)) go();
@@ -72,7 +74,7 @@ class World {
         this.watched.push(table);
         const w = { table, where, cb };
         this.watchers.add(w);
-        if (this.slow) {
+        if (this.slow || this.slowLog) {
           const settled = new Promise<void>((go) =>
             this.held.push(() => {
               cb(this.rowsFor(table, where));
@@ -417,6 +419,35 @@ describe('CRDT fields', () => {
     await world.fold('doc:1', 'body', server);
     await vi.advanceTimersByTimeAsync(1100);
     expect(text(fb)).toBe('Hello world');
+  });
+
+  // threads-e2e 2026-10-22: a second device opening a just-created thread kept
+  // an empty editor. Its published-document read came back before the fold,
+  // and its log query answered after the fold had deleted the rows.
+  it('a first open still gets the content when a fold lands between its two reads', async () => {
+    const world = new World();
+    const a = world.client('user:a');
+    const fa = await a.manager.open('doc', 'doc:1', 'body');
+    fa.getDoc().getText('body').insert(0, 'shared seed');
+    fa.getDoc().commit();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(world.log).toHaveLength(1);
+
+    world.slowLog = true;
+    const b = world.client('user:b');
+    const opening = b.manager.open('doc', 'doc:1', 'body');
+    // B's published-document read answers now (nothing published yet) while
+    // its log query is still out.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(world.published.size).toBe(0);
+    await world.fold('doc:1', 'body', LoroDoc.fromSnapshot(fa.getDoc().export({ mode: 'snapshot' })));
+    expect(world.log).toHaveLength(0);
+    world.slowLog = false;
+    world.release();
+    await vi.advanceTimersByTimeAsync(10);
+    const fb = await opening;
+    expect(text(fb)).toBe('shared seed');
+    expect(fb.isLoaded()).toBe(true);
   });
 
   it('report a document that differs from the published one at the same version', async () => {

@@ -163,6 +163,32 @@ apps:
       - "gomod:/go"
 ```
 
+## Worker backends (`apps.<name>.worker`)
+
+A `type: backend` app with a `worker:` block runs, on a Cloudflare project, as a Dynamic Worker
+inside the project's SSP Worker instead of a Docker container. It is still a sp00ky backend: it
+needs `spec` and an outbox `method` with a `table`, and jobs reach it at `worker://<name>` (the SSP
+POSTs the payload as JSON, with `Authorization: Bearer <auth.token>` when `auth` is set). Only the
+paths in `expose` are public, on `https://<slug>.<domain>`. Keys: `entry` (required),
+`compatibilityDate` (default `2026-10-01`), `compatibilityFlags`, `textModules` (globs imported as
+strings), `cpuMs` (1..300000), `ai` (env binding for Workers AI), `workflows: [{binding, class}]`
+(Cloudflare Workflows; the class is exported from the entry), `expose` (trailing `*` = prefix).
+
+- Validation (`WorkerDeployConfig::validate`, `AppConfig::validate_worker` in `src/backend.rs`):
+  `hosting: external` and `runOn` are refused; bindings must not repeat. `spky lint`
+  (`Sp00kyConfig::worker_lint`) errors on a missing `entry` and warns on `baseUrl` (unused on
+  Cloudflare, though `spky dev` uses it), on `expose` overlapping a spec path, and on a manifest
+  that can only target VMs.
+- `spky deploy` on a Cloudflare project (`deploy_worker_backend_cloudflare` in `src/cloud.rs`)
+  bundles `entry` with a pinned `npx esbuild` (platform neutral; `node:*`, `cloudflare:*` and, under
+  `nodejs_compat`, bare Node builtins stay external), uploads it by sha256, and sends
+  `worker_backends` in the deploy body. On a VM project the block is ignored with a warning and the
+  Dockerfile path runs.
+- The backend's env (the `SPKY_*` base plus its own `env`, vault resolved) reaches it as plain
+  strings. No other Cloudflare bindings. `spky dev` does not run it under workerd: it runs from its
+  `dev` command at its `baseUrl`, like any backend.
+- Runtime side: `apps/ssp-cf/js/host.mjs`. User docs: `docs/backend/workers.mdx` on the site.
+
 ## Sync transport (`sync.transport`)
 
 `sync.transport: changefeed` changes what the schema pipeline emits, in three

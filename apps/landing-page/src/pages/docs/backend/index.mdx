@@ -66,6 +66,14 @@ column.
   of them. Learn the job row and you know all three.
 </Note>
 
+## Where it runs
+
+On a VM project a backend is a Docker container next to the SSP, or any HTTPS service you host
+yourself. On a Cloudflare project a TypeScript backend can be a
+[Worker backend](/docs/backend/workers): add a `worker:` block and it runs inside the project's SSP
+Worker, with no Dockerfile and no URL. It is still called through jobs. Only the paths you list
+under `expose` are public, for things like streaming an LLM answer to the browser.
+
 ## Other app types
 
 `apps:` in `sp00ky.yml` holds more than backends. Every entry has a `type`:
@@ -90,6 +98,12 @@ column.
     title="Backend options"
     icon="config"
     description="Auth, timeouts, environment variables, external hosting."
+  />
+  <LinkCard
+    href="/docs/backend/workers"
+    title="Worker backends"
+    icon="bolt"
+    description="Run a TypeScript backend inside the SSP Worker on a Cloudflare project."
   />
   <LinkCard
     href="/docs/jobs"

@@ -1,0 +1,284 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Worker backends
+description: On a Cloudflare project, a TypeScript backend runs inside the project's SSP Worker. No Dockerfile, no URL, configured only from sp00ky.yml.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+<Experimental>
+  Worker backends are new in canary.344. They run on Cloudflare Dynamic Workers, which are an
+  open beta. TypeScript and JavaScript only for now.
+</Experimental>
+
+A **Worker backend** is a normal sp00ky backend (an OpenAPI `spec`, an outbox `method`, called with
+`db.run()`) that runs as a Cloudflare Worker instead of a Docker container. Add a `worker:` block to
+the backend in `sp00ky.yml` and `spky deploy` does the rest: it bundles your code, uploads it, and
+the project's SSP Worker loads it as a Cloudflare Dynamic Worker.
+
+Nothing else to set up. The backend has no Dockerfile, no `baseUrl`, no wrangler config and no
+Cloudflare account of its own.
+
+## How it is called
+
+Jobs, exactly as for any backend. A job row in the outbox table makes the SSP `POST` the row's
+`path` to your backend, with the `payload` as the JSON body. A 2xx answer marks the job `success`
+and stores the body in `result`. Anything else, a thrown error or a timeout, is a failed attempt:
+it lands in `errors` and the job retries by `max_retries` and `retry_strategy`, then ends `failed`.
+See [Jobs](/docs/jobs).
+
+The call never leaves Cloudflare. The SSP hands the request straight to the backend's isolate, so
+your handler sees an ordinary `https` request with the job's path. With an `auth` block the request
+also carries `Authorization: Bearer <token>`, as on a VM, so the same bearer check works in both
+places.
+
+**Nothing is public by default.** A Worker backend has no URL. The only way in is a job, unless you
+list paths under `expose`.
+
+## `expose`: the public escape hatch
+
+Some routes have to answer the browser directly, the usual one being an LLM answer streamed token by
+token. List those paths under `worker.expose` and they are served on the project host,
+`https://<slug>.<domain>`. Requests on those paths go straight to the backend, and a streamed
+response passes through as it is produced.
+
+- A pattern starts with `/`. A trailing `*` makes it a prefix: `/llm/*` covers `/llm/answer` but
+  not `/llm` itself.
+- Everything else on the host stays the SSP's and your web app's.
+- An exposed route is public. Check the caller yourself, for example by verifying the user's
+  SurrealDB token.
+- `spky lint` warns when an `expose` pattern also covers a path in your OpenAPI spec, because that
+  job route would then be public too.
+
+Prefer jobs for everything else. A job is retried, survives a reload and shows its progress as a
+live row; an exposed route gives you none of that.
+
+## Example
+
+A Hono backend with Workers AI, one Cloudflare Workflow, and one public streaming route:
+
+<CodeBlock fileName="sp00ky.yml" code={configCode} lang="yaml" />
+
+<CodeBlock fileName="api/src/index.ts" code={handlerCode} lang="typescript" />
+
+Call the job routes as usual:
+
+<CodeBlock code={runCode} lang="typescript" />
+
+## What the code sees
+
+- **`export default app`.** The entry's default export handles every request, jobs and exposed
+  routes alike. A Hono `app` works as it is, and so does any object with a `fetch(request, env)`
+  method.
+- **Env vars as strings.** The backend's `env` from `sp00ky.yml` (vault values included) arrives as
+  plain strings on the handler's `env` (in Hono, `c.env`), next to `SPKY_ENV=cloud`, `SPKY_DB_NS`
+  and `SPKY_DB_NAME`. Read them from `env`, not from `process.env`.
+- **Workers AI.** With `ai: AI`, `env.AI.run(model, input)` runs a
+  [Workers AI](https://developers.cloudflare.com/workers-ai/) model. `run()` is the only method
+  forwarded.
+- **Workflows.** Each `workflows` entry gives `env.<binding>`, a
+  [Cloudflare Workflow](https://developers.cloudflare.com/workflows/) binding
+  (`env.INGEST.create({ params })`). The `class` must be exported from the entry. Its `this.env` is
+  the same env.
+- **Text modules.** Files matched by `textModules` import as strings
+  (`import query from './material.surql'`).
+- **Outbound `fetch` is open.** Call any API you like.
+- **No other Cloudflare bindings.** No R2, KV, D1, Durable Objects or service bindings.
+
+## `worker` keys
+
+<PropTable props={[
+  { name: 'entry', type: 'path', default: '(required)', desc: 'The entry module, relative to sp00ky.yml. Its default export handles requests.' },
+  { name: 'compatibilityDate', type: 'YYYY-MM-DD', default: '2026-10-01', desc: 'Workers compatibility date.' },
+  { name: 'compatibilityFlags', type: 'string[]', default: '[]', desc: 'Workers compatibility flags, e.g. [nodejs_compat] for Node built-ins.' },
+  { name: 'textModules', type: 'glob[]', default: '[]', desc: 'Files imported as strings, e.g. ["**/*.surql"]. Only the extension counts: every imported .surql file becomes a string.' },
+  { name: 'cpuMs', type: 'number', default: "(Cloudflare's default)", desc: 'CPU time per request in ms, 1 to 300000. The SSP Worker takes the largest value of its backends.' },
+  { name: 'ai', type: 'string', default: '-', desc: 'Name of the env binding for Workers AI, e.g. AI.' },
+  { name: 'workflows', type: '{ binding, class }[]', default: '[]', desc: 'Cloudflare Workflows the backend starts: env.<binding> runs the exported class.' },
+  { name: 'expose', type: 'string[]', default: '[]', desc: 'Paths served publicly on the project host. A trailing * matches a prefix. Default: none.' },
+]} />
+
+The rest of the backend entry is the usual: `spec` and an outbox `method` with a `table` are
+required, `auth` and `env` work as on any backend. Binding names (`ai` and each workflow `binding`)
+must differ, and the backend's name must be lowercase letters, digits, `-` or `_`. These are
+refused with `worker`:
+
+- `hosting: external`: sp00ky hosts a Worker backend.
+- `runOn`: it runs inside the SSP Worker, not on a machine.
+
+`baseUrl` is not used on Cloudflare (`spky lint` says so), and neither are `deploy.dockerfile`,
+`deploy.port` and `deploy.resources`.
+
+## On a VM project
+
+The `worker` block only means something on a Cloudflare project. On a VM project it is ignored and
+the backend deploys from its Dockerfile, as before, with a warning from `spky deploy`. One
+`sp00ky.yml` can carry both: `worker` for Cloudflare, `deploy.dockerfile` for a VM.
+
+## Local development
+
+`spky dev` does not run Worker backends under workerd yet. Run the backend locally as you do today,
+in Node behind a `dev` command, and give it a `baseUrl` so the local SSP can reach it:
+
+<CodeBlock fileName="sp00ky.yml" code={devCode} lang="yaml" />
+
+Locally, `env` comes from `process.env` and there is no `AI` or Workflow binding, so keep those calls
+behind a check or a small stub.
+
+## Deploying
+
+`spky deploy` on a Cloudflare project, for each Worker backend:
+
+1. Bundles `entry` with esbuild into one ES module (platform `neutral`, run from the nearest
+   directory above `entry` with a `package.json`, so install your dependencies first). `node:*` and
+   `cloudflare:*` imports stay external; with `nodejs_compat` so do bare Node built-ins such as
+   `buffer`. This needs Node.js with `npx` on the machine that deploys.
+2. Uploads the bundle. Its hash names the version, so a deploy never reuses old code.
+3. Sends the backend's settings and env. The control plane ships the bundle with the project's
+   SSP Worker and creates the Workflows and the `expose` routes. Routes you no longer list are
+   removed.
+
+This needs an SSP from canary.344 on. A project whose [`version`](/docs/reference/config#versions)
+pins an older SSP deploys without its Worker backends.
+
+An import esbuild cannot resolve fails the deploy and names the module. For a Node built-in, import
+it as `node:<name>` and add `nodejs_compat`. `--only api` deploys just that backend and keeps the
+others as they are; a `devOnly` backend is never bundled. See [Deploying](/docs/cloud/deploying#cloudflare-projects).
+
+## Limits
+
+<Warning>
+  A job request times out after **10 seconds**. `deploy.timeout` is not applied to Worker backends
+  yet. For longer work, have the job route start a Workflow and return, or use an exposed route.
+</Warning>
+
+- **Cold starts.** Loading a backend and answering its first call takes 29 ms (1 KB bundle) to
+  350 ms (1.3 MB). Warm calls cost under 1 ms. Idle isolates go away within a few minutes, so a
+  quiet project pays the cold load on most jobs. Keep bundles small.
+- **At least once.** A job in flight when the SSP Worker is evicted runs again, whatever its
+  `max_retries`. Make job routes safe to repeat, for example with a key from the payload.
+- **TypeScript and JavaScript only.** Rust, Python and Go Worker backends are planned.
+- **Cloudflare projects only.** Containers (Docker backends) do not run on Cloudflare yet.
+
+## Next
+
+<CardGrid>
+  <LinkCard
+    href="/docs/jobs"
+    title="Jobs"
+    icon="jobs"
+    description="The job row your db.run() call writes: status, retries, results."
+  />
+  <LinkCard
+    href="/docs/reference/config#apps"
+    title="sp00ky.yml reference"
+    icon="config"
+    description="Every key of an app entry, worker included."
+  />
+  <LinkCard
+    href="/docs/cloud/deploying#cloudflare-projects"
+    title="Deploying"
+    icon="rocket"
+    description="What spky deploy builds and where each part runs on Cloudflare."
+  />
+  <LinkCard
+    href="/docs/dev/env"
+    title="Environment variables"
+    icon="key"
+    description="Vault, files and per-environment values for your backend."
+  />
+</CardGrid>
+
+export const configCode = `apps:
+  api:
+    type: backend
+    spec: ./api/openapi.yml              # the job routes, as for any backend
+    method:
+      type: outbox
+      table: job
+      schema: ./schema/src/outbox/api.surql
+    worker:
+      entry: ./api/src/index.ts
+      compatibilityFlags: [nodejs_compat]
+      textModules: ["**/*.surql"]        # import .surql files as strings
+      cpuMs: 60000
+      ai: AI                             # env.AI.run(...)
+      workflows:
+        - binding: INGEST                # env.INGEST.create(...)
+          class: IngestMaterial          # exported from the entry
+      expose: [/llm/*]                   # public on https://<slug>.<domain>
+    env:
+      cloud:
+        vault: [LLM_API_KEY]`;
+
+export const handlerCode = `import { Hono } from 'hono';
+import { WorkflowEntrypoint } from 'cloudflare:workers';
+import materialQuery from './material.surql'; // a string, via textModules
+
+type Env = {
+  LLM_API_KEY: string; // from env (the vault), a plain string
+  SPKY_DB_NS: string;
+  AI: Ai;              // worker.ai
+  INGEST: Workflow;    // worker.workflows
+};
+
+const app = new Hono<{ Bindings: Env }>();
+
+// A job route (in openapi.yml): db.run('api', '/ingest', { materialId }).
+app.post('/ingest', async (c) => {
+  const { materialId } = await c.req.json();
+  const run = await c.env.INGEST.create({ params: { materialId } });
+  return c.json({ runId: run.id }); // 2xx: the job is a success
+});
+
+// Exposed (expose: [/llm/*]): public, and the stream passes through.
+app.post('/llm/answer', async (c) => {
+  const { question } = await c.req.json();
+  const upstream = await fetch('https://llm.example.com/v1/stream', {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer ' + c.env.LLM_API_KEY,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ question }),
+  });
+  return new Response(upstream.body, {
+    headers: { 'content-type': 'text/event-stream' },
+  });
+});
+
+// The Workflow behind env.INGEST. Its env is the backend's env.
+export class IngestMaterial extends WorkflowEntrypoint<Env, { materialId: string }> {
+  async run(event, step) {
+    const text = await step.do('load', () =>
+      loadMaterial(materialQuery, event.payload.materialId),
+    );
+    await step.do('summarize', () =>
+      this.env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+        prompt: 'Summarize: ' + text,
+      }),
+    );
+  }
+}
+
+export default app;`;
+
+export const runCode = `await db.run('api', '/ingest', { materialId: material.id }, { assignedTo: material.id });`;
+
+export const devCode = `apps:
+  api:
+    # ...the backend entry above, plus:
+    baseUrl: http://host.docker.internal:3660   # used by spky dev only
+    dev:
+      type: npm
+      script: dev                              # e.g. serves the same app with @hono/node-server
+      workdir: ./api
+    env:
+      dev: .env.local
+      cloud:
+        vault: [LLM_API_KEY]`;

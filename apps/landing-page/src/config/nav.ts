@@ -59,6 +59,7 @@ export const docsNav = [
       { text: 'What is a backend', href: `${basePath}/docs/backend` },
       { text: 'Add a backend', href: `${basePath}/docs/backend/add` },
       { text: 'Backend options', href: `${basePath}/docs/backend/options` },
+      { text: 'Worker backends', href: `${basePath}/docs/backend/workers`, experimental: true },
     ],
   },
   {

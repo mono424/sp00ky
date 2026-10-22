@@ -60,7 +60,8 @@ The deploy command performs these steps automatically:
 6. **Deploys** your backend and frontend containers
 7. **Configures** DNS and SSL certificates
 
-You'll see real-time progress as each step completes.
+You'll see real-time progress as each step completes. These are the steps of a VM project; a
+Cloudflare project has no containers, see [Cloudflare projects](#cloudflare-projects).
 
 <Note>
   Run <code>spky lint</code> before deploying to catch config issues early.
@@ -109,6 +110,23 @@ one has taken over:
 If the new container never becomes ready, the old one keeps serving and the
 restart or deploy reports the failure. `--clean` (which wipes the scheduler
 volume) and SurrealDB upgrades still stop the old container first.
+
+### Cloudflare projects
+
+A Cloudflare project (the free plan runs on Cloudflare) has no VMs and no containers. `spky deploy`
+puts each part of it here:
+
+| Part | Where it runs |
+| --- | --- |
+| Web app | Static assets on Workers, built from `deploy.static`. No Docker image. |
+| SSP | A Durable Object in the project's SSP Worker. It also runs your outbox jobs; there is no separate scheduler. |
+| [Worker backends](/docs/backend/workers) | Dynamic Workers inside the SSP Worker. `spky deploy` bundles each `worker.entry` with esbuild and uploads it with the SSP Worker. Their `expose` paths are served on `https://<slug>.<domain>`. |
+| Schema | Pushed to the SSP after the deploy. `spky push` retries it. |
+
+Docker backends do not run on a Cloudflare project. Make the backend a
+[Worker backend](/docs/backend/workers), or host it yourself (`hosting: external`) at a public
+`baseUrl` the SSP Worker can reach. `--only` works as on a VM: `spky deploy --only api` bundles and
+ships just that Worker backend, and the others keep their last version.
 
 ## Checking Status
 

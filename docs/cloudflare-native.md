@@ -403,9 +403,10 @@ an idle project still sets no alarm:
   least once: the on-demand recovery sweep re-admits them. Replay hands a
   pending job row to the job path as a CREATE even when a rebuild already
   loaded it (pickup keys on a pending CREATE; the claim on `pending` keeps it
-  to one run). Dispatch to Worker backends over a service binding or the
-  SSP's Dynamic Worker loader comes with phase 5; until then a backend is any
-  HTTPS endpoint.
+  to one run). Worker backends are built (phase 5, 2026-10-22): a job for
+  `worker://<name>` never touches the network, `CfHttp` hands it to host.mjs,
+  which loads that backend as a Dynamic Worker and calls its fetch. Any other
+  backend is still any HTTPS endpoint at its `baseUrl`.
 - **Schedules and workflows (built):** `ssp_node::schedules::build_engine` on
   DO alarms. Instead of a 5 s sweep, `ScheduleEngine::next_wake` (one round
   trip) says when the engine next has work: now for an unplanned or triggered
@@ -531,7 +532,7 @@ seconds for Node or Python images (S3, §7.5).
 
 | Backend | Host | Why |
 |---|---|---|
-| TS/JS (and Rust/Go compiled to wasm, pending S5) | **Dynamic Worker loaded by the project's SSP DO**: `env.LOADER.get("<project>:<backend>:<bundleHash>", cb)`; the callback reads the bundle the control plane stored in R2 by hash | measured inside the DO: cold load + first call 29 ms (1 KB bundle), 68 ms (180 KB), 350 ms (1.3 MB) p50; warm calls under 1 ms; deploy is "store bytes, use a new id", previews are just another id; no script upload, no propagation |
+| TS/JS (Rust/Go compiled to wasm later, §7.2) | **Dynamic Worker loaded by the project's SSP Worker**: `env.LOADER.get("<slug>:<backend>:<bundleHash>", cb)`; the bundle ships as a text module of the SSP script upload (`backends/<name>-<hash>.js`), so the callback reads it from the module graph, no R2 | measured inside the DO: cold load + first call 29 ms (1 KB bundle), 68 ms (180 KB), 350 ms (1.3 MB) p50; warm calls under 1 ms; deploy is "store bytes, use a new id", previews are just another id; no script upload, no propagation |
 | Python | Dynamic Worker too | S4b measured about 1 s cold either way (Dynamic Worker 1.2 s, WfP user script 1.0 s for a hello app), so the deploy-time snapshot gives no clear win; revisit with heavy imports |
 | `runtime: container` | the project's own WfP user script (S4b: a Container class bound in a user script starts, 333 / 706 ms for Go lite) | a Container class must live in a deployed script and a `DurableObjectNamespace` cannot be passed into a Dynamic Worker's `env`; size `max_instances` above churn (stopping instances count against it) |
 | Frontends | WfP project script | Workers Assets, SSR; S4b: 4 to 8 s from deploy to the new `index.html` being served |
@@ -810,7 +811,7 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 | 2 | Durable ingest inbox with replay by current DB state (§5.3) | no user write fails during a forced cold start. **Code done 2026-10-21** (smoke-tested under local workerd: cold object, DB unreachable, eviction with queued notices, failed bootstrap). Job routing without the circuit moved to phase 4 |
 | 3 | Table images + journal warm start, delta images, segmented arena (§5.4); IngestVerify | Ready p95 <= 1.5 s at 20 MB. **Done 2026-10-21, released in canary.338/.339:** on Cloudflare the DO is Ready 0.32 s into a warm start at 25 MB (full rebuild 5.7 to 6.9 s). IngestVerify is open |
 | 4 | Standalone parity: jobs, schedules, push, admin-core (§6) | threads e2e suite green on a Cloudflare staging project. **Jobs, schedules, push and the admin API built 2026-10-21** (on demand, smoke-tested under workerd). E2e gate: the app suite passes 21/21 and every older spec passes alone, but the full 42-test run failed from about test 32 on because the DO reset at the 128 MB isolate limit with ~400 registered views. The per-view cost is cut from 55 KB to 16 KB (§14); views explain only about 21 MB of the 120-136 MB, so re-run the suite on Cloudflare after the next release |
-| 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native |
+| 5 | Worker backends as Dynamic Workers loaded by the SSP DO: TS and Rust first, then Python, then Go (after the per-request instance question is settled); SDKs, CLI build, `spky dev` (§7) | each language passes the SDK conformance test on Worker and native. **TS/JS Worker backends built 2026-10-22, shipping in canary.344:** `apps.<name>.worker` in sp00ky.yml (job-triggered like any backend; `expose` is the opt-in for public routes), CLI esbuild bundle + upload, control-plane metadata (`backends.mjs`, `LOADER`/AI/Workflow bindings, one env secret per backend), Cloudflare Workflows via `@cloudflare/dynamic-workflows`, `expose` zone routes, teardown, and the ssp-cf `host.mjs` main module. User docs: `apps/landing-page/src/pages/docs/backend/workers.mdx`. Still open: Rust, Python and Go backends, the SDKs, `spky dev` under workerd, and a job timeout for Worker backends (the CLI sends none, so jobs get the 10 s default) |
 | 6 | Doorbell server + client, poll cap (§9) | remote queries per idle minute about 1 |
 | 7 | Ingest transports (`async` + changefeed backstop as the Cloudflare default) + conformance suite in CI as `spky doctor db` (§8) | suite green on SurrealDB 3.x; run against Earth when available |
 | 8 | Container-SSP (§10) if S9 passes and a project crosses the thresholds | |
@@ -824,7 +825,6 @@ paths. Throwaway Cloudflare resources are named `spike-*` and deleted after.
 | Python (about 1 s with heavy imports) and Containers (1-3 s) cold starts | platform floors; Worker-first defaults, session-open container start |
 | Go depends on the experimental community `workers-go`, which starts a new Go instance per request (S5) | upstream a persistent-instance loader, or default Go to `runtime: container`; keep the same Handler on both |
 | Dynamic Workers are open beta and now the default backend host | the same bundle uploads as a WfP user Worker; keep that switch tested |
-| WfP not yet purchased, so S4b is not run | buy the $25/month subscription when the control-plane phase starts, then run the ready S4b bench |
 | `async` events deliver at most twice with no durable retry | always paired with the changefeed backstop or IngestVerify; order by `_00_rv` |
 | Other beta products (Workers VPC, `durable_object` scheduling policy) | none required on day one; container snapshots dropped |
 | Cross-provider latency while the DB is on Hetzner | DO location hint near the DB |

@@ -71,8 +71,9 @@ static HTTP_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// An outbound request slower than this is logged with what else was in flight.
 const SLOW_HTTP_MS: u64 = 5_000;
 
-/// The first words of the first statement after the bind `LET`s: enough to
-/// tell a fold commit from a TTL delete, never a bound value.
+/// The first words of the first statement after the bind `LET`s and any
+/// `BEGIN`: enough to tell a fold commit from an edge write or a TTL delete,
+/// never a bound value.
 fn statement_hint(body: Option<&serde_json::Value>) -> String {
     let Some(query) = body.and_then(|b| b.get("params")).and_then(|p| p.get(0)).and_then(|q| q.as_str()) else {
         return String::new();
@@ -80,7 +81,7 @@ fn statement_hint(body: Option<&serde_json::Value>) -> String {
     query
         .split(";\n")
         .map(str::trim)
-        .find(|stmt| !stmt.is_empty() && !stmt.starts_with("LET $"))
+        .find(|stmt| !stmt.is_empty() && !stmt.starts_with("LET $") && !stmt.starts_with("BEGIN"))
         .map(|stmt| stmt.chars().take(48).collect())
         .unwrap_or_default()
 }

@@ -190,6 +190,18 @@ fn ok_json(json: Value) -> ApiResponse {
     ApiResponse::json(200, json)
 }
 
+/// Bytes of wasm linear memory, `None` on a native build.
+fn linear_memory_bytes() -> Option<u64> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(core::arch::wasm32::memory_size(0) as u64 * 65_536)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 fn err_json(status: u16, code: &str, message: impl Into<String>) -> ApiResponse {
     ApiResponse::json(status, json!({ "code": code, "message": message.into() }))
 }
@@ -1093,6 +1105,11 @@ impl SspNode {
         };
         ok_json(json!({
             "total_bytes": report.total_bytes(),
+            // What a wasm host is charged for (a Cloudflare Durable Object's
+            // 128 MB counts it): linear memory only grows, so this is the high
+            // water mark of everything the node ever held at once, not an
+            // estimate. `null` off wasm.
+            "linear_memory_bytes": linear_memory_bytes(),
             // The merge win, measured rather than inferred: `views` counts
             // registrations, `graphs` counts operator DAGs, and the gap is what
             // sharing saved. Equal counts with `merging` true means nothing

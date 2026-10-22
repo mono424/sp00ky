@@ -27,7 +27,10 @@ web-time = "1"
 
 schedule-core = { path = "../schedule-core" }
 push-core = { path = "../push-core" }
-ssp = { path = "../ssp" }
+# No `mimalloc`: the global allocator is the binary's choice (apps/ssp and
+# ssp-portable keep the default), and a library that picks one leaves its
+# tests unable to count allocations (tests/view_memory.rs).
+ssp = { path = "../ssp", default-features = false, features = ["parallel", "mmap-store"] }
 ssp-protocol = { path = "../ssp-protocol" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

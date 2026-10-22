@@ -1,6 +1,8 @@
-import { test, expect, type Page, type Browser } from '@playwright/test';
+import type { Page, Browser } from '@playwright/test';
 import { UPSTREAM, upstreamHeaders } from '../fixtures/target';
 import {
+  test,
+  expect,
   registerUser,
   loginUser,
   uniqueUser,

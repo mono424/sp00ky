@@ -3,8 +3,8 @@
  * way a person would, on as many devices (browser contexts) as a test needs,
  * and `withoutReload` asserts the single-page app never reloads to get there.
  */
-import { expect, test as base, type Locator, type Page } from '@playwright/test';
-import { uniqueUser, waitForAppReady, typeIntoEditor, type TestUser } from './test-fixtures';
+import { expect, type Locator, type Page } from '@playwright/test';
+import { test as base, uniqueUser, waitForAppReady, typeIntoEditor, type TestUser } from './test-fixtures';
 import { UPSTREAM, upstreamHeaders } from './target';
 
 export { expect, uniqueUser, type TestUser };

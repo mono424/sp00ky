@@ -293,7 +293,11 @@ void db.preload(db.query('thread').build(), { signal: ctrl.signal });"> <svg cla
 
 
 
-<table><thead><tr><th>State</th><th>Behaviour</th></tr></thead><tbody><tr><td>Resolved before on this device</td><td>Resolves at once; the rows are already in the local store.</td></tr><tr><td>Never resolved</td><td>Resolves once the server’s membership and every record are local. Pass <code>signal</code> to abort the wait.</td></tr><tr><td>Signed out, without <code>enableAnonymousLiveQueries</code></td><td>Resolves at once. The server sends a signed-out session membership only with anonymous live queries on, so there is nothing to wait for.</td></tr></tbody></table>
+
+
+
+
+<table><thead><tr><th>State</th><th>Behaviour</th></tr></thead><tbody><tr><td>Resolved before on this device</td><td>Resolves at once; the rows are already in the local store.</td></tr><tr><td>Never resolved</td><td>Resolves once the server’s membership and every record are local. Pass <code>signal</code> to abort the wait.</td></tr><tr><td>Signed out, without <code>enableAnonymousLiveQueries</code></td><td>Resolves at once. The server sends a signed-out session membership only with anonymous live queries on, so there is nothing to wait for.</td></tr><tr><td>Offline</td><td>Resolves at once with whatever is local, so an app started without a network still paints; the query fills in once the network returns. The browser reads <code>navigator.onLine</code>; the Dart client cannot see connectivity, so it goes by what the app last passed to <code>client.setOffline</code> (<a href="/docs/guide/flutter#startup">Flutter startup</a>).</td></tr></tbody></table>
 <p>A preloaded query stays registered (and live) until a ttl after nothing has mounted it; a view
 that mounts the same query simply attaches to it.</p>
 <h2 id="telling-clients-a-new-version-shipped">Telling clients a new version shipped</h2>

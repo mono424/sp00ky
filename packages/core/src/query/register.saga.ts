@@ -140,10 +140,35 @@ export const isNotAllowlisted = (error: unknown): boolean =>
   /not_allowlisted|\b403\b|forbidden/i.test(String((error as { message?: unknown })?.message ?? error));
 
 /**
+ * The entry no longer names the remote id this registration sent: a salt
+ * rotation (`rebindQueries`) re-keyed it while the request was out, and
+ * seeded a fresh lifecycle for the new id.
+ */
+const movedOff = (current: QueryEntry, sent: QueryEntry): boolean => String(current.def.id) !== String(sent.def.id);
+
+/**
+ * Release the id a superseded registration sent and register the new one.
+ * The re-key's own `RegisterRemote` for this hash joined the run still in
+ * flight (the lane dedupes per hash), so it is armed again on a timer, which
+ * fires once this run has left the lane.
+ */
+function* handOff(hash: QueryHash, sent: QueryEntry): Saga<void> {
+  yield fx.dispatch({ type: 'ReleaseSuperseded', ids: [sent.def.id] });
+  yield fx.timer.set(`register:${hash}`, 0, { type: 'RegisterRemote', hash });
+}
+
+/**
  * One remote registration: `fn::query::register` plus the edge/meta/children
  * read in ONE request, then membership application. Concurrent with every
  * other registration; retried on its own backoff; stops when the entry is
  * gone.
+ *
+ * An answer that lands after the query moved to a new id applies nothing:
+ * the membership and the `registered` flag belong to the id it sent, which
+ * this page no longer uses, so it releases that id and leaves the new one to
+ * the registration the re-key dispatched. Marking the new id registered from
+ * the old id's answer meant the new id was never registered, and nothing
+ * ever named the old one again.
  */
 export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): Saga<void> {
   const state = (yield fx.state.read((s) => s)) as ClientState;
@@ -154,6 +179,7 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
   // A query that already shows rows (cached or live) only re-verifies them
   // here: the cycle holds `fetching` but is not traffic the user waits on.
   const background = entry.lifecycle.phase !== 'cold';
+  let superseded = false;
   yield fx.state.update(
     R.compose(R.applyLifecycle(hash, { type: 'remote-registering' }), R.applyLifecycle(hash, { type: 'fetch-begin', background }))
   );
@@ -170,8 +196,13 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
       }),
       env.remoteTimeoutMs
     )) as StatementResult[];
-    const stillThere = (yield fx.state.read((s) => s.queries.has(hash))) as boolean;
-    if (!stillThere) return;
+    const answered = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
+    if (!answered) return;
+    superseded = movedOff(answered, entry);
+    if (superseded) {
+      yield* handOff(hash, entry);
+      return;
+    }
     const register = stmt(results, 0);
     if (!register || register.status === 'ERR') throw new Error(register?.status === 'ERR' ? register.error : 'register returned nothing');
     const answer = (r: StatementResult | undefined): unknown => (r?.status === 'OK' ? r.result : FAILED);
@@ -202,6 +233,12 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
   } catch (error) {
     const current = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
     if (!current) return;
+    // A request that timed out may still land: release its id all the same.
+    superseded = movedOff(current, entry);
+    if (superseded) {
+      yield* handOff(hash, entry);
+      return;
+    }
     if (isNotAllowlisted(error)) {
       yield fx.state.update(R.applyLifecycle(hash, { type: 'remote-failed' }));
       yield fx.emit({
@@ -229,7 +266,28 @@ export function* registerRemote(env: SagaEnv, hash: QueryHash, retry = false): S
       yield fx.timer.set(`register:${hash}`, backoffMs(attempts), { type: 'RegisterRemote', hash, retry: true });
     }
   } finally {
+    // A re-key seeded a fresh lifecycle: this cycle's begin is not in it.
     const stillThere = (yield fx.state.read((s) => s.queries.has(hash))) as boolean;
-    if (stillThere) yield fx.state.update(R.applyLifecycle(hash, { type: 'fetch-end', background }));
+    if (stillThere && !superseded) yield fx.state.update(R.applyLifecycle(hash, { type: 'fetch-end', background }));
+  }
+}
+
+/**
+ * Hand back remote ids this page registered and no longer uses: a query
+ * moved to a new salt (sign-up, sign-in, sign-out, impersonation) while its
+ * old id was registered or on its way. Nothing names the old id again, not
+ * the heartbeat, not the pagehide beacon, so it used to hold a live view
+ * until its TTL ran out, and the SSP fanned every change to a row it held out
+ * to it. Best-effort: a row the caller may no longer touch (another
+ * principal's) or a failed request is left to the TTL sweep, as before.
+ */
+export function* releaseSuperseded(env: SagaEnv, ids: ReadonlyArray<QueryEntry['def']['id']>): Saga<void> {
+  if (ids.length === 0) return;
+  const sessionIds = (yield fx.service('remote.sessionIds')) as readonly string[];
+  const batch = sql.releaseBatch(ids, sessionIds);
+  try {
+    yield fx.remote.query(batch.sql, batch.vars, env.remoteTimeoutMs);
+  } catch (error) {
+    yield fx.emit({ type: 'log', level: 'debug', message: 'superseded view release failed; the TTL sweep reclaims it', data: { ids: ids.map(String), error } });
   }
 }

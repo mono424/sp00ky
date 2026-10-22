@@ -103,6 +103,8 @@ export interface ServiceCalls {
   /** The platform reports no network at all (a browser's `navigator.onLine === false`). */
   'net.offline': () => boolean;
   'remote.releaseViews': (ids: unknown[]) => void;
+  /** `session::id()` of every socket this page has had, oldest first. */
+  'remote.sessionIds': () => readonly string[];
   'supervisor.start': () => void;
   'tabs.start': (bucketId: string) => Promise<'solo' | 'leader' | 'follower'>;
   'tabs.moveToBucket': (bucketId: string) => Promise<'solo' | 'leader' | 'follower'>;

@@ -4,7 +4,9 @@ import { runPure, sha256Hex } from '../testing/run-pure';
 import { buildEntry, buildState } from '../testing/build';
 import { defaultEnv } from './env';
 import { queryHashInput } from './hash';
-import { ensureRegistered, isNotAllowlisted, registerLocal, registerRemote } from './register.saga';
+import { ensureRegistered, isNotAllowlisted, registerLocal, registerRemote, releaseSuperseded } from './register.saga';
+import { seedLifecycle } from '../state/lifecycle';
+import { fakeServices } from '../testing/services';
 import * as R from '../state/reducers';
 import { emptyState } from '../state/client-state';
 import type { StatementResult } from '../kernel/effects';
@@ -308,5 +310,60 @@ describe('registerRemote', () => {
       },
     });
     expect(gone.dispatched).toEqual([]);
+  });
+  it('a registration that lands after its query moved to a new id releases the id it registered and leaves the new one to register', async () => {
+    // A sign-up: the page registered under the anonymous salt with the socket
+    // already signed in, and the auth flip re-keyed the query while that
+    // request was out. Before the fix the answer marked the NEW id registered,
+    // so it was never registered, and nothing ever released the old one.
+    const moved = new RecordId('_00_query', 'b'.repeat(64));
+    for (const fail of [false, true]) {
+      const out = await runPure(registerRemote(env, 'a'), {
+        state: buildState([entry]),
+        handlers: {
+          'remote.query': (_e, ctx) => {
+            ctx.state = R.rebindQuery('a', { id: moved, lifecycle: seedLifecycle(false), remoteArray: [], localArray: [] })(ctx.state);
+            if (fail) throw new Error('Remote request timed out');
+            return happy();
+          },
+          'local.upsert': () => undefined,
+        },
+      });
+      const e = out.state.queries.get('a')!;
+      expect(e.def.id).toBe(moved);
+      expect(e.lifecycle).toMatchObject({ remote: 'unregistered', fetchDepth: 0, backgroundDepth: 0 });
+      expect(e.remoteArray).toEqual([]);
+      expect(e.registerAttempts).toBe(0);
+      expect(out.dispatched).toEqual([{ type: 'ReleaseSuperseded', ids: [entry.def.id] }]);
+      // The re-key's RegisterRemote joined this run on the per-hash lane: arm it again.
+      expect([...out.timers]).toEqual([['register:a', { ms: 0, event: { type: 'RegisterRemote', hash: 'a' } }]]);
+    }
+  });
+});
+
+describe('releaseSuperseded', () => {
+  it("per id: unsubscribe as this socket, then leave for this page's earlier sockets, in one request; a failure is only logged", async () => {
+    const ids = [new RecordId('_00_query', 'a'.repeat(64)), new RecordId('_00_query', 'b'.repeat(64))];
+    const out = await runPure(releaseSuperseded(env, ids), {
+      handlers: {
+        service: fakeServices({ 'remote.sessionIds': () => ['s1', 's2'] }).handler,
+        'remote.query': () => [okStmt({ released: true }), okStmt({ leaving: false }), okStmt({ released: true }), okStmt({ leaving: false })],
+      },
+    });
+    const req = out.log.find((x) => x.kind === 'remote.query') as any;
+    expect(req.sql).toBe('fn::query::unsubscribe($id0);\nfn::query::leave($id0, $sids);\nfn::query::unsubscribe($id1);\nfn::query::leave($id1, $sids)');
+    expect(req.vars).toEqual({ id0: ids[0], id1: ids[1], sids: ['s1', 's2'] });
+    expect(req.timeoutMs).toBe(env.remoteTimeoutMs);
+    const failing = await runPure(releaseSuperseded(env, ids), {
+      handlers: {
+        service: fakeServices({ 'remote.sessionIds': () => [] }).handler,
+        'remote.query': () => {
+          throw new Error('offline');
+        },
+      },
+    });
+    expect(failing.emitted).toEqual([expect.objectContaining({ type: 'log', level: 'debug' })]);
+    const none = await runPure(releaseSuperseded(env, []), {});
+    expect(none.log).toEqual([]);
   });
 });

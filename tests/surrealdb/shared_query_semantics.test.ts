@@ -1,5 +1,5 @@
 import { createTestDb, clearTestDb, TEST_DB_CONFIG, getTestDbPort } from './setup';
-import { Surreal } from 'surrealdb';
+import { RecordId, Surreal } from 'surrealdb';
 
 /**
  * Phase 0 of the shared-query work: pin the SurrealDB behaviours the design
@@ -461,6 +461,48 @@ describe('shared-query SurrealDB semantics', () => {
           await a.close();
         }
       });
+    });
+
+    /**
+     * A query re-keyed under a new salt (sign-up, sign-in) releases the id it
+     * leaves over the same socket, after the identity changed. That works
+     * only because a socket keeps its `session::id()` through a sign-in: the
+     * anonymous row answers to that id alone, and the user row the sign-up
+     * race registered on the signed-in socket lists it as its subscriber.
+     */
+    test("a socket that signs in keeps its session id, so it can release the rows it is leaving", async () => {
+      const db = new Surreal();
+      await db.connect(`ws://127.0.0.1:${getTestDbPort()}/rpc`, {
+        namespace: TEST_DB_CONFIG.namespace,
+        database: TEST_DB_CONFIG.database,
+      });
+      try {
+        const [before] = await q(db, `RETURN <string>session::id()`);
+        await q(root, `CREATE _00_query:anonsalt SET auth_id = 'anon', ttl = 1h, subscribers = [{ id: $sid, seenAt: time::now() }];`, { sid: before });
+        await db.signin({
+          namespace: TEST_DB_CONFIG.namespace,
+          database: TEST_DB_CONFIG.database,
+          access: 'user_access',
+          variables: { email: 'alice@test' },
+        } as any);
+        const [after] = await q(db, `RETURN <string>session::id()`);
+        expect(after).toBe(before);
+        await q(root, `CREATE _00_query:oldsalt SET auth_id = 'person:alice', ttl = 1h, subscribers = [{ id: $sid, seenAt: time::now() }];`, { sid: after });
+
+        // What the client sends (`releaseBatch` in packages/core/src/query/sql.ts).
+        const res = await q(
+          db,
+          `fn::query::unsubscribe($id0);\nfn::query::leave($id0, $sids);\nfn::query::unsubscribe($id1);\nfn::query::leave($id1, $sids)`,
+          { id0: new RecordId('_00_query', 'anonsalt'), id1: new RecordId('_00_query', 'oldsalt'), sids: [after] }
+        );
+        expect(res[0]).toMatchObject({ released: true });
+        expect(res[2]).toMatchObject({ released: true });
+        expect((await q(root, `SELECT VALUE id FROM _00_query:anonsalt, _00_query:oldsalt`))[0]).toEqual([]);
+        // The user's other view is untouched.
+        expect((await q(root, `SELECT VALUE rowCount FROM ONLY ${ID}`))[0]).toBe(7);
+      } finally {
+        await db.close();
+      }
     });
 
     test('an anon row is readable without auth by its own session only', async () => {

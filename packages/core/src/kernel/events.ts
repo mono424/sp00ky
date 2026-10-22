@@ -1,3 +1,4 @@
+import type { RecordId } from 'surrealdb';
 import type { ConnectionState, EdgeDelta, InlineRow, QueryHash, QueryStatus, SyncHealth } from '../types';
 import type { StreamUpdate } from '../services/stream-processor/index';
 
@@ -9,6 +10,7 @@ import type { StreamUpdate } from '../services/stream-processor/index';
 export type RuntimeEvent =
   | { type: 'EnsureRegistered'; requireAuth?: boolean; attempt?: number }
   | { type: 'RegisterRemote'; hash: QueryHash; retry?: boolean }
+  | { type: 'ReleaseSuperseded'; ids: RecordId<string>[] }
   | { type: 'SyncOutcome'; ok: boolean; error?: unknown }
   | { type: 'AckPrune' }
   | { type: 'ReadDirtyMembership' }

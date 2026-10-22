@@ -330,6 +330,7 @@ export function createAdapters<S extends SchemaStructure>(config: Sp00kyConfig<S
       const sql = leaveViewsBeacon(ids, s.remote.sessionIds());
       if (sql) s.remote.beaconSql(sql);
     },
+    'remote.sessionIds': () => s.remote.sessionIds(),
     'supervisor.start': () => s.connectionSupervisor.start(),
     'net.offline': () => typeof navigator !== 'undefined' && navigator.onLine === false,
     'tabs.start': (bucketId) => {

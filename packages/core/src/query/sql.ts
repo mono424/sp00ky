@@ -118,6 +118,23 @@ export function heartbeatBatch(ids: ReadonlyArray<RecordId<string>>): { sql: str
   return { sql: stmts.join(';\n'), vars };
 }
 
+/**
+ * Hand back view ids this page no longer answers to. Per id,
+ * `fn::query::unsubscribe` drops this socket's entry and deletes the row when
+ * nobody else watches it; `fn::query::leave` then drops the entries of this
+ * page's earlier sockets (a reconnect re-registered under a new session id)
+ * and pulls the expiry in when none remain. Result index 2i answers the
+ * unsubscribe of id i, 2i + 1 its leave.
+ */
+export function releaseBatch(ids: ReadonlyArray<RecordId<string>>, sessionIds: ReadonlyArray<string>): { sql: string; vars: Vars } {
+  const vars: Vars = { sids: [...sessionIds] };
+  const stmts = ids.flatMap((id, i) => {
+    vars[`id${i}`] = id;
+    return [`fn::query::unsubscribe($id${i})`, `fn::query::leave($id${i}, $sids)`];
+  });
+  return { sql: stmts.join(';\n'), vars };
+}
+
 /** A heartbeat answer whose statement matched no row: the view was reclaimed. */
 export const heartbeatRowGone = (result: unknown): boolean => Array.isArray(result) && result.length === 0;
 

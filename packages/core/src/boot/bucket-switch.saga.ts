@@ -100,9 +100,21 @@ export function* dropImpersonatedBucket(left: string): Saga<void> {
   }
 }
 
-/** Re-seed every active query from the new store and rebuild its SSP view. */
+/**
+ * Re-seed every active query from the new store and rebuild its SSP view.
+ *
+ * Under a new salt each query gets a new remote id, and the id it leaves
+ * goes back to the server: nothing names it again (not the heartbeat, not
+ * the pagehide beacon), so it otherwise held a live view for its whole TTL.
+ * A sign-up left one such row per query, because the page's queries mount
+ * as the sign-up resolves and register under the anonymous salt on a socket
+ * that is already signed in. Ids still in flight are released by their
+ * registration when it lands (`registerRemote`); releasing them here too
+ * covers a request that timed out and landed anyway.
+ */
 export function* rebindQueries(): Saga<void> {
   const [entries, sessionId] = (yield fx.state.read((s) => [[...s.queries.values()], s.sessionId])) as [QueryEntry[], string | null];
+  const superseded: QueryEntry['def']['id'][] = [];
   for (const entry of entries) {
     let view: ReturnType<typeof parseViewRow> = null;
     try {
@@ -125,7 +137,9 @@ export function* rebindQueries(): Saga<void> {
       yield fx.emit({ type: 'log', level: 'warn', message: 'local view rebuild failed after bucket switch', data: { hash: entry.def.hash, error } });
     }
     const lifecycle = seedLifecycle(isResolvedBefore(view));
-    yield fx.state.update(R.rebindQuery(entry.def.hash, { id: new RecordId('_00_query', hash), lifecycle, remoteArray: view?.ids ?? [], localArray }));
+    const id = new RecordId('_00_query', hash);
+    if (entry.lifecycle.remote !== 'unregistered' && String(id) !== String(entry.def.id)) superseded.push(entry.def.id);
+    yield fx.state.update(R.rebindQuery(entry.def.hash, { id, lifecycle, remoteArray: view?.ids ?? [], localArray }));
     // A re-seed is never answered, not even from a durable view: subscribers
     // still hold the previous store's rows until `materialize` paints the new
     // store's, and only that render flips authority back on.
@@ -133,4 +147,5 @@ export function* rebindQueries(): Saga<void> {
       yield fx.emit({ type: 'query:authority', hash: entry.def.hash, known: false });
     }
   }
+  if (superseded.length > 0) yield fx.dispatch({ type: 'ReleaseSuperseded', ids: superseded });
 }

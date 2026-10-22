@@ -7,6 +7,7 @@ import type { Saga } from '../kernel/saga';
 import * as R from '../state/reducers';
 import { Runtime } from './runtime';
 import { rebindQueries } from '../boot/bucket-switch.saga';
+import { registerLocal } from '../query/register.saga';
 
 const env = defaultEnv({ tables: [] } as any, { materializeDebounceMs: 5 });
 const noop = () => {};
@@ -231,5 +232,68 @@ describe('Runtime state hooks', () => {
     fire();
     await tick();
     expect(rt.state.dirty.has('q')).toBe(true);
+  });
+});
+
+describe('Runtime sign-up', () => {
+  it('the page ends up owning one remote row per query when its registration races the auth flip', async () => {
+    // threads-e2e, canary.350: the list mounts as the sign-up resolves and
+    // registers under the anonymous salt on a socket already signed in; the
+    // flip re-keys it while that request is out. The fake server keeps the
+    // `_00_query` rows the way `fn::query::register` / `unsubscribe` do.
+    const rows = new Set<string>();
+    let land!: () => void;
+    const held = new Promise<void>((r) => (land = r));
+    let first = true;
+    const ok = (result: unknown) => ({ status: 'OK' as const, result });
+    let bucket = 'anon';
+    const { a, rt } = make(
+      {
+        remote: {
+          queryResponses: async (sql: string, vars?: Record<string, any>) => {
+            if (sql.startsWith('fn::query::register($config)')) {
+              rows.add(String(vars!.config.id));
+              if (first) {
+                first = false;
+                await held;
+              }
+              return [ok(null), ok([]), ok({ rowCount: 0, state: 'ready' }), ok([])];
+            }
+            if (sql.includes('fn::query::unsubscribe')) {
+              for (const [k, v] of Object.entries(vars ?? {})) if (k.startsWith('id')) rows.delete(String(v));
+              return [];
+            }
+            return [];
+          },
+        },
+        services: {
+          'auth.sessionAuthId': () => 'user:u1',
+          'auth.access': () => 'account',
+          'local.currentBucketId': () => bucket,
+          'local.beginSwitch': () => () => undefined,
+          'local.switchStore': async (target: string) => void (bucket = target),
+          'local.usesSurqlSchema': () => false,
+          'auth.currentUser': () => null,
+          'remote.sessionIds': () => ['s1'],
+        },
+      },
+      { ...buildState(), sessionId: 'anon-salt', saltUserId: null, bucketId: 'anon', primed: true }
+    );
+    const hash = await rt.run(registerLocal(env, { tableName: 'thread', surql: 'SELECT * FROM thread', params: {}, ttl: '10m' }));
+    await tick();
+    expect(rows.size).toBe(1);
+    const anonId = [...rows][0];
+
+    await rt.dispatch({ type: 'AuthFlip', userId: 'user:u1' });
+    land();
+    for (let i = 0; i < 10; i++) {
+      await tick();
+      a.timers.fire(`register:${hash}`);
+    }
+
+    const entry = rt.state.queries.get(hash)!;
+    expect(String(entry.def.id)).not.toBe(anonId);
+    expect([...rows]).toEqual([String(entry.def.id)]);
+    expect(entry.lifecycle.remote).toBe('registered');
   });
 });

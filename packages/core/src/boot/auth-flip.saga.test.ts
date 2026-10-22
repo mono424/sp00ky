@@ -66,6 +66,45 @@ describe('authFlip', () => {
     expect(id).toBe(await sha256Hex(queryHashInput(def, 'salt-1')));
     expect(id).not.toBe(before);
   });
+  it('a sign-up releases the id each query held under the anonymous salt, so the page owns one remote row per query', async () => {
+    // threads-e2e, canary.350: the list mounted as the sign-up resolved, so
+    // its queries registered under the anonymous salt on a socket already
+    // signed in, then the flip re-keyed them. Every query left a second row
+    // (same surql, same auth_id) that the pagehide beacon never named and
+    // that fanned out every change for its whole TTL.
+    const svc = fakeServices({
+      'auth.sessionAuthId': () => 'user:u1',
+      'auth.access': () => 'account',
+      'local.currentBucketId': () => 'anon',
+      'local.beginSwitch': () => () => undefined,
+      'local.usesSurqlSchema': () => false,
+      'auth.token': () => 'jwt',
+      'auth.currentUser': () => null,
+    });
+    const threads = { surql: 'SELECT * FROM thread', params: {} };
+    const user = { surql: 'SELECT * FROM user WHERE id = $id', params: { id: 'user:u1' } };
+    const anonId = async (def: typeof threads) => new RecordId('_00_query', await sha256Hex(queryHashInput(def, 'anon-salt')));
+    const [threadsId, userId] = [await anonId(threads), await anonId(user)];
+    const state = R.compose(
+      R.putQuery(buildEntry({ def: { hash: 't', ...threads, id: threadsId }, lifecycle: { phase: 'live', remote: 'registered' } })),
+      R.putQuery(buildEntry({ def: { hash: 'u', ...user, id: userId }, lifecycle: { phase: 'cold', remote: 'registering' } })),
+      R.putQuery(buildEntry({ def: { hash: 'n', surql: 'SELECT * FROM comment' }, lifecycle: { phase: 'cold', remote: 'unregistered' } }))
+    )({ ...buildState(), sessionId: 'anon-salt', saltUserId: null, bucketId: 'anon' });
+    const out = await runPure(authFlip(env, 'user:u1'), {
+      state,
+      handlers: {
+        service: svc.handler,
+        'local.getById': () => null,
+        'ssp.register': () => ({ localArray: [], timings: {} }),
+        'local.query': () => [],
+      },
+    });
+    expect(String(out.state.queries.get('t')!.def.id.id)).toBe(await sha256Hex(queryHashInput(threads, 'salt-1')));
+    expect(String(out.state.queries.get('u')!.def.id.id)).toBe(await sha256Hex(queryHashInput(user, 'salt-1')));
+    // Registered and in-flight ids may exist on the server; a never-registered one cannot.
+    expect(out.dispatched.filter((d) => d.type === 'ReleaseSuperseded')).toEqual([{ type: 'ReleaseSuperseded', ids: [threadsId, userId] }]);
+    expect(out.dispatched.map((d) => d.type)).toContain('EnsureRegistered');
+  });
   it('a new principal on the same bucket still re-keys its queries', async () => {
     const svc = fakeServices({
       'auth.sessionAuthId': () => 'user:b',

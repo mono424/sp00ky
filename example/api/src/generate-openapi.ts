@@ -1,6 +1,6 @@
 import { writeFile } from 'fs/promises';
 import { dump } from 'js-yaml';
-import app from './server';
+import { app } from './server';
 
 async function generate() {
   const doc = app.getOpenAPI31Document({

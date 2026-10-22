@@ -151,6 +151,10 @@ apps:
       # Anything over the limit waits as a `pending` row and is admitted
       # oldest-first as slots free — the outbox is the queue.
       concurrency: 4
+    # Durable workflows (`@spooky-sync/backend`): `env.DIGEST` starts the
+    # exported ThreadDigest class; its steps run as jobs in the outbox above.
+    workflows:
+      - { binding: DIGEST, class: ThreadDigest }
     env:
       dev: '.env.local'
       cloud:

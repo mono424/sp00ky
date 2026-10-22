@@ -400,6 +400,7 @@ pub fn add_api(
         }),
         run_on: None,
         worker: None,
+        workflows: Vec::new(),
         image: None,
         ports: Vec::new(),
         args: Vec::new(),

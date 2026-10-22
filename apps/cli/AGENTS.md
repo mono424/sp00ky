@@ -174,6 +174,13 @@ paths in `expose` are public, on `https://<slug>.<domain>`. Keys: `entry` (requi
 strings), `cpuMs` (1..300000), `ai` (env binding for Workers AI), `workflows: [{binding, class}]`
 (Cloudflare Workflows; the class is exported from the entry), `expose` (trailing `*` = prefix).
 
+A backend's own `workflows: [{binding, class}]` (not under `worker`) declares durable workflows on
+sp00ky's engine (`@spooky-sync/backend`, every host). `AppConfig::validate_durable_workflows`
+requires an outbox `method` with a `table` and identifier-shaped, unique bindings (also against
+`worker.ai` / `worker.workflows`); it runs for `devOnly` backends too. `AppConfig::spky_app_vars`
+injects `SPKY_OUTBOX_TABLE` into the backend's env in `spky dev`, VM deploys and Worker backends.
+The `_00_wf_instance` / `_00_wf_step` / `_00_wf_event` tables ship in `src/schedule_tables.surql`.
+
 - Validation (`WorkerDeployConfig::validate`, `AppConfig::validate_worker` in `src/backend.rs`):
   `hosting: external` and `runOn` are refused; bindings must not repeat. `spky lint`
   (`Sp00kyConfig::worker_lint`) errors on a missing `entry` and warns on `baseUrl` (unused on

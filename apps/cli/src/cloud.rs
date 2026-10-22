@@ -2009,6 +2009,13 @@ fn build_spky_cloud_vars(config: &backend::Sp00kyConfig) -> Vec<String> {
     ]
 }
 
+/// [`build_spky_cloud_vars`] plus the app's own (`SPKY_OUTBOX_TABLE`).
+fn app_spky_cloud_vars(config: &backend::Sp00kyConfig, app: &backend::AppConfig) -> Vec<String> {
+    let mut vars = build_spky_cloud_vars(config);
+    vars.extend(app.spky_app_vars().into_iter().map(|(k, v)| format!("{k}={v}")));
+    vars
+}
+
 /// Warn if a frontend app uses vault without a whitelist.
 fn warn_frontend_vault_no_whitelist_deploy(name: &str, env: &Option<backend::EnvConfig>) {
     if let Some(backend::EnvConfig::Source(backend::EnvSource::Str(s))) = env {
@@ -2618,7 +2625,7 @@ pub fn deploy(
                 let hash =
                     deploy_worker_backend_cloudflare(&client, &pid, &slug, name, worker, config_dir)?;
                 let user_env = resolve_env_for_deploy(&app_config.env, config_dir, &mut client, &pid);
-                let env = worker_backend_env(&build_spky_cloud_vars(&config), &user_env);
+                let env = worker_backend_env(&app_spky_cloud_vars(&config, app_config), &user_env);
                 worker_backends.push(build_worker_backend_manifest(name, &hash, worker, env));
                 println!("  Worker backend '{}' ready for deployment.", name);
                 continue;
@@ -2703,7 +2710,7 @@ pub fn deploy(
         //     in the manifest)
         //   → SPKY_* base
         //   → user config (wins on conflicts)
-        let spky_vars = build_spky_cloud_vars(&config);
+        let spky_vars = app_spky_cloud_vars(&config, app_config);
         let user_env = resolve_env_for_deploy(&app_config.env, config_dir, &mut client, &pid);
         let image_env = get_docker_env(&image_tag);
         let mut env_map = std::collections::BTreeMap::new();

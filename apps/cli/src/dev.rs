@@ -2808,7 +2808,9 @@ fn spawn_backend_dev_commands(
         );
         color_idx += 1;
         let user_envs = resolve_env_for_dev(&app.env, project_dir);
-        let envs = merge_spky_with_user_env(&spky_vars, user_envs);
+        let mut app_vars = spky_vars.clone();
+        app_vars.extend(app.spky_app_vars());
+        let envs = merge_spky_with_user_env(&app_vars, user_envs);
         match dev_config {
             BackendDevConfig::Command(cmd) => {
                 sink.push_verbose(&format!("Starting: {}", cmd));

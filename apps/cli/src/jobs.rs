@@ -76,17 +76,11 @@ pub fn run(
 // =============================================================
 
 fn client_from(conn: &ConnectionArgs, config: &Option<PathBuf>) -> Result<SurrealClient> {
-    // `--cloud` resolves the deployment's SurrealDB URL + root password from
-    // Sp00ky Cloud; otherwise the local URL/ns/db come from sp00ky.yml (the dev
+    // `--cloud` resolves the deployment's SurrealDB URL + login from Sp00ky
+    // Cloud; otherwise the local URL/ns/db come from sp00ky.yml (the dev
     // stack maps SurrealDB to localhost:8666).
     let c = conn.resolve(config)?;
-    Ok(SurrealClient::new(
-        &c.url,
-        &c.namespace,
-        &c.database,
-        &c.username,
-        &c.password,
-    ))
+    Ok(c.client())
 }
 
 /// Map of job table name -> backend app name, parsed from `sp00ky.yml`. Any

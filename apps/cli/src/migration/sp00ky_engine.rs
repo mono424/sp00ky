@@ -39,6 +39,8 @@ pub(crate) struct Sp00kyEngine {
     password: String,
     internal_schema: Option<InternalSchemaConfig>,
     remote_functions: Option<RemoteFunctionsConfig>,
+    /// Namespace `username` is defined on (the free plan's namespace login).
+    auth_namespace: Option<String>,
 }
 
 impl Sp00kyEngine {
@@ -61,7 +63,13 @@ impl Sp00kyEngine {
             password,
             internal_schema,
             remote_functions,
+            auth_namespace: None,
         }
+    }
+
+    pub(crate) fn with_auth_namespace(mut self, auth_namespace: Option<String>) -> Self {
+        self.auth_namespace = auth_namespace;
+        self
     }
 
     fn make_client(&self) -> SurrealClient {
@@ -75,6 +83,7 @@ impl Sp00kyEngine {
                 &self.username,
                 &self.password,
             )
+            .with_auth_namespace(self.auth_namespace.as_deref())
         }
     }
 }

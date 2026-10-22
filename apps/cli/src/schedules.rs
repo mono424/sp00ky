@@ -70,13 +70,7 @@ pub fn run(
 
 fn client_from(conn: &ConnectionArgs, config: &Option<PathBuf>) -> Result<SurrealClient> {
     let c = conn.resolve(config)?;
-    Ok(SurrealClient::new(
-        &c.url,
-        &c.namespace,
-        &c.database,
-        &c.username,
-        &c.password,
-    ))
+    Ok(c.client())
 }
 
 fn esc(s: &str) -> String {

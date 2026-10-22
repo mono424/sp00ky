@@ -1654,26 +1654,19 @@ pub(crate) fn frontend_package_version(
 }
 
 /// UPSERT the `_00_app_release:<app>` row announcing `version` as the current
-/// release of frontend `app`. Root-only write; synced live to clients via the
-/// `_00_app_release` ingest-notify events (sp00ky.rs), where SDK hooks like
+/// release of frontend `app`. A system-user write (root, or the free plan's
+/// namespace owner); synced live to clients via the `_00_app_release`
+/// ingest-notify events (sp00ky.rs), where SDK hooks like
 /// `useAppRelease` compare it against the running build and offer/force a
 /// reload. Best-effort like `record_schema_hash`: a failure only means clients
 /// aren't nudged, never a failed deploy.
 pub(crate) fn write_app_release_row(
-    db_url: &str,
-    db_password: &str,
-    namespace: &str,
-    database: &str,
+    surreal_client: &crate::surreal_client::SurrealClient,
     app_name: &str,
     version: &str,
     cache_bust: bool,
     mandatory: bool,
 ) {
-    let surreal_client = if db_password.is_empty() {
-        crate::surreal_client::SurrealClient::new_unauthenticated(db_url, namespace, database)
-    } else {
-        crate::surreal_client::SurrealClient::new(db_url, namespace, database, "root", db_password)
-    };
     // App names come from sp00ky.yml keys (identifier-safe) and the version
     // from a parsed package.json; sanitize anyway since this lands in a query.
     let safe_app: String = app_name
@@ -1706,7 +1699,10 @@ pub(crate) fn write_app_release_row(
         cache_bust = cache_bust,
         mandatory = mandatory,
     );
-    match surreal_client.query(&q) {
+    // `execute`, not `query`: a statement-level ERR (a permission the login
+    // lacks, a failing event) arrives in a 200 response and must not read as
+    // success.
+    match surreal_client.execute(&q) {
         Ok(_) => println!(
             "  ▸ Release row updated: {} -> v{}{}{}",
             safe_app,
@@ -1728,10 +1724,7 @@ pub(crate) fn write_app_release_row(
 /// under `off`/`warn`; under `enforce` a missing or stale allowlist is an
 /// error, because deploying it would refuse every query of the new release.
 pub(crate) fn write_query_allowlist_rows(
-    db_url: &str,
-    db_password: &str,
-    namespace: &str,
-    database: &str,
+    surreal_client: &crate::surreal_client::SurrealClient,
     config: &backend::Sp00kyConfig,
     config_dir: &std::path::Path,
     version: &str,
@@ -1751,11 +1744,6 @@ pub(crate) fn write_query_allowlist_rows(
         }
         return Ok(());
     }
-    let surreal_client = if db_password.is_empty() {
-        crate::surreal_client::SurrealClient::new_unauthenticated(db_url, namespace, database)
-    } else {
-        crate::surreal_client::SurrealClient::new(db_url, namespace, database, "root", db_password)
-    };
     let strict = mode == backend::QueryAllowlistMode::Enforce;
     for (ct, (queries_path, json_path)) in entries_with_queries {
         let app: String = ct
@@ -1902,25 +1890,10 @@ pub fn release(
 
     let cloud = resolve_cloud_surreal(&config_path)?;
     let resolved = config.resolved_surrealdb();
-    write_query_allowlist_rows(
-        &cloud.url,
-        &cloud.password,
-        &resolved.namespace,
-        &resolved.database,
-        &config,
-        config_dir,
-        &version,
-    )?;
-    write_app_release_row(
-        &cloud.url,
-        &cloud.password,
-        &resolved.namespace,
-        &resolved.database,
-        &app,
-        &version,
-        cache_bust,
-        mandatory,
-    );
+    let (namespace, database) = cloud.target(&resolved.namespace, &resolved.database);
+    let surreal_client = cloud.client(&namespace, &database);
+    write_query_allowlist_rows(&surreal_client, &config, config_dir, &version)?;
+    write_app_release_row(&surreal_client, &app, &version, cache_bust, mandatory);
     Ok(())
 }
 
@@ -3461,6 +3434,7 @@ pub fn deploy(
                                     database: resolved.database.clone(),
                                     username: "root".to_string(),
                                     password: db_password.to_string(),
+                                    auth_namespace: None,
                                     surrealkit_binary: config.resolved_surrealkit_binary(),
                                     internal_schema: None,
                                     remote_functions: None,
@@ -3577,22 +3551,31 @@ pub fn deploy(
                                         let db_password = status["surrealdb_password"]
                                             .as_str()
                                             .unwrap_or("");
+                                        let surreal_client = if db_password.is_empty() {
+                                            crate::surreal_client::SurrealClient::new_unauthenticated(
+                                                db_url,
+                                                &resolved.namespace,
+                                                &resolved.database,
+                                            )
+                                        } else {
+                                            crate::surreal_client::SurrealClient::new(
+                                                db_url,
+                                                &resolved.namespace,
+                                                &resolved.database,
+                                                "root",
+                                                db_password,
+                                            )
+                                        };
                                         match frontend_package_version(config_dir, frontend_app) {
                                             Some(version) => {
                                                 write_query_allowlist_rows(
-                                                    db_url,
-                                                    db_password,
-                                                    &resolved.namespace,
-                                                    &resolved.database,
+                                                    &surreal_client,
                                                     &config,
                                                     config_dir,
                                                     &version,
                                                 )?;
                                                 write_app_release_row(
-                                                    db_url,
-                                                    db_password,
-                                                    &resolved.namespace,
-                                                    &resolved.database,
+                                                    &surreal_client,
                                                     frontend_name,
                                                     &version,
                                                     cache_bust,
@@ -4776,16 +4759,56 @@ pub fn status() -> Result<()> {
 pub struct CloudSurreal {
     /// HTTP(S) endpoint of the deployment's SurrealDB.
     pub url: String,
-    /// Root password issued for the deployment.
+    /// `root` on a dedicated deployment's DB. On the free plan's shared DB, the
+    /// namespace-level user the control plane keeps for the project.
+    pub username: String,
+    /// Password issued for the deployment.
     pub password: String,
+    /// Free plan: the project's namespace on the shared DB, which its user is
+    /// defined on and confined to. `None` for a root login.
+    pub auth_namespace: Option<String>,
+    /// Free plan: the database the control plane put the project in. `None`
+    /// leaves it to sp00ky.yml.
+    pub database: Option<String>,
 }
 
-/// Resolve the SurrealDB HTTP endpoint and root password for the project
-/// configured in `sp00ky.yml` (or `SP00KY_CLOUD_PROJECT`) from Sp00ky Cloud,
-/// the same lookup `spky project credentials` performs. This is what backs the
-/// `--cloud` flag on the DB-connecting commands (`jobs`, `flag`, `migrate`):
-/// it requires a configured project slug, valid credentials, and a deployed
-/// project, erroring clearly otherwise rather than silently using local defaults.
+impl CloudSurreal {
+    /// The namespace and database to work in, given sp00ky.yml's. A namespace
+    /// login only reaches its own namespace, and the control plane chose the
+    /// project's database there, so both win over the manifest.
+    pub fn target(&self, namespace: &str, database: &str) -> (String, String) {
+        match &self.auth_namespace {
+            Some(ns) => (
+                ns.clone(),
+                self.database
+                    .clone()
+                    .unwrap_or_else(|| database.to_string()),
+            ),
+            None => (namespace.to_string(), database.to_string()),
+        }
+    }
+
+    /// A client signed in with this login, working in `namespace`/`database`.
+    pub fn client(&self, namespace: &str, database: &str) -> crate::surreal_client::SurrealClient {
+        crate::surreal_client::SurrealClient::new(
+            &self.url,
+            namespace,
+            database,
+            &self.username,
+            &self.password,
+        )
+        .with_auth_namespace(self.auth_namespace.as_deref())
+    }
+}
+
+/// Resolve the SurrealDB HTTP endpoint and login for the project configured in
+/// `sp00ky.yml` (or `SP00KY_CLOUD_PROJECT`) from Sp00ky Cloud, the same lookup
+/// `spky project credentials` performs. This is what backs the `--cloud` flag
+/// on the DB-connecting commands (`jobs`, `flag`, `migrate`): it requires a
+/// configured project slug, valid credentials, and a deployed project, erroring
+/// clearly otherwise rather than silently using local defaults. A dedicated
+/// deployment yields its root login; a free project, which lives in a namespace
+/// of the shared DB, yields that namespace's `owner` user.
 pub fn resolve_cloud_surreal(config_path: &std::path::Path) -> Result<CloudSurreal> {
     let slug = std::env::var("SP00KY_CLOUD_PROJECT")
         .ok()
@@ -4811,26 +4834,6 @@ pub fn resolve_cloud_surreal(config_path: &std::path::Path) -> Result<CloudSurre
         .into_json()
         .context("Failed to parse deployment response")?;
 
-    // A free project has no database of its own: `--cloud` signs in as root,
-    // which only exists on a dedicated deployment's DB.
-    if !data["surrealdb_access"].is_null() {
-        bail!(
-            "--cloud is not supported for free-plan projects yet: their data lives in a \
-             namespace of the shared database. Run `spky project credentials` for a \
-             namespace-level login."
-        );
-    }
-
-    let url = data["urls"]["surrealdb"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No SurrealDB URL for project '{}'. Has it been deployed?",
-                slug
-            )
-        })?
-        .to_string();
     let password = data["surrealdb_password"]
         .as_str()
         .or_else(|| data["db_password"].as_str())
@@ -4843,7 +4846,81 @@ pub fn resolve_cloud_surreal(config_path: &std::path::Path) -> Result<CloudSurre
         })?
         .to_string();
 
-    Ok(CloudSurreal { url, password })
+    // A free project has no database of its own, so no root login: the control
+    // plane keeps a namespace-level user for it on the shared DB, recorded at
+    // deploy as `surrealdb_access`.
+    let free = project["platform"].as_str() == Some("cloudflare")
+        || project["plan"].as_str() == Some("free");
+    let root_url = data["urls"]["surrealdb"].as_str().filter(|s| !s.is_empty());
+    let access = &data["surrealdb_access"];
+    if free || (root_url.is_none() && !access.is_null()) {
+        return free_plan_surreal(&slug, access, password);
+    }
+
+    let url = root_url
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No SurrealDB URL for project '{}'. Has it been deployed?",
+                slug
+            )
+        })?
+        .to_string();
+
+    Ok(CloudSurreal {
+        url,
+        username: "root".to_string(),
+        password,
+        auth_namespace: None,
+        database: None,
+    })
+}
+
+/// The free plan's login from GET /deployment's `surrealdb_access`: its
+/// namespace-level user on the shared DB, which signs in with the project's
+/// password. Same cases as `spky project credentials`.
+fn free_plan_surreal(
+    slug: &str,
+    access: &serde_json::Value,
+    password: String,
+) -> Result<CloudSurreal> {
+    if access["external"].as_bool() == Some(true) {
+        bail!(
+            "Project '{}' uses its own SurrealDB ({}), and Sp00ky Cloud holds no login \
+             for it. Declare it in sp00ky.yml (`surrealdb.hosting: external` with its \
+             endpoint and credentials) or pass --url/--username/--password without --cloud.",
+            slug,
+            access["url"].as_str().unwrap_or("unknown URL")
+        );
+    }
+    let (Some(url), Some(username), Some(namespace)) = (
+        access["url"].as_str().filter(|s| !s.is_empty()),
+        access["username"].as_str().filter(|s| !s.is_empty()),
+        access["namespace"].as_str().filter(|s| !s.is_empty()),
+    ) else {
+        bail!(
+            "Project '{}' has no database login yet. Free-plan projects get one on \
+             their next `spky deploy`.",
+            slug
+        );
+    };
+    if let Some(level) = access["level"].as_str().filter(|l| *l != "namespace") {
+        bail!(
+            "Project '{}' has a '{}'-level database login, which this spky cannot sign in \
+             with. Update spky.",
+            slug,
+            level
+        );
+    }
+    Ok(CloudSurreal {
+        url: url.to_string(),
+        username: username.to_string(),
+        password,
+        auth_namespace: Some(namespace.to_string()),
+        database: access["database"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// A fully-resolved external SurrealDB connection (endpoint + credentials).
@@ -6328,6 +6405,7 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                         database: resolved.database.clone(),
                         username: "root".to_string(),
                         password: db_password.clone(),
+                        auth_namespace: None,
                         surrealkit_binary: config.resolved_surrealkit_binary(),
                         internal_schema: None,
                         remote_functions: None,
@@ -6497,6 +6575,7 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                         database: resolved.database.clone(),
                         username: "root".to_string(),
                         password: db_password.to_string(),
+                        auth_namespace: None,
                         surrealkit_binary: config.resolved_surrealkit_binary(),
                         internal_schema: None,
                         remote_functions: None,
@@ -9130,5 +9209,109 @@ mod registry_push_tests {
         assert_eq!(m["image"], "127.0.0.1:5100/wp/api@sha256:new");
         assert_eq!(m["image_hash"], "sha256:new");
         assert_eq!(m["flat_semantics"], true);
+    }
+}
+
+#[cfg(test)]
+mod cloud_surreal_tests {
+    use super::*;
+
+    fn access(json: serde_json::Value) -> Result<CloudSurreal> {
+        free_plan_surreal("talktobolo", &json, "pw".to_string())
+    }
+
+    /// The control plane's `surrealdb_access` for a free project on the shared
+    /// DB becomes a namespace login that fixes both namespace and database.
+    #[test]
+    fn free_plan_access_is_a_namespace_login() {
+        let cloud = access(serde_json::json!({
+            "url": "https://surreal-free.stg.spky.cloud",
+            "namespace": "talktobolo",
+            "database": "main",
+            "username": "owner",
+            "level": "namespace",
+        }))
+        .unwrap();
+        assert_eq!(cloud.url, "https://surreal-free.stg.spky.cloud");
+        assert_eq!(cloud.username, "owner");
+        assert_eq!(cloud.password, "pw");
+        assert_eq!(cloud.auth_namespace.as_deref(), Some("talktobolo"));
+        assert_eq!(
+            cloud.target("main", "app"),
+            ("talktobolo".to_string(), "main".to_string())
+        );
+    }
+
+    #[test]
+    fn free_plan_access_without_a_database_keeps_the_manifests() {
+        let cloud = access(serde_json::json!({
+            "url": "https://surreal-free.stg.spky.cloud",
+            "namespace": "talktobolo",
+            "username": "owner",
+        }))
+        .unwrap();
+        assert_eq!(
+            cloud.target("main", "app"),
+            ("talktobolo".to_string(), "app".to_string())
+        );
+    }
+
+    #[test]
+    fn root_login_targets_the_manifest() {
+        let cloud = CloudSurreal {
+            url: "https://acme-db.spky.cloud".to_string(),
+            username: "root".to_string(),
+            password: "pw".to_string(),
+            auth_namespace: None,
+            database: None,
+        };
+        assert_eq!(
+            cloud.target("acme", "app"),
+            ("acme".to_string(), "app".to_string())
+        );
+    }
+
+    #[test]
+    fn free_plan_without_a_login_says_to_deploy() {
+        for json in [
+            serde_json::Value::Null,
+            serde_json::json!({ "url": "https://surreal-free.stg.spky.cloud", "namespace": "talktobolo" }),
+        ] {
+            let err = access(json).err().expect("no login").to_string();
+            assert!(err.contains("next `spky deploy`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn free_plan_on_its_own_db_is_pointed_at_sp00ky_yml() {
+        let err = access(serde_json::json!({
+            "url": "wss://acme.surreal.cloud",
+            "namespace": "acme",
+            "database": "main",
+            "external": true,
+        }))
+        .err()
+        .expect("external DB")
+        .to_string();
+        assert!(
+            err.contains("its own SurrealDB (wss://acme.surreal.cloud)"),
+            "{err}"
+        );
+        assert!(err.contains("surrealdb.hosting: external"), "{err}");
+    }
+
+    #[test]
+    fn unknown_login_level_is_refused() {
+        let err = access(serde_json::json!({
+            "url": "https://surreal-free.stg.spky.cloud",
+            "namespace": "talktobolo",
+            "database": "main",
+            "username": "owner",
+            "level": "database",
+        }))
+        .err()
+        .expect("database-level login")
+        .to_string();
+        assert!(err.contains("'database'-level"), "{err}");
     }
 }

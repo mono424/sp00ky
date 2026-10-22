@@ -202,6 +202,12 @@ deployment, without deploying anything else. It resolves the SurrealDB URL and r
 your login and the `slug` in `sp00ky.yml`, and reads the mode, namespace and database from
 `sp00ky.yml` too, so there are no connection flags to pass.
 
+A free-plan project has no root login: its data lives in a namespace of the shared free database.
+There `migrate prod`, `spky release` and every `--cloud` command (`migrate`, `query`, `jobs`,
+`flag`, `schedules`, `workflows`, `push`) sign in as the project's namespace-level `owner` user, the one
+`spky project credentials` prints, and work in the namespace and database the project was given
+there. `--namespace` cannot reach outside it.
+
 | Flag | What it does |
 | --- | --- |
 | `-y`, `--yes` | The [global flag](#running-unattended--y----yes): confirms applying to production. Without it, and without a terminal, the migration is refused rather than run unasked. |

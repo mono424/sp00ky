@@ -762,7 +762,7 @@ async fn node_fallback(State(state): State<AppState>, req: Request) -> Response 
         axum::http::Method::DELETE => ssp_node::Method::Delete,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let path = req.uri().path().to_string();
+    let path = routed_path(req.uri());
     let bearer = req
         .headers()
         .get(AUTHORIZATION)
@@ -2119,8 +2119,30 @@ fn spawn_body_verification(rows: Arc<warm::RowCheckpoints>, boot: Arc<ClusterBoo
 // portable core (`ssp_node::bootstrap`); the shell keeps only the cluster
 // split-source path below.
 
+/// The path the node routes on: the bare path, plus the query string for the
+/// admin API, which reads its filters (`?status=`, `?origin=`, `?limit=`) from
+/// it, as the Cloudflare shell already passes it. Every other route matches on
+/// the bare path.
+fn routed_path(uri: &axum::http::Uri) -> String {
+    match uri.query() {
+        Some(q) if !q.is_empty() && ssp_node::admin::is_admin_path(uri.path()) => {
+            format!("{}?{}", uri.path(), q)
+        }
+        _ => uri.path().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod shell_policy_tests {
+    #[test]
+    fn only_the_admin_api_keeps_its_query_string() {
+        let routed = |s: &str| super::routed_path(&s.parse().unwrap());
+        assert_eq!(routed("/admin/api/jobs?origin=durable&limit=5"), "/admin/api/jobs?origin=durable&limit=5");
+        assert_eq!(routed("/admin/api/durable/instances"), "/admin/api/durable/instances");
+        assert_eq!(routed("/info?verbose=1"), "/info");
+        assert_eq!(routed("/ingest"), "/ingest");
+    }
+
     use super::heartbeat_view_count;
     use ssp::circuit::Circuit;
     use std::sync::Arc;

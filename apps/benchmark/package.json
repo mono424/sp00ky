@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/benchmark",
-  "version": "0.0.1-canary.350",
+  "version": "0.0.1-canary.351",
   "description": "Performance benchmark CLI for sp00ky scheduler + SSP",
   "private": true,
   "type": "module",

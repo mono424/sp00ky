@@ -27,7 +27,7 @@
 <table><thead><tr><th>Table</th><th>Who can read it</th><th>Who can write it</th></tr></thead><tbody><tr><td><code>_00_feature_flag</code></td><td>nobody (root only)</td><td><code>spky flag</code> CLI + scheduler</td></tr><tr><td><code>_00_user_feature</code></td><td>each user, their own rows only</td><td>nobody but root</td></tr></tbody></table>
 <ol>
 <li>You write a flag <strong>definition</strong> (variants, default, targeting rules) into <code>_00_feature_flag</code> with the <code>spky flag</code> CLI.</li>
-<li>On every write the CLI runs the evaluator inline and <strong>materializes one row per existing user</strong> into <code>_00_user_feature</code> with their resolved variant.</li>
+<li>On every write the CLI runs the evaluator inline and <strong>materializes one row per existing user</strong> into <code>_00_user_feature</code> with their resolved variant. Only the rows whose variant or payload changed are written, so only those users’ clients are notified; re-running an unchanged flag costs nothing on the sync path. Allowlisting or removing one user from the DevTools Access tab re-evaluates just that user.</li>
 <li>The scheduler runs a periodic sweep that fills in assignments for <strong>users who signed up since the last write</strong>, so new accounts get their flags within seconds.</li>
 <li>The client subscribes to its own <code>_00_user_feature</code> row. When the materialized variant changes, the new value rides the existing websocket straight into your reactive UI.</li>
 </ol>

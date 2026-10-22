@@ -291,6 +291,13 @@ impl SspNode {
         self.edge_update_tx.try_reserve_registration(bytes)
     }
 
+    /// [`crate::edges::EdgePublisher::reserve_cleanup`], with the publisher
+    /// running to take the work.
+    fn cleanup_admission(&self) -> crate::edges::PublicationPermit {
+        self.start_publisher();
+        self.edge_update_tx.reserve_cleanup()
+    }
+
     fn start_publisher(&self) {
         self.edge_update_tx.start(&self.platform, self.platform.db.clone(), self.processor.clone(),
             self.publication_gate.clone(), self.ref_mode, std::time::Duration::ZERO);
@@ -1178,51 +1185,41 @@ impl SspNode {
         else {
             return Some(err_json(422, "bad_body", "invalid unregister payload"));
         };
-        let _publication = self.publication_gate.lock().await;
         debug!("Unregistering view: {}", payload.id);
         // Circuit keys are the bare `<hash>` (see `ssp::canonical_query_id`);
         // callers may send either spelling. `view_metrics` is keyed the same.
         let view_key = ssp::canonical_query_id(&payload.id);
-        self.edge_update_tx.invalidate_view(&view_key);
-
-        // Look up the auth_id from the View before removing it, so the edge
-        // cleanup targets the right per-user `_00_list_ref_user_<id>`.
-        let auth_id = {
-            let circuit = self.processor.read().await;
-            circuit.registration(&view_key).map(|(_, auth)| auth).unwrap_or_default()
-        };
+        // A standby follows the registration set (the scheduler forwards it a
+        // shadow of every unregister) but the edges are its predecessor's.
+        let permit = (!self.is_standby()).then(|| self.cleanup_admission());
+        // No publication gate and no database call here. The caller is the
+        // `_00_query` row's delete event (TIMEOUT 10s): behind a slow
+        // publication round it timed out, the delete failed, and the TTL sweep
+        // paid 10 s per expired view. The edges go through the publication
+        // queue instead, behind any round already writing them, and the
+        // epoch moved here drops whatever the queue still holds for the view.
         {
             let mut circuit = self.processor.write().await;
+            self.edge_update_tx.invalidate_view(&view_key);
+            // Read before the release, so the drop targets the right per-user
+            // `_00_list_ref_user_<id>`.
+            let auth_id = circuit.registration(&view_key).map(|(_, auth)| auth).unwrap_or_default();
             // Release rather than destroy: this graph may be shared with other
             // registrations computing the same thing, and tearing it down would
             // blank their lists. `detach_subscriber` removes it only when this
             // was the last holder. With merging disabled there is never more
             // than one holder, so this is exactly `remove_query`.
             circuit.detach_subscriber(&view_key);
+            if let Some(permit) = permit {
+                let cleanup = crate::edges::PublicationCleanup::DropViewEdges {
+                    table: crate::tables::list_ref_table(self.ref_mode, &auth_id),
+                    view: crate::edges::format_incantation_id(&payload.id),
+                };
+                self.edge_update_tx.enqueue(permit, Vec::new(), &circuit, None, false, vec![cleanup]);
+            }
         }
         self.view_metrics.write().await.remove(&view_key);
         self.platform.telemetry.gauge_add("view_count", -1);
-
-        // A standby follows the registration set (the scheduler forwards it a
-        // shadow of every unregister) but the edges are its predecessor's.
-        if self.is_standby() {
-            return Some(ok_json(Value::Null));
-        }
-
-        // Delete all edges for this incantation via the Db port.
-        let incantation_id = crate::edges::format_incantation_id(&payload.id);
-        let list_ref = crate::tables::list_ref_table(self.ref_mode, &auth_id);
-        // Bind the incantation as a record (single-arg type::record parses the
-        // full `_00_query:<key>` faithfully).
-        let stmt = format!("DELETE (type::record($from))->{list_ref}");
-        if let Err(e) = self
-            .platform
-            .db
-            .query(&stmt, &[("from", json!(incantation_id))])
-            .await
-        {
-            error!("Failed to delete edges for view {}: {}", incantation_id, e);
-        }
 
         Some(ok_json(Value::Null))
     }
@@ -2643,10 +2640,20 @@ async fn cleanup_expired_query(
         return;
     }
 
-    // The row's delete event has usually unregistered the view already. What
-    // follows is for when it could not (no endpoint reachable, a standby
-    // primary), under the publication gate so it cannot interleave with a
-    // registration's publish.
+    // The row's delete event has usually unregistered the view already: the
+    // view is released and its edge drop queued in publication order. Then
+    // nothing is left here, and the sweep does not wait for the gate behind
+    // publication rounds once per expired view (it runs in the one alarm a
+    // Durable Object has, holding every other timer while it goes).
+    if gate.is_some() && !processor.read().await.is_registered(query_id) {
+        telemetry.counter("ttl_cleanup", 1);
+        debug!(query_id = %query_id, "TTL cleanup: query expired, released by its delete event");
+        return;
+    }
+
+    // What follows is for when the event could not (no endpoint reachable, a
+    // standby primary), under the publication gate so it cannot interleave
+    // with a registration's publish.
     let _publication = match gate {
         Some(g) => Some(g.lock().await),
         None => None,

@@ -205,12 +205,22 @@ pub enum PublicationCleanup {
     /// another, and deleting a 3,728-game database held every other
     /// publication behind ~7,500 of them (whitepawn, 2026-09-16).
     DropEdgesTo { table: String, record: String },
+    /// Drop every `table` edge of `view` (`_00_query:<key>`), a view that was
+    /// just unregistered. Queued by the unregister instead of run under the
+    /// publication gate on its request path: that request is a database
+    /// event's call with a 10 s timeout, and behind a slow publication round
+    /// it timed out, failed the `_00_query` delete and left the gate queue
+    /// longer for the next one. In queue order it lands after any round that
+    /// was already writing the view's edges. Folded per table like
+    /// [`Self::DropEdgesTo`].
+    DropViewEdges { table: String, view: String },
 }
 impl PublicationCleanup {
     fn bytes(&self) -> u64 {
         match self {
             Self::Statement(s) | Self::EnsureUser(s) | Self::DropUser(s) => s.capacity() as u64,
             Self::DropEdgesTo { table, record } => (table.capacity() + record.capacity()) as u64,
+            Self::DropViewEdges { table, view } => (table.capacity() + view.capacity()) as u64,
         }
     }
 }
@@ -226,21 +236,43 @@ const MAX_ROUND_OPERATIONS: usize = 4 * MAX_TX_STATEMENTS;
 /// Records per coalesced edge drop (see [`flush_edge_drops`]).
 const MAX_EDGE_DROP_RECORDS: usize = 500;
 
+/// Edge drops a round folds per table: edges to deleted records, edges of
+/// unregistered views. Both only delete, so their order among themselves does
+/// not matter.
+#[derive(Default)]
+struct EdgeDrops {
+    to_records: Vec<(String, Vec<String>)>,
+    of_views: Vec<(String, Vec<String>)>,
+}
+impl EdgeDrops {
+    fn add(list: &mut Vec<(String, Vec<String>)>, table: &str, id: &str) {
+        match list.iter_mut().find(|(t, _)| t == table) {
+            Some((_, ids)) => ids.push(id.to_string()),
+            None => list.push((table.to_string(), vec![id.to_string()])),
+        }
+    }
+}
+
 /// Run a round's cleanup in queue order, folding each run of
-/// [`PublicationCleanup::DropEdgesTo`] into one statement per table.
+/// [`PublicationCleanup::DropEdgesTo`] and [`PublicationCleanup::DropViewEdges`]
+/// into one statement per table.
 ///
 /// All or nothing: on the first failure it stops and reports `false`, and the
 /// caller keeps every item's cleanup for the retry. Every step is idempotent,
 /// so re-running the ones that already succeeded is harmless.
 async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]) -> bool {
-    let mut drops: Vec<(String, Vec<String>)> = Vec::new();
+    let mut drops = EdgeDrops::default();
     for cleanup in items.iter().flat_map(|c| c.iter()) {
-        if let PublicationCleanup::DropEdgesTo { table, record } = cleanup {
-            match drops.iter_mut().find(|(t, _)| t == table) {
-                Some((_, records)) => records.push(record.clone()),
-                None => drops.push((table.clone(), vec![record.clone()])),
+        match cleanup {
+            PublicationCleanup::DropEdgesTo { table, record } => {
+                EdgeDrops::add(&mut drops.to_records, table, record);
+                continue;
             }
-            continue;
+            PublicationCleanup::DropViewEdges { table, view } => {
+                EdgeDrops::add(&mut drops.of_views, table, view);
+                continue;
+            }
+            _ => {}
         }
         // Anything else is ordered against the drops before it.
         if !flush_edge_drops(db, &mut drops).await {
@@ -250,7 +282,7 @@ async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]
             PublicationCleanup::Statement(sql) => query_retrying(db, sql, &[]).await.map(|_| ()).map_err(anyhow::Error::from),
             PublicationCleanup::EnsureUser(user) => tables::ensure_user_tables(db, mode, user).await,
             PublicationCleanup::DropUser(user) => tables::drop_user_tables(db, mode, user).await,
-            PublicationCleanup::DropEdgesTo { .. } => unreachable!("folded above"),
+            PublicationCleanup::DropEdgesTo { .. } | PublicationCleanup::DropViewEdges { .. } => unreachable!("folded above"),
         };
         if let Err(e) = result {
             if !tables::is_missing_table_error(&e.to_string()) {
@@ -262,8 +294,23 @@ async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]
     flush_edge_drops(db, &mut drops).await
 }
 
-async fn flush_edge_drops(db: &dyn Db, drops: &mut Vec<(String, Vec<String>)>) -> bool {
-    for (table, records) in drops.drain(..) {
+async fn flush_edge_drops(db: &dyn Db, drops: &mut EdgeDrops) -> bool {
+    for (table, views) in drops.of_views.drain(..) {
+        for chunk in views.chunks(MAX_EDGE_DROP_RECORDS) {
+            // The views are bound (any key), the table is a validated
+            // identifier from `list_ref_table`. A view without edges, or whose
+            // `_00_query` row is gone, deletes nothing.
+            let sql = format!("FOR $v IN $views {{ DELETE (type::record($v))->{table}; }}");
+            if let Err(e) = query_retrying(db, &sql, &[("views", json!(chunk))]).await {
+                if !tables::is_missing_table_error(&e.to_string()) {
+                    warn!(target: "ssp::edges", table = %table, views = chunk.len(), error = %e,
+                        "Dropping edges of unregistered views failed; the round stays pending");
+                    return false;
+                }
+            }
+        }
+    }
+    for (table, records) in drops.to_records.drain(..) {
         for chunk in records.chunks(MAX_EDGE_DROP_RECORDS) {
             // Both halves are validated identifiers: the table comes from
             // `list_ref_table`, the records passed `valid_record_id` at ingest.
@@ -305,7 +352,7 @@ fn work_selectable(work: &PublicationWork, now: web_time::Instant) -> bool {
 /// Work that can share a round. Table lifecycle (and free-form statements)
 /// keeps a round of its own, so no delta ahead of it is written after it.
 fn work_mergeable(work: &PublicationWork) -> bool {
-    work.cleanup.iter().all(|c| matches!(c, PublicationCleanup::DropEdgesTo { .. }))
+    work.cleanup.iter().all(|c| matches!(c, PublicationCleanup::DropEdgesTo { .. } | PublicationCleanup::DropViewEdges { .. }))
 }
 
 /// A queued item's edge statements, for sizing a round.
@@ -430,6 +477,22 @@ impl EdgePublisher {
     /// live changes always find room.
     pub fn try_reserve_registration(&self, input_bytes: usize) -> Option<PublicationPermit> {
         self.reserve(input_bytes, self.0.limits.registration_share())
+    }
+    /// Whether [`Self::try_reserve`] would admit a live change now, without
+    /// reserving anything.
+    pub fn has_room(&self) -> bool {
+        let state = self.0.state.lock().unwrap();
+        let limits = self.0.limits;
+        state.leases.len() < limits.slots
+            && state.leases.values().map(|s| s.bytes).sum::<u64>() <= limits.bytes
+            && state.leases.values().map(|s| s.operations).sum::<u64>() < limits.operations
+    }
+    /// A reservation for an unregister's edge drop, granted however full the
+    /// queue is: refusing it would leave the view's edges behind, and the
+    /// work it queues is one small statement that frees capacity.
+    pub fn reserve_cleanup(&self) -> PublicationPermit {
+        let unlimited = PublicationLimits { slots: usize::MAX, bytes: u64::MAX, operations: u64::MAX };
+        self.reserve(0, unlimited).expect("an unlimited reservation is always granted")
     }
     fn reserve(&self, input_bytes: usize, limits: PublicationLimits) -> Option<PublicationPermit> {
         let mut state = self.0.state.lock().unwrap();
@@ -953,6 +1016,19 @@ pub fn build_edge_batch(
         let meta = format!("LET $cid{idx} = (SELECT VALUE clientId FROM {from} LIMIT 1)[0]");
         let auth = format!("LET $aid{idx} = (SELECT VALUE auth_id FROM {from} LIMIT 1)[0]");
         let (cid, aid) = (format!("$cid{idx}"), format!("$aid{idx}"));
+        // Every `RELATE` writes nothing once the view's `_00_query` row is
+        // gone (`$cid` NONE). The TTL sweep deletes the row before this node
+        // hears of it, and the queue still holds the view's deltas meanwhile:
+        // a NONE `clientId` (a `TYPE string` field) failed the whole
+        // transaction, every other view in it with it, and the batch was
+        // bisected one round trip at a time under the publication gate. After
+        // a long e2e run, with hundreds of views expiring, that held the gate
+        // for minutes, and every registration waited behind it.
+        let mut relates = false;
+        let mut relate = |statement: String| {
+            relates = true;
+            format!("IF {cid} != NONE {{ {statement} }}")
+        };
 
         // On the shared anon table an edge's `clientId` is read again after
         // the write: every signed-out client filters its LIVE to the sockets
@@ -990,10 +1066,10 @@ pub fn build_edge_batch(
             }
             let version = versions.version_of(id);
             group.created += 1;
-            group.body.push(format!(
+            group.body.push(relate(format!(
                 "RELATE {from}->{list_ref}->{out} SET version = {version}, clientId = {cid}, auth_id = {aid}",
                 from = from, list_ref = list_ref, out = id, version = version, cid = cid, aid = aid,
-            ));
+            )));
         }
 
         // Updates (Updated)
@@ -1057,7 +1133,7 @@ pub fn build_edge_batch(
                 SubqueryOp::Add => {
                     let version = versions.version_of(&item.id);
                     group.created += 1;
-                    group.body.push(format!(
+                    group.body.push(relate(format!(
                         "RELATE {from}->{list_ref}->{id} SET \
                          version = {version}, \
                          clientId = {cid}, \
@@ -1066,7 +1142,7 @@ pub fn build_edge_batch(
                          parent_rel = '{alias}'",
                         from = from, list_ref = list_ref, id = item.id, cid = cid, aid = aid,
                         version = version, parent = item.parent_key, alias = item.alias,
-                    ));
+                    )));
                 }
                 SubqueryOp::Update => {
                     let version = versions.version_of(&item.id);
@@ -1106,7 +1182,6 @@ pub fn build_edge_batch(
 
         // Only a body with a `RELATE` in it needs the view's metadata, and an
         // anon body that restamps an edge needs its `clientId`.
-        let relates = group.body.iter().any(|s| s.starts_with("RELATE "));
         if relates || (restamp && group.updated > 0) {
             group.preamble.push(meta);
         }
@@ -1934,8 +2009,8 @@ mod tests {
         );
         let body = &b.deltas[0].body;
         assert_eq!(body[0], "DELETE $from0->_00_list_ref", "delete-all precedes the RELATEs");
-        assert!(body[1].starts_with("RELATE $from0->_00_list_ref->thread:1"), "{}", body[1]);
-        assert!(body[2].starts_with("RELATE $from0->_00_list_ref->thread:2"), "{}", body[2]);
+        assert!(body[1].starts_with("IF $cid0 != NONE { RELATE $from0->_00_list_ref->thread:1"), "{}", body[1]);
+        assert!(body[2].starts_with("IF $cid0 != NONE { RELATE $from0->_00_list_ref->thread:2"), "{}", body[2]);
         assert_eq!(
             body.last().unwrap(),
             "UPDATE $from0 SET state = 'ready'",
@@ -2582,7 +2657,7 @@ mod publication_tests {
         drained(&p).await;
         let st = statements(&db);
         assert_eq!(st.len(), 2, "{st:#?}");
-        assert!(st[0].starts_with("RELATE "));
+        assert!(st[0].starts_with("IF $cid0 != NONE { RELATE "), "{}", st[0]);
         assert!(st[1].starts_with("DELETE (SELECT"));
         task.abort();
     }

@@ -128,7 +128,7 @@ impl BucketService {
                 match self.store.get(&store_key(&bucket, &key)).await {
                     Ok(Some(object)) => bytes_response(&key, object.meta.content_type, object.body),
                     Ok(None) => error(404, "no such file"),
-                    Err(e) => error(502, &e.to_string()),
+                    Err(e) => store_error(&e),
                 }
             }
             Method::Put => {
@@ -140,7 +140,7 @@ impl BucketService {
                 }
                 match self.store.put(&store_key(&bucket, &key), req.body, content_type_for(&key)).await {
                     Ok(()) => ApiResponse::json(200, json!({ "ok": true })),
-                    Err(e) => error(502, &e.to_string()),
+                    Err(e) => store_error(&e),
                 }
             }
             Method::Delete => {
@@ -149,7 +149,7 @@ impl BucketService {
                 }
                 match self.store.delete(&store_key(&bucket, &key)).await {
                     Ok(()) => ApiResponse::json(200, json!({ "ok": true })),
-                    Err(e) => error(502, &e.to_string()),
+                    Err(e) => store_error(&e),
                 }
             }
             Method::Post => self.operation(token, &bucket, &key, &req.body).await,
@@ -188,26 +188,26 @@ impl BucketService {
         match action {
             Action::Head => match self.store.head(&source).await {
                 Ok(meta) => ApiResponse::json(200, meta.map_or(Value::Null, |m| head_json(key, &m))),
-                Err(e) => error(502, &e.to_string()),
+                Err(e) => store_error(&e),
             },
             Action::Exists => match self.store.head(&source).await {
                 Ok(meta) => ApiResponse::json(200, json!(meta.is_some())),
-                Err(e) => error(502, &e.to_string()),
+                Err(e) => store_error(&e),
             },
             Action::Copy | Action::Rename => {
                 let target = store_key(bucket, target.as_deref().unwrap_or_default());
                 let object = match self.store.get(&source).await {
                     Ok(Some(object)) => object,
                     Ok(None) => return error(404, "no such file"),
-                    Err(e) => return error(502, &e.to_string()),
+                    Err(e) => return store_error(&e),
                 };
                 let content_type = object.meta.content_type.unwrap_or_else(|| content_type_for(key).to_string());
                 if let Err(e) = self.store.put(&target, object.body, &content_type).await {
-                    return error(502, &e.to_string());
+                    return store_error(&e);
                 }
                 if action == Action::Rename {
                     if let Err(e) = self.store.delete(&source).await {
-                        return error(502, &e.to_string());
+                        return store_error(&e);
                     }
                 }
                 ApiResponse::json(200, json!({ "ok": true }))
@@ -367,6 +367,13 @@ fn bytes_response(key: &str, content_type: Option<String>, body: Bytes) -> ApiRe
 
 fn error(status: u16, message: &str) -> ApiResponse {
     ApiResponse::json(status, json!({ "error": message }))
+}
+
+/// The object store failed: a 502 the caller sees, and a warning the
+/// operator sees.
+fn store_error(e: &dyn std::fmt::Display) -> ApiResponse {
+    tracing::warn!(error = %e, "bucket object store request failed");
+    error(502, &e.to_string())
 }
 
 fn add_cors(response: &mut ApiResponse) {

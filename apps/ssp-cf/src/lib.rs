@@ -1334,6 +1334,10 @@ fn to_worker_response(resp: ssp_node::ApiResponse) -> Result<Response> {
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // `/bucket/*` and exposed backend routes run here, not in the Durable
+    // Object, so their warnings (a failed permission check answers 502) need
+    // the subscriber too. Once per isolate.
+    log::init(env.var("SPKY_LOG").ok().map(|v| v.to_string()));
     if BucketService::handles(&req.path()) {
         return bucket_route(req, &env).await;
     }

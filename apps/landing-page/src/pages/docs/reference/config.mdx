@@ -54,15 +54,36 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 
 ## Apps
 
-Each entry under `apps` is a service `spky` knows how to run locally and deploy to the cloud. Set `type: frontend`, `type: backend`, or `type: docker`, then describe how it boots (`dev`) and how it deploys (`deploy`). Backends additionally need an OpenAPI `spec`, a `baseUrl`, an optional `auth` block, and a `method` (typically `outbox`) so the SSP can deliver jobs.
+Each entry under `apps` is a service `spky` knows how to run locally and deploy to the cloud. Set `type: frontend`, `type: backend`, or `type: docker`, then describe how it boots (`dev`) and how it deploys (`deploy`). Backends additionally need an OpenAPI `spec`, a `baseUrl` (except a [Worker backend](#worker-a-backend-as-a-cloudflare-worker)), an optional `auth` block, and a `method` (typically `outbox`) so the SSP can deliver jobs.
 
 <CodeBlock code={ymlApps} lang="yaml" />
 
 A backend may also set `runOn: { pool: <name> }` to run its jobs on a [machine pool](#machine-pools) instead of an always-on container, or `runOn: { machine: <name> }` to run, always on, on a [dedicated machine](#dedicated-machines), alone or next to other backends.
 
+On a Cloudflare project a backend may instead set `worker:` to run as a Cloudflare Worker inside the project's SSP Worker, with no Dockerfile and no `baseUrl`. See [`worker`](#worker-a-backend-as-a-cloudflare-worker) below.
+
 `method` describes the outbox the SSP delivers jobs through: `type: outbox`, the `table` the rows live in, the `schema` file defining it, and an optional `concurrency` bounding how many of that table's jobs run at once (default `1`; extra rows wait as `pending` and are admitted oldest-first). See [Jobs → Concurrency](/docs/jobs#concurrency).
 
 `dev` accepts either a raw command string or a typed form: `{type: npm, script, workdir?}`, `{type: docker, file, workdir?, port?}` (builds a Dockerfile for this app's dev server), or `{type: uv, script, workdir?}`. `deploy` accepts `dockerfile`, `context`, `port`, `healthcheck`, `resources` (`vcpus`, `memory`, `disk`), a `timeout`, a `cmd` (override the image's ENTRYPOINT/CMD), `build_args` (build-time-only args, same shape as `env`), `expose` (backends only: publish it at `<slug>-<name>.<domain>`, which is also what a [custom domain](/docs/reference/cli) can point at), `grpc_port` (a second, h2c port at `<slug>-<name>-grpc.<domain>`), and `static` (`{build, dir}`, for Cloudflare static-asset frontends).
+
+#### `worker`: a backend as a Cloudflare Worker
+
+A `type: backend` app with a `worker:` block is a [Worker backend](/docs/backend/workers). On a Cloudflare project, `spky deploy` bundles `entry` with esbuild and the project's SSP Worker runs it as a Dynamic Worker. It is called through jobs like any backend, so `spec` and an outbox `method` with a `table` are still required. On a VM project the block is ignored and the backend deploys from its Dockerfile.
+
+| Key | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `entry` | path | (required) | The entry module, relative to `sp00ky.yml`. Its default export (a Hono `app`, or any object with `fetch`) handles every request. |
+| `compatibilityDate` | `YYYY-MM-DD` | `2026-10-01` | Workers compatibility date. |
+| `compatibilityFlags` | string[] | `[]` | Workers compatibility flags, e.g. `[nodejs_compat]`. With `nodejs_compat` (or `nodejs_compat_v2`) bare Node built-in imports stay external in the bundle. |
+| `textModules` | glob[] | `[]` | Files imported as strings, e.g. `["**/*.surql"]`. Each glob must end in an extension, and the extension is what counts. |
+| `cpuMs` | number | Cloudflare's default | CPU time per request in ms, `1` to `300000`. |
+| `ai` | string | (none) | Env binding name for Workers AI, e.g. `AI`. The backend calls `env.AI.run(...)`. |
+| `workflows` | `{ binding, class }[]` | `[]` | Cloudflare Workflows. `env.<binding>` starts the `class`, which must be exported from `entry`. |
+| `expose` | string[] | `[]` | Paths served publicly on the project host `https://<slug>.<domain>`. Each starts with `/`; a trailing `*` matches a prefix. Everything else is reachable only through jobs. |
+
+<CodeBlock code={ymlWorker} lang="yaml" />
+
+Rules `spky lint` and `spky deploy` enforce: `hosting: external` and `runOn` are refused with `worker`; binding names (`ai` and every workflow `binding`) must differ; `entry` must exist; the backend's name must be lowercase letters, digits, `-` or `_`. `spky lint` warns when `baseUrl` is set (unused on Cloudflare, though `spky dev` still uses it to reach the backend locally), when an `expose` pattern covers a path in the OpenAPI spec (that job route would be public too), and when the manifest can only deploy to VMs.
 
 #### `scope`: where an app runs
 
@@ -403,6 +424,19 @@ export const ymlApps = `apps:
     image: livekit/livekit-server:latest
     ports: [7880, 7881, "7882/udp"]
     args: ["--dev", "--bind", "0.0.0.0"]`;
+
+export const ymlWorker = `apps:
+  api:
+    type: backend
+    spec: ./api/openapi.yml
+    method: { type: outbox, table: job, schema: ./schema/src/outbox/api.surql }
+    worker:
+      entry: ./api/src/index.ts
+      compatibilityFlags: [nodejs_compat]
+      ai: AI
+      workflows:
+        - { binding: INGEST, class: IngestMaterial }
+      expose: [/llm/*]`;
 
 export const ymlAllowlist = `sync:
   queryAllowlist: warn          # off | warn | enforce

@@ -2186,6 +2186,244 @@ fn default_static_dir() -> String {
     "dist".to_string()
 }
 
+/// Compatibility date of a Worker backend that sets none. Matches the SSP
+/// Worker that hosts it (`apps/ssp-cf/wrangler.toml`).
+pub const DEFAULT_WORKER_COMPATIBILITY_DATE: &str = "2026-10-01";
+
+/// Cloudflare's ceiling for a Worker's `limits.cpu_ms` (five minutes).
+const MAX_WORKER_CPU_MS: u32 = 300_000;
+
+/// A backend that runs as a Cloudflare Worker (`worker:`) on a Cloudflare
+/// project: `spky deploy` bundles `entry` with esbuild and the project's SSP
+/// Worker loads it as a Dynamic Worker. Jobs reach it at `worker://<name>`
+/// like any outbox backend; only the `expose` paths are public. On a VM
+/// project the block is ignored and the backend deploys from its Dockerfile.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerDeployConfig {
+    /// The Worker's entry module (relative to sp00ky.yml), e.g. `./apps/api/src/index.ts`.
+    pub entry: String,
+    /// Workers compatibility date. Omitted => [`DEFAULT_WORKER_COMPATIBILITY_DATE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_date: Option<String>,
+    /// Workers compatibility flags, e.g. `[nodejs_compat]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility_flags: Vec<String>,
+    /// Globs of files imported as text (wrangler's `Text` rule), e.g.
+    /// `["**/*.surql"]`. Each glob's extension becomes an esbuild text loader.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_modules: Vec<String>,
+    /// CPU time limit per invocation in ms (`limits.cpu_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u32>,
+    /// Binding name for Workers AI in the backend's `env`, e.g. `AI`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<String>,
+    /// Cloudflare Workflows the backend starts, one binding each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<WorkerWorkflowBinding>,
+    /// Path patterns served publicly on the project host, e.g. `["/llm/*"]`.
+    /// Everything else is reachable only through jobs. Default: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+}
+
+/// One Workflow of a Worker backend: the `env` binding and the exported class.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkflowBinding {
+    pub binding: String,
+    pub class: String,
+}
+
+impl WorkerDeployConfig {
+    /// The compatibility date sent to the control plane.
+    pub fn resolved_compatibility_date(&self) -> &str {
+        self.compatibility_date
+            .as_deref()
+            .unwrap_or(DEFAULT_WORKER_COMPATIBILITY_DATE)
+    }
+
+    fn validate(&self, name: &str) -> Result<()> {
+        if self.entry.trim().is_empty() {
+            bail!("Worker backend '{}' has an empty 'worker.entry'", name);
+        }
+        if let Some(date) = &self.compatibility_date {
+            if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+                bail!(
+                    "Worker backend '{}': worker.compatibilityDate '{}' is not a YYYY-MM-DD date",
+                    name,
+                    date
+                );
+            }
+        }
+        if let Some(cpu) = self.cpu_ms {
+            if cpu == 0 || cpu > MAX_WORKER_CPU_MS {
+                bail!(
+                    "Worker backend '{}': worker.cpuMs must be between 1 and {}, got {}",
+                    name,
+                    MAX_WORKER_CPU_MS,
+                    cpu
+                );
+            }
+        }
+        for glob in &self.text_modules {
+            if text_module_extension(glob).is_none() {
+                bail!(
+                    "Worker backend '{}': worker.textModules entry '{}' must end in a file extension (e.g. \"**/*.surql\")",
+                    name,
+                    glob
+                );
+            }
+        }
+        let mut bindings: Vec<&str> = Vec::new();
+        if let Some(ai) = &self.ai {
+            bindings.push(ai);
+        }
+        for wf in &self.workflows {
+            if wf.binding.trim().is_empty() || wf.class.trim().is_empty() {
+                bail!(
+                    "Worker backend '{}': every worker.workflows entry needs a 'binding' and a 'class'",
+                    name
+                );
+            }
+            bindings.push(&wf.binding);
+        }
+        for (i, b) in bindings.iter().enumerate() {
+            if b.trim().is_empty() {
+                bail!("Worker backend '{}': worker.ai is empty", name);
+            }
+            if bindings[..i].contains(b) {
+                bail!("Worker backend '{}': binding '{}' is declared twice", name, b);
+            }
+        }
+        for pattern in &self.expose {
+            if !pattern.starts_with('/') {
+                bail!(
+                    "Worker backend '{}': worker.expose pattern '{}' must start with '/'",
+                    name,
+                    pattern
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The file extension a `textModules` glob matches (`"**/*.surql"` → `surql`),
+/// or None when its last segment has no `*.<ext>` / `name.<ext>` form.
+pub fn text_module_extension(glob: &str) -> Option<&str> {
+    let last = glob.rsplit('/').next()?;
+    let (_, ext) = last.rsplit_once('.')?;
+    let valid = !ext.is_empty()
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    valid.then_some(ext)
+}
+
+/// True if a request path matched by `expose` pattern `pattern` could also be
+/// the OpenAPI path `spec_path`. A trailing `*` matches any rest of the path
+/// (as in a Cloudflare route); a `{param}` spec segment matches any segment.
+pub fn expose_pattern_overlaps(pattern: &str, spec_path: &str) -> bool {
+    let is_param = |s: &str| s.starts_with('{') && s.ends_with('}');
+    let seg_eq = |s: &str, p: &str| s == p || (is_param(s) && !p.is_empty());
+    let (prefix, wildcard) = match pattern.strip_suffix('*') {
+        Some(p) => (p, true),
+        None => (pattern, false),
+    };
+    let spec: Vec<&str> = spec_path.split('/').collect();
+    let pat: Vec<&str> = prefix.split('/').collect();
+    if !wildcard {
+        return spec.len() == pat.len() && spec.iter().zip(&pat).all(|(s, p)| seg_eq(s, p));
+    }
+    // Every pattern segment but the last equals its spec segment; the last
+    // one (the text before `*`) is a prefix of the spec segment it lands on.
+    if pat.len() > spec.len() {
+        return false;
+    }
+    let last = pat.len() - 1;
+    spec.iter().zip(&pat).enumerate().all(|(i, (s, p))| {
+        if i < last {
+            seg_eq(s, p)
+        } else {
+            is_param(s) || s.starts_with(p)
+        }
+    })
+}
+
+/// The `paths:` keys of an OpenAPI file, read as plain YAML/JSON so a spec the
+/// strict parser rejects still lints.
+pub fn spec_paths(spec_file: &Path) -> Result<Vec<String>> {
+    let content = fs::read_to_string(spec_file)
+        .context(format!("Failed to read openapi spec: {:?}", spec_file))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&content).context("Failed to parse openapi spec")?;
+    Ok(doc
+        .get("paths")
+        .and_then(|p| p.as_mapping())
+        .map(|m| m.keys().filter_map(|k| k.as_str().map(String::from)).collect())
+        .unwrap_or_default())
+}
+
+impl Sp00kyConfig {
+    /// True when this manifest can only deploy to a VM project: a frontend
+    /// built from a Dockerfile without `deploy.static`, or machine pools or
+    /// dedicated machines. `spky lint` runs offline, so this stands in for the
+    /// cloud project's platform.
+    pub fn targets_vm_platform(&self) -> bool {
+        let docker_frontend = self.frontend().is_some_and(|(_, app)| {
+            app.deploy
+                .as_ref()
+                .is_some_and(|d| d.dockerfile.is_some() && d.static_site.is_none())
+        });
+        docker_frontend || !self.pools.is_empty() || !self.machines.is_empty()
+    }
+
+    /// `spky lint` findings for Worker backends, as (errors, warnings). The
+    /// structural rules are in [`AppConfig::validate`].
+    pub fn worker_lint(&self, base_dir: &Path) -> (Vec<String>, Vec<String>) {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let vm = self.targets_vm_platform();
+        for (name, app) in self.backends() {
+            let Some(worker) = &app.worker else { continue };
+            let prefix = format!("apps.{}.worker", name);
+            let entry = base_dir.join(&worker.entry);
+            if !entry.is_file() {
+                errors.push(format!("{}.entry not found: {}", prefix, entry.display()));
+            }
+            if vm {
+                warnings.push(format!(
+                    "{}: only a Cloudflare project runs Worker backends; this project deploys to VMs, so the block is ignored and '{}' deploys from its Dockerfile",
+                    prefix, name
+                ));
+            }
+            if app.base_url.is_some() {
+                warnings.push(format!(
+                    "apps.{}.baseUrl is unused on a Cloudflare project: jobs reach a Worker backend at worker://{}",
+                    name, name
+                ));
+            }
+            if worker.expose.is_empty() {
+                continue;
+            }
+            let Some(spec) = &app.spec else { continue };
+            // A missing or broken spec is reported by the spec checks.
+            let Ok(paths) = spec_paths(&base_dir.join(spec)) else { continue };
+            for pattern in &worker.expose {
+                for path in paths.iter().filter(|p| expose_pattern_overlaps(pattern, p)) {
+                    warnings.push(format!(
+                        "{}.expose '{}' overlaps the job path '{}': that job route is also public on the project host",
+                        prefix, pattern, path
+                    ));
+                }
+            }
+        }
+        (errors, warnings)
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BackendDeployResources {
     /// Number of vCPUs (default: 1)
@@ -2257,6 +2495,10 @@ pub struct AppConfig {
     /// `machines:`). See `pool_config::RunOnConfig`.
     #[serde(default, rename = "runOn", skip_serializing_if = "Option::is_none")]
     pub run_on: Option<crate::pool_config::RunOnConfig>,
+    /// Run this backend as a Cloudflare Worker on a Cloudflare project instead
+    /// of a Docker container (see [`WorkerDeployConfig`]). Ignored on a VM project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerDeployConfig>,
 
     // ── Docker-app fields (type: docker) ────────────────────────────────
     /// Prebuilt image to run (required for `type: docker`).
@@ -2353,6 +2595,9 @@ impl AppConfig {
         if self.scope == AppScope::DevOnly {
             return self.validate_deploy_resources(name);
         }
+        if self.worker.is_some() && self.app_type != AppType::Backend {
+            bail!("App '{}' sets 'worker', which only a backend can use", name);
+        }
         match self.app_type {
             AppType::Backend => {
                 if self.spec.is_none() {
@@ -2367,12 +2612,17 @@ impl AppConfig {
                         name
                     );
                 }
+                if let Some(worker) = &self.worker {
+                    self.validate_worker(name, worker)?;
+                }
             }
             AppType::Frontend => {
+                // A free-plan (Cloudflare) frontend ships `deploy.static`, with
+                // no Docker image to build.
                 if let Some(ref deploy) = self.deploy {
-                    if deploy.dockerfile.is_none() {
+                    if deploy.dockerfile.is_none() && deploy.static_site.is_none() {
                         bail!(
-                            "Frontend app '{}' has 'deploy' but is missing 'dockerfile'",
+                            "Frontend app '{}' has 'deploy' but neither 'dockerfile' nor 'static'",
                             name
                         );
                     }
@@ -2382,6 +2632,38 @@ impl AppConfig {
             AppType::Docker => {}
         }
         self.validate_deploy_resources(name)
+    }
+
+    /// A Worker backend is triggered by jobs like any backend, so it needs the
+    /// OpenAPI `spec` and an outbox `method` with a table. It needs neither a
+    /// Dockerfile nor a `baseUrl`: its jobs go to `worker://<name>`.
+    fn validate_worker(&self, name: &str, worker: &WorkerDeployConfig) -> Result<()> {
+        if self.spec.is_none() {
+            bail!(
+                "Worker backend '{}' is missing 'spec' (the OpenAPI file of the routes its jobs call)",
+                name
+            );
+        }
+        match &self.method {
+            Some(m) if m.method_type == MethodType::Outbox && m.table.is_some() => {}
+            _ => bail!(
+                "Worker backend '{}' needs an outbox 'method' with a 'table' (jobs are how it is called)",
+                name
+            ),
+        }
+        if self.resolved_hosting() == HostingMode::External {
+            bail!(
+                "Backend '{}' sets both 'worker' and hosting 'external'; a Worker backend is hosted by sp00ky",
+                name
+            );
+        }
+        if self.run_on.is_some() {
+            bail!(
+                "Worker backend '{}' cannot set 'runOn': it runs inside the project's SSP Worker",
+                name
+            );
+        }
+        worker.validate(name)
     }
 
     fn validate_deploy_resources(&self, name: &str) -> Result<()> {
@@ -2593,7 +2875,8 @@ fn load_linked_yaml(base_dir: &Path, rel: &str, section: &str) -> Result<serde_y
 /// by prefixing the service dir so they still resolve against the root dir.
 ///
 /// MUST track `AppConfig`'s path-bearing fields (see `AppConfig`,
-/// `AppDeployConfig`, `BackendMethod`, `BackendDevTypedConfig`). Non-path
+/// `AppDeployConfig`, `BackendMethod`, `BackendDevTypedConfig`,
+/// `WorkerDeployConfig`). Non-path
 /// fields (e.g. `baseUrl` is a URL, `deploy.static.build` is a shell command,
 /// docker `volumes` use the absolute `${PROJECT_DIR}`) are intentionally
 /// excluded.
@@ -2612,6 +2895,7 @@ fn rebase_app_paths(app: &mut serde_yaml::Value, service_rel: &str) {
         ("method", &["schema"]),
         ("dev", &["workdir"]),
         ("deploy", &["dockerfile", "context"]),
+        ("worker", &["entry"]),
     ];
     for (parent, keys) in nested {
         if let Some(obj) = app.get_mut(parent) {
@@ -3932,5 +4216,183 @@ mod infra_env_tests {
         let cfg: Sp00kyConfig =
             serde_yaml::from_str("name: demo\ndeployment:\n  sspCount: 2\n").expect("yaml parse");
         assert!(cfg.deployment.as_ref().and_then(|d| d.env.as_ref()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn cfg(yaml: &str) -> Sp00kyConfig {
+        serde_yaml::from_str(yaml).expect("yaml parse")
+    }
+
+    const WORKER_API: &str = "\
+apps:
+  api:
+    type: backend
+    spec: ./apps/api/openapi.yml
+    method: { type: outbox, table: job, schema: ./schema/src/outbox/api.surql }
+    worker:
+      entry: ./apps/api/src/index.ts
+      compatibilityDate: 2026-10-15
+      compatibilityFlags: [nodejs_compat]
+      textModules: [\"**/*.surql\"]
+      cpuMs: 300000
+      ai: AI
+      workflows: [{ binding: INGEST, class: IngestMaterial }]
+      expose: [/llm/*]
+";
+
+    #[test]
+    fn worker_block_parses_every_field() {
+        let config = cfg(WORKER_API);
+        let w = config.apps["api"].worker.as_ref().expect("worker block");
+        assert_eq!(w.entry, "./apps/api/src/index.ts");
+        assert_eq!(w.resolved_compatibility_date(), "2026-10-15");
+        assert_eq!(w.compatibility_flags, vec!["nodejs_compat"]);
+        assert_eq!(w.text_modules, vec!["**/*.surql"]);
+        assert_eq!(w.cpu_ms, Some(300_000));
+        assert_eq!(w.ai.as_deref(), Some("AI"));
+        assert_eq!(
+            w.workflows,
+            vec![WorkerWorkflowBinding { binding: "INGEST".into(), class: "IngestMaterial".into() }]
+        );
+        assert_eq!(w.expose, vec!["/llm/*"]);
+        config.validate_manifest().expect("a full Worker backend validates");
+    }
+
+    #[test]
+    fn worker_defaults_and_typo_rejection() {
+        let w: WorkerDeployConfig = serde_yaml::from_str("entry: ./src/index.ts\n").unwrap();
+        assert_eq!(w.resolved_compatibility_date(), DEFAULT_WORKER_COMPATIBILITY_DATE);
+        assert!(w.expose.is_empty() && w.workflows.is_empty() && w.text_modules.is_empty());
+        let err = serde_yaml::from_str::<WorkerDeployConfig>("entry: x.ts\ncompatibility_date: 2026-01-01\n")
+            .expect_err("snake_case key is a typo");
+        assert!(err.to_string().contains("compatibility_date"), "got: {err}");
+        assert!(serde_yaml::from_str::<WorkerDeployConfig>("compatibilityDate: 2026-01-01\n").is_err());
+    }
+
+    /// No Dockerfile and no baseUrl, but `spec` and an outbox `method` with a
+    /// table, like any backend.
+    #[test]
+    fn worker_backend_needs_spec_and_outbox_table_only() {
+        cfg("apps:\n  api:\n    type: backend\n    spec: a.yml\n    method: { type: outbox, table: job, schema: a.surql }\n    worker: { entry: i.ts }\n")
+            .validate_manifest()
+            .expect("no deploy block, no baseUrl");
+
+        let no_spec = cfg("apps:\n  api:\n    type: backend\n    method: { type: outbox, table: job, schema: a.surql }\n    worker: { entry: i.ts }\n");
+        let err = no_spec.validate_manifest().unwrap_err().to_string();
+        assert!(err.contains("missing 'spec'"), "got: {err}");
+
+        let no_method = cfg("apps:\n  api:\n    type: backend\n    spec: a.yml\n    worker: { entry: i.ts }\n");
+        assert!(no_method.validate_manifest().unwrap_err().to_string().contains("outbox 'method'"));
+
+        let no_table = cfg("apps:\n  api:\n    type: backend\n    spec: a.yml\n    method: { type: outbox, schema: a.surql }\n    worker: { entry: i.ts }\n");
+        assert!(no_table.validate_manifest().is_err());
+    }
+
+    #[test]
+    fn worker_rejects_bad_shapes() {
+        let base = "apps:\n  api:\n    type: backend\n    spec: a.yml\n    method: { type: outbox, table: job, schema: a.surql }\n";
+        for (worker, needle) in [
+            ("worker: { entry: i.ts, cpuMs: 0 }", "cpuMs"),
+            ("worker: { entry: i.ts, cpuMs: 300001 }", "cpuMs"),
+            ("worker: { entry: i.ts, compatibilityDate: soon }", "compatibilityDate"),
+            ("worker: { entry: i.ts, textModules: [\"**/*\"] }", "textModules"),
+            ("worker: { entry: i.ts, expose: [llm/*] }", "start with '/'"),
+            ("worker: { entry: i.ts, ai: AI, workflows: [{ binding: AI, class: W }] }", "declared twice"),
+            ("worker: { entry: '' }", "empty 'worker.entry'"),
+            ("hosting: external\n    baseUrl: https://x\n    worker: { entry: i.ts }", "hosting 'external'"),
+            ("runOn: { pool: p }\n    worker: { entry: i.ts }", "runOn"),
+        ] {
+            let config = cfg(&format!("{base}    {worker}\n"));
+            let err = config.apps["api"].validate("api").unwrap_err().to_string();
+            assert!(err.contains(needle), "{worker}: got {err}");
+        }
+        let frontend = cfg("apps:\n  web:\n    type: frontend\n    worker: { entry: i.ts }\n");
+        assert!(frontend.validate_manifest().unwrap_err().to_string().contains("only a backend"));
+    }
+
+    /// A free-plan frontend has `deploy.static` and no Dockerfile.
+    #[test]
+    fn static_only_frontend_validates() {
+        cfg("apps:\n  web:\n    type: frontend\n    deploy:\n      static: { build: npm run build, dir: dist }\n")
+            .validate_manifest()
+            .expect("static frontend needs no dockerfile");
+        let neither = cfg("apps:\n  web:\n    type: frontend\n    deploy: { port: 3000 }\n");
+        assert!(neither.validate_manifest().is_err());
+    }
+
+    #[test]
+    fn text_module_extension_takes_the_glob_suffix() {
+        assert_eq!(text_module_extension("**/*.surql"), Some("surql"));
+        assert_eq!(text_module_extension("src/prompts/*.md"), Some("md"));
+        assert_eq!(text_module_extension("schema.sql"), Some("sql"));
+        assert_eq!(text_module_extension("**/*"), None);
+        assert_eq!(text_module_extension("**/*.{a,b}"), None);
+    }
+
+    #[test]
+    fn expose_overlap_follows_route_semantics() {
+        assert!(expose_pattern_overlaps("/llm/*", "/llm/chat"));
+        assert!(expose_pattern_overlaps("/llm/*", "/llm/{id}/stream"));
+        assert!(!expose_pattern_overlaps("/llm/*", "/llm"));
+        assert!(!expose_pattern_overlaps("/llm/*", "/ingest"));
+        assert!(expose_pattern_overlaps("/*", "/ingest"));
+        assert!(expose_pattern_overlaps("/llm*", "/llmx/a"));
+        assert!(expose_pattern_overlaps("/health", "/health"));
+        assert!(!expose_pattern_overlaps("/health", "/health/deep"));
+        assert!(expose_pattern_overlaps("/items/abc", "/items/{id}"));
+        assert!(expose_pattern_overlaps("/items/*", "/items/{id}"));
+    }
+
+    /// An app pulled in by `path` gets its entry rebased like `spec`.
+    #[test]
+    fn path_include_rebases_worker_entry() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("api")).unwrap();
+        std::fs::write(
+            dir.path().join("api/sp00ky.app.yml"),
+            "type: backend\nspec: ./openapi.yml\nmethod: { type: outbox, table: job, schema: ./a.surql }\nworker: { entry: ./src/index.ts }\n",
+        )
+        .unwrap();
+        let config = parse_config_with_includes("apps:\n  api:\n    path: ./api\n", dir.path()).unwrap();
+        assert_eq!(config.apps["api"].worker.as_ref().unwrap().entry, "api/src/index.ts");
+    }
+
+    #[test]
+    fn worker_lint_reports_entry_overlap_and_platform() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("apps/api/src")).unwrap();
+        std::fs::write(
+            root.join("apps/api/openapi.yml"),
+            "openapi: 3.0.0\ninfo: { title: api, version: '1' }\npaths:\n  /ingest: {}\n  /llm/summary: {}\n",
+        )
+        .unwrap();
+        let config = cfg(WORKER_API);
+
+        let (errors, warnings) = config.worker_lint(root);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("worker.entry not found"), "{errors:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("'/llm/summary'"), "{warnings:?}");
+
+        std::fs::write(root.join("apps/api/src/index.ts"), "export default {}\n").unwrap();
+        std::fs::write(
+            root.join("apps/api/openapi.yml"),
+            "openapi: 3.0.0\ninfo: { title: api, version: '1' }\npaths:\n  /ingest: {}\n",
+        )
+        .unwrap();
+        assert_eq!(config.worker_lint(root), (vec![], vec![]));
+
+        // A Docker frontend means a VM project, where the block is ignored.
+        let vm = cfg(&format!(
+            "{WORKER_API}  web:\n    type: frontend\n    deploy: {{ dockerfile: ./Dockerfile }}\n"
+        ));
+        let (_, warnings) = vm.worker_lint(root);
+        assert!(warnings.iter().any(|w| w.contains("only a Cloudflare project")), "{warnings:?}");
     }
 }

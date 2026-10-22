@@ -121,6 +121,9 @@
     "deploy": {
       "$ref": "#/$defs/appDeployConfig"
     },
+    "worker": {
+      "$ref": "#/$defs/workerConfig"
+    },
     "env": {
       "$ref": "#/$defs/envConfig"
     }
@@ -401,6 +404,104 @@
         },
         "static": {
           "$ref": "#/$defs/staticDeployConfig"
+        }
+      },
+      "additionalProperties": false
+    },
+    "workerConfig": {
+      "type": "object",
+      "description": "Run this backend as a Cloudflare Worker on a Cloudflare (free plan) project instead of a Docker container. `spky deploy` bundles `entry` with esbuild and the project's SSP Worker loads it as a Dynamic Worker. Like any backend it is triggered by jobs (its `spec` routes, called through the outbox `method`), and nothing is public except the `expose` paths. Needs no Dockerfile and no baseUrl. Ignored on a VM project, where the backend deploys from its Dockerfile.",
+      "required": [
+        "entry"
+      ],
+      "properties": {
+        "entry": {
+          "type": "string",
+          "description": "The Worker's entry module, relative to sp00ky.yml. Its default export handles `fetch`.",
+          "examples": [
+            "./apps/api/src/index.ts"
+          ]
+        },
+        "compatibilityDate": {
+          "type": "string",
+          "description": "Workers compatibility date (YYYY-MM-DD). Defaults to the SSP Worker's date.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "examples": [
+            "2026-10-15"
+          ]
+        },
+        "compatibilityFlags": {
+          "type": "array",
+          "description": "Workers compatibility flags.",
+          "items": {
+            "type": "string"
+          },
+          "examples": [
+            [
+              "nodejs_compat"
+            ]
+          ]
+        },
+        "textModules": {
+          "type": "array",
+          "description": "Globs of files imported as strings (like wrangler's Text rule). Each glob's file extension gets esbuild's text loader.",
+          "items": {
+            "type": "string"
+          },
+          "examples": [
+            [
+              "**/*.surql"
+            ]
+          ]
+        },
+        "cpuMs": {
+          "type": "integer",
+          "description": "CPU time limit per invocation in milliseconds (Cloudflare's limits.cpu_ms).",
+          "minimum": 1,
+          "maximum": 300000
+        },
+        "ai": {
+          "type": "string",
+          "description": "Binding name under which Workers AI appears in the backend's env.",
+          "examples": [
+            "AI"
+          ]
+        },
+        "workflows": {
+          "type": "array",
+          "description": "Cloudflare Workflows the backend starts: the env binding and the exported WorkflowEntrypoint class of each.",
+          "items": {
+            "type": "object",
+            "required": [
+              "binding",
+              "class"
+            ],
+            "properties": {
+              "binding": {
+                "type": "string",
+                "description": "Binding name in the backend's env, e.g. INGEST."
+              },
+              "class": {
+                "type": "string",
+                "description": "Name of the exported Workflow class, e.g. IngestMaterial."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "expose": {
+          "type": "array",
+          "description": "Path patterns served publicly on the project host (a trailing * matches the rest of the path), e.g. for LLM streaming. Default: none, so the backend is reachable only through jobs. A pattern that covers a `spec` path makes that job route public too; `spky lint` warns about it.",
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "default": [],
+          "examples": [
+            [
+              "/llm/*"
+            ]
+          ]
         }
       },
       "additionalProperties": false

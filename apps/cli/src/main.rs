@@ -2822,6 +2822,12 @@ fn handle_lint(config_path: &Path) -> Result<()> {
         }
     }
 
+    // 4a. Worker backends: the entry module exists, and `expose` does not
+    // publish a job path.
+    let (worker_errors, worker_warnings) = config.worker_lint(base_dir);
+    errors.extend(worker_errors);
+    warnings.extend(worker_warnings);
+
     // 4b. Schedules and workflows: `config.validate()` above already covered the
     // structural rules (cadence, cron syntax, DAG acyclicity). What needs the
     // backend route map — does that backend exist, does it have an outbox table,

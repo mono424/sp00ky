@@ -500,6 +500,9 @@
             "deploy": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/appDeployConfig"
             },
+            "worker": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/workerConfig"
+            },
             "env": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/envConfig"
             }

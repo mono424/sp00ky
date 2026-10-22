@@ -413,6 +413,58 @@ pub fn build_server_schema(config: &SchemaBuilderConfig) -> Result<String> {
 /// free/Cloudflare `push` path (`build_server_schema`) does NOT emit them, so
 /// `spky push` must append this. Uses `DEFINE EVENT OVERWRITE`, so it is safe
 /// to (re-)apply to an existing database.
+/// Make a whole schema re-appliable for a Cloudflare project, whose deploy
+/// pushes the full schema every time instead of migrations: a plain
+/// `DEFINE TABLE job` fails with "already exists" on the second deploy, the
+/// control plane then skips the SSP reload, and no changed definition after
+/// the first deploy ever lands.
+///
+/// Definitions that are cheap to replace become `OVERWRITE`, so the pushed
+/// schema is the desired state. Two keep their first definition instead,
+/// `IF NOT EXISTS`: an `ACCESS` without `WITH JWT` gets a new random signing
+/// key from every overwrite, which signs every user out, and an overwritten
+/// `INDEX` is rebuilt row by row inside the apply. A statement that already
+/// says `OVERWRITE` or `IF NOT EXISTS` is left as written.
+pub fn idempotent_push_sql(sql: &str) -> String {
+    const REPLACE: &[&str] = &[
+        "TABLE", "FIELD", "EVENT", "FUNCTION", "PARAM", "ANALYZER", "BUCKET", "API",
+    ];
+    const KEEP_FIRST: &[&str] = &["ACCESS", "INDEX"];
+    let mut out = String::with_capacity(sql.len() + sql.len() / 16);
+    let mut rest = sql;
+    while let Some(at) = rest.find("DEFINE ") {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let after_define = &from["DEFINE ".len()..];
+        let keyword = REPLACE
+            .iter()
+            .chain(KEEP_FIRST)
+            .find(|k| {
+                after_define.starts_with(**k)
+                    && after_define[k.len()..].starts_with(char::is_whitespace)
+            });
+        match keyword {
+            Some(k) => {
+                let tail = after_define[k.len()..].trim_start();
+                out.push_str("DEFINE ");
+                out.push_str(k);
+                out.push(' ');
+                let explicit = tail.starts_with("OVERWRITE ") || tail.starts_with("IF NOT EXISTS ");
+                if !explicit {
+                    out.push_str(if KEEP_FIRST.contains(k) { "IF NOT EXISTS " } else { "OVERWRITE " });
+                }
+                rest = tail;
+            }
+            None => {
+                out.push_str("DEFINE ");
+                rest = after_define;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn build_server_events(config: &SchemaBuilderConfig) -> Result<String> {
     let raw_content = fs::read_to_string(&config.input_path).context(format!(
         "Failed to read input schema file: {:?}",
@@ -1566,5 +1618,44 @@ mod session_guard_tests {
         assert_eq!(guard_from("name: demo\nsessionGuard: \"  $auth.live = true; \"\n").as_deref(), Some("$auth.live = true"));
         assert_eq!(guard_from("name: demo\nsessionGuard: \"  \"\n"), None);
         assert_eq!(guard_from("name: demo\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod idempotent_push_tests {
+    use super::idempotent_push_sql;
+
+    #[test]
+    fn replaces_cheap_definitions_and_keeps_keys_and_indexes() {
+        let sql = "DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNIN (SELECT 1);\n\
+                   DEFINE TABLE job SCHEMAFULL;\n\
+                   DEFINE FIELD path ON TABLE job TYPE string;\n\
+                   DEFINE INDEX idx ON TABLE job FIELDS path;\n\
+                   DEFINE EVENT e ON job THEN {};\n\
+                   DEFINE FUNCTION fn::x() { RETURN 1; };";
+        let out = idempotent_push_sql(sql);
+        assert!(out.contains("DEFINE ACCESS IF NOT EXISTS account"), "{out}");
+        assert!(out.contains("DEFINE TABLE OVERWRITE job"), "{out}");
+        assert!(out.contains("DEFINE FIELD OVERWRITE path"), "{out}");
+        assert!(out.contains("DEFINE INDEX IF NOT EXISTS idx"), "{out}");
+        assert!(out.contains("DEFINE EVENT OVERWRITE e"), "{out}");
+        assert!(out.contains("DEFINE FUNCTION OVERWRITE fn::x"), "{out}");
+    }
+
+    #[test]
+    fn explicit_clauses_and_other_text_are_left_alone() {
+        let sql = "DEFINE FIELD OVERWRITE errors[*] ON job TYPE object FLEXIBLE;\n\
+                   DEFINE FIELD IF NOT EXISTS timeout ON job TYPE option<int>;\n\
+                   DEFINE ACCESS OVERWRITE agent ON DATABASE TYPE RECORD;\n\
+                   DEFINE INDEX IF NOT EXISTS idx_job_dispatch ON TABLE job COLUMNS status;\n\
+                   UPSERT _00_job_policy:job MERGE { concurrency: 2 };\n\
+                   -- UNDEFINED words and DEFINEd prose stay";
+        assert_eq!(idempotent_push_sql(sql), sql);
+    }
+
+    #[test]
+    fn applying_twice_changes_nothing() {
+        let once = idempotent_push_sql("DEFINE TABLE a;\nDEFINE INDEX i ON a FIELDS x;");
+        assert_eq!(idempotent_push_sql(&once), once);
     }
 }

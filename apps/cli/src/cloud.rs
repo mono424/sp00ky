@@ -6211,6 +6211,8 @@ pub(crate) fn push_schema_inner(client: &mut CloudClient, slug: &str, pid: &str)
     sql.push('\n');
     sql.push_str(&schedule_sql);
 
+    let sql = crate::schema_builder::idempotent_push_sql(&sql);
+
     println!("Pushing schema for '{}' ({} bytes)...", slug, sql.len());
     client
         .post(

@@ -85,7 +85,8 @@ const RUN_STATUSES: &[&str] = &["running", "success", "failed", "killed"];
 const VIEW_SORTS: &[&str] = &["slowest", "newest", "rows", "updates", "errors", "active"];
 /// The four the outbox table's own ASSERT allows.
 const JOB_STATUSES: &[&str] = &["pending", "processing", "success", "failed"];
-const JOB_ORIGINS: &[&str] = &["schedule", "workflow", "app"];
+const JOB_ORIGINS: &[&str] = &["schedule", "workflow", "durable", "app"];
+const INSTANCE_STATUSES: &[&str] = &["queued", "running", "waiting", "complete", "errored", "terminated"];
 
 const fn t(
     name: &'static str,
@@ -167,6 +168,19 @@ pub const TOOLS: &[ToolDef] = &[
         path_params = &[req("id", "string", "Run id")]),
     tool!("workflow_run_retry", "Retry a failed or killed run from its failed steps; successful steps keep their output.", "POST", "/workflows/runs/{id}/retry",
         path_params = &[req("id", "string", "Run id")]),
+    // ---- Durable workflows (step.do in a backend, @spooky-sync/backend) ----
+    tool!("durable_instances_list", "Durable workflow instances (a backend's WorkflowEntrypoint classes), newest first: status, steps done, the step running or waited on, when the next run is due.", "GET", "/durable/instances",
+        query = &[
+            p("binding", "string", "Only instances created through this binding, e.g. INGEST"),
+            choice(p("status", "string", "Only instances in this status"), INSTANCE_STATUSES),
+            p("limit", "number", "Max rows (default 50, max 500)"),
+        ], read_only = true),
+    tool!("durable_instance_get", "One durable workflow instance with its params, output or error, every step (status, attempts, output, error, retry or wake time) and the events sent to it.", "GET", "/durable/instances/{id}",
+        path_params = &[req("id", "string", "Instance id as create() returned it; the _00_wf_instance:<id> spelling is accepted too")], read_only = true),
+    tool!("durable_instance_cancel", "Terminate a durable workflow instance: a run holding it stops at its next write and no queued job runs it again.", "POST", "/durable/instances/{id}/cancel",
+        path_params = &[req("id", "string", "Instance id")], destructive = true),
+    tool!("durable_instance_retry", "Give an active durable workflow instance a fresh job due now: the way out when its outbox job gave up. A live run keeps the instance; the new job waits for its lease.", "POST", "/durable/instances/{id}/retry",
+        path_params = &[req("id", "string", "Instance id")]),
     tool!("schedules_list", "Every schedule with cadence, pause state, next and last fire.", "GET", "/schedules", read_only = true),
     tool!("schedule_get", "One schedule with its recent fires, its hourly outcome tally (the retention rollup plus the runs not pruned yet) and any forEach keys the failure budget has quarantined.", "GET", "/schedules/{name}",
         path_params = &[req("name", "string", "Schedule name")], read_only = true),

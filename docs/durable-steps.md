@@ -387,6 +387,17 @@ a `devOnly` backend's outbox got no ingest events (jobs waited for the
 recovery sweep); and the VM SSP dropped the admin API's query string, so every
 admin list filter was ignored.
 
+**Manual check on a plain `spky dev`** (default ports, with no other dev stack
+running): in `example/sp00ky.yml` swap `surrealdb:` to
+`{ namespace: main, database: example }` and drop the `web`, `mailpit` and
+`worker` apps and the dart `clientTypes` entry (restore the file afterwards),
+build `ssp-server` (`cargo build -p ssp-server`), run `spky dev -y
+--apply-migrations` in `example/`, then create a thread and
+`CREATE job SET path = '/digest', payload = { id: '<thread id>', flaky: true }`
+as root. Within about 5 s `_00_wf_instance` shows the instance `complete` with
+four steps, the thread has `title_suggestion = '<title> (<n> words)'`, and
+`GET /admin/api/durable/instances` on the SSP (bearer `mysecret`) lists it.
+
 The plan the tests follow:
 
 - SDK unit tests over an in-memory store with the same CAS semantics: replay,

@@ -953,7 +953,8 @@ enum ProjectCommands {
     /// List cloud projects
     #[command(visible_alias = "ls")]
     List,
-    /// Print SurrealDB root credentials for the current project
+    /// Print SurrealDB credentials for the current project (root on a dedicated
+    /// database, a namespace-level login on the free plan's shared one)
     Credentials {
         /// Print only the password (no URL / username label) — handy for piping
         /// into other tools (e.g. `export SURREAL_PASS=$(spky project credentials --raw)`).

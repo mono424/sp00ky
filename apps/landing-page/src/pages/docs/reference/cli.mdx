@@ -131,7 +131,7 @@ instead of opening one they stop with the exact command or environment variable 
 | Command | What it does |
 | --- | --- |
 | `spky login`, `spky logout` | Authenticate with Sp00ky Cloud. |
-| `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. [Docs](/docs/cloud/getting-started) |
+| `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. On the free plan's shared database, `credentials` prints a namespace-level login (user `owner` in the namespace named after the slug): sign in at the namespace level, not as root. [Docs](/docs/cloud/getting-started) |
 | `spky deploy` | Build, upload, provision, migrate, deploy. With `sync.queryAllowlist` on, also publishes the committed allowlist JSON as `_00_query_allowlist:<app>__<version>` (the frontend's `package.json` version) and keeps the previous version's row; under `enforce`, a missing or stale JSON (`sourceHash` no longer matches the query module) fails the deploy, under `warn` it warns. [Docs](/docs/cloud/deploying) |
 | `spky push` (no subcommand) | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. With a subcommand it is the [Web Push](#web-push) tool. |
 | `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. Also publishes the app's allowlist JSON under the announced version, so a regenerated [query allowlist](/docs/guide/query-allowlist) goes live without a restart. |

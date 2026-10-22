@@ -4811,6 +4811,16 @@ pub fn resolve_cloud_surreal(config_path: &std::path::Path) -> Result<CloudSurre
         .into_json()
         .context("Failed to parse deployment response")?;
 
+    // A free project has no database of its own: `--cloud` signs in as root,
+    // which only exists on a dedicated deployment's DB.
+    if !data["surrealdb_access"].is_null() {
+        bail!(
+            "--cloud is not supported for free-plan projects yet: their data lives in a \
+             namespace of the shared database. Run `spky project credentials` for a \
+             namespace-level login."
+        );
+    }
+
     let url = data["urls"]["surrealdb"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -4902,10 +4912,38 @@ pub fn resolve_external_surreal(config_path: &std::path::Path) -> Result<Externa
 pub fn credentials(raw: bool) -> Result<()> {
     let creds = require_credentials()?;
     let mut client = CloudClient::new(&creds);
-    let (_, pid) = resolve_project_id(&mut client)?;
+    let slug = resolve_project_slug()?;
+    let project = fetch_project(&mut client, &slug)?
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' not found.", slug))?;
+    let pid = project_id(&project);
+    let free = project["platform"].as_str() == Some("cloudflare")
+        || project["plan"].as_str() == Some("free");
 
     let resp = client.get(&format!("/v1/projects/{}/deployment", pid))?;
     let data: serde_json::Value = resp.into_json().context("Failed to parse response")?;
+
+    // A free project has no database of its own. On the shared one it gets a
+    // namespace-level user (recorded at deploy as `surrealdb_access`); the
+    // project's root password alone signs in nowhere.
+    let access = &data["surrealdb_access"];
+    if free {
+        if access["external"].as_bool() == Some(true) {
+            bail!(
+                "Project '{}' uses its own SurrealDB ({}). Sign in with the credentials \
+                 from sp00ky.yml (`surrealdb.username` / `surrealdb.password`); Sp00ky \
+                 Cloud does not manage them.",
+                slug,
+                access["url"].as_str().unwrap_or("unknown URL")
+            );
+        }
+        if access["username"].as_str().is_none() {
+            bail!(
+                "Project '{}' has no database login yet. Free-plan projects get one on \
+                 their next `spky deploy`.",
+                slug
+            );
+        }
+    }
 
     let password = data["surrealdb_password"]
         .as_str()
@@ -4920,6 +4958,19 @@ pub fn credentials(raw: bool) -> Result<()> {
 
     if raw {
         println!("{}", password);
+        return Ok(());
+    }
+
+    if let Some(username) = access["username"].as_str() {
+        println!("  SurrealDB URL:      {}", access["url"].as_str().unwrap_or("(unknown)"));
+        println!("  Namespace:          {}", access["namespace"].as_str().unwrap_or(&slug));
+        println!("  Database:           {}", access["database"].as_str().unwrap_or("main"));
+        println!("  Username:           {}", username);
+        println!("  Password:           {}", password);
+        println!();
+        println!(
+            "  Sign in at the namespace level, not as root (Surrealist: Authentication > Namespace)."
+        );
         return Ok(());
     }
 

@@ -188,8 +188,8 @@ export default app;"> <svg class="copy-icon w-4 h-4" fill="none" viewBox="0 0 24
 routes alike. A Hono <code>app</code> works as it is, and so does any object with a <code>fetch(request, env)</code>
 method.</li>
 <li><strong>Env vars as strings.</strong> The backend’s <code>env</code> from <code>sp00ky.yml</code> (vault values included) arrives as
-plain strings on the handler’s <code>env</code> (in Hono, <code>c.env</code>). Read them from <code>env</code>, not from
-<code>process.env</code>.</li>
+plain strings on the handler’s <code>env</code> (in Hono, <code>c.env</code>). With <code>nodejs_compat</code> they are on
+<code>process.env</code> too, so code written for a VM backend runs unchanged.</li>
 <li><strong>The project’s database.</strong> Like a VM backend, it gets <code>SPKY_ENV=cloud</code>, <code>SPKY_DB_URL</code> (https),
 <code>SPKY_DB_WS</code> (wss), <code>SPKY_DB_NS</code> and <code>SPKY_DB_NAME</code>. On the shared free database it also gets
 <code>SPKY_DB_USER</code> and <code>SPKY_DB_PASS</code>, the project’s namespace owner, with <code>SPKY_DB_LEVEL=namespace</code>:

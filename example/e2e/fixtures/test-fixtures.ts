@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test';
+import type { Browser, BrowserContext, Page } from '@playwright/test';
 import { test as base, expect } from '@playwright/test';
 import { UPSTREAM, upstreamHeaders } from './target';
 
@@ -239,7 +239,48 @@ export async function typeIntoEditor(page: Page, selector: string, text: string)
   await page.keyboard.type(text);
 }
 
-export const test = base.extend<{ testUser: TestUser }>({
+/**
+ * Close a context's pages before the context itself. `context.close()` tears
+ * the pages down without `pagehide`, so the app never sent its leave beacon
+ * and every view a test opened stayed registered for its full 10-minute TTL.
+ * Mid-suite the SSP held 600+ views for a handful of open pages, and each
+ * edit to a published thread was written into all of them: publication fell
+ * behind and the later specs failed on it (canary.348/.349). `page.close()`
+ * does fire `pagehide`.
+ */
+async function closePagesFirst(context: BrowserContext) {
+  await Promise.all(context.pages().map((page) => page.close().catch(() => {})));
+}
+
+const releasing = new WeakSet<Browser>();
+
+export const test = base.extend<{ testUser: TestUser }, { releasingBrowser: Browser }>({
+  // The worker's browser, patched once so contexts a test makes itself
+  // (`browser.newContext()`) close their pages first too.
+  releasingBrowser: [
+    async ({ browser }, use) => {
+      if (!releasing.has(browser)) {
+        releasing.add(browser);
+        const newContext = browser.newContext.bind(browser);
+        browser.newContext = async (options) => {
+          const context = await newContext(options);
+          const close = context.close.bind(context);
+          context.close = async (closeOptions) => {
+            await closePagesFirst(context);
+            return close(closeOptions);
+          };
+          return context;
+        };
+      }
+      await use(browser);
+    },
+    { scope: 'worker', auto: true },
+  ],
+  // The built-in `page`'s context.
+  context: async ({ context }, use) => {
+    await use(context);
+    await closePagesFirst(context);
+  },
   // eslint-disable-next-line no-empty-pattern
   testUser: async ({}, use) => {
     await use(testUser);

@@ -991,6 +991,10 @@ impl SspNode {
                 "version": self.version,
                 "surrealdb_version": self.surrealdb_version,
                 "uptime_seconds": uptime_seconds,
+                // Wasm linear memory (the high-water mark a Durable Object's
+                // 128 MB counts), `null` off wasm. Public like the rest of
+                // `/info`, so memory growth shows without the admin secret.
+                "linear_memory_bytes": linear_memory_bytes(),
                 "last_heartbeat_seconds_ago": null,
                 "circuit_tables": circuit_tables,
                 "circuit_hashes": circuit_hashes,

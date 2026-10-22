@@ -412,6 +412,7 @@ Get entity information for this SSP (no authentication required).
     "ref_mode": "dedicated",
     "version": "0.0.1-canary.66",
     "uptime_seconds": 3204,
+    "linear_memory_bytes": 23527424,
     "circuit_tables": { "thread": 12, "user": 3 },
     "circuit_hashes": { "thread": "ab12…", "user": "cd34…" },
     "bootstrap_warnings": [],
@@ -437,6 +438,10 @@ whose SurrealQL did not compile, the decision `counters` since start
 `enforce`), and the last 20 misses in `last_refused`. The list is reloaded at
 every Ready transition, whenever a `_00_query_allowlist` row changes, and at
 most once per 5 s after a miss.
+
+`linear_memory_bytes` is the SSP's wasm linear memory on Cloudflare (`null`
+on a VM). It only grows, so it is the most the node ever held at once, and it
+is what counts against a Durable Object's 128 MB.
 
 `crdt` reports the [CRDT field](/docs/client/crdt) fold on this SSP:
 `pending_fields` and `pending_rows` waiting for a fold, folds `running` now,

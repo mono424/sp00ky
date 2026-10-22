@@ -11,6 +11,10 @@
 use crate::ports::TimerKind;
 use serde::{Deserialize, Serialize};
 
+/// How long past its time an armed alarm may stay unfired before
+/// [`TimerMux::alarm_to_arm`] sets it again.
+pub const ALARM_LOST_AFTER_MS: u64 = 30_000;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TimerMux {
     /// (kind, due_at_epoch_ms). Small (single digits of entries) — linear
@@ -76,6 +80,22 @@ impl TimerMux {
         due.into_iter().map(|(kind, _)| kind).collect()
     }
 
+    /// The deadline to set the platform alarm to, or `None` when the armed
+    /// alarm (`armed_at`) already covers the next deadline. A host calls it
+    /// after any timer call, even one that changed nothing: an alarm
+    /// invocation that dies between consuming the alarm and re-arming it
+    /// leaves timers pending and none armed, and `schedule_min` on a kind that
+    /// is already (over)due changes nothing. On Cloudflare that held the CRDT
+    /// fold tick for 45 s under e2e load (2026-10-22). An armed alarm more than
+    /// [`ALARM_LOST_AFTER_MS`] past its time is taken as lost too.
+    pub fn alarm_to_arm(&self, armed_at: Option<u64>, now_epoch_ms: u64) -> Option<u64> {
+        let next = self.next_deadline()?;
+        match armed_at {
+            Some(at) if at == next && now_epoch_ms <= at.saturating_add(ALARM_LOST_AFTER_MS) => None,
+            _ => Some(next),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -107,6 +127,24 @@ mod tests {
         assert!(mux.schedule_min(TimerKind::TtlCleanup, 500), "earlier: moved");
         assert_eq!(mux.next_deadline(), Some(500));
         assert!(!mux.schedule_min(TimerKind::TtlCleanup, 500), "same: unchanged");
+    }
+
+    #[test]
+    fn a_missing_or_lost_alarm_is_armed_again_even_when_nothing_changed() {
+        let mut mux = TimerMux::new();
+        assert_eq!(mux.alarm_to_arm(None, 0), None, "nothing pending, nothing to arm");
+        mux.schedule(TimerKind::CrdtFoldTick, 1_000);
+        mux.schedule(TimerKind::TtlCleanup, 5_000);
+        assert_eq!(mux.alarm_to_arm(None, 0), Some(1_000), "pending and none armed");
+        assert_eq!(mux.alarm_to_arm(Some(1_000), 900), None, "armed at the next deadline");
+        assert_eq!(mux.alarm_to_arm(Some(1_000), 1_000 + ALARM_LOST_AFTER_MS), None, "late, not yet lost");
+        assert_eq!(mux.alarm_to_arm(Some(1_000), 1_001 + ALARM_LOST_AFTER_MS), Some(1_000), "lost: armed again");
+        assert_eq!(mux.alarm_to_arm(Some(5_000), 0), Some(1_000), "armed for a later timer");
+
+        // The alarm consumed, the invocation gone before it re-armed: the fold
+        // tick is still pending and overdue, and ensuring it again changes nothing.
+        assert!(!mux.schedule_min(TimerKind::CrdtFoldTick, 3_000));
+        assert_eq!(mux.alarm_to_arm(None, 3_000), Some(1_000));
     }
 
     #[test]

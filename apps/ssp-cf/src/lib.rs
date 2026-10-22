@@ -62,6 +62,29 @@ const LEGACY_SNAPSHOT_KEYS: [&str; 2] = ["ssp:circuit_blob", "ssp:resume_point"]
 /// port and (indirectly) the `Db` port via `HttpSqlDb`.
 struct CfHttp;
 
+/// Outbound requests in flight on this object. Its requests share one I/O
+/// context, and at most six fetches at a time may wait for response headers
+/// (a SurrealDB answer has none until the query is done), so a few slow
+/// queries hold up every other one.
+static HTTP_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An outbound request slower than this is logged with what else was in flight.
+const SLOW_HTTP_MS: u64 = 5_000;
+
+/// The first words of the first statement after the bind `LET`s: enough to
+/// tell a fold commit from a TTL delete, never a bound value.
+fn statement_hint(body: Option<&serde_json::Value>) -> String {
+    let Some(query) = body.and_then(|b| b.get("params")).and_then(|p| p.get(0)).and_then(|q| q.as_str()) else {
+        return String::new();
+    };
+    query
+        .split(";\n")
+        .map(str::trim)
+        .find(|stmt| !stmt.is_empty() && !stmt.starts_with("LET $"))
+        .map(|stmt| stmt.chars().take(48).collect())
+        .unwrap_or_default()
+}
+
 #[async_trait(?Send)]
 impl HttpClient for CfHttp {
     async fn send(
@@ -127,7 +150,9 @@ impl HttpClient for CfHttp {
             }
         };
         let timeout = req.timeout;
-        tokio::select! {
+        let in_flight = HTTP_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let started = now_epoch_ms();
+        let result = tokio::select! {
             biased;
             _ = cancelled => {
                 controller.abort();
@@ -138,7 +163,22 @@ impl HttpClient for CfHttp {
                 controller.abort();
                 Err(HttpError::Timeout(timeout))
             }
+        };
+        HTTP_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let elapsed = now_epoch_ms().saturating_sub(started);
+        if elapsed >= SLOW_HTTP_MS {
+            let path = req.url.split('?').next().unwrap_or_default().rsplit('/').next().unwrap_or_default();
+            tracing::warn!(
+                elapsed_ms = elapsed,
+                in_flight_at_start = in_flight,
+                in_flight_now = HTTP_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed),
+                path,
+                statement = %statement_hint(req.json_body.as_ref()),
+                ok = result.is_ok(),
+                "slow outbound request"
+            );
         }
+        result
     }
 }
 
@@ -324,28 +364,28 @@ impl CfScheduler {
     }
 
     async fn rearm_alarm(&self) {
-        let next = self.mux.borrow().next_deadline();
-        match next {
-            None => {
-                if self.armed_at.get().is_some() {
-                    let _ = self.storage.delete_alarm().await;
-                    self.armed_at.set(None);
-                    meta_put(&self.storage, META_ARMED_AT, None);
-                    tracing::debug!("alarm deleted: no timer pending");
-                }
+        if self.mux.borrow().is_empty() {
+            if self.armed_at.get().is_some() {
+                let _ = self.storage.delete_alarm().await;
+                self.armed_at.set(None);
+                meta_put(&self.storage, META_ARMED_AT, None);
+                tracing::debug!("alarm deleted: no timer pending");
             }
-            Some(at) if self.armed_at.get() != Some(at) => {
-                let offset = (at as i64 - now_epoch_ms() as i64).max(0);
-                match self.storage.set_alarm(offset).await {
-                    Ok(()) => {
-                        self.armed_at.set(Some(at));
-                        meta_put(&self.storage, META_ARMED_AT, Some(&at.to_string()));
-                        tracing::debug!(in_ms = offset, "alarm set");
-                    }
-                    Err(e) => tracing::warn!(error = %e, "setting the alarm failed"),
-                }
+            return;
+        }
+        let now = now_epoch_ms();
+        let Some(at) = self.mux.borrow().alarm_to_arm(self.armed_at.get(), now) else { return };
+        if let Some(armed) = self.armed_at.get().filter(|armed| now > armed.saturating_add(ssp_node::timers::ALARM_LOST_AFTER_MS)) {
+            tracing::warn!(late_ms = now - armed, "the armed alarm never fired; arming it again");
+        }
+        let offset = (at as i64 - now as i64).max(0);
+        match self.storage.set_alarm(offset).await {
+            Ok(()) => {
+                self.armed_at.set(Some(at));
+                meta_put(&self.storage, META_ARMED_AT, Some(&at.to_string()));
+                tracing::debug!(in_ms = offset, "alarm set");
             }
-            Some(_) => {}
+            Err(e) => tracing::warn!(error = %e, "setting the alarm failed"),
         }
     }
 }
@@ -357,19 +397,21 @@ impl Scheduler for CfScheduler {
         self.persist_timers();
         self.rearm_alarm().await;
     }
+    // Both re-arm even when the table did not change: `alarm_to_arm` is
+    // what notices an alarm lost with an invocation that died mid-run.
     async fn cancel(&self, kind: &TimerKind) {
         let had = self.mux.borrow().len();
         self.mux.borrow_mut().cancel(kind);
         if self.mux.borrow().len() != had {
             self.persist_timers();
-            self.rearm_alarm().await;
         }
+        self.rearm_alarm().await;
     }
     async fn ensure(&self, kind: TimerKind, at_epoch_ms: u64) {
         if self.mux.borrow_mut().schedule_min(kind, at_epoch_ms) {
             self.persist_timers();
-            self.rearm_alarm().await;
         }
+        self.rearm_alarm().await;
     }
     async fn sleep(&self, dur: Duration) {
         Delay::from(dur).await;

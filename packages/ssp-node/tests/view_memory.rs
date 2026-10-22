@@ -241,6 +241,7 @@ async fn node() -> (Arc<SspNode>, Arc<Surreal<MemEngine>>) {
         checkpoint_interval_secs: None,
         max_snapshot_age_secs: 3600,
         last_heartbeat_seen: Arc::new(std::sync::Mutex::new(None)),
+        admin: Default::default(),
     };
     node.apply_circuit_policy().await;
     let node = Arc::new(node);

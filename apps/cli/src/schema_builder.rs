@@ -16,6 +16,12 @@ pub struct SchemaBuilderConfig {
     pub include_functions: bool,
 }
 
+/// The remote functions that need neither the SSP's endpoint nor its secret:
+/// `fn::query::heartbeat`, `fn::query::unsubscribe` and `fn::query::leave`,
+/// pure database writes on `_00_query`. A free (Cloudflare) project's push
+/// carries them too, since they hold no credentials.
+pub const COMMON_REMOTE_FUNCTIONS: &str = include_str!("functions_remote.surql");
+
 /// Build ONLY the remote functions SQL (heartbeat + mode-specific functions
 /// with endpoint/secret substitution).  Used by `dev.rs` to apply functions
 /// separately with Docker-internal URLs.
@@ -41,7 +47,7 @@ pub fn build_remote_functions_schema(
     ));
 
     // Common remote functions (heartbeat)
-    content.push_str(include_str!("functions_remote.surql"));
+    content.push_str(COMMON_REMOTE_FUNCTIONS);
 
     // Mode-specific functions
     let functions_remote_singlenode = include_str!("functions_remote_singlenode.surql");
@@ -1180,11 +1186,20 @@ DEFINE FIELD meta.secret ON TABLE user
             secret: None,
             include_functions: false,
         };
-        // Mirror `push_schema_inner`: server schema + appended ingest events.
+        // Mirror `push_schema_inner`: server schema + appended ingest events
+        // + the common remote functions.
         let mut sql = build_server_schema(&config).unwrap();
         sql.push('\n');
         sql.push_str(&build_server_events(&config).unwrap());
+        sql.push('\n');
+        sql.push_str(COMMON_REMOTE_FUNCTIONS);
         std::fs::remove_file(&path).ok();
+
+        // The pagehide release calls `fn::query::leave`; missing on a free
+        // project, every closed page's views lived out their TTL.
+        for f in ["fn::query::heartbeat", "fn::query::unsubscribe", "fn::query::leave"] {
+            assert!(sql.contains(&format!("DEFINE FUNCTION OVERWRITE {f}(")), "free-plan push lacks {f}");
+        }
 
         assert!(
             sql.contains("DEFINE EVENT OVERWRITE _00_thread_mutation")
@@ -1201,6 +1216,15 @@ DEFINE FIELD meta.secret ON TABLE user
             .find("DEFINE EVENT OVERWRITE _00_push_message_ingest ON TABLE _00_push_message")
             .expect("direct-push ingest event in the free-plan schema");
         assert!(table < event);
+    }
+
+    // A free project's push must not carry the SSP's endpoint or secret: the
+    // control plane keeps them server-side.
+    #[test]
+    fn the_common_remote_functions_hold_no_ssp_credentials() {
+        for needle in ["{{", "$sp00ky_secret", "$sp00ky_endpoint", "http::"] {
+            assert!(!COMMON_REMOTE_FUNCTIONS.contains(needle), "common remote functions use {needle}");
+        }
     }
 
     // `fn::query::register` posts to the SSP while the client waits on it.

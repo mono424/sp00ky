@@ -1240,8 +1240,8 @@ export const DevToolsProvider: ParentComponent = (props) => {
    * Dispatch an Access-tab op into the page and await the correlated response.
    *
    * 30s, not the 15s storage budget or the 10s query one: a flag write calls
-   * `fn::feature::materialize`, which re-evaluates the flag for EVERY user and
-   * upserts a row each, and an impersonation start switches the page's whole
+   * `fn::feature::materialize` (the enable toggle), which re-evaluates the flag
+   * for EVERY user and writes the rows that changed, and an impersonation start switches the page's whole
    * local store. Both are long single operations.
    */
   const pageOpRequest = (

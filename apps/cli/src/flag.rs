@@ -19,6 +19,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::surreal_client::{MigrationDB, SurrealClient, SurrealResponse};
@@ -704,6 +705,19 @@ fn materialize(client: &SurrealClient, key: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Every write to `_00_user_feature` that changes the row posts to the SSP
+    // inside the transaction (0.5-1 s each on Cloudflare), so only the users
+    // whose assignment actually moves are written.
+    let existing = existing_assignments(rows(
+        client
+            .execute(&format!(
+                "SELECT <string>user AS user, variant, payload FROM _00_user_feature WHERE key = '{}';",
+                esc(key)
+            ))
+            .context("Failed to load current user feature assignments")?,
+    ));
+
+    let total = users.len();
     let mut statements: Vec<String> = Vec::with_capacity(users.len());
     for user in users {
         let user_id = match user.as_str() {
@@ -711,21 +725,31 @@ fn materialize(client: &SurrealClient, key: &str) -> Result<()> {
             None => continue,
         };
         let (variant, payload) = evaluate_one(&flag, &user_id);
+        let payload = payload.filter(|p| !p.is_null());
+        if existing.get(&user_id) == Some(&(variant.clone(), payload.clone())) {
+            continue;
+        }
         let payload_sql = payload
             .map(|p| serde_json::to_string(&p).unwrap_or_else(|_| "NONE".to_string()))
             .unwrap_or_else(|| "NONE".to_string());
+        // `evaluated_at` first, reading the stored row: an id the map above
+        // spelled differently still rewrites an unchanged row byte for byte,
+        // so it does not post. Same SET as `fn::feature::assign`.
         statements.push(format!(
-            "UPSERT _00_user_feature SET user = {}, key = '{}', variant = '{}', payload = {} WHERE user = {} AND key = '{}';",
-            user_id,
-            esc(key),
-            esc(&variant),
-            payload_sql,
-            user_id,
-            esc(key),
+            "UPSERT _00_user_feature SET evaluated_at = IF variant = '{v}' AND payload = {p} AND evaluated_at != NONE {{ evaluated_at }} ELSE {{ time::now() }}, \
+             user = {u}, key = '{k}', variant = '{v}', payload = {p} WHERE user = {u} AND key = '{k}';",
+            u = user_id,
+            k = esc(key),
+            v = esc(&variant),
+            p = payload_sql,
         ));
     }
 
     if statements.is_empty() {
+        println!(
+            "{}No assignment changed{} for flag '{}' ({} user(s)).",
+            DIM, RESET, key, total
+        );
         return Ok(());
     }
 
@@ -735,13 +759,28 @@ fn materialize(client: &SurrealClient, key: &str) -> Result<()> {
         .context("Failed to materialize user feature assignments")?;
 
     println!(
-        "{}Materialized{} {} assignment(s) for flag '{}'.",
+        "{}Materialized{} {} changed assignment(s) of {} for flag '{}'.",
         DIM,
         RESET,
         statements.len(),
+        total,
         key
     );
     Ok(())
+}
+
+/// `user -> (variant, payload)` for a flag's stored assignments, from
+/// `SELECT <string>user AS user, variant, payload`. A null or missing payload
+/// is `None`, as `evaluate_one` reports a variant without one.
+fn existing_assignments(rows: Vec<Value>) -> HashMap<String, (String, Option<Value>)> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let user = row.get("user")?.as_str()?.to_string();
+            let variant = row.get("variant")?.as_str()?.to_string();
+            let payload = row.get("payload").filter(|p| !p.is_null()).cloned();
+            Some((user, (variant, payload)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -914,5 +953,41 @@ mod tests {
         let (ids, skipped) = extract_user_ids(rows);
         assert_eq!(ids, vec!["user:a"]);
         assert_eq!(skipped, 1, "only the post:1 id counts as a skipped record");
+    }
+
+    // ---- existing_assignments -------------------------------------------
+
+    #[test]
+    fn existing_assignments_match_what_evaluate_one_returns() {
+        // `materialize` skips a user when their stored row equals the
+        // evaluator's answer, so the two shapes must compare equal: a missing
+        // or null payload is `None` on both sides.
+        let flag = json!({
+            "key": "pl",
+            "default_variant": "off",
+            "payloads": { "treatment": { "copy": "Hello" } },
+            "rules": [{ "kind": "allowlist", "variant": "treatment", "users": ["user:abc"], "priority": 10 }]
+        });
+        let stored = existing_assignments(vec![
+            json!({ "user": "user:abc", "variant": "treatment", "payload": { "copy": "Hello" } }),
+            json!({ "user": "user:xyz", "variant": "off" }),
+            json!({ "user": "user:nul", "variant": "off", "payload": null }),
+            json!({ "variant": "off" }),
+        ]);
+        assert_eq!(stored.len(), 3, "a row without a user is ignored");
+        for user in ["user:abc", "user:xyz", "user:nul"] {
+            assert_eq!(
+                stored.get(user),
+                Some(&evaluate_one(&flag, user)),
+                "{user}'s unchanged row must read as unchanged"
+            );
+        }
+
+        let moved = json!({ "key": "pl", "default_variant": "off", "rules": [] });
+        assert_ne!(
+            stored.get("user:abc"),
+            Some(&evaluate_one(&moved, "user:abc")),
+            "a changed variant must be written"
+        );
     }
 }

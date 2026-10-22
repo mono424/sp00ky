@@ -417,7 +417,14 @@ DEFINE FIELD OVERWRITE user ON TABLE _00_user_feature TYPE record;
 DEFINE FIELD OVERWRITE key ON TABLE _00_user_feature TYPE string;
 DEFINE FIELD OVERWRITE variant ON TABLE _00_user_feature TYPE string;
 DEFINE FIELD OVERWRITE payload ON TABLE _00_user_feature TYPE option<object> FLEXIBLE;
-DEFINE FIELD OVERWRITE evaluated_at ON TABLE _00_user_feature TYPE datetime VALUE time::now();
+-- When the assignment last CHANGED. A DEFAULT, not `VALUE time::now()`, and
+-- writers bump it only when the variant or payload moves (see
+-- fn::feature::assign). Every write to this table fires the ingest event in
+-- sp00ky.rs, which posts to the SSP inside the transaction (0.5-1 s on
+-- Cloudflare) unless the row is unchanged (`WHEN $before != $after`). A
+-- `VALUE time::now()` made every re-evaluation a change, so materializing a
+-- flag posted once per user even when no assignment moved.
+DEFINE FIELD OVERWRITE evaluated_at ON TABLE _00_user_feature TYPE datetime DEFAULT time::now();
 DEFINE INDEX OVERWRITE idx_user_feature_user_key ON TABLE _00_user_feature COLUMNS user, key UNIQUE;
 
 -- Stable hash for percentage rollouts. Combines flag key and user id
@@ -469,12 +476,83 @@ DEFINE FUNCTION OVERWRITE fn::feature::hash($key: string, $user_id: string) -> i
 -- are unaffected by the clauses.
 -- ==================================================
 
--- Re-evaluate ONE flag for EVERY user and refresh `_00_user_feature`.
+-- A flag's targeting rules, normalised once so a sweep over every user does
+-- not redo it per user. `enabled = false` => no rules, so everyone gets
+-- default_variant.
+--   rank:  priority ascending, original position as tiebreak, because
+--           Rust sorts with the stable `sort_by_key`. 100 is the
+--           missing-priority default; the CLI writes 10 (allowlist)
+--           and 50 (rollout).
+--   users: `rules[].users` holds STRINGS on disk (`flag.rs` pushes
+--           Value::String and interpolates the JSON verbatim), so a
+--           record-vs-array compare would never match. Cast both
+--           sides to string and a hand-written record element works
+--           too.
+DEFINE FUNCTION OVERWRITE fn::feature::rules($flag: object) -> array {
+    LET $rules = IF ($flag.enabled ?? true) { $flag.rules ?? [] } ELSE { [] };
+    RETURN array::map($rules, |$r, $i| {
+        RETURN {
+            rank: (<int>($r.priority ?? 100)) * 100000 + $i,
+            kind: $r.kind,
+            variant: $r.variant,
+            percent: <int>($r.percent ?? 0),
+            users: array::map($r.users ?? [], |$x| <string>$x)
+        };
+    });
+}
+PERMISSIONS WHERE $auth.id != NONE
+    AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
+
+-- Evaluate `$flag` for ONE user and write their `_00_user_feature` row.
 -- Faithful port of the Rust evaluator (`apps/cli/src/flag.rs::evaluate_one`
 -- and `apps/scheduler/src/feature_flags.rs::evaluate_one`); the golden
 -- vectors pinned in both Rust test suites are asserted against this
 -- implementation too, so drift fails a test rather than silently
 -- assigning different variants depending on who flipped the flag.
+-- `$ranked` is `fn::feature::rules($flag)`.
+--
+-- An unchanged assignment is rewritten byte for byte: `evaluated_at` comes
+-- FIRST in the SET and reads the stored row (a SET expression sees the
+-- fields as they are before the assignments that follow it), so it keeps
+-- its old stamp unless the variant or payload moves. The row then compares
+-- equal, the ingest event's `WHEN $before != $after` skips it, and nothing
+-- is posted to the SSP. That is what keeps a sweep over every user cheap:
+-- it only pays the SSP round trip for the users whose assignment changed.
+DEFINE FUNCTION OVERWRITE fn::feature::assign($flag: object, $ranked: array, $user: record) -> string {
+    LET $key = $flag.key;
+    LET $uid = <string>$user;
+
+    LET $matched = array::filter($ranked, |$c| {
+        RETURN IF $c.variant = NONE { false }
+            ELSE IF $c.kind = 'allowlist' { $uid IN $c.users }
+            ELSE IF $c.kind = 'rollout' {
+                $c.percent > 0 AND fn::feature::hash($key, $uid) < $c.percent
+            }
+            ELSE { false };
+    });
+
+    -- First match wins = lowest rank. Avoids `SELECT … ORDER BY` over an
+    -- array, which SurrealDB 3 rejects when the ORDER BY field isn't in
+    -- the projection.
+    LET $best    = array::min(array::map($matched, |$c| $c.rank));
+    LET $win     = array::first(array::filter($matched, |$c| $c.rank = $best));
+    LET $variant = IF $win = NONE { $flag.default_variant ?? 'off' } ELSE { $win.variant };
+    LET $payload = ($flag.payloads ?? {})[$variant];
+
+    UPSERT _00_user_feature
+        SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
+                { evaluated_at } ELSE { time::now() },
+            user = $user, key = $key, variant = $variant, payload = $payload
+        WHERE user = $user AND key = $key;
+    RETURN $variant;
+}
+PERMISSIONS WHERE $auth.id != NONE
+    AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
+
+-- Re-evaluate ONE flag for EVERY user and refresh `_00_user_feature`. Only
+-- the users whose assignment changed are written for real (and posted to
+-- the SSP), see fn::feature::assign. For a change that can only move one
+-- user, fn::feature::allow / disallow re-evaluate just that user instead.
 DEFINE FUNCTION OVERWRITE fn::feature::materialize($key: string) -> object {
     LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
 
@@ -485,69 +563,25 @@ DEFINE FUNCTION OVERWRITE fn::feature::materialize($key: string) -> object {
         RETURN { key: $key, found: false, users: 0 };
     };
 
-    LET $default  = $flag.default_variant ?? 'off';
-    LET $payloads = $flag.payloads ?? {};
-    -- `enabled = false` => everyone gets default_variant, rules ignored.
-    LET $rules    = IF ($flag.enabled ?? true) { $flag.rules ?? [] } ELSE { [] };
-
-    -- Normalise the rules ONCE (they don't depend on the user).
-    --   rank  — priority ascending, original position as tiebreak, because
-    --           Rust sorts with the stable `sort_by_key`. 100 is the
-    --           missing-priority default; the CLI writes 10 (allowlist)
-    --           and 50 (rollout).
-    --   users — `rules[].users` holds STRINGS on disk (`flag.rs` pushes
-    --           Value::String and interpolates the JSON verbatim), so a
-    --           record-vs-array compare would never match. Cast both
-    --           sides to string and a hand-written record element works
-    --           too.
-    LET $ranked = array::map($rules, |$r, $i| {
-        RETURN {
-            rank: (<int>($r.priority ?? 100)) * 100000 + $i,
-            kind: $r.kind,
-            variant: $r.variant,
-            percent: <int>($r.percent ?? 0),
-            users: array::map($r.users ?? [], |$x| <string>$x)
-        };
-    });
-
+    LET $ranked = fn::feature::rules($flag);
     LET $users = (SELECT VALUE id FROM user);
 
     -- The SELECT above runs under the CALLER's permissions (fact 2). Every
     -- shipped schema template uses `FOR create, select WHERE true` on
     -- `user`, but an app that scopes user selects to `id = $auth.id` would
-    -- return just the admin — materializing one row and leaving everyone
+    -- return just the admin, materializing one row and leaving everyone
     -- else on the old variant, with no error. The scheduler stamps the
     -- root-enumerated count each sweep precisely so we can catch that.
     LET $expected = _00_module_state:feature_user_count.count ?? 0;
     IF array::len($users) < $expected {
         THROW "fn::feature::materialize can only see " + <string>array::len($users) + " of "
             + <string>$expected + " users, so it would leave most of them on a stale variant. "
-            + "The `user` table's SELECT permission is hiding rows from this admin — widen it, "
+            + "The `user` table's SELECT permission is hiding rows from this admin: widen it, "
             + "or change the flag with `spky flag` instead.";
     };
 
     FOR $u IN $users {
-        LET $uid = <string>$u;
-
-        LET $matched = array::filter($ranked, |$c| {
-            RETURN IF $c.variant = NONE { false }
-                ELSE IF $c.kind = 'allowlist' { $uid IN $c.users }
-                ELSE IF $c.kind = 'rollout' {
-                    $c.percent > 0 AND fn::feature::hash($key, $uid) < $c.percent
-                }
-                ELSE { false };
-        });
-
-        -- First match wins = lowest rank. Avoids `SELECT … ORDER BY` over an
-        -- array, which SurrealDB 3 rejects when the ORDER BY field isn't in
-        -- the projection.
-        LET $best    = array::min(array::map($matched, |$c| $c.rank));
-        LET $win     = array::first(array::filter($matched, |$c| $c.rank = $best));
-        LET $variant = IF $win = NONE { $default } ELSE { $win.variant };
-
-        UPSERT _00_user_feature
-            SET user = $u, key = $key, variant = $variant, payload = $payloads[$variant]
-            WHERE user = $u AND key = $key;
+        fn::feature::assign($flag, $ranked, $u);
     };
 
     RETURN { key: $key, found: true, users: array::len($users) };
@@ -555,7 +589,31 @@ DEFINE FUNCTION OVERWRITE fn::feature::materialize($key: string) -> object {
 PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
 
--- Add `$user` to `$key`'s allowlist for `$variant`, then re-materialize.
+-- Re-evaluate `$key` for the one user an allowlist edit touched. An edit to
+-- `$user`'s allowlist membership cannot change anyone else's variant
+-- (allowlist rules match by user, rollouts do not depend on the allowlist),
+-- so re-evaluating every user, as these functions once did, wrote and posted
+-- one row per user for nothing: on a project with 637 users one
+-- fn::feature::allow took over 30 s on Cloudflare. Users who have no row yet
+-- (signed up since the flag was last materialized) are not this edit's
+-- business; the scheduler sweep fills them in.
+--
+-- Only `user` records get a row, matching the `SELECT VALUE id FROM user` the
+-- full sweep enumerates. Existence is not checked: `record::exists` runs
+-- under the caller's select permission, so an app that hides users from an
+-- admin would silently skip the very user they asked for.
+DEFINE FUNCTION OVERWRITE fn::feature::reassign($key: string, $user: record) -> object {
+    LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+    IF $flag = NONE OR record::tb($user) != 'user' {
+        RETURN { key: $key, found: $flag != NONE, users: 0 };
+    };
+    fn::feature::assign($flag, fn::feature::rules($flag), $user);
+    RETURN { key: $key, found: true, users: 1 };
+}
+PERMISSIONS WHERE $auth.id != NONE
+    AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
+
+-- Add `$user` to `$key`'s allowlist for `$variant`, then re-evaluate them.
 -- Rule shape and priority (10) must stay identical to
 -- `apps/cli/src/flag.rs::upsert_allowlist` / PRIORITY_ALLOWLIST. The rule
 -- object is rebuilt field-by-field rather than merged, because an
@@ -563,7 +621,7 @@ PERMISSIONS WHERE $auth.id != NONE
 --
 -- This is a read-modify-write over the whole `rules` array (the same shape
 -- `spky flag set` uses). Two admins acting on one flag at the same moment
--- therefore collide — but SurrealDB fails the loser with "Transaction
+-- therefore collide, but SurrealDB fails the loser with "Transaction
 -- conflict ... can be retried" instead of dropping the write, so no entry is
 -- silently lost. The DevTools bridge retries on that error
 -- (`FlagsAdminService.mutate`); a caller using these functions directly
@@ -597,12 +655,12 @@ DEFINE FUNCTION OVERWRITE fn::feature::allow($key: string, $variant: string, $us
     };
 
     UPDATE _00_feature_flag SET rules = $next WHERE key = $key;
-    RETURN fn::feature::materialize($key);
+    RETURN fn::feature::reassign($key, $user);
 }
 PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
 
--- Remove `$user` from every allowlist rule on `$key`, then re-materialize.
+-- Remove `$user` from every allowlist rule on `$key`, then re-evaluate them.
 -- Mirrors `spky flag unset --for-user`: the rule is kept (possibly with an
 -- empty `users`), only the membership goes.
 DEFINE FUNCTION OVERWRITE fn::feature::disallow($key: string, $user: record) -> object {
@@ -622,7 +680,7 @@ DEFINE FUNCTION OVERWRITE fn::feature::disallow($key: string, $user: record) -> 
     });
 
     UPDATE _00_feature_flag SET rules = $next WHERE key = $key;
-    RETURN fn::feature::materialize($key);
+    RETURN fn::feature::reassign($key, $user);
 }
 PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;

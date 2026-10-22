@@ -84,7 +84,7 @@ Two server tables back the whole system:
 | `_00_user_feature` | each user, their own rows only | nobody but root |
 
 1. You write a flag **definition** (variants, default, targeting rules) into `_00_feature_flag` with the `spky flag` CLI.
-2. On every write the CLI runs the evaluator inline and **materializes one row per existing user** into `_00_user_feature` with their resolved variant.
+2. On every write the CLI runs the evaluator inline and **materializes one row per existing user** into `_00_user_feature` with their resolved variant. Only the rows whose variant or payload changed are written, so only those users' clients are notified; re-running an unchanged flag costs nothing on the sync path. Allowlisting or removing one user from the DevTools Access tab re-evaluates just that user.
 3. The scheduler runs a periodic sweep that fills in assignments for **users who signed up since the last write**, so new accounts get their flags within seconds.
 4. The client subscribes to its own `_00_user_feature` row. When the materialized variant changes, the new value rides the existing websocket straight into your reactive UI.
 

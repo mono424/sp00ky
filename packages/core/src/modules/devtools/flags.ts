@@ -242,7 +242,7 @@ export class FlagsAdminService {
 
   /**
    * Add or remove a user from `$key`'s allowlist for `$variant`, then
-   * re-materialize. Defaults to the signed-in user, so the common case
+   * re-evaluate that one user (nobody else's variant can change). Defaults to the signed-in user, so the common case
    * ("turn this on for me, for real") needs no user picker.
    */
   async setFlagUserVariant(

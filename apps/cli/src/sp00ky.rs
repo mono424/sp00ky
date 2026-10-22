@@ -710,6 +710,16 @@ DEFINE FIELD body ON TABLE doc TYPE string;
                 out.contains("http::post($sp00ky_endpoint + '/ingest'"),
                 "feature-flag changes must notify the SSP ingest endpoint"
             );
+            // Materializing a flag rewrites every user's row; only the ones
+            // whose assignment moved may post. `fn::feature::assign` keeps an
+            // unchanged row byte-identical so this guard skips it, and
+            // `feature_materialize_e2e` counts writes with the same WHEN.
+            assert!(
+                out.contains(
+                    "ON TABLE _00_user_feature\nWHEN $before != $after AND $event != \"DELETE\"\n"
+                ),
+                "an unchanged _00_user_feature write must not post to the SSP"
+            );
         }
     }
 

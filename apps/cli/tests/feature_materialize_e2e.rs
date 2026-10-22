@@ -23,8 +23,11 @@
 //! Marked `#[ignore]` so the default `cargo test` stays fast and CI-safe:
 //!
 //! ```sh
-//! cargo test -p sp00ky-cli --test feature_materialize_e2e -- --ignored
+//! cargo test -p sp00ky-cli --test feature_materialize_e2e -- --ignored --test-threads=1
 //! ```
+//!
+//! (One container name and port for every test, so they cannot run in
+//! parallel.)
 //!
 //! Skips (rather than fails) when Docker is unavailable, mirroring
 //! `flag_sql_e2e.rs`.
@@ -217,6 +220,41 @@ fn seed_schema() {
         all_ok(&body),
         "failed to apply the feature-flag internal schema: {body}"
     );
+
+    // Stand-in for the ingest event `sp00ky.rs` puts on `_00_user_feature`:
+    // the same WHEN, but it records the write instead of posting it to the
+    // SSP. Each `_write` row is one SSP round trip in production.
+    let body = sql(
+        "DEFINE TABLE _write SCHEMALESS PERMISSIONS FULL;
+         DEFINE EVENT count_writes ON TABLE _00_user_feature
+         WHEN $before != $after AND $event != \"DELETE\"
+         THEN { CREATE _write SET user = <string>$after.user, key = $after.key, variant = $after.variant };",
+    );
+    assert!(all_ok(&body), "failed to define the write counter: {body}");
+}
+
+/// Writes that would have posted to the SSP for `key`, per user.
+fn posted(key: &str) -> String {
+    sql(&format!(
+        "SELECT VALUE user FROM _write WHERE key = '{key}' ORDER BY user;"
+    ))
+}
+
+/// A response body without its per-statement timing, so two reads compare.
+fn result_of(body: &str) -> String {
+    body.split("\"time\"").next().unwrap_or_default().to_string()
+}
+
+/// Number of writes that would have posted to the SSP for `key`.
+fn posted_count(key: &str) -> usize {
+    let body = sql(&format!(
+        "RETURN count(SELECT VALUE id FROM _write WHERE key = '{key}');"
+    ));
+    body.split("\"result\":")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).find(|t| !t.is_empty()))
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no count in {body}"))
 }
 
 #[test]
@@ -412,6 +450,21 @@ fn only_admins_can_read_or_change_flags() {
         "a non-admin must not be able to call fn::feature::allow"
     );
 
+    // `assign` takes the flag as an argument, so an open one would let anyone
+    // write any assignment for themselves from a forged definition.
+    assert!(
+        sql_as(
+            &user_token,
+            "RETURN fn::feature::assign({ key: 'beta', default_variant: 'HACKED' }, [], $auth.id);"
+        )
+        .contains("permission"),
+        "a non-admin must not be able to call fn::feature::assign"
+    );
+    assert!(
+        sql_as(&user_token, "RETURN fn::feature::reassign('beta', $auth.id);").contains("permission"),
+        "a non-admin must not be able to call fn::feature::reassign"
+    );
+
     // A denied write is a silent no-op in SurrealDB, so assert the DATA, not
     // the response: this is the check that stops self-enabling a flag.
     sql_as(
@@ -460,5 +513,119 @@ fn only_admins_can_read_or_change_flags() {
     assert!(
         roster_count.contains("\"count\":1"),
         "an admin was able to write _00_admin: {roster_count}"
+    );
+}
+
+#[test]
+#[ignore = "requires Docker; run with: cargo test -p sp00ky-cli --test feature_materialize_e2e -- --ignored"]
+fn only_changed_assignments_are_written() {
+    if !docker_available() {
+        eprintln!("skipping feature_materialize_e2e: Docker is not available");
+        return;
+    }
+    let _guard = start_surrealdb();
+    seed_schema();
+
+    sql("CREATE user:abc SET username = 'abc', password = 'x';
+         CREATE user:xyz SET username = 'xyz', password = 'x';
+         CREATE user:alice SET username = 'alice', password = 'x';
+         CREATE _00_feature_flag SET key = 'w', enabled = true, default_variant = 'off',
+           variants = ['off','on'],
+           rules = [{ kind: 'allowlist', variant: 'on', users: ['user:abc'], priority: 10 }],
+           payloads = { on: { copy: 'Hello' } };");
+
+    // ---- first materialize creates one row per user --------------------
+    sql("RETURN fn::feature::materialize('w');");
+    assert_eq!(posted_count("w"), 3, "one create per user: {}", posted("w"));
+    let stamps = result_of(&sql("SELECT user, evaluated_at FROM _00_user_feature WHERE key = 'w' ORDER BY user;"));
+
+    // ---- a re-materialize with nothing changed writes nothing ----------
+    sql("RETURN fn::feature::materialize('w');");
+    assert_eq!(
+        posted_count("w"),
+        3,
+        "an unchanged assignment must not post to the SSP: {}",
+        posted("w")
+    );
+    assert_eq!(
+        result_of(&sql("SELECT user, evaluated_at FROM _00_user_feature WHERE key = 'w' ORDER BY user;")),
+        stamps,
+        "evaluated_at must stay put while the assignment does"
+    );
+
+    // ---- allow / disallow write the one user they touch ----------------
+    let allowed = sql("RETURN fn::feature::allow('w', 'on', user:xyz);");
+    assert!(allowed.contains("\"users\":1"), "allow re-evaluates one user: {allowed}");
+    assert_eq!(posted_count("w"), 4, "allow must write only user:xyz: {}", posted("w"));
+    assert!(
+        sql("SELECT variant, payload FROM _00_user_feature WHERE key = 'w' AND user = user:xyz;")
+            .contains("Hello"),
+        "allow must assign the variant and its payload"
+    );
+    sql("RETURN fn::feature::disallow('w', user:xyz);");
+    assert_eq!(posted_count("w"), 5, "disallow must write only user:xyz: {}", posted("w"));
+    assert!(
+        sql("SELECT VALUE variant FROM _00_user_feature WHERE key = 'w' AND user = user:xyz;")
+            .contains("\"off\""),
+        "disallow must fall back to the default"
+    );
+    let abc_stamp = sql("SELECT VALUE evaluated_at FROM _00_user_feature WHERE key = 'w' AND user = user:abc;");
+
+    // ---- a definition change posts only for the users it moves ---------
+    // A 100% rollout under the allowlist moves everyone not already 'on'.
+    sql("UPDATE _00_feature_flag SET rules += { kind: 'rollout', variant: 'on', percent: 100, priority: 50 } WHERE key = 'w';
+         RETURN fn::feature::materialize('w');");
+    assert_eq!(
+        posted_count("w"),
+        7,
+        "only xyz and alice moved to 'on'; abc was already there: {}",
+        posted("w")
+    );
+    assert_eq!(
+        result_of(&sql("SELECT VALUE evaluated_at FROM _00_user_feature WHERE key = 'w' AND user = user:abc;")),
+        result_of(&abc_stamp),
+        "abc's assignment did not change, so its stamp must not either"
+    );
+
+    // ---- allow on a never-materialized flag writes one row -------------
+    // The e2e spec's shape: a flag created by hand, so nobody has a row yet.
+    // Filling the others in is the scheduler sweep's job, not this edit's.
+    sql("CREATE _00_feature_flag SET key = 'fresh', enabled = true, default_variant = 'off',
+           variants = ['off','on'], rules = [];
+         RETURN fn::feature::allow('fresh', 'on', user:alice);");
+    assert_eq!(posted_count("fresh"), 1, "allow on a fresh flag: {}", posted("fresh"));
+    assert!(
+        sql("SELECT VALUE variant FROM _00_user_feature WHERE key = 'fresh' AND user = user:alice;")
+            .contains("\"on\""),
+        "the allowlisted user must be on"
+    );
+
+    // ---- only user records get a row ------------------------------------
+    sql("RETURN fn::feature::allow('fresh', 'on', post:1);");
+    assert_eq!(posted_count("fresh"), 1, "a non-user record must not get a row");
+
+    // ---- the same holds for an admin calling from the browser ----------
+    // The SET reads the stored row under the admin's permissions, which
+    // cannot SELECT other users' assignments. The no-op must still hold.
+    let admin_token = signup("adm");
+    sql("LET $a = (SELECT VALUE id FROM ONLY user WHERE username = 'adm' LIMIT 1);
+         UPSERT _00_admin SET user = $a WHERE user = $a;
+         RETURN fn::feature::materialize('w');");
+    let before = posted_count("w");
+    let again = sql_as(&admin_token, "RETURN fn::feature::materialize('w');");
+    assert!(all_ok(&again), "an admin must be able to re-materialize: {again}");
+    assert_eq!(
+        posted_count("w"),
+        before,
+        "an admin's no-op re-materialize must not post: {}",
+        posted("w")
+    );
+    let allowed = sql_as(&admin_token, "RETURN fn::feature::disallow('w', user:abc);");
+    assert!(all_ok(&allowed), "an admin must be able to disallow: {allowed}");
+    assert_eq!(
+        posted_count("w"),
+        before,
+        "abc stays 'on' through the 100% rollout, so nothing moves: {}",
+        posted("w")
     );
 }

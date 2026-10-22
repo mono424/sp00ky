@@ -121,12 +121,19 @@ puts each part of it here:
 | Web app | Static assets on Workers, built from `deploy.static`. No Docker image. |
 | SSP | A Durable Object in the project's SSP Worker. It also runs your outbox jobs; there is no separate scheduler. |
 | [Worker backends](/docs/backend/workers) | Dynamic Workers inside the SSP Worker. `spky deploy` bundles each `worker.entry` with esbuild and uploads it with the SSP Worker. Their `expose` paths are served on `https://<slug>.<domain>`. |
-| Schema | Pushed to the SSP after the deploy. `spky push` retries it. |
+| Schema | Pushed to the SSP after the deploy, with your schedules, workflows and job policies. `spky push` retries it. |
 
 Docker backends do not run on a Cloudflare project. Make the backend a
 [Worker backend](/docs/backend/workers), or host it yourself (`hosting: external`) at a public
 `baseUrl` the SSP Worker can reach. `--only` works as on a VM: `spky deploy --only api` bundles and
 ships just that Worker backend, and the others keep their last version.
+
+A Cloudflare project has no migrations: every deploy pushes the whole schema as the desired state.
+Tables, fields, events, functions, params, analyzers and buckets are replaced with what your files
+say. Two kinds keep their first definition: `DEFINE ACCESS` (overwriting a record access that has no
+`WITH JWT` key gives it a new random key, which signs every user out) and `DEFINE INDEX` (an
+overwrite rebuilds the index row by row). To change one of those, write `OVERWRITE` into that
+statement yourself for one deploy.
 
 ## Checking Status
 

@@ -2287,6 +2287,81 @@ async fn incremental_ingest_leaves_state_ready() {
     assert_eq!(state_of(&h, "v1").await, "ready", "an increment must not rewrite state");
 }
 
+/// Edges of `key`'s view as they are now, without waiting for publication.
+async fn edges_now(h: &Harness, key: &str) -> i64 {
+    let n: Option<i64> = h
+        .raw_db
+        .query(format!("SELECT VALUE count() FROM _00_list_ref WHERE in = _00_query:{key} GROUP ALL"))
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap_or(None);
+    n.unwrap_or(0)
+}
+
+/// `/view/unregister` is a database event's call (`_00_dbsp_cleanup`, TIMEOUT
+/// 10s). It used to take the publication gate and delete the edges under it,
+/// so behind a slow publication round it timed out, the `_00_query` delete
+/// failed, and every queued unregister a registration replayed waited for the
+/// gate again (a registration took 416 s in the local repro of the
+/// Cloudflare stall). It must answer without the gate, and the edges still go.
+#[tokio::test]
+async fn unregister_answers_without_the_publication_gate_and_drops_edges_in_order() {
+    let h = thread_harness().await;
+    let ingest = json!({ "table": "thread", "op": "CREATE", "id": "thread:1", "record": { "title": "t" } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest)).await.unwrap().status, 200);
+    assert_eq!(
+        h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap().status,
+        200
+    );
+    assert_eq!(edge_count_of(&h, "v1").await, 1);
+
+    // A publication round in flight.
+    let round = h.node.publication_gate.lock().await;
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.node.route(authed(Method::Post, "/view/unregister", json!({ "id": "_00_query:v1" }))),
+    )
+    .await
+    .expect("an unregister must not wait for the publication gate")
+    .unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(h.node.processor.read().await.view_count(), 0, "the view is released at once");
+    assert_eq!(edges_now(&h, "v1").await, 1, "its edges wait for the round ahead of them");
+
+    drop(round);
+    assert_eq!(edge_count_of(&h, "v1").await, 0, "then the queued drop removes them");
+}
+
+/// The TTL sweep deletes a `_00_query` row before the node hears of it, while
+/// the publication queue still holds that view's deltas. Its `clientId` is
+/// then NONE, which a `TYPE string` field refuses: the whole transaction
+/// failed, every other view in it with it, and the batch was bisected one
+/// round trip at a time under the publication gate. With hundreds of views
+/// expiring after a long e2e run that held the gate for minutes.
+#[tokio::test]
+async fn a_view_whose_row_is_gone_does_not_fail_the_shared_edge_transaction() {
+    let h = thread_harness().await;
+    h.raw_db.query("DEFINE FIELD clientId ON TABLE _00_list_ref TYPE string;").await.unwrap();
+    for id in ["_00_query:v1", "_00_query:v2"] {
+        assert_eq!(h.node.route(authed(Method::Post, "/view/register", thread_register(id))).await.unwrap().status, 200);
+    }
+    publication_drained(&h).await;
+    // Expired and deleted upstream; the unregister has not arrived yet.
+    h.raw_db.query("DELETE _00_query:v2;").await.unwrap();
+
+    let before = h.db_queries.load(Ordering::SeqCst);
+    let ingest = json!({ "table": "thread", "op": "CREATE", "id": "thread:1", "record": { "title": "t" } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest)).await.unwrap().status, 200);
+    assert_eq!(edge_count_of(&h, "v1").await, 1, "the live view gets its edge");
+    assert_eq!(edges_now(&h, "v2").await, 0, "the gone one writes nothing");
+    assert_eq!(
+        h.db_queries.load(Ordering::SeqCst) - before,
+        1,
+        "one transaction for both views, no bisecting around the gone one"
+    );
+}
+
 #[tokio::test]
 async fn re_registration_republishes_a_view_whose_rows_went_missing() {
     let h = thread_harness().await;

@@ -602,9 +602,19 @@ impl DurableObject for SspNodeDo {
             return self.accept_notice(req, path).await;
         }
         self.ensure_ready().await;
-        // A registration must see what was accepted before it.
+        // A queued unregister lands before this request: a re-registration of
+        // its id must not be released by it afterwards. Queued row changes
+        // are the replay timer's: a view registered before them gets their
+        // deltas when they land. Waiting for them made `/view/register`
+        // (which `fn::query::register` awaits with no timeout) replay the
+        // whole inbox first, a database read per page, for minutes behind a
+        // mass delete.
         if self.inbox_len.get() > 0 {
-            self.drain_inbox().await;
+            if self.unregister_queued() {
+                self.drain_inbox().await;
+            } else {
+                self.scheduler.ensure(TimerKind::IngestReplay, now_epoch_ms()).await;
+            }
         }
         let (node, runtime) = match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
             (Some(n), Some(r)) => (n, r),
@@ -817,8 +827,15 @@ impl SspNodeDo {
             (Some(node), Some(runtime)) => Some((node, runtime)),
             _ => None,
         };
+        // An unregister does not wait behind queued changes: it releases the
+        // view and queues its edge drop, nothing a slow database or a full
+        // publication queue can hold up, and its order against row changes
+        // does not matter (they only produce deltas the released view drops).
+        // Queued, a registration of the same id would have to replay every
+        // change ahead of it first.
+        let unregister = kind == "unregister";
         if let Some((node, runtime)) = ready {
-            if !queued_ahead && *node.status.read().await == SspStatus::Ready {
+            if (!queued_ahead || unregister) && *node.status.read().await == SspStatus::Ready {
                 let api_req = ssp_node::ApiRequest {
                     method: ApiMethod::Post,
                     path: path.clone(),
@@ -849,6 +866,18 @@ impl SspNodeDo {
         // Wake as soon as possible: bootstrap (if cold), then replay.
         self.scheduler.ensure(TimerKind::IngestReplay, now_epoch_ms()).await;
         json_response(200, serde_json::json!({ "status": "queued" }))
+    }
+
+    /// Whether an unregister is still in the inbox (accepted while the node
+    /// was not Ready).
+    fn unregister_queued(&self) -> bool {
+        self.storage
+            .sql()
+            .exec("SELECT 1 FROM ssp_inbox WHERE applied = 0 AND kind = 'unregister' LIMIT 1", None)
+            .and_then(|c| c.to_array::<serde_json::Value>())
+            .map(|rows| !rows.is_empty())
+            // Unknown: drain, as before.
+            .unwrap_or(true)
     }
 
     fn mark_applied(&self, seq: i64) {
@@ -925,6 +954,16 @@ impl SspNodeDo {
             // replay awaits the DB.
             self.inbox_len.set(inbox_count(&self.storage));
             if self.inbox_len.get() == 0 || *node.status.read().await != SspStatus::Ready {
+                return;
+            }
+            // A full publication queue refuses every replayed change, after
+            // the database read that precedes it. Every queued notice pulls
+            // this timer to now, so trying anyway read the database once per
+            // notice, from the same database the publisher was draining to.
+            if !node.edge_update_tx.has_room() && !self.unregister_queued() {
+                self.scheduler
+                    .ensure(TimerKind::IngestReplay, now_epoch_ms() + REPLAY_RETRY_MS)
+                    .await;
                 return;
             }
             let rows: Vec<serde_json::Value> = match self

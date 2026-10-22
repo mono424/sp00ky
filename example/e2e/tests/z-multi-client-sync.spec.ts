@@ -207,17 +207,20 @@ test.describe('Multi-client real-time sync', () => {
       await pageB.keyboard.press('Home');
       await Promise.all([pageA.keyboard.type(fromA, { delay: 30 }), pageB.keyboard.type(fromB, { delay: 30 })]);
 
-      for (const editor of [editorA, editorB]) {
-        await expect(editor).toContainText(fromA, { timeout: 30_000 });
-        await expect(editor).toContainText(fromB, { timeout: 30_000 });
-      }
-      // Same document on both sides (remote cursor widgets left out).
+      // The document's text, remote cursor widgets left out: a cursor's
+      // username label renders inline, so with the other client's caret
+      // inside a word the editor's text read "typed o⁠e2e_testuser⁠n A".
       const docText = (editor: typeof editorA) =>
         editor.evaluate((el) => {
           const copy = el.cloneNode(true) as HTMLElement;
           copy.querySelectorAll('.ProseMirror-loro-cursor').forEach((c) => c.remove());
           return (copy.textContent ?? '').replace(/\u2060/g, '');
         });
+      for (const editor of [editorA, editorB]) {
+        await expect.poll(() => docText(editor), { timeout: 30_000 }).toContain(fromA);
+        await expect.poll(() => docText(editor), { timeout: 30_000 }).toContain(fromB);
+      }
+      // Same document on both sides.
       await expect.poll(() => docText(editorB), { timeout: 10_000 }).toBe(await docText(editorA));
 
       // The server folds both edit streams into one document and mirrors

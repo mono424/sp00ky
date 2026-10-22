@@ -1711,15 +1711,20 @@ async fn an_ingest_lands_while_a_window_builds_its_index() {
         while h.node.processor.read().await.built_indexes().is_empty() {
             tokio::task::yield_now().await;
         }
+        let sent_at = started.elapsed();
         let row = json!({ "table": "game", "op": "CREATE", "id": "game:n1", "record": { "database": "game_database:0", "sort_index": -1 } });
         let r = h.node.route(authed(Method::Post, "/ingest", row)).await.unwrap();
-        (r.status, started.elapsed())
+        (r.status, sent_at, started.elapsed())
     };
-    let ((reg_status, registered_at), (ingest_status, ingested_at)) = tokio::join!(registration, ingest);
+    let ((reg_status, registered_at), (ingest_status, sent_at, ingested_at)) = tokio::join!(registration, ingest);
     assert_eq!((reg_status, ingest_status), (200, 200));
+    // Measured from the moment the build was under way, so the setup before
+    // it (which a loaded test machine stretches) does not count: an ingest
+    // that waited out the build would take as long as the rest of it.
+    let (ingest_took, build_left) = (ingested_at - sent_at, registered_at - sent_at);
     assert!(
-        ingested_at * 4 < registered_at,
-        "the ingest landed at {ingested_at:?}, the registration ended at {registered_at:?}"
+        ingest_took * 4 < build_left,
+        "the ingest took {ingest_took:?} while the build had {build_left:?} left"
     );
     // Written mid-build, the row is in the window all the same.
     let mut keys = h.node.processor.read().await.view_keys("v1");

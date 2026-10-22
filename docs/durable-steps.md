@@ -6,7 +6,10 @@ Backend code that uses `WorkflowEntrypoint`, `step.do`, `step.sleep` and
 replay loop inside the backend SDK; the queue is the backend's own outbox
 table, so retries, kill, recovery and concurrency are the job runner's.
 
-Status: **design, first cut being built** (2026-10-22). Related:
+Status: **first cut built 2026-10-22** (branch `claude/dazzling-allen-c8e32c`,
+not released): SDK, tables, job headers, admin, CLI config, docs, example.
+Not built yet: synced views over the tables (§5.3), `pause()`/`resume()`,
+non-TypeScript SDKs, a dashboard page for instances. Related:
 [`cloudflare-native.md`](cloudflare-native.md) §6 (jobs, schedules and
 workflows on the Cloudflare SSP) and §7 (Worker backends).
 
@@ -269,6 +272,8 @@ run waits for every executing step to settle before it suspends.
 | The outbox gives up (10 failed attempts, e.g. the backend was down for minutes) | the instance stays `running` or `waiting` with no job; `restart()` or the admin `retry` creates a new token and job |
 | A user-owned outbox column the workflow job does not set is required | the CREATE fails (same constraint as `schedules:`); make it `option<...>` |
 | A step longer than the job timeout | VM: the SSP retries a request the backend is still serving; the replay is fenced or stale, the original run persists and continues. Cloudflare: the request is cancelled, the step retries until its retries run out |
+| A long sleep across an SSP restart or a Durable Object eviction | the delayed job's in-memory timer is lost; the job runner's recovery sweep picks the due row up (up to its sweep interval late) |
+| `sendEvent` committing while a run hands over | the store request loses the write race and is repeated (4 times, jittered); the run then sees the new token and schedules itself now |
 
 ## 5. Visibility and control
 
@@ -361,6 +366,28 @@ pipelines on a schedule; durable steps fit imperative logic inside one backend
 start a durable workflow by calling a route that calls `create()`.
 
 ## 9. Tests
+
+Results 2026-10-22: SDK 32 tests (engine over the memory store; SQL store
+against SurrealDB 3.1.5 and 3.3.4 in Docker), `schedule-core` 203 (admin list,
+cancel, retry, and the retention prune over the real DDL), CLI 627, ssp-server
+36, ssp-node 161 plus its integration tests, ssp-protocol 72.
+
+`spky dev` with `example/api` (`ThreadDigest`: load a thread, count words with
+a flaky first attempt, sleep 3 s, write a title suggestion), on a dev stack
+built from this branch with shifted ports so it ran beside another project's:
+a job to `/digest` created the instance; run 1 executed two steps (the flaky
+one retried inline after 1 s) and handed the 3 s sleep to a job with
+`delay: 2997`; run 2 finished; the suggestion was on the thread 5.4 s after
+the first job was created. An instance cancelled through the SSP's admin API
+mid-sleep stayed `terminated`, its delayed job answered `done`, and no later
+step ran. The run surfaced four dev bugs, fixed on the same branch: the
+example outbox's `assigned_to` was still required in its migrations; a
+host-binary dev SSP was handed `host.docker.internal` URLs it cannot resolve;
+a `devOnly` backend's outbox got no ingest events (jobs waited for the
+recovery sweep); and the VM SSP dropped the admin API's query string, so every
+admin list filter was ignored.
+
+The plan the tests follow:
 
 - SDK unit tests over an in-memory store with the same CAS semantics: replay,
   retries with backoff, budget hand-off, sleeps, events, the wake token, the

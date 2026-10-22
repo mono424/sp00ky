@@ -43,6 +43,13 @@ mod snapshot;
 /// control plane when the project declares one.
 const FILES_BINDING: &str = "SPKY_FILES";
 
+/// Folded `@crdt` documents kept in memory between folds. A cached document
+/// is 36-48 KB (measured natively: a short title, and 2,000 typed characters
+/// with their history), so the VM default of 1,024 could take 40 MB or more of
+/// the 128 MB isolate. A miss imports the canonical snapshot the fold's claim
+/// already returns, so it costs CPU, not a round trip.
+const CRDT_CACHE_DOCS: usize = 64;
+
 /// Where the JSON circuit snapshot used to live (Durable Object KV), removed
 /// on boot: the row images in SQLite (`snapshot.rs`) replaced it.
 const LEGACY_SNAPSHOT_KEYS: [&str; 2] = ["ssp:circuit_blob", "ssp:resume_point"];
@@ -1078,7 +1085,7 @@ fn build_node(
         bootstrap_warnings: Arc::new(RwLock::new(Vec::new())),
         backend_health: None,
         crdt: Arc::new(ssp_node::crdt::CrdtFold::new(
-            ssp_node::crdt::FoldConfig::default(),
+            ssp_node::crdt::FoldConfig { cache_size: CRDT_CACHE_DOCS, ..Default::default() },
             cfg.ssp_id.clone(),
         )),
         view_metrics: Arc::new(RwLock::new(std::collections::HashMap::new())),

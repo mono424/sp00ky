@@ -580,7 +580,7 @@ bearer; only `/health`, `/info`, `/info/text` and `/version` are public.
 | `POST /job/recover` | Claim a `pending` job the recovery sweep found orphaned |
 | `GET /debug/heartbeat` | The last heartbeat sequence this SSP observed, used by the end-to-end latency probe |
 | `GET /debug/catchup-rows/:table` | Row counts for one table, for drift diagnosis |
-| `GET /debug/memory` | Circuit memory breakdown |
+| `GET /debug/memory` | Circuit memory breakdown, per table and per view. On a wasm host (the Cloudflare Durable Object) `linear_memory_bytes` is the wasm linear memory, which only grows: the high-water mark the isolate is charged for |
 | `GET /info/text` | The same content as `/info`, formatted for a terminal |
 
 Job kill and retry are normally reached through the cluster, not directly: the

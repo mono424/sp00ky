@@ -25,6 +25,20 @@ pub(crate) type SortKey = SmallVec<[SortableValue; 1]>;
 /// Least slack a bounded buffer keeps past its window; see [`TopK`].
 const MIN_SLACK: usize = 16;
 
+/// Entries per `indexset` node for a buffer bounded at `capacity`.
+///
+/// `indexset` allocates a whole node up front, 1024 entries unless told
+/// otherwise: 64 KB per operator natively and about 48 KB on wasm32, before a
+/// single row arrives and whatever the window. Every `LIMIT` in every
+/// registered view paid it, so on a Cloudflare Durable Object (128 MB) a few
+/// hundred small views were the bulk of the heap. The buffer never holds more
+/// than `capacity + 1` entries, so one node of that size (a power of two, as
+/// `indexset` splits a node at half its allocation) holds all of it; windows
+/// past 1024 rows keep the default node size and its split behaviour.
+fn node_size(capacity: usize) -> usize {
+    capacity.saturating_add(1).next_power_of_two().min(1024)
+}
+
 /// TopK operator with sorted buffer state (Z⁻¹).
 ///
 /// Keeps the smallest input records in a sorted buffer and emits the window
@@ -217,13 +231,14 @@ impl TopK {
         // Slack so ordinary retractions inside the window refill from the
         // buffer instead of costing a rebuild.
         let slack = limit.max(MIN_SLACK);
+        let capacity = offset.saturating_add(limit).saturating_add(slack);
         Self {
             limit,
             offset,
             order_by,
-            buffer: BTreeSet::new(),
+            buffer: BTreeSet::with_maximum_node_size(node_size(capacity)),
             key_index: HashMap::new(),
-            capacity: offset.saturating_add(limit).saturating_add(slack),
+            capacity,
             boundary: None,
         }
     }
@@ -370,13 +385,10 @@ impl super::Operator for TopK {
         // Both structures hold up to `capacity` rows (the window plus slack)
         // — `buffer` to keep them sorted, `key_index` so a retraction can
         // find its sort key again.
-        let buffer: usize = self
-            .buffer
-            .iter()
-            .map(|(sort_key, _)| {
-                std::mem::size_of::<(SortKey, RowKey)>() + sortable_bytes(sort_key)
-            })
-            .sum();
+        // The node's slots are allocated whether or not they hold a row.
+        let slots = self.buffer.len().max(node_size(self.capacity));
+        let buffer: usize = slots * std::mem::size_of::<(SortKey, RowKey)>()
+            + self.buffer.iter().map(|(sort_key, _)| sortable_bytes(sort_key)).sum::<usize>();
         let index: usize =
             crate::size::map_table_bytes::<RowKey, SortKey>(self.key_index.capacity())
                 + self
@@ -479,6 +491,40 @@ mod tests {
         let live: std::collections::BTreeSet<String> = input.keys().map(|k| k.to_string()).collect();
         assert_eq!(window_of(&op), sorted_window(&store, &live, 50, 100));
         assert!(!op.needs_rebuild());
+    }
+
+    /// An empty `LIMIT 1` used to reserve a 1024-entry `indexset` node (64 KB
+    /// natively), the bulk of a small view's memory. The node is sized to the
+    /// window now, the estimator charges it, and a buffer bigger than one
+    /// node still splits and stays exact.
+    #[test]
+    fn the_buffer_node_is_sized_to_the_window() {
+        let small = TopK::new(1, 0, by_rank());
+        assert_eq!(node_size(small.capacity), 32);
+        let entry = std::mem::size_of::<(SortKey, RowKey)>();
+        assert_eq!(small.state_bytes(), 32 * entry);
+        assert!(small.state_bytes() < 4096, "an empty LIMIT 1 holds {} B", small.state_bytes());
+        assert_eq!(node_size(TopK::new(10, 0, None).capacity), 32);
+        assert_eq!(node_size(TopK::new(50, 100, None).capacity), 256);
+        assert_eq!(node_size(TopK::new(2_000, 0, None).capacity), 1024);
+
+        let mut store = Store::new();
+        store.ensure_collection("g");
+        let mut input = ZSet::new();
+        for i in 0..3_000 {
+            store.apply_change(&Change::create("g", &format!("r{i}"), json!({ "rank": (i * 7919) % 3_000 })));
+            input.insert(format!("g:r{i}").as_str().into(), 1);
+        }
+        let live: std::collections::BTreeSet<String> = input.keys().map(|k| k.to_string()).collect();
+        // One node holds the whole buffer.
+        let mut op = TopK::new(50, 20, by_rank());
+        op.step(&[&input], &store, None);
+        assert_eq!(window_of(&op), sorted_window(&store, &live, 50, 20));
+        // Capacity 1,700 in nodes of 1,024: the buffer spans several.
+        let mut op = TopK::new(600, 500, by_rank());
+        op.step(&[&input], &store, None);
+        assert_eq!(op.buffer.len(), op.capacity);
+        assert_eq!(window_of(&op), sorted_window(&store, &live, 600, 500));
     }
 
     /// Random inserts and retractions against a full sort: while the operator

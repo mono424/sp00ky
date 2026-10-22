@@ -76,8 +76,8 @@ Call the job routes as usual:
   routes alike. A Hono `app` works as it is, and so does any object with a `fetch(request, env)`
   method.
 - **Env vars as strings.** The backend's `env` from `sp00ky.yml` (vault values included) arrives as
-  plain strings on the handler's `env` (in Hono, `c.env`). Read them from `env`, not from
-  `process.env`.
+  plain strings on the handler's `env` (in Hono, `c.env`). With `nodejs_compat` they are on
+  `process.env` too, so code written for a VM backend runs unchanged.
 - **The project's database.** Like a VM backend, it gets `SPKY_ENV=cloud`, `SPKY_DB_URL` (https),
   `SPKY_DB_WS` (wss), `SPKY_DB_NS` and `SPKY_DB_NAME`. On the shared free database it also gets
   `SPKY_DB_USER` and `SPKY_DB_PASS`, the project's namespace owner, with `SPKY_DB_LEVEL=namespace`:

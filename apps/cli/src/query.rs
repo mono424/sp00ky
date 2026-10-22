@@ -31,13 +31,7 @@ pub fn run(
 ) -> Result<()> {
     let is_cloud = conn.cloud;
     let resolved = resolve(conn, config)?;
-    let client = SurrealClient::new(
-        &resolved.url,
-        &resolved.namespace,
-        &resolved.database,
-        &resolved.username,
-        &resolved.password,
-    );
+    let client = resolved.client();
 
     match sql {
         Some(sql) => run_once(&client, &sql, json),
@@ -50,7 +44,7 @@ pub fn run(
 // =============================================================
 
 /// Resolve the connection parameters. With `--cloud`, this resolves the
-/// deployment's SurrealDB URL + root password from Sp00ky Cloud (same lookup as
+/// deployment's SurrealDB URL + login from Sp00ky Cloud (same lookup as
 /// `spky project credentials`); otherwise it falls back to local resolution
 /// from `sp00ky.yml`, honoring explicit `--namespace`/`--database` overrides.
 fn resolve(conn: ConnectionArgs, config: Option<PathBuf>) -> Result<ResolvedConnection> {

@@ -100,13 +100,7 @@ pub fn run(action: PushCommands) -> Result<()> {
 
 fn client_from(conn: &ConnectionArgs, config: &Option<PathBuf>) -> Result<SurrealClient> {
     let c = conn.resolve(config)?;
-    Ok(SurrealClient::new(
-        &c.url,
-        &c.namespace,
-        &c.database,
-        &c.username,
-        &c.password,
-    ))
+    Ok(c.client())
 }
 
 /// One statement's result as a list of rows.

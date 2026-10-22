@@ -131,7 +131,7 @@ instead of opening one they stop with the exact command or environment variable 
 | Command | What it does |
 | --- | --- |
 | `spky login`, `spky logout` | Authenticate with Sp00ky Cloud. |
-| `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. [Docs](/docs/cloud/getting-started) |
+| `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. On the free plan's shared database, `credentials` prints a namespace-level login (user `owner` in the namespace named after the slug): sign in at the namespace level, not as root. [Docs](/docs/cloud/getting-started) |
 | `spky deploy` | Build, upload, provision, migrate, deploy. With `sync.queryAllowlist` on, also publishes the committed allowlist JSON as `_00_query_allowlist:<app>__<version>` (the frontend's `package.json` version) and keeps the previous version's row; under `enforce`, a missing or stale JSON (`sourceHash` no longer matches the query module) fails the deploy, under `warn` it warns. [Docs](/docs/cloud/deploying) |
 | `spky push` (no subcommand) | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. With a subcommand it is the [Web Push](#web-push) tool. |
 | `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. Also publishes the app's allowlist JSON under the announced version, so a regenerated [query allowlist](/docs/guide/query-allowlist) goes live without a restart. |
@@ -201,6 +201,12 @@ local dev database by default or the cloud deployment with `--cloud` (or any dat
 deployment, without deploying anything else. It resolves the SurrealDB URL and root password from
 your login and the `slug` in `sp00ky.yml`, and reads the mode, namespace and database from
 `sp00ky.yml` too, so there are no connection flags to pass.
+
+A free-plan project has no root login: its data lives in a namespace of the shared free database.
+There `migrate prod`, `spky release` and every `--cloud` command (`migrate`, `query`, `jobs`,
+`flag`, `schedules`, `workflows`, `push`) sign in as the project's namespace-level `owner` user, the one
+`spky project credentials` prints, and work in the namespace and database the project was given
+there. `--namespace` cannot reach outside it.
 
 | Flag | What it does |
 | --- | --- |

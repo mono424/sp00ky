@@ -26,6 +26,8 @@ pub struct LegacyEngine {
     /// Completes each migration's tables with their sync identity as they apply.
     /// `None` = verbatim (no manifest found). See [`migrate::SyncIdentity`].
     identity: Option<migrate::SyncIdentity>,
+    /// Namespace `username` is defined on (the free plan's namespace login).
+    auth_namespace: Option<String>,
 }
 
 impl LegacyEngine {
@@ -47,11 +49,17 @@ impl LegacyEngine {
             migrations_dir,
             secrets,
             identity: None,
+            auth_namespace: None,
         }
     }
 
     pub fn with_sync_identity(mut self, identity: Option<migrate::SyncIdentity>) -> Self {
         self.identity = identity;
+        self
+    }
+
+    pub fn with_auth_namespace(mut self, auth_namespace: Option<String>) -> Self {
+        self.auth_namespace = auth_namespace;
         self
     }
 
@@ -63,6 +71,7 @@ impl LegacyEngine {
             &self.username,
             &self.password,
         )
+        .with_auth_namespace(self.auth_namespace.as_deref())
     }
 }
 

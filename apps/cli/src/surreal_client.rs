@@ -54,6 +54,11 @@ pub struct SurrealClient {
     namespace: String,
     database: String,
     auth_header: String,
+    /// Namespace the Basic-auth user is defined on, sent as `surreal-auth-ns`.
+    /// `None` for a root user. SurrealDB only finds a namespace-level user (the
+    /// free plan's `owner` on the shared DB) with this header; without it the
+    /// sign-in fails with "There was a problem with authentication".
+    auth_namespace: Option<String>,
 }
 
 /// Normalize a SurrealDB endpoint to an HTTP(S) URL for the `/sql` transport.
@@ -92,7 +97,15 @@ impl SurrealClient {
             namespace: namespace.to_string(),
             database: database.to_string(),
             auth_header,
+            auth_namespace: None,
         }
+    }
+
+    /// Sign in as a user defined on `auth_namespace` instead of a root user.
+    /// `None` keeps root-level auth.
+    pub fn with_auth_namespace(mut self, auth_namespace: Option<&str>) -> Self {
+        self.auth_namespace = auth_namespace.map(str::to_string);
+        self
     }
 
     /// Create a client without authentication (for unauthenticated SurrealDB instances).
@@ -102,6 +115,7 @@ impl SurrealClient {
             namespace: namespace.to_string(),
             database: database.to_string(),
             auth_header: String::new(),
+            auth_namespace: None,
         }
     }
 }
@@ -117,6 +131,7 @@ impl SurrealClient {
 fn send_raw_sql_unchecked(
     url: &str,
     auth_header: &str,
+    auth_ns_header: Option<&str>,
     ns_header: Option<&str>,
     db_header: Option<&str>,
     query: &str,
@@ -131,6 +146,9 @@ fn send_raw_sql_unchecked(
 
     if !auth_header.is_empty() {
         req = req.set("Authorization", auth_header);
+    }
+    if let Some(auth_ns) = auth_ns_header {
+        req = req.set("surreal-auth-ns", auth_ns);
     }
 
     if let Some(ns) = ns_header {
@@ -175,11 +193,19 @@ fn send_raw_sql_unchecked(
 fn send_raw_sql(
     url: &str,
     auth_header: &str,
+    auth_ns_header: Option<&str>,
     ns_header: Option<&str>,
     db_header: Option<&str>,
     query: &str,
 ) -> Result<Vec<SurrealResponse>> {
-    let body = send_raw_sql_unchecked(url, auth_header, ns_header, db_header, query)?;
+    let body = send_raw_sql_unchecked(
+        url,
+        auth_header,
+        auth_ns_header,
+        ns_header,
+        db_header,
+        query,
+    )?;
 
     for r in &body {
         if r.status == "ERR" {
@@ -231,6 +257,7 @@ impl SurrealClient {
         send_raw_sql_unchecked(
             &format!("{}/sql", self.url),
             &self.auth_header,
+            self.auth_namespace.as_deref(),
             Some(&self.namespace),
             Some(&self.database),
             query,
@@ -242,6 +269,7 @@ impl SurrealClient {
         send_raw_sql(
             &format!("{}/sql", self.url),
             &self.auth_header,
+            self.auth_namespace.as_deref(),
             Some(&self.namespace),
             Some(&self.database),
             query,
@@ -258,6 +286,7 @@ impl SurrealClient {
         send_raw_sql(
             &format!("{}/sql", self.url),
             &self.auth_header,
+            self.auth_namespace.as_deref(),
             None,
             None,
             &query,
@@ -269,15 +298,11 @@ impl SurrealClient {
 
     /// Ensure namespace and database exist (usable outside the MigrationDB trait).
     pub fn ensure_ns_db(&self) -> Result<()> {
-        let query = format!(
-            "DEFINE NAMESPACE IF NOT EXISTS {}; USE NS {}; DEFINE DATABASE IF NOT EXISTS {};",
-            quote_ident(&self.namespace),
-            quote_ident(&self.namespace),
-            quote_ident(&self.database)
-        );
+        let query = self.ensure_ns_db_query();
         send_raw_sql(
             &format!("{}/sql", self.url),
             &self.auth_header,
+            self.auth_namespace.as_deref(),
             None,
             None,
             &query,
@@ -285,6 +310,26 @@ impl SurrealClient {
         .context("Failed to create namespace/database")?;
 
         Ok(())
+    }
+
+    /// The statements behind `ensure_ns_db`. A namespace-level user cannot
+    /// `DEFINE NAMESPACE` ("IAM error: Not enough permissions"), even with IF NOT
+    /// EXISTS; its namespace exists by definition, so only the database is made.
+    fn ensure_ns_db_query(&self) -> String {
+        let use_db = format!(
+            "USE NS {}; DEFINE DATABASE IF NOT EXISTS {};",
+            quote_ident(&self.namespace),
+            quote_ident(&self.database)
+        );
+        if self.auth_namespace.is_some() {
+            use_db
+        } else {
+            format!(
+                "DEFINE NAMESPACE IF NOT EXISTS {}; {}",
+                quote_ident(&self.namespace),
+                use_db
+            )
+        }
     }
 }
 
@@ -427,6 +472,28 @@ mod tests {
         );
         assert_eq!(client.namespace, "my_namespace");
         assert_eq!(client.database, "my_database");
+    }
+
+    #[test]
+    fn test_root_client_defines_namespace_and_database() {
+        let client = SurrealClient::new("http://localhost:8000", "my-ns", "main", "root", "root");
+        assert_eq!(client.auth_namespace, None);
+        assert_eq!(
+            client.ensure_ns_db_query(),
+            "DEFINE NAMESPACE IF NOT EXISTS `my-ns`; USE NS `my-ns`; DEFINE DATABASE IF NOT EXISTS `main`;"
+        );
+    }
+
+    #[test]
+    fn test_namespace_client_skips_define_namespace() {
+        let client =
+            SurrealClient::new("http://localhost:8000", "talktobolo", "main", "owner", "pw")
+                .with_auth_namespace(Some("talktobolo"));
+        assert_eq!(client.auth_namespace.as_deref(), Some("talktobolo"));
+        assert_eq!(
+            client.ensure_ns_db_query(),
+            "USE NS `talktobolo`; DEFINE DATABASE IF NOT EXISTS `main`;"
+        );
     }
 
     #[test]

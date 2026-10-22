@@ -953,7 +953,8 @@ enum ProjectCommands {
     /// List cloud projects
     #[command(visible_alias = "ls")]
     List,
-    /// Print SurrealDB root credentials for the current project
+    /// Print SurrealDB credentials for the current project (root on a dedicated
+    /// database, a namespace-level login on the free plan's shared one)
     Credentials {
         /// Print only the password (no URL / username label) — handy for piping
         /// into other tools (e.g. `export SURREAL_PASS=$(spky project credentials --raw)`).
@@ -1429,11 +1430,13 @@ enum MigrateCommands {
     },
     /// Apply pending migrations to the project's Sp00ky Cloud deployment (no deploy).
     ///
-    /// Resolves the SurrealDB URL + root password from your login (`spky login`)
-    /// and the `slug` in sp00ky.yml, then applies any pending migrations plus the
-    /// internal Sp00ky schema. The deploy mode (singlenode/cluster/surrealism),
-    /// namespace, and database are read from sp00ky.yml — no connection flags
-    /// needed. Use this to migrate prod on demand, decoupled from a full deploy.
+    /// Resolves the SurrealDB URL + login from your login (`spky login`) and the
+    /// `slug` in sp00ky.yml (root on a dedicated database, the project's
+    /// namespace user on the free plan's shared one), then applies any pending
+    /// migrations plus the internal Sp00ky schema. The deploy mode
+    /// (singlenode/cluster/surrealism), namespace, and database are read from
+    /// sp00ky.yml (the free plan's login fixes the latter two), so no connection
+    /// flags are needed. Use this to migrate prod on demand, decoupled from a full deploy.
     Prod {
         /// Path to sp00ky.yml config file
         #[arg(long)]
@@ -1492,8 +1495,9 @@ struct ConnectionArgs {
     #[arg(long, env = "SURREAL_PASS", default_value = "root")]
     password: String,
     /// Target the project's Sp00ky Cloud deployment. Resolves the SurrealDB URL
-    /// and root password automatically from your login (`spky login`) and the
-    /// `slug` in sp00ky.yml, so you don't pass --url/--password.
+    /// and login automatically from your login (`spky login`) and the `slug` in
+    /// sp00ky.yml, so you don't pass --url/--password: root on a dedicated
+    /// database, the project's namespace user on the free plan's shared one.
     #[arg(long)]
     cloud: bool,
 }
@@ -1505,14 +1509,33 @@ pub(crate) struct ResolvedConnection {
     pub(crate) database: String,
     pub(crate) username: String,
     pub(crate) password: String,
+    /// Namespace the user is defined on: the free plan's namespace login on the
+    /// shared DB. `None` for a root user.
+    pub(crate) auth_namespace: Option<String>,
+}
+
+impl ResolvedConnection {
+    /// A client signed in with this connection's login.
+    pub(crate) fn client(&self) -> surreal_client::SurrealClient {
+        surreal_client::SurrealClient::new(
+            &self.url,
+            &self.namespace,
+            &self.database,
+            &self.username,
+            &self.password,
+        )
+        .with_auth_namespace(self.auth_namespace.as_deref())
+    }
 }
 
 impl ConnectionArgs {
     /// When `--cloud` is set, resolve the deployment's SurrealDB endpoint and
-    /// root password from Sp00ky Cloud (the same lookup as `spky project
-    /// credentials`). `namespace`/`database` come from explicit flags when
-    /// given, otherwise from sp00ky.yml. Returns `Ok(None)` when `--cloud` was
-    /// not passed, so callers fall back to their existing local resolution.
+    /// login from Sp00ky Cloud (the same lookup as `spky project credentials`).
+    /// `namespace`/`database` come from explicit flags when given, otherwise
+    /// from sp00ky.yml; a free project's namespace login pins the namespace and
+    /// defaults the database to where the control plane put the project.
+    /// Returns `Ok(None)` when `--cloud` was not passed, so callers fall back
+    /// to their existing local resolution.
     pub(crate) fn cloud_connection(
         &self,
         config: &Option<PathBuf>,
@@ -1544,15 +1567,33 @@ impl ConnectionArgs {
                 database,
                 username: ext.username,
                 password: ext.password,
+                auth_namespace: None,
             }));
         }
         let cloud = cloud::resolve_cloud_surreal(&config_file)?;
+        if let Some(ns) = &cloud.auth_namespace {
+            if self.namespace != "main" && self.namespace != *ns {
+                anyhow::bail!(
+                    "--namespace {} is out of reach: this project's login on the shared \
+                     free-plan database only opens its own namespace '{}'.",
+                    self.namespace,
+                    ns
+                );
+            }
+        }
+        let (namespace, cloud_database) = cloud.target(&namespace, &database);
+        let database = if self.database == "main" {
+            cloud_database
+        } else {
+            self.database.clone()
+        };
         Ok(Some(ResolvedConnection {
             url: cloud.url,
             namespace,
             database,
-            username: "root".to_string(),
+            username: cloud.username,
             password: cloud.password,
+            auth_namespace: cloud.auth_namespace,
         }))
     }
 
@@ -1591,6 +1632,7 @@ impl ConnectionArgs {
                 database,
                 username: ext.username,
                 password: ext.password,
+                auth_namespace: None,
             });
         }
         let url = self
@@ -1603,6 +1645,7 @@ impl ConnectionArgs {
             database,
             username: self.username.clone(),
             password: self.password.clone(),
+            auth_namespace: None,
         })
     }
 }
@@ -2061,6 +2104,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 database: conn_resolved.database,
                 username: conn_resolved.username,
                 password: conn_resolved.password,
+                auth_namespace: conn_resolved.auth_namespace,
                 surrealkit_binary: sp00ky_config.resolved_surrealkit_binary(),
                 internal_schema: Some(migration::InternalSchemaConfig {
                     schema_path: resolved.schema,
@@ -2093,11 +2137,15 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
             let resolved = sp00ky_config.resolved_schema();
             let resolved_migrations = migrations_dir.unwrap_or(resolved.migrations);
 
-            // Always target the cloud deployment: resolve the SurrealDB URL + root
-            // password from the login + `slug` in sp00ky.yml (same lookup as
-            // `migrate apply --cloud` and `project credentials`).
+            // Always target the cloud deployment: resolve the SurrealDB URL + login
+            // from the login + `slug` in sp00ky.yml (same lookup as
+            // `migrate apply --cloud` and `project credentials`). A free project
+            // signs in as its namespace user on the shared DB: the internal
+            // schema is database-level DDL, which that user may run.
             let cloud = cloud::resolve_cloud_surreal(&config_file)?;
             let resolved_surreal = sp00ky_config.resolved_surrealdb();
+            let (namespace, database) =
+                cloud.target(&resolved_surreal.namespace, &resolved_surreal.database);
             // Deploy mode comes from sp00ky.yml so the internal schema matches the
             // deployment topology (e.g. cluster). `migrate apply --cloud` instead
             // defaults its --mode flag to singlenode, which would push the wrong
@@ -2106,7 +2154,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
 
             println!(
                 "Target: {} (ns={}, db={}, mode={})",
-                cloud.url, resolved_surreal.namespace, resolved_surreal.database, deploy_mode
+                cloud.url, namespace, database, deploy_mode
             );
 
             // `consent`, not a bare prompt: this gate used to be skipped whenever
@@ -2129,10 +2177,11 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 project_dir: std::env::current_dir()?,
                 migrations_dir: resolved_migrations,
                 url: cloud.url,
-                namespace: resolved_surreal.namespace,
-                database: resolved_surreal.database,
-                username: "root".to_string(),
+                namespace,
+                database,
+                username: cloud.username,
                 password: cloud.password,
+                auth_namespace: cloud.auth_namespace,
                 surrealkit_binary: sp00ky_config.resolved_surrealkit_binary(),
                 internal_schema: Some(migration::InternalSchemaConfig {
                     schema_path: resolved.schema,
@@ -2175,6 +2224,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 database: conn_resolved.database,
                 username: conn_resolved.username,
                 password: conn_resolved.password,
+                auth_namespace: conn_resolved.auth_namespace,
                 surrealkit_binary: sp00ky_config.resolved_surrealkit_binary(),
                 internal_schema: None,
                 remote_functions: None,
@@ -2206,6 +2256,7 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
                 database: conn_resolved.database,
                 username: conn_resolved.username,
                 password: conn_resolved.password,
+                auth_namespace: conn_resolved.auth_namespace,
                 surrealkit_binary: sp00ky_config.resolved_surrealkit_binary(),
                 internal_schema: None,
                 remote_functions: None,
@@ -3413,6 +3464,7 @@ mod migration_tests {
             database: "test_db".into(),
             username: "root".into(),
             password: "root".into(),
+            auth_namespace: None,
             surrealkit_binary,
             internal_schema: None,
             remote_functions: None,
@@ -3433,6 +3485,17 @@ mod migration_tests {
         match migration::create_engine(make_ctx(&tmp, Some("nonexistent_xyz_12345".into()))) {
             Err(e) => assert!(e.to_string().contains("not found")),
             Ok(_) => panic!("should fail with missing binary"),
+        }
+    }
+
+    #[test]
+    fn test_factory_refuses_surrealkit_with_namespace_login() {
+        let tmp = TempDir::new().unwrap();
+        let mut ctx = make_ctx(&tmp, Some("echo".into()));
+        ctx.auth_namespace = Some("talktobolo".into());
+        match migration::create_engine(ctx) {
+            Err(e) => assert!(e.to_string().contains("namespace 'talktobolo'"), "{e}"),
+            Ok(_) => panic!("surrealkit cannot sign in with a namespace login"),
         }
     }
 

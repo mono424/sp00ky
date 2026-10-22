@@ -1226,6 +1226,7 @@ fn apply_migrations(
         database: resolved_surreal.database.clone(),
         username: "root".to_string(),
         password: "root".to_string(),
+        auth_namespace: None,
         surrealkit_binary: sp00ky_config.resolved_surrealkit_binary(),
         internal_schema: None,
         remote_functions: None,
@@ -2768,15 +2769,7 @@ fn apply_internal_sp00ky_schema(
     // Publish the query allowlist so a `warn`/`enforce` dev SSP has something to
     // compare against. Version "dev": one row, overwritten on every start.
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    crate::cloud::write_query_allowlist_rows(
-        surreal_url,
-        "root",
-        &resolved_surreal.namespace,
-        &resolved_surreal.database,
-        &config,
-        config_dir,
-        "dev",
-    )
+    crate::cloud::write_query_allowlist_rows(&client, &config, config_dir, "dev")
 }
 
 // ── Backend dev command helpers ──────────────────────────────────────────────

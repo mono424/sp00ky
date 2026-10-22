@@ -3,7 +3,7 @@ mod legacy;
 pub(crate) mod sp00ky_engine;
 pub(crate) mod surrealkit;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::path::PathBuf;
 
 pub use engine::{MigrationEngine, MigrationEnvironment, MigrationInfo, MigrationState};
@@ -20,6 +20,9 @@ pub struct MigrationContext {
     pub database: String,
     pub username: String,
     pub password: String,
+    /// Namespace `username` is defined on: the free plan's namespace login on
+    /// the shared DB. `None` for a root user.
+    pub auth_namespace: Option<String>,
     // surrealkit-specific (None = use legacy engine)
     pub surrealkit_binary: Option<String>,
     // Post-migration steps (optional, set by caller based on context)
@@ -39,6 +42,14 @@ pub struct MigrationContext {
 pub fn create_engine(ctx: MigrationContext) -> Result<Box<dyn MigrationEngine>> {
     let has_secrets = ctx.secrets.as_ref().is_some_and(|s| !s.is_empty());
     let inner: Box<dyn MigrationEngine> = if let Some(ref binary) = ctx.surrealkit_binary {
+        if let Some(ns) = &ctx.auth_namespace {
+            bail!(
+                "The surrealkit engine signs in as a root user, but this database only has a \
+                 login on namespace '{}' (the free plan's shared database). Remove \
+                 `surrealkit.binary` from sp00ky.yml to migrate it with the built-in engine.",
+                ns
+            );
+        }
         if has_secrets {
             eprintln!(
                 "WARNING: {{{{KEY}}}} placeholder substitution is not supported by the \
@@ -56,26 +67,32 @@ pub fn create_engine(ctx: MigrationContext) -> Result<Box<dyn MigrationEngine>> 
             ctx.password.clone(),
         )?)
     } else {
-        Box::new(legacy::LegacyEngine::new(
-            ctx.url.clone(),
-            ctx.namespace.clone(),
-            ctx.database.clone(),
-            ctx.username.clone(),
-            ctx.password.clone(),
-            ctx.migrations_dir.clone(),
-            ctx.secrets.clone(),
+        Box::new(
+            legacy::LegacyEngine::new(
+                ctx.url.clone(),
+                ctx.namespace.clone(),
+                ctx.database.clone(),
+                ctx.username.clone(),
+                ctx.password.clone(),
+                ctx.migrations_dir.clone(),
+                ctx.secrets.clone(),
+            )
+            .with_sync_identity(crate::migrate::SyncIdentity::discover(&ctx.project_dir))
+            .with_auth_namespace(ctx.auth_namespace.clone()),
         )
-        .with_sync_identity(crate::migrate::SyncIdentity::discover(&ctx.project_dir)))
     };
 
-    Ok(Box::new(sp00ky_engine::Sp00kyEngine::new(
-        inner,
-        ctx.url,
-        ctx.namespace,
-        ctx.database,
-        ctx.username,
-        ctx.password,
-        ctx.internal_schema,
-        ctx.remote_functions,
-    )))
+    Ok(Box::new(
+        sp00ky_engine::Sp00kyEngine::new(
+            inner,
+            ctx.url,
+            ctx.namespace,
+            ctx.database,
+            ctx.username,
+            ctx.password,
+            ctx.internal_schema,
+            ctx.remote_functions,
+        )
+        .with_auth_namespace(ctx.auth_namespace),
+    ))
 }

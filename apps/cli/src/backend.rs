@@ -2399,12 +2399,8 @@ impl Sp00kyConfig {
                     prefix, name
                 ));
             }
-            if app.base_url.is_some() {
-                warnings.push(format!(
-                    "apps.{}.baseUrl is unused on a Cloudflare project: jobs reach a Worker backend at worker://{}",
-                    name, name
-                ));
-            }
+            // A `baseUrl` stays legitimate: `spky dev` sends jobs there, while
+            // a Cloudflare deploy routes them to worker://<name>.
             if worker.expose.is_empty() {
                 continue;
             }
@@ -2638,6 +2634,20 @@ impl AppConfig {
     /// OpenAPI `spec` and an outbox `method` with a table. It needs neither a
     /// Dockerfile nor a `baseUrl`: its jobs go to `worker://<name>`.
     fn validate_worker(&self, name: &str, worker: &WorkerDeployConfig) -> Result<()> {
+        // The control plane's rule: the name becomes a binding, a Workflow
+        // name and a module path, so a bad one would fail only after upload.
+        let mut chars = name.chars();
+        let valid_name = name.len() <= 63
+            && chars
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if !valid_name {
+            bail!(
+                "Worker backend '{}': the name must be lowercase letters, digits, '-' or '_', start with a letter or digit, at most 63 characters",
+                name
+            );
+        }
         if self.spec.is_none() {
             bail!(
                 "Worker backend '{}' is missing 'spec' (the OpenAPI file of the routes its jobs call)",
@@ -4315,6 +4325,9 @@ apps:
             let err = config.apps["api"].validate("api").unwrap_err().to_string();
             assert!(err.contains(needle), "{worker}: got {err}");
         }
+        let bad_name = cfg("apps:\n  My.Api:\n    type: backend\n    spec: a.yml\n    method: { type: outbox, table: job, schema: a.surql }\n    worker: { entry: i.ts }\n");
+        let err = bad_name.validate_manifest().unwrap_err().to_string();
+        assert!(err.contains("lowercase letters"), "got: {err}");
         let frontend = cfg("apps:\n  web:\n    type: frontend\n    worker: { entry: i.ts }\n");
         assert!(frontend.validate_manifest().unwrap_err().to_string().contains("only a backend"));
     }

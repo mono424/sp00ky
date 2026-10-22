@@ -76,8 +76,13 @@ Call the job routes as usual:
   routes alike. A Hono `app` works as it is, and so does any object with a `fetch(request, env)`
   method.
 - **Env vars as strings.** The backend's `env` from `sp00ky.yml` (vault values included) arrives as
-  plain strings on the handler's `env` (in Hono, `c.env`), next to `SPKY_ENV=cloud`, `SPKY_DB_NS`
-  and `SPKY_DB_NAME`. Read them from `env`, not from `process.env`.
+  plain strings on the handler's `env` (in Hono, `c.env`). Read them from `env`, not from
+  `process.env`.
+- **The project's database.** Like a VM backend, it gets `SPKY_ENV=cloud`, `SPKY_DB_URL` (https),
+  `SPKY_DB_WS` (wss), `SPKY_DB_NS` and `SPKY_DB_NAME`. On the shared free database it also gets
+  `SPKY_DB_USER` and `SPKY_DB_PASS`, the project's namespace owner, with `SPKY_DB_LEVEL=namespace`:
+  sign in with `{ namespace: SPKY_DB_NS, username, password }`. On your own database, put its
+  credentials in the vault. These names are set by sp00ky and win over your own keys.
 - **Workers AI.** With `ai: AI`, `env.AI.run(model, input)` runs a
   [Workers AI](https://developers.cloudflare.com/workers-ai/) model. `run()` is the only method
   forwarded.
@@ -111,8 +116,9 @@ refused with `worker`:
 - `hosting: external`: sp00ky hosts a Worker backend.
 - `runOn`: it runs inside the SSP Worker, not on a machine.
 
-`baseUrl` is not used on Cloudflare (`spky lint` says so), and neither are `deploy.dockerfile`,
-`deploy.port` and `deploy.resources`.
+On Cloudflare, jobs go to `worker://<name>`, so `baseUrl` only matters to `spky dev`, which sends
+jobs there locally. `deploy.timeout` and `deploy.timeoutOverridable` apply as on any backend;
+`deploy.dockerfile`, `deploy.port` and `deploy.resources` are not used.
 
 ## On a VM project
 
@@ -153,8 +159,9 @@ others as they are; a `devOnly` backend is never bundled. See [Deploying](/docs/
 ## Limits
 
 <Warning>
-  A job request times out after **10 seconds**. `deploy.timeout` is not applied to Worker backends
-  yet. For longer work, have the job route start a Workflow and return, or use an exposed route.
+  A job request times out after `deploy.timeout` seconds, **10** when unset. Set it for slow routes
+  such as an LLM call (`deploy: { timeout: 120 }`), or have the job route start a Workflow and
+  return.
 </Warning>
 
 - **Cold starts.** Loading a backend and answering its first call takes 29 ms (1 KB bundle) to

@@ -83,7 +83,7 @@ A `type: backend` app with a `worker:` block is a [Worker backend](/docs/backend
 
 <CodeBlock code={ymlWorker} lang="yaml" />
 
-Rules `spky lint` and `spky deploy` enforce: `hosting: external` and `runOn` are refused with `worker`; binding names (`ai` and every workflow `binding`) must differ; `entry` must exist; the backend's name must be lowercase letters, digits, `-` or `_`. `spky lint` warns when `baseUrl` is set (unused on Cloudflare, though `spky dev` still uses it to reach the backend locally), when an `expose` pattern covers a path in the OpenAPI spec (that job route would be public too), and when the manifest can only deploy to VMs.
+Rules `spky lint` and `spky deploy` enforce: `hosting: external` and `runOn` are refused with `worker`; binding names (`ai` and every workflow `binding`) must differ; `entry` must exist; the backend's name must be lowercase letters, digits, `-` or `_`. `spky lint` warns when an `expose` pattern covers a path in the OpenAPI spec (that job route would be public too), and when the manifest can only deploy to VMs.
 
 #### `scope`: where an app runs
 

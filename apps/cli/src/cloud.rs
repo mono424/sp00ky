@@ -2317,8 +2317,16 @@ fn deploy_worker_backend_cloudflare(
         worker.entry,
         WORKER_ESBUILD_VERSION
     );
+    // npx gets a prefix outside the project: inside a pnpm workspace npm 12
+    // finds the pinned esbuild in `node_modules/.pnpm`, takes it as installed
+    // and runs a bin pnpm never linked ("esbuild: command not found"). esbuild
+    // itself still runs in the app dir and resolves imports from the entry.
+    let npx_prefix = std::env::temp_dir().join("sp00ky-esbuild");
+    fs::create_dir_all(&npx_prefix).context("Failed to create the esbuild npx prefix")?;
     // stderr is captured (and echoed) to name the imports esbuild could not resolve.
     let output = std::process::Command::new("npx")
+        .arg("--prefix")
+        .arg(&npx_prefix)
         .args(worker_esbuild_args(&entry, &outfile, worker))
         .current_dir(&app_dir)
         .stdout(std::process::Stdio::inherit())

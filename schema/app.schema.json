@@ -124,6 +124,9 @@
     "worker": {
       "$ref": "#/$defs/workerConfig"
     },
+    "workflows": {
+      "$ref": "#/$defs/durableWorkflows"
+    },
     "env": {
       "$ref": "#/$defs/envConfig"
     }
@@ -407,6 +410,38 @@
         }
       },
       "additionalProperties": false
+    },
+    "durableWorkflows": {
+      "type": "array",
+      "description": "Durable workflows on sp00ky's own engine (@spooky-sync/backend), on every host: the env binding and the exported WorkflowEntrypoint class of each. Their runs are jobs in the backend's outbox table, so the backend needs an outbox `method`. Not Cloudflare Workflows (that is `worker.workflows`).",
+      "items": {
+        "type": "object",
+        "required": [
+          "binding",
+          "class"
+        ],
+        "properties": {
+          "binding": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "description": "Binding name in the backend's env, e.g. INGEST."
+          },
+          "class": {
+            "type": "string",
+            "description": "Name of the exported WorkflowEntrypoint class, e.g. IngestMaterial."
+          }
+        },
+        "additionalProperties": false
+      },
+      "default": [],
+      "examples": [
+        [
+          {
+            "binding": "INGEST",
+            "class": "IngestMaterial"
+          }
+        ]
+      ]
     },
     "workerConfig": {
       "type": "object",

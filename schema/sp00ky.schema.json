@@ -503,6 +503,9 @@
             "worker": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/workerConfig"
             },
+            "workflows": {
+              "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/durableWorkflows"
+            },
             "env": {
               "$ref": "https://sp00ky.cloud/schema/app.schema.json#/$defs/envConfig"
             }

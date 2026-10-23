@@ -946,15 +946,15 @@ enum ProjectCommands {
         /// Project slug (lowercase, alphanumeric + hyphens)
         #[arg(long)]
         slug: Option<String>,
-        /// Plan: starter, pro, business
-        #[arg(long, default_value = "starter")]
+        /// Plan: payg (Cloudflare, pay as you go), starter or pro (VMs)
+        #[arg(long, default_value = "payg")]
         plan: String,
     },
     /// List cloud projects
     #[command(visible_alias = "ls")]
     List,
     /// Print SurrealDB credentials for the current project (root on a dedicated
-    /// database, a namespace-level login on the free plan's shared one)
+    /// database, a namespace-level login on the retired free plan's shared one)
     Credentials {
         /// Print only the password (no URL / username label) — handy for piping
         /// into other tools (e.g. `export SURREAL_PASS=$(spky project credentials --raw)`).

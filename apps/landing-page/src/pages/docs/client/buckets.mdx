@@ -239,7 +239,7 @@ the files instead:
   lang="sql"
 />
 
-- **On the free plan (Cloudflare)**, `spky deploy` asks for an R2 bucket bound
+- **On a Cloudflare project (pay as you go)**, `spky deploy` asks for an R2 bucket bound
   to the project's SSP Worker, and bakes the Worker's URL into the frontend
   build as `VITE_SPKY_FILES_ENDPOINT`.
 - **Locally**, `spky dev` keeps the files in the SSP's data directory and sets
@@ -263,7 +263,7 @@ a bucket clause with them off), and signed-out requests are refused. Listing
 an `r2` bucket is refused, as SurrealDB refuses it to record users.
 
 `spky bucket backend <name> r2` switches an existing bucket. The R2 backend is
-served by the free plan's Cloudflare SSP; on other plans use a
+served by a Cloudflare project's SSP; on the VM plans use a
 [persistent](#persistent-storage) `file:` backend.
 
 ## CLI: Adding a Bucket

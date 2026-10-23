@@ -3219,11 +3219,19 @@ pub fn deploy(
     // Build SurrealDB manifest
     let resolved_surreal = config.resolved_surrealdb();
     let mut surrealdb_manifest = match resolved_surreal.hosting {
-        HostingMode::Cloud => serde_json::json!({
-            "hosting": "cloud",
-            "namespace": resolved_surreal.namespace,
-            "database": resolved_surreal.database,
-        }),
+        HostingMode::Cloud => {
+            let mut m = serde_json::json!({
+                "hosting": "cloud",
+                "namespace": resolved_surreal.namespace,
+                "database": resolved_surreal.database,
+            });
+            // Pay as you go: the managed database's size. Omitted when unset,
+            // so the cloud keeps its default (S) and VM deploys are unchanged.
+            if let Some(size) = &resolved_surreal.size {
+                m["size"] = serde_json::json!(size);
+            }
+            m
+        }
         HostingMode::External => {
             use base64::Engine as _;
             // Resolve credentials — each is a literal or a `{ vault: KEY }`

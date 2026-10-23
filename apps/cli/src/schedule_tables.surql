@@ -482,3 +482,97 @@ DEFINE FIELD OVERWRITE concurrency ON TABLE _00_job_policy TYPE int DEFAULT 1
     ASSERT $value > 0;
 
 DEFINE FIELD OVERWRITE updated_at ON TABLE _00_job_policy TYPE datetime VALUE time::now();
+
+-- ==================================================
+-- SPOOKY DURABLE WORKFLOWS (docs/durable-steps.md)
+-- Instances of a backend's durable workflow classes (`apps.<name>.workflows`,
+-- `@spooky-sync/backend`), their memoized steps and the events sent to them.
+-- The engine is the backend SDK: a job in the backend's own outbox runs an
+-- instance, replaying `run()` over the stored steps.
+--
+-- Written by the backend's own login only (root or the namespace owner): every
+-- write a run makes is a transaction fenced on `lease_epoch`. Readable by the
+-- instance's `owner` (set by `create({ owner })`), so a client can follow its
+-- own runs; an instance without an owner is root-only. `wake` is the token of
+-- the one job allowed to run the instance next, a capability, so no client
+-- ever reads it.
+-- ==================================================
+DEFINE TABLE OVERWRITE _00_wf_instance SCHEMAFULL
+    PERMISSIONS
+      FOR select WHERE owner != NONE AND owner = $auth.id
+      FOR create, update, delete NONE;
+
+-- The binding it was created through (`env.INGEST`) and its class, for the admin.
+DEFINE FIELD OVERWRITE binding ON TABLE _00_wf_instance TYPE string;
+DEFINE FIELD OVERWRITE class ON TABLE _00_wf_instance TYPE option<string>;
+-- Where its jobs go: the backend's outbox table and `/__spky/workflow/<binding>`.
+DEFINE FIELD OVERWRITE outbox ON TABLE _00_wf_instance TYPE string;
+DEFINE FIELD OVERWRITE path ON TABLE _00_wf_instance TYPE string;
+-- JSON text, exactly what was passed and returned: SurrealDB objects sort their
+-- keys, and a replay must see the same value as the run that produced it.
+DEFINE FIELD OVERWRITE params ON TABLE _00_wf_instance TYPE option<string>;
+DEFINE FIELD OVERWRITE output ON TABLE _00_wf_instance TYPE option<string>;
+DEFINE FIELD OVERWRITE error ON TABLE _00_wf_instance TYPE option<object> FLEXIBLE;
+DEFINE FIELD OVERWRITE status ON TABLE _00_wf_instance TYPE string DEFAULT 'queued'
+    ASSERT $value INSIDE ['queued', 'running', 'waiting', 'complete', 'errored', 'terminated'];
+DEFINE FIELD OVERWRITE owner ON TABLE _00_wf_instance TYPE option<record>;
+DEFINE FIELD OVERWRITE wake ON TABLE _00_wf_instance TYPE string
+    PERMISSIONS FOR select NONE;
+-- When the job carrying `wake` is due: a sleep, a retry backoff, an event timeout.
+DEFINE FIELD OVERWRITE wake_at ON TABLE _00_wf_instance TYPE option<datetime>;
+-- The run lease: a claim bumps the epoch, every run write is fenced on it.
+DEFINE FIELD OVERWRITE lease_epoch ON TABLE _00_wf_instance TYPE int DEFAULT 0;
+DEFINE FIELD OVERWRITE lease_until ON TABLE _00_wf_instance TYPE option<datetime>;
+-- Progress for a UI: finished steps, and the step running or waited on.
+DEFINE FIELD OVERWRITE steps_done ON TABLE _00_wf_instance TYPE int DEFAULT 0;
+DEFINE FIELD OVERWRITE current_step ON TABLE _00_wf_instance TYPE option<string>;
+DEFINE FIELD OVERWRITE created_at ON TABLE _00_wf_instance TYPE datetime DEFAULT time::now();
+DEFINE FIELD OVERWRITE started_at ON TABLE _00_wf_instance TYPE option<datetime>;
+DEFINE FIELD OVERWRITE updated_at ON TABLE _00_wf_instance TYPE datetime DEFAULT time::now();
+DEFINE FIELD OVERWRITE finished_at ON TABLE _00_wf_instance TYPE option<datetime>;
+
+-- The admin list (newest first, by status) and the retention prune.
+DEFINE INDEX IF NOT EXISTS idx_wfi_status ON TABLE _00_wf_instance COLUMNS status, created_at;
+DEFINE INDEX IF NOT EXISTS idx_wfi_finished ON TABLE _00_wf_instance COLUMNS status, finished_at;
+
+-- One row per step, id `_00_wf_step:[<instance key>, '<name>#<n>']`: the name
+-- and its occurrence in the run, which is the replay's cache key.
+DEFINE TABLE OVERWRITE _00_wf_step SCHEMAFULL
+    PERMISSIONS
+      FOR select WHERE instance.owner != NONE AND instance.owner = $auth.id
+      FOR create, update, delete NONE;
+
+DEFINE FIELD OVERWRITE instance ON TABLE _00_wf_step TYPE record<_00_wf_instance>;
+DEFINE FIELD OVERWRITE name ON TABLE _00_wf_step TYPE string;
+DEFINE FIELD OVERWRITE n ON TABLE _00_wf_step TYPE int DEFAULT 0;
+DEFINE FIELD OVERWRITE kind ON TABLE _00_wf_step TYPE string
+    ASSERT $value INSIDE ['do', 'sleep', 'event'];
+DEFINE FIELD OVERWRITE status ON TABLE _00_wf_step TYPE string
+    ASSERT $value INSIDE ['success', 'failed', 'retrying', 'sleeping', 'waiting'];
+DEFINE FIELD OVERWRITE attempts ON TABLE _00_wf_step TYPE int DEFAULT 0;
+-- JSON text, at most 1 MiB (the SDK refuses more: big outputs go to a bucket).
+DEFINE FIELD OVERWRITE output ON TABLE _00_wf_step TYPE option<string>;
+DEFINE FIELD OVERWRITE error ON TABLE _00_wf_step TYPE option<object> FLEXIBLE;
+-- Retry, wake or timeout time.
+DEFINE FIELD OVERWRITE next_at ON TABLE _00_wf_step TYPE option<datetime>;
+DEFINE FIELD OVERWRITE event_type ON TABLE _00_wf_step TYPE option<string>;
+DEFINE FIELD OVERWRITE started_at ON TABLE _00_wf_step TYPE option<datetime>;
+DEFINE FIELD OVERWRITE finished_at ON TABLE _00_wf_step TYPE option<datetime>;
+DEFINE FIELD OVERWRITE updated_at ON TABLE _00_wf_step TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS idx_wfs_instance ON TABLE _00_wf_step COLUMNS instance;
+
+-- Events sent to an instance (`instance.sendEvent`). Kept until a matching
+-- `waitForEvent` consumes them, oldest first, so an event may arrive before
+-- the instance waits for it. Root-only.
+DEFINE TABLE OVERWRITE _00_wf_event SCHEMAFULL PERMISSIONS NONE;
+
+DEFINE FIELD OVERWRITE instance ON TABLE _00_wf_event TYPE record<_00_wf_instance>;
+DEFINE FIELD OVERWRITE type ON TABLE _00_wf_event TYPE string;
+-- JSON text.
+DEFINE FIELD OVERWRITE payload ON TABLE _00_wf_event TYPE option<string>;
+-- The step that consumed it (`<name>#<n>`), NONE until then.
+DEFINE FIELD OVERWRITE step ON TABLE _00_wf_event TYPE option<string>;
+DEFINE FIELD OVERWRITE created_at ON TABLE _00_wf_event TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS idx_wfe_instance ON TABLE _00_wf_event COLUMNS instance, type;

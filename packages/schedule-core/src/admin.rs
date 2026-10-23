@@ -126,12 +126,14 @@ fn pair<'a>(pairs: &'a [(String, String)], key: &str) -> Option<String> {
 
 /// Which part of the system created a job. It is in the id: `schedule_core::ids`
 /// mints `sch_<run key>` for a schedule fire and `wf_<run key>_<step>` for a
-/// workflow step; anything else was created by the application.
+/// workflow step, and the backend SDK mints `dwf_<wake token>` for a run of a
+/// durable workflow instance; anything else was created by the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
     Schedule,
     Workflow,
+    Durable,
     App,
 }
 
@@ -140,6 +142,7 @@ impl Origin {
         match self {
             Origin::Schedule => "schedule",
             Origin::Workflow => "workflow",
+            Origin::Durable => "durable",
             Origin::App => "app",
         }
     }
@@ -148,6 +151,7 @@ impl Origin {
         match s {
             "schedule" => Some(Origin::Schedule),
             "workflow" => Some(Origin::Workflow),
+            "durable" => Some(Origin::Durable),
             "app" => Some(Origin::App),
             _ => None,
         }
@@ -159,9 +163,11 @@ impl Origin {
         match self {
             Origin::Schedule => "string::starts_with(record::id(id), 'sch_')",
             Origin::Workflow => "string::starts_with(record::id(id), 'wf_')",
+            Origin::Durable => "string::starts_with(record::id(id), 'dwf_')",
             Origin::App => {
                 "!string::starts_with(record::id(id), 'sch_') \
-                 AND !string::starts_with(record::id(id), 'wf_')"
+                 AND !string::starts_with(record::id(id), 'wf_') \
+                 AND !string::starts_with(record::id(id), 'dwf_')"
             }
         }
     }
@@ -175,6 +181,8 @@ pub fn origin_of(key: &str) -> Origin {
         Origin::Schedule
     } else if key.starts_with("wf_") {
         Origin::Workflow
+    } else if key.starts_with("dwf_") {
+        Origin::Durable
     } else {
         Origin::App
     }
@@ -436,7 +444,7 @@ async fn attach_origins(db: &dyn ScheduleDb, jobs: &mut [Value]) {
         match origin_of(key) {
             Origin::Schedule => scheduled.push(id.to_string()),
             Origin::Workflow => stepped.push(id.to_string()),
-            Origin::App => {}
+            Origin::Durable | Origin::App => {}
         }
     }
 
@@ -971,6 +979,177 @@ pub async fn retry_run(engine: &ScheduleEngine, id: &str) -> AdminResult<Value> 
         "reset": out.reset,
         "kept": out.kept,
     }))
+}
+
+// =============================================================
+// Durable workflow instances
+// =============================================================
+//
+// Instances of a backend's durable workflow classes (`@spooky-sync/backend`,
+// docs/durable-steps.md). The engine lives in the backend; the operator surface
+// only reads the rows and moves the instance's state the way the SDK does
+// (`terminate()`, a new wake token), so the two can never disagree about what a
+// cancelled instance looks like.
+
+const INSTANCE_FIELDS: &str = "record::id(id) AS id, binding, class, status, outbox, \
+     steps_done, current_step, error, \
+     type::string(wake_at) AS wake_at, type::string(lease_until) AS lease_until, \
+     type::string(created_at) AS created_at, type::string(started_at) AS started_at, \
+     type::string(updated_at) AS updated_at, type::string(finished_at) AS finished_at";
+
+/// The statuses an instance can still move from.
+const DURABLE_ACTIVE: &str = "['queued', 'running', 'waiting']";
+
+/// `GET /durable/instances` filters.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct InstancesQuery {
+    #[serde(default)]
+    pub binding: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl InstancesQuery {
+    pub fn from_pairs(pairs: &[(String, String)]) -> Self {
+        Self {
+            binding: pair(pairs, "binding"),
+            status: pair(pairs, "status"),
+            limit: pair(pairs, "limit").and_then(|s| s.parse().ok()),
+        }
+    }
+
+    pub fn surql(&self) -> String {
+        let mut filters = Vec::new();
+        if let Some(binding) = nonempty(&self.binding) {
+            filters.push(format!("binding = '{}'", esc(binding)));
+        }
+        if let Some(status) = nonempty(&self.status) {
+            filters.push(format!("status = '{}'", esc(status)));
+        }
+        let where_clause =
+            if filters.is_empty() { String::new() } else { format!("WHERE {} ", filters.join(" AND ")) };
+        let limit = self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        format!("SELECT {INSTANCE_FIELDS} FROM _00_wf_instance {where_clause}ORDER BY created_at DESC LIMIT {limit};")
+    }
+}
+
+/// An instance's key from what an operator passes: the bare id `create()`
+/// returned, or the record id (`_00_wf_instance:abc`, `_00_wf_instance:⟨a-b⟩`).
+pub fn instance_key(id: &str) -> String {
+    let key = id.trim();
+    let key = key.strip_prefix("_00_wf_instance:").unwrap_or(key);
+    let key = key
+        .strip_prefix('⟨')
+        .and_then(|k| k.strip_suffix('⟩'))
+        .or_else(|| key.strip_prefix('`').and_then(|k| k.strip_suffix('`')))
+        .unwrap_or(key);
+    key.to_string()
+}
+
+fn instance_record(id: &str) -> String {
+    format!("type::record('_00_wf_instance', '{}')", esc(&instance_key(id)))
+}
+
+/// `GET /durable/instances`
+pub async fn list_instances(db: &dyn ScheduleDb, q: &InstancesQuery) -> AdminResult<Value> {
+    Ok(json!({ "instances": query_rows(db, &q.surql()).await? }))
+}
+
+/// `GET /durable/instances/:id`: the instance with its params and output, its
+/// steps in the order they first ran, and the events still waiting for a step.
+pub async fn instance_detail(db: &dyn ScheduleDb, id: &str) -> AdminResult<Value> {
+    let rec = instance_record(id);
+    let instance = query_rows(db, &format!("SELECT {INSTANCE_FIELDS}, params, output FROM {rec};"))
+        .await?
+        .into_iter()
+        .next()
+        .filter(Value::is_object)
+        .ok_or_else(|| AdminError::new(404, format!("No durable workflow instance '{id}'")))?;
+    let steps = query_rows(
+        db,
+        &format!(
+            "SELECT name, n, kind, status, attempts, output, error, event_type, \
+             type::string(next_at) AS next_at, type::string(started_at) AS started_at, \
+             type::string(finished_at) AS finished_at, started_at AS started \
+             FROM _00_wf_step WHERE instance = {rec} ORDER BY started ASC;"
+        ),
+    )
+    .await?;
+    let events = query_rows(
+        db,
+        &format!(
+            "SELECT type, step, type::string(created_at) AS created_at FROM _00_wf_event \
+             WHERE instance = {rec} ORDER BY created_at ASC LIMIT {MAX_LIMIT};"
+        ),
+    )
+    .await?;
+    Ok(json!({ "instance": instance, "steps": steps, "events": events }))
+}
+
+/// `POST /durable/instances/:id/cancel`: `terminate()`. The epoch moves, so a run
+/// holding the instance stops at its next write; the token moves, so no queued
+/// job can run it again.
+pub async fn cancel_instance(db: &dyn ScheduleDb, id: &str) -> AdminResult<Value> {
+    let rec = instance_record(id);
+    let out = query_rows(
+        db,
+        &format!(
+            "RETURN {{ \
+             LET $done = (UPDATE {rec} SET status = 'terminated', lease_epoch = (lease_epoch ?? 0) + 1, \
+             lease_until = NONE, wake = rand::string(32), wake_at = NONE, current_step = NONE, \
+             finished_at = time::now(), updated_at = time::now() \
+             WHERE status INSIDE {DURABLE_ACTIVE} RETURN VALUE status); \
+             RETURN {{ done: array::len($done) > 0, status: (SELECT VALUE status FROM ONLY {rec}) }}; \
+             }};"
+        ),
+    )
+    .await?;
+    answer_transition(id, out, "terminated")
+}
+
+/// `POST /durable/instances/:id/retry`: hand an active instance a new token and
+/// a job due now, in one statement (a block runs in one transaction). The way out when its outbox job gave up (the backend was down
+/// for longer than the job's retries): the instance is still `running` or
+/// `waiting`, and nothing would ever run it again. A live run is left alone: the
+/// new job answers 503 until that run's lease is free.
+pub async fn retry_instance(db: &dyn ScheduleDb, id: &str) -> AdminResult<Value> {
+    let rec = instance_record(id);
+    let key = esc(&instance_key(id));
+    let out = query_rows(
+        db,
+        &format!(
+            "RETURN {{ \
+             LET $cur = (SELECT status, outbox, path FROM ONLY {rec}); \
+             LET $active = $cur != NONE AND $cur.status INSIDE {DURABLE_ACTIVE}; \
+             LET $wake = rand::string(32); \
+             IF $active {{ \
+               UPDATE {rec} SET wake = $wake, wake_at = time::now(), updated_at = time::now(); \
+               CREATE type::record($cur.outbox, string::concat('dwf_', $wake)) CONTENT {{ \
+                 path: $cur.path, payload: {{ instance: '{key}', wake: $wake }}, delay: 0, \
+                 max_retries: 10, retry_strategy: 'exponential' \
+               }}; \
+             }}; \
+             RETURN {{ done: $active, status: $cur.status }}; \
+             }};"
+        ),
+    )
+    .await?;
+    answer_transition(id, out, "retried")
+}
+
+/// The answer to a state change: done, already finished (409) or missing (404).
+fn answer_transition(id: &str, rows: Vec<Value>, verb: &str) -> AdminResult<Value> {
+    let out = rows.into_iter().last().unwrap_or(Value::Null);
+    let status = out.get("status").cloned().unwrap_or(Value::Null);
+    if status.is_null() {
+        return Err(AdminError::new(404, format!("No durable workflow instance '{id}'")));
+    }
+    if out.get("done").and_then(Value::as_bool) != Some(true) {
+        return Err(AdminError::new(409, format!("Instance '{id}' is already {status}")));
+    }
+    Ok(json!({ "instance": instance_key(id), "status": status, "action": verb }))
 }
 
 // =============================================================

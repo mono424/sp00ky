@@ -169,6 +169,9 @@ const PRUNE_BATCH: usize = 500;
 /// without ever spiking the ingest path.
 const PRUNE_MAX_BATCHES: usize = 20;
 
+/// Durable instances per prune statement: each takes its steps with it.
+const DURABLE_PRUNE_BATCH: usize = 50;
+
 /// Job rows looked up per statement when healing. The ids are interpolated, so this
 /// bounds statement length as well as result size.
 const HEAL_LOOKUP_BATCH: usize = 500;
@@ -1320,6 +1323,12 @@ impl ScheduleEngine {
             .await;
         }
 
+        // Finished durable workflow instances, on the run windows.
+        for (status, failed) in sql::DURABLE_PRUNABLE {
+            let window = if failed { policy.run_failed } else { policy.run_success };
+            self.prune_durable(status, &json!(stamp(now - window)), report).await;
+        }
+
         // Outbox job rows. These are ordinary synced user tables, so every deleted
         // row fires the table's generated delete event and POSTs the record to
         // `/ingest` — which is why the batch budget matters far more here than on
@@ -1533,6 +1542,31 @@ impl ScheduleEngine {
     ///
     /// Never returns `Err`: retention failing is a warning, not a reason to abort a
     /// sweep that has already planned and fired.
+    /// Delete finished durable instances (and their steps and events) older than
+    /// `before`. No rollup: an instance is not a schedule run, and its outcome is
+    /// on the instance row until it goes.
+    async fn prune_durable(&self, status: &str, before: &Value, report: &mut TickReport) {
+        for _ in 0..PRUNE_MAX_BATCHES {
+            let binds = [("before", before.clone()), ("batch", json!(DURABLE_PRUNE_BATCH)), ("status", json!(status))];
+            match self.db.query(sql::PRUNE_DURABLE_INSTANCES, &binds).await {
+                Ok(results) => {
+                    let n = rows(results).len();
+                    report.pruned += n;
+                    if n < DURABLE_PRUNE_BATCH {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // A project that predates the tables has none to prune.
+                    if !e.to_string().to_ascii_lowercase().contains("does not exist") {
+                        tracing::warn!(error = %e, status, "durable instance prune failed");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     async fn prune_batches(
         &self,
         stmt: &str,

@@ -60,6 +60,7 @@ export const docsNav = [
       { text: 'Add a backend', href: `${basePath}/docs/backend/add` },
       { text: 'Backend options', href: `${basePath}/docs/backend/options` },
       { text: 'Worker backends', href: `${basePath}/docs/backend/workers`, experimental: true },
+      { text: 'Durable workflows', href: `${basePath}/docs/backend/durable-workflows`, experimental: true },
     ],
   },
   {

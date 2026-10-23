@@ -660,10 +660,11 @@ export interface WorkflowRunDetail extends WorkflowRun {
  * Where a job came from, derived by the scheduler from the key
  * `schedule-core` minted for it.
  *
+ * `durable` is a run of a durable workflow instance (`@spooky-sync/backend`).
  * `app` is the class with no other surface anywhere in the dashboard: a job the
  * application created itself, belonging to no schedule and no workflow.
  */
-export type OriginKind = 'schedule' | 'workflow' | 'app';
+export type OriginKind = 'schedule' | 'workflow' | 'durable' | 'app';
 
 /**
  * The origin block on every job row. `kind` is always present; the rest is the

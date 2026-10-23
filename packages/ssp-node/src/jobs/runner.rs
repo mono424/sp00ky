@@ -250,7 +250,7 @@ impl JobRunnerCtx {
                     method: Method::Post,
                     url,
                     bearer: job.auth_token.clone(),
-                    headers: vec![],
+                    headers: job_headers(&job),
                     json_body: Some(payload),
                     timeout: job.timeout,
                 },
@@ -486,6 +486,18 @@ impl JobRunnerCtx {
         }
         Ok(())
     }
+}
+
+/// What the backend learns about the job it is serving, besides the payload:
+/// its id, which attempt this is (1 on the first), and the deadline this request
+/// runs under. A durable workflow run (`@spooky-sync/backend`) sizes its time
+/// budget from the deadline so it hands over before the runner cuts it off.
+pub fn job_headers(job: &JobEntry) -> Vec<(String, String)> {
+    vec![
+        ("x-spky-job-id".to_string(), job.id.clone()),
+        ("x-spky-job-attempt".to_string(), (job.retries + 1).to_string()),
+        ("x-spky-job-timeout-ms".to_string(), job.timeout.as_millis().to_string()),
+    ]
 }
 
 /// Cap on the stored size of a job's captured `result`. A backend that streams
@@ -1036,6 +1048,27 @@ fn calculate_delay(retries: u32, strategy: &str) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_request_names_the_job_its_attempt_and_its_deadline() {
+        let mut job = JobEntry::from_record(
+            "job:dwf_abc".into(),
+            "http://backend".into(),
+            None,
+            &json!({ "path": "/__spky/workflow/INGEST", "retries": 2 }),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            job_headers(&job),
+            vec![
+                ("x-spky-job-id".to_string(), "job:dwf_abc".to_string()),
+                ("x-spky-job-attempt".to_string(), "3".to_string()),
+                ("x-spky-job-timeout-ms".to_string(), "60000".to_string()),
+            ]
+        );
+        job.retries = 0;
+        assert_eq!(job_headers(&job)[1].1, "1");
+    }
 
     #[test]
     fn validate_job_id_accepts_table_colon_key() {

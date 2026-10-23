@@ -347,6 +347,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/workflows/runs", get(workflows::list_runs))
         .route("/workflows/runs/:id", get(workflows::run_detail))
         .route("/workflows/stream", get(workflows::stream_runs))
+        .route("/durable/instances", get(workflows::list_instances))
+        .route("/durable/instances/:id", get(workflows::instance_detail))
         .route("/schedules", get(workflows::list_schedules))
         .route("/schedules/:name", get(workflows::schedule_detail))
         // Actions. Every one logs the session subject; the long-running
@@ -369,6 +371,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/workflows/runs/:id/cancel", post(workflows::cancel_run))
         .route("/workflows/runs/:id/rerun", post(workflows::rerun_run))
         .route("/workflows/runs/:id/retry", post(workflows::retry_run))
+        .route("/durable/instances/:id/cancel", post(workflows::cancel_instance))
+        .route("/durable/instances/:id/retry", post(workflows::retry_instance))
         .route("/pools", get(pools::list_pools))
         .route("/pools/:name/machines", get(pools::list_machines))
         .route("/pools/:name/pause", post(pools::pool_pause))

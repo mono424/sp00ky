@@ -89,7 +89,8 @@ Call the job routes as usual:
 - **Workflows.** Each `workflows` entry gives `env.<binding>`, a
   [Cloudflare Workflow](https://developers.cloudflare.com/workflows/) binding
   (`env.INGEST.create({ params })`). The `class` must be exported from the entry. Its `this.env` is
-  the same env.
+  the same env. For workflows that also run on a VM and under `spky dev`, with no Cloudflare
+  Workflows behind them, use [durable workflows](/docs/backend/durable-workflows) (the same API).
 - **Text modules.** Files matched by `textModules` import as strings
   (`import query from './material.surql'`).
 - **Outbound `fetch` is open.** Call any API you like.

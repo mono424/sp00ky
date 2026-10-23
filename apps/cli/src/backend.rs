@@ -2228,7 +2228,9 @@ pub struct WorkerDeployConfig {
     pub expose: Vec<String>,
 }
 
-/// One Workflow of a Worker backend: the `env` binding and the exported class.
+/// One workflow of a backend: the `env` binding and the exported class. Used by
+/// `worker.workflows` (Cloudflare Workflows) and by `workflows` (durable
+/// workflows on sp00ky's own engine, every host).
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerWorkflowBinding {
@@ -2495,6 +2497,12 @@ pub struct AppConfig {
     /// of a Docker container (see [`WorkerDeployConfig`]). Ignored on a VM project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerDeployConfig>,
+    /// Durable workflows this backend runs on sp00ky's own engine
+    /// (`@spooky-sync/backend`, docs/durable-steps.md), on every host: one `env`
+    /// binding and exported `WorkflowEntrypoint` class each. Their runs are jobs
+    /// in the backend's outbox table, so it needs `method: outbox`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<WorkerWorkflowBinding>,
 
     // ── Docker-app fields (type: docker) ────────────────────────────────
     /// Prebuilt image to run (required for `type: docker`).
@@ -2580,11 +2588,74 @@ impl AppConfig {
         self.scope != AppScope::DevOnly
     }
 
+    /// Variables sp00ky injects into this app's env on every host, besides the
+    /// project-wide `SPKY_*` ones: `SPKY_OUTBOX_TABLE`, where the backend SDK
+    /// puts the jobs of a durable workflow.
+    pub fn spky_app_vars(&self) -> Vec<(String, String)> {
+        match &self.method {
+            Some(m) if m.method_type == MethodType::Outbox => m
+                .table
+                .iter()
+                .map(|t| ("SPKY_OUTBOX_TABLE".to_string(), t.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `workflows`: a backend with an outbox, identifier-shaped bindings and
+    /// classes, and no binding declared twice across `workflows`,
+    /// `worker.workflows` and `worker.ai` (they share the backend's `env`).
+    fn validate_durable_workflows(&self, name: &str) -> Result<()> {
+        if self.workflows.is_empty() {
+            return Ok(());
+        }
+        if self.app_type != AppType::Backend {
+            bail!("App '{}' sets 'workflows', which only a backend can use", name);
+        }
+        match &self.method {
+            Some(m) if m.method_type == MethodType::Outbox && m.table.is_some() => {}
+            _ => bail!(
+                "Backend '{}' declares durable 'workflows' but has no outbox 'method' with a 'table': \
+                 their runs are jobs in that table",
+                name
+            ),
+        }
+        let ident = |s: &str, extra: char| {
+            let mut chars = s.chars();
+            chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == extra)
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == extra)
+        };
+        let mut seen: Vec<&str> = Vec::new();
+        if let Some(worker) = &self.worker {
+            seen.extend(worker.ai.as_deref());
+            seen.extend(worker.workflows.iter().map(|w| w.binding.as_str()));
+        }
+        for wf in &self.workflows {
+            if !ident(&wf.binding, '_') {
+                bail!(
+                    "Backend '{}': workflow binding '{}' must be letters, digits and '_', not starting with a digit",
+                    name,
+                    wf.binding
+                );
+            }
+            if !ident(&wf.class, '$') {
+                bail!("Backend '{}': workflow class '{}' is not a JavaScript class name", name, wf.class);
+            }
+            if seen.contains(&wf.binding.as_str()) {
+                bail!("Backend '{}': binding '{}' is declared twice", name, wf.binding);
+            }
+            seen.push(&wf.binding);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, name: &str) -> Result<()> {
         // A docker app always needs an image (regardless of scope).
         if self.app_type == AppType::Docker && self.image.is_none() {
             bail!("Docker app '{}' is missing required field 'image'", name);
         }
+        // Durable workflows run under `spky dev` too, so devOnly apps check them.
+        self.validate_durable_workflows(name)?;
         // devOnly apps are local-only processes — they carry no spec/method/deploy,
         // so skip the backend deploy-shape requirements below. They still validate
         // `deploy` resources if a deploy block happens to be present (checked at end).
@@ -3121,11 +3192,14 @@ impl BackendProcessor {
             if app.app_type != AppType::Backend {
                 continue;
             }
-            // devOnly backends are local-only host processes (e.g. the LiveKit SFU
-            // run via `dev: "livekit-server …"`); they carry no spec/method/schema
-            // to apply, matching AppConfig::validate's devOnly early-return. Without
-            // this skip, process_backend bails "missing 'method' field".
-            if app.scope == AppScope::DevOnly {
+            // devOnly backends are usually local-only host processes (e.g. the
+            // LiveKit SFU run via `dev: "livekit-server …"`) with no spec/method/
+            // schema to apply, matching AppConfig::validate's devOnly early-return.
+            // One that does declare an outbox `method` and a `spec` (the example's
+            // `api`) is a real job backend in dev: skipping it left its outbox
+            // without the ingest events and platform fields, so every job waited
+            // for the recovery sweep (30-60 s) and ran without a lease.
+            if app.scope == AppScope::DevOnly && (app.method.is_none() || app.spec.is_none()) {
                 continue;
             }
             // A backend with no `method` is a direct-HTTP service (e.g. the
@@ -3671,6 +3745,35 @@ apps:
             !p.schema_appends.contains("livekit"),
             "skipped devOnly backend must not contribute schema"
         );
+    }
+
+    /// A devOnly backend that DOES declare an outbox (the example's `api`) is a
+    /// job backend in dev: its outbox schema must be processed, or the table gets
+    /// no ingest events and its jobs wait for the recovery sweep.
+    #[test]
+    fn devonly_backend_with_an_outbox_is_processed() {
+        let yaml = "\
+slug: t
+surrealdb:
+  namespace: main
+  database: main
+apps:
+  api:
+    type: backend
+    scope: devOnly
+    spec: ./openapi.yml
+    method: { type: outbox, table: job, schema: ./outbox.surql }
+";
+        let (dir, path) = write_config(yaml);
+        std::fs::write(dir.path().join("outbox.surql"), "DEFINE TABLE job SCHEMAFULL;\n").unwrap();
+        std::fs::write(
+            dir.path().join("openapi.yml"),
+            "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths: {}\n",
+        )
+        .unwrap();
+        let mut p = BackendProcessor::new();
+        p.process(&path).expect("processed");
+        assert!(p.schema_appends.contains("DEFINE TABLE job"), "{}", p.schema_appends);
     }
 
     /// A `type: backend` with no `method` is a direct-HTTP / deploy-only service
@@ -4254,6 +4357,43 @@ apps:
       workflows: [{ binding: INGEST, class: IngestMaterial }]
       expose: [/llm/*]
 ";
+
+    #[test]
+    fn durable_workflows_parse_validate_and_name_the_outbox() {
+        let ok = cfg("\
+apps:
+  api:
+    type: backend
+    scope: devOnly
+    method: { type: outbox, table: job, schema: ./o.surql }
+    workflows: [{ binding: INGEST, class: IngestMaterial }, { binding: MAIL, class: $Mail }]
+    worker: { entry: ./i.ts, ai: AI }
+");
+        let api = &ok.apps["api"];
+        assert_eq!(api.workflows.len(), 2);
+        api.validate("api").expect("valid");
+        assert_eq!(api.spky_app_vars(), vec![("SPKY_OUTBOX_TABLE".to_string(), "job".to_string())]);
+
+        for (yaml, needle) in [
+            ("workflows: [{ binding: INGEST, class: I }]", "outbox"),
+            (
+                "method: { type: outbox, table: job, schema: o }\n    workflows: [{ binding: 1X, class: I }]",
+                "letters, digits",
+            ),
+            (
+                "method: { type: outbox, table: job, schema: o }\n    workflows: [{ binding: X, class: not-a-class }]",
+                "class name",
+            ),
+            (
+                "method: { type: outbox, table: job, schema: o }\n    workflows: [{ binding: AI, class: W }]\n    worker: { entry: i.ts, ai: AI }",
+                "declared twice",
+            ),
+        ] {
+            let c = cfg(&format!("apps:\n  api:\n    type: backend\n    scope: devOnly\n    {yaml}\n"));
+            let err = c.apps["api"].validate("api").expect_err(yaml).to_string();
+            assert!(err.contains(needle), "{yaml}: {err}");
+        }
+    }
 
     #[test]
     fn worker_block_parses_every_field() {

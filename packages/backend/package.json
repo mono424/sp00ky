@@ -1,0 +1,52 @@
+{
+  "name": "@spooky-sync/backend",
+  "version": "0.0.1-canary.350",
+  "description": "sp00ky backend SDK: durable workflows with Cloudflare Workflows' API on sp00ky's own job engine (VM, spky dev, Cloudflare Worker backends)",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "AGENTS.md",
+    "skills"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "test": "vitest run",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "sp00ky",
+    "surrealdb",
+    "workflows",
+    "durable",
+    "cloudflare",
+    "tanstack-intent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mono424/sp00ky.git",
+    "directory": "packages/backend"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsdown": "^0.12.4",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  }
+}

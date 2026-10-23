@@ -29,7 +29,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
 use maintenance::db::ReconnectingDb;
-use schedule_core::admin::{self as core, ReleaseBody, RunsQuery};
+use schedule_core::admin::{self as core, InstancesQuery, ReleaseBody, RunsQuery};
 use schedule_core::ScheduleEngine;
 
 use super::{core_db, core_error, db_unavailable, rows, AdminState, ApiError, CurrentSession};
@@ -52,6 +52,44 @@ pub async fn run_detail(
     // The path segment arrives percent-decoded by axum; the shared query
     // escapes it into a string literal.
     core::run_detail(&core_db(&state)?, &id).await.map(Json).map_err(core_error)
+}
+
+/// `GET /admin/api/durable/instances`
+pub async fn list_instances(
+    State(state): State<AdminState>,
+    Query(q): Query<InstancesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    core::list_instances(&core_db(&state)?, &q).await.map(Json).map_err(core_error)
+}
+
+/// `GET /admin/api/durable/instances/:id`
+pub async fn instance_detail(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    core::instance_detail(&core_db(&state)?, &id).await.map(Json).map_err(core_error)
+}
+
+/// `POST /admin/api/durable/instances/:id/cancel`
+pub async fn cancel_instance(
+    State(state): State<AdminState>,
+    Extension(CurrentSession(session)): Extension<CurrentSession>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let out = core::cancel_instance(&core_db(&state)?, &id).await.map_err(core_error)?;
+    tracing::info!(instance = %id, by = %session.subject, "Durable workflow instance cancelled from the dashboard");
+    Ok(Json(out))
+}
+
+/// `POST /admin/api/durable/instances/:id/retry`
+pub async fn retry_instance(
+    State(state): State<AdminState>,
+    Extension(CurrentSession(session)): Extension<CurrentSession>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let out = core::retry_instance(&core_db(&state)?, &id).await.map_err(core_error)?;
+    tracing::info!(instance = %id, by = %session.subject, "Durable workflow instance retried from the dashboard");
+    Ok(Json(out))
 }
 
 pub async fn list_schedules(State(state): State<AdminState>) -> Result<Json<Value>, ApiError> {

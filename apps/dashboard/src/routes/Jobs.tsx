@@ -90,6 +90,11 @@ const ORIGINS: { key: OriginKind; label: string; hint: string }[] = [
     hint: 'One step of a workflow run',
   },
   {
+    key: 'durable',
+    label: 'Durable workflow',
+    hint: 'A run of a durable workflow instance (step.do in a backend)',
+  },
+  {
     key: 'app',
     label: 'Application',
     hint: 'Created by your own code, belonging to no schedule or workflow',

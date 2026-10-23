@@ -659,6 +659,25 @@ RETURN $doomed; \
 
 
 
+/// Finished durable workflow instances (`@spooky-sync/backend`) past their
+/// window, with their steps and events. An instance can hold hundreds of
+/// steps, so the engine runs this with a smaller batch than the run prunes.
+pub const PRUNE_DURABLE_INSTANCES: &str = "\
+RETURN { \
+LET $doomed = (SELECT id, finished_at FROM _00_wf_instance \
+WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$before \
+ORDER BY finished_at ASC LIMIT $batch); \
+LET $ids = $doomed.id; \
+DELETE _00_wf_step WHERE instance INSIDE $ids; \
+DELETE _00_wf_event WHERE instance INSIDE $ids; \
+DELETE $ids; \
+RETURN $doomed; \
+}";
+
+/// The durable instance statuses the prune takes, each with whether it keeps
+/// the failure window (true) or the success one.
+pub const DURABLE_PRUNABLE: [(&str, bool); 3] = [("complete", false), ("errored", true), ("terminated", true)];
+
 // ---------------------------------------------------------------------------
 // Retention policy + job-table prune
 // ---------------------------------------------------------------------------

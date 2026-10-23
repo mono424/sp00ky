@@ -2434,7 +2434,10 @@ mod supervisor_tests {
 /// is the SSP container's own loopback, so a host-process backend (`dev: npm` /
 /// `uv`) or a sibling `dev: docker` backend (published to the host) is
 /// unreachable there. Rewrite the loopback host to `host.docker.internal` so
-/// the containerized SSP reaches the host. A host-binary SSP keeps `127.0.0.1`.
+/// the containerized SSP reaches the host. A host-binary SSP gets the reverse:
+/// `host.docker.internal` (what the example and most dev configs write) only
+/// resolves inside a container, so it becomes `localhost`, and every job
+/// otherwise failed with "error sending request".
 fn build_job_config_json(config: &Sp00kyConfig, ssp_in_docker: bool) -> String {
     let mut entries = Vec::new();
     for (name, app) in config.backends() {
@@ -2457,7 +2460,7 @@ fn build_job_config_json(config: &Sp00kyConfig, ssp_in_docker: bool) -> String {
             Some(u) if ssp_in_docker => u
                 .replace("127.0.0.1", "host.docker.internal")
                 .replace("localhost", "host.docker.internal"),
-            Some(u) => u.clone(),
+            Some(u) => u.replace("host.docker.internal", "localhost"),
             None => continue,
         };
         let table = match &method.table {
@@ -2808,7 +2811,9 @@ fn spawn_backend_dev_commands(
         );
         color_idx += 1;
         let user_envs = resolve_env_for_dev(&app.env, project_dir);
-        let envs = merge_spky_with_user_env(&spky_vars, user_envs);
+        let mut app_vars = spky_vars.clone();
+        app_vars.extend(app.spky_app_vars());
+        let envs = merge_spky_with_user_env(&app_vars, user_envs);
         match dev_config {
             BackendDevConfig::Command(cmd) => {
                 sink.push_verbose(&format!("Starting: {}", cmd));
@@ -3356,5 +3361,19 @@ apps:
         );
         let on_pool = build_job_config_json(&cfg("{ pool: render }"), true);
         assert_eq!(on_pool, "[]");
+    }
+
+    /// Each kind of SSP gets the host name that reaches a host backend from
+    /// where it runs: a container `host.docker.internal`, a host process
+    /// `localhost` (it cannot resolve `host.docker.internal`).
+    #[test]
+    fn the_backend_url_matches_where_the_ssp_runs() {
+        let config: Sp00kyConfig = serde_yaml::from_str(
+            "apps:\n  api:\n    type: backend\n    baseUrl: http://host.docker.internal:3660\n    \
+             method: { type: outbox, table: job, schema: ./x.surql }\n",
+        )
+        .unwrap();
+        assert!(build_job_config_json(&config, true).contains("http://host.docker.internal:3660"));
+        assert!(build_job_config_json(&config, false).contains("http://localhost:3660"));
     }
 }

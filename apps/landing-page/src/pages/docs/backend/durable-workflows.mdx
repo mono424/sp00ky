@@ -1,0 +1,189 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Durable workflows
+description: Cloudflare Workflows' API (WorkflowEntrypoint, step.do, step.sleep, step.waitForEvent) on sp00ky's own job engine, the same code on a VM, under spky dev and as a Worker backend.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import PropTable from '../../../components/ui/PropTable.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+<Experimental>
+  Durable workflows are new. TypeScript and JavaScript backends only, through
+  `@spooky-sync/backend`.
+</Experimental>
+
+A **durable workflow** is a class in your backend whose `run()` is a list of steps. Each step's
+result is stored, so a crash, a deploy, a retry or a long sleep resumes the workflow where it left
+off instead of starting over. The API is Cloudflare Workflows' (`WorkflowEntrypoint`, `step.do`,
+`step.sleep`, `step.waitForEvent`), but nothing runs on Cloudflare Workflows: the engine is a small
+replay loop in the SDK and the queue is your backend's own [outbox](/docs/jobs). The same code runs
+on a VM, under `spky dev` and as a [Worker backend](/docs/backend/workers).
+
+## Write one
+
+<CodeBlock code={workflowCode} lang="ts" fileName="api/src/server.ts" />
+
+Declare it on the backend, which needs an outbox `method` (its runs are jobs in that table):
+
+<CodeBlock code={configCode} lang="yaml" fileName="sp00ky.yml" />
+
+`withWorkflows(app, { BINDING: Class })` does two things: every request your app handles sees
+`env.<BINDING>`, and `POST /__spky/workflow/<BINDING>`, the route the job runner calls, runs the
+instance. It wraps a Hono app, an `{ fetch }` object or a plain fetch function, and works on Node
+and on Workers alike. On Node, serve the wrapped handler:
+
+<CodeBlock code={nodeCode} lang="ts" fileName="api/src/index.ts" />
+
+## How it runs
+
+`create()` writes an instance row (`_00_wf_instance`) and an outbox job in one transaction. The SSP
+posts the job to your backend. The run replays `run()` from the top: a step with a stored result
+returns it at once, the first step without one executes, and its result is stored in `_00_wf_step`.
+The run goes on until the workflow finishes, fails, has to wait (a sleep, a retry backoff, an event)
+or spends its time budget, then hands over to a new job, due when the wait ends.
+
+- **Retries.** `step.do(name, { retries: { limit, delay, backoff }, timeout }, fn)`, Cloudflare's
+  defaults (5 retries, 10 s, exponential, a 10-minute timeout). A short backoff waits inside the
+  run; a longer one becomes a delayed job. A `NonRetryableError` fails the step at once. A step out
+  of retries throws into `run()`, where a `try/catch` may still run steps.
+- **Sleeps.** `step.sleep(name, '1 hour')` and `step.sleepUntil(name, date)` are delayed jobs.
+- **Events.** `step.waitForEvent(name, { type, timeout })` resolves with the next event of that type
+  sent through `instance.sendEvent({ type, payload })`, including one sent before the wait, and
+  throws when the timeout (default 24 hours) passes first.
+- **Time budget.** A run starts new steps until about 80% of the job's timeout is spent (at most
+  60 s), then hands over. Raise `deploy.timeout` for steps that take long.
+- **One run at a time.** A run holds a lease on the instance; a second job for the same instance
+  answers 503 and the job runner retries it. Every write a run makes is fenced, so a run that lost
+  the instance (it hung, or the instance was terminated) writes nothing.
+
+## Rules
+
+These are Cloudflare's rules too.
+
+- **Code between steps must be deterministic.** `run()` replays from the top on every job and only
+  step results are stored. Put `Date.now()`, `Math.random()`, `crypto.randomUUID()` and reads of
+  data that changes inside a step.
+- **Step names are the cache key**, by name and occurrence: the third `step.do('poll')` of a loop is
+  its own step. Keep the order of steps the same between replays.
+- **Steps run at least once.** A crash after a step's side effect and before its result is stored
+  runs it again. Make steps idempotent (upserts, ids derived from the instance id).
+- **Results are JSON.** A `Date` comes back as its ISO string, `undefined` fields disappear. The
+  first run sees the same JSON round trip as every replay.
+- **At most 1 MiB per step result, params and output.** Put files and large data in a
+  [bucket](/docs/client/buckets) and return the key.
+
+## The binding
+
+<PropTable props={[
+  { name: 'create({ id?, params?, owner? })', type: 'Promise<WorkflowInstance>', default: '-', desc: 'Start an instance. id defaults to a UUID. owner (a record id such as user:abc) may read the instance and its steps.' },
+  { name: 'createBatch([...])', type: 'Promise<WorkflowInstance[]>', default: '-', desc: 'Several create() calls.' },
+  { name: 'get(id)', type: 'Promise<WorkflowInstance>', default: '-', desc: 'An existing instance; throws when there is none.' },
+  { name: 'instance.status()', type: 'Promise<{ status, error?, output? }>', default: '-', desc: 'queued, running, waiting, complete, errored or terminated.' },
+  { name: 'instance.terminate()', type: 'Promise<void>', default: '-', desc: 'Stop it: a running run stops at its next write.' },
+  { name: 'instance.restart()', type: 'Promise<void>', default: '-', desc: 'Forget every step and run from the start.' },
+  { name: 'instance.sendEvent({ type, payload })', type: 'Promise<void>', default: '-', desc: 'Deliver an event to waitForEvent; wakes the instance now.' },
+]} />
+
+`pause()` and `resume()` are not supported yet.
+
+## Progress, admin and retention
+
+Instances and steps are ordinary tables: `_00_wf_instance` (status, `steps_done`, `current_step`,
+`wake_at`, params, output, error) and `_00_wf_step` (one row per step with its attempts, output,
+error and retry or wake time). An instance created with an `owner` is readable by that user, so a
+client can `LIVE SELECT` it on the database. To show progress inside your app's synced data, write
+it to your own rows from inside a step.
+
+The admin API and its MCP server list, inspect, cancel and retry instances
+(`durable_instances_list`, `durable_instance_get`, `durable_instance_cancel`,
+`durable_instance_retry`), and the jobs list shows their runs with the origin `durable`. A finished
+instance is deleted with its steps on the project's run retention window (`retention.runSuccess` /
+`runFailed`).
+
+<Note>
+  `retry` is the way out when an instance's job ran out of attempts (the backend was down for
+  several minutes): the instance stays `running` or `waiting` with nothing to run it, and retry gives
+  it a fresh job.
+</Note>
+
+## Coming from Cloudflare Workflows
+
+Code written for Cloudflare Workflows changes in two places, plus sp00ky.yml:
+
+1. The import: `WorkflowEntrypoint`, `WorkflowEvent` and `WorkflowStep` come from
+   `@spooky-sync/backend` instead of `cloudflare:workers`, and `NonRetryableError` instead of
+   `cloudflare:workflows`. The `Workflow` binding type too.
+2. The default export: `export default withWorkflows(app, { INGEST: IngestMaterial })`.
+3. Move the binding from `worker.workflows` to the backend's `workflows`.
+
+`worker.workflows` keeps running real Cloudflare Workflows on a Cloudflare project. It is
+Cloudflare-only; `workflows` runs everywhere.
+
+<Warning>
+  Every outbox column a workflow job does not set must be optional (`option<...>`) and `payload`
+  must accept an object (`any`), the same as for [schedules](/docs/jobs/schedules). The outbox
+  template `spky add api` writes already does.
+</Warning>
+
+## Workflows and the `workflows:` DAG
+
+The top-level [`workflows:`](/docs/jobs/workflows) key is a different feature: a static DAG in
+sp00ky.yml whose steps are separate jobs, possibly on different backends, run by the SSP or the
+scheduler. Durable workflows are code in one backend with any control flow (loops over pages,
+polling with sleeps, waiting for a person). A DAG step can start a durable workflow by calling a
+route that calls `create()`.
+
+<CardGrid>
+  <LinkCard title="Jobs" href="/docs/jobs" description="The outbox every backend call goes through." />
+  <LinkCard title="Worker backends" href="/docs/backend/workers" description="Run the same backend inside the project's SSP Worker." />
+  <LinkCard title="Workflows (DAG)" href="/docs/jobs/workflows" description="Declarative pipelines of jobs in sp00ky.yml." />
+</CardGrid>
+
+export const workflowCode = `import { Hono } from 'hono';
+import { WorkflowEntrypoint, withWorkflows, NonRetryableError,
+  type Workflow, type WorkflowEvent, type WorkflowStep } from '@spooky-sync/backend';
+
+type Params = { materialId: string };
+type Env = { INGEST: Workflow<Params> };
+
+export class IngestMaterial extends WorkflowEntrypoint<Env, Params> {
+  async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+    const pages = await step.do('count pages', async () => countPages(event.payload.materialId));
+    for (let from = 1; from <= pages; from += 10) {
+      await step.do('convert', { retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' } },
+        async () => convertPages(event.payload.materialId, from, from + 9));
+    }
+    await step.sleep('let the index settle', '1 minute');
+    const review = await step.waitForEvent<{ ok: boolean }>('review', { type: 'reviewed', timeout: '1 day' });
+    if (!review.payload.ok) throw new NonRetryableError('rejected');
+    return { pages };
+  }
+}
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post('/materials/index', async (c) => {
+  const { materialId } = await c.req.json();
+  const instance = await c.env.INGEST.create({ params: { materialId } });
+  return c.json({ id: instance.id });
+});
+
+export default withWorkflows(app, { INGEST: IngestMaterial });`;
+
+export const configCode = `apps:
+  api:
+    type: backend
+    spec: ./api/openapi.yml
+    method: { type: outbox, table: job, schema: ./schema/src/outbox/api.surql }
+    workflows:
+      - { binding: INGEST, class: IngestMaterial }`;
+
+export const nodeCode = `import { serve } from '@hono/node-server';
+import handler from './server';
+
+serve({ fetch: handler.fetch, port: Number(process.env.PORT ?? '3000') });`;

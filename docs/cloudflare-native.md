@@ -428,6 +428,13 @@ an idle project still sets no alarm:
   `/admin/reload` (a deploy may add schedules). Cloudflare Workflows are not
   available inside Workers for Platforms namespaces, and alarms keep VM
   parity.
+- **Durable steps (design 2026-10-22):** backend code written against
+  Cloudflare Workflows' API (`WorkflowEntrypoint`, `step.do`, `step.sleep`,
+  `step.waitForEvent`) runs on sp00ky's own engine instead: a replay loop in
+  the backend SDK, the backend's outbox as the queue, progress in
+  `_00_wf_instance` / `_00_wf_step`. Same code on a VM, under `spky dev` and
+  as a Worker backend, no Cloudflare Workflows. See
+  [`durable-steps.md`](durable-steps.md).
 - **Push (built):** `CfPushHttp` sends Web Push, FCM HTTP v1 and APNs over
   fetch (spike S7: APNs' HTTP/2 works, warm p50 76 ms from a DO); the VAPID
   key derives from `SPKY_AUTH_SECRET`. `PushEngine::next_wake_ms` replaces the

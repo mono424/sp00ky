@@ -71,6 +71,7 @@ const ThreadList = () => {
 | [`@spooky-sync/core`](https://www.npmjs.com/package/@spooky-sync/core)                   | Core client SDK — sync engine, caching, reactivity |
 | [`@spooky-sync/client-solid`](https://www.npmjs.com/package/@spooky-sync/client-solid)   | SolidJS bindings (`useQuery`, etc.)                |
 | [`@spooky-sync/query-builder`](https://www.npmjs.com/package/@spooky-sync/query-builder) | Type-safe query builder                            |
+| [`@spooky-sync/backend`](https://www.npmjs.com/package/@spooky-sync/backend)             | Backend SDK: durable workflows (`step.do`) on sp00ky's job engine |
 | [`@spooky-sync/cli`](https://www.npmjs.com/package/@spooky-sync/cli)                     | CLI for schema generation                          |
 | [`@spooky-sync/query-allowlist`](https://www.npmjs.com/package/@spooky-sync/query-allowlist) | Records the query allowlist from an app's `q*` module (`spky generate`) |
 | [`mono424/spooky-ssp`](https://hub.docker.com/r/mono424/spooky-ssp)                     | SSP sidecar (Docker)                               |

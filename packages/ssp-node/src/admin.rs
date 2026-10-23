@@ -276,6 +276,10 @@ fn served(method: &str, template: &str) -> bool {
             | ("POST", "/workflows/runs/{id}/cancel")
             | ("POST", "/workflows/runs/{id}/rerun")
             | ("POST", "/workflows/runs/{id}/retry")
+            | ("GET", "/durable/instances")
+            | ("GET", "/durable/instances/{id}")
+            | ("POST", "/durable/instances/{id}/cancel")
+            | ("POST", "/durable/instances/{id}/retry")
     )
 }
 
@@ -409,6 +413,23 @@ impl SspNode {
                     tracing::info!(run = %id, action, by = %session.subject, "Workflow action from the admin API");
                 }
                 from_core(out, ok)
+            }
+
+            // ---- Durable workflow instances ----
+            (Method::Get, ["durable", "instances"]) => {
+                from_core(core::list_instances(&db, &core::InstancesQuery::from_pairs(&pairs)).await, 200)
+            }
+            (Method::Get, ["durable", "instances", id]) => from_core(core::instance_detail(&db, id).await, 200),
+            (Method::Post, ["durable", "instances", id, action]) => {
+                let out = match *action {
+                    "cancel" => core::cancel_instance(&db, id).await,
+                    "retry" => core::retry_instance(&db, id).await,
+                    other => return error(404, format!("No durable instance action '{other}'")),
+                };
+                if out.is_ok() {
+                    tracing::info!(instance = %id, action, by = %session.subject, "Durable workflow action from the admin API");
+                }
+                from_core(out, 200)
             }
 
             (_, [first, ..]) if CLUSTER_ONLY.contains(first) => error(
@@ -790,7 +811,16 @@ mod tests {
     #[test]
     fn the_mcp_server_lists_only_what_a_node_serves() {
         let names: Vec<&str> = ssp_protocol::admin_mcp::TOOLS.iter().filter(|t| serves_tool(t)).map(|t| t.name).collect();
-        for expected in ["overview", "jobs_list", "job_kill", "schedule_trigger", "workflow_run_retry", "backends_list"] {
+        for expected in [
+            "overview",
+            "jobs_list",
+            "job_kill",
+            "schedule_trigger",
+            "workflow_run_retry",
+            "backends_list",
+            "durable_instances_list",
+            "durable_instance_cancel",
+        ] {
             assert!(names.contains(&expected), "{expected} missing from {names:?}");
         }
         for absent in ["ssp_restart", "logs_recent", "backup_create", "pools_list", "views_list"] {

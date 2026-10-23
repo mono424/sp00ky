@@ -819,6 +819,34 @@ async fn seed_aged_runs(h: &Harness, n: usize, prefix: &str) {
 /// made the prune the most expensive thing in a tick while almost always
 /// deleting nothing.
 #[tokio::test]
+async fn prune_drops_finished_durable_instances_with_their_steps() {
+    let h = harness().await;
+    let old = stamp(Utc::now() - Duration::days(60));
+    h.raw
+        .query(
+            "CREATE _00_wf_instance:old CONTENT { binding: 'F', outbox: 'job', path: '/p', wake: 'a', \
+             status: 'complete', finished_at: <datetime>$old }; \
+             CREATE _00_wf_step:['old', 's#0'] CONTENT { instance: _00_wf_instance:old, name: 's', kind: 'do', status: 'success' }; \
+             CREATE _00_wf_event CONTENT { instance: _00_wf_instance:old, type: 't', step: 's#0' }; \
+             CREATE _00_wf_instance:recent CONTENT { binding: 'F', outbox: 'job', path: '/p', wake: 'b', \
+             status: 'errored', finished_at: time::now() }; \
+             CREATE _00_wf_instance:live CONTENT { binding: 'F', outbox: 'job', path: '/p', wake: 'c', \
+             status: 'waiting', created_at: <datetime>$old }",
+        )
+        .bind(("old", old))
+        .await
+        .expect("seed instances");
+
+    let report = h.engine.tick_pass().await.unwrap();
+    assert_eq!(report.pruned, 1, "{report:?}");
+    let ids = h.strings("SELECT VALUE record::id(id) FROM _00_wf_instance").await;
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(!ids.contains(&"old".to_string()), "an aged-out instance is gone");
+    assert_eq!(h.count("SELECT count() FROM _00_wf_step GROUP ALL").await, 0, "with its steps");
+    assert_eq!(h.count("SELECT count() FROM _00_wf_event GROUP ALL").await, 0, "and its events");
+}
+
+#[tokio::test]
 async fn prune_runs_on_its_own_cadence_not_every_sweep() {
     let h = harness().await;
     // The first sweep claims the prune slot.
@@ -3734,6 +3762,70 @@ async fn admin_job_detail_keeps_the_history_and_clear_spares_live_work() {
     assert_eq!(out["total"], 2, "the failed and the finished job: {out}");
     let left = admin::list_jobs(&db, &Default::default()).await.unwrap();
     assert_eq!(left["returned"], 1, "the pending job stays: {left}");
+}
+
+async fn rows_of(db: &MemDb, sql: &str) -> Vec<Value> {
+    crate::db::rows(db.query(sql, &[]).await.expect("query"))
+}
+
+#[tokio::test]
+async fn admin_lists_cancels_and_retries_durable_instances() {
+    use crate::admin::{self, InstancesQuery};
+    let (h, db) = admin_harness().await;
+    // Two instances the way `@spooky-sync/backend` creates them: the row, and
+    // the job carrying its wake token in the backend's outbox.
+    h.set(
+        "CREATE _00_wf_instance:ingest1 CONTENT { binding: 'INGEST', class: 'Ingest', outbox: 'job', \
+             path: '/__spky/workflow/INGEST', params: '{\"id\":1}', status: 'waiting', wake: 'tok1', \
+             lease_epoch: 3, steps_done: 2, current_step: 'nap' }; \
+         CREATE job:dwf_tok1 SET path = '/__spky/workflow/INGEST', payload = { instance: 'ingest1', wake: 'tok1' }, delay = 60000; \
+         CREATE _00_wf_instance:⟨mail-2⟩ CONTENT { binding: 'MAIL', outbox: 'job', path: '/__spky/workflow/MAIL', \
+             status: 'running', wake: 'tok2' }; \
+         CREATE _00_wf_step:['ingest1', 'load#0'] CONTENT { instance: _00_wf_instance:ingest1, name: 'load', n: 0, \
+             kind: 'do', status: 'success', attempts: 1, output: '[1]', started_at: time::now() }; \
+         CREATE _00_wf_event CONTENT { instance: _00_wf_instance:ingest1, type: 'approved' };",
+    )
+    .await;
+
+    let all = admin::list_instances(&db, &InstancesQuery::default()).await.unwrap();
+    assert_eq!(all["instances"].as_array().unwrap().len(), 2, "{all}");
+    let ingest = admin::list_instances(&db, &InstancesQuery { binding: Some("INGEST".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(ingest["instances"][0]["id"], "ingest1", "{ingest}");
+    assert!(ingest["instances"][0].get("wake").is_none(), "the wake token is never listed");
+
+    let detail = admin::instance_detail(&db, "_00_wf_instance:ingest1").await.unwrap();
+    assert_eq!(detail["instance"]["params"], "{\"id\":1}", "{detail}");
+    assert_eq!(detail["steps"][0]["name"], "load");
+    assert_eq!(detail["events"][0]["type"], "approved");
+    assert_eq!(admin::instance_detail(&db, "nope").await.unwrap_err().status, 404);
+
+    // Retry: a new token and a job due now; the old job is stale from here on.
+    let out = admin::retry_instance(&db, "ingest1").await.unwrap();
+    assert_eq!(out["action"], "retried", "{out}");
+    let now = rows_of(&db, "SELECT wake FROM _00_wf_instance:ingest1;").await;
+    let wake = now[0]["wake"].as_str().unwrap().to_string();
+    assert_ne!(wake, "tok1");
+    let job = rows_of(&db, &format!("SELECT payload, delay FROM job:dwf_{wake};")).await;
+    assert_eq!(job[0]["payload"], json!({ "instance": "ingest1", "wake": wake }), "{job:?}");
+    assert_eq!(job[0]["delay"], 0);
+
+    // Cancel: terminated, epoch bumped (a running run is fenced), token moved.
+    let out = admin::cancel_instance(&db, "_00_wf_instance:⟨mail-2⟩").await.unwrap();
+    assert_eq!(out, json!({ "instance": "mail-2", "status": "terminated", "action": "terminated" }));
+    let row = rows_of(&db, "SELECT status, lease_epoch, wake FROM _00_wf_instance:⟨mail-2⟩;").await;
+    assert_eq!(row[0]["lease_epoch"], 1);
+    assert_ne!(row[0]["wake"], "tok2");
+    assert_eq!(admin::cancel_instance(&db, "mail-2").await.unwrap_err().status, 409);
+    assert_eq!(admin::retry_instance(&db, "mail-2").await.unwrap_err().status, 409);
+    assert_eq!(admin::cancel_instance(&db, "gone").await.unwrap_err().status, 404);
+
+    // A continuation job reads as durable work in the jobs list.
+    let page = admin::list_jobs(&db, &admin::JobsQuery { origin: Some("durable".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(page["returned"], 2, "the first job and the retry's: {page}");
 }
 
 #[tokio::test]

@@ -566,20 +566,9 @@ impl CloudClient {
 // ---------------------------------------------------------------------------
 
 fn resolve_project_slug() -> Result<String> {
-    // 1. Environment variable
-    if let Ok(slug) = std::env::var("SP00KY_CLOUD_PROJECT") {
+    // 1. Environment variable, 2. sp00ky.yml
+    if let Some(slug) = project_slug_here() {
         return Ok(slug);
-    }
-
-    // 2. Read slug from sp00ky.yml
-    if let Ok(cwd) = std::env::current_dir() {
-        let config_path = cwd.join("sp00ky.yml");
-        if config_path.exists() {
-            let config = backend::load_config(&config_path);
-            if let Some(slug) = config.slug {
-                return Ok(slug);
-            }
-        }
     }
 
     // 3. Prompt
@@ -589,6 +578,19 @@ fn resolve_project_slug() -> Result<String> {
         .context("Failed to read project slug")?;
 
     Ok(slug)
+}
+
+/// The project this command runs for without asking: `SP00KY_CLOUD_PROJECT`,
+/// else the slug in ./sp00ky.yml.
+fn project_slug_here() -> Option<String> {
+    if let Ok(slug) = std::env::var("SP00KY_CLOUD_PROJECT") {
+        return Some(slug);
+    }
+    let config_path = std::env::current_dir().ok()?.join("sp00ky.yml");
+    if !config_path.exists() {
+        return None;
+    }
+    backend::load_config(&config_path).slug
 }
 
 // ---------------------------------------------------------------------------
@@ -7084,12 +7086,69 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
     Ok(())
 }
 
+fn money(cents: i64) -> String {
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+/// Prints `GET /v1/billing/payg`'s estimate: every metered line with what is
+/// included, the base fee, the total and the spend cap.
+fn print_payg_estimate(slug: &str, est: &serde_json::Value) {
+    let period = est["period"].as_str().unwrap_or("this month");
+    println!("  Pay as you go, {}, {} so far", slug, period);
+    println!();
+    println!(
+        "  {:<18} {:>26} {:>10} {:>9}",
+        "", "USED", "INCLUDED", "COST"
+    );
+    for line in est["lines"].as_array().into_iter().flatten() {
+        let metric = line["metric"].as_str().unwrap_or("");
+        let quantity = line["quantity"].as_f64().unwrap_or(0.0);
+        // The size add-ons only show while the database has that size.
+        if metric.starts_with("db_size_") && quantity == 0.0 {
+            continue;
+        }
+        let included = line["included"].as_f64().unwrap_or(0.0);
+        println!(
+            "  {:<18} {:>26} {:>10} {:>9}",
+            line["label"].as_str().unwrap_or(metric),
+            format!("{:.2} {}", quantity, line["unit"].as_str().unwrap_or("")),
+            if included > 0.0 { format!("{}", included) } else { "-".to_string() },
+            money(line["cents"].as_i64().unwrap_or(0)),
+        );
+    }
+    let base = est["base_cents"].as_i64().unwrap_or(0);
+    let total = est["total_cents"].as_i64().unwrap_or(0);
+    let cap = est["cap_cents"].as_i64().unwrap_or(0);
+    println!("  {:<18} {:>26} {:>10} {:>9}", "Base fee", "", "", money(base));
+    println!();
+    println!(
+        "  Total so far {} of a {} spend cap (change it: spky billing cap <dollars>).",
+        money(total),
+        money(cap)
+    );
+    if est["stopped"].as_bool() == Some(true) {
+        println!("  Stopped at the spend cap: the project is not serving. Raise the cap to start it again.");
+    }
+}
+
 pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
     let creds = require_credentials()?;
     let mut client = CloudClient::new(&creds);
 
     match action {
         Some(CloudBillingCommands::Usage) => {
+            // In a pay-as-you-go project: its month so far, priced.
+            if let Some(slug) = project_slug_here() {
+                if let Some(project) = fetch_project(&mut client, &slug)? {
+                    if project["plan"].as_str() == Some("payg") {
+                        let resp = client.get(&format!("/v1/billing/payg?project={}", slug))?;
+                        let data: serde_json::Value =
+                            resp.into_json().context("Failed to parse usage")?;
+                        print_payg_estimate(&slug, &data["estimate"]);
+                        return Ok(());
+                    }
+                }
+            }
             let resp = client.get("/v1/billing/usage")?;
             let usage: Vec<serde_json::Value> =
                 resp.into_json().context("Failed to parse usage")?;
@@ -7108,6 +7167,35 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
                     entry["metric"].as_str().unwrap_or("-"),
                     entry["total"].as_f64().unwrap_or(0.0),
                 );
+            }
+            Ok(())
+        }
+        Some(CloudBillingCommands::Cap { dollars }) => {
+            let slug = resolve_project_slug()?;
+            if !dollars.is_finite() || dollars < 10.0 {
+                bail!("The spend cap is at least $10, the base fee (got {})", dollars);
+            }
+            let cents = (dollars * 100.0).round() as i64;
+            let resp = client.post(
+                "/v1/billing/spend-cap",
+                &serde_json::json!({ "project_id": slug, "cap_cents": cents }),
+            )?;
+            let data: serde_json::Value = resp
+                .into_json()
+                .context("Failed to parse spend cap response")?;
+            println!(
+                "  Spend cap of {}: {} a month, base fee included.",
+                slug,
+                money(cents)
+            );
+            let est = &data["estimate"];
+            if let Some(total) = est["total_cents"].as_i64() {
+                println!("  This month so far: {}.", money(total));
+                if est["stopped"].as_bool() == Some(true) && total < cents {
+                    println!("  It stopped at the old cap and serves again within about 10 minutes.");
+                } else if total >= cents {
+                    println!("  The bill is already at the new cap: the project stops serving within about 10 minutes.");
+                }
             }
             Ok(())
         }

@@ -1156,11 +1156,19 @@ pub enum CloudBackupCommands {
 
 #[derive(Subcommand, Debug)]
 enum CloudBillingCommands {
-    /// Show current usage
+    /// Show current usage (for a pay-as-you-go project: the month so far,
+    /// priced, and its spend cap)
     Usage,
     /// Change plan or billing interval
     #[command(name = "plan")]
     ChangePlan,
+    /// Set the monthly spend cap of a pay-as-you-go project, in dollars, base
+    /// fee included. At the cap the project stops serving until the cap is
+    /// raised or the month ends.
+    Cap {
+        /// The most a month may cost, e.g. 50 for $50 (at least 10, the base fee)
+        dollars: f64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

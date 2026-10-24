@@ -152,7 +152,12 @@ pub struct SspNode {
 pub const CATCHUP_ROWS_DUMP_LIMIT: usize = 50_000;
 
 pub const JOB_RECOVERY_INTERVAL_SECS: u64 = 60;
-const JOB_RECOVERY_PENDING_GRACE_SECS: u64 = 30;
+/// How long a fresh `pending` row is left to the live pickup before the recovery
+/// sweep may take it.
+pub const JOB_RECOVERY_PENDING_GRACE_SECS: u64 = 30;
+/// How late an on-demand recovery wake fires after the moment a row becomes the
+/// sweep's, so the sweep's strict comparisons see it due.
+pub const JOB_WAKE_SLACK_MS: u64 = 1_000;
 // A `processing` row is reclaimed when its LEASE expires, not at a fixed age — see
 // `schedule_core::sql::LEASE_EXPIRED`. The old fixed 600s window survives only as
 // that predicate's fallback for a table deployed before the lease fields existed.
@@ -2096,22 +2101,19 @@ impl SspNode {
         let standby = self.is_standby();
 
         // Job routing.
-        if let Some(backend_info) = self.job_config.job_tables.get(&payload.table).filter(|_| !standby).cloned() {
-            self.job_dispatcher.note_job_row();
-            let is_assigned =
-                self.standalone || payload.job_assignee.as_deref() == Some(self.ssp_id.as_str());
-
-            if is_assigned && op == Operation::Create {
-                if payload.record.get("status").and_then(|v| v.as_str()) == Some("pending") {
-                    self.route_pending_job(&payload, &backend_info).await;
+        if self.job_config.job_tables.contains_key(&payload.table) && !standby {
+            if op == Operation::Create {
+                self.route_job_create(&payload).await;
+            } else {
+                self.job_dispatcher.note_job_row();
+                if op == Operation::Update {
+                    // The runner's terminal status write fires this table's mutation
+                    // event, which is how the schedule engine learns a scheduled job
+                    // or workflow step finished. Not gated on assignment: the
+                    // engine only ever reads the job row, and in cluster mode the
+                    // node that RAN the job is not the node that ticks.
+                    self.observe_job_terminal(&payload.id, &payload.record).await;
                 }
-            } else if op == Operation::Update {
-                // The runner's terminal status write fires this table's mutation
-                // event, which is how the schedule engine learns a scheduled job
-                // or workflow step finished. Not gated on `is_assigned`: the
-                // engine only ever reads the job row, and in cluster mode the
-                // node that RAN the job is not the node that ticks.
-                self.observe_job_terminal(&payload.id, &payload.record).await;
             }
         }
 
@@ -2256,6 +2258,23 @@ impl SspNode {
         Some(ApiResponse::json(200, Value::Null))
     }
 
+    /// Hand a job-table CREATE to the job queue when it is a `pending` row this
+    /// node owns. Needs no circuit, so a host that queues a change notice while
+    /// its circuit is not in memory (cold, bootstrapping, failed) calls it to run
+    /// the job now; the notice's replay routes it again, which the enqueued mark
+    /// and the claim make a no-op.
+    pub async fn route_job_create(&self, payload: &ssp_protocol::IngestRequest) {
+        if self.is_standby() || !payload.op.eq_ignore_ascii_case("CREATE") {
+            return;
+        }
+        let Some(backend_info) = self.job_config.job_tables.get(&payload.table).cloned() else { return };
+        self.job_dispatcher.note_job_row();
+        let is_assigned = self.standalone || payload.job_assignee.as_deref() == Some(self.ssp_id.as_str());
+        if is_assigned && payload.record.get("status").and_then(|v| v.as_str()) == Some("pending") {
+            self.route_pending_job(payload, &backend_info).await;
+        }
+    }
+
     /// Queue a pending job created via ingest (with optional delay window).
     async fn route_pending_job(
         &self,
@@ -2274,8 +2293,14 @@ impl SspNode {
         let job_id = job_entry.id.clone();
         let table = job_entry.table.clone();
 
+        let delay = std::time::Duration::from_millis(delay_ms);
         if delay_ms == 0 {
             self.admit_or_backlog(job_entry).await;
+        } else if self.platform.scheduler.max_job_sleep().is_some_and(|max| delay > max) {
+            // Too long to wait in memory on this host: the row stays `pending`
+            // and the recovery sweep admits it once due. The ingest that brought
+            // it arms that wake (`Runtime::after_request`).
+            debug!(job_id = %job_id, delay_ms, "Delayed job left to the recovery wake");
         } else {
             // Delayed: sleep on a port timer, THEN ask for a slot. Admitting up
             // front would let a job with `delay: 1h` hold the table's only
@@ -2286,7 +2311,6 @@ impl SspNode {
             // second sleeper; the mark still lets exactly one of them through.
             let dispatcher = Arc::clone(&self.job_dispatcher);
             let scheduler = Arc::clone(&self.platform.scheduler);
-            let delay = std::time::Duration::from_millis(delay_ms);
             let standalone = self.standalone;
             let ssp_id = self.ssp_id.clone();
             let db = Arc::clone(&self.platform.db);

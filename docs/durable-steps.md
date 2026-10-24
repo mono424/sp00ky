@@ -272,7 +272,7 @@ run waits for every executing step to settle before it suspends.
 | The outbox gives up (10 failed attempts, e.g. the backend was down for minutes) | the instance stays `running` or `waiting` with no job; `restart()` or the admin `retry` creates a new token and job |
 | A user-owned outbox column the workflow job does not set is required | the CREATE fails (same constraint as `schedules:`); make it `option<...>` |
 | A step longer than the job timeout | VM: the SSP retries a request the backend is still serving; the replay is fenced or stale, the original run persists and continues. Cloudflare: the request is cancelled, the step retries until its retries run out |
-| A long sleep across an SSP restart or a Durable Object eviction | the delayed job's in-memory timer is lost; the job runner's recovery sweep picks the due row up (up to its sweep interval late) |
+| A long sleep across an SSP restart or a Durable Object eviction | Cloudflare: a sleep over 30 s never waits in memory; the job wake fires when the delayed row is due (about a second late) and the recovery sweep runs it. VM: the in-memory timer is lost on restart; the recovery sweep picks the due row up (up to its 60 s interval late) |
 | `sendEvent` committing while a run hands over | the store request loses the write race and is repeated (4 times, jittered); the run then sees the new token and schedules itself now |
 
 ## 5. Visibility and control

@@ -221,7 +221,7 @@ A delayed job is just a pending job, so it stays visible and cancellable while i
 </Warning>
 
 <Note>
-  Delayed jobs survive a restart: the recovery sweep re-dispatches a job whose delay elapsed while its SSP was down, so the window can't be lost.
+  Delayed jobs survive a restart: the recovery sweep re-dispatches a job whose delay elapsed while its SSP was down, so the window can't be lost. On a [Cloudflare project](/docs/cloud/deploying#jobs-schedules-and-workflows-on-cloudflare) a delay longer than 30 seconds waits in the database, and the SSP wakes when it ends.
 </Note>
 
 ## Scheduled and multi-step work
@@ -262,8 +262,8 @@ The job runner is built into the SSP. There is nothing to install or implement:
 
 1. **Pickup is create-only.** Writing a `pending` row fires an event that hands the job to the runner, which is why `db.run()` creates a row rather than updating one. With several SSPs, the scheduler names one per event; an SSP that is behind on events still takes jobs when no other is caught up, and runs them as it catches up.
 2. **The runner is the only writer of `status`.** Everything else (kill, retry, recovery) goes through guarded statements, so two writers can never disagree about a job's state.
-3. **Retries happen in-process,** with linear or exponential backoff. A job that exhausts them is marked `failed` with its error history intact.
-4. **A recovery sweep catches what events miss:** rows created while the SSP was down, jobs whose delay elapsed during a restart, and `processing` rows whose lease has run out.
+3. **Retries happen in-process,** with linear or exponential backoff. A job that exhausts them is marked `failed` with its error history intact. On Cloudflare a backoff longer than 30 seconds, like a delay that long, waits in the database instead of a timer, so a sleeping job never keeps the SSP's Durable Object running.
+4. **A recovery sweep catches what events miss:** rows created while the SSP was down, jobs whose delay elapsed during a restart, and `processing` rows whose lease has run out. On a VM it runs every minute; on Cloudflare it runs when the next job row is due, and not at all while nothing is pending.
 5. **Every attempt holds a lease, and it expires.** Claiming a job stamps `lease_until` (the job's own `timeout` plus a grace margin) and bumps `lease_epoch`. A `processing` row past its lease is handed back to the queue **regardless of whether the SSP that claimed it is still alive** — "that process is up" and "this work is progressing" are different questions, and an SSP that restarts under the same id, or one that is heartbeating but has lost its queue, answers the first one yes while holding rows it will never finish. A dead owner only makes the reclaim happen sooner.
 
    The lease covers one *attempt*, not the whole retry budget: a job that fails and backs off is claimed again and gets a fresh window, so nothing has to renew anything.

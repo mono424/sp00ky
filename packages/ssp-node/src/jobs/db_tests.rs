@@ -896,6 +896,78 @@ async fn a_retry_backoff_does_not_hold_the_slot() {
     );
 }
 
+/// A scheduler that holds no job wait longer than `cap` in memory (a Durable
+/// Object's), recording what it arms.
+struct CappedScheduler {
+    cap: Duration,
+    armed: Arc<std::sync::Mutex<Vec<(TimerKind, u64)>>>,
+}
+
+#[async_trait::async_trait]
+impl Scheduler for CappedScheduler {
+    async fn schedule(&self, kind: TimerKind, at: u64) {
+        self.armed.lock().unwrap().push((kind, at));
+    }
+    async fn cancel(&self, _kind: &TimerKind) {}
+    async fn sleep(&self, dur: Duration) {
+        tokio::time::sleep(dur).await;
+    }
+    fn max_job_sleep(&self) -> Option<Duration> {
+        Some(self.cap)
+    }
+}
+
+/// A backoff longer than the host holds in memory is not slept through: the row
+/// keeps `processing` with its lease ending at the retry time, the recovery wake is
+/// armed then, and the sweep's reclaim is what runs it again.
+#[tokio::test]
+async fn a_retry_past_the_hosts_sleep_cap_waits_on_its_lease() {
+    let backend = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(match_path("/run"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+        .expect(1)
+        .mount(&backend)
+        .await;
+
+    let (port, raw) = mem_db().await;
+    let (dispatcher, _rx) = make_dispatcher(Arc::clone(&port), backend.uri());
+    let armed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runner = JobRunner::new(
+        mpsc::channel(1).1,
+        Arc::clone(&port),
+        Arc::new(TestHttp(reqwest::Client::new())),
+        Arc::new(CappedScheduler { cap: Duration::from_millis(100), armed: Arc::clone(&armed) }),
+        Arc::new(TestSpawner),
+        dispatcher,
+    );
+    insert_job(&raw, "slow", "pending").await;
+    raw.query("UPDATE job:slow SET retries = 0, max_retries = 3").await.expect("reset retries");
+
+    // Linear backoff after the first failure: 400ms, past the 100ms cap.
+    let started = crate::now_epoch_ms();
+    runner.execute_job(job_entry("job:slow", backend.uri(), 3)).await.expect("run");
+
+    assert_eq!(select_string(&raw, "SELECT VALUE status FROM ONLY job:slow").await.as_deref(), Some("processing"));
+    assert_eq!(select_i64(&raw, "SELECT VALUE retries FROM ONLY job:slow").await, Some(1));
+    assert_eq!(
+        select_bool(&raw, "SELECT VALUE lease_until > time::now() AND lease_until < time::now() + 1s FROM ONLY job:slow").await,
+        Some(true),
+        "the lease ends at the retry time"
+    );
+    let wake = armed.lock().unwrap().iter().find(|(k, _)| *k == TimerKind::JobRecoverySweep).map(|(_, at)| *at);
+    assert!(
+        wake.is_some_and(|at| at >= started + 400 && at <= crate::now_epoch_ms() + 400 + crate::node::JOB_WAKE_SLACK_MS),
+        "the recovery wake is armed at the retry time, got {wake:?}"
+    );
+
+    // Nothing retries in memory; once the lease is out the sweep reclaims it.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(select_string(&raw, "SELECT VALUE status FROM ONLY job:slow").await.as_deref(), Some("processing"));
+    assert!(reclaim_expired_lease(port.as_ref(), "job:slow").await.expect("reclaim"));
+    assert_eq!(select_string(&raw, "SELECT VALUE status FROM ONLY job:slow").await.as_deref(), Some("pending"));
+}
+
 // --- the lease: claim, fence, expiry -----------------------------------------
 //
 // A `processing` row used to be reclaimable only if its OWNER looked dead, which is a

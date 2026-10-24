@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimerKind {
-    /// Standalone job recovery sweep (re-arms every `JOB_RECOVERY_INTERVAL_SECS`).
+    /// Standalone job recovery sweep (re-arms every `JOB_RECOVERY_INTERVAL_SECS`;
+    /// on demand, when the next job row is due: the job wake).
     JobRecoverySweep,
     /// Standalone schedule sweep: plan/fire declarative schedules, advance
     /// workflow DAGs, heal lost job-completion events (re-arms every
@@ -42,9 +43,10 @@ pub enum TimerKind {
     /// is what blocks admission: this node then has free local slots, runs
     /// nothing, and so never completes a job to kick its own drain.
     JobDrain { table: String },
-    /// A job created with a delay window, due later.
+    /// A job created with a delay window, due later. Not armed: a delay waits
+    /// in memory, or past `Scheduler::max_job_sleep` on the job wake.
     DelayedJob { id: String },
-    /// Retry backoff for a failed job dispatch.
+    /// Retry backoff for a failed job dispatch. Not armed, like `DelayedJob`.
     JobRetry { id: String },
     /// Bootstrap retry with backoff (tables may not exist yet).
     BootstrapRetry { attempt: u32 },
@@ -101,4 +103,14 @@ pub trait Scheduler: MaybeSendSync {
     /// Bounded in-request sleep (commit-wait backoff, bootstrap retry pause).
     /// NOT for periodic work — that's `schedule` + re-arm.
     async fn sleep(&self, dur: std::time::Duration);
+
+    /// The longest wait a job may spend in [`Self::sleep`] here. A job delay
+    /// or a retry backoff longer than this is left to the database instead:
+    /// the row waits (its `delay`, its lease) and the recovery sweep takes it
+    /// when it is due. `None`, the default: any wait (a VM process runs
+    /// anyway). A Durable Object stays in memory, and is billed, while a
+    /// timer is pending, and loses the timer when it is evicted.
+    fn max_job_sleep(&self) -> Option<std::time::Duration> {
+        None
+    }
 }

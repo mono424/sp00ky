@@ -759,6 +759,11 @@ pub const LEASE_EXPIRED: &str =
 /// remaining unreachable by recovery, invisible to both.
 pub const LEASE_LIVE: &str = "(lease_until ?? (updated_at + <duration>('600s'))) > time::now()";
 
+/// When this `processing` row's lease runs out: the moment [`LEASE_EXPIRED`] turns
+/// true. An on-demand host (a Durable Object) arms its recovery wake at it instead
+/// of sweeping on a cadence.
+pub const LEASE_DEADLINE: &str = "(lease_until ?? (updated_at + <duration>('600s')))";
+
 /// A table name safe to interpolate into a statement.
 pub fn is_plain_identifier(name: &str) -> bool {
     !name.is_empty()
@@ -1163,6 +1168,11 @@ mod tests {
             LEASE_EXPIRED.replace(" < ", " > "),
             LEASE_LIVE,
             "the live and expired predicates must differ ONLY in the comparison"
+        );
+        assert_eq!(
+            format!("{LEASE_DEADLINE} < time::now()"),
+            LEASE_EXPIRED,
+            "the recovery wake must arm at the moment the sweep's predicate turns true"
         );
     }
 

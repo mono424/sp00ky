@@ -52,6 +52,8 @@ or spends its time budget, then hands over to a new job, due when the wait ends.
   run; a longer one becomes a delayed job. A `NonRetryableError` fails the step at once. A step out
   of retries throws into `run()`, where a `try/catch` may still run steps.
 - **Sleeps.** `step.sleep(name, '1 hour')` and `step.sleepUntil(name, date)` are delayed jobs.
+  A sleeping workflow costs nothing: on Cloudflare a sleep longer than 30 seconds waits in the
+  database and the SSP wakes when it ends, about a second late.
 - **Events.** `step.waitForEvent(name, { type, timeout })` resolves with the next event of that type
   sent through `instance.sendEvent({ type, payload })`, including one sent before the wait, and
   throws when the timeout (default 24 hours) passes first.

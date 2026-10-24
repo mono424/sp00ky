@@ -426,6 +426,12 @@ impl Scheduler for CfScheduler {
     async fn sleep(&self, dur: Duration) {
         Delay::from(dur).await;
     }
+    // A pending timer holds the object in memory, billed, and an eviction
+    // loses it. Up to the recovery sweep's grace a short wait in memory is
+    // the precise path; past it the job wake fires when the row is due.
+    fn max_job_sleep(&self) -> Option<Duration> {
+        Some(Duration::from_secs(ssp_node::node::JOB_RECOVERY_PENDING_GRACE_SECS))
+    }
 }
 
 fn map_method(m: ApiMethod) -> Method {
@@ -595,12 +601,17 @@ pub struct SspNodeDo {
     env: Env,
     storage: Rc<Storage>,
     scheduler: Arc<CfScheduler>,
+    /// Built on the first event that needs it, circuit or not (see
+    /// [`SspNodeDo::ensure_built`]).
     node: RefCell<Option<Arc<SspNode>>>,
     runtime: RefCell<Option<Runtime>>,
-    /// Single flight for the cold build: a DB fetch opens the input gate, so a
-    /// second request would otherwise build (and hold in memory) a second
-    /// circuit while the first is still bootstrapping.
+    /// Single flight for the cold build and bootstrap: a DB fetch opens the
+    /// input gate, so a second request would otherwise build (and hold in
+    /// memory) a second circuit while the first is still bootstrapping.
     boot: tokio::sync::Mutex<()>,
+    /// Whether this instance has bootstrapped the circuit (or tried: a failed
+    /// bootstrap retries on its own timer).
+    booted: Cell<bool>,
     /// Change notices accepted but not yet applied (rows in `ssp_inbox`).
     inbox_len: Cell<u64>,
     /// Single flight for draining the inbox.
@@ -618,6 +629,22 @@ pub struct SspNodeDo {
 /// the SSP is cold, bootstrapping or busy publishing.
 fn is_notice_route(path: &str) -> bool {
     matches!(path, "/ingest" | "/ingest/batch" | "/view/unregister")
+}
+
+/// Timers whose work needs the database and not the circuit: they run on the
+/// built node, and an alarm that fires only these never bootstraps (loads every
+/// view). The node's own gates keep circuit work out of them (a checkpoint
+/// of a circuit that is not in memory skips, metrics not in memory are clean).
+fn runs_without_circuit(kind: &TimerKind) -> bool {
+    matches!(
+        kind,
+        TimerKind::JobRecoverySweep
+            | TimerKind::JobDrain { .. }
+            | TimerKind::ScheduleSweep
+            | TimerKind::PushTick
+            | TimerKind::ViewMetricsFlush
+            | TimerKind::CircuitCheckpoint
+    )
 }
 
 /// Change notices in arrival order. `applied = 0` rows are the inbox (accepted,
@@ -708,6 +735,7 @@ impl DurableObject for SspNodeDo {
             node: RefCell::new(None),
             runtime: RefCell::new(None),
             boot: tokio::sync::Mutex::new(()),
+            booted: Cell::new(false),
             inbox_len,
             drain: tokio::sync::Mutex::new(()),
             snapshot,
@@ -778,19 +806,27 @@ impl DurableObject for SspNodeDo {
 
     async fn alarm(&self) -> Result<Response> {
         self.scheduler.alarm_consumed();
-        self.ensure_ready().await;
-        let runtime = match self.runtime.borrow().as_ref() {
-            Some(r) => r.clone(),
-            None => return Response::ok("not ready"),
+        let due = self.scheduler.take_due(now_epoch_ms());
+        // Jobs, schedules and push need the database, not the circuit: a cron
+        // fire or a job wake runs on the built node without loading every
+        // view, and keeps running while a bootstrap fails. Nothing due (an
+        // early alarm): nothing to build.
+        if !due.iter().all(runs_without_circuit) {
+            self.ensure_ready().await;
+        }
+        let runtime = match due.is_empty() {
+            true => None,
+            false => self.ensure_built().await.map(|(_, runtime)| runtime),
         };
-        for kind in self.scheduler.take_due(now_epoch_ms()) {
+        for kind in due {
+            let Some(runtime) = &runtime else { break };
             tracing::debug!(?kind, "timer fired");
             match kind {
                 TimerKind::BootstrapRetry { attempt } => {
                     // The wake itself may just have built the node Ready.
                     if *runtime.node().status.read().await != SspStatus::Ready {
                         runtime.bootstrap_with(Some(&self.snapshot)).await;
-                        self.after_bootstrap(&runtime, attempt).await;
+                        self.after_bootstrap(runtime, attempt).await;
                     }
                 }
                 TimerKind::IngestReplay => self.drain_inbox().await,
@@ -804,16 +840,47 @@ impl DurableObject for SspNodeDo {
 }
 
 impl SspNodeDo {
-    /// Build + bootstrap the node on first wake (or after eviction). Idempotent
-    /// and single-flight.
-    async fn ensure_ready(&self) {
-        if self.node.borrow().is_some() {
-            return;
+    /// The node and its runtime, built on first use (or after eviction) but
+    /// not bootstrapped: the job runner, the schedule engine and push work on
+    /// it with no circuit in memory. Single flight.
+    async fn ensure_built(&self) -> Option<(Arc<SspNode>, Runtime)> {
+        if let Some(built) = self.built() {
+            return Some(built);
         }
         let _boot = self.boot.lock().await;
-        if self.node.borrow().is_some() {
+        if self.built().is_none() {
+            self.build().await;
+        }
+        self.built()
+    }
+
+    fn built(&self) -> Option<(Arc<SspNode>, Runtime)> {
+        match (self.node.borrow().clone(), self.runtime.borrow().clone()) {
+            (Some(node), Some(runtime)) => Some((node, runtime)),
+            _ => None,
+        }
+    }
+
+    /// Build + bootstrap the node on first wake (or after eviction). Idempotent
+    /// and single-flight: a second caller waits for the first's bootstrap.
+    async fn ensure_ready(&self) {
+        if self.booted.get() {
             return;
         }
+        let Some((_, runtime)) = self.ensure_built().await else { return };
+        let _boot = self.boot.lock().await;
+        if self.booted.get() {
+            return;
+        }
+        for key in LEGACY_SNAPSHOT_KEYS {
+            let _ = self.storage.delete(key).await;
+        }
+        runtime.bootstrap_with(Some(&self.snapshot)).await;
+        self.booted.set(true);
+        self.after_bootstrap(&runtime, 0).await;
+    }
+
+    async fn build(&self) {
         let cfg = read_config(&self.env).unwrap_or(NodeConfigCf {
             db_url: String::new(),
             db_ns: String::new(),
@@ -868,14 +935,8 @@ impl SspNodeDo {
             spawn_local(runner.run());
             tracing::info!(tables = node.job_config.job_tables.len(), "job runner started");
         }
-        let runtime = Runtime::on_demand(node.clone());
-        for key in LEGACY_SNAPSHOT_KEYS {
-            let _ = self.storage.delete(key).await;
-        }
-        runtime.bootstrap_with(Some(&self.snapshot)).await;
+        *self.runtime.borrow_mut() = Some(Runtime::on_demand(node.clone()));
         *self.node.borrow_mut() = Some(node);
-        *self.runtime.borrow_mut() = Some(runtime.clone());
-        self.after_bootstrap(&runtime, 0).await;
     }
 
     /// Ready: arm what the node has pending. Failed: retry with backoff
@@ -919,7 +980,7 @@ impl SspNodeDo {
             return json_response(401, serde_json::json!({ "code": "unauthorized" }));
         }
         let body = req.bytes().await.unwrap_or_default();
-        let (kind, stored) = match compact_for_inbox(&path, &body) {
+        let (kind, stored, job_creates) = match compact_for_inbox(&path, &body) {
             Ok(v) => v,
             Err(e) => return json_response(400, serde_json::json!({ "code": "invalid_notice", "message": e })),
         };
@@ -985,6 +1046,17 @@ impl SspNodeDo {
         }
 
         self.inbox_len.set(self.inbox_len.get() + 1);
+        // A job needs no circuit: a pending job row runs now, not once the node
+        // has bootstrapped (never, while bootstrap fails). Its replay routes
+        // it again, a no-op once it is queued or claimed.
+        if !job_creates.is_empty() {
+            if let Some((node, runtime)) = self.ensure_built().await {
+                for notice in &job_creates {
+                    node.route_job_create(notice).await;
+                }
+                runtime.after_request("/ingest").await;
+            }
+        }
         // Wake as soon as possible: bootstrap (if cold), then replay.
         self.scheduler.ensure(TimerKind::IngestReplay, now_epoch_ms()).await;
         self.stay_awake();
@@ -1215,22 +1287,33 @@ impl SspNodeDo {
 
 /// What the inbox keeps of a notice: `ingest` rows hold the compact notices
 /// (record bodies dropped, replay reads the DB again), `unregister` rows the
-/// request as it came.
-fn compact_for_inbox(path: &str, body: &[u8]) -> std::result::Result<(&'static str, String), String> {
+/// request as it came. Also the notices that may create a job (a CREATE of a
+/// `pending` row), with their bodies, to route before the circuit is up.
+type InboxEntry = (&'static str, String, Vec<ssp_protocol::IngestRequest>);
+
+fn compact_for_inbox(path: &str, body: &[u8]) -> std::result::Result<InboxEntry, String> {
     use ssp_node::replay::compact_notice;
     let notices: Vec<ssp_protocol::IngestRequest> = match path {
         "/view/unregister" => {
             let text = std::str::from_utf8(body).map_err(|e| e.to_string())?;
             serde_json::from_str::<serde_json::Value>(text).map_err(|e| e.to_string())?;
-            return Ok(("unregister", text.to_string()));
+            return Ok(("unregister", text.to_string(), Vec::new()));
         }
         "/ingest/batch" => {
             serde_json::from_slice::<ssp_protocol::IngestBatchRequest>(body).map_err(|e| e.to_string())?.records
         }
         _ => vec![serde_json::from_slice::<ssp_protocol::IngestRequest>(body).map_err(|e| e.to_string())?],
     };
+    let job_creates = notices
+        .iter()
+        .filter(|n| {
+            n.op.eq_ignore_ascii_case("CREATE")
+                && n.record.get("status").and_then(serde_json::Value::as_str) == Some("pending")
+        })
+        .cloned()
+        .collect();
     let compact: Vec<_> = notices.into_iter().map(compact_notice).collect();
-    Ok(("ingest", serde_json::to_string(&compact).map_err(|e| e.to_string())?))
+    Ok(("ingest", serde_json::to_string(&compact).map_err(|e| e.to_string())?, job_creates))
 }
 
 /// The node, and the job queue's receiver when the project has job tables

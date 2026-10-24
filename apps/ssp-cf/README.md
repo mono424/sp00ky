@@ -23,7 +23,12 @@ bootstrap retries with 1 s to 60 s backoff through `TimerKind::BootstrapRetry`).
 
 Timers run on demand (`Runtime::on_demand`): a sweep is armed only while it has
 work, the alarm is deleted when nothing is pending, and timers survive eviction
-in the object's SQLite. An idle project sets no alarm and is evicted. While the
+in the object's SQLite. An idle project sets no alarm and is evicted. The job
+recovery sweep is armed when the next job row is due (a delay's end, a lease's
+end), and job delays or retry backoffs over 30 s wait in the database rather
+than in a timer. Job, schedule and push timers run on the node built without
+its circuit (`ensure_built`): a cron fire does not load every view, and a
+failed bootstrap does not stop them. While the
 node holds views, each request keeps the object in memory for 5 minutes (a
 pending timer), so a short pause does not hibernate it and rebuild the node on
 the next request. Design and

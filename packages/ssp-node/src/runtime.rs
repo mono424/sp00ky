@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use ssp::circuit::Circuit;
 
-use crate::node::JOB_RECOVERY_INTERVAL_SECS;
+use crate::node::{JOB_RECOVERY_INTERVAL_SECS, JOB_RECOVERY_PENDING_GRACE_SECS, JOB_WAKE_SLACK_MS};
 use crate::schedules::SCHEDULE_SWEEP_INTERVAL_SECS;
 use crate::ports::CircuitStoreError;
 use crate::status::SspStatus;
@@ -77,7 +77,7 @@ impl Runtime {
         self.node.platform.spawner.spawn(Box::pin(async move {
             let node = &runtime.node;
             runtime.arm_ttl().await;
-            runtime.arm_job_recovery_if_pending().await;
+            runtime.arm_job_wake().await;
             // What the periodic CrdtSweep was for: rebuild the fold tracker from
             // the log tables once per wake, then fold only if that found work.
             if !node.is_standby() {
@@ -145,19 +145,19 @@ impl Runtime {
         if path == "/admin/reload" || crate::admin::touches_schedules(path) {
             self.arm_schedule_sweep_now().await;
         }
-        let registered = path.starts_with("/view/register");
-        // Only an ingest into a job table can leave a job row behind. Probing
-        // after every ingest cost one DB query per row of any table.
-        let ingested = path.starts_with("/ingest") && node.job_dispatcher.take_job_rows_noticed();
-        if registered || ingested {
+        // Only an ingest into a job table can leave a job row behind. The wake
+        // comes once the row is past the live pickup's grace, with no query on
+        // the request path: that sweep finds what the pickup missed, then arms
+        // at the next row's deadline (`arm_job_wake`). A burst of rows keeps
+        // the first wake.
+        if path.starts_with("/ingest") && node.job_dispatcher.take_job_rows_noticed() && node.standalone {
+            let at = now_epoch_ms() + JOB_RECOVERY_PENDING_GRACE_SECS * 1000 + JOB_WAKE_SLACK_MS;
+            sched.ensure(TimerKind::JobRecoverySweep, at).await;
+        }
+        if path.starts_with("/view/register") {
             let runtime = self.clone();
             node.platform.spawner.spawn(Box::pin(async move {
-                if registered {
-                    runtime.arm_ttl().await;
-                }
-                if ingested {
-                    runtime.arm_job_recovery_if_pending().await;
-                }
+                runtime.arm_ttl().await;
             }));
         }
     }
@@ -184,20 +184,36 @@ impl Runtime {
         }
     }
 
-    async fn arm_job_recovery_if_pending(&self) {
+    /// The recovery sweep at the moment the next job row becomes its: a
+    /// delayed row's delay ends, a fresh row leaves the live pickup's grace, a
+    /// lease (a running job's, a retry's backoff) runs out. While rows are past
+    /// that already (a backlog the drain works through, a pickup an eviction
+    /// lost) the fixed cadence stays the safety net. None when no row is
+    /// pending or processing, so an idle node sets no alarm.
+    async fn arm_job_wake(&self) {
         let node = &self.node;
         if !node.standalone {
             return;
         }
-        if jobs_pending(node).await {
-            node.platform
-                .scheduler
-                .ensure(
-                    TimerKind::JobRecoverySweep,
-                    now_epoch_ms() + JOB_RECOVERY_INTERVAL_SECS * 1000,
-                )
-                .await;
-        }
+        let at = match next_job_wake_ms(node).await {
+            Ok(Some(at)) => at,
+            Ok(None) => return,
+            // Unknown: keep recovery rather than lose it.
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "job recovery: reading the next job deadline failed");
+                now_epoch_ms() + ON_DEMAND_RETRY_MS
+            }
+        };
+        node.platform.scheduler.ensure(TimerKind::JobRecoverySweep, at).await;
+    }
+
+    /// Whether a job, schedule or push timer may run its work. Periodic: once
+    /// the node is Ready, as always. On demand that work needs the database,
+    /// never the circuit, so a host can run it on a node it has built but not
+    /// bootstrapped (a Durable Object woken by a cron fire does not load every
+    /// view first), and a failed bootstrap does not stop jobs and schedules.
+    async fn may_run_control(&self) -> bool {
+        self.policy == TimerPolicy::OnDemand || *self.node.status.read().await == SspStatus::Ready
     }
 
     async fn arm_crdt_fold(&self) {
@@ -213,7 +229,8 @@ impl Runtime {
     /// Dispatch one fired timer. Handles the PORTABLE periodic kinds
     /// (`JobRecoverySweep`, `JobDrain`, `ScheduleSweep`, `TtlCleanup`,
     /// `CircuitCheckpoint`) — each runs its
-    /// work (gated on `Ready`) then re-arms itself via the `Scheduler` port.
+    /// work (gated on `Ready`; on demand the job, schedule and push kinds are
+    /// not, see `may_run_control`) then re-arms itself via the `Scheduler` port.
     /// Host-specific kinds (`DbResignin`, `BackendHealth` — they need the
     /// non-wasm `maintenance` crate) are NOT handled here; the shell's drain
     /// loop keeps those inline. One-shot kinds (`DelayedJob`, `JobRetry`,
@@ -225,7 +242,7 @@ impl Runtime {
         match kind {
             TimerKind::JobRecoverySweep => {
                 // Standalone owns recovery; cluster mode leaves it to the scheduler.
-                if node.standalone && *node.status.read().await == SspStatus::Ready {
+                if node.standalone && self.may_run_control().await {
                     node.job_recovery_sweep().await;
                 }
                 if node.standalone {
@@ -238,7 +255,7 @@ impl Runtime {
                                 )
                                 .await;
                         }
-                        TimerPolicy::OnDemand => self.arm_job_recovery_if_pending().await,
+                        TimerPolicy::OnDemand => self.arm_job_wake().await,
                     }
                 }
             }
@@ -248,7 +265,7 @@ impl Runtime {
                 // blocked by the global count, and so never complete a job to
                 // kick its own drain. The drain re-arms this itself while the
                 // table still has a backlog.
-                if *node.status.read().await == SspStatus::Ready {
+                if self.may_run_control().await {
                     node.job_dispatcher.drain(&table).await;
                 }
             }
@@ -256,7 +273,7 @@ impl Runtime {
                 // Standalone owns the schedule engine; in cluster mode the
                 // scheduler service ticks and `schedule_engine` is None.
                 if let Some(engine) = node.schedule_engine.as_ref() {
-                    if *node.status.read().await == SspStatus::Ready {
+                    if self.may_run_control().await {
                         match engine.tick_pass().await {
                             Ok(report) => {
                                 if report != Default::default() {
@@ -287,7 +304,7 @@ impl Runtime {
             }
             TimerKind::PushTick => {
                 if let Some(engine) = node.push_engine.as_ref() {
-                    if *node.status.read().await == SspStatus::Ready {
+                    if self.may_run_control().await {
                         engine.tick().await;
                     }
                     if self.policy == TimerPolicy::OnDemand {
@@ -584,46 +601,75 @@ async fn earliest_view_expiry_ms(db: &dyn crate::ports::Db) -> anyhow::Result<Op
         .map(|secs| (secs.max(0.0) * 1000.0) as u64))
 }
 
-/// Whether any outbox table holds a row the recovery sweep could act on
-/// (`pending` or `processing`). One multi-statement request; a failed probe
-/// answers `true` so recovery is kept rather than lost.
-async fn jobs_pending(node: &SspNode) -> bool {
+/// The earliest job wake over every outbox table, on this host's clock (see
+/// [`Runtime::arm_job_wake`]); `None` when no row is pending or processing.
+/// One multi-statement request.
+async fn next_job_wake_ms(node: &SspNode) -> anyhow::Result<Option<u64>> {
     let tables: Vec<&String> = node.job_config.job_tables.keys().collect();
     if tables.is_empty() {
-        return false;
+        return Ok(None);
     }
-    let probe = |t: &str| {
-        format!(
-            "RETURN array::len((SELECT VALUE id FROM {t} \
-             WHERE status IN ['pending', 'processing'] LIMIT 1));"
-        )
-    };
     let db = node.platform.db.as_ref();
-    let batch: String = tables.iter().map(|t| probe(t)).collect();
-    match db.query(&batch, &[]).await {
-        Ok(rows) => rows.iter().any(|v| v.as_u64().unwrap_or(0) > 0),
+    let batch: String = tables.iter().map(|t| job_wake_sql(t)).collect();
+    let rows = match db.query(&batch, &[]).await {
+        Ok(rows) => rows,
         // SurrealDB 3 errors on a table nobody has written to yet, rather than
         // returning no rows, and one such table fails the whole batch: ask
         // each table on its own, counting a missing one as empty.
         Err(e) if missing_table(&e.to_string()) => {
+            let mut rows = Vec::new();
             for table in &tables {
-                match db.query(&probe(table), &[]).await {
-                    Ok(rows) if rows.iter().any(|v| v.as_u64().unwrap_or(0) > 0) => return true,
-                    Ok(_) => {}
+                match db.query(&job_wake_sql(table), &[]).await {
+                    Ok(answer) => rows.extend(answer),
                     Err(e) if missing_table(&e.to_string()) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "job recovery: pending-rows probe failed");
-                        return true;
-                    }
+                    Err(e) => return Err(anyhow::anyhow!("{e}")),
                 }
             }
-            false
+            rows
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "job recovery: pending-rows probe failed");
-            true
-        }
-    }
+        Err(e) => return Err(anyhow::anyhow!("{e}")),
+    };
+    let now = now_epoch_ms();
+    Ok(rows.iter().filter_map(|answer| job_wake_at(answer, now)).min())
+}
+
+/// One table's answer for [`next_job_wake_ms`], in the database's clock: its
+/// time now, the earliest moment a row becomes the recovery sweep's (a pending
+/// row due and past the live pickup's grace, a processing row past its lease)
+/// and how many rows are past it already. The deadlines are the sweep's own
+/// predicates solved for time.
+fn job_wake_sql(table: &str) -> String {
+    format!(
+        "RETURN {{ \
+         LET $now = time::now(); \
+         LET $at = array::concat(\
+         (SELECT VALUE time::max([{due}, updated_at + {grace}s]) FROM {table} WHERE status = 'pending'), \
+         (SELECT VALUE {lease} FROM {table} WHERE status = 'processing')); \
+         LET $next = time::min($at[WHERE $this > $now]); \
+         [time::millis($now), IF $next THEN time::millis($next) END, array::len($at[WHERE $this <= $now])] \
+         }};",
+        due = crate::jobs::PENDING_DUE_AT,
+        grace = JOB_RECOVERY_PENDING_GRACE_SECS,
+        lease = schedule_core::sql::LEASE_DEADLINE,
+    )
+}
+
+/// When one table's rows next need the sweep, on this host's clock `now`, from
+/// `[db_now_ms, next_ms | NONE, overdue]`: the next deadline (moved by the
+/// difference between the clocks, plus the slack), or the fixed cadence while
+/// rows are overdue, whichever comes first. An answer of another shape keeps
+/// the cadence.
+fn job_wake_at(answer: &serde_json::Value, now: u64) -> Option<u64> {
+    let cadence = now + JOB_RECOVERY_INTERVAL_SECS * 1000;
+    let Some(db_now) = answer.get(0).and_then(serde_json::Value::as_u64) else {
+        return Some(cadence);
+    };
+    let next = answer
+        .get(1)
+        .and_then(serde_json::Value::as_u64)
+        .map(|at| now + at.saturating_sub(db_now) + JOB_WAKE_SLACK_MS);
+    let overdue = answer.get(2).and_then(serde_json::Value::as_u64).unwrap_or(0) > 0;
+    next.into_iter().chain(overdue.then_some(cadence)).min()
 }
 
 /// SurrealDB 3's answer to a SELECT on a table that was never defined or

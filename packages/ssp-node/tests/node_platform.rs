@@ -93,15 +93,22 @@ impl HttpClient for MockHttp {
 #[derive(Clone, Default)]
 struct MockScheduler {
     scheduled: Arc<Mutex<Vec<TimerKind>>>,
+    /// Every arming with its deadline, in order.
+    armed: Arc<Mutex<Vec<(TimerKind, u64)>>>,
+    max_job_sleep: Option<Duration>,
 }
 
 #[async_trait::async_trait]
 impl Scheduler for MockScheduler {
-    async fn schedule(&self, kind: TimerKind, _at: u64) {
+    async fn schedule(&self, kind: TimerKind, at: u64) {
+        self.armed.lock().unwrap().push((kind.clone(), at));
         self.scheduled.lock().unwrap().push(kind);
     }
     async fn cancel(&self, _kind: &TimerKind) {}
     async fn sleep(&self, _dur: Duration) {}
+    fn max_job_sleep(&self) -> Option<Duration> {
+        self.max_job_sleep
+    }
 }
 
 struct MockSpawner;
@@ -148,6 +155,7 @@ struct Harness {
     db_queries: Arc<AtomicUsize>,
     http_calls: Arc<Mutex<Vec<String>>>,
     scheduled: Arc<Mutex<Vec<TimerKind>>>,
+    armed: Arc<Mutex<Vec<(TimerKind, u64)>>>,
     telemetry_gauge: Arc<Mutex<i64>>,
     backend_updates: Arc<Mutex<Vec<BackendSpec>>>,
     _job_rx: mpsc::Receiver<JobEntry>,
@@ -175,6 +183,8 @@ struct HarnessOpts {
     guests: bool,
     /// `SPKY_ADMIN_PASSWORD`: offer a break-glass admin login.
     admin_password: Option<&'static str>,
+    /// The scheduler's `max_job_sleep` (a Durable Object's cap).
+    max_job_sleep: Option<Duration>,
 }
 
 impl Default for HarnessOpts {
@@ -192,6 +202,7 @@ impl Default for HarnessOpts {
             anonymous_live_queries: false,
             guests: false,
             admin_password: None,
+            max_job_sleep: None,
         }
     }
 }
@@ -240,6 +251,7 @@ async fn build(opts: HarnessOpts) -> Harness {
 
     let http_calls = Arc::new(Mutex::new(Vec::new()));
     let scheduled = Arc::new(Mutex::new(Vec::new()));
+    let armed = Arc::new(Mutex::new(Vec::new()));
     let telemetry_gauge = Arc::new(Mutex::new(0));
     let mem_db = MemDb::new(Arc::clone(&raw));
     let db_queries = Arc::clone(&mem_db.queries);
@@ -247,7 +259,11 @@ async fn build(opts: HarnessOpts) -> Harness {
     let platform = Platform {
         db: Arc::new(mem_db),
         http: Arc::new(MockHttp { calls: Arc::clone(&http_calls), status: Arc::new(AtomicUsize::new(0)) }),
-        scheduler: Arc::new(MockScheduler { scheduled: Arc::clone(&scheduled) }),
+        scheduler: Arc::new(MockScheduler {
+            scheduled: Arc::clone(&scheduled),
+            armed: Arc::clone(&armed),
+            max_job_sleep: opts.max_job_sleep,
+        }),
         spawner: Arc::new(MockSpawner),
         telemetry: Arc::new(MockTelemetry { gauge: Arc::clone(&telemetry_gauge) }),
         circuit_store: opts
@@ -359,6 +375,7 @@ async fn build(opts: HarnessOpts) -> Harness {
         db_queries,
         http_calls,
         scheduled,
+        armed,
         telemetry_gauge,
         backend_updates,
         _job_rx: dead_rx,
@@ -1139,57 +1156,173 @@ async fn on_demand_sweeps_without_work_do_not_rearm() {
     );
 }
 
+/// The last deadline `kind` was armed at, as an offset from now in seconds.
+fn armed_in_secs(h: &Harness, kind: &TimerKind) -> Option<i64> {
+    let now = ssp_node::now_epoch_ms() as i64;
+    h.armed.lock().unwrap().iter().rev().find(|(k, _)| k == kind).map(|(_, at)| (*at as i64 - now) / 1000)
+}
+
+// A Durable Object used to wake every minute while any job row was pending or
+// processing: a `delay: 1 day` job or a `step.sleep('1 day')` cost about 1,440
+// alarms, and still ran up to a minute late. The wake now comes when the next
+// row becomes the sweep's.
 #[tokio::test]
-async fn on_demand_job_recovery_rearms_while_a_job_is_pending() {
+async fn on_demand_job_wake_arms_at_the_next_rows_deadline() {
+    use ssp_node::Runtime;
+    let h = build(HarnessOpts { job_tables: vec![("job", "http://b")], ..Default::default() }).await;
+    let rt = Runtime::on_demand(Arc::clone(&h.node));
+    let wake = || armed_in_secs(&h, &TimerKind::JobRecoverySweep);
+
+    // A day's delay: due when the delay ends, not in a minute.
+    h.raw_db
+        .query("CREATE job:later SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, delay = 86400000, created_at = time::now(), updated_at = time::now();")
+        .await
+        .unwrap();
+    rt.on_timer(TimerKind::JobRecoverySweep).await;
+    assert!(matches!(wake(), Some(86_399..=86_401)), "at the end of the delay, got {:?}", wake());
+
+    // A fresh row with no delay: once it leaves the live pickup's grace.
+    h.raw_db
+        .query("CREATE job:fresh SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now(), updated_at = time::now();")
+        .await
+        .unwrap();
+    rt.on_timer(TimerKind::JobRecoverySweep).await;
+    assert!(matches!(wake(), Some(30..=31)), "past the grace, got {:?}", wake());
+
+    // A running job: when its lease runs out (a retry's backoff is one too).
+    h.raw_db.query("DELETE job:fresh; CREATE job:running SET status = 'processing', path = '/x', payload = {}, retries = 0, max_retries = 3, lease_until = time::now() + 90s, created_at = time::now(), updated_at = time::now();").await.unwrap();
+    rt.on_timer(TimerKind::JobRecoverySweep).await;
+    assert!(matches!(wake(), Some(90..=91)), "at the lease's end, got {:?}", wake());
+}
+
+// Rows the sweep has already acted on but that are still waiting (a backlog
+// the drain works through) keep the minute cadence as the safety net, never
+// a wake that spins on them.
+#[tokio::test]
+async fn on_demand_job_wake_keeps_the_cadence_while_rows_are_overdue() {
     use ssp_node::Runtime;
     let h = build(HarnessOpts { job_tables: vec![("job", "http://b")], ..Default::default() }).await;
     h.raw_db
-        .query("CREATE job:j1 SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now(), updated_at = time::now();")
+        .query("CREATE job:a SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now() - 5m, updated_at = time::now() - 5m;\
+                CREATE job:b SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now() - 5m, updated_at = time::now() - 5m;")
         .await
         .unwrap();
     Runtime::on_demand(Arc::clone(&h.node)).on_timer(TimerKind::JobRecoverySweep).await;
-    assert!(
-        h.scheduled.lock().unwrap().contains(&TimerKind::JobRecoverySweep),
-        "a pending job keeps the recovery sweep armed"
-    );
+    // The sweep handed one to the runner (the limit is 1), the other waits.
+    assert_eq!(h.job_rx.lock().await.try_recv().expect("the sweep re-admits an overdue row").id, "job:a");
+    let wake = armed_in_secs(&h, &TimerKind::JobRecoverySweep);
+    assert!(matches!(wake, Some(59..=60)), "the cadence, got {wake:?}");
 }
 
 // A project with a job table probed for pending jobs after EVERY ingest, one
 // DB query per row whatever its table (Cloudflare, 2026-10-22). Only an ingest
-// into a job table can leave a job row behind.
+// into a job table can leave a job row behind, and it arms the wake past the
+// live pickup's grace without a query on the request path.
 #[tokio::test]
-async fn on_demand_probes_for_jobs_only_after_a_job_table_ingest() {
+async fn on_demand_arms_the_job_wake_only_after_a_job_table_ingest() {
     use ssp_node::Runtime;
     let h = build(HarnessOpts { job_tables: vec![("job", "http://b")], ..Default::default() }).await;
-    h.raw_db
-        .query("CREATE job:j1 SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now(), updated_at = time::now();")
-        .await
-        .unwrap();
     let runtime = Runtime::on_demand(Arc::clone(&h.node));
     let ingest = |table: &str, op: &str, id: &str, record: Value| {
         authed(Method::Post, "/ingest", json!({ "table": table, "op": op, "id": id, "record": record }))
     };
-    let armed = || h.scheduled.lock().unwrap().contains(&TimerKind::JobRecoverySweep);
+    let wake = || armed_in_secs(&h, &TimerKind::JobRecoverySweep);
 
     let r = h.node.route(ingest("thread", "CREATE", "thread:a", json!({ "id": "thread:a" }))).await.unwrap();
     assert_eq!(r.status, 200);
-    let before = h.db_queries.load(Ordering::SeqCst);
     runtime.after_request("/ingest").await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(h.db_queries.load(Ordering::SeqCst), before, "a thread row cannot leave a job behind");
-    assert!(!armed());
+    assert_eq!(wake(), None, "a thread row cannot leave a job behind");
 
     let r = h.node
         .route(ingest("job", "UPDATE", "job:j1", json!({ "id": "job:j1", "status": "processing" })))
         .await
         .unwrap();
     assert_eq!(r.status, 200);
+    let before = h.db_queries.load(Ordering::SeqCst);
     runtime.after_request("/ingest").await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !armed() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    assert_eq!(h.db_queries.load(Ordering::SeqCst), before, "no query on the request path");
+    assert!(matches!(wake(), Some(30..=31)), "past the grace, got {:?}", wake());
+}
+
+// A Durable Object's job timers need the database, not the circuit: a cron
+// fire or a job wake must not load every view first, and a node whose
+// bootstrap failed still runs its jobs. The VM keeps its Ready gate.
+#[tokio::test]
+async fn on_demand_job_timers_run_before_the_circuit_is_ready() {
+    use ssp_node::Runtime;
+    for (on_demand, runs) in [(false, false), (true, true)] {
+        let h = build(HarnessOpts {
+            job_tables: vec![("job", "http://b")],
+            status: SspStatus::Failed,
+            ..Default::default()
+        })
+        .await;
+        h.raw_db
+            .query("CREATE job:a SET status = 'pending', path = '/x', payload = {}, retries = 0, max_retries = 3, created_at = time::now() - 5m, updated_at = time::now() - 5m;")
+            .await
+            .unwrap();
+        let rt = if on_demand { Runtime::on_demand(Arc::clone(&h.node)) } else { Runtime::new(Arc::clone(&h.node)) };
+        rt.on_timer(TimerKind::JobRecoverySweep).await;
+        assert_eq!(h.job_rx.lock().await.try_recv().is_ok(), runs, "on demand: {on_demand}");
+    }
+}
+
+// A Durable Object queues a change notice while its circuit is not in memory
+// and replays it once bootstrapped. A job row in it runs now: jobs need no
+// circuit, and a bootstrap that keeps failing must not hold them back.
+#[tokio::test]
+async fn a_job_create_is_routed_without_the_circuit() {
+    let h = build(HarnessOpts {
+        job_tables: vec![("job", "http://backend")],
+        status: SspStatus::Bootstrapping,
+        ..Default::default()
     })
-    .await
-    .expect("a job-table ingest probes and arms the recovery sweep");
+    .await;
+    let notice = |table: &str, op: &str, id: &str, status: &str| ssp_protocol::IngestRequest {
+        table: table.into(),
+        op: op.into(),
+        id: id.into(),
+        record: json!({ "status": status, "path": "/run", "payload": {} }),
+        job_assignee: None,
+    };
+    // The ingest route itself refuses while bootstrapping.
+    let body = json!({ "table": "job", "op": "CREATE", "id": "job:via_ingest", "record": { "status": "pending", "path": "/run" } });
+    assert_eq!(h.node.route(authed(Method::Post, "/ingest", body)).await.unwrap().status, 503);
+
+    h.node.route_job_create(&notice("thread", "CREATE", "thread:a", "pending")).await;
+    h.node.route_job_create(&notice("job", "UPDATE", "job:u", "pending")).await;
+    h.node.route_job_create(&notice("job", "CREATE", "job:done", "success")).await;
+    h.node.route_job_create(&notice("job", "CREATE", "job:a", "pending")).await;
+    let mut rx = h.job_rx.lock().await;
+    assert_eq!(rx.try_recv().expect("the pending job row runs").id, "job:a");
+    assert!(rx.try_recv().is_err(), "only a pending job-table CREATE is a job to run");
+    assert!(h.node.job_dispatcher.take_job_rows_noticed(), "so the host arms the job wake");
+}
+
+// A delay longer than the host holds in memory (a Durable Object's, billed
+// while it waits and lost on eviction) is left to the row and the job wake.
+#[tokio::test]
+async fn a_delay_past_the_hosts_sleep_cap_is_left_to_the_job_wake() {
+    let h = build(HarnessOpts {
+        job_tables: vec![("job", "http://backend")],
+        max_job_sleep: Some(Duration::from_secs(30)),
+        ..Default::default()
+    })
+    .await;
+    let create = |id: &str, delay: u64| {
+        let body = json!({
+            "table": "job", "op": "CREATE", "id": id,
+            "record": { "status": "pending", "path": "/run", "payload": {}, "delay": delay }
+        });
+        authed(Method::Post, "/ingest", body)
+    };
+    assert_eq!(h.node.route(create("job:later", 3_600_000)).await.unwrap().status, 200);
+    assert_eq!(h.node.route(create("job:soon", 5_000)).await.unwrap().status, 200);
+    // The mock's sleep returns at once: a sleeper would have been admitted.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut rx = h.job_rx.lock().await;
+    assert_eq!(rx.try_recv().expect("a short delay still waits in memory").id, "job:soon");
+    assert!(rx.try_recv().is_err(), "the hour-long delay is the job wake's");
 }
 
 #[tokio::test]

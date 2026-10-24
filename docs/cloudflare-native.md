@@ -171,15 +171,21 @@ synchronous). Add `Scheduler::ensure(kind, at)` (keep the earlier deadline) and
 | CrdtFoldTick | Armed when `crdt.observe` reports newly pending work; re-armed at the next pending due time; none when empty |
 | CrdtSweep | `last_crdt_activity + sweep_secs`, only if CRDT tables exist |
 | TtlCleanup | After each sweep, armed at the earliest `lastActiveAt + ttl` in `_00_query`; none when no views exist. Heartbeats go to the DB, so they never wake the DO |
-| JobRecoverySweep | Only while pending or processing job rows exist, or at the next lease expiry |
+| JobRecoverySweep | The job wake: at the next job row's deadline (a delayed row's `created_at + delay`, a fresh row's 30 s pickup grace, a lease's end), a second late; the minute cadence only while rows are overdue (a backlog); none when no row is pending or processing. A job-table ingest arms it 31 s out with no query |
 | ScheduleSweep | At the engine's earliest `next_fire_at`, plus on `_00_schedule` ingest |
 | PushTick | On enqueue and at the engine's next due time |
 | CircuitCheckpoint | Dirty + 30 s quiet, at most 120 s |
 | BootstrapRetry | Only after a failure |
 
-Jobs, schedules, push and the CRDT fold run on a circuit-free `ControlNode`
-(config, Db, job dispatcher, engines), so a 3 am cron fire does not load a
-large circuit. Target: an idle project sets zero alarms per hour.
+Jobs, schedules and push run without the circuit (built 2026-10-23), so a
+3 am cron fire does not load a large circuit. There is no separate
+`ControlNode` type: the shell builds the node without bootstrapping it
+(`ensure_built`), and an alarm whose due timers are all job, schedule, push,
+metrics or checkpoint kinds (`runs_without_circuit`) runs on it. On demand the
+runtime runs those kinds whatever the node's status
+(`Runtime::may_run_control`), so a failed bootstrap no longer stops jobs and
+schedules; the VM keeps its Ready gate. Any other due timer bootstraps first
+(`ensure_ready`). Target: an idle project sets zero alarms per hour.
 
 Spike S2 confirmed it on Cloudflare: with demand-armed, persisted timers an
 idle project set 2 alarms in its first 2 minutes (one flush, one TTL sweep at
@@ -190,8 +196,11 @@ per hour) and was never evicted. Three rules the spike added:
   (`(expiry + 1 s).max(now)`), or an alarm wake costs a second alarm.
 - A fold that keeps failing must not keep a "pending" tick at 5 s forever:
   arm at the earliest due fold (`retry_at`, idle deadline) and cap retries.
-- TTL cleanup, like jobs and the CRDT fold, runs on the circuit-free control
-  path; a TTL alarm on an evicted DO must not bootstrap the whole node.
+- TTL cleanup should run on the circuit-free path too, so a TTL alarm on an
+  evicted DO does not bootstrap the whole node. Not built: the sweep removes
+  circuit views and drops per-user tables no live query backs, which an
+  empty circuit would read as "none". The CRDT fold also still bootstraps
+  (its tracker is rebuilt at boot).
 
 ### 5.3 Durable ingest through the output gate
 
@@ -412,7 +421,14 @@ an idle project still sets no alarm:
 - **Jobs (built):** when `SPKY_JOB_CONFIG` names job tables the shell preloads
   the job policies and runs a `JobRunner` on the object's isolate; each job is
   an HTTP call to its backend over fetch. Evicted mid-request jobs run at
-  least once: the on-demand recovery sweep re-admits them. Replay hands a
+  least once: the job wake fires when the claim's lease runs out and the
+  recovery sweep re-admits them. A delay or retry backoff longer than 30 s
+  (`Scheduler::max_job_sleep`) is not slept in memory, where a pending timer
+  keeps the object in memory (billed) and an eviction loses it: the row waits
+  (its `delay`; for a retry, its lease moved to the retry time) and the job
+  wake fires when it is due, about a second late. A job row noticed while the
+  circuit is not in memory runs at once (`SspNode::route_job_create` before
+  the notice is queued). Replay hands a
   pending job row to the job path as a CREATE even when a rebuild already
   loaded it (pickup keys on a pending CREATE; the claim on `pending` keeps it
   to one run). Worker backends are built (phase 5, 2026-10-22): a job for

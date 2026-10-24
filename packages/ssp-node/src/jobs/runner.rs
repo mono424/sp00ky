@@ -9,7 +9,7 @@ use super::dispatcher::JobDispatcher;
 use super::types::{JobControl, JobEntry};
 use crate::api::Method;
 use crate::db_retry::{is_write_conflict, query_retrying};
-use crate::ports::{Db, HttpClient, HttpError, OutboundRequest, Scheduler, Spawner};
+use crate::ports::{Db, HttpClient, HttpError, OutboundRequest, Scheduler, Spawner, TimerKind};
 
 /// SQL boolean expression (for recovery-sweep `WHERE` clauses): is a pending job
 /// DUE now? A job is due at `created_at + <delay>`; `??` falls back when `delay`
@@ -23,6 +23,10 @@ use crate::ports::{Db, HttpClient, HttpError, OutboundRequest, Scheduler, Spawne
 /// per cycle, so an outbox row is once again always a single execution.
 pub const PENDING_DUE_CLAUSE: &str =
     "(created_at + <duration>(string::concat(<string>(delay ?? 0), 'ms'))) <= time::now()";
+
+/// When this pending row becomes due: the moment [`PENDING_DUE_CLAUSE`] turns true.
+/// An on-demand host arms its recovery wake at it instead of sweeping on a cadence.
+pub const PENDING_DUE_AT: &str = "(created_at + <duration>(string::concat(<string>(delay ?? 0), 'ms')))";
 
 /// Slack added to a job's own timeout to get its lease length.
 ///
@@ -356,6 +360,16 @@ impl JobRunnerCtx {
             // backoff — a regression against the serial runner this replaces.
             job.permit = None;
 
+            // Too long to sleep through on this host (`Scheduler::max_job_sleep`):
+            // the row keeps `processing` with its lease ending at the retry time,
+            // and the recovery sweep reclaims and re-runs it then, as it does any
+            // lease that ran out. The attempt count is on the row (above).
+            if self.scheduler.max_job_sleep().is_some_and(|max| delay > max) {
+                self.defer_retry(&job, delay).await;
+                self.job_control.clear_enqueued(&job.id);
+                return Ok(());
+            }
+
             // Requeue with delay: a fire-and-forget task that sleeps through the
             // backoff. Lost on restart/eviction by design — the recovery sweep
             // re-picks the pending row (deadlines live in SurrealQL, not here).
@@ -416,6 +430,20 @@ impl JobRunnerCtx {
         }
 
         Ok(())
+    }
+
+    /// Park a failed attempt's row until its retry is due (see `handle_failure`),
+    /// and wake the recovery sweep then.
+    async fn defer_retry(&self, job: &JobEntry, delay: Duration) {
+        match defer_retry_helper(self.db.as_ref(), &job.id, delay, job.lease_epoch).await {
+            Ok(true) => {
+                let at = crate::now_epoch_ms() + delay.as_millis() as u64 + crate::node::JOB_WAKE_SLACK_MS;
+                self.scheduler.ensure(TimerKind::JobRecoverySweep, at).await;
+            }
+            Ok(false) => fenced(&job.id, job.lease_epoch, "retry deferral"),
+            // The claim's lease still runs out, and the sweep retries the job then.
+            Err(e) => warn!(job_id = %job.id, error = format!("{e:#}"), "Failed to defer a retry to its lease"),
+        }
     }
 
     /// A terminal status write by the attempt that is running the job, fenced on its
@@ -895,6 +923,22 @@ pub async fn update_status_fenced(
     Ok(updated_any(&results))
 }
 
+/// Hold a failed attempt's row for its retry backoff: still `processing`, its lease
+/// ending when the retry is due, so the recovery sweep reclaims it then. Fenced like
+/// every write of an attempt; `false` when the row has moved on.
+pub async fn defer_retry_helper(db: &dyn Db, job_id: &str, wait: Duration, epoch: Option<i64>) -> Result<bool> {
+    validate_job_id(job_id)?;
+    let (sql, mut binds) = fenced_write(
+        job_id,
+        epoch,
+        "SET lease_until = time::now() + <duration>(string::concat(<string>$wait, 'ms')), \
+         updated_at = time::now()",
+    );
+    binds.push(("wait", json!(wait.as_millis() as u64)));
+    let results = db.query(&sql, &binds).await.context("Failed to defer a retry")?;
+    Ok(updated_any(&results))
+}
+
 /// Persist the owning SSP node id (`ssp_id`) onto a job row so cluster recovery
 /// can tell which SSP accepted a job (and re-dispatch only if that SSP dies).
 /// Deliberately does **not** touch `updated_at`: the recovery staleness clock
@@ -1048,6 +1092,11 @@ fn calculate_delay(retries: u32, strategy: &str) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_due_moment_is_the_due_predicate_solved_for_time() {
+        assert_eq!(format!("{PENDING_DUE_AT} <= time::now()"), PENDING_DUE_CLAUSE);
+    }
 
     #[test]
     fn a_job_request_names_the_job_its_attempt_and_its_deadline() {

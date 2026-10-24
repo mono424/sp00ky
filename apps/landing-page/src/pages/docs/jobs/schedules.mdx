@@ -378,7 +378,7 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
 - no name is used by both a schedule and a workflow
 
 <Warning>
-  `spky deploy` syncs schedules on every kind of project, Cloudflare included, where the SSP runs them on Durable Object alarms. `spky lint` warns when a schedule targets a `devOnly` backend: it will run locally under `spky dev`, but not in the cloud.
+  `spky deploy` syncs schedules on every kind of project, Cloudflare included, where the SSP runs them on Durable Object alarms: a fire wakes it at the scheduled time, without loading its live queries (see [Cloudflare projects](/docs/cloud/deploying#jobs-schedules-and-workflows-on-cloudflare)). `spky lint` warns when a schedule targets a `devOnly` backend: it will run locally under `spky dev`, but not in the cloud.
 </Warning>
 
 ## Reference

@@ -123,6 +123,23 @@ puts each part of it here:
 | [Worker backends](/docs/backend/workers) | Dynamic Workers inside the SSP Worker. `spky deploy` bundles each `worker.entry` with esbuild and uploads it with the SSP Worker. Their `expose` paths are served on `https://<slug>.<domain>`. |
 | Schema | Pushed to the SSP after the deploy, with your schedules, workflows and job policies. `spky push` retries it. |
 
+#### Jobs, schedules and workflows on Cloudflare
+
+They behave as on a VM: the same outbox, retries, leases, schedules and workflows. The SSP's Durable
+Object runs them on its alarm, and only sets one when something is due, so an idle project costs
+nothing and the object is evicted between jobs.
+
+- **Wakes follow what is due.** A delayed job, a `step.sleep`, a retry's backoff and a schedule's
+  next fire each wake the SSP at that moment (a job about a second late), not on a polling
+  cadence. A `delay` of one day is one wake, not one a minute.
+- **Long waits live in the database.** A delay or backoff longer than 30 seconds is not a timer in
+  memory: the job row waits, and an eviction cannot lose it. Shorter ones wait in memory.
+- **Background work does not load your views.** A cron fire or a job wake runs on the SSP without
+  rebuilding its live queries first, and keeps running while the SSP is still starting (or failing
+  to start) after a deploy. A job created during that time runs at once.
+- **At least once.** A job in flight when the object is evicted runs again when its lease runs out.
+  Make job routes safe to repeat.
+
 Docker backends do not run on a Cloudflare project. Make the backend a
 [Worker backend](/docs/backend/workers), or host it yourself (`hosting: external`) at a public
 `baseUrl` the SSP Worker can reach. `--only` works as on a VM: `spky deploy --only api` bundles and

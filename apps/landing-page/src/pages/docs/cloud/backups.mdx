@@ -118,7 +118,9 @@ Restoring replaces your current data with the backup. Anything you wrote after t
 
 A pay-as-you-go project has no scheduler, so Sp00ky Cloud takes and restores its backups itself, with the same commands and the same backup files. A restore wipes the database, imports the backup and reloads the sync engine, which picks up the restored data on its own; run your migrations again afterwards as above.
 
-A restore gives every `DEFINE ACCESS` new signing keys, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and restoring that placeholder would let anyone sign a valid token. An access that verifies tokens of an outside issuer with a key is left out of the restore and defined again by your next deploy.
+### Signing keys after a restore
+
+A restore gives every `DEFINE ACCESS` new signing keys, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and restoring that placeholder would let anyone sign a valid token, so the restore drops it. An access that verifies tokens of an outside issuer with a key is left out of the restore: run its `DEFINE ACCESS` statement again afterwards (the restore log names it).
 
 <Note>
 If the main database gets wiped but the snapshot replica fails to import, the scheduler stays in the `restoring` state on purpose. That blocks reads until someone re-runs the restore. Serving traffic from a half-restored cluster would give back wrong data.

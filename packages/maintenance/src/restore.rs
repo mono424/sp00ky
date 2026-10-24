@@ -4,7 +4,7 @@ use flate2::read::GzDecoder;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -327,17 +327,21 @@ async fn execute_restore(
     // 2. Gunzip file to file.
     let tmp = tempfile::NamedTempFile::new().context("Failed to create tempfile for dump")?;
     let (src, dst) = (gz.path().to_path_buf(), tmp.path().to_path_buf());
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let dropped = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
         let input = File::open(&src).context("Failed to open downloaded dump")?;
-        let mut decoder = GzDecoder::new(BufReader::new(input));
+        let decoder = BufReader::new(GzDecoder::new(BufReader::new(input)));
         let mut output =
             BufWriter::new(File::create(&dst).context("Failed to create dump tempfile")?);
-        std::io::copy(&mut decoder, &mut output).context("Failed to decompress S3 artifact")?;
+        let dropped =
+            copy_sanitized(decoder, &mut output).context("Failed to decompress S3 artifact")?;
         output.flush().context("Failed to write dump tempfile")?;
-        Ok(())
+        Ok(dropped)
     })
     .await
     .context("Gunzip task panicked")??;
+    for name in &dropped {
+        info!(restore_id = %job.restore_id, access = %name, "DEFINE ACCESS carried a redacted key and was left out of the restore; define it again afterwards");
+    }
     drop(gz);
     let dump_path = tmp.path().to_path_buf();
 
@@ -385,4 +389,116 @@ async fn execute_restore(
     progress.host_state_restored = outcome.host_state_restored;
 
     Ok(outcome)
+}
+
+/// SurrealDB's export prints the signing keys of `DEFINE ACCESS` as
+/// `'[REDACTED]'`, and importing that sets the key to the literal string
+/// "[REDACTED]": anyone could then sign a token for any user (reproduced on
+/// 3.1.5). A restore drops the redacted key clauses of record accesses, so
+/// SurrealDB generates fresh keys and signed-in users sign in again. An
+/// access whose key cannot be dropped that way (a JWT access verifying an
+/// outside issuer's tokens) is left out, to be defined again by hand. The
+/// export writes one statement per line.
+const REDACTED_KEY: &str = "'[REDACTED]'";
+
+fn sanitize_access(line: &str) -> Option<String> {
+    if !line.starts_with("DEFINE ACCESS ") || !line.contains(REDACTED_KEY) {
+        return Some(line.to_string());
+    }
+    let mut out = line.to_string();
+    if out.contains(" TYPE RECORD ") {
+        out = drop_clause(&out, " WITH JWT ALGORITHM ", true);
+        out = drop_clause(&out, " WITH ISSUER ", false);
+    }
+    (!out.contains(REDACTED_KEY)).then_some(out)
+}
+
+/// Removes `<prefix>[ALGORITHM X ]KEY '[REDACTED]'` (with `algorithm_first`,
+/// `<prefix>X KEY '[REDACTED]'`) wherever it appears.
+fn drop_clause(line: &str, prefix: &str, algorithm_first: bool) -> String {
+    let mut out = line.to_string();
+    let mut from = 0;
+    while let Some(rel) = out[from..].find(prefix) {
+        let start = from + rel;
+        let mut rest = &out[start + prefix.len()..];
+        if algorithm_first {
+            match rest.split_once(' ') {
+                Some((_, after)) => rest = after,
+                None => break,
+            }
+        } else if let Some(after) = rest.strip_prefix("ALGORITHM ") {
+            match after.split_once(' ') {
+                Some((_, after)) => rest = after,
+                None => break,
+            }
+        }
+        let key = format!("KEY {REDACTED_KEY}");
+        if let Some(after) = rest.strip_prefix(key.as_str()) {
+            let end = out.len() - after.len();
+            out.replace_range(start..end, "");
+            from = start;
+        } else {
+            from = start + prefix.len();
+        }
+    }
+    out
+}
+
+/// Copies a dump line by line through [`sanitize_access`]; returns the names
+/// of the accesses left out.
+fn copy_sanitized(
+    mut input: impl BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<Vec<String>> {
+    let mut dropped = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.starts_with(b"DEFINE ACCESS ") {
+            output.write_all(&line)?;
+            continue;
+        }
+        let text = String::from_utf8_lossy(&line);
+        match sanitize_access(&text) {
+            Some(clean) => output.write_all(clean.as_bytes())?,
+            None => dropped.push(
+                text.trim_start_matches("DEFINE ACCESS ")
+                    .trim_start_matches("OVERWRITE ")
+                    .trim_start_matches("IF NOT EXISTS ")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("?")
+                    .to_string(),
+            ),
+        }
+    }
+    Ok(dropped)
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn restore_drops_redacted_access_keys() {
+        let dump = concat!(
+            "OPTION IMPORT;\n",
+            "DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNUP (CREATE user SET name = $name) SIGNIN (SELECT * FROM user WHERE name = $name) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION 1d;\n",
+            "DEFINE ACCESS partner ON DATABASE TYPE JWT ALGORITHM HS256 KEY '[REDACTED]' DURATION FOR SESSION 1h;\n",
+            "DEFINE ACCESS jwks ON DATABASE TYPE JWT URL 'https://example.com/jwks.json';\n",
+            "INSERT [ { id: note:1, text: 'KEY \\'[REDACTED]\\'' } ];\n",
+        );
+        let mut out = Vec::new();
+        let dropped = copy_sanitized(dump.as_bytes(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("SIGNIN (SELECT * FROM user WHERE name = $name) DURATION FOR TOKEN 1h, FOR SESSION 1d;\n"), "{out}");
+        assert!(!out.contains("ACCESS partner"), "{out}");
+        assert_eq!(dropped, vec!["partner".to_string()]);
+        for keep in ["OPTION IMPORT;", "ACCESS jwks", "INSERT [ { id: note:1"] {
+            assert!(out.contains(keep), "lost {keep}: {out}");
+        }
+    }
 }

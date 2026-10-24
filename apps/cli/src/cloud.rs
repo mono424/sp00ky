@@ -7707,6 +7707,7 @@ pub fn keys(action: CloudKeyCommands) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn print_deployment_details(data: &serde_json::Value) {
+    let on_cloudflare = data.pointer("/image_versions/ssp-cf").is_some();
     if let Some(dep) = data.get("deployment") {
         println!(
             "  Deployment v{} — {}",
@@ -7880,7 +7881,12 @@ fn print_deployment_details(data: &serde_json::Value) {
                 );
             }
 
-            report_version_skew(&component_versions, &pinned_release_roles(&data));
+            // A Cloudflare project runs no scheduler and its SSP is a Worker,
+            // so there is no container version to compare (only a pay-as-you-go
+            // project's own database shows in the table).
+            if !on_cloudflare {
+                report_version_skew(&component_versions, &pinned_release_roles(&data));
+            }
         }
     }
 
@@ -7972,7 +7978,7 @@ fn print_deployment_details(data: &serde_json::Value) {
     }
 
     // Print spooky status endpoint
-    if let Some(db_url) = urls.get("surrealdb") {
+    if let Some(db_url) = urls.get("surrealdb").filter(|_| !on_cloudflare) {
         if db_url.starts_with("http") {
             let config_path = std::env::current_dir()
                 .unwrap_or_default()

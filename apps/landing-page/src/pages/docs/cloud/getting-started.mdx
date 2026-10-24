@@ -113,13 +113,15 @@ Shows all your cloud projects with their plan, status, and creation date.
 ## Destroying a Project
 
 <Warning>
-This permanently tears down all VMs and infrastructure for the project. Data will be lost unless you have a backup.
+Destroying a project deletes everything it has, for good: its containers or Workers, its database and the volumes behind it, and its backups too. Nothing is kept to restore from. To keep the data, export it first with `surreal export`, using the login `spky project credentials` prints.
 </Warning>
 
 <CodeBlock
   code={code2}
   lang="bash"
 />
+
+Once the project is gone, its subscription is cancelled and its slug is free again. A new project created with that slug starts with an empty database: nothing of the old project carries over.
 
 ## Billing
 

@@ -107,8 +107,9 @@ Here's what happens when you run it:
 3. Both databases are wiped and reloaded from the same backup file. Main SurrealDB and the scheduler's snapshot replica stay in sync.
 4. Pending items are cleared. That covers the in-memory event buffer, the write-ahead log, and any per-SSP message buffers.
 5. Connected SSPs are evicted. They'll re-register on their next heartbeat against the restored state.
-6. The CLI polls for progress every 5 seconds (up to 5 minutes) and shows the current phase as it moves from `queued` to `running` to `completed`.
-7. Once the restore finishes, your migrations run again against the restored database.
+6. Sp00ky Cloud gives the restored database's access methods new signing keys and checks that no forged token gets in (see [Signing keys after a restore](#signing-keys-after-a-restore)). Only then is the restore reported as done.
+7. The CLI polls for progress every 5 seconds (up to 5 minutes) and shows the current phase as it moves from `queued` to `running` to `completed`.
+8. Once the restore finishes, your migrations run again against the restored database.
 
 <Warning>
 Restoring replaces your current data with the backup. Anything you wrote after the backup was taken is gone. If you're not sure, take a fresh backup first.
@@ -130,7 +131,7 @@ If the main database gets wiped but the snapshot replica fails to import, the sc
 
 ## From the dashboard
 
-The scheduler's [admin dashboard](/docs/reference/admin-dashboard#backups) has a Backups tab that does everything above except `reset`: create, list, restore, delete and configure the schedule. It shows the same catalog as `spky backup list`, joined to what the scheduler itself knows about each backup, and a restore there reports the real stages as the scheduler moves through them (`queued`, `running`, main database restored, replica restored, done). Migrations still have to be run again afterwards.
+The scheduler's [admin dashboard](/docs/reference/admin-dashboard#backups) has a Backups tab that does everything above except `reset`: create, list, restore, delete and configure the schedule. It shows the same catalog as `spky backup list`, joined to what the scheduler itself knows about each backup, and a restore there reports the real stages as the scheduler moves through them (`queued`, `running`, main database restored, replica restored, done). It goes through Sp00ky Cloud like `spky backup restore`, so the signing keys are renewed the same way, and migrations still have to be run again afterwards.
 
 <Note>
 **How the dashboard talks to Sp00ky Cloud.** The control plane injects `SPKY_CLOUD_API_URL` and `SPKY_CLOUD_PROJECT` into the scheduler container (only the scheduler, never the SSPs). The scheduler then calls an allow-listed route family, `/v1/internal/projects/{slug}/…` (restart, deployment status, and the backup routes minus `reset`), authenticated with the project's existing `SPKY_AUTH_SECRET`. No new credential is created. A control plane that supports this lists `scheduler_link` under `features` in its `/health` response; a scheduler without the link still works and marks those actions as unavailable.
@@ -153,6 +154,8 @@ list would be.
   code={code5}
   lang="bash"
 />
+
+Backups belong to their project: [destroying the project](/docs/cloud/getting-started#destroying-a-project) deletes all of them.
 
 ## Automatic Backups
 

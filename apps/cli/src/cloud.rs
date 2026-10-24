@@ -2217,7 +2217,7 @@ fn deploy_static_frontend_cloudflare(
     );
     let progress = ProgressReader::new(&data, total, "  Uploading frontend");
     match ureq::put(&url)
-        .set("Authorization", &format!("Bearer {}", client.token))
+        .set("Authorization", &client.auth_header())
         .set("Content-Type", "application/gzip")
         .set("Content-Length", &total.to_string())
         .send(progress)
@@ -2426,7 +2426,7 @@ fn deploy_worker_backend_cloudflare(
         hash
     );
     match ureq::put(&url)
-        .set("Authorization", &format!("Bearer {}", client.token))
+        .set("Authorization", &client.auth_header())
         .set("Content-Type", "application/javascript")
         .send_bytes(&data)
     {
@@ -2910,7 +2910,7 @@ pub fn deploy(
         let progress = ProgressReader::new(&image_data, total, &format!("  Uploading '{}'", name));
         let hash_header = image_id.as_deref().unwrap_or("");
         match ureq::put(&upload_url)
-            .set("Authorization", &format!("Bearer {}", client.token))
+            .set("Authorization", &client.auth_header())
             .set("Content-Type", "application/octet-stream")
             .set("Content-Length", &total.to_string())
             .set("X-Image-Hash", hash_header)
@@ -3151,7 +3151,7 @@ pub fn deploy(
         );
         let progress = ProgressReader::new(&image_data, total, &format!("  Uploading '{}'", name));
         match ureq::put(&upload_url)
-            .set("Authorization", &format!("Bearer {}", client.token))
+            .set("Authorization", &client.auth_header())
             .set("Content-Type", "application/octet-stream")
             .set("Content-Length", &total.to_string())
             .set("X-Image-Hash", image_id.as_deref().unwrap_or(""))
@@ -3574,7 +3574,7 @@ pub fn deploy(
             let progress = ProgressReader::new(&image_data, total, "  Uploading frontend");
             let hash_header = frontend_image_id.as_deref().unwrap_or("");
             match ureq::put(&upload_url)
-                .set("Authorization", &format!("Bearer {}", client.token))
+                .set("Authorization", &client.auth_header())
                 .set("Content-Type", "application/octet-stream")
                 .set("Content-Length", &total.to_string())
                 .set("X-Image-Hash", hash_header)
@@ -4667,7 +4667,7 @@ fn get_remote_image_hash(client: &CloudClient, pid: &str, image_name: &str) -> O
         client.base_url, pid, image_name
     );
     let resp = ureq::get(&url)
-        .set("Authorization", &format!("Bearer {}", client.token))
+        .set("Authorization", &client.auth_header())
         .call()
         .ok()?;
     let data: serde_json::Value = resp.into_json().ok()?;
@@ -4939,7 +4939,7 @@ fn poll_deployment_status(
     let deadline = std::time::Instant::now() + deploy_poll_deadline();
     loop {
         if let Ok(resp) = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", client.token))
+            .set("Authorization", &client.auth_header())
             .set("Accept", "application/json")
             .timeout(Duration::from_secs(30))
             .call()
@@ -4984,7 +4984,7 @@ fn stream_deployment_events(
         .build();
     let sse_result = agent
         .get(&events_url)
-        .set("Authorization", &format!("Bearer {}", client.token))
+        .set("Authorization", &client.auth_header())
         .set("Accept", "text/event-stream")
         .call();
 

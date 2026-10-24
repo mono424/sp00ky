@@ -271,7 +271,7 @@ A machine is ready in a couple of seconds, so scale-up, idle timeouts and a kill
 Deploy with `spky deploy`. It sends the pool definitions along, keeps pool backends off the core host (their image only runs on pool machines), and publishes the scheduler's pool listener at `<slug>-pool.<domain>` for machines to dial.
 
 <PropTable props={[
-  { name: 'Free', type: 'plan', default: '-', desc: 'No pool machines. (Free projects have no scheduler.)' },
+  { name: 'Pay as you go', type: 'plan', default: '-', desc: 'No pool machines. (Cloudflare projects have no scheduler.)' },
   { name: 'Starter', type: 'plan', default: '-', desc: 'Up to 2 pool machines per project at a time.' },
   { name: 'Pro', type: 'plan', default: '-', desc: 'Up to 10 pool machines per project at a time.' },
 ]} />

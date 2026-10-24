@@ -131,9 +131,9 @@ instead of opening one they stop with the exact command or environment variable 
 | Command | What it does |
 | --- | --- |
 | `spky login`, `spky logout` | Authenticate with Sp00ky Cloud. |
-| `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `credentials --raw` prints just the password, for piping. On the free plan's shared database, `credentials` prints a namespace-level login (user `owner` in the namespace named after the slug): sign in at the namespace level, not as root. [Docs](/docs/cloud/getting-started) |
+| `spky project` | Manage cloud projects: `create`, `list`, `credentials`, `destroy`. `create --plan` takes `payg` (Cloudflare, pay as you go; the default), `starter` or `pro` (VMs). `credentials --raw` prints just the password, for piping. `destroy` deletes the project with its data and its backups, and frees the slug; a new project with that slug starts empty. A pay-as-you-go project's own database gets a root login like a VM project's; on the retired free plan's shared database, `credentials` prints a namespace-level login (user `owner` in the namespace named after the slug): sign in at the namespace level, not as root. [Docs](/docs/cloud/getting-started) |
 | `spky deploy` | Build, upload, provision, migrate, deploy. On a Cloudflare project it bundles each [Worker backend](/docs/backend/workers) with esbuild and uploads it with the SSP Worker instead of building a Docker image (Node.js with `npx` required). With `sync.queryAllowlist` on, also publishes the committed allowlist JSON as `_00_query_allowlist:<app>__<version>` (the frontend's `package.json` version) and keeps the previous version's row; under `enforce`, a missing or stale JSON (`sourceHash` no longer matches the query module) fails the deploy, under `warn` it warns. [Docs](/docs/cloud/deploying) |
-| `spky push` (no subcommand) | Push schema to a free (Cloudflare) project's SSP node. Paid plans apply schema during `deploy`. With a subcommand it is the [Web Push](#web-push) tool. |
+| `spky push` (no subcommand) | Push schema to a Cloudflare project's SSP node. VM plans apply schema during `deploy`. With a subcommand it is the [Web Push](#web-push) tool. |
 | `spky release <app>` | Announce a new version to running clients without deploying. `--mandatory`, `--cache-bust`. Also publishes the app's allowlist JSON under the announced version, so a regenerated [query allowlist](/docs/guide/query-allowlist) goes live without a restart. |
 | `spky env` | Encrypted variables and the vault: `set`, `list`, `rm`, `pull`, `import`, `unlock`, `passphrase`, `share-ci`, `reset`. `set --file <path>` reads a multi-line value (a PEM key) from disk, scoped with `--dev` or `--prod`. `reset` takes `request`, `approve <email>`, `complete`, `list`. [Docs](/docs/cloud/env-variables) |
 | `spky domain` | Custom domains: `add`, `list`, `remove`. `add --app <name>` picks which app serves it (a frontend, an exposed backend, or a backend on a [dedicated machine](/docs/cloud/dedicated-machines)), `add --status` attaches it to the public uptime page. |
@@ -141,7 +141,7 @@ instead of opening one they stop with the exact command or environment variable 
 | `spky link` | GitHub push-to-deploy: `connect`, `status`, `settings`, `disconnect`, `trigger`, `runs`. [Docs](/docs/cloud/ci-cd) |
 | `spky token` | API tokens for CI: `create`, `list`, `revoke`. |
 | `spky team` | Members and invitations: `list`, `invite`, `invites`, `revoke`, `remove`, `rename`. [Docs](/docs/cloud/team) |
-| `spky billing` | Billing: `usage`, `plan`. No subcommand opens the portal. |
+| `spky billing` | Billing: `usage`, `plan`, `cap <dollars>`. No subcommand opens the portal. `usage` in a pay-as-you-go project shows the month so far, priced, and its spend cap; `cap` sets that cap (base fee included, at least $10). `plan` switches between Starter and Pro on a VM project; a pay-as-you-go project has one plan, and moving between Cloudflare and VM hosting needs a new project. See [Plans & billing](/docs/cloud/billing). |
 | `spky notice [message]` | Post a notice to the public uptime page. `list` and `remove` manage existing ones. |
 
 ## Restarting containers
@@ -202,7 +202,8 @@ deployment, without deploying anything else. It resolves the SurrealDB URL and r
 your login and the `slug` in `sp00ky.yml`, and reads the mode, namespace and database from
 `sp00ky.yml` too, so there are no connection flags to pass.
 
-A free-plan project has no root login: its data lives in a namespace of the shared free database.
+A pay-as-you-go project's own database is reached as root, like a VM project's. A project on the
+retired free plan has no root login: its data lives in a namespace of the shared free database.
 There `migrate prod`, `spky release` and every `--cloud` command (`migrate`, `query`, `jobs`,
 `flag`, `schedules`, `workflows`, `push`) sign in as the project's namespace-level `owner` user, the one
 `spky project credentials` prints, and work in the namespace and database the project was given

@@ -212,6 +212,11 @@ pub enum SurrealDbConfig {
         /// External DB auth password. Literal or `{ vault: KEY }`. Default "root".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<SecretValue>,
+        /// Size of the database Sp00ky Cloud runs for a pay-as-you-go
+        /// (Cloudflare) project: "S" (1 GiB, included), "M" (2 GiB) or "L"
+        /// (4 GiB). Only with `hosting: cloud`; VM plans ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<String>,
     },
 }
 
@@ -228,7 +233,13 @@ pub struct ResolvedSurrealDb {
     /// Unresolved username/password (literal or `{ vault: KEY }`); default "root".
     pub username: SecretValue,
     pub password: SecretValue,
+    /// The managed database's size ("S", "M", "L"), uppercased; `None` keeps
+    /// the cloud's default (S).
+    pub size: Option<String>,
 }
+
+/// The sizes a pay-as-you-go project's managed database comes in.
+pub const DB_SIZES: [&str; 3] = ["S", "M", "L"];
 
 impl ResolvedSurrealDb {
     pub fn from_config(config: &Option<SurrealDbConfig>) -> Self {
@@ -241,6 +252,7 @@ impl ResolvedSurrealDb {
                 endpoint: None,
                 username: SecretValue::Literal("root".to_string()),
                 password: SecretValue::Literal("root".to_string()),
+                size: None,
             },
             Some(SurrealDbConfig::Full {
                 version,
@@ -250,6 +262,7 @@ impl ResolvedSurrealDb {
                 endpoint,
                 username,
                 password,
+                size,
             }) => Self {
                 version: version
                     .clone()
@@ -264,6 +277,7 @@ impl ResolvedSurrealDb {
                 password: password
                     .clone()
                     .unwrap_or_else(|| SecretValue::Literal("root".to_string())),
+                size: size.as_ref().map(|s| s.trim().to_ascii_uppercase()),
             },
             None => Self {
                 version: DEFAULT_SURREALDB_VERSION.to_string(),
@@ -273,6 +287,7 @@ impl ResolvedSurrealDb {
                 endpoint: None,
                 username: SecretValue::Literal("root".to_string()),
                 password: SecretValue::Literal("root".to_string()),
+                size: None,
             },
         }
     }
@@ -280,6 +295,14 @@ impl ResolvedSurrealDb {
     pub fn validate(&self) -> Result<()> {
         if self.hosting == HostingMode::External && self.endpoint.is_none() {
             bail!("SurrealDB hosting is 'external' but no endpoint URL was provided");
+        }
+        if let Some(size) = &self.size {
+            if !DB_SIZES.contains(&size.as_str()) {
+                bail!("surrealdb.size must be S, M or L (got '{}')", size);
+            }
+            if self.hosting == HostingMode::External {
+                bail!("surrealdb.size sizes the database Sp00ky Cloud runs; it does not apply to hosting: external");
+            }
         }
         Ok(())
     }
@@ -4179,6 +4202,22 @@ mod surrealdb_tests {
         // hosting omitted defaults to cloud.
         let c = cfg("surrealdb:\n  endpoint: https://db.example.com\n");
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn managed_db_size_is_uppercased_and_checked() {
+        let c = cfg("surrealdb:\n  size: m\n");
+        c.validate().expect("size m is valid");
+        assert_eq!(c.resolved_surrealdb().size.as_deref(), Some("M"));
+        assert_eq!(cfg("surrealdb:\n  namespace: app\n").resolved_surrealdb().size, None);
+
+        let err = cfg("surrealdb:\n  size: XL\n").validate().expect_err("XL is no size");
+        assert!(err.to_string().contains("S, M or L"));
+
+        let err = cfg("surrealdb:\n  hosting: external\n  endpoint: https://db.example.com\n  size: S\n")
+            .validate()
+            .expect_err("an external DB has no size");
+        assert!(err.to_string().contains("hosting: external"));
     }
 
     #[test]

@@ -566,20 +566,9 @@ impl CloudClient {
 // ---------------------------------------------------------------------------
 
 fn resolve_project_slug() -> Result<String> {
-    // 1. Environment variable
-    if let Ok(slug) = std::env::var("SP00KY_CLOUD_PROJECT") {
+    // 1. Environment variable, 2. sp00ky.yml
+    if let Some(slug) = project_slug_here() {
         return Ok(slug);
-    }
-
-    // 2. Read slug from sp00ky.yml
-    if let Ok(cwd) = std::env::current_dir() {
-        let config_path = cwd.join("sp00ky.yml");
-        if config_path.exists() {
-            let config = backend::load_config(&config_path);
-            if let Some(slug) = config.slug {
-                return Ok(slug);
-            }
-        }
     }
 
     // 3. Prompt
@@ -589,6 +578,19 @@ fn resolve_project_slug() -> Result<String> {
         .context("Failed to read project slug")?;
 
     Ok(slug)
+}
+
+/// The project this command runs for without asking: `SP00KY_CLOUD_PROJECT`,
+/// else the slug in ./sp00ky.yml.
+fn project_slug_here() -> Option<String> {
+    if let Ok(slug) = std::env::var("SP00KY_CLOUD_PROJECT") {
+        return Some(slug);
+    }
+    let config_path = std::env::current_dir().ok()?.join("sp00ky.yml");
+    if !config_path.exists() {
+        return None;
+    }
+    backend::load_config(&config_path).slug
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +755,47 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
     Ok((slug, project))
 }
 
+/// The plans a new project can be created on, in prompt order. Pay as you go
+/// runs on Cloudflare and is the default; starter and pro run on VMs.
+const PLAN_CHOICES: [(&str, &str); 3] = [
+    ("Pay as you go: Cloudflare, base fee includes usage (recommended)", "payg"),
+    ("Starter: VMs", "starter"),
+    ("Pro: VMs", "pro"),
+];
+
+/// Ask which plan a new project runs on; pay as you go without a terminal.
+fn prompt_new_project_plan() -> Result<String> {
+    if !is_interactive() {
+        return Ok("payg".to_string());
+    }
+    let labels: Vec<&str> = PLAN_CHOICES.iter().map(|(label, _)| *label).collect();
+    let picked = inquire::Select::new("Select a plan:", labels)
+        .prompt()
+        .context("Failed to select plan")?;
+    Ok(PLAN_CHOICES
+        .iter()
+        .find(|(label, _)| *label == picked)
+        .map(|(_, plan)| plan.to_string())
+        .unwrap_or_else(|| "payg".to_string()))
+}
+
+/// The platform a plan deploys to, as the control plane derives it.
+fn platform_for_plan(plan: &str) -> &'static str {
+    match plan {
+        "payg" | "free" => "cloudflare",
+        _ => "hetzner",
+    }
+}
+
+/// Whether a project signs in to SurrealDB with the namespace login the
+/// control plane keeps on the shared free-plan database (or its own external
+/// one), instead of root on a database the cloud runs for it. Pay as you go
+/// gets its own database, like the VM plans.
+fn uses_shared_db_login(project: &serde_json::Value) -> bool {
+    let plan = project["plan"].as_str().unwrap_or("");
+    plan != "payg" && (plan == "free" || project["platform"].as_str() == Some("cloudflare"))
+}
+
 /// Create a project inline and return (slug, project_json).
 /// Retries with a different slug if the chosen one is already taken.
 fn create_project_inline(
@@ -767,7 +810,7 @@ fn create_project_inline(
             .context("Failed to read slug")?,
     };
 
-    let plan = "starter".to_string();
+    let plan = prompt_new_project_plan()?;
 
     loop {
         match client.post(
@@ -864,22 +907,42 @@ fn ensure_billing_active(
 
 /// Open Stripe checkout and poll until payment completes.
 fn wait_for_billing(client: &mut CloudClient, slug: &str) -> Result<()> {
-    // Plan selection
-    let plan = if is_interactive() {
+    // The plan follows the project's hosting: a pay-as-you-go (Cloudflare)
+    // project pays for that plan, monthly; a VM project picks Starter or Pro.
+    // Crossing between the two is refused by the API.
+    let current_plan = fetch_project(client, slug)?
+        .and_then(|p| p["plan"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "payg".to_string());
+    if current_plan == "free" {
+        bail!(
+            "Project '{}' is on the retired free plan, which cannot move to a paid plan yet. \
+             Create a new project with `spky project create`.",
+            slug
+        );
+    }
+    let payg = current_plan == "payg";
+    let plan = if payg {
+        "payg"
+    } else if is_interactive() {
         let plans = vec!["Starter", "Pro"];
         let selection = inquire::Select::new("Select a plan:", plans)
+            .with_starting_cursor(if current_plan == "pro" { 1 } else { 0 })
             .prompt()
             .context("Failed to select plan")?;
         match selection {
             "Pro" => "pro",
             _ => "starter",
         }
+    } else if current_plan == "pro" {
+        "pro"
     } else {
         "starter"
     };
 
-    // Billing interval selection
-    let interval = if is_interactive() {
+    // Billing interval selection (pay as you go bills monthly)
+    let interval = if payg {
+        "monthly"
+    } else if is_interactive() {
         let intervals = vec!["Monthly", "Yearly"];
         let selection = inquire::Select::new("Billing interval:", intervals)
             .prompt()
@@ -2490,10 +2553,12 @@ pub fn deploy(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    // The free plan always runs on Cloudflare — derive it if the API omitted the
-    // platform (older responses), so the static-frontend path is taken.
-    if platform.is_empty() && project.get("plan").and_then(|v| v.as_str()) == Some("free") {
-        platform = "cloudflare".to_string();
+    // Derive the platform from the plan if the API omitted it (older
+    // responses), so a Cloudflare project takes the static-frontend path.
+    if platform.is_empty() {
+        if let Some(plan) = project.get("plan").and_then(|v| v.as_str()) {
+            platform = platform_for_plan(plan).to_string();
+        }
     }
     ensure_billing_active(&mut client, &slug, &project)?;
 
@@ -3156,11 +3221,19 @@ pub fn deploy(
     // Build SurrealDB manifest
     let resolved_surreal = config.resolved_surrealdb();
     let mut surrealdb_manifest = match resolved_surreal.hosting {
-        HostingMode::Cloud => serde_json::json!({
-            "hosting": "cloud",
-            "namespace": resolved_surreal.namespace,
-            "database": resolved_surreal.database,
-        }),
+        HostingMode::Cloud => {
+            let mut m = serde_json::json!({
+                "hosting": "cloud",
+                "namespace": resolved_surreal.namespace,
+                "database": resolved_surreal.database,
+            });
+            // Pay as you go: the managed database's size. Omitted when unset,
+            // so the cloud keeps its default (S) and VM deploys are unchanged.
+            if let Some(size) = &resolved_surreal.size {
+                m["size"] = serde_json::json!(size);
+            }
+            m
+        }
         HostingMode::External => {
             use base64::Engine as _;
             // Resolve credentials — each is a literal or a `{ vault: KEY }`
@@ -3239,19 +3312,28 @@ pub fn deploy(
     }
     if let Some((frontend_name, frontend_app)) = config.frontend().filter(|_| frontend_selected) {
         if platform == "cloudflare" {
-        // Free plan: static SPA on Cloudflare Workers Static Assets. Bake the
-        // SurrealDB endpoint the SPA connects to directly. No manifest — the
-        // control plane's free deploy path publishes the uploaded assets.
+        // Cloudflare: static SPA on Workers Static Assets. Bake the SurrealDB
+        // endpoint the SPA connects to directly. No manifest: the control
+        // plane's Cloudflare deploy path publishes the uploaded assets.
         //
-        // Without a database of its own the project lives on the shared free
-        // DB, in the namespace named after its slug (the control plane
-        // enforces that, whatever namespace the manifest carries), database
-        // `main`. Before this the SPA got no endpoint at all on that path.
-        let shared_db = matches!(resolved_surreal.hosting, HostingMode::Cloud);
+        // `hosting: cloud` on pay as you go is the project's own database,
+        // which the cloud runs at `{slug}-db` like a VM project's, in the
+        // namespace and database the manifest asks for. On the retired free
+        // plan it is the shared DB, in the namespace named after the slug (the
+        // control plane enforces that, whatever namespace the manifest
+        // carries), database `main`.
+        let hosted_db = matches!(resolved_surreal.hosting, HostingMode::Cloud);
+        let own_db = hosted_db && project["plan"].as_str() == Some("payg");
         let manifest_str = |k: &str| {
             surrealdb_manifest.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
         };
-        let (db_endpoint, db_ns, db_db) = if shared_db {
+        let (db_endpoint, db_ns, db_db) = if own_db {
+            (
+                derive_db_ws_endpoint(&client.base_url, &slug),
+                manifest_str("namespace"),
+                manifest_str("database"),
+            )
+        } else if hosted_db {
             (
                 derive_cf_shared_db_url(&client.base_url),
                 Some(slug.clone()),
@@ -3603,8 +3685,8 @@ pub fn deploy(
     let r2_buckets = crate::bucket::r2_bucket_names(&config, config_dir);
     if !r2_buckets.is_empty() && platform != "cloudflare" {
         crate::ui::warn(format!(
-            "Bucket(s) {} use the r2 backend, which only the free plan's Cloudflare SSP \
-             serves; on this plan use a file backend with deployment.storage.sizeGB.",
+            "Bucket(s) {} use the r2 backend, which only a Cloudflare project's SSP \
+             serves; on a VM plan use a file backend with deployment.storage.sizeGB.",
             r2_buckets.join(", ")
         ));
     }
@@ -4151,6 +4233,26 @@ mod version_skew_tests {
             Some("https://app.db.spky.cloud")
         );
         assert_eq!(derive_cf_ssp_url("http://localhost:8080", "app"), None);
+    }
+
+    #[test]
+    fn plans_map_to_their_platform() {
+        assert_eq!(platform_for_plan("payg"), "cloudflare");
+        assert_eq!(platform_for_plan("free"), "cloudflare");
+        assert_eq!(platform_for_plan("starter"), "hetzner");
+        assert_eq!(platform_for_plan("pro"), "hetzner");
+        assert_eq!(PLAN_CHOICES[0].1, "payg", "pay as you go is offered first");
+    }
+
+    #[test]
+    fn only_free_projects_sign_in_with_the_shared_db_login() {
+        let project = |plan: &str, platform: &str| serde_json::json!({ "plan": plan, "platform": platform });
+        assert!(uses_shared_db_login(&project("free", "cloudflare")));
+        assert!(!uses_shared_db_login(&project("payg", "cloudflare")));
+        assert!(!uses_shared_db_login(&project("starter", "hetzner")));
+        // An older response without a plan still reads a Cloudflare project
+        // as one on the shared DB, as before pay as you go.
+        assert!(uses_shared_db_login(&serde_json::json!({ "platform": "cloudflare" })));
     }
 
     #[test]
@@ -5168,8 +5270,7 @@ pub fn resolve_cloud_surreal(config_path: &std::path::Path) -> Result<CloudSurre
     // A free project has no database of its own, so no root login: the control
     // plane keeps a namespace-level user for it on the shared DB, recorded at
     // deploy as `surrealdb_access`.
-    let free = project["platform"].as_str() == Some("cloudflare")
-        || project["plan"].as_str() == Some("free");
+    let free = uses_shared_db_login(&project);
     let root_url = data["urls"]["surrealdb"].as_str().filter(|s| !s.is_empty());
     let access = &data["surrealdb_access"];
     if free || (root_url.is_none() && !access.is_null()) {
@@ -5312,8 +5413,7 @@ pub fn credentials(raw: bool) -> Result<()> {
     let project = fetch_project(&mut client, &slug)?
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found.", slug))?;
     let pid = project_id(&project);
-    let free = project["platform"].as_str() == Some("cloudflare")
-        || project["plan"].as_str() == Some("free");
+    let free = uses_shared_db_login(&project);
 
     let resp = client.get(&format!("/v1/projects/{}/deployment", pid))?;
     let data: serde_json::Value = resp.into_json().context("Failed to parse response")?;
@@ -6986,12 +7086,69 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
     Ok(())
 }
 
+fn money(cents: i64) -> String {
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+/// Prints `GET /v1/billing/payg`'s estimate: every metered line with what is
+/// included, the base fee, the total and the spend cap.
+fn print_payg_estimate(slug: &str, est: &serde_json::Value) {
+    let period = est["period"].as_str().unwrap_or("this month");
+    println!("  Pay as you go, {}, {} so far", slug, period);
+    println!();
+    println!(
+        "  {:<18} {:>26} {:>10} {:>9}",
+        "", "USED", "INCLUDED", "COST"
+    );
+    for line in est["lines"].as_array().into_iter().flatten() {
+        let metric = line["metric"].as_str().unwrap_or("");
+        let quantity = line["quantity"].as_f64().unwrap_or(0.0);
+        // The size add-ons only show while the database has that size.
+        if metric.starts_with("db_size_") && quantity == 0.0 {
+            continue;
+        }
+        let included = line["included"].as_f64().unwrap_or(0.0);
+        println!(
+            "  {:<18} {:>26} {:>10} {:>9}",
+            line["label"].as_str().unwrap_or(metric),
+            format!("{:.2} {}", quantity, line["unit"].as_str().unwrap_or("")),
+            if included > 0.0 { format!("{}", included) } else { "-".to_string() },
+            money(line["cents"].as_i64().unwrap_or(0)),
+        );
+    }
+    let base = est["base_cents"].as_i64().unwrap_or(0);
+    let total = est["total_cents"].as_i64().unwrap_or(0);
+    let cap = est["cap_cents"].as_i64().unwrap_or(0);
+    println!("  {:<18} {:>26} {:>10} {:>9}", "Base fee", "", "", money(base));
+    println!();
+    println!(
+        "  Total so far {} of a {} spend cap (change it: spky billing cap <dollars>).",
+        money(total),
+        money(cap)
+    );
+    if est["stopped"].as_bool() == Some(true) {
+        println!("  Stopped at the spend cap: the project is not serving. Raise the cap to start it again.");
+    }
+}
+
 pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
     let creds = require_credentials()?;
     let mut client = CloudClient::new(&creds);
 
     match action {
         Some(CloudBillingCommands::Usage) => {
+            // In a pay-as-you-go project: its month so far, priced.
+            if let Some(slug) = project_slug_here() {
+                if let Some(project) = fetch_project(&mut client, &slug)? {
+                    if project["plan"].as_str() == Some("payg") {
+                        let resp = client.get(&format!("/v1/billing/payg?project={}", slug))?;
+                        let data: serde_json::Value =
+                            resp.into_json().context("Failed to parse usage")?;
+                        print_payg_estimate(&slug, &data["estimate"]);
+                        return Ok(());
+                    }
+                }
+            }
             let resp = client.get("/v1/billing/usage")?;
             let usage: Vec<serde_json::Value> =
                 resp.into_json().context("Failed to parse usage")?;
@@ -7013,6 +7170,35 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
             }
             Ok(())
         }
+        Some(CloudBillingCommands::Cap { dollars }) => {
+            let slug = resolve_project_slug()?;
+            if !dollars.is_finite() || dollars < 10.0 {
+                bail!("The spend cap is at least $10, the base fee (got {})", dollars);
+            }
+            let cents = (dollars * 100.0).round() as i64;
+            let resp = client.post(
+                "/v1/billing/spend-cap",
+                &serde_json::json!({ "project_id": slug, "cap_cents": cents }),
+            )?;
+            let data: serde_json::Value = resp
+                .into_json()
+                .context("Failed to parse spend cap response")?;
+            println!(
+                "  Spend cap of {}: {} a month, base fee included.",
+                slug,
+                money(cents)
+            );
+            let est = &data["estimate"];
+            if let Some(total) = est["total_cents"].as_i64() {
+                println!("  This month so far: {}.", money(total));
+                if est["stopped"].as_bool() == Some(true) && total < cents {
+                    println!("  It stopped at the old cap and serves again within about 10 minutes.");
+                } else if total >= cents {
+                    println!("  The bill is already at the new cap: the project stops serving within about 10 minutes.");
+                }
+            }
+            Ok(())
+        }
         Some(CloudBillingCommands::ChangePlan) => {
             let slug = resolve_project_slug()?;
 
@@ -7025,8 +7211,25 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
             println!("  Current plan: {} ({})", current_plan, current_interval);
             println!();
 
-            // Plan selection
-            let plans = vec!["Starter", "Pro", "Free (Cloudflare)"];
+            // A plan only changes within the project's hosting: pay as you go
+            // is the one Cloudflare plan, and moving between Cloudflare and VMs
+            // needs a new project. The free plan is retired.
+            match current_plan {
+                "payg" => {
+                    println!("  Pay as you go is the only plan for Cloudflare projects.");
+                    println!("  Moving to VM hosting (Starter, Pro) needs a new project: `spky project create --plan starter`.");
+                    return Ok(());
+                }
+                "free" => {
+                    println!("  The free plan is retired and cannot move to a paid plan yet.");
+                    println!("  Create a new project with `spky project create` (pay as you go by default).");
+                    return Ok(());
+                }
+                _ => {}
+            }
+
+            // Plan selection (VM plans)
+            let plans = vec!["Starter", "Pro"];
             let default_plan = if current_plan == "pro" { 1 } else { 0 };
             let plan_selection = inquire::Select::new("Select a plan:", plans)
                 .with_starting_cursor(default_plan)
@@ -7034,40 +7237,8 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
                 .context("Failed to select plan")?;
             let new_plan = match plan_selection {
                 "Pro" => "pro",
-                "Free (Cloudflare)" => "free",
                 _ => "starter",
             };
-
-            // Free: no billing interval. Confirm the (destructive) downgrade —
-            // this cancels the subscription and tears down the paid deployment.
-            if new_plan == "free" {
-                if current_plan == "free" {
-                    println!("  Already on the free plan.");
-                    return Ok(());
-                }
-                let confirm = crate::ui::consent("Downgrade to Free? This cancels your subscription and tears down \
-                     the current deployment. You then run `spky deploy` to publish on Cloudflare.")?;
-                if !confirm {
-                    println!("  Cancelled.");
-                    return Ok(());
-                }
-                let resp = client.post(
-                    "/v1/billing/change-plan",
-                    &serde_json::json!({ "project_id": slug, "plan": "free" }),
-                )?;
-                let data: serde_json::Value =
-                    resp.into_json().context("Failed to parse response")?;
-                let status = data["status"].as_str().unwrap_or("unknown");
-                if status == "downgraded" {
-                    println!("  Switched to the free plan. Old deployment torn down.");
-                    println!("  Run `spky deploy` to publish on Cloudflare.");
-                } else if status == "no_change" {
-                    println!("  Already on the free plan.");
-                } else {
-                    println!("  Response: {}", data);
-                }
-                return Ok(());
-            }
 
             // Billing interval selection
             let intervals = vec!["Monthly", "Yearly"];
@@ -7536,6 +7707,7 @@ pub fn keys(action: CloudKeyCommands) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn print_deployment_details(data: &serde_json::Value) {
+    let on_cloudflare = data.pointer("/image_versions/ssp-cf").is_some();
     if let Some(dep) = data.get("deployment") {
         println!(
             "  Deployment v{} — {}",
@@ -7709,7 +7881,12 @@ fn print_deployment_details(data: &serde_json::Value) {
                 );
             }
 
-            report_version_skew(&component_versions, &pinned_release_roles(&data));
+            // A Cloudflare project runs no scheduler and its SSP is a Worker,
+            // so there is no container version to compare (only a pay-as-you-go
+            // project's own database shows in the table).
+            if !on_cloudflare {
+                report_version_skew(&component_versions, &pinned_release_roles(&data));
+            }
         }
     }
 
@@ -7801,7 +7978,7 @@ fn print_deployment_details(data: &serde_json::Value) {
     }
 
     // Print spooky status endpoint
-    if let Some(db_url) = urls.get("surrealdb") {
+    if let Some(db_url) = urls.get("surrealdb").filter(|_| !on_cloudflare) {
         if db_url.starts_with("http") {
             let config_path = std::env::current_dir()
                 .unwrap_or_default()

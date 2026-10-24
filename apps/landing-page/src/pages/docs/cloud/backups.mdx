@@ -107,12 +107,23 @@ Here's what happens when you run it:
 3. Both databases are wiped and reloaded from the same backup file. Main SurrealDB and the scheduler's snapshot replica stay in sync.
 4. Pending items are cleared. That covers the in-memory event buffer, the write-ahead log, and any per-SSP message buffers.
 5. Connected SSPs are evicted. They'll re-register on their next heartbeat against the restored state.
-6. The CLI polls for progress every 5 seconds (up to 5 minutes) and shows the current phase as it moves from `queued` to `running` to `completed`.
-7. Once the restore finishes, your migrations run again against the restored database.
+6. Sp00ky Cloud gives the restored database's access methods new signing keys and checks that no forged token gets in (see [Signing keys after a restore](#signing-keys-after-a-restore)). Only then is the restore reported as done.
+7. The CLI polls for progress every 5 seconds (up to 5 minutes) and shows the current phase as it moves from `queued` to `running` to `completed`.
+8. Once the restore finishes, your migrations run again against the restored database.
 
 <Warning>
 Restoring replaces your current data with the backup. Anything you wrote after the backup was taken is gone. If you're not sure, take a fresh backup first.
 </Warning>
+
+### Pay-as-you-go projects
+
+A pay-as-you-go project has no scheduler, so Sp00ky Cloud takes and restores its backups itself, with the same commands and the same backup files. A restore wipes the database, imports the backup and reloads the sync engine, which picks up the restored data on its own; run your migrations again afterwards as above.
+
+### Signing keys after a restore
+
+Every restore, on VMs and on pay as you go, gives each record `DEFINE ACCESS` a new signing key, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and a database restored with that placeholder would let anyone sign a valid token for any user. Sp00ky Cloud checks the restored database after every restore, whatever scheduler version imported it, and refuses to report a restore as done until no access accepts such a token.
+
+Two kinds of access cannot get their key back. Admin impersonation (`_00_impersonate`) works again after your next `spky deploy`, which sets its key. An access that verifies tokens of an outside issuer with a shared key is removed by the restore: run its `DEFINE ACCESS` statement again afterwards (the restore's metadata names it).
 
 <Note>
 If the main database gets wiped but the snapshot replica fails to import, the scheduler stays in the `restoring` state on purpose. That blocks reads until someone re-runs the restore. Serving traffic from a half-restored cluster would give back wrong data.
@@ -120,7 +131,7 @@ If the main database gets wiped but the snapshot replica fails to import, the sc
 
 ## From the dashboard
 
-The scheduler's [admin dashboard](/docs/reference/admin-dashboard#backups) has a Backups tab that does everything above except `reset`: create, list, restore, delete and configure the schedule. It shows the same catalog as `spky backup list`, joined to what the scheduler itself knows about each backup, and a restore there reports the real stages as the scheduler moves through them (`queued`, `running`, main database restored, replica restored, done). Migrations still have to be run again afterwards.
+The scheduler's [admin dashboard](/docs/reference/admin-dashboard#backups) has a Backups tab that does everything above except `reset`: create, list, restore, delete and configure the schedule. It shows the same catalog as `spky backup list`, joined to what the scheduler itself knows about each backup, and a restore there reports the real stages as the scheduler moves through them (`queued`, `running`, main database restored, replica restored, done). It goes through Sp00ky Cloud like `spky backup restore`, so the signing keys are renewed the same way, and migrations still have to be run again afterwards.
 
 <Note>
 **How the dashboard talks to Sp00ky Cloud.** The control plane injects `SPKY_CLOUD_API_URL` and `SPKY_CLOUD_PROJECT` into the scheduler container (only the scheduler, never the SSPs). The scheduler then calls an allow-listed route family, `/v1/internal/projects/{slug}/…` (restart, deployment status, and the backup routes minus `reset`), authenticated with the project's existing `SPKY_AUTH_SECRET`. No new credential is created. A control plane that supports this lists `scheduler_link` under `features` in its `/health` response; a scheduler without the link still works and marks those actions as unavailable.
@@ -144,6 +155,8 @@ list would be.
   lang="bash"
 />
 
+Backups belong to their project: [destroying the project](/docs/cloud/getting-started#destroying-a-project) deletes all of them.
+
 ## Automatic Backups
 
 Set up a schedule with a cron expression:
@@ -158,6 +171,8 @@ Set up a schedule with a cron expression:
 | `--enabled` | Turn automatic backups on or off (`true`/`false`) |
 | `--schedule` | Cron expression for how often to back up (e.g. `"0 2 * * *"` for daily at 2 AM) |
 | `--retention` | How many backups to keep before the oldest ones get deleted |
+
+A pay-as-you-go project is backed up every day at 03:00 UTC and keeps the last 7, until you configure backups yourself. Scheduled backups pause while a project is stopped at its [spend cap](/docs/cloud/billing#spend-cap).
 
 ## Database Reset
 

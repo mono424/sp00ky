@@ -25,7 +25,7 @@ export const code5 = `# Interactive, prompts for slug if not provided
 spky project create
 
 # With options
-spky project create --slug my-app --plan starter`;
+spky project create --slug my-app --plan payg`;
 
 export const code4 = `# sp00ky.yml
 slug: my-app
@@ -92,7 +92,7 @@ For automated pipelines, create an API key with <code>spky token create</code> a
   lang="bash"
 />
 
-Available plans: `starter`, `pro`, `business`. The slug must be lowercase alphanumeric with hyphens, and is globally unique.
+Available plans: `payg` (the default) runs the project on Cloudflare and bills a monthly base fee that includes some usage, the rest by use; `starter` and `pro` run it on VMs. Every plan starts with a checkout (pay as you go bills monthly only), and a project cannot move between Cloudflare and VM hosting later: create a new project instead. The free plan is retired. What each plan includes, and the spend cap of a pay-as-you-go project, are on [Plans & billing](/docs/cloud/billing). The slug must be lowercase alphanumeric with hyphens, and is globally unique.
 
 Your project slug should match the `slug` field in your `sp00ky.yml`:
 
@@ -113,13 +113,15 @@ Shows all your cloud projects with their plan, status, and creation date.
 ## Destroying a Project
 
 <Warning>
-This permanently tears down all VMs and infrastructure for the project. Data will be lost unless you have a backup.
+Destroying a project deletes everything it has, for good: its containers or Workers, its database and the volumes behind it, and its backups too. Nothing is kept to restore from. To keep the data, export it first with `surreal export`, using the login `spky project credentials` prints.
 </Warning>
 
 <CodeBlock
   code={code2}
   lang="bash"
 />
+
+Once the project is gone, its subscription is cancelled and its slug is free again. A new project created with that slug starts with an empty database: nothing of the old project carries over.
 
 ## Billing
 

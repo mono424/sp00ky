@@ -113,14 +113,15 @@ volume) and SurrealDB upgrades still stop the old container first.
 
 ### Cloudflare projects
 
-A Cloudflare project (the free plan runs on Cloudflare) has no VMs and no containers. `spky deploy`
-puts each part of it here:
+A Cloudflare project (plan `payg`, pay as you go) has no VMs and no containers of its own except its
+database. `spky deploy` puts each part of it here:
 
 | Part | Where it runs |
 | --- | --- |
 | Web app | Static assets on Workers, built from `deploy.static`. No Docker image. |
 | SSP | A Durable Object in the project's SSP Worker. It also runs your outbox jobs; there is no separate scheduler. |
 | [Worker backends](/docs/backend/workers) | Dynamic Workers inside the SSP Worker. `spky deploy` bundles each `worker.entry` with esbuild and uploads it with the SSP Worker. Their `expose` paths are served on `https://<slug>.<domain>`. |
+| Database | With `surrealdb.hosting: cloud`, a SurrealDB of the project's own (1 GiB), run by Sp00ky Cloud at `{slug}-db.<domain>` like a VM project's; `spky deploy` bakes its endpoint into the web app. With `hosting: external` your own database. |
 | Schema | Pushed to the SSP after the deploy, with your schedules, workflows and job policies. `spky push` retries it. |
 
 #### Jobs, schedules and workflows on Cloudflare

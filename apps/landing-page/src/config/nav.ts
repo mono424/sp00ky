@@ -87,6 +87,7 @@ export const docsNav = [
     links: [
       { text: 'Getting started', href: `${basePath}/docs/cloud/getting-started` },
       { text: 'Deploying', href: `${basePath}/docs/cloud/deploying` },
+      { text: 'Plans & billing', href: `${basePath}/docs/cloud/billing` },
       { text: 'Dedicated machines', href: `${basePath}/docs/cloud/dedicated-machines`, experimental: true },
       { text: 'Environment & vault', href: `${basePath}/docs/cloud/env-variables` },
       { text: 'Logs & monitoring', href: `${basePath}/docs/cloud/logs` },

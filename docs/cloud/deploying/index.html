@@ -103,6 +103,22 @@ puts each part of it here:</p>
 
 
 <table><thead><tr><th>Part</th><th>Where it runs</th></tr></thead><tbody><tr><td>Web app</td><td>Static assets on Workers, built from <code>deploy.static</code>. No Docker image.</td></tr><tr><td>SSP</td><td>A Durable Object in the project’s SSP Worker. It also runs your outbox jobs; there is no separate scheduler.</td></tr><tr><td><a href="/docs/backend/workers">Worker backends</a></td><td>Dynamic Workers inside the SSP Worker. <code>spky deploy</code> bundles each <code>worker.entry</code> with esbuild and uploads it with the SSP Worker. Their <code>expose</code> paths are served on <code>https://&lt;slug&gt;.&lt;domain&gt;</code>.</td></tr><tr><td>Schema</td><td>Pushed to the SSP after the deploy, with your schedules, workflows and job policies. <code>spky push</code> retries it.</td></tr></tbody></table>
+<h4 id="jobs-schedules-and-workflows-on-cloudflare">Jobs, schedules and workflows on Cloudflare</h4>
+<p>They behave as on a VM: the same outbox, retries, leases, schedules and workflows. The SSP’s Durable
+Object runs them on its alarm, and only sets one when something is due, so an idle project costs
+nothing and the object is evicted between jobs.</p>
+<ul>
+<li><strong>Wakes follow what is due.</strong> A delayed job, a <code>step.sleep</code>, a retry’s backoff and a schedule’s
+next fire each wake the SSP at that moment (a job about a second late), not on a polling
+cadence. A <code>delay</code> of one day is one wake, not one a minute.</li>
+<li><strong>Long waits live in the database.</strong> A delay or backoff longer than 30 seconds is not a timer in
+memory: the job row waits, and an eviction cannot lose it. Shorter ones wait in memory.</li>
+<li><strong>Background work does not load your views.</strong> A cron fire or a job wake runs on the SSP without
+rebuilding its live queries first, and keeps running while the SSP is still starting (or failing
+to start) after a deploy. A job created during that time runs at once.</li>
+<li><strong>At least once.</strong> A job in flight when the object is evicted runs again when its lease runs out.
+Make job routes safe to repeat.</li>
+</ul>
 <p>Docker backends do not run on a Cloudflare project. Make the backend a
 <a href="/docs/backend/workers">Worker backend</a>, or host it yourself (<code>hosting: external</code>) at a public
 <code>baseUrl</code> the SSP Worker can reach. <code>--only</code> works as on a VM: <code>spky deploy --only api</code> bundles and

@@ -114,6 +114,12 @@ Here's what happens when you run it:
 Restoring replaces your current data with the backup. Anything you wrote after the backup was taken is gone. If you're not sure, take a fresh backup first.
 </Warning>
 
+### Pay-as-you-go projects
+
+A pay-as-you-go project has no scheduler, so Sp00ky Cloud takes and restores its backups itself, with the same commands and the same backup files. A restore wipes the database, imports the backup and reloads the sync engine, which picks up the restored data on its own; run your migrations again afterwards as above.
+
+A restore gives every `DEFINE ACCESS` new signing keys, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and restoring that placeholder would let anyone sign a valid token. An access that verifies tokens of an outside issuer with a key is left out of the restore and defined again by your next deploy.
+
 <Note>
 If the main database gets wiped but the snapshot replica fails to import, the scheduler stays in the `restoring` state on purpose. That blocks reads until someone re-runs the restore. Serving traffic from a half-restored cluster would give back wrong data.
 </Note>
@@ -158,6 +164,8 @@ Set up a schedule with a cron expression:
 | `--enabled` | Turn automatic backups on or off (`true`/`false`) |
 | `--schedule` | Cron expression for how often to back up (e.g. `"0 2 * * *"` for daily at 2 AM) |
 | `--retention` | How many backups to keep before the oldest ones get deleted |
+
+A pay-as-you-go project is backed up every day at 03:00 UTC and keeps the last 7, until you configure backups yourself. Scheduled backups pause while a project is stopped at its [spend cap](/docs/cloud/billing#spend-cap).
 
 ## Database Reset
 

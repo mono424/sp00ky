@@ -141,7 +141,7 @@ instead of opening one they stop with the exact command or environment variable 
 | `spky link` | GitHub push-to-deploy: `connect`, `status`, `settings`, `disconnect`, `trigger`, `runs`. [Docs](/docs/cloud/ci-cd) |
 | `spky token` | API tokens for CI: `create`, `list`, `revoke`. |
 | `spky team` | Members and invitations: `list`, `invite`, `invites`, `revoke`, `remove`, `rename`. [Docs](/docs/cloud/team) |
-| `spky billing` | Billing: `usage`, `plan`. No subcommand opens the portal. `plan` switches between Starter and Pro on a VM project; a pay-as-you-go project has one plan, and moving between Cloudflare and VM hosting needs a new project. |
+| `spky billing` | Billing: `usage`, `plan`, `cap <dollars>`. No subcommand opens the portal. `usage` in a pay-as-you-go project shows the month so far, priced, and its spend cap; `cap` sets that cap (base fee included, at least $10). `plan` switches between Starter and Pro on a VM project; a pay-as-you-go project has one plan, and moving between Cloudflare and VM hosting needs a new project. See [Plans & billing](/docs/cloud/billing). |
 | `spky notice [message]` | Post a notice to the public uptime page. `list` and `remove` manage existing ones. |
 
 ## Restarting containers

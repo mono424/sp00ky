@@ -12,20 +12,45 @@ interface Plan {
   description: string;
   monthlyPrice: number;
   yearlyPrice: number;
+  /** Billed by the month only: the yearly toggle shows the monthly price. */
+  monthlyOnly?: boolean;
+  /** Shown under the price, e.g. what the base fee includes. */
+  priceNote?: string;
   command: string | null;
   ctaHref?: string;
-  popular: boolean;
+  badge?: string;
   features: PlanFeature[];
 }
 
 const plans: Plan[] = [
   {
+    name: 'Pay as you go',
+    description: 'Runs on Cloudflare. The default for new projects.',
+    monthlyPrice: 10,
+    yearlyPrice: 10,
+    monthlyOnly: true,
+    priceNote: 'base fee, usage included, the rest billed by use',
+    command: 'npx @spooky-sync/cli project create --plan payg',
+    badge: 'Recommended',
+    features: [
+      { label: 'Dedicated SurrealDB', type: 'included', specs: { cpu: '1', mem: '1GB' } },
+      { label: '5M requests', type: 'included' },
+      { label: '300 sync hours', type: 'included' },
+      { label: '10M CPU-ms', type: 'included' },
+      { label: '5GB database storage', type: 'included' },
+      { label: '5GB file storage', type: 'included' },
+      { label: 'Daily backups (7 days)', type: 'included' },
+      { label: 'Custom domains', type: 'included' },
+      { label: 'Spend cap, $25 by default', type: 'included' },
+      { label: 'Usage over the included amounts', type: 'addon', addonPrice: 'see below' },
+    ],
+  },
+  {
     name: 'Starter',
-    description: 'For side projects and small apps.',
+    description: 'Dedicated VMs for side projects and small apps.',
     monthlyPrice: 29,
     yearlyPrice: 290,
-    command: 'npx @spky/cli deploy --plan starter',
-    popular: false,
+    command: 'npx @spooky-sync/cli project create --plan starter',
     features: [
       { label: 'Scheduler', type: 'included', specs: { cpu: '1', mem: '512MB' } },
       { label: '1 SSP instance', type: 'included', specs: { cpu: '1', mem: '512MB' } },
@@ -43,11 +68,10 @@ const plans: Plan[] = [
   },
   {
     name: 'Pro',
-    description: 'For teams shipping production apps.',
+    description: 'Dedicated VMs for teams shipping production apps.',
     monthlyPrice: 229,
     yearlyPrice: 2290,
-    command: 'npx @spky/cli deploy --plan pro',
-    popular: true,
+    command: 'npx @spooky-sync/cli project create --plan pro',
     features: [
       { label: 'Scheduler', type: 'included', specs: { cpu: '2', mem: '2GB' } },
       { label: '3 SSP instances', type: 'included', specs: { cpu: '2', mem: '1GB' } },
@@ -70,7 +94,6 @@ const plans: Plan[] = [
     yearlyPrice: 0,
     command: null,
     ctaHref: 'https://github.com/mono424/sp00ky',
-    popular: false,
     features: [
       { label: 'Full source access', type: 'general' },
       { label: 'Unlimited everything', type: 'general' },
@@ -165,7 +188,7 @@ export const PricingPage: React.FC = () => {
   const [yearly, setYearly] = useState(false);
 
   return (
-    <div className="max-w-5xl mx-auto px-4">
+    <div className="max-w-6xl mx-auto px-4">
       {/* Toggle */}
       <div className="flex justify-center mb-12">
         <div className="relative inline-grid grid-cols-2 rounded-full bg-white/[0.03] border border-white/[0.06] p-1">
@@ -197,16 +220,17 @@ export const PricingPage: React.FC = () => {
       </div>
 
       {/* Plan Cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         {plans.map((plan) => {
-          const price = yearly ? plan.yearlyPrice : plan.monthlyPrice;
-          const period = plan.monthlyPrice === 0 ? null : yearly ? '/yr' : '/mo';
+          const showYearly = yearly && !plan.monthlyOnly;
+          const price = showYearly ? plan.yearlyPrice : plan.monthlyPrice;
+          const period = plan.monthlyPrice === 0 ? null : showYearly ? '/yr' : '/mo';
 
           return (
             <div
               key={plan.name}
               className={`relative flex flex-col rounded-xl p-6 ${
-                plan.popular
+                plan.badge
                   ? 'bg-white/[0.04] border border-white/[0.1]'
                   : 'bg-white/[0.02] border border-white/[0.06]'
               }`}
@@ -214,9 +238,9 @@ export const PricingPage: React.FC = () => {
               {/* Header */}
               <div className="flex items-center gap-2 mb-1">
                 <h3 className="text-[15px] font-semibold text-text-primary">{plan.name}</h3>
-                {plan.popular && (
+                {plan.badge && (
                   <span className="text-[10px] font-medium text-text-tertiary bg-white/[0.06] px-2 py-0.5 rounded-full uppercase tracking-wide">
-                    Popular
+                    {plan.badge}
                   </span>
                 )}
               </div>
@@ -232,6 +256,12 @@ export const PricingPage: React.FC = () => {
                 )}
                 {price === 0 && (
                   <span className="text-[13px] text-text-muted ml-1">forever</span>
+                )}
+                {plan.priceNote && (
+                  <p className="text-[12px] text-text-muted mt-1">
+                    {plan.priceNote}
+                    {yearly && plan.monthlyOnly ? ', billed monthly' : ''}
+                  </p>
                 )}
               </div>
 
@@ -306,9 +336,37 @@ export const PricingPage: React.FC = () => {
         })}
       </div>
 
-      {/* Add-ons */}
+      {/* Pay-as-you-go usage */}
       <div className="mt-20 max-w-xl mx-auto">
-        <p className="text-[13px] text-text-muted mb-6">Add-ons</p>
+        <p className="text-[13px] text-text-muted mb-2">Pay as you go: usage over the included amounts</p>
+        <p className="text-[12px] text-text-quaternary mb-6">
+          Sync hours are the hours your project's sync engine is awake, which is while clients are connected.
+          At the spend cap your project stops serving until you raise it; your data stays.
+        </p>
+        <div className="space-y-0">
+          {[
+            { name: 'Requests', price: '$0.50 / million' },
+            { name: 'Sync hours', price: '$0.01 / hour' },
+            { name: 'CPU time', price: '$0.05 / million ms' },
+            { name: 'Database storage', price: '$0.10/GB/mo' },
+            { name: 'File storage', price: '$0.05/GB/mo' },
+            { name: 'Database size M (2GB)', price: '+$8/mo' },
+            { name: 'Database size L (4GB)', price: '+$20/mo' },
+          ].map((rate) => (
+            <div
+              key={rate.name}
+              className="flex items-center justify-between py-3 border-b border-white/[0.06]"
+            >
+              <span className="text-[13px] text-text-tertiary">{rate.name}</span>
+              <span className="text-[13px] text-text-muted tabular-nums">{rate.price}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Add-ons */}
+      <div className="mt-16 max-w-xl mx-auto">
+        <p className="text-[13px] text-text-muted mb-6">VM plan add-ons</p>
         <div className="space-y-0">
           {[
             { name: 'SurrealDB', price: 'from $19/mo' },

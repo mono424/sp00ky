@@ -1,0 +1,126 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Plans & billing
+description: Pay as you go on Cloudflare or a VM plan, what is included, the spend cap, and how to see the month so far.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const createCode = `# Pay as you go (the default): runs on Cloudflare
+spky project create --slug my-app
+
+# A VM plan instead
+spky project create --slug my-app --plan starter`;
+
+export const usageCode = `spky billing usage`;
+
+export const usageOutput = `  Pay as you go, my-app, 2026-10 so far
+
+                                           USED   INCLUDED      COST
+  Requests              2.10 million requests          5     $0.00
+  Sync hours                       412.50 hours        300     $1.13
+  CPU time                3.40 million CPU-ms         10     $0.00
+  Database storage                1.20 GB-months         5     $0.00
+  File storage                    0.40 GB-months         5     $0.00
+  Base fee                                                    $10.00
+
+  Total so far $11.13 of a $25.00 spend cap (change it: spky billing cap <dollars>).`;
+
+export const capCode = `# At most $50 a month, base fee included
+spky billing cap 50
+
+# Nothing beyond the included amounts
+spky billing cap 10`;
+
+export const sizeCode = `surrealdb:
+  size: M   # S (default), M or L`;
+
+export const portalCode = `# Invoices, card and cancellation (opens the Stripe portal)
+spky billing
+
+# Switch between Starter and Pro (VM projects)
+spky billing plan`;
+
+Every project is on one plan. **Pay as you go** is the default: the project runs on Cloudflare (Workers and a Durable Object for sync) with a database of its own, and costs a monthly base fee that already includes some usage. **Starter** and **Pro** run the project on VMs for a fixed price.
+
+<CodeBlock code={createCode} lang="bash" />
+
+The plan is chosen when the project is created and paid for in a Stripe checkout before the first deploy. There is no free plan and no free trial. A project cannot move between Cloudflare and VM hosting later: create a new project instead.
+
+## Pay as you go
+
+$10 a month per project, billed monthly. That includes:
+
+| Included every month | Beyond it |
+| :--- | :--- |
+| A dedicated SurrealDB, size S (1 GiB RAM), daily backups | size M (2 GiB) +$8 a month, L (4 GiB) +$20 a month |
+| 5 million requests (web, sync and backends) | $0.50 per million |
+| 300 sync hours (the time the sync engine is awake, by the minute) | $0.01 per hour |
+| 10 million CPU-ms (the project's Worker and its sync engine) | $0.05 per million CPU-ms |
+| 5 GB database storage | $0.10 per GB-month |
+| 5 GB file storage | $0.05 per GB-month |
+
+The sync engine stays awake for 5 minutes after the last request while clients hold live queries, so sync hours follow the hours your app has people on it. A project with someone connected around the clock uses about 720 hours a month: the 300 included plus $4.20.
+
+Usage beyond the included amounts is added to the next month's invoice, so you pay once a month. A size add-on is charged for the share of the month the database had that size.
+
+### Database size
+
+The database size is set in `sp00ky.yml` and applied on the next deploy:
+
+<CodeBlock code={sizeCode} lang="yaml" fileName="sp00ky.yml" />
+
+A project with its own database (`surrealdb.endpoint`) has no managed database and no size. See [config reference](/docs/reference/config).
+
+## The month so far
+
+Run this in the project's directory:
+
+<CodeBlock code={usageCode} lang="bash" />
+
+<CodeBlock code={usageOutput} lang="text" />
+
+Usage is read from Cloudflare every 10 minutes and arrives a few minutes late, so the last half hour can still grow. The quantities are the month so far; the included amounts are always a full month's, also for a project created mid-month. In a VM project, or outside a project directory, `spky billing usage` lists the tenant's metered usage instead.
+
+## Spend cap
+
+Every pay-as-you-go project has a monthly spend cap on its whole bill, base fee included. It is **$25** until you set another:
+
+<CodeBlock code={capCode} lang="bash" />
+
+The cap is between $10 and $100,000. The base fee alone never counts against it, so a cap of $10 means "nothing beyond the included amounts".
+
+The project's owner gets an email at 50%, 80% and 100% of the cap. **At the cap the project stops serving**:
+
+- its web hostname answers `402 Payment Required` with a page that names the cap, and its sync hostname (`{slug}.db.…`, the one the client connects to) the same as JSON;
+- its database is stopped. Its data is kept;
+- deploys are refused with `spend_cap_reached`, and scheduled backups pause.
+
+It serves again within about 10 minutes of raising the cap above the month's bill, or when the next month starts.
+
+<Note>
+The cap is checked every 10 minutes, so a sudden burst can pass it by up to ten minutes of usage before the project stops. What was used is billed.
+</Note>
+
+<Warning>
+A stopped project is down for everyone, including signed-in users. If your app must not go dark, set a cap well above your usual month and watch the 80% email.
+</Warning>
+
+## Starter and Pro
+
+The VM plans have a fixed monthly or yearly price, with add-ons on the [pricing page](/pricing). They have no spend cap; their metered extras (bucket storage, build minutes, seats) are on the same monthly invoice.
+
+<CodeBlock code={portalCode} lang="bash" />
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Deploying" href="/docs/cloud/deploying" description="What a deploy does on Cloudflare and on VMs." />
+  <LinkCard title="Backups" href="/docs/cloud/backups" description="Snapshots, schedules and restores." />
+  <LinkCard title="CLI reference" href="/docs/reference/cli" description="Every spky command, billing included." />
+  <LinkCard title="Pricing" href="/pricing" description="All plans and add-ons side by side." />
+</CardGrid>

@@ -120,7 +120,9 @@ A pay-as-you-go project has no scheduler, so Sp00ky Cloud takes and restores its
 
 ### Signing keys after a restore
 
-A restore gives every `DEFINE ACCESS` new signing keys, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and restoring that placeholder would let anyone sign a valid token, so the restore drops it. An access that verifies tokens of an outside issuer with a key is left out of the restore: run its `DEFINE ACCESS` statement again afterwards (the restore log names it).
+Every restore, on VMs and on pay as you go, gives each record `DEFINE ACCESS` a new signing key, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and a database restored with that placeholder would let anyone sign a valid token for any user. Sp00ky Cloud checks the restored database after every restore, whatever scheduler version imported it, and refuses to report a restore as done until no access accepts such a token.
+
+Two kinds of access cannot get their key back. Admin impersonation (`_00_impersonate`) works again after your next `spky deploy`, which sets its key. An access that verifies tokens of an outside issuer with a shared key is removed by the restore: run its `DEFINE ACCESS` statement again afterwards (the restore's metadata names it).
 
 <Note>
 If the main database gets wiped but the snapshot replica fails to import, the scheduler stays in the `restoring` state on purpose. That blocks reads until someone re-runs the restore. Serving traffic from a half-restored cluster would give back wrong data.

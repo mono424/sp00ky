@@ -1,3 +1,4 @@
+import 'package:spooky_core/src/kernel/constants.dart';
 import 'package:spooky_core/src/kernel/effects.dart';
 import 'package:spooky_core/src/kernel/events.dart';
 import 'package:spooky_core/src/state/client_state.dart';
@@ -166,7 +167,7 @@ void main() {
         handlers: defaults(),
       );
       expect(out.state.membershipDirty, {'a'});
-      expect(out.timers['membership']!.ms, 50);
+      expect(out.timers['membership']!.ms, membershipLeadingMs);
     });
 
     test('pulls a backed-off poll back to base, and leaves a base one alone',

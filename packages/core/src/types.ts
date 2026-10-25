@@ -251,10 +251,10 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
   /** A pino browser transmit object for forwarding logs (e.g. via @spooky-sync/core/otel). */
   otelTransmit?: PinoTransmit;
   /**
-   * Debounce time in milliseconds for stream updates (the client-side SSP
-   * aggregation throttle — coalesces the in-browser StreamProcessor's
-   * per-record updates per query before notifying readers).
-   * Defaults to 50ms.
+   * Minimum gap in milliseconds between two materializations of one query
+   * (coalesces per-record updates before notifying readers). The first change
+   * after a quiet spell is delivered on the next tick; later ones inside the
+   * window fold into one update at its end. Defaults to 50ms.
    */
   streamDebounceTime?: number;
   /**

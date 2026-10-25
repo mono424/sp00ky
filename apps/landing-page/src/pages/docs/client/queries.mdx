@@ -96,9 +96,9 @@ live window follows.
 
 Under the hood `useQuery` calls `subscribe(queryHash, callback, { immediate: true })`. The
 `immediate` flag fires the callback synchronously with whatever is already in the local store, so
-the first paint has data even offline. UPDATE events are debounced by `streamDebounceTime`
-(default 50 ms, see [Client config](/docs/reference/client-config)); CREATE and DELETE fire
-immediately. Subscriptions tear down on unmount.
+the first paint has data even offline. Updates are throttled per query by `streamDebounceTime`
+(default 50 ms, see [Client config](/docs/reference/client-config)): the first change after a
+quiet spell is delivered on the next tick, later ones inside the window fold into one update. Subscriptions tear down on unmount.
 
 ## One-off reads
 

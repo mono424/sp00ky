@@ -7,11 +7,20 @@
 /// backend.
 library;
 
-/// Trailing coalesce for materialization after a state change.
+/// Minimum gap between two materializations of one query. The first change
+/// after a quiet spell materializes on the next tick; changes inside the
+/// window fold into one trailing run at its end.
 const int materializeDebounceMs = 50;
 
-/// Coalesce window for LIVE membership dirt before the batched edge re-read.
+/// Minimum gap between two batched edge re-reads driven by LIVE dirt. Dirt
+/// after a quiet spell is read after [membershipLeadingMs]; dirt inside the
+/// window waits for its end.
 const int membershipCoalesceMs = 50;
+
+/// Leading wait before the first re-read of a burst. One edge transaction fans
+/// out as a run of notifications landing within a few milliseconds; this folds
+/// the run into the first read instead of paying a second round trip for it.
+const int membershipLeadingMs = 5;
 
 /// Re-read ladder while the server reports a view as `materializing`.
 const List<int> materializingRereadLadderMs = [150, 400, 1000];

@@ -225,7 +225,7 @@ describe('registerRemote', () => {
       expect(e.registerAttempts).toBe(0);
       expect(e.lifecycle).toMatchObject({ remote: 'registered', fetchDepth: 0 });
       expect(out.state.membershipDirty.has('a')).toBe(true);
-      expect(out.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
+      expect(out.timers.get('membership')).toEqual({ ms: 5, event: { type: 'ReadDirtyMembership' } });
       expect(out.dispatched).toContainEqual({ type: 'SyncOutcome', ok: false, error: 'registration read-back failed' });
     }
     const empty = await runPure(registerRemote(env, 'a'), { state: buildState([entry]), handlers: { 'remote.query': () => [] } });

@@ -90,6 +90,26 @@ describe('Runtime state hooks', () => {
     expect(seen).toEqual([[{ id: 'thing:1' }]]);
     expect(rt.state.dirty.has('q')).toBe(false);
   });
+  it('materializes the first change at once, and holds the next one to the window', async () => {
+    const { a, rt } = make(
+      { local: { select: async () => [{ id: 'thing:1' }] } },
+      buildState([buildEntry({ def: { hash: 'q', plan: { table: 'thing' } as any } })], R.reloadViews(new Map([['v', ['thing:1']]])))
+    );
+    rt.update(R.markDirty(['q']));
+    expect(a.timers.pending.get('mat:q')?.ms).toBe(0);
+    a.timers.fire('mat:q');
+    await tick();
+    await tick();
+    a.advance(2);
+    rt.update(R.markDirty(['q']));
+    expect(a.timers.pending.get('mat:q')?.ms).toBe(3);
+    a.timers.fire('mat:q');
+    await tick();
+    await tick();
+    a.advance(50);
+    rt.update(R.markDirty(['q']));
+    expect(a.timers.pending.get('mat:q')?.ms).toBe(0);
+  });
   it('the bucket-switch window: a re-seeded query never reads "known and idle" before its rows are painted', async () => {
     // A sign-in: the query was registered in the anon bucket (cold, nothing
     // painted), then the switch re-seeds it from the user's durable view.

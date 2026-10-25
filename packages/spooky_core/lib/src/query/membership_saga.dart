@@ -327,13 +327,30 @@ Future<MembershipRead> readMembership(
 /// `_00_list_ref` table (registrations, an import, another client syncing) the
 /// events never stop for a whole 50 ms and the read simply never ran, leaving
 /// membership frozen until a poll tick happened to cover it.
+///
+/// Leading edge: when none of these queries was read within the last
+/// [membershipCoalesceMs], the read goes out after the short
+/// [membershipLeadingMs] instead of waiting the whole window. Dirt arriving
+/// while that read is in flight still gets its own trailing read from
+/// [readDirtyMembership], so the cap of one read per window holds.
 Future<void> markMembershipDirty(Ctx ctx, List<QueryHash> hashes) async {
   final armed = await ctx(Fx.stateRead((s) => s.membershipDirty.isNotEmpty));
+  final lastRead = await ctx(Fx.stateRead((s) {
+    var at = 0;
+    for (final h in hashes) {
+      final polled = s.queries[h]?.lastPolledAt ?? 0;
+      if (polled > at) at = polled;
+    }
+    return at;
+  }));
   await ctx(Fx.stateUpdate(r.markMembershipDirty(hashes)));
-  if (!armed) {
-    await ctx(Fx.timerSet(
-        'membership', membershipCoalesceMs, const ReadDirtyMembership()));
-  }
+  if (armed) return;
+  final now = await ctx(Fx.now());
+  final wait = lastRead + membershipCoalesceMs - now;
+  await ctx(Fx.timerSet(
+      'membership',
+      wait > membershipLeadingMs ? wait : membershipLeadingMs,
+      const ReadDirtyMembership()));
 }
 
 Future<void> readDirtyMembership(Ctx ctx, SagaEnv env) async {

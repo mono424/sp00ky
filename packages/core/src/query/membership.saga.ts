@@ -5,6 +5,7 @@ import { fx } from '../kernel/effects';
 import {
   MATERIALIZING_REREAD_LADDER_MS,
   MEMBERSHIP_COALESCE_MS,
+  MEMBERSHIP_LEADING_MS,
   VIEW_LOST_RETRY_BASE_MS,
   VIEW_LOST_RETRY_MAX_MS,
   backoffMs,
@@ -159,9 +160,14 @@ const stmt = (results: unknown, i: number): unknown => {
  * materializing, no view-lost recovery pending): before that the read decides
  * what the set is. Removals are never applied here, so a view whose edges
  * are being rewritten never loses (and garbage-collects) bodies mid-rewrite.
- * Nor for a query with a `LIMIT`: a row joining it pushes another out, and
- * rendering the joiner before the read removes the leaver would show one row
- * too many (the id-set render drops the `LIMIT`).
+ * A query with a `LIMIT` takes it only when every delta is a version bump of
+ * a row it already holds. A row JOINING it pushes another out, and rendering
+ * the joiner before the read removes the leaver would show one row too many
+ * (the id-set render drops the `LIMIT`); a bump cannot change the count. A row
+ * that an edit moves out of the window arrives as its own `DELETE`, which still
+ * marks the query dirty. Windowed lists are most lists, so this spares the
+ * coalesce window and a full round trip on the common case of an edit to a
+ * row already on screen.
  */
 export function* applyEdgeDeltas(deltas: EdgeDelta[]): Saga<Set<QueryHash>> {
   const settled = new Set<QueryHash>();
@@ -170,7 +176,11 @@ export function* applyEdgeDeltas(deltas: EdgeDelta[]): Saga<Set<QueryHash>> {
   for (const [hash, list] of byHash) {
     const entry = (yield fx.state.read((s) => s.queries.get(hash))) as QueryEntry | undefined;
     if (!entry || entry.lifecycle.phase !== 'live' || entry.serverState === 'materializing' || entry.viewLostRetryAt !== null) continue;
-    if (entry.def.plan ? entry.def.plan.limit != null : /\bLIMIT\b/i.test(entry.def.surql)) continue;
+    const limited = entry.def.plan ? entry.def.plan.limit != null : /\bLIMIT\b/i.test(entry.def.surql);
+    if (limited) {
+      const held = new Set(entry.remoteArray.map(([id]) => id));
+      if (!list.every((d) => held.has(d.id))) continue;
+    }
     const next = withDeltas(entry.remoteArray, list);
     // Never empty, so always applied.
     if (next !== entry.remoteArray) yield* applyMembership(hash, next);
@@ -296,11 +306,25 @@ export function* readMembership(
  * `_00_list_ref` table (registrations, an import, another tab syncing) the
  * events never stop for a whole 50 ms and the read simply never ran, leaving
  * membership frozen until a poll tick happened to cover it.
+ *
+ * Leading edge: when none of these queries was read within the last
+ * {@link MEMBERSHIP_COALESCE_MS}, the read goes out after the short
+ * {@link MEMBERSHIP_LEADING_MS} instead of waiting the whole window. A lone
+ * remote edit is the common case, and the full window sat in front of every
+ * one of them. Dirt arriving while that read is in flight still gets its own
+ * trailing read from {@link readDirtyMembership}, so the cap of one read per
+ * window holds.
  */
 export function* markMembershipDirty(hashes: QueryHash[]): Saga<void> {
-  const armed = (yield fx.state.read((s) => s.membershipDirty.size > 0)) as boolean;
+  const [armed, lastRead] = (yield fx.state.read((s) => [
+    s.membershipDirty.size > 0,
+    hashes.reduce((at, h) => Math.max(at, s.queries.get(h)?.lastPolledAt ?? 0), 0),
+  ])) as [boolean, number];
   yield fx.state.update(R.markMembershipDirty(hashes));
-  if (!armed) yield fx.timer.set('membership', MEMBERSHIP_COALESCE_MS, { type: 'ReadDirtyMembership' });
+  if (armed) return;
+  const now = (yield fx.now()) as number;
+  const delay = Math.max(MEMBERSHIP_LEADING_MS, lastRead + MEMBERSHIP_COALESCE_MS - now);
+  yield fx.timer.set('membership', delay, { type: 'ReadDirtyMembership' });
 }
 
 export function* readDirtyMembership(env: SagaEnv): Saga<void> {

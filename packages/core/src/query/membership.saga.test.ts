@@ -379,7 +379,7 @@ describe('dirty helpers', () => {
     const s = buildState([buildEntry({ def: { hash: 'a' } })]);
     const out = await runPure(markMembershipDirty(['a']), { state: s });
     expect(out.state.membershipDirty.has('a')).toBe(true);
-    expect(out.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
+    expect(out.timers.get('membership')).toEqual({ ms: 5, event: { type: 'ReadDirtyMembership' } });
     const clean = await runPure(readDirtyMembership(env), { state: s });
     expect(clean.log.filter((e) => e.kind === 'remote.query')).toHaveLength(0);
     const dirty = await runPure(readDirtyMembership(env), {
@@ -387,6 +387,17 @@ describe('dirty helpers', () => {
       handlers: { 'remote.query': () => [ok([]), ok(null), ok([])] },
     });
     expect(dirty.log.filter((e) => e.kind === 'remote.query')).toHaveLength(1);
+  });
+
+  it('reads at once after a quiet spell, and waits out the window after a recent read', async () => {
+    const now = 1_000_000;
+    const quiet = await runPure(markMembershipDirty(['a']), { state: buildState([buildEntry({ def: { hash: 'a' }, lastPolledAt: now - 5_000 })]), now });
+    expect(quiet.timers.get('membership')?.ms).toBe(5);
+    const recent = await runPure(markMembershipDirty(['a', 'b']), {
+      state: buildState([buildEntry({ def: { hash: 'a' }, lastPolledAt: now - 30 }), buildEntry({ def: { hash: 'b' }, lastPolledAt: null })]),
+      now,
+    });
+    expect(recent.timers.get('membership')?.ms).toBe(20);
   });
 
   it('arms the window once per burst, and again for dirt the read left behind', async () => {
@@ -458,6 +469,27 @@ describe('applyEdgeDeltas', () => {
       expect(out.state.queries.get('a')!.remoteArray).toEqual([['t:1', 1]]);
     }
     expect((await runPure(applyEdgeDeltas([{ hash: 'zz', id: 't:2', version: 1 }]), { state: buildState([live()]) })).result.size).toBe(0);
+  });
+
+  it('commits a version bump of a held row in a bounded view without reading the edges', async () => {
+    for (const def of [
+      { hash: 'a', viewKey: 'vk', surql: 'SELECT * FROM t ORDER BY at DESC LIMIT 10' },
+      { hash: 'a', viewKey: 'vk', plan: { table: 't', limit: 10 } },
+    ]) {
+      const out = await runPure(applyEdgeDeltas([{ hash: 'a', id: 't:1', version: 4 }]), { state: buildState([live({ def })]), handlers });
+      expect([...out.result]).toEqual(['a']);
+      expect(out.state.queries.get('a')!.remoteArray).toEqual([['t:1', 4]]);
+      expect(out.log.some((e) => e.kind === 'remote.query')).toBe(false);
+    }
+  });
+
+  it('leaves a bounded view to the read when any delta in the batch is a joiner', async () => {
+    const entry = live({ def: { hash: 'a', plan: { table: 't', limit: 10 } } });
+    const out = await runPure(applyEdgeDeltas([{ hash: 'a', id: 't:1', version: 4 }, { hash: 'a', id: 't:2', version: 1 }]), {
+      state: buildState([entry]),
+    });
+    expect(out.result.size).toBe(0);
+    expect(out.state.queries.get('a')!.remoteArray).toEqual([['t:1', 1]]);
   });
 });
 

@@ -47,6 +47,8 @@ export class Runtime {
   private readonly lastStatus = new Map<QueryHash, QueryStatus>();
   private readonly listeners = new Map<string, Set<(event: OutEvent) => void>>();
   private readonly scheduledMaterialize = new Set<QueryHash>();
+  /** When each query last materialized, for the leading-edge throttle in `setState`. */
+  private readonly materializedAt = new Map<QueryHash, number>();
   private readonly timerKeys = new Set<string>();
   private lastActivity = { fetching: 0, pending: 0 };
   private lastHealth: ClientState['sync']['health'];
@@ -141,11 +143,20 @@ export class Runtime {
         w.resolve();
       }
     }
+    // Throttle with a leading edge: the first change after a quiet spell
+    // materializes on the next tick (a zero delay still folds every state
+    // update of the current turn into it), later ones inside the window fold
+    // into one run at its end. A trailing-only debounce put the whole window
+    // in front of every lone remote edit.
+    const now = this.adapters.clock.now();
     for (const hash of next.dirty) {
       if (this.scheduledMaterialize.has(hash)) continue;
       this.scheduledMaterialize.add(hash);
-      this.adapters.timers.set(`mat:${hash}`, this.env.materializeDebounceMs, () => {
+      const last = this.materializedAt.get(hash);
+      const delay = last === undefined ? 0 : Math.max(0, last + this.env.materializeDebounceMs - now);
+      this.adapters.timers.set(`mat:${hash}`, delay, () => {
         this.scheduledMaterialize.delete(hash);
+        this.materializedAt.set(hash, this.adapters.clock.now());
         void this.dispatch({ type: 'Materialize', hash });
       });
     }

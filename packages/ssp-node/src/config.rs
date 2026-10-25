@@ -59,6 +59,7 @@ pub struct NodeConfig {
     pub impersonation: bool,
     /// Idle-to-active debounce (ms) for the bounded query-edge publisher.
     /// Queued work drains without per-item delays. `0` starts immediately.
+    /// Env: `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS`, default 20.
     pub query_update_throttle_ms: u64,
     /// How often (ms) the per-view metrics (`rowCount`, `updateCount`, the
     /// materialization percentiles on `_00_query`) are flushed. The ingest path

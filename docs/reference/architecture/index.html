@@ -263,13 +263,16 @@ once) produced one transaction per record, so SurrealDB fired a <code>LIVE</code
 notification per record and a connecting client streamed its whole window
 over seconds of serialized round-trips. Batching collapses that into a
 few <code>LIVE</code> deliveries.</p>
-<p>The window is set by <code>SPKY_SSP_QUERY_UPDATE_THROTTLE_MS</code> (default <code>100</code>;
-<code>0</code> disables batching and flushes each update immediately). The buffer
+<p>The window is set by <code>SPKY_SSP_QUERY_UPDATE_THROTTLE_MS</code> (default <code>20</code>;
+<code>0</code> starts each publication immediately). It is an idle-to-active debounce:
+updates that arrive while a publication is in flight are merged into the
+next round without any extra wait, so a burst still lands as a few
+transactions while a lone edit pays only the short window. The buffer
 also flushes early once it crosses an internal size cap, and flushes any
-remainder on shutdown. On the client, the in-browser Stream Processor has
-the analogous <code>streamDebounceTime</code> (default <code>50</code>ms. See
-<a href="/docs/reference/config">Configuration</a>), which coalesces the resulting
-per-query stream updates before they reach <code>useQuery</code>.</p>
+remainder on shutdown. On the client, <code>streamDebounceTime</code> (default <code>50</code>ms.
+See <a href="/docs/reference/config">Configuration</a>) caps how often one query
+re-materializes: the first change after a quiet spell is delivered on the
+next tick, and later ones inside the window fold into one update at its end.</p>
 <h3 id="bootstrap-pagination">Bootstrap Pagination</h3>
 <p>Both the scheduler’s snapshot replica and the SSP load large tables in
 bounded pages rather than one giant <code>SELECT</code> (which overflows the

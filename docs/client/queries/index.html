@@ -244,9 +244,9 @@ const results = useQuery(db, () =>
 <span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">);</span></span></code></pre> </div> </div> </div> 
 <p>Under the hood <code>useQuery</code> calls <code>subscribe(queryHash, callback, { immediate: true })</code>. The
 <code>immediate</code> flag fires the callback synchronously with whatever is already in the local store, so
-the first paint has data even offline. UPDATE events are debounced by <code>streamDebounceTime</code>
-(default 50 ms, see <a href="/docs/reference/client-config">Client config</a>); CREATE and DELETE fire
-immediately. Subscriptions tear down on unmount.</p>
+the first paint has data even offline. Updates are throttled per query by <code>streamDebounceTime</code>
+(default 50 ms, see <a href="/docs/reference/client-config">Client config</a>): the first change after a
+quiet spell is delivered on the next tick, later ones inside the window fold into one update. Subscriptions tear down on unmount.</p>
 <h2 id="one-off-reads">One-off reads</h2>
 <p>Sometimes you want a value rather than a subscription, inside an event handler say. Call <code>.run()</code> on the
 built query and await it.</p>

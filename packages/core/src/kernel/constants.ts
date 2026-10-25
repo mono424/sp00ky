@@ -4,10 +4,24 @@
  * test can pin the schedule by asserting the effect log.
  */
 
-/** Trailing coalesce for materialization after a state change. */
+/**
+ * Minimum gap between two materializations of one query. The first change
+ * after a quiet spell materializes on the next tick; changes inside the window
+ * fold into one trailing run at its end.
+ */
 export const MATERIALIZE_DEBOUNCE_MS = 50;
-/** Coalesce window for LIVE membership dirt before the batched edge re-read. */
+/**
+ * Minimum gap between two batched edge re-reads driven by LIVE dirt. Dirt
+ * after a quiet spell is read after {@link MEMBERSHIP_LEADING_MS}; dirt inside
+ * the window waits for its end.
+ */
 export const MEMBERSHIP_COALESCE_MS = 50;
+/**
+ * Leading wait before the first re-read of a burst. One edge transaction fans
+ * out as a run of notifications landing within a few milliseconds; this folds
+ * the run into the first read instead of paying a second round trip for it.
+ */
+export const MEMBERSHIP_LEADING_MS = 5;
 /** Re-read ladder while the server reports a view as `materializing`. */
 export const MATERIALIZING_REREAD_LADDER_MS: readonly number[] = [150, 400, 1000];
 /** How long an acked outbox item stays in the overlay when membership never names it. */

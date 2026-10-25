@@ -52,7 +52,7 @@ Key fields:
 - `schemaSurql` — The compiled SURQL schema string for local DB provisioning
 - `logLevel` — `'debug' | 'info' | 'warn' | 'error'`
 - `persistenceClient` — `'surrealdb'` (default), `'localstorage'`, or a custom `PersistenceClient`
-- `streamDebounceTime` — Debounce ms for stream updates (default: 100)
+- `streamDebounceTime` — Minimum gap in ms between re-materializations of one query; the first change after a quiet spell is immediate (default: 50)
 
 ## Querying
 

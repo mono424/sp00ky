@@ -31,7 +31,7 @@ interface Sp00kyConfig<S extends SchemaStructure> {
   persistenceClient?: PersistenceClient | 'surrealdb' | 'localstorage';
   /** A pino browser transmit object for forwarding logs (e.g. via @spooky-sync/core/otel) */
   otelTransmit?: PinoTransmit;
-  /** Debounce time in ms for stream updates (default: 100) */
+  /** Minimum gap in ms between re-materializations of one query; first change is immediate (default: 50) */
   streamDebounceTime?: number;
 }
 ```

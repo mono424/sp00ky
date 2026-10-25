@@ -116,11 +116,17 @@ void main() {
     expect(runs, 2);
   });
 
-  test('a dirty query schedules exactly one debounced materialization', () {
+  test('a dirty query schedules exactly one materialization, leading edge first',
+      () {
     final built = build(state: buildState([buildEntry()]));
     built.runtime.update(r.markDirty(['h1']));
     built.runtime.update(r.markDirty(['h1']));
     expect(built.fakes.timers.pending.keys, ['mat:h1']);
+    expect(built.fakes.timers.pending['mat:h1']!.ms, 0,
+        reason: 'the first change after a quiet spell is not held back');
+    built.fakes.timers.fire('mat:h1');
+    // The clock has not moved: the next change waits out the whole window.
+    built.runtime.update(r.markDirty(['h1', 'h2']));
     expect(built.fakes.timers.pending['mat:h1']!.ms, 50);
   });
 

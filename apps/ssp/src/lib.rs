@@ -212,10 +212,14 @@ pub fn load_config() -> Config {
         impersonation: ssp_protocol::impersonation::env_enabled(
             std::env::var(ssp_protocol::impersonation::ENV_FLAG).ok().as_deref(),
         ),
+        // Idle-to-active debounce only: a burst arriving while a publication
+        // is in flight is merged into the next round regardless, so a short
+        // window keeps the batching and takes most of the fixed delay out of
+        // every lone remote edit (100 ms sat in front of each one before).
         query_update_throttle_ms: std::env::var("SPKY_SSP_QUERY_UPDATE_THROTTLE_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100),
+            .unwrap_or(20),
         merge_views: std::env::var("SPKY_SSP_MERGE_VIEWS")
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();

@@ -314,13 +314,16 @@ notification per record and a connecting client streamed its whole window
 over seconds of serialized round-trips. Batching collapses that into a
 few `LIVE` deliveries.
 
-The window is set by `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS` (default `100`;
-`0` disables batching and flushes each update immediately). The buffer
+The window is set by `SPKY_SSP_QUERY_UPDATE_THROTTLE_MS` (default `20`;
+`0` starts each publication immediately). It is an idle-to-active debounce:
+updates that arrive while a publication is in flight are merged into the
+next round without any extra wait, so a burst still lands as a few
+transactions while a lone edit pays only the short window. The buffer
 also flushes early once it crosses an internal size cap, and flushes any
-remainder on shutdown. On the client, the in-browser Stream Processor has
-the analogous `streamDebounceTime` (default `50`ms. See
-[Configuration](/docs/reference/config)), which coalesces the resulting
-per-query stream updates before they reach `useQuery`.
+remainder on shutdown. On the client, `streamDebounceTime` (default `50`ms.
+See [Configuration](/docs/reference/config)) caps how often one query
+re-materializes: the first change after a quiet spell is delivered on the
+next tick, and later ones inside the window fold into one update at its end.
 
 ### Bootstrap Pagination
 

@@ -78,6 +78,9 @@ class Runtime implements InterpreterHost {
   final Map<QueryHash, QueryStatus> _lastStatus = {};
   final Map<String, Set<void Function(OutEvent)>> _listeners = {};
   final Set<QueryHash> _scheduledMaterialize = {};
+
+  /// When each query last materialized, for the leading-edge throttle below.
+  final Map<QueryHash, int> _materializedAt = {};
   ({int fetching, int pending}) _lastActivity = (fetching: 0, pending: 0);
   Set<String> _lastUnsynced = const {};
   late SyncHealth _lastHealth;
@@ -164,11 +167,20 @@ class Runtime implements InterpreterHost {
         w.done.complete();
       }
     }
+    // Throttle with a leading edge: the first change after a quiet spell
+    // materializes on the next tick (a zero delay still folds every state
+    // update of the current turn into it), later ones inside the window fold
+    // into one run at its end. A trailing-only debounce put the whole window
+    // in front of every lone remote edit.
+    final now = _adapters.now();
     for (final hash in next.dirty) {
       if (_scheduledMaterialize.contains(hash)) continue;
       _scheduledMaterialize.add(hash);
-      _adapters.timers.set('mat:$hash', _env.materializeDebounceMs, () {
+      final last = _materializedAt[hash];
+      final wait = last == null ? 0 : last + _env.materializeDebounceMs - now;
+      _adapters.timers.set('mat:$hash', wait > 0 ? wait : 0, () {
         _scheduledMaterialize.remove(hash);
+        _materializedAt[hash] = _adapters.now();
         dispatch(Materialize(hash));
       });
     }

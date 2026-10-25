@@ -86,7 +86,8 @@ class Sp00kyConfig {
   final String logLevel;
   final dynamic persistenceClient;
 
-  /// Trailing coalesce (ms) before a dirty query re-materializes. Matches the
+  /// Minimum gap (ms) between two re-materializations of one query; the first
+  /// change after a quiet spell materializes on the next tick. Matches the
   /// browser core's `MATERIALIZE_DEBOUNCE_MS`, so the two clients repaint on
   /// the same cadence.
   final int streamDebounceTime;

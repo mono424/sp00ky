@@ -62,7 +62,7 @@ describe('liveChange', () => {
     const out = await runPure(liveChange(env, ['a', 'zz']), { state: { ...s, tabRole: 'leader' } });
     expect([...out.state.membershipDirty]).toEqual(['a']);
     expect(out.state.sync.pollIdleStreak).toBe(0);
-    expect(out.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
+    expect(out.timers.get('membership')).toEqual({ ms: 5, event: { type: 'ReadDirtyMembership' } });
     expect(out.emitted).toEqual([{ type: 'tabs:broadcast', message: { type: 'membership-dirty', hashes: ['a'] } }]);
     const solo = await runPure(liveChange(env, ['a']), { state: s });
     expect(solo.emitted).toEqual([]);
@@ -224,6 +224,6 @@ describe('liveChange with edge deltas', () => {
       { state: buildState([live('a'), cold]) }
     );
     expect([...out.state.membershipDirty].sort()).toEqual(['a', 'b']);
-    expect(out.timers.get('membership')).toEqual({ ms: 50, event: { type: 'ReadDirtyMembership' } });
+    expect(out.timers.get('membership')).toEqual({ ms: 5, event: { type: 'ReadDirtyMembership' } });
   });
 });

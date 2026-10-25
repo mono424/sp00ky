@@ -1,3 +1,4 @@
+import 'package:spooky_core/src/kernel/constants.dart';
 import 'package:spooky_core/src/kernel/effects.dart';
 import 'package:spooky_core/src/kernel/events.dart';
 import 'package:spooky_core/src/query/membership.dart';
@@ -528,7 +529,7 @@ void main() {
         state: state,
         handlers: defaults(),
       );
-      expect(first.timers['membership']!.ms, 50);
+      expect(first.timers['membership']!.ms, membershipLeadingMs);
 
       final second = await runPure<void>(
         (ctx) => markMembershipDirty(ctx, ['a']),

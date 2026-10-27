@@ -103,6 +103,18 @@ export interface PendingWrite {
   readonly mirrorId: string | null;
 }
 
+/**
+ * A create or delete a channel peer sent, applied here before the server has
+ * it (see `modules/channel`). Shown like an own optimistic write through the
+ * overlay; when `expiresAt` passes it is either confirmed (the server's body
+ * landed) or undone.
+ */
+export interface PeerWrite {
+  readonly kind: 'create' | 'delete';
+  readonly table: string;
+  readonly expiresAt: number;
+}
+
 export interface SyncSlice {
   readonly health: SyncHealth;
   readonly consecutiveFailures: number;
@@ -151,6 +163,8 @@ export interface ClientState {
   readonly views: ReadonlyMap<string, ReadonlyArray<string>>;
   readonly outbox: ReadonlyArray<OutboxItem>;
   readonly pendingWrites: ReadonlyMap<string, PendingWrite>;
+  /** Channel peers' unconfirmed creates and deletes, by record id. */
+  readonly peerWrites: ReadonlyMap<string, PeerWrite>;
   readonly failedCount: number;
   /** Queries whose render inputs changed since their last materialization. */
   readonly dirty: ReadonlySet<QueryHash>;
@@ -196,6 +210,7 @@ export function emptyState(init: { tabId: string }): ClientState {
     views: new Map(),
     outbox: [],
     pendingWrites: new Map(),
+    peerWrites: new Map(),
     failedCount: 0,
     dirty: new Set(),
     membershipDirty: new Set(),

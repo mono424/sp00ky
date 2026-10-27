@@ -317,3 +317,21 @@ describe('durable view index', () => {
     expect(reloaded.views).toEqual(new Map([['va', ['t:new']], ['vb', ['t:b']], ['vc', ['t:c']]]));
   });
 });
+
+describe('peer writes', () => {
+  it('set and clear an entry, dirtying the queries of its table', () => {
+    const s0 = buildState([buildEntry({ def: { hash: 'q', tableName: 'thing' } })], R.clearDirty('q'));
+    const s1 = R.setPeerWrite('thing:1', { kind: 'create', table: 'thing', expiresAt: 5 })(s0);
+    expect(s1.peerWrites.get('thing:1')).toEqual({ kind: 'create', table: 'thing', expiresAt: 5 });
+    expect(s1.dirty.has('q')).toBe(true);
+    const s2 = R.clearPeerWrite('thing:1')(R.clearDirty('q')(s1));
+    expect(s2.peerWrites.size).toBe(0);
+    expect(s2.dirty.has('q')).toBe(true);
+    expect(R.clearPeerWrite('thing:9')(s2)).toBe(s2);
+  });
+
+  it('a bucket switch forgets them', () => {
+    const s = R.setPeerWrite('thing:1', { kind: 'delete', table: 'thing', expiresAt: 5 })(buildState());
+    expect(R.clearBucketState()(s).peerWrites.size).toBe(0);
+  });
+});

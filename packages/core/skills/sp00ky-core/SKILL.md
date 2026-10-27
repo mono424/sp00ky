@@ -139,6 +139,10 @@ act on the tray with `db.failedMutationCount`, `db.subscribeToFailedMutations(cb
 `db.listFailedMutations()`, `db.retryFailedMutation(id)` (a fresh optimistic
 write) and `db.discardFailedMutation(id)`.
 
+## Peer to peer channels (experimental)
+
+On `-- @channel` tables, `client.channel(query, peers)` opens WebRTC channels to the users listed (both sides must list each other) for the rows the query's `where` matches (checked per row, never registered). Plain `client.update` / `create` / `delete` reach the peers of every open channel whose filter the row matches; the handle's own writes limit that to its peers. `-- @ephemeral` fields go only to peers. Order/limit/select/`.one()` warn unless `.ignoreUnusedArgs()`. Follow status with `ch.subscribe(cb)`, close with `ch.close()`. Config: `channels: { accept, iceServers, transport, confirmTimeoutMs }`. Docs: `/docs/client/channels`.
+
 ## Authentication
 
 See [references/auth.md](references/auth.md) for the full auth API.

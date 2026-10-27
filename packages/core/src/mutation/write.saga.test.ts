@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { RecordId } from 'surrealdb';
 import { runPure } from '../testing/run-pure';
-import { buildEntry, buildState } from '../testing/build';
+import { buildEntry, buildOutboxItem, buildState } from '../testing/build';
 import { defaultEnv } from '../query/env';
-import { adoptPendingWrites, flushPendingWrites, flushWrite, write } from './write.saga';
+import { adoptPendingWrites, flushPendingWrites, flushWrite, peerCreate, peerDelete, peerWriteExpired, readRow, write } from './write.saga';
 import * as R from '../state/reducers';
 
 const env = defaultEnv({ tables: [{ name: 'thing', columns: { a: {}, b: {} } }] } as any);
@@ -312,5 +312,125 @@ describe('adoptPendingWrites', () => {
     expect(noTable.dispatched).toEqual([]);
     const empty = await runPure(adoptPendingWrites(), { state: buildState(), handlers: { 'local.query': () => [[]] } });
     expect(empty.timers.size).toBe(0);
+  });
+});
+
+describe('channel peer writes', () => {
+  const row = { id: rid, a: 1 };
+  const local = (existing: unknown) => ({ 'local.query': () => [existing] });
+
+  it('readRow: the stored row, or null', async () => {
+    expect((await runPure(readRow('thing:1'), { handlers: local(row) })).result).toEqual(row);
+    expect((await runPure(readRow('thing:1'), { handlers: local(null) })).result).toBeNull();
+  });
+
+  it('peerCreate: inserts without an outbox entry, feeds the circuit unversioned, shows it, arms the expiry', async () => {
+    const out = await runPure(peerCreate(env, { recordId: 'thing:1', data: { a: 1, junk: 2 }, ttlMs: 5000 }), {
+      state: withQuery(),
+      handlers: {
+        ...local(null),
+        'local.execute': (e: any) => {
+          expect(e.query.sql).not.toContain('mutationType');
+          expect(e.vars).toEqual({ id: rid, data_a: 1 });
+          return row;
+        },
+        'ssp.ingest': (e: any) => expect(e.records).toEqual([{ table: 'thing', op: 'CREATE', id: 'thing:1', record: { ...row, _00_rv: 0 } }]),
+      },
+    });
+    expect(out.result).toBe(true);
+    expect(out.state.outbox).toEqual([]);
+    expect(out.state.versions.has('thing:1')).toBe(false);
+    expect(out.state.peerWrites.get('thing:1')).toEqual({ kind: 'create', table: 'thing', expiresAt: 1_700_000_005_000 });
+    expect(out.state.dirty.has('q')).toBe(true);
+    expect(out.timers.get('peer:thing:1')).toEqual({ ms: 5000, event: { type: 'PeerWriteExpired', id: 'thing:1' } });
+  });
+
+  it('peerCreate: refuses unknown tables, confirmed rows, own pending writes and a second create', async () => {
+    expect((await runPure(peerCreate(env, { recordId: 'nope:1', ttlMs: 1 }))).result).toBe(false);
+    const confirmed = buildState([], (s) => ({ ...s, versions: new Map([['thing:1', 2]]) }));
+    expect((await runPure(peerCreate(env, { recordId: 'thing:1', ttlMs: 1 }), { state: confirmed })).result).toBe(false);
+    const own = buildState([], R.outboxReplace([buildOutboxItem({ id: 'm', type: 'update', recordId: 'thing:1' })]));
+    expect((await runPure(peerCreate(env, { recordId: 'thing:1', ttlMs: 1 }), { state: own })).result).toBe(false);
+    const twice = R.setPeerWrite('thing:1', { kind: 'create', table: 'thing', expiresAt: 1 })(buildState());
+    expect((await runPure(peerCreate(env, { recordId: 'thing:1', ttlMs: 1 }), { state: twice })).result).toBe(false);
+  });
+
+  it("peerCreate: an existing unconfirmed row (another tab's copy) is shown without a second insert", async () => {
+    const out = await runPure(peerCreate(env, { recordId: 'thing:1', ttlMs: 10 }), {
+      state: withQuery(),
+      handlers: { ...local(row), 'ssp.ingest': () => undefined },
+    });
+    expect(out.result).toBe(true);
+    expect(out.log.some((e) => e.kind === 'local.execute')).toBe(false);
+  });
+
+  it('peerCreate: a store refusal or an empty answer applies nothing; a circuit failure is logged and still shows', async () => {
+    const refused = await runPure(peerCreate(env, { recordId: 'thing:1', ttlMs: 10 }), {
+      handlers: { ...local(null), 'local.execute': () => { throw new Error('schema'); } },
+    });
+    expect(refused.result).toBe(false);
+    expect(refused.emitted[0]).toMatchObject({ type: 'log', level: 'debug' });
+    const empty = await runPure(peerCreate(env, { recordId: 'thing:1', ttlMs: 10 }), { handlers: { ...local(null), 'local.execute': () => [] } });
+    expect(empty.result).toBe(false);
+    const circuit = await runPure(peerCreate(env, { recordId: 'thing:1', data: { a: 1 }, ttlMs: 10 }), {
+      handlers: { ...local(null), 'local.execute': () => row, 'ssp.ingest': () => { throw new Error('wasm'); } },
+    });
+    expect(circuit.result).toBe(true);
+    expect(circuit.emitted[0]).toMatchObject({ type: 'log', level: 'error' });
+  });
+
+  it('peerDelete: hides an existing row, keeps it in the store, arms the expiry', async () => {
+    const out = await runPure(peerDelete(env, { recordId: 'thing:1', ttlMs: 3000 }), { state: withQuery(), handlers: local(row) });
+    expect(out.result).toBe(true);
+    expect(out.state.peerWrites.get('thing:1')).toMatchObject({ kind: 'delete' });
+    expect(out.log.some((e) => e.kind === 'local.execute')).toBe(false);
+    expect(out.timers.get('peer:thing:1')?.ms).toBe(3000);
+    expect((await runPure(peerDelete(env, { recordId: 'thing:1', ttlMs: 1 }), { handlers: local(null) })).result).toBe(false);
+    expect((await runPure(peerDelete(env, { recordId: 'nope:1', ttlMs: 1 }))).result).toBe(false);
+  });
+
+  it("peerDelete: of the peer's own unconfirmed create undoes it; of a confirmed one hides it", async () => {
+    const created = R.setPeerWrite('thing:1', { kind: 'create', table: 'thing', expiresAt: 1 })(withQuery());
+    const undo = await runPure(peerDelete(env, { recordId: 'thing:1', ttlMs: 1 }), {
+      state: created,
+      handlers: {
+        ...local(row),
+        'local.execute': (e: any) => expect(e.query.sql).toContain('DELETE'),
+        'ssp.ingest': (e: any) => expect(e.records).toEqual([{ table: 'thing', op: 'DELETE', id: 'thing:1', record: row }]),
+      },
+    });
+    expect(undo.result).toBe(true);
+    expect(undo.state.peerWrites.size).toBe(0);
+    const confirmed = { ...created, versions: new Map([['thing:1', 1]]) };
+    const hide = await runPure(peerDelete(env, { recordId: 'thing:1', ttlMs: 1 }), { state: confirmed, handlers: local(row) });
+    expect(hide.state.peerWrites.get('thing:1')).toMatchObject({ kind: 'delete' });
+  });
+
+  it('peerWriteExpired: undoes an unconfirmed create, keeps a confirmed or own one, forgets a delete', async () => {
+    expect((await runPure(peerWriteExpired('thing:1'))).log.filter((e) => e.kind !== 'state.read')).toEqual([]);
+    const created = R.setPeerWrite('thing:1', { kind: 'create', table: 'thing', expiresAt: 1 })(withQuery());
+    const undone = await runPure(peerWriteExpired('thing:1'), {
+      state: created,
+      handlers: { ...local(null), 'local.execute': () => undefined },
+    });
+    expect(undone.state.peerWrites.size).toBe(0);
+    expect(undone.log.some((e) => e.kind === 'ssp.ingest')).toBe(false);
+    const failed = await runPure(peerWriteExpired('thing:1'), {
+      state: created,
+      handlers: { ...local(row), 'local.execute': () => { throw new Error('locked'); } },
+    });
+    expect(failed.emitted[0]).toMatchObject({ type: 'log', level: 'warn' });
+    expect(failed.state.peerWrites.size).toBe(0);
+    const confirmed = await runPure(peerWriteExpired('thing:1'), { state: { ...created, versions: new Map([['thing:1', 1]]) } });
+    expect(confirmed.state.peerWrites.size).toBe(0);
+    expect(confirmed.log.some((e) => e.kind === 'local.execute')).toBe(false);
+    const own = await runPure(peerWriteExpired('thing:1'), {
+      state: R.outboxReplace([buildOutboxItem({ id: 'm', type: 'update', recordId: 'thing:1' })])(created),
+    });
+    expect(own.state.peerWrites.size).toBe(0);
+    const deleted = await runPure(peerWriteExpired('thing:1'), {
+      state: R.setPeerWrite('thing:1', { kind: 'delete', table: 'thing', expiresAt: 1 })(withQuery()),
+    });
+    expect(deleted.state.peerWrites.size).toBe(0);
   });
 });

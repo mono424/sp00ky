@@ -36,6 +36,12 @@ export interface ColumnSchema {
    * two diverge silently.
    */
   readonly opaque?: boolean;
+  /**
+   * True for `-- @ephemeral` columns of a `-- @channel` table: the value only
+   * travels between clients over peer to peer channels. It is never written to
+   * the database, so like `opaque` it cannot be filtered or ordered on.
+   */
+  readonly ephemeral?: boolean;
 }
 
 /**
@@ -171,6 +177,8 @@ export interface SchemaStructure {
     readonly name: string;
     readonly columns: Record<string, ColumnSchema>;
     readonly primaryKey: readonly string[];
+    /** `-- @channel`: queries on this table may open peer to peer channels. */
+    readonly channel?: boolean;
   }[];
   readonly relationships: readonly {
     readonly from: string;
@@ -283,6 +291,9 @@ export type GetTable<S extends SchemaStructure, Name extends TableNames<S>> = Ex
  * Extract all table names from the schema
  */
 export type TableNames<S extends SchemaStructure> = S['tables'][number]['name'];
+
+/** Names of the tables marked `-- @channel` (peer to peer channels may carry them). */
+export type ChannelTableNames<S extends SchemaStructure> = Extract<S['tables'][number], { channel: true }>['name'];
 
 /**
  * Extract all field names from a type

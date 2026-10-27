@@ -2,7 +2,7 @@ import { RecordId } from 'surrealdb';
 import type { MutationEventType, UpdateOptions } from '../types';
 import type { Saga } from '../kernel/saga';
 import { fx } from '../kernel/effects';
-import type { ClientState, PendingWrite } from '../state/client-state';
+import type { ClientState, PeerWrite, PendingWrite } from '../state/client-state';
 import * as R from '../state/reducers';
 import { parseParams } from '../utils/parser';
 import { extractTablePart, parseRecordIdString } from '../utils/index';
@@ -17,6 +17,8 @@ import {
   planDeferredOutboxRowTx,
   planDeleteTx,
   planLocalOnlyUpdateTx,
+  planPeerCreateTx,
+  planPeerUndoTx,
   planUpdateTx,
   type LocalTx,
   type PendingWriteRow,
@@ -265,4 +267,118 @@ export function* adoptPendingWrites(): Saga<void> {
   }
   if (adopted > 0) yield fx.dispatch({ type: 'Drain' });
   if (recheckAt !== Infinity) yield fx.timer.set('adopt-writes', recheckAt - now, { type: 'AdoptPendingWrites' });
+}
+
+// ---- channel peers' creates and deletes ------------------------------------------
+
+/** The row as the local store holds it, or null: what a channel checks its filter against. */
+export function* readRow(recordId: string): Saga<Record<string, unknown> | null> {
+  return yield* readBefore(parseRecordIdString(recordId));
+}
+
+export interface PeerWriteInput {
+  recordId: string;
+  /** The row's fields, for a create. */
+  data?: Record<string, unknown>;
+  /** How long it shows without the server confirming it. */
+  ttlMs: number;
+}
+
+/**
+ * A channel peer created a row: put it in the store and the circuit like an
+ * own optimistic create, minus the outbox entry (the peer pushes it), and
+ * show it through the overlay. `_00_rv` stays unset on purpose: the server's
+ * body (with its computed fields) still downloads and replaces this one.
+ * Refuses an id this client already holds a confirmed row or an own pending
+ * write for, so a peer can never overwrite real data. Returns whether it applied.
+ */
+export function* peerCreate(env: SagaEnv, input: PeerWriteInput): Saga<boolean> {
+  const table = extractTablePart(input.recordId);
+  const columns = columnsFor(env, table);
+  if (!columns) return false;
+  const [confirmed, ownPending, peerPending] = (yield fx.state.read((s) => [
+    s.versions.has(input.recordId),
+    s.outbox.some((i) => i.recordId === input.recordId),
+    s.peerWrites.has(input.recordId),
+  ])) as [boolean, boolean, boolean];
+  if (confirmed || ownPending || peerPending) return false;
+  const rid = parseRecordIdString(input.recordId);
+  const existing = yield* readBefore(rid);
+  let record = existing;
+  if (!existing) {
+    const params = parseParams(columns as never, input.data ?? {});
+    const tx = planPeerCreateTx({ recordId: rid, data: params });
+    try {
+      const res = (yield fx.local.execute(tx.query, tx.vars)) as unknown;
+      record = res && typeof res === 'object' && !Array.isArray(res) ? (res as Record<string, unknown>) : null;
+    } catch (error) {
+      yield fx.emit({ type: 'log', level: 'debug', message: 'peer create refused by the local store', data: { recordId: input.recordId, error } });
+      return false;
+    }
+  }
+  // An existing unconfirmed row is another tab's copy of the same peer create.
+  if (!record) return false;
+  try {
+    yield fx.ssp.ingest([{ table, op: 'CREATE', id: input.recordId, record: { ...record, _00_rv: 0 } }]);
+  } catch (error) {
+    yield fx.emit({ type: 'log', level: 'error', message: 'circuit ingest failed after a peer create', data: { recordId: input.recordId, error } });
+  }
+  const now = (yield fx.now()) as number;
+  yield fx.state.update(R.setPeerWrite(input.recordId, { kind: 'create', table, expiresAt: now + input.ttlMs }));
+  yield fx.timer.set(`peer:${input.recordId}`, input.ttlMs, { type: 'PeerWriteExpired', id: input.recordId });
+  return true;
+}
+
+/**
+ * A channel peer deleted a row: hide it through the overlay, keep it in the
+ * store. Undoing is then just forgetting the entry; a confirmed delete has
+ * taken the row out of the server's membership by the time it expires.
+ */
+export function* peerDelete(env: SagaEnv, input: PeerWriteInput): Saga<boolean> {
+  const table = extractTablePart(input.recordId);
+  if (!columnsFor(env, table)) return false;
+  const [known, confirmed] = (yield fx.state.read((s) => [s.peerWrites.get(input.recordId), s.versions.has(input.recordId)])) as [
+    PeerWrite | undefined,
+    boolean,
+  ];
+  if (known?.kind === 'create' && !confirmed) {
+    // Deleting a row the same peer created and nobody confirmed: just undo it.
+    yield fx.timer.clear(`peer:${input.recordId}`);
+    yield* undoPeerCreate(table, input.recordId);
+    return true;
+  }
+  const exists = (yield* readBefore(parseRecordIdString(input.recordId))) !== null;
+  if (!exists) return false;
+  const now = (yield fx.now()) as number;
+  yield fx.state.update(R.setPeerWrite(input.recordId, { kind: 'delete', table, expiresAt: now + input.ttlMs }));
+  yield fx.timer.set(`peer:${input.recordId}`, input.ttlMs, { type: 'PeerWriteExpired', id: input.recordId });
+  return true;
+}
+
+/** Timer target: a peer's write stops showing as unconfirmed. */
+export function* peerWriteExpired(id: string): Saga<void> {
+  const [write, confirmed, ownPending] = (yield fx.state.read((s) => [
+    s.peerWrites.get(id),
+    s.versions.has(id),
+    s.outbox.some((i) => i.recordId === id),
+  ])) as [PeerWrite | undefined, boolean, boolean];
+  if (!write) return;
+  if (write.kind === 'create' && !confirmed && !ownPending) {
+    yield* undoPeerCreate(write.table, id);
+    return;
+  }
+  yield fx.state.update(R.clearPeerWrite(id));
+}
+
+function* undoPeerCreate(table: string, id: string): Saga<void> {
+  const rid = parseRecordIdString(id);
+  const before = yield* readBefore(rid);
+  try {
+    const tx = planPeerUndoTx(rid);
+    yield fx.local.execute(tx.query, tx.vars);
+    if (before) yield fx.ssp.ingest([{ table, op: 'DELETE', id, record: before }]);
+  } catch (error) {
+    yield fx.emit({ type: 'log', level: 'warn', message: 'could not undo an unconfirmed peer create', data: { recordId: id, error } });
+  }
+  yield fx.state.update(R.clearPeerWrite(id));
 }

@@ -8,7 +8,9 @@ pub struct FieldAnnotation {
 }
 
 /// Known annotation names. Unknown annotations produce a warning.
-const KNOWN_ANNOTATIONS: &[&str] = &["crdt", "cursor", "parent", "nosync", "opaque"];
+const KNOWN_ANNOTATIONS: &[&str] = &[
+    "crdt", "cursor", "parent", "nosync", "opaque", "channel", "ephemeral",
+];
 
 /// Field-name group shared by every `DEFINE FIELD` matcher here.
 ///

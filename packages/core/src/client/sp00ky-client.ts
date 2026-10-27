@@ -11,7 +11,10 @@ import type {
   TableModel,
   TableNames,
   BucketNames,
+  ChannelPeer,
+  ChannelTableNames,
 } from '@spooky-sync/query-builder';
+import type { ChannelQuery } from '../types';
 import { QueryBuilder } from '@spooky-sync/query-builder';
 import type {
   PreloadOptions,
@@ -19,6 +22,7 @@ import type {
   QueryStatusCallback,
   QueryTimeToLive,
   RunOptions,
+  Sp00kyChannel,
   Sp00kyConfig,
   Sp00kyQueryResultPromise,
   StorageHealth,
@@ -35,6 +39,8 @@ import type { FeatureFlagOptions, FeatureFlagOverride } from '../modules/feature
 import { AppReleaseModule, AppReleaseHandle } from '../modules/app-release/index';
 import type { AppReleaseOptions } from '../modules/app-release/index';
 import { WebPushModule } from '../modules/web-push/index';
+import { ChannelManager, type ChannelHandle } from '../modules/channel/index';
+import { surrealSignal, webrtcTransport } from '../modules/channel/webrtc';
 import { DevToolsService } from '../modules/devtools/index';
 import type { DevToolsQuerySource } from '../modules/devtools/index';
 import { parseQueryParams, generateId } from '../utils/index';
@@ -45,7 +51,7 @@ import { pendingMutationCount, fetchingQueryCount, phaseTimings, toQueryState } 
 import { defaultEnv, type SagaEnv } from '../query/env';
 import { registerLocal, type RegisterInput } from '../query/register.saga';
 import { evictQuery } from '../query/lifecycle.saga';
-import { write } from '../mutation/write.saga';
+import { peerCreate, peerDelete, readRow, write } from '../mutation/write.saga';
 import { discardFailed, listFailed, retryFailed } from '../mutation/tray.saga';
 import type { FailedMutationRow } from '../mutation/rows';
 import { buildJobRecord } from '../mutation/jobs';
@@ -78,6 +84,8 @@ export class Sp00kyClient<S extends SchemaStructure> {
   public readonly streamProcessor: StreamProcessorService;
   /** Web Push for this browser: subscribe, devices, self-pushes, service worker bridge. */
   public readonly webPush: WebPushModule;
+  /** Peer to peer channels of `-- @channel` tables. */
+  private readonly channels: ChannelManager;
 
   private readonly services: Services<S>;
   private readonly env: SagaEnv;
@@ -177,6 +185,26 @@ export class Sp00kyClient<S extends SchemaStructure> {
       config: config.webPush,
     });
     this.disposers.push(this.webPush.attach());
+
+    const channelsConfig = config.channels;
+    this.channels = new ChannelManager(config.schema, {
+      config: channelsConfig,
+      logger: s.logger,
+      rows: {
+        create: (_table, id, row, ttlMs) => this.runtime.run(peerCreate(this.env, { recordId: id, data: row, ttlMs })),
+        delete: (_table, id, ttlMs) => this.runtime.run(peerDelete(this.env, { recordId: id, ttlMs })),
+        read: (id) => this.runtime.run(readRow(id)),
+      },
+      transport:
+        channelsConfig?.transport ??
+        ((hooks) =>
+          webrtcTransport(hooks, {
+            signal: surrealSignal(s.remote, s.connectionSupervisor, s.logger),
+            iceServers: channelsConfig?.iceServers,
+            logger: s.logger,
+          })),
+    });
+    if (this.channels.enabled) this.disposers.push(s.auth.subscribe((userId) => this.channels.setUser(userId)));
 
     const querySource: DevToolsQuerySource = {
       getActiveQueries: () => [...this.runtime.state.queries.values()].map(toQueryState),
@@ -329,6 +357,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
     const s = this.services;
     s.connectionSupervisor.dispose();
     for (const dispose of this.disposers.splice(0)) dispose();
+    this.channels.close();
     this.runtime.dispose();
     await this.featureFlags.closeAll();
     await this.appReleases.closeAll();
@@ -355,7 +384,12 @@ export class Sp00kyClient<S extends SchemaStructure> {
     options: QueryOptions<TableModel<GetTable<S, Table>>, false>,
     ttl: QueryTimeToLive = '10m'
   ): QueryBuilder<S, Table, Sp00kyQueryResultPromise> {
-    return new QueryBuilder<S, Table, Sp00kyQueryResultPromise>(this.config.schema, table, async (q) => ({ hash: await this.initQuery(table, q, ttl) }), options);
+    return new QueryBuilder<S, Table, Sp00kyQueryResultPromise>(
+      this.config.schema,
+      table,
+      async (q) => ({ hash: await this.initQuery(table, q, ttl) }),
+      options
+    );
   }
 
   private registerInput(table: string, q: InnerQuery<any, any, any>, ttl: QueryTimeToLive): RegisterInput {
@@ -405,7 +439,55 @@ export class Sp00kyClient<S extends SchemaStructure> {
   }
 
   async subscribe(queryHash: string, callback: (records: Record<string, any>[]) => void, options?: { immediate?: boolean }): Promise<() => void> {
-    return this.runtime.subscribe(queryHash, callback, options);
+    if (!this.channels.enabled) return this.runtime.subscribe(queryHash, callback, options);
+    // Channel values (peer updates, ephemeral fields) are folded into what
+    // subscribers see, never into the store.
+    const tap = this.channels.tap(callback);
+    const stop = this.runtime.subscribe(queryHash, tap.feed, options);
+    return () => {
+      stop();
+      tap.stop();
+    };
+  }
+
+  /**
+   * Open a peer to peer channel to `peers` (your own id is skipped; a
+   * connection forms only when both sides list each other) for the rows
+   * `queries` match, each a query on a `-- @channel` table. Only its `where`
+   * counts, evaluated against each row; the query is never registered. Writes
+   * to matching rows (plain or the channel's own) reach the peers. Close it
+   * when done.
+   */
+  channel<T extends ChannelTableNames<S>>(
+    queries: ChannelQuery<S, T> | ReadonlyArray<ChannelQuery<S, T>>,
+    peers: Iterable<ChannelPeer>
+  ): Sp00kyChannel<S, T> {
+    const handle = this.channels.open(this.channelScopes(queries), peers);
+    const scoped = (table: string) => {
+      this.channels.assertCarries(handle, table);
+      return handle;
+    };
+    return {
+      tables: handle.tables as () => ReadonlyArray<T>,
+      state: handle.state,
+      subscribe: handle.subscribe,
+      setPeers: handle.setPeers,
+      setQueries: (next) => handle.setScopes(this.channelScopes(next)),
+      close: handle.close,
+      update: (table, id, data, options) => this.writeUpdate(table, id, data as Record<string, unknown>, options, scoped(table)) as never,
+      create: (id, data) => this.writeCreate(id, data as Record<string, unknown>, scoped(id.slice(0, id.indexOf(':')))) as never,
+      delete: (table, id) => this.writeDelete(table, id, scoped(table)),
+    };
+  }
+
+  private channelScopes(queries: ChannelQuery<S, any> | ReadonlyArray<ChannelQuery<S, any>>) {
+    const list = (Array.isArray(queries) ? queries : [queries]) as ReadonlyArray<ChannelQuery<S, any>>;
+    return list.map((q) => {
+      const final = 'build' in q && typeof q.build === 'function' ? q.build() : (q as FinalQuery<S, any, any, any, any, any>);
+      const plan = final.innerQuery?.selectQuery?.plan;
+      if (!plan) throw new Error('channel(): pass a query, e.g. db.query(\'message\').where({ conversation })');
+      return this.channels.scope(plan, { isOne: final.isOne, ignoreUnused: final.ignoresUnusedArgs });
+    });
   }
 
   deregisterQuery(queryHash: string): void {
@@ -429,16 +511,46 @@ export class Sp00kyClient<S extends SchemaStructure> {
   // ---- mutations ---------------------------------------------------------------
 
   async create<T extends Record<string, unknown>>(id: string, data: T): Promise<T> {
-    const out = await this.runtime.run(write(this.env, { kind: 'create', recordId: id, data }));
-    return (out.record ?? data) as T;
+    return (await this.writeCreate(id, data)) as T;
   }
 
-  async update<T extends Record<string, unknown>>(_table: string, id: string, data: Partial<T>, options?: UpdateOptions): Promise<T> {
-    const out = await this.runtime.run(write(this.env, { kind: 'update', recordId: id, data: data as Record<string, unknown>, options }));
-    return (out.record ?? data) as T;
+  async update<T extends Record<string, unknown>>(table: string, id: string, data: Partial<T>, options?: UpdateOptions): Promise<T> {
+    return (await this.writeUpdate(table, id, data as Record<string, unknown>, options)) as T;
   }
 
-  async delete(_table: string, id: string): Promise<void> {
+  async delete(table: string, id: string): Promise<void> {
+    await this.writeDelete(table, id);
+  }
+
+  // Peers go first in all three: the local write costs a transaction they need
+  // not wait for. `@ephemeral` fields never reach the database.
+
+  private async writeCreate(id: string, data: Record<string, unknown>, scope?: ChannelHandle): Promise<Record<string, unknown>> {
+    const table = id.slice(0, id.indexOf(':'));
+    const { persistent, ephemeral } = this.channels.split(table, data);
+    this.channels.localCreate(table, id, data, scope);
+    const out = await this.runtime.run(write(this.env, { kind: 'create', recordId: id, data: persistent }));
+    return { ...(out.record ?? persistent), ...(ephemeral ?? {}) };
+  }
+
+  private async writeUpdate(
+    table: string,
+    id: string,
+    data: Record<string, unknown>,
+    options?: UpdateOptions,
+    scope?: ChannelHandle
+  ): Promise<Record<string, unknown>> {
+    const tableName = table || id.slice(0, id.indexOf(':'));
+    const { persistent, ephemeral } = this.channels.split(tableName, data);
+    this.channels.local(tableName, id, persistent, ephemeral, scope);
+    if (ephemeral && Object.keys(persistent).length === 0) return data;
+    const out = await this.runtime.run(write(this.env, { kind: 'update', recordId: id, data: persistent, options }));
+    return { ...(out.record ?? persistent), ...(ephemeral ?? {}) };
+  }
+
+  private async writeDelete(table: string, id: string, scope?: ChannelHandle): Promise<void> {
+    // Awaited: the filter is checked against the row, which the delete removes.
+    await this.channels.localDelete(table || id.slice(0, id.indexOf(':')), id, scope);
     await this.runtime.run(write(this.env, { kind: 'delete', recordId: id }));
   }
 

@@ -339,3 +339,90 @@ describe('Sp00kyClient facade (builder, devtools source, event fan-out)', () => 
     expect(tuned.tabRole).toBeNull();
   });
 });
+
+describe('Sp00kyClient facade (channels)', () => {
+  const chSchema = {
+    tables: [
+      { name: 'room', columns: { a: { type: 'number', optional: true }, pos: { type: 'string', optional: true, ephemeral: true } }, channel: true },
+    ],
+    backends: {},
+  } as any;
+
+  function channelClient(channels?: unknown) {
+    const services = fakeServiceBundle<any>();
+    const a = fakeAdapters({
+      local: {
+        execute: (async (_q: unknown, vars: any) => ({ id: vars?.id ?? new RecordId('room', '1'), a: 1 })) as any,
+        query: (async () => []) as any,
+      },
+      services: {
+        'hint.read': () => 'u1',
+        'local.usesSurqlSchema': () => false,
+        'auth.restoreSession': async () => null,
+        'auth.sessionAuthId': () => null,
+        'remote.connect': () => new Promise(() => {}),
+      },
+    });
+    const runtime = new Runtime({ env: defaultEnv(chSchema, { materializeDebounceMs: 1 }), adapters: a.adapters, logger: services.logger, tabId: 'tab-test' });
+    const client = new Sp00kyClient<any>({ ...config, schema: chSchema, channels } as any, { services, runtime });
+    return { client, runtime };
+  }
+
+  it('opens a channel, keeps ephemeral fields out of writes, scopes its own writes, and wires peer rows to the runtime', async () => {
+    let wanted: ReadonlySet<string> = new Set();
+    const { client } = channelClient({ transport: () => ({ supported: true, want: (u: ReadonlySet<string>) => (wanted = u), send() {}, close() {} }) });
+    await client.init();
+    (client as any).channels.setUser('user:a');
+    const ch = client.channel((client.query('room', {} as any) as any).where({ a: 1 }), ['user:a', 'user:b']);
+    const states: string[] = [];
+    ch.subscribe((s) => states.push(s.status));
+    expect([...wanted]).toEqual(['user:b']);
+    expect(states).toEqual(['connecting']);
+    expect(ch.tables()).toEqual(['room']);
+    ch.setQueries([(client.query('room', {} as any) as any).limit(3).ignoreUnusedArgs().build()]);
+    expect(() => client.channel([{} as any], [])).toThrow(/pass a query/);
+
+    // Subscriptions see channel values folded in.
+    const { hash } = await (client.query('room', {} as any) as any).build().run();
+    const stop = await client.subscribe(hash, () => {}, { immediate: true });
+
+    // Ephemeral-only: no write at all.
+    expect(await client.update('room', 'room:1', { pos: '3' })).toEqual({ pos: '3' });
+    expect(client.state.outbox).toHaveLength(0);
+    // Mixed create: the database gets the persistent part only.
+    expect(await client.create('room:2', { a: 1, pos: 'x' })).toMatchObject({ a: 1, pos: 'x' });
+    expect(client.state.outbox).toHaveLength(1);
+    await expect(client.delete('', 'room:2')).resolves.toBeUndefined();
+
+    // The channel's own writes.
+    expect(await ch.update('room', 'room:1', { pos: '4' } as never)).toEqual({ pos: '4' });
+    expect(await ch.create('room:4', { a: 2 } as never)).toBeTruthy();
+    await expect(ch.delete('room', 'room:4')).resolves.toBeUndefined();
+    expect(() => ch.update('nope' as never, 'nope:1', {} as never)).toThrow(/no query on 'nope'/);
+    // The filter is checked against the stored row.
+    expect(await (client as any).channels.deps.rows.read('room:1')).toBeNull();
+
+    const deps = (client as any).channels.deps.rows;
+    expect(await deps.create('room', 'room:3', { a: 1 }, 1000)).toBe(true);
+    expect(client.state.peerWrites.get('room:3')).toMatchObject({ kind: 'create' });
+    expect(await deps.delete('room', 'room:3', 1000)).toBe(true);
+    expect(client.state.peerWrites.has('room:3')).toBe(false);
+    ch.setPeers(['user:c']);
+    expect([...wanted]).toEqual(['user:c']);
+    ch.close();
+    expect([...wanted]).toEqual([]);
+    expect(ch.state().status).toBe('connecting');
+    stop();
+    await client.close();
+  });
+
+  it('builds the WebRTC transport by default (unsupported without RTCPeerConnection)', async () => {
+    const { client } = channelClient();
+    await client.init();
+    (client as any).channels.setUser('user:a');
+    const ch = client.channel((client.query('room', {} as any) as any).build(), ['user:b']);
+    expect(ch.state().status).toBe('unsupported');
+    ch.close();
+    await client.close();
+  });
+});

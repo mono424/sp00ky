@@ -51,6 +51,24 @@ Returns `{ data, ready, error, isLoading, isFetching, isAuthoritative, hasData, 
 
 Rows are Solid 2 store proxies; class instances (RecordId) are proxied with bound methods. `db.delete('table', row.id)` works; for surrealdb APIs that check `instanceof`, unwrap with `snapshot(row)` first.
 
+## Peer to peer channels (experimental)
+
+Mark a table `-- @channel` (and peer-only fields `-- @ephemeral`, which must be `option<...>`), then open a channel over the rows of a query for the component's lifetime:
+
+```ts
+const ch = useChannel(
+  () => db.query('message').where({ conversation: convoId() }),   // only the where counts
+  () => [me(), other()]
+);
+ch.status(); // 'idle' | 'connecting' | 'connected' | 'failed' | 'unsupported'
+
+// No new write API: writes to rows matching the filter reach the peers over WebRTC,
+// and every createQuery showing the row reflects them. @ephemeral fields never hit the DB.
+await db.create('message:' + crypto.randomUUID(), { conversation: convoId(), text });
+```
+
+Typed from the query. `orderBy` / `limit` / `select` / `.one()` are ignored by a channel and warn; add `.ignoreUnusedArgs()` when the query is shared with a list on purpose. Peer writes are claims: normal fields, creates and deletes show until the server confirms them (5 s max), ephemeral fields last writer wins. Decide what to accept per table with the client config `channels.accept`. Docs: `/docs/client/channels`.
+
 ## Mutations
 
 Engine is optimistic local-first end to end (local commit → live re-emit → outbox sync; `db.run()` creates an outbox job row `status: 'pending'`). Use plain `db.create/update/delete/run`. For UI pending/error state:

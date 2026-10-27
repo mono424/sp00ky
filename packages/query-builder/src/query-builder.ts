@@ -52,6 +52,13 @@ function assertNotOpaque(
     // rather than a name suffix, so the key is always the bare column name.
     const column: ColumnSchema | undefined =
       table.columns[field] ?? table.columns[field.split('.')[0]];
+    if (column?.ephemeral) {
+      throw new Error(
+        `Cannot use '${field}' in ${clause}(): it is marked '-- @ephemeral' on ` +
+          `${tableName}, so it only travels between peers and the database never ` +
+          `holds it. Read the field from query results instead.`
+      );
+    }
     if (column?.opaque) {
       throw new Error(
         `Cannot use '${field}' in ${clause}(): it is marked '-- @opaque' on ` +
@@ -215,6 +222,7 @@ export class InnerQuery<
     return this.executor(this);
   }
 
+
   public buildUpdateQuery(patches: any[]): QueryInfo {
     return buildQueryFromOptions('UPDATE', this._tableName, this.options, this.schema, patches);
   }
@@ -340,6 +348,11 @@ export class FinalQuery<
 
   get hash(): number {
     return this._innerQuery.hash;
+  }
+
+  /** Whether `.ignoreUnusedArgs()` was called on the builder. */
+  get ignoresUnusedArgs(): boolean {
+    return this.options.ignoreUnusedArgs === true;
   }
 }
 
@@ -541,6 +554,19 @@ export class QueryBuilder<
    */
   offset(count: number): QueryBuilder<S, TableName, R, RelatedFields, IsOne> {
     this.options.offset = count;
+    return this;
+  }
+
+  /**
+   * Say that parts of this query are ignored where it is used, on purpose.
+   * A channel (`useChannel(query, peers)`) only reads the `where`, so
+   * `orderBy`, `limit`, `offset`, `select` and `.one()` do nothing there and
+   * draw a warning; this silences it while showing the reader the query
+   * carries arguments that do not apply (handy when one query object serves
+   * both a list and a channel).
+   */
+  ignoreUnusedArgs(): QueryBuilder<S, TableName, R, RelatedFields, IsOne> {
+    this.options.ignoreUnusedArgs = true;
     return this;
   }
 

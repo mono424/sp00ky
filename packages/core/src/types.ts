@@ -1,5 +1,6 @@
+import type { ChannelHandle, ChannelsConfig } from './modules/channel/index';
 import type { ImpersonationBannerConfig } from './modules/auth/impersonation-banner';
-import type { RecordId, SchemaStructure, QueryPlan } from '@spooky-sync/query-builder';
+import type { FinalQuery, GetTable, QueryBuilder, RecordId, SchemaStructure, QueryPlan, TableModel, TableNames } from '@spooky-sync/query-builder';
 import type { Level, LoggerOptions } from 'pino';
 import type { PushEventOptions } from './events/index';
 import type { LocalEngineChoice } from './services/database/cache-engine';
@@ -280,6 +281,14 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    * out of apps that don't use collaboration. Defaults to `false`.
    */
   crdt?: boolean;
+  /**
+   * Peer to peer channels for `-- @channel` tables (see `.channel(peers)` on
+   * a query). `accept` holds the app's rules per table: which peer updates to
+   * apply. `iceServers` configures the default WebRTC transport (a public
+   * STUN server when omitted; add TURN for networks that block direct
+   * connections), `transport` replaces it.
+   */
+  channels?: ChannelsConfig;
   /**
    * Cadence (ms) for the `_00_list_ref` poll that catches cross-session
    * UPDATEs the SurrealDB v3 LIVE-permission gap drops. Lower = faster
@@ -890,4 +899,33 @@ export interface DebounceOptions {
    * delay is lost on reload. Meant for throwaway state like a cursor position.
    */
   flushOnHide?: boolean;
+}
+
+/** A query a channel takes its filter from: a builder or a built query, on a `-- @channel` table. */
+export type ChannelQuery<S extends SchemaStructure, T extends TableNames<S>> =
+  | QueryBuilder<S, T, any, any, any>
+  | FinalQuery<S, T, any, any, any, any>;
+
+/**
+ * An open peer to peer channel (`client.channel(queries, peers)`): its
+ * state, plus writes that go to ITS peers only (when the row matches its
+ * filter). Plain `create` / `update` / `delete` reach the peers of every
+ * open channel whose filter the row matches.
+ */
+export interface Sp00kyChannel<S extends SchemaStructure, T extends string> extends Omit<ChannelHandle, 'tables' | 'setScopes'> {
+  /** The tables its queries read. */
+  tables(): ReadonlyArray<T>;
+  /** Replace the queries (their filters changed). */
+  setQueries(queries: ChannelQuery<S, T & TableNames<S>> | ReadonlyArray<ChannelQuery<S, T & TableNames<S>>>): void;
+  update<N extends T>(
+    table: N,
+    id: string,
+    data: Partial<TableModel<GetTable<S, N & TableNames<S>>>>,
+    options?: UpdateOptions
+  ): Promise<Partial<TableModel<GetTable<S, N & TableNames<S>>>>>;
+  create<N extends T>(
+    id: `${N}:${string}`,
+    data: Partial<TableModel<GetTable<S, N & TableNames<S>>>>
+  ): Promise<Partial<TableModel<GetTable<S, N & TableNames<S>>>>>;
+  delete<N extends T>(table: N, id: string): Promise<void>;
 }

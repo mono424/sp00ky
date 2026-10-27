@@ -243,6 +243,22 @@ export function planDeleteTx(input: WritePlanInput): LocalTx {
 }
 
 /**
+ * A channel peer's create: the row alone, no outbox entry (the peer's own
+ * client pushes it). Result index 0 is the row.
+ */
+export function planPeerCreateTx(input: { recordId: RecordId<string>; data: Record<string, unknown> }): LocalTx {
+  const keys = Object.keys(input.data).map((key) => ({ key, variable: `data_${key}` }));
+  const vars: Vars = { id: input.recordId };
+  for (const { key, variable } of keys) vars[variable] = input.data[key];
+  return { query: surql.seal<unknown>(surql.tx([surql.createSet('id', keys)]), { resultIndex: 0 }), vars };
+}
+
+/** Undo a peer's create the server never confirmed: the row alone, no outbox entry. */
+export function planPeerUndoTx(recordId: RecordId<string>): LocalTx {
+  return { query: surql.seal<unknown>(surql.tx([surql.delete('id')])), vars: { id: recordId } };
+}
+
+/**
  * Debounced update: bump `_00_rv` and MERGE now; the outbox row comes later.
  * With a `mirror`, the merged patch so far is written to `_00_pending_writes`
  * in the same transaction, so the row never changes without a durable copy of

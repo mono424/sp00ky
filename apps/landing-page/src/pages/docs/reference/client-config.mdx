@@ -119,6 +119,20 @@ for a pause, so other editors see the text a few hundred ms behind, not
 seconds. Lower values reach other editors sooner and create more rows (the
 SSP folds them into the document either way). Defaults to `200`.
 
+#### `channels`
+
+Settings for [peer to peer channels](/docs/client/channels) on `-- @channel` tables:
+
+- `accept`: per table, `({ kind, from, table, id, row, patch }) => boolean`. Decides whether a peer's
+  update, create or delete (`kind`) is applied, after the built-in checks (sender listed by an open channel
+  whose query the row matches, fields exist and fit their column type). Without a rule every such write
+  is applied.
+- `iceServers`: STUN/TURN servers for the default WebRTC transport. Defaults to a public STUN server;
+  add TURN for networks that block direct connections.
+- `transport`: a `ChannelTransportFactory` that replaces WebRTC (an existing room or relay).
+- `confirmTimeoutMs`: how long a peer's persistent value, create or delete shows without the server
+  confirming it. Defaults to `5000`.
+
 #### `liveInlineBodies`
 
 Carry a changed row's body on the client's LIVE notification (`FETCH out`)

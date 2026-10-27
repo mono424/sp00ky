@@ -1,7 +1,7 @@
 import { describe, it, expect, expectTypeOf } from 'vitest';
 import { QueryBuilder, buildQueryFromOptions } from './query-builder';
 import { RecordId } from 'surrealdb';
-import type { TableModel } from './table-schema';
+import type { ChannelTableNames, TableModel } from './table-schema';
 
 // Schema for testing the new array-based API
 const testSchema = {
@@ -675,5 +675,53 @@ describe('@opaque column guards', () => {
     expect(() =>
       new QueryBuilder(multi, 'other').where({ thumbnail: 'x' } as never)
     ).not.toThrow();
+  });
+});
+
+// `-- @channel` tables accept `.channel(peers)`; `-- @ephemeral` columns only
+// travel between peers, so the server can never filter on them.
+const channelSchema = {
+  tables: [
+    {
+      name: 'call' as const,
+      columns: {
+        id: { type: 'string' as const, optional: false, recordId: true },
+        caller: { type: 'string' as const, optional: false, recordId: true },
+        callee: { type: 'string' as const, optional: false, recordId: true },
+        view_pos: { type: 'string' as const, optional: true, ephemeral: true },
+      },
+      channel: true as const,
+      primaryKey: ['id'] as const,
+    },
+    {
+      name: 'note' as const,
+      columns: {
+        id: { type: 'string' as const, optional: false, recordId: true },
+        title: { type: 'string' as const, optional: false },
+      },
+      primaryKey: ['id'] as const,
+    },
+  ],
+  relationships: [],
+  backends: {},
+} as const;
+
+describe('channel schema', () => {
+  it('rejects an ephemeral column in where() and orderBy()', () => {
+    expect(() => new QueryBuilder(channelSchema, 'call').where({ view_pos: '1' } as never)).toThrow(/@ephemeral/);
+    expect(() => new QueryBuilder(channelSchema, 'call').orderBy('view_pos' as never)).toThrow(/@ephemeral/);
+  });
+
+  it('ignoreUnusedArgs marks the query without changing it', () => {
+    const plain = new QueryBuilder(channelSchema, 'call').limit(5).build();
+    const marked = new QueryBuilder(channelSchema, 'call').limit(5).ignoreUnusedArgs().build();
+    expect(plain.ignoresUnusedArgs).toBe(false);
+    expect(marked.ignoresUnusedArgs).toBe(true);
+    expect(marked.hash).toBe(plain.hash);
+    expect(marked.innerQuery.selectQuery.query).toBe(plain.innerQuery.selectQuery.query);
+  });
+
+  it('names the channel tables', () => {
+    expectTypeOf<ChannelTableNames<typeof channelSchema>>().toEqualTypeOf<'call'>();
   });
 });

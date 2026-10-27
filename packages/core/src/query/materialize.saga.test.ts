@@ -54,6 +54,18 @@ describe('materialize', () => {
     const l = await runPure(materialize('a'), { state: live, handlers: { 'local.select': (e: any) => e.plan.ids.map((id: any) => ({ id: `${id.table}:${id.id}` })) } });
     expect(l.state.queries.get('a')!.records).toEqual([{ id: 'thing:2' }]);
   });
+  it("cold: a peer's unconfirmed delete hides the row the store still holds", async () => {
+    const s = buildState(
+      [buildEntry({ def: { hash: 'a', plan } })],
+      vouch('thing:1', 'thing:2'),
+      R.setPeerWrite('thing:2', { kind: 'delete', table: 'thing', expiresAt: 1 })
+    );
+    const out = await runPure(materialize('a'), {
+      state: s,
+      handlers: { 'local.select': () => [{ id: 'thing:1' }, { id: 'thing:2' }, { name: 'no id' }] },
+    });
+    expect(out.state.queries.get('a')!.records).toEqual([{ id: 'thing:1' }, { name: 'no id' }]);
+  });
   it('cold window renders the SSP local window (orphans dropped); live renders membership with the overlay', async () => {
     const win = buildState(
       [buildEntry({ def: { hash: 'w', plan: { ...plan, offset: 5 }, surql: 'SELECT * FROM thing LIMIT 5 START 5' }, localArray: [['thing:7', 1], ['thing:8', 1]] })],

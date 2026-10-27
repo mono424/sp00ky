@@ -2,6 +2,7 @@ import type { ConnectionState, QueryHash, RecordVersionArray, SyncHealth } from 
 import type {
   ClientState,
   OutboxItem,
+  PeerWrite,
   PendingWrite,
   QueryEntry,
   QueryTelemetry,
@@ -375,6 +376,25 @@ export const outboxReplace =
     return next;
   };
 
+/** A channel peer's create or delete is now showing; its table re-renders. */
+export const setPeerWrite =
+  (id: string, write: PeerWrite): Reducer =>
+  (s) => {
+    const peerWrites = new Map(s.peerWrites);
+    peerWrites.set(id, write);
+    return markTableDirty(write.table)({ ...s, peerWrites });
+  };
+
+export const clearPeerWrite =
+  (id: string): Reducer =>
+  (s) => {
+    const write = s.peerWrites.get(id);
+    if (!write) return s;
+    const peerWrites = new Map(s.peerWrites);
+    peerWrites.delete(id);
+    return markTableDirty(write.table)({ ...s, peerWrites });
+  };
+
 export const outboxPush =
   (item: OutboxItem): Reducer =>
   (s) =>
@@ -505,6 +525,7 @@ export const clearBucketState = (): Reducer => (s) => ({
   views: new Map(),
   outbox: [],
   pendingWrites: new Map(),
+  peerWrites: new Map(),
   dirty: new Set(),
   membershipDirty: new Set(),
   membershipReread: new Map(),

@@ -42,6 +42,7 @@ export const docsNav = [
       { text: 'Admin impersonation', href: `${basePath}/docs/client/impersonation` },
       { text: 'File buckets', href: `${basePath}/docs/client/buckets`, experimental: true },
       { text: 'CRDT fields', href: `${basePath}/docs/client/crdt`, experimental: true },
+      { text: 'Peer to peer channels', href: `${basePath}/docs/client/channels`, experimental: true },
     ],
   },
   {

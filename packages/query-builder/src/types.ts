@@ -149,7 +149,17 @@ export interface QueryOptions<TModel extends GenericModel, IsOne extends boolean
   /** Related tables to include via subqueries */
   related?: RelatedQuery[];
   isOne?: IsOne;
+  /**
+   * Set by `.ignoreUnusedArgs()`: the caller knows some parts of this query
+   * are ignored where it is used (a channel only reads the `where`), so no
+   * warning is wanted. Not part of the query: never changes surql or hash.
+   */
+  ignoreUnusedArgs?: boolean;
 }
+
+/** A user a channel connects to: a record id, its string form, or nothing. */
+export type ChannelPeer = string | { toString(): string } | null | undefined;
+
 
 export type LiveQueryOptions<TModel extends GenericModel> = Omit<
   QueryOptions<TModel, boolean>,

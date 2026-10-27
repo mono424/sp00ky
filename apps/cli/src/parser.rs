@@ -30,6 +30,11 @@ pub struct TableSchema {
     /// skip it during snapshot/bootstrap. The table still exists in the main
     /// DB (and is backed up). Set in `parse_file` from `extract_table_annotations`.
     pub no_sync: bool,
+    /// True when the table is marked `-- @channel`: clients may open peer to
+    /// peer channels on its rows (`.channel(peers)` on a query) and send
+    /// updates straight to each other. Its `-- @ephemeral` fields only ever
+    /// travel over those channels.
+    pub channel: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -205,9 +210,12 @@ impl SchemaParser {
         // Apply table-level annotations (e.g. `-- @nosync`). Parsed from the raw
         // content because surrealdb-core strips comments during parsing.
         for (table_name, anns) in crate::annotations::extract_table_annotations(content) {
-            if crate::annotations::has_annotation(&anns, "nosync") {
-                if let Some(table) = self.tables.get_mut(&table_name) {
+            if let Some(table) = self.tables.get_mut(&table_name) {
+                if crate::annotations::has_annotation(&anns, "nosync") {
                     table.no_sync = true;
+                }
+                if crate::annotations::has_annotation(&anns, "channel") {
+                    table.channel = true;
                 }
             }
         }
@@ -237,6 +245,7 @@ impl SchemaParser {
         self.propagate_strip_to_child_paths();
 
         self.validate_excluded_field_usage(content)?;
+        self.validate_channel_annotations()?;
 
         Ok(())
     }
@@ -260,6 +269,50 @@ impl SchemaParser {
     /// The SSP enforces (1) again at registration time, but only for a query
     /// that actually reaches it. Failing at deploy is what makes it a schema
     /// error the author sees immediately rather than an empty list in the app.
+    /// `-- @channel` / `-- @ephemeral` rules. An ephemeral field is never
+    /// written to the database, so the table must be a channel table (the only
+    /// way the value can travel), and the field must be optional (a SCHEMAFULL
+    /// create would otherwise demand a value that never comes).
+    fn validate_channel_annotations(&self) -> Result<()> {
+        for (table_name, table) in &self.tables {
+            if table.channel && table.no_sync {
+                anyhow::bail!(
+                    "Table '{table_name}' is marked both `-- @channel` and `-- @nosync`. \
+                     A channel sends row updates between clients, which never hold a \
+                     @nosync table. Remove one of the two."
+                );
+            }
+            for (field_name, field) in &table.fields {
+                if !crate::annotations::has_annotation(&field.annotations, "ephemeral") {
+                    continue;
+                }
+                if !table.channel {
+                    anyhow::bail!(
+                        "Field '{table_name}.{field_name}' is `-- @ephemeral` but table \
+                         '{table_name}' is not `-- @channel`. Ephemeral values only travel \
+                         over channels: add `-- @channel` above `DEFINE TABLE {table_name}`."
+                    );
+                }
+                for other in ["crdt", "opaque", "nosync", "parent", "cursor"] {
+                    if crate::annotations::has_annotation(&field.annotations, other) {
+                        anyhow::bail!(
+                            "Field '{table_name}.{field_name}' cannot be both `-- @ephemeral` \
+                             and `-- @{other}`."
+                        );
+                    }
+                }
+                if !field.optional && !matches!(field.field_type, FieldType::Option(_)) {
+                    anyhow::bail!(
+                        "Field '{table_name}.{field_name}' is `-- @ephemeral`, so the database \
+                         never receives a value for it. Declare it optional \
+                         (`TYPE option<...>`)."
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_excluded_field_usage(&self, content: &str) -> Result<()> {
         use regex::Regex;
 
@@ -595,6 +648,7 @@ impl SchemaParser {
                         relation_to,
                         table_permissions,
                         no_sync: false,
+                        channel: false,
                     },
                 );
             }
@@ -1100,5 +1154,58 @@ DEFINE FIELD meta.secret ON TABLE user TYPE string;
             fields.get("meta.secret").expect("child field").should_strip,
             "child of a stripped parent must be stripped too"
         );
+    }
+
+    #[test]
+    fn channel_table_and_ephemeral_field_parse() {
+        let p = parse(
+            "\
+-- @channel
+DEFINE TABLE call SCHEMAFULL PERMISSIONS FULL;
+DEFINE FIELD view_id ON TABLE call TYPE option<string>;
+-- @ephemeral
+DEFINE FIELD view_pos ON TABLE call TYPE option<string>;
+",
+        )
+        .expect("parses");
+        let call = p.tables.get("call").expect("call table");
+        assert!(call.channel, "@channel must mark the table");
+        let pos = call.fields.get("view_pos").expect("view_pos");
+        assert!(crate::annotations::has_annotation(&pos.annotations, "ephemeral"));
+        assert!(!pos.should_strip, "an ephemeral field stays in the client schema");
+    }
+
+    #[test]
+    fn ephemeral_field_needs_a_channel_table() {
+        let err = parse(
+            "\
+DEFINE TABLE call SCHEMAFULL PERMISSIONS FULL;
+-- @ephemeral
+DEFINE FIELD view_pos ON TABLE call TYPE option<string>;
+",
+        )
+        .err()
+        .expect("must be rejected");
+        assert!(err.to_string().contains("@channel"), "{err}");
+    }
+
+    #[test]
+    fn ephemeral_field_must_be_optional() {
+        let err = parse(
+            "\
+-- @channel
+DEFINE TABLE call SCHEMAFULL PERMISSIONS FULL;
+-- @ephemeral
+DEFINE FIELD view_pos ON TABLE call TYPE string;
+",
+        )
+        .err()
+        .expect("must be rejected");
+        assert!(err.to_string().contains("option<"), "{err}");
+    }
+
+    #[test]
+    fn channel_and_nosync_conflict() {
+        assert!(parse("-- @channel\n-- @nosync\nDEFINE TABLE call SCHEMAFULL PERMISSIONS FULL;\n").is_err());
     }
 }

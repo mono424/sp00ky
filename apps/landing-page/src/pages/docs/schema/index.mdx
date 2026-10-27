@@ -39,6 +39,8 @@ table or field is generated and synced.
 | `-- @nosync` | above a `DEFINE TABLE` or `DEFINE FIELD` | Server-only table or field. Excluded from sync entirely (see below). |
 | `-- @opaque` | above a `DEFINE FIELD` | Field is synced to the client but never stored by the sync engine, so it can't be filtered or ordered on (see below). |
 | `-- @crdt text` / `-- @crdt prosemirror` | above a `DEFINE FIELD ... TYPE string` | Collaborative field backed by a Loro document. Edits travel through a generated edit log; the field itself holds the server-written plain text (see below). |
+| `-- @channel` | above a `DEFINE TABLE` | Clients may open [peer to peer channels](/docs/client/channels) on the table's rows (`.channel(peers)` on a query); updates reach the other participants directly, on top of the normal sync. |
+| `-- @ephemeral` | above a `DEFINE FIELD` (of a `@channel` table, `TYPE option<...>`) | Field only travels between peers over channels and is never written to the database. |
 | `-- @cursor` | above a `DEFINE FIELD` (with `@crdt`) | Adds per-session presence (remote cursors) for that field, in a generated `<table>__crdt_presence` table. |
 | `-- @parent` | suffix on a `DEFINE FIELD ... TYPE record<...>` | Marks the parent side of a relationship; written automatically from the auth context, never by client code. |
 

@@ -48,7 +48,13 @@ export function* materialize(hash: QueryHash): Saga<void> {
   let rows: Record<string, unknown>[];
   try {
     rows = rowsFromResult(effect, yield effect);
-    if (ids === null) rows = rows.filter((row) => paints(rowKey(row)));
+    // A peer's delete leaves the row in the store until it is confirmed, so
+    // the predicate scan must drop it here (an own delete removed it already).
+    if (ids === null)
+      rows = rows.filter((row) => {
+        const key = rowKey(row);
+        return paints(key) && !(key !== null && ov.deletes.has(key));
+      });
   } catch (error) {
     yield fx.state.update(R.compose(R.recordError(hash), R.clearDirty(hash)));
     yield fx.emit({ type: 'log', level: 'warn', message: 'materialize failed', data: { hash, error } });

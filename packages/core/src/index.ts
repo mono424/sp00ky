@@ -3,6 +3,23 @@ export * from './sp00ky';
 export * from './modules/auth/index';
 export { CrdtField, CrdtManager, cursorColorFromName, CURSOR_COLORS } from './modules/crdt/index';
 export {
+  type ChannelAcceptRule,
+  type ChannelHandle,
+  type ChannelScope,
+  matchesWhere,
+  unusedArgs,
+  type ChannelMessage,
+  type ChannelOp,
+  type ChannelState,
+  type ChannelStatus,
+  type ChannelTransport,
+  type ChannelTransportFactory,
+  type ChannelsConfig,
+  type PeerRef,
+  type TransportHooks,
+} from './modules/channel/index';
+export { webrtcTransport, surrealSignal, type SignalPort, type Signal, type OutgoingSignal } from './modules/channel/webrtc';
+export {
   FeatureFlagModule,
   FeatureFlagHandle,
   type FeatureFlagOptions,

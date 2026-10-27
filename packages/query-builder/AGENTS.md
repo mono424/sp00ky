@@ -42,6 +42,7 @@ db.query('thread')                              // QueryBuilder<Schema, 'thread'
 - `.select(...fields)` — narrow returned columns. Calling twice throws.
 - `.orderBy(field, 'asc' | 'desc')`.
 - `.limit(n)`, `.offset(n)`.
+- `.ignoreUnusedArgs()`: marks that parts of the query do nothing where it is used, on purpose (a peer to peer channel, `useChannel(query, peers)`, only reads the `where`; without this its `orderBy` / `limit` / `offset` / `select` / `.one()` draw a warning). Changes neither surql nor hash.
 - `.related(field, modifier?)` — pull in a related record (or array) by field name. `modifier` is a builder callback for nested filters / selects on the related table. Three signatures: `(field)`, `(field, modifier)`, `(field, cardinality, modifier)`.
 - `.build()` — produces a `FinalQuery`.
 - `FinalQuery.run()` — executes via the configured executor.

@@ -4,6 +4,7 @@ mod agents;
 mod annotations;
 mod backend;
 mod bucket;
+mod channel_schema;
 mod cloud;
 mod codegen;
 mod create;

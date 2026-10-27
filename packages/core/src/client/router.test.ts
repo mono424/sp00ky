@@ -22,6 +22,7 @@ describe('route', () => {
       [{ type: 'GcTick' }, 'dedupe:gc'],
       [{ type: 'Drain' }, 'serial:outbox'],
       [{ type: 'FlushWrite', key: 'k' }, 'serial:outbox-write'],
+      [{ type: 'PeerWriteExpired', id: 'thing:1' }, 'serial:peer:thing:1'],
       [{ type: 'FlushPendingWrites' }, undefined],
       [{ type: 'AdoptPendingWrites' }, 'serial:outbox-write'],
       [{ type: 'PollTick' }, 'dedupe:poll'],

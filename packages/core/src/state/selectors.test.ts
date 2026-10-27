@@ -35,6 +35,21 @@ describe('overlay and outbox counts', () => {
   });
 });
 
+describe('overlay with channel peers', () => {
+  it('shows peer creates as writes and peer deletes as deletes', () => {
+    const s = buildState(
+      [],
+      R.setPeerWrite('thing:1', { kind: 'create', table: 'thing', expiresAt: 1 }),
+      R.setPeerWrite('thing:2', { kind: 'delete', table: 'thing', expiresAt: 1 })
+    );
+    const o = S.overlay(s);
+    expect([...o.writes]).toEqual(['thing:1']);
+    expect([...o.deletes]).toEqual(['thing:2']);
+    // Not an own write: nothing to push.
+    expect(S.pendingMutationCount(s)).toBe(0);
+  });
+});
+
 describe('needed / planFetch / settled', () => {
   const live = { phase: 'live' } as const;
   it('needed compares membership versions against local versions and skips pending deletes', () => {

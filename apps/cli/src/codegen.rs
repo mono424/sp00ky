@@ -382,6 +382,7 @@ impl CodeGenerator {
                                 let has_cursor = col_def.get("x-cursor").is_some();
                                 let is_parent = col_def.get("x-parent").is_some();
                                 let is_opaque = col_def.get("x-opaque").is_some();
+                                let is_ephemeral = col_def.get("x-ephemeral").is_some();
 
                                 let clean_col_name = col_name.replace("`", "");
 
@@ -424,6 +425,13 @@ impl CodeGenerator {
                                 if is_opaque {
                                     flags.push("opaque: true".to_string());
                                 }
+                                // `@ephemeral`: travels only over peer to peer
+                                // channels, never to the database. The client
+                                // keeps it out of writes and the query builder
+                                // rejects it in where/orderBy.
+                                if is_ephemeral {
+                                    flags.push("ephemeral: true".to_string());
+                                }
                                 // `array<T>`: `col_type` is already the element
                                 // type (via map_json_schema_type_to_value_type),
                                 // so flag it so the runtime value is `T[]`.
@@ -458,6 +466,11 @@ impl CodeGenerator {
                     }
 
                     tables_lines.push("      },".to_string());
+                    // `-- @channel`: `.channel(peers)` is only offered (and
+                    // only accepted at runtime) on tables carrying this.
+                    if table_def.get("x-channel").and_then(|v| v.as_bool()) == Some(true) {
+                        tables_lines.push("      channel: true as const,".to_string());
+                    }
                     tables_lines.push("      primaryKey: ['id'] as const".to_string());
                     tables_lines.push("    },".to_string());
                 }

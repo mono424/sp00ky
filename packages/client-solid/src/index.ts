@@ -11,9 +11,13 @@ import {
   type PreloadOptions,
   type PreloadRefresh,
   type WebPushModule,
+  type Sp00kyChannel,
+  type ChannelQuery,
 } from '@spooky-sync/core';
 
 import type {
+  ChannelPeer,
+  ChannelTableNames,
   GetTable,
   QueryBuilder,
   SchemaStructure,
@@ -83,6 +87,8 @@ export {
   type PushNotification,
 } from '@spooky-sync/core';
 export { useCrdtField } from './lib/use-crdt-field';
+export { useChannel, type UseChannel, type ChannelPeers, type ChannelQueries } from './lib/use-channel';
+export type { ChannelState, ChannelStatus, ChannelOp, ChannelsConfig, Sp00kyChannel } from '@spooky-sync/core';
 export { useFeatureFlag, type UseFeatureFlag } from './lib/use-feature-flag';
 export {
   useAppRelease,
@@ -277,6 +283,19 @@ export class SyncedDb<S extends SchemaStructure> {
   ): QueryBuilder<S, TName, Sp00kyQueryResultPromise, {}, false> {
     if (!this.sp00ky) throw new Error('SyncedDb not initialized');
     return this.sp00ky.query(table, {});
+  }
+
+  /**
+   * Open a peer to peer channel to `peers` for the rows `query` matches (a
+   * query on a `-- @channel` table; only its `where` counts). Prefer the
+   * `useChannel` hook, which closes it with the component.
+   */
+  public channel<T extends ChannelTableNames<S>>(
+    query: ChannelQuery<S, T> | ReadonlyArray<ChannelQuery<S, T>>,
+    peers: Iterable<ChannelPeer>
+  ): Sp00kyChannel<S, T> {
+    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
+    return this.sp00ky.channel(query, peers);
   }
 
   /**

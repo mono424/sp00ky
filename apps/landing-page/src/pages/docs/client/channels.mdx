@@ -1,0 +1,307 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Peer to peer channels
+description: Open a channel to other users over the rows of a query with useChannel and their writes reach you over WebRTC in tens of milliseconds, optimistically, with ephemeral fields that never touch the database.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+<Experimental>
+  Channels are experimental. The API may change between canary releases.
+</Experimental>
+
+A normal write reaches another device through the database: outbox, server, sync, about a second
+end to end. That is fine for a list. For a game, a shared cursor or "follow me through this game"
+in a call, it is too slow.
+
+A **channel** connects you to a few other users directly, over WebRTC, for the rows a query
+matches. Any write one of them makes to those rows reaches the others in tens of milliseconds and lands in their
+cache like their own optimistic write would. The normal sync still runs underneath, so the database
+stays the source of truth.
+
+## 1. Opt a table in
+
+Put `-- @channel` above the table. Fields that should travel **only** between peers, never to the
+database, get `-- @ephemeral`:
+
+<CodeBlock code={schemaCode} lang="sql" fileName="schema/src/schema.surql" />
+
+The rules, checked by `spky generate`:
+
+- `useChannel` only takes queries on `@channel` tables, both in the types and at runtime. Other
+  tables never fan out.
+- An `@ephemeral` field must be optional (`TYPE option<...>`): the database never gets a value
+  for it.
+- `@ephemeral` cannot be combined with `@crdt`, `@opaque`, `@nosync`, `@parent` or `@cursor`, and
+  you cannot filter or order on it (the query builder throws).
+- A `@channel` table cannot be `@nosync`.
+
+Apply the schema (`spky migrate` / `spky deploy`). It now also holds `_00_channel_signal`, the
+server-only table the connections are set up through.
+
+## 2. Open a channel
+
+`useChannel(query, peers)` opens a channel for as long as the component lives. The query says
+**which rows** the channel carries: only its `where` counts. It is checked against each row on both
+sides and never registered or synced. `peers` is a list of users, or an accessor of one, re-read
+when it changes. Your own id is skipped, so listing everyone is fine:
+
+<CodeBlock code={openCode} lang="tsx" />
+
+The query may be an accessor (re-read when it changes; returning nothing closes the channel until it
+returns a query again), a built query, or a list of queries. Everything is typed from the query:
+it must be on a `@channel` table, and the channel's writes take that table's fields.
+
+| `ch.status()` | Meaning |
+|---|---|
+| `idle` | The peers list is empty (or only you). |
+| `connecting` | Setting up a connection. |
+| `connected` | At least one listed user has a tab connected. `ch.peers()` lists them. |
+| `failed` | No connection could be made (see [networks](#networks-and-turn)). It keeps retrying. |
+| `unsupported` | No WebRTC in this runtime (SSR, tests). |
+
+Outside components, `db.channel(query, peers)` returns the same handle; call `close()` when done.
+
+<Note title="Both sides must list each other">
+  A connection only forms when each side's channel lists the other. Nobody can push themselves into
+  your channel, and leaving a user out disconnects them.
+</Note>
+
+### What the filter can be
+
+The `where` must be decidable from the row alone: the table's own fields (nested object paths
+included), literal values, and `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `NOT IN`, `CONTAINS`,
+`CONTAINSNOT` and `_or` groups. Opening a channel throws for `.related()`, a filter that follows a
+record link (`'conversation.owner'`) or a `$parameter`.
+
+`orderBy`, `limit`, `offset`, `select` and `.one()` do nothing in a channel. They are not an error,
+but each draws a warning (once per query shape). When one query object serves both a list and a
+channel, say so with `.ignoreUnusedArgs()`:
+
+<CodeBlock code={unusedCode} lang="ts" />
+
+## 3. Write as usual
+
+There is no new write API. `db.update`, `db.create` and `db.delete` reach the peers of every open
+channel whose filter the row matches:
+
+<CodeBlock code={writeCode} lang="ts" />
+
+What happens to each field of an update:
+
+| Field | You | Peers | Database |
+|---|---|---|---|
+| normal | optimistic, through the outbox (as always) | shows it at once, until their synced row catches up | written as always |
+| `@ephemeral` | in memory, shows at once | shows it at once, last writer wins | never sent |
+
+- **A peer's normal field is a claim.** A peer shows it until its own synced row holds the same
+  value, or for 5 seconds at most (`channels.confirmTimeoutMs`). A value the server rejected, or
+  one a peer made up, falls back to the server's on its own.
+- **Ephemeral values live as long as the connection.** A peer that connects later gets everyone's
+  current values; a peer that leaves takes its values with it.
+- **Writes never wait for the connection.** Before it is up, normal fields still sync; ephemeral
+  values go out the moment it opens.
+
+### Routing by the filter
+
+Each write goes only to the channels whose query the row matches, so with Bob's and Carol's chats
+open at once, a message in Bob's conversation reaches Bob and not Carol. A create is checked
+against the new row; an update or delete against the row as stored (one local read), before and
+after the patch, so a row moving to another conversation reaches both. The channel's own
+`ch.update` / `ch.create` / `ch.delete` limit a write to that channel's peers (and still only when
+the row matches its query).
+
+## Creates and deletes
+
+A created row reaches the peers the same way, so a new chat message shows up on the other side as
+fast as a cursor moves:
+
+<CodeBlock code={chatCode} lang="tsx" />
+
+- **The peer puts it in its cache like its own optimistic create**, so every query that matches it
+  shows it, sorted where it belongs. The server's row still downloads and replaces it, computed fields
+  (`VALUE time::now()`) included.
+- **Unconfirmed, it is undone.** If the peer's sync has not delivered the row within
+  `confirmTimeoutMs`, the peer removes it again. An id the peer already holds a synced row for is
+  refused, so a peer cannot overwrite real data.
+- **A delete hides the row on the peer** until the server confirms it. If the server never does, the
+  row comes back. Deleting a create that was never confirmed simply undoes it.
+- `@ephemeral` fields of a created row go to the peers' overlay, never their store.
+
+## Who may send what
+
+Sp00ky proves **who** sent an update. **What** to accept is your decision.
+
+What is checked for you, on every message:
+
+- The sender is listed by one of your open channels, and the row matches that channel's query: the
+  new row for a create, your copy for an update (before or after the patch) or a delete. An update
+  or delete of a row you do not hold is ignored, since there is nothing to check it against.
+- The table is `@channel`, every field exists on it and fits its column type.
+
+What you add: an `accept` rule per table, in the client config. It runs after those checks:
+
+<CodeBlock code={acceptCode} lang="ts" />
+
+The rule gets `{ kind, from, table, id, row, patch }`: `kind` is `update`, `create` or `delete`, `row`
+is the row as you show it (undefined for a create) and `patch` the fields (the whole new row for a
+create, `{}` for a delete).
+
+Ephemeral fields have no other check than your rule: the database never sees them. For normal
+fields the server still enforces your table permissions on the real write, so the worst a peer can
+do is show a wrong value for the confirm timeout.
+
+<Warning title="Identity comes from the signaling rows">
+  The database stamps each signaling row with its sender, and the offer carries the fingerprint of the
+  encrypted connection it opens. That is what lets the receiving tab know which user is on the other
+  end. Impersonation sessions may not open channels.
+</Warning>
+
+## How a connection is set up
+
+Signaling goes through the database, once per pair of tabs, not per message:
+
+1. A tab that wants user B writes a `hello` row to B. B's tabs hear it through one raw `LIVE SELECT`.
+2. Of the two tabs, the one with the lower id offers, the other answers. ICE candidates trickle in
+   small batches, so nothing waits for gathering to finish.
+3. The WebRTC data channel opens. From here on, messages go peer to peer.
+
+Setup costs about two database round trips plus the WebRTC handshake. Open the channel when the
+screen mounts and it is usually ready long before anyone writes. One connection per pair of tabs is shared
+by every channel between them. Old signaling rows are swept as new ones arrive.
+
+## Networks and TURN
+
+The default transport uses a public STUN server. Most connections work with that. Some networks
+(strict NATs, corporate firewalls) need a TURN relay; add one:
+
+<CodeBlock code={iceCode} lang="ts" />
+
+Without a connection, everything still works at normal sync speed, except ephemeral fields, which do
+not arrive. `ch.status()` is `failed`, so the UI can say so.
+
+A mesh connects every pair of participants, which suits 2 to 8 people (calls, games). An app that
+already has a room (a LiveKit call, its own relay) can replace the transport with `channels.transport`
+(see `ChannelTransport` in `@spooky-sync/core`).
+
+## Example: follow someone through a game in a call
+
+The call row holds what each side is looking at. The game stays persistent (it survives a reload),
+the move is ephemeral (scrubbing writes nothing to the database). The existing query keeps showing
+the row; the channel only makes the peer's writes arrive sooner:
+
+<CodeBlock code={followCode} lang="tsx" />
+
+## Limits
+
+- TypeScript clients only for now (`client-solid`, `client-solid2`, core). Flutter does not open
+  channels yet; its normal sync is unaffected.
+- Mesh topology, so small groups.
+
+<CardGrid>
+  <LinkCard title="Mutations" href="/docs/client/mutations" description="The optimistic writes channels build on." />
+  <LinkCard title="Schema annotations" href="/docs/schema" description="@channel, @ephemeral and the other descriptors." />
+  <LinkCard title="Client config" href="/docs/reference/client-config#channels" description="accept, iceServers, transport, confirmTimeoutMs." />
+</CardGrid>
+
+export const schemaCode = `-- @channel
+DEFINE TABLE call SCHEMAFULL
+  PERMISSIONS FOR select, update WHERE caller = $auth.id OR callee = $auth.id;
+
+DEFINE FIELD caller ON TABLE call TYPE record<user>;
+DEFINE FIELD callee ON TABLE call TYPE record<user>;
+-- persistent: synced as always, and sent to peers instantly
+DEFINE FIELD caller_view_id ON TABLE call TYPE option<string>;
+-- only ever travels between peers
+-- @ephemeral
+DEFINE FIELD caller_view_pos ON TABLE call TYPE option<string>;`;
+
+export const openCode = `import { useChannel } from '@spooky-sync/client-solid';
+
+const ch = useChannel(
+  () => db.query('message').where({ conversation: convoId() }),
+  () => [me(), other()]
+);
+
+ch.status();  // 'connecting' -> 'connected'
+ch.peers();   // ['user:bob']`;
+
+export const writeCode = `// both fields reach the peer in tens of ms;
+// only caller_view_id is written to the database
+await db.update('call', callId, {
+  caller_view_id: 'game:abc',
+  caller_view_pos: '12',
+});`;
+
+export const unusedCode = `// warns: the channel ignores orderBy and limit
+useChannel(messagesQuery(), peers);
+
+// shared with the list on purpose: no warning
+const messagesQuery = () =>
+  db.query('message')
+    .where({ conversation: convoId() })
+    .orderBy('created_ms')
+    .limit(50)
+    .ignoreUnusedArgs();`;
+
+export const acceptCode = `const db = new SyncedDb({
+  // ...
+  channels: {
+    accept: {
+      // each side may only write its own half of the call row
+      call: ({ from, row, patch }) => {
+        const side = from === String(row?.caller) ? 'caller_' : 'callee_';
+        return Object.keys(patch).every((field) => field.startsWith(side));
+      },
+      // a peer may only create messages it sent, and delete its own
+      message: ({ kind, from, row, patch }) =>
+        kind === 'create' ? String(patch.sender) === from : String(row?.sender) === from,
+    },
+  },
+});`;
+
+export const chatCode = `-- schema: -- @channel above DEFINE TABLE message
+
+useChannel(() => db.query('message').where({ conversation: convoId() }), () => [me(), other()]);
+const messages = useQuery(() =>
+  db.query('message').where({ conversation: convoId() }).orderBy('created_ms').build()
+);
+
+// the other side sees it in tens of ms, then it syncs as usual
+await db.create('message:' + crypto.randomUUID(), {
+  conversation: convoId(),
+  sender: me(),
+  recipient: other(),
+  text,
+  created_ms: Date.now(),
+});
+
+await db.delete('message', id);   // hidden on the other side at once`;
+
+export const iceCode = `channels: {
+  iceServers: [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
+  ],
+}`;
+
+export const followCode = `// Exactly the call row, while the call is up.
+useChannel(
+  () => db.query('call').where({ id: callId() }),
+  () => [call()?.caller, call()?.callee]
+);
+
+// The screen publishes where it is; nothing else changes.
+db.update('call', callId, { caller_view_id: gameId, caller_view_pos: String(ply) });
+
+// The follower's existing row query now gets the peer's position
+// in tens of ms instead of a second later.
+createEffect(() => {
+  const pos = call()?.callee_view_pos;
+  if (following() && pos != null) goToPly(Number(pos));
+});`;

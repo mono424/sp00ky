@@ -39,6 +39,7 @@ export type {
   WhereNode,
   WhereComparison,
   WhereOr,
+  ChannelPeer,
   RelationshipDefinition,
   RelationshipsMetadata,
   RelationshipFields,
@@ -59,6 +60,7 @@ export type {
 export type {
   SchemaStructure,
   TableNames,
+  ChannelTableNames,
   GetTable,
   TableModel,
   TableRelationships,

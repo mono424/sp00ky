@@ -494,6 +494,11 @@ impl JsonSchemaGenerator {
             definition.insert("additionalProperties".to_string(), Value::Bool(false));
         }
 
+        // `-- @channel`: codegen marks the table so `.channel()` type-checks.
+        if table.channel {
+            definition.insert("x-channel".to_string(), Value::Bool(true));
+        }
+
         Value::Object(definition)
     }
 

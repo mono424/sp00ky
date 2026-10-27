@@ -30,9 +30,9 @@ export const queryStatus = (s: ClientState, hash: QueryHash): QueryStatus | unde
 };
 
 export interface Overlay {
-  /** Ids with an unsynced or just-acked create/update. */
+  /** Ids with an unsynced or just-acked create/update (own, or a channel peer's create). */
   readonly writes: ReadonlySet<string>;
-  /** Ids with an unsynced or just-acked delete. */
+  /** Ids with an unsynced or just-acked delete (own, or a channel peer's). */
   readonly deletes: ReadonlySet<string>;
 }
 
@@ -43,6 +43,11 @@ export function overlay(s: ClientState): Overlay {
   for (const item of s.outbox) {
     if (item.type === 'delete') deletes.add(item.recordId);
     else writes.add(item.recordId);
+  }
+  // Channel peers' writes show exactly like our own until confirmed or undone.
+  for (const [id, write] of s.peerWrites) {
+    if (write.kind === 'delete') deletes.add(id);
+    else writes.add(id);
   }
   return { writes, deletes };
 }

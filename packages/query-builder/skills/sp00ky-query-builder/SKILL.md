@@ -94,6 +94,7 @@ const query = new QueryBuilder(schema, 'post')
 | `limit` | `.limit(count)` | Limit the number of results. |
 | `offset` | `.offset(count)` | Skip the first N results. |
 | `one` | `.one()` | Return a single object instead of an array. Implicitly sets `limit(1)`. |
+| `ignoreUnusedArgs` | `.ignoreUnusedArgs()` | Silence the warning a peer to peer channel (`useChannel(query, peers)`, which only reads the `where`) gives for `orderBy` / `limit` / `offset` / `select` / `.one()`. Changes neither the query nor its hash. |
 | `related` | `.related(field, modifier?)` | Include related data via subquery. See [Relationships](#relationships). |
 | `build` | `.build()` | Finalize the query into a `FinalQuery` object. |
 

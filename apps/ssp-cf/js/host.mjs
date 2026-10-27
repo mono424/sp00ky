@@ -25,7 +25,7 @@ import {
 } from "@cloudflare/dynamic-workflows";
 import ssp from "./index.js";
 import backends, { exposeHost } from "./backends.mjs";
-import { envSecretName, exposedBackend } from "./routing.mjs";
+import { bundleModules, envSecretName, exposedBackend } from "./routing.mjs";
 
 export { SspNodeDo } from "./index.js";
 // Required by wrapWorkflowBinding: the wrapped bindings are stubs of this class.
@@ -63,7 +63,7 @@ function load(name) {
 		compatibilityDate: backend.compatibilityDate,
 		compatibilityFlags: backend.compatibilityFlags ?? [],
 		mainModule: "main.js",
-		modules: { "main.js": backend.code },
+		modules: bundleModules(backend.code),
 		env: backendEnv(name, backend),
 	}));
 }

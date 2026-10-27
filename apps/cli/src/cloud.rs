@@ -2268,7 +2268,10 @@ fn worker_has_nodejs_compat(worker: &backend::WorkerDeployConfig) -> bool {
 /// `npx` arguments that bundle a Worker backend's entry into one ESM module.
 /// `node:*` and `cloudflare:*` imports stay external for workerd to resolve,
 /// and so do bare Node builtins (`buffer`) under `nodejs_compat`; each
-/// `textModules` glob's extension is imported as a string.
+/// `textModules` glob's extension is imported as a string. `.wasm` imports
+/// stay imports too: the deploy ships each file as a wasm module beside the
+/// bundle (see [`worker_wasm_imports`]), found through the metafile written
+/// next to `outfile`.
 fn worker_esbuild_args(
     entry: &std::path::Path,
     outfile: &std::path::Path,
@@ -2285,6 +2288,8 @@ fn worker_esbuild_args(
         "--main-fields=module,main".into(),
         "--external:node:*".into(),
         "--external:cloudflare:*".into(),
+        "--external:*.wasm".into(),
+        format!("--metafile={}", worker_metafile(outfile).to_string_lossy()),
     ];
     if worker_has_nodejs_compat(worker) {
         args.extend(NODE_BUILTIN_MODULES.iter().map(|m| format!("--external:{}", m)));
@@ -2302,6 +2307,124 @@ fn worker_esbuild_args(
     }
     args.push(format!("--outfile={}", outfile.to_string_lossy()));
     args
+}
+
+/// Where esbuild writes the metafile of the bundle `outfile`.
+fn worker_metafile(outfile: &std::path::Path) -> std::path::PathBuf {
+    let mut name = outfile.as_os_str().to_owned();
+    name.push(".meta.json");
+    std::path::PathBuf::from(name)
+}
+
+/// The line that carries one wasm module of a Worker backend after its
+/// bundle: `//# sp00ky-wasm-module <name> <base64>`. The SSP Worker's host
+/// (`apps/ssp-cf/js/routing.mjs::bundleModules`) splits them off again and
+/// hands each to the Worker Loader as a wasm module, so the backend imports
+/// a compiled `WebAssembly.Module` (code generation from bytes is not
+/// allowed in a Worker).
+const WASM_MODULE_LINE: &str = "//# sp00ky-wasm-module ";
+
+/// A `.wasm` file a Worker backend imports, and the module name it ships as.
+#[derive(Debug, PartialEq)]
+struct WasmImport {
+    /// The import specifier as esbuild left it in the bundle.
+    specifier: String,
+    path: std::path::PathBuf,
+    /// `<sha256 prefix>-<file name>`: a plain module name next to `main.js`.
+    module: String,
+}
+
+/// The `.wasm` files the bundle imports, from esbuild's metafile (its input
+/// paths are relative to `app_dir`, where esbuild ran). A relative specifier
+/// is resolved from its importer, a bare one (`loro-crdt/web/x.wasm`) from
+/// the `node_modules` directories above it, the way Node finds a package
+/// file.
+fn worker_wasm_imports(metafile: &serde_json::Value, app_dir: &std::path::Path) -> Result<Vec<WasmImport>> {
+    use sha2::Digest;
+
+    let mut found: Vec<WasmImport> = Vec::new();
+    let inputs = metafile.get("inputs").and_then(|v| v.as_object());
+    for (importer, input) in inputs.into_iter().flatten() {
+        let imports = input.get("imports").and_then(|v| v.as_array());
+        for import in imports.into_iter().flatten() {
+            let external = import.get("external").and_then(|v| v.as_bool()).unwrap_or(false);
+            let Some(specifier) = import.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !external || !specifier.ends_with(".wasm") {
+                continue;
+            }
+            let from = app_dir.join(importer);
+            let dir = from.parent().unwrap_or(app_dir);
+            let path = if specifier.starts_with("./") || specifier.starts_with("../") {
+                Some(dir.join(specifier))
+            } else if specifier.starts_with('/') {
+                Some(std::path::PathBuf::from(specifier))
+            } else {
+                dir.ancestors()
+                    .map(|d| d.join("node_modules").join(specifier))
+                    .find(|p| p.is_file())
+            };
+            let path = match path.filter(|p| p.is_file()) {
+                Some(p) => fs::canonicalize(&p).unwrap_or(p),
+                None => bail!(
+                    "{} imports \"{}\", but the file was not found (a package's \"exports\" map is not followed: import the file by its path in the package)",
+                    importer,
+                    specifier
+                ),
+            };
+            if let Some(seen) = found.iter().find(|w| w.specifier == specifier) {
+                if seen.path != path {
+                    bail!(
+                        "\"{}\" names two different wasm files ({} and {}): import them by distinct paths",
+                        specifier,
+                        seen.path.display(),
+                        path.display()
+                    );
+                }
+                continue;
+            }
+            let bytes = fs::read(&path).context(format!("Failed to read {}", path.display()))?;
+            let file = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            let module = format!("{}-{}", &hex::encode(sha2::Sha256::digest(&bytes))[..16], file);
+            found.push(WasmImport { specifier: specifier.to_string(), path, module });
+        }
+    }
+    Ok(found)
+}
+
+/// The upload of a Worker backend: the bundle with each wasm import pointed
+/// at its module (`./<module>`), then one [`WASM_MODULE_LINE`] per file.
+fn append_wasm_modules(bundle: &str, wasm: &[WasmImport]) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+
+    let mut code = bundle.trim_end().to_string();
+    for w in wasm {
+        let target = format!("\"./{}\"", w.module);
+        let quoted = format!("\"{}\"", w.specifier);
+        let mut hits = 0;
+        for (before, after) in [
+            (format!("from {}", quoted), format!("from {}", target)),
+            (format!("import {}", quoted), format!("import {}", target)),
+            (format!("import({})", quoted), format!("import({})", target)),
+        ] {
+            hits += code.matches(&before).count();
+            code = code.replace(&before, &after);
+        }
+        if hits == 0 {
+            bail!("the bundle imports \"{}\" in a way the deploy cannot ship", w.specifier);
+        }
+    }
+    for w in wasm {
+        let bytes = fs::read(&w.path).context(format!("Failed to read {}", w.path.display()))?;
+        code.push('\n');
+        code.push_str(WASM_MODULE_LINE);
+        code.push_str(&w.module);
+        code.push(' ');
+        code.push_str(&base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    code.push('\n');
+    Ok(code.into_bytes())
 }
 
 /// The modules esbuild reported as `Could not resolve "<module>"`, in order,
@@ -2380,6 +2503,7 @@ fn deploy_worker_backend_cloudflare(
     let app_dir = worker_app_dir(&entry, config_dir);
     let outfile = std::env::temp_dir().join(format!("sp00ky-{}-{}-worker.js", slug, name));
     let _ = fs::remove_file(&outfile);
+    let _ = fs::remove_file(worker_metafile(&outfile));
 
     println!(
         "  Bundling Worker backend '{}' ({}) with esbuild {}...",
@@ -2412,6 +2536,25 @@ fn deploy_worker_backend_cloudflare(
     let data = fs::read(&outfile)
         .context(format!("Failed to read the bundle of Worker backend '{}'", name))?;
     let _ = fs::remove_file(&outfile);
+    let metafile = worker_metafile(&outfile);
+    let meta = fs::read(&metafile)
+        .context(format!("Failed to read the esbuild metafile of Worker backend '{}'", name))?;
+    let _ = fs::remove_file(&metafile);
+    let meta: serde_json::Value = serde_json::from_slice(&meta)
+        .context(format!("The esbuild metafile of Worker backend '{}' is not JSON", name))?;
+    let wasm = worker_wasm_imports(&meta, &app_dir)
+        .map_err(|e| anyhow::anyhow!("Worker backend '{}': {}", name, e))?;
+    let data = if wasm.is_empty() {
+        data
+    } else {
+        for w in &wasm {
+            println!("  Shipping wasm module {} ({})", w.module, w.specifier);
+        }
+        let bundle = String::from_utf8(data)
+            .context(format!("The bundle of Worker backend '{}' is not UTF-8", name))?;
+        append_wasm_modules(&bundle, &wasm)
+            .map_err(|e| anyhow::anyhow!("Worker backend '{}': {}", name, e))?
+    };
     let hash = hex::encode(sha2::Sha256::digest(&data));
     println!(
         "  Uploading Worker backend '{}' ({:.1}KB)...",
@@ -9866,6 +10009,8 @@ mod worker_backend_tests {
                 "--main-fields=module,main",
                 "--external:node:*",
                 "--external:cloudflare:*",
+                "--external:*.wasm",
+                "--metafile=/tmp/out.js.meta.json",
                 "--loader:.surql=text",
                 "--loader:.md=text",
                 "--outfile=/tmp/out.js",
@@ -9893,8 +10038,8 @@ mod worker_backend_tests {
                 .iter()
                 .filter_map(|a| a.strip_prefix("--external:"))
                 .collect();
-            assert_eq!(externals[..2], ["node:*", "cloudflare:*"]);
-            assert_eq!(externals[2..], *NODE_BUILTIN_MODULES);
+            assert_eq!(externals[..3], ["node:*", "cloudflare:*", "*.wasm"]);
+            assert_eq!(externals[3..], *NODE_BUILTIN_MODULES);
             for m in ["assert", "async_hooks", "buffer", "crypto", "events", "fs/promises", "path",
                 "process", "stream", "string_decoder", "url", "util", "zlib"]
             {
@@ -9904,6 +10049,61 @@ mod worker_backend_tests {
             assert_eq!(args[args.len() - 2], "--loader:.surql=text");
             assert_eq!(args[args.len() - 1], "--outfile=/tmp/out.js");
         }
+    }
+
+    /// A bare wasm import resolves through node_modules, a relative one from
+    /// its importer; both ship as `<hash>-<file>` modules after the bundle.
+    #[test]
+    fn wasm_imports_ship_as_modules_after_the_bundle() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("apps/api");
+        let pkg = dir.path().join("node_modules/loro-crdt/web");
+        fs::create_dir_all(app.join("src/wasm")).unwrap();
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("loro_wasm_bg.wasm"), b"\0asm-loro").unwrap();
+        fs::write(app.join("src/wasm/own.wasm"), b"\0asm-own").unwrap();
+        let meta = serde_json::json!({
+            "inputs": {
+                "src/index.ts": { "imports": [
+                    { "path": "loro-crdt/web/loro_wasm_bg.wasm", "kind": "import-statement", "external": true },
+                    { "path": "./wasm/own.wasm", "kind": "import-statement", "external": true },
+                    { "path": "node:buffer", "kind": "import-statement", "external": true },
+                    { "path": "src/other.ts", "kind": "import-statement" }
+                ] },
+                "src/other.ts": { "imports": [
+                    { "path": "loro-crdt/web/loro_wasm_bg.wasm", "kind": "import-statement", "external": true }
+                ] }
+            }
+        });
+        let wasm = worker_wasm_imports(&meta, &app).unwrap();
+        assert_eq!(wasm.len(), 2, "{wasm:?}");
+        let loro = wasm.iter().find(|w| w.specifier.starts_with("loro")).unwrap();
+        let own = wasm.iter().find(|w| w.specifier == "./wasm/own.wasm").unwrap();
+        assert!(loro.module.ends_with("-loro_wasm_bg.wasm") && loro.module.find('-') == Some(16), "{}", loro.module);
+        assert!(own.module.ends_with("-own.wasm"));
+
+        let bundle = "import loroWasm from \"loro-crdt/web/loro_wasm_bg.wasm\";\nimport own from \"./wasm/own.wasm\";\nexport default {};\n";
+        let out = String::from_utf8(append_wasm_modules(bundle, &wasm).unwrap()).unwrap();
+        assert!(out.starts_with(&format!("import loroWasm from \"./{}\";\nimport own from \"./{}\";\n", loro.module, own.module)), "{out}");
+        let lines: Vec<&str> = out.trim_end().lines().filter(|l| l.starts_with(WASM_MODULE_LINE)).collect();
+        assert_eq!(lines.len(), 2);
+        let (name, b64) = lines[0][WASM_MODULE_LINE.len()..].split_once(' ').unwrap();
+        assert_eq!(name, loro.module);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(b64).unwrap(), b"\0asm-loro");
+        assert!(out.ends_with('\n') && !out.contains("loro-crdt/web"));
+    }
+
+    #[test]
+    fn a_missing_wasm_file_fails_the_deploy() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({ "inputs": { "src/index.ts": { "imports": [
+            { "path": "nope/x.wasm", "kind": "import-statement", "external": true }
+        ] } } });
+        let err = worker_wasm_imports(&meta, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("\"nope/x.wasm\"") && err.contains("not found"), "{err}");
+        assert!(worker_wasm_imports(&serde_json::json!({ "inputs": {} }), dir.path()).unwrap().is_empty());
     }
 
     #[test]

@@ -93,6 +93,12 @@ Call the job routes as usual:
   Workflows behind them, use [durable workflows](/docs/backend/durable-workflows) (the same API).
 - **Text modules.** Files matched by `textModules` import as strings
   (`import query from './material.surql'`).
+- **WebAssembly.** A `.wasm` import gives a compiled `WebAssembly.Module`, as in wrangler:
+  `spky deploy` ships each imported file beside the bundle, since a Worker may not compile wasm
+  from bytes. Import the file by its path, relative or inside a package
+  (`import wasm from 'loro-crdt/web/loro_wasm_bg.wasm'`), and instantiate it yourself
+  (`initSync({ module: wasm })` for a wasm-bindgen `web` build). It counts towards the 10 MB of
+  the bundle, as base64.
 - **Outbound `fetch` is open.** Call any API you like.
 - **No other Cloudflare bindings.** No R2, KV, D1, Durable Objects or service bindings.
 

@@ -424,6 +424,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A record's digest must survive the JSON text the SSP receives it as:
+    /// the scheduler hashes its in-process value, the SSP the one it parsed
+    /// back. whitepawn's `inventory_item.card_y = 0.09791666666666667` parsed
+    /// one bit off without serde_json's `float_roundtrip`, and every SSP
+    /// bootstrap of that table failed its integrity check (2026-10-27).
+    #[test]
+    fn digest_survives_a_json_round_trip_of_its_floats() {
+        for f in [0.09791666666666667_f64, 0.8433333333333334, 0.1 + 0.2, 1e-300, 123456.789e10] {
+            let row = json!({ "id": "t:1", "x": f });
+            let text = serde_json::to_string(&row).unwrap();
+            let parsed: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed["x"].as_f64().unwrap().to_bits(), f.to_bits(), "{f} must parse back exactly");
+            assert_eq!(record_digest("1", &row), record_digest("1", &parsed), "{f}");
+        }
+    }
+
     #[test]
     fn order_independent() {
         let a = vec![

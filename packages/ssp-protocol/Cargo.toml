@@ -5,6 +5,12 @@ edition = "2021"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: parse floats exactly. Without it serde_json parses some
+# floats one bit off (0.09791666666666667 -> 0.09791666666666668), and the
+# content hashes compare the scheduler's in-process value with the SSP's copy
+# parsed from JSON: a single such float failed every SSP bootstrap of its
+# table, forever. Enabled here because every hashing build depends on this
+# crate, and Cargo unifies features per build.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 blake3 = { version = "1.5", default-features = false, features = ["std"] }

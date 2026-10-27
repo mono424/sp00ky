@@ -1064,13 +1064,23 @@ pub fn apply_internal_schema(
     internal_sql.push_str(&meta_tables_remote);
     internal_sql.push('\n');
 
-    // Generated `@crdt` tables, plus the text-mirror guards re-asserted over
-    // whatever the user migrations defined: a record user must never be able
-    // to write a mirror, or it could drift from the folded document.
-    if !crdt.parents.is_empty() {
-        ui::detail(format!("{} CRDT parent table(s)", crdt.parents.len()));
+    // Generated tables (`@crdt` logs/presence/docs, the `@channel` signaling
+    // table), plus the text-mirror guards re-asserted over whatever the user
+    // migrations defined: a record user must never be able to write a
+    // mirror, or it could drift from the folded document. The generated DDL
+    // goes in whenever there is any: a schema with `@channel` tables and no
+    // `@crdt` field still needs `_00_channel_signal`.
+    if !crdt.generated.is_empty() {
+        if !crdt.parents.is_empty() {
+            ui::detail(format!("{} CRDT parent table(s)", crdt.parents.len()));
+        }
+        if crate::channel_schema::has_channel_tables(&raw_content) {
+            ui::detail("channel signaling table");
+        }
         internal_sql.push_str(&crdt.generated);
         internal_sql.push('\n');
+    }
+    if !crdt.parents.is_empty() {
         internal_sql.push_str(&crdt.mirror_defs);
         internal_sql.push('\n');
     }

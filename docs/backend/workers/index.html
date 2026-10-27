@@ -205,6 +205,12 @@ the same env. For workflows that also run on a VM and under <code>spky dev</code
 Workflows behind them, use <a href="/docs/backend/durable-workflows">durable workflows</a> (the same API).</li>
 <li><strong>Text modules.</strong> Files matched by <code>textModules</code> import as strings
 (<code>import query from &#39;./material.surql&#39;</code>).</li>
+<li><strong>WebAssembly.</strong> A <code>.wasm</code> import gives a compiled <code>WebAssembly.Module</code>, as in wrangler:
+<code>spky deploy</code> ships each imported file beside the bundle, since a Worker may not compile wasm
+from bytes. Import the file by its path, relative or inside a package
+(<code>import wasm from &#39;loro-crdt/web/loro_wasm_bg.wasm&#39;</code>), and instantiate it yourself
+(<code>initSync({ module: wasm })</code> for a wasm-bindgen <code>web</code> build). It counts towards the 10 MB of
+the bundle, as base64.</li>
 <li><strong>Outbound <code>fetch</code> is open.</strong> Call any API you like.</li>
 <li><strong>No other Cloudflare bindings.</strong> No R2, KV, D1, Durable Objects or service bindings.</li>
 </ul>

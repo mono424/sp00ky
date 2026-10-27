@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/cli-darwin-x64",
-  "version": "0.0.1-canary.357",
+  "version": "0.0.1-canary.358",
   "description": "macOS Intel binary for @spooky-sync/cli",
   "license": "MIT",
   "os": [

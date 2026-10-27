@@ -6,7 +6,7 @@
 
 [package]
 name = "ssp-cf"
-version = "0.0.1-canary.357"
+version = "0.0.1-canary.358"
 edition = "2021"
 
 [lib]

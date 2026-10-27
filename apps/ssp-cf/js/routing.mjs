@@ -17,3 +17,35 @@ export function exposedBackend(table, pathname) {
 	}
 	return null;
 }
+
+/** The line `spky deploy` appends to a backend's bundle per wasm file it imports. */
+const WASM_MODULE_LINE = "//# sp00ky-wasm-module ";
+
+function base64Bytes(b64) {
+	if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(b64);
+	const binary = atob(b64);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	return bytes;
+}
+
+/**
+ * A backend bundle as Worker Loader modules: `main.js`, plus a wasm module
+ * per `//# sp00ky-wasm-module <name> <base64>` line after it (the CLI's
+ * `append_wasm_modules`). The bundle imports them as `./<name>`, so it gets
+ * a compiled `WebAssembly.Module`: a Worker may not compile wasm from bytes.
+ */
+export function bundleModules(code) {
+	const modules = {};
+	let end = code.length;
+	while (end > 0) {
+		const text = code.slice(0, end).trimEnd();
+		const start = text.lastIndexOf("\n") + 1;
+		const line = text.slice(start);
+		if (!line.startsWith(WASM_MODULE_LINE)) break;
+		const [name, b64] = line.slice(WASM_MODULE_LINE.length).split(" ");
+		modules[name] = { wasm: base64Bytes(b64) };
+		end = start;
+	}
+	return { "main.js": code.slice(0, end), ...modules };
+}

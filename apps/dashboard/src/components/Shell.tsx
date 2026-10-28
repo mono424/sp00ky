@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createSignal, onCleanup, type JSX } from 'solid-js';
 import { A, useLocation } from '@solidjs/router';
-import { servedByNode } from '../api/client';
+import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
@@ -9,6 +9,16 @@ interface NavLink {
   href: string;
   label: string;
   count?: string;
+  /** Section heading the link sits under; links keep their order. */
+  group?: string;
+}
+
+/** Two letters for an avatar: initials of a name, or the first two of a slug. */
+function initials(text: string | undefined): string {
+  const words = (text ?? '').trim().split(/[\s._@-]+/).filter(Boolean);
+  if (words.length === 0) return '?';
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return (words[0][0] + words[1][0]).toUpperCase();
 }
 
 // Icons inherit link color; text remains the accessible navigation name.
@@ -69,6 +79,7 @@ export function Shell(props: {
     {
       href: '/ssps',
       label: 'SSPs',
+      group: 'Sync',
       count: props.overview
         ? `${props.overview.totals.ssps_ready}/${props.overview.totals.ssps}`
         : undefined,
@@ -76,6 +87,7 @@ export function Shell(props: {
     {
       href: '/backends',
       label: 'Backends',
+      group: 'Sync',
       count: props.overview
         ? `${props.overview.totals.backends_healthy}/${props.overview.totals.backends}`
         : undefined,
@@ -83,6 +95,7 @@ export function Shell(props: {
     {
       href: '/views',
       label: 'Views',
+      group: 'Sync',
       // Off the presence block the overview poll already carries. Absent until
       // the scheduler's sampler has run once, which is not the same as "no
       // views are registered".
@@ -90,11 +103,12 @@ export function Shell(props: {
         ? formatCount(props.overview.presence.totals.views)
         : undefined,
     },
-    { href: '/workflows', label: 'Workflows' },
-    { href: '/schedules', label: 'Schedules' },
+    { href: '/workflows', label: 'Workflows', group: 'Run' },
+    { href: '/schedules', label: 'Schedules', group: 'Run' },
     {
       href: '/jobs',
       label: 'Jobs',
+      group: 'Run',
       // Work outstanding, not work done: pending plus in flight is the number
       // that means "there is something to look at". Absent until the job
       // sampler has run once, which is not the same as "the queue is empty".
@@ -105,15 +119,31 @@ export function Shell(props: {
           )
         : undefined,
     },
-    { href: '/backups', label: 'Backups' },
+    { href: '/backups', label: 'Backups', group: 'Data' },
     // Sp00ky Cloud only: the scheduler cannot measure its neighbours or the
     // database's volume, the control plane can. Hidden, not disabled, when
     // unlinked: there is nothing on that page a self-hosted cluster could use.
-    ...(props.overview?.cloud_linked ? [{ href: '/resources', label: 'Resources' }] : []),
-    { href: '/incidents', label: 'Incidents' },
-    { href: '/logs', label: 'Logs' },
-    { href: '/access', label: 'Access' },
+    ...(props.overview?.cloud_linked ? [{ href: '/resources', label: 'Resources', group: 'Data' }] : []),
+    { href: '/incidents', label: 'Incidents', group: 'Observe' },
+    { href: '/logs', label: 'Logs', group: 'Observe' },
+    { href: '/access', label: 'Access', group: 'Settings' },
   ];
+
+  /** Consecutive links with the same group, in order. */
+  const sections = () => {
+    const out: { group?: string; links: NavLink[] }[] = [];
+    for (const l of links()) {
+      const last = out[out.length - 1];
+      if (last && last.group === l.group) last.links.push(l);
+      else out.push({ group: l.group, links: [l] });
+    }
+    return out;
+  };
+
+  const slug = () => currentMode().config?.project_slug ?? 'sp00ky';
+  const schedStatus = () => props.overview?.scheduler?.status;
+  const schedTone = () =>
+    !schedStatus() ? 'idle' : schedStatus() === 'ready' ? 'ok' : 'warn';
 
   // Navigating closes the drawer — otherwise tapping a link leaves it sitting
   // open over the page it just moved to.
@@ -165,43 +195,67 @@ export function Shell(props: {
           <span class="brand-tag">admin</span>
         </div>
 
+        <div class="project" title={`Project ${slug()}`}>
+          <span class="project-mark">{initials(slug())}</span>
+          <span class="project-text">
+            <span class="project-name">{slug()}</span>
+            <span class="project-sub">
+              <span class="dot" classList={{ [schedTone()]: true, pulse: schedTone() === 'warn' }} />
+              {schedStatus() ? `scheduler ${schedStatus()}` : servedByNode() ? 'served by an SSP' : 'connecting'}
+            </span>
+          </span>
+        </div>
+
         <div class="nav">
-          <For each={links()}>
-            {(link) => (
-              // `activeClass` + `end` rather than comparing pathnames by hand:
-              // the router applies the base ("/admin") to every href, so a
-              // hand-rolled `location.pathname === href` never matches and the
-              // rail silently highlights nothing. `end` keeps "/" from
-              // matching every route as a prefix.
-              <A
-                href={link.href}
-                class="nav-link"
-                activeClass="active"
-                end={link.href === '/'}
-              >
-                <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} /><span>{link.label}</span></span>
-                <Show when={link.count}>
-                  <span class="nav-count">{link.count}</span>
+          <For each={sections()}>
+            {(section) => (
+              <div class="nav-section">
+                <Show when={section.group}>
+                  <div class="nav-heading">{section.group}</div>
                 </Show>
-              </A>
+                <For each={section.links}>
+                  {(link) => (
+                    // `activeClass` + `end` rather than comparing pathnames by
+                    // hand: the router applies the base ("/admin") to every
+                    // href, so a hand-rolled `location.pathname === href`
+                    // never matches and the rail silently highlights nothing.
+                    // `end` keeps "/" from matching every route as a prefix.
+                    <A
+                      href={link.href}
+                      class="nav-link"
+                      activeClass="active"
+                      end={link.href === '/'}
+                    >
+                      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} /><span>{link.label}</span></span>
+                      <Show when={link.count}>
+                        <span class="nav-count">{link.count}</span>
+                      </Show>
+                    </A>
+                  )}
+                </For>
+              </div>
             )}
           </For>
         </div>
 
         <div class="sidebar-foot">
-          <div class="spread">
-            <span class="truncate" title={props.session.subject}>
+          <span class="avatar" aria-hidden="true">{initials(props.session.label)}</span>
+          <span class="who">
+            <span class="who-name truncate" title={props.session.subject}>
               {props.session.label}
             </span>
-            <button class="link-btn" onClick={props.onSignOut}>
-              Sign out
-            </button>
-          </div>
-          <Show when={props.overview?.scheduler?.version}>
-            <div class="sidebar-version" title="Scheduler version">
-              scheduler v{props.overview!.scheduler!.version}
-            </div>
-          </Show>
+            <Show when={props.overview?.scheduler?.version}>
+              <span class="sidebar-version" title="Scheduler version">
+                v{props.overview!.scheduler!.version}
+              </span>
+            </Show>
+          </span>
+          <button class="icon-btn" onClick={props.onSignOut} title="Sign out" aria-label="Sign out">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3 M10 8l-4 4 4 4 M6 12h10" />
+            </svg>
+          </button>
         </div>
       </nav>
 

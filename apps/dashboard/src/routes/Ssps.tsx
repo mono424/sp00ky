@@ -2,7 +2,8 @@ import { For, Show } from 'solid-js';
 import { A } from '@solidjs/router';
 import { Bento, Empty, PageHead, Panel, Pill, StatusDot, Tile } from '../components/Chrome';
 import { BootstrapProgress } from '../components/BootstrapProgress';
-import { ActivityStrip, OpBadge } from '../components/Actions';
+import { OpBadge } from '../components/Actions';
+import { ActivityStrip } from '../components/OpCard';
 import { AllSspsActions, SspActions, SspLogsLink } from '../components/ClusterActions';
 import { formatBytes, formatCount, formatDuration, formatUptime } from '../lib/format';
 import { sspTone } from '../lib/status';
@@ -23,7 +24,7 @@ export function Ssps(props: { data: Overview | undefined; refresh: () => void })
       />
 
       <div class="page-body">
-        <ActivityStrip operations={props.data?.operations} />
+        <ActivityStrip operations={props.data?.operations} ssps={props.data?.ssps} />
 
         <Show when={props.data} fallback={<Empty>Loading…</Empty>}>
           {(data) => (

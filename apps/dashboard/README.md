@@ -78,8 +78,8 @@ SPKY_ADMIN_DIR=apps/dashboard/dist cargo run -p scheduler
   failed probe is drawn as a *gap*, not a full-height bar — an outage is the
   absence of a measurement, not the slowest possible one.
 - **Fonts ship in the bundle.** The dashboard is served by a scheduler on a
-  private network, so a request to a font CDN would hang. Space Grotesk (labels,
-  prose) and JetBrains Mono (every figure and identifier) are vendored as
+  private network, so a request to a font CDN would hang. Inter (labels,
+  prose, figures) and JetBrains Mono (identifiers, logs) are vendored as
   variable woff2 subsets under `src/assets/fonts` and declared in
   `styles/fonts.css`; nothing may reference a remote font.
 - **The overview is a bento, not a stack.** `Bento` is a 12-column grid and

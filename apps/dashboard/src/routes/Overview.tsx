@@ -1,94 +1,205 @@
 import { For, Show, createMemo, type JSX } from 'solid-js';
 import { A } from '@solidjs/router';
-import {
-  Bento,
-  Empty,
-  KeyValue,
-  PageHead,
-  Pill,
-  Readout,
-  Segments,
-  SkeletonBento,
-  StatusDot,
-  Tile,
-} from '../components/Chrome';
+import { PageHead, Pill } from '../components/Chrome';
 import { Sparkline, type Point } from '../components/Sparkline';
-import { BootstrapProgress } from '../components/BootstrapProgress';
-import { ActivityStrip, OpBadge } from '../components/Actions';
-import {
-  SchedulerActions,
-  SspActions,
-  SspLogsLink,
-} from '../components/ClusterActions';
-import {
-  formatClock,
-  formatCount,
-  formatMs,
-  formatRelativeTime,
-  formatStamp,
-  formatUptime,
-  relativeStamp,
-  splitValue,
-} from '../lib/format';
-import { backendTone, schedulerTone, sspTone, type Tone } from '../lib/status';
-import type {
-  JobTotals,
-  Overview as OverviewData,
-  PresenceSample,
-  IncidentSummary,
-} from '../api/types';
+import { ActivityStrip } from '../components/OpCard';
+import { SchedulerActions } from '../components/ClusterActions';
+import { currentMode } from '../api/client';
+import { formatCount, formatMs, formatUptime, splitValue } from '../lib/format';
+import { sspTone, type Tone } from '../lib/status';
+import type { Overview as OverviewData } from '../api/types';
 
 /**
- * One presence count: the number, a line of context, and its history filling
- * the rest of the tile. The three of these on the overview keep separate
- * scales on purpose — views outnumber users by one to two orders of
- * magnitude, and a shared axis would flatten the users line onto the baseline.
+ * The home screen answers one question first: is anything wrong?
+ *
+ * Top to bottom:
+ *
+ *  1. A headline: "All systems normal", or how many things need attention.
+ *  2. The things that need attention, one line each with where to go. This
+ *     list is empty, and so absent, on a healthy cluster.
+ *  3. Four numbers worth glancing at: sync latency, live users, SSPs ready,
+ *     jobs queued.
+ *  4. What is running right now (restarts, backups, restores).
+ *
+ * Everything else (scheduler details, sessions, view counts, the fleets as
+ * tables, the incident strip) has its own page in the sidebar. A figure only
+ * earns a place here by being the first thing an operator looks at, or by
+ * being wrong.
  */
-function PresenceTile(props: {
-  i: number;
-  label: string;
-  sub: string;
-  to?: string;
-  ready: boolean;
-  value: number | undefined;
-  foot?: JSX.Element;
-  points: Point[];
-}) {
+
+interface Issue {
+  tone: 'warn' | 'bad';
+  title: string;
+  detail?: string;
+  to: string;
+}
+
+const plural = (n: number, word: string) => `${formatCount(n)} ${word}${n === 1 ? '' : 's'}`;
+
+/** Every condition worth an operator's attention, worst first. */
+function issuesOf(d: OverviewData): Issue[] {
+  const out: Issue[] = [];
+  const s = d.scheduler;
+  // An SSP an operation is already restarting has its own progress card.
+  const busy = new Set(
+    (d.operations ?? []).filter((o) => o.status === 'running').map((o) => o.target),
+  );
+
+  if (s && s.status !== 'ready') {
+    out.push({
+      tone: 'warn',
+      title: `Scheduler is ${s.status}`,
+      detail: 'Ingest and queries may pause until it is ready.',
+      to: '/logs?source=scheduler',
+    });
+  }
+
+  const hb = s?.heartbeat;
+  if (hb?.enabled && (hb.stale || (hb.consecutive_failures ?? 0) > 0)) {
+    out.push({
+      tone: 'warn',
+      title: 'Sync probe is failing',
+      detail:
+        hb.blocked_reason ??
+        `${plural(hb.consecutive_failures ?? 0, 'probe')} in a row did not reach every SSP.`,
+      to: '/ssps',
+    });
+  }
+
+  if (d.totals.ssps === 0) {
+    out.push({ tone: 'bad', title: 'No SSPs registered', detail: 'No client receives live updates.', to: '/ssps' });
+  }
+  for (const ssp of d.ssps) {
+    if (ssp.status === 'ready' || busy.has(ssp.id)) continue;
+    const b = ssp.bootstrap;
+    out.push({
+      tone: sspTone(ssp.status) === 'warn' ? 'warn' : 'bad',
+      title: `${ssp.id} is ${ssp.status}`,
+      detail: b
+        ? `${b.tables_done}/${b.tables_total} tables loaded. Its clients wait until it is ready.`
+        : 'Its clients have no live queries until it is ready.',
+      to: '/ssps',
+    });
+  }
+
+  for (const b of d.backends) {
+    if (['healthy', 'idle', 'starting'].includes(b.status)) continue;
+    out.push({
+      tone: 'bad',
+      title: `${b.name ?? b.id ?? 'Backend'} is ${b.status}`,
+      detail: 'Work routed to it fails or waits.',
+      to: '/backends',
+    });
+  }
+
+  if ((s?.lag ?? 0) > 1000) {
+    out.push({
+      tone: 'warn',
+      title: 'Ingest is falling behind',
+      detail: `${formatCount(s!.lag)} events not yet applied to the replica.`,
+      to: '/logs?source=scheduler',
+    });
+  }
+
+  const j = d.jobs;
+  if (j?.ready) {
+    if (j.blind) {
+      out.push({ tone: 'bad', title: 'Job tables are not answering', detail: 'Queue figures are unknown.', to: '/jobs' });
+    } else if (j.stalled > 0) {
+      out.push({ tone: 'bad', title: plural(j.stalled, 'stalled job'), detail: 'A lease expired with nobody holding it.', to: '/jobs' });
+    }
+    if (j.counts.failed > 0) {
+      out.push({ tone: 'warn', title: `${plural(j.counts.failed, 'job')} failed in the last hour`, to: '/jobs' });
+    }
+  }
+
+  const p = d.presence;
+  if (p?.ready && p.totals.errored_views > 0) {
+    out.push({ tone: 'bad', title: `${plural(p.totals.errored_views, 'view')} errored`, detail: 'Their clients see stale data.', to: '/views' });
+  } else if (p?.ready && p.totals.slow_views > 0) {
+    out.push({ tone: 'warn', title: plural(p.totals.slow_views, 'slow view'), to: '/views' });
+  }
+
+  const inc = d.incidents;
+  if (inc?.storage_error) {
+    out.push({ tone: 'warn', title: 'Incident history is unavailable', to: '/incidents' });
+  } else if (inc && inc.open > 0) {
+    const l = inc.latest;
+    out.push({
+      tone: 'warn',
+      title: plural(inc.open, 'open incident'),
+      detail: l ? `Latest: ${l.component} ${l.kind.replace(/_/g, ' ')}` : undefined,
+      to: '/incidents',
+    });
+  }
+
+  // Stable: faults first, then warnings, each in the order found above.
+  return [...out.filter((i) => i.tone === 'bad'), ...out.filter((i) => i.tone === 'warn')];
+}
+
+function Chevron() {
   return (
-    <Tile i={props.i} span={3} label={props.label} sub={props.sub} to={props.to}>
-      <Show
-        when={props.ready}
-        fallback={<Empty>Waiting for the first presence sample…</Empty>}
-      >
-        <Readout value={formatCount(props.value)} />
-        <Show when={props.foot}>
-          <div class="tile-foot">{props.foot}</div>
-        </Show>
-        <div class="tile-plot tile-end">
-          <Sparkline
-            points={props.points}
-            fill
-            bare
-            format={formatCount}
-            ariaLabel={props.label}
-          />
-        </div>
-      </Show>
-    </Tile>
+    <svg class="ov-arrow" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
   );
 }
 
 /**
- * Is the cluster healthy, and how fast is a write reaching a client right now.
- *
- * Laid out as a bento: the sync round trip is the hero tile because it is the
- * one number that measures the real product — the scheduler writes
- * `_00_heartbeat:probe` upstream and times the full path through `/ingest`,
- * the WAL, the broadcast and every SSP's circuit. Around it, one tile per
- * question an operator asks during an incident: are the SSPs up, are the
- * backends up, is ingest keeping up, what is the scheduler running. Then who
- * is here, then the two fleets in detail.
+ * Change across the chart's window: first good sample to last. Null when the
+ * window is too short or starts at zero, where a percentage means nothing.
  */
+function trend(points: Point[] | undefined): number | null {
+  const v = (points ?? []).filter((p) => p.ok && typeof p.ms === 'number').map((p) => p.ms as number);
+  if (v.length < 3 || v[0] === 0) return null;
+  const pct = ((v[v.length - 1] - v[0]) / v[0]) * 100;
+  return Math.abs(pct) < 1 ? 0 : Math.round(pct);
+}
+
+function Stat(props: {
+  label: string;
+  value: JSX.Element;
+  unit?: string;
+  note?: JSX.Element;
+  tone?: Tone;
+  to: string;
+  points?: Point[];
+  format?: (v: number | null | undefined) => string;
+  /** Drawn at the foot of the card in place of a chart. */
+  children?: JSX.Element;
+}) {
+  return (
+    <A href={props.to} class="ov-stat">
+      <span class="ov-stat-label">
+        {props.label}
+        <Chevron />
+      </span>
+      <span class="ov-stat-value" classList={{ [`tone-${props.tone}`]: props.tone === 'warn' || props.tone === 'bad' }}>
+        {props.value}
+        <Show when={props.unit}>
+          <span class="ov-stat-unit">{props.unit}</span>
+        </Show>
+      </span>
+      <span class="ov-stat-note">
+        <Show when={trend(props.points)}>
+          {(t) => (
+            <span class="ov-delta" classList={{ up: t() > 0, down: t() < 0 }}>
+              {t() > 0 ? '↑' : '↓'} {Math.abs(t())}%
+            </span>
+          )}
+        </Show>
+        {props.note}
+      </span>
+      <Show when={(props.points?.length ?? 0) > 1}>
+        <span class="ov-stat-plot">
+          <Sparkline points={props.points!} fill bare format={props.format} ariaLabel={props.label} />
+        </span>
+      </Show>
+      {props.children}
+    </A>
+  );
+}
+
 export function Overview(props: {
   data: OverviewData | undefined;
   error?: string;
@@ -97,107 +208,31 @@ export function Overview(props: {
   /** Re-poll the overview now, e.g. right after an action. */
   refresh: () => void;
 }) {
+  const issues = createMemo(() => (props.data ? issuesOf(props.data) : []));
+  const worst = (): Tone =>
+    issues().some((i) => i.tone === 'bad') ? 'bad' : issues().length ? 'warn' : 'ok';
+
   const sched = () => props.data?.scheduler;
-  const heartbeat = () => sched()?.heartbeat;
-
-  const points = (): Point[] =>
-    (heartbeat()?.samples ?? []).map((s) => ({ ts: s.ts, ms: s.ms, ok: s.ok }));
-
-  // The presence sampler's ring, folded into this same poll — so every readout
-  // and chart below costs no request of its own and no database work.
+  const hb = () => sched()?.heartbeat;
+  const latency = () => splitValue(formatMs(hb()?.last_e2e_ms));
+  const hbPoints = (): Point[] =>
+    (hb()?.samples ?? []).map((s) => ({ ts: s.ts, ms: s.ms, ok: s.ok }));
   const presence = () => props.data?.presence;
+  const userPoints = (): Point[] =>
+    (presence()?.samples ?? []).map((s) => ({ ts: s.ts, ms: s.users, ok: true as const }));
   const jobs = () => props.data?.jobs;
+  const jobPoints = (): Point[] =>
+    (jobs()?.samples ?? []).map((s) => ({ ts: s.t, ms: s.pending, ok: true as const }));
 
-  /**
-   * A stalled job outranks a deep queue: a backlog is the system working, a
-   * lease that expired with nobody holding it is the system not working.
-   */
-  const jobsTone = (j: JobTotals): string => {
-    if (!j.ready) return 'idle';
-    if (j.stalled > 0 || j.blind) return 'bad';
-    if (j.counts.failed > 0 || j.counts.pending > 0) return 'warn';
-    return 'ok';
-  };
-  const totals = () => presence()?.totals;
-  const series = (pick: (s: PresenceSample) => number): Point[] =>
-    (presence()?.samples ?? []).map((s) => ({
-      ts: s.ts,
-      ms: pick(s),
-      ok: true as const,
-    }));
-
-  const hb = createMemo(() => {
-    const pts = points();
-    const oks = pts
-      .filter((p) => p.ok && typeof p.ms === 'number')
-      .map((p) => p.ms as number);
-    const failed = pts.filter((p) => !p.ok);
-    return {
-      n: pts.length,
-      failed: failed.length,
-      lastFailure: failed.length ? failed[failed.length - 1]!.ts : null,
-      min: oks.length ? Math.min(...oks) : null,
-      max: oks.length ? Math.max(...oks) : null,
-    };
-  });
-
-  const hbTone = (): Tone => {
-    const h = heartbeat();
-    if (!h?.enabled) return 'idle';
-    if (h.stale || (h.consecutive_failures ?? 0) > 0) return 'warn';
-    return 'ok';
-  };
-
-  const hbFoot = () => {
-    const h = heartbeat();
-    if (!h?.enabled) return 'probe disabled';
-    if (h.blocked_reason) return h.blocked_reason;
-    const fails = h.consecutive_failures ?? 0;
-    if (fails > 0) return `${fails} consecutive failures`;
-    return h.last_ok_epoch_ms
-      ? `last probe ok at ${formatClock(h.last_ok_epoch_ms)}`
-      : 'no probe has completed yet';
-  };
-
-  const lag = () => sched()?.lag ?? 0;
-  const latency = () => splitValue(formatMs(heartbeat()?.last_e2e_ms));
-
-  const sspsTone = (d: OverviewData): Tone =>
-    d.totals.ssps === 0
-      ? 'bad'
-      : d.totals.ssps_ready === d.totals.ssps
-        ? 'ok'
-        : 'warn';
-
-  const backendsTone = (d: OverviewData): Tone =>
-    d.totals.backends === 0
-      ? 'idle'
-      : d.totals.backends_healthy === d.totals.backends
-        ? 'ok'
-        : 'bad';
-
-  const slowestBackend = (d: OverviewData) =>
-    d.backends
-      .filter((b) => typeof b.response_time_ms === 'number')
-      .sort((a, b) => (b.response_time_ms ?? 0) - (a.response_time_ms ?? 0))[0];
-
-  const backendName = (b: OverviewData['backends'][number]) => b.name ?? b.id ?? '—';
-
-  const sampledAgo = (ms: number | null) =>
-    ms === null ? '—' : formatRelativeTime(ms);
-
-  const viewHealthTone = (): Tone | undefined => {
-    const t = totals();
-    if (!t) return undefined;
-    if (t.errored_views) return 'bad';
-    if (t.slow_views || t.large_views || t.hot_views) return 'warn';
-    return undefined;
+  const headline = () => {
+    const n = issues().length;
+    if (n === 0) return 'All systems normal';
+    return `${n} ${n === 1 ? 'thing needs' : 'things need'} attention`;
   };
 
   return (
     <>
       <PageHead
-        crumb="Dashboard"
         title="Overview"
         actions={
           <>
@@ -211,12 +246,11 @@ export function Overview(props: {
                 refreshing
               </Pill>
             </Show>
-            <Show when={sched()}>
-              {(s) => (
-                <Pill tone={schedulerTone(s().status)} dot pulse={s().status !== 'ready'}>
-                  scheduler {s().status}
-                </Pill>
-              )}
+            {/* Restart, reclone, rehash, cloud actions: the scheduler's own
+                menu, kept here because the overview is where a cluster-wide
+                fix starts. */}
+            <Show when={props.data?.scheduler}>
+              <SchedulerActions size="sm" label="Scheduler" onDone={props.refresh} />
             </Show>
           </>
         }
@@ -230,582 +264,132 @@ export function Overview(props: {
           </div>
         </Show>
 
-        <Show when={props.data?.incidents?.storage_error}>
-          <div class="error-banner">Incident history storage is unavailable. Open incident history for details.</div>
-        </Show>
-      <ActivityStrip operations={props.data?.operations} />
-
-        <Show when={props.data} fallback={<SkeletonBento />}>
-          {(data) => (
-            <Bento>
-              {/* ---- hero: the one number that measures the product ---- */}
-              <Tile
-                i={0}
-                span={6}
-                rows={2}
-                hero
-                label="Sync round trip"
-                sub="A write reaching every SSP's circuit, timed by the scheduler's own probe"
-                tone={hbTone()}
-                pulse={hbTone() === 'warn'}
-                actions={
-                  <Show when={hb().failed > 0}>
-                    <span
-                      class="pill bad"
-                      title={
-                        hb().lastFailure
-                          ? `Last failed cycle at ${formatClock(hb().lastFailure!)}`
-                          : undefined
-                      }
-                    >
-                      {hb().failed} failed of {hb().n}
-                    </span>
-                  </Show>
-                }
-              >
-                <div class="readout">
-                  <span class="readout-value">{latency().value}</span>
-                  <span class="readout-unit">{latency().unit}</span>
-                  <div class="readout-aside">
-                    <span class="tag">
-                      min<span class="val">{formatMs(hb().min)}</span>
-                    </span>
-                    <span class="tag">
-                      max<span class="val">{formatMs(hb().max)}</span>
-                    </span>
-                    <Show when={heartbeat()?.interval_secs}>
-                      <span class="tag">
-                        every<span class="val">{heartbeat()!.interval_secs}s</span>
-                      </span>
-                    </Show>
+        <Show when={props.data} fallback={<div class="ov-skeleton" />}>
+          {(d) => (
+            <div class="ov">
+              {/* 1. the headline */}
+              <section class="ov-hero" classList={{ [worst()]: true }} style={{ '--n': 0 }}>
+                <span class="ov-orb" aria-hidden="true">
+                  <span class="ov-orb-ring" />
+                  <span class="ov-orb-ring" />
+                  <span class="ov-orb-core" />
+                </span>
+                <div class="ov-hero-text">
+                  <div class="ov-hero-eyebrow">{currentMode().config?.project_slug ?? 'scheduler'}</div>
+                  <h2 class="ov-hero-title">{headline()}</h2>
+                  <div class="ov-hero-sub">
+                    {issues().length === 0
+                      ? 'Every sync processor is serving and nothing is queued up behind a fault.'
+                      : 'Start at the top: problems are listed worst first.'}
                   </div>
                 </div>
-                <div class="tile-foot">{hbFoot()}</div>
-                <div class="tile-plot tile-end">
-                  <Sparkline points={points()} fill bare ariaLabel="Sync round trip" />
-                </div>
-              </Tile>
-
-              {/* ---- the four questions ---- */}
-              <Tile
-                i={1}
-                span={3}
-                label="Sync processors"
-                sub="Queries are pinned per SSP"
-                to="/ssps"
-                tone={sspsTone(data())}
-                pulse={sspsTone(data()) === 'warn'}
-              >
-                <Readout
-                  value={`${data().totals.ssps_ready}/${data().totals.ssps}`}
-                  unit="ready"
-                />
-                <Segments
-                  items={data().ssps.map((s) => ({
-                    id: s.id,
-                    tone: sspTone(s.status),
-                    title: `${s.id} · ${s.status}`,
-                  }))}
-                />
-                <div class="tile-foot tile-end">
-                  <Show
-                    when={data().totals.ssps > 0}
-                    fallback="none registered, nothing is serving live queries"
-                  >
-                    {formatCount(sched()?.views ?? 0)} live views
-                    <Show when={data().totals.ssps - data().totals.ssps_ready > 0}>
-                      {' · '}
-                      {data().totals.ssps - data().totals.ssps_ready} catching up
-                    </Show>
-                  </Show>
-                </div>
-              </Tile>
-
-              <Tile
-                i={2}
-                span={3}
-                label="Backends"
-                sub="Health-checked services"
-                to="/backends"
-                tone={backendsTone(data())}
-              >
-                <Readout
-                  value={`${data().totals.backends_healthy}/${data().totals.backends}`}
-                  unit="healthy"
-                />
-                <Segments
-                  items={data().backends.map((b) => ({
-                    id: backendName(b),
-                    tone: backendTone(b.status),
-                    title: `${backendName(b)} · ${b.status}`,
-                  }))}
-                />
-                <div class="tile-foot tile-end">
-                  <Show when={data().totals.backends > 0} fallback="none configured">
-                    <Show when={slowestBackend(data())} fallback="no response times yet">
-                      {(b) => (
-                        <>
-                          slowest {backendName(b())} at {formatMs(b().response_time_ms)}
-                        </>
-                      )}
-                    </Show>
-                  </Show>
-                </div>
-              </Tile>
-
-              <Tile
-                i={3}
-                span={3}
-                label="Ingest lag"
-                sub="Events the replica has yet to apply"
-                tone={lag() > 1000 ? 'warn' : 'ok'}
-              >
-                <Readout value={formatCount(lag())} unit="events" />
-                <div class="tile-foot tile-end">
-                  seq {formatCount(sched()?.latest_seq)} · snapshot{' '}
-                  {formatCount(sched()?.snapshot_seq)} ·{' '}
-                  {formatCount(sched()?.pending_events)} pending
-                </div>
-              </Tile>
-
-              <Tile
-                i={4}
-                span={3}
-                label="Scheduler"
-                sub={
-                  <span class="id truncate" style={{ display: 'block' }} title={sched()?.id}>
-                    {sched()?.id}
-                  </span>
-                }
-                tone={schedulerTone(sched()?.status)}
-                pulse={!!sched() && sched()!.status !== 'ready'}
-                actions={<SchedulerActions size="sm" onDone={props.refresh} />}
-              >
-                <KeyValue
-                  rows={[
-                    [
-                      'Status',
-                      <Pill tone={schedulerTone(sched()?.status)}>
-                        {sched()?.status ?? '—'}
-                      </Pill>,
-                    ],
-                    ['Version', sched()?.version ?? '—'],
-                    ['SurrealDB', sched()?.surrealdb_version ?? '—'],
-                    ['Uptime', formatUptime(sched()?.uptime_seconds)],
-                    ['Address', sched()?.ip ?? '—'],
-                  ]}
-                />
-              </Tile>
-
-              {/* ---- who is here. Every figure counts only rows still inside
-                   `lastActiveAt + ttl`, so a closed tab fades out over minutes
-                   rather than vanishing. ---- */}
-              <Show when={presence()}>
-                {(p) => (
-                  <>
-                    <PresenceTile
-                      i={5}
-                      label="Users"
-                      sub="Signed in, fading out over ~9 min"
-                      to="/views"
-                      ready={p().ready}
-                      value={p().totals.users}
-                      foot="with at least one live view"
-                      points={series((s) => s.users)}
-                    />
-                    <PresenceTile
-                      i={6}
-                      label="Sessions"
-                      sub="One per open tab"
-                      to="/views"
-                      ready={p().ready}
-                      value={p().totals.sessions}
-                      foot={`${formatCount(p().totals.anon_sessions)} anonymous`}
-                      points={series((s) => s.sessions)}
-                    />
-                    <PresenceTile
-                      i={7}
-                      label="Registered views"
-                      sub="One per session, per query"
-                      to="/views"
-                      ready={p().ready}
-                      value={p().totals.views}
-                      foot={`${formatCount(p().totals.shared_views)} shared by more than one tab`}
-                      points={series((s) => s.views)}
-                    />
-                    <Tile
-                      i={8}
-                      span={3}
-                      label="View health"
-                      sub="Materialization, current window"
-                      to="/views"
-                      tone={viewHealthTone()}
-                    >
-                      <Show
-                        when={p().ready}
-                        fallback={<Empty>Waiting for the first presence sample…</Empty>}
-                      >
-                        {/* Hot, not Shared, in the first slot: shared is a
-                            reading the Registered views tile already carries,
-                            and this tile is about what needs looking at. */}
-                        <div class="stat3 stat4">
-                          <div>
-                            <div class="k">Hot</div>
-                            <div class="v" classList={{ 'tone-warn': p().totals.hot_views > 0 }}>
-                              {formatCount(p().totals.hot_views)}
-                            </div>
-                          </div>
-                          <div>
-                            <div class="k">Large</div>
-                            <div class="v" classList={{ 'tone-warn': p().totals.large_views > 0 }}>
-                              {formatCount(p().totals.large_views)}
-                            </div>
-                          </div>
-                          <div>
-                            <div class="k">Slow</div>
-                            <div class="v" classList={{ 'tone-warn': p().totals.slow_views > 0 }}>
-                              {formatCount(p().totals.slow_views)}
-                            </div>
-                          </div>
-                          <div>
-                            <div class="k">Errored</div>
-                            <div class="v" classList={{ 'tone-bad': p().totals.errored_views > 0 }}>
-                              {formatCount(p().totals.errored_views)}
-                            </div>
-                          </div>
-                        </div>
-                        <div class="tile-foot tile-end">
-                          <Show
-                            when={!p().error}
-                            fallback={<span class="tone-bad">{p().error}</span>}
-                          >
-                            <Show
-                              when={!p().truncated}
-                              fallback="row cap hit, every figure is a floor"
-                            >
-                              sampled {sampledAgo(p().taken_at_ms)} · every{' '}
-                              {p().sample_interval_secs}s
-                            </Show>
-                          </Show>
-                        </div>
-                      </Show>
-                    </Tile>
-                  </>
-                )}
-              </Show>
-
-              {/* ---- the outbox. Same bargain as presence: the job sampler
-                   holds these, so the tile rides this poll and adds nothing to
-                   the database. Span 12 because the presence row above already
-                   fills its twelve columns, and a lone span-3 tile here would
-                   leave nine of them empty. ---- */}
-              <Show when={jobs()}>
-                {(j) => (
-                  <Tile
-                    i={9}
-                    span={12}
-                    label="Jobs"
-                    sub="The outbox queue, across every table"
-                    to="/jobs"
-                    tone={jobsTone(j())}
-                  >
-                    <Show
-                      when={j().ready}
-                      fallback={
-                        <Empty>
-                          <Show
-                            when={j().enabled === false}
-                            fallback={<>Waiting for the first job sample…</>}
-                          >
-                            The job sampler is switched off on this scheduler (
-                            <span class="mono">SPKY_ADMIN_JOB_INTERVAL_SECS=0</span>).
-                            The Jobs page still lists and filters.
-                          </Show>
-                        </Empty>
-                      }
-                    >
-                      <div class="stat3 stat5">
-                        <div>
-                          <div class="k">Pending</div>
-                          <div class="v" classList={{ 'tone-warn': j().counts.pending > 0 }}>
-                            {formatCount(j().counts.pending)}
-                          </div>
-                        </div>
-                        <div>
-                          <div class="k">In flight</div>
-                          <div class="v">{formatCount(j().in_flight)}</div>
-                        </div>
-                        <div>
-                          <div class="k">Stalled</div>
-                          <div class="v" classList={{ 'tone-bad': j().stalled > 0 }}>
-                            {formatCount(j().stalled)}
-                          </div>
-                        </div>
-                        <div>
-                          <div class="k">Failed</div>
-                          <div class="v" classList={{ 'tone-bad': j().counts.failed > 0 }}>
-                            {formatCount(j().counts.failed)}
-                          </div>
-                        </div>
-                        <div>
-                          <div class="k">Per min</div>
-                          <div class="v">{formatCount(j().throughput_1m)}</div>
-                        </div>
+                <Show when={sched()}>
+                  {(s) => (
+                    <dl class="ov-facts">
+                      <div>
+                        <dt>Uptime</dt>
+                        <dd>{formatUptime(s().uptime_seconds)}</dd>
                       </div>
-                      <div class="tile-foot tile-end">
-                        <Show
-                          when={!j().blind}
-                          fallback={
-                            <span class="tone-bad">
-                              every outbox table refused to answer, so these are not measurements
-                            </span>
-                          }
-                        >
-                          <Show
-                            when={j().stalled === 0}
-                            fallback={
-                              <span class="tone-bad">
-                                a stalled job's lease expired with nobody holding it
-                              </span>
-                            }
-                          >
-                            <Show
-                              when={j().oldest_pending}
-                              fallback={<>nothing queued · failures counted over the last hour</>}
-                            >
-                              oldest pending {relativeStamp(j().oldest_pending)} ·
-                              failures over the last hour
-                            </Show>
-                          </Show>
-                        </Show>
+                      <div>
+                        <dt>Version</dt>
+                        <dd class="mono">{s().version.replace(/^0\.0\.1-/, '')}</dd>
                       </div>
-                    </Show>
-                  </Tile>
-                )}
-              </Show>
-
-              {/* ---- incidents: the last day as a strip ---- */}
-              <Show when={data().incidents}>
-                {(inc) => <IncidentsTile i={10} summary={inc()} />}
-              </Show>
-
-              {/* ---- the fleets in detail ---- */}
-              <Tile
-                i={10}
-                span={12}
-                flush
-                label="Sync processors"
-                sub="One lagging processor is a real outage for the clients pinned to it"
-                to="/ssps"
-              >
-                <Show
-                  when={data().ssps.length > 0}
-                  fallback={
-                    <Empty>No SSPs registered. Nothing is serving live queries.</Empty>
-                  }
-                >
-                  <div class="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>SSP</th>
-                          <th>Status</th>
-                          <th>Views</th>
-                          <th>Uptime</th>
-                          <th style={{ width: '30%' }}>Progress</th>
-                          <th />
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={data().ssps}>
-                          {(ssp) => (
-                            <tr>
-                              <td style={{ 'white-space': 'nowrap' }}>
-                                <div class="row">
-                                  <StatusDot
-                                    tone={sspTone(ssp.status)}
-                                    pulse={ssp.status !== 'ready'}
-                                  />
-                                  <span class="ident mono">{ssp.id}</span>
-                                </div>
-                                <div class="id truncate" style={{ 'margin-top': '2px' }}>
-                                  {ssp.ip ?? '—'} · v{ssp.version}
-                                </div>
-                              </td>
-                              <td data-label="Status">
-                                <Pill tone={sspTone(ssp.status)}>{ssp.status}</Pill>
-                              </td>
-                              <td class="mono" data-label="Views">
-                                {formatCount(ssp.views)}
-                              </td>
-                              <td class="dim mono" data-label="Uptime">
-                                {formatUptime(ssp.uptime_seconds)}
-                              </td>
-                              <td data-label="Progress">
-                                <Show
-                                  when={ssp.status !== 'ready'}
-                                  fallback={
-                                    <div class="row">
-                                      <span class="ghost">caught up</span>
-                                      <OpBadge
-                                        operations={data().operations}
-                                        target={ssp.id}
-                                      />
-                                    </div>
-                                  }
-                                >
-                                  <BootstrapProgress
-                                    ssp={ssp}
-                                    timeoutSecs={data().bootstrap_timeout_secs}
-                                  />
-                                </Show>
-                              </td>
-                              <td data-label="Actions" style={{ 'text-align': 'right' }}>
-                                <SspActions ssp={ssp} size="sm" onDone={props.refresh} />
-                                <SspLogsLink ssp={ssp} />
-                              </td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
+                      <div>
+                        <dt>SurrealDB</dt>
+                        <dd class="mono">{s().surrealdb_version ?? '—'}</dd>
+                      </div>
+                    </dl>
+                  )}
                 </Show>
-              </Tile>
+              </section>
 
-              <Show when={data().backends.length > 0}>
-                <Tile
-                  i={11}
-                  span={12}
-                  flush
-                  label="Backends"
-                  sub="Health-checked application services"
-                  to="/backends"
-                >
-                  <div class="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Name</th>
-                          <th>Status</th>
-                          <th>Response</th>
-                          <th>Check</th>
-                          <th>Last healthy</th>
-                          <th>URL</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={data().backends}>
-                          {(b) => (
-                            <tr>
-                              <td style={{ 'white-space': 'nowrap' }}>
-                                <A href={`/backends/${encodeURIComponent(backendName(b))}`}>
-                                  <div class="row">
-                                    <StatusDot tone={backendTone(b.status)} />
-                                    <span class="ident">{backendName(b)}</span>
-                                  </div>
-                                </A>
-                              </td>
-                              <td data-label="Status">
-                                <Pill tone={backendTone(b.status)}>{b.status}</Pill>
-                              </td>
-                              <td class="dim mono" data-label="Response">
-                                {formatMs(b.response_time_ms)}
-                              </td>
-                              <td class="ghost mono" data-label="Check">
-                                {b.healthcheck}
-                              </td>
-                              <td
-                                class="dim"
-                                data-label="Last healthy"
-                                title={formatStamp(b.last_healthy)}
+              {/* 2. what is wrong, only when something is */}
+              <Show when={issues().length > 0}>
+                <ul class="ov-issues" style={{ '--n': 1 }}>
+                  <For each={issues()}>
+                    {(i) => (
+                      <li>
+                        <A href={i.to} class="ov-issue" classList={{ [i.tone]: true }}>
+                          <span class="ov-issue-icon" aria-hidden="true">
+                            <svg viewBox="0 0 16 16">
+                              <Show
+                                when={i.tone === 'bad'}
+                                fallback={<path d="M8 2.8 14 13H2zM8 6.6v3M8 11.4h.01" />}
                               >
-                                {relativeStamp(b.last_healthy)}
-                              </td>
-                              <td class="ghost mono truncate" data-label="URL">
-                                {b.url}
-                              </td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
-                </Tile>
+                                <path d="M8 1.8a6.2 6.2 0 1 0 0 12.4A6.2 6.2 0 0 0 8 1.8zM5.9 5.9l4.2 4.2m0-4.2-4.2 4.2" />
+                              </Show>
+                            </svg>
+                          </span>
+                          <span class="ov-issue-text">
+                            <span class="ov-issue-title">{i.title}</span>
+                            <Show when={i.detail}>
+                              <span class="ov-issue-detail">{i.detail}</span>
+                            </Show>
+                          </span>
+                          <Chevron />
+                        </A>
+                      </li>
+                    )}
+                  </For>
+                </ul>
               </Show>
-            </Bento>
+
+              {/* 3. the four numbers */}
+              <div class="ov-stats" style={{ '--n': 2 }}>
+                <Stat
+                  label="Sync latency"
+                  to="/ssps"
+                  value={latency().value}
+                  unit={latency().unit}
+                  note="write to every client"
+                  points={hbPoints()}
+                />
+                <Stat
+                  label="Live users"
+                  to="/views"
+                  value={presence()?.ready ? formatCount(presence()!.totals.users) : '—'}
+                  note={
+                    presence()?.ready
+                      ? `${formatCount(presence()!.totals.sessions)} open tabs`
+                      : 'waiting for a sample'
+                  }
+                  points={userPoints()}
+                  format={formatCount}
+                />
+                <Stat
+                  label="Sync processors"
+                  to="/ssps"
+                  value={`${d().totals.ssps_ready}/${d().totals.ssps}`}
+                  unit="ready"
+                  tone={d().totals.ssps > 0 && d().totals.ssps_ready === d().totals.ssps ? 'ok' : 'warn'}
+                  note={`${formatCount(sched()?.views ?? 0)} live queries`}
+                >
+                  <span class="ov-fleet" aria-hidden="true">
+                    <For each={d().ssps}>
+                      {(ssp) => <span class="ov-fleet-bar" classList={{ [sspTone(ssp.status)]: true }} title={`${ssp.id} · ${ssp.status}`} />}
+                    </For>
+                  </span>
+                </Stat>
+                <Stat
+                  label="Jobs queued"
+                  to="/jobs"
+                  value={jobs()?.ready ? formatCount(jobs()!.counts.pending) : '—'}
+                  note={
+                    jobs()?.ready
+                      ? `${formatCount(jobs()!.throughput_1m)} done per minute`
+                      : 'waiting for a sample'
+                  }
+                  points={jobPoints()}
+                  format={formatCount}
+                />
+              </div>
+
+              {/* 4. what is running */}
+              <ActivityStrip operations={d().operations} ssps={d().ssps} />
+            </div>
           )}
         </Show>
       </div>
     </>
-  );
-}
-
-
-/**
- * The last 24 hours of incidents as a strip: one marker per episode placed by
- * its start time, as wide as it lasted, pulsing while it is still open. The
- * readout is what is open right now; the foot names the latest episode. A
- * quiet day is an empty strip, which is itself the answer.
- */
-function IncidentsTile(props: { i: number; summary: IncidentSummary }) {
-  const s = () => props.summary;
-  const now = () => s().server_time_ms ?? Date.now();
-  const DAY = 24 * 3_600_000;
-  const start = () => now() - DAY;
-  const pct = (ms: number) => `${Math.min(100, Math.max(0, ((ms - start()) / DAY) * 100))}%`;
-  const recent = () => s().recent ?? [];
-  const tone = (state: string) =>
-    state === 'recovered' ? 'ok' : state === 'failed' ? 'bad' : state === 'open' || state === 'interrupted' ? 'warn' : 'idle';
-  const label = (v: string) => v.replace(/_/g, ' ');
-  return (
-    <Tile
-      i={props.i}
-      span={12}
-      label="Incidents"
-      sub={s().open > 0 ? 'recovery not yet observed on an open episode' : `${formatCount(s().last_24h ?? recent().length)} in the last 24 h, none open`}
-      to="/incidents"
-      tone={s().open > 0 ? 'warn' : 'ok'}
-      pulse={s().open > 0}
-    >
-      <div class="row" style={{ 'align-items': 'flex-end', gap: '20px', 'flex-wrap': 'wrap' }}>
-        <Readout value={formatCount(s().open)} unit="open" />
-        <div class="stat3" style={{ flex: '1 1 260px' }}>
-          <div>
-            <div class="k">Last 24 h</div>
-            <div class="v">{formatCount(s().last_24h ?? recent().length)}</div>
-          </div>
-          <div>
-            <div class="k">Retained</div>
-            <div class="v">{formatCount(s().total)}</div>
-          </div>
-          <div>
-            <div class="k">Latest</div>
-            <div class="v" style={{ 'font-size': '13px', 'font-family': 'var(--sans)' }}>
-              <Show when={s().latest} fallback="none">
-                {(l) => <A href={`/incidents/${encodeURIComponent(l().id)}`}>{l().component} · {label(l().kind)} · {formatRelativeTime(l().started_at)}</A>}
-              </Show>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="strip" role="img" aria-label={`${recent().length} incidents in the last 24 hours`}>
-        <For each={[6, 12, 18]}>
-          {(h) => <span class="strip-tick" style={{ left: `${(h / 24) * 100}%` }}><span>-{24 - h}h</span></span>}
-        </For>
-        <For each={recent()}>
-          {(r) => (
-            <A
-              class="strip-mark"
-              classList={{ [tone(r.state)]: true, open: r.state === 'open' }}
-              href={`/incidents/${encodeURIComponent(r.id)}`}
-              style={{ left: pct(r.started_at), width: `max(3px, calc(${pct(r.ended_at ?? now())} - ${pct(r.started_at)}))` }}
-              title={`${r.component} · ${label(r.kind)} · ${label(r.state)} · ${formatRelativeTime(r.started_at)}`}
-            />
-          )}
-        </For>
-        <span class="strip-now" />
-      </div>
-    </Tile>
   );
 }

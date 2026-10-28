@@ -6,7 +6,6 @@ import {
   createUniqueId,
   onCleanup,
   onMount,
-  type JSX,
 } from 'solid-js';
 import { Portal } from 'solid-js/web';
 import { api, ApiError } from '../api/client';
@@ -31,10 +30,8 @@ import type { OpKind, Operation } from '../api/types';
  *  - `toast()` + `ToastHost`: the server's own message, verbatim. The API
  *    answers errors as `{error}` with a sentence written for a human, and the
  *    toast is where that sentence is read.
- *  - `ActivityStrip`: the operations the scheduler says are running. Every
- *    action is asynchronous from the operator's seat (an SSP exits on its
- *    NEXT heartbeat; a reclone takes minutes), so the strip is what turns a
- *    click into something they can watch finish.
+ *  - `OpBadge`: a running operation next to the thing it targets. The full
+ *    progress card for every running operation lives in `OpCard.tsx`.
  */
 
 /* ------------------------------------------------------------------ */
@@ -499,75 +496,6 @@ function useNow(intervalMs = 1000) {
   return now;
 }
 
-function fraction(op: Operation): number | null {
-  const d = op.detail ?? {};
-  const done = d.done;
-  const total = d.total;
-  if (typeof done === 'number' && typeof total === 'number' && total > 0) {
-    return Math.min(1, done / total);
-  }
-  return null;
-}
-
-function progressText(op: Operation): string | null {
-  const d = op.detail ?? {};
-  if (typeof d.done === 'number' && typeof d.total === 'number') {
-    const cur = typeof d.current === 'string' ? ` · ${d.current}` : '';
-    return `${d.done}/${d.total}${cur}`;
-  }
-  if (typeof d.stage === 'string') return d.stage;
-  if (typeof d.status === 'string') return d.status;
-  return null;
-}
-
-/**
- * What is happening right now. Collapses to nothing when idle, so it costs no
- * space on a quiet cluster.
- */
-export function ActivityStrip(props: { operations: Operation[] | undefined }) {
-  const now = useNow();
-  const running = () => (props.operations ?? []).filter((o) => o.status === 'running');
-
-  return (
-    <Show when={running().length > 0}>
-      <div class="activity">
-        <For each={running()}>
-          {(op) => {
-            const frac = () => fraction(op);
-            return (
-              <div class="activity-item">
-                <div class="activity-head">
-                  <span class="dot warn pulse" />
-                  <span class="activity-kind">{opLabel(op.kind)}</span>
-                  <Show when={op.target}>
-                    <span class="activity-target">{op.target}</span>
-                  </Show>
-                  <span class="activity-meta">
-                    <Show when={progressText(op)}>
-                      {(t) => <span>{t()} · </span>}
-                    </Show>
-                    {formatDuration(Math.max(0, now() - op.started_at))}
-                  </span>
-                </div>
-                <div class="bar">
-                  <div
-                    class="bar-fill"
-                    classList={{ indeterminate: frac() === null }}
-                    style={frac() !== null ? { width: `${frac()! * 100}%` } : undefined}
-                  />
-                </div>
-                <Show when={op.message}>
-                  <div class="activity-msg">{op.message}</div>
-                </Show>
-              </div>
-            );
-          }}
-        </For>
-      </div>
-    </Show>
-  );
-}
-
 /** A finished-or-not badge for one target, e.g. next to an SSP's name. */
 export function OpBadge(props: { operations: Operation[] | undefined; target: string }) {
   const now = useNow();
@@ -585,35 +513,5 @@ export function OpBadge(props: { operations: Operation[] | undefined; target: st
         </span>
       )}
     </Show>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Stepper                                                              */
-/* ------------------------------------------------------------------ */
-
-export type StepState = 'done' | 'active' | 'pending' | 'failed';
-
-export function Stepper(props: {
-  steps: { label: string; state: StepState; note?: JSX.Element }[];
-}) {
-  return (
-    <ol class="stepper">
-      <For each={props.steps}>
-        {(s, i) => (
-          <li class="step" classList={{ [s.state]: true }}>
-            <span class="step-marker">
-              {s.state === 'done' ? '✓' : s.state === 'failed' ? '!' : i() + 1}
-            </span>
-            <span class="step-body">
-              <span class="step-label">{s.label}</span>
-              <Show when={s.note}>
-                <span class="step-note">{s.note}</span>
-              </Show>
-            </span>
-          </li>
-        )}
-      </For>
-    </ol>
   );
 }

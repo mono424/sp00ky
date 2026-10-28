@@ -245,7 +245,12 @@ export function AllSspsActions(props: { count: number; onDone: () => void }) {
 }
 
 /** The scheduler's own menu. */
-export function SchedulerActions(props: { onDone: () => void; size?: 'sm' }) {
+export function SchedulerActions(props: {
+  onDone: () => void;
+  size?: 'sm';
+  /** Show a single menu button with this label instead of a "Restart" split button. */
+  label?: string;
+}) {
   const native = (mode: SchedulerRestartMode) =>
     post<OperationResponse>('/scheduler/restart', { mode });
   const cloud = (body: CloudRestartRequest) =>
@@ -397,5 +402,12 @@ export function SchedulerActions(props: { onDone: () => void; size?: 'sm' }) {
     },
   ];
 
-  return <ActionMenu size={props.size} primary={restart} entries={entries} />;
+  return (
+    <ActionMenu
+      size={props.size}
+      primary={props.label ? undefined : restart}
+      label={props.label}
+      entries={entries}
+    />
+  );
 }

@@ -105,14 +105,33 @@ async fn await_comeback(
     id: &str,
     since: Instant,
     budget: Duration,
+    report: Option<&str>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + budget;
     let mut seen_gone = false;
+    // Epoch-ms marks of each transition, sent whole on every change because
+    // `progress` merges only top-level keys. The dashboard times its steps
+    // from these rather than from when a tab happened to poll.
+    let mut marks = serde_json::Map::new();
+    let mut mark = |key: &str, phase: &str| {
+        let Some(op_id) = report else { return };
+        if marks.contains_key(key) {
+            return;
+        }
+        marks.insert(key.to_string(), json!(super::ops::now_ms()));
+        state
+            .ops
+            .progress(op_id, json!({ "phase": phase, "marks": Value::Object(marks.clone()) }));
+    };
     loop {
         {
             let pool = state.metrics.ssp_pool.read().await;
             match pool.get(id) {
                 Some(s) if s.connected_at > since => {
+                    // A relaunch fast enough to never leave the pool still
+                    // exited first; stamp both.
+                    mark("exited_at", "exited");
+                    mark("registered_at", "bootstrapping");
                     if pool.is_ready(id) {
                         return Ok(());
                     }
@@ -122,7 +141,10 @@ async fn await_comeback(
                     // consumed yet, or the SSP is between exit and relaunch
                     // with its stale entry not yet reaped.
                 }
-                None => seen_gone = true,
+                None => {
+                    seen_gone = true;
+                    mark("exited_at", "exited");
+                }
             }
         }
         if Instant::now() >= deadline {
@@ -209,7 +231,7 @@ pub async fn ssp_restart(
     let watcher_state = state.clone();
     let op_id = op.id.clone();
     tokio::spawn(async move {
-        match await_comeback(&watcher_state, &id, requested_at, budget).await {
+        match await_comeback(&watcher_state, &id, requested_at, budget, Some(&op_id)).await {
             Ok(()) => watcher_state
                 .ops
                 .finish(&op_id, Some("Back and ready".to_string())),
@@ -263,7 +285,7 @@ pub async fn ssps_restart_all(
             let mut failed = Vec::new();
             let mut done = 0usize;
             for id in ids {
-                match await_comeback(&watcher, &id, requested_at, budget).await {
+                match await_comeback(&watcher, &id, requested_at, budget, None).await {
                     Ok(()) => {
                         done += 1;
                         watcher.ops.progress(&op_id, json!({ "done": done }));
@@ -314,7 +336,7 @@ pub async fn ssps_restart_all(
                 }
                 pool.mark_for_resync_with(&id, kind);
             }
-            if let Err(reason) = await_comeback(&watcher, &id, requested_at, budget).await {
+            if let Err(reason) = await_comeback(&watcher, &id, requested_at, budget, None).await {
                 // Stop the roll: continuing would take down the next SSP
                 // while this one is still missing, which is the exact
                 // outage a rolling restart exists to avoid.
@@ -512,7 +534,7 @@ pub async fn cloud_restart(
             let budget = comeback_budget(&watcher) + Duration::from_secs(600);
             let mut failed = Vec::new();
             for id in ids {
-                if let Err(reason) = await_comeback(&watcher, &id, requested_at, budget).await {
+                if let Err(reason) = await_comeback(&watcher, &id, requested_at, budget, None).await {
                     failed.push(reason);
                 }
             }

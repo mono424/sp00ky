@@ -17,7 +17,7 @@ export function PageHead(props: {
         </Show>
         <h1>{props.title}</h1>
         <Show when={props.subtitle}>
-          <div class="id" style={{ 'margin-top': '5px' }}>
+          <div class="page-sub">
             {props.subtitle}
           </div>
         </Show>

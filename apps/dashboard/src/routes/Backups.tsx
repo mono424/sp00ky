@@ -3,21 +3,14 @@ import { api } from '../api/client';
 import {
   Cell,
   Empty,
-  KeyValue,
   PageHead,
   Panel,
   Pill,
   Rail,
   StatusDot,
 } from '../components/Chrome';
-import {
-  ActivityStrip,
-  Stepper,
-  runAction,
-  post,
-  toast,
-  type StepState,
-} from '../components/Actions';
+import { runAction, post, toast } from '../components/Actions';
+import { ActivityStrip, OpCard, restoreView } from '../components/OpCard';
 import { describeCron } from '../lib/cron';
 import {
   elapsed,
@@ -49,7 +42,7 @@ import type {
  *
  * A restore is the one destructive action on the whole dashboard that cannot
  * be undone by another click, so it gets the fullest treatment: consequences
- * up front, a typed word, then a stepper fed by the scheduler's own stage
+ * up front, a typed word, then a step card fed by the scheduler's own stage
  * flags rather than a spinner.
  */
 
@@ -113,7 +106,8 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
     props.refresh();
   };
 
-  const [watching, setWatching] = createSignal<string | null>(null);
+  /** The restore drawn as a card above the catalog: by restore id. */
+  const [watching, setWatching] = createSignal<{ id: string; backupId: string; label?: string; sub?: string } | null>(null);
 
   const completed = () => (data()?.catalog ?? []).filter((c) => c.status === 'completed');
   const latest = () => completed()[0];
@@ -159,7 +153,12 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
       request: post(`/backups/${encodeURIComponent(entry.id)}/restore`),
       success: (r) => `Restore ${r.restore_id} queued`,
       after: (r) => {
-        setWatching(r.restore_id);
+        setWatching({
+          id: r.restore_id,
+          backupId: entry.id,
+          label: `Data as of ${formatStamp(entry.completed_at ?? entry.created_at)}`,
+          sub: entry.name ? `${entry.name} · ${entry.id}` : entry.id,
+        });
         refreshAll();
       },
     });
@@ -206,7 +205,11 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
       />
 
       <div class="page-body">
-        <ActivityStrip operations={props.overview?.operations} />
+        <ActivityStrip
+          operations={props.overview?.operations}
+          ssps={props.overview?.ssps}
+          exclude={(op) => op.kind === 'backup_restore' && op.detail?.restore_id === watching()?.id}
+        />
 
         <Show
           when={!error()}
@@ -254,10 +257,13 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                   />
                 </Rail>
 
-                <Show when={watching()}>
-                  {(id) => (
+                <Show when={watching()} keyed>
+                  {(w) => (
                     <RestoreProgress
-                      id={id()}
+                      id={w.id}
+                      backupId={w.backupId}
+                      label={w.label}
+                      sub={w.sub}
                       onDone={() => {
                         refreshAll();
                       }}
@@ -451,7 +457,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                             {(r) => (
                               <tr
                                 class="clickable"
-                                onClick={() => setWatching(r.restore_id)}
+                                onClick={() => setWatching({ id: r.restore_id, backupId: r.backup_id })}
                               >
                                 <td>
                                   <div class="row">
@@ -637,7 +643,14 @@ function SchedulePanel(props: {
 /* Restore progress                                                     */
 /* ------------------------------------------------------------------ */
 
-function RestoreProgress(props: { id: string; onDone: () => void; onClose: () => void }) {
+function RestoreProgress(props: {
+  id: string;
+  backupId: string;
+  label?: string;
+  sub?: string;
+  onDone: () => void;
+  onClose: () => void;
+}) {
   const [status, { refetch }] = createResource(
     () => props.id,
     (id) => api.getResult<RestoreStatus>(`/backups/${encodeURIComponent(id)}/restore`),
@@ -666,114 +679,45 @@ function RestoreProgress(props: { id: string; onDone: () => void; onClose: () =>
   }, 2000);
   onCleanup(() => clearInterval(timer));
 
+  const opened = Date.now();
   const local = () => st()?.local ?? null;
-  const stage = () => st()?.stage ?? 'queued';
 
   /**
-   * The five stages the scheduler actually goes through. Lit from its own
-   * flags: `main_db_restored` and `replica_restored` are set by the restore
-   * worker as it passes each point, `ssps_evicted` at the end. "Downloading"
-   * is inferred: running, nothing restored yet.
+   * The main database came back but the scheduler's own state did not. It
+   * stays in `restoring` on purpose rather than serve a replica that
+   * disagrees with the database; say so, with the two ways out.
    */
-  const steps = (): { label: string; state: StepState; note?: string }[] => {
-    const l = local();
-    const failed = stage() === 'failed';
-    const done = stage() === 'done';
-    const running = stage() === 'running' || stage() === 'main_db' || stage() === 'replica';
-    const dbDone = !!l?.main_db_restored;
-    const repDone = !!l?.replica_restored;
-
-    const s = (cond: boolean, activeCond: boolean): StepState =>
-      cond ? 'done' : failed ? 'failed' : activeCond ? 'active' : 'pending';
-
-    return [
-      {
-        label: 'Queued',
-        state: l || st()?.cloud ? 'done' : 'active',
-      },
-      {
-        label: 'Downloading and unpacking the export',
-        state: s(dbDone || repDone || done, running && !dbDone),
-        note: l?.storage_path ?? undefined,
-      },
-      {
-        label: 'Gate closed: ingest and queries refused, bootstraps drained',
-        state: s(dbDone || repDone || done, running && !dbDone),
-      },
-      {
-        label: 'Main database dropped and re-imported',
-        state: s(dbDone, running && !dbDone),
-        note: l?.snapshot_seq != null ? `snapshot seq ${formatCount(l.snapshot_seq)}` : undefined,
-      },
-      {
-        label: 'Replica rebuilt from the same export',
-        state: s(repDone, running && dbDone && !repDone),
-        note: l?.pending_cleared != null ? `${formatCount(l.pending_cleared)} pending events cleared` : undefined,
-      },
-      {
-        label: 'SSPs evicted, scheduler ready',
-        state: done ? 'done' : failed ? 'failed' : repDone ? 'active' : 'pending',
-        note: l?.ssps_evicted != null ? `${l.ssps_evicted} evicted` : undefined,
-      },
-    ];
-  };
-
   const stuck = () =>
-    stage() === 'failed' && !!local()?.main_db_restored && !local()?.replica_restored;
+    st()?.stage === 'failed' && !!local()?.main_db_restored && !local()?.replica_restored;
 
   return (
-    <Panel
-      title={`Restore ${props.id}`}
-      sub={
-        stage() === 'done'
-          ? 'Complete. Run your migrations, then check the SSPs re-bootstrapped.'
-          : stage() === 'failed'
-            ? 'Failed'
-            : 'In progress. Polling the scheduler every two seconds.'
-      }
-      actions={
-        <button class="btn btn-sm" onClick={props.onClose}>
-          close
-        </button>
-      }
-    >
-      <Show when={!err()} fallback={<Empty>{err()}</Empty>}>
-        <div class="grid grid-2">
-          <Stepper steps={steps()} />
-          <div class="stack" style={{ gap: '10px' }}>
-            <Show when={local()}>
-              {(l) => (
-                <KeyValue
-                  rows={[
-                    ['Backup', l().backup_id],
-                    ['Status', <Pill tone={restoreTone(l().status)}>{l().status}</Pill>],
-                    ['Started', formatStamp(l().started_at)],
-                    ['Finished', formatStamp(l().finished_at)],
-                  ]}
-                />
-              )}
-            </Show>
-            <Show when={st()?.cloud && !local()}>
-              <div class="callout">
-                Sp00ky Cloud has queued this restore ({st()!.cloud!.status}). The scheduler
-                has not been asked yet; its worker polls every few seconds.
-              </div>
-            </Show>
-            <Show when={local()?.error}>
-              <div class="callout bad">{local()!.error}</div>
-            </Show>
-            <Show when={stuck()}>
-              <div class="callout bad">
-                The main database was restored but the scheduler's own state was not. The
-                scheduler stays in <span class="mono">restoring</span> on purpose, refusing
-                traffic rather than serving a replica that disagrees with the database.
-                Run the restore again, or restart the scheduler with a clean volume so it
-                reclones from the restored database.
-              </div>
-            </Show>
-          </div>
-        </div>
-      </Show>
-    </Panel>
+    <Show when={!err()} fallback={<div class="panel"><Empty>{err()}</Empty></div>}>
+      <div class="opc-grid">
+        <OpCard
+          view={{
+            ...restoreView(props.backupId, st(), props.label, opened, props.sub),
+            onClose: props.onClose,
+            notice: (
+              <>
+                <Show when={st()?.cloud && !local()}>
+                  <div class="opc-message">
+                    Sp00ky Cloud has queued this restore ({st()!.cloud!.status}). The
+                    scheduler's worker picks it up within a few seconds.
+                  </div>
+                </Show>
+                <Show when={stuck()}>
+                  <div class="opc-message bad">
+                    The database was restored but the scheduler's replica was not, so it
+                    stays in <span class="mono">restoring</span> and refuses traffic. Run
+                    the restore again, or restart the scheduler with a clean volume so it
+                    reclones from the restored database.
+                  </div>
+                </Show>
+              </>
+            ),
+          }}
+        />
+      </div>
+    </Show>
   );
 }

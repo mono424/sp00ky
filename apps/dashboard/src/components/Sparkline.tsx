@@ -144,8 +144,8 @@ export function Sparkline(props: {
         >
           <defs>
             <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color={colour()} stop-opacity="0.28" />
-              <stop offset="100%" stop-color={colour()} stop-opacity="0" />
+              <stop offset="0%" stop-color={colour()} stop-opacity="0.12" />
+              <stop offset="70%" stop-color={colour()} stop-opacity="0" />
             </linearGradient>
           </defs>
 

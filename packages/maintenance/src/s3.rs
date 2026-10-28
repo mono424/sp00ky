@@ -106,10 +106,16 @@ pub async fn upload_file(bucket: &Bucket, path: &Path, key: &str) -> Result<()> 
         .initiate_multipart_upload(key, GZIP_CONTENT_TYPE)
         .await
         .context("Failed to start multipart upload")?;
-    let result = upload_parts(bucket, &mut file, first, &upload.key, &upload.upload_id).await;
+    // Address the parts by the key we asked for, never `upload.key`: on a
+    // virtual-hosted endpoint (`https://<bucket>.<host>`) with path-style
+    // requests the store keys the object as `<bucket>/<key>` and echoes that
+    // back, so re-sending it prefixes the bucket twice and every part fails
+    // with `NoSuchUpload`. Single-request PUTs and GETs never read the echo,
+    // which is why small backups and restores kept working.
+    let result = upload_parts(bucket, &mut file, first, key, &upload.upload_id).await;
     if result.is_err() {
         // Best effort: an unfinished multipart upload keeps its parts stored.
-        let _ = bucket.abort_upload(&upload.key, &upload.upload_id).await;
+        let _ = bucket.abort_upload(key, &upload.upload_id).await;
     }
     result
 }
@@ -150,4 +156,72 @@ async fn read_part(file: &mut tokio::fs::File) -> Result<Vec<u8>> {
         .await
         .context("Failed to read upload part")?;
     Ok(part)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Hetzner Object Storage behind a virtual-hosted endpoint echoes the key
+    /// with the bucket prefixed. Parts and completion must still go to the key
+    /// the upload was started with, or the store answers `NoSuchUpload`.
+    #[tokio::test]
+    async fn multipart_upload_ignores_echoed_key() {
+        let server = MockServer::start().await;
+        let object = "/backups/whitepawn/b1.surql.gz";
+        let upload_id = "2~abc";
+
+        Mock::given(method("POST"))
+            .and(path(object))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<InitiateMultipartUploadResult><Bucket>backups</Bucket>\
+                 <Key>backups/whitepawn/b1.surql.gz</Key><UploadId>{upload_id}</UploadId>\
+                 </InitiateMultipartUploadResult>"
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(object))
+            .and(query_param("uploadId", upload_id))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e\""))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(object))
+            .and(query_param("uploadId", upload_id))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Anything addressed elsewhere is what Ceph rejects in production.
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "<Error><Code>NoSuchUpload</Code></Error>",
+            ))
+            .mount(&server)
+            .await;
+
+        let config = BackupConfig {
+            s3_endpoint: server.uri(),
+            s3_access_key: "k".into(),
+            s3_secret_key: "s".into(),
+            s3_bucket: "backups".into(),
+            s3_region: "fsn1".into(),
+        };
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![7u8; CHUNK_SIZE + 10]).unwrap();
+
+        let bucket = config.get_bucket().unwrap();
+        upload_file(&bucket, file.path(), "whitepawn/b1.surql.gz")
+            .await
+            .unwrap();
+    }
 }

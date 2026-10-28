@@ -113,6 +113,10 @@ pub struct SspPool {
     /// or it crashed after retiring) would serve every view beside its
     /// successor and publish each change twice.
     replaced_by: HashMap<String, String>,
+    /// SSPs removed while no other SSP was Ready. Their `removed` incident is
+    /// an outage and stays open until some SSP is Ready again: the removed id
+    /// itself rarely comes back, since a recreated SSP registers a new id.
+    unserved_removals: Vec<String>,
     strategy: LoadBalanceStrategy,
     round_robin_index: usize,
     max_buffer_size: usize,
@@ -135,6 +139,7 @@ impl SspPool {
             publication: HashMap::new(),
             standby_of: HashMap::new(),
             replaced_by: HashMap::new(),
+            unserved_removals: Vec::new(),
             strategy,
             round_robin_index: 0,
             max_buffer_size,
@@ -344,6 +349,9 @@ impl SspPool {
         if self.message_buffers.get(ssp_id).map_or(true, |b| b.is_empty()) {
             let reason = if self.is_lagging(ssp_id) { "Missed events replayed; SSP ready without a restart" } else { "Bootstrap and replay completed; SSP ready" };
             crate::admin::incidents::emit(ssp_id, "ready", "recovered", reason, None);
+        }
+        for removed in std::mem::take(&mut self.unserved_removals) {
+            crate::admin::incidents::emit(&removed, "removed", "recovered", &format!("Routing restored: {ssp_id} is Ready"), None);
         }
         self.ssp_states.insert(ssp_id.to_string(), SspState::Ready);
         self.state_since.insert(ssp_id.to_string(), Instant::now());
@@ -597,7 +605,18 @@ impl SspPool {
     pub fn remove(&mut self, ssp_id: &str) -> Option<SspInfo> {
         self.publication.remove(ssp_id);
         if self.ssps.contains_key(ssp_id) {
-            crate::admin::incidents::emit(ssp_id, "removed", "open", "SSP removed from routing; heartbeat, bootstrap deadline or administrative removal", None);
+            // Another Ready SSP keeps serving (a redeploy retiring the old
+            // SSP, or one of several dropping out): a record, not an outage
+            // that could only end if this exact id registered again.
+            let serving = self.ssps.keys().any(|id| id != ssp_id && self.is_ready(id));
+            if serving {
+                crate::admin::incidents::emit(ssp_id, "removed", "interrupted", "SSP removed from routing while another Ready SSP keeps serving", None);
+                crate::admin::incidents::emit(ssp_id, "removed", "recorded", "SSP removed from routing; another Ready SSP keeps serving", None);
+            } else {
+                crate::admin::incidents::emit(ssp_id, "removed", "open", "SSP removed from routing; heartbeat, bootstrap deadline or administrative removal", None);
+                self.unserved_removals.retain(|id| id != ssp_id);
+                self.unserved_removals.push(ssp_id.to_string());
+            }
         }
         self.ssp_states.remove(ssp_id);
         self.message_buffers.remove(ssp_id);

@@ -661,6 +661,66 @@ mod tests {
         assert_eq!(h.rows[0].events[1].kind, "ready");
     }
 
+    /// Feeds every incident a closure emits through the log ring, as in production.
+    fn record(history: &Incidents, f: impl FnOnce()) {
+        use tracing_subscriber::prelude::*;
+        let ring = maintenance::log_ring::LogRing::new(64);
+        let mut rx = ring.subscribe();
+        let subscriber =
+            tracing_subscriber::registry().with(maintenance::log_ring::LogRingLayer::new(ring));
+        tracing::subscriber::with_default(subscriber, f);
+        while let Ok(line) = rx.try_recv() {
+            history.observe_line(&line);
+        }
+    }
+
+    #[test]
+    fn a_removed_ssp_with_a_ready_successor_leaves_no_open_incident() {
+        use crate::{config::LoadBalanceStrategy, router::SspPool};
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        record(&history, || {
+            let mut pool = SspPool::new(LoadBalanceStrategy::RoundRobin, 100);
+            for id in ["ssp-0-old", "ssp-0-new"] {
+                pool.update_ssp(id, 0, None, None, "v".into());
+                pool.mark_ready(id);
+            }
+            // A redeploy retires the old SSP once its successor serves.
+            pool.remove("ssp-0-old");
+        });
+        let h = history.history.lock().unwrap();
+        assert!(h.rows.iter().all(|r| r.state != "open"), "{:?}", h.rows);
+        let removed = h.rows.iter().find(|r| r.kind == "removed").unwrap();
+        assert_eq!((removed.state.as_str(), removed.severity.as_str()), ("recorded", "info"));
+    }
+
+    #[test]
+    fn removing_the_last_ready_ssp_stays_open_until_any_ssp_is_ready() {
+        use crate::{config::LoadBalanceStrategy, router::SspPool};
+        let dir = tempfile::tempdir().unwrap();
+        let history = Incidents::open(dir.path().join("incidents.json"));
+        let mut pool = SspPool::new(LoadBalanceStrategy::RoundRobin, 100);
+        record(&history, || {
+            pool.update_ssp("ssp-0-a", 0, None, None, "v".into());
+            pool.mark_ready("ssp-0-a");
+            pool.remove("ssp-0-a");
+        });
+        {
+            let h = history.history.lock().unwrap();
+            let removed = h.rows.iter().find(|r| r.component == "ssp-0-a").unwrap();
+            assert_eq!(removed.state, "open");
+        }
+        // The container is recreated under a new id.
+        record(&history, || {
+            pool.update_ssp("ssp-0-b", 0, None, None, "v".into());
+            pool.mark_ready("ssp-0-b");
+        });
+        let h = history.history.lock().unwrap();
+        let removed = h.rows.iter().find(|r| r.component == "ssp-0-a").unwrap();
+        assert_eq!(removed.state, "recovered");
+        assert!(h.rows.iter().all(|r| r.state != "open"));
+    }
+
     #[tokio::test]
     async fn retention_bounds_count_and_expires_without_new_transitions() {
         let dir = tempfile::tempdir().unwrap();

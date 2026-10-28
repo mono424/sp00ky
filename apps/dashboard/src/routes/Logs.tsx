@@ -1,8 +1,8 @@
 import { For, Show, createEffect, createSignal, onCleanup } from 'solid-js';
 import { useSearchParams } from '@solidjs/router';
 import { openStream } from '../api/client';
-import { Empty, PageHead, Pill, StatusDot } from '../components/Chrome';
-import { formatClock } from '../lib/format';
+import { Empty, PageHead, StatusDot } from '../components/Chrome';
+import { formatClock, formatCount } from '../lib/format';
 import type { LogLine, Overview } from '../api/types';
 
 /** Above this many lines the oldest are dropped, so a long tail cannot grow
@@ -118,33 +118,21 @@ export function Logs(props: { overview: Overview | undefined }) {
     if (atBottom !== follow()) setFollow(atBottom);
   };
 
+  const jumpToEnd = () => {
+    setFollow(true);
+    if (viewport) viewport.scrollTop = viewport.scrollHeight;
+  };
+
   return (
     <>
       <PageHead
-        crumb="Dashboard"
         title="Logs"
         actions={
-          <Pill tone={connected() ? 'live' : 'idle'}>
-            <StatusDot tone={connected() ? 'ok' : 'idle'} />
-            {connected() ? 'streaming' : 'connecting…'}
-          </Pill>
-        }
-      />
-
-      <div class="page-body">
-      <Show when={error()}>
-        <div class="banner">
-          <span class="dot bad" />
-          {error()}
-        </div>
-      </Show>
-
-      <div class="panel" style={{ 'margin-bottom': '12px', padding: '14px' }}>
-        <div class="row" style={{ gap: '12px', 'flex-wrap': 'wrap', 'align-items': 'flex-end' }}>
-          <div style={{ 'min-width': '220px' }}>
-            <label for="src">Source</label>
+          <div class="lg-controls">
             <select
-              id="src"
+              class="lg-source"
+              aria-label="Source"
+              title="Scheduler and SSPs only: backends are health-checked over HTTP, their output never reaches the scheduler."
               value={source()}
               onChange={(e) => setParams({ source: e.currentTarget.value })}
             >
@@ -152,85 +140,90 @@ export function Logs(props: { overview: Overview | undefined }) {
                 {(s) => <option value={s.value}>{s.label}</option>}
               </For>
             </select>
-          </div>
-          <div style={{ 'min-width': '130px' }}>
-            <label for="lvl">Level</label>
             <select
-              id="lvl"
+              class="lg-level"
+              aria-label="Level"
               value={levelFilter()}
               onChange={(e) => setLevelFilter(e.currentTarget.value)}
             >
-              <option value="">All</option>
+              <option value="">All levels</option>
               <option value="ERROR">Error</option>
               <option value="WARN">Warn</option>
               <option value="INFO">Info</option>
               <option value="DEBUG">Debug</option>
               <option value="TRACE">Trace</option>
             </select>
-          </div>
-          <div style={{ flex: '1', 'min-width': '200px' }}>
-            <label for="q">Search</label>
             <input
-              id="q"
-              placeholder="message, target or field…"
+              class="lg-search"
+              type="search"
+              aria-label="Search"
+              placeholder="Search"
               value={text()}
               onInput={(e) => setText(e.currentTarget.value)}
             />
           </div>
-          <div style={{ 'align-self': 'flex-end' }}>
-            <button
-              class="btn"
-              onClick={() => {
-                setFollow(true);
-                if (viewport) viewport.scrollTop = viewport.scrollHeight;
-              }}
-              disabled={follow()}
-            >
-              {follow() ? 'Following' : 'Follow'}
-            </button>
+        }
+      />
+
+      <div class="page-body lg-page">
+        <Show when={error()}>
+          <div class="banner">
+            <span class="dot bad" />
+            {error()}
           </div>
-        </div>
-      </div>
-
-      <div class="logs" ref={viewport} onScroll={onScroll}>
-        <Show
-          when={visible().length > 0}
-          fallback={
-            <Empty>
-              {connected() ? 'No lines match.' : 'Waiting for the stream…'}
-            </Empty>
-          }
-        >
-          <For each={visible()}>
-            {(entry) =>
-              entry.kind === 'dropped' ? (
-                <div class="log-dropped">
-                  … {entry.count} lines dropped (this viewer fell behind)
-                </div>
-              ) : (
-                <div class="log-line">
-                  <span class="log-ts">{formatClock(entry.line.ts)}</span>
-                  <span class={`log-level ${entry.line.level}`}>
-                    {entry.line.level}
-                  </span>
-                  <span class="log-target">{entry.line.target}</span>
-                  <span>
-                    {entry.line.message}
-                    <Show when={entry.line.fields}>
-                      <span class="log-fields"> {entry.line.fields}</span>
-                    </Show>
-                  </span>
-                </div>
-              )
-            }
-          </For>
         </Show>
-      </div>
 
-      <div class="ghost" style={{ 'margin-top': '10px', 'font-size': '11px' }}>
-        Scheduler and SSP logs only. Backends are reached over HTTP health
-        checks, so the scheduler has no access to their output.
-      </div>
+        <div class="lg-frame">
+          <div class="lg-bar">
+            <span class="lg-status" classList={{ on: connected() }}>
+              <StatusDot tone={connected() ? 'ok' : 'idle'} pulse={connected()} />
+              {connected() ? 'Streaming' : 'Connecting'}
+            </span>
+            <span class="lg-count">
+              {formatCount(visible().filter((e) => e.kind === 'line').length)} lines
+            </span>
+          </div>
+
+          <div class="lg-view" ref={viewport} onScroll={onScroll}>
+            <Show
+              when={visible().length > 0}
+              fallback={
+                <Empty>
+                  {connected() ? 'No lines match.' : 'Waiting for the stream.'}
+                </Empty>
+              }
+            >
+              <For each={visible()}>
+                {(entry) =>
+                  entry.kind === 'dropped' ? (
+                    <div class="lg-dropped">
+                      {formatCount(entry.count)} lines dropped, this viewer fell behind
+                    </div>
+                  ) : (
+                    <div class={`lg-line ${entry.line.level}`}>
+                      <span class="lg-ts">{formatClock(entry.line.ts)}</span>
+                      <span class="lg-lvl">{entry.line.level}</span>
+                      <span class="lg-msg">
+                        <span class="lg-target">{entry.line.target}</span>
+                        {entry.line.message}
+                        <Show when={entry.line.fields}>
+                          <span class="lg-fields"> {entry.line.fields}</span>
+                        </Show>
+                      </span>
+                    </div>
+                  )
+                }
+              </For>
+            </Show>
+          </div>
+
+          {/* Scrolled up to read: one click back to the live tail. */}
+          <Show when={!follow()}>
+            <button class="btn btn-sm lg-jump" onClick={jumpToEnd}>
+              Jump to latest
+            </button>
+          </Show>
+        </div>
       </div>
     </>
   );

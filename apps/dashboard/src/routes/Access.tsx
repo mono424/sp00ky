@@ -1,6 +1,6 @@
 import { For, Show, createResource, createSignal } from 'solid-js';
 import { api, currentMode } from '../api/client';
-import { Empty, PageHead, Panel, Pill } from '../components/Chrome';
+import { Empty, PageHead, Panel, SkeletonList } from '../components/Chrome';
 import { toast } from '../components/Actions';
 import { formatStamp } from '../lib/format';
 import type { McpTool, MeResponse, SessionScope, TokenResponse } from '../api/types';
@@ -73,7 +73,7 @@ function CopyButton(props: { value: string; label?: string }) {
         setTimeout(() => setDone(false), 1400);
       }}
     >
-      {done() ? 'copied' : (props.label ?? 'copy')}
+      {done() ? 'Copied' : (props.label ?? 'Copy')}
     </button>
   );
 }
@@ -82,11 +82,11 @@ function Snippet(props: { title: string; file?: string; code: string }) {
   return (
     <div class="snippet">
       <div class="snippet-head">
-        <span class="tag">
+        <span class="ac-snippet-title">
           {props.title}
           <Show when={props.file}>
             {' '}
-            <span class="ghost">{props.file}</span>
+            <span class="mono ac-snippet-file">{props.file}</span>
           </Show>
         </span>
         <CopyButton value={props.code} />
@@ -207,221 +207,185 @@ export function Access() {
     }));
   };
 
+  const meValue = () => {
+    const m = me();
+    return m && m.ok ? m.value : undefined;
+  };
+
   return (
     <>
       <PageHead
-        crumb="Dashboard"
         title="Access"
         subtitle={
-          <Show when={me()?.ok && me()}>
+          <Show when={meValue()}>
             {(m) => (
               <>
-                signed in as {(m() as { ok: true; value: MeResponse }).value.label}
-                {' · '}
-                {(m() as { ok: true; value: MeResponse }).value.mode}
-                {' · '}
-                {(m() as { ok: true; value: MeResponse }).value.scope ?? 'full'}
+                Signed in as {m().label}, {m().scope ?? 'full'} access
+                <Show when={m().mode !== 'roster'}> ({m().mode})</Show>
               </>
             )}
           </Show>
         }
       />
 
-      <div class="page-body">
-        <div class="stack">
-          <Show when={!persistent()}>
-            <div class="banner">
-              <span class="dot warn" />
-              No <span class="dim">SPKY_AUTH_SECRET</span> is set, so tokens live in this
-              scheduler process only and die with it. Set the secret to mint tokens that
-              survive a restart.
-            </div>
-          </Show>
+      <div class="page-body page-stack">
+        <Show when={!persistent()}>
+          <div class="banner">
+            <span class="dot warn" />
+            <span>
+              <span class="mono">SPKY_AUTH_SECRET</span> is not set, so tokens die with this
+              scheduler process.
+            </span>
+          </div>
+        </Show>
 
-          <div class="grid grid-2">
-            <Panel
-              title="MCP access"
-              sub="A token an AI agent presents to this scheduler's MCP endpoint"
+        <div class="ac-grid">
+          <Panel title="New MCP token" sub="For an AI agent to call this scheduler's MCP endpoint.">
+            <Show
+              when={canMint()}
+              fallback={<Empty>Only a full, interactive sign-in can create tokens.</Empty>}
             >
-              <Show
-                when={canMint()}
-                fallback={
-                  <Empty>
-                    This session cannot mint tokens: only a full, interactive sign-in can.
-                  </Empty>
-                }
-              >
-                <form class="stack" style={{ gap: '12px' }} onSubmit={mint}>
-                  <div>
-                    <label class="tag" style={{ display: 'block', 'margin-bottom': '6px' }}>
-                      Label
-                    </label>
+              <form class="ac-form" onSubmit={mint}>
+                <div class="ac-row">
+                  <div class="ac-grow">
+                    <label for="ac-label">Label</label>
                     <input
-                      placeholder="e.g. claude-code on my laptop"
+                      id="ac-label"
+                      placeholder="claude-code on my laptop"
                       value={label()}
                       onInput={(e) => setLabel(e.currentTarget.value)}
-                      style={{ width: '100%' }}
                     />
                   </div>
-
-                  <div>
-                    <div class="tag" style={{ 'margin-bottom': '6px' }}>
-                      Scope
-                    </div>
-                    <div class="choice-list">
-                      <label class="choice" classList={{ on: scope() === 'read' }}>
-                        <input
-                          type="radio"
-                          name="scope"
-                          checked={scope() === 'read'}
-                          onChange={() => setScope('read')}
-                        />
-                        <div>
-                          <div class="choice-title">Read-only</div>
-                          <div class="choice-sub">
-                            Overview, backends, logs, runs, schedules, backups catalog.
-                            Every write is refused with a 403.
-                          </div>
-                        </div>
-                      </label>
-                      <label class="choice" classList={{ on: scope() === 'full' }}>
-                        <input
-                          type="radio"
-                          name="scope"
-                          checked={scope() === 'full'}
-                          onChange={() => setScope('full')}
-                        />
-                        <div>
-                          <div class="choice-title">Full</div>
-                          <div class="choice-sub">
-                            Everything the dashboard can do: restarts, cancels, retries,
-                            backups and restores. Same blast radius as your own session.
-                          </div>
-                        </div>
-                      </label>
-                    </div>
-                  </div>
-
-                  <div>
-                    <label class="tag" style={{ display: 'block', 'margin-bottom': '6px' }}>
-                      Lifetime
-                    </label>
+                  <div class="ac-ttl">
+                    <label for="ac-ttl">Expires in</label>
                     <select
+                      id="ac-ttl"
                       value={String(ttl())}
                       onChange={(e) => setTtl(Number(e.currentTarget.value))}
                     >
                       <For each={LIFETIMES}>
-                        {(d) => (
-                          <option value={String(d)}>
-                            {d} days
-                          </option>
-                        )}
+                        {(d) => <option value={String(d)}>{d} days</option>}
                       </For>
                     </select>
                   </div>
-
-                  <div class="row">
-                    <button class="btn btn-primary" type="submit" disabled={busy()}>
-                      Create token
-                    </button>
-                  </div>
-                </form>
-              </Show>
-
-              <Show when={minted()}>
-                {(t) => (
-                  <div class="stack" style={{ gap: '10px', 'margin-top': '18px' }}>
-                    <div class="banner" style={{ 'margin-bottom': '0' }}>
-                      <span class="dot warn" />
-                      Shown once. Copy it now; the scheduler keeps no record of it.
-                    </div>
-                    <div class="token-box">
-                      <span class="token-value">{t().token}</span>
-                      <CopyButton value={t().token} />
-                    </div>
-                    <div class="ghost" style={{ 'font-size': '11px' }}>
-                      {t().label} · {t().scope} · expires {formatStamp(t().expires_at)}
-                    </div>
-                    <Snippet title="Claude Code" code={claudeCmd(t())} />
-                    <Snippet title="Cursor" file="~/.cursor/mcp.json" code={cursorJson(t())} />
-                    <Snippet title="VS Code" file=".vscode/mcp.json" code={vscodeJson(t())} />
-                  </div>
-                )}
-              </Show>
-            </Panel>
-
-            <div class="stack">
-              <Panel title="Endpoint" sub="Streamable HTTP, JSON-RPC over POST">
-                <div class="token-box" style={{ 'border-color': 'var(--rule)' }}>
-                  <span class="token-value">{endpointBase()}/admin/api/mcp</span>
-                  <CopyButton value={`${endpointBase()}/admin/api/mcp`} />
                 </div>
-                <div class="ghost prose" style={{ 'margin-top': '10px', 'font-size': '11.5px' }}>
-                  Any admin session token works as the bearer too; a minted token is only
-                  a longer-lived one with an explicit scope.
-                </div>
-              </Panel>
 
-              <Panel title="Revoke a token" sub="Takes effect immediately for this process">
-                <form class="row" onSubmit={revoke}>
-                  <input
-                    placeholder="paste the token"
-                    value={revokeValue()}
-                    onInput={(e) => setRevokeValue(e.currentTarget.value)}
-                    style={{ flex: '1' }}
-                  />
-                  <button class="btn" type="submit" disabled={busy() || !revokeValue().trim()}>
-                    Revoke
+                <div role="radiogroup" aria-label="Scope" class="ac-scopes">
+                  <label class="ac-scope" classList={{ on: scope() === 'read' }}>
+                    <input
+                      type="radio"
+                      name="scope"
+                      checked={scope() === 'read'}
+                      onChange={() => setScope('read')}
+                    />
+                    <span class="ac-scope-title">Read-only</span>
+                    <span class="ac-scope-sub">Every write is refused.</span>
+                  </label>
+                  <label class="ac-scope" classList={{ on: scope() === 'full' }}>
+                    <input
+                      type="radio"
+                      name="scope"
+                      checked={scope() === 'full'}
+                      onChange={() => setScope('full')}
+                    />
+                    <span class="ac-scope-title">Full</span>
+                    <span class="ac-scope-sub">Restarts, retries, backups and restores.</span>
+                  </label>
+                </div>
+
+                <div>
+                  <button class="btn btn-primary" type="submit" disabled={busy()}>
+                    Create token
                   </button>
-                </form>
-                <Show when={persistent()}>
-                  <div class="ghost" style={{ 'margin-top': '8px', 'font-size': '11px' }}>
-                    Revocations are kept in memory; a scheduler restart forgets them until the
-                    token's own expiry.
-                  </div>
-                </Show>
-              </Panel>
-            </div>
-          </div>
+                </div>
+              </form>
+            </Show>
 
-          <Panel
-            title="Tools"
-            sub="What an agent can call, as this scheduler lists them"
-            actions={
-              <button class="btn btn-sm" onClick={() => void refetchTools()}>
-                refresh
-              </button>
-            }
-          >
-            <Show when={tools()} fallback={<Empty>Loading…</Empty>}>
+            <Show when={minted()}>
               {(t) => (
-                <Show
-                  when={t().ok}
-                  fallback={<Empty>{(t() as { ok: false; message: string }).message}</Empty>}
-                >
-                  <For each={grouped()}>
-                    {(g) => (
-                      <div class="tool-group">
-                        <div class="tag" style={{ 'margin-bottom': '4px' }}>
-                          {g.group}
-                        </div>
-                        <For each={g.tools}>
-                          {(tool) => (
-                            <div class="tool-row">
-                              <span class="tool-name">{tool.name}</span>
-                              <Pill tone={toolTone(tool).tone}>{toolTone(tool).label}</Pill>
-                              <span class="tool-desc">{tool.description}</span>
-                            </div>
-                          )}
-                        </For>
-                      </div>
-                    )}
-                  </For>
-                </Show>
+                <div class="ac-minted">
+                  <div class="ac-minted-head">
+                    <span class="dot warn" />
+                    Shown once, copy it now.
+                    <span class="ac-minted-meta">
+                      {t().label}, {t().scope}, expires {formatStamp(t().expires_at)}
+                    </span>
+                  </div>
+                  <div class="token-box">
+                    <span class="token-value">{t().token}</span>
+                    <CopyButton value={t().token} />
+                  </div>
+                  <Snippet title="Claude Code" code={claudeCmd(t())} />
+                  <Snippet title="Cursor" file="~/.cursor/mcp.json" code={cursorJson(t())} />
+                  <Snippet title="VS Code" file=".vscode/mcp.json" code={vscodeJson(t())} />
+                </div>
               )}
             </Show>
           </Panel>
+
+          <div class="page-stack">
+            <Panel title="Endpoint" sub="Any admin session token works as the bearer.">
+              <div class="ac-endpoint">
+                <span class="token-value mono">{endpointBase()}/admin/api/mcp</span>
+                <CopyButton value={`${endpointBase()}/admin/api/mcp`} />
+              </div>
+            </Panel>
+
+            <Panel
+              title="Revoke a token"
+              sub={persistent() ? 'Immediate; a restart forgets it until the token expires.' : 'Immediate.'}
+            >
+              <form class="ac-revoke" onSubmit={revoke}>
+                <input
+                  aria-label="Token to revoke"
+                  placeholder="Paste the token"
+                  value={revokeValue()}
+                  onInput={(e) => setRevokeValue(e.currentTarget.value)}
+                />
+                <button class="btn" type="submit" disabled={busy() || !revokeValue().trim()}>
+                  Revoke
+                </button>
+              </form>
+            </Panel>
+          </div>
         </div>
+
+        <Panel
+          flush
+          title="Tools"
+          sub="What an agent can call here."
+          actions={
+            <button class="btn btn-sm" onClick={() => void refetchTools()}>
+              Refresh
+            </button>
+          }
+        >
+          <Show when={tools()} fallback={<SkeletonList rows={5} />}>
+            {(t) => (
+              <Show
+                when={t().ok}
+                fallback={<Empty>{(t() as { ok: false; message: string }).message}</Empty>}
+              >
+                <For each={grouped()}>
+                  {(g) => (
+                    <div class="ac-group">
+                      <div class="ac-group-name">{g.group}</div>
+                      <For each={g.tools}>
+                        {(tool) => (
+                          <div class="ac-tool">
+                            <span class="ac-tool-name mono">{tool.name}</span>
+                            <span class="ac-tool-desc">{tool.description}</span>
+                            <span class={`ac-kind ${toolTone(tool).tone}`}>{toolTone(tool).label}</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  )}
+                </For>
+              </Show>
+            )}
+          </Show>
+        </Panel>
       </div>
     </>
   );

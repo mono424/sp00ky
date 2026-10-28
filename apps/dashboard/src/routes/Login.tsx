@@ -7,7 +7,7 @@ import { Logo } from '../components/Chrome';
  * Sign-in.
  *
  * The endpoint field appears only when this bundle is NOT being served by a
- * scheduler. Embedded, the endpoint is where the page came from — asking for it
+ * scheduler. Embedded, the endpoint is where the page came from, and asking for it
  * again would be asking the operator to retype something we already know.
  */
 export function Login(props: { onSignedIn: (session: LoginResponse) => void }) {
@@ -62,83 +62,89 @@ export function Login(props: { onSignedIn: (session: LoginResponse) => void }) {
     }
   };
 
+  const tone = () => (config() ? 'ok' : 'idle');
+
   return (
-    <div class="login-wrap">
-      <form class="login-card" onSubmit={submit}>
-        <div class="login-title">
+    <div class="login-wrap li-wrap">
+      <form class="li-card" classList={{ [tone()]: true }} onSubmit={submit}>
+        <div class="li-brand">
           <Logo />
           <span class="brand-tag">admin</span>
         </div>
-        <div class="login-sub">
-          <Show
-            when={config()}
-            fallback="Connect to a scheduler to sign in."
-          >
-            {(c) => (
-              <>
-                {c().scheduler_id} · v{c().version}
-              </>
-            )}
-          </Show>
+
+        <div class="li-head">
+          <span class="li-orb" aria-hidden="true">
+            <span class="li-orb-ring" />
+            <span class="li-orb-core" />
+          </span>
+          <div class="li-head-text">
+            <h1 class="li-title">{breakglass() ? 'Break-glass sign-in' : 'Sign in'}</h1>
+            <div class="li-sub">
+              <Show when={config()} fallback="Connect to a scheduler to sign in.">
+                {(c) => (
+                  <>
+                    {c().project_slug ?? c().scheduler_id}
+                    <span class="li-version mono">{c().version.replace(/^0\.0\.1-/, '')}</span>
+                  </>
+                )}
+              </Show>
+            </div>
+          </div>
         </div>
 
-        <Show when={!embedded()}>
-          <div class="field">
-            <label for="endpoint">Scheduler endpoint</label>
+        <div class="li-fields">
+          <Show when={!embedded()}>
+            <div>
+              <label for="endpoint">Scheduler endpoint</label>
+              <input
+                id="endpoint"
+                class="mono"
+                placeholder="http://10.0.0.5:9668"
+                value={endpoint()}
+                onInput={(e) => setEndpointValue(e.currentTarget.value)}
+                onBlur={connect}
+                autocomplete="url"
+              />
+            </div>
+          </Show>
+
+          <Show when={!breakglass()}>
+            <div>
+              <label for="username">Username</label>
+              <input
+                id="username"
+                value={username()}
+                onInput={(e) => setUsername(e.currentTarget.value)}
+                autocomplete="username"
+                autofocus
+              />
+            </div>
+          </Show>
+
+          <div>
+            <label for="password">{breakglass() ? 'Admin password' : 'Password'}</label>
             <input
-              id="endpoint"
-              placeholder="http://10.0.0.5:9668"
-              value={endpoint()}
-              onInput={(e) => setEndpointValue(e.currentTarget.value)}
-              onBlur={connect}
-              autocomplete="url"
+              id="password"
+              type="password"
+              value={password()}
+              onInput={(e) => setPassword(e.currentTarget.value)}
+              autocomplete="current-password"
             />
           </div>
-        </Show>
-
-        <Show when={!breakglass()}>
-          <div class="field">
-            <label for="username">Username</label>
-            <input
-              id="username"
-              value={username()}
-              onInput={(e) => setUsername(e.currentTarget.value)}
-              autocomplete="username"
-              autofocus
-            />
-          </div>
-        </Show>
-
-        <div class="field">
-          <label for="password">
-            {breakglass() ? 'Admin password' : 'Password'}
-          </label>
-          <input
-            id="password"
-            type="password"
-            value={password()}
-            onInput={(e) => setPassword(e.currentTarget.value)}
-            autocomplete="current-password"
-          />
         </div>
 
         <Show when={error()}>
-          <div class="login-error">{error()}</div>
+          <div class="login-error li-error" role="alert">{error()}</div>
         </Show>
 
-        <button
-          class="btn btn-primary"
-          type="submit"
-          disabled={busy()}
-          style={{ width: '100%' }}
-        >
+        <button class="btn btn-primary li-submit" type="submit" disabled={busy()}>
           {busy() ? 'Signing in…' : 'Sign in'}
         </button>
 
-        {/* Offered only when the scheduler says a break-glass password is
-            configured, so the option never appears where it cannot work. */}
-        <Show when={config()?.breakglass_available}>
-          <div style={{ 'margin-top': '14px', 'text-align': 'center' }}>
+        <div class="li-foot">
+          {/* Offered only when the scheduler says a break-glass password is
+              configured, so the option never appears where it cannot work. */}
+          <Show when={config()?.breakglass_available}>
             <button
               type="button"
               class="link-btn"
@@ -147,21 +153,15 @@ export function Login(props: { onSignedIn: (session: LoginResponse) => void }) {
                 setError(null);
               }}
             >
-              {breakglass()
-                ? 'Sign in with an admin account'
-                : 'Use the break-glass admin password'}
+              {breakglass() ? 'Use an admin account' : 'Use the break-glass password'}
             </button>
-          </div>
-        </Show>
-
-        <Show when={!breakglass()}>
-          <div
-            class="faint"
-            style={{ 'margin-top': '16px', 'font-size': '11.5px', 'text-align': 'center' }}
-          >
-            Accounts are granted access with <span class="mono">spky admin add</span>.
-          </div>
-        </Show>
+          </Show>
+          <Show when={!breakglass()}>
+            <span>
+              Get access with <span class="mono">spky admin add</span>
+            </span>
+          </Show>
+        </div>
       </form>
     </div>
   );

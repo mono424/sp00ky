@@ -8,35 +8,24 @@ import {
   onCleanup,
   type JSX,
 } from 'solid-js';
-import { A, useNavigate, useParams } from '@solidjs/router';
+import { A, useParams } from '@solidjs/router';
 import { api, openStream, streamsAvailable } from '../api/client';
 import {
-  Bento,
   Chips,
   CopyId,
   Empty,
   KeyValue,
-  LaneBar,
   PageHead,
   Panel,
   Pill,
-  Readout,
   Reason,
-  ReasonLine,
-  SkeletonBento,
-  SkeletonList,
   Stale,
-  StatusDot,
-  Tile,
 } from '../components/Chrome';
 import { readStash, writeStash } from '../lib/stash';
-import { Sparkline, type Point } from '../components/Sparkline';
+import { Trace, hueOf, type TraceRow, type TraceState } from '../components/Trace';
 import {
   decodeParam,
-  elapsed,
   formatCount,
-  formatDuration,
-  formatStamp,
   orNull,
   relativeStamp,
 } from '../lib/format';
@@ -76,7 +65,6 @@ import type {
 /** How often a filtered view refetches. The stream covers the unfiltered one. */
 const FILTERED_POLL_MS = 3000;
 
-const STATUSES = ['pending', 'processing', 'success', 'failed'] as const;
 
 const ORIGINS: { key: OriginKind; label: string; hint: string }[] = [
   {
@@ -167,12 +155,12 @@ function attemptLabel(retries: number | null, max: number | null): string {
  * this, which is exactly why it earns a label of its own here rather than
  * sitting in the list looking like ordinary in-flight work.
  */
-function isStalled(job: Pick<JobSummary, 'status' | 'lease_until'>): boolean {
+function isStalled(job: Pick<JobSummary, 'status' | 'lease_until'>, now = Date.now()): boolean {
   if (job.status !== 'processing') return false;
   const until = orNull(job.lease_until);
   if (!until) return false;
   const t = Date.parse(until);
-  return !Number.isNaN(t) && t < Date.now();
+  return !Number.isNaN(t) && t < now;
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,17 +168,30 @@ function isStalled(job: Pick<JobSummary, 'status' | 'lease_until'>): boolean {
 /* ------------------------------------------------------------------ */
 
 export function Jobs() {
-  const navigate = useNavigate();
   // Paint the last frame we saw before the stream's first one arrives.
   const cached = readStash<JobsListResponse>('jobs');
-  const [page, setPage] = createSignal<JobsListResponse | null>(cached?.value ?? null);
+  const [page, setPageRaw] = createSignal<JobsListResponse | null>(cached?.value ?? null);
+  // The trace follows the SCHEDULER's clock: the frame says when it was
+  // sampled, and the time since it arrived is added on. A browser clock that
+  // is off by minutes would otherwise slide every bar.
+  let receivedAt = Date.now();
+  const setPage = (p: JobsListResponse | null) => {
+    receivedAt = Date.now();
+    setPageRaw(p);
+  };
+  const serverNow = () => {
+    const sampled = page()?.sampled_at_ms;
+    return sampled ? sampled + (Date.now() - receivedAt) : Date.now();
+  };
   const [stale, setStale] = createSignal(cached != null);
   const [error, setError] = createSignal<string | null>(null);
   const [connected, setConnected] = createSignal(false);
 
   const [status, setStatus] = createSignal('');
-  const [origin, setOrigin] = createSignal('');
-  const [table, setTable] = createSignal('');
+  // Origin and table filters are still honoured by the query; the trace
+  // groups by table instead of offering a table chip.
+  const [origin] = createSignal('');
+  const [table] = createSignal('');
   const [search, setSearch] = createSignal('');
 
   const filtered = () => !!(status() || origin() || table() || search());
@@ -268,25 +269,6 @@ export function Jobs() {
   const tables = () => page()?.tables ?? [];
   const stalled = () => totals()?.stalled ?? 0;
 
-  const points = (): Point[] =>
-    (totals()?.samples ?? []).map((s) => ({
-      ts: s.t,
-      ms: s.pending,
-      ok: true,
-    }));
-  const throughputPoints = (): Point[] =>
-    (totals()?.samples ?? []).map((s) => ({
-      ts: s.t,
-      ms: s.throughput_1m,
-      ok: true,
-    }));
-  /** The deepest lane sets the scale every lane is drawn against. */
-  const laneMax = () =>
-    tables().reduce(
-      (m, t) => Math.max(m, t.counts.pending + t.in_flight + t.counts.failed, t.concurrency),
-      1,
-    );
-
   const refresh = () => {
     // The stream pushes the next frame on its own; a filtered view is on a
     // timer. Either way an action's `after` only has to not be empty.
@@ -297,25 +279,134 @@ export function Jobs() {
 
   const clearAll = () => void clearJobs({ table: table() || undefined }, refresh);
 
+  const t = (iso: string | null | undefined) => {
+    const v = orNull(iso ?? null);
+    if (!v) return null;
+    const n = Date.parse(v);
+    return Number.isNaN(n) ? null : n;
+  };
+
+  /** What a job's origin says in one short phrase. */
+  const originText = (o: JobOrigin) =>
+    orNull(o.schedule ?? null) ??
+    (orNull(o.workflow_run ?? null) ? `${orNull(o.step ?? null) ?? 'step'} of ${o.workflow_run}` : null) ??
+    originLabel(o.kind).toLowerCase();
+
+  const rowOf = (job: JobSummary, parent?: string): TraceRow => {
+    const created = t(job.created_at);
+    const updated = t(job.updated_at);
+    const stuck = isStalled(job, serverNow());
+    const state: TraceState =
+      job.status === 'pending'
+        ? 'waiting'
+        : job.status === 'processing'
+          ? stuck
+            ? 'failed'
+            : 'running'
+          : job.status === 'failed'
+            ? 'failed'
+            : 'done';
+    const attempts = (job.retries ?? 0) + 1;
+    return {
+      id: job.id,
+      parent,
+      depth: parent ? 1 : 0,
+      label: job.path ?? job.key,
+      sub: [originText(job.origin), job.assignee].filter(Boolean).join(' · '),
+      badge: job.origin.kind === 'schedule' ? 'S' : job.origin.kind === 'workflow' ? 'W' : job.origin.kind === 'durable' ? 'D' : 'A',
+      color: hueOf(job.table),
+      state,
+      // No pickup time is recorded, so a job's bar spans its row's life: from
+      // creation to its last write, or to now while it runs.
+      start: state === 'waiting' ? null : created,
+      end: state === 'running' ? null : state === 'waiting' ? null : updated,
+      queued: state === 'waiting' ? created : null,
+      meta: [
+        stuck ? 'stalled' : null,
+        attempts > 1 ? `attempt ${attempts} of ${(job.max_retries ?? 0) + 1}` : null,
+        state === 'failed' && job.last_error?.reason ? String(job.last_error.reason) : null,
+      ]
+        .filter(Boolean)
+        .join(' · ') || undefined,
+      href: `/jobs/${encodeURIComponent(job.id)}`,
+      actions:
+        job.status === 'processing'
+          ? () => (
+              <button class="btn btn-sm" onClick={() => void killJob(job.id, refresh)}>
+                Kill
+              </button>
+            )
+          : job.status === 'failed' || job.status === 'success'
+            ? () => (
+                <button class="btn btn-sm" onClick={() => void retryJob(job.id, refresh)}>
+                  Retry
+                </button>
+              )
+            : undefined,
+    };
+  };
+
+  /**
+   * One collapsible group per outbox table, its jobs under it. A table with
+   * nothing in this page still gets its header line when it holds pending or
+   * failed work, so a queue backing up is visible even when the listed page is
+   * all other tables.
+   */
+  const rows = createMemo((): TraceRow[] => {
+    const list = jobs();
+    const byTable = new Map<string, JobSummary[]>();
+    for (const j of list) byTable.set(j.table, [...(byTable.get(j.table) ?? []), j]);
+    const out: TraceRow[] = [];
+    const known = new Set<string>();
+    for (const lane of tables()) {
+      known.add(lane.table);
+      const mine = byTable.get(lane.table) ?? [];
+      if (mine.length === 0 && lane.counts.pending + lane.in_flight + lane.counts.failed === 0) continue;
+      const saturated = lane.in_flight >= lane.concurrency && lane.counts.pending > 0;
+      out.push({
+        id: `table:${lane.table}`,
+        group: true,
+        label: lane.table,
+        sub: [
+          lane.counts.pending ? `${formatCount(lane.counts.pending)} pending` : null,
+          `${lane.in_flight}/${lane.concurrency} running`,
+          lane.counts.failed ? `${formatCount(lane.counts.failed)} failed` : null,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+        color: hueOf(lane.table),
+        state: lane.error || lane.stalled > 0 ? 'failed' : saturated ? 'running' : 'done',
+        start: null,
+        end: null,
+      });
+      for (const j of mine) out.push(rowOf(j, `table:${lane.table}`));
+    }
+    // Jobs from a table the sampler did not report (a filtered page).
+    for (const j of list) if (!known.has(j.table)) out.push(rowOf(j));
+    return out;
+  });
+
   return (
     <>
       <PageHead
-        crumb="Dashboard"
         title="Jobs"
-        subtitle="Every outbox job, whatever created it"
         actions={
           <div class="row">
             <Stale when={stale()} />
-            <Pill tone={connected() ? 'live' : 'idle'}>
-              <StatusDot tone={connected() ? 'ok' : 'idle'} />
-              {connected() ? 'live' : filtered() ? 'filtered' : 'connecting…'}
+            <Pill tone={connected() ? 'live' : 'idle'} dot pulse={connected()}>
+              {connected() ? 'live' : filtered() ? 'filtered' : 'connecting'}
             </Pill>
+            <Show when={tables().length > 0}>
+              <button class="btn btn-sm" onClick={clearAll}>
+                Clear finished
+              </button>
+            </Show>
           </div>
         }
       />
 
       <div class="page-body">
-        <div class="stack">
+        <div class="page-stack">
           <Show when={error()}>
             <div class="banner">
               <span class="dot bad" />
@@ -323,346 +414,78 @@ export function Jobs() {
             </div>
           </Show>
 
-          {/* The sampler has not completed a pass. Said plainly: zeros here
-              would read as an empty, healthy queue, which is a different claim
-              from "not measured yet". */}
           <Show when={totals() && !totals()!.ready}>
             <div class="banner">
               <span class="dot warn" />
-              <Show
-                when={totals()!.enabled === false}
-                fallback={<>The job sampler has not completed its first pass yet.</>}
-              >
-                The job sampler is switched off on this scheduler (
-                <span class="mono">SPKY_ADMIN_JOB_INTERVAL_SECS=0</span>), so the
-                totals below are not being measured. The listing still works.
-              </Show>
+              {totals()!.enabled === false
+                ? 'The job sampler is switched off on this scheduler, so the totals are not measured.'
+                : 'Waiting for the first job sample.'}
             </div>
           </Show>
 
           <Show when={totals()?.blind}>
             <div class="banner">
               <span class="dot bad" />
-              Every outbox table refused to answer, so these counts mean nothing.
-              The per-table panel below has each table's own error.
+              No outbox table answered, so these counts mean nothing.
             </div>
           </Show>
 
-          <Show when={totals()} fallback={<SkeletonBento shape={[{ span: 6, rows: 2 }, { span: 3 }, { span: 3 }, { span: 3 }, { span: 3 }, { span: 12 }]} />}>
-            {(t) => (
-              <Bento>
-                {/* ---- hero: the queue over time ---- */}
-                <Tile
-                  i={0}
-                  span={6}
-                  rows={2}
-                  hero
-                  label="Queue depth"
-                  sub={
-                    t().oldest_pending
-                      ? `oldest pending ${relativeStamp(t().oldest_pending)}`
-                      : 'nothing queued'
-                  }
-                  tone={stalled() > 0 ? 'bad' : t().counts.pending > 0 ? 'warn' : 'ok'}
-                >
-                  <div class="row" style={{ 'align-items': 'flex-end', gap: '20px', 'flex-wrap': 'wrap' }}>
-                    <Readout value={formatCount(t().counts.pending)} unit="pending" />
-                    <div class="stat3" style={{ flex: '1 1 200px' }}>
-                      <div>
-                        <div class="k">In flight</div>
-                        <div class="v">{formatCount(t().in_flight)}</div>
-                      </div>
-                      <div>
-                        <div class="k">Stalled</div>
-                        <div class="v" classList={{ 'tone-bad': stalled() > 0 }}>{formatCount(stalled())}</div>
-                      </div>
-                      <div>
-                        <div class="k">Tables</div>
-                        <div class="v">{formatCount(t().tables)}</div>
-                      </div>
-                    </div>
-                  </div>
-                  <Show when={points().length > 1} fallback={<div class="tile-foot tile-end">collecting samples…</div>}>
-                    <div class="tile-plot tile-end">
-                      <Sparkline points={points()} fill format={formatCount} ariaLabel="Pending jobs over time" />
-                    </div>
-                  </Show>
-                </Tile>
-
-                <Tile
-                  i={1}
-                  span={3}
-                  label="Throughput"
-                  sub="succeeded per minute"
-                >
-                  <Readout value={formatCount(t().throughput_1m)} unit="per min" />
-                  <Show when={throughputPoints().length > 1}>
-                    <div class="tile-plot tile-end">
-                      <Sparkline points={throughputPoints()} bare format={formatCount} ariaLabel="Throughput" />
-                    </div>
-                  </Show>
-                </Tile>
-
-                <Tile
-                  i={2}
-                  span={3}
-                  label="Failed"
-                  sub="in the last hour"
-                  tone={t().counts.failed > 0 ? 'bad' : 'ok'}
-                >
-                  <Readout value={formatCount(t().counts.failed)} />
-                </Tile>
-
-                <Tile
-                  i={3}
-                  span={3}
-                  label="In flight"
-                  sub={
-                    stalled() > 0
-                      ? `${formatCount(stalled())} stalled: lease expired, nobody is working on them`
-                      : 'every lease live'
-                  }
-                  tone={stalled() > 0 ? 'bad' : 'ok'}
-                  pulse={t().in_flight > 0}
-                >
-                  <Readout value={formatCount(t().in_flight)} />
-                </Tile>
-
-                <Tile i={4} span={3} label="Succeeded" sub="retained in the window">
-                  <Readout value={formatCount(t().counts.success)} />
-                </Tile>
-
-                {/* ---- lanes: one queue per table, one scale ---- */}
-                <Tile
-                  i={5}
-                  span={12}
-                  flush
-                  label="Queues"
-                  sub="Each outbox table on one scale. The tick is the concurrency the dispatcher admits on."
-                  actions={
-                    <Show when={tables().length > 0}>
-                      <button class="btn btn-sm" onClick={clearAll}>Clear terminal jobs</button>
-                    </Show>
-                  }
-                >
-                  <Show
-                    when={tables().length > 0}
-                    fallback={
-                      <Empty>
-                        No outbox tables. <span class="mono">spky deploy</span> writes
-                        the list to <span class="mono">_00_retention.job_tables</span>.
-                      </Empty>
-                    }
-                  >
-                    <div class="lanes" role="table" aria-label="Outbox queues">
-                      <div class="lane lane-head" role="row">
-                        <span role="columnheader">Table</span>
-                        <span role="columnheader">Queue</span>
-                        <span class="num" role="columnheader">Pending</span>
-                        <span class="num" role="columnheader">In flight</span>
-                        <span class="num" role="columnheader">Failed 1h</span>
-                        <span class="num" role="columnheader">Oldest</span>
-                      </div>
-                      <For each={tables()}>
-                        {(lane) => {
-                          const saturated = () => lane.in_flight >= lane.concurrency && lane.counts.pending > 0;
-                          const running = () => lane.in_flight - lane.stalled;
-                          return (
-                            <div class="lane" role="row" classList={{ active: table() === lane.table }}>
-                              <div class="lane-name" role="cell">
-                                <StatusDot tone={lane.error || lane.stalled > 0 ? 'bad' : saturated() ? 'warn' : 'ok'} />
-                                <button
-                                  type="button"
-                                  class="lane-link"
-                                  onClick={() => setTable(table() === lane.table ? '' : lane.table)}
-                                  title="Filter the list to this table"
-                                >
-                                  {lane.table}
-                                </button>
-                                <Show when={lane.error}><ReasonLine error={lane.error} /></Show>
-                              </div>
-                              <LaneBar
-                                max={laneMax()}
-                                cap={lane.concurrency}
-                                segments={[
-                                  { value: running(), tone: 'ok', title: `${running()} in flight` },
-                                  { value: lane.stalled, tone: 'bad', title: `${lane.stalled} stalled` },
-                                  { value: lane.counts.pending, tone: 'accent', title: `${lane.counts.pending} pending` },
-                                  { value: lane.counts.failed, tone: 'warn', title: `${lane.counts.failed} failed in the last hour` },
-                                ]}
-                              />
-                              <span class="num" role="cell" data-label="pending">
-                                <b classList={{ zero: lane.counts.pending === 0 }}>{formatCount(lane.counts.pending)}</b>
-                              </span>
-                              <span class="num" role="cell" data-label="in flight" classList={{ 'tone-warn': saturated() }}>
-                                <b classList={{ zero: lane.in_flight === 0 }}>{lane.in_flight}</b>
-                                <span class="lane-of">/{lane.concurrency}</span>
-                              </span>
-                              <span class="num" role="cell" data-label="failed" classList={{ 'tone-bad': lane.counts.failed > 0 }}>
-                                <b classList={{ zero: lane.counts.failed === 0 }}>{formatCount(lane.counts.failed)}</b>
-                              </span>
-                              <span class="num lane-age" role="cell" data-label="oldest" classList={{ empty: !lane.oldest_pending }}>
-                                {lane.oldest_pending ? relativeStamp(lane.oldest_pending) : '·'}
-                              </span>
-                            </div>
-                          );
-                        }}
-                      </For>
-                    </div>
-                    <div class="lane-legend">
-                      <span class="ok">in flight</span>
-                      <span class="bad">stalled</span>
-                      <span class="accent">pending</span>
-                      <span class="warn">failed, last hour</span>
-                      <span class="cap">concurrency</span>
-                    </div>
-                  </Show>
-                </Tile>
-              </Bento>
-            )}
+          <Show when={page()} fallback={<div class="ov-skeleton" />}>
+            <Trace
+              title="Queue"
+              live
+              clock={serverNow}
+              windows={[
+                { key: '5m', label: 'Last 5 min', ms: 5 * 60_000 },
+                { key: '1m', label: 'Last minute', ms: 60_000 },
+                { key: '15m', label: 'Last 15 min', ms: 15 * 60_000 },
+                { key: '1h', label: 'Last hour', ms: 3_600_000 },
+                { key: '6h', label: 'Last 6 hours', ms: 6 * 3_600_000 },
+                { key: '24h', label: 'Last day', ms: 24 * 3_600_000 },
+              ]}
+              treeLabel="Queues"
+              rows={rows()}
+              legend={['run', 'wait', 'failed']}
+              empty={filtered() ? 'Nothing matches those filters.' : 'No jobs. Finished ones are pruned on your retention window.'}
+              stats={[
+                { label: 'Pending', value: formatCount(totals()?.counts.pending ?? 0) },
+                { label: 'Running', value: formatCount(totals()?.in_flight ?? 0) },
+                { label: 'Stalled', value: formatCount(stalled()), tone: stalled() > 0 ? 'bad' : undefined },
+                {
+                  label: 'Failed, 1h',
+                  value: formatCount(totals()?.counts.failed ?? 0),
+                  tone: (totals()?.counts.failed ?? 0) > 0 ? 'warn' : undefined,
+                },
+                { label: 'Per minute', value: formatCount(totals()?.throughput_1m ?? 0) },
+                {
+                  label: 'Oldest pending',
+                  value: totals()?.oldest_pending ? relativeStamp(totals()!.oldest_pending) : 'none',
+                },
+              ]}
+              tools={
+                <>
+                  <Chips
+                    value={status()}
+                    onChange={setStatus}
+                    options={[
+                      { key: '', label: 'All' },
+                      { key: 'pending', label: 'Waiting' },
+                      { key: 'processing', label: 'Running' },
+                      { key: 'failed', label: 'Failed', tone: 'bad' },
+                      { key: 'success', label: 'Done' },
+                    ]}
+                  />
+                  <input
+                    type="search"
+                    placeholder="Search path or id"
+                    value={search()}
+                    onInput={(e) => setSearch(e.currentTarget.value)}
+                    aria-label="Search jobs"
+                  />
+                </>
+              }
+            />
           </Show>
-
-          <Panel flush>
-            <div class="toolbar">
-              <div class="toolbar-groups">
-                <Chips label="Status" value={status()} onChange={setStatus}
-                  options={[{ key: '', label: 'Any' }, ...STATUSES.map((s) => ({ key: s, label: s, tone: s === 'failed' ? 'bad' : s === 'pending' ? 'warn' : s === 'success' ? 'ok' : undefined }))]} />
-                <Chips label="Origin" value={origin()} onChange={setOrigin}
-                  options={[{ key: '', label: 'Any' }, ...ORIGINS.map((o) => ({ key: o.key, label: o.label }))]} />
-                <Show when={tables().length > 1}>
-                  <Chips label="Table" value={table()} onChange={setTable}
-                    options={[{ key: '', label: 'Every' }, ...tables().map((t) => ({ key: t.table, label: t.table, count: t.counts.pending + t.in_flight }))]} />
-                </Show>
-              </div>
-              <div class="row">
-                <input
-                  type="search"
-                  placeholder="Search the path or the id"
-                  value={search()}
-                  onInput={(e) => setSearch(e.currentTarget.value)}
-                  aria-label="Search jobs"
-                />
-                <Show when={filtered()}>
-                  <button class="btn btn-sm" onClick={() => { setStatus(''); setOrigin(''); setTable(''); setSearch(''); }}>
-                    Clear
-                  </button>
-                </Show>
-              </div>
-            </div>
-          </Panel>
-
-          <Panel
-            title="Jobs"
-            sub={`${jobs().length} shown${
-              page()?.live === false ? ', matching the filters' : ', newest activity first'
-            }`}
-            flush
-          >
-            <Show
-              when={jobs().length > 0}
-              fallback={<Show when={page()} fallback={<SkeletonList rows={6} />}>
-                <Empty>
-                  <Show
-                    when={filtered()}
-                    fallback={
-                      <>
-                        No jobs. Terminal rows are pruned on your retention
-                        window, so a quiet queue and a swept one look the same
-                        here.
-                      </>
-                    }
-                  >
-                    Nothing matches those filters.
-                  </Show>
-                </Empty>
-              </Show>}
-            >
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Job</th>
-                      <th>Status</th>
-                      <th>Origin</th>
-                      <th>Attempts</th>
-                      <th>Age</th>
-                      <th />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <For each={jobs()}>
-                      {(job) => (
-                        <tr
-                          class="clickable"
-                          onClick={() =>
-                            navigate(`/jobs/${encodeURIComponent(job.id)}`)
-                          }
-                        >
-                          <td>
-                            <div class="row">
-                              <StatusDot
-                                tone={jobTone(job.status)}
-                                pulse={job.status === 'processing' && !isStalled(job)}
-                              />
-                              <span class="truncate">{job.path ?? '—'}</span>
-                            </div>
-                            <div class="id" style={{ 'margin-top': '2px' }}>
-                              {job.id}
-                            </div>
-                            {/* The reason on the row: a list where four say
-                                `failed` and nothing else forces four clicks to
-                                find out whether it is four problems or one. */}
-                            <Show when={job.last_error}>
-                              <ReasonLine error={job.last_error} />
-                            </Show>
-                          </td>
-                          <td data-label="Status">
-                            <Pill tone={isStalled(job) ? 'bad' : jobTone(job.status)}>
-                              {isStalled(job) ? 'stalled' : job.status}
-                            </Pill>
-                          </td>
-                          <td data-label="Origin">
-                            <OriginCell origin={job.origin} />
-                          </td>
-                          <td class="dim" data-label="Attempts">
-                            {attemptLabel(job.retries, job.max_retries)}
-                          </td>
-                          <td class="dim" data-label="Age">
-                            {relativeStamp(job.created_at)}
-                          </td>
-                          <td data-label="Actions" data-empty={true}>
-                            <div
-                              class="row-actions"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <Show when={job.status === 'processing'}>
-                                <button
-                                  class="btn btn-sm"
-                                  onClick={() => void killJob(job.id, refresh)}
-                                >
-                                  Kill
-                                </button>
-                              </Show>
-                              <Show
-                                when={job.status === 'failed' || job.status === 'success'}
-                              >
-                                <button
-                                  class="btn btn-sm"
-                                  onClick={() => void retryJob(job.id, refresh)}
-                                >
-                                  Retry
-                                </button>
-                              </Show>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </For>
-                  </tbody>
-                </table>
-              </div>
-            </Show>
-          </Panel>
         </div>
       </div>
     </>
@@ -734,14 +557,10 @@ export function JobDetailView() {
   return (
     <>
       <PageHead
-        crumb="Jobs"
         title={job()?.path ?? 'Job'}
         subtitle={<CopyId value={id()} />}
         actions={
           <div class="row">
-            <A href="/jobs" class="btn btn-sm">
-              all jobs
-            </A>
             <Show when={job()?.status === 'processing'}>
               <button
                 class="btn btn-sm"
@@ -802,24 +621,13 @@ export function JobDetailView() {
                     ...((j().assignee
                       ? [['SSP', <span class="mono">{j().assignee!}</span>]]
                       : []) as [string, JSX.Element][]),
-                    ...((j().timeout
-                      ? [['Timeout', formatDuration(j().timeout! * 1000)]]
-                      : []) as [string, JSX.Element][]),
-                    ...((j().delay
-                      ? [['Delay', formatDuration(j().delay!)]]
-                      : []) as [string, JSX.Element][]),
-                    ['Lease until', formatStamp(j().lease_until)],
-                    ['Queued', formatStamp(j().created_at)],
-                    ['Last write', formatStamp(j().updated_at)],
-                    ['In the queue', elapsed(j().created_at, j().updated_at)],
+                    ['Queued', relativeStamp(j().created_at)],
+                    ['Last write', relativeStamp(j().updated_at)],
                   ]}
                 />
               </Panel>
 
-              <Panel
-                title="Attempts"
-                sub="Every attempt the backend made, not only the one that ended the job."
-              >
+              <Panel title="Attempts">
                 <JobAttempts job={j()} />
               </Panel>
 

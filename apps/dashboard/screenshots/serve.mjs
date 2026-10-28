@@ -16,7 +16,9 @@ import { fileURLToPath } from 'node:url';
 import { ROUTES, STREAMS, TOKEN } from './fixtures.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DIST = resolve(HERE, '..', 'dist');
+// DASH_DIST serves another build, so parallel work can preview without
+// clobbering each other's dist/.
+const DIST = process.env.DASH_DIST ? resolve(process.env.DASH_DIST) : resolve(HERE, '..', 'dist');
 const PORT = Number(process.env.PORT ?? 4310);
 
 const TYPES = {

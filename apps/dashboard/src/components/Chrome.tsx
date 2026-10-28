@@ -12,9 +12,8 @@ export function PageHead(props: {
   return (
     <div class="page-head">
       <div style={{ 'min-width': '0' }}>
-        <Show when={props.crumb}>
-          <div class="crumb">{props.crumb}</div>
-        </Show>
+        {/* `crumb` is accepted and ignored: every page sits one level under
+            the sidebar, so a breadcrumb only ever said "Dashboard". */}
         <h1>{props.title}</h1>
         <Show when={props.subtitle}>
           <div class="page-sub">
@@ -119,6 +118,62 @@ export function Panel(props: {
 
 export function Empty(props: { children: JSX.Element }) {
   return <div class="empty">{props.children}</div>;
+}
+
+/** The right-pointing chevron every clickable row and card ends with. */
+export function Chevron() {
+  return (
+    <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+/**
+ * One headline number: label, value, a short note, and optionally a small
+ * chart or anything else at its foot. Linked when `to` is given, with a
+ * chevron; a static card otherwise. Laid out in a `.stat-grid`.
+ */
+export function StatCard(props: {
+  label: string;
+  value: JSX.Element;
+  unit?: string;
+  note?: JSX.Element;
+  /** Colours the value: only for warn and bad, fine is the default. */
+  tone?: string;
+  to?: string;
+  /** Drawn at the foot of the card: a sparkline, fleet bars. */
+  children?: JSX.Element;
+}) {
+  const body = () => (
+    <>
+      <span class="stat-label">
+        {props.label}
+        <Show when={props.to}>
+          <Chevron />
+        </Show>
+      </span>
+      <span class="stat-value" classList={{ [`tone-${props.tone}`]: props.tone === 'warn' || props.tone === 'bad' }}>
+        {props.value}
+        <Show when={props.unit}>
+          <span class="stat-unit">{props.unit}</span>
+        </Show>
+      </span>
+      <Show when={props.note}>
+        <span class="stat-note">{props.note}</span>
+      </Show>
+      <Show when={props.children}>
+        <span class="stat-foot">{props.children}</span>
+      </Show>
+    </>
+  );
+  return (
+    <Show when={props.to} fallback={<div class="stat-card">{body()}</div>}>
+      <A href={props.to!} class="stat-card link">
+        {body()}
+      </A>
+    </Show>
+  );
 }
 
 /** An identifier with a copy affordance — ids here are long and get pasted. */

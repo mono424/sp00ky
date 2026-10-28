@@ -152,6 +152,23 @@ export function Shell(props: {
     setOpen(false);
   });
 
+  /**
+   * Entrance animations play once, when a page is opened, and never again.
+   * Polled lists rebuild their rows on every refresh (each poll is new
+   * objects, so `<For>` mounts new nodes), and without this every refresh
+   * replayed the rise-in. A second after navigating the shell is marked
+   * settled; the stylesheet switches entrance animations off under it.
+   */
+  const [settled, setSettled] = createSignal(false);
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    location.pathname;
+    setSettled(false);
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => setSettled(true), 1000);
+  });
+  onCleanup(() => clearTimeout(settleTimer));
+
   // An open drawer must not let the page behind it scroll under the scrim.
   createEffect(() => {
     document.body.style.overflow = open() ? 'hidden' : '';
@@ -167,7 +184,7 @@ export function Shell(props: {
   onCleanup(() => window.removeEventListener('keydown', onKey));
 
   return (
-    <div class="shell">
+    <div class="shell" classList={{ settled: settled() }}>
       {/* Mobile only; `display:none` above the breakpoint. */}
       <header class="mobile-bar">
         <button

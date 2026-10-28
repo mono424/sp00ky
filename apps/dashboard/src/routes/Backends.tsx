@@ -2,17 +2,26 @@ import { For, Show, createResource, onCleanup } from 'solid-js';
 import { A, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import {
-  Cell,
+  Chevron,
   Empty,
   KeyValue,
   PageHead,
   Panel,
   Pill,
-  Rail,
-  StatusDot,
+  ReasonLine,
+  SkeletonList,
+  StatCard,
 } from '../components/Chrome';
 import { Sparkline } from '../components/Sparkline';
-import { decodeParam, formatMs, formatStamp, relativeStamp } from '../lib/format';
+import {
+  decodeParam,
+  formatCount,
+  formatMs,
+  formatStamp,
+  isAbsent,
+  relativeStamp,
+  splitValue,
+} from '../lib/format';
 import { backendTone } from '../lib/status';
 import type { BackendDetail, BackendSummary, PoolBacking } from '../api/types';
 
@@ -24,7 +33,16 @@ function poolSummary(p: PoolBacking): string {
   if (p.queued > 0) parts.push(`${p.queued} queued`);
   if (p.paused) parts.push('paused');
   if (p.breaker_open) parts.push('breaker open');
-  return parts.join(' · ');
+  return parts.join(', ');
+}
+
+/** A backend that is not answering its health check. */
+const failing = (b: BackendSummary) => backendTone(b.status) === 'bad' || b.status === 'unhealthy';
+
+/** When the backend last passed its check, phrased for its current state. */
+function healthLine(b: BackendSummary): string {
+  if (isAbsent(b.last_healthy)) return 'never healthy';
+  return `${failing(b) ? 'last healthy' : 'healthy'} ${relativeStamp(b.last_healthy)}`;
 }
 
 export function Backends() {
@@ -37,68 +55,74 @@ export function Backends() {
   const timer = setInterval(refetch, 10_000);
   onCleanup(() => clearInterval(timer));
 
+  const healthy = () => data()?.backends.filter((b) => !failing(b)).length ?? 0;
+
   return (
     <>
-      <PageHead crumb="Dashboard" title="Backends" />
+      <PageHead
+        title="Backends"
+        subtitle={
+          <Show when={data()?.backends.length}>
+            {(n) => (healthy() === n() ? `All ${n()} answering` : `${n() - healthy()} of ${n()} failing`)}
+          </Show>
+        }
+      />
 
       <div class="page-body">
-      <Show when={data()} fallback={<Empty>Loading…</Empty>}>
-        {(d) => (
-          <Show
-            when={d().backends.length > 0}
-            fallback={
-              <Panel>
-                <Empty>
-                  No backends configured. The scheduler reads them from{' '}
-                  <span class="dim">SPKY_BACKENDS</span>.
-                </Empty>
-              </Panel>
-            }
-          >
-            <Panel flush>
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Name</th>
-                      <th>Status</th>
-                      <th>Response</th>
-                      <th>Last healthy</th>
-                      <th>Healthcheck</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <For each={d().backends}>
-                      {(b) => (
-                        <tr>
-                          <td>
-                            <A href={`/backends/${encodeURIComponent(b.name)}`}>
-                              <div class="row">
-                                <StatusDot tone={backendTone(b.status)} />
-                                {b.name}
-                              </div>
-                            </A>
-                          </td>
-                          <td data-label="Status">
-                            <Pill tone={backendTone(b.status)}>{b.status}</Pill>
-                          </td>
-                          <td class="dim" data-label="Response">
-                            <Show when={b.pool} fallback={formatMs(b.response_time_ms)}>
-                              {(p) => <>pool {p().pool} · {poolSummary(p())}</>}
+        <Show when={data()} fallback={<SkeletonList rows={3} />}>
+          {(d) => (
+            <Show
+              when={d().backends.length > 0}
+              fallback={
+                <Panel>
+                  <Empty>No backends configured.</Empty>
+                </Panel>
+              }
+            >
+              <ul class="list">
+                <For each={d().backends}>
+                  {(b) => (
+                    <li>
+                      <A
+                        href={`/backends/${encodeURIComponent(b.name)}`}
+                        class="list-item"
+                        classList={{ [backendTone(b.status)]: true }}
+                      >
+                        <span class="list-icon" aria-hidden="true">
+                          <svg viewBox="0 0 16 16">
+                            <rect x="2.5" y="3" width="11" height="4" rx="1.2" />
+                            <rect x="2.5" y="9" width="11" height="4" rx="1.2" />
+                            <path d="M5 5h.01M5 11h.01" />
+                          </svg>
+                        </span>
+                        <span class="list-text">
+                          <span class="list-title">{b.name}</span>
+                          <span class="list-detail">
+                            <Show
+                              when={b.pool}
+                              fallback={failing(b) ? `${b.status}, ${b.healthcheck_url}` : b.status}
+                            >
+                              {(p) => <>pool {p().pool}, {poolSummary(p())}</>}
                             </Show>
-                          </td>
-                          <td class="dim" data-label="Last healthy">{relativeStamp(b.last_healthy)}</td>
-                          <td class="ghost truncate" data-label="Healthcheck">{b.healthcheck_url}</td>
-                        </tr>
-                      )}
-                    </For>
-                  </tbody>
-                </table>
-              </div>
-            </Panel>
-          </Show>
-        )}
-      </Show>
+                          </span>
+                        </span>
+                        <span class="bk-meta">
+                          <Show when={!b.pool && b.response_time_ms !== null}>
+                            <span class="bk-ms" classList={{ 'tone-bad': failing(b) }}>
+                              {formatMs(b.response_time_ms)}
+                            </span>
+                          </Show>
+                          <span class="list-meta">{healthLine(b)}</span>
+                        </span>
+                        <Chevron />
+                      </A>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+          )}
+        </Show>
       </div>
     </>
   );
@@ -126,21 +150,19 @@ export function BackendDetailView() {
   const timer = setInterval(refetch, 10_000);
   onCleanup(() => clearInterval(timer));
 
-  const points = () =>
-    (data()?.history ?? []).map((h) => ({ ts: h.at, ms: h.ms, ok: h.ok }));
+  const points = () => (data()?.history ?? []).map((h) => ({ ts: h.at, ms: h.ms, ok: h.ok }));
 
   const windowMinutes = () => {
     const d = data();
     if (!d || d.history.length === 0) return null;
-    return Math.round((d.history.length * d.check_interval_secs) / 60);
+    return Math.max(1, Math.round((d.history.length * d.check_interval_secs) / 60));
   };
 
   return (
     <>
       <PageHead
-        crumb="Backends"
         title={name()}
-        subtitle={<Show when={data()}>{(b) => <>{b().healthcheck_url}</>}</Show>}
+        subtitle={<Show when={data()}>{(b) => <span class="mono">{b().url}</span>}</Show>}
         actions={
           <Show when={data()}>
             {(b) => (
@@ -156,66 +178,58 @@ export function BackendDetailView() {
         <Show
           when={!error()}
           fallback={
-            <div class="panel">
+            <Panel>
               <Empty>{error()}</Empty>
-            </div>
+            </Panel>
           }
         >
-          <Show when={data()} fallback={<Empty>Loading…</Empty>}>
+          <Show when={data()} fallback={<SkeletonList rows={4} />}>
             {(b) => (
-              <div class="stack">
-                <Rail>
-                  <Cell
-                    label="Status"
-                    tone={backendTone(b().status)}
-                    value={b().status}
-                  />
+              <div class="page-stack">
+                <div class="stat-grid">
                   <Show
                     when={b().pool}
                     fallback={
-                      <Cell
-                        label="Last response"
-                        value={formatMs(b().response_time_ms)}
+                      <StatCard
+                        label="Response time"
+                        value={splitValue(formatMs(b().response_time_ms)).value}
+                        unit={splitValue(formatMs(b().response_time_ms)).unit}
+                        tone={failing(b()) ? 'bad' : undefined}
+                        note={`checked ${relativeStamp(b().last_checked)}, every ${b().check_interval_secs}s`}
                       />
                     }
                   >
                     {(p) => (
-                      <Cell
+                      <StatCard
                         label="Machines"
-                        value={`${p().ready + p().starting}`}
-                        foot={`pool ${p().pool}`}
+                        value={formatCount(p().ready + p().starting)}
+                        note={p().starting > 0 ? `${p().starting} booting` : `pool ${p().pool}`}
                       />
                     )}
                   </Show>
-                  <Cell
+                  <StatCard
                     label="Last healthy"
-                    value={relativeStamp(b().last_healthy)}
-                    foot={formatStamp(b().last_healthy)}
+                    value={isAbsent(b().last_healthy) ? 'never' : relativeStamp(b().last_healthy)}
+                    tone={failing(b()) ? 'warn' : undefined}
+                    note={formatStamp(b().last_healthy)}
                   />
-                  <Cell
-                    label="Check every"
-                    value={`${b().check_interval_secs}`}
-                    unit="s"
-                    foot={`checked ${relativeStamp(b().last_checked)}`}
-                  />
-                </Rail>
+                </div>
 
                 <Show when={b().pool}>
                   {(p) => (
-                    <Panel
-                      title="Machine pool"
-                      sub="This backend runs on pool machines, created on demand; there is no container to probe between jobs"
-                    >
+                    <Panel title="Machine pool" sub="Machines start on demand, so there is nothing to probe between jobs">
+                      <Show when={p().error}>
+                        {(e) => <ReasonLine error={e()} />}
+                      </Show>
                       <KeyValue
                         rows={[
                           ['Pool', p().pool],
-                          ['Ready machines', `${p().ready}`],
-                          ['Booting machines', `${p().starting}`],
-                          ['Busy slots', `${p().busy_slots}`],
-                          ['Queued jobs', `${p().queued}`],
+                          ['Ready', formatCount(p().ready)],
+                          ['Booting', formatCount(p().starting)],
+                          ['Busy slots', formatCount(p().busy_slots)],
+                          ['Queued jobs', formatCount(p().queued)],
                           ['Paused', p().paused ? 'yes' : 'no'],
                           ['Breaker', p().breaker_open ? 'open' : 'closed'],
-                          ...(p().error ? [['Last error', p().error] as [string, string]] : []),
                         ]}
                       />
                     </Panel>
@@ -223,66 +237,32 @@ export function BackendDetailView() {
                 </Show>
 
                 <Show when={!b().pool}>
-                <Panel
-                  title="Response time"
-                  sub={
-                    <Show when={windowMinutes()} fallback="No probes recorded yet">
-                      {(m) => (
-                        <>
-                          Last {m()} {m() === 1 ? 'minute' : 'minutes'} · failures
-                          drawn as gaps
-                        </>
-                      )}
-                    </Show>
-                  }
-                >
-                  <Sparkline points={points()} height={90} />
-                </Panel>
+                  <Panel
+                    title="Response time"
+                    sub={
+                      <Show when={windowMinutes()} fallback="No checks recorded yet">
+                        {(m) => <>Last {m()} min, failed checks show as gaps</>}
+                      </Show>
+                    }
+                  >
+                    <Sparkline points={points()} height={90} />
+                  </Panel>
                 </Show>
 
-                <div class="grid grid-2">
-                  <Panel title="Target">
-                    <KeyValue
-                      rows={[
-                        ['URL', b().url],
-                        ['Healthcheck', b().healthcheck_url],
-                        ['Address', b().ip ?? '—'],
-                        ['Port', b().port ?? '—'],
-                      ]}
-                    />
-
-                    {/* Said plainly rather than left as a missing tab: the
-                        scheduler reaches backends over HTTP health checks and
-                        has no pipe to their stdout. */}
-                    <Show when={!b().logs_available}>
-                      <div
-                        class="ghost prose"
-                        style={{ 'margin-top': '14px', 'font-size': '11.5px' }}
-                      >
-                        Log streaming is not available for backends — the
-                        scheduler health-checks them over HTTP and has no access
-                        to their output. Scheduler and SSP logs are under{' '}
-                        <A href="/logs" style={{ 'text-decoration': 'underline' }}>
-                          Logs
-                        </A>
-                        .
-                      </div>
-                    </Show>
-                  </Panel>
-
+                <Panel title="Target">
+                  <KeyValue
+                    rows={[
+                      ['Health check', b().healthcheck_url],
+                      ['Address', b().ip ? `${b().ip}${b().port ? `:${b().port}` : ''}` : '—'],
+                    ]}
+                  />
                   <Show when={b().env && Object.keys(b().env!).length > 0}>
-                    <Panel
-                      title="Environment"
-                      sub="Secrets are masked by the scheduler"
-                    >
-                      <KeyValue
-                        rows={Object.entries(b().env!).map(
-                          ([k, v]) => [k, v] as [string, string],
-                        )}
-                      />
-                    </Panel>
+                    <details class="bk-env">
+                      <summary>Environment</summary>
+                      <KeyValue rows={Object.entries(b().env!).map(([k, v]) => [k, v] as [string, string])} />
+                    </details>
                   </Show>
-                </div>
+                </Panel>
               </div>
             )}
           </Show>

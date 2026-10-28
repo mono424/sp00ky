@@ -9,20 +9,21 @@ import {
 import { A, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import {
-  Cell,
+  Chevron,
+  Chips,
   CopyId,
   Empty,
   KeyValue,
   PageHead,
   Panel,
   Pill,
-  Rail,
+  SkeletonList,
+  StatCard,
 } from '../components/Chrome';
 import {
   decodeParam,
   formatBytes,
   formatCount,
-  formatDuration,
   formatMs,
   formatRate,
   formatRelativeTime,
@@ -30,32 +31,27 @@ import {
   formatUptime,
   isAbsent,
   relativeStamp,
+  splitValue,
 } from '../lib/format';
-import type {
-  Presence,
-  ViewDetailData,
-  ViewSummary,
-  ViewsList,
-} from '../api/types';
+import type { Presence, ViewDetailData, ViewsList } from '../api/types';
 
 /**
  * Every registered live query, and everything known about one of them.
  *
- * The rollup that used to head this page (users / sessions / views, and their
- * charts) lives on the Overview now: those numbers answer "is anyone here?",
- * which is a landing-page question. What is left here is the question you come
- * to this tab to ask — *which* queries are registered, who owns them, and which
- * ones are costing time.
+ * The page answers which views cost something: hot (updating fast), slow
+ * (p99 over the threshold), large (too many rows to republish) or erroring,
+ * and who owns them. Conditions come first as rows that apply their filter;
+ * the table below is the drill-in. User and SSP filters are chips built from
+ * the presence sampler's rankings, so the common case is one click.
  *
- * The caveat the page still has to carry: a client refreshes its liveness on a
- * `0.9 * ttl` timer, so a closed tab decays out of this listing over minutes
- * rather than disappearing from it. The per-row "expires" column is what makes
- * that legible instead of looking like a leak.
+ * A closed tab fades out over minutes (clients refresh on a `0.9 * ttl`
+ * timer), so a lapsed row is marked rather than treated as a leak.
  */
 
 const POLL_MS = 10_000;
 
 type SortKey = 'slowest' | 'newest' | 'rows' | 'updates' | 'errors' | 'active';
+type ShowKey = '' | 'hot' | 'slow' | 'large' | 'shared';
 
 const SORTS: { key: SortKey; label: string }[] = [
   { key: 'slowest', label: 'Slowest' },
@@ -66,27 +62,29 @@ const SORTS: { key: SortKey; label: string }[] = [
   { key: 'errors', label: 'Errors' },
 ];
 
-/** How long until a view's TTL reclaims it, or how long ago it lapsed. */
-function expiry(view: ViewSummary, now: number): { text: string; tone?: string } {
-  if (view.expires_at_ms === null) return { text: '—' };
-  const delta = view.expires_at_ms - now;
-  if (delta <= 0) return { text: 'lapsed', tone: 'idle' };
-  return { text: formatDuration(delta) };
+const plural = (n: number, one: string, many: string) => `${formatCount(n)} ${n === 1 ? one : many}`;
+
+/** A warning glyph for the condition rows. */
+function WarnIcon() {
+  return (
+    <span class="list-icon" aria-hidden="true">
+      <svg viewBox="0 0 16 16">
+        <path d="M8 2.8 14 13H2zM8 6.6v3M8 11.4h.01" />
+      </svg>
+    </span>
+  );
 }
 
 export function Views() {
   const [sort, setSort] = createSignal<SortKey>('slowest');
+  const [show, setShow] = createSignal<ShowKey>('');
   const [user, setUser] = createSignal('');
   const [ssp, setSsp] = createSignal('');
   const [search, setSearch] = createSignal('');
-  const [sharedOnly, setSharedOnly] = createSignal(false);
-  const [slowOnly, setSlowOnly] = createSignal(false);
-  const [largeOnly, setLargeOnly] = createSignal(false);
-  const [hotOnly, setHotOnly] = createSignal(false);
 
   // `/presence` is served from the scheduler's sampler memory, so this is a
-  // cheap request: it carries the ranking, the per-SSP split and the slow
-  // threshold the table's filter needs.
+  // cheap request: it carries the counts, the rankings and the slow threshold
+  // the filters need.
   const [presence, { refetch: refetchPresence }] = createResource(() =>
     api.getResult<Presence>('/presence'),
   );
@@ -101,16 +99,14 @@ export function Views() {
     if (user()) params.set('user', user());
     if (ssp()) params.set('ssp', ssp());
     if (search()) params.set('q', search());
-    if (sharedOnly()) params.set('shared', 'true');
-    if (slowOnly() && extra()) params.set('slow_ms', String(extra()!.slow_ms));
-    if (largeOnly()) params.set('large', 'true');
-    if (hotOnly()) params.set('hot', 'true');
+    if (show() === 'shared') params.set('shared', 'true');
+    if (show() === 'slow' && extra()) params.set('slow_ms', String(extra()!.slow_ms));
+    if (show() === 'large') params.set('large', 'true');
+    if (show() === 'hot') params.set('hot', 'true');
     return `/views?${params.toString()}`;
   });
 
-  const [result, { refetch }] = createResource(query, (q) =>
-    api.getResult<ViewsList>(q),
-  );
+  const [result, { refetch }] = createResource(query, (q) => api.getResult<ViewsList>(q));
   const data = () => {
     const r = result();
     return r?.ok ? r.value : undefined;
@@ -127,496 +123,246 @@ export function Views() {
   onCleanup(() => clearInterval(timer));
 
   const now = () => data()?.server_time_ms ?? Date.now();
+  const totals = () => extra()?.totals;
+  const filtering = () => !!(show() || user() || ssp() || search());
+  const reset = () => {
+    setShow('');
+    setUser('');
+    setSsp('');
+    setSearch('');
+  };
+
+  /** The chosen value stays a chip even when it fell out of the ranking. */
+  const userOptions = () => {
+    const top = extra()?.top_users ?? [];
+    const opts: { key: string; label: string; count?: number }[] = top.map((u) => ({
+      key: u.auth_id,
+      label: u.auth_id,
+      count: u.views,
+    }));
+    if (user() && !top.some((u) => u.auth_id === user())) opts.push({ key: user(), label: user() });
+    return [{ key: '', label: 'Anyone' }, ...opts];
+  };
+  const sspOptions = () => [
+    { key: '', label: 'All' },
+    ...(extra()?.by_ssp ?? []).map((s) => ({ key: s.ssp_id, label: s.ssp_id, count: s.views })),
+  ];
 
   return (
     <>
       <PageHead
-        crumb="Dashboard"
         title="Views"
-        subtitle="Every live query registered against this stack"
+        subtitle={
+          <Show when={totals()}>
+            {(t) => `${formatCount(t().views)} live, ${formatCount(t().shared_views)} shared`}
+          </Show>
+        }
         actions={
           <Show when={extra()?.truncated}>
-            <Pill tone="warn">capped — figures are a floor</Pill>
+            <Pill tone="warn">sampler capped, counts are a floor</Pill>
           </Show>
         }
       />
 
-      <div class="page-body">
-        <div class="stack">
-          {/* Said once, prominently, rather than left to be inferred from a
-              listing that keeps rows a closed tab has already abandoned. */}
-          <Panel>
-            <div class="dim">
-              A client proves it is still watching on a{' '}
-              <span class="ghost">0.9 &times; ttl</span> timer — about nine
-              minutes at the default <span class="ghost">10m</span>. So a closed
-              tab fades out of this listing over minutes rather than leaving at
-              once, and every row carries its own{' '}
-              <span class="ghost">expires</span> so you can see which ones are
-              on the way out.
-            </div>
-          </Panel>
-
-          {/* A live condition rather than a standing one, so it goes first.
-              The scheduler reads every view's running `updateCount` on each
-              presence sample and divides by the gap; a view at or over the
-              hot rate is churning its SSP's publication queue and every
-              subscriber's socket. The shape this exists for is a bulk import
-              into a table someone has open: a PGN import moved one game-list
-              view ~125 times a second and backed the SSP up for minutes
-              (2026-10-08). The `hot_views` incident keeps the record once
-              the burst is over. */}
-          <Show when={(extra()?.totals.hot_views ?? 0) > 0}>
-            <Panel>
-              <div
-                style={{
-                  display: 'flex',
-                  gap: '12px',
-                  'align-items': 'flex-start',
-                  'justify-content': 'space-between',
-                }}
-              >
-                <div>
-                  <div>
-                    <Pill tone="warn" dot>
-                      {formatCount(extra()!.totals.hot_views)}{' '}
-                      {extra()!.totals.hot_views === 1 ? 'view is' : 'views are'} hot
-                    </Pill>
-                  </div>
-                  <div class="dim" style={{ 'margin-top': '6px' }}>
-                    Updating at least {formatRate(extra()!.hot_view_rate)} between
-                    the last two presence samples. Every update is a delta the SSP publishes and every
-                    subscriber downloads. A burst like this is usually a bulk
-                    write (an import, a backfill, a script) into a table
-                    somebody has open. Pace the writer, or window the view so
-                    most of those rows never land in it.
-                  </div>
-                  <div style={{ 'margin-top': '8px', display: 'grid', gap: '4px' }}>
-                    <For each={extra()!.hot.slice(0, 3)}>
-                      {(h) => (
-                        <div class="dim">
-                          <span class="tone-warn">{formatRate(h.per_sec)}</span>{' '}
-                          <A href={`/views/${encodeURIComponent(h.key)}`}>
-                            <span class="id">{h.key.slice(0, 12)}</span>
-                          </A>{' '}
-                          · {h.auth_id || 'no auth'}
-                          <Show when={h.ssp_id}> · {h.ssp_id}</Show>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </div>
-                <button
-                  class="btn btn-sm"
-                  style={{ flex: 'none' }}
-                  onClick={() => setHotOnly(true)}
-                  title="Filter the table to the hot views"
-                >
-                  Show them
+      <div class="page-body page-stack">
+        {/* What costs something right now, one row each, worst first. A hot
+            view is churning its SSP's publication queue and every
+            subscriber's socket (a bulk import into an open table, typically);
+            a large one is republished row by row on every cold registration
+            and has stalled a tenant database before. */}
+        <Show when={(totals()?.errored_views ?? 0) + (totals()?.hot_views ?? 0) + (totals()?.large_views ?? 0) > 0}>
+          <ul class="list">
+            <Show when={totals()!.errored_views > 0}>
+              <li>
+                <button type="button" class="list-item bad vw-row" onClick={() => setSort('errors')}>
+                  <span class="list-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16">
+                      <path d="M8 1.8a6.2 6.2 0 1 0 0 12.4A6.2 6.2 0 0 0 8 1.8zM5.9 5.9l4.2 4.2m0-4.2-4.2 4.2" />
+                    </svg>
+                  </span>
+                  <span class="list-text">
+                    <span class="list-title">{plural(totals()!.errored_views, 'view is', 'views are')} erroring</span>
+                    <span class="list-detail">Their clients see stale data.</span>
+                  </span>
+                  <span class="list-meta">Sort by errors</span>
                 </button>
-              </div>
-            </Panel>
-          </Show>
-
-          {/* The standing warning. A view this size is republished row by row as
-              `_00_list_ref` edges on every cold registration, in one
-              transaction; a few thousand of them at once stalled a tenant's
-              SurrealDB (3.0.5) for minutes and took every other registration
-              down with it. The fix is on the app side: window the query
-              (LIMIT/START) or resolve rows by id. */}
-          <Show when={(extra()?.totals.large_views ?? 0) > 0}>
-            <Panel>
-              <div
-                style={{
-                  display: 'flex',
-                  gap: '12px',
-                  'align-items': 'flex-start',
-                  'justify-content': 'space-between',
-                }}
-              >
-                <div>
-                  <div>
-                    <Pill tone="warn" dot>
-                      {formatCount(extra()!.totals.large_views)}{' '}
-                      {extra()!.totals.large_views === 1 ? 'view holds' : 'views hold'}{' '}
+              </li>
+            </Show>
+            <For each={extra()?.hot.slice(0, 3) ?? []}>
+              {(h) => (
+                <li>
+                  <A href={`/views/${encodeURIComponent(h.key)}`} class="list-item warn">
+                    <WarnIcon />
+                    <span class="list-text">
+                      <span class="list-title">
+                        Hot view, {formatRate(h.per_sec)} for {h.auth_id || 'anonymous'}
+                      </span>
+                      <span class="list-detail">
+                        Usually a bulk write into a table this view watches. Pace the writer or window the query.
+                      </span>
+                    </span>
+                    <span class="list-meta mono">{h.ssp_id ?? ''}</span>
+                    <Chevron />
+                  </A>
+                </li>
+              )}
+            </For>
+            <Show when={totals()!.large_views > 0}>
+              <li>
+                <button type="button" class="list-item warn vw-row" onClick={() => setShow('large')}>
+                  <WarnIcon />
+                  <span class="list-text">
+                    <span class="list-title">
+                      {plural(totals()!.large_views, 'view holds', 'views hold')}{' '}
                       {formatCount(extra()!.large_view_rows)}+ rows
-                    </Pill>
-                  </div>
-                  <div class="dim" style={{ 'margin-top': '6px' }}>
-                    Every row of an unwindowed live view is an edge the SSP
-                    republishes on each cold registration, in a single
-                    transaction. At this size that write stalls the database
-                    and every other client's registration behind it. Window
-                    the query with <span class="ghost">LIMIT</span>/
-                    <span class="ghost">START</span>, or resolve rows by id,
-                    instead of syncing the whole table.
-                  </div>
-                </div>
-                <button
-                  class="btn btn-sm"
-                  style={{ flex: 'none' }}
-                  onClick={() => setLargeOnly(true)}
-                  title="Filter the table to the large views"
-                >
-                  Show them
+                    </span>
+                    <span class="list-detail">
+                      Every cold registration republishes each row. Window it with LIMIT or resolve rows by id.
+                    </span>
+                  </span>
+                  <span class="list-meta">Show them</span>
                 </button>
-              </div>
-            </Panel>
-          </Show>
+              </li>
+            </Show>
+          </ul>
+        </Show>
 
-          <Show when={extra()?.top_users?.length}>
-            <div class="grid grid-2">
-              <Panel title="Heaviest users" flush>
-                <div class="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>User</th>
-                        <th>Views</th>
-                        <th>Sessions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <For each={extra()!.top_users}>
-                        {(u) => (
-                          <tr>
-                            <td>
-                              <button
-                                class="btn btn-sm"
-                                onClick={() => setUser(u.auth_id)}
-                                title="Filter the table to this user"
-                              >
-                                {u.auth_id}
-                              </button>
-                            </td>
-                            <td class="dim" data-label="Views">
-                              {formatCount(u.views)}
-                            </td>
-                            <td class="dim" data-label="Sessions">
-                              {formatCount(u.sessions)}
-                            </td>
-                          </tr>
-                        )}
-                      </For>
-                    </tbody>
-                  </table>
-                </div>
-              </Panel>
-
-              <Panel
-                title="Views per SSP"
-                sub="Where the scheduler routed each registration"
-                flush
-              >
-                <div class="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>SSP</th>
-                        <th>Views</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <For
-                        each={extra()!.by_ssp}
-                        fallback={
-                          <tr>
-                            <td colSpan={2}>
-                              <Empty>No assignments recorded.</Empty>
-                            </td>
-                          </tr>
-                        }
-                      >
-                        {(s) => (
-                          <tr>
-                            <td>
-                              <button
-                                class="btn btn-sm"
-                                onClick={() => setSsp(s.ssp_id)}
-                                title="Filter the table to this SSP"
-                              >
-                                {s.ssp_id}
-                              </button>
-                            </td>
-                            <td class="dim" data-label="Views">
-                              {formatCount(s.views)}
-                            </td>
-                          </tr>
-                        )}
-                      </For>
-                    </tbody>
-                  </table>
-                </div>
-              </Panel>
-            </div>
-          </Show>
-
-          <Panel
-            title="Registered views"
-            sub={
-              <Show when={data()} fallback="Loading…">
-                {(d) => (
-                  <>
-                    {formatCount(d().returned)} of {formatCount(d().total)}
-                    <Show when={d().ssp_filtered}>
-                      {' '}
-                      (the total counts every SSP; the SSP filter narrows only
-                      this page)
-                    </Show>
-                  </>
-                )}
-              </Show>
-            }
-            actions={
-              <Show
-                when={
-                  user() || ssp() || search() || sharedOnly() || slowOnly() || largeOnly() || hotOnly()
-                }
-              >
-                <button
-                  class="btn btn-sm"
-                  onClick={() => {
-                    setUser('');
-                    setSsp('');
-                    setSearch('');
-                    setSharedOnly(false);
-                    setSlowOnly(false);
-                    setLargeOnly(false);
-                    setHotOnly(false);
-                  }}
-                >
-                  Clear filters
-                </button>
-              </Show>
-            }
-          >
-            <div class="filters">
-              <select
+        <Panel flush>
+          <div class="toolbar">
+            <div class="toolbar-groups">
+              <Chips
+                label="Show"
+                value={show()}
+                onChange={(k) => setShow(k as ShowKey)}
+                options={[
+                  { key: '', label: 'All', count: totals()?.views },
+                  { key: 'hot', label: 'Hot', count: totals()?.hot_views, tone: 'warn' },
+                  { key: 'slow', label: 'Slow', count: totals()?.slow_views, tone: 'warn' },
+                  { key: 'large', label: 'Large', count: totals()?.large_views, tone: 'warn' },
+                  { key: 'shared', label: 'Shared', count: totals()?.shared_views },
+                ]}
+              />
+              <Chips
+                label="Sort"
                 value={sort()}
-                onChange={(e) => setSort(e.currentTarget.value as SortKey)}
-                aria-label="Sort"
-              >
-                <For each={SORTS}>
-                  {(s) => <option value={s.key}>{s.label}</option>}
-                </For>
-              </select>
+                onChange={(k) => setSort(k as SortKey)}
+                options={SORTS}
+              />
+            </div>
+            <div class="row">
               <input
-                class="grow"
-                placeholder="Search the SurrealQL"
+                type="search"
+                placeholder="Search the query"
                 value={search()}
                 onInput={(e) => setSearch(e.currentTarget.value)}
+                aria-label="Search the query"
               />
-              <input
-                placeholder="auth_id"
-                value={user()}
-                onInput={(e) => setUser(e.currentTarget.value)}
-              />
-              <input
-                placeholder="SSP id"
-                value={ssp()}
-                onInput={(e) => setSsp(e.currentTarget.value)}
-              />
-              <label>
-                <input
-                  type="checkbox"
-                  checked={sharedOnly()}
-                  onChange={(e) => setSharedOnly(e.currentTarget.checked)}
-                />
-                Shared only
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={slowOnly()}
-                  onChange={(e) => setSlowOnly(e.currentTarget.checked)}
-                />
-                Slow only
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={largeOnly()}
-                  onChange={(e) => setLargeOnly(e.currentTarget.checked)}
-                />
-                Large only
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={hotOnly()}
-                  onChange={(e) => setHotOnly(e.currentTarget.checked)}
-                />
-                Hot only
-              </label>
+              <Show when={filtering()}>
+                <button type="button" class="btn btn-sm" onClick={reset}>
+                  Clear
+                </button>
+              </Show>
             </div>
-          </Panel>
-
-          <Show when={error()}>
-            {(msg) => (
-              <Panel>
-                <Empty>{msg()}</Empty>
-              </Panel>
-            )}
+          </div>
+          <Show when={userOptions().length > 2 || sspOptions().length > 2}>
+            <div class="toolbar vw-owners">
+              <div class="toolbar-groups">
+                <Show when={userOptions().length > 1}>
+                  <Chips label="User" value={user()} onChange={setUser} options={userOptions()} />
+                </Show>
+                <Show when={sspOptions().length > 2}>
+                  <Chips label="SSP" value={ssp()} onChange={setSsp} options={sspOptions()} />
+                </Show>
+              </div>
+            </div>
           </Show>
 
-          <Show when={data()}>
+          <Show when={error()}>{(msg) => <Empty>{msg()}</Empty>}</Show>
+
+          <Show when={data()} fallback={<Show when={!error()}><SkeletonList rows={6} /></Show>}>
             {(d) => (
               <Show
                 when={d().views.length > 0}
-                fallback={
-                  <Panel>
-                    <Empty>
-                      No live views match. A view is reclaimed once{' '}
-                      <span class="ghost">lastActiveAt + ttl</span> passes.
-                    </Empty>
-                  </Panel>
-                }
+                fallback={<Empty>No live views match.</Empty>}
               >
-                <Panel flush>
-                  <div class="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>View</th>
-                          <th>User</th>
-                          <th>SSP</th>
-                          <th>Rows</th>
-                          <th>Subs</th>
-                          <th>p90</th>
-                          <th>p99</th>
-                          <th>Updates</th>
-                          <th>Errors</th>
-                          <th>Expires</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={d().views}>
-                          {(v) => {
-                            const exp = () => expiry(v, now());
-                            const slow = () =>
-                              v.p99 !== null && v.p99 >= d().slow_ms;
-                            const large = () =>
-                              v.row_count >= d().large_view_rows;
-                            // Was hot while registered, but is not now: the
-                            // burst is over and the incident has the rest.
-                            const cooled = () =>
-                              !v.hot && (v.update_rate_peak ?? 0) >= d().hot_view_rate;
-                            return (
-                              <tr>
-                                <td class="cell-surql">
-                                  <A href={`/views/${encodeURIComponent(v.key)}`}>
-                                    <span
-                                      class="clamp-3"
-                                      title={v.surql ?? v.key}
-                                    >
-                                      {v.surql ?? v.key}
-                                    </span>
-                                  </A>
-                                </td>
-                                <td class="dim truncate" data-label="User">
-                                  {v.auth_id || '—'}
-                                </td>
-                                <td class="ghost" data-label="SSP">
-                                  {v.ssp_id ?? '—'}
-                                </td>
-                                <td
-                                  classList={{
-                                    dim: !large(),
-                                    'tone-warn': large(),
-                                  }}
-                                  data-label="Rows"
-                                  title={
-                                    large()
-                                      ? `At least ${formatCount(d().large_view_rows)} rows: republished as edges on every cold registration. Window this query.`
-                                      : undefined
-                                  }
-                                >
-                                  {formatCount(v.row_count)}
-                                  <Show when={large()}>
-                                    {' '}
-                                    <Pill tone="warn">large</Pill>
-                                  </Show>
-                                </td>
-                                <td data-label="Subs">
-                                  <Show
-                                    when={v.shared}
-                                    fallback={
-                                      <span class="dim">
-                                        {v.subscriber_count}
-                                      </span>
-                                    }
-                                  >
-                                    <Pill tone="ok">{v.subscriber_count}</Pill>
-                                  </Show>
-                                </td>
-                                <td class="dim" data-label="p90">
-                                  {formatMs(v.p90)}
-                                </td>
-                                <td
-                                  classList={{
-                                    dim: !slow(),
-                                    'tone-warn': slow(),
-                                  }}
-                                  data-label="p99"
-                                >
-                                  {formatMs(v.p99)}
-                                </td>
-                                <td
-                                  classList={{ dim: !v.hot, 'tone-warn': v.hot }}
-                                  data-label="Updates"
-                                  title={
-                                    v.hot
-                                      ? `Updating ${formatRate(v.update_rate)}, at or over ${formatRate(d().hot_view_rate)}. Usually a bulk write into a table this view watches.`
-                                      : cooled()
-                                        ? `Peaked at ${formatRate(v.update_rate_peak)} ${formatRelativeTime(v.update_rate_peak_at_ms!)}`
-                                        : undefined
-                                  }
-                                >
-                                  <span style={{ 'white-space': 'nowrap' }}>
-                                    {formatCount(v.update_count)}
-                                    <Show
-                                      when={v.hot}
-                                      fallback={
-                                        <Show when={(v.update_rate ?? 0) > 0 || cooled()}>
-                                          <span class="ghost">
-                                            {' '}
-                                            · {cooled()
-                                              ? `peaked ${formatRate(v.update_rate_peak)}`
-                                              : formatRate(v.update_rate)}
-                                          </span>
-                                        </Show>
-                                      }
-                                    >
-                                      {' · '}
-                                      {formatRate(v.update_rate)}{' '}
-                                      <Pill tone="warn">hot</Pill>
-                                    </Show>
+                <div class="table-scroll">
+                  <table class="vw-table">
+                    <thead>
+                      <tr>
+                        <th>Query</th>
+                        <th>User</th>
+                        <th class="num">Rows</th>
+                        <th class="num">p99</th>
+                        <th class="num">Updates</th>
+                        <th class="num">Errors</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <For each={d().views}>
+                        {(v) => {
+                          const slow = () => v.p99 !== null && v.p99 >= d().slow_ms;
+                          const large = () => v.row_count >= d().large_view_rows;
+                          const lapsed = () => v.expires_at_ms !== null && v.expires_at_ms <= now();
+                          return (
+                            <tr classList={{ 'vw-lapsed': lapsed() }}>
+                              <td class="vw-query">
+                                <A href={`/views/${encodeURIComponent(v.key)}`}>
+                                  <span class="vw-surql mono" title={v.surql ?? v.key}>
+                                    {v.surql ?? v.key}
                                   </span>
-                                </td>
-                                <td
-                                  classList={{
-                                    dim: !v.error_count,
-                                    'tone-bad': !!v.error_count,
-                                  }}
-                                  data-label="Errors"
+                                </A>
+                                <span class="vw-sub">
+                                  <span class="mono">{v.ssp_id ?? 'unassigned'}</span>
+                                  <Show when={v.shared}>
+                                    <span>shared by {formatCount(v.subscriber_count)}</span>
+                                  </Show>
+                                  <Show when={lapsed()}>
+                                    <span>lapsed</span>
+                                  </Show>
+                                </span>
+                              </td>
+                              <td class="vw-user" data-label="User">
+                                <button
+                                  type="button"
+                                  class="vw-link"
+                                  onClick={() => setUser(v.auth_id)}
+                                  title="Only this user's views"
+                                  disabled={!v.auth_id}
                                 >
-                                  {formatCount(v.error_count)}
-                                </td>
-                                <td class="ghost" data-label="Expires">
-                                  {exp().text}
-                                </td>
-                              </tr>
-                            );
-                          }}
-                        </For>
-                      </tbody>
-                    </table>
+                                  {v.auth_id || 'anonymous'}
+                                </button>
+                              </td>
+                              <td class="num" classList={{ 'tone-warn': large() }} data-label="Rows">
+                                {formatCount(v.row_count)}
+                              </td>
+                              <td class="num" classList={{ 'tone-warn': slow() }} data-label="p99">
+                                {formatMs(v.p99)}
+                              </td>
+                              <td class="num" data-label="Updates">
+                                {formatCount(v.update_count)}
+                                <Show when={v.hot}>
+                                  <span class="vw-rate tone-warn">{formatRate(v.update_rate)}</span>
+                                </Show>
+                              </td>
+                              <td class="num" classList={{ 'tone-bad': !!v.error_count, faint: !v.error_count }} data-label="Errors">
+                                {formatCount(v.error_count)}
+                              </td>
+                            </tr>
+                          );
+                        }}
+                      </For>
+                    </tbody>
+                  </table>
+                </div>
+                <Show when={d().total > d().returned}>
+                  <div class="vw-foot">
+                    Showing {formatCount(d().returned)} of {formatCount(d().total)}
                   </div>
-                </Panel>
+                </Show>
               </Show>
             )}
           </Show>
-        </div>
+        </Panel>
       </div>
     </>
   );
@@ -652,8 +398,7 @@ export function ViewDetail() {
   return (
     <>
       <PageHead
-        crumb="Views"
-        title="Registered view"
+        title="View"
         subtitle={<CopyId value={key()} />}
         actions={
           <Show when={view()}>
@@ -663,9 +408,7 @@ export function ViewDetail() {
                   <Pill tone="idle">lapsed</Pill>
                 </Show>
                 <Show when={v().shared}>
-                  <Pill tone="ok" dot>
-                    shared
-                  </Pill>
+                  <Pill tone="ok">shared</Pill>
                 </Show>
                 <Show when={slow()}>
                   <Pill tone="warn">slow</Pill>
@@ -690,277 +433,124 @@ export function ViewDetail() {
           )}
         </Show>
 
-        <Show when={data()} fallback={<Show when={!error()}><Empty>Loading…</Empty></Show>}>
-          {(d) => (
-            <div class="stack">
-              <Rail>
-                <Cell label="Rows" value={formatCount(d().view.row_count)} />
-                <Cell
-                  label="Updates"
-                  value={formatCount(d().view.update_count)}
-                />
-                <Cell
-                  label="Update rate"
-                  value={formatRate(d().view.update_rate)}
-                  tone={d().view.hot ? 'warn' : undefined}
-                  foot={
-                    d().view.update_rate_peak !== null &&
-                    d().view.update_rate_peak_at_ms !== null
-                      ? `peak ${formatRate(d().view.update_rate_peak)} ${formatRelativeTime(d().view.update_rate_peak_at_ms!)}`
-                      : `hot at ${formatRate(d().hot_view_rate)}`
-                  }
-                />
-                <Cell
-                  label="Errors"
-                  value={formatCount(d().view.error_count)}
-                  tone={d().view.error_count ? 'bad' : undefined}
-                />
-                <Cell
-                  label="Subscribers"
-                  value={formatCount(d().view.subscribers.length)}
-                  foot="live sessions"
-                />
-                <Cell
-                  label="p99"
-                  value={formatMs(d().view.p99)}
-                  tone={slow() ? 'warn' : undefined}
-                  foot="materialization"
-                />
-              </Rail>
-
-              <Panel
-                title="Query"
-                sub="Exactly what the SSP compiled, after the permission rewrite"
-              >
-                <pre class="json">{d().view.surql ?? '—'}</pre>
-              </Panel>
-
-              <div class="grid grid-2">
-                <Panel
-                  title="Params"
-                  sub="`auth.id` and `access` are injected server-side so the SSP can evaluate the table's own SELECT predicate"
-                >
-                  <pre class="json">
-                    {JSON.stringify(d().view.params ?? null, null, 2)}
-                  </pre>
-                </Panel>
-
-                <Panel title="Registration">
-                  <KeyValue
-                    rows={[
-                      ['User', d().view.auth_id || '—'],
-                      [
-                        'Session',
-                        d().view.client_id ? (
-                          <CopyId value={d().view.client_id} />
-                        ) : (
-                          '—'
-                        ),
-                      ],
-                      ['SSP', d().view.ssp_id ?? 'unassigned'],
-                      ['Registered', formatStamp(d().view.created_at)],
-                      ['Last active', relativeStamp(d().view.last_active_at)],
-                      ['TTL', formatUptime(d().view.ttl_secs)],
-                      [
-                        'Expires',
-                        isAbsent(d().view.expires_at)
-                          ? '—'
-                          : formatStamp(d().view.expires_at),
-                      ],
-                      ['Build time', formatMs(d().view.registration_ms)],
-                    ]}
+        <Show when={data()} fallback={<Show when={!error()}><SkeletonList rows={5} /></Show>}>
+          {(d) => {
+            const v = () => d().view;
+            const p99 = () => splitValue(formatMs(v().p99));
+            const heap = () => {
+              const sv = d().ssp?.view;
+              return sv ? (sv.view_bytes ?? 0) + (sv.operator_bytes ?? 0) : null;
+            };
+            return (
+              <div class="page-stack">
+                <div class="stat-grid">
+                  <StatCard
+                    label="Rows"
+                    value={formatCount(v().row_count)}
+                    tone={v().row_count >= d().large_view_rows ? 'warn' : undefined}
+                    note={heap() !== null ? `${formatBytes(heap())} in the SSP` : undefined}
                   />
-                </Panel>
-              </div>
-
-              <div class="grid grid-2">
-                <Panel
-                  title="Materialization"
-                  sub="A rolling window the SSP keeps per view and flushes onto its row"
-                >
-                  <KeyValue
-                    rows={[
-                      ['p55', formatMs(d().view.p55)],
-                      ['p90', formatMs(d().view.p90)],
-                      ['p99', formatMs(d().view.p99)],
-                      ['Last ingest', formatMs(d().view.last_ingest_ms)],
-                    ]}
+                  <StatCard
+                    label="p99"
+                    value={p99().value}
+                    unit={p99().unit}
+                    tone={slow() ? 'warn' : undefined}
+                    note={`p90 ${formatMs(v().p90)}`}
                   />
-                </Panel>
-
-                <Panel
-                  title="In the SSP"
-                  sub={
-                    d().ssp
-                      ? 'Heap this view holds, and whether the circuit merged it with another'
-                      : undefined
-                  }
-                >
-                  <Show
-                    when={d().ssp}
-                    fallback={
-                      <Empty>
-                        {d().view.ssp_id
-                          ? 'The SSP serving this view did not answer.'
-                          : 'This view has no SSP assignment on this scheduler.'}
-                      </Empty>
+                  <StatCard
+                    label="Updates"
+                    value={formatCount(v().update_count)}
+                    tone={v().hot ? 'warn' : undefined}
+                    note={
+                      (v().update_rate ?? 0) > 0
+                        ? `${formatRate(v().update_rate)} now`
+                        : v().update_rate_peak !== null && v().update_rate_peak_at_ms !== null
+                          ? `peaked ${formatRate(v().update_rate_peak)} ${formatRelativeTime(v().update_rate_peak_at_ms!)}`
+                          : undefined
                     }
-                  >
-                    {(s) => (
-                      <KeyValue
-                        rows={[
-                          [
-                            'Cached records',
-                            formatCount(s().view?.cached_records),
-                          ],
-                          ['View heap', formatBytes(s().view?.view_bytes)],
-                          [
-                            'Operator heap',
-                            formatBytes(s().view?.operator_bytes),
-                          ],
-                          [
-                            'Merging',
-                            s().merging ? (
-                              // Equal counts with merging on means nothing
-                              // actually merged, which is a finding rather
-                              // than a formality.
-                              <>
-                                on — {formatCount(s().graphs)} graphs serving{' '}
-                                {formatCount(s().subscribers)} subscribers
-                              </>
-                            ) : (
-                              <span class="dim">
-                                off (SPKY_SSP_MERGE_VIEWS)
-                              </span>
-                            ),
-                          ],
-                          ['Circuit total', formatBytes(s().total_bytes)],
-                        ]}
-                      />
-                    )}
-                  </Show>
-                </Panel>
-              </div>
-
-              <Panel
-                title="Subscribers"
-                sub="One entry per WebSocket session, re-stamped on every heartbeat"
-                flush
-              >
-                <Show
-                  when={d().view.subscribers.length > 0}
-                  fallback={
-                    <div class="panel-body">
-                      <Empty>
-                        No subscriber has stamped this row yet. `lastActiveAt`,
-                        not this list, is what keeps the view alive.
-                      </Empty>
-                    </div>
-                  }
-                >
-                  <div class="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Session</th>
-                          <th>Last seen</th>
-                          <th>Age</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={d().view.subscribers}>
-                          {(s) => (
-                            <tr>
-                              <td class="id truncate">{s.id}</td>
-                              <td class="dim" data-label="Last seen">
-                                {s.seen_at_ms
-                                  ? new Date(s.seen_at_ms).toLocaleString()
-                                  : '—'}
-                              </td>
-                              <td data-label="Age">
-                                <Show
-                                  when={s.stale}
-                                  fallback={
-                                    <span class="dim">
-                                      {formatUptime(s.age_secs)}
-                                    </span>
-                                  }
-                                >
-                                  <Pill tone="idle">
-                                    {formatUptime(s.age_secs)} — stale
-                                  </Pill>
-                                </Show>
-                              </td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
-                </Show>
-              </Panel>
-
-              <Panel
-                title="Same query elsewhere"
-                sub="Other live registrations of identical SurrealQL and identical params. The query id is salted per browser session, so two tabs of one person are two rows here by design."
-                flush
-              >
-                <div class="panel-body">
-                  <KeyValue
-                    rows={[
-                      [
-                        'Sessions',
-                        <>
-                          {formatCount(d().siblings.sessions)}
-                          <Show when={d().siblings.sessions <= 1}>
-                            {' '}
-                            <span class="dim">— only this one</span>
-                          </Show>
-                        </>,
-                      ],
-                      ['Users', formatCount(d().siblings.users)],
-                    ]}
+                  />
+                  <StatCard
+                    label="Errors"
+                    value={formatCount(v().error_count)}
+                    tone={v().error_count ? 'bad' : undefined}
                   />
                 </div>
+
+                <Panel title="Query">
+                  <pre class="json vw-pre">{v().surql ?? '—'}</pre>
+                </Panel>
+
+                <div class="grid grid-2">
+                  <Panel title="Owner">
+                    <KeyValue
+                      rows={[
+                        ['User', v().auth_id || 'anonymous'],
+                        ['Session', v().client_id ? <CopyId value={v().client_id} /> : '—'],
+                        ['SSP', v().ssp_id ?? 'unassigned'],
+                        ['Registered', formatStamp(v().created_at)],
+                        ['Last active', relativeStamp(v().last_active_at)],
+                        ['Expires', isAbsent(v().expires_at) ? '—' : relativeStamp(v().expires_at)],
+                        [
+                          'Same query',
+                          d().siblings.sessions <= 1
+                            ? 'only this session'
+                            : `${plural(d().siblings.sessions, 'session', 'sessions')}, ${plural(d().siblings.users, 'user', 'users')}`,
+                        ],
+                      ]}
+                    />
+                  </Panel>
+
+                  <Panel title="Params">
+                    <pre class="json">{JSON.stringify(v().params ?? null, null, 2)}</pre>
+                  </Panel>
+                </div>
+
                 <Show when={d().siblings.rows.length > 0}>
-                  <div class="table-scroll">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>View</th>
-                          <th>User</th>
-                          <th>Rows</th>
-                          <th>Last active</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={d().siblings.rows}>
-                          {(r) => (
-                            <tr>
-                              <td>
-                                <A href={`/views/${encodeURIComponent(r.key)}`}>
-                                  <span class="id truncate">{r.key}</span>
-                                </A>
-                              </td>
-                              <td class="dim truncate" data-label="User">
-                                {r.auth_id || '—'}
-                              </td>
-                              <td class="dim" data-label="Rows">
-                                {formatCount(r.row_count)}
-                              </td>
-                              <td class="ghost" data-label="Last active">
-                                {relativeStamp(r.last_active_at)}
-                              </td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
+                  <Panel title="Same query elsewhere" flush>
+                    <ul class="list">
+                      <For each={d().siblings.rows}>
+                        {(r) => (
+                          <li>
+                            <A href={`/views/${encodeURIComponent(r.key)}`} class="list-item">
+                              <span class="list-text">
+                                <span class="list-title">{r.auth_id || 'anonymous'}</span>
+                                <span class="list-detail mono">{r.key}</span>
+                              </span>
+                              <span class="list-meta">
+                                {formatCount(r.row_count)} rows, active {relativeStamp(r.last_active_at)}
+                              </span>
+                              <Chevron />
+                            </A>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Panel>
                 </Show>
-              </Panel>
-            </div>
-          )}
+
+                <Show when={v().subscribers.length > 1}>
+                  <Panel title="Subscribers" flush>
+                    <ul class="list">
+                      <For each={v().subscribers}>
+                        {(sub) => (
+                          <li>
+                            <div class="list-item">
+                              <span class="list-text">
+                                <span class="list-title mono">{sub.id}</span>
+                              </span>
+                              <span class="list-meta" classList={{ 'tone-warn': sub.stale }}>
+                                {sub.stale ? 'stale, ' : ''}seen {formatUptime(sub.age_secs)} ago
+                              </span>
+                            </div>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Panel>
+                </Show>
+              </div>
+            );
+          }}
         </Show>
       </div>
     </>

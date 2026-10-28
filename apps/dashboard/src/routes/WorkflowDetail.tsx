@@ -2,26 +2,24 @@ import { For, Show, createResource, onCleanup, type JSX } from 'solid-js';
 import { A, useNavigate, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import {
-  Cell,
+  Chevron,
   CopyId,
   Empty,
   KeyValue,
   PageHead,
   Panel,
   Pill,
-  Rail,
   Reason,
 } from '../components/Chrome';
-import { Timeline, type Lane } from '../components/Timeline';
+import { Trace, hueOf, short, type TraceRow, type TraceState } from '../components/Trace';
 import {
   decodeParam,
   elapsed,
-  formatDuration,
   formatStamp,
   orNull,
   relativeStamp,
 } from '../lib/format';
-import { jobTone, runTone, stepTone } from '../lib/status';
+import { jobTone, runTone } from '../lib/status';
 import { cancelRun, killJob, rerunRun, retryJob, retryRun } from '../lib/runActions';
 import { JobAttempts } from './Jobs';
 import type { JobDetail, StepRun, WorkflowRun, WorkflowRunDetail } from '../api/types';
@@ -29,10 +27,10 @@ import type { JobDetail, StepRun, WorkflowRun, WorkflowRunDetail } from '../api/
 /**
  * One workflow run.
  *
- * Laid out the way a run is actually read: identity and outcome at the top,
- * then WHERE THE TIME WENT (the timeline), then the payloads. The timeline is
- * the primary object on this page, not a supplement to a table — a run that is
- * stuck is diagnosed by seeing which bar never ended and what it sits behind.
+ * The trace IS the page: a strip of numbers, then every step as a bar on the
+ * run's own time axis, with hand-offs from each dependency to the step that
+ * waited for it. A stuck run is read off the bar that never ended and what
+ * sits behind it. Clicking a step opens its job, attempts and output.
  */
 export function WorkflowDetail() {
   const params = useParams<{ id: string }>();
@@ -166,21 +164,82 @@ export function WorkflowDetail() {
     return { at: created, estimated: s.depends_on.length > 0 };
   };
 
-  const lanes = (): Lane[] => {
-    const byName = new Map((data()?.steps ?? []).map((s) => [s.step, s]));
+  /** Longest dependency chain above each step: its indent in the tree. */
+  const depthOf = (steps: StepRun[]) => {
+    const byName = new Map(steps.map((s) => [s.step, s]));
+    const memo = new Map<string, number>();
+    const visit = (name: string, seen: Set<string>): number => {
+      if (memo.has(name)) return memo.get(name)!;
+      const st = byName.get(name);
+      if (!st || seen.has(name)) return 0;
+      seen.add(name);
+      const d = st.depends_on.length
+        ? 1 + Math.max(...st.depends_on.map((x) => visit(x, seen)))
+        : 0;
+      memo.set(name, d);
+      return d;
+    };
+    return (name: string) => Math.min(4, visit(name, new Set()));
+  };
+
+  const stateOf = (status: string): TraceState => {
+    switch (status) {
+      case 'success':
+        return 'done';
+      case 'dispatched':
+        return 'running';
+      case 'failed':
+        return 'failed';
+      case 'skipped':
+        return 'skipped';
+      default:
+        return 'waiting';
+    }
+  };
+
+  /** When every dependency had finished, or null while one still runs. */
+  const readyAt = (s: StepRun, byName: Map<string, StepRun>, runStart: number | null) => {
+    if (!s.depends_on.length) return runStart;
+    const ends = s.depends_on.map((d) => parse(byName.get(d)?.finished_at));
+    if (ends.some((e) => e == null)) return null;
+    return Math.max(...(ends as number[]));
+  };
+
+  const rows = (): TraceRow[] => {
+    const steps = data()?.steps ?? [];
+    const byName = new Map(steps.map((s) => [s.step, s]));
+    const depth = depthOf(steps);
+    const runStart = parse(data()?.run.created_at);
     return orderedSteps().map((s) => {
-      const started = hasStarted(s.status)
-        ? startOf(s, byName)
-        : { at: null, estimated: false };
+      const started = hasStarted(s.status) ? startOf(s, byName) : { at: null, estimated: false };
+      const end = hasStarted(s.status) ? parse(s.finished_at) : null;
+      const state = stateOf(s.status);
+      const attempts = s.dispatch_attempts ?? 0;
+      const took =
+        started.at != null && end != null ? short(end - started.at) : null;
       return {
         id: s.step,
         label: s.step,
+        sub:
+          state === 'waiting'
+            ? s.depends_on.length
+              ? `after ${s.depends_on.join(', ')}`
+              : s.status
+            : state === 'skipped'
+              ? 'skipped'
+              : undefined,
+        depth: depth(s.step),
+        color: hueOf(s.step),
+        state,
         start: started.at,
+        end,
         estimated: started.estimated,
-        end: hasStarted(s.status) ? parse(s.finished_at) : null,
-        status: s.status,
-        tone: stepTone(s.status),
-        dependsOn: s.depends_on,
+        // Hatched only once every dependency has finished: from then on the
+        // step is waiting to be picked up. Before that it is not waiting on
+        // the queue, it simply has not been reached.
+        queued: state === 'waiting' && isRunning() ? readyAt(s, byName, runStart) : null,
+        after: s.depends_on,
+        meta: [took, attempts > 1 ? `${attempts} dispatches` : null].filter(Boolean).join(' · ') || undefined,
         detail: () => <StepDetail step={s} onChange={refreshAll} />,
       };
     });
@@ -192,16 +251,16 @@ export function WorkflowDetail() {
       total: steps.length,
       done: steps.filter((s) => s.status === 'success').length,
       failed: steps.filter((s) => s.status === 'failed').length,
+      dispatches: steps.reduce((n, s) => n + Math.max(s.dispatch_attempts ?? 0, s.job_id ? 1 : 0), 0),
     };
   };
 
   return (
     <>
       <PageHead
-        crumb="Workflows / Run"
         title={run()?.workflow_name ?? runId()}
         subtitle={
-          <div class="stack" style={{ gap: '3px' }}>
+          <div class="row" style={{ gap: '10px', 'flex-wrap': 'wrap' }}>
             <CopyId value={runId()} />
             <Show when={rerunOf()}>
               {(src) => (
@@ -256,7 +315,7 @@ export function WorkflowDetail() {
                   href={`/schedules/${encodeURIComponent(name())}`}
                   class="btn btn-sm"
                 >
-                  schedule · {name()}
+                  Schedule
                 </A>
               )}
             </Show>
@@ -282,152 +341,67 @@ export function WorkflowDetail() {
             </div>
           }
         >
-          <Show when={data()} fallback={<Empty>Loading…</Empty>}>
+          <Show when={data()} fallback={<div class="ov-skeleton" />}>
             {(d) => (
-              <div class="stack">
-                <Rail>
-                  <Cell
-                    label="Status"
-                    tone={runTone(d().run.status)}
-                    pulse={isRunning()}
-                    value={d().run.status}
-                    foot={d().run.kill_requested ? 'kill requested' : undefined}
-                  />
-                  <Cell
-                    label="Duration"
-                    value={elapsed(d().run.created_at, d().run.finished_at)}
-                    foot={d().run.finished_at ? 'total' : 'still running'}
-                  />
-                  <Cell
-                    label="Started"
-                    value={relativeStamp(d().run.created_at)}
-                    foot={formatStamp(d().run.created_at)}
-                  />
-                  <Cell
-                    label="Steps"
-                    value={`${counts().done}/${counts().total}`}
-                    foot={
-                      counts().failed > 0
-                        ? `${counts().failed} failed`
-                        : 'succeeded'
-                    }
-                    tone={counts().failed > 0 ? 'bad' : undefined}
-                  />
-                </Rail>
-
+              <div class="page-stack">
                 <Show when={d().run.error}>
-                  <Panel title="Run error">
-                    <Reason
-                      error={d().run.error}
-                      tone={d().run.status === 'killed' ? 'warn' : 'bad'}
-                    />
+                  <Panel title={d().run.status === 'killed' ? 'Why it stopped' : 'Why it failed'}>
+                    <Reason error={d().run.error} tone={d().run.status === 'killed' ? 'warn' : 'bad'} />
                   </Panel>
                 </Show>
 
-                <Panel
-                  title="Timeline"
-                  sub="Every step on one axis. Click a step for its payload."
-                  actions={
-                    <span class="tag">
-                      <span class="val">
-                        {formatDuration(
-                          Math.max(
-                            0,
-                            (parse(d().run.finished_at) ?? Date.now()) -
-                              (parse(d().run.created_at) ?? Date.now()),
-                          ),
-                        )}
-                      </span>{' '}
-                      total
-                    </span>
-                  }
-                  flush
-                >
-                  <Timeline
-                    lanes={lanes()}
-                    windowStart={parse(d().run.created_at)}
-                    windowEnd={parse(d().run.finished_at)}
-                  />
-                </Panel>
+                <Trace
+                  title="Trace"
+                  live={isRunning()}
+                  from={parse(d().run.created_at)}
+                  to={isRunning() ? null : parse(d().run.finished_at)}
+                  rows={rows()}
+                  legend={['run', 'wait', 'handoff', 'skipped', 'failed']}
+                  empty="This run has no steps."
+                  stats={[
+                    {
+                      label: 'Duration',
+                      value: short(
+                        Math.max(0, (parse(d().run.finished_at) ?? Date.now()) - (parse(d().run.created_at) ?? Date.now())),
+                      ),
+                    },
+                    { label: 'Steps', value: `${counts().done}/${counts().total}` },
+                    { label: 'Failed', value: String(counts().failed), tone: counts().failed > 0 ? 'bad' : undefined },
+                    { label: 'Dispatches', value: String(counts().dispatches) },
+                    { label: 'Started', value: relativeStamp(d().run.created_at) },
+                    { label: 'Trigger', value: d().run.trigger ?? (d().run.schedule_name ? 'cron' : 'manual') },
+                  ]}
+                />
 
-                <div class="grid grid-2">
-                  <Panel title="Run">
-                    <KeyValue
-                      rows={[
-                        ['Workflow', d().run.workflow_name],
-                        ['Schedule', d().run.schedule_name ?? '—'],
-                        ['Target table', d().run.target_table ?? '—'],
-                        ['Created', formatStamp(d().run.created_at)],
-                        ['Updated', formatStamp(d().run.updated_at)],
-                        ['Finished', formatStamp(d().run.finished_at)],
-                      ]}
-                    />
-                  </Panel>
-
+                <Show when={d().run.input}>
                   <Panel title="Input">
-                    <Show
-                      when={d().run.input}
-                      fallback={<Empty>This run carried no input.</Empty>}
-                    >
-                      <pre class="json">
-                        {JSON.stringify(d().run.input, null, 2)}
-                      </pre>
-                    </Show>
+                    <pre class="json">{JSON.stringify(d().run.input, null, 2)}</pre>
                   </Panel>
-                </div>
+                </Show>
 
                 <Show when={rerunList().length > 0}>
-                  <Panel
-                    title="Reruns"
-                    sub="Runs created from this one, newest first"
-                    flush
-                  >
-                    <div class="table-scroll">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Run</th>
-                            <th>Status</th>
-                            <th>Started</th>
-                            <th>Duration</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          <For each={rerunList()}>
-                            {(r) => (
-                              <tr
-                                class="clickable"
-                                onClick={() =>
-                                  navigate(`/workflows/${encodeURIComponent(r.id)}`)
-                                }
-                              >
-                                <td>
-                                  <div class="row">
-                                    <span class="dot" classList={{ [runTone(r.status)]: true }} />
-                                    <span class="id">{r.id}</span>
-                                  </div>
-                                </td>
-                                <td data-label="Status">
-                                  <Pill tone={runTone(r.status)}>{r.status}</Pill>
-                                </td>
-                                <td class="dim" data-label="Started">
-                                  {relativeStamp(r.created_at)}
-                                </td>
-                                <td class="dim" data-label="Duration">
-                                  {elapsed(r.created_at, r.finished_at)}
-                                </td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
+                  <Panel title="Reruns" flush>
+                    <ul class="list">
+                      <For each={rerunList()}>
+                        {(r) => (
+                          <li>
+                            <A href={`/workflows/${encodeURIComponent(r.id)}`} class="list-item" classList={{ [runTone(r.status)]: true }}>
+                              <span class="dot" classList={{ [runTone(r.status)]: true, pulse: r.status === 'running' }} />
+                              <span class="list-text">
+                                <span class="list-title mono">{r.id}</span>
+                                <span class="list-detail">
+                                  {r.status} · {relativeStamp(r.created_at)}
+                                </span>
+                              </span>
+                              <span class="list-meta">{elapsed(r.created_at, r.finished_at)}</span>
+                              <Chevron />
+                            </A>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
                   </Panel>
                 </Show>
-
-                <Panel title="DAG" sub="As stored on the run">
-                  <pre class="json">{JSON.stringify(d().run.dag, null, 2)}</pre>
-                </Panel>
               </div>
             )}
           </Show>
@@ -438,7 +412,7 @@ export function WorkflowDetail() {
 }
 
 /**
- * The expanded body of one timeline lane.
+ * The opened body of one step in the trace.
  *
  * Two sources, and they answer different questions. The step row says what the
  * ENGINE decided — dispatched, skipped, and why. The job row says what the
@@ -480,11 +454,6 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
     <div class="stack" style={{ gap: '10px', 'padding-top': '10px' }}>
       <KeyValue
         rows={[
-          ['Status', <Pill tone={stepTone(s().status)}>{s().status}</Pill>],
-          [
-            'Depends on',
-            s().depends_on.length ? s().depends_on.join(', ') : '—',
-          ],
           [
             'Job',
             <div class="row" style={{ 'flex-wrap': 'wrap' }}>
@@ -525,7 +494,6 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
               </Show>
             </div>,
           ],
-          ['Queued', formatStamp(s().created_at)],
           ['Started', formatStamp(s().started_at)],
           ['Finished', formatStamp(s().finished_at)],
           // Only worth a row when it is not the ordinary 0-or-1. Above that, the
@@ -576,18 +544,11 @@ function StepDetail(props: { step: StepRun; onChange: () => void }) {
                     ['Path', j().path],
                     [
                       'Retries',
-                      `${j().retries ?? 0} of ${j().max_retries ?? 0} (${j().retry_strategy ?? 'linear'})`,
+                      `${j().retries ?? 0} of ${j().max_retries ?? 0}`,
                     ],
                     ...((j().assignee
                       ? [['SSP', j().assignee!]]
                       : []) as [string, JSX.Element][]),
-                    ...((j().timeout
-                      ? [['Timeout', formatDuration(j().timeout! * 1000)]]
-                      : []) as [string, JSX.Element][]),
-                    ...((j().delay
-                      ? [['Delay', formatDuration(j().delay!)]]
-                      : []) as [string, JSX.Element][]),
-                    ['Last write', formatStamp(j().updated_at)],
                   ]}
                 />
                 {/* The Jobs page renders the same history; sharing the

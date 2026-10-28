@@ -2,7 +2,7 @@ import { For, Show, createMemo, createResource, createSignal, onCleanup, type Ac
 import { A, useNavigate, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import type { PublicationMetrics } from '../api/types';
-import { Cell, Chips, Empty, KeyValue, PageHead, Panel, Pill, Rail, SkeletonList, Stale } from '../components/Chrome';
+import { Chevron, Chips, Empty, KeyValue, PageHead, Panel, SkeletonList, Stale, StatCard } from '../components/Chrome';
 import { decodeParam, formatBytes, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
 import { readStash, writeStash } from '../lib/stash';
 
@@ -54,6 +54,7 @@ const RANGES: { key: string; label: string; ms: number }[] = [
 ];
 const STATES = ['open', 'recovered', 'interrupted', 'failed', 'recorded'];
 const label = (value: string) => value.replace(/_/g, ' ');
+const sentence = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const stamp = (value: number) => new Date(value).toLocaleString();
 const clock = (value: number) =>
   new Date(value).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -92,6 +93,32 @@ function usePoll<T>(path: Accessor<string>, stash?: string) {
   };
 }
 
+/** One open incident: what broke, the latest word on it, how long so far. */
+function OpenRow(props: { incident: Incident; now: number }) {
+  const last = () => props.incident.events[props.incident.events.length - 1];
+  return (
+    <li>
+      <A href={`/incidents/${encodeURIComponent(props.incident.id)}`} class="list-item warn">
+        <span class="list-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16"><path d="M8 2.8 14 13H2zM8 6.6v3M8 11.4h.01" /></svg>
+        </span>
+        <span class="list-text">
+          <span class="list-title">
+            <span class="mono">{props.incident.component}</span> {label(props.incident.kind)}
+          </span>
+          <Show when={last()?.summary}>
+            <span class="list-detail">{last()!.summary}</span>
+          </Show>
+        </span>
+        <span class="list-meta" title={`since ${stamp(props.incident.started_at)}`}>
+          {duration(props.incident, props.now)} ongoing
+        </span>
+        <Chevron />
+      </A>
+    </li>
+  );
+}
+
 export function Incidents() {
   const navigate = useNavigate();
   const [range, setRange] = createSignal('7d');
@@ -110,20 +137,23 @@ export function Incidents() {
   const poll = usePoll<IncidentList>(path, `incidents:${range()}`);
   const now = () => poll.data()?.server_time_ms ?? Date.now();
   const all = () => poll.data()?.incidents ?? [];
+  // Open episodes lead the page; the history below is everything that ended.
+  const open = createMemo(() => all().filter((i) => i.state === 'open'));
+  const past = createMemo(() => all().filter((i) => i.state !== 'open'));
 
   const components = createMemo(() => {
     const seen = new Map<string, number>();
-    for (const i of all()) seen.set(i.component, (seen.get(i.component) ?? 0) + 1);
+    for (const i of past()) seen.set(i.component, (seen.get(i.component) ?? 0) + 1);
     return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   });
   const stateCounts = createMemo(() => {
     const counts: Record<string, number> = {};
-    for (const i of all()) counts[i.state] = (counts[i.state] ?? 0) + 1;
+    for (const i of past()) counts[i.state] = (counts[i.state] ?? 0) + 1;
     return counts;
   });
   const filtered = createMemo(() => {
     const q = search().trim().toLowerCase();
-    return all().filter((i) =>
+    return past().filter((i) =>
       (!state() || i.state === state()) &&
       (!component() || i.component === component()) &&
       (!q || `${i.component} ${i.kind} ${i.severity} ${i.events.map((e) => e.summary).join(' ')}`.toLowerCase().includes(q)));
@@ -138,84 +168,89 @@ export function Incidents() {
     }
     return out;
   });
-  const open = () => stateCounts().open ?? 0;
-  const warnings = () => all().filter((i) => i.severity !== 'info').length;
-  const longest = () => all().reduce((m, i) => Math.max(m, (i.ended_at ?? now()) - i.started_at), 0);
-  const latest = () => all()[0];
   const reset = () => { setState(''); setComponent(''); setSearch(''); setShown(60); };
   const filtering = () => !!(state() || component() || search().trim());
+  const go = (i: Incident) => navigate(`/incidents/${encodeURIComponent(i.id)}`);
 
   return <>
-    <PageHead crumb="Dashboard" title="Incidents" subtitle="Lag, recoveries, heartbeat failures and operator actions, as the scheduler recorded them."
+    <PageHead title="Incidents"
       actions={<><Stale when={poll.stale()} /><A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
         <button class="btn btn-sm" onClick={poll.refresh} disabled={poll.loading()}>Refresh</button></>} />
-    <div class="page-body stack">
+    <div class="page-body page-stack">
       <Show when={poll.error()}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
       <Show when={poll.data()?.storage_error}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
 
-      <Rail>
-        <Cell label="Open now" tone={open() > 0 ? 'warn' : 'ok'} value={formatCount(open())}
-          foot={open() > 0 ? 'recovery not yet observed' : 'nothing ongoing'} />
-        <Cell label={`In the last ${RANGES.find((r) => r.key === range())?.label ?? 'range'}`} value={formatCount(all().length)}
-          foot={`${formatCount(warnings())} warning${warnings() === 1 ? '' : 's'}, ${formatCount(all().length - warnings())} informational`} />
-        <Cell label="Longest episode" value={all().length ? formatDuration(longest()) : '—'} foot="start to recovery" />
-        <Cell label="Latest" value={latest() ? formatRelativeTime(latest()!.started_at) : '—'}
-          foot={latest() ? `${latest()!.component} · ${label(latest()!.kind)}` : 'no incidents recorded'} />
-      </Rail>
+      <Show when={poll.data()}>
+        <Show when={open().length} fallback={
+          <div class="list"><div class="list-item ok">
+            <span class="list-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m4 8.4 2.6 2.6L12 5.4" /></svg></span>
+            <span class="list-text">
+              <span class="list-title">Nothing open</span>
+              <span class="list-detail">{all().length
+                ? `Last incident ${formatRelativeTime(all()[0].started_at)}`
+                : 'No incidents in this range.'}</span>
+            </span>
+          </div></div>
+        }>
+          <section class="inc-open">
+            <h2 class="inc-h">{open().length} open</h2>
+            <ul class="list"><For each={open()}>{(i) => <OpenRow incident={i} now={now()} />}</For></ul>
+          </section>
+        </Show>
+      </Show>
 
       <Panel flush>
-        <div class="toolbar">
+        <div class="toolbar inc-toolbar">
+          <h2 class="inc-h">History</h2>
           <div class="toolbar-groups">
-            <Chips label="Range" value={range()} onChange={(k) => { setRange(k); setShown(60); }}
+            <Chips value={range()} label="Range" onChange={(k) => { setRange(k); setShown(60); }}
               options={RANGES.map((r) => ({ key: r.key, label: r.label }))} />
-            <Chips label="State" value={state()} onChange={(k) => { setState(k); setShown(60); }}
-              options={[{ key: '', label: 'All', count: all().length },
-                ...STATES.filter((s) => stateCounts()[s]).map((s) => ({ key: s, label: label(s), count: stateCounts()[s], tone: tone(s) }))]} />
+            <Show when={Object.keys(stateCounts()).length > 1}>
+              <Chips value={state()} label="State" onChange={(k) => { setState(k); setShown(60); }}
+                options={[{ key: '', label: 'All' },
+                  ...STATES.filter((s) => stateCounts()[s]).map((s) => ({ key: s, label: label(s), count: stateCounts()[s], tone: tone(s) }))]} />
+            </Show>
             <Show when={components().length > 1}>
-              <Chips label="Component" value={component()} onChange={(k) => { setComponent(k); setShown(60); }}
+              <Chips value={component()} label="Component" onChange={(k) => { setComponent(k); setShown(60); }}
                 options={[{ key: '', label: 'All' }, ...components().map(([c, n]) => ({ key: c, label: c, count: n }))]} />
             </Show>
           </div>
-          <div class="row">
-            <input type="search" placeholder="Search kind or summary" value={search()} onInput={(e) => { setSearch(e.currentTarget.value); setShown(60); }} aria-label="Search incidents" />
+          <div class="row inc-search">
+            <input type="search" placeholder="Search" value={search()} onInput={(e) => { setSearch(e.currentTarget.value); setShown(60); }} aria-label="Search incidents" />
             <Show when={filtering()}><button type="button" class="btn btn-sm" onClick={reset}>Clear</button></Show>
           </div>
         </div>
 
         <Show when={poll.data()} fallback={<Show when={!poll.error()}><SkeletonList rows={7} /></Show>}>
-          <Show when={filtered().length} fallback={<Empty>{filtering() ? 'Nothing matches these filters.' : 'No incidents in this range.'}</Empty>}>
-            <div class="feed" aria-busy={poll.loading()}>
+          <Show when={filtered().length} fallback={<Empty>{filtering() ? 'Nothing matches these filters.' : 'Nothing has ended in this range.'}</Empty>}>
+            <div class="inc-feed" aria-busy={poll.loading()}>
               <For each={groups()}>{(group) => <>
-                <div class="feed-day">{group.day}</div>
+                <div class="inc-day">{group.day}</div>
                 <For each={group.items}>{(incident) => {
                   const last = incident.events[incident.events.length - 1];
-                  return <div class="feed-row" role="link" tabIndex={0} onClick={() => navigate(`/incidents/${encodeURIComponent(incident.id)}`)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') navigate(`/incidents/${encodeURIComponent(incident.id)}`); }}>
-                    <div class="feed-time" title={stamp(incident.started_at)}>{clock(incident.started_at)}</div>
-                    <div class="feed-mark" classList={{ [tone(incident.state)]: true, open: incident.state === 'open' }} />
-                    <div>
-                      <div class="feed-title">
-                        <span class="mono">{incident.component}</span>
-                        <span>{label(incident.kind)}</span>
-                        <Pill tone={tone(incident.state)} dot pulse={incident.state === 'open'}>{label(incident.state)}</Pill>
-                        <Show when={incident.severity !== 'info'}><span class="id">{incident.severity}</span></Show>
-                      </div>
-                      <Show when={last?.summary}><div class="feed-summary">{last!.summary}</div></Show>
-                    </div>
-                    <div class="feed-meta">
-                      <span title="duration">{duration(incident, now())}{incident.state === 'open' ? ' ongoing' : ''}</span>
-                      <span title="recorded events">{formatCount(incident.event_count)} event{incident.event_count === 1 ? '' : 's'}</span>
-                      <Show when={incident.max_buffered_events > 0}><span title="peak buffered events">{formatCount(incident.max_buffered_events)} buffered</span></Show>
-                    </div>
+                  return <div class="inc-row" role="link" tabIndex={0} onClick={() => go(incident)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') go(incident); }}>
+                    <span class="inc-time" title={stamp(incident.started_at)}>{clock(incident.started_at)}</span>
+                    <span class={`inc-dot ${tone(incident.state)}`} title={label(incident.state)} />
+                    <span class="inc-text">
+                      <span class="inc-title"><span class="mono">{incident.component}</span> {label(incident.kind)}</span>
+                      <Show when={last?.summary}><span class="inc-summary">{last!.summary}</span></Show>
+                    </span>
+                    <span class="inc-meta">
+                      <span classList={{ [`inc-state-${tone(incident.state)}`]: true }}>{label(incident.state)}</span>
+                      <span>{duration(incident, now())}</span>
+                    </span>
                   </div>;
                 }}</For>
               </>}</For>
             </div>
-            <div class="panel-body spread" style={{ 'flex-wrap': 'wrap', gap: '12px' }}>
-              <span class="dim" aria-live="polite">{Math.min(shown(), filtered().length)} of {formatCount(filtered().length)} shown
-                <Show when={(poll.data()?.total ?? 0) > all().length}> · {formatCount(poll.data()!.total)} in the range, newest {WINDOW} loaded</Show></span>
-              <Show when={filtered().length > shown()}><button class="btn btn-sm" onClick={() => setShown(shown() + 60)}>Show more</button></Show>
-            </div>
+            <Show when={filtered().length > shown() || (poll.data()?.total ?? 0) > all().length}>
+              <div class="inc-more">
+                <span aria-live="polite">{Math.min(shown(), filtered().length)} of {formatCount(filtered().length)}
+                  <Show when={(poll.data()?.total ?? 0) > all().length}>, newest {WINDOW} of {formatCount(poll.data()!.total)} loaded</Show></span>
+                <Show when={filtered().length > shown()}><button class="btn btn-sm" onClick={() => setShown(shown() + 60)}>Show more</button></Show>
+              </div>
+            </Show>
           </Show>
         </Show>
       </Panel>
@@ -228,57 +263,60 @@ export function IncidentDetail() {
   const path = createMemo(() => `/incidents/${encodeURIComponent(decodeParam(params.id))}`);
   const poll = usePoll<{ incident: Incident }>(path);
   return <>
-    <PageHead crumb="Incidents" title={poll.data()?.incident.component ?? 'Incident detail'}
-      subtitle={poll.data() ? label(poll.data()!.incident.kind) : undefined}
+    <PageHead title={poll.data()?.incident.component ?? 'Incident'}
+      subtitle={poll.data() ? `${label(poll.data()!.incident.kind)}, started ${stamp(poll.data()!.incident.started_at)}` : undefined}
       actions={<><A class="btn btn-sm" href="/incidents">All incidents</A><A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
         <button class="btn btn-sm" onClick={poll.refresh} disabled={poll.loading()}>Refresh</button></>} />
-    <div class="page-body stack">
+    <div class="page-body page-stack">
       <Show when={poll.error()}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
       <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><Panel flush><SkeletonList rows={4} /></Panel></Show>}>
         {(incident) => <>
-          <Rail>
-            <Cell label="State" tone={tone(incident().state)} value={label(incident().state)} foot={incident().severity} />
-            <Cell label="Duration" value={duration(incident(), Date.now())} foot={incident().state === 'open' ? 'Recovery not yet observed' : 'Episode closed'} />
-            <Cell label="Events" value={formatCount(incident().event_count)} foot="Recorded transitions" />
-            <Cell label="Peak buffered" value={formatCount(incident().max_buffered_events)} foot="Events waiting for replay" />
-          </Rail>
-          <Show when={incident().state === 'interrupted'}><div class="banner"><span class="dot warn" />The scheduler restarted before recovery was observed. This incident is not confirmed recovered.</div></Show>
-          <Panel title="Episode"><KeyValue rows={[
-            ['Incident ID', <span class="mono">{incident().id}</span>],
-            ['Started', stamp(incident().started_at)],
-            ['Ended', incident().ended_at == null ? 'Still open' : stamp(incident().ended_at!)],
-          ]} /></Panel>
-          <Show when={incident().publication}>{(publication) => <Panel title="Publication backlog" sub="Sampled from SSP heartbeats during this incident. Peaks may fall between samples.">
+          <Show when={incident().state === 'interrupted'}><div class="banner"><span class="dot warn" />The scheduler restarted before recovery was seen.</div></Show>
+          <div class="stat-grid">
+            <StatCard label="State" value={sentence(label(incident().state))} tone={tone(incident().state)} note={incident().severity} />
+            <StatCard label="Duration" value={duration(incident(), Date.now())}
+              note={incident().ended_at == null ? 'still open' : `ended ${stamp(incident().ended_at!)}`} />
+            <StatCard label="Events" value={formatCount(incident().event_count)} />
+            <Show when={incident().max_buffered_events > 0}>
+              <StatCard label="Peak buffered" value={formatCount(incident().max_buffered_events)} note="waiting for replay" />
+            </Show>
+          </div>
+          <Show when={incident().publication}>{(publication) => <Panel title="Publication backlog" sub="Sampled from SSP heartbeats; peaks may fall between samples.">
             <KeyValue rows={[
               ['Peak pending operations', formatCount(incident().max_publication_operations)],
               ['Peak pending bytes', formatBytes(incident().max_publication_bytes)],
-              ['Longest observed wait', formatDuration(incident().max_publication_age_ms ?? 0)],
-              ['Parked batches at last nonempty sample', formatCount(publication().parked_batches)],
-              ['Last successful publication', publication().last_success_at_ms == null ? 'Not reported' : stamp(publication().last_success_at_ms!)],
-              ['Overload rejections since SSP start', formatCount(publication().overload_total)],
+              ['Longest wait', formatDuration(incident().max_publication_age_ms ?? 0)],
+              ['Parked batches', formatCount(publication().parked_batches)],
+              ['Last publication', publication().last_success_at_ms == null ? 'Not reported' : stamp(publication().last_success_at_ms!)],
+              ['Overload rejections', formatCount(publication().overload_total)],
             ]} />
             <Show when={publication().connection}>{(connection) => <KeyValue rows={[
-              ['Database session generation', formatCount(connection().generation)],
-              ['Last reconnect attempt', connection().last_reconnect_duration_ms == null ? 'No reconnect attempted' : formatDuration(connection().last_reconnect_duration_ms!)],
-              ['Failed reconnect attempts', formatCount(connection().reconnect_failures)],
+              ['Session generation', formatCount(connection().generation)],
+              ['Last reconnect', connection().last_reconnect_duration_ms == null ? 'None' : formatDuration(connection().last_reconnect_duration_ms!)],
+              ['Failed reconnects', formatCount(connection().reconnect_failures)],
             ]} />}</Show>
             <Show when={publication().worst_views.length}>
-              <div class="table-scroll"><table><thead><tr><th>View</th><th>Pending operations</th><th>Pending bytes</th><th>Oldest wait</th></tr></thead>
+              <div class="table-scroll"><table><thead><tr><th>View</th><th>Pending ops</th><th>Pending bytes</th><th>Oldest wait</th></tr></thead>
                 <tbody><For each={publication().worst_views}>{(view) => <tr>
                   <td><A class="mono" href={`/views/${encodeURIComponent(view.query_id)}`}>{view.query_id}</A></td>
                   <td>{formatCount(view.pending_operations)}</td><td>{formatBytes(view.pending_bytes)}</td><td>{formatDuration(view.oldest_age_ms)}</td>
                 </tr>}</For></tbody></table></div>
             </Show>
           </Panel>}</Show>
-          <Panel title="Timeline" sub={`${incident().events.length} retained of ${formatCount(incident().event_count)} recorded events. Oldest first.`}>
-            <Show when={incident().events.length} fallback={<Empty>No timeline events retained.</Empty>}>
-              <ol style={{ margin: '0', padding: '0', 'list-style': 'none' }}>
-                <For each={incident().events}>{(event) => <li style={{ 'border-left': '2px solid var(--rule)', padding: '0 0 24px 20px', 'margin-left': '5px' }}>
-                  <div class="row" style={{ 'flex-wrap': 'wrap', 'margin-bottom': '8px' }}><Pill tone={tone(event.state)} dot>{label(event.state)}</Pill>
-                    <time class="dim mono" dateTime={new Date(event.at).toISOString()}>{stamp(event.at)}</time></div>
-                  <div style={{ 'overflow-wrap': 'anywhere' }}>{event.summary}</div>
-                  <div class="id" style={{ 'margin-top': '6px', 'overflow-wrap': 'anywhere' }}>{event.component} · {label(event.kind)} · v{event.version}
-                    {event.operation_id ? ` · operation ${event.operation_id}` : ''}</div>
+          <Panel title="Timeline" sub={incident().events.length < incident().event_count
+            ? `${incident().events.length} of ${formatCount(incident().event_count)} events kept, oldest first`
+            : 'Oldest first'}>
+            <Show when={incident().events.length} fallback={<Empty>No events kept.</Empty>}>
+              <ol class="inc-tl">
+                <For each={incident().events}>{(event) => <li class="inc-tl-item">
+                  <span class={`inc-dot ${tone(event.state)}`} />
+                  <div class="inc-tl-body">
+                    <div class="inc-tl-head"><span class="inc-tl-state">{label(event.state)}</span>
+                      <time class="inc-tl-time" dateTime={new Date(event.at).toISOString()}>{stamp(event.at)}</time></div>
+                    <div class="inc-tl-text">{event.summary}</div>
+                    <div class="inc-tl-meta id">{event.component} · {label(event.kind)} · v{event.version}
+                      {event.operation_id ? ` · operation ${event.operation_id}` : ''}</div>
+                  </div>
                 </li>}</For>
               </ol>
             </Show>

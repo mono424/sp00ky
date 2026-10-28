@@ -1,14 +1,6 @@
 import { For, Show, createResource, createSignal, onCleanup } from 'solid-js';
 import { api } from '../api/client';
-import {
-  Cell,
-  Empty,
-  PageHead,
-  Panel,
-  Pill,
-  Rail,
-  StatusDot,
-} from '../components/Chrome';
+import { Empty, PageHead, Panel, StatCard } from '../components/Chrome';
 import { runAction, post, toast } from '../components/Actions';
 import { ActivityStrip, OpCard, restoreView } from '../components/OpCard';
 import { describeCron } from '../lib/cron';
@@ -31,19 +23,18 @@ import type {
 } from '../api/types';
 
 /**
- * Backups.
+ * Backups: when the last one was taken, how many are kept, when the next one
+ * runs, and the list to restore from.
  *
- * Two sources of truth, deliberately shown as one list. The scheduler EXECUTES
- * backups (export, gzip, upload) and remembers the last fifty in memory. The
- * catalog, the schedule and retention live in Sp00ky Cloud when the scheduler
- * is linked to it, or in a plain bucket listing when it is not. The API joins
- * the two by id, which is what lets an in-flight backup show its size filling
- * in before the control plane has heard about it.
+ * Two sources are shown as one list. The scheduler EXECUTES backups (export,
+ * gzip, upload) and remembers recent ones in memory; the catalog, schedule
+ * and retention live in Sp00ky Cloud when linked, or in a bucket listing when
+ * not. The API joins them by id, so an in-flight backup fills in its size
+ * before the control plane has heard of it.
  *
- * A restore is the one destructive action on the whole dashboard that cannot
- * be undone by another click, so it gets the fullest treatment: consequences
- * up front, a typed word, then a step card fed by the scheduler's own stage
- * flags rather than a spinner.
+ * A restore is the one action here no later click can undo, so it gets
+ * consequences up front, a typed word, then a step card fed by the
+ * scheduler's own stage flags.
  */
 
 function catalogTone(status: CatalogEntry['status']) {
@@ -73,6 +64,18 @@ function restoreTone(status: RestoreJobState['status']) {
       return 'idle';
   }
 }
+
+const ArchiveIcon = () => (
+  <svg viewBox="0 0 16 16">
+    <path d="M2.5 3.5h11v3h-11zM3.5 6.5v6h9v-6M6.5 9h3" />
+  </svg>
+);
+
+const RestoreIcon = () => (
+  <svg viewBox="0 0 16 16">
+    <path d="M3 8a5 5 0 1 0 1.5-3.6M3 2.5v2.2h2.2" />
+  </svg>
+);
 
 export function Backups(props: { overview: Overview | undefined; refresh: () => void }) {
   const [result, { refetch }] = createResource(() => api.getResult<BackupsData>('/backups'));
@@ -178,327 +181,246 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
       after: refreshAll,
     });
 
+  const configured = () => !!data()?.s3.configured;
+  const restoreBlocked = () => {
+    const st = data()?.scheduler_status;
+    return st && st !== 'ready' ? `Scheduler is ${st}; restore needs ready` : undefined;
+  };
+
+  const lastValue = () => {
+    const l = latest();
+    return l ? relativeStamp(l.completed_at ?? l.created_at) : 'never';
+  };
+
   return (
     <>
       <PageHead
-        crumb="Dashboard"
         title="Backups"
         subtitle={
-          <Show when={data()}>
-            {(d) => (
+          <Show when={data()?.s3.bucket}>
+            {(b) => (
               <>
-                {d().linked ? 'catalog from Sp00ky Cloud' : 'catalog from bucket listing'}
-                {d().s3.bucket ? ` · ${d().s3.bucket}` : ''}
+                Stored in <span class="mono">{b()}</span>
               </>
             )}
           </Show>
         }
         actions={
           <Show when={data()}>
-            {(d) => (
-              <Pill tone={d().s3.configured ? 'ok' : 'bad'} dot>
-                {d().s3.configured ? 'storage configured' : 'no storage'}
-              </Pill>
-            )}
+            <div class="bk-create">
+              <input
+                class="bk-name"
+                placeholder="Name (optional)"
+                value={name()}
+                disabled={creating() || !configured()}
+                onInput={(e) => setName(e.currentTarget.value)}
+                onKeyDown={(e) => e.key === 'Enter' && void create()}
+              />
+              <button
+                class="btn btn-primary"
+                disabled={creating() || !configured()}
+                title={configured() ? undefined : 'No object storage configured'}
+                onClick={() => void create()}
+              >
+                Back up now
+              </button>
+            </div>
           </Show>
         }
       />
 
       <div class="page-body">
-        <ActivityStrip
-          operations={props.overview?.operations}
-          ssps={props.overview?.ssps}
-          exclude={(op) => op.kind === 'backup_restore' && op.detail?.restore_id === watching()?.id}
-        />
+        <div class="page-stack">
+          <ActivityStrip
+            operations={props.overview?.operations}
+            ssps={props.overview?.ssps}
+            exclude={(op) => op.kind === 'backup_restore' && op.detail?.restore_id === watching()?.id}
+          />
 
-        <Show
-          when={!error()}
-          fallback={
+          <Show when={error()}>
             <div class="panel">
               <Empty>{error()}</Empty>
             </div>
-          }
-        >
-          <Show when={data()} fallback={<Empty>Loading…</Empty>}>
+          </Show>
+
+          <Show when={!error() && data()} fallback={<Show when={!error()}><Empty>Loading…</Empty></Show>}>
             {(d) => (
-              <div class="stack">
-                <Rail>
-                  <Cell
-                    label="Last backup"
-                    tone={latest() ? 'ok' : 'idle'}
-                    value={latest() ? relativeStamp(latest()!.completed_at ?? latest()!.created_at) : 'never'}
-                    foot={latest() ? formatBytes(latest()!.size_bytes) : 'no completed backup'}
-                  />
-                  <Cell
-                    label="Kept"
-                    value={formatCount(completed().length)}
-                    foot={`${formatBytes(totalBytes())} in storage`}
-                  />
-                  <Cell
-                    label="Next scheduled"
-                    tone={d().config?.enabled ? 'ok' : 'idle'}
-                    value={
-                      d().config?.enabled && d().config?.next_run_at
-                        ? relativeStamp(d().config!.next_run_at)
-                        : 'none'
-                    }
-                    foot={
-                      d().config
-                        ? d().config!.enabled
-                          ? (d().config!.schedule ? describeCron(d().config!.schedule!) ?? d().config!.schedule : 'no cron set')
-                          : 'schedule off'
-                        : 'not linked'
-                    }
-                  />
-                  <Cell
-                    label="Retention"
-                    value={d().config?.retention ? formatCount(d().config!.retention) : '—'}
-                    foot={d().config?.retention ? 'most recent kept' : 'not enforced here'}
-                  />
-                </Rail>
+                <>
+                  <Show when={!d().s3.configured}>
+                    <div class="banner">
+                      <span class="dot bad" />
+                      No object storage. Set <span class="mono">S3_ENDPOINT</span>,{' '}
+                      <span class="mono">S3_ACCESS_KEY</span>, <span class="mono">S3_SECRET_KEY</span> and{' '}
+                      <span class="mono">S3_BUCKET</span> on the scheduler.
+                    </div>
+                  </Show>
 
-                <Show when={watching()} keyed>
-                  {(w) => (
-                    <RestoreProgress
-                      id={w.id}
-                      backupId={w.backupId}
-                      label={w.label}
-                      sub={w.sub}
-                      onDone={() => {
-                        refreshAll();
-                      }}
-                      onClose={() => setWatching(null)}
-                    />
-                  )}
-                </Show>
-
-                <div class="grid grid-2">
-                  <Panel
-                    title="Create backup"
-                    sub="A SurrealDB export, gzipped, uploaded to the bucket. The scheduler keeps serving."
-                  >
-                    <Show
-                      when={d().s3.configured}
-                      fallback={
-                        <div class="callout">
-                          No object storage configured. The scheduler needs{' '}
-                          <code>S3_ENDPOINT</code>, <code>S3_ACCESS_KEY</code>,{' '}
-                          <code>S3_SECRET_KEY</code> and <code>S3_BUCKET</code> in its
-                          environment.
-                        </div>
+                  <div class="stat-grid">
+                    <StatCard
+                      label="Last backup"
+                      value={lastValue()}
+                      tone={latest() ? undefined : 'warn'}
+                      note={
+                        d().local.current_running
+                          ? `backing up now, ${elapsed(
+                              d().local.current_running!.started_at ?? d().local.current_running!.enqueued_at,
+                              null,
+                            )}`
+                          : latest()
+                            ? formatBytes(latest()!.size_bytes)
+                            : 'none completed yet'
                       }
-                    >
-                      <div class="form-row">
-                        <input
-                          placeholder="Name (optional)"
-                          value={name()}
-                          disabled={creating()}
-                          onInput={(e) => setName(e.currentTarget.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && void create()}
-                        />
-                        <button
-                          class="btn btn-primary"
-                          disabled={creating()}
-                          onClick={() => void create()}
-                        >
-                          Back up now
-                        </button>
-                      </div>
-                      <Show when={d().local.current_running}>
-                        {(job) => (
-                          <div style={{ 'margin-top': '12px' }}>
-                            <div class="spread faint" style={{ 'font-size': '11.5px', 'margin-bottom': '6px' }}>
-                              <span>
-                                running · {job().backup_id}
-                              </span>
-                              <span>{elapsed(job().started_at ?? job().enqueued_at, null)}</span>
-                            </div>
-                            <div class="bar">
-                              <div class="bar-fill indeterminate" />
-                            </div>
-                          </div>
-                        )}
-                      </Show>
-                      <Show when={d().local.queue_len > 0}>
-                        <div class="field-hint">
-                          {d().local.queue_len} queued behind it
-                        </div>
-                      </Show>
+                    />
+                    <StatCard
+                      label="Kept"
+                      value={formatCount(completed().length)}
+                      unit={completed().length === 1 ? 'backup' : 'backups'}
+                      note={
+                        formatBytes(totalBytes()) +
+                        (d().config?.retention ? `, newest ${formatCount(d().config!.retention)} kept` : '')
+                      }
+                    />
+                    <StatCard
+                      label="Next backup"
+                      value={
+                        d().config?.enabled && d().config?.next_run_at
+                          ? relativeStamp(d().config!.next_run_at)
+                          : 'off'
+                      }
+                      note={
+                        d().config
+                          ? d().config!.enabled && d().config!.schedule
+                            ? (describeCron(d().config!.schedule!) ?? d().config!.schedule!)
+                            : 'no schedule'
+                          : 'scheduled by Sp00ky Cloud'
+                      }
+                    />
+                  </div>
+
+                  <Show when={watching()} keyed>
+                    {(w) => (
+                      <RestoreProgress
+                        id={w.id}
+                        backupId={w.backupId}
+                        label={w.label}
+                        sub={w.sub}
+                        onDone={() => {
+                          refreshAll();
+                        }}
+                        onClose={() => setWatching(null)}
+                      />
+                    )}
+                  </Show>
+
+                  <Panel title="Backups" flush>
+                    <Show when={d().catalog.length > 0} fallback={<Empty>No backups yet.</Empty>}>
+                      <ul class="list">
+                        <For each={d().catalog}>
+                          {(c) => {
+                            const size = () => c.local?.size_bytes ?? c.size_bytes;
+                            const live = () => c.status === 'pending' || c.status === 'in_progress';
+                            const state = () =>
+                              c.status === 'completed'
+                                ? null
+                                : c.local && live()
+                                  ? c.local.status
+                                  : c.status.replace('_', ' ');
+                            return (
+                              <li class="list-item bk-row" classList={{ [catalogTone(c.status)]: true }}>
+                                <span class="list-icon" aria-hidden="true">
+                                  <ArchiveIcon />
+                                </span>
+                                <span class="list-text">
+                                  <span class="list-title">
+                                    {c.name ?? c.id}
+                                    <Show when={state()}>
+                                      <span class="bk-state" classList={{ [catalogTone(c.status)]: true }}>
+                                        {state()}
+                                      </span>
+                                    </Show>
+                                  </span>
+                                  <Show
+                                    when={c.error}
+                                    fallback={
+                                      <span class="list-detail">
+                                        <Show when={c.name}>
+                                          <span class="mono">{c.id}</span>
+                                          {size() ? ' · ' : ''}
+                                        </Show>
+                                        {size() ? formatBytes(size()!) : ''}
+                                      </span>
+                                    }
+                                  >
+                                    <span class="list-detail bk-error" title={c.error!}>
+                                      {c.error}
+                                    </span>
+                                  </Show>
+                                </span>
+                                <span class="list-meta" title={formatStamp(c.created_at)}>
+                                  {relativeStamp(c.created_at)}
+                                </span>
+                                <span class="bk-actions">
+                                  <Show when={c.status === 'completed'}>
+                                    <button
+                                      class="btn btn-sm"
+                                      title={restoreBlocked()}
+                                      disabled={!!restoreBlocked()}
+                                      onClick={() => void restore(c)}
+                                    >
+                                      Restore
+                                    </button>
+                                    <Show when={d().linked}>
+                                      <button class="btn btn-sm" onClick={() => void remove(c)}>
+                                        Delete
+                                      </button>
+                                    </Show>
+                                  </Show>
+                                </span>
+                              </li>
+                            );
+                          }}
+                        </For>
+                      </ul>
                     </Show>
                   </Panel>
 
-                  <SchedulePanel
-                    linked={d().linked}
-                    config={d().config}
-                    onSaved={refreshAll}
-                  />
-                </div>
-
-                <Panel
-                  title="Catalog"
-                  sub={
-                    d().linked
-                      ? 'Newest first. Deleted backups are hidden.'
-                      : 'Newest first, from the bucket. Sp00ky Cloud tracks names and retention; a bucket listing has neither.'
-                  }
-                  flush
-                >
-                  <Show
-                    when={d().catalog.length > 0}
-                    fallback={<Empty>No backups yet.</Empty>}
-                  >
-                    <div class="table-scroll">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Backup</th>
-                            <th>Status</th>
-                            <th>Size</th>
-                            <th>Snapshot</th>
-                            <th>Created</th>
-                            <th />
-                          </tr>
-                        </thead>
-                        <tbody>
-                          <For each={d().catalog}>
-                            {(c) => {
-                              const size = () => c.local?.size_bytes ?? c.size_bytes;
-                              const seq = () => c.local?.snapshot_seq ?? c.snapshot_seq;
-                              const live = () => c.status === 'pending' || c.status === 'in_progress';
-                              return (
-                                <tr>
-                                  <td>
-                                    <div class="row">
-                                      <StatusDot tone={catalogTone(c.status)} pulse={live()} />
-                                      <span>{c.name ?? c.id}</span>
-                                    </div>
-                                    <Show when={c.name}>
-                                      <div class="id" style={{ 'margin-top': '2px' }}>{c.id}</div>
-                                    </Show>
-                                    <Show when={c.error}>
-                                      <div class="id" style={{ 'margin-top': '2px', color: 'var(--bad)' }}>
-                                        {c.error}
-                                      </div>
-                                    </Show>
-                                  </td>
-                                  <td data-label="Status">
-                                    <Pill tone={catalogTone(c.status)}>
-                                      {c.local && live() ? c.local.status : c.status.replace('_', ' ')}
-                                    </Pill>
-                                  </td>
-                                  <td class="dim" data-label="Size">
-                                    {size() ? formatBytes(size()!) : '—'}
-                                  </td>
-                                  <td class="ghost" data-label="Snapshot" data-empty={seq() == null}>
-                                    {seq() != null ? formatCount(seq()) : '—'}
-                                  </td>
-                                  <td class="dim" data-label="Created" title={formatStamp(c.created_at)}>
-                                    {relativeStamp(c.created_at)}
-                                  </td>
-                                  <td data-label="Actions" data-empty={c.status !== 'completed'}>
-                                    <div class="row" style={{ 'justify-content': 'flex-end' }}>
-                                      <Show when={c.status === 'completed'}>
-                                        <button
-                                          class="btn btn-sm"
-                                          title={
-                                            d().scheduler_status !== 'ready'
-                                              ? `Scheduler is ${d().scheduler_status}; restore needs ready`
-                                              : undefined
-                                          }
-                                          disabled={d().scheduler_status !== 'ready'}
-                                          onClick={() => void restore(c)}
-                                        >
-                                          Restore
-                                        </button>
-                                        <Show when={d().linked}>
-                                          <button
-                                            class="btn btn-sm"
-                                            onClick={() => void remove(c)}
-                                          >
-                                            Delete
-                                          </button>
-                                        </Show>
-                                      </Show>
-                                    </div>
-                                  </td>
-                                </tr>
-                              );
-                            }}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
-                  </Show>
-                </Panel>
-
-                <Panel
-                  title="Restore history"
-                  sub="What this scheduler process has restored. Kept in memory only, so it starts empty after a restart."
-                  flush
-                >
-                  <Show
-                    when={d().restores.length > 0}
-                    fallback={<Empty>No restores since this scheduler started.</Empty>}
-                  >
-                    <div class="table-scroll">
-                      <table>
-                        <thead>
-                          <tr>
-                            <th>Restore</th>
-                            <th>Status</th>
-                            <th>From</th>
-                            <th>Stages</th>
-                            <th>Started</th>
-                            <th>Duration</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          <For each={d().restores}>
-                            {(r) => (
-                              <tr
-                                class="clickable"
+                  {/* In memory on this scheduler only, so usually empty. */}
+                  <Show when={d().restores.length > 0}>
+                    <Panel title="Restores" flush>
+                      <ul class="list">
+                        <For each={d().restores}>
+                          {(r) => (
+                            <li>
+                              <button
+                                class="list-item bk-restore"
+                                classList={{ [restoreTone(r.status)]: true }}
                                 onClick={() => setWatching({ id: r.restore_id, backupId: r.backup_id })}
                               >
-                                <td>
-                                  <div class="row">
-                                    <StatusDot
-                                      tone={restoreTone(r.status)}
-                                      pulse={r.status === 'running'}
-                                    />
-                                    <span class="id">{r.restore_id}</span>
-                                  </div>
-                                </td>
-                                <td data-label="Status">
-                                  <Pill tone={restoreTone(r.status)}>{r.status}</Pill>
-                                </td>
-                                <td class="ghost" data-label="From">{r.backup_id}</td>
-                                <td class="ghost" data-label="Stages">
-                                  {[
-                                    r.main_db_restored ? 'db' : null,
-                                    r.replica_restored ? 'replica' : null,
-                                    r.ssps_evicted != null ? `${r.ssps_evicted} ssp` : null,
-                                  ]
-                                    .filter(Boolean)
-                                    .join(' · ') || '—'}
-                                </td>
-                                <td class="dim" data-label="Started">
-                                  {relativeStamp(r.started_at ?? r.enqueued_at)}
-                                </td>
-                                <td class="dim" data-label="Duration">
-                                  {elapsed(r.started_at ?? r.enqueued_at, r.finished_at)}
-                                </td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
+                                <span class="list-icon" aria-hidden="true">
+                                  <RestoreIcon />
+                                </span>
+                                <span class="list-text">
+                                  <span class="list-title">
+                                    From <span class="mono">{r.backup_id}</span>
+                                  </span>
+                                  <span class="list-detail">
+                                    {r.status}, took {elapsed(r.started_at ?? r.enqueued_at, r.finished_at)}
+                                  </span>
+                                </span>
+                                <span class="list-meta">{relativeStamp(r.started_at ?? r.enqueued_at)}</span>
+                              </button>
+                            </li>
+                          )}
+                        </For>
+                      </ul>
+                    </Panel>
                   </Show>
-                </Panel>
-              </div>
+
+                  <SchedulePanel linked={d().linked} config={d().config} onSaved={refreshAll} />
+                </>
             )}
           </Show>
-        </Show>
+        </div>
       </div>
     </>
   );
@@ -558,25 +480,17 @@ function SchedulePanel(props: {
   };
 
   return (
-    <Panel
-      title="Schedule"
-      sub={
-        props.linked
-          ? 'Run by Sp00ky Cloud on this cron, in UTC. Retention keeps the newest N completed backups.'
-          : 'Scheduled backups are run by Sp00ky Cloud.'
-      }
-    >
+    <Panel title="Schedule">
       <Show
         when={props.linked}
         fallback={
-          <div class="callout">
-            This scheduler is not linked to Sp00ky Cloud, so there is no schedule to
-            show or edit. From a linked project:{' '}
-            <code>spky backup configure --enabled true --schedule "0 3 * * *" --retention 7</code>
+          <div class="bk-unlinked">
+            Scheduled backups need a project linked to Sp00ky Cloud, then{' '}
+            <span class="mono">spky backup configure</span>.
           </div>
         }
       >
-        <div class="stack" style={{ gap: '12px' }}>
+        <div class="bk-form">
           <label class="switch">
             <input
               type="checkbox"
@@ -587,42 +501,39 @@ function SchedulePanel(props: {
             <span>{enabled() ? 'Scheduled backups on' : 'Scheduled backups off'}</span>
           </label>
 
-          <div>
-            <span class="tag field-label">Cron (UTC)</span>
-            <input
-              value={schedule()}
-              placeholder="0 3 * * *"
-              spellcheck={false}
-              onInput={(e) => setSchedule(e.currentTarget.value)}
-            />
-            <div class="field-hint">
-              <Show when={preview()} fallback="Five fields: minute hour day month weekday">
-                {(p) => <>{p()}</>}
-              </Show>
-              <Show when={props.config?.next_run_at && props.config?.enabled}>
-                {' · next '}
-                {relativeStamp(props.config!.next_run_at)}
-              </Show>
-            </div>
+          <div class="bk-fields">
+            <label>
+              <span class="tag field-label">Cron, UTC</span>
+              <input
+                class="mono"
+                value={schedule()}
+                placeholder="0 3 * * *"
+                spellcheck={false}
+                onInput={(e) => setSchedule(e.currentTarget.value)}
+              />
+              <span class="field-hint">
+                <Show when={preview()} fallback="minute hour day month weekday">
+                  {(p) => <>{p()}</>}
+                </Show>
+              </span>
+            </label>
+
+            <label>
+              <span class="tag field-label">Keep</span>
+              <input
+                value={retention()}
+                placeholder="7"
+                inputmode="numeric"
+                onInput={(e) => setRetention(e.currentTarget.value)}
+              />
+              <span class="field-hint">newest backups, empty or 0 keeps all</span>
+            </label>
           </div>
 
-          <div>
-            <span class="tag field-label">Retention (backups kept)</span>
-            <input
-              value={retention()}
-              placeholder="7"
-              inputmode="numeric"
-              onInput={(e) => setRetention(e.currentTarget.value)}
-            />
-            <div class="field-hint">
-              Older completed backups are deleted from storage. Empty or 0 keeps everything.
-            </div>
-          </div>
-
-          <div class="spread">
-            <span class="faint" style={{ 'font-size': '11px' }}>
+          <div class="bk-form-foot">
+            <span class="field-hint">
               <Show when={props.config?.last_scheduled_at && !isAbsent(props.config?.last_scheduled_at)}>
-                last scheduled run {relativeStamp(props.config!.last_scheduled_at)}
+                Last scheduled run {relativeStamp(props.config!.last_scheduled_at)}
               </Show>
             </span>
             <button
@@ -630,7 +541,7 @@ function SchedulePanel(props: {
               disabled={!dirty() || saving()}
               onClick={() => void save()}
             >
-              Save schedule
+              Save
             </button>
           </div>
         </div>

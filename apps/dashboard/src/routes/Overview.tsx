@@ -1,6 +1,6 @@
 import { For, Show, createMemo, type JSX } from 'solid-js';
 import { A } from '@solidjs/router';
-import { PageHead, Pill } from '../components/Chrome';
+import { Chevron, PageHead, Pill, StatCard } from '../components/Chrome';
 import { Sparkline, type Point } from '../components/Sparkline';
 import { ActivityStrip } from '../components/OpCard';
 import { SchedulerActions } from '../components/ClusterActions';
@@ -137,14 +137,6 @@ function issuesOf(d: OverviewData): Issue[] {
   return [...out.filter((i) => i.tone === 'bad'), ...out.filter((i) => i.tone === 'warn')];
 }
 
-function Chevron() {
-  return (
-    <svg class="ov-arrow" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-    </svg>
-  );
-}
-
 /**
  * Change across the chart's window: first good sample to last. Null when the
  * window is too short or starts at zero, where a percentage means nothing.
@@ -156,6 +148,7 @@ function trend(points: Point[] | undefined): number | null {
   return Math.abs(pct) < 1 ? 0 : Math.round(pct);
 }
 
+/** A StatCard whose foot is the window's chart, with its trend chip. */
 function Stat(props: {
   label: string;
   value: JSX.Element;
@@ -165,38 +158,34 @@ function Stat(props: {
   to: string;
   points?: Point[];
   format?: (v: number | null | undefined) => string;
-  /** Drawn at the foot of the card in place of a chart. */
   children?: JSX.Element;
 }) {
   return (
-    <A href={props.to} class="ov-stat">
-      <span class="ov-stat-label">
-        {props.label}
-        <Chevron />
-      </span>
-      <span class="ov-stat-value" classList={{ [`tone-${props.tone}`]: props.tone === 'warn' || props.tone === 'bad' }}>
-        {props.value}
-        <Show when={props.unit}>
-          <span class="ov-stat-unit">{props.unit}</span>
-        </Show>
-      </span>
-      <span class="ov-stat-note">
-        <Show when={trend(props.points)}>
-          {(t) => (
-            <span class="ov-delta" classList={{ up: t() > 0, down: t() < 0 }}>
-              {t() > 0 ? '↑' : '↓'} {Math.abs(t())}%
-            </span>
-          )}
-        </Show>
-        {props.note}
-      </span>
-      <Show when={(props.points?.length ?? 0) > 1}>
-        <span class="ov-stat-plot">
+    <StatCard
+      label={props.label}
+      value={props.value}
+      unit={props.unit}
+      tone={props.tone}
+      to={props.to}
+      note={
+        <>
+          <Show when={trend(props.points)}>
+            {(t) => (
+              <span class="delta">
+                {t() > 0 ? '↑' : '↓'} {Math.abs(t())}%
+              </span>
+            )}
+          </Show>
+          {props.note}
+        </>
+      }
+    >
+      <Show when={(props.points?.length ?? 0) > 1} fallback={props.children}>
+        <span class="stat-plot">
           <Sparkline points={props.points!} fill bare format={props.format} ariaLabel={props.label} />
         </span>
       </Show>
-      {props.children}
-    </A>
+    </StatCard>
   );
 }
 
@@ -305,12 +294,12 @@ export function Overview(props: {
 
               {/* 2. what is wrong, only when something is */}
               <Show when={issues().length > 0}>
-                <ul class="ov-issues" style={{ '--n': 1 }}>
+                <ul class="list" style={{ '--n': 1 }}>
                   <For each={issues()}>
                     {(i) => (
                       <li>
-                        <A href={i.to} class="ov-issue" classList={{ [i.tone]: true }}>
-                          <span class="ov-issue-icon" aria-hidden="true">
+                        <A href={i.to} class="list-item" classList={{ [i.tone]: true }}>
+                          <span class="list-icon" aria-hidden="true">
                             <svg viewBox="0 0 16 16">
                               <Show
                                 when={i.tone === 'bad'}
@@ -320,10 +309,10 @@ export function Overview(props: {
                               </Show>
                             </svg>
                           </span>
-                          <span class="ov-issue-text">
-                            <span class="ov-issue-title">{i.title}</span>
+                          <span class="list-text">
+                            <span class="list-title">{i.title}</span>
                             <Show when={i.detail}>
-                              <span class="ov-issue-detail">{i.detail}</span>
+                              <span class="list-detail">{i.detail}</span>
                             </Show>
                           </span>
                           <Chevron />
@@ -335,7 +324,7 @@ export function Overview(props: {
               </Show>
 
               {/* 3. the four numbers */}
-              <div class="ov-stats" style={{ '--n': 2 }}>
+              <div class="stat-grid" style={{ '--n': 2 }}>
                 <Stat
                   label="Sync latency"
                   to="/ssps"

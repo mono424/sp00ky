@@ -1,6 +1,6 @@
 {
   "name": "example-api",
-  "version": "0.0.1-canary.360",
+  "version": "0.0.1-canary.361",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:example": "pnpm dev",

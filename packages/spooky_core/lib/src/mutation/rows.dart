@@ -329,6 +329,20 @@ List<LocalOp> planDeleteTx(WritePlanInput input) => [
           _pendingRow(input, MutationEventType.delete, withBefore: true)),
     ];
 
+/// A channel peer's create: the row alone, no outbox entry (the peer's own
+/// client pushes it). `_00_rv` stays unset, so the server's body (with its
+/// computed fields) still downloads and replaces this one.
+List<LocalOp> planPeerCreateTx(
+        String table, String recordId, Map<String, dynamic> data) =>
+    [
+      PutOp(table, recordId, {...data, 'id': recordId}),
+    ];
+
+/// Undo a peer's create the server never confirmed: the row alone, no outbox
+/// entry.
+List<LocalOp> planPeerUndoTx(String table, String recordId) =>
+    [DeleteOp(table, recordId)];
+
 /// Debounced update: bump `_00_rv` and merge now; the outbox row comes later.
 List<LocalOp> planLocalOnlyUpdateTx(
         String table, String recordId, Map<String, dynamic> data) =>

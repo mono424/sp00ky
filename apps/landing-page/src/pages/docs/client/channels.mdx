@@ -63,7 +63,7 @@ it must be on a `@channel` table, and the channel's writes take that table's fie
 | `connecting` | Setting up a connection. |
 | `connected` | At least one listed user has a tab connected. `ch.peers()` lists them. |
 | `failed` | No connection could be made (see [networks](#networks-and-turn)). It keeps retrying. |
-| `unsupported` | No WebRTC in this runtime (SSR, tests). |
+| `unsupported` | No WebRTC in this runtime (SSR, tests), or a Dart client without `ChannelsConfig(rtc: ...)`. |
 
 Outside components, `db.channel(query, peers)` returns the same handle; call `close()` when done.
 
@@ -197,10 +197,33 @@ the row; the channel only makes the peer's writes arrive sooner:
 
 <CodeBlock code={followCode} lang="tsx" />
 
+## Flutter and Dart
+
+`spooky_core` has the same channels, on the same wire protocol: a Flutter app and a browser tab in
+one channel connect to each other. The core is pure Dart and ships no WebRTC of its own, so give it
+the `flutter_webrtc` connections from `spooky_flutter`:
+
+<CodeBlock code={dartConfigCode} lang="dart" fileName="lib/sync/database.dart" />
+
+Then open a channel with `client.channel(query, peers)` (a `QueryBuilder` or `TypedQuery`, or a
+list of them) and write as usual:
+
+<CodeBlock code={dartUseCode} lang="dart" />
+
+- `ch.state` / `ch.states` (a `Stream<ChannelState>`, current value first) / `ch.subscribe(cb)`,
+  `ch.setPeers`, `ch.setQueries`, `ch.close()`, and the scoped `ch.update` / `ch.create` /
+  `ch.delete`. Peers are `table:id` strings or `RecordId`s.
+- Peers' values fold into every query `Stream` showing the row, as on the web. Dart rows hold record
+  links and dates as strings, so a peer's values arrive in that shape too; a Dart client still sends
+  them to a browser peer as record ids and dates.
+- Regenerate the Dart schema (`dart run spooky_core:spooky_gen`) after adding `-- @channel` /
+  `-- @ephemeral`: it marks the table (`'channel': true`) and the field (`ephemeral: true`), and
+  rejects the same mistakes `spky generate` does.
+- With the default background client, the connections live on the app's isolate and the database
+  work (signaling rows, peers' creates and deletes) in the sync worker.
+
 ## Limits
 
-- TypeScript clients only for now (`client-solid`, `client-solid2`, core). Flutter does not open
-  channels yet; its normal sync is unaffected.
 - Mesh topology, so small groups.
 
 <CardGrid>
@@ -305,3 +328,31 @@ createEffect(() => {
   const pos = call()?.callee_view_pos;
   if (following() && pos != null) goToPly(Number(pos));
 });`;
+
+export const dartConfigCode = `import 'package:spooky_core/spooky_core.dart';
+import 'package:spooky_flutter/spooky_flutter.dart';
+
+final client = Sp00kyClient(Sp00kyConfig(
+  database: database,
+  schema: spookySchema,
+  schemaSurql: surqlSchema,
+  channels: ChannelsConfig(
+    rtc: flutterWebRtc,
+    accept: {
+      'call': (op) => op.patch.keys.every(
+          (f) => f.startsWith(op.from == op.row?['caller'] ? 'caller_' : 'callee_')),
+    },
+  ),
+));`;
+
+export const dartUseCode = `final ch = client.channel(
+  client.query('call').where({'id': callId}),
+  [call.caller, call.callee],
+);
+
+ch.states.listen((s) => print(s.status)); // connecting -> connected
+
+// caller_view_pos is @ephemeral: peers only, never the database
+await client.update('call', callId, {'caller_view_pos': '12'});
+
+ch.close();`;

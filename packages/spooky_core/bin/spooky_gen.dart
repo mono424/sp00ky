@@ -64,8 +64,15 @@ void main(List<String> args) {
     backends.add(parseOpenApi(entry.key, specFile.readAsStringSync()));
   }
 
-  final source =
-      generateDartSource(schemaFile.readAsStringSync(), backends: backends);
+  final String source;
+  try {
+    source =
+        generateDartSource(schemaFile.readAsStringSync(), backends: backends);
+  } on FormatException catch (e) {
+    stderr.writeln('Invalid schema: ${e.message}');
+    exitCode = 65; // EX_DATAERR
+    return;
+  }
 
   if (outPath != null) {
     File(outPath).writeAsStringSync(source);

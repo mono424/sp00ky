@@ -8,6 +8,7 @@ class FieldDef {
     required this.isDateTime,
     this.recordTable,
     this.opaque = false,
+    this.ephemeral = false,
   });
 
   /// Field name as declared (kept as-is, e.g. snake_case).
@@ -27,13 +28,21 @@ class FieldDef {
   /// stores the value, so it cannot be used for server-side filtering or
   /// ordering. Contrast `-- @nosync`, which removes the field entirely.
   final bool opaque;
+
+  /// `-- @ephemeral` (on a `-- @channel` table): the value only travels between
+  /// clients over peer to peer channels and is never written to the database.
+  final bool ephemeral;
 }
 
 /// A parsed table from a `DEFINE TABLE` statement, with its fields.
 class TableDef {
-  TableDef(this.name) : fields = [];
+  TableDef(this.name, {this.channel = false}) : fields = [];
   final String name;
   final List<FieldDef> fields;
+
+  /// `-- @channel`: clients may open peer to peer channels on its rows
+  /// (`client.channel(query, peers)`).
+  bool channel;
 }
 
 final _defineTable = RegExp(
@@ -49,6 +58,10 @@ const _nosyncTableComment = 'sp00ky:nosync';
 // `@opaque`: the field IS synced to the client (unlike `@nosync`), but the sync
 // engine never stores its value, so it cannot be filtered or ordered on.
 final _opaqueComment = RegExp(r'--\s*@opaque\b', caseSensitive: false);
+
+// `@channel` (table) / `@ephemeral` (field): peer to peer channels.
+final _channelComment = RegExp(r'--\s*@channel\b', caseSensitive: false);
+final _ephemeralComment = RegExp(r'--\s*@ephemeral\b', caseSensitive: false);
 
 final _defineField = RegExp(
     r'^DEFINE\s+FIELD\s+(?:IF\s+NOT\s+EXISTS\s+|OVERWRITE\s+)?([A-Za-z_][A-Za-z0-9_.*\[\]]*)\s+ON\s+(?:TABLE\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+TYPE\s+(.*)$',
@@ -217,7 +230,8 @@ List<TableDef> parseSchema(String surql) {
         nosync.add(name);
         continue;
       }
-      tableFor(name);
+      final table = tableFor(name);
+      if (annotations.channelTables.contains(name)) table.channel = true;
       continue;
     }
 
@@ -237,11 +251,42 @@ List<TableDef> parseSchema(String surql) {
             fieldName,
             typeExpr,
             opaque: annotations.opaqueFields.contains(key),
+            ephemeral: annotations.ephemeralFields.contains(key),
           ));
     }
   }
 
-  return [for (final name in order) tables[name]!];
+  final result = [for (final name in order) tables[name]!];
+  _validateChannels(result, nosync);
+  return result;
+}
+
+/// `-- @channel` / `-- @ephemeral` rules, as the Rust CLI enforces them: an
+/// ephemeral field is never written to the database, so its table must be a
+/// channel table (the only way the value can travel) and the field must be
+/// optional (a SCHEMAFULL create would otherwise demand a value that never
+/// comes).
+void _validateChannels(List<TableDef> tables, Set<String> nosync) {
+  for (final table in tables) {
+    for (final field in table.fields) {
+      if (!field.ephemeral) continue;
+      final where = '${table.name}.${field.name}';
+      if (!table.channel) {
+        throw FormatException("Field '$where' is `-- @ephemeral` but table "
+            "'${table.name}' is not `-- @channel`. Ephemeral values only travel "
+            "over channels: add `-- @channel` above `DEFINE TABLE ${table.name}`.");
+      }
+      if (field.opaque) {
+        throw FormatException(
+            "Field '$where' cannot be both `-- @ephemeral` and `-- @opaque`.");
+      }
+      if (!field.optional) {
+        throw FormatException("Field '$where' is `-- @ephemeral`, so the "
+            'database never receives a value for it. Declare it optional '
+            '(`TYPE option<...>`).');
+      }
+    }
+  }
 }
 
 /// `-- @nosync` / `-- @opaque` annotations, resolved to the statement each one
@@ -251,6 +296,8 @@ class _CommentAnnotations {
   /// `"<table>.<field>"` keys, matching how the main loop looks them up.
   final Set<String> nosyncFields = {};
   final Set<String> opaqueFields = {};
+  final Set<String> channelTables = {};
+  final Set<String> ephemeralFields = {};
 }
 
 /// Resolve annotation comments to the `DEFINE TABLE` / `DEFINE FIELD` that
@@ -266,6 +313,15 @@ _CommentAnnotations _annotationsFromComments(String surql) {
   final result = _CommentAnnotations();
   var pendingNosync = false;
   var pendingOpaque = false;
+  var pendingChannel = false;
+  var pendingEphemeral = false;
+
+  void clear() {
+    pendingNosync = false;
+    pendingOpaque = false;
+    pendingChannel = false;
+    pendingEphemeral = false;
+  }
 
   for (final line in surql.split('\n')) {
     final trimmed = line.trim();
@@ -273,22 +329,23 @@ _CommentAnnotations _annotationsFromComments(String surql) {
     if (trimmed.startsWith('--')) {
       if (_nosyncComment.hasMatch(trimmed)) pendingNosync = true;
       if (_opaqueComment.hasMatch(trimmed)) pendingOpaque = true;
+      if (_channelComment.hasMatch(trimmed)) pendingChannel = true;
+      if (_ephemeralComment.hasMatch(trimmed)) pendingEphemeral = true;
       // A non-annotation comment does not clear pending, so prose between the
       // marker and the statement is allowed.
       continue;
     }
 
     if (trimmed.isEmpty) {
-      pendingNosync = false;
-      pendingOpaque = false;
+      clear();
       continue;
     }
 
     final table = _defineTable.firstMatch(trimmed);
     if (table != null) {
       if (pendingNosync) result.nosyncTables.add(table.group(1)!);
-      pendingNosync = false;
-      pendingOpaque = false;
+      if (pendingChannel) result.channelTables.add(table.group(1)!);
+      clear();
       continue;
     }
 
@@ -297,14 +354,13 @@ _CommentAnnotations _annotationsFromComments(String surql) {
       final key = '${field.group(2)!}.${field.group(1)!}';
       if (pendingNosync) result.nosyncFields.add(key);
       if (pendingOpaque) result.opaqueFields.add(key);
-      pendingNosync = false;
-      pendingOpaque = false;
+      if (pendingEphemeral) result.ephemeralFields.add(key);
+      clear();
       continue;
     }
 
     // Any other statement orphans the annotation.
-    pendingNosync = false;
-    pendingOpaque = false;
+    clear();
   }
   return result;
 }
@@ -362,7 +418,8 @@ String _extractType(String afterType) {
   return typePart.trim();
 }
 
-FieldDef _buildField(String name, String typeExpr, {bool opaque = false}) {
+FieldDef _buildField(String name, String typeExpr,
+    {bool opaque = false, bool ephemeral = false}) {
   var type = typeExpr.trim();
   var optional = false;
 
@@ -395,5 +452,6 @@ FieldDef _buildField(String name, String typeExpr, {bool opaque = false}) {
     isDateTime: isDateTime,
     recordTable: recordTable,
     opaque: opaque,
+    ephemeral: ephemeral,
   );
 }

@@ -1,4 +1,6 @@
 import '../modules/auth/sp00ky_auth.dart';
+import '../modules/channel/channel.dart' show PeerRef;
+import '../modules/channel/webrtc.dart' show OutgoingSignal, Signal;
 import '../types.dart';
 import '../modules/query_builder.dart';
 
@@ -30,6 +32,12 @@ enum WorkerOp {
   retry,
   discard,
   kv,
+  peerCreate,
+  peerDelete,
+  readRow,
+  signalSend,
+  signalListen,
+  signalStop,
   close
 }
 
@@ -246,6 +254,58 @@ final class CloseCommand extends WorkerCommand {
   WorkerOp get op => WorkerOp.close;
 }
 
+/// A channel peer's create, for the `peerCreate` saga.
+final class PeerCreateCommand extends WorkerCommand {
+  const PeerCreateCommand(this.recordId, this.row, this.ttlMs);
+  final String recordId;
+  final Map<String, dynamic> row;
+  final int ttlMs;
+  @override
+  WorkerOp get op => WorkerOp.peerCreate;
+}
+
+/// A channel peer's delete, for the `peerDelete` saga.
+final class PeerDeleteCommand extends WorkerCommand {
+  const PeerDeleteCommand(this.recordId, this.ttlMs);
+  final String recordId;
+  final int ttlMs;
+  @override
+  WorkerOp get op => WorkerOp.peerDelete;
+}
+
+/// The stored row a channel checks its filter against.
+final class ReadRowCommand extends WorkerCommand {
+  const ReadRowCommand(this.recordId);
+  final String recordId;
+  @override
+  WorkerOp get op => WorkerOp.readRow;
+}
+
+/// One WebRTC signal, written as a `_00_channel_signal` row.
+final class SignalSendCommand extends WorkerCommand {
+  const SignalSendCommand(this.signal);
+  final OutgoingSignal signal;
+  @override
+  WorkerOp get op => WorkerOp.signalSend;
+}
+
+/// Follow the signals addressed to [self]; they come back as [WorkerSignal]s
+/// tagged [listenId].
+final class SignalListenCommand extends WorkerCommand {
+  const SignalListenCommand(this.listenId, this.self);
+  final int listenId;
+  final PeerRef self;
+  @override
+  WorkerOp get op => WorkerOp.signalListen;
+}
+
+final class SignalStopCommand extends WorkerCommand {
+  const SignalStopCommand(this.listenId);
+  final int listenId;
+  @override
+  WorkerOp get op => WorkerOp.signalStop;
+}
+
 class WorkerRequest {
   const WorkerRequest(this.id, this.command);
   final int id;
@@ -315,4 +375,11 @@ class WorkerRows {
   final int id;
   final List<Map<String, dynamic>> rows;
   final WorkerFailure? error;
+}
+
+/// A signal for the channel transport on the app's isolate.
+class WorkerSignal {
+  const WorkerSignal(this.listenId, this.signal);
+  final int listenId;
+  final Signal signal;
 }

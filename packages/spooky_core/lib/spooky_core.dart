@@ -42,6 +42,38 @@ export 'src/modules/app_release/app_release.dart'
 export 'src/modules/query_builder.dart'
     show QueryBuilder, QueryOp, RelationPlan;
 export 'src/modules/relationships.dart' show SchemaRelationship;
+export 'src/modules/channel/channel.dart'
+    show
+        ChannelsConfig,
+        ChannelState,
+        ChannelStatus,
+        ChannelOp,
+        ChannelOpKind,
+        ChannelAcceptRule,
+        ChannelMessage,
+        ChannelTransport,
+        ChannelTransportFactory,
+        TransportHooks,
+        PeerRef,
+        PeerLinkStatus,
+        Hlc,
+        ChannelScope,
+        ChannelCondition,
+        matchesWhere,
+        RtcPeerConnection,
+        RtcPeerConnectionFactory,
+        RtcDataChannel,
+        RtcDescription;
+export 'src/modules/channel/webrtc.dart'
+    show
+        webrtcTransport,
+        WebRtcOptions,
+        SignalPort,
+        Signal,
+        OutgoingSignal,
+        SignalKind,
+        surrealSignal,
+        SignalRemote;
 
 export 'src/modules/auth/sp00ky_auth.dart'
     show

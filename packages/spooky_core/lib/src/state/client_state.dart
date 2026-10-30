@@ -277,6 +277,24 @@ class PendingWrite {
   final int firstAt;
 }
 
+/// A create or delete a channel peer sent, applied here before the server has
+/// it (see `modules/channel`). Shown like an own optimistic write through the
+/// overlay; when [expiresAt] passes it is either confirmed (the server's body
+/// landed) or undone.
+class PeerWrite {
+  const PeerWrite({
+    required this.kind,
+    required this.table,
+    required this.expiresAt,
+  });
+
+  final PeerWriteKind kind;
+  final String table;
+  final int expiresAt;
+}
+
+enum PeerWriteKind { create, delete }
+
 class SyncSlice {
   const SyncSlice({
     required this.health,
@@ -355,6 +373,7 @@ class ClientState {
     required this.versions,
     required this.outbox,
     required this.pendingWrites,
+    this.peerWrites = const {},
     required this.failedCount,
     required this.dirty,
     required this.membershipDirty,
@@ -394,6 +413,9 @@ class ClientState {
   final Map<String, int> versions;
   final List<OutboxItem> outbox;
   final Map<String, PendingWrite> pendingWrites;
+
+  /// Channel peers' unconfirmed creates and deletes, by record id.
+  final Map<String, PeerWrite> peerWrites;
   final int failedCount;
 
   /// Queries whose render inputs changed since their last materialization.
@@ -425,6 +447,7 @@ class ClientState {
     Map<String, int>? versions,
     List<OutboxItem>? outbox,
     Map<String, PendingWrite>? pendingWrites,
+    Map<String, PeerWrite>? peerWrites,
     int? failedCount,
     Set<QueryHash>? dirty,
     Set<QueryHash>? membershipDirty,
@@ -448,6 +471,7 @@ class ClientState {
         versions: versions ?? this.versions,
         outbox: outbox ?? this.outbox,
         pendingWrites: pendingWrites ?? this.pendingWrites,
+        peerWrites: peerWrites ?? this.peerWrites,
         failedCount: failedCount ?? this.failedCount,
         dirty: dirty ?? this.dirty,
         membershipDirty: membershipDirty ?? this.membershipDirty,

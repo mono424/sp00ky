@@ -396,6 +396,14 @@ share a pool of `DatabaseConfig.maxConcurrentQueries` requests on the one
 socket, default 6. Writes from the outbox go one at a time, in order, in a lane
 of their own, so a pending write never waits behind a startup's registrations.
 
+## Peer to peer channels
+
+Tables marked `-- @channel` can be carried over WebRTC between devices, so a
+peer's write (a cursor, a chat message, a move) shows up in tens of
+milliseconds instead of after a sync round. Pass `spooky_flutter`'s
+`flutterWebRtc` as `ChannelsConfig(rtc: ...)` and open one with
+`client.channel(query, peers)`. See [Peer to peer channels](/docs/client/channels#flutter-and-dart).
+
 ## Push notifications
 
 The `spooky_push` plugin adds native push: APNs on iOS, FCM on Android, from the

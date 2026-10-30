@@ -174,6 +174,55 @@ DEFINE TABLE game SCHEMAFULL;''';
       expect(owner.recordTable, 'user');
     });
 
+    test('@channel marks the table and @ephemeral the field', () {
+      const surql = '''
+-- @channel
+DEFINE TABLE call SCHEMAFULL PERMISSIONS FULL;
+DEFINE FIELD view_id ON TABLE call TYPE option<string>;
+-- @ephemeral
+DEFINE FIELD view_pos ON TABLE call TYPE option<string>;
+
+DEFINE TABLE note SCHEMAFULL;
+DEFINE FIELD title ON TABLE note TYPE string;
+''';
+      final tables = parseSchema(surql);
+      final call = tables.firstWhere((t) => t.name == 'call');
+      expect(call.channel, isTrue);
+      expect(call.fields.firstWhere((f) => f.name == 'view_pos').ephemeral,
+          isTrue);
+      expect(call.fields.firstWhere((f) => f.name == 'view_id').ephemeral,
+          isFalse);
+      expect(tables.firstWhere((t) => t.name == 'note').channel, isFalse);
+
+      final map = emitSchemaMap(tables);
+      expect(map, contains("'channel': true"));
+      expect(
+          map,
+          contains(
+              "'view_pos': ColumnSchema(type: 'string', optional: true, ephemeral: true)"));
+      expect(RegExp("'channel': true").allMatches(map), hasLength(1));
+    });
+
+    test('@ephemeral needs a @channel table and an optional type', () {
+      expect(
+          () => parseSchema('''
+DEFINE TABLE call SCHEMAFULL;
+-- @ephemeral
+DEFINE FIELD view_pos ON TABLE call TYPE option<string>;
+'''),
+          throwsA(isA<FormatException>()
+              .having((e) => e.message, 'message', contains('@channel'))));
+      expect(
+          () => parseSchema('''
+-- @channel
+DEFINE TABLE call SCHEMAFULL;
+-- @ephemeral
+DEFINE FIELD view_pos ON TABLE call TYPE string;
+'''),
+          throwsA(isA<FormatException>()
+              .having((e) => e.message, 'message', contains('option<'))));
+    });
+
     test('parseProject returns tables + accesses together', () {
       const surql = '''
         DEFINE ACCESS account ON DATABASE TYPE RECORD

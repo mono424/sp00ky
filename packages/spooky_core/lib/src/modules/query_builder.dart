@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import '../services/logger/logger.dart';
+import '../utils/parser.dart' show ColumnSchema;
 import '../utils/duration_utils.dart';
 import 'relationships.dart';
 
@@ -93,6 +94,24 @@ class QueryBuilder {
   int? _limit;
   int? _offset;
   bool _isOne = false;
+  bool _ignoreUnusedArgs = false;
+
+  /// The table the query reads.
+  String get table => _table;
+
+  /// The `where` conditions as given (AND-joined): a plain value means `=`, a
+  /// [QueryOp] its own operator.
+  Map<String, Object?> get conditions => Map.unmodifiable(_where);
+
+  List<String> get selectFields => List.unmodifiable(_select);
+  List<(String field, String dir)> get orderFields =>
+      List.unmodifiable(_orderBy);
+  int? get limitValue => _limit;
+  int? get offsetValue => _offset;
+  bool get isOne => _isOne;
+
+  /// Whether [ignoreUnusedArgs] was called.
+  bool get ignoresUnusedArgs => _ignoreUnusedArgs;
 
   QueryBuilder select(List<String> fields) {
     _select = fields.isEmpty ? const ['*'] : fields;
@@ -102,13 +121,32 @@ class QueryBuilder {
   /// Add equality / operator conditions (AND-joined). A value of [QueryOp]
   /// emits `field <op> $field`; any other value emits `field = $field`.
   QueryBuilder where(Map<String, Object?> conditions) {
+    for (final field in conditions.keys) {
+      _assertNotEphemeral(field, 'where');
+    }
     _where.addAll(conditions);
     return this;
   }
 
   QueryBuilder orderBy(String field, [String direction = 'ASC']) {
+    _assertNotEphemeral(field, 'orderBy');
     _orderBy.add((field, direction));
     return this;
+  }
+
+  /// An `-- @ephemeral` field only travels between channel peers; the database
+  /// never holds it, so a query cannot filter or order on it.
+  void _assertNotEphemeral(String field, String clause) {
+    final entry = _schema[_table];
+    final columns = entry is Map ? entry['columns'] : null;
+    if (columns is! Map) return;
+    final column = columns[field] ?? columns[field.split('.').first];
+    if (column is ColumnSchema && column.ephemeral) {
+      throw ArgumentError("Cannot use '$field' in $clause(): it is marked "
+          "'-- @ephemeral' on $_table, so it only travels between peers and "
+          'the database never holds it. Read the field from query results '
+          'instead.');
+    }
   }
 
   QueryBuilder limit(int count) {
@@ -123,6 +161,17 @@ class QueryBuilder {
 
   QueryBuilder one() {
     _isOne = true;
+    return this;
+  }
+
+  /// Say that parts of this query are ignored where it is used, on purpose. A
+  /// channel (`client.channel(query, peers)`) only reads the `where`, so
+  /// `orderBy`, `limit`, `offset`, `select` and `.one()` do nothing there and
+  /// draw a warning; this silences it while showing the reader the query
+  /// carries arguments that do not apply (handy when one query object serves
+  /// both a list and a channel). Does not change the query's hash.
+  QueryBuilder ignoreUnusedArgs() {
+    _ignoreUnusedArgs = true;
     return this;
   }
 

@@ -224,3 +224,139 @@ Future<void> flushWrite(Ctx ctx, SagaEnv env, String key) async {
 /// The local table an outbox row lives in. Exposed so the drain can read rows
 /// back through the same effect family the write used.
 const String outboxTable = pendingTable;
+
+// ---- channel peers' creates and deletes -------------------------------------
+
+/// The row as the local store holds it, or null: what a channel checks its
+/// filter against.
+Future<Map<String, dynamic>?> readRow(Ctx ctx, String recordId) =>
+    ctx(Fx.localGet(extractTablePart(recordId), recordId));
+
+class PeerWriteInput {
+  const PeerWriteInput({required this.recordId, this.data, required this.ttlMs});
+
+  final String recordId;
+
+  /// The row's fields, for a create.
+  final Map<String, dynamic>? data;
+
+  /// How long it shows without the server confirming it.
+  final int ttlMs;
+}
+
+/// A channel peer created a row: put it in the store and the circuit like an
+/// own optimistic create, minus the outbox entry (the peer pushes it), and show
+/// it through the overlay. `_00_rv` and [ClientState.versions] stay unset on
+/// purpose: the server's body (with its computed fields) still downloads and
+/// replaces this one. Refuses an id this client already holds a confirmed row
+/// or an own pending write for, so a peer can never overwrite real data.
+/// Returns whether it applied.
+Future<bool> peerCreate(Ctx ctx, SagaEnv env, PeerWriteInput input) async {
+  final table = extractTablePart(input.recordId);
+  final columns = columnsFor(env, table);
+  if (columns == null) return false;
+  final (confirmed, ownPending, peerPending) = await ctx(Fx.stateRead((s) => (
+        s.versions.containsKey(input.recordId),
+        s.outbox.any((i) => i.recordId == input.recordId),
+        s.peerWrites.containsKey(input.recordId),
+      )));
+  if (confirmed || ownPending || peerPending) return false;
+  var record = await ctx(Fx.localGet(table, input.recordId));
+  if (record == null) {
+    final params = parseQueryParams(columns, input.data ?? const {});
+    try {
+      await ctx(
+          Fx.localTx(planPeerCreateTx(table, input.recordId, params)));
+      record = await ctx(Fx.localGet(table, input.recordId));
+    } catch (error) {
+      await ctx(Fx.log(LogLevel.debug, 'peer create refused by the local store',
+          {'recordId': input.recordId, 'error': error}));
+      return false;
+    }
+  }
+  if (record == null) return false;
+  try {
+    await ctx(Fx.sspIngest([
+      IngestRecord(
+        table: table,
+        op: IngestOp.create,
+        id: input.recordId,
+        record: {...record, '_00_rv': 0},
+      )
+    ]));
+  } catch (error) {
+    await ctx(Fx.log(LogLevel.error, 'circuit ingest failed after a peer create',
+        {'recordId': input.recordId, 'error': error}));
+  }
+  final now = await ctx(Fx.now());
+  await ctx(Fx.stateUpdate(r.setPeerWrite(
+      input.recordId,
+      PeerWrite(
+          kind: PeerWriteKind.create,
+          table: table,
+          expiresAt: now + input.ttlMs))));
+  await ctx(Fx.timerSet('peer:${input.recordId}', input.ttlMs,
+      PeerWriteExpired(input.recordId)));
+  return true;
+}
+
+/// A channel peer deleted a row: hide it through the overlay, keep it in the
+/// store. Undoing is then just forgetting the entry; a confirmed delete has
+/// taken the row out of the server's membership by the time it expires.
+Future<bool> peerDelete(Ctx ctx, SagaEnv env, PeerWriteInput input) async {
+  final table = extractTablePart(input.recordId);
+  if (columnsFor(env, table) == null) return false;
+  final (known, confirmed) = await ctx(Fx.stateRead((s) => (
+        s.peerWrites[input.recordId],
+        s.versions.containsKey(input.recordId),
+      )));
+  if (known?.kind == PeerWriteKind.create && !confirmed) {
+    // Deleting a row the same peer created and nobody confirmed: just undo it.
+    await ctx(Fx.timerClear('peer:${input.recordId}'));
+    await _undoPeerCreate(ctx, table, input.recordId);
+    return true;
+  }
+  final exists = await ctx(Fx.localGet(table, input.recordId)) != null;
+  if (!exists) return false;
+  final now = await ctx(Fx.now());
+  await ctx(Fx.stateUpdate(r.setPeerWrite(
+      input.recordId,
+      PeerWrite(
+          kind: PeerWriteKind.delete,
+          table: table,
+          expiresAt: now + input.ttlMs))));
+  await ctx(Fx.timerSet('peer:${input.recordId}', input.ttlMs,
+      PeerWriteExpired(input.recordId)));
+  return true;
+}
+
+/// Timer target: a peer's write stops showing as unconfirmed.
+Future<void> peerWriteExpired(Ctx ctx, String id) async {
+  final (write, confirmed, ownPending) = await ctx(Fx.stateRead((s) => (
+        s.peerWrites[id],
+        s.versions.containsKey(id),
+        s.outbox.any((i) => i.recordId == id),
+      )));
+  if (write == null) return;
+  if (write.kind == PeerWriteKind.create && !confirmed && !ownPending) {
+    await _undoPeerCreate(ctx, write.table, id);
+    return;
+  }
+  await ctx(Fx.stateUpdate(r.clearPeerWrite(id)));
+}
+
+Future<void> _undoPeerCreate(Ctx ctx, String table, String id) async {
+  final before = await ctx(Fx.localGet(table, id));
+  try {
+    await ctx(Fx.localTx(planPeerUndoTx(table, id)));
+    if (before != null) {
+      await ctx(Fx.sspIngest([
+        IngestRecord(table: table, op: IngestOp.delete, id: id, record: before)
+      ]));
+    }
+  } catch (error) {
+    await ctx(Fx.log(LogLevel.warn, 'could not undo an unconfirmed peer create',
+        {'recordId': id, 'error': error}));
+  }
+  await ctx(Fx.stateUpdate(r.clearPeerWrite(id)));
+}

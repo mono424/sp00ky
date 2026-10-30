@@ -32,7 +32,8 @@ class Overlay {
   final Set<String> deletes;
 }
 
-/// The optimistic overlay, derived from the outbox (pending AND acked items).
+/// The optimistic overlay, derived from the outbox (pending AND acked items)
+/// and the channel peers' unconfirmed creates and deletes.
 Overlay overlay(ClientState s) {
   final writes = <String>{};
   final deletes = <String>{};
@@ -41,6 +42,14 @@ Overlay overlay(ClientState s) {
       deletes.add(item.recordId);
     } else {
       writes.add(item.recordId);
+    }
+  }
+  // Channel peers' writes show exactly like our own until confirmed or undone.
+  for (final MapEntry(key: id, value: write) in s.peerWrites.entries) {
+    if (write.kind == PeerWriteKind.delete) {
+      deletes.add(id);
+    } else {
+      writes.add(id);
     }
   }
   return Overlay(writes: writes, deletes: deletes);

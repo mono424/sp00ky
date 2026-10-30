@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'events/event_system.dart';
 import 'ffi/stream_update.dart' show RecordVersionArray;
+import 'modules/channel/channel.dart' show ChannelsConfig;
 import 'modules/query_builder.dart' show RelationPlan;
 import 'surreal/value.dart';
 import 'utils/duration_utils.dart';
@@ -73,6 +74,7 @@ class Sp00kyConfig {
     this.reconnect = const ReconnectConfig(),
     this.blobCache = const BlobCacheConfig(),
     this.circuitCheckpointMs = 30000,
+    this.channels,
   });
 
   final DatabaseConfig database;
@@ -139,6 +141,35 @@ class Sp00kyConfig {
   /// the circuit and reconcile, instead of re-reading every cached row; the
   /// host's own lifecycle checkpoint only helps when it gets to run.
   final int circuitCheckpointMs;
+
+  /// Peer to peer channels for `-- @channel` tables (`client.channel(query,
+  /// peers)`): the app's `accept` rules per table, and the WebRTC setup. In
+  /// Flutter pass `ChannelsConfig(rtc: flutterWebRtc)` from `spooky_flutter`;
+  /// without a peer connection factory (or a custom `transport`) channels
+  /// report `unsupported`. See [ChannelsConfig].
+  final ChannelsConfig? channels;
+
+  /// This config minus [channels]: what the sync worker gets. Channels live
+  /// on the caller's isolate, and the accept rules are app closures that have
+  /// no business crossing over.
+  Sp00kyConfig withoutChannels() => channels == null
+      ? this
+      : Sp00kyConfig(
+          database: database,
+          schema: schema,
+          schemaSurql: schemaSurql,
+          logLevel: logLevel,
+          persistenceClient: persistenceClient,
+          streamDebounceTime: streamDebounceTime,
+          crdtDebounceMs: crdtDebounceMs,
+          refSyncIntervalMs: refSyncIntervalMs,
+          enableAnonymousLiveQueries: enableAnonymousLiveQueries,
+          syncHealth: syncHealth,
+          liveInlineBodies: liveInlineBodies,
+          reconnect: reconnect,
+          blobCache: blobCache,
+          circuitCheckpointMs: circuitCheckpointMs,
+        );
 }
 
 /// Local cache for bucket files (TS `Sp00kyConfig.blobCache`).

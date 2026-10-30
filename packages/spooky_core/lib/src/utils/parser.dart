@@ -20,12 +20,17 @@ class ColumnSchema {
     this.dateTime = false,
     this.type,
     this.optional = false,
+    this.ephemeral = false,
   });
 
   final bool recordId;
   final bool dateTime;
   final String? type;
   final bool optional;
+
+  /// `-- @ephemeral` on a `-- @channel` table: the value only travels between
+  /// peers over channels and is never written to the database.
+  final bool ephemeral;
 }
 
 /// Strip server-only fields: keep `id`, any `_00_*` metadata, and declared

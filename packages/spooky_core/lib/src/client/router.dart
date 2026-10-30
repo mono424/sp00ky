@@ -79,6 +79,10 @@ RouteTarget route(SagaEnv env, RuntimeEvent event) => switch (event) {
           (ctx) => flushWrite(ctx, env, key),
           const Lane.serial('outbox-write'),
         ),
+      PeerWriteExpired(:final id) => RouteTarget(
+          (ctx) => peerWriteExpired(ctx, id),
+          Lane.serial('peer:$id'),
+        ),
       PollTick() =>
         RouteTarget((ctx) => pollTick(ctx, env), const Lane.dedupe('poll')),
       SelfHealTick() =>

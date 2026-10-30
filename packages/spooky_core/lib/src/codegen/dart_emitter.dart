@@ -17,6 +17,8 @@ String emitSchemaMap(List<TableDef> tables, [List<AccessDef> accesses = const []
       buf.writeln("      '${field.name}': ${_columnSchema(field)},");
     }
     buf.writeln('    },');
+    // `-- @channel`: `client.channel(query, peers)` only accepts these tables.
+    if (table.channel) buf.writeln("    'channel': true,");
     buf.writeln('  },');
   }
   final relationships = deriveRelationships(tables);
@@ -103,6 +105,10 @@ String _columnSchema(FieldDef f) {
   if (f.isRecord) args.add('recordId: true');
   if (f.isDateTime) args.add('dateTime: true');
   if (f.optional) args.add('optional: true');
+  // `@ephemeral`: travels only over peer to peer channels, never to the
+  // database. The client keeps it out of writes and the query builder rejects
+  // it in where/orderBy.
+  if (f.ephemeral) args.add('ephemeral: true');
   return 'ColumnSchema(${args.join(', ')})';
 }
 

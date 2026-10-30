@@ -3,6 +3,8 @@ import 'dart:isolate';
 import '../sp00ky_client.dart';
 import '../in_process_client.dart';
 import '../modules/auth/sp00ky_auth.dart';
+import '../modules/channel/channel.dart' show PeerRef;
+import '../modules/channel/webrtc.dart';
 import '../modules/query_builder.dart';
 import '../mutation/rows.dart';
 import '../services/logger/logger.dart';
@@ -46,6 +48,7 @@ class WorkerSp00kyClient extends Sp00kyClient {
   final _streams = <int, StreamController<List<Map<String, dynamic>>>>{};
   final _queries = <String, WorkerQueryState>{};
   final _listeners = <String, Set<void Function(dynamic)>>{};
+  final _signalListeners = <int, void Function(Signal)>{};
   @override
   bool isLocalReady = false;
   @override
@@ -84,7 +87,7 @@ class WorkerSp00kyClient extends Sp00kyClient {
   // Internal seam for deterministic worker-failure tests. The normal public
   // factory never accepts executable callbacks or custom worker factories.
   Future<Isolate> spawnWorker(SendPort output) =>
-      Isolate.spawn(_workerMain, (output, config),
+      Isolate.spawn(_workerMain, (output, config.withoutChannels()),
           debugName: 'sp00ky core', onExit: output, onError: output);
 
   void _receive(dynamic event) {
@@ -128,6 +131,8 @@ class WorkerSp00kyClient extends Sp00kyClient {
         _emit('status:${event.hash}', event.status);
       if (previous?.authoritative != event.authoritative)
         _emit('authority:${event.hash}', event.authoritative);
+    } else if (event is WorkerSignal) {
+      _signalListeners[event.listenId]?.call(event.signal);
     } else if (event is WorkerRows) {
       if (event.epoch != _epoch) return;
       if (event.error case final error?) {
@@ -155,6 +160,7 @@ class WorkerSp00kyClient extends Sp00kyClient {
     }
     _streams.clear();
     _listeners.clear();
+    _signalListeners.clear();
     _auth.clearListeners();
     _worker?.kill(priority: Isolate.immediate);
     _inbox?.close();
@@ -211,7 +217,7 @@ class WorkerSp00kyClient extends Sp00kyClient {
           {QueryTimeToLive ttl = defaultTtl}) =>
       _call(PreloadCommand(sql, params, ttl));
   @override
-  Stream<List<Map<String, dynamic>>> subscribeStream(String hash,
+  Stream<List<Map<String, dynamic>>> subscribeRecords(String hash,
       {bool immediate = true}) {
     late StreamController<List<Map<String, dynamic>>> controller;
     int? subscription;
@@ -258,16 +264,28 @@ class WorkerSp00kyClient extends Sp00kyClient {
   @override
   void deregisterQuery(String hash) => _send(DeregisterCommand(hash));
   @override
-  Future<Map<String, dynamic>> create(String id, Map<String, dynamic> data) =>
+  Future<Map<String, dynamic>> createRecord(
+          String id, Map<String, dynamic> data) =>
       _call(CreateCommand(id, data));
   @override
-  Future<Map<String, dynamic>> update(
+  Future<Map<String, dynamic>> updateRecord(
           String table, String id, Map<String, dynamic> data,
           {UpdateOptions? options}) =>
       _call(UpdateCommand(table, id, data, options));
   @override
-  Future<void> delete(String table, String id) =>
+  Future<void> deleteRecord(String table, String id) =>
       _call(DeleteCommand(table, id));
+  @override
+  Future<bool> peerCreate(String id, Map<String, dynamic> row, int ttlMs) =>
+      _call(PeerCreateCommand(id, row, ttlMs));
+  @override
+  Future<bool> peerDelete(String id, int ttlMs) =>
+      _call(PeerDeleteCommand(id, ttlMs));
+  @override
+  Future<Map<String, dynamic>?> readRow(String id) =>
+      _call(ReadRowCommand(id));
+  @override
+  late final SignalPort channelSignal = _WorkerSignalPort(this);
   @override
   Future<void> run(String backend, String path, Map<String, dynamic> payload,
           {RunOptions? options}) =>
@@ -323,6 +341,33 @@ class WorkerSp00kyClient extends Sp00kyClient {
     } finally {
       _terminate(StateError('Client is closed'), StackTrace.current);
     }
+  }
+}
+
+/// Signals cross to the worker, which owns the socket; the channel transport
+/// stays on this isolate (WebRTC plugins live on the platform thread).
+class _WorkerSignalPort implements SignalPort {
+  _WorkerSignalPort(this.client);
+  final WorkerSp00kyClient client;
+
+  @override
+  Future<void> send(OutgoingSignal signal) =>
+      client._call(SignalSendCommand(signal));
+
+  @override
+  void Function() listen(PeerRef self, void Function(Signal) cb) {
+    final id = ++client._nextId;
+    client._signalListeners[id] = cb;
+    client.init().then((_) {
+      if (client._signalListeners.containsKey(id)) {
+        client._send(SignalListenCommand(id, self));
+      }
+    }, onError: (Object _) => client._signalListeners.remove(id));
+    return () {
+      if (client._signalListeners.remove(id) != null) {
+        client._send(SignalStopCommand(id));
+      }
+    };
   }
 }
 
@@ -411,12 +456,13 @@ WorkerFailure _failure(Object e, StackTrace s) => WorkerFailure(
 
 Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
   final (output, config) = input;
-  final client = InProcessSp00kyClient(config);
+  final client = InProcessSp00kyClient(config, hostChannels: false);
   final commands = ReceivePort();
   final subscriptions = <int, StreamSubscription<List<Map<String, dynamic>>>>{};
   final queryObservers = <String, List<void Function()>>{};
   final observers = <void Function()>[];
   final queuedRows = <int, WorkerRows>{};
+  final signalStops = <int, void Function()>{};
   bool scheduled = false;
   bool stopped = false;
   int getEpoch() => client.storeEpoch;
@@ -576,11 +622,32 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
           }, onError: (Object e, StackTrace s) {
             output.send(WorkerRows(getEpoch(), id, const [], _failure(e, s)));
           });
+        case PeerCreateCommand command:
+          result = await client.peerCreate(
+              command.recordId, command.row, command.ttlMs);
+        case PeerDeleteCommand command:
+          result = await client.peerDelete(command.recordId, command.ttlMs);
+        case ReadRowCommand command:
+          result = await client.readRow(command.recordId);
+        case SignalSendCommand command:
+          await client.channelSignal.send(command.signal);
+        case SignalListenCommand command:
+          final id = command.listenId;
+          signalStops.remove(id)?.call();
+          signalStops[id] = client.channelSignal.listen(command.self, (signal) {
+            if (!stopped) output.send(WorkerSignal(id, signal));
+          });
+        case SignalStopCommand command:
+          signalStops.remove(command.listenId)?.call();
         case UnsubscribeCommand command:
           queuedRows.remove(command.subscriptionId);
           await subscriptions.remove(command.subscriptionId)?.cancel();
         case CloseCommand():
           stopped = true;
+          for (final stop in signalStops.values) {
+            stop();
+          }
+          signalStops.clear();
           for (final off in observers) {
             off();
           }

@@ -105,6 +105,15 @@ class FlushWrite extends RuntimeEvent {
   String get type => 'FlushWrite';
 }
 
+/// Timer target: a channel peer's create or delete stops showing as
+/// unconfirmed.
+class PeerWriteExpired extends RuntimeEvent {
+  const PeerWriteExpired(this.id);
+  final String id;
+  @override
+  String get type => 'PeerWriteExpired';
+}
+
 class PollTick extends RuntimeEvent {
   const PollTick();
   @override

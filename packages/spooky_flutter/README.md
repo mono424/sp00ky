@@ -1,7 +1,9 @@
 # spooky_flutter
 
-Flutter bindings for [`spooky_core`](../spooky_core). Today that is rendering
-bucket files:
+Flutter bindings for [`spooky_core`](../spooky_core): rendering bucket files,
+and WebRTC for peer to peer channels.
+
+## Bucket images
 
 ```dart
 final covers = db.client.bucket('puzzle_covers');
@@ -28,3 +30,20 @@ Sp00kyConfig(
   ),
 )
 ```
+
+## Peer to peer channels
+
+`flutterWebRtc` gives `-- @channel` tables their WebRTC connections, over
+`flutter_webrtc` (same data channel and ICE shape as a browser tab, so web and
+Flutter peers connect to each other):
+
+```dart
+Sp00kyConfig(
+  ...,
+  channels: ChannelsConfig(rtc: flutterWebRtc),
+)
+
+final ch = client.channel(client.query('call').where({'id': callId}), [peerId]);
+```
+
+See `/docs/client/channels` for the filter rules, `accept` and ephemeral fields.

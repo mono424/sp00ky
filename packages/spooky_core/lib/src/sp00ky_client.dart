@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:meta/meta.dart';
 import 'client/worker_client.dart';
+import 'modules/channel/channel.dart';
+import 'modules/channel/webrtc.dart';
 import 'modules/auth/sp00ky_auth.dart';
 import 'modules/query_builder.dart';
 import 'modules/query_host.dart';
@@ -13,6 +16,7 @@ import 'mutation/rows.dart';
 import 'services/blobs/blob_cache.dart';
 import 'services/logger/logger.dart';
 import 'state/client_state.dart';
+import 'typed/typed_query.dart' show TypedQuery;
 import 'types.dart';
 
 /// Native local-first client. SQLite, the circuit and sync live in one worker.
@@ -36,8 +40,36 @@ abstract class Sp00kyClient {
   Future<List<dynamic>> queryRemote(String sql, [Map<String, dynamic>? vars]);
   Future<void> preload(String sql, Map<String, dynamic> params,
       {QueryTimeToLive ttl = defaultTtl});
+  /// A registered query's rows as a broadcast [Stream]. With `@channel` tables
+  /// in the schema, channel peers' values are folded in (output only, never the
+  /// store).
   Stream<List<Map<String, dynamic>>> subscribeStream(String hash,
+      {bool immediate = true}) {
+    final raw = subscribeRecords(hash, immediate: immediate);
+    final channels = activeChannels;
+    if (channels == null) return raw;
+    late StreamController<List<Map<String, dynamic>>> controller;
+    StreamSubscription<List<Map<String, dynamic>>>? sub;
+    void Function()? stop;
+    controller = StreamController.broadcast(onListen: () {
+      final tap = channels.tap(controller.add);
+      stop = tap.stop;
+      sub = raw.listen(tap.feed,
+          onError: controller.addError, onDone: controller.close);
+    }, onCancel: () {
+      stop?.call();
+      stop = null;
+      unawaited(sub?.cancel());
+      sub = null;
+    });
+    return controller.stream;
+  }
+
+  /// The rows as the engine renders them, before any channel overlay.
+  @protected
+  Stream<List<Map<String, dynamic>>> subscribeRecords(String hash,
       {bool immediate = true});
+
   void Function() subscribe(String hash, QueryUpdateCallback callback,
       {bool immediate = false}) {
     final sub = subscribeStream(hash, immediate: immediate).listen(callback);
@@ -69,11 +101,24 @@ abstract class Sp00kyClient {
           String sql, Map<String, dynamic> params,
           {QueryTimeToLive ttl = defaultTtl}) async =>
       subscribeStream(await queryRaw(sql, params, ttl: ttl));
-  Future<Map<String, dynamic>> create(String id, Map<String, dynamic> data);
+  Future<Map<String, dynamic>> create(String id, Map<String, dynamic> data) =>
+      _writeCreate(id, data, null);
   Future<Map<String, dynamic>> update(
+          String table, String id, Map<String, dynamic> data,
+          {UpdateOptions? options}) =>
+      _writeUpdate(table, id, data, options, null);
+  Future<void> delete(String table, String id) => _writeDelete(table, id, null);
+
+  /// The optimistic write itself, without channel peers.
+  @protected
+  Future<Map<String, dynamic>> createRecord(
+      String id, Map<String, dynamic> data);
+  @protected
+  Future<Map<String, dynamic>> updateRecord(
       String table, String id, Map<String, dynamic> data,
       {UpdateOptions? options});
-  Future<void> delete(String table, String id);
+  @protected
+  Future<void> deleteRecord(String table, String id);
   Future<void> run(String backend, String path, Map<String, dynamic> payload,
       {RunOptions? options});
   int get failedMutationCount;
@@ -127,7 +172,159 @@ abstract class Sp00kyClient {
       logger: SpookyLogger.root())
     ..attach();
 
+  // ---- peer to peer channels ------------------------------------------------
+
+  /// Open a peer to peer channel to [peers] (`table:id` strings or
+  /// [RecordId]s; your own id is skipped, and a connection forms only when
+  /// both sides list each other) for the rows [queries] match: a
+  /// [QueryBuilder] or [TypedQuery] on a `-- @channel` table, or a list of
+  /// them. Only the `where` counts, evaluated against each row; the query is
+  /// never registered. Writes to matching rows (plain or the channel's own)
+  /// reach the peers, and theirs show in this client's query results before
+  /// the database has them. Close it when done.
+  Sp00kyChannel channel(Object queries, Iterable<Object?> peers) {
+    if (!hostsChannels) {
+      throw StateError('Channels are opened on the client the app holds.');
+    }
+    final channels = _channelManager ??= _buildChannels();
+    final handle = channels.open(_channelScopes(channels, queries), peers);
+    _bindChannelUser(channels);
+    return Sp00kyChannel._(this, channels, handle);
+  }
+
+  /// False for the client a sync worker runs: channels live on the caller's
+  /// side of the isolate boundary.
+  @protected
+  bool get hostsChannels => true;
+
+  /// The channel manager when the schema has `@channel` tables, else null.
+  @protected
+  ChannelManager? get activeChannels {
+    if (!hostsChannels) return null;
+    final channels = _channelManager ??= _buildChannels();
+    return channels.enabled ? channels : null;
+  }
+
+  /// A channel peer created a row: into the store and the circuit unconfirmed
+  /// for [ttlMs] (the `peerCreate` saga). False when refused.
+  @internal
+  Future<bool> peerCreate(String id, Map<String, dynamic> row, int ttlMs);
+
+  /// A channel peer deleted a row: hidden until confirmed (the `peerDelete`
+  /// saga). False when there was nothing to do.
+  @internal
+  Future<bool> peerDelete(String id, int ttlMs);
+
+  /// The row as the local store holds it, or null.
+  @internal
+  Future<Map<String, dynamic>?> readRow(String id);
+
+  /// Where WebRTC signals go: rows of `_00_channel_signal`.
+  @internal
+  SignalPort get channelSignal;
+
+  ChannelManager? _channelManager;
+  bool _channelUserBound = false;
+  void Function()? _channelAuthOff;
+
+  ChannelManager _buildChannels() {
+    final cfg = config.channels;
+    final logger = SpookyLogger.root('spooky.channel');
+    return ChannelManager(
+      config.schema,
+      config: cfg,
+      logger: logger,
+      rows: ChannelRows(
+        create: (_, id, row, ttlMs) => peerCreate(id, row, ttlMs),
+        delete: (_, id, ttlMs) => peerDelete(id, ttlMs),
+        read: readRow,
+      ),
+      transport: cfg?.transport ??
+          (hooks) => webrtcTransport(
+              hooks,
+              WebRtcOptions(
+                signal: channelSignal,
+                rtc: cfg?.rtc,
+                iceServers: cfg?.iceServers,
+                logger: logger,
+              )),
+    );
+  }
+
+  /// Follow the signed-in user once a channel is open: who this device is to
+  /// its peers.
+  void _bindChannelUser(ChannelManager channels) {
+    if (_channelUserBound) return;
+    _channelUserBound = true;
+    unawaited(init().then((_) {
+      if (_channelAuthOff != null || !identical(_channelManager, channels)) {
+        return;
+      }
+      _channelAuthOff = auth.subscribe(channels.setUser);
+    }).catchError((Object error) {
+      SpookyLogger.root('spooky.channel')
+          .warn('channels have no signed-in user: $error');
+    }));
+  }
+
+  List<ChannelScope> _channelScopes(ChannelManager channels, Object queries) {
+    final list = queries is Iterable ? queries.toList() : [queries];
+    return [
+      for (final q in list)
+        channels.scope(switch (q) {
+          QueryBuilder b => b,
+          TypedQuery t => t.builder,
+          _ => throw ArgumentError(
+              "channel(): pass a query, e.g. client.query('message')"
+              ".where({'conversation': id})"),
+        }),
+    ];
+  }
+
+  // Peers go first in all three: the local write costs a transaction they
+  // need not wait for. `@ephemeral` fields never reach the database.
+
+  Future<Map<String, dynamic>> _writeCreate(
+      String id, Map<String, dynamic> data, ChannelHandle? scope) async {
+    final channels = activeChannels;
+    if (channels == null) return createRecord(id, data);
+    final table = _tableOf(id);
+    final (:persistent, :ephemeral) = channels.split(table, data);
+    channels.localCreate(table, id, data, scope);
+    final out = await createRecord(id, persistent);
+    return {...out, ...?ephemeral};
+  }
+
+  Future<Map<String, dynamic>> _writeUpdate(
+      String table,
+      String id,
+      Map<String, dynamic> data,
+      UpdateOptions? options,
+      ChannelHandle? scope) async {
+    final channels = activeChannels;
+    if (channels == null) {
+      return updateRecord(table, id, data, options: options);
+    }
+    final tableName = table.isEmpty ? _tableOf(id) : table;
+    final (:persistent, :ephemeral) = channels.split(tableName, data);
+    channels.local(tableName, id, persistent, ephemeral, scope);
+    if (ephemeral != null && persistent.isEmpty) return {...data, 'id': id};
+    final out = await updateRecord(table, id, persistent, options: options);
+    return {...out, ...?ephemeral};
+  }
+
+  Future<void> _writeDelete(
+      String table, String id, ChannelHandle? scope) async {
+    final channels = activeChannels;
+    // Awaited: the filter is checked against the row, which the delete removes.
+    await channels?.localDelete(table.isEmpty ? _tableOf(id) : table, id, scope);
+    await deleteRecord(table, id);
+  }
+
   void closeModules() {
+    _channelAuthOff?.call();
+    _channelAuthOff = null;
+    _channelManager?.close();
     _flags?.closeAll();
     _releases?.closeAll();
     _push?.dispose();
@@ -203,6 +400,69 @@ abstract class Sp00kyClient {
       throw UnimplementedError('CRDT deferred');
   void closeCrdtField(String table, String recordId, String field) =>
       throw UnimplementedError('CRDT deferred');
+}
+
+String _tableOf(String id) {
+  final i = id.indexOf(':');
+  return i < 0 ? id : id.substring(0, i);
+}
+
+/// An open peer to peer channel (`client.channel(queries, peers)`): its state,
+/// plus writes that go to ITS peers only (when the row matches its filter).
+/// Plain `create` / `update` / `delete` reach the peers of every open channel
+/// whose filter the row matches.
+class Sp00kyChannel {
+  Sp00kyChannel._(this._client, this._manager, this._handle);
+
+  final Sp00kyClient _client;
+  final ChannelManager _manager;
+  final ChannelHandle _handle;
+
+  /// The tables its queries read.
+  List<String> get tables => _handle.tables;
+
+  ChannelState get state => _handle.state;
+
+  /// The current state at once, then every change.
+  Stream<ChannelState> get states => broadcast(_handle.subscribe);
+
+  /// Called at once with the current state, then on every change.
+  void Function() subscribe(void Function(ChannelState) cb) =>
+      _handle.subscribe(cb);
+
+  /// Replace who it connects to (your own id is skipped).
+  void setPeers(Iterable<Object?> peers) => _handle.setPeers(peers);
+
+  /// Replace the queries (their filters changed).
+  void setQueries(Object queries) =>
+      _handle.setScopes(_client._channelScopes(_manager, queries));
+
+  bool get isClosed => _handle.isClosed;
+
+  void close() => _handle.close();
+
+  ChannelHandle _scoped(String table) {
+    _manager.assertCarries(_handle, table);
+    return _handle;
+  }
+
+  Future<Map<String, dynamic>> update(
+      String table, String id, Map<String, dynamic> data,
+      {UpdateOptions? options}) async {
+    final scope = _scoped(table.isEmpty ? _tableOf(id) : table);
+    return _client._writeUpdate(table, id, data, options, scope);
+  }
+
+  Future<Map<String, dynamic>> create(
+      String id, Map<String, dynamic> data) async {
+    final scope = _scoped(_tableOf(id));
+    return _client._writeCreate(id, data, scope);
+  }
+
+  Future<void> delete(String table, String id) async {
+    final scope = _scoped(table.isEmpty ? _tableOf(id) : table);
+    return _client._writeDelete(table, id, scope);
+  }
 }
 
 Stream<T> broadcast<T>(void Function() Function(void Function(T)) attach) {

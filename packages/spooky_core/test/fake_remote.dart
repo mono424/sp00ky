@@ -22,6 +22,9 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
   /// Bodies the server holds, by record id.
   final Map<String, Map<String, dynamic>> records = {};
 
+  /// The user the session's `$auth.id` names.
+  String authUser = 'user:u1';
+
   /// The server's view membership: `_00_query` id -> `(recordId, version)`.
   final Map<String, List<(String, int)>> membership = {};
 
@@ -153,10 +156,10 @@ class FakeRemote implements RemoteSurrealClient, StatementAwareRemote {
   StatementResult _answer(String sql, Map<String, dynamic> vars) {
     if (sql == 'RETURN true') return const StatementResult.ok(true);
     if (sql.contains(r'$auth.id') && sql.startsWith('RETURN')) {
-      return const StatementResult.ok('user:u1');
+      return StatementResult.ok(authUser);
     }
     if (sql.startsWith('SELECT * FROM ONLY \$auth.id')) {
-      return StatementResult.ok(records['user:u1']);
+      return StatementResult.ok(records[authUser]);
     }
     if (sql.contains('fn::query::register')) {
       return const StatementResult.ok(null);

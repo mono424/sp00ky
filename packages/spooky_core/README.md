@@ -161,6 +161,16 @@ collaborative fields are still deferred: `openCrdtField` / `closeCrdtField`
 throw `UnimplementedError` until the TS client's edit-log protocol is ported
 (`docs/crdt-v2.md` at the repo root).
 
+Peer to peer channels (`-- @channel` tables, `client.channel(query, peers)`)
+are ported on the same wire protocol, so Dart and browser peers connect to each
+other (`lib/src/modules/channel/`). The core has no WebRTC of its own: the
+transport talks to an `RtcPeerConnection` interface, and `spooky_flutter`'s
+`flutterWebRtc` implements it over `flutter_webrtc` (pass it as
+`ChannelsConfig(rtc: ...)`). With the background client the channel manager and
+the connections stay on the caller's isolate; signaling rows and peers'
+creates/deletes (`peerCreate`/`peerDelete` sagas) cross to the worker. Filters
+take the dynamic builder's `where` map (no `_or` groups).
+
 The blob cache is ported with files on disk in place of OPFS
 (`Sp00kyConfig.blobCache.directory`; in-memory without one). Its manifest is
 rebuilt from a directory walk at start rather than kept in a `_00_blob` table,

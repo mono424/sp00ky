@@ -133,6 +133,10 @@ Settings for [peer to peer channels](/docs/client/channels) on `-- @channel` tab
 - `confirmTimeoutMs`: how long a peer's persistent value, create or delete shows without the server
   confirming it. Defaults to `5000`.
 
+In Dart (`spooky_core`) the same keys live on `ChannelsConfig` (`accept`, `iceServers`, `transport`,
+`confirmTimeoutMs`), plus `rtc`: the peer connection factory, `flutterWebRtc` from `spooky_flutter`.
+Without `rtc` or `transport`, channels report `unsupported`.
+
 #### `liveInlineBodies`
 
 Carry a changed row's body on the client's LIVE notification (`FETCH out`)

@@ -13,6 +13,15 @@ class TypedQuery<M> {
   final QueryBuilder _builder;
   final M Function(Map<String, dynamic> json) _fromJson;
 
+  /// The dynamic query underneath, e.g. for `client.channel(...)`.
+  QueryBuilder get builder => _builder;
+
+  /// See [QueryBuilder.ignoreUnusedArgs].
+  TypedQuery<M> ignoreUnusedArgs() {
+    _builder.ignoreUnusedArgs();
+    return this;
+  }
+
   TypedQuery<M> where(List<Condition> conditions) {
     for (final c in conditions) {
       _builder

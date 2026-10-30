@@ -394,6 +394,17 @@ Reducer clearPendingWrite(String key) => (s) =>
         ? s.copyWith(pendingWrites: {...s.pendingWrites}..remove(key))
         : s;
 
+/// A channel peer's create or delete is now showing; its table re-renders.
+Reducer setPeerWrite(String id, PeerWrite write) => (s) => markTableDirty(
+    write.table)(s.copyWith(peerWrites: {...s.peerWrites, id: write}));
+
+Reducer clearPeerWrite(String id) => (s) {
+      final write = s.peerWrites[id];
+      if (write == null) return s;
+      return markTableDirty(write.table)(
+          s.copyWith(peerWrites: {...s.peerWrites}..remove(id)));
+    };
+
 Reducer setFailedCount(int failedCount) =>
     (s) => s.failedCount == failedCount ? s : s.copyWith(failedCount: failedCount);
 
@@ -485,6 +496,7 @@ Reducer clearBucketState() => (s) => s.copyWith(
       versions: const {},
       outbox: const [],
       pendingWrites: const {},
+      peerWrites: const {},
       dirty: const {},
       membershipDirty: const {},
       membershipReread: const {},

@@ -14,6 +14,8 @@ import 'kernel/saga.dart';
 import 'modules/app_release/app_release.dart';
 import 'modules/auth/auth_service.dart';
 import 'modules/bucket.dart';
+import 'modules/channel/channel.dart' show PeerRef;
+import 'modules/channel/webrtc.dart';
 import 'modules/feature_flag/feature_flag.dart';
 import 'modules/query_host.dart';
 import 'modules/query_builder.dart';
@@ -51,9 +53,18 @@ class InProcessSp00kyClient extends Sp00kyClient {
     this.config, {
     SpookyLogger? logger,
     RemoteSurrealClient? remoteClient,
+    bool hostChannels = true,
   })  : _logger = logger ?? SpookyLogger.root(),
         _remoteClientOverride = remoteClient,
+        _hostChannels = hostChannels,
         super.internal();
+
+  /// False for the client a sync worker runs (`WorkerSp00kyClient` holds the
+  /// channels on the app's isolate and reaches this one for rows and signals).
+  final bool _hostChannels;
+
+  @override
+  bool get hostsChannels => _hostChannels;
 
   final Sp00kyConfig config;
   final SpookyLogger _logger;
@@ -421,7 +432,8 @@ class InProcessSp00kyClient extends Sp00kyClient {
   /// Subscribe to a registered query as a broadcast [Stream]. Multiple
   /// listeners share one internal registration; [immediate] replays the current
   /// result set on first listen (so a `StreamBuilder` renders immediately).
-  Stream<List<Map<String, dynamic>>> subscribeStream(
+  @override
+  Stream<List<Map<String, dynamic>>> subscribeRecords(
     String queryHash, {
     bool immediate = true,
   }) =>
@@ -429,12 +441,25 @@ class InProcessSp00kyClient extends Sp00kyClient {
           (add) => _runtime.subscribe(queryHash, add, immediate: immediate));
 
   /// Faithful callback-based subscribe (TS `subscribe`).
+  @override
   void Function() subscribe(
     String hash,
     QueryUpdateCallback callback, {
     bool immediate = false,
-  }) =>
-      _runtime.subscribe(hash, callback, immediate: immediate);
+  }) {
+    final channels = activeChannels;
+    if (channels == null) {
+      return _runtime.subscribe(hash, callback, immediate: immediate);
+    }
+    // Channel values (peer updates, ephemeral fields) are folded into what
+    // subscribers see, never into the store.
+    final tap = channels.tap(callback);
+    final stop = _runtime.subscribe(hash, tap.feed, immediate: immediate);
+    return () {
+      stop();
+      tap.stop();
+    };
+  }
 
   /// A query's fetch status (idle/fetching) via callback.
   void Function() subscribeQueryStatus(
@@ -524,14 +549,16 @@ class InProcessSp00kyClient extends Sp00kyClient {
 
   // ==================== MUTATIONS ====================
 
-  Future<Map<String, dynamic>> create(
+  @override
+  Future<Map<String, dynamic>> createRecord(
       String id, Map<String, dynamic> data) async {
     final out = await _write(write_saga.WriteInput(
         kind: MutationEventType.create, recordId: id, data: data));
     return out.record ?? {...data, 'id': id};
   }
 
-  Future<Map<String, dynamic>> update(
+  @override
+  Future<Map<String, dynamic>> updateRecord(
     String table,
     String id,
     Map<String, dynamic> data, {
@@ -546,9 +573,49 @@ class InProcessSp00kyClient extends Sp00kyClient {
     return out.record ?? {...data, 'id': id};
   }
 
-  Future<void> delete(String table, String id) async {
+  @override
+  Future<void> deleteRecord(String table, String id) async {
     await _write(
         write_saga.WriteInput(kind: MutationEventType.delete, recordId: id));
+  }
+
+  // ---- channel peers ---------------------------------------------------------
+
+  @override
+  Future<bool> peerCreate(String id, Map<String, dynamic> row, int ttlMs) =>
+      _runtime.run(
+          (ctx) => write_saga.peerCreate(ctx, _env,
+              write_saga.PeerWriteInput(recordId: id, data: row, ttlMs: ttlMs)),
+          lane: const Lane.serial('write'));
+
+  @override
+  Future<bool> peerDelete(String id, int ttlMs) => _runtime.run(
+      (ctx) => write_saga.peerDelete(
+          ctx, _env, write_saga.PeerWriteInput(recordId: id, ttlMs: ttlMs)),
+      lane: const Lane.serial('write'));
+
+  @override
+  Future<Map<String, dynamic>?> readRow(String id) =>
+      _runtime.run((ctx) => write_saga.readRow(ctx, id));
+
+  SignalPort? _signal;
+
+  @override
+  SignalPort get channelSignal => _signal ??= _buildSignal();
+
+  SignalPort _buildSignal() {
+    final remote = _remote;
+    final supervisor = _supervisor;
+    if (remote == null || supervisor == null) return const _NoSignal();
+    return surrealSignal(
+      SignalRemote(
+        query: remote.query,
+        live: remote.live,
+        kill: remote.kill,
+        subscribeConnection: supervisor.subscribe,
+      ),
+      logger: _logger,
+    );
   }
 
   Future<write_saga.WriteResult> _write(write_saga.WriteInput input) =>
@@ -800,6 +867,18 @@ class _StreamUpdateBridge implements StreamUpdateReceiver {
 
   @override
   void onStreamUpdate(update) => _runtime.dispatch(StreamUpdateEvent(update));
+}
+
+/// Signaling for a client without a server: channels cannot connect.
+class _NoSignal implements SignalPort {
+  const _NoSignal();
+
+  @override
+  Future<void> send(OutgoingSignal signal) =>
+      Future.error(StateError('Channels need a remote endpoint'));
+
+  @override
+  void Function() listen(PeerRef self, void Function(Signal) cb) => () {};
 }
 
 /// The remote port of a local-only client: every call fails the way an

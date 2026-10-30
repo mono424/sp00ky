@@ -285,13 +285,7 @@ pub fn generate_sp00ky_events(
             "        (CREATE _00_version SET record_id = $after.id, version = 1 RETURN AFTER)\n",
         );
         events.push_str("    } ELSE IF $event = \"UPDATE\" {\n");
-        events.push_str("        IF $sp00ky_target_version != NONE AND $sp00ky_target_version.id == $after.id {\n");
-        events.push_str("            LET $u = (UPDATE _00_version SET version = <int>$sp00ky_target_version.version WHERE record_id = $after.id RETURN AFTER);\n");
-        events.push_str("            LET $sp00ky_target_version = NONE;\n");
-        events.push_str("            $u\n");
-        events.push_str("        } ELSE {\n");
-        events.push_str("            (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n");
-        events.push_str("        }\n");
+        events.push_str("        (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n");
         events.push_str("    };\n");
         events.push_str("    LET $sp00ky_ver = $sp00ky_ver_rec[0].version;\n\n");
 
@@ -436,9 +430,6 @@ pub fn generate_sp00ky_events(
     // every app table gets (skipped above for `_00_` tables) so a root UPSERT
     // reaches `/ingest`, the SSP recomputes the registered query, and the
     // subscriber's `_00_list_ref_user_<id>` updates in real time.
-    //
-    // Server-written only, so there is no client-mutation version targeting
-    // (`$sp00ky_target_version`); the version simply increments.
     events.push_str("-- Table: _00_user_feature Mutation (server-written; ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_user_feature_mutation ON TABLE _00_user_feature\n");
     events.push_str("WHEN $before != $after AND $event != \"DELETE\"\nTHEN {\n");

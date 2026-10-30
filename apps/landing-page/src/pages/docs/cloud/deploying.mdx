@@ -71,7 +71,7 @@ Cloudflare project has no containers, see [Cloudflare projects](#cloudflare-proj
 
 | Flag | Effect |
 | --- | --- |
-| `--upgrade` | Also move the SSP and Scheduler to the newest published build. Only for a project whose [`version`](/docs/reference/config#versions) is `any` or unset: a pinned version stays where `sp00ky.yml` put it, and `newest` already rolls on every deploy. The swap is blue/green, see [Zero-downtime upgrades](#zero-downtime-upgrades). |
+| `--upgrade` | Also move the SSP and Scheduler to the newest published build. Only for a project whose [`version`](/docs/reference/config#versions) is `any` or unset: a pinned version stays where `sp00ky.yml` put it, and `newest` already rolls on every deploy. The swap is blue/green, see [Zero-downtime upgrades](#zero-downtime-upgrades). On pay as you go it also moves a SurrealDB 3 database to SurrealDB 4 after a backup, whatever `version` says, see [SurrealDB version](/docs/cloud/billing#surrealdb-version). |
 | `--only api,web` | Build and deploy just these apps. Everything else keeps running untouched. |
 | `--clean` | Wipe the scheduler's persistent volume first. Last resort: the scheduler self-heals stale snapshot state on startup, and `spky verify --fix` (or `POST /admin/resync` on the scheduler) repairs it without a wipe. Your SurrealDB data is not touched either way. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when the hash says nothing changed. Drift recovery. |

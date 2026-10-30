@@ -243,7 +243,7 @@ export const flagsCode = `spky dev --clean            # rebuild SSP/scheduler st
 spky dev --clean-db         # also wipe the database
 spky dev --verbose          # stream all SurrealDB/SSP/scheduler logs
 spky deploy --only api,web  # deploy a subset of apps
-spky deploy --upgrade       # also move SSP/scheduler to the newest build (unless version: pins them)
+spky deploy --upgrade       # also move SSP/scheduler to the newest build (unless version: pins them); pay as you go: SurrealDB 3 -> 4 after a backup
 spky doctor --json          # machine-readable health check
 spky query --cloud '…'      # run SurrealQL against production
 spky logs --since 1h --grep 'error'`;

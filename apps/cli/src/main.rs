@@ -191,7 +191,9 @@ enum Commands {
     /// Deploy the current project to Sp00ky Cloud
     Deploy {
         /// Also move the SSP and scheduler to the newest published build.
-        /// Does not move a role that sp00ky.yml pins with `version:`.
+        /// Does not move a role that sp00ky.yml pins with `version:`. On pay
+        /// as you go it also moves a SurrealDB 3 database to SurrealDB 4, after
+        /// a backup; the conversion is one way.
         #[arg(long)]
         upgrade: bool,
         /// Wipe the scheduler's persistent volume before redeploy. Use

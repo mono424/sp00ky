@@ -55,7 +55,18 @@ CborValue valueToCbor(Object? v) {
     );
   }
   if (v is SurrealDuration) {
-    return CborString(v.value, tags: const [SurrealCborTag.stringDuration]);
+    // SurrealDB 4 refuses the string form (tag 13) with a 400 for the whole
+    // request; [seconds, nanoseconds] works on 3.x too. A string this parser
+    // does not know (it is not a SurrealQL duration either) keeps tag 13,
+    // which 3.x parses and 4.x refuses as before.
+    final parts = _durationParts(v.value);
+    if (parts == null) {
+      return CborString(v.value, tags: const [SurrealCborTag.stringDuration]);
+    }
+    return CborList(
+      [CborInt(parts.$1), CborInt(parts.$2)],
+      tags: const [SurrealCborTag.customDuration],
+    );
   }
   if (v is bool) return CborBool(v);
   if (v is int) return CborInt(BigInt.from(v));
@@ -71,6 +82,38 @@ CborValue valueToCbor(Object? v) {
     });
   }
   return CborString(v.toString());
+}
+
+/// Nanoseconds per SurrealQL duration unit (a year is 365 days there).
+final _durationUnits = <String, BigInt>{
+  'ns': BigInt.one,
+  'us': BigInt.from(1000),
+  'µs': BigInt.from(1000),
+  'ms': BigInt.from(1000000),
+  's': BigInt.from(1000000000),
+  'm': BigInt.from(60000000000),
+  'h': BigInt.from(3600000000000),
+  'd': BigInt.from(86400000000000),
+  'w': BigInt.from(604800000000000),
+  'y': BigInt.from(31536000000000000),
+};
+
+final _durationPart = RegExp(r'(\d+)(ns|us|µs|ms|s|m|h|d|w|y)');
+
+/// `1h30m`, `250ms`, ... as (seconds, nanoseconds); null when [text] is not
+/// a SurrealQL duration.
+(BigInt, BigInt)? _durationParts(String text) {
+  if (text.isEmpty) return null;
+  var total = BigInt.zero;
+  var at = 0;
+  for (final m in _durationPart.allMatches(text)) {
+    if (m.start != at) return null;
+    total += BigInt.parse(m.group(1)!) * _durationUnits[m.group(2)!]!;
+    at = m.end;
+  }
+  if (at != text.length) return null;
+  final perSecond = _durationUnits['s']!;
+  return (total ~/ perSecond, total.remainder(perSecond));
 }
 
 /// [CborValue] → normalized Dart value (inverse of [valueToCbor]).

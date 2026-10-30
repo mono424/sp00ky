@@ -1,0 +1,26 @@
+[package]
+name = "db-conformance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S8: which SurrealDB features sp00ky depends on does an endpoint support"
+
+# Its own workspace on purpose: a spike stays out of the release workspace, its
+# lockfile and the version bump. Build with `cargo run --release` from here.
+[workspace]
+
+[dependencies]
+# The transport under test is the one the Cloudflare SSP uses: `HttpSqlDb`
+# over the `HttpClient` port, JSON-RPC on `/rpc`. Production helpers
+# (bootstrap page query, record ranges, impersonation mint) come from the
+# same crates so the probes run the exact statements sp00ky runs.
+ssp-node = { path = "../../../packages/ssp-node" }
+ssp-protocol = { path = "../../../packages/ssp-protocol" }
+
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process"] }

@@ -1,24 +1,32 @@
 import { For, Show, type JSX } from 'solid-js';
 import { A } from '@solidjs/router';
+import { currentMode } from '../api/client';
 
 /** Small shared pieces of the panel chrome. */
 
 export function PageHead(props: {
+  /** The list this page belongs to, for a detail page: "Jobs" above a job. */
   crumb?: string;
+  /** Where the crumb leads; defaults to the crumb's own page. */
+  crumbHref?: string;
   title: string;
   subtitle?: JSX.Element;
   actions?: JSX.Element;
 }) {
+  // Every page's top bar reads `project / [list /] page`, in the frame's voice.
+  const slug = () => currentMode().config?.project_slug ?? currentMode().config?.scheduler_id ?? 'sp00ky';
   return (
     <div class="page-head">
-      <div style={{ 'min-width': '0' }}>
-        {/* `crumb` is accepted and ignored: every page sits one level under
-            the sidebar, so a breadcrumb only ever said "Dashboard". */}
-        <h1>{props.title}</h1>
+      <div class="ph-crumb cap">
+        <span>{slug()}</span>
+        <Show when={props.crumb}>
+          <span class="ph-sep">/</span>
+          <A href={props.crumbHref ?? `/${props.crumb!.toLowerCase()}`}>{props.crumb}</A>
+        </Show>
+        <span class="ph-sep">/</span>
+        <h1 class="ph-title">{props.title}</h1>
         <Show when={props.subtitle}>
-          <div class="page-sub">
-            {props.subtitle}
-          </div>
+          <span class="ph-sub">{props.subtitle}</span>
         </Show>
       </div>
       <Show when={props.actions}>

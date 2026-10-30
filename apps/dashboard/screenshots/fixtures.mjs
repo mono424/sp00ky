@@ -142,6 +142,24 @@ const BACKENDS = [
   },
 ];
 
+/** What `GET /backends/:name` adds: the last few minutes of checks and the env. */
+const backendDetail = (b, base, swing) => ({
+  ...b,
+  check_interval_secs: 10,
+  logs_available: false,
+  env: { PORT: String(b.port), NODE_ENV: 'production', DATABASE_URL: 'ws://surrealdb:8000/rpc' },
+  history: Array.from({ length: 36 }, (_, i) => ({
+    at: ago((35 - i) * 10_000),
+    ms: Math.round(base + swing * Math.sin(i / 3) + ((i * 7) % 5)),
+    status: 'healthy',
+    ok: true,
+  })),
+});
+const BACKEND_DETAILS = {
+  api: backendDetail(BACKENDS[0], 9, 3),
+  worker: backendDetail(BACKENDS[1], 15, 5),
+};
+
 const PRESENCE = {
   totals: {
     users: 148,
@@ -334,6 +352,30 @@ const INCIDENTS = [
       ),
     ],
   },
+  // A week of history behind the last day, so the page has something to show.
+  ...[
+    ['inc-9b40aa', 'ssp-1', 'publication_backlog', 'warning', 'recovered', 50, 9, 'Publication backlog crossed 2,000 operations.', 'Backlog published; queue empty.'],
+    ['inc-8e12f3', 'api', 'backend_unhealthy', 'error', 'failed', 61, 23, 'Health check returned 503 three times in a row.', 'Gave up after 23m; the backend was redeployed.'],
+    ['inc-77c5d1', 'ssp-0', 'bootstrap_slow', 'warning', 'recovered', 74, 14, 'Bootstrap still loading after 10m (52 of 70 tables).', 'Bootstrap finished; the SSP is ready.'],
+    ['inc-6d0e9c', 'views', 'slow_views', 'warning', 'recovered', 98, 6, '3 views over the slow threshold (p99 > 100ms).', 'All views back under the threshold.'],
+    ['inc-5c7a28', 'scheduler', 'ingest_stall', 'warning', 'interrupted', 121, 4, 'Ingest made no progress for 60s.', 'The scheduler restarted before recovery was seen.'],
+    ['inc-4b19e0', 'ssp-1', 'ingest_lag', 'warning', 'recovered', 140, 3, 'Buffered events crossed the lag threshold (12,004).', 'Backlog drained; the circuit is live again.'],
+    ['inc-3a88c4', 'worker', 'backend_unhealthy', 'warning', 'recovered', 152, 2, 'Health check timed out after 5s.', 'Health check answered in 18ms.'],
+  ].map(([id, component, kind, severity, state, hoursAgo, minutes, first, last]) => ({
+    id,
+    component,
+    kind,
+    severity,
+    state,
+    started_at: ago(hoursAgo * 3_600_000),
+    ended_at: ago(hoursAgo * 3_600_000 - minutes * 60_000),
+    max_buffered_events: kind === 'ingest_lag' ? 12_004 : 0,
+    event_count: 2,
+    events: [
+      incidentEvent(ago(hoursAgo * 3_600_000), component, kind, 'open', first),
+      incidentEvent(ago(hoursAgo * 3_600_000 - minutes * 60_000), component, kind, state, last),
+    ],
+  })),
 ];
 
 const brief = ({ id, component, kind, severity, state, started_at, ended_at }) => ({
@@ -918,36 +960,20 @@ export const BACKUPS = {
   project_slug: 'acme',
   scheduler_status: 'ready',
   local: { current_running: null, queue_len: 0, recent: [] },
+  // Two weeks of nightlies, one taken by hand before an upgrade, and one
+  // night that failed: the page's history needs all three to look like one.
   catalog: [
-    catalogEntry({
-      id: 'bkp-9f2c1a',
+    ...Array.from({ length: 13 }, (_, i) => catalogEntry({
+      id: `bkp-${(0x9f2c1a - i * 4099).toString(16)}`,
       name: 'nightly',
-      size: 412_140_032,
-      seq: 884_012,
-      age: 8 * 3_600_000,
-    }),
-    catalogEntry({
-      id: 'bkp-7b04de',
-      name: 'nightly',
-      size: 409_993_216,
-      seq: 871_204,
-      age: 32 * 3_600_000,
-    }),
-    catalogEntry({
-      id: 'bkp-22aa90',
-      name: 'before upgrade',
-      size: 402_653_184,
-      seq: 858_770,
-      age: 54 * 3_600_000,
-    }),
-    catalogEntry({
-      id: 'bkp-5c18b3',
-      name: 'nightly',
-      size: 398_458_880,
-      seq: 844_119,
-      age: 80 * 3_600_000,
-    }),
-  ],
+      size: Math.round(412_140_032 - i * 3_100_000 - (i % 3) * 900_000),
+      seq: 884_012 - i * 12_800,
+      age: (8 + i * 24) * 3_600_000,
+    })).filter((_, i) => i !== 4),
+    { ...catalogEntry({ id: 'bkp-31e0f7', name: 'nightly', size: 0, seq: null, age: (8 + 4 * 24) * 3_600_000 }),
+      status: 'failed', completed_at: null, error: 'upload to acme-backups failed: SlowDown (503) after 3 attempts' },
+    catalogEntry({ id: 'bkp-22aa90', name: 'before upgrade', size: 402_653_184, seq: 858_770, age: 54 * 3_600_000 }),
+  ].sort((x, y) => y.created_at.localeCompare(x.created_at)),
   restores: [],
   config: {
     enabled: true,
@@ -1013,6 +1039,43 @@ const LOG_LINES = [
   },
 ];
 
+/**
+ * Twenty minutes of tail: the lines above on a loop, a line every few seconds,
+ * with one bad stretch (a backend timing out, then a job failing) so the page
+ * has levels to tell apart.
+ */
+const LOG_TAIL = (() => {
+  const out = [];
+  const span = 20 * 60_000;
+  let t = span;
+  let i = 0;
+  while (t > 0) {
+    const base = LOG_LINES[i % LOG_LINES.length];
+    const minute = Math.floor((span - t) / 60_000);
+    let line = { ...base, fields: '' };
+    if (minute >= 11 && minute <= 13 && i % 3 === 0) {
+      line = {
+        level: 'WARN',
+        target: 'scheduler::backends',
+        message: `worker health check took ${180 + (i % 7) * 31}ms (threshold 200ms)`,
+        fields: 'backend=worker attempt=1',
+      };
+    }
+    if (minute === 12 && i % 5 === 0) {
+      line = {
+        level: 'ERROR',
+        target: 'scheduler::jobs',
+        message: 'job /jobs/welcome-mail failed: backend returned 503',
+        fields: 'table=digest_job attempt=4 max=4',
+      };
+    }
+    out.push({ ...line, ts: ago(t) });
+    t -= 3_000 + ((i * 1_700) % 4_000);
+    i++;
+  }
+  return out;
+})();
+
 /** `text/event-stream` bodies, delivered in one go and then closed. */
 export const STREAMS = {
   'GET /jobs/stream': `event: jobs
@@ -1023,29 +1086,69 @@ data: ${JSON.stringify(JOBS)}
 data: ${JSON.stringify(WORKFLOW_RUNS)}
 
 `,
-  'GET /logs': LOG_LINES.map(
-    (line, i) =>
-      `event: line
-data: ${JSON.stringify({ ...line, ts: ago((LOG_LINES.length - i) * 4_000), fields: '' })}
-
-`
-  ).join(''),
+  'GET /logs': LOG_TAIL.map((line) => `event: line\ndata: ${JSON.stringify(line)}\n\n`).join(''),
 };
 
+/**
+ * The scheduler's MCP tools as `tools/list` answers them: the real names, each
+ * marked read-only or destructive the way the server annotates them.
+ */
+const tool = (name, description, kind = 'write') => ({
+  name,
+  description,
+  inputSchema: { type: 'object' },
+  annotations: { readOnlyHint: kind === 'read', destructiveHint: kind === 'destructive' },
+});
 const MCP_TOOLS = [
-  {
-    name: 'overview',
-    description: 'Cluster health: scheduler, SSPs, backends, presence and jobs.',
-  },
-  { name: 'views_list', description: 'Registered live queries, with their cost and subscribers.' },
-  { name: 'jobs_list', description: 'The outbox queue, filterable by table and status.' },
-  { name: 'job_retry', description: 'Re-enqueue a failed job.' },
-  { name: 'schedules_list', description: 'Cron schedules and their next fire.' },
-  { name: 'schedule_trigger', description: 'Fire a schedule now.' },
-  { name: 'workflow_runs_list', description: 'Workflow runs and their status.' },
-  { name: 'incidents_list', description: 'Lag, heartbeat and restart episodes.' },
-  { name: 'logs_recent', description: 'Recent log lines from any component.' },
-  { name: 'ssp_restart', description: 'Restart one SSP, optionally cleaning its state.' },
+  tool('overview', 'Cluster health: scheduler, SSPs, backends, presence and jobs.', 'read'),
+  tool('admin_config', 'What this scheduler is: version, project, cloud link.', 'read'),
+  tool('operations_list', 'Restarts, backups and restores in flight or recent.', 'read'),
+  tool('incidents_list', 'Lag, heartbeat and restart episodes.', 'read'),
+  tool('incident_get', 'One incident with its event timeline.', 'read'),
+  tool('logs_recent', 'Recent log lines from the scheduler or an SSP.', 'read'),
+  tool('ssp_restart', 'Restart one SSP, optionally cleaning its state.'),
+  tool('ssps_restart_all', 'Restart every SSP, rolling or all at once.', 'destructive'),
+  tool('scheduler_restart', 'Restart the scheduler process.', 'destructive'),
+  tool('backends_list', 'Every backend and its last health check.', 'read'),
+  tool('backend_get', 'One backend with its recent checks.', 'read'),
+  tool('views_list', 'Registered live queries, with their cost and subscribers.', 'read'),
+  tool('view_get', 'One live query, its owner and its siblings.', 'read'),
+  tool('view_history', 'How one live query has updated over time.', 'read'),
+  tool('presence', 'Who is connected: users, tabs and views.', 'read'),
+  tool('jobs_list', 'The outbox queue, filterable by table and status.', 'read'),
+  tool('job_get', 'One job with its payload and result.', 'read'),
+  tool('job_retry', 'Re-enqueue a failed job.'),
+  tool('job_kill', 'Stop a running job.', 'destructive'),
+  tool('jobs_clear', 'Delete finished jobs from the outbox.', 'destructive'),
+  tool('schedules_list', 'Cron schedules and their next fire.', 'read'),
+  tool('schedule_get', 'One schedule with its recent fires.', 'read'),
+  tool('schedule_trigger', 'Fire a schedule now.'),
+  tool('schedule_pause', 'Stop a schedule from firing.'),
+  tool('schedule_resume', 'Let a paused schedule fire again.'),
+  tool('schedule_release', 'Release a quarantined schedule key.'),
+  tool('workflow_runs_list', 'Workflow runs and their status.', 'read'),
+  tool('workflow_run_get', 'One run with its steps.', 'read'),
+  tool('workflow_run_retry', 'Retry a failed run from its failed step.'),
+  tool('workflow_run_rerun', 'Run a workflow again from the start.'),
+  tool('workflow_run_cancel', 'Cancel a running workflow.', 'destructive'),
+  tool('durable_instances_list', 'Durable workflow instances.', 'read'),
+  tool('durable_instance_get', 'One durable instance and its history.', 'read'),
+  tool('durable_instance_retry', 'Retry a failed durable instance.'),
+  tool('durable_instance_cancel', 'Cancel a durable instance.', 'destructive'),
+  tool('backups_list', 'The backup catalog.', 'read'),
+  tool('backup_create', 'Take a backup now.'),
+  tool('backups_configure', 'Set the backup schedule and retention.'),
+  tool('backup_restore', 'Replace the database with a backup.', 'destructive'),
+  tool('backup_restore_status', 'Where a restore has got to.', 'read'),
+  tool('backup_delete', 'Delete a backup from storage.', 'destructive'),
+  tool('cloud_stats', 'CPU, memory and disk of every container.', 'read'),
+  tool('cloud_deployment', 'The current deployment on Sp00ky Cloud.', 'read'),
+  tool('cloud_restart', 'Restart containers through Sp00ky Cloud.', 'destructive'),
+  tool('pools_list', 'Machine pools and their state.', 'read'),
+  tool('pool_machines', 'The machines in one pool.', 'read'),
+  tool('pool_pause', 'Stop a pool from starting machines.'),
+  tool('pool_resume', 'Let a paused pool start machines again.'),
+  tool('machine_drain', 'Drain and stop one dedicated machine.', 'destructive'),
 ];
 
 export const MCP_TOOLS_RESULT = {
@@ -1106,6 +1209,92 @@ const CLOUD_STATS = {
   server_time: new Date(NOW).toISOString(),
 };
 
+/* ------------------------------------------------------------------ */
+/* Run, job and schedule details: what the Runs page's sheet opens        */
+/* ------------------------------------------------------------------ */
+
+const step = (name, deps, status, startedAgo, finishedAgo, extra = {}) => ({
+  step: name,
+  depends_on: deps,
+  status,
+  job_id: status === 'pending' ? null : `search_job:wf_${extra.run ?? 'run'}_${name}`,
+  output: status === 'success' ? { ok: true } : null,
+  error: extra.error ?? null,
+  created_at: iso(extra.runAgo ?? startedAgo),
+  started_at: startedAgo == null ? null : iso(startedAgo),
+  finished_at: finishedAgo == null ? null : iso(finishedAgo),
+  dispatch_attempts: extra.attempts ?? 1,
+});
+
+const RUN_DETAILS = {
+  'run-9f2c1a': [
+    step('collect', [], 'success', 240_000, 200_000, { run: 'run-9f2c1a', runAgo: 240_000 }),
+    step('render', ['collect'], 'success', 199_000, 70_000, { run: 'run-9f2c1a', runAgo: 240_000 }),
+    step('reindex', ['collect'], 'processing', 198_000, null, { run: 'run-9f2c1a', runAgo: 240_000 }),
+    step('send', ['render', 'reindex'], 'pending', null, null, { run: 'run-9f2c1a', runAgo: 240_000 }),
+  ],
+  'run-5c18b3': [
+    step('snapshot', [], 'success', 30 * 3_600_000, 30 * 3_600_000 - 40_000, { run: 'run-5c18b3', runAgo: 30 * 3_600_000 }),
+    step('export', ['snapshot'], 'failed', 30 * 3_600_000 - 39_000, 30 * 3_600_000 - 70_000, {
+      run: 'run-5c18b3', runAgo: 30 * 3_600_000, attempts: 4,
+      error: { code: 'backend_status', reason: 'backend returned 503 for /jobs/export', status: 503 },
+    }),
+    step('notify', ['export'], 'skipped', null, null, { run: 'run-5c18b3', runAgo: 30 * 3_600_000 }),
+  ],
+};
+
+const runDetail = (id) => {
+  const r = WORKFLOW_RUNS.runs.find((x) => x.id === id);
+  const steps = RUN_DETAILS[id] ?? [
+    step('main', [], r.status === 'running' ? 'processing' : r.status, NOW - Date.parse(r.created_at), r.finished_at ? NOW - Date.parse(r.finished_at) : null, { run: id, runAgo: NOW - Date.parse(r.created_at) }),
+  ];
+  // Line the steps up with the run's own start, whatever hours they were written at.
+  const starts = steps.map((x) => Date.parse(x.created_at));
+  const shift = Date.parse(r.created_at) - Math.min(...starts);
+  const move = (v) => (v ? new Date(Date.parse(v) + shift).toISOString() : v);
+  const aligned = steps.map((x) => ({ ...x, created_at: move(x.created_at), started_at: move(x.started_at), finished_at: move(x.finished_at) }));
+  const end = aligned.map((x) => x.finished_at).filter(Boolean).sort().at(-1);
+  const run = r.status === 'running' ? r : { ...r, finished_at: end ?? r.finished_at };
+  return { run: { ...run, dag: null, input: { tenant: 'acme', window: '24h' }, target_table: 'search_job' }, steps: aligned };
+};
+
+const jobDetail = (j) => ({
+  job: {
+    id: j.id, status: j.status, path: j.path, table: j.table, key: j.key, origin: j.origin,
+    payload: { tenant: 'acme', id: j.key }, result: j.status === 'success' ? { indexed: 1284 } : null,
+    errors: j.status === 'failed'
+      ? [1, 2, 3, 4].map((n) => ({ code: 'backend_status', reason: 'backend returned 503', attempt: n }))
+      : null,
+    retries: j.retries, max_retries: j.max_retries, retry_strategy: j.retry_strategy,
+    assignee: j.assignee, timeout: 30, delay: null, lease_until: j.lease_until,
+    created_at: j.created_at, updated_at: j.updated_at,
+  },
+});
+
+const scheduleDetail = (sc) => {
+  const runs = Array.from({ length: 12 }, (_, i) => {
+    const failed = sc.last_run_status === 'failed' ? i % 3 === 0 : i === 5;
+    const at = NOW - (i + 1) * (sc.every_ms ?? 3_600_000);
+    return {
+      id: `srun-${sc.name}-${i}`, schedule_name: sc.name, key: sc.name, kind: sc.kind,
+      status: failed ? 'failed' : 'success', trigger: 'cron',
+      job_id: sc.kind === 'job' ? `${sc.target_table}:sch_${sc.name}_${1700 - i}` : null,
+      workflow_run: sc.kind === 'workflow' ? `run-${(0x7b04de + i).toString(16)}` : null,
+      error: failed ? { code: 'backend_status', reason: 'backend returned 503' } : null,
+      fire_at: new Date(at).toISOString(), created_at: new Date(at).toISOString(),
+      finished_at: new Date(at + 42_000).toISOString(),
+    };
+  });
+  const rollup = Array.from({ length: 24 }, (_, h) => ({
+    bucket: new Date(NOW - (23 - h) * 3_600_000).toISOString(),
+    success: 3 + (h % 4), failed: sc.last_run_status === 'failed' && h % 6 === 0 ? 1 : 0, skipped: 0, replaced: 0, killed: 0,
+  }));
+  return {
+    schedule: sc, runs, rollup,
+    quarantined: sc.for_each ? [{ key: 'workspace:7f20', consecutive_failures: 5, quarantined_at: iso(2 * 3_600_000) }] : [],
+  };
+};
+
 export const ROUTES = {
   'GET /config': CONFIG,
   'GET /me': ME,
@@ -1114,8 +1303,34 @@ export const ROUTES = {
   'GET /views': VIEWS,
   'GET /views/907461255': VIEW_DETAIL,
   'GET /schedules': SCHEDULES,
+  'GET /jobs': JOBS,
+  'GET /workflows/runs': WORKFLOW_RUNS,
+  ...Object.fromEntries(WORKFLOW_RUNS.runs.map((r) => [`GET /workflows/runs/${r.id}`, runDetail(r.id)])),
+  ...Object.fromEntries(JOBS.jobs.map((j) => [`GET /jobs/${encodeURIComponent(j.id)}`, jobDetail(j)])),
+  ...Object.fromEntries(SCHEDULES.schedules.map((sc) => [`GET /schedules/${sc.name}`, scheduleDetail(sc)])),
+  // The sign-in form, so the fixture server can be signed into and out of.
+  'POST /session': { token: TOKEN, mode: 'roster', subject: ME.subject, label: ME.label, expires_in_secs: 43_200 },
+  'POST /logout': { ok: true },
+  'POST /tokens': {
+    token: 'spky_mcp_7Hq2vT9xKcN4pLw8RzYb3mFa6sJd1uGe',
+    label: 'claude-code on my laptop',
+    scope: 'read',
+    expires_at: new Date(NOW + 90 * 86_400_000).toISOString(),
+    endpoint: '/admin/api/mcp',
+  },
+  'DELETE /tokens': { ok: true },
+  // Starting a backup answers with the operation that runs it.
+  'POST /backups': {
+    backup_id: 'bkp-a1c3f0',
+    operation: {
+      id: 'op-a1c3f0', kind: 'backup_create', target: 'bkp-a1c3f0', requested_by: 'user:mira',
+      started_at: NOW, finished_at: null, status: 'running', message: 'queued', detail: { backup_id: 'bkp-a1c3f0', status: 'queued' },
+    },
+  },
   'GET /backends': { backends: BACKENDS, check_interval_secs: 10 },
+  ...Object.fromEntries(Object.entries(BACKEND_DETAILS).map(([name, detail]) => [`GET /backends/${name}`, detail])),
   'GET /incidents': INCIDENT_LIST,
+  ...Object.fromEntries(INCIDENTS.map((incident) => [`GET /incidents/${incident.id}`, { incident }])),
   'GET /backups': BACKUPS,
   'GET /cloud/stats': CLOUD_STATS,
   'POST /mcp': MCP_TOOLS_RESULT,

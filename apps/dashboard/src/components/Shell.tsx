@@ -1,5 +1,5 @@
-import { For, Show, createEffect, createSignal, onCleanup, type JSX } from 'solid-js';
-import { A, useLocation } from '@solidjs/router';
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js';
+import { A, useLocation, useNavigate } from '@solidjs/router';
 import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
@@ -9,6 +9,8 @@ interface NavLink {
   href: string;
   label: string;
   count?: string;
+  /** Amber count: something there needs looking at. */
+  warn?: boolean;
   /** Section heading the link sits under; links keep their order. */
   group?: string;
 }
@@ -27,9 +29,7 @@ const NAV_PATHS: Record<string, string> = {
   '/ssps': 'M4 3h16v7H4z M4 14h16v7H4z M7 6.5h1 M7 17.5h1 M16 6.5h1 M16 17.5h1',
   '/backends': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0',
   '/views': 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0',
-  '/workflows': 'M3 3h6v6H3z M15 15h6v6h-6z M6 9v9h9 M9 6h9v9',
-  '/schedules': 'M5 4h14v17H5z M8 2v4 M16 2v4 M5 9h14 M8 13h2 M14 13h2 M8 17h2',
-  '/jobs': 'M5 6h14v15H5z M9 6V3h6v3 M8 11h8 M8 15h8',
+  '/runs': 'M3 3h6v6H3z M15 15h6v6h-6z M6 9v9h9 M9 6h9v9',
   '/backups': 'M4 4h16v5H4z M6 9v12h12V9 M9 13h6',
   '/incidents': 'M12 3 2 21h20L12 3z M12 9v5 M12 17v1',
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
@@ -75,7 +75,15 @@ export function Shell(props: {
   const clusterOnly = new Set(['/views', '/backups', '/incidents', '/logs']);
   const links = (): NavLink[] => allLinks().filter((l) => !servedByNode() || !clusterOnly.has(l.href));
   const allLinks = (): NavLink[] => [
+    // Where an operator starts: the cluster, what went wrong, what it said.
     { href: '/', label: 'Overview' },
+    {
+      href: '/incidents',
+      label: 'Incidents',
+      count: props.overview?.incidents?.open ? formatCount(props.overview.incidents.open) : undefined,
+      warn: !!props.overview?.incidents?.open,
+    },
+    { href: '/logs', label: 'Logs' },
     {
       href: '/ssps',
       label: 'SSPs',
@@ -103,12 +111,10 @@ export function Shell(props: {
         ? formatCount(props.overview.presence.totals.views)
         : undefined,
     },
-    { href: '/workflows', label: 'Workflows', group: 'Run' },
-    { href: '/schedules', label: 'Schedules', group: 'Run' },
     {
-      href: '/jobs',
-      label: 'Jobs',
-      group: 'Run',
+      href: '/runs',
+      label: 'Runs',
+      group: 'Automation',
       // Work outstanding, not work done: pending plus in flight is the number
       // that means "there is something to look at". Absent until the job
       // sampler has run once, which is not the same as "the queue is empty".
@@ -124,9 +130,7 @@ export function Shell(props: {
     // database's volume, the control plane can. Hidden, not disabled, when
     // unlinked: there is nothing on that page a self-hosted cluster could use.
     ...(props.overview?.cloud_linked ? [{ href: '/resources', label: 'Resources', group: 'Data' }] : []),
-    { href: '/incidents', label: 'Incidents', group: 'Observe' },
-    { href: '/logs', label: 'Logs', group: 'Observe' },
-    { href: '/access', label: 'Access', group: 'Settings' },
+    { href: '/access', label: 'Access', group: 'Data' },
   ];
 
   /** Consecutive links with the same group, in order. */
@@ -141,9 +145,6 @@ export function Shell(props: {
   };
 
   const slug = () => currentMode().config?.project_slug ?? 'sp00ky';
-  const schedStatus = () => props.overview?.scheduler?.status;
-  const schedTone = () =>
-    !schedStatus() ? 'idle' : schedStatus() === 'ready' ? 'ok' : 'warn';
 
   // Navigating closes the drawer — otherwise tapping a link leaves it sitting
   // open over the page it just moved to.
@@ -177,8 +178,29 @@ export function Shell(props: {
     document.body.style.overflow = '';
   });
 
+  const atRoot = () => /^(\/admin)?\/?$/.test(location.pathname);
+  const [menuOpen, setMenuOpen] = createSignal(false);
+  const [paletteOpen, setPaletteOpen] = createSignal(false);
+  createEffect(() => {
+    location.pathname;
+    setMenuOpen(false);
+  });
+  // A click anywhere outside the user menu closes it.
+  const onDocClick = (e: MouseEvent) => {
+    if (menuOpen() && !(e.target as Element).closest('.sb-me')) setMenuOpen(false);
+  };
+  document.addEventListener('click', onDocClick);
+  onCleanup(() => document.removeEventListener('click', onDocClick));
+
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === 'Escape') setOpen(false);
+    if (e.key === 'Escape') {
+      setOpen(false);
+      setMenuOpen(false);
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      setPaletteOpen(!paletteOpen());
+    }
   };
   window.addEventListener('keydown', onKey);
   onCleanup(() => window.removeEventListener('keydown', onKey));
@@ -199,7 +221,6 @@ export function Shell(props: {
           <span />
         </button>
         <Logo />
-        <span class="brand-tag">admin</span>
       </header>
 
       <Show when={open()}>
@@ -207,21 +228,45 @@ export function Shell(props: {
       </Show>
 
       <nav class="sidebar" classList={{ open: open() }}>
-        <div class="brand">
-          <Logo />
-          <span class="brand-tag">admin</span>
+        {/* Who is signed in. The menu holds what used to sit at the foot:
+            access and signing out. */}
+        <div class="sb-me">
+          <button
+            class="sb-me-btn"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen()}
+            onClick={() => setMenuOpen(!menuOpen())}
+          >
+            <span class="sb-av" aria-hidden="true">{initials(props.session.label)}</span>
+            <span class="sb-me-name" title={props.session.subject}>{props.session.label}</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="1.6" aria-hidden="true">
+              <path d="M7 10l5 5 5-5" />
+            </svg>
+          </button>
+          <Show when={menuOpen()}>
+            <div class="sb-menu" role="menu">
+              <div class="sb-menu-sub">
+                {slug()} · {props.session.mode === 'breakglass' ? 'break-glass' : props.session.subject}
+              </div>
+              <A href="/access" role="menuitem" onClick={() => setMenuOpen(false)}>
+                Access and tokens
+              </A>
+              <button role="menuitem" onClick={props.onSignOut}>
+                Sign out
+              </button>
+            </div>
+          </Show>
         </div>
 
-        <div class="project" title={`Project ${slug()}`}>
-          <span class="project-mark">{initials(slug())}</span>
-          <span class="project-text">
-            <span class="project-name">{slug()}</span>
-            <span class="project-sub">
-              <span class="dot" classList={{ [schedTone()]: true, pulse: schedTone() === 'warn' }} />
-              {schedStatus() ? `scheduler ${schedStatus()}` : servedByNode() ? 'served by an SSP' : 'connecting'}
-            </span>
-          </span>
-        </div>
+        <button class="sb-jump cap" onClick={() => setPaletteOpen(true)}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="1.6" aria-hidden="true">
+            <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
+          </svg>
+          Jump to
+          <kbd>⌘K</kbd>
+        </button>
 
         <div class="nav">
           <For each={sections()}>
@@ -242,10 +287,15 @@ export function Shell(props: {
                       class="nav-link"
                       activeClass="active"
                       end={link.href === '/'}
+                      // The scheduler serves the app at "/admin/", which the
+                      // router's exact match for "/admin" does not count.
+                      // Only on that link: the router merges this over its own
+                      // active class, so `active: false` elsewhere would erase it.
+                      classList={link.href === '/' ? { active: atRoot() } : undefined}
                     >
                       <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} /><span>{link.label}</span></span>
                       <Show when={link.count}>
-                        <span class="nav-count">{link.count}</span>
+                        <span class="nav-count" classList={{ warn: link.warn }}>{link.count}</span>
                       </Show>
                     </A>
                   )}
@@ -255,26 +305,14 @@ export function Shell(props: {
           </For>
         </div>
 
-        <div class="sidebar-foot">
-          <span class="avatar" aria-hidden="true">{initials(props.session.label)}</span>
-          <span class="who">
-            <span class="who-name truncate" title={props.session.subject}>
-              {props.session.label}
-            </span>
-            <Show when={props.overview?.scheduler?.version}>
-              <span class="sidebar-version" title="Scheduler version">
-                v{props.overview!.scheduler!.version}
-              </span>
-            </Show>
-          </span>
-          <button class="icon-btn" onClick={props.onSignOut} title="Sign out" aria-label="Sign out">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3 M10 8l-4 4 4 4 M6 12h10" />
-            </svg>
-          </button>
+        <div class="sb-foot cap">
+          {props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? currentMode().config?.version?.replace(/^0\.0\.1-/, '') ?? ''}
         </div>
       </nav>
+
+      <Show when={paletteOpen()}>
+        <Palette links={links()} onClose={() => setPaletteOpen(false)} />
+      </Show>
 
       <div class="main-frame">
         <main class="main">
@@ -289,6 +327,76 @@ export function Shell(props: {
             </div>
           </Show>
         </main>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Jump to any page by typing part of its name. ⌘K (Ctrl-K) opens it from
+ * anywhere; arrows move, Enter goes, Escape closes.
+ */
+function Palette(props: { links: NavLink[]; onClose: () => void }) {
+  const navigate = useNavigate();
+  const [query, setQuery] = createSignal('');
+  const [index, setIndex] = createSignal(0);
+  const matches = createMemo(() => {
+    const q = query().trim().toLowerCase();
+    return q ? props.links.filter((l) => `${l.label} ${l.group ?? ''}`.toLowerCase().includes(q)) : props.links;
+  });
+  createEffect(() => {
+    query();
+    setIndex(0);
+  });
+
+  const go = (l: NavLink | undefined) => {
+    if (!l) return;
+    props.onClose();
+    navigate(l.href);
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setIndex((i) => Math.min(i + 1, matches().length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      go(matches()[index()]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      props.onClose();
+    }
+  };
+
+  return (
+    <div class="palette-scrim" onClick={(e) => e.target === e.currentTarget && props.onClose()}>
+      <div class="palette" role="dialog" aria-label="Jump to a page">
+        <input
+          ref={(el) => queueMicrotask(() => el.focus())}
+          placeholder="Jump to…"
+          value={query()}
+          onInput={(e) => setQuery(e.currentTarget.value)}
+          onKeyDown={onKey}
+        />
+        <div class="palette-list">
+          <For each={matches()} fallback={<div class="palette-empty cap">No page matches</div>}>
+            {(l, i) => (
+              <button
+                class="palette-item"
+                classList={{ on: i() === index() }}
+                onMouseEnter={() => setIndex(i())}
+                onClick={() => go(l)}
+              >
+                <NavIcon href={l.href} />
+                {l.label}
+                <span class="cap">{l.group ?? ''}</span>
+              </button>
+            )}
+          </For>
+        </div>
       </div>
     </div>
   );

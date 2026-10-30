@@ -1,6 +1,7 @@
-import { For, Show, createResource, createSignal, onCleanup } from 'solid-js';
+import { For, Show, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { api } from '../api/client';
-import { Empty, PageHead, Panel, StatCard } from '../components/Chrome';
+import { PageHead } from '../components/Chrome';
+import { FxCell, Sq } from '../components/Frame';
 import { runAction, post, toast } from '../components/Actions';
 import { ActivityStrip, OpCard, restoreView } from '../components/OpCard';
 import { describeCron } from '../lib/cron';
@@ -18,7 +19,6 @@ import type {
   CatalogEntry,
   OperationResponse,
   Overview,
-  RestoreJobState,
   RestoreStatus,
 } from '../api/types';
 
@@ -36,46 +36,6 @@ import type {
  * consequences up front, a typed word, then a step card fed by the
  * scheduler's own stage flags.
  */
-
-function catalogTone(status: CatalogEntry['status']) {
-  switch (status) {
-    case 'completed':
-      return 'ok';
-    case 'pending':
-    case 'in_progress':
-      return 'warn';
-    case 'failed':
-      return 'bad';
-    default:
-      return 'idle';
-  }
-}
-
-function restoreTone(status: RestoreJobState['status']) {
-  switch (status) {
-    case 'completed':
-      return 'ok';
-    case 'queued':
-    case 'running':
-      return 'warn';
-    case 'failed':
-      return 'bad';
-    default:
-      return 'idle';
-  }
-}
-
-const ArchiveIcon = () => (
-  <svg viewBox="0 0 16 16">
-    <path d="M2.5 3.5h11v3h-11zM3.5 6.5v6h9v-6M6.5 9h3" />
-  </svg>
-);
-
-const RestoreIcon = () => (
-  <svg viewBox="0 0 16 16">
-    <path d="M3 8a5 5 0 1 0 1.5-3.6M3 2.5v2.2h2.2" />
-  </svg>
-);
 
 export function Backups(props: { overview: Overview | undefined; refresh: () => void }) {
   const [result, { refetch }] = createResource(() => api.getResult<BackupsData>('/backups'));
@@ -186,243 +146,277 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
     const st = data()?.scheduler_status;
     return st && st !== 'ready' ? `Scheduler is ${st}; restore needs ready` : undefined;
   };
-
   const lastValue = () => {
     const l = latest();
     return l ? relativeStamp(l.completed_at ?? l.created_at) : 'never';
+  };
+  const running = () => data()?.local.current_running ?? null;
+  const failedRecent = () => (data()?.catalog ?? []).filter((c) => c.status === 'failed').length;
+  /** Older than a day and a half while a daily schedule is on: a night was missed. */
+  const stale = () => {
+    const l = latest();
+    if (!l || !data()?.config?.enabled) return !l;
+    const t = Date.parse(l.completed_at ?? l.created_at);
+    return Date.now() - t > 36 * 3_600_000;
   };
 
   return (
     <>
       <PageHead
         title="Backups"
-        subtitle={
-          <Show when={data()?.s3.bucket}>
-            {(b) => (
-              <>
-                Stored in <span class="mono">{b()}</span>
-              </>
-            )}
-          </Show>
-        }
         actions={
           <Show when={data()}>
-            <div class="bk-create">
-              <input
-                class="bk-name"
-                placeholder="Name (optional)"
-                value={name()}
-                disabled={creating() || !configured()}
-                onInput={(e) => setName(e.currentTarget.value)}
-                onKeyDown={(e) => e.key === 'Enter' && void create()}
-              />
-              <button
-                class="btn btn-primary"
-                disabled={creating() || !configured()}
-                title={configured() ? undefined : 'No object storage configured'}
-                onClick={() => void create()}
-              >
-                Back up now
-              </button>
-            </div>
+            <BackupNow disabled={creating() || !configured()} reason={configured() ? undefined : 'No object storage configured'}
+              name={name()} setName={setName} onStart={() => void create()} />
           </Show>
         }
       />
 
-      <div class="page-body">
-        <div class="page-stack">
-          <ActivityStrip
-            operations={props.overview?.operations}
-            ssps={props.overview?.ssps}
-            exclude={(op) => op.kind === 'backup_restore' && op.detail?.restore_id === watching()?.id}
-          />
+      <Show when={error()}>
+        <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{error()}</span></div></FxCell></section>
+      </Show>
 
-          <Show when={error()}>
-            <div class="panel">
-              <Empty>{error()}</Empty>
-            </div>
-          </Show>
-
-          <Show when={!error() && data()} fallback={<Show when={!error()}><Empty>Loading…</Empty></Show>}>
-            {(d) => (
-                <>
-                  <Show when={!d().s3.configured}>
-                    <div class="banner">
-                      <span class="dot bad" />
-                      No object storage. Set <span class="mono">S3_ENDPOINT</span>,{' '}
-                      <span class="mono">S3_ACCESS_KEY</span>, <span class="mono">S3_SECRET_KEY</span> and{' '}
-                      <span class="mono">S3_BUCKET</span> on the scheduler.
-                    </div>
-                  </Show>
-
-                  <div class="stat-grid">
-                    <StatCard
-                      label="Last backup"
-                      value={lastValue()}
-                      tone={latest() ? undefined : 'warn'}
-                      note={
-                        d().local.current_running
-                          ? `backing up now, ${elapsed(
-                              d().local.current_running!.started_at ?? d().local.current_running!.enqueued_at,
-                              null,
-                            )}`
-                          : latest()
-                            ? formatBytes(latest()!.size_bytes)
-                            : 'none completed yet'
-                      }
-                    />
-                    <StatCard
-                      label="Kept"
-                      value={formatCount(completed().length)}
-                      unit={completed().length === 1 ? 'backup' : 'backups'}
-                      note={
-                        formatBytes(totalBytes()) +
-                        (d().config?.retention ? `, newest ${formatCount(d().config!.retention)} kept` : '')
-                      }
-                    />
-                    <StatCard
-                      label="Next backup"
-                      value={
-                        d().config?.enabled && d().config?.next_run_at
-                          ? relativeStamp(d().config!.next_run_at)
-                          : 'off'
-                      }
-                      note={
-                        d().config
-                          ? d().config!.enabled && d().config!.schedule
-                            ? (describeCron(d().config!.schedule!) ?? d().config!.schedule!)
-                            : 'no schedule'
-                          : 'scheduled by Sp00ky Cloud'
-                      }
-                    />
+      <Show when={!error() && data()} fallback={<Show when={!error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+        {(d) => (
+          <div class="fx-page">
+            <Show when={!d().s3.configured}>
+              <section class="fx-row">
+                <FxCell>
+                  <div class="fx-log bad">
+                    <span class="fx-what">No object storage · set S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY and S3_BUCKET on the scheduler</span>
                   </div>
+                </FxCell>
+              </section>
+            </Show>
 
-                  <Show when={watching()} keyed>
-                    {(w) => (
-                      <RestoreProgress
-                        id={w.id}
-                        backupId={w.backupId}
-                        label={w.label}
-                        sub={w.sub}
-                        onDone={() => {
-                          refreshAll();
-                        }}
-                        onClose={() => setWatching(null)}
-                      />
-                    )}
-                  </Show>
+            <Show when={(props.overview?.operations ?? []).some((o) => o.status === 'running')}>
+              <section class="fx-row">
+                <FxCell label="Running now">
+                  <ActivityStrip
+                    operations={props.overview?.operations}
+                    ssps={props.overview?.ssps}
+                    exclude={(op) => op.kind === 'backup_restore' && op.detail?.restore_id === watching()?.id}
+                  />
+                </FxCell>
+              </section>
+            </Show>
 
-                  <Panel title="Backups" flush>
-                    <Show when={d().catalog.length > 0} fallback={<Empty>No backups yet.</Empty>}>
-                      <ul class="list">
-                        <For each={d().catalog}>
-                          {(c) => {
-                            const size = () => c.local?.size_bytes ?? c.size_bytes;
-                            const live = () => c.status === 'pending' || c.status === 'in_progress';
-                            const state = () =>
-                              c.status === 'completed'
-                                ? null
-                                : c.local && live()
-                                  ? c.local.status
-                                  : c.status.replace('_', ' ');
-                            return (
-                              <li class="list-item bk-row" classList={{ [catalogTone(c.status)]: true }}>
-                                <span class="list-icon" aria-hidden="true">
-                                  <ArchiveIcon />
-                                </span>
-                                <span class="list-text">
-                                  <span class="list-title">
-                                    {c.name ?? c.id}
-                                    <Show when={state()}>
-                                      <span class="bk-state" classList={{ [catalogTone(c.status)]: true }}>
-                                        {state()}
-                                      </span>
-                                    </Show>
-                                  </span>
-                                  <Show
-                                    when={c.error}
-                                    fallback={
-                                      <span class="list-detail">
-                                        <Show when={c.name}>
-                                          <span class="mono">{c.id}</span>
-                                          {size() ? ' · ' : ''}
-                                        </Show>
-                                        {size() ? formatBytes(size()!) : ''}
-                                      </span>
-                                    }
-                                  >
-                                    <span class="list-detail bk-error" title={c.error!}>
-                                      {c.error}
-                                    </span>
-                                  </Show>
-                                </span>
-                                <span class="list-meta" title={formatStamp(c.created_at)}>
-                                  {relativeStamp(c.created_at)}
-                                </span>
-                                <span class="bk-actions">
-                                  <Show when={c.status === 'completed'}>
-                                    <button
-                                      class="btn btn-sm"
-                                      title={restoreBlocked()}
-                                      disabled={!!restoreBlocked()}
-                                      onClick={() => void restore(c)}
-                                    >
-                                      Restore
-                                    </button>
-                                    <Show when={d().linked}>
-                                      <button class="btn btn-sm" onClick={() => void remove(c)}>
-                                        Delete
-                                      </button>
-                                    </Show>
-                                  </Show>
-                                </span>
-                              </li>
-                            );
-                          }}
-                        </For>
-                      </ul>
+            <Show when={watching()} keyed>
+              {(w) => (
+                <section class="fx-row">
+                  <FxCell label="Restore">
+                    <RestoreProgress id={w.id} backupId={w.backupId} label={w.label} sub={w.sub}
+                      onDone={refreshAll} onClose={() => setWatching(null)} />
+                  </FxCell>
+                </section>
+              )}
+            </Show>
+
+            {/* where things stand ============================================ */}
+            <section class="fx-row" style={{ 'grid-template-columns': 'repeat(4, minmax(0, 1fr))' }}>
+              <FxCell label="Last backup" meta={<Show when={running()}><span class="warn">backing up now</span></Show>}>
+                <div class="fx-big"><span classList={{ warn: stale() }}>{lastValue()}</span></div>
+                <div class="fx-sub cap">
+                  <Show when={running()} fallback={
+                    <Show when={latest()} fallback={<span class="warn">none completed yet</span>}>
+                      {(l) => <><span><b>{formatBytes(l().size_bytes)}</b></span><Show when={l().snapshot_seq != null}><span>seq <b>{formatCount(l().snapshot_seq)}</b></span></Show></>}
                     </Show>
-                  </Panel>
-
-                  {/* In memory on this scheduler only, so usually empty. */}
-                  <Show when={d().restores.length > 0}>
-                    <Panel title="Restores" flush>
-                      <ul class="list">
-                        <For each={d().restores}>
-                          {(r) => (
-                            <li>
-                              <button
-                                class="list-item bk-restore"
-                                classList={{ [restoreTone(r.status)]: true }}
-                                onClick={() => setWatching({ id: r.restore_id, backupId: r.backup_id })}
-                              >
-                                <span class="list-icon" aria-hidden="true">
-                                  <RestoreIcon />
-                                </span>
-                                <span class="list-text">
-                                  <span class="list-title">
-                                    From <span class="mono">{r.backup_id}</span>
-                                  </span>
-                                  <span class="list-detail">
-                                    {r.status}, took {elapsed(r.started_at ?? r.enqueued_at, r.finished_at)}
-                                  </span>
-                                </span>
-                                <span class="list-meta">{relativeStamp(r.started_at ?? r.enqueued_at)}</span>
-                              </button>
-                            </li>
-                          )}
-                        </For>
-                      </ul>
-                    </Panel>
+                  }>
+                    {(r) => <span class="warn">started {elapsed(r().started_at ?? r().enqueued_at, null)} ago</span>}
                   </Show>
+                </div>
+              </FxCell>
+              <FxCell label="Next backup">
+                <div class="fx-big">
+                  {d().config?.enabled && d().config?.next_run_at ? relativeStamp(d().config!.next_run_at) : 'off'}
+                </div>
+                <div class="fx-sub cap">
+                  <span>
+                    {d().config
+                      ? d().config!.enabled && d().config!.schedule
+                        ? (describeCron(d().config!.schedule!) ?? d().config!.schedule!)
+                        : 'no schedule'
+                      : 'scheduled by Sp00ky Cloud'}
+                  </span>
+                </div>
+              </FxCell>
+              <FxCell label="Kept" meta={<Show when={failedRecent()}><span class="bad">{failedRecent()} failed</span></Show>}>
+                <div class="fx-big">{formatCount(completed().length)}<small>{completed().length === 1 ? 'backup' : 'backups'}</small></div>
+                <div class="fx-sub cap">
+                  <span><b>{formatBytes(totalBytes())}</b></span>
+                  <Show when={d().config?.retention}><span>newest <b>{formatCount(d().config!.retention)}</b> kept</span></Show>
+                </div>
+              </FxCell>
+              <FxCell label="Stored in" meta={<span>{d().linked ? 'Sp00ky Cloud' : 'bucket listing'}</span>}>
+                <div class="fx-big bk-bucket">{d().s3.bucket ?? '—'}</div>
+                <div class="fx-sub cap"><span>{d().s3.endpoint ?? 'no endpoint'}</span></div>
+              </FxCell>
+            </section>
 
-                  <SchedulePanel linked={d().linked} config={d().config} onSaved={refreshAll} />
-                </>
-            )}
-          </Show>
-        </div>
-      </div>
+            {/* how they have gone, and when they run ========================== */}
+            <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 2fr) minmax(0, 1fr)' }}>
+              <FxCell label="History" meta={<span>size of each backup, oldest left</span>}>
+                <History catalog={d().catalog} />
+              </FxCell>
+              <SchedulePanel linked={d().linked} config={d().config} onSaved={refreshAll} />
+            </section>
+
+            {/* every backup =================================================== */}
+            <section class="fx-row">
+              <FxCell label="Backups" meta={<span><b>{formatCount(d().catalog.length)}</b></span>}>
+                <Show when={d().catalog.length > 0} fallback={<div class="fx-empty cap">No backups yet</div>}>
+                  <table class="fx-list bu-list">
+                    <colgroup>
+                      <col style={{ width: '22%' }} /><col style={{ width: '14%' }} /><col style={{ width: '11%' }} />
+                      <col style={{ width: '12%' }} /><col /><col style={{ width: '200px' }} />
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th class="cap">Backup</th><th class="cap">Taken</th><th class="cap r">Size</th>
+                        <th class="cap r">Snapshot</th><th class="cap">State</th><th class="cap" />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <For each={d().catalog}>
+                        {(c) => {
+                          const size = () => c.local?.size_bytes ?? c.size_bytes;
+                          const live = () => c.status === 'pending' || c.status === 'in_progress';
+                          const tone = () => (c.status === 'failed' ? 'bad' : live() ? 'warn' : c.status === 'deleted' ? 'idle' : '');
+                          return (
+                            <tr classList={{ 'bu-dead': c.status === 'deleted' }}>
+                              <td>
+                                <span class="fx-who">
+                                  <Sq tone={tone()} />
+                                  <span style={{ color: 'var(--ink)' }}>{c.name ?? c.id}</span>
+                                </span>
+                                <Show when={c.name}><span class="vw-meta cap"><span>{c.id}</span></span></Show>
+                              </td>
+                              <td title={formatStamp(c.created_at)}>{relativeStamp(c.created_at)}</td>
+                              <td class="r">{size() ? formatBytes(size()!) : '—'}</td>
+                              <td class="r">{c.snapshot_seq != null ? formatCount(c.snapshot_seq) : '—'}</td>
+                              <td class="bu-state" classList={{ bad: c.status === 'failed', warn: live() }} title={c.error ?? undefined}>
+                                {c.error ?? (live() ? (c.local?.status ?? c.status.replace('_', ' ')) : c.status === 'completed' ? 'completed' : c.status)}
+                              </td>
+                              <td class="r">
+                                <Show when={c.status === 'completed'}>
+                                  <span class="bu-actions">
+                                    <button class="btn btn-sm" title={restoreBlocked()} disabled={!!restoreBlocked()} onClick={() => void restore(c)}>Restore</button>
+                                    <Show when={d().linked}>
+                                      <button class="btn btn-sm" onClick={() => void remove(c)}>Delete</button>
+                                    </Show>
+                                  </span>
+                                </Show>
+                              </td>
+                            </tr>
+                          );
+                        }}
+                      </For>
+                    </tbody>
+                  </table>
+                </Show>
+              </FxCell>
+            </section>
+
+            {/* In memory on this scheduler only, so usually empty. */}
+            <Show when={d().restores.length > 0}>
+              <section class="fx-row">
+                <FxCell label="Restores" meta={<span>since the scheduler started</span>}>
+                  <table class="fx-list">
+                    <thead><tr><th class="cap">From</th><th class="cap">State</th><th class="cap r">Took</th><th class="cap r">Started</th></tr></thead>
+                    <tbody>
+                      <For each={d().restores}>
+                        {(r) => (
+                          <tr class="inc-tr" onClick={() => setWatching({ id: r.restore_id, backupId: r.backup_id })}>
+                            <td><span class="fx-who"><Sq tone={r.status === 'failed' ? 'bad' : r.status === 'queued' || r.status === 'running' ? 'warn' : ''} /><span style={{ color: 'var(--ink)' }}>{r.backup_id}</span></span></td>
+                            <td classList={{ bad: r.status === 'failed', warn: r.status === 'running' || r.status === 'queued' }}>{r.status}</td>
+                            <td class="r">{elapsed(r.started_at ?? r.enqueued_at, r.finished_at)}</td>
+                            <td class="r">{relativeStamp(r.started_at ?? r.enqueued_at)}</td>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </FxCell>
+              </section>
+            </Show>
+          </div>
+        )}
+      </Show>
     </>
+  );
+}
+
+/**
+ * "Back up now", with an optional name: the button opens a small popover so
+ * the name field does not sit in the top bar for the one time in fifty it is
+ * wanted. Enter starts it; Escape closes.
+ */
+function BackupNow(props: { disabled: boolean; reason?: string; name: string; setName: (v: string) => void; onStart: () => void }) {
+  const [open, setOpen] = createSignal(false);
+  let root: HTMLDivElement | undefined;
+  let input: HTMLInputElement | undefined;
+  const onDoc = (e: MouseEvent) => {
+    if (open() && root && !root.contains(e.target as Node)) setOpen(false);
+  };
+  document.addEventListener('mousedown', onDoc);
+  onCleanup(() => document.removeEventListener('mousedown', onDoc));
+  const start = () => {
+    setOpen(false);
+    props.onStart();
+  };
+  return (
+    <div class="fm" ref={root}>
+      <button class="btn btn-sm btn-primary" disabled={props.disabled} title={props.reason}
+        onClick={() => { setOpen(!open()); queueMicrotask(() => input?.focus()); }}>
+        Back up now
+      </button>
+      <Show when={open()}>
+        <div class="fm-pop bu-pop" style={{ left: 'auto', right: '0' }}
+          onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false); if (e.key === 'Enter') start(); }}>
+          <div class="fm-search">
+            <input ref={input} placeholder="Name (optional)" value={props.name} onInput={(e) => props.setName(e.currentTarget.value)} />
+          </div>
+          <div class="bu-pop-foot">
+            <span class="cap">taken from the live database</span>
+            <button class="btn btn-sm btn-primary" onClick={start}>Start</button>
+          </div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/** One bar per backup, oldest left: its size, red where it failed, the newest in the accent. */
+function History(props: { catalog: CatalogEntry[] }) {
+  const items = createMemo(() =>
+    [...props.catalog].filter((c) => c.status !== 'deleted').sort((a, b) => a.created_at.localeCompare(b.created_at)),
+  );
+  const hi = () => Math.max(1, ...items().map((c) => c.size_bytes || 0));
+  const lo = () => Math.min(...items().filter((c) => c.size_bytes).map((c) => c.size_bytes));
+  const day = (iso: string) => new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return (
+    <Show when={items().length} fallback={<div class="fx-empty cap">No backups yet</div>}>
+      <div class="bu-hist">
+        <For each={items()}>
+          {(c, i) => {
+            const failed = c.status === 'failed';
+            // From 40% up, so a few percent of growth is still visible.
+            const h = () => (failed || !c.size_bytes ? 100 : 40 + ((c.size_bytes - lo()) / Math.max(1, hi() - lo())) * 60);
+            return (
+              <span class="bu-col" title={`${c.name ?? c.id} · ${day(c.created_at)} · ${failed ? 'failed' : formatBytes(c.size_bytes)}`}>
+                <i classList={{ failed, live: c.status === 'pending' || c.status === 'in_progress', last: !failed && i() === items().length - 1 }}
+                  style={{ height: `${h()}%` }} />
+              </span>
+            );
+          }}
+        </For>
+      </div>
+      <div class="fx-axis cap">
+        <span>{day(items()[0].created_at)}</span>
+        <span>{formatBytes(lo())} – {formatBytes(hi())}</span>
+        <span>{day(items()[items().length - 1].created_at)}</span>
+      </div>
+    </Show>
   );
 }
 
@@ -480,73 +474,33 @@ function SchedulePanel(props: {
   };
 
   return (
-    <Panel title="Schedule">
+    <FxCell label="Schedule" meta={<Show when={props.config?.last_scheduled_at && !isAbsent(props.config?.last_scheduled_at)}><span>last ran {relativeStamp(props.config!.last_scheduled_at)}</span></Show>}>
       <Show
         when={props.linked}
-        fallback={
-          <div class="bk-unlinked">
-            Scheduled backups need a project linked to Sp00ky Cloud, then{' '}
-            <span class="mono">spky backup configure</span>.
-          </div>
-        }
+        fallback={<div class="fx-empty cap">Scheduled backups need a project linked to Sp00ky Cloud, then spky backup configure</div>}
       >
-        <div class="bk-form">
+        <div class="bu-form">
           <label class="switch">
-            <input
-              type="checkbox"
-              checked={enabled()}
-              onChange={(e) => setEnabled(e.currentTarget.checked)}
-            />
+            <input type="checkbox" checked={enabled()} onChange={(e) => setEnabled(e.currentTarget.checked)} />
             <span class="switch-track" />
-            <span>{enabled() ? 'Scheduled backups on' : 'Scheduled backups off'}</span>
+            <span class="cap">{enabled() ? 'On' : 'Off'}</span>
           </label>
-
-          <div class="bk-fields">
-            <label>
-              <span class="tag field-label">Cron, UTC</span>
-              <input
-                class="mono"
-                value={schedule()}
-                placeholder="0 3 * * *"
-                spellcheck={false}
-                onInput={(e) => setSchedule(e.currentTarget.value)}
-              />
-              <span class="field-hint">
-                <Show when={preview()} fallback="minute hour day month weekday">
-                  {(p) => <>{p()}</>}
-                </Show>
-              </span>
-            </label>
-
-            <label>
-              <span class="tag field-label">Keep</span>
-              <input
-                value={retention()}
-                placeholder="7"
-                inputmode="numeric"
-                onInput={(e) => setRetention(e.currentTarget.value)}
-              />
-              <span class="field-hint">newest backups, empty or 0 keeps all</span>
-            </label>
-          </div>
-
-          <div class="bk-form-foot">
-            <span class="field-hint">
-              <Show when={props.config?.last_scheduled_at && !isAbsent(props.config?.last_scheduled_at)}>
-                Last scheduled run {relativeStamp(props.config!.last_scheduled_at)}
-              </Show>
-            </span>
-            <button
-              class="btn btn-primary"
-              disabled={!dirty() || saving()}
-              onClick={() => void save()}
-            >
-              Save
-            </button>
-          </div>
+          <label class="li-field">
+            <span>Cron, UTC</span>
+            <input class="mono" value={schedule()} placeholder="0 3 * * *" spellcheck={false} onInput={(e) => setSchedule(e.currentTarget.value)} />
+            <small class="cap">{preview() ?? 'minute hour day month weekday'}</small>
+          </label>
+          <label class="li-field">
+            <span>Keep</span>
+            <input value={retention()} placeholder="7" inputmode="numeric" onInput={(e) => setRetention(e.currentTarget.value)} />
+            <small class="cap">newest backups · empty or 0 keeps all</small>
+          </label>
+          <button class="btn btn-sm btn-primary bu-save" disabled={!dirty() || saving()} onClick={() => void save()}>
+            {saving() ? 'Saving…' : 'Save'}
+          </button>
         </div>
       </Show>
-    </Panel>
+    </FxCell>
   );
 }
 
@@ -602,7 +556,7 @@ function RestoreProgress(props: {
     st()?.stage === 'failed' && !!local()?.main_db_restored && !local()?.replica_restored;
 
   return (
-    <Show when={!err()} fallback={<div class="panel"><Empty>{err()}</Empty></div>}>
+    <Show when={!err()} fallback={<div class="fx-log bad"><span class="fx-what">{err()}</span></div>}>
       <div class="opc-grid">
         <OpCard
           view={{

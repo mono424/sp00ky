@@ -209,82 +209,68 @@ when it cannot get a machine.
   caption="Your own services, their resolved health-check URLs and response times."
 />
 
-**Workflows** — runs updating in real time, and a run page built around a
-timeline: every step plotted on one shared axis, so where the time went is
-visible at a glance rather than reconstructed from timestamps. Each row in the
-list carries the run's own failure reason, so four `failed` runs do not cost
-four clicks to tell one problem from four. Click a step to expand its job,
-output and error inline. A step still waiting on its dependencies is drawn
-hatched at the origin rather than as a bar, because it has not run. The
-scheduler runs a single shared poller behind the live list, so ten open
-dashboards cost your database exactly what one does, and a closed one costs
-nothing.
+**Runs** — schedules, workflow runs and jobs on one page, because they are one
+machine seen from three sides: a schedule fires either a job (a row in an outbox
+table that a backend runs at a path) or a workflow run, and every step of a
+workflow run is itself a job. On separate pages one failure showed up three
+times; here it shows up once.
 
 <Screenshot
-  src="/docs/admin/workflows.png"
-  caption="Runs updating live, each carrying its own failure reason."
+  src="/docs/admin/runs.png"
+  caption="What is running and waiting, every schedule with its last fires, every run, and the queues."
 />
 
-An expanded step also loads its **job**, which is where a failure says what
-actually happened: the step row keeps only the attempt that ended the job, while
-the job's `errors` array keeps every attempt. A step that failed after two
-timeouts and a 502 is a different problem from one that 502'd immediately, and
-only the job can tell them apart. The job is fetched per opened step rather than
-with the run, so a fan-out run with hundreds of steps costs nothing extra.
+Top to bottom:
 
-**Schedules** — the definition, the next fire, recent fires, and a
-success/failure tally. The tally comes from `_00_run_rollup` rather than
-counting run rows, so it stays accurate after retention has pruned them. Each
-fire shows **why** it ended as it did, and a schedule whose fires are being
-suppressed says so at the top of the page, naming the run that is holding the
-key — a wall of `skipped` rows looks like "nothing to do" and means "something
-is still running".
+- **The numbers**: running, waiting (with the oldest wait), jobs done per minute,
+  and failures in the last hour. **Stalled** is called out separately from
+  running: a `processing` row whose lease has expired, meaning nobody is working
+  on it and a recovery sweep will reclaim it on its own clock.
+- **Schedules**: each one's cadence in words, its last twelve fires as squares
+  (red where a fire failed; click one to open what it ran), the last and next
+  fire, and **Run now** and **Pause** on hover.
+- **Runs**: everything that executed, running and waiting first. A workflow run
+  is one row and its step jobs live inside it; a job of its own (from a
+  `kind: job` schedule, a durable instance, or your own code, which belongs to
+  no schedule and no workflow) is one row. Each row carries its failure reason,
+  so four failed runs do not cost four clicks to tell one problem from four.
+  **Filter** by status, kind, what started it, schedule or queue, or search by
+  name, id or error. A filter the scheduler can answer is pushed into SurrealQL
+  rather than applied to the page already fetched, so failures on a busy table
+  are found even when they are older than the newest page.
+- **Queues**: one row per outbox table, running against its `_00_job_policy`
+  concurrency, its pace, what waits and what failed.
+
+A run, job or schedule opens in a sheet beside the list. The sheet is part of
+the address (`/admin/runs?open=run:<id>`, `job:<id>`, `schedule:<name>`), so it
+survives a reload, and the old `/admin/jobs/<id>`, `/admin/workflows/<id>` and
+`/admin/schedules/<name>` links land on it.
 
 <Screenshot
-  src="/docs/admin/schedules.png"
-  caption="Definitions, cadence, last outcome and next fire."
+  src="/docs/admin/run.png"
+  caption="A failed run: its steps on one time axis, the step that failed and why."
 />
 
-**Jobs** — every outbox job in one list, whatever created it. This is the only
-place two whole classes of work are visible at all: a `kind: job` schedule's
-fires, and jobs your own code created, which belong to no schedule and no
-workflow. Each row says where it came from, and links back to the schedule or
-the workflow step when the owning run still exists — a terminal run is pruned on
-its own retention window well before the jobs that outlived it, so "scheduled
-work whose fire has aged out" and "a job nobody can account for" are deliberately
-not drawn the same.
+- A **workflow run** draws every step on the run's own time axis, so where the
+  time went is visible at a glance. A step still waiting on its dependencies is
+  a dashed line rather than a bar, because it has not run. Click a step to open
+  its **job**, which is where a failure says what actually happened: the step
+  row keeps only the attempt that ended the job, while the job keeps every
+  attempt.
+- A **schedule** shows its definition, the last 24 hours of outcomes, recent
+  fires with why each ended as it did, and any quarantined keys with a way to
+  release them. The tally comes from `_00_run_rollup` rather than counting run
+  rows, so it stays accurate after retention has pruned them.
 
-The top of the page is the queue itself: a **Queue depth** tile with the pending
-count and its history from the sampler, throughput, failures in the last hour,
-in-flight and succeeded beside it, then **Queues**, one lane per outbox table
-drawn on a shared scale (in flight, stalled, pending and failed as segments,
-a tick where the table's concurrency sits). Clicking a lane's name filters the
-list below to that table.
+The scheduler runs one shared poller behind the live run list and one job
+sampler behind the queue figures, so ten open dashboards cost your database
+exactly what one does, and a closed one costs nothing. Counts cover work in
+flight plus the last hour of terminal work, never all of history: once
+retention keeps failures longer than successes, an all-time ratio reports a
+failure rate that climbs as successes age out. A bounded window is the only
+honest denominator, and it is the one `spky jobs` uses too.
 
-<Screenshot
-  src="/docs/admin/jobs.png"
-  caption="Queue depth, throughput and failures, then one lane per outbox table."
-/>
-
-Filter with the chips by origin (`schedule`, `workflow`, `app`), by status, by
-table, or by a substring of the path. The filter is pushed into SurrealQL rather than applied to
-the page that was already fetched, so asking for application jobs on a busy table
-returns them instead of reporting none.
-
-The tiles above the list are the queue itself: pending depth with the age of the
-oldest one, in-flight against each table's `_00_job_policy` concurrency ceiling,
-failures over the last hour, and jobs succeeded per minute. **Stalled** is called
-out separately from in-flight and is worth knowing: it is a `processing` row
-whose lease has expired, meaning nobody is working on it and a recovery sweep
-will reclaim it on its own clock. The schema has no status for that state, which
-is exactly why it earns a name here.
-
-Counts cover work in flight plus the last hour of terminal work, never all of
-history. Once retention keeps failures longer than successes, an all-time ratio
-reports a failure rate that climbs as successes age out; a bounded window is the
-only honest denominator, and it is the one `spky jobs` uses too.
-
-<Note title="What the Jobs page costs your database">
+<Note title="What the Runs page costs your database">
   Every job aggregate is a scan of one of your own tables, so the scheduler takes them <em>once</em>
   , in a single sampler that every reader serves from — the same bargain the presence sampler
   strikes. It reads every 15 seconds while nobody has the page open and every 2 seconds while
@@ -292,7 +278,7 @@ only honest denominator, and it is the one `spky jobs` uses too.
   Tune both with <code>SPKY_ADMIN_JOB_INTERVAL_SECS</code> and
   <code>SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS</code>, or set the first to <code>0</code>
   to switch the sampler off entirely: the list and its filters still work, the totals and the
-  Overview tile then say they are not being measured rather than showing zeros.
+  Overview then say they are not being measured rather than showing zeros.
 </Note>
 
 **Logs** — a live tail of the scheduler's or any SSP's log output, with level

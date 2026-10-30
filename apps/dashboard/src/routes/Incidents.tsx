@@ -2,7 +2,8 @@ import { For, Show, createMemo, createResource, createSignal, onCleanup, type Ac
 import { A, useNavigate, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import type { PublicationMetrics } from '../api/types';
-import { Chevron, Chips, Empty, KeyValue, PageHead, Panel, SkeletonList, Stale, StatCard } from '../components/Chrome';
+import { PageHead, Stale } from '../components/Chrome';
+import { FilterMenu, FxCell, Sq, type FilterValue } from '../components/Frame';
 import { decodeParam, formatBytes, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
 import { readStash, writeStash } from '../lib/stash';
 
@@ -54,7 +55,6 @@ const RANGES: { key: string; label: string; ms: number }[] = [
 ];
 const STATES = ['open', 'recovered', 'interrupted', 'failed', 'recorded'];
 const label = (value: string) => value.replace(/_/g, ' ');
-const sentence = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
 const stamp = (value: number) => new Date(value).toLocaleString();
 const clock = (value: number) =>
   new Date(value).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -93,50 +93,94 @@ function usePoll<T>(path: Accessor<string>, stash?: string) {
   };
 }
 
-/** One open incident: what broke, the latest word on it, how long so far. */
-function OpenRow(props: { incident: Incident; now: number }) {
-  const last = () => props.incident.events[props.incident.events.length - 1];
+/** The square's tone for an incident: amber while it is open, red when it failed. */
+const sq = (i: Incident) =>
+  i.state === 'failed' ? 'bad' : i.state === 'open' || i.state === 'interrupted' ? 'warn' : i.severity === 'info' ? 'idle' : '';
+
+/** The time axis for a range, in whole steps: every 6 h, every day, every 5 days. */
+const axisFor = (ms: number) => {
+  const h = ms / 3_600_000;
+  const step = h <= 24 ? 6 : h <= 7 * 24 ? 24 : 5 * 24;
+  const out: string[] = [];
+  for (let v = h; v > 0.01; v -= step) out.push(v >= 48 ? `-${Math.round(v / 24)}d` : `-${Math.round(v)}h`);
+  out.push('now');
+  return out;
+};
+
+/**
+ * Every incident of the range on one time axis, one lane per component:
+ * where things broke, when, and for how long. A bar is clickable; open ones
+ * run to the now line.
+ */
+function Lanes(props: { incidents: Incident[]; from: number; now: number; span: number; onPick: (i: Incident) => void }) {
+  const lanes = createMemo(() => {
+    const by = new Map<string, Incident[]>();
+    for (const i of props.incidents) {
+      const list = by.get(i.component) ?? [];
+      list.push(i);
+      by.set(i.component, list);
+    }
+    return [...by.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  });
+  const x = (t: number) => Math.max(0, Math.min(100, ((t - props.from) / props.span) * 100));
   return (
-    <li>
-      <A href={`/incidents/${encodeURIComponent(props.incident.id)}`} class="list-item warn">
-        <span class="list-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16"><path d="M8 2.8 14 13H2zM8 6.6v3M8 11.4h.01" /></svg>
-        </span>
-        <span class="list-text">
-          <span class="list-title">
-            <span class="mono">{props.incident.component}</span> {label(props.incident.kind)}
-          </span>
-          <Show when={last()?.summary}>
-            <span class="list-detail">{last()!.summary}</span>
-          </Show>
-        </span>
-        <span class="list-meta" title={`since ${stamp(props.incident.started_at)}`}>
-          {duration(props.incident, props.now)} ongoing
-        </span>
-        <Chevron />
-      </A>
-    </li>
+    <div class="inc-lanes">
+      <For each={lanes()} fallback={<div class="fx-empty cap">Nothing happened in this range</div>}>
+        {([component, items]) => (
+          <div class="inc-lane">
+            <span class="inc-lane-name mono">{component}</span>
+            <div class="inc-lane-track">
+              <For each={items}>
+                {(i) => {
+                  const left = () => x(i.started_at);
+                  const width = () => x(i.ended_at ?? props.now) - left();
+                  return (
+                    <button
+                      class={`inc-bar ${sq(i)}`}
+                      classList={{ live: i.state === 'open', point: i.ended_at === i.started_at }}
+                      style={{ left: `${left()}%`, width: `${width()}%` }}
+                      title={`${i.component} ${label(i.kind)} · ${label(i.state)} · ${duration(i, props.now)}\n${stamp(i.started_at)}`}
+                      onClick={() => props.onPick(i)}
+                    />
+                  );
+                }}
+              </For>
+            </div>
+          </div>
+        )}
+      </For>
+      <div class="inc-lane inc-lane-axis">
+        <span />
+        <div class="fx-axis cap">
+          <For each={axisFor(props.span)}>{(a) => <span>{a}</span>}</For>
+        </div>
+      </div>
+    </div>
   );
 }
 
 export function Incidents() {
   const navigate = useNavigate();
   const [range, setRange] = createSignal('7d');
-  const [state, setState] = createSignal('');
-  const [component, setComponent] = createSignal('');
+  const [filters, setFilters] = createSignal<FilterValue>({});
+  const states = () => filters().state ?? [];
+  const comps = () => filters().component ?? [];
   const [search, setSearch] = createSignal('');
   const [shown, setShown] = createSignal(60);
 
+  const span = () => RANGES.find((x) => x.key === range())?.ms ?? RANGES[1].ms;
   const since = createMemo(() => {
-    const r = RANGES.find((x) => x.key === range());
     // Re-evaluated with the range only: the window's edge moving a few
     // seconds per poll is not worth a new resource key.
-    return r ? Date.now() - r.ms : 0;
+    return Date.now() - span();
   });
   const path = createMemo(() => `/incidents?limit=${WINDOW}${since() ? `&since=${since()}` : ''}`);
   const poll = usePoll<IncidentList>(path, `incidents:${range()}`);
   const now = () => poll.data()?.server_time_ms ?? Date.now();
-  const all = () => poll.data()?.incidents ?? [];
+  // The scheduler's clock bounds the chart, so a skewed browser clock does not
+  // push the history off its own axis.
+  const from = () => now() - span();
+  const all = () => (poll.data()?.incidents ?? []).filter((i) => (i.ended_at ?? now()) >= from());
   // Open episodes lead the page; the history below is everything that ended.
   const open = createMemo(() => all().filter((i) => i.state === 'open'));
   const past = createMemo(() => all().filter((i) => i.state !== 'open'));
@@ -144,18 +188,24 @@ export function Incidents() {
   const components = createMemo(() => {
     const seen = new Map<string, number>();
     for (const i of past()) seen.set(i.component, (seen.get(i.component) ?? 0) + 1);
-    return [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    return [...seen.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   });
   const stateCounts = createMemo(() => {
     const counts: Record<string, number> = {};
     for (const i of past()) counts[i.state] = (counts[i.state] ?? 0) + 1;
     return counts;
   });
+  // Recovery: how long the ones that recovered took, typically and at worst.
+  const recovered = createMemo(() =>
+    past().filter((i) => i.state === 'recovered' && i.ended_at != null).map((i) => i.ended_at! - i.started_at).sort((a, b) => a - b),
+  );
+  const median = () => (recovered().length ? recovered()[Math.floor(recovered().length / 2)] : null);
+  const longest = () => (recovered().length ? recovered()[recovered().length - 1] : null);
   const filtered = createMemo(() => {
     const q = search().trim().toLowerCase();
     return past().filter((i) =>
-      (!state() || i.state === state()) &&
-      (!component() || i.component === component()) &&
+      (!states().length || states().includes(i.state)) &&
+      (!comps().length || comps().includes(i.component)) &&
       (!q || `${i.component} ${i.kind} ${i.severity} ${i.events.map((e) => e.summary).join(' ')}`.toLowerCase().includes(q)));
   });
   const groups = createMemo(() => {
@@ -168,93 +218,134 @@ export function Incidents() {
     }
     return out;
   });
-  const reset = () => { setState(''); setComponent(''); setSearch(''); setShown(60); };
-  const filtering = () => !!(state() || component() || search().trim());
+  const reset = () => { setFilters({}); setSearch(''); setShown(60); };
+  const filtering = () => !!(states().length || comps().length || search().trim());
   const go = (i: Incident) => navigate(`/incidents/${encodeURIComponent(i.id)}`);
 
   return <>
     <PageHead title="Incidents"
-      actions={<><Stale when={poll.stale()} /><A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
-        <button class="btn btn-sm" onClick={poll.refresh} disabled={poll.loading()}>Refresh</button></>} />
-    <div class="page-body page-stack">
-      <Show when={poll.error()}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
-      <Show when={poll.data()?.storage_error}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
+      actions={<>
+        <Stale when={poll.stale()} />
+        <div class="fx-range" role="group" aria-label="Range">
+          <For each={RANGES}>{(r) => (
+            <button classList={{ on: range() === r.key }} aria-pressed={range() === r.key}
+              onClick={() => { setRange(r.key); setShown(60); }}>{r.key}</button>
+          )}</For>
+        </div>
+        <A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
+      </>} />
 
-      <Show when={poll.data()}>
-        <Show when={open().length} fallback={
-          <div class="list"><div class="list-item ok">
-            <span class="list-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m4 8.4 2.6 2.6L12 5.4" /></svg></span>
-            <span class="list-text">
-              <span class="list-title">Nothing open</span>
-              <span class="list-detail">{all().length
-                ? `Last incident ${formatRelativeTime(all()[0].started_at)}`
-                : 'No incidents in this range.'}</span>
-            </span>
-          </div></div>
-        }>
-          <section class="inc-open">
-            <h2 class="inc-h">{open().length} open</h2>
-            <ul class="list"><For each={open()}>{(i) => <OpenRow incident={i} now={now()} />}</For></ul>
+    <Show when={poll.error() || poll.data()?.storage_error}>
+      {(error) => <section class="fx-row"><div class="fx-cell"><div class="fx-log bad" role="alert"><span class="fx-what">{error()}</span></div></div></section>}
+    </Show>
+
+    <Show when={poll.data()} fallback={<Show when={!poll.error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+      <div class="fx-page">
+        {/* when and where, and how it is going */}
+        <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 2fr) minmax(0, 1fr)' }}>
+          <FxCell label="Timeline" meta={<span><b>{formatCount(all().length)}</b> in {RANGES.find((r) => r.key === range())?.label}</span>}>
+            <Lanes incidents={all()} from={from()} now={now()} span={span()} onPick={go} />
+          </FxCell>
+          <FxCell label="Open now" meta={<Show when={all().length}><span>last {formatRelativeTime(all()[0].started_at - (now() - Date.now()))}</span></Show>}>
+            <div class="fx-big" classList={{ 'inc-open-n': open().length > 0 }}>{open().length}</div>
+            <div class="fx-foot inc-facts">
+              <div><span class="cap">Recovered</span><b>{stateCounts().recovered ?? 0}</b></div>
+              <div><span class="cap">Failed</span><b classList={{ bad: (stateCounts().failed ?? 0) > 0 }}>{stateCounts().failed ?? 0}</b></div>
+              <div><span class="cap">Typical fix</span><b>{median() != null ? formatDuration(median()!) : '—'}</b></div>
+              <div><span class="cap">Longest</span><b>{longest() != null ? formatDuration(longest()!) : '—'}</b></div>
+            </div>
+          </FxCell>
+        </section>
+
+        {/* what is wrong right now */}
+        <Show when={open().length}>
+          <section class="fx-row">
+            <FxCell label="Open" meta={<span class="warn">{open().length} ongoing</span>}>
+              <For each={open()}>{(i) => {
+                const last = () => i.events[i.events.length - 1];
+                return (
+                  <div class="fx-log" classList={{ bad: i.severity === 'error' || i.severity === 'critical' }}>
+                    <span class="cap" title={stamp(i.started_at)}>{clock(i.started_at)}</span>
+                    <span class="fx-what">
+                      {i.component} · {label(i.kind)}{last()?.summary ? <em> · {last()!.summary}</em> : null}
+                    </span>
+                    <span class="cap">{duration(i, now())}</span>
+                    <A class="btn btn-sm" href={`/incidents/${encodeURIComponent(i.id)}`}>Open</A>
+                  </div>
+                );
+              }}</For>
+            </FxCell>
           </section>
         </Show>
-      </Show>
 
-      <Panel flush>
-        <div class="toolbar inc-toolbar">
-          <h2 class="inc-h">History</h2>
-          <div class="toolbar-groups">
-            <Chips value={range()} label="Range" onChange={(k) => { setRange(k); setShown(60); }}
-              options={RANGES.map((r) => ({ key: r.key, label: r.label }))} />
-            <Show when={Object.keys(stateCounts()).length > 1}>
-              <Chips value={state()} label="State" onChange={(k) => { setState(k); setShown(60); }}
-                options={[{ key: '', label: 'All' },
-                  ...STATES.filter((s) => stateCounts()[s]).map((s) => ({ key: s, label: label(s), count: stateCounts()[s], tone: tone(s) }))]} />
-            </Show>
-            <Show when={components().length > 1}>
-              <Chips value={component()} label="Component" onChange={(k) => { setComponent(k); setShown(60); }}
-                options={[{ key: '', label: 'All' }, ...components().map(([c, n]) => ({ key: c, label: c, count: n }))]} />
-            </Show>
-          </div>
-          <div class="row inc-search">
-            <input type="search" placeholder="Search" value={search()} onInput={(e) => { setSearch(e.currentTarget.value); setShown(60); }} aria-label="Search incidents" />
-            <Show when={filtering()}><button type="button" class="btn btn-sm" onClick={reset}>Clear</button></Show>
-          </div>
-        </div>
-
-        <Show when={poll.data()} fallback={<Show when={!poll.error()}><SkeletonList rows={7} /></Show>}>
-          <Show when={filtered().length} fallback={<Empty>{filtering() ? 'Nothing matches these filters.' : 'Nothing has ended in this range.'}</Empty>}>
-            <div class="inc-feed" aria-busy={poll.loading()}>
-              <For each={groups()}>{(group) => <>
-                <div class="inc-day">{group.day}</div>
-                <For each={group.items}>{(incident) => {
-                  const last = incident.events[incident.events.length - 1];
-                  return <div class="inc-row" role="link" tabIndex={0} onClick={() => go(incident)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') go(incident); }}>
-                    <span class="inc-time" title={stamp(incident.started_at)}>{clock(incident.started_at)}</span>
-                    <span class={`inc-dot ${tone(incident.state)}`} title={label(incident.state)} />
-                    <span class="inc-text">
-                      <span class="inc-title"><span class="mono">{incident.component}</span> {label(incident.kind)}</span>
-                      <Show when={last?.summary}><span class="inc-summary">{last!.summary}</span></Show>
-                    </span>
-                    <span class="inc-meta">
-                      <span classList={{ [`inc-state-${tone(incident.state)}`]: true }}>{label(incident.state)}</span>
-                      <span>{duration(incident, now())}</span>
-                    </span>
-                  </div>;
-                }}</For>
-              </>}</For>
-            </div>
-            <Show when={filtered().length > shown() || (poll.data()?.total ?? 0) > all().length}>
-              <div class="inc-more">
-                <span aria-live="polite">{Math.min(shown(), filtered().length)} of {formatCount(filtered().length)}
-                  <Show when={(poll.data()?.total ?? 0) > all().length}>, newest {WINDOW} of {formatCount(poll.data()!.total)} loaded</Show></span>
-                <Show when={filtered().length > shown()}><button class="btn btn-sm" onClick={() => setShown(shown() + 60)}>Show more</button></Show>
+        {/* everything that ended */}
+        <section class="fx-row">
+          <FxCell label="History" meta={<span><b>{formatCount(filtered().length)}</b>{filtering() ? ` of ${formatCount(past().length)}` : ''}</span>}>
+            <div class="inc-filters">
+              <FilterMenu
+                value={filters()}
+                onChange={(v) => { setFilters(v); setShown(60); }}
+                fields={[
+                  {
+                    key: 'state',
+                    label: 'State',
+                    options: STATES.filter((x) => stateCounts()[x]).map((x) => ({
+                      value: x,
+                      label: label(x),
+                      count: stateCounts()[x],
+                      tone: x === 'failed' ? 'bad' : x === 'interrupted' ? 'warn' : x === 'recorded' ? 'idle' : '',
+                    })),
+                  },
+                  {
+                    key: 'component',
+                    label: 'Component',
+                    options: components().map(([c, n]) => ({ value: c, label: c, count: n })),
+                  },
+                ]}
+              />
+              <div class="inc-find">
+                <input type="search" placeholder="Search" value={search()} onInput={(e) => { setSearch(e.currentTarget.value); setShown(60); }} aria-label="Search incidents" />
+                <Show when={filtering()}><button type="button" class="btn btn-sm" onClick={reset}>Clear all</button></Show>
               </div>
+            </div>
+
+            <Show when={filtered().length} fallback={<div class="fx-empty cap">{filtering() ? 'Nothing matches these filters' : 'Nothing has ended in this range'}</div>}>
+              <table class="fx-list inc-list" aria-busy={poll.loading()}>
+                <colgroup>
+                  <col style={{ width: '9%' }} /><col style={{ width: '14%' }} /><col style={{ width: '17%' }} />
+                  <col /><col style={{ width: '11%' }} /><col style={{ width: '9%' }} />
+                </colgroup>
+                <For each={groups()}>{(group) => (
+                  <tbody>
+                    <tr class="fx-gh"><th class="cap" colSpan={6}><span class="fx-gt">{group.day}</span><span>{group.items.length}</span></th></tr>
+                    <For each={group.items}>{(i) => {
+                      const last = i.events[i.events.length - 1];
+                      return (
+                        <tr class="inc-tr" role="link" tabIndex={0} onClick={() => go(i)} onKeyDown={(e) => { if (e.key === 'Enter') go(i); }}>
+                          <td title={stamp(i.started_at)}>{clock(i.started_at)}</td>
+                          <td><span class="fx-who"><Sq tone={sq(i)} /><span style={{ color: 'var(--ink)' }}>{i.component}</span></span></td>
+                          <td>{label(i.kind)}</td>
+                          <td class="inc-sum">{last?.summary ?? ''}</td>
+                          <td><span class="cap" classList={{ warn: sq(i) === 'warn', bad: sq(i) === 'bad' }}>{label(i.state)}</span></td>
+                          <td class="r">{i.ended_at === i.started_at ? '·' : duration(i, now())}</td>
+                        </tr>
+                      );
+                    }}</For>
+                  </tbody>
+                )}</For>
+              </table>
+              <Show when={filtered().length > shown() || (poll.data()?.total ?? 0) > (poll.data()?.incidents.length ?? 0)}>
+                <div class="inc-pager cap">
+                  <span aria-live="polite">{Math.min(shown(), filtered().length)} of {formatCount(filtered().length)}
+                    <Show when={(poll.data()?.total ?? 0) > (poll.data()?.incidents.length ?? 0)}>, newest {WINDOW} of {formatCount(poll.data()!.total)} loaded</Show></span>
+                  <Show when={filtered().length > shown()}><button class="btn btn-sm" onClick={() => setShown(shown() + 60)}>Show more</button></Show>
+                </div>
+              </Show>
             </Show>
-          </Show>
-        </Show>
-      </Panel>
-    </div>
+          </FxCell>
+        </section>
+      </div>
+    </Show>
   </>;
 }
 
@@ -263,66 +354,93 @@ export function IncidentDetail() {
   const path = createMemo(() => `/incidents/${encodeURIComponent(decodeParam(params.id))}`);
   const poll = usePoll<{ incident: Incident }>(path);
   return <>
-    <PageHead title={poll.data()?.incident.component ?? 'Incident'}
-      subtitle={poll.data() ? `${label(poll.data()!.incident.kind)}, started ${stamp(poll.data()!.incident.started_at)}` : undefined}
-      actions={<><A class="btn btn-sm" href="/incidents">All incidents</A><A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>
-        <button class="btn btn-sm" onClick={poll.refresh} disabled={poll.loading()}>Refresh</button></>} />
-    <div class="page-body page-stack">
-      <Show when={poll.error()}>{(error) => <div class="banner" role="alert"><span class="dot bad" />{error()}</div>}</Show>
-      <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><Panel flush><SkeletonList rows={4} /></Panel></Show>}>
-        {(incident) => <>
-          <Show when={incident().state === 'interrupted'}><div class="banner"><span class="dot warn" />The scheduler restarted before recovery was seen.</div></Show>
-          <div class="stat-grid">
-            <StatCard label="State" value={sentence(label(incident().state))} tone={tone(incident().state)} note={incident().severity} />
-            <StatCard label="Duration" value={duration(incident(), Date.now())}
-              note={incident().ended_at == null ? 'still open' : `ended ${stamp(incident().ended_at!)}`} />
-            <StatCard label="Events" value={formatCount(incident().event_count)} />
-            <Show when={incident().max_buffered_events > 0}>
-              <StatCard label="Peak buffered" value={formatCount(incident().max_buffered_events)} note="waiting for replay" />
-            </Show>
-          </div>
-          <Show when={incident().publication}>{(publication) => <Panel title="Publication backlog" sub="Sampled from SSP heartbeats; peaks may fall between samples.">
-            <KeyValue rows={[
-              ['Peak pending operations', formatCount(incident().max_publication_operations)],
-              ['Peak pending bytes', formatBytes(incident().max_publication_bytes)],
-              ['Longest wait', formatDuration(incident().max_publication_age_ms ?? 0)],
-              ['Parked batches', formatCount(publication().parked_batches)],
-              ['Last publication', publication().last_success_at_ms == null ? 'Not reported' : stamp(publication().last_success_at_ms!)],
-              ['Overload rejections', formatCount(publication().overload_total)],
-            ]} />
-            <Show when={publication().connection}>{(connection) => <KeyValue rows={[
-              ['Session generation', formatCount(connection().generation)],
-              ['Last reconnect', connection().last_reconnect_duration_ms == null ? 'None' : formatDuration(connection().last_reconnect_duration_ms!)],
-              ['Failed reconnects', formatCount(connection().reconnect_failures)],
-            ]} />}</Show>
-            <Show when={publication().worst_views.length}>
-              <div class="table-scroll"><table><thead><tr><th>View</th><th>Pending ops</th><th>Pending bytes</th><th>Oldest wait</th></tr></thead>
-                <tbody><For each={publication().worst_views}>{(view) => <tr>
-                  <td><A class="mono" href={`/views/${encodeURIComponent(view.query_id)}`}>{view.query_id}</A></td>
-                  <td>{formatCount(view.pending_operations)}</td><td>{formatBytes(view.pending_bytes)}</td><td>{formatDuration(view.oldest_age_ms)}</td>
-                </tr>}</For></tbody></table></div>
-            </Show>
-          </Panel>}</Show>
-          <Panel title="Timeline" sub={incident().events.length < incident().event_count
-            ? `${incident().events.length} of ${formatCount(incident().event_count)} events kept, oldest first`
-            : 'Oldest first'}>
-            <Show when={incident().events.length} fallback={<Empty>No events kept.</Empty>}>
-              <ol class="inc-tl">
-                <For each={incident().events}>{(event) => <li class="inc-tl-item">
-                  <span class={`inc-dot ${tone(event.state)}`} />
-                  <div class="inc-tl-body">
-                    <div class="inc-tl-head"><span class="inc-tl-state">{label(event.state)}</span>
-                      <time class="inc-tl-time" dateTime={new Date(event.at).toISOString()}>{stamp(event.at)}</time></div>
-                    <div class="inc-tl-text">{event.summary}</div>
-                    <div class="inc-tl-meta id">{event.component} · {label(event.kind)} · v{event.version}
-                      {event.operation_id ? ` · operation ${event.operation_id}` : ''}</div>
-                  </div>
-                </li>}</For>
-              </ol>
-            </Show>
-          </Panel>
-        </>}
-      </Show>
-    </div>
+    <PageHead crumb="Incidents" title={poll.data() ? `${poll.data()!.incident.component} ${label(poll.data()!.incident.kind)}` : 'Incident'}
+      actions={<A class="btn btn-sm" href="/logs?source=scheduler">Scheduler logs</A>} />
+
+    <Show when={poll.error()}>
+      {(error) => <section class="fx-row"><div class="fx-cell"><div class="fx-log bad" role="alert"><span class="fx-what">{error()}</span></div></div></section>}
+    </Show>
+
+    <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+      {(incident) => {
+        const ended = () => incident().ended_at != null;
+        return <div class="fx-page">
+          {/* the four facts */}
+          <section class="fx-row" style={{ 'grid-template-columns': 'repeat(4, minmax(0, 1fr))' }}>
+            <FxCell label="State" meta={<span>{incident().severity}</span>}>
+              <div class="fx-big inc-state">
+                <Sq tone={sq(incident())} />
+                <span classList={{ warn: sq(incident()) === 'warn', bad: sq(incident()) === 'bad' }}>{label(incident().state)}</span>
+              </div>
+            </FxCell>
+            <FxCell label="Duration" meta={<span>{ended() ? 'ended' : 'still open'}</span>}>
+              <div class="fx-big">{duration(incident(), Date.now())}</div>
+              <div class="fx-sub cap"><span>since <b>{stamp(incident().started_at)}</b></span></div>
+            </FxCell>
+            <FxCell label="Events">
+              <div class="fx-big">{formatCount(incident().event_count)}</div>
+              <Show when={incident().events.length < incident().event_count}>
+                <div class="fx-sub cap"><span><b>{incident().events.length}</b> kept</span></div>
+              </Show>
+            </FxCell>
+            <FxCell label="Peak buffered">
+              <div class="fx-big">{incident().max_buffered_events > 0 ? formatCount(incident().max_buffered_events) : '—'}</div>
+              <div class="fx-sub cap"><span>events waiting for replay</span></div>
+            </FxCell>
+          </section>
+
+          <Show when={incident().state === 'interrupted'}>
+            <section class="fx-row"><div class="fx-cell"><div class="fx-log"><span class="fx-what">The scheduler restarted before recovery was seen</span></div></div></section>
+          </Show>
+
+          {/* what was stuck, for a publication incident */}
+          <Show when={incident().publication}>{(publication) => (
+            <section class="fx-row">
+              <FxCell label="Publication backlog" meta={<span>sampled from SSP heartbeats</span>}>
+                <div class="fx-foot inc-facts wide">
+                  <div><span class="cap">Peak operations</span><b>{formatCount(incident().max_publication_operations)}</b></div>
+                  <div><span class="cap">Peak bytes</span><b>{formatBytes(incident().max_publication_bytes)}</b></div>
+                  <div><span class="cap">Longest wait</span><b>{formatDuration(incident().max_publication_age_ms ?? 0)}</b></div>
+                  <div><span class="cap">Parked batches</span><b>{formatCount(publication().parked_batches)}</b></div>
+                  <div><span class="cap">Overload rejects</span><b>{formatCount(publication().overload_total)}</b></div>
+                  <div><span class="cap">Last published</span><b>{publication().last_success_at_ms == null ? '—' : clock(publication().last_success_at_ms!)}</b></div>
+                </div>
+                <Show when={publication().worst_views.length}>
+                  <table class="fx-list" style={{ 'margin-top': '22px' }}>
+                    <thead><tr><th class="cap">View</th><th class="cap r">Pending ops</th><th class="cap r">Pending bytes</th><th class="cap r">Oldest wait</th></tr></thead>
+                    <tbody><For each={publication().worst_views}>{(view) => <tr>
+                      <td><A href={`/views/${encodeURIComponent(view.query_id)}`} style={{ color: 'var(--ink)' }}>{view.query_id}</A></td>
+                      <td class="r">{formatCount(view.pending_operations)}</td><td class="r">{formatBytes(view.pending_bytes)}</td><td class="r">{formatDuration(view.oldest_age_ms)}</td>
+                    </tr>}</For></tbody>
+                  </table>
+                </Show>
+              </FxCell>
+            </section>
+          )}</Show>
+
+          {/* what happened, in order */}
+          <section class="fx-row">
+            <FxCell label="Timeline" meta={<span>oldest first</span>}>
+              <Show when={incident().events.length} fallback={<div class="fx-empty cap">No events kept</div>}>
+                <table class="fx-list inc-list">
+                  <colgroup><col style={{ width: '16%' }} /><col style={{ width: '12%' }} /><col /><col style={{ width: '24%' }} /></colgroup>
+                  <thead><tr><th class="cap">Time</th><th class="cap">State</th><th class="cap">What happened</th><th class="cap r">Version</th></tr></thead>
+                  <tbody><For each={incident().events}>{(event) => (
+                    <tr>
+                      <td title={stamp(event.at)}>{new Date(event.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}</td>
+                      <td><span class="fx-who"><Sq tone={tone(event.state) === 'ok' ? '' : tone(event.state)} /><span class="cap">{label(event.state)}</span></span></td>
+                      <td class="inc-sum" style={{ color: 'var(--ink)' }}>{event.summary}
+                        <Show when={event.operation_id}><span class="cap" style={{ 'margin-left': '10px' }}>op {event.operation_id}</span></Show>
+                      </td>
+                      <td class="r">{event.version.replace(/^0\.0\.1-/, '')}</td>
+                    </tr>
+                  )}</For></tbody>
+                </table>
+              </Show>
+            </FxCell>
+          </section>
+        </div>;
+      }}
+    </Show>
   </>;
 }

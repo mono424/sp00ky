@@ -1,14 +1,18 @@
-import { For, Show, createResource, onCleanup } from 'solid-js';
+import { For, Show, createMemo, createResource, onCleanup } from 'solid-js';
 import { api } from '../api/client';
 import type { CloudService, CloudStats } from '../api/types';
-import { Empty, PageHead, Panel, Pill, StatCard } from '../components/Chrome';
-import { Sparkline, type Point } from '../components/Sparkline';
-import { formatBytes, relativeStamp, splitValue } from '../lib/format';
-import { containerTone, fillTone, type Tone } from '../lib/status';
+import { PageHead } from '../components/Chrome';
+import { FxCell, LineChart, Meter, Seg, Sq } from '../components/Frame';
+import { formatBytes, formatUptime, relativeStamp } from '../lib/format';
+import { containerTone } from '../lib/status';
 
 /**
- * Resources: what the deployment runs on, as Sp00ky Cloud measures it, with
- * whatever is closest to its limit first.
+ * Resources: what the deployment runs on, as Sp00ky Cloud measures it.
+ *
+ * Top to bottom: the deployment's CPU, memory and bucket disk against what is
+ * allocated, over the last fifteen minutes; how that CPU and memory splits
+ * across the containers; every container, closest to a limit first; and the
+ * machines behind dedicated and pooled backends.
  *
  * Only a cloud-linked scheduler has this page (the nav hides it otherwise):
  * the scheduler cannot see its neighbours' containers or the database's
@@ -21,9 +25,8 @@ const POLL_MS = 15_000;
 /** The collector's sample interval, used to lay series out on a time axis. */
 const SAMPLE_MS = 15_000;
 
-function series(values: number[], now: number): Point[] {
-  return values.map((v, i) => ({ ts: now - (values.length - 1 - i) * SAMPLE_MS, ms: v, ok: true }));
-}
+/** Shades of the accent, one per container in the split bars. */
+const SHADES = ['#c6cbea', '#9ca5d3', '#7f88bd', '#b7bede', '#6f78a8', '#a8adc4', '#8e96b8', '#5f68ad', '#4a5396'];
 
 /** Sum several series aligned on their newest point. */
 function sumSeries(all: number[][]): number[] {
@@ -38,65 +41,34 @@ function sumSeries(all: number[][]): number[] {
   return out;
 }
 
-const pct = (v: number | null | undefined) =>
-  v === null || v === undefined || !Number.isFinite(v) ? '—' : `${v < 10 ? v.toFixed(1) : Math.round(v)}%`;
-
 const memLimit = (s: CloudService) => s.sample?.mem_limit_bytes || s.memory_mb * 1024 * 1024;
-
 /** CPU as a share of the container's vCPUs; `cpu_pct` is per core. */
-const cpuFrac = (s: CloudService) =>
-  s.sample && s.vcpus > 0 ? s.sample.cpu_pct / (s.vcpus * 100) : null;
-const memFrac = (s: CloudService) => (s.sample ? s.sample.mem_bytes / memLimit(s) : null);
+const cpuPct = (s: CloudService) => (s.sample && s.vcpus > 0 ? s.sample.cpu_pct / s.vcpus : null);
+const memPct = (s: CloudService) => (s.sample ? (s.sample.mem_bytes / memLimit(s)) * 100 : null);
 
-/** How close a container is to any limit, 0..1; a stopped one sorts first. */
+/** How close a container is to any limit; a stopped one sorts first. */
 function pressure(s: CloudService): number {
-  if (s.status !== 'running') return 2;
-  return Math.max(cpuFrac(s) ?? 0, memFrac(s) ?? 0);
+  if (s.status !== 'running') return 1000;
+  return Math.max(cpuPct(s) ?? 0, memPct(s) ?? 0);
 }
 
-function rowTone(s: CloudService): Tone {
-  if (s.status !== 'running') return containerTone(s.status);
-  const t = fillTone(Math.max(cpuFrac(s) ?? 0, memFrac(s) ?? 0));
-  return t === 'idle' ? 'ok' : t;
+function toneOf(s: CloudService): string {
+  if (s.status !== 'running') {
+    const t = containerTone(s.status);
+    return t === 'ok' ? '' : t;
+  }
+  const p = pressure(s);
+  return p >= 90 ? 'bad' : p >= 80 ? 'warn' : '';
 }
 
-/** One usage bar with its caption. Neutral until it nears the limit. */
-function Meter(props: { label: string; value: string; fraction: number | null; title?: string }) {
-  const tone = () => fillTone(props.fraction);
-  return (
-    <span class="res-meter" title={props.title}>
-      <span class="res-meter-head">
-        <span>{props.label}</span>
-        <span class="res-meter-value" classList={{ [`tone-${tone()}`]: tone() === 'warn' || tone() === 'bad' }}>
-          {props.value}
-        </span>
-      </span>
-      <span class="res-bar">
-        <span
-          class="res-bar-fill"
-          classList={{ [tone()]: true }}
-          style={{ width: `${Math.min(100, Math.max(1, (props.fraction ?? 0) * 100))}%` }}
-        />
-      </span>
-    </span>
-  );
-}
-
-const BoxIcon = () => (
-  <svg viewBox="0 0 16 16">
-    <path d="M8 1.8 13.5 4.8v6.4L8 14.2 2.5 11.2V4.8zM2.5 4.8 8 7.8l5.5-3M8 7.8v6.4" />
-  </svg>
-);
-
-const ServerIcon = () => (
-  <svg viewBox="0 0 16 16">
-    <path d="M2.5 3h11v4h-11zM2.5 9h11v4h-11zM5 5h.01M5 11h.01" />
-  </svg>
-);
+const pct = (v: number | null | undefined) =>
+  v == null || !Number.isFinite(v) ? '—' : `${v < 10 ? v.toFixed(1) : Math.round(v)}%`;
+const rate = (bps: number | null | undefined) => (bps == null ? '—' : `${formatBytes(bps)}/s`);
+const cores = (v: number) => (v < 10 ? v.toFixed(2) : v.toFixed(1));
 
 export function Resources() {
   const [result, { refetch }] = createResource(() => api.getResult<CloudStats>('/cloud/stats'));
-  const timer = setInterval(() => void refetch(), POLL_MS);
+  const timer = setInterval(() => !document.hidden && void refetch(), POLL_MS);
   onCleanup(() => clearInterval(timer));
 
   const data = () => {
@@ -108,194 +80,277 @@ export function Resources() {
     return r && !r.ok ? r.message : undefined;
   };
   const now = () => (data() ? Date.parse(data()!.server_time) : Date.now());
+  const metrics = () => !!data()?.metrics_available;
 
   const running = () => (data()?.services ?? []).filter((s) => s.status === 'running');
   const cpuNow = () => running().reduce((a, s) => a + (s.sample?.cpu_pct ?? 0), 0) / 100;
   const cpuAlloc = () => running().reduce((a, s) => a + s.vcpus, 0);
   const memNow = () => running().reduce((a, s) => a + (s.sample?.mem_bytes ?? 0), 0);
   const memAlloc = () => running().reduce((a, s) => a + memLimit(s), 0);
-  const cpuSeries = () => sumSeries(running().map((s) => s.cpu_series));
-  const memSeries = () => sumSeries(running().map((s) => s.mem_series));
 
-  const services = () => [...(data()?.services ?? [])].sort((a, b) => pressure(b) - pressure(a));
+  const points = (values: number[]) =>
+    values.map((v, i) => ({ ts: now() - (values.length - 1 - i) * SAMPLE_MS, v }));
+  const cpuPoints = () => points(sumSeries(running().map((s) => s.cpu_series)).map((v) => v / 100));
+  const memPoints = () => points(sumSeries(running().map((s) => s.mem_series)));
+
+  const services = createMemo(() =>
+    [...(data()?.services ?? [])].sort((a, b) => pressure(b) - pressure(a) || a.name.localeCompare(b.name)),
+  );
+  /** Stable shades: by name, not by the order pressure puts them in. */
+  const shade = (name: string) => {
+    const names = [...(data()?.services ?? [])].map((s) => s.name).sort();
+    return SHADES[Math.max(0, names.indexOf(name)) % SHADES.length];
+  };
 
   const volume = () => data()?.bucket_volume ?? null;
-  const diskFrac = () => {
+  const diskPct = () => {
     const u = volume()?.usage;
-    return u && u.fs_bytes > 0 ? u.used_bytes / u.fs_bytes : null;
+    return u && u.fs_bytes > 0 ? (u.used_bytes / u.fs_bytes) * 100 : null;
   };
 
   const machines = () => [
     ...(data()?.machines ?? []).map((m) => ({
       name: m.name,
-      status: m.status,
-      label: m.phase || m.status,
-      detail: ['dedicated', m.backend, m.server_type, m.location, m.ip].filter(Boolean).join(' · '),
+      kind: 'dedicated',
+      runs: m.backend ?? '—',
+      type: m.server_type,
+      where: m.location ?? '—',
+      ip: m.ip ?? '—',
+      status: m.phase || m.status,
+      tone: m.last_error ? 'bad' : containerTone(m.status) === 'ok' ? '' : containerTone(m.status),
+      since: m.created_at,
+      error: m.last_error,
     })),
     ...(data()?.pool_machines ?? []).map((m) => ({
       name: m.machine_id,
+      kind: 'pool',
+      runs: m.pool,
+      type: m.server_type,
+      where: m.location ?? '—',
+      ip: '—',
       status: m.status,
-      label: m.status,
-      detail: [`pool ${m.pool}`, m.server_type, m.location].filter(Boolean).join(' · '),
+      tone: containerTone(m.status) === 'ok' ? '' : containerTone(m.status),
+      since: m.created_at,
+      error: undefined as string | undefined,
     })),
   ];
-
-  const memSplit = () => splitValue(formatBytes(memNow()));
 
   return (
     <>
       <PageHead
         title="Resources"
-        subtitle={
+        actions={
           <Show when={data()?.deployment}>
             {(d) => (
-              <>
-                Deployment v{d().version}
-                <Show when={d().deployed_at}>, deployed {relativeStamp(d().deployed_at)}</Show>
-              </>
+              <span class="cap">
+                deployment <b style={{ color: 'var(--ink-dim)' }}>v{d().version}</b>
+                <Show when={d().deployed_at}> · deployed {relativeStamp(d().deployed_at)}</Show>
+              </span>
             )}
           </Show>
         }
       />
 
-      <div class="page-body">
-        <Show when={error()}>
-          {(message) => (
-            <div class="banner">
-              <span class="dot bad" />
-              {message()}
-            </div>
-          )}
-        </Show>
+      <Show when={error()}>
+        {(message) => (
+          <section class="fx-row">
+            <FxCell>
+              <div class="fx-log bad"><span class="fx-what">{message()}</span></div>
+            </FxCell>
+          </section>
+        )}
+      </Show>
 
-        <Show when={data()} fallback={<Show when={!error()}><Empty>Loading…</Empty></Show>}>
-          {(d) => (
-            <div class="page-stack">
-              <div class="stat-grid">
-                <StatCard
-                  label="CPU"
-                  value={d().metrics_available ? cpuNow().toFixed(2) : '—'}
-                  unit={`of ${cpuAlloc()} vCPU`}
-                  note={d().metrics_available ? 'last 15 minutes' : 'no metrics from Sp00ky Cloud'}
-                >
-                  <Show when={d().metrics_available && cpuSeries().length > 1}>
-                    <span class="stat-plot">
-                      <Sparkline points={series(cpuSeries(), now())} fill bare format={pct} ariaLabel="CPU, last 15 minutes" />
-                    </span>
-                  </Show>
-                </StatCard>
-                <StatCard
-                  label="Memory"
-                  value={d().metrics_available ? memSplit().value : '—'}
-                  unit={`${d().metrics_available ? memSplit().unit + ' ' : ''}of ${formatBytes(memAlloc())}`}
-                  tone={fillTone(memAlloc() > 0 ? memNow() / memAlloc() : null)}
-                  note={d().metrics_available ? 'last 15 minutes' : 'no metrics from Sp00ky Cloud'}
-                >
-                  <Show when={d().metrics_available && memSeries().length > 1}>
-                    <span class="stat-plot">
-                      <Sparkline points={series(memSeries(), now())} fill bare format={formatBytes} ariaLabel="Memory, last 15 minutes" />
-                    </span>
-                  </Show>
-                </StatCard>
-                <StatCard
-                  label="Bucket disk"
-                  value={diskFrac() != null ? pct(diskFrac()! * 100) : '—'}
-                  unit={diskFrac() != null ? 'full' : undefined}
-                  tone={fillTone(diskFrac())}
-                  note={
-                    volume()?.usage
-                      ? `${formatBytes(volume()!.usage!.free_bytes)} free of ${formatBytes(volume()!.usage!.fs_bytes)}`
-                      : volume()
-                        ? 'waiting for the first measurement'
-                        : 'no bucket volume configured'
-                  }
-                >
-                  <Show when={diskFrac() != null}>
-                    <span class="res-disk">
-                      <span class="res-bar">
-                        <span
-                          class="res-bar-fill"
-                          classList={{ [fillTone(diskFrac())]: true }}
-                          style={{ width: `${Math.min(100, Math.max(1, diskFrac()! * 100))}%` }}
-                        />
-                      </span>
-                    </span>
-                  </Show>
-                </StatCard>
-              </div>
+      <Show when={data()} fallback={<Show when={!error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+        {(d) => (
+          <div class="fx-page">
+            <Show when={!d().metrics_available}>
+              <section class="fx-row">
+                <FxCell>
+                  <div class="fx-log"><span class="fx-what">Sp00ky Cloud has no metrics for this project · usage reads as not reported</span></div>
+                </FxCell>
+              </section>
+            </Show>
 
-              <Panel title="Containers" sub="Closest to a limit first" flush>
-                <Show when={services().length > 0} fallback={<Empty>No containers are running.</Empty>}>
-                  <ul class="list">
-                    <For each={services()}>
-                      {(s) => (
-                        <li class="list-item res-row" classList={{ [rowTone(s)]: true }}>
-                          <span class="list-icon" aria-hidden="true">
-                            <BoxIcon />
-                          </span>
-                          <span class="list-text">
-                            <span class="list-title">{s.name}</span>
-                            <span class="list-detail">
-                              {s.machine ? `forwards to ${s.machine}` : s.role}
-                            </span>
-                          </span>
-                          <Show
-                            when={s.status === 'running' && s.sample}
-                            fallback={
-                              <span class="res-meters">
-                                <Show when={s.status !== 'running'} fallback={<span class="list-meta">no recent sample</span>}>
-                                  <Pill tone={containerTone(s.status)}>{s.status}</Pill>
-                                </Show>
-                              </span>
-                            }
-                          >
-                            {(sample) => (
-                              <span class="res-meters">
-                                <Meter
-                                  label="CPU"
-                                  value={pct((cpuFrac(s) ?? 0) * 100)}
-                                  fraction={cpuFrac(s)}
-                                  title={`${(sample().cpu_pct / 100).toFixed(2)} of ${s.vcpus} vCPU`}
-                                />
-                                <Meter
-                                  label="Memory"
-                                  value={`${formatBytes(sample().mem_bytes)} / ${formatBytes(memLimit(s))}`}
-                                  fraction={memFrac(s)}
-                                />
-                              </span>
-                            )}
-                          </Show>
-                        </li>
-                      )}
-                    </For>
-                  </ul>
+            {/* the deployment as a whole, last 15 minutes ====================== */}
+            <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1.4fr)) minmax(0, 1fr)' }}>
+              <FxCell label="CPU" meta={<span>of <b>{cpuAlloc()}</b> vCPU · last 15 min</span>}>
+                <div class="fx-big">
+                  {metrics() ? cores(cpuNow()) : '—'}
+                  <small>cores · {pct(cpuAlloc() ? (cpuNow() / cpuAlloc()) * 100 : null)}</small>
+                </div>
+                <Show when={metrics()}>
+                  <LineChart points={cpuPoints()} format={(v) => `${cores(v)}`} now={now()} />
                 </Show>
-              </Panel>
+              </FxCell>
+              <FxCell label="Memory" meta={<span>of <b>{formatBytes(memAlloc())}</b> · last 15 min</span>}>
+                <div class="fx-big">
+                  {metrics() ? formatBytes(memNow()) : '—'}
+                  <small>{pct(memAlloc() ? (memNow() / memAlloc()) * 100 : null)}</small>
+                </div>
+                <Show when={metrics()}>
+                  <LineChart points={memPoints()} format={(v) => formatBytes(v)} now={now()} />
+                </Show>
+              </FxCell>
+              <FxCell label="Bucket disk" meta={<Show when={volume()?.usage}>{(u) => <span>measured {relativeStamp(u().measured_at)}</span>}</Show>}>
+                <div class="fx-big">
+                  <span classList={{ warn: (diskPct() ?? 0) >= 80 && (diskPct() ?? 0) < 90, bad: (diskPct() ?? 0) >= 90 }}>
+                    {diskPct() != null ? pct(diskPct()) : '—'}
+                  </span>
+                  <Show when={diskPct() != null}><small>full</small></Show>
+                </div>
+                <Show
+                  when={volume()?.usage}
+                  fallback={<div class="fx-sub cap"><span>{volume() ? 'waiting for the first measurement' : 'no bucket volume configured'}</span></div>}
+                >
+                  {(u) => (
+                    <>
+                      <div style={{ 'margin-top': '16px' }}><Seg pct={diskPct()} wide /></div>
+                      <div class="fx-foot rs-disk">
+                        <div><span class="cap">Used</span><b>{formatBytes(u().used_bytes)}</b></div>
+                        <div><span class="cap">Free</span><b>{formatBytes(u().free_bytes)}</b></div>
+                        <div><span class="cap">Volume</span><b>{volume()!.provisioned_gb} <em>GB</em></b></div>
+                      </div>
+                    </>
+                  )}
+                </Show>
+              </FxCell>
+            </section>
 
-              <Show when={machines().length > 0}>
-                <Panel title="Machines" flush>
-                  <ul class="list">
-                    <For each={machines()}>
-                      {(m) => (
-                        <li class="list-item" classList={{ [containerTone(m.status)]: true }}>
-                          <span class="list-icon" aria-hidden="true">
-                            <ServerIcon />
-                          </span>
-                          <span class="list-text">
-                            <span class="list-title">{m.name}</span>
-                            <span class="list-detail">{m.detail}</span>
-                          </span>
-                          <span class="list-meta">{m.label}</span>
-                        </li>
-                      )}
-                    </For>
-                  </ul>
-                </Panel>
-              </Show>
-            </div>
-          )}
-        </Show>
-      </div>
+            {/* who uses it ===================================================== */}
+            <Show when={metrics() && running().length > 0}>
+              <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1fr))' }}>
+                <Split
+                  label="CPU by container"
+                  items={running().map((s) => ({ name: s.name, value: (s.sample?.cpu_pct ?? 0) / 100, shade: shade(s.name) }))}
+                  format={(v) => `${cores(v)} cores`}
+                />
+                <Split
+                  label="Memory by container"
+                  items={running().map((s) => ({ name: s.name, value: s.sample?.mem_bytes ?? 0, shade: shade(s.name) }))}
+                  format={(v) => formatBytes(v)}
+                />
+              </section>
+            </Show>
+
+            {/* every container ================================================== */}
+            <section class="fx-row">
+              <FxCell label="Containers" meta={<span><b>{running().length}</b> of {services().length} running · closest to a limit first</span>}>
+                <Show when={services().length} fallback={<div class="fx-empty cap">No containers are running</div>}>
+                  <table class="fx-list">
+                    <colgroup>
+                      <col style={{ width: '20%' }} /><col style={{ width: '20%' }} /><col style={{ width: '24%' }} />
+                      <col style={{ width: '11%' }} /><col style={{ width: '15%' }} /><col style={{ width: '10%' }} />
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th class="cap">Container</th><th class="cap">CPU</th><th class="cap">Memory</th>
+                        <th class="cap r">Disk writes</th><th class="cap r">Network in / out</th><th class="cap r">Up</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <For each={services()}>
+                        {(s) => (
+                          <tr>
+                            <td>
+                              <span class="fx-who">
+                                <Sq tone={toneOf(s)} />
+                                <span style={{ color: 'var(--ink)' }}>{s.name}</span>
+                              </span>
+                              <span class="vw-meta cap">
+                                <span>{s.machine ? `forwards to ${s.machine}` : s.role}</span>
+                                <Show when={s.status !== 'running'}><span classList={{ warn: toneOf(s) === 'warn', bad: toneOf(s) === 'bad' }}>{s.status}</span></Show>
+                              </span>
+                            </td>
+                            <td>
+                              <Meter pct={s.status === 'running' && s.sample ? cpuPct(s) : null}>
+                                {pct(cpuPct(s))} <em>/ {s.vcpus} vCPU</em>
+                              </Meter>
+                            </td>
+                            <td>
+                              <Meter pct={s.status === 'running' && s.sample ? memPct(s) : null}>
+                                {s.sample ? formatBytes(s.sample.mem_bytes) : '—'} <em>/ {formatBytes(memLimit(s))}</em>
+                              </Meter>
+                            </td>
+                            <td class="r">{rate(s.sample?.disk_write_bps)}</td>
+                            <td class="r">{rate(s.sample?.net_rx_bps)} <span style={{ color: 'var(--ink-ghost)' }}>/</span> {rate(s.sample?.net_tx_bps)}</td>
+                            <td class="r">{s.since ? formatUptime((now() - Date.parse(s.since)) / 1000) : '—'}</td>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </Show>
+              </FxCell>
+            </section>
+
+            {/* the machines behind dedicated and pooled backends ================ */}
+            <Show when={machines().length > 0}>
+              <section class="fx-row">
+                <FxCell label="Machines" meta={<span><b>{machines().length}</b></span>}>
+                  <table class="fx-list">
+                    <thead>
+                      <tr>
+                        <th class="cap">Machine</th><th class="cap">Kind</th><th class="cap">Runs</th><th class="cap">Type</th>
+                        <th class="cap">Location</th><th class="cap">Address</th><th class="cap">State</th><th class="cap r">Up</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <For each={machines()}>
+                        {(m) => (
+                          <tr>
+                            <td><span class="fx-who"><Sq tone={m.tone} /><span style={{ color: 'var(--ink)' }}>{m.name}</span></span></td>
+                            <td>{m.kind}</td>
+                            <td>{m.runs}</td>
+                            <td>{m.type}</td>
+                            <td>{m.where}</td>
+                            <td>{m.ip}</td>
+                            <td classList={{ warn: m.tone === 'warn', bad: m.tone === 'bad' }} title={m.error}>{m.error ?? m.status}</td>
+                            <td class="r">{formatUptime((now() - Date.parse(m.since)) / 1000)}</td>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </FxCell>
+              </section>
+            </Show>
+          </div>
+        )}
+      </Show>
     </>
+  );
+}
+
+/** How a total splits across containers: one bar in shades, then the biggest few. */
+function Split(props: { label: string; items: { name: string; value: number; shade: string }[]; format: (v: number) => string }) {
+  const sorted = () => [...props.items].sort((a, b) => b.value - a.value);
+  const total = () => props.items.reduce((n, i) => n + i.value, 0);
+  return (
+    <FxCell label={props.label} meta={<span><b>{props.format(total())}</b></span>}>
+      <div class="sp-share">
+        <For each={sorted()}>{(i) => <i style={{ 'flex-grow': i.value || 0.0001, background: i.shade }} title={`${i.name}: ${props.format(i.value)}`} />}</For>
+      </div>
+      <table class="fx-list vw-mini">
+        <tbody>
+          <For each={sorted().slice(0, 5)}>
+            {(i) => (
+              <tr>
+                <td><span class="fx-who"><i class="vw-key" style={{ background: i.shade }} /><span style={{ color: 'var(--ink)' }}>{i.name}</span></span></td>
+                <td class="r">{props.format(i.value)}</td>
+                <td class="r" style={{ width: '16%' }}>{total() ? Math.round((i.value / total()) * 100) : 0}%</td>
+              </tr>
+            )}
+          </For>
+          <Show when={sorted().length > 5}>
+            <tr>
+              <td class="cap" style={{ color: 'var(--ink-ghost)' }}>{sorted().length - 5} more</td>
+              <td class="r">{props.format(sorted().slice(5).reduce((n, i) => n + i.value, 0))}</td>
+              <td class="r" style={{ width: '16%' }}>{total() ? Math.round((sorted().slice(5).reduce((n, i) => n + i.value, 0) / total()) * 100) : 0}%</td>
+            </tr>
+          </Show>
+        </tbody>
+      </table>
+    </FxCell>
   );
 }

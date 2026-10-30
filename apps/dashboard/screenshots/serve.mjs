@@ -32,8 +32,10 @@ const TYPES = {
 };
 
 // Seeds the fixture token (keyed by the empty base URL, i.e. same-origin, as a
-// scheduler serving /admin looks) before the app reads it.
-const SEED = `<script>try{localStorage.setItem('spky.token:',${JSON.stringify(TOKEN)})}catch{}</script>`;
+// scheduler serving /admin looks) before the app reads it, unless the page was
+// signed out. `?signedout` clears it and drops the flag from the address, so
+// signing in through the form (answered by `POST /session`) survives a reload.
+const SEED = `<script>try{var k='spky.token:',f='spky.fixture.signedout';if(/[?&]signedout\\b/.test(location.search)){localStorage.removeItem(k);localStorage.setItem(f,'1');history.replaceState(null,'',location.pathname)}else if(!localStorage.getItem(f))localStorage.setItem(k,${JSON.stringify(TOKEN)})}catch{}</script>`;
 
 async function sendFile(res, path) {
   const body = await readFile(path);

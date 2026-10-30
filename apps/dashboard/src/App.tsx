@@ -17,10 +17,7 @@ import { Login } from './routes/Login';
 import { Overview } from './routes/Overview';
 import { Ssps } from './routes/Ssps';
 import { Backends, BackendDetailView } from './routes/Backends';
-import { Workflows } from './routes/Workflows';
-import { WorkflowDetail } from './routes/WorkflowDetail';
-import { ScheduleDetail, Schedules } from './routes/Schedules';
-import { JobDetailView, Jobs } from './routes/Jobs';
+import { Runs, RunsOpen, RunsRedirect } from './routes/Runs';
 import { Backups } from './routes/Backups';
 import { Logs } from './routes/Logs';
 import { ViewDetail, Views } from './routes/Views';
@@ -149,7 +146,7 @@ export function App() {
 
   return (
     <>
-      <Show when={ready()} fallback={<div class="login-wrap" />}>
+      <Show when={ready()} fallback={<div class="li-wrap" />}>
         <Show when={!restarting()} fallback={<Reconnecting message={restarting()!} />}>
           <Show when={session()} fallback={<Login onSignedIn={signIn} />}>
             {(s) => (
@@ -181,14 +178,17 @@ export function App() {
                   path="/ssps"
                   component={() => <Ssps data={overview()} refresh={poll} />}
                 />
-                <Route path="/backends" component={Backends} />
-                <Route path="/backends/:name" component={BackendDetailView} />
-                <Route path="/workflows" component={Workflows} />
-                <Route path="/workflows/:id" component={WorkflowDetail} />
-                <Route path="/schedules" component={Schedules} />
-                <Route path="/schedules/:name" component={ScheduleDetail} />
-                <Route path="/jobs" component={Jobs} />
-                <Route path="/jobs/:id" component={JobDetailView} />
+                <Route path="/backends" component={() => <Backends overview={overview()} />} />
+                <Route path="/backends/:name" component={() => <BackendDetailView overview={overview()} />} />
+                {/* Schedules, workflows and jobs are one page now; their old
+                    addresses land on it, filtered or with the thing open. */}
+                <Route path="/runs" component={Runs} />
+                <Route path="/jobs" component={() => <RunsRedirect kind="job" />} />
+                <Route path="/jobs/:id" component={() => <RunsOpen kind="job" />} />
+                <Route path="/workflows" component={() => <RunsRedirect kind="workflow" />} />
+                <Route path="/workflows/:id" component={() => <RunsOpen kind="run" />} />
+                <Route path="/schedules" component={() => <RunsRedirect />} />
+                <Route path="/schedules/:name" component={() => <RunsOpen kind="schedule" />} />
                 <Route
                   path="/backups"
                   component={() => <Backups overview={overview()} refresh={poll} />}

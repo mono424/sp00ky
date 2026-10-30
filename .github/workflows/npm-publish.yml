@@ -107,7 +107,7 @@ jobs:
       - name: Rewrite workspace deps to release version
         run: |
           V="${{ needs.prepare.outputs.version }}"
-          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json apps/devtools-mcp/package.json; do
+          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/backend/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json apps/devtools-mcp/package.json; do
             jq --arg v "$V" 'reduce ("dependencies","optionalDependencies","peerDependencies") as $k (.; if (.[$k]|type)=="object" then .[$k] |= with_entries(if (.value|type)=="string" and (.value|startswith("workspace:")) then .value=$v else . end) else . end)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
@@ -145,6 +145,17 @@ jobs:
 
       - name: Publish core
         working-directory: packages/core
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
+      # 3b. Build and publish @spooky-sync/backend (durable steps for backends)
+      - name: Set version — backend
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/backend/package.json > tmp.json && mv tmp.json packages/backend/package.json
+
+      - name: Build backend
+        run: pnpm --filter @spooky-sync/backend build
+
+      - name: Publish backend
+        working-directory: packages/backend
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
       # 4. Build and publish @spooky-sync/client-solid

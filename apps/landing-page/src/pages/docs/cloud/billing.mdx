@@ -36,6 +36,7 @@ spky billing cap 50
 # Nothing beyond the included amounts
 spky billing cap 10`;
 
+export const upgradeCode = `spky deploy --upgrade`;
 export const sizeCode = `surrealdb:
   size: M   # S (default), M or L`;
 
@@ -75,6 +76,16 @@ The database size is set in `sp00ky.yml` and applied on the next deploy:
 <CodeBlock code={sizeCode} lang="yaml" fileName="sp00ky.yml" />
 
 A project with its own database (`surrealdb.endpoint`) has no managed database and no size. See [config reference](/docs/reference/config).
+
+### SurrealDB version
+
+A new pay-as-you-go database runs SurrealDB 4 (`v4.0.0-beta.1`, a beta) on SurrealKV, its only storage engine. A database created before that keeps SurrealDB 3.1.5 until you run:
+
+<CodeBlock code={upgradeCode} lang="bash" />
+
+The deploy first takes a backup (listed by `spky backup list` like any other), then starts SurrealDB 4 on the same data, which converts it in place. The conversion is one way: no SurrealDB 3 opens the database again, so going back means restoring that backup. Signed-in users stay signed in. Backups from SurrealDB 3 restore into SurrealDB 4.
+
+`spky dev` keeps running SurrealDB 3 locally, because the local scheduler and SSP use the SurrealDB Rust SDK 3, which refuses a version 4 server. Two differences can show between the two: SurrealDB 4 answers an error, not an empty result, for a table that was never defined, and rows come back in no defined order unless the query has `ORDER BY`, even with `LIMIT` or `START`.
 
 ## The month so far
 

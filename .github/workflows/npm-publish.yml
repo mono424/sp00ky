@@ -147,17 +147,6 @@ jobs:
         working-directory: packages/core
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
-      # 3b. Build and publish @spooky-sync/backend (durable steps for backends)
-      - name: Set version — backend
-        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/backend/package.json > tmp.json && mv tmp.json packages/backend/package.json
-
-      - name: Build backend
-        run: pnpm --filter @spooky-sync/backend build
-
-      - name: Publish backend
-        working-directory: packages/backend
-        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
-
       # 4. Build and publish @spooky-sync/client-solid
       - name: Set version — client-solid
         run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/client-solid/package.json > tmp.json && mv tmp.json packages/client-solid/package.json
@@ -189,6 +178,23 @@ jobs:
 
       - name: Publish devtools-mcp
         working-directory: apps/devtools-mcp
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
+      # Last, and allowed to fail: npm refuses a package's first publish from
+      # CI (E404 on PUT), so @spooky-sync/backend needs one `npm publish` by an
+      # owner of the @spooky-sync scope before this step can take over. Until
+      # then it must not stop the packages above.
+      - name: Set version — backend
+        continue-on-error: true
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/backend/package.json > tmp.json && mv tmp.json packages/backend/package.json
+
+      - name: Build backend
+        continue-on-error: true
+        run: pnpm --filter @spooky-sync/backend build
+
+      - name: Publish backend
+        continue-on-error: true
+        working-directory: packages/backend
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
       # 7. Build and publish @spooky-sync/query-allowlist (depends on query-builder).

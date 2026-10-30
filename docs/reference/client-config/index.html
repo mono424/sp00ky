@@ -282,6 +282,9 @@ add TURN for networks that block direct connections.</li>
 <li><code>confirmTimeoutMs</code>: how long a peer’s persistent value, create or delete shows without the server
 confirming it. Defaults to <code>5000</code>.</li>
 </ul>
+<p>In Dart (<code>spooky_core</code>) the same keys live on <code>ChannelsConfig</code> (<code>accept</code>, <code>iceServers</code>, <code>transport</code>,
+<code>confirmTimeoutMs</code>), plus <code>rtc</code>: the peer connection factory, <code>flutterWebRtc</code> from <code>spooky_flutter</code>.
+Without <code>rtc</code> or <code>transport</code>, channels report <code>unsupported</code>.</p>
 <h4 id="liveinlinebodies"><code>liveInlineBodies</code></h4>
 <p>Carry a changed row’s body on the client’s LIVE notification (<code>FETCH out</code>)
 instead of fetching it afterwards, which saves one round trip between another

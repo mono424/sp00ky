@@ -28,19 +28,14 @@
       "file": "views.png"
     },
     {
-      "name": "jobs",
-      "caption": "The outbox: queued, running and failed jobs, with kill and retry.",
-      "file": "jobs.png"
+      "name": "runs",
+      "caption": "Schedules, workflow runs and jobs on one page, with the queues below.",
+      "file": "runs.png"
     },
     {
-      "name": "schedules",
-      "caption": "Cron schedules, their next run, and pause, resume or trigger.",
-      "file": "schedules.png"
-    },
-    {
-      "name": "workflows",
-      "caption": "Workflow runs as they happen, with cancel, rerun and retry.",
-      "file": "workflows.png"
+      "name": "run",
+      "caption": "A failed workflow run: its steps on one time axis, the failed step and why.",
+      "file": "run.png"
     },
     {
       "name": "incidents",

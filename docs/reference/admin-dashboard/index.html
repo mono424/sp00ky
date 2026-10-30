@@ -137,69 +137,65 @@ breaker is open or its last pass failed. No <code>backend_down</code> incident i
 opened for it; the pool’s own <code>pool_breaker_open</code> incident carries the reason
 when it cannot get a machine.</p>
 <figure class="my-6">  <img src="/docs/admin/backends.png" alt="Your own services, their resolved health-check URLs and response times." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">Your own services, their resolved health-check URLs and response times.</figcaption> </figure>
-<p><strong>Workflows</strong> — runs updating in real time, and a run page built around a
-timeline: every step plotted on one shared axis, so where the time went is
-visible at a glance rather than reconstructed from timestamps. Each row in the
-list carries the run’s own failure reason, so four <code>failed</code> runs do not cost
-four clicks to tell one problem from four. Click a step to expand its job,
-output and error inline. A step still waiting on its dependencies is drawn
-hatched at the origin rather than as a bar, because it has not run. The
-scheduler runs a single shared poller behind the live list, so ten open
-dashboards cost your database exactly what one does, and a closed one costs
-nothing.</p>
-<figure class="my-6">  <img src="/docs/admin/workflows.png" alt="Runs updating live, each carrying its own failure reason." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">Runs updating live, each carrying its own failure reason.</figcaption> </figure>
-<p>An expanded step also loads its <strong>job</strong>, which is where a failure says what
-actually happened: the step row keeps only the attempt that ended the job, while
-the job’s <code>errors</code> array keeps every attempt. A step that failed after two
-timeouts and a 502 is a different problem from one that 502’d immediately, and
-only the job can tell them apart. The job is fetched per opened step rather than
-with the run, so a fan-out run with hundreds of steps costs nothing extra.</p>
-<p><strong>Schedules</strong> — the definition, the next fire, recent fires, and a
-success/failure tally. The tally comes from <code>_00_run_rollup</code> rather than
-counting run rows, so it stays accurate after retention has pruned them. Each
-fire shows <strong>why</strong> it ended as it did, and a schedule whose fires are being
-suppressed says so at the top of the page, naming the run that is holding the
-key — a wall of <code>skipped</code> rows looks like “nothing to do” and means “something
-is still running”.</p>
-<figure class="my-6">  <img src="/docs/admin/schedules.png" alt="Definitions, cadence, last outcome and next fire." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">Definitions, cadence, last outcome and next fire.</figcaption> </figure>
-<p><strong>Jobs</strong> — every outbox job in one list, whatever created it. This is the only
-place two whole classes of work are visible at all: a <code>kind: job</code> schedule’s
-fires, and jobs your own code created, which belong to no schedule and no
-workflow. Each row says where it came from, and links back to the schedule or
-the workflow step when the owning run still exists — a terminal run is pruned on
-its own retention window well before the jobs that outlived it, so “scheduled
-work whose fire has aged out” and “a job nobody can account for” are deliberately
-not drawn the same.</p>
-<p>The top of the page is the queue itself: a <strong>Queue depth</strong> tile with the pending
-count and its history from the sampler, throughput, failures in the last hour,
-in-flight and succeeded beside it, then <strong>Queues</strong>, one lane per outbox table
-drawn on a shared scale (in flight, stalled, pending and failed as segments,
-a tick where the table’s concurrency sits). Clicking a lane’s name filters the
-list below to that table.</p>
-<figure class="my-6">  <img src="/docs/admin/jobs.png" alt="Queue depth, throughput and failures, then one lane per outbox table." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">Queue depth, throughput and failures, then one lane per outbox table.</figcaption> </figure>
-<p>Filter with the chips by origin (<code>schedule</code>, <code>workflow</code>, <code>app</code>), by status, by
-table, or by a substring of the path. The filter is pushed into SurrealQL rather than applied to
-the page that was already fetched, so asking for application jobs on a busy table
-returns them instead of reporting none.</p>
-<p>The tiles above the list are the queue itself: pending depth with the age of the
-oldest one, in-flight against each table’s <code>_00_job_policy</code> concurrency ceiling,
-failures over the last hour, and jobs succeeded per minute. <strong>Stalled</strong> is called
-out separately from in-flight and is worth knowing: it is a <code>processing</code> row
-whose lease has expired, meaning nobody is working on it and a recovery sweep
-will reclaim it on its own clock. The schema has no status for that state, which
-is exactly why it earns a name here.</p>
-<p>Counts cover work in flight plus the last hour of terminal work, never all of
-history. Once retention keeps failures longer than successes, an all-time ratio
-reports a failure rate that climbs as successes age out; a bounded window is the
-only honest denominator, and it is the one <code>spky jobs</code> uses too.</p>
-<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">What the Jobs page costs your database</strong> <p>Every job aggregate is a scan of one of your own tables, so the scheduler takes them <em>once</em>
+<p><strong>Runs</strong> — schedules, workflow runs and jobs on one page, because they are one
+machine seen from three sides: a schedule fires either a job (a row in an outbox
+table that a backend runs at a path) or a workflow run, and every step of a
+workflow run is itself a job. On separate pages one failure showed up three
+times; here it shows up once.</p>
+<figure class="my-6">  <img src="/docs/admin/runs.png" alt="What is running and waiting, every schedule with its last fires, every run, and the queues." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">What is running and waiting, every schedule with its last fires, every run, and the queues.</figcaption> </figure>
+<p>Top to bottom:</p>
+<ul>
+<li><strong>The numbers</strong>: running, waiting (with the oldest wait), jobs done per minute,
+and failures in the last hour. <strong>Stalled</strong> is called out separately from
+running: a <code>processing</code> row whose lease has expired, meaning nobody is working
+on it and a recovery sweep will reclaim it on its own clock.</li>
+<li><strong>Schedules</strong>: each one’s cadence in words, its last twelve fires as squares
+(red where a fire failed; click one to open what it ran), the last and next
+fire, and <strong>Run now</strong> and <strong>Pause</strong> on hover.</li>
+<li><strong>Runs</strong>: everything that executed, running and waiting first. A workflow run
+is one row and its step jobs live inside it; a job of its own (from a
+<code>kind: job</code> schedule, a durable instance, or your own code, which belongs to
+no schedule and no workflow) is one row. Each row carries its failure reason,
+so four failed runs do not cost four clicks to tell one problem from four.
+<strong>Filter</strong> by status, kind, what started it, schedule or queue, or search by
+name, id or error. A filter the scheduler can answer is pushed into SurrealQL
+rather than applied to the page already fetched, so failures on a busy table
+are found even when they are older than the newest page.</li>
+<li><strong>Queues</strong>: one row per outbox table, running against its <code>_00_job_policy</code>
+concurrency, its pace, what waits and what failed.</li>
+</ul>
+<p>A run, job or schedule opens in a sheet beside the list. The sheet is part of
+the address (<code>/admin/runs?open=run:&lt;id&gt;</code>, <code>job:&lt;id&gt;</code>, <code>schedule:&lt;name&gt;</code>), so it
+survives a reload, and the old <code>/admin/jobs/&lt;id&gt;</code>, <code>/admin/workflows/&lt;id&gt;</code> and
+<code>/admin/schedules/&lt;name&gt;</code> links land on it.</p>
+<figure class="my-6">  <img src="/docs/admin/run.png" alt="A failed run: its steps on one time axis, the step that failed and why." loading="lazy" decoding="async" class="w-full drop-shadow-2xl"> <figcaption class="mt-2 text-sm text-zinc-500">A failed run: its steps on one time axis, the step that failed and why.</figcaption> </figure>
+<ul>
+<li>A <strong>workflow run</strong> draws every step on the run’s own time axis, so where the
+time went is visible at a glance. A step still waiting on its dependencies is
+a dashed line rather than a bar, because it has not run. Click a step to open
+its <strong>job</strong>, which is where a failure says what actually happened: the step
+row keeps only the attempt that ended the job, while the job keeps every
+attempt.</li>
+<li>A <strong>schedule</strong> shows its definition, the last 24 hours of outcomes, recent
+fires with why each ended as it did, and any quarantined keys with a way to
+release them. The tally comes from <code>_00_run_rollup</code> rather than counting run
+rows, so it stays accurate after retention has pruned them.</li>
+</ul>
+<p>The scheduler runs one shared poller behind the live run list and one job
+sampler behind the queue figures, so ten open dashboards cost your database
+exactly what one does, and a closed one costs nothing. Counts cover work in
+flight plus the last hour of terminal work, never all of history: once
+retention keeps failures longer than successes, an all-time ratio reports a
+failure rate that climbs as successes age out. A bounded window is the only
+honest denominator, and it is the one <code>spky jobs</code> uses too.</p>
+<div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-white/[0.08] bg-white/[0.03]"> <div class="shrink-0 mt-0.5 text-zinc-400"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M12 2.25c-4.97 0-9 3.654-9 8.25v6.592c0 1.135.834 2.1 1.956 2.262 1.296.186 2.458-.876 2.458-2.074 0 .736 1.011 1.258 1.968 1.455 1.295.267 2.618-.846 2.618-2.148 0 .808 1.054 1.465 2.112 1.625 1.306.196 2.508-.85 2.508-2.062 0 .764 1.06 1.304 2.058 1.448 1.3.188 2.32-.98 2.32-2.164V10.5c0-4.596-4.03-8.25-9-8.25Zm-3.75 7.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Zm7.5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-zinc-400"> <strong class="block mb-1 text-sm font-medium text-zinc-100">What the Runs page costs your database</strong> <p>Every job aggregate is a scan of one of your own tables, so the scheduler takes them <em>once</em>
 , in a single sampler that every reader serves from — the same bargain the presence sampler
 strikes. It reads every 15 seconds while nobody has the page open and every 2 seconds while
 someone does, so ten open dashboards cost what one does and an idle cluster costs almost nothing.
 Tune both with <code>SPKY_ADMIN_JOB_INTERVAL_SECS</code> and
 <code>SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS</code>, or set the first to <code>0</code>
 to switch the sampler off entirely: the list and its filters still work, the totals and the
-Overview tile then say they are not being measured rather than showing zeros.</p> </div> </div>
+Overview then say they are not being measured rather than showing zeros.</p> </div> </div>
 <p><strong>Logs</strong> — a live tail of the scheduler’s or any SSP’s log output, with level
 and text filters. If a viewer falls behind, the gap is shown explicitly rather
 than hidden.</p>

@@ -562,11 +562,9 @@ impl Ctx {
         Ok(())
     }
     async fn exists(&self, rid: &str) -> anyhow::Result<bool> {
-        Ok(self
-            .q1(&format!("SELECT VALUE id FROM {rid};"))
-            .await?
-            .as_array()
-            .is_some_and(|a| !a.is_empty()))
+        // `record::exists` answers false for a table that was never created;
+        // a plain SELECT is an error there on SurrealDB 4.0.
+        Ok(self.q1(&format!("RETURN record::exists({rid});")).await? == json!(true))
     }
     fn rpc_headers(&self, auth: Option<&str>) -> Vec<(String, String)> {
         let mut h = vec![
@@ -671,13 +669,7 @@ THEN {{\n\
     LET $sp00ky_ver_rec = IF $event = \"CREATE\" {{\n\
         (CREATE _00_version SET record_id = $after.id, version = 1 RETURN AFTER)\n\
     }} ELSE IF $event = \"UPDATE\" {{\n\
-        IF $sp00ky_target_version != NONE AND $sp00ky_target_version.id == $after.id {{\n\
-            LET $u = (UPDATE _00_version SET version = <int>$sp00ky_target_version.version WHERE record_id = $after.id RETURN AFTER);\n\
-            LET $sp00ky_target_version = NONE;\n\
-            $u\n\
-        }} ELSE {{\n\
-            (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n\
-        }}\n\
+        (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n\
     }};\n\
     LET $sp00ky_ver = $sp00ky_ver_rec[0].version;\n\n\
     LET $plain_after = {{\n\
@@ -1394,24 +1386,6 @@ async fn event_sp00ky_ingest(c: &Ctx) -> R {
         && auth_ok
         && arr(&leftover).is_empty();
     verdict(ok, format!("ops {ops:?}, _00_rv {rvs:?}, bearer ok {auth_ok}, first payload {first}, _00_version left {leftover}"))
-}
-
-async fn event_outer_let_visible(c: &Ctx) -> R {
-    c.set_endpoint("tv").await?;
-    c.q("CREATE cf_item:tv SET n = 1;").await?;
-    c.q(
-        "LET $sp00ky_target_version = { id: cf_item:tv, version: 7 }; UPDATE cf_item:tv SET n = 2;",
-    )
-    .await?;
-    let v = c
-        .q1("SELECT VALUE version FROM ONLY _00_version WHERE record_id = cf_item:tv LIMIT 1;")
-        .await?;
-    verdict(
-        v == json!(7),
-        format!(
-            "_00_version after UPDATE with $sp00ky_target_version = 7 in the same request: {v}"
-        ),
-    )
 }
 
 async fn http_post_order(c: &Ctx) -> R {
@@ -2440,12 +2414,6 @@ async fn main() -> anyhow::Result<()> {
     .await;
     r.run("events", "event.sp00ky_ingest", event_sp00ky_ingest(&c))
         .await;
-    r.run(
-        "events",
-        "event.outer_let_visible",
-        event_outer_let_visible(&c),
-    )
-    .await;
     r.run("http", "http.post_order", http_post_order(&c)).await;
     r.run("http", "http.post_runs_in_txn", http_post_in_txn(&c))
         .await;

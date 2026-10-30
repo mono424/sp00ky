@@ -161,6 +161,38 @@ Both runs on 2026-10-20 against local docker containers, `surrealkv` storage,
 | live | `live.record_user_cross_session` | **pass** | **pass** | own edge delivered with inline body {"author":"user:1vz3pu4xsw449qrbgfi0","id":"cf_thread:t1","published":true,"title":"collab"}; other user's edge filtered |
 | live | `regress.ws_row_fresh_after_update` | **pass** | **pass** | bob read "collab" then "renamed-over-ws" after another session's UPDATE |
 
+## SurrealDB 4.0.0-beta.1 (2026-10-29)
+
+Rerun against `surrealdb/surrealdb:v4.0.0-beta.1` (crates.io and Docker Hub,
+2026-10-28; no GitHub release yet), JS SDK `surrealdb@2.1.0` for the live rows,
+after the sp00ky fixes on branch `claude/surrealdb-4`:
+
+- **fresh 4.0 datastore**: 81 probes, 81 pass.
+- **3.1.5 RocksDB datastore opened by 4.0** (`surrealkv:` or `rocksdb:` path,
+  converted in place on first start, RocksDB files kept in
+  `<path>/_rocksdb_backup`, compatibility level stays 3): 81 probes, 81 pass.
+  Every table, row, access, function and param came across; a record token
+  issued by 3.1.5 is still accepted.
+- **3.1.5** for comparison: 80 pass, 1 known-bug (`regress.return_in_txn_commits`,
+  fixed in 4.0). `live.kill` failed once in three runs with SDK 2.1.0 (one
+  notification after KILL): flaky, not 4.0.
+
+What the first 4.0 run (before the fixes) found, and where it went:
+
+| Probe | 4.0 behaviour | Fix |
+|---|---|---|
+| `access.impersonation_external_jwt` | `'session' is a protected variable and cannot be set`: a function parameter may not be named `$session` | `fn::_00_impersonate::stop($session_id)`. The client bound the id as `session`, which 3.1.5 refuses too: `stop` never ended a session server-side, the token just expired |
+| `event.outer_let_visible` | an event no longer sees a `LET` from the request that wrote the row | probe removed: nothing has set `$sp00ky_target_version` since the pre-alpha, and the dead branch is gone from the generated events |
+| `regress.return_in_txn_commits` | the rollback is right, then a SELECT on the never-created table is an error, not `[]` | `exists()` uses `record::exists` |
+| `live.ws_connect` | JS SDK 2.0.3 refuses a server `>= 4.0.0` | SDK 2.1.0 accepts `< 5.0.0`; the last 2.0.3 pins (tests, example api, benchmark) moved |
+
+Found outside the suite: the Dart client sent durations as CBOR tag 13 (a
+string), which 4.0 answers with 400 for the whole request (tag 0 datetimes as
+well); it now sends tag 14 `[seconds, nanoseconds]`, which 3.x reads too. The
+Rust SDK 3.x refuses a 4.x server on connect (`>=3.0.0-alpha.1, <4.0.0`, also
+3.3.5), so the VM scheduler, SSP and maintenance stay on 3.x servers until they
+move to the 4.x SDK, which has no RocksDB engine for the scheduler replica.
+
 ## Surprises
 
 1. **`DEFINE EVENT ... ASYNC` already exists, on 3.1.5 as well as 3.3.4.**

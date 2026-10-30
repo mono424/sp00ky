@@ -1234,8 +1234,8 @@ class ChannelManager {
       ((columns[key]?.ephemeral ?? false) ? ephemeral : persistent)[key] =
           value;
     }
-    unawaited(rows.create(msg.table, rid, persistent, _confirmMs).then(
-        (applied) {
+    unawaited(
+        rows.create(msg.table, rid, persistent, _confirmMs).then((applied) {
       if (!applied || _closed || ephemeral.isEmpty) return;
       final map = _overlay[rid] ?? <String, OverlayEntry>{};
       for (final MapEntry(key: f, :value) in ephemeral.entries) {
@@ -1248,9 +1248,9 @@ class ChannelManager {
       }
       _overlay[rid] = map;
       _emitFor({rid});
-    },
-        onError: (Object error) =>
-            _logger?.debug('peer create failed: $error')));
+    }, onError: (Object error) {
+      _logger?.debug('peer create failed: $error');
+    }));
   }
 
   /// A peer deleted a row inside a channel's filter: hide it until the server

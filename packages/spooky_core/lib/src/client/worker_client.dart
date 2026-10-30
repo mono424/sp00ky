@@ -362,7 +362,9 @@ class _WorkerSignalPort implements SignalPort {
       if (client._signalListeners.containsKey(id)) {
         client._send(SignalListenCommand(id, self));
       }
-    }, onError: (Object _) => client._signalListeners.remove(id));
+    }, onError: (Object _) {
+      client._signalListeners.remove(id);
+    });
     return () {
       if (client._signalListeners.remove(id) != null) {
         client._send(SignalStopCommand(id));

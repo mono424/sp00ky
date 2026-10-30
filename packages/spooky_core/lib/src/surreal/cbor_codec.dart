@@ -55,9 +55,10 @@ CborValue valueToCbor(Object? v) {
     );
   }
   if (v is SurrealDuration) {
-    // SurrealDB 4 refuses the string form (tag 13); [seconds, nanoseconds]
-    // works on 3.x too. A string this parser does not know keeps tag 13, so
-    // the server still names what it could not read.
+    // SurrealDB 4 refuses the string form (tag 13) with a 400 for the whole
+    // request; [seconds, nanoseconds] works on 3.x too. A string this parser
+    // does not know (it is not a SurrealQL duration either) keeps tag 13,
+    // which 3.x parses and 4.x refuses as before.
     final parts = _durationParts(v.value);
     if (parts == null) {
       return CborString(v.value, tags: const [SurrealCborTag.stringDuration]);

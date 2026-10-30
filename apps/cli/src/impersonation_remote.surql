@@ -139,8 +139,10 @@ DEFINE FUNCTION OVERWRITE fn::_00_impersonate::renew() {
 
 -- End a session. The impersonated session may end itself; an admin may end
 -- any session (the table's update rule decides which rows are visible).
-DEFINE FUNCTION OVERWRITE fn::_00_impersonate::stop($session: string) {
-    LET $rec = type::record($session);
+-- `$session` is a protected SurrealDB variable: neither a parameter nor a
+-- bound query variable may take that name, so the session id is `$session_id`.
+DEFINE FUNCTION OVERWRITE fn::_00_impersonate::stop($session_id: string) {
+    LET $rec = type::record($session_id);
     IF record::tb($rec) != '_00_impersonation' {
         THROW 'Not an impersonation session.';
     };

@@ -382,7 +382,7 @@ export class AuthService<S extends SchemaStructure> {
     if (!info) return;
     if (!opts.serverEnded) {
       try {
-        await this.remote.query('RETURN fn::_00_impersonate::stop($session)', { session: info.session });
+        await this.remote.query('RETURN fn::_00_impersonate::stop($sid)', { sid: info.session });
       } catch (error) {
         // The token expires on its own; the local switch below is what matters.
         this.logger.warn(
@@ -659,8 +659,8 @@ export class AuthService<S extends SchemaStructure> {
     if (impersonating) {
       this.endedImpersonationTarget = impersonating.target;
       try {
-        await this.remote.query('RETURN fn::_00_impersonate::stop($session)', {
-          session: impersonating.session,
+        await this.remote.query('RETURN fn::_00_impersonate::stop($sid)', {
+          sid: impersonating.session,
         });
       } catch (_e) {
         // The token expires on its own.

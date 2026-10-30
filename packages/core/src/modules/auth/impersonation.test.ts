@@ -49,7 +49,7 @@ function makeServer(opts: { refuse?: Set<string>; unreachable?: boolean } = {}) 
     }
     if (sql.includes('fn::_00_impersonate::current')) return [state.ended ? null : { session: '_00_impersonation:s1' }];
     if (sql.includes('fn::_00_impersonate::stop')) {
-      state.stops.push(vars?.session);
+      state.stops.push(vars?.sid);
       state.ended = true;
       return [null];
     }

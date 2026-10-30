@@ -64,8 +64,8 @@ DEFINE FUNCTION fn::_00_impersonate::start($target: string, $reason: string) {
   UPSERT _00_impersonation:s1 SET target = type::record($target), admin = $auth.id, reason = $reason, ended_at = NONE;
   RETURN { token: $test_imp_token, session: '_00_impersonation:s1' };
 } PERMISSIONS FULL;
-DEFINE FUNCTION fn::_00_impersonate::stop($session: string) {
-  UPDATE type::record($session) SET ended_at = time::now();
+DEFINE FUNCTION fn::_00_impersonate::stop($session_id: string) {
+  UPDATE type::record($session_id) SET ended_at = time::now();
   RETURN NONE;
 } PERMISSIONS FULL;
 DEFINE FUNCTION fn::_00_impersonate::renew() {
@@ -149,6 +149,10 @@ describe('impersonation on the SurrealDB-WASM engine', () => {
     expect(String(auth.currentUser.id)).toBe('user:alice');
     expect(store.get('sp00ky_auth_token')).toBe(adminToken);
     expect(store.has(ORIGIN_TOKEN_KEY)).toBe(false);
+    // The server session ended too. Binding the id as `session` (a protected
+    // variable) failed silently here, and only the token's expiry ended it.
+    const [ended] = await db.query<[unknown]>('SELECT VALUE ended_at FROM ONLY _00_impersonation:s1');
+    expect(ended).toBeTruthy();
   });
 
   it('an explicit stop racing a server-ended stop still returns to the admin', async () => {

@@ -36,6 +36,29 @@ void main() {
       expect((surrealCborDecode(bytes) as Map)['when'], dt.toIso8601String());
     });
 
+    test('SurrealDuration is sent as [seconds, nanoseconds] (tag 14)', () {
+      // SurrealDB 4 answers 400 to the string form (tag 13).
+      List<int> parts(String text) {
+        final raw = _rawField(
+            surrealCborEncode({'d': SurrealDuration(text)}), 'd') as CborList;
+        expect(raw.tags, contains(SurrealCborTag.customDuration));
+        return raw.map((e) => (e as CborInt).toInt()).toList();
+      }
+
+      expect(parts('5m'), [300, 0]);
+      expect(parts('1h30m'), [5400, 0]);
+      expect(parts('1s250ms'), [1, 250000000]);
+      expect(parts('2w1d'), [1296000, 0]);
+      expect(parts('1y'), [31536000, 0]);
+      expect(parts('7ns'), [0, 7]);
+    });
+
+    test('a duration it cannot read keeps the string form (tag 13)', () {
+      final raw = _rawField(
+          surrealCborEncode({'d': const SurrealDuration('soon')}), 'd');
+      expect(raw.tags, contains(SurrealCborTag.stringDuration));
+    });
+
     test('primitives + nested maps/lists round-trip', () {
       final v = {
         's': 'hi',

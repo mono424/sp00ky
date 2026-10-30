@@ -19,7 +19,7 @@
   "dependencies": {
     "commander": "^12.1.0",
     "execa": "^9.5.1",
-    "surrealdb": "2.0.3",
+    "surrealdb": "2.1.0",
     "testcontainers": "^11.10.0",
     "undici": "^6.21.0"
   },

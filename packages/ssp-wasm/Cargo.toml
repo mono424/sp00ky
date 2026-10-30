@@ -1,6 +1,6 @@
 [package]
 name = "ssp-wasm"
-version = "0.0.1-canary.364"
+version = "0.0.1-canary.365"
 edition = "2021"
 description = "WASM bindings for ssp"
 license = "MIT"

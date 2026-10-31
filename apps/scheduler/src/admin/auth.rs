@@ -24,7 +24,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::session::SessionMode;
+use super::session::{Scope, SessionMode};
 use super::AdminState;
 
 /// Attempts allowed per source address inside [`RATE_WINDOW`].
@@ -36,7 +36,13 @@ pub struct LoginRequest {
     /// Omitted for a break-glass login.
     #[serde(default)]
     pub username: Option<String>,
+    /// Empty for a console grant.
+    #[serde(default)]
     pub password: String,
+    /// A Sp00ky Cloud console grant (see `admin::grant`), instead of a
+    /// username and password.
+    #[serde(default)]
+    pub grant: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +366,45 @@ pub async fn login(
     }
 
     let ttl = state.config.session_ttl.as_secs();
+
+    // A console user, vouched for by Sp00ky Cloud. Who may is the control
+    // plane's decision (workspace membership); a valid grant is that
+    // decision, made for this project, moments ago, and used once.
+    if let Some(grant) = req.grant.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        let Some(verifier) = state.grants.as_ref() else {
+            return Err(error(
+                StatusCode::UNAUTHORIZED,
+                "Sp00ky Cloud sign-in is not enabled on this scheduler",
+            ));
+        };
+        return match verifier.verify(grant).await {
+            Ok(claims) => {
+                state.rate_limiter.clear(ip);
+                let scope = Scope::parse(&claims.scope).unwrap_or(Scope::Read);
+                let subject = format!("cloud:{}", claims.sub);
+                let label = claims.name.clone().unwrap_or_else(|| claims.sub.clone());
+                let token = state.sessions.create_with(
+                    subject.clone(),
+                    label.clone(),
+                    SessionMode::Cloud,
+                    scope,
+                    verifier.session_ttl,
+                );
+                info!(%ip, %subject, scope = scope.as_str(), tenant = ?claims.tenant, "Sp00ky Cloud console login");
+                Ok(Json(LoginResponse {
+                    token,
+                    mode: SessionMode::Cloud,
+                    subject,
+                    label,
+                    expires_in_secs: verifier.session_ttl.as_secs(),
+                }))
+            }
+            Err(e) => {
+                warn!(%ip, error = %e, "Console grant refused");
+                Err(error(StatusCode::UNAUTHORIZED, &format!("Sign-in refused: {e}")))
+            }
+        };
+    }
 
     // Break-glass: password only, and only when one is configured.
     let Some(username) = req.username.as_ref().filter(|u| !u.is_empty()) else {

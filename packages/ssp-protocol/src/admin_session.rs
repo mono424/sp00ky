@@ -29,6 +29,9 @@ pub enum SessionMode {
     /// The node's own bearer (`SPKY_AUTH_SECRET`), presented by the control
     /// plane. Never minted into a token.
     Node,
+    /// A Sp00ky Cloud console user, signed in with a grant from the control
+    /// plane (`console_grant`). Short-lived; the console renews it.
+    Cloud,
 }
 
 impl SessionMode {
@@ -38,6 +41,7 @@ impl SessionMode {
             SessionMode::Breakglass => "breakglass",
             SessionMode::Mcp => "mcp",
             SessionMode::Node => "node",
+            SessionMode::Cloud => "cloud",
         }
     }
 
@@ -46,6 +50,7 @@ impl SessionMode {
             "roster" => Some(SessionMode::Roster),
             "breakglass" => Some(SessionMode::Breakglass),
             "mcp" => Some(SessionMode::Mcp),
+            "cloud" => Some(SessionMode::Cloud),
             _ => None,
         }
     }
@@ -138,7 +143,7 @@ pub fn verify(key: &[u8; 32], token: &str, now_secs: u64) -> Option<Claims> {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn base64_url_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
@@ -155,7 +160,7 @@ fn base64_url_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> { B64.iter().position(|&b| b == c).map(|p| p as u32) };
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);

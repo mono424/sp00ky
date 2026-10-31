@@ -123,7 +123,7 @@ pub struct WorkflowWatcher {
 
 /// Decrements the subscriber count when a stream ends, however it ends
 /// (client disconnect, error, or the process shutting down).
-struct SubscriberGuard(Arc<WorkflowWatcher>);
+pub(crate) struct SubscriberGuard(Arc<WorkflowWatcher>);
 
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
@@ -140,7 +140,7 @@ impl WorkflowWatcher {
         })
     }
 
-    fn subscribe(self: &Arc<Self>, db: Arc<ReconnectingDb>) -> (broadcast::Receiver<Value>, SubscriberGuard) {
+    pub(crate) fn subscribe(self: &Arc<Self>, db: Arc<ReconnectingDb>) -> (broadcast::Receiver<Value>, SubscriberGuard) {
         let rx = self.tx.subscribe();
         let guard = SubscriberGuard(Arc::clone(self));
         let previous = self.subscribers.fetch_add(1, Ordering::SeqCst);

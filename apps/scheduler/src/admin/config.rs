@@ -65,6 +65,28 @@ pub struct AdminConfig {
     /// Fast enough to watch a backlog drain, and paid only while someone is
     /// actually watching it.
     pub job_live_interval: std::time::Duration,
+    /// Browser origins allowed to call the API and open `/v2/live`, from the
+    /// comma-separated `SPKY_ADMIN_ALLOWED_ORIGINS`. Empty (unset) or `*`
+    /// allows any origin, which is safe because the bearer token, never a
+    /// cookie, is what authenticates; the list is defence in depth. This
+    /// host's own origin is always allowed for the socket.
+    pub allowed_origins: Vec<String>,
+    /// Whether a Sp00ky Cloud console user may sign in with a grant
+    /// (`SPKY_ADMIN_CLOUD_LOGIN`, default on). Only takes effect on a
+    /// cloud-linked scheduler: the grant's audience is the linked project.
+    pub cloud_login: bool,
+    /// The control plane's grant keys, inline (`SPKY_ADMIN_CLOUD_JWKS`, a
+    /// JWKS document). Without it, or for a key it lacks, the keys are
+    /// fetched from `{SPKY_CLOUD_API_URL}/.well-known/jwks.json`.
+    pub cloud_jwks: Option<String>,
+    /// Expected grant issuer (`SPKY_ADMIN_CLOUD_ISSUER`); defaults to
+    /// `SPKY_CLOUD_API_URL`.
+    pub cloud_issuer: Option<String>,
+    /// How long a session opened with a grant lasts
+    /// (`SPKY_ADMIN_CLOUD_SESSION_TTL_SECS`, default 900). Short on purpose:
+    /// the console renews it from a fresh grant, so a member removed from a
+    /// workspace loses access within this window.
+    pub cloud_session_ttl: std::time::Duration,
 }
 
 impl AdminConfig {
@@ -161,6 +183,25 @@ impl AdminConfig {
             // worse.
             job_live_interval: std::time::Duration::from_secs(
                 job_live_interval_secs.min(job_interval_secs.max(1)),
+            ),
+            allowed_origins: std::env::var("SPKY_ADMIN_ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|o| o.trim().trim_end_matches('/').to_string())
+                .filter(|o| !o.is_empty())
+                .collect(),
+            cloud_login: !matches!(
+                std::env::var("SPKY_ADMIN_CLOUD_LOGIN").as_deref(),
+                Ok("0") | Ok("false") | Ok("off")
+            ),
+            cloud_jwks: std::env::var("SPKY_ADMIN_CLOUD_JWKS").ok().filter(|s| !s.trim().is_empty()),
+            cloud_issuer: std::env::var("SPKY_ADMIN_CLOUD_ISSUER").ok().filter(|s| !s.trim().is_empty()),
+            cloud_session_ttl: std::time::Duration::from_secs(
+                std::env::var("SPKY_ADMIN_CLOUD_SESSION_TTL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(900),
             ),
         }
     }

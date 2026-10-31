@@ -1,0 +1,109 @@
+[
+  {
+    "name": "doc: nested change and removal",
+    "shape": "doc",
+    "prev": {"a": 1, "ssps": {"ssp-0": {"status": "ready", "views": 3}, "ssp-1": {"status": "ready"}}},
+    "next": {"a": 1, "ssps": {"ssp-0": {"status": "lagging", "views": 3}}},
+    "patch": {"ssps": {"ssp-0": {"status": "lagging"}, "ssp-1": null}}
+  },
+  {
+    "name": "doc: arrays replace whole, objects merge",
+    "shape": "doc",
+    "prev": {"x": [1, 2], "y": {"z": 1}},
+    "next": {"x": [1, 2, 3], "y": {"z": 1, "w": "s"}},
+    "patch": {"x": [1, 2, 3], "y": {"w": "s"}}
+  },
+  {
+    "name": "doc: a null member is the same as a missing one",
+    "shape": "doc",
+    "prev": {"a": 1, "b": null},
+    "next": {"a": 1},
+    "patch": null
+  },
+  {
+    "name": "doc: setting a member to null deletes it",
+    "shape": "doc",
+    "prev": {"a": 1, "b": 2},
+    "next": {"a": 1, "b": null},
+    "patch": {"b": null}
+  },
+  {
+    "name": "doc: an object over a scalar travels whole",
+    "shape": "doc",
+    "prev": {"a": 1},
+    "next": {"a": {"b": {"c": 2}}},
+    "patch": {"a": {"b": {"c": 2}}}
+  },
+  {
+    "name": "window: changed and new rows, one removal, no reorder",
+    "shape": "window",
+    "key": "id",
+    "prev": {"rows": [{"id": "a", "n": 1}, {"id": "b", "n": 1}, {"id": "c", "n": 1}], "meta": {"total": 3}},
+    "next": {"rows": [{"id": "a", "n": 2}, {"id": "c", "n": 1}, {"id": "d", "n": 1}], "meta": {"total": 3}},
+    "patch": {"up": [{"id": "a", "n": 2}, {"id": "d", "n": 1}], "rm": ["b"]}
+  },
+  {
+    "name": "window: newest first needs the order",
+    "shape": "window",
+    "key": "id",
+    "prev": {"rows": [{"id": "b"}, {"id": "a"}], "meta": {}},
+    "next": {"rows": [{"id": "c"}, {"id": "b"}, {"id": "a"}], "meta": {}},
+    "patch": {"up": [{"id": "c"}], "order": ["c", "b", "a"]}
+  },
+  {
+    "name": "window: a pure move is only an order",
+    "shape": "window",
+    "key": "id",
+    "prev": {"rows": [{"id": "a"}, {"id": "b"}, {"id": "c"}], "meta": {}},
+    "next": {"rows": [{"id": "c"}, {"id": "a"}, {"id": "b"}], "meta": {}},
+    "patch": {"order": ["c", "a", "b"]}
+  },
+  {
+    "name": "window: numeric keys travel as strings; meta merges",
+    "shape": "window",
+    "key": "n",
+    "prev": {"rows": [{"n": 1}, {"n": 2}], "meta": {"total": 2, "x": {"y": 1}}},
+    "next": {"rows": [{"n": 2}, {"n": 3}], "meta": {"total": 9, "x": {"y": 1}}},
+    "patch": {"up": [{"n": 3}], "rm": ["1"], "meta": {"total": 9}}
+  },
+  {
+    "name": "window: a row losing a member is replaced whole",
+    "shape": "window",
+    "key": "id",
+    "prev": {"rows": [{"id": "a", "error": "boom", "n": 1}], "meta": {}},
+    "next": {"rows": [{"id": "a", "error": null, "n": 1}], "meta": {}},
+    "patch": {"up": [{"id": "a", "n": 1}]}
+  },
+  {
+    "name": "window: duplicate keys cannot be patched",
+    "shape": "window",
+    "key": "id",
+    "prev": {"rows": [], "meta": {}},
+    "next": {"rows": [{"id": "a"}, {"id": "a"}], "meta": {}},
+    "patch": "reset"
+  },
+  {
+    "name": "series: append past the window and trim",
+    "shape": "series",
+    "key": "t",
+    "prev": {"items": [{"t": 1}, {"t": 2}, {"t": 3}], "keep": 3, "meta": {}},
+    "next": {"items": [{"t": 3}, {"t": 4}, {"t": 5}], "keep": 3, "meta": {}},
+    "patch": {"append": [{"t": 4}, {"t": 5}]}
+  },
+  {
+    "name": "series: going backwards needs a snapshot",
+    "shape": "series",
+    "key": "t",
+    "prev": {"items": [{"t": 5}, {"t": 6}], "keep": 10, "meta": {}},
+    "next": {"items": [{"t": 1}], "keep": 10, "meta": {}},
+    "patch": "reset"
+  },
+  {
+    "name": "series: meta alone",
+    "shape": "series",
+    "key": "t",
+    "prev": {"items": [{"t": 1}], "keep": 10, "meta": {"dropped": 0}},
+    "next": {"items": [{"t": 1}], "keep": 10, "meta": {"dropped": 4}},
+    "patch": {"meta": {"dropped": 4}}
+  }
+]

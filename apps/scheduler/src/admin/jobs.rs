@@ -121,7 +121,7 @@ impl JobSampler {
         self.snapshot.read().ok().and_then(|g| g.clone())
     }
 
-    fn samples(&self) -> Value {
+    pub(crate) fn samples(&self) -> Value {
         let samples: Vec<JobSample> = self
             .samples
             .lock()
@@ -198,6 +198,12 @@ impl JobSampler {
         }
     }
 
+    /// The unfiltered listing body of the latest sample, when there is one:
+    /// what the live `jobs` topic starts from before the next broadcast.
+    pub(crate) fn live_payload(&self) -> Option<Value> {
+        self.current().map(|s| self.payload_of(&s, DEFAULT_LIMIT))
+    }
+
     /// The listing body for a snapshot, in the shape `GET /jobs` answers with.
     fn payload_of(&self, snapshot: &Snapshot, limit: usize) -> Value {
         snapshot.payload(limit, self.samples(), true)
@@ -240,7 +246,7 @@ impl JobSampler {
         }
     }
 
-    fn subscribe(self: &Arc<Self>) -> (broadcast::Receiver<Value>, WatcherGuard) {
+    pub(crate) fn subscribe(self: &Arc<Self>) -> (broadcast::Receiver<Value>, WatcherGuard) {
         let rx = self.tx.subscribe();
         let guard = WatcherGuard(Arc::clone(self));
         if self.watchers.fetch_add(1, Ordering::SeqCst) == 0 {

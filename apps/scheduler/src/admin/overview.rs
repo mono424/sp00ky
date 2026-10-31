@@ -11,6 +11,12 @@ use serde_json::json;
 use super::AdminState;
 
 pub async fn overview(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    Json(overview_value(&state).await)
+}
+
+/// The `/overview` body. Shared with the live `overview` topic, so a poll and
+/// a subscription can never describe the fleet differently.
+pub async fn overview_value(state: &AdminState) -> serde_json::Value {
     let entities = crate::metrics::build_entities(&state.metrics).await;
 
     let mut scheduler = serde_json::Value::Null;
@@ -42,7 +48,7 @@ pub async fn overview(State(state): State<AdminState>) -> Json<serde_json::Value
         })
         .count();
 
-    Json(json!({
+    json!({
         "scheduler": scheduler,
         "ssps": ssps,
         "backends": backends,
@@ -71,7 +77,7 @@ pub async fn overview(State(state): State<AdminState>) -> Json<serde_json::Value
         "push": crate::push::status_json(&state.metrics.ingest.push),
         "cloud_linked": state.cloud.is_some(),
         "server_time_ms": now_ms(),
-    }))
+    })
 }
 
 fn now_ms() -> u64 {

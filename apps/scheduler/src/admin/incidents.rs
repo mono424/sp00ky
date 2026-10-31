@@ -224,6 +224,12 @@ impl Incidents {
         })
     }
 
+    /// The newest `limit` incidents, newest first, as the listing serves them.
+    pub(crate) fn recent(&self, limit: usize) -> Vec<Value> {
+        let h = self.history.lock().unwrap();
+        h.rows.iter().take(limit).filter_map(|r| serde_json::to_value(r).ok()).collect()
+    }
+
     fn observe_line(&self, line: &maintenance::log_ring::LogLine) {
         if line.target == TARGET {
             if let Some(payload) = line.fields.strip_prefix("incident=") {

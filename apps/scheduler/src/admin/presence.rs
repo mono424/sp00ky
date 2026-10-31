@@ -666,7 +666,7 @@ impl PresenceTracker {
         }
     }
 
-    fn samples(&self) -> Vec<PresenceSample> {
+    pub(crate) fn samples(&self) -> Vec<PresenceSample> {
         self.samples
             .lock()
             .map(|g| g.iter().copied().collect())
@@ -705,7 +705,7 @@ impl PresenceTracker {
         }
     }
 
-    fn presence_json(&self) -> Value {
+    pub(crate) fn presence_json(&self) -> Value {
         let mut out = self.overview_block();
         let snap = self.snapshot.read().ok().and_then(|g| g.clone());
         out["slow_ms"] = json!(self.slow_ms);

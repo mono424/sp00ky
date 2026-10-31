@@ -3557,6 +3557,16 @@ mod admin_plane {
     /// a scheduler built from a checkout has no dashboard bundle, and that
     /// must be a working API with a placeholder page rather than a failure.
     fn admin_app(h: &TestHarness, password: Option<&str>) -> Router {
+        admin_app_state(h, password, Vec::new()).1
+    }
+
+    /// The admin state and router, with an origin allow-list, for the tests
+    /// that drive the plane from outside a request (the live socket).
+    fn admin_app_state(
+        h: &TestHarness,
+        password: Option<&str>,
+        allowed_origins: Vec<String>,
+    ) -> (admin::AdminState, Router) {
         let config = AdminConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
@@ -3578,9 +3588,13 @@ mod admin_plane {
             // tests deliberately do not publish.
             job_interval: std::time::Duration::ZERO,
             job_live_interval: std::time::Duration::from_secs(2),
+            allowed_origins,
+            cloud_login: true,
+            cloud_jwks: None,
+            cloud_issuer: None,
+            cloud_session_ttl: std::time::Duration::from_secs(900),
         };
-        let (_state, router) = admin::build(config, h.admin_deps(None, None));
-        router
+        admin::build(config, h.admin_deps(None, None))
     }
 
     /// The admin router with a Sp00ky Cloud link pointed at `api_url` and a
@@ -3591,6 +3605,17 @@ mod admin_plane {
         cloud_api_url: Option<&str>,
         auth_secret: Option<&str>,
     ) -> Router {
+        admin_app_cloud(h, password, cloud_api_url, auth_secret, None).1
+    }
+
+    /// The cloud-linked plane with the control plane's grant keys inline.
+    fn admin_app_cloud(
+        h: &TestHarness,
+        password: Option<&str>,
+        cloud_api_url: Option<&str>,
+        auth_secret: Option<&str>,
+        cloud_jwks: Option<&str>,
+    ) -> (admin::AdminState, Router) {
         let config = AdminConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
@@ -3612,9 +3637,13 @@ mod admin_plane {
             // tests deliberately do not publish.
             job_interval: std::time::Duration::ZERO,
             job_live_interval: std::time::Duration::from_secs(2),
+            allowed_origins: Vec::new(),
+            cloud_login: true,
+            cloud_jwks: cloud_jwks.map(str::to_string),
+            cloud_issuer: None,
+            cloud_session_ttl: std::time::Duration::from_secs(900),
         };
-        let (_state, router) = admin::build(config, h.admin_deps(cloud_api_url, auth_secret));
-        router
+        admin::build(config, h.admin_deps(cloud_api_url, auth_secret))
     }
 
     /// `oneshot` carries no connection info, but the login handler rate-limits
@@ -3691,6 +3720,365 @@ mod admin_plane {
         let older = body_json(app.clone().oneshot(request("/admin/api/incidents/older")).await.unwrap()).await;
         assert_eq!(older["incident"]["state"], "interrupted");
         assert_eq!(app.oneshot(request("/admin/api/incidents/missing")).await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Serve `router` on a real port: a WebSocket needs a real upgrade.
+    async fn serve(router: Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    mod live_socket {
+        use super::*;
+        use futures::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        type Socket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+        async fn connect(addr: SocketAddr) -> Socket {
+            let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/admin/api/v2/live")).await.unwrap();
+            ws
+        }
+
+        async fn send(ws: &mut Socket, v: Value) {
+            ws.send(Message::Text(v.to_string())).await.unwrap();
+        }
+
+        /// The next protocol frame, skipping pings. `None` once closed, with
+        /// the close code when there was one.
+        async fn recv(ws: &mut Socket) -> Result<Value, Option<u16>> {
+            loop {
+                let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                    .await
+                    .expect("a frame within 5s");
+                match msg {
+                    Some(Ok(Message::Text(t))) => return Ok(serde_json::from_str(&t).unwrap()),
+                    Some(Ok(Message::Close(frame))) => return Err(frame.map(|f| u16::from(f.code))),
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => return Err(None),
+                }
+            }
+        }
+
+        async fn signed_in(addr: SocketAddr, token: &str) -> Socket {
+            let mut ws = connect(addr).await;
+            send(&mut ws, json!({"op": "auth", "token": token})).await;
+            let ready = recv(&mut ws).await.unwrap();
+            assert_eq!(ready["op"], "ready", "{ready}");
+            assert_eq!(ready["session"]["mode"], "breakglass");
+            assert!(ready["topics"].as_array().unwrap().iter().any(|t| t == "operations"));
+            ws
+        }
+
+        #[tokio::test]
+        async fn subscribe_snapshot_diff_and_resume() {
+            let h = TestHarness::new().await;
+            let (state, app) = admin_app_state(&h, Some("live-test"), Vec::new());
+            let token = breakglass_token(&app, "live-test").await;
+            let addr = serve(app).await;
+
+            let mut ws = signed_in(addr, &token).await;
+            send(&mut ws, json!({"op": "sub", "ref": "r1", "topic": "operations"})).await;
+            let subscribed = recv(&mut ws).await.unwrap();
+            assert_eq!(subscribed, json!({"op": "subscribed", "ref": "r1", "key": "operations", "shape": "window"}));
+            let snap = recv(&mut ws).await.unwrap();
+            assert_eq!(snap["op"], "snap");
+            assert_eq!(snap["data"]["rows"], json!([]));
+            let mut seq = snap["seq"].as_u64().unwrap();
+
+            // A change arrives as a patch on top of the snapshot.
+            let op = state.ops.start(admin::ops::OpKind::Rehash, None, "test".into(), json!({}));
+            let diff = recv(&mut ws).await.unwrap();
+            assert_eq!(diff["op"], "diff", "{diff}");
+            assert_eq!(diff["from"].as_u64(), Some(seq));
+            assert_eq!(diff["patch"]["up"][0]["id"], op.id);
+            assert_eq!(diff["patch"]["up"][0]["status"], "running");
+            seq = diff["seq"].as_u64().unwrap();
+
+            // Reconnect holding that seq: nothing to resend.
+            drop(ws);
+            let mut ws = signed_in(addr, &token).await;
+            send(&mut ws, json!({"op": "sub", "ref": "r2", "topic": "operations", "since": seq})).await;
+            assert_eq!(recv(&mut ws).await.unwrap()["op"], "subscribed");
+            state.ops.finish(&op.id, None);
+            let diff = recv(&mut ws).await.unwrap();
+            assert_eq!(diff["op"], "diff", "a resumed reader gets the next patch, not a snapshot: {diff}");
+            assert_eq!(diff["from"].as_u64(), Some(seq));
+            assert_eq!(diff["patch"]["up"][0]["status"], "done");
+            let after_finish = diff["seq"].as_u64().unwrap();
+
+            // Reconnect one patch behind: the ring replays it.
+            drop(ws);
+            let mut ws = signed_in(addr, &token).await;
+            send(&mut ws, json!({"op": "sub", "ref": "r3", "topic": "operations", "since": seq})).await;
+            assert_eq!(recv(&mut ws).await.unwrap()["op"], "subscribed");
+            let replayed = recv(&mut ws).await.unwrap();
+            assert_eq!(replayed["op"], "diff");
+            assert_eq!(replayed["seq"].as_u64(), Some(after_finish));
+
+            // A seq the ring never held costs a snapshot, never a wrong state.
+            // (Not `1`: that is this topic's first snapshot, which the ring
+            // can still replay from.)
+            send(&mut ws, json!({"op": "sub", "ref": "r4", "topic": "operations", "since": 999_999_999u64})).await;
+            assert_eq!(recv(&mut ws).await.unwrap()["op"], "subscribed");
+            let snap = recv(&mut ws).await.unwrap();
+            assert_eq!(snap["op"], "snap");
+            assert_eq!(snap["data"]["rows"][0]["status"], "done");
+        }
+
+        #[tokio::test]
+        async fn overview_is_a_keyed_doc_without_clocks() {
+            let h = TestHarness::new().await;
+            let (_state, app) = admin_app_state(&h, Some("live-test"), Vec::new());
+            let token = breakglass_token(&app, "live-test").await;
+            let addr = serve(app).await;
+            let mut ws = signed_in(addr, &token).await;
+            send(&mut ws, json!({"op": "sub", "ref": "o", "topic": "overview"})).await;
+            assert_eq!(recv(&mut ws).await.unwrap()["shape"], "doc");
+            let snap = recv(&mut ws).await.unwrap();
+            assert_eq!(snap["op"], "snap");
+            let data = &snap["data"];
+            assert!(data["ssps"].is_object(), "entity lists are keyed: {data}");
+            assert!(data.get("server_time_ms").is_none());
+            assert!(data["scheduler"]["heartbeat"].get("samples").is_none(), "samples ride `metrics`");
+
+            send(&mut ws, json!({"op": "sub", "ref": "m", "topic": "metrics", "args": {"name": "sync"}})).await;
+            let subscribed = recv(&mut ws).await.unwrap();
+            assert_eq!(subscribed["key"], r#"metrics?{"name":"sync"}"#);
+            assert_eq!(subscribed["shape"], "series");
+            assert_eq!(recv(&mut ws).await.unwrap()["op"], "snap");
+        }
+
+        #[tokio::test]
+        async fn bad_topics_are_errors_not_disconnects() {
+            let h = TestHarness::new().await;
+            let (_state, app) = admin_app_state(&h, Some("live-test"), Vec::new());
+            let token = breakglass_token(&app, "live-test").await;
+            let addr = serve(app).await;
+            let mut ws = signed_in(addr, &token).await;
+            send(&mut ws, json!({"op": "sub", "ref": "x", "topic": "nope"})).await;
+            let err = recv(&mut ws).await.unwrap();
+            assert_eq!(err["op"], "error");
+            assert_eq!(err["ref"], "x");
+            send(&mut ws, json!({"op": "sub", "ref": "y", "topic": "metrics", "args": {"name": "cpu"}})).await;
+            assert_eq!(recv(&mut ws).await.unwrap()["code"], "bad_topic");
+            send(&mut ws, json!({"op": "ping"})).await;
+            assert_eq!(recv(&mut ws).await.unwrap()["op"], "pong");
+        }
+
+        #[tokio::test]
+        async fn a_bad_token_or_a_missing_auth_closes_the_socket() {
+            let h = TestHarness::new().await;
+            let (_state, app) = admin_app_state(&h, Some("live-test"), Vec::new());
+            let addr = serve(app).await;
+
+            let mut ws = connect(addr).await;
+            send(&mut ws, json!({"op": "auth", "token": "forged"})).await;
+            assert_eq!(recv(&mut ws).await, Err(Some(4401)));
+
+            let mut ws = connect(addr).await;
+            send(&mut ws, json!({"op": "sub", "ref": "r", "topic": "overview"})).await;
+            assert_eq!(recv(&mut ws).await, Err(Some(4400)), "the first message must be auth");
+        }
+
+        #[tokio::test]
+        async fn a_logout_closes_the_socket_and_the_token_never_rides_the_url() {
+            let h = TestHarness::new().await;
+            let (state, app) = admin_app_state(&h, Some("live-test"), Vec::new());
+            let token = breakglass_token(&app, "live-test").await;
+            let addr = serve(app).await;
+            // A token in the query string is not a way in.
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/admin/api/v2/live?token={token}"))
+                .await
+                .unwrap();
+            send(&mut ws, json!({"op": "sub", "ref": "r", "topic": "overview"})).await;
+            assert_eq!(recv(&mut ws).await, Err(Some(4400)));
+
+            let mut ws = signed_in(addr, &token).await;
+            state.sessions.revoke(&token);
+            // Re-auth with the revoked token is refused at once.
+            send(&mut ws, json!({"op": "auth", "token": token})).await;
+            assert_eq!(recv(&mut ws).await, Err(Some(4401)));
+        }
+
+        #[tokio::test]
+        async fn allowed_origins_gate_the_upgrade() {
+            let h = TestHarness::new().await;
+            let (_state, app) = admin_app_state(&h, Some("live-test"), vec!["https://console.sp00ky.cloud".into()]);
+            let addr = serve(app).await;
+            let request = |origin: &str| {
+                let mut req = format!("ws://{addr}/admin/api/v2/live").into_client_request().unwrap();
+                req.headers_mut().insert("Origin", origin.parse().unwrap());
+                req
+            };
+            assert!(tokio_tungstenite::connect_async(request("https://evil.example")).await.is_err());
+            assert!(tokio_tungstenite::connect_async(request("https://console.sp00ky.cloud")).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn http_snapshot_serves_the_same_states() {
+            let h = TestHarness::new().await;
+            let (_state, app) = admin_app_state(&h, Some("live-test"), Vec::new());
+            let token = breakglass_token(&app, "live-test").await;
+            let subs = urlencode(r#"[{"topic":"operations"},{"topic":"metrics","args":{"name":"jobs"}}]"#);
+            let res = app
+                .clone()
+                .oneshot(get_auth(&format!("/admin/api/v2/snapshot?subs={subs}"), &token))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = body_json(res).await;
+            assert!(body["boot"].is_string());
+            assert_eq!(body["snaps"][0]["key"], "operations");
+            assert_eq!(body["snaps"][0]["shape"], "window");
+            assert_eq!(body["snaps"][1]["shape"], "series");
+            let res = app.oneshot(get("/admin/api/v2/snapshot?subs=[]")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        fn urlencode(s: &str) -> String {
+            s.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                    _ => format!("%{b:02X}"),
+                })
+                .collect()
+        }
+    }
+
+    mod console_grant_login {
+        use super::*;
+        use ssp_protocol::console_grant::{self, GrantClaims};
+
+        const KEY: [u8; 32] = [5; 32];
+        const API: &str = "https://api.test";
+
+        fn jwks() -> String {
+            json!({ "keys": [console_grant::public_jwk("k1", &KEY)] }).to_string()
+        }
+
+        fn now() -> u64 {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        }
+
+        fn grant(jti: &str, project: &str, scope: &str) -> String {
+            let now = now();
+            console_grant::sign(
+                &GrantClaims {
+                    iss: API.into(),
+                    aud: json!(console_grant::audience(project)),
+                    sub: "acct_9".into(),
+                    name: Some("mira".into()),
+                    scope: scope.into(),
+                    perms: vec![],
+                    tenant: Some("t_1".into()),
+                    jti: jti.into(),
+                    iat: now,
+                    exp: now + 60,
+                    nbf: None,
+                    auth_time: Some(now),
+                },
+                "k1",
+                &KEY,
+            )
+        }
+
+        #[tokio::test]
+        async fn a_grant_opens_a_short_cloud_session_once() {
+            let h = TestHarness::new().await;
+            let jwks = jwks();
+            let (_state, app) = admin_app_cloud(&h, None, Some(API), Some("cluster-secret"), Some(&jwks));
+            let config = body_json(app.clone().oneshot(get("/admin/api/config")).await.unwrap()).await;
+            assert_eq!(config["cloud_login"], true);
+
+            let token = grant("g-1", "test-project", "full");
+            let res = app.clone().oneshot(login_req(json!({ "grant": token }), "10.0.0.9")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = body_json(res).await;
+            assert_eq!(body["mode"], "cloud");
+            assert_eq!(body["subject"], "cloud:acct_9");
+            assert_eq!(body["label"], "mira");
+            assert_eq!(body["expires_in_secs"], 900, "console sessions are short; the console renews them");
+            let session = body["token"].as_str().unwrap().to_string();
+            let me = body_json(app.clone().oneshot(get_auth("/admin/api/me", &session)).await.unwrap()).await;
+            assert_eq!(me["mode"], "cloud");
+            assert_eq!(me["scope"], "full");
+
+            // The same grant twice is a replay.
+            let res = app.clone().oneshot(login_req(json!({ "grant": token }), "10.0.0.9")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            assert!(body_json(res).await["error"].as_str().unwrap().contains("already used"));
+
+            // A grant for another project never opens this one.
+            let res = app
+                .clone()
+                .oneshot(login_req(json!({ "grant": grant("g-2", "other-project", "full") }), "10.0.0.9"))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            assert!(body_json(res).await["error"].as_str().unwrap().contains("another project"));
+        }
+
+        #[tokio::test]
+        async fn a_read_grant_cannot_write() {
+            let h = TestHarness::new().await;
+            let jwks = jwks();
+            let (_state, app) = admin_app_cloud(&h, None, Some(API), Some("cluster-secret"), Some(&jwks));
+            let res = app
+                .clone()
+                .oneshot(login_req(json!({ "grant": grant("g-r", "test-project", "read") }), "10.0.0.9"))
+                .await
+                .unwrap();
+            let session = body_json(res).await["token"].as_str().unwrap().to_string();
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/api/scheduler/restart")
+                        .header("Authorization", format!("Bearer {session}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_forged_grant_or_an_unlinked_scheduler_is_refused() {
+            let h = TestHarness::new().await;
+            let jwks = jwks();
+            let (_state, app) = admin_app_cloud(&h, None, Some(API), Some("cluster-secret"), Some(&jwks));
+            let forged = console_grant::sign(
+                &serde_json::from_value(json!({
+                    "iss": API, "aud": "spky-admin:test-project", "sub": "x", "scope": "full",
+                    "jti": "g-f", "iat": now(), "exp": now() + 60
+                }))
+                .unwrap(),
+                "k1",
+                &[6; 32],
+            );
+            let res = app.oneshot(login_req(json!({ "grant": forged }), "10.0.0.9")).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+            // Self-hosted (no cloud link): grants are not a way in at all.
+            let app = admin_app(&h, Some("pw"));
+            let config = body_json(app.clone().oneshot(get("/admin/api/config")).await.unwrap()).await;
+            assert_eq!(config["cloud_login"], false);
+            let res = app
+                .oneshot(login_req(json!({ "grant": grant("g-3", "test-project", "full") }), "10.0.0.9"))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]

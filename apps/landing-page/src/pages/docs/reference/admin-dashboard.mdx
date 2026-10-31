@@ -88,7 +88,8 @@ docker run -p 9668:9668 mono424/spooky-scheduler   # dashboard reachable
 
 ## Signing in
 
-Two ways in.
+Two ways in on the scheduler's own page, and a third from the
+[Sp00ky Cloud console](/docs/cloud/console).
 
 ### Admin accounts (the normal path)
 
@@ -125,6 +126,19 @@ this way is flagged with a persistent banner in the UI.
 
 Leave the variable unset to disable this path entirely; there is no default
 password.
+
+### From the Sp00ky Cloud console
+
+On a cloud-linked scheduler, a member of the project's workspace can open its
+dashboard from [console.sp00ky.cloud](/docs/cloud/console) without an account
+on the roster. The control plane signs a one-minute **grant** for that one
+project (an EdDSA JWT), and the console posts it to `POST /admin/api/session`
+as `{grant}`. The scheduler accepts it only if it is signed with a key from
+the control plane's `/.well-known/jwks.json`, names this project as its
+audience, was issued moments ago, and has not been used before; it answers
+with a `cloud` session of 15 minutes, which the console renews from a fresh
+grant. Removing someone from the workspace therefore ends their access within
+15 minutes. Self-hosted schedulers have no cloud link and refuse grants.
 
 ### Session behaviour
 
@@ -570,6 +584,23 @@ view key and the user. A rate needs two samples, so a view registered less than
 one presence interval ago has none yet, and the rate is measured over that
 interval (`15s` by default).
 
+## Live updates and caching
+
+The dashboard keeps one WebSocket open to `GET /admin/api/v2/live` instead of
+polling. It subscribes to **topics** (the overview, presence, the metrics
+series, jobs, workflow runs, incidents, operations, the scheduler's log tail);
+the scheduler computes each topic once however many dashboards watch it and
+sends a snapshot followed by small patches, so an idle cluster sends nothing
+and ten open tabs cost what one does. The session token is the socket's first
+message, never part of its URL. After a network blip the dashboard resumes
+from the last patch it holds; the scheduler keeps a minute of them.
+
+On https pages the dashboard caches the topics in the browser (SQLite in the
+Origin Private File System), so a reload paints at once and then asks only for
+what changed. Signing out clears that cache. A scheduler reached over plain
+http keeps them in memory only. If a proxy blocks WebSockets the dashboard
+falls back to polling on its own.
+
 ## Configuration
 
 | Variable                            | Default                       | Meaning                                                                                                                                                                                                                                                                |
@@ -588,6 +619,11 @@ interval (`15s` by default).
 | `SPKY_ADMIN_PRESENCE_MAX_ROWS`      | `20000`                       | Ceiling on rows one presence or views query may pull back                                                                                                                                                                                                              |
 | `SPKY_ADMIN_JOB_INTERVAL_SECS`      | `15`                          | How often the job sampler reads the outbox tables while nobody has the Jobs page open. `0` switches the sampler off: the Jobs list still works, the totals and the Overview tile report that they are not measured                                                     |
 | `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | `2`                           | The cadence while at least one dashboard holds `/admin/api/jobs/stream` open. Clamped to no slower than the idle interval                                                                                                                                              |
+| `SPKY_ADMIN_ALLOWED_ORIGINS`        | unset (any)                   | Comma-separated browser origins allowed to call the API and open the live socket. Unset or `*` allows any (the bearer token, never a cookie, is what authenticates); the scheduler's own page is always allowed. Sp00ky Cloud sets it to the console and the project's admin host |
+| `SPKY_ADMIN_CLOUD_LOGIN`            | `true`                        | Whether console grants are accepted on a cloud-linked scheduler. `0`/`false`/`off` refuses them                                                                                                                                                                        |
+| `SPKY_ADMIN_CLOUD_JWKS`             | unset                         | The control plane's grant keys as a JWKS document. Without it (or for an unknown key) they are fetched from `{SPKY_CLOUD_API_URL}/.well-known/jwks.json`                                                                                                              |
+| `SPKY_ADMIN_CLOUD_ISSUER`           | `SPKY_CLOUD_API_URL`          | The issuer a grant must name                                                                                                                                                                                                                                           |
+| `SPKY_ADMIN_CLOUD_SESSION_TTL_SECS` | `900`                         | Lifetime of a session opened with a grant (capped by `SPKY_ADMIN_SESSION_TTL_SECS`)                                                                                                                                                                                    |
 | `SPKY_CLOUD_API_URL`                | unset                         | Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane                                                                                                                                                                                  |
 | `SPKY_CLOUD_PROJECT`                | unset                         | The project slug, injected alongside it                                                                                                                                                                                                                                |
 | `SPKY_PROJECT_SLUG`                 | `default`                     | Storage prefix for backups on an unlinked scheduler                                                                                                                                                                                                                    |
@@ -634,8 +670,10 @@ and port with no path lands on the dashboard.
 
 | Endpoint                                    | Purpose                                                                                                                                                                                                                                                              |
 | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /admin/api/config`                     | Scheduler id, version, `breakglass_available`, `cloud_linked`, `supervised`, `sessions_persistent`, `project_slug`. Unauthenticated                                                                                                                                  |
-| `POST /admin/api/session`                   | Sign in. `{username, password}` or `{password}` for break-glass                                                                                                                                                                                                      |
+| `GET /admin/api/config`                     | Scheduler id, version, `breakglass_available`, `cloud_linked`, `cloud_login`, `supervised`, `sessions_persistent`, `project_slug`, and `live` (the live protocol version) with its `topics`. Unauthenticated                                                         |
+| `POST /admin/api/session`                   | Sign in. `{username, password}`, `{password}` for break-glass, or `{grant}` from the Sp00ky Cloud console                                                                                                                                                            |
+| `GET /admin/api/v2/live`                    | WebSocket. First message `{"op":"auth","token":…}`; then `{"op":"sub","ref","topic","args","since"}` per topic. The host answers `snap` (full state) and `diff` (`from`, `seq`, patch), and `expiring` before the session ends. Closes `4401` for a lost session      |
+| `GET /admin/api/v2/snapshot`                | The same topic states for a reader that polls. `?subs=[{"topic":"overview"},{"topic":"metrics","args":{"name":"sync"}}]`                                                                                                                                           |
 | `POST /admin/api/logout`                    | Revoke the current token                                                                                                                                                                                                                                             |
 | `GET /admin/api/me`                         | Current session's subject, label, mode and scope                                                                                                                                                                                                                     |
 | `GET /admin/api/overview`                   | Scheduler, SSP and backend entities plus totals, and the presence rollup                                                                                                                                                                                             |

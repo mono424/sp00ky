@@ -1,0 +1,79 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Console
+description: Every workspace and project in one place at console.sp00ky.cloud, with each project's live dashboard, deployments and settings.
+---
+
+import Note from '../../../components/ui/Note.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+# Console
+
+[console.sp00ky.cloud](https://console.sp00ky.cloud) is the web home of your
+Sp00ky Cloud projects. Sign in with GitHub, the same account `spky cloud login`
+uses, and you see every workspace you belong to and every project in it.
+
+## Finding your way
+
+- **The workspace selector** (top right) switches workspaces and holds the
+  workspace's own pages: members and invitations, billing and usage, the
+  vault, API keys and MCP tokens, activity, and your sessions. `⌘⇧W` opens it.
+- **The project switcher** is the first part of the breadcrumb (top left).
+  `⌘P` opens it; each project shows its state and whether it runs on VMs or
+  on Cloudflare.
+- **The sidebar** is the project's dashboard: Overview, Deployments,
+  Incidents, Logs, sync, runs, backups, resources, and **Settings** at the
+  bottom (environment, domains, git link, scale, access tokens, danger zone).
+  `⌘K` jumps to any page.
+
+Addresses are shareable: `/acme/whitepawn/deployments` is that page of that
+project, `/acme/-/members` the members of that workspace.
+
+## Deployments
+
+The Deployments page answers *what is live*: the deployment serving traffic
+right now (a deploy in progress does not count until it has taken over, and a
+failed one never does), where it came from (a git push with its commit, the
+CLI, CI, a rollback), and its image versions. A rollout in progress shows its
+build and deploy stages as they move. History lists every version with who
+started it and how long it took; **Roll back** brings back the newest version
+before the live one, **Restart** can restart or upgrade parts of the project,
+and **Rebuild** reruns the build of a git-linked project.
+
+## Settings
+
+Env values are encrypted with your workspace's vault. Setting a value never
+needs the vault; revealing values does. **Unlock** asks for your vault
+passphrase, stretches it in the browser (argon2id, exactly as the CLI does)
+and sends only the result. The unlocked vault lives in that tab's memory and
+locks itself after five idle minutes, or a minute after you leave the tab.
+
+## How it connects
+
+The console never relays a project's dashboard through Sp00ky Cloud. When you
+open a project, the control plane signs a one-minute **grant** naming you and
+that project, and your browser hands it to the project's own scheduler, which
+exchanges it for a 15-minute session. The console renews that session before
+it ends. Who may open a project is decided by workspace membership; removing
+someone from the workspace ends their access within 15 minutes. The
+[admin dashboard reference](/docs/reference/admin-dashboard#from-the-sp00ky-cloud-console)
+has the details.
+
+<Note>
+A project's live dashboard needs a scheduler from canary.370 or later. An
+older one still shows Deployments and Settings, with a note to upgrade it
+(`spky restart --upgrade`). Cloudflare projects show Deployments and
+Settings until their SSP learns console sign-in.
+</Note>
+
+The console's own session is a cookie that only console.sp00ky.cloud can
+read or send, and every request it makes carries a header no other page can
+add, so no other site can act through it. Project secrets and database
+passwords are never sent to the console.
+
+<CardGrid>
+  <LinkCard title="Admin dashboard" href="/docs/reference/admin-dashboard" description="Every page of a project's dashboard, and the API behind it." />
+  <LinkCard title="Environment & vault" href="/docs/cloud/env-variables" description="How env values are encrypted, and the vault passphrase." />
+  <LinkCard title="Teams" href="/docs/cloud/team" description="Invite members and manage roles." />
+</CardGrid>

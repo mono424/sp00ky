@@ -199,7 +199,13 @@ export class LiveClient {
       if (this.disposed) return;
       if (ev.code === CLOSE_UNAUTHORIZED) {
         this.setStatus('unauthorized');
-        this.opts.onUnauthorized?.();
+        // A host that can renew (the console mints a fresh session from a
+        // grant) gets one try before the session counts as lost.
+        if (this.opts.renew) {
+          void this.opts.renew().then((t) => (t ? this.retry() : this.opts.onUnauthorized?.()));
+        } else {
+          this.opts.onUnauthorized?.();
+        }
         return;
       }
       if (this.status() === 'idle') return; // parked on purpose

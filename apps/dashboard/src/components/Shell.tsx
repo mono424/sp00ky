@@ -4,6 +4,7 @@ import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
+import { useConsoleChrome } from '../console/chrome';
 
 interface NavLink {
   href: string;
@@ -35,6 +36,8 @@ const NAV_PATHS: Record<string, string> = {
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
   '/access': 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3',
   '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
+  '/deployments': 'M12 3l9 5-9 5-9-5 9-5z M3 13l9 5 9-5',
+  '/settings': 'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
 };
 
 function NavIcon(props: { href: string }) {
@@ -69,14 +72,24 @@ export function Shell(props: {
 }) {
   const location = useLocation();
   const [open, setOpen] = createSignal(false);
+  // In the console the workspace menu (top-right) holds the account, and
+  // Deployments and Settings join the rail; elsewhere this is undefined.
+  const cx = useConsoleChrome();
 
   // Pages only a scheduler can fill: an SSP serving the API alone has no
   // presence sampler, incident log, log ring or backups.
   const clusterOnly = new Set(['/views', '/backups', '/incidents', '/logs']);
-  const links = (): NavLink[] => allLinks().filter((l) => !servedByNode() || !clusterOnly.has(l.href));
+  const links = (): NavLink[] => {
+    if (cx?.limited()) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }];
+    return allLinks()
+      .filter((l) => !servedByNode() || !clusterOnly.has(l.href))
+      // The console keeps tokens under Settings.
+      .filter((l) => !cx || l.href !== '/access');
+  };
   const allLinks = (): NavLink[] => [
     // Where an operator starts: the cluster, what went wrong, what it said.
     { href: '/', label: 'Overview' },
+    ...(cx ? [{ href: '/deployments', label: 'Deployments' }] : []),
     {
       href: '/incidents',
       label: 'Incidents',
@@ -229,8 +242,12 @@ export function Shell(props: {
 
       <nav class="sidebar" classList={{ open: open() }}>
         {/* Who is signed in. The menu holds what used to sit at the foot:
-            access and signing out. */}
-        <div class="sb-me">
+            access and signing out. In the console the account lives in the
+            workspace menu, and the rail starts with the wordmark. */}
+        <Show when={cx}>
+          <div class="sb-me cx-brand"><Logo /><span class="cap">console</span></div>
+        </Show>
+        <div class="sb-me" style={cx ? { display: 'none' } : undefined}>
           <button
             class="sb-me-btn"
             aria-haspopup="menu"
@@ -305,6 +322,11 @@ export function Shell(props: {
           </For>
         </div>
 
+        <Show when={cx}>
+          <A href="/settings" class="nav-link cx-settings" activeClass="active">
+            <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
+          </A>
+        </Show>
         <div class="sb-foot cap">
           {props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? currentMode().config?.version?.replace(/^0\.0\.1-/, '') ?? ''}
         </div>

@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "type-check": "tsc --noEmit",
     "screenshots": "node screenshots/capture.mjs",
-    "test": "node test/build-adapter-test.mjs && node --test 'test/*.test.ts' 'test/dist/*.test.mjs'"
+    "test": "node test/build-adapter-test.mjs && node --test 'test/*.test.ts' 'test/dist/*.test.mjs'",
+    "build:console": "tsc --noEmit && vite build --mode console",
+    "dev:console": "vite --mode console"
   },
   "dependencies": {
     "@journeyapps/wa-sqlite": "^1.4.1",
@@ -18,6 +20,7 @@
     "@tanstack/browser-db-sqlite-persistence": "1.0.0-rc.1.1",
     "@tanstack/db": "1.0.0-rc.1.1",
     "@tanstack/solid-db": "1.0.0-rc.1.1",
+    "hash-wasm": "^4.12.0",
     "solid-js": "^1.9.10"
   },
   "devDependencies": {

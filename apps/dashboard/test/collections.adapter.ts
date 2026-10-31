@@ -98,3 +98,34 @@ test('the same topic is one collection per host', async () => {
   assert.equal(topics.get(TOPICS.jobs), topics.get(TOPICS.jobs));
   await topics.dispose();
 });
+
+test('page views: jobs, runs and incidents read like the REST payloads they replace', async () => {
+  const { createRoot } = await import('solid-js');
+  const { liveIncidentsView, liveJobsView, liveRunsView } = await import('../src/api/liveStack');
+  const client = new FakeClient();
+  const topics = new TopicCollections(client as unknown as LiveClient, 'test', null);
+  await createRoot(async (dispose) => {
+    const jobs = liveJobsView(topics);
+    const runs = liveRunsView(topics);
+    const incidents = liveIncidentsView(topics);
+    await Promise.resolve();
+    assert.equal(jobs(), undefined, 'no snapshot yet: the page keeps its fallback data');
+
+    client.sink('jobs').snap('b', 1, {
+      rows: [{ id: 'job:a', created_at: '2026-10-31T10:00:00Z' }, { id: 'job:b', created_at: '2026-10-31T11:00:00Z' }],
+      meta: { totals: { counts: { pending: 1 } }, limit: 50 },
+    });
+    client.sink('metrics').snap('b', 1, { items: [{ t: 2 }, { t: 1 }], keep: 120, meta: {} });
+    const page = jobs()!;
+    assert.deepEqual(page.jobs.map((j) => j.id), ['job:b', 'job:a'], 'newest first');
+    assert.deepEqual((page.totals as unknown as { samples: { t: number }[] }).samples.map((s) => s.t), [1, 2]);
+
+    client.sink('runs').snap('b', 1, { rows: [{ id: 'r1', created_at: '2026-10-30T00:00:00Z' }, { id: 'r2', created_at: '2026-10-31T00:00:00Z' }], meta: {} });
+    assert.deepEqual(runs().map((r) => r.id), ['r2', 'r1']);
+
+    client.sink('incidents').snap('b', 1, { rows: [{ id: 'i1', started_at: 1 }, { id: 'i2', started_at: 5 }], meta: { total: 9, open: 1 } });
+    assert.equal(incidents().total, 9);
+    assert.deepEqual(incidents().incidents.map((i) => (i as unknown as { id: string }).id), ['i2', 'i1']);
+    dispose();
+  });
+});

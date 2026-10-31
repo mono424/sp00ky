@@ -6,6 +6,7 @@ import { PageHead, Stale } from '../components/Chrome';
 import { FilterMenu, FxCell, Sq, type FilterValue } from '../components/Frame';
 import { decodeParam, formatBytes, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
 import { readStash, writeStash } from '../lib/stash';
+import { liveIncidentsView, useLiveView } from '../api/liveStack';
 
 interface IncidentEvent {
   at: number;
@@ -73,14 +74,14 @@ const dayKey = (ms: number) => {
 };
 
 /** Match the dashboard's resource polling, with cleanup and no overlapping polls. */
-function usePoll<T>(path: Accessor<string>, stash?: string) {
+function usePoll<T>(path: Accessor<string>, stash?: string, paused: Accessor<boolean> = () => false) {
   const [result, { refetch }] = createResource(path, async (url) => {
     const r = await api.getResult<T>(url);
     if (r.ok && stash) writeStash(stash, r.value);
     return r;
   });
   const timer = setInterval(() => {
-    if (!result.loading && !document.hidden) void refetch();
+    if (!result.loading && !document.hidden && !paused()) void refetch();
   }, 5000);
   onCleanup(() => clearInterval(timer));
   const cached = stash ? readStash<T>(stash)?.value : undefined;
@@ -175,7 +176,15 @@ export function Incidents() {
     return Date.now() - span();
   });
   const path = createMemo(() => `/incidents?limit=${WINDOW}${since() ? `&since=${since()}` : ''}`);
-  const poll = usePoll<IncidentList>(path, `incidents:${range()}`);
+  // The live socket's `incidents` topic (the newest 200) when there is one;
+  // the poll keeps the page working everywhere else.
+  const live = useLiveView(liveIncidentsView);
+  const polled = usePoll<IncidentList>(path, `incidents:${range()}`, () => !!live());
+  const poll = {
+    ...polled,
+    data: (): IncidentList | undefined => (live()?.() as IncidentList | undefined) ?? polled.data(),
+    stale: () => !live() && polled.stale(),
+  };
   const now = () => poll.data()?.server_time_ms ?? Date.now();
   // The scheduler's clock bounds the chart, so a skewed browser clock does not
   // push the history off its own axis.

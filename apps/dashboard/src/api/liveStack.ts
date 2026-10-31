@@ -10,7 +10,7 @@ import { createContext, createMemo, createSignal, onCleanup, useContext, type Ac
 import { LiveClient, liveUrl } from './live';
 import { TopicCollections, TOPICS, loadPersistedOptions, type DocRow, type TopicCollection } from './collections';
 import { clearPersistence, getPersistence } from './persistence';
-import type { Overview } from './types';
+import type { JobSummary, JobsListResponse, LogLine, Overview, WorkflowRun } from './types';
 
 export interface LiveStack {
   client: LiveClient;
@@ -157,4 +157,81 @@ export const LiveProvider = LiveContext.Provider;
 /** The session's live stack, or null when polling. */
 export function useLive(): Accessor<LiveStack | null> {
   return useContext(LiveContext);
+}
+
+/* ------------------------------------------------------------------ */
+/* Live views for the pages that used to stream or poll on their own    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A live view while the socket carries data, `undefined` otherwise (no live
+ * host, or a socket that never got through): the page then keeps its own
+ * stream or poll. Re-evaluated only when that answer flips.
+ */
+export function useLiveView<T>(make: (topics: TopicCollections) => Accessor<T>): Accessor<Accessor<T> | undefined> {
+  const live = useLive();
+  const usable = createMemo(() => {
+    const st = live();
+    return !!st && st.client.status() !== 'blocked';
+  });
+  return createMemo(() => (usable() ? make(live()!.topics) : undefined));
+}
+
+const newestFirst = <T>(rows: T[], key: string): T[] =>
+  [...rows].sort((a, b) => {
+    const x = (a as Record<string, unknown>)[key];
+    const y = (b as Record<string, unknown>)[key];
+    const nx = typeof x === 'number' ? x : Date.parse(String(x ?? ''));
+    const ny = typeof y === 'number' ? y : Date.parse(String(y ?? ''));
+    return (Number.isFinite(ny) ? ny : 0) - (Number.isFinite(nx) ? nx : 0);
+  });
+
+/** `GET /jobs` as the `jobs` topic and its sparkline series serve it. */
+export function liveJobsView(topics: TopicCollections): Accessor<JobsListResponse | undefined> {
+  const col = topics.get(TOPICS.jobs);
+  const rows = rowsSignal<JobSummary>(col);
+  const samples = rowsSignal<unknown>(topics.get(TOPICS.jobMetrics));
+  return createMemo(() => {
+    const meta = col.utils.meta() as Partial<JobsListResponse> & { totals?: JobsListResponse['totals'] };
+    if (!meta.totals) return undefined;
+    return {
+      ...meta,
+      jobs: newestFirst(rows(), 'created_at'),
+      totals: { ...meta.totals, samples: byKey(samples(), 't') },
+    } as JobsListResponse;
+  });
+}
+
+/** The newest workflow runs, newest first. */
+export function liveRunsView(topics: TopicCollections): Accessor<WorkflowRun[]> {
+  const rows = rowsSignal<WorkflowRun>(topics.get(TOPICS.runs));
+  return createMemo(() => newestFirst(rows(), 'created_at'));
+}
+
+/** The newest incidents with the summary the topic carries as meta. */
+export function liveIncidentsView(topics: TopicCollections) {
+  const col = topics.get(TOPICS.incidents);
+  const rows = rowsSignal<{ started_at: number }>(col);
+  return createMemo(() => {
+    const meta = col.utils.meta() as { total?: number; storage_error?: string | null };
+    const list = newestFirst(rows(), 'started_at');
+    return {
+      incidents: list,
+      total: meta.total ?? list.length,
+      offset: 0,
+      limit: list.length,
+      storage_error: meta.storage_error ?? null,
+      server_time_ms: Date.now(),
+    };
+  });
+}
+
+/** The scheduler's own log tail, oldest first, with the count the host dropped. */
+export function liveLogsView(topics: TopicCollections) {
+  const col = topics.get(TOPICS.logs);
+  const rows = rowsSignal<LogLine & { n: number }>(col);
+  return createMemo(() => ({
+    lines: byKey(rows(), 'n') as (LogLine & { n: number })[],
+    dropped: Number((col.utils.meta() as { dropped?: number }).dropped ?? 0),
+  }));
 }

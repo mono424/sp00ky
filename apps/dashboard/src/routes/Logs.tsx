@@ -4,6 +4,7 @@ import { openStream } from '../api/client';
 import { PageHead } from '../components/Chrome';
 import { FilterMenu, Sq, type FilterValue } from '../components/Frame';
 import { formatClock, formatCount } from '../lib/format';
+import { liveLogsView, useLiveView } from '../api/liveStack';
 import type { LogLine, Overview } from '../api/types';
 
 /** Above this many lines the oldest are dropped, so a long tail cannot grow
@@ -62,8 +63,28 @@ export function Logs(props: { overview: Overview | undefined }) {
   // Re-open the stream whenever the source changes. `createEffect` tracking
   // `source()` plus `onCleanup` inside it is what makes switching sources tear
   // the old stream down rather than accumulating them.
+  // The scheduler's own tail rides the live socket when there is one (the
+  // `logs` topic); an SSP's log, and every host without a socket, streams.
+  const live = useLiveView(liveLogsView);
+  createEffect(() => {
+    const view = live();
+    if (source() !== 'scheduler' || !view) return;
+    const { lines, dropped } = view();
+    const next: Entry[] = lines.map((l) => ({ kind: 'line' as const, line: l, seq: l.n }));
+    if (dropped > 0) next.unshift({ kind: 'dropped', count: dropped, seq: -1 });
+    setEntries(next.slice(-MAX_LINES));
+    setConnected(true);
+    setError(null);
+    if (follow()) {
+      queueMicrotask(() => {
+        if (viewport) viewport.scrollTop = viewport.scrollHeight;
+      });
+    }
+  });
+
   createEffect(() => {
     const src = source();
+    if (src === 'scheduler' && live()) return;
     setEntries([]);
     setConnected(false);
     setError(null);

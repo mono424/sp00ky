@@ -1,6 +1,6 @@
 name: spooky_flutter
 description: Flutter bindings for spooky_core - render bucket files through the local blob cache, WebRTC for peer to peer channels.
-version: 0.0.1-canary.367
+version: 0.0.1-canary.368
 publish_to: none
 
 environment:

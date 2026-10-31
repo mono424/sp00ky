@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/backend",
-  "version": "0.0.1-canary.367",
+  "version": "0.0.1-canary.368",
   "description": "sp00ky backend SDK: durable workflows with Cloudflare Workflows' API on sp00ky's own job engine (VM, spky dev, Cloudflare Worker backends)",
   "type": "module",
   "main": "dist/index.cjs",

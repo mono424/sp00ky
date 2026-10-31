@@ -4120,7 +4120,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "maintenance"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5520,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "push-core"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -6598,7 +6598,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7137,7 +7137,7 @@ dependencies = [
 
 [[package]]
 name = "sp00ky-cli"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7219,7 +7219,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "blake3",
@@ -7247,7 +7247,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-ffi"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "libc",
@@ -7258,7 +7258,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-node"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7286,7 +7286,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-portable"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7309,7 +7309,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-protocol"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -7320,7 +7320,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-server"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7357,7 +7357,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-wasm"
-version = "0.0.1-canary.369"
+version = "0.0.1-canary.370"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",

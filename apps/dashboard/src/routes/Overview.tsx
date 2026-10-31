@@ -582,6 +582,7 @@ export function Overview(props: {
               </div>
 
               <Barcode
+                max={120}
                 values={jobSamples().map((s) => s.throughput_1m)}
                 warn={jobSamples().map((s, i) => s.failed > (jobSamples()[i - 1]?.failed ?? 0))}
               />

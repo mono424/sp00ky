@@ -193,12 +193,13 @@ const JOB_TOTALS = {
   oldest_pending: iso(2_400),
   tables: 4,
   blind: false,
-  samples: Array.from({ length: 40 }, (_, i) => ({
-    t: ago((39 - i) * 30_000),
+  // A full ring, as the scheduler keeps it (SAMPLE_WINDOW = 120): an hour.
+  samples: Array.from({ length: 120 }, (_, i) => ({
+    t: ago((119 - i) * 30_000),
     pending: 2 + ((i * 3) % 7),
-    processing: (i % 3) + 1,
-    failed: i === 22 ? 2 : 0,
-    throughput_1m: 30 + ((i * 5) % 25),
+    processing: Math.max(0, Math.round(2 + 1.6 * Math.sin(i / 7) + (i % 11 === 0 ? 2 : 0))),
+    failed: i >= 70 ? 2 : 0,
+    throughput_1m: 30 + ((i * 5) % 25) + Math.round(12 * Math.sin(i / 9)),
   })),
   taken_at_ms: ago(11_000),
   sample_interval_secs: 30,

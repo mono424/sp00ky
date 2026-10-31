@@ -403,15 +403,43 @@ export function Matrix(props: { values: number[]; columns?: number }) {
 }
 
 /** One thin bar per sample; `warn` marks the samples where something failed. */
-export function Barcode(props: { values: number[]; warn?: boolean[] }) {
-  const hi = () => Math.max(1, ...props.values);
+/** The most bars a barcode draws by default: a quarter-width cell fits them. */
+const BARCODE_MAX = 48;
+
+/**
+ * A run of samples as thin bars, newest right. More samples than fit (the job
+ * sampler keeps an hour) are averaged into `max` buckets, and a bucket with
+ * any warning in it warns, so the strip always stays inside its cell. A
+ * full-width cell can take every sample.
+ */
+export function Barcode(props: { values: number[]; warn?: boolean[]; bad?: boolean[]; max?: number }) {
+  const bars = createMemo(() => {
+    const v = props.values;
+    const per = Math.max(1, Math.ceil(v.length / (props.max ?? BARCODE_MAX)));
+    const out: { v: number; warn: boolean; bad: boolean }[] = [];
+    // Bucketed from the newest end, so the last bar is always "now".
+    for (let end = v.length; end > 0; end -= per) {
+      const start = Math.max(0, end - per);
+      let sum = 0;
+      let warn = false;
+      let bad = false;
+      for (let i = start; i < end; i++) {
+        sum += v[i]!;
+        warn ||= !!props.warn?.[i];
+        bad ||= !!props.bad?.[i];
+      }
+      out.unshift({ v: sum / (end - start), warn, bad });
+    }
+    return out;
+  });
+  const hi = () => Math.max(1, ...bars().map((b) => b.v));
   return (
     <div class="fx-barcode" aria-hidden="true">
-      <For each={props.values}>
-        {(v, i) => (
+      <For each={bars()}>
+        {(b, i) => (
           <i
-            classList={{ warn: !!props.warn?.[i()], now: i() === props.values.length - 1 }}
-            style={{ height: `${Math.max(4, (v / hi()) * 100)}%` }}
+            classList={{ warn: b.warn, bad: b.bad, now: i() === bars().length - 1 }}
+            style={{ height: `${Math.max(4, (b.v / hi()) * 100)}%` }}
           />
         )}
       </For>

@@ -334,6 +334,8 @@ export function Runs() {
     [...(history()?.[name] ?? [])].sort((a, b) => (a.fire_at ?? a.created_at ?? '').localeCompare(b.fire_at ?? b.created_at ?? '')).slice(-12);
 
   const totals = () => jobs.page()?.totals;
+  /** The sampler's last hour, one point per sample, behind every figure's strip. */
+  const samples = () => totals()?.samples ?? [];
   const failedRuns = () => wf.runs().filter((r) => r.status === 'failed' && (time(r.finished_at) ?? 0) > now() - 3_600_000).length;
   const tables = () => jobs.page()?.tables ?? [];
 
@@ -369,14 +371,17 @@ export function Runs() {
               <span><b>{count((i) => i.kind === 'job' && i.status === 'running')}</b> jobs</span>
               <Show when={totals()?.stalled}><span class="warn"><b>{totals()!.stalled}</b> stalled</span></Show>
             </div>
+            <Barcode values={samples().map((x) => x.processing)} />
           </FxCell>
           <FxCell label="Waiting">
             <div class="fx-big">{totals() ? formatCount(totals()!.counts.pending) : '—'}</div>
             <div class="fx-sub cap"><span>oldest <b>{ago(time(totals()?.oldest_pending))}</b></span></div>
+            <Barcode values={samples().map((x) => x.pending)} />
           </FxCell>
           <FxCell label="Done" meta={<span>per minute</span>}>
             <div class="fx-big">{totals() ? formatCount(totals()!.throughput_1m) : '—'}</div>
-            <Barcode values={(totals()?.samples ?? []).map((x) => x.throughput_1m)} />
+            <div class="fx-sub cap"><span><b>{totals() ? formatCount(totals()!.counts.success) : '—'}</b> in the last hour</span></div>
+            <Barcode values={samples().map((x) => x.throughput_1m)} />
           </FxCell>
           <FxCell label="Failed" meta={<span>last hour</span>}>
             <div class="fx-big">
@@ -389,6 +394,7 @@ export function Runs() {
                 <button class="fx-link cap" onClick={() => setFilters({ status: ['failed'] })}>show</button>
               </Show>
             </div>
+            <Barcode values={samples().map((x) => x.failed)} bad={samples().map((x) => x.failed > 0)} />
           </FxCell>
         </section>
 

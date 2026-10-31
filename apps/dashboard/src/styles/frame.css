@@ -1170,8 +1170,9 @@ tbody tr:hover > td {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 3px;
+  gap: 1px;
   height: 72px;
+  overflow: hidden;
   margin-top: 16px;
   border-bottom: 1px solid var(--line);
 }
@@ -1187,8 +1188,20 @@ tbody tr:hover > td {
   background: var(--warn);
 }
 
+.fx-barcode i.bad {
+  background: var(--bad);
+  opacity: 0.7;
+}
+
+
 .fx-barcode i.now {
   background: var(--accent-strong);
+}
+
+/* the newest failing bar stays red, at full strength */
+.fx-barcode i.bad.now {
+  background: var(--bad);
+  opacity: 1;
 }
 
 /* a big figure with its parts beside it */

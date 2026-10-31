@@ -9,13 +9,19 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "type-check": "tsc --noEmit",
-    "screenshots": "node screenshots/capture.mjs"
+    "screenshots": "node screenshots/capture.mjs",
+    "test": "node test/build-adapter-test.mjs && node --test 'test/*.test.ts' 'test/dist/*.test.mjs'"
   },
   "dependencies": {
+    "@journeyapps/wa-sqlite": "^1.4.1",
     "@solidjs/router": "^0.15.3",
+    "@tanstack/browser-db-sqlite-persistence": "1.0.0-rc.1.1",
+    "@tanstack/db": "1.0.0-rc.1.1",
+    "@tanstack/solid-db": "1.0.0-rc.1.1",
     "solid-js": "^1.9.10"
   },
   "devDependencies": {
+    "esbuild": "0.21.5",
     "typescript": "^5.3.3",
     "vite": "^5.0.0",
     "vite-plugin-solid": "^2.8.0"

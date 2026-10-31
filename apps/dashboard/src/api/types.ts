@@ -6,6 +6,10 @@ export type SessionMode = 'roster' | 'breakglass' | 'mcp';
 export type SessionScope = 'read' | 'full';
 
 export interface ServerConfig {
+  /** The live protocol version this host speaks (`/v2/live`); absent on older hosts. */
+  live?: number;
+  /** Topics the host can stream. */
+  topics?: string[];
   scheduler_id: string;
   version: string;
   /** Whether `SPKY_ADMIN_PASSWORD` is set, i.e. password-only login is offered. */

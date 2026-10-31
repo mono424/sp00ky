@@ -161,6 +161,11 @@ function notifyUnauthorized() {
   unauthorizedHandlers.forEach((fn) => fn());
 }
 
+/** The live socket was refused the session (close 4401): the same loss. */
+export function signalUnauthorized() {
+  notifyUnauthorized();
+}
+
 export function url(path: string): string {
   return `${mode.baseUrl}/admin/api${path}`;
 }

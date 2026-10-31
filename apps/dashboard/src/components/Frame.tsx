@@ -127,6 +127,8 @@ export function Gauge(props: {
   unit?: string;
   pct: number | null;
   series?: number[];
+  /** In place of the trend, for a figure that has none. */
+  note?: JSX.Element;
 }) {
   return (
     <div class="fx-gauge">
@@ -148,7 +150,9 @@ export function Gauge(props: {
         </div>
       </Show>
       <Seg pct={props.pct} wide />
-      <Spark values={props.series ?? []} />
+      <Show when={props.note} fallback={<Spark values={props.series ?? []} />}>
+        <div class="fx-gnote cap">{props.note}</div>
+      </Show>
     </div>
   );
 }
@@ -169,6 +173,15 @@ export function usage(s: CloudService | undefined) {
     memLimit: limit,
     vcpus: s.vcpus,
     diskWriteBps: s.sample?.disk_write_bps ?? null,
+    // The room a container has is what it takes plus what is still free on
+    // the disk it shares: a host filling up shows here as well.
+    diskBytes: s.disk?.used_bytes ?? null,
+    diskFree: s.disk?.free_bytes ?? null,
+    diskRoom: s.disk ? s.disk.used_bytes + s.disk.free_bytes : null,
+    diskPct: s.disk && s.disk.used_bytes + s.disk.free_bytes > 0
+      ? (s.disk.used_bytes / (s.disk.used_bytes + s.disk.free_bytes)) * 100
+      : null,
+    diskAt: s.disk?.measured_at ?? null,
     since: s.since,
   };
 }

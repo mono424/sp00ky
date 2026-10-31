@@ -970,6 +970,20 @@ export interface CloudService {
   /** The last 15 minutes, one point per 15 s, oldest first. */
   cpu_series: number[];
   mem_series: number[];
+  /**
+   * How much the container's volumes take, measured every few minutes, and
+   * the host disk they grow into (shared with every other container there).
+   * Null until measured, for a container without a volume, and from a control
+   * plane that predates it. The bucket volume is `bucket_volume` instead.
+   */
+  disk?: CloudServiceDisk | null;
+}
+
+export interface CloudServiceDisk {
+  used_bytes: number;
+  fs_bytes: number;
+  free_bytes: number;
+  measured_at: string;
 }
 
 export interface CloudDedicatedMachine {

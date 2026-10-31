@@ -884,6 +884,18 @@ tbody tr:hover > td {
   color: var(--ink-ghost);
 }
 
+/* a gauge without a trend (disk is measured every few minutes): the same
+   40px as the spark it stands in for, so gauges in a row stay level */
+.fx-gnote {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+  min-height: 40px;
+  margin-top: 12px;
+  color: var(--ink-ghost);
+}
+
 .fx-spark {
   display: block;
   width: 100%;
@@ -2288,6 +2300,12 @@ h2 {
   margin: 0 0 14px;
 }
 
+/* an SSP measured by Sp00ky Cloud has its disk as a fourth fact, on the
+   same line */
+.sp-facts:has(> :nth-child(4)) {
+  grid-template-columns: 1.3fr 0.8fr 1fr 0.9fr;
+}
+
 .sp-facts div {
   display: grid;
   gap: 3px;
@@ -3550,6 +3568,15 @@ h2 {
   .rn-sched td:nth-child(4),
   .rn-sched th:nth-child(6),
   .rn-sched td:nth-child(6) {
+    display: none;
+  }
+
+  .rs-containers th:nth-child(n + 5),
+  .rs-containers td:nth-child(n + 5) {
+    display: none;
+  }
+  .rs-containers .fx-meter em,
+  .rs-containers .fx-meter .fx-seg {
     display: none;
   }
 

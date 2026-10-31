@@ -210,6 +210,12 @@ function SspRow(props: {
               <dt class="cap">Heartbeat</dt>
               <dd classList={{ warn: s().last_heartbeat_seconds_ago > 30 }}>{short(s().last_heartbeat_seconds_ago)} ago</dd>
             </div>
+            <Show when={props.use?.diskBytes != null}>
+              <div title={`circuit snapshot and row arena · ${formatBytes(props.use!.diskFree)} free on host`}>
+                <dt class="cap">Disk</dt>
+                <dd classList={{ warn: (props.use!.diskPct ?? 0) >= 80 }}>{formatBytes(props.use!.diskBytes)}</dd>
+              </div>
+            </Show>
           </dl>
           <DayTicks component={s().id} incidents={props.data.incidents?.recent} uptimeSecs={s().uptime_seconds} now={props.now} />
           <div class="sp-actions">

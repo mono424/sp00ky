@@ -17,7 +17,7 @@ import {
   usage,
 } from '../components/Frame';
 import { api } from '../api/client';
-import { formatCount, formatMs, formatRelativeTime, formatUptime } from '../lib/format';
+import { formatBytes, formatCount, formatMs, formatRelativeTime, formatUptime } from '../lib/format';
 import { backendTone, sspTone } from '../lib/status';
 import { retryJob } from '../lib/runActions';
 import type {
@@ -327,7 +327,7 @@ export function Overview(props: {
                   </span>
                 </span>
               </div>
-              <Usage use={dbUse()} />
+              <Usage use={dbUse()} now={now()} />
               <div class="fx-foot">
                 <div>
                   <span class="cap">Write to live</span>
@@ -368,7 +368,7 @@ export function Overview(props: {
                   </span>
                 </span>
               </div>
-              <Usage use={schedUse()} />
+              <Usage use={schedUse()} now={now()} />
               <div class="fx-foot">
                 <div>
                   <span class="cap">Ingest lag</span>
@@ -642,9 +642,10 @@ export function Overview(props: {
 }
 
 /** CPU, memory and disk of one container; "not reported" where unknown. */
-function Usage(props: { use: ReturnType<typeof usage> }) {
+function Usage(props: { use: ReturnType<typeof usage>; now: number }) {
   const mem = () => (props.use?.memBytes != null ? memText(props.use.memBytes) : null);
   const limit = () => (props.use ? memText(props.use.memLimit) : null);
+  const disk = () => (props.use?.diskBytes != null ? memText(props.use.diskBytes) : null);
   return (
     <div class="fx-gauges">
       <Gauge
@@ -663,8 +664,23 @@ function Usage(props: { use: ReturnType<typeof usage> }) {
         pct={props.use?.memPct ?? null}
         series={props.use?.memSeries}
       />
-      {/* Volume usage is not in the control plane's metrics yet. */}
-      <Gauge label="Disk" value={null} pct={null} />
+      <Gauge
+        label="Disk"
+        of={props.use?.diskRoom != null ? formatBytes(props.use.diskRoom) : undefined}
+        value={disk()?.value ?? null}
+        unit={disk()?.unit}
+        pct={props.use?.diskPct ?? null}
+        note={
+          props.use?.diskFree != null ? (
+            <>
+              <span>{formatBytes(props.use.diskFree)} free on host</span>
+              <Show when={props.use.diskAt}>
+                {(at) => <span>measured {formatUptime(Math.max(0, props.now - Date.parse(at())) / 1000)} ago</span>}
+              </Show>
+            </>
+          ) : undefined
+        }
+      />
     </div>
   );
 }

@@ -1182,12 +1182,14 @@ const service = (id, name, role, vcpus, memoryMb, cpu, cpuSwing, memMb, extra = 
     cpu_series: cpuS, mem_series: memS, ...extra,
   };
 };
+/** A container's volumes on the host disk (160 GB, 62 GB of it free). */
+const disk = (usedBytes) => ({ disk: { used_bytes: usedBytes, fs_bytes: 171_798_691_840, free_bytes: 66_571_993_088, measured_at: iso(2 * 60_000) } });
 const CLOUD_STATS = {
   deployment: { id: 'dep_7f2c', version: 142, status: 'running', deployed_at: iso(2 * 3_600_000) },
   services: [
-    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740),
-    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210),
-    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380),
+    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740, disk(4_617_089_843)),
+    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210, disk(1_288_490_189)),
+    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380, disk(402_653_184)),
     service('vm-api', 'api', 'backend', 1, 512, 6, 3, 212, { image: 'acme/api' }),
     service('vm-mail', 'email', 'backend', 1, 512, 1.2, 0.6, 64, { image: 'acme/email' }),
     service('vm-render', 'renderer', 'backend', 1, 64, 0.4, 0.2, 9, { image: 'nginx:1.27-alpine', machine: 'media' }),

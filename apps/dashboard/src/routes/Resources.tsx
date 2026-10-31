@@ -45,6 +45,11 @@ const memLimit = (s: CloudService) => s.sample?.mem_limit_bytes || s.memory_mb *
 /** CPU as a share of the container's vCPUs; `cpu_pct` is per core. */
 const cpuPct = (s: CloudService) => (s.sample && s.vcpus > 0 ? s.sample.cpu_pct / s.vcpus : null);
 const memPct = (s: CloudService) => (s.sample ? (s.sample.mem_bytes / memLimit(s)) * 100 : null);
+/** Its volumes against the room they have: what they take plus what the host disk has free. */
+const volumesPct = (s: CloudService) => {
+  const room = s.disk ? s.disk.used_bytes + s.disk.free_bytes : 0;
+  return s.disk && room > 0 ? (s.disk.used_bytes / room) * 100 : null;
+};
 
 /** How close a container is to any limit; a stopped one sorts first. */
 function pressure(s: CloudService): number {
@@ -237,14 +242,15 @@ export function Resources() {
             <section class="fx-row">
               <FxCell label="Containers" meta={<span><b>{running().length}</b> of {services().length} running · closest to a limit first</span>}>
                 <Show when={services().length} fallback={<div class="fx-empty cap">No containers are running</div>}>
-                  <table class="fx-list">
+                  <table class="fx-list rs-containers">
                     <colgroup>
-                      <col style={{ width: '20%' }} /><col style={{ width: '20%' }} /><col style={{ width: '24%' }} />
-                      <col style={{ width: '11%' }} /><col style={{ width: '15%' }} /><col style={{ width: '10%' }} />
+                      <col style={{ width: '13%' }} /><col style={{ width: '18%' }} /><col style={{ width: '18%' }} />
+                      <col style={{ width: '19%' }} /><col style={{ width: '8%' }} /><col style={{ width: '17%' }} /><col style={{ width: '7%' }} />
                     </colgroup>
                     <thead>
                       <tr>
                         <th class="cap">Container</th><th class="cap">CPU</th><th class="cap">Memory</th>
+                        <th class="cap" title="its volumes, against what they take plus what is still free on the host disk">Disk</th>
                         <th class="cap r">Disk writes</th><th class="cap r">Network in / out</th><th class="cap r">Up</th>
                       </tr>
                     </thead>
@@ -270,6 +276,11 @@ export function Resources() {
                             <td>
                               <Meter pct={s.status === 'running' && s.sample ? memPct(s) : null}>
                                 {s.sample ? formatBytes(s.sample.mem_bytes) : '—'} <em>/ {formatBytes(memLimit(s))}</em>
+                              </Meter>
+                            </td>
+                            <td>
+                              <Meter pct={volumesPct(s)}>
+                                {formatBytes(s.disk?.used_bytes)} <em>/ {formatBytes(s.disk ? s.disk.used_bytes + s.disk.free_bytes : null)}</em>
                               </Meter>
                             </td>
                             <td class="r">{rate(s.sample?.disk_write_bps)}</td>

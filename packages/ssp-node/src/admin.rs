@@ -56,9 +56,19 @@ pub struct AdminSettings {
     /// `SPKY_ADMIN_ACCESS`: the record access a roster login signs in
     /// through. Discovered from `INFO FOR DB` when absent.
     pub access: Option<String>,
-    /// The project's slug, for the MCP server's instructions.
+    /// The project's slug, for the MCP server's instructions and as the
+    /// audience a Sp00ky Cloud console grant must name.
     pub project_slug: Option<String>,
+    /// The control plane that signs console grants (`SPKY_CLOUD_API_URL`).
+    pub cloud_issuer: Option<String>,
+    /// Its public keys, a JWKS document the control plane hands the node at
+    /// deploy time (`SPKY_ADMIN_CLOUD_JWKS`). A Worker cannot be relied on to
+    /// fetch them mid-request, so a node accepts grants only when given both.
+    pub cloud_jwks: Option<String>,
 }
+
+/// How long a session opened with a console grant lasts; the console renews it.
+const CLOUD_SESSION_TTL_SECS: u64 = 15 * 60;
 
 /// The admin API's state on one node: its settings and what it remembers
 /// between requests. Lost on restart, which costs a revoked token its
@@ -69,6 +79,18 @@ pub struct AdminState {
     revoked: Mutex<HashSet<String>>,
     failures: Mutex<VecDeque<u64>>,
     job_totals: Mutex<Option<(u64, Value)>>,
+    /// `jti` -> `exp` of every console grant exchanged and not yet expired.
+    grants_used: Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl AdminSettings {
+    /// The keys and issuer for console grants, when this node accepts them.
+    fn cloud_login(&self) -> Option<(ssp_protocol::console_grant::Jwks, &str, &str)> {
+        let issuer = self.cloud_issuer.as_deref().filter(|s| !s.is_empty())?;
+        let slug = self.project_slug.as_deref().filter(|s| !s.is_empty())?;
+        let jwks = serde_json::from_str(self.cloud_jwks.as_deref()?).ok()?;
+        Some((jwks, issuer, slug))
+    }
 }
 
 impl AdminState {
@@ -455,6 +477,8 @@ impl SspNode {
                 "project_slug": self.admin.settings.project_slug,
                 // Streams need a background sampler; a node answers by poll.
                 "streams": false,
+                // Whether a Sp00ky Cloud console user can sign in with a grant.
+                "cloud_login": self.admin.settings.cloud_login().is_some(),
             }),
         )
     }
@@ -467,6 +491,9 @@ impl SspNode {
             return error(429, "Too many attempts. Try again later.");
         }
         let body = body_json(req);
+        if let Some(grant) = body.get("grant").and_then(Value::as_str).map(str::trim).filter(|g| !g.is_empty()) {
+            return self.admin_grant_login(grant);
+        }
         let password = body.get("password").and_then(Value::as_str).unwrap_or("");
         let username = body.get("username").and_then(Value::as_str).filter(|u| !u.is_empty());
 
@@ -533,6 +560,43 @@ impl SspNode {
                 error(503, "The project's database could not be reached")
             }
         }
+    }
+
+    /// A console user, vouched for by Sp00ky Cloud: the same checks as the
+    /// scheduler (`ssp_protocol::console_grant`), and each grant once.
+    fn admin_grant_login(&self, grant: &str) -> ApiResponse {
+        use ssp_protocol::console_grant::{self as cg, LEEWAY_SECS};
+        let Some((jwks, issuer, slug)) = self.admin.settings.cloud_login() else {
+            return error(401, "Sp00ky Cloud sign-in is not enabled on this node");
+        };
+        let now = now_secs();
+        let claims = match cg::verify(grant, &jwks, issuer, &cg::audience(slug), now) {
+            Ok(c) => c,
+            Err(e) => {
+                self.admin_login_failed();
+                tracing::warn!(error = %e, "Console grant refused");
+                return error(401, format!("Sign-in refused: {e}"));
+            }
+        };
+        {
+            let Ok(mut used) = self.admin.grants_used.lock() else { return error(500, "grant memory poisoned") };
+            used.retain(|_, exp| exp.saturating_add(LEEWAY_SECS) > now);
+            if used.contains_key(&claims.jti) {
+                return error(401, "Sign-in refused: grant was already used");
+            }
+            if used.len() >= 10_000 {
+                return error(429, "Too many grants in flight; try again shortly");
+            }
+            used.insert(claims.jti.clone(), claims.exp);
+        }
+        let scope = Scope::parse(&claims.scope).unwrap_or(Scope::Read);
+        let subject = format!("cloud:{}", claims.sub);
+        let label = claims.name.clone().unwrap_or_else(|| claims.sub.clone());
+        let (token, _) = self.mint_admin_token(subject.clone(), label.clone(), SessionMode::Cloud, scope, CLOUD_SESSION_TTL_SECS);
+        json_response(
+            200,
+            json!({ "token": token, "mode": SessionMode::Cloud, "subject": subject, "label": label, "expires_in_secs": CLOUD_SESSION_TTL_SECS }),
+        )
     }
 
     fn admin_login_answer(&self, subject: String, label: String, mode: SessionMode) -> ApiResponse {

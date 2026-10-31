@@ -247,10 +247,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                   <Show when={d().config?.retention}><span>newest <b>{formatCount(d().config!.retention)}</b> kept</span></Show>
                 </div>
               </FxCell>
-              <FxCell label="Stored in" meta={<span>{d().linked ? 'Sp00ky Cloud' : 'bucket listing'}</span>}>
-                <div class="fx-big bk-bucket">{d().s3.bucket ?? '—'}</div>
-                <div class="fx-sub cap"><span>{d().s3.endpoint ?? 'no endpoint'}</span></div>
-              </FxCell>
+              <StoredIn endpoint={d().s3.endpoint} bucket={d().s3.bucket} linked={d().linked} />
             </section>
 
             {/* how they have gone, and when they run ========================== */}
@@ -585,4 +582,71 @@ function RestoreProgress(props: {
       </div>
     </Show>
   );
+}
+
+/**
+ * Where the backups are, as a person would say it: the provider and its
+ * region, read off the S3 endpoint. The bucket follows on one line, shortened
+ * in the middle (Sp00ky Cloud's are named after the tenant id) and copyable
+ * whole; the full endpoint is the headline's tooltip.
+ */
+function StoredIn(props: { endpoint: string | null; bucket: string | null; linked: boolean }) {
+  const [copied, setCopied] = createSignal(false);
+  const where = () => storeOf(props.endpoint);
+  return (
+    <FxCell label="Stored in" meta={<span>{props.linked ? 'Sp00ky Cloud' : 'bucket listing'}</span>}>
+      <div class="fx-big bu-where" title={props.endpoint ?? undefined}>
+        <span>{where().provider}</span>
+        <Show when={where().region}>
+          <small>{where().region}</small>
+        </Show>
+      </div>
+      <Show when={props.bucket} fallback={<div class="fx-sub cap"><span>no bucket configured</span></div>}>
+        {(bucket) => (
+          <div class="fx-sub cap bu-store">
+            <span>bucket</span>
+            <b title={bucket()}>{middle(bucket(), 22)}</b>
+            <button
+              class="bu-copy cap"
+              classList={{ done: copied() }}
+              title={`Copy ${bucket()}`}
+              onClick={() => {
+                void navigator.clipboard?.writeText(bucket());
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1200);
+              }}
+            >
+              {copied() ? 'copied' : 'copy'}
+            </button>
+          </div>
+        )}
+      </Show>
+    </FxCell>
+  );
+}
+
+/** The provider and region of an S3 endpoint; the bare host when unknown. */
+function storeOf(endpoint: string | null): { provider: string; region?: string } {
+  if (!endpoint) return { provider: '—' };
+  let host = endpoint;
+  try {
+    host = new URL(endpoint.includes('://') ? endpoint : `https://${endpoint}`).host;
+  } catch {
+    // not a URL: show it as given
+  }
+  const h = host.toLowerCase();
+  let m: RegExpExecArray | null;
+  if ((m = /(?:^|\.)([a-z]{3}\d)\.your-objectstorage\.com$/.exec(h))) return { provider: 'Hetzner', region: m[1] };
+  if (h.endsWith('.r2.cloudflarestorage.com')) return { provider: 'Cloudflare R2' };
+  if ((m = /(?:^|\.)s3[.-]([a-z0-9-]+)\.amazonaws\.com$/.exec(h))) return { provider: 'AWS S3', region: m[1] };
+  if (h.endsWith('.amazonaws.com')) return { provider: 'AWS S3' };
+  if ((m = /(?:^|\.)([a-z]{3}\d)\.digitaloceanspaces\.com$/.exec(h))) return { provider: 'DO Spaces', region: m[1] };
+  return { provider: host };
+}
+
+/** A long name cut in the middle, keeping both ends. */
+function middle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const tail = Math.floor((max - 1) / 2);
+  return `${text.slice(0, max - 1 - tail)}…${text.slice(-tail)}`;
 }

@@ -2839,10 +2839,44 @@ h2 {
    BACKUPS
    ================================================================ */
 
-.bk-bucket {
-  font-size: 22px;
-  letter-spacing: -0.02em;
-  overflow-wrap: anywhere;
+/* where the backups are: provider and region, one line however long */
+.bu-where {
+  min-width: 0;
+}
+
+.bu-where > span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.bu-store {
+  align-items: baseline;
+  flex-wrap: nowrap;
+  gap: 10px;
+}
+
+.bu-store b {
+  min-width: 0;
+  overflow: hidden;
+  font: 12px var(--mono);
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.bu-copy {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-ghost);
+  cursor: pointer;
+}
+
+.bu-copy:hover,
+.bu-copy.done {
+  color: var(--accent);
 }
 
 /* one bar per backup: its size, red where it failed */

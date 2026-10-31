@@ -956,7 +956,7 @@ const catalogEntry = (o) => ({
 
 export const BACKUPS = {
   linked: true,
-  s3: { configured: true, endpoint: 's3.eu-central-1.amazonaws.com', bucket: 'acme-backups' },
+  s3: { configured: true, endpoint: 'https://spooky-t-4c1e9a7b2f8d4e6a9b3c5d7e1f2a4b6c.fsn1.your-objectstorage.com', bucket: 'spooky-t-4c1e9a7b2f8d4e6a9b3c5d7e1f2a4b6c' },
   project_slug: 'acme',
   scheduler_status: 'ready',
   local: { current_running: null, queue_len: 0, recent: [] },

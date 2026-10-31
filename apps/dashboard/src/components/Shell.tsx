@@ -1,14 +1,16 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js';
-import { A, useLocation, useNavigate } from '@solidjs/router';
+import { A, useLocation, useNavigate, useResolvedPath } from '@solidjs/router';
 import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
-import { useConsoleChrome } from '../console/chrome';
+import { WORKSPACE_LINKS, WorkspaceMenu, useConsoleChrome } from '../console/chrome';
 
-interface NavLink {
+export interface NavLink {
   href: string;
   label: string;
+  /** SVG path data; the page's own icon by default. */
+  icon?: string;
   count?: string;
   /** Amber count: something there needs looking at. */
   warn?: boolean;
@@ -40,12 +42,79 @@ const NAV_PATHS: Record<string, string> = {
   '/settings': 'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
 };
 
-function NavIcon(props: { href: string }) {
+function NavIcon(props: { href: string; icon?: string }) {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
     stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"
     aria-hidden="true" style={{ 'flex-shrink': '0' }}>
-    <path d={NAV_PATHS[props.href]} />
+    <path d={props.icon ?? NAV_PATHS[props.href]} />
   </svg>;
+}
+
+/**
+ * A project's rail, counts off the overview where it has them. The console
+ * adds Deployments and keeps tokens under Settings.
+ */
+export function projectNav(console: boolean, overview?: Overview): NavLink[] {
+  const o = overview;
+  return [
+    // Where an operator starts: the cluster, what went wrong, what it said.
+    { href: '/', label: 'Overview' },
+    ...(console ? [{ href: '/deployments', label: 'Deployments' }] : []),
+    {
+      href: '/incidents',
+      label: 'Incidents',
+      count: o?.incidents?.open ? formatCount(o.incidents.open) : undefined,
+      warn: !!o?.incidents?.open,
+    },
+    { href: '/logs', label: 'Logs' },
+    {
+      href: '/ssps',
+      label: 'SSPs',
+      group: 'Sync',
+      count: o ? `${o.totals.ssps_ready}/${o.totals.ssps}` : undefined,
+    },
+    {
+      href: '/backends',
+      label: 'Backends',
+      group: 'Sync',
+      count: o ? `${o.totals.backends_healthy}/${o.totals.backends}` : undefined,
+    },
+    {
+      href: '/views',
+      label: 'Views',
+      group: 'Sync',
+      // Off the presence block the overview poll already carries. Absent until
+      // the scheduler's sampler has run once, which is not the same as "no
+      // views are registered".
+      count: o?.presence?.ready ? formatCount(o.presence.totals.views) : undefined,
+    },
+    {
+      href: '/runs',
+      label: 'Runs',
+      group: 'Automation',
+      // Work outstanding, not work done: pending plus in flight is the number
+      // that means "there is something to look at". Absent until the job
+      // sampler has run once, which is not the same as "the queue is empty".
+      count: o?.jobs?.ready ? formatCount(o.jobs.counts.pending + o.jobs.counts.processing) : undefined,
+    },
+    { href: '/backups', label: 'Backups', group: 'Data' },
+    // Sp00ky Cloud only: the scheduler cannot measure its neighbours or the
+    // database's volume, the control plane can. Hidden, not disabled, when
+    // unlinked: there is nothing on that page a self-hosted cluster could use.
+    ...(o?.cloud_linked ? [{ href: '/resources', label: 'Resources', group: 'Data' }] : []),
+    ...(console ? [] : [{ href: '/access', label: 'Access', group: 'Data' }]),
+  ];
+}
+
+/** Consecutive links with the same group, in order. */
+function sectionsOf(links: NavLink[]): { group?: string; links: NavLink[] }[] {
+  const out: { group?: string; links: NavLink[] }[] = [];
+  for (const l of links) {
+    const last = out[out.length - 1];
+    if (last && last.group === l.group) last.links.push(l);
+    else out.push({ group: l.group, links: [l] });
+  }
+  return out;
 }
 
 /**
@@ -68,6 +137,8 @@ export function Shell(props: {
   session: LoginResponse;
   overview: Overview | undefined;
   onSignOut: () => void;
+  /** A rail of its own instead of a project's pages: a console workspace. */
+  nav?: { heading: string; links: NavLink[] };
   children: JSX.Element;
 }) {
   const location = useLocation();
@@ -80,82 +151,12 @@ export function Shell(props: {
   // presence sampler, incident log, log ring or backups.
   const clusterOnly = new Set(['/views', '/backups', '/incidents', '/logs']);
   const links = (): NavLink[] => {
+    if (props.nav) return props.nav.links.map((l) => ({ ...l, group: props.nav!.heading }));
     if (cx?.limited()) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }];
-    return allLinks()
-      .filter((l) => !servedByNode() || !clusterOnly.has(l.href))
-      // The console keeps tokens under Settings.
-      .filter((l) => !cx || l.href !== '/access');
+    return projectNav(!!cx, props.overview).filter((l) => !servedByNode() || !clusterOnly.has(l.href));
   };
-  const allLinks = (): NavLink[] => [
-    // Where an operator starts: the cluster, what went wrong, what it said.
-    { href: '/', label: 'Overview' },
-    ...(cx ? [{ href: '/deployments', label: 'Deployments' }] : []),
-    {
-      href: '/incidents',
-      label: 'Incidents',
-      count: props.overview?.incidents?.open ? formatCount(props.overview.incidents.open) : undefined,
-      warn: !!props.overview?.incidents?.open,
-    },
-    { href: '/logs', label: 'Logs' },
-    {
-      href: '/ssps',
-      label: 'SSPs',
-      group: 'Sync',
-      count: props.overview
-        ? `${props.overview.totals.ssps_ready}/${props.overview.totals.ssps}`
-        : undefined,
-    },
-    {
-      href: '/backends',
-      label: 'Backends',
-      group: 'Sync',
-      count: props.overview
-        ? `${props.overview.totals.backends_healthy}/${props.overview.totals.backends}`
-        : undefined,
-    },
-    {
-      href: '/views',
-      label: 'Views',
-      group: 'Sync',
-      // Off the presence block the overview poll already carries. Absent until
-      // the scheduler's sampler has run once, which is not the same as "no
-      // views are registered".
-      count: props.overview?.presence?.ready
-        ? formatCount(props.overview.presence.totals.views)
-        : undefined,
-    },
-    {
-      href: '/runs',
-      label: 'Runs',
-      group: 'Automation',
-      // Work outstanding, not work done: pending plus in flight is the number
-      // that means "there is something to look at". Absent until the job
-      // sampler has run once, which is not the same as "the queue is empty".
-      count: props.overview?.jobs?.ready
-        ? formatCount(
-            props.overview.jobs.counts.pending +
-              props.overview.jobs.counts.processing,
-          )
-        : undefined,
-    },
-    { href: '/backups', label: 'Backups', group: 'Data' },
-    // Sp00ky Cloud only: the scheduler cannot measure its neighbours or the
-    // database's volume, the control plane can. Hidden, not disabled, when
-    // unlinked: there is nothing on that page a self-hosted cluster could use.
-    ...(props.overview?.cloud_linked ? [{ href: '/resources', label: 'Resources', group: 'Data' }] : []),
-    { href: '/access', label: 'Access', group: 'Data' },
-  ];
 
-  /** Consecutive links with the same group, in order. */
-  const sections = () => {
-    const out: { group?: string; links: NavLink[] }[] = [];
-    for (const l of links()) {
-      const last = out[out.length - 1];
-      if (last && last.group === l.group) last.links.push(l);
-      else out.push({ group: l.group, links: [l] });
-    }
-    return out;
-  };
+  const sections = () => sectionsOf(links());
 
   const slug = () => currentMode().config?.project_slug ?? 'sp00ky';
 
@@ -191,7 +192,10 @@ export function Shell(props: {
     document.body.style.overflow = '';
   });
 
-  const atRoot = () => /^(\/admin)?\/?$/.test(location.pathname);
+  // The router's exact match misses "/admin/" for "/admin"; compare the
+  // root's own href, base included, with the trailing slash dropped.
+  const rootPath = useResolvedPath(() => '/');
+  const atRoot = () => location.pathname.replace(/\/$/, '') === (rootPath() ?? '').replace(/\/$/, '');
   const [menuOpen, setMenuOpen] = createSignal(false);
   const [paletteOpen, setPaletteOpen] = createSignal(false);
   createEffect(() => {
@@ -234,6 +238,10 @@ export function Shell(props: {
           <span />
         </button>
         <Logo />
+        {/* The page head's workspace menu, moved up here on a phone. */}
+        <Show when={cx}>
+          <span class="mb-ws"><WorkspaceMenu shortcut={false} /></span>
+        </Show>
       </header>
 
       <Show when={open()}>
@@ -310,7 +318,7 @@ export function Shell(props: {
                       // active class, so `active: false` elsewhere would erase it.
                       classList={link.href === '/' ? { active: atRoot() } : undefined}
                     >
-                      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} /><span>{link.label}</span></span>
+                      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} icon={link.icon} /><span>{link.label}</span></span>
                       <Show when={link.count}>
                         <span class="nav-count" classList={{ warn: link.warn }}>{link.count}</span>
                       </Show>
@@ -322,14 +330,20 @@ export function Shell(props: {
           </For>
         </div>
 
-        <Show when={cx}>
-          <A href="/settings" class="nav-link cx-settings" activeClass="active">
-            <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
-          </A>
+        {/* The foot of the rail: Settings (console only) and the version,
+            pinned to the bottom however long the nav runs. */}
+        <Show when={!props.nav}>
+          <div class="sb-foot" classList={{ 'cx-foot': !!cx }}>
+            <Show when={cx}>
+              <A href="/settings" class="nav-link" activeClass="active">
+                <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
+              </A>
+            </Show>
+            <div class="sb-ver cap">
+              {props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? currentMode().config?.version?.replace(/^0\.0\.1-/, '') ?? ''}
+            </div>
+          </div>
         </Show>
-        <div class="sb-foot cap">
-          {props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? currentMode().config?.version?.replace(/^0\.0\.1-/, '') ?? ''}
-        </div>
       </nav>
 
       <Show when={paletteOpen()}>
@@ -348,6 +362,122 @@ export function Shell(props: {
               </div>
             </div>
           </Show>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A page while it loads: the frame's rows, shimmering, under the real head
+ * when there is one. Every loading state draws this, so nothing around the
+ * page moves when it arrives.
+ */
+export function PageSkeleton(props: { head?: JSX.Element }) {
+  return (
+    <>
+      {props.head ?? (
+        <div class="page-head">
+          <div class="ph-crumb cap">
+            <span class="sk sk-cap" style={{ width: '84px' }} />
+            <span class="ph-sep">/</span>
+            <span class="sk sk-cap" style={{ width: '64px' }} />
+          </div>
+        </div>
+      )}
+      <div class="fx-page sk-page" aria-busy="true" aria-label="Loading">
+        <section class="fx-row sk-tiles">
+          <For each={[0, 1, 2, 3]}>
+            {(i) => (
+              <div class="fx-cell" style={{ '--i': String(i) }}>
+                <span class="sk sk-cap" />
+                <span class="sk sk-big" />
+                <span class="sk sk-line" />
+              </div>
+            )}
+          </For>
+        </section>
+        <section class="fx-row">
+          <div class="fx-cell">
+            <span class="sk sk-cap" />
+            <span class="sk sk-area" />
+          </div>
+        </section>
+        <div class="skeleton-list">
+          <For each={[0, 1, 2, 3, 4, 5]}>{(i) => <div class="skeleton-row" style={{ '--i': String(i) }} />}</For>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * The whole frame before a router or a session exists: the rail with its
+ * real pages (not clickable yet), the top bar, and a loading page. It paints
+ * from the entry chunk, before the app's own code has loaded. In the console
+ * the address says whether a workspace or a project is opening.
+ */
+export function FrameSkeleton(props: { console?: boolean }) {
+  const seg = window.location.pathname.split('/').filter(Boolean);
+  const workspace = props.console && seg.length > 0 && (seg.length === 1 || seg[1] === '-');
+  const links = (): NavLink[] =>
+    workspace ? WORKSPACE_LINKS.map((l) => ({ ...l, group: seg[0] })) : projectNav(!!props.console);
+  return (
+    <div class="shell settled">
+      <header class="mobile-bar">
+        <span class="burger" aria-hidden="true"><span /><span /><span /></span>
+        <Logo />
+      </header>
+      <nav class="sidebar" aria-hidden="true">
+        <Show
+          when={props.console}
+          fallback={
+            <div class="sb-me">
+              <span class="sb-me-btn"><span class="sb-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
+            </div>
+          }
+        >
+          <div class="sb-me cx-brand"><Logo /><span class="cap">console</span></div>
+        </Show>
+        <div class="sb-jump cap">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
+          </svg>
+          Jump to
+          <kbd>⌘K</kbd>
+        </div>
+        <div class="nav">
+          <For each={sectionsOf(links())}>
+            {(section) => (
+              <div class="nav-section">
+                <Show when={section.group}>
+                  <div class="nav-heading">{section.group}</div>
+                </Show>
+                <For each={section.links}>
+                  {(link) => (
+                    <span class="nav-link">
+                      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} icon={link.icon} /><span>{link.label}</span></span>
+                    </span>
+                  )}
+                </For>
+              </div>
+            )}
+          </For>
+        </div>
+        <Show when={!workspace}>
+          <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
+            <Show when={props.console}>
+              <span class="nav-link">
+                <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
+              </span>
+            </Show>
+            <div class="sb-ver cap" />
+          </div>
+        </Show>
+      </nav>
+      <div class="main-frame">
+        <main class="main">
+          <PageSkeleton />
         </main>
       </div>
     </div>
@@ -412,7 +542,7 @@ function Palette(props: { links: NavLink[]; onClose: () => void }) {
                 onMouseEnter={() => setIndex(i())}
                 onClick={() => go(l)}
               >
-                <NavIcon href={l.href} />
+                <NavIcon href={l.href} icon={l.icon} />
                 {l.label}
                 <span class="cap">{l.group ?? ''}</span>
               </button>

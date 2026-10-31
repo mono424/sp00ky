@@ -212,7 +212,7 @@ export function Deployments(props: Ctx) {
           <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{message(data.error)}</span></div></FxCell></section>
         </Show>
 
-        <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 2fr) minmax(0, 1fr)' }}>
+        <section class="fx-row cx-top">
           <FxCell
             label={<span class="cx-head">Live deployment <Show when={live()}><span class="cx-chip live">Live</span></Show></span>}
             meta={<Show when={live()?.live_from}><span>since {formatStamp(live()!.live_from)}</span></Show>}
@@ -500,7 +500,7 @@ function EnvTab(props: Ctx) {
       </section>
       <section class="fx-row">
         <FxCell label="Variables" meta={<span>{rows()?.length ?? 0}</span>}>
-          <table class="fx-list">
+          <table class="fx-list cx-env">
             <thead><tr><th class="cap">Name</th><th class="cap">Development</th><th class="cap">Production</th><th class="cap">Updated</th><th class="cap" /></tr></thead>
             <tbody>
               <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.loading ? 'Loading' : rows.error ? message(rows.error) : 'No variables yet'}</td></tr>}>
@@ -576,7 +576,7 @@ function DomainsTab(props: Ctx) {
     <>
       <section class="fx-row">
         <FxCell label="Custom domains">
-          <table class="fx-list">
+          <table class="fx-list cx-domains">
             <thead><tr><th class="cap">Domain</th><th class="cap">Serves</th><th class="cap">Status</th><th class="cap">DNS</th><th class="cap" /></tr></thead>
             <tbody>
               <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.loading ? 'Loading' : rows.error ? message(rows.error) : 'No custom domains'}</td></tr>}>
@@ -672,7 +672,7 @@ function GitTab(props: Ctx) {
       </section>
       <section class="fx-row">
         <FxCell label="Builds" meta={<button class="btn btn-sm btn-primary" onClick={() => void trigger()}>Build now</button>}>
-          <table class="fx-list">
+          <table class="fx-list cx-builds">
             <thead><tr><th class="cap">Commit</th><th class="cap">Author</th><th class="cap">Status</th><th class="cap">Started</th></tr></thead>
             <tbody>
               <For each={runs() ?? []} fallback={<tr><td colspan="4" class="dim">No builds yet</td></tr>}>

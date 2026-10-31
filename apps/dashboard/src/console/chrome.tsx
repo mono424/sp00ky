@@ -91,6 +91,17 @@ const caret = (up: boolean) => (
   </svg>
 );
 
+/** A workspace's own rail in the console. */
+export const WORKSPACE_LINKS: { href: string; label: string; icon: string }[] = [
+  { href: '/', label: 'Projects', icon: 'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z' },
+  { href: '/members', label: 'Members', icon: 'M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M2 21v-1a7 7 0 0 1 14 0v1 M16 3.5a4 4 0 0 1 0 7.5 M22 21v-1a7 7 0 0 0-4-6.3' },
+  { href: '/billing', label: 'Billing & usage', icon: 'M3 6h18v12H3z M3 10h18 M7 15h4' },
+  { href: '/vault', label: 'Vault', icon: 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4' },
+  { href: '/keys', label: 'API keys', icon: 'M14 4a6 6 0 1 0 3 11.2L20 18v3h-3v-2h-2v-2l-1.2-1.2A6 6 0 0 0 14 4z' },
+  { href: '/activity', label: 'Activity', icon: 'M3 12h4l3-8 4 16 3-8h4' },
+  { href: '/sessions', label: 'Sessions', icon: 'M3 5h18v11H3z M8 20h8 M12 16v4' },
+];
+
 /** The breadcrumb's project: a button that opens every project in the workspace. ⌘P. */
 export function ProjectSwitcher() {
   const c = useConsoleChrome()!;
@@ -171,10 +182,11 @@ export function ProjectSwitcher() {
 }
 
 /** The workspace selector (top-right): workspaces, this workspace's pages, the account. ⌘⇧W. */
-export function WorkspaceMenu() {
+export function WorkspaceMenu(props: { shortcut?: boolean }) {
   const c = useConsoleChrome()!;
   const [open, setOpen] = usePopover('.cx-ws-wrap');
   const onKey = (e: KeyboardEvent) => {
+    if (props.shortcut === false) return;
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'w') {
       e.preventDefault();
       setOpen(!open());

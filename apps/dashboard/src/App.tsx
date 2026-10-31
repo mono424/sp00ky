@@ -5,6 +5,7 @@ import { readStash, writeStash } from './lib/stash';
 import { ConfirmHost, ToastHost } from './components/Actions';
 import { Login } from './routes/Login';
 import { ProjectApp, wipeLiveCache } from './ProjectApp';
+import { FrameSkeleton } from './components/Shell';
 
 /**
  * The scheduler-hosted dashboard (and its standalone build): sign in to one
@@ -68,7 +69,8 @@ export function App() {
 
   return (
     <>
-      <Show when={ready()} fallback={<div class="li-wrap" />}>
+      {/* Signed in before, the frame paints at once; else the sign-in page's ground. */}
+      <Show when={ready()} fallback={getToken() ? <FrameSkeleton /> : <div class="li-wrap" />}>
         <Show when={session()} fallback={<Login onSignedIn={setSession} />}>
           {(s) => (
             <ProjectApp

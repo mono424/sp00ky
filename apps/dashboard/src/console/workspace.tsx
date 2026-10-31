@@ -384,7 +384,7 @@ export function Activity(props: Props) {
       <div class="fx-page">
         <section class="fx-row">
           <FxCell label="Recent" meta={<span>{events()?.length ?? 0}</span>}>
-            <table class="fx-list">
+            <table class="fx-list cx-activity">
               <thead><tr><th class="cap">When</th><th class="cap">Who</th><th class="cap">What</th><th class="cap">Project</th><th class="cap">From</th></tr></thead>
               <tbody>
                 <For each={events() ?? []} fallback={<tr><td colspan="5" class="dim">{events.loading ? 'Loading' : events.error ? message(events.error) : 'Nothing yet'}</td></tr>}>
@@ -424,7 +424,7 @@ export function Sessions() {
       <div class="fx-page">
         <section class="fx-row">
           <FxCell label="Console sessions">
-            <table class="fx-list">
+            <table class="fx-list cx-sessions">
               <thead><tr><th class="cap">Browser</th><th class="cap">From</th><th class="cap">Signed in</th><th class="cap">Last seen</th><th class="cap" /></tr></thead>
               <tbody>
                 <For each={sessions() ?? []}>

@@ -16,7 +16,6 @@
 
 import {
   ErrorBoundary,
-  For,
   Match,
   Show,
   Switch,
@@ -28,15 +27,15 @@ import {
   onMount,
   type JSX,
 } from 'solid-js';
-import { A, Route, Router } from '@solidjs/router';
+import { Route, Router, useParams } from '@solidjs/router';
 import { fetchConfig, onUnauthorized, setConsoleTarget } from '../api/client';
 import type { LoginResponse } from '../api/types';
 import { ConfirmHost, ToastHost } from '../components/Actions';
 import { Logo, PageHead } from '../components/Chrome';
-import { Shell } from '../components/Shell';
+import { FrameSkeleton, PageSkeleton, Shell } from '../components/Shell';
 import { ProjectApp } from '../ProjectApp';
 import { CloudError, consoleApi, signIn, signOut, type Grant, type Workspace, type WorkspaceProject } from './cloud';
-import { ConsoleChromeProvider, type ConsoleChrome } from './chrome';
+import { ConsoleChromeProvider, WORKSPACE_LINKS, type ConsoleChrome } from './chrome';
 import { Deployments, Settings } from './project';
 import { Activity, Billing, Keys, Members, Projects, Sessions, Vault } from './workspace';
 import { lock } from './vault';
@@ -128,7 +127,7 @@ export function ConsoleApp() {
 
   return (
     <>
-      <Switch fallback={<Splash text="Loading" />}>
+      <Switch fallback={<FrameSkeleton console />}>
         <Match when={me.state === 'ready' && me() === null}>
           <Landing />
         </Match>
@@ -201,6 +200,9 @@ function Splash(props: { text: string; detail?: string }) {
 /* ------------------------------------------------------------------ */
 /* A project: grant, session, dashboard                                 */
 /* ------------------------------------------------------------------ */
+
+/** The cloud's own pages run on the console cookie, not a project session. */
+const CLOUD_SESSION: LoginResponse = { token: '', subject: '', label: '', mode: 'cloud', expires_in_secs: 0 };
 
 /** Why the project's own dashboard cannot be shown; the cloud's pages still can. */
 class Limited extends Error {}
@@ -286,7 +288,10 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
   return (
     <Switch>
       <Match when={state().kind === 'connecting'}>
-        <Splash text={`Opening ${props.project.slug}`} />
+        {/* The real frame while the session opens: switcher, rail, menu. */}
+        <Router base={base} root={(r) => <Shell session={CLOUD_SESSION} overview={undefined} onSignOut={() => undefined}>{r.children}</Shell>}>
+          <Route path="*rest" component={Opening} />
+        </Router>
       </Match>
       <Match when={state().kind === 'ready' && state()}>
         {(s) => (
@@ -307,9 +312,19 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
   );
 }
 
+/** A project page while its session opens: its own head, a loading body. */
+function Opening() {
+  const params = useParams<{ rest?: string }>();
+  const title = () => {
+    const page = (params.rest ?? '').split('/')[0];
+    if (!page) return 'Overview';
+    return page === 'ssps' ? 'SSPs' : page[0].toUpperCase() + page.slice(1);
+  };
+  return <PageSkeleton head={<PageHead title={title()} />} />;
+}
+
 /** The cloud's own pages for a project whose dashboard cannot open. */
 function CloudOnly(props: { base: string; reason: string; routes: JSX.Element }) {
-  const session: LoginResponse = { token: '', subject: '', label: '', mode: 'cloud' as LoginResponse['mode'], expires_in_secs: 0 };
   const Notice = () => (
     <>
       <PageHead title="Overview" />
@@ -324,7 +339,7 @@ function CloudOnly(props: { base: string; reason: string; routes: JSX.Element })
     </>
   );
   return (
-    <Router base={props.base} root={(r) => <Shell session={session} overview={undefined} onSignOut={() => undefined}>{r.children}</Shell>}>
+    <Router base={props.base} root={(r) => <Shell session={CLOUD_SESSION} overview={undefined} onSignOut={() => undefined}>{r.children}</Shell>}>
       <Route path="/" component={Notice} />
       {props.routes}
       <Route path="*" component={Notice} />
@@ -336,49 +351,16 @@ function CloudOnly(props: { base: string; reason: string; routes: JSX.Element })
 /* A workspace                                                          */
 /* ------------------------------------------------------------------ */
 
-const WORKSPACE_LINKS: { href: string; label: string; icon: string }[] = [
-  { href: '/', label: 'Projects', icon: 'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z' },
-  { href: '/members', label: 'Members', icon: 'M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M2 21v-1a7 7 0 0 1 14 0v1 M16 3.5a4 4 0 0 1 0 7.5 M22 21v-1a7 7 0 0 0-4-6.3' },
-  { href: '/billing', label: 'Billing & usage', icon: 'M3 6h18v12H3z M3 10h18 M7 15h4' },
-  { href: '/vault', label: 'Vault', icon: 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4' },
-  { href: '/keys', label: 'API keys', icon: 'M14 4a6 6 0 1 0 3 11.2L20 18v3h-3v-2h-2v-2l-1.2-1.2A6 6 0 0 0 14 4z' },
-  { href: '/activity', label: 'Activity', icon: 'M3 12h4l3-8 4 16 3-8h4' },
-  { href: '/sessions', label: 'Sessions', icon: 'M3 5h18v11H3z M8 20h8 M12 16v4' },
-];
-
 function WorkspaceView(props: { workspace: Workspace }) {
   return (
     <Router
       base={`/${props.workspace.slug}/-`}
       root={(r) => (
-        <div class="shell settled">
-          <nav class="sidebar">
-            <div class="sb-me cx-brand"><Logo /><span class="cap">console</span></div>
-            <div class="nav">
-              <div class="nav-section">
-                <div class="nav-heading">{props.workspace.name}</div>
-                <For each={WORKSPACE_LINKS}>
-                  {(l) => (
-                    <A href={l.href} class="nav-link" activeClass="active" end={l.href === '/'}>
-                      <span class="row" style={{ gap: '10px' }}>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={l.icon} /></svg>
-                        <span>{l.label}</span>
-                      </span>
-                    </A>
-                  )}
-                </For>
-              </div>
-            </div>
-            <div class="sb-foot cap">console</div>
-          </nav>
-          <div class="main-frame">
-            <main class="main">
-              <ErrorBoundary fallback={(e) => <div class="fx-page"><div class="fx-log bad"><span class="fx-what">{String(e?.message ?? e)}</span></div></div>}>
-                {r.children}
-              </ErrorBoundary>
-            </main>
-          </div>
-        </div>
+        <Shell session={CLOUD_SESSION} overview={undefined} onSignOut={() => undefined} nav={{ heading: props.workspace.name, links: WORKSPACE_LINKS }}>
+          <ErrorBoundary fallback={(e) => <div class="fx-page"><div class="fx-log bad"><span class="fx-what">{String(e?.message ?? e)}</span></div></div>}>
+            {r.children}
+          </ErrorBoundary>
+        </Shell>
       )}
     >
       <Route path="/" component={() => <Projects workspace={props.workspace} />} />

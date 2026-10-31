@@ -25,8 +25,10 @@ pub mod backends;
 pub mod backups;
 pub mod cloud;
 pub mod config;
+pub mod grant;
 pub mod jobs;
 pub mod incidents;
+pub mod live;
 pub mod logs;
 pub mod mcp;
 pub mod ops;
@@ -47,7 +49,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
@@ -102,6 +104,11 @@ pub struct AdminState {
     /// The outbox tables, sampled on a timer for the same reason: every job
     /// aggregate is a scan of a user table, so it is paid for once.
     pub jobs: Arc<jobs::JobSampler>,
+    /// The live topics behind `/v2/live`, shared by every connection.
+    pub live: Arc<live::LiveHub>,
+    /// Checks Sp00ky Cloud console grants; `None` when console sign-in is
+    /// off or this scheduler is not cloud-linked.
+    pub grants: Option<Arc<grant::GrantVerifier>>,
     /// The Sp00ky Cloud link, when this scheduler was given one.
     pub cloud: Option<CloudLink>,
     /// The backup plane's registries and queues, shared with the ingest port.
@@ -266,6 +273,12 @@ async fn config_handler(State(state): State<AdminState>) -> Json<serde_json::Val
         "supervised": state.supervised,
         "sessions_persistent": state.sessions.persistent(),
         "project_slug": state.project_slug,
+        // Whether a Sp00ky Cloud console user can sign in here with a grant.
+        "cloud_login": state.grants.is_some(),
+        // The live protocol this host speaks (`/v2/live`) and what it can
+        // subscribe to; a dashboard without it falls back to polling.
+        "live": ssp_protocol::admin_live::PROTOCOL_VERSION,
+        "topics": live::TOPICS,
     }))
 }
 
@@ -326,13 +339,28 @@ pub fn create_admin_router(state: AdminState) -> Router {
     // Origin `*` with no credentials: the token travels in a header the browser
     // only sends when the page has it, so a hostile page gains nothing here.
     // Allowing credentials with `*` is what would be unsafe, and is not done.
+    //
+    // `SPKY_ADMIN_ALLOWED_ORIGINS` narrows that to a list (Sp00ky Cloud sets it
+    // to the console and the project's own admin host). The token is still
+    // what protects the API; the list keeps every other page from even asking.
+    let allowed: Vec<axum::http::HeaderValue> = state
+        .config
+        .allowed_origins
+        .iter()
+        .filter(|o| o.as_str() != "*")
+        .filter_map(|o| axum::http::HeaderValue::from_str(o.trim_end_matches('/')).ok())
+        .collect();
+    let open = state.config.allowed_origins.is_empty()
+        || state.config.allowed_origins.iter().any(|o| o == "*");
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(if open { AllowOrigin::any() } else { AllowOrigin::list(allowed) })
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
-        .allow_methods(Any);
+        .allow_methods(Any)
+        .max_age(std::time::Duration::from_secs(600));
 
     let protected = Router::new()
         .route("/me", get(me_handler))
+        .route("/v2/snapshot", get(live::snapshot))
         .route("/logout", post(logout_handler))
         .route("/overview", get(overview::overview))
         .route("/presence", get(presence::presence))
@@ -405,6 +433,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
     let api = Router::new()
         .route("/config", get(config_handler))
         .route("/session", post(auth::login))
+        // Authenticated in-band: the token is the socket's first message.
+        .route("/v2/live", get(live::live))
         .merge(protected)
         .layer(cors)
         .with_state(state.clone());
@@ -426,6 +456,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
         .nest("/admin/api", api)
         .nest_service("/admin", assets)
+        .layer(tower_http::compression::CompressionLayer::new())
         // Bare `/` is a convenience: someone who types the host and port
         // without a path means the dashboard.
         .route(
@@ -483,6 +514,8 @@ pub fn build(config: AdminConfig, deps: AdminDeps) -> (AdminState, Router) {
         incidents: incidents::Incidents::open(scheduler_config.wal_path.parent().unwrap_or_else(|| std::path::Path::new(".")).join("incidents.json")),
         presence: presence::PresenceTracker::new(&config_for_presence),
         jobs: jobs::JobSampler::new(&config_for_presence),
+        live: live::LiveHub::new(),
+        grants: grant::GrantVerifier::from_config(&config_for_presence, deps.cloud.as_ref()),
         cloud: deps.cloud,
         backup: deps.backup,
         resync: deps.resync,

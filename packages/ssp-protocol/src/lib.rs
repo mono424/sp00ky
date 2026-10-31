@@ -2,8 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod admin_live;
 pub mod admin_mcp;
 pub mod admin_session;
+#[cfg(feature = "console-grant")]
+pub mod console_grant;
 pub mod impersonation;
 pub mod range_hash;
 pub mod schema;

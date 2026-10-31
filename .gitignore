@@ -34,3 +34,4 @@ scripts/push-e2e/project/.sp00ky/
 
 # wrangler dev local state
 .wrangler/
+dist-console/

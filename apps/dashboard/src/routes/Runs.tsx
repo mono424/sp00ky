@@ -1,4 +1,4 @@
-import { For, Index, Show, createMemo, createResource, createSignal, onCleanup, type JSX } from 'solid-js';
+import { For, Index, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from 'solid-js';
 import { Navigate, useLocation, useNavigate, useParams, useSearchParams } from '@solidjs/router';
 import { api, openStream, streamsAvailable } from '../api/client';
 import { PageHead } from '../components/Chrome';
@@ -8,6 +8,7 @@ import { describeCron } from '../lib/cron';
 import { decodeParam, formatCount, formatDuration, formatRelativeTime, formatStamp } from '../lib/format';
 import { cancelRun, clearJobs, killJob, pauseSchedule, rerunRun, retryJob, retryRun, triggerSchedule } from '../lib/runActions';
 import { readStash, writeStash } from '../lib/stash';
+import { liveJobsView, liveRunsView, useLiveView } from '../api/liveStack';
 import type {
   JobDetail,
   JobSummary,
@@ -149,6 +150,24 @@ function cadence(s: Schedule): string {
 function useJobs() {
   const [page, setPage] = createSignal<JobsListResponse | null>(readStash<JobsListResponse>('jobs')?.value ?? null);
   const [error, setError] = createSignal<string | null>(null);
+  // The live socket's `jobs` topic when there is one; the stream or the poll
+  // below only while there is not.
+  const live = useLiveView(liveJobsView);
+  createEffect(() => {
+    const next = live()?.();
+    if (!next) return;
+    setPage(next);
+    setError(null);
+    writeStash('jobs', next);
+  });
+  createEffect(() => {
+    if (live()) return;
+    fallbackJobs(setPage, setError);
+  });
+  return { page, error, refresh: () => void api.getResult<JobsListResponse>('/jobs').then((r) => r.ok && setPage(r.value)) };
+}
+
+function fallbackJobs(setPage: (p: JobsListResponse) => void, setError: (e: string | null) => void) {
   if (streamsAvailable()) {
     const close = openStream('/jobs/stream', {
       onOpen: () => setError(null),
@@ -177,15 +196,24 @@ function useJobs() {
     const t = setInterval(() => !document.hidden && void load(), POLL_MS);
     onCleanup(() => clearInterval(t));
   }
-  return { page, error, refresh: () => void api.getResult<JobsListResponse>('/jobs').then((r) => r.ok && setPage(r.value)) };
 }
 
 function useWorkflowRuns() {
-  const [runs, setRuns] = createSignal<WorkflowRun[]>([]);
+  const [polled, setRuns] = createSignal<WorkflowRun[]>([]);
   const load = async () => {
     const r = await api.getResult<{ runs: WorkflowRun[] }>('/workflows/runs?limit=100');
     if (r.ok) setRuns(r.value.runs);
   };
+  const live = useLiveView(liveRunsView);
+  createEffect(() => {
+    if (live()) return;
+    fallbackRuns(setRuns, load);
+  });
+  const runs = () => live()?.() ?? polled();
+  return { runs, refresh: load };
+}
+
+function fallbackRuns(setRuns: (r: WorkflowRun[]) => void, load: () => Promise<void>) {
   if (streamsAvailable()) {
     const close = openStream('/workflows/stream', {
       onEvent: (event, data) => {
@@ -203,7 +231,6 @@ function useWorkflowRuns() {
     const t = setInterval(() => !document.hidden && void load(), POLL_MS);
     onCleanup(() => clearInterval(t));
   }
-  return { runs, refresh: load };
 }
 
 /* ------------------------------------------------------------------ */

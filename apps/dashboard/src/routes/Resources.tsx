@@ -299,7 +299,7 @@ export function Resources() {
             <Show when={machines().length > 0}>
               <section class="fx-row">
                 <FxCell label="Machines" meta={<span><b>{machines().length}</b></span>}>
-                  <table class="fx-list">
+                  <table class="fx-list rs-machines">
                     <thead>
                       <tr>
                         <th class="cap">Machine</th><th class="cap">Kind</th><th class="cap">Runs</th><th class="cap">Type</th>

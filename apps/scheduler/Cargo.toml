@@ -25,14 +25,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 config = "0.14"
 anyhow = "1"
-axum = "0.7"
-tower-http = { version = "0.6", features = ["timeout", "fs", "cors"] }
+axum = { version = "0.7", features = ["ws"] }
+# `compression-*`: the admin plane gzips/brotlis its JSON and the dashboard
+# bundle (the wa-sqlite cache module alone is a 1.1 MB wasm). SSE streams and
+# WebSocket upgrades are left alone by the default predicate.
+tower-http = { version = "0.6", features = ["timeout", "fs", "cors", "compression-gzip", "compression-br"] }
 # `util` for `ServiceExt::oneshot`: the MCP server dispatches tool calls
 # through the admin router in-process rather than re-implementing handlers.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 uuid = { version = "1", features = ["v4"] }
-ssp-protocol = { path = "../../packages/ssp-protocol" }
+ssp-protocol = { path = "../../packages/ssp-protocol", features = ["console-grant"] }
 maintenance = { path = "../../packages/maintenance" }
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 flate2 = "1"
@@ -46,3 +49,6 @@ chrono = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# The live socket tests (`/admin/api/v2/live`). The version axum's `ws`
+# feature already builds, so the test client adds no second copy.
+tokio-tungstenite = "0.24"

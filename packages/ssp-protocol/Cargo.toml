@@ -14,3 +14,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
+# Console grants (`console_grant`): only hosts that accept Sp00ky Cloud's
+# console users link Ed25519 in.
+ed25519-dalek = { version = "2.2", optional = true }
+
+[features]
+console-grant = ["dep:ed25519-dalek"]

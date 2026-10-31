@@ -398,7 +398,7 @@ export function Overview(props: {
                 </span>
               }
             >
-              <table class="fx-list">
+              <table class="fx-list ov-procs">
                 <colgroup>
                   <col style={{ width: '24%' }} />
                   <col style={{ width: '8%' }} />
@@ -588,7 +588,7 @@ export function Overview(props: {
               />
 
               <Show when={tables().length > 0}>
-                <table class="fx-list" style={{ 'margin-top': '18px' }}>
+                <table class="fx-list ov-queues" style={{ 'margin-top': '18px' }}>
                   <colgroup>
                     <col style={{ width: '30%' }} />
                     <col style={{ width: '22%' }} />

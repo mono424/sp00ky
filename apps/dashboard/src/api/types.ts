@@ -1,11 +1,17 @@
 /** Wire types for the scheduler's `/admin/api` surface. */
 
-export type SessionMode = 'roster' | 'breakglass' | 'mcp';
+export type SessionMode = 'roster' | 'breakglass' | 'mcp' | 'cloud';
 
 /** What a session may do. Roster and break-glass sessions are always `full`. */
 export type SessionScope = 'read' | 'full';
 
 export interface ServerConfig {
+  /** The live protocol version this host speaks (`/v2/live`); absent on older hosts. */
+  live?: number;
+  /** Topics the host can stream. */
+  topics?: string[];
+  /** Whether a Sp00ky Cloud console user can sign in here with a grant. */
+  cloud_login?: boolean;
   scheduler_id: string;
   version: string;
   /** Whether `SPKY_ADMIN_PASSWORD` is set, i.e. password-only login is offered. */

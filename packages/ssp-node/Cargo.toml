@@ -31,7 +31,7 @@ push-core = { path = "../push-core" }
 # ssp-portable keep the default), and a library that picks one leaves its
 # tests unable to count allocations (tests/view_memory.rs).
 ssp = { path = "../ssp", default-features = false, features = ["parallel", "mmap-store"] }
-ssp-protocol = { path = "../ssp-protocol" }
+ssp-protocol = { path = "../ssp-protocol", features = ["console-grant"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # ssp → ulid → rand → getrandom: needs the JS backend on wasm32 (paired with

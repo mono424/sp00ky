@@ -88,7 +88,7 @@ export function normalizeEndpoint(raw: string): string {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
 }
 
-async function fetchConfig(baseUrl: string): Promise<ServerConfig> {
+export async function fetchConfig(baseUrl: string): Promise<ServerConfig> {
   const res = await fetch(`${baseUrl}/admin/api/config`);
   if (!res.ok) throw new ApiError(res.status, `config responded ${res.status}`);
   return (await res.json()) as ServerConfig;
@@ -133,12 +133,32 @@ function tokenKey(): string {
   return `${TOKEN_PREFIX}${mode.baseUrl}`;
 }
 
+/** Where a session token is kept, when not in localStorage. */
+export interface TokenStore {
+  get(): string | null;
+  set(token: string | null): void;
+}
+
+let tokenStore: TokenStore | null = null;
+
+/**
+ * Point the client at one project's admin API for the console
+ * (console.sp00ky.cloud). The session there is minted from a Sp00ky Cloud
+ * grant and re-minted before it expires, so it lives in memory only and never
+ * touches localStorage.
+ */
+export function setConsoleTarget(baseUrl: string, config: ServerConfig, store: TokenStore) {
+  mode = { embedded: false, baseUrl, config };
+  tokenStore = store;
+}
+
 export function getToken(): string | null {
-  return readStore(tokenKey());
+  return tokenStore ? tokenStore.get() : readStore(tokenKey());
 }
 
 export function setToken(token: string | null) {
-  writeStore(tokenKey(), token);
+  if (tokenStore) tokenStore.set(token);
+  else writeStore(tokenKey(), token);
 }
 
 /** Listeners fired when the server rejects our token, so the app can sign out. */
@@ -159,6 +179,11 @@ function isSessionLoss(message: string): boolean {
 function notifyUnauthorized() {
   setToken(null);
   unauthorizedHandlers.forEach((fn) => fn());
+}
+
+/** The live socket was refused the session (close 4401): the same loss. */
+export function signalUnauthorized() {
+  notifyUnauthorized();
 }
 
 export function url(path: string): string {

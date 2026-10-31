@@ -568,6 +568,9 @@ fn read_config(env: &Env) -> Result<NodeConfigCf> {
             password: Some(secret("SPKY_ADMIN_PASSWORD")).filter(|p| !p.is_empty()),
             access: Some(var("SPKY_ADMIN_ACCESS")).filter(|a| !a.is_empty()),
             project_slug: Some(var("SPKY_PROJECT_SLUG")).filter(|s| !s.is_empty()),
+            // Console sign-in: who signs grants and the keys to check them with.
+            cloud_issuer: Some(var("SPKY_CLOUD_API_URL")).filter(|s| !s.is_empty()),
+            cloud_jwks: Some(var("SPKY_ADMIN_CLOUD_JWKS")).filter(|s| !s.is_empty()),
         },
         // Must match the client's `refMode` (sp00ky.yml). Default Dedicated —
         // core's default (see ssp-node config.rs) and the common case; a

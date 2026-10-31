@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>acme · Overview · sp00ky</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+@font-face { font-family: 'Inter'; font-weight: 100 900; src: url('../src/assets/fonts/inter-latin.woff2') format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 300 700; src: url('../src/assets/fonts/jetbrainsmono-latin.woff2') format('woff2'); }
+
+:root {
+  --bg: #070707;
+  --panel: #0c0c0c;
+  --raise: rgba(255, 255, 255, 0.025);
+  --hover: rgba(255, 255, 255, 0.035);
+  --rule: rgba(255, 255, 255, 0.06);
+  --rule-strong: rgba(255, 255, 255, 0.1);
+
+  --ink: #e6e6e6;
+  --ink-dim: #a1a1a1;
+  --ink-faint: #737373;
+  --ink-ghost: #4a4a4a;
+
+  --accent: #9ca5d3;
+  --accent-strong: #c6cbea;
+  --accent-deep: #5f68ad;
+  --accent-wash: rgba(156, 165, 211, 0.08);
+  --accent-line: rgba(156, 165, 211, 0.3);
+
+  --ok: #3dd68c;
+  --warn: #f1b440;
+  --bad: #ff6369;
+
+  --sans: 'Inter', ui-sans-serif, -apple-system, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 1.4 -0.2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+
+  /* A hairline that fades out at both ends: the soft edge of the login. */
+  --fade-x: linear-gradient(90deg, transparent, var(--rule) 10%, var(--rule) 90%, transparent);
+  --fade-y: linear-gradient(180deg, transparent, var(--rule) 18%, var(--rule) 82%, transparent);
+}
+
+* { box-sizing: border-box; min-width: 0; }
+html, body { margin: 0; height: 100%; }
+body {
+  background:
+    radial-gradient(1100px 600px at 85% -10%, rgba(45, 57, 146, 0.07), transparent 70%),
+    radial-gradient(900px 500px at 0% 0%, rgba(255, 255, 255, 0.02), transparent 60%),
+    var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--sans);
+  letter-spacing: -0.006em;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+body::after {
+  content: ''; position: fixed; inset: 0; z-index: 50; pointer-events: none;
+  background: var(--grain) 0 0 / 180px 180px; opacity: 0.07;
+}
+a { color: inherit; text-decoration: none; }
+.mono { font-family: var(--mono); letter-spacing: -0.01em; }
+.num { font-variant-numeric: tabular-nums; }
+svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+svg.i.sm { width: 14px; height: 14px; }
+
+/* ---- shell -------------------------------------------------------- */
+.shell { display: grid; grid-template-columns: 252px minmax(0, 1fr); height: 100%; }
+
+.side { display: flex; flex-direction: column; padding: 14px 12px 12px; gap: 4px; }
+
+.switcher {
+  display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 8px;
+  transition: background .15s;
+}
+.switcher:hover { background: var(--hover); }
+.tile {
+  display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px;
+  background: linear-gradient(160deg, #1a1d2c, #0f1018);
+  box-shadow: inset 0 0 0 1px rgba(156, 165, 211, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  font: 600 11px var(--mono); color: var(--accent-strong); letter-spacing: 0;
+}
+.switcher-name { font-weight: 550; font-size: 13.5px; }
+.switcher .chev { margin-left: auto; color: var(--ink-ghost); }
+.switcher .avatar { width: 28px; height: 28px; font-size: 10.5px; }
+.dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--ink-ghost); }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(61, 214, 140, 0.12); }
+.dot.warn { background: var(--warn); }
+
+.search {
+  display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; padding: 7px 10px;
+  border-radius: 7px; background: var(--raise); color: var(--ink-faint);
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.search kbd { margin-left: auto; font: 10.5px var(--mono); color: var(--ink-ghost); }
+
+.nav-label { padding: 14px 10px 4px; font-size: 11px; color: var(--ink-ghost); }
+.nav a {
+  position: relative; display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+  border-radius: 7px; color: var(--ink-faint); font-weight: 500; transition: color .12s, background .12s;
+}
+.nav a:hover { color: var(--ink); background: var(--hover); }
+.nav a.on { color: var(--ink); background: rgba(255, 255, 255, 0.05); }
+.nav a.on::before {
+  content: ''; position: absolute; left: -12px; top: 8px; bottom: 8px; width: 2px; border-radius: 0 2px 2px 0;
+  background: var(--accent); box-shadow: 0 0 10px rgba(45, 57, 146, 0.6);
+}
+.nav .count { margin-left: auto; font: 11px var(--mono); color: var(--ink-ghost); }
+.nav .count.warn { color: var(--warn); }
+
+.side-foot { margin-top: auto; display: grid; gap: 10px; }
+.avatar {
+  display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%;
+  background: #1c1c1c; box-shadow: inset 0 0 0 1px var(--rule-strong); font: 600 10px var(--sans); color: var(--ink-dim);
+}
+.synced { display: flex; align-items: center; gap: 8px; padding: 0 10px 2px; font: 11px var(--mono); color: var(--ink-ghost); }
+
+/* ---- main panel ---------------------------------------------------- */
+.main {
+  margin: 10px 10px 10px 0; border-radius: 12px; overflow: auto; position: relative;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0.008) 240px), var(--panel);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.045), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.topbar {
+  position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 14px;
+  height: 52px; padding: 0 28px;
+  background: linear-gradient(180deg, rgba(12, 12, 12, 0.92), rgba(12, 12, 12, 0.78));
+  backdrop-filter: blur(10px);
+}
+.topbar::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 1px; background: var(--fade-x); }
+.crumb { display: flex; align-items: center; gap: 8px; color: var(--ink-faint); }
+.crumb b { color: var(--ink); font-weight: 550; }
+.crumb .sep { color: var(--ink-ghost); }
+.seg { display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--raise); box-shadow: inset 0 0 0 1px var(--rule); margin-left: 10px; }
+.seg span { padding: 3px 10px; border-radius: 6px; font-size: 12px; color: var(--ink-faint); }
+.seg span.on { background: rgba(255, 255, 255, 0.06); color: var(--ink); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05); }
+.topbar .right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.topbar .seg { margin-left: 0; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 7px;
+  background: var(--raise); box-shadow: inset 0 0 0 1px var(--rule-strong), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  color: var(--ink-dim); font: 500 12.5px var(--sans); border: 0; cursor: pointer; transition: color .15s, background .15s;
+}
+.btn:hover { color: var(--ink); background: rgba(255, 255, 255, 0.05); }
+.btn .i { color: var(--ink-faint); }
+.btn.quiet-accent {
+  background: rgba(156, 165, 211, 0.07); color: var(--ink);
+  box-shadow: inset 0 0 0 1px rgba(156, 165, 211, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.btn.quiet-accent .i { color: var(--accent); }
+.group { display: inline-flex; }
+.group .btn:first-child { border-radius: 7px 0 0 7px; }
+.group .btn:last-child { border-radius: 0 7px 7px 0; margin-left: -1px; padding: 0 8px; }
+
+.page { max-width: 1040px; margin: 0 auto; padding: 0 40px 64px; }
+
+/* ---- hero --------------------------------------------------------- */
+.hero { display: flex; align-items: flex-start; gap: 20px; padding: 36px 0 30px; }
+.hero { align-items: center; padding: 40px 0 32px; }
+.hero .tile { width: 48px; height: 48px; border-radius: 12px; font-size: 16px; }
+.hero h1 { margin: 0; display: flex; align-items: center; gap: 12px; font-size: 28px; font-weight: 550; letter-spacing: -0.035em; line-height: 1.15; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 9px; border-radius: 999px;
+  font: 500 11.5px var(--sans); letter-spacing: 0; color: var(--ink-faint); box-shadow: inset 0 0 0 1px var(--rule-strong);
+}
+.pill.warn { color: var(--warn); box-shadow: inset 0 0 0 1px rgba(241, 180, 64, 0.25); background: rgba(241, 180, 64, 0.06); }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 6px; color: var(--ink-faint); font-size: 12.5px; }
+.meta span { display: inline-flex; align-items: center; gap: 6px; }
+.meta .i { color: var(--ink-ghost); }
+.hero .actions { margin-left: auto; display: flex; gap: 8px; padding-top: 4px; }
+
+/* ---- stats strip -------------------------------------------------- */
+.strip { position: relative; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.strip::before, .strip::after { content: ''; position: absolute; left: 0; right: 0; height: 1px; background: var(--fade-x); }
+.strip::before { top: 0; } .strip::after { bottom: 0; }
+.stat { position: relative; padding: 20px 24px 18px; display: flex; flex-direction: column; gap: 6px; min-height: 124px; }
+.stat + .stat::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 1px; background: var(--fade-y); }
+.stat:first-child { padding-left: 4px; }
+.stat-head { display: flex; align-items: baseline; justify-content: space-between; color: var(--ink-faint); font-size: 12.5px; }
+.stat-head .trend { font: 500 11.5px var(--mono); color: var(--accent); }
+.stat-val { font-size: 30px; font-weight: 500; letter-spacing: -0.04em; line-height: 1.15; }
+.stat-val small { font-size: 14px; color: var(--ink-faint); letter-spacing: -0.01em; font-weight: 450; margin-left: 4px; }
+.stat svg.spark { margin-top: auto; width: 100%; height: 34px; display: block; overflow: visible; }
+/* Last 24 hours per SSP, one tick an hour: quiet green when nothing
+   happened, amber for the hour something did. */
+.uptime { margin-top: auto; display: grid; gap: 5px; }
+.uptime > div { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: center; gap: 8px; }
+.uptime > div > span { font: 10.5px var(--mono); color: var(--ink-ghost); }
+.ticks { display: flex; gap: 2px; height: 11px; }
+.ticks i { flex: 1; border-radius: 1.5px; background: rgba(61, 214, 140, 0.32); }
+.ticks i.warn { background: rgba(241, 180, 64, 0.75); }
+.ticks i:last-child { background: rgba(61, 214, 140, 0.7); }
+
+/* ---- body --------------------------------------------------------- */
+.sec { padding-top: 34px; }
+.sec-head { display: flex; align-items: center; gap: 8px; padding: 0 0 10px; }
+.sec-head h2 { margin: 0; font-size: 13.5px; font-weight: 550; letter-spacing: -0.01em; }
+.sec-head .n { font: 12px var(--mono); color: var(--ink-ghost); }
+.sec-head .link { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; color: var(--ink-faint); font-size: 12.5px; }
+.sec-head .link:hover { color: var(--accent-strong); }
+
+.rows { position: relative; }
+.rows::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: var(--fade-x); }
+.row {
+  position: relative; display: grid; align-items: center; gap: 14px; padding: 11px 10px; margin: 0 -10px;
+  border-radius: 8px; transition: background .12s;
+}
+.row:hover { background: var(--hover); }
+.row + .row::before { content: ''; position: absolute; left: 10px; right: 10px; top: 0; height: 1px; background: var(--fade-x); }
+.row:hover::before, .row:hover + .row::before { opacity: 0; }
+
+.attn { grid-template-columns: 28px minmax(0, 1fr) auto; }
+.ic {
+  display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px;
+  color: var(--warn); background: rgba(241, 180, 64, 0.07); box-shadow: inset 0 0 0 1px rgba(241, 180, 64, 0.18);
+}
+.row-title { font-size: 13.5px; font-weight: 500; }
+.row-sub { font-size: 12px; color: var(--ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.time { font: 11.5px var(--mono); color: var(--ink-ghost); text-align: right; min-width: 32px; }
+.btn.sm { height: 26px; padding: 0 10px; font-size: 12px; }
+
+.act { grid-template-columns: 18px minmax(0, 1fr) auto; padding-top: 10px; padding-bottom: 10px; }
+.st { display: grid; place-items: center; }
+.st.ok { color: var(--ok); } .st.bad { color: var(--bad); } .st.run { color: var(--accent); } .st.idle { color: var(--ink-ghost); }
+.st.run svg { animation: spin 1.6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.act .what { font-size: 13px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.act .what em { font-style: normal; color: var(--ink-faint); }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ sidebar ============ -->
+  <aside class="side">
+    <!-- Who is signed in; the menu holds Access and sign out. -->
+    <a class="switcher" href="#">
+      <span class="avatar">MO</span>
+      <span class="switcher-name">Mira Oyelaran</span>
+      <svg class="i sm chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>
+    </a>
+
+    <div class="search">
+      <svg class="i sm" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>
+      Jump to…
+      <kbd>⌘K</kbd>
+    </div>
+
+    <nav class="nav">
+      <a class="on" href="#"><svg class="i" viewBox="0 0 24 24"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>Overview</a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3z M12 9v5 M12 17v1"/></svg>Incidents<span class="count warn">1</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5"/></svg>Logs</a>
+
+      <div class="nav-label">Sync</div>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M4 3h16v7H4z M4 14h16v7H4z M7 6.5h1 M7 17.5h1 M16 6.5h1 M16 17.5h1"/></svg>SSPs<span class="count">2/2</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0"/></svg>Backends<span class="count">2/2</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0"/></svg>Views<span class="count">72</span></a>
+
+      <div class="nav-label">Run</div>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M3 3h6v6H3z M15 15h6v6h-6z M6 9v9h9 M9 6h9v9"/></svg>Workflows<span class="count">1</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M5 9h14 M8 13h2 M14 13h2 M8 17h2"/></svg>Schedules<span class="count">5</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 6h14v15H5z M9 6V3h6v3 M8 11h8 M8 15h8"/></svg>Jobs<span class="count">4</span></a>
+
+      <div class="nav-label">Data</div>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M4 4h16v5H4z M6 9v12h12V9 M9 13h6"/></svg>Backups</a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3"/></svg>Resources</a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3"/></svg>Access</a>
+    </nav>
+
+    <div class="side-foot">
+      <div class="synced">canary.265</div>
+    </div>
+  </aside>
+
+  <!-- ============ main ============ -->
+  <main class="main">
+    <header class="topbar">
+      <div class="crumb"><span>acme</span><span class="sep">/</span><b>Overview</b></div>
+      <div class="right">
+        <div class="seg"><span>1h</span><span class="on">24h</span><span>7d</span></div>
+      </div>
+    </header>
+
+    <div class="page">
+      <section class="hero">
+        <span class="tile">ac</span>
+        <div>
+          <h1>acme <span class="pill warn"><span class="dot warn"></span>2 need attention</span></h1>
+          <div class="meta">
+            <span>SurrealDB <span class="mono">3.1.5</span></span>
+            <span>up 1.7d</span>
+            <span>deployed 2h ago</span>
+          </div>
+        </div>
+        <div class="actions">
+          <span class="group">
+            <button class="btn"><svg class="i sm" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7 M20 4v4h-4"/></svg>Restart</button>
+            <button class="btn"><svg class="i sm" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+          </span>
+          <button class="btn quiet-accent"><svg class="i sm" viewBox="0 0 24 24"><path d="M4 4h16v5H4z M6 9v12h12V9 M9 13h6"/></svg>Back up now</button>
+        </div>
+      </section>
+
+      <section class="strip">
+        <div class="stat">
+          <div class="stat-head">Sync round trip <span class="trend">↑ 5%</span></div>
+          <div class="stat-val num">61.0<small>ms</small></div>
+          <svg class="spark" data-spark="lat" viewBox="0 0 200 34" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="stat">
+          <div class="stat-head">Live users <span class="trend">↑ 28%</span></div>
+          <div class="stat-val num">148</div>
+          <svg class="spark" data-spark="users" viewBox="0 0 200 34" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="stat">
+          <div class="stat-head">Sync processors</div>
+          <div class="stat-val num">2/2<small>ready</small></div>
+          <div class="uptime">
+            <div><span>ssp-0</span><div class="ticks" data-ticks=""></div></div>
+            <div><span>ssp-1</span><div class="ticks" data-ticks="13"></div></div>
+          </div>
+        </div>
+        <div class="stat">
+          <div class="stat-head">Jobs <span class="trend">↑ 250%</span></div>
+          <div class="stat-val num">42<small>/ min</small></div>
+          <svg class="spark" data-spark="jobs" viewBox="0 0 200 34" preserveAspectRatio="none"></svg>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head"><h2>Needs attention</h2><span class="n">2</span></div>
+        <div class="rows">
+          <div class="row attn">
+            <span class="ic"><svg class="i sm" viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3z M12 9v5 M12 17v1"/></svg></span>
+            <div>
+              <div class="row-title">2 jobs failed in the last hour</div>
+              <div class="row-sub">Backend returned 503</div>
+            </div>
+            <button class="btn sm">Retry both</button>
+          </div>
+          <div class="row attn">
+            <span class="ic"><svg class="i sm" viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3z M12 9v5 M12 17v1"/></svg></span>
+            <div>
+              <div class="row-title">2 slow views</div>
+              <div class="row-sub">p99 118 ms on ssp-1</div>
+            </div>
+            <button class="btn sm">Open views</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="sec">
+        <div class="sec-head">
+          <h2>Recent activity</h2>
+          <a class="link" href="#">All logs <svg class="i sm" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></a>
+        </div>
+        <div class="rows">
+          <div class="row act">
+            <span class="st run"><svg class="i sm" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/></svg></span>
+            <span class="what">/jobs/reindex <em>running on ssp-0</em></span>
+            <span class="time">now</span>
+          </div>
+          <div class="row act">
+            <span class="st ok"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg></span>
+            <span class="what">nightly-digest <em>finished in 2m 22s</em></span>
+            <span class="time">4m</span>
+          </div>
+          <div class="row act">
+            <span class="st bad"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M9.5 9.5l5 5 M14.5 9.5l-5 5"/></svg></span>
+            <span class="what">/jobs/welcome-mail <em>failed, attempt 4 of 4</em></span>
+            <span class="time">12m</span>
+          </div>
+          <div class="row act">
+            <span class="st ok"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/></svg></span>
+            <span class="what">Nightly backup <em>393 MB</em></span>
+            <span class="time">8h</span>
+          </div>
+          <div class="row act">
+            <span class="st idle"><svg class="i sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8 12h8"/></svg></span>
+            <span class="what">ssp-1 ingest lag <em>recovered after 6.9m</em></span>
+            <span class="time">11h</span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script>
+// Deterministic sparkline data, so the mockup looks the same every load.
+const rand = (seed) => () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+const series = (seed, n, base, wobble, drift) => {
+  const r = rand(seed); let v = base;
+  return Array.from({ length: n }, (_, i) => (v += (r() - 0.5) * wobble + drift, Math.max(1, v)));
+};
+const DATA = {
+  lat: series(7, 48, 58, 6, 0.05),
+  users: series(11, 48, 110, 8, 0.8),
+  jobs: series(3, 48, 12, 7, 0.6),
+};
+for (const el of document.querySelectorAll('.ticks')) {
+  const warn = new Set(el.dataset.ticks.split(',').filter(Boolean).map(Number));
+  el.innerHTML = Array.from({ length: 24 }, (_, i) => `<i class="${warn.has(i) ? 'warn' : ''}"></i>`).join('');
+}
+for (const svg of document.querySelectorAll('svg.spark')) {
+  const d = DATA[svg.dataset.spark]; const W = 200, H = 34;
+  const lo = Math.min(...d), hi = Math.max(...d);
+  const pts = d.map((v, i) => [(i / (d.length - 1)) * W, H - 3 - ((v - lo) / (hi - lo || 1)) * (H - 6)]);
+  const line = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+  const id = 'g' + svg.dataset.spark;
+  svg.innerHTML = `
+    <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9ca5d3" stop-opacity="0.22"/><stop offset="1" stop-color="#9ca5d3" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="${id}l" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9ca5d3" stop-opacity="0"/><stop offset="0.25" stop-color="#9ca5d3" stop-opacity="0.9"/><stop offset="1" stop-color="#c6cbea"/>
+    </linearGradient></defs>
+    <path d="${line} L${W} ${H} L0 ${H} Z" fill="url(#${id})"/>
+    <path d="${line}" fill="none" stroke="url(#${id}l)" stroke-width="1.4" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    <circle cx="${pts.at(-1)[0]}" cy="${pts.at(-1)[1]}" r="2.6" fill="#c6cbea"/>`;
+}
+</script>
+</body>
+</html>

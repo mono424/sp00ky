@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>acme · Overview · sp00ky</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+@font-face { font-family: 'Inter'; font-weight: 100 900; src: url('../src/assets/fonts/inter-latin.woff2') format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 300 700; src: url('../src/assets/fonts/jetbrainsmono-latin.woff2') format('woff2'); }
+
+:root {
+  --bg: #080808;
+  --cell: #0b0b0b;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-soft: rgba(255, 255, 255, 0.045);
+  --hover: rgba(255, 255, 255, 0.03);
+
+  --ink: #e4e4e4;
+  --ink-dim: #a3a3a3;
+  --ink-faint: #707070;
+  --ink-ghost: #474747;
+
+  --accent: #9ca5d3;
+  --accent-strong: #c6cbea;
+  --warn: #f1b440;
+  --bad: #ff6369;
+
+  --sans: 'Inter', ui-sans-serif, -apple-system, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 1.4 -0.2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  /* The dotted canvas charts are drawn on. */
+  --dots: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1.2px) 0 0 / 12px 12px;
+}
+
+* { box-sizing: border-box; min-width: 0; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: radial-gradient(1000px 520px at 88% -8%, rgba(45, 57, 146, 0.08), transparent 70%), var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+body::after {
+  content: ''; position: fixed; inset: 0; z-index: 50; pointer-events: none;
+  background: var(--grain) 0 0 / 180px 180px; opacity: 0.07;
+}
+a { color: inherit; text-decoration: none; }
+.mono { font-family: var(--mono); }
+/* The voice of every label: small, mono, upper case, spaced. */
+.cap { font: 500 10.5px var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); }
+.warn { color: var(--warn); }
+svg.i { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: square; stroke-linejoin: miter; }
+
+/* ---- frame: one grid of hairlines, squares where they cross ---------- */
+.shell { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100%; }
+.node { position: absolute; width: 7px; height: 7px; background: var(--bg); border: 1px solid rgba(255, 255, 255, 0.2); z-index: 3; }
+
+/* ---- sidebar ------------------------------------------------------ */
+.side { position: relative; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+.me { display: flex; align-items: center; gap: 10px; height: 52px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+.av { display: grid; place-items: center; width: 24px; height: 24px; background: #1a1a1a; border: 1px solid var(--line); font: 600 9.5px var(--mono); color: var(--ink-dim); }
+.me b { font-weight: 550; font-size: 13px; }
+.me .i { margin-left: auto; color: var(--ink-ghost); }
+.search {
+  display: flex; align-items: center; gap: 8px; margin: 14px 14px 6px; height: 32px; padding: 0 10px;
+  border: 1px solid var(--line); background: rgba(255, 255, 255, 0.015); color: var(--ink-faint);
+}
+.search kbd { margin-left: auto; font: 10px var(--mono); color: var(--ink-ghost); }
+.nav { display: grid; padding: 4px 0; }
+.nav .cap { padding: 16px 16px 6px; color: var(--ink-ghost); }
+.nav a { position: relative; display: flex; align-items: center; gap: 11px; height: 32px; padding: 0 16px; color: var(--ink-faint); font-weight: 500; }
+.nav a:hover { color: var(--ink); background: var(--hover); }
+.nav a.on { color: var(--ink); background: rgba(255, 255, 255, 0.04); }
+.nav a.on::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+.nav .n { margin-left: auto; font: 10.5px var(--mono); color: var(--ink-ghost); }
+.nav .n.warn { color: var(--warn); }
+.side-foot { margin-top: auto; padding: 14px 16px; border-top: 1px solid var(--line); }
+
+/* ---- main --------------------------------------------------------- */
+.main { position: relative; display: grid; grid-template-rows: 52px auto auto auto 1fr; }
+.top { display: flex; align-items: center; gap: 14px; padding: 0 24px; border-bottom: 1px solid var(--line); }
+.top .crumb { color: var(--ink-ghost); }
+.top .crumb b { color: var(--ink); font-weight: 500; }
+.top .right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.readout { display: flex; align-items: center; gap: 8px; padding-right: 6px; }
+.readout b { font: 500 12px var(--mono); color: var(--ink); letter-spacing: 0; }
+.pulse { width: 5px; height: 5px; background: var(--accent); animation: blink 2s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0.25; } }
+.seg { display: flex; border: 1px solid var(--line); }
+.seg span { padding: 5px 10px; }
+.seg span + span { border-left: 1px solid var(--line); }
+.seg span.on { color: var(--ink); background: rgba(255, 255, 255, 0.05); }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02); cursor: pointer; color: var(--ink-dim);
+}
+.btn:hover { color: var(--ink); border-color: rgba(255, 255, 255, 0.14); }
+.btn.sm { height: 24px; padding: 0 9px; }
+
+.row { position: relative; display: grid; border-bottom: 1px solid var(--line); }
+.cell { position: relative; display: flex; flex-direction: column; padding: 18px 24px 22px; }
+.cell + .cell { border-left: 1px solid var(--line); }
+.head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.head .idx { color: var(--ink-ghost); }
+.head .cap.t { color: var(--ink-dim); }
+.head .meta { margin-left: auto; display: flex; gap: 14px; }
+.head .meta b { color: var(--ink-dim); font-weight: 500; }
+
+.big { display: flex; align-items: baseline; gap: 8px; font: 400 40px/1 var(--mono); letter-spacing: -0.04em; color: var(--ink); }
+.big small { font: 400 13px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); }
+.sub { margin-top: 8px; display: flex; gap: 14px; }
+.sub b { color: var(--ink-dim); font-weight: 500; }
+
+/* round trip: a line over its samples, on the dotted canvas */
+.canvas { position: relative; flex: 1; margin-top: 16px; min-height: 150px; background: var(--dots); }
+.canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.ylab { position: absolute; right: 0; transform: translateY(-50%); color: var(--ink-ghost); background: var(--cell); padding-left: 6px; }
+.axis { display: flex; justify-content: space-between; margin-top: 8px; color: var(--ink-ghost); }
+.tip {
+  position: absolute; transform: translate(-50%, calc(-100% - 12px)); padding: 6px 9px; white-space: nowrap;
+  background: #111; border: 1px solid rgba(255, 255, 255, 0.14); color: var(--ink); font: 500 11px var(--mono); letter-spacing: 0.04em;
+}
+.tip span { color: var(--ink-faint); margin-right: 10px; }
+.mark { position: absolute; width: 7px; height: 7px; transform: translate(-50%, -50%); background: var(--cell); border: 1.5px solid var(--accent-strong); }
+
+/* live users: a pixel matrix, one column an hour */
+.matrix { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; margin-top: 18px; }
+.matrix .col { display: grid; grid-template-rows: repeat(7, 1fr); gap: 3px; }
+.matrix i { aspect-ratio: 1; background: rgba(255, 255, 255, 0.045); }
+.matrix i.on { background: rgba(156, 165, 211, 0.42); }
+.matrix .col.now i.on { background: var(--accent-strong); }
+
+/* a line of the stream: amber edge, timestamp, what happened */
+.log { display: flex; align-items: center; gap: 14px; padding: 8px 10px; margin-top: 8px; border-left: 2px solid var(--warn); background: rgba(241, 180, 64, 0.035); }
+.log .ts { color: var(--ink-ghost); letter-spacing: 0.02em; }
+.log .what { flex: 1; font: 11.5px var(--mono); color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* ---- 02 -------------------------------------------------------------- */
+.diag { border-top: 1px solid var(--line-soft); }
+.diag > div { display: flex; align-items: center; gap: 12px; height: 34px; border-bottom: 1px solid var(--line-soft); }
+.diag .v { margin-left: auto; font: 500 12px var(--mono); color: var(--ink); }
+.diag .blocks { margin-left: auto; }
+.diag .blocks + .v { margin-left: 12px; min-width: 64px; text-align: right; }
+.diag .v em { font-style: normal; color: var(--ink-faint); font-weight: 400; }
+.blocks { display: flex; gap: 2px; width: 90px; }
+.blocks i { flex: 1; height: 8px; background: rgba(255, 255, 255, 0.06); }
+.blocks i.on { background: var(--accent); }
+
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; padding: 0 12px 10px; }
+th.r, td.r { text-align: right; }
+td { padding: 0 12px; height: 46px; border-top: 1px solid var(--line-soft); font: 12px var(--mono); color: var(--ink-dim); white-space: nowrap; }
+th:first-child, td:first-child { padding-left: 0; }
+th:last-child, td:last-child { padding-right: 0; }
+tr:hover td { background: var(--hover); }
+.pname { display: flex; align-items: center; gap: 10px; color: var(--ink); }
+.sq { width: 6px; height: 6px; background: var(--ink-dim); flex: none; }
+.pname em { font-style: normal; color: var(--ink-ghost); font-size: 11px; }
+/* one bar per row, the busiest in the accent */
+.bar { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+.bar span { position: relative; display: block; width: 110px; height: 6px; background: rgba(255, 255, 255, 0.04); }
+.bar span i { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(255, 255, 255, 0.22); }
+.bar span i.top { background: var(--accent); }
+.ticks { display: flex; gap: 2px; width: 120px; height: 12px; margin-left: auto; }
+.ticks i { flex: 1; background: rgba(255, 255, 255, 0.1); }
+.ticks i:last-child { background: rgba(255, 255, 255, 0.4); }
+.ticks i.warn { background: var(--warn); }
+
+/* ---- 03 -------------------------------------------------------------- */
+.barcode { position: relative; display: flex; align-items: flex-end; gap: 3px; height: 72px; margin-top: 16px; border-bottom: 1px solid var(--line); }
+.barcode i { flex: 1; min-width: 1px; max-width: 2px; background: rgba(255, 255, 255, 0.32); }
+.barcode i.warn { background: var(--warn); }
+.barcode i.now { background: var(--accent-strong); }
+.counts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin-top: 16px; border-top: 1px solid var(--line-soft); }
+.counts div { padding: 10px 14px 0; }
+.counts div:first-child { padding-left: 0; }
+.counts div + div { border-left: 1px solid var(--line-soft); }
+.counts b { display: block; margin-top: 4px; font: 400 20px var(--mono); letter-spacing: -0.03em; color: var(--ink); }
+
+.list > div { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 12px; height: 38px; border-bottom: 1px solid var(--line-soft); }
+.list > div:first-child { border-top: 1px solid var(--line-soft); }
+.list .nm { font: 12px var(--mono); color: var(--ink); text-transform: uppercase; letter-spacing: 0.04em; }
+.list .tag { font: 10.5px var(--mono); color: var(--ink-ghost); letter-spacing: 0.08em; text-transform: uppercase; }
+.list .val { font: 500 12px var(--mono); color: var(--ink-dim); min-width: 52px; text-align: right; }
+.list svg { width: 70px; height: 16px; overflow: visible; }
+.slots { display: flex; gap: 2px; }
+.slots i { width: 10px; height: 8px; background: rgba(255, 255, 255, 0.07); }
+.slots i.on { background: var(--accent); }
+
+/* ---- 02: four equal units along the path a change takes ------------ */
+.pipe { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.unit .status { display: flex; align-items: center; gap: 8px; margin: -4px 0 16px; color: var(--ink-dim); }
+.unit .big { font-size: 32px; }
+.be .big { font-size: 26px; }
+.reads { margin-top: 16px; border-top: 1px solid var(--line-soft); }
+.reads > div { display: flex; align-items: center; height: 32px; border-bottom: 1px solid var(--line-soft); }
+.reads .v { margin-left: auto; font: 500 12px var(--mono); color: var(--ink); }
+.reads .v em { font-style: normal; font-weight: 400; color: var(--ink-faint); }
+.reads .v.warn { color: var(--warn); }
+.day { margin-top: auto; padding-top: 16px; display: grid; gap: 8px; }
+.day .ticks { width: 100%; margin: 0; }
+/* where one stage hands to the next */
+.flow {
+  position: absolute; left: -9px; top: 108px; z-index: 4; display: grid; place-items: center;
+  width: 17px; height: 17px; background: var(--bg); border: 1px solid rgba(255, 255, 255, 0.22); color: var(--accent);
+}
+.flow svg { width: 9px; height: 9px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+
+/* ---- 03 ------------------------------------------------------------- */
+.figure { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
+.inline { display: flex; }
+.inline div { padding: 0 16px; }
+.inline div + div { border-left: 1px solid var(--line-soft); }
+.inline div:last-child { padding-right: 0; }
+.inline b { display: block; margin-top: 3px; font: 400 18px var(--mono); color: var(--ink); }
+.queues { margin-top: 18px; }
+.queues td { height: 38px; }
+.queues td.qn { color: var(--ink); }
+.stack .be { flex: 1; display: flex; flex-direction: column; padding: 4px 0 18px; }
+.stack .be + .be { border-top: 1px solid var(--line-soft); padding-top: 18px; padding-bottom: 0; }
+.be-top { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.be-top .nm { font: 12px var(--mono); color: var(--ink); text-transform: uppercase; letter-spacing: 0.04em; }
+.be-top .cap { margin-left: auto; color: var(--ink-dim); }
+/* The history takes whatever height the block has to spare. */
+.be .hist { flex: 1; width: 100%; min-height: 36px; margin-top: 14px; overflow: visible; }
+.be .reads { margin-top: 12px; }
+
+/* ---- singletons: CPU and memory read at a glance ------------------- */
+.unit .status { gap: 8px; }
+.unit .status .dim { margin-left: 6px; color: var(--ink-ghost); }
+.res { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
+.gauge { padding: 14px 20px 16px 0; }
+.gauge + .gauge { padding: 14px 0 16px 20px; border-left: 1px solid var(--line-soft); }
+.g-top { display: flex; justify-content: space-between; }
+.dim { color: var(--ink-ghost); }
+.gv { margin: 6px 0 12px; font: 400 30px/1 var(--mono); letter-spacing: -0.04em; color: var(--ink); }
+.gv small { margin-left: 4px; font-size: 13px; letter-spacing: 0.04em; color: var(--ink-faint); }
+.gauge .spark { display: block; width: 100%; height: 40px; margin-top: 12px; background: var(--dots); overflow: visible; }
+.unit .reads { margin-top: 0; border-top: 0; }
+
+/* a usage bar in segments: accent, amber from 80% */
+.seg { display: inline-flex; gap: 2px; width: 96px; flex: none; }
+.seg i { flex: 1; height: 10px; background: rgba(255, 255, 255, 0.07); }
+.seg i.on { background: var(--accent); }
+.seg.hot i.on { background: var(--warn); }
+.seg.wide { display: flex; width: 100%; }
+.seg.wide i { height: 12px; }
+
+/* ---- fleets: one row per instance, any count ----------------------- */
+.fleet td { height: 44px; }
+.meter { display: inline-flex; align-items: center; gap: 12px; }
+.meter b { min-width: 92px; font-weight: 500; color: var(--ink); }
+.meter b em { font-style: normal; font-weight: 400; color: var(--ink-faint); }
+.meter b.warn { color: var(--warn); }
+.sq.warn { background: var(--warn); }
+.pname em { margin-left: 4px; }
+.fleet .hist { width: 120px; height: 16px; display: block; overflow: visible; }
+.ticks i.off { background: transparent; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06); }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="side">
+    <div class="me">
+      <span class="av">MO</span><b>Mira Oyelaran</b>
+      <svg class="i" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>
+    </div>
+    <div class="search cap">
+      <svg class="i" viewBox="0 0 24 24"><path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5"/></svg>
+      Jump to<kbd>⌘K</kbd>
+    </div>
+    <nav class="nav">
+      <a class="on" href="#"><svg class="i" viewBox="0 0 24 24"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>Overview</a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3z M12 9v5 M12 17v1"/></svg>Incidents<span class="n warn">1</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5"/></svg>Logs</a>
+      <div class="cap">Sync</div>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M4 3h16v7H4z M4 14h16v7H4z M7 6.5h1 M7 17.5h1"/></svg>SSPs<span class="n">3/3</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0"/></svg>Backends<span class="n">3/3</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0"/></svg>Views<span class="n">72</span></a>
+      <div class="cap">Run</div>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M3 3h6v6H3z M15 15h6v6h-6z M6 9v9h9 M9 6h9v9"/></svg>Workflows<span class="n">1</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v17H5z M8 2v4 M16 2v4 M5 9h14"/></svg>Schedules<span class="n">5</span></a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 6h14v15H5z M9 6V3h6v3 M8 11h8 M8 15h8"/></svg>Jobs<span class="n">4</span></a>
+      <div class="cap">Data</div>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M4 4h16v5H4z M6 9v12h12V9 M9 13h6"/></svg>Backups</a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3"/></svg>Resources</a>
+      <a href="#"><svg class="i" viewBox="0 0 24 24"><path d="M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4"/></svg>Access</a>
+    </nav>
+    <div class="side-foot cap" style="color: var(--ink-ghost)">canary.265</div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <span class="cap crumb">acme <span style="margin: 0 6px">/</span> <b>Overview</b></span>
+      <div class="right">
+        <span class="readout cap"><span class="pulse"></span>Round trip <b>61 ms</b></span>
+        <div class="seg cap"><span>1h</span><span class="on">24h</span><span>7d</span></div>
+        <button class="btn cap"><svg class="i" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7 M20 4v4h-4"/></svg>Restart</button>
+        <button class="btn cap"><svg class="i" viewBox="0 0 24 24"><path d="M4 4h16v5H4z M6 9v12h12V9 M9 13h6"/></svg>Back up</button>
+      </div>
+    </header>
+
+    <!-- 01 sync ======================================================== -->
+    <section class="row" style="grid-template-columns: minmax(0, 2fr) minmax(0, 1fr)">
+      <div class="cell">
+        <div class="head"><span class="cap t">Sync round trip</span>
+          <span class="meta cap"><span>p99 <b>142 ms</b></span><span>peak <b>310 ms</b></span><span><b>0</b> failed</span></span></div>
+        <div class="big">61<small>ms</small></div>
+        <div class="canvas" id="rtt"><svg viewBox="0 0 700 150" preserveAspectRatio="none"></svg></div>
+        <div class="axis cap"><span>-24h</span><span>-18h</span><span>-12h</span><span>-6h</span><span>now</span></div>
+      </div>
+      <div class="cell">
+        <div class="head"><span class="cap t">Live users</span></div>
+        <div class="big">148</div>
+        <div class="sub cap"><span><b>212</b> tabs</span><span><b>72</b> views</span><span><b>12</b> anon</span></div>
+        <div class="matrix" id="users"></div>
+        <div class="log">
+          <span class="what">2 slow views · 1 hot at 118/s</span>
+          <a class="btn sm cap" href="#">Views</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- the two singletons: one database, one scheduler ================== -->
+    <section class="row" style="grid-template-columns: repeat(2, minmax(0, 1fr))">
+      <div class="cell unit">
+        <div class="head"><span class="cap t">SurrealDB</span><span class="meta cap"><span>3.1.5</span></span></div>
+        <div class="status cap"><span class="sq"></span>Healthy<span class="dim">up 1.7d</span></div>
+        <div class="res">
+          <div class="gauge">
+            <div class="g-top"><span class="cap">CPU</span><span class="cap dim">of 3 vCPU</span></div>
+            <div class="gv">38<small>%</small></div>
+            <span class="seg wide" data-seg="38"></span>
+            <svg class="spark" data-spark="1" data-base="38"></svg>
+          </div>
+          <div class="gauge">
+            <div class="g-top"><span class="cap">Memory</span><span class="cap dim">of 3 GB</span></div>
+            <div class="gv">1.7<small>GB</small></div>
+            <span class="seg wide" data-seg="57"></span>
+            <svg class="spark" data-spark="2" data-base="57" data-flat="1"></svg>
+          </div>
+        </div>
+        <div class="reads">
+          <div><span class="cap">Write to live</span><span class="v">OK</span></div>
+          <div><span class="cap">Disk</span><span class="v">30 <em>%</em></span></div>
+        </div>
+        <div class="day"><div class="ticks" data-ticks=""></div></div>
+      </div>
+      <div class="cell unit">
+        <div class="head"><span class="cap t">Scheduler</span><span class="meta cap"><span>72 views</span></span></div>
+        <div class="status cap"><span class="sq"></span>Ready<span class="dim">up 1.7d</span></div>
+        <div class="res">
+          <div class="gauge">
+            <div class="g-top"><span class="cap">CPU</span><span class="cap dim">of 1 vCPU</span></div>
+            <div class="gv">11<small>%</small></div>
+            <span class="seg wide" data-seg="11"></span>
+            <svg class="spark" data-spark="3" data-base="11"></svg>
+          </div>
+          <div class="gauge">
+            <div class="g-top"><span class="cap">Memory</span><span class="cap dim">of 3 GB</span></div>
+            <div class="gv">1.2<small>GB</small></div>
+            <span class="seg wide" data-seg="39"></span>
+            <svg class="spark" data-spark="4" data-base="39" data-flat="1"></svg>
+          </div>
+        </div>
+        <div class="reads">
+          <div><span class="cap">Ingest lag</span><span class="v">0 <em>events</em></span></div>
+          <div><span class="cap">Pending events</span><span class="v">12</span></div>
+        </div>
+        <div class="day"><div class="ticks" data-ticks=""></div></div>
+      </div>
+    </section>
+
+    <!-- sync processors: any number, one row each, trouble first ======== -->
+    <section class="row">
+      <div class="cell">
+        <div class="head"><span class="cap t">Sync processors</span>
+          <span class="meta cap"><span><b>3</b> of 3 ready</span></span></div>
+        <table class="fleet">
+          <thead><tr>
+            <th class="cap">SSP</th><th class="cap r">Views</th><th class="cap r">Heartbeat</th><th class="cap r">Backlog</th>
+            <th class="cap">CPU</th><th class="cap">Memory</th><th class="cap r">Up</th><th class="cap r">Last 24h</th>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="pname"><span class="sq warn"></span>ssp-1<em>ready</em></span></td>
+              <td class="r">24</td><td class="r">3s</td><td class="r warn">34 ops</td>
+              <td><span class="meter"><span class="seg" data-seg="31"></span><b>31%</b></span></td>
+              <td><span class="meter"><span class="seg" data-seg="85"></span><b class="warn">1.7 <em>/ 2 GB</em></b></span></td>
+              <td class="r">1.0d</td><td><div class="ticks" data-ticks="13"></div></td>
+            </tr>
+            <tr>
+              <td><span class="pname"><span class="sq"></span>ssp-0<em>ready</em></span></td>
+              <td class="r">26</td><td class="r">2s</td><td class="r">0</td>
+              <td><span class="meter"><span class="seg" data-seg="24"></span><b>24%</b></span></td>
+              <td><span class="meter"><span class="seg" data-seg="65"></span><b>1.3 <em>/ 2 GB</em></b></span></td>
+              <td class="r">1.7d</td><td><div class="ticks" data-ticks=""></div></td>
+            </tr>
+            <tr>
+              <td><span class="pname"><span class="sq"></span>ssp-2<em>ready</em></span></td>
+              <td class="r">22</td><td class="r">1s</td><td class="r">0</td>
+              <td><span class="meter"><span class="seg" data-seg="9"></span><b>9%</b></span></td>
+              <td><span class="meter"><span class="seg" data-seg="30"></span><b>0.6 <em>/ 2 GB</em></b></span></td>
+              <td class="r">6h</td><td><div class="ticks" data-ticks="" data-from="18"></div></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- jobs ========================================================== -->
+    <section class="row">
+      <div class="cell">
+        <div class="head"><span class="cap t">Jobs</span>
+          <span class="meta cap"><span class="warn">2 failed in 1h</span></span></div>
+        <div class="log" style="margin: 0 0 18px">
+          <span class="cap ts">22:41:08</span><span class="what">/jobs/welcome-mail · backend returned 503 · attempt 4/4</span>
+          <a class="btn sm cap" href="#">Retry 2</a>
+        </div>
+        <div class="figure">
+          <div class="big">42<small>/ min</small></div>
+          <div class="inline">
+            <div><span class="cap">Pending</span><b>3</b></div>
+            <div><span class="cap">Running</span><b>1</b></div>
+            <div><span class="cap">Stalled</span><b>0</b></div>
+            <div><span class="cap">Oldest wait</span><b>2s</b></div>
+          </div>
+        </div>
+        <div class="barcode" id="jobs"></div>
+        <table class="queues">
+          <thead><tr>
+            <th class="cap">Queue</th><th class="cap">Backend</th><th class="cap">Running / limit</th><th class="cap r">Rate</th><th class="cap r">Waiting</th><th class="cap r">Failed 1h</th>
+          </tr></thead>
+          <tbody>
+            <tr><td class="qn">search_job</td><td>api</td><td><span class="slots"><i class="on"></i><i></i><i></i><i></i></span></td><td class="r">28/m</td><td class="r">2</td><td class="r warn">1</td></tr>
+            <tr><td class="qn">digest_job</td><td>worker</td><td><span class="slots"><i></i><i></i></span></td><td class="r">10/m</td><td class="r">0</td><td class="r warn">1</td></tr>
+            <tr><td class="qn">maintenance_job</td><td>api</td><td><span class="slots"><i></i></span></td><td class="r">4/m</td><td class="r">1</td><td class="r">0</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- backends: any number, same shape as the processors ============= -->
+    <section class="row">
+      <div class="cell">
+        <div class="head"><span class="cap t">Backends</span><span class="meta cap"><span><b>3</b> of 3 healthy</span></span></div>
+        <table class="fleet">
+          <thead><tr>
+            <th class="cap">Backend</th><th class="cap r">Response</th><th class="cap">Last checks</th>
+            <th class="cap">CPU</th><th class="cap">Memory</th><th class="cap r">Queues</th><th class="cap r">Checked</th>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="pname"><span class="sq"></span>api<em>healthy</em></span></td>
+              <td class="r">8 ms</td><td><svg class="hist" data-hist="5"></svg></td>
+              <td><span class="meter"><span class="seg" data-seg="6"></span><b>6%</b></span></td>
+              <td><span class="meter"><span class="seg" data-seg="41"></span><b>212 <em>/ 512 MB</em></b></span></td>
+              <td class="r">2</td><td class="r">4s</td>
+            </tr>
+            <tr>
+              <td><span class="pname"><span class="sq"></span>worker<em>healthy</em></span></td>
+              <td class="r">14 ms</td><td><svg class="hist" data-hist="9"></svg></td>
+              <td><span class="meter"><span class="seg" data-seg="18"></span><b>18%</b></span></td>
+              <td><span class="meter"><span class="seg" data-seg="59"></span><b>302 <em>/ 512 MB</em></b></span></td>
+              <td class="r">1</td><td class="r">4s</td>
+            </tr>
+            <tr>
+              <td><span class="pname"><span class="sq"></span>email<em>healthy</em></span></td>
+              <td class="r">21 ms</td><td><svg class="hist" data-hist="13"></svg></td>
+              <td><span class="meter"><span class="seg" data-seg="1"></span><b>1%</b></span></td>
+              <td><span class="meter"><span class="seg" data-seg="13"></span><b>64 <em>/ 512 MB</em></b></span></td>
+              <td class="r">0</td><td class="r">4s</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <div></div>
+  </main>
+</div>
+
+<script>
+const rand = (seed) => () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+const series = (seed, n, base, wobble, drift = 0) => {
+  const r = rand(seed); let v = base;
+  return Array.from({ length: n }, () => (v += (r() - 0.5) * wobble + drift, Math.max(1, v)));
+};
+
+// 01 round trip: faint sample bars under a line, a hover crosshair, a peak marker.
+{
+  const box = document.getElementById('rtt'); const svg = box.querySelector('svg');
+  const W = 700, H = box.clientHeight, hi = 330;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const d = series(7, 120, 60, 9).map((v, i) => (i === 52 ? 310 : i === 53 ? 170 : v));
+  const y = (v) => H - (v / hi) * H;
+  const x = (i) => (i / (d.length - 1)) * W;
+  const hover = 88;
+  let bars = '';
+  d.forEach((v, i) => {
+    const after = i >= hover;
+    bars += `<line x1="${x(i)}" x2="${x(i)}" y1="${y(v)}" y2="${H}" stroke="rgba(156,165,211,${after ? 0.28 : 0.1})" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
+  });
+  const line = d.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(' ');
+  const grid = [100, 200, 300].map((v) => `<line x1="0" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="rgba(255,255,255,0.06)" vector-effect="non-scaling-stroke"/>`).join('');
+  svg.innerHTML = `${grid}${bars}
+    <path d="${line}" fill="none" stroke="#c6cbea" stroke-width="1.3" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    <line x1="${x(hover)}" x2="${x(hover)}" y1="0" y2="${H}" stroke="rgba(255,255,255,0.35)" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/>`;
+  for (const v of [100, 200, 300]) {
+    const l = document.createElement('span'); l.className = 'ylab cap'; l.textContent = `${v} ms`; l.style.top = `${y(v)}px`; box.append(l);
+  }
+  const mark = (i, cls) => {
+    const m = document.createElement('span'); m.className = 'mark';
+    m.style.left = `${(x(i) / W) * 100}%`; m.style.top = `${y(d[i])}px`;
+    if (cls === 'peak') { m.style.borderColor = 'var(--warn)'; }
+    box.append(m);
+  };
+  mark(hover); mark(52, 'peak');
+  const tip = document.createElement('div'); tip.className = 'tip';
+  tip.innerHTML = '<span>17:30</span>58 MS';
+  tip.style.left = `${(x(hover) / W) * 100}%`; tip.style.top = `${y(d[hover])}px`;
+  box.append(tip);
+}
+
+// 01 users: 24 columns of 7 pixels, the current hour in the accent.
+{
+  const d = series(11, 24, 60, 22, 3.6); const hi = Math.max(...d);
+  document.getElementById('users').innerHTML = d.map((v, c) => {
+    const lit = Math.max(1, Math.round((v / hi) * 7));
+    return `<div class="col${c === 23 ? ' now' : ''}">${Array.from({ length: 7 }, (_, r) => `<i class="${7 - r <= lit ? 'on' : ''}"></i>`).join('')}</div>`;
+  }).join('');
+}
+
+// Usage bars in segments; amber once the value reaches 80%.
+for (const el of document.querySelectorAll('[data-seg]')) {
+  const pct = +el.dataset.seg; const n = el.classList.contains('wide') ? 30 : 16;
+  const lit = Math.max(pct > 0 ? 1 : 0, Math.round((pct / 100) * n));
+  if (pct >= 80) el.classList.add('hot');
+  el.innerHTML = Array.from({ length: n }, (_, i) => `<i class="${i < lit ? 'on' : ''}"></i>`).join('');
+}
+// The last 15 minutes behind each singleton's CPU and memory, on a 0-100% scale.
+for (const svg of document.querySelectorAll('svg.spark')) {
+  const base = +svg.dataset.base; const flat = !!svg.dataset.flat;
+  const d = series(+svg.dataset.spark * 7, 60, base, flat ? 1.5 : base * 0.35).map((v) => Math.min(100, v));
+  const W = 300, H = 40;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.setAttribute('preserveAspectRatio', 'none');
+  const pts = d.map((v, i) => [(i / (d.length - 1)) * W, H - (v / 100) * H]);
+  const line = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+  svg.innerHTML = `<path d="${line} L${W} ${H} L0 ${H} Z" fill="rgba(156,165,211,0.12)"/>
+    <path d="${line}" fill="none" stroke="#9ca5d3" stroke-width="1.2" vector-effect="non-scaling-stroke"/>`;
+}
+// 02 meters and 24h strips.
+for (const el of document.querySelectorAll('[data-blocks]')) {
+  const on = +el.dataset.blocks;
+  el.innerHTML = Array.from({ length: 20 }, (_, i) => `<i class="${i < on ? 'on' : ''}"></i>`).join('');
+}
+for (const el of document.querySelectorAll('.ticks')) {
+  const warn = new Set(el.dataset.ticks.split(',').filter(Boolean).map(Number));
+  const from = +(el.dataset.from ?? 0); // hours before this one, the process did not exist yet
+  el.innerHTML = Array.from({ length: 24 }, (_, i) => `<i class="${i < from ? 'off' : warn.has(i) ? 'warn' : ''}"></i>`).join('');
+}
+
+// 03 jobs per minute as a barcode; minutes with a failure in amber.
+{
+  const d = series(3, 160, 14, 9, 0.12); const hi = Math.max(...d);
+  const failed = new Set([131, 148]);
+  document.getElementById('jobs').innerHTML = d.map((v, i) =>
+    `<i class="${failed.has(i) ? 'warn' : i === d.length - 1 ? 'now' : ''}" style="height:${Math.max(4, (v / hi) * 100)}%"></i>`).join('');
+}
+
+// 03 backend response history.
+for (const svg of document.querySelectorAll('svg[data-hist]')) {
+  // As many checks as there are pixels to spare, so the bars read as one texture.
+  const seed = +svg.dataset.hist; const n = 60; const d = series(seed, n, seed === 5 ? 8 : seed === 9 ? 14 : 21, 3); const hi = Math.max(...d) * 1.15;
+  svg.setAttribute('viewBox', `0 0 ${n} 16`); svg.setAttribute('preserveAspectRatio', 'none');
+  svg.innerHTML = d.map((v, i) => `<line x1="${i + 0.5}" x2="${i + 0.5}" y1="${16 - (v / hi) * 16}" y2="16" stroke="${i === n - 1 ? '#c6cbea' : 'rgba(255,255,255,0.28)'}" stroke-width="1" vector-effect="non-scaling-stroke"/>`).join('');
+}
+
+// Squares where the frame's lines cross: the sidebar edge with each row.
+{
+  const main = document.querySelector('.main');
+  const ys = [52, ...[...document.querySelectorAll('.row')].map((r) => r.offsetTop + r.offsetHeight)];
+  for (const y of ys) {
+    const n = document.createElement('span'); n.className = 'node';
+    n.style.left = '-4px'; n.style.top = `${y - 4}px`; main.append(n);
+  }
+  for (const row of document.querySelectorAll('.row')) {
+    for (const cell of [...row.children].slice(1)) {
+      const n = document.createElement('span'); n.className = 'node';
+      n.style.left = `${cell.offsetLeft - 4}px`; n.style.top = `${row.offsetTop - 4}px`; main.append(n);
+    }
+  }
+}
+</script>
+</body>
+</html>

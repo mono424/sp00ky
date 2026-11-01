@@ -9,6 +9,7 @@ import { A } from '@solidjs/router';
 import { PageHead } from '../components/Chrome';
 import { FxCell, Sq } from '../components/Frame';
 import { confirm, toast } from '../components/Actions';
+import { Onboarding } from './onboarding';
 import { formatStamp } from '../lib/format';
 import { cloud, consoleApi, type Workspace } from './cloud';
 import { Stamp, WORKSPACE_LINKS, projectLine, projectTone, useConsoleChrome } from './chrome';
@@ -40,12 +41,14 @@ function Head(props: { title: string; actions?: JSX.Element }) {
 
 export function Projects(props: Props) {
   const cx = useConsoleChrome();
+  // Decided on arrival: the project this page is waiting for must not end it.
+  if (props.workspace.projects.length === 0) return <Onboarding workspace={props.workspace} />;
   return (
     <>
-      <Head title="Projects" />
+      <Head title="Projects" actions={<A class="btn btn-sm" href="/new">New project</A>} />
       <div class="fx-page">
         <section class="fx-row cx-cards">
-          <For each={props.workspace.projects} fallback={<FxCell><p class="cx-note">No projects in {props.workspace.name} yet. Create one with `spky deploy`.</p></FxCell>}>
+          <For each={props.workspace.projects} fallback={<FxCell><p class="cx-note">No projects left in {props.workspace.name}. <A href="/new">Start a new one</A>.</p></FxCell>}>
             {(p) => (
               <button class="fx-cell cx-card" onClick={() => cx?.go(`/${props.workspace.slug}/${p.slug}`)}>
                 <div class="cx-card-top">

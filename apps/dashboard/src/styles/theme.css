@@ -6156,3 +6156,11 @@ button.list-item.bk-restore {
     transition: none;
   }
 }
+
+/* An anchor in the sign-in button's place: Sp00ky Cloud signs in through GitHub. */
+a.li-submit {
+  text-decoration: none;
+}
+.li-social {
+  gap: 11px;
+}

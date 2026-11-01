@@ -87,10 +87,12 @@ function cloudRoute(method, path) {
     ] }];
   }
   if (/^\/projects\/[^/]+\/deployment$/.test(path)) {
+    const backends = ['comments', 'chat', 'games', 'server', 'iroh-relay', 'livekit', 'play', 'record', 'relay', 'surreal', 'video', 'call'];
     return [200, { deployment: { id: 'd42', version: 42, status: 'superseded' }, vms: [
       { role: 'scheduler', status: 'running', name: 'scheduler' }, { role: 'ssp', status: 'running', name: 'ssp-0' }, { role: 'ssp', status: 'running', name: 'ssp-1' },
-      { role: 'surrealdb', status: 'running', name: 'surrealdb' }, { role: 'backend', status: 'running', name: 'api' },
-    ], urls: { app: 'https://whitepawn-app.stg.spky.cloud', ...Object.fromEntries(['comments', 'chat', 'games', 'server', 'iroh-relay', 'livekit', 'play', 'record', 'relay', 'surreal', 'video', 'call'].map((n) => [n, `https://whitepawn-${n}.stg.spky.cloud`])), surrealdb: 'https://whitepawn-db.stg.spky.cloud', admin: 'https://whitepawn-admin.stg.spky.cloud/admin' } }];
+      { role: 'surrealdb', status: 'running', name: 'surrealdb' }, { role: 'frontend', status: 'running', name: 'app' },
+      ...backends.map((name) => ({ role: 'backend', status: name === 'livekit' ? 'starting' : 'running', name })),
+    ], urls: { app: 'https://whitepawn-app.stg.spky.cloud', ...Object.fromEntries(backends.map((n) => [n, `https://whitepawn-${n}.stg.spky.cloud`])), surrealdb: 'https://whitepawn-db.stg.spky.cloud', admin: 'https://whitepawn-admin.stg.spky.cloud/admin' } }];
   }
   if (/^\/projects\/[^/]+\/link$/.test(path) && method === 'GET') return [200, { status: 'linked', repo_owner: 'mono424', repo_name: 'whitepawn', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' }];
   if (/^\/projects\/[^/]+\/link\/runs$/.test(path)) return [200, [
@@ -103,7 +105,10 @@ function cloudRoute(method, path) {
     { name: 'STOCKFISH_THREADS', has_dev: true, has_prod: true, updated_at: iso(32 * 24 * H) },
   ]];
   if (/^\/projects\/[^/]+\/envs\/load$/.test(path)) return [200, { variables: { LICHESS_TOKEN: 'lip_fixture_9f2', RESEND_API_KEY: 're_fixture_x1', STOCKFISH_THREADS: '4' } }];
-  if (/^\/projects\/[^/]+\/domains$/.test(path)) return [200, [{ id: 'dm1', domain: 'whitepawn.com', target_kind: 'frontend', target_name: 'app', status: 'active', dns_target: 'connect.stg.spky.cloud', created_at: iso(30 * 24 * H) }]];
+  if (/^\/projects\/[^/]+\/domains$/.test(path)) return [200, [
+    { id: 'dm1', domain: 'whitepawn.com', target_kind: 'frontend', target_name: 'app', status: 'active', dns_target: 'connect.stg.spky.cloud', created_at: iso(30 * 24 * H) },
+    { id: 'dm2', domain: 'api.whitepawn.com', target_kind: 'backend', target_name: 'server', status: 'pending_dns', dns_target: 'connect.stg.spky.cloud', created_at: iso(2 * H) },
+  ]];
   if (/^\/tenants\/[^/]+\/members$/.test(path)) return [200, [
     { id: 'm1', account_id: 'acct-1', role: 'admin', email: 'mira@acme.dev', github_login: 'mono424', created_at: iso(300 * 24 * H) },
     { id: 'm2', account_id: 'acct-2', role: 'member', email: 'sam@acme.dev', github_login: 'samk', created_at: iso(40 * 24 * H) },

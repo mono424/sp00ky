@@ -1,16 +1,17 @@
 /**
  * A workspace's own pages in the console: its projects, members, billing,
- * vault, API keys, activity, and the signed-in person's sessions. All of it
+ * vault, API keys, activity, settings, and the signed-in person's sessions. All of it
  * is Sp00ky Cloud's; no project's scheduler is involved.
  */
 
 import { For, Show, createResource, createSignal, type JSX } from 'solid-js';
+import { A } from '@solidjs/router';
 import { PageHead } from '../components/Chrome';
 import { FxCell, Sq } from '../components/Frame';
 import { confirm, toast } from '../components/Actions';
 import { formatStamp } from '../lib/format';
 import { cloud, consoleApi, type Workspace } from './cloud';
-import { Stamp, projectLine, projectTone, useConsoleChrome } from './chrome';
+import { Stamp, WORKSPACE_LINKS, projectLine, projectTone, useConsoleChrome } from './chrome';
 import { derivedKey, isUnlocked, lock, unlock, vaultStatus } from './vault';
 
 type Props = { workspace: Workspace };
@@ -526,6 +527,104 @@ export function Sessions() {
               </tbody>
             </table>
           </FxCell>
+        </section>
+      </div>
+    </>
+  );
+}
+
+/* ---------- settings ---------- */
+
+interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  type: string;
+  created_at: string;
+}
+
+/** The workspace's other pages, as the settings page lists them. */
+const MANAGE: { href: string; what: string }[] = [
+  { href: '/members', what: 'Who is in this workspace, their roles and pending invitations.' },
+  { href: '/billing', what: 'The plan, invoices and what each project used.' },
+  { href: '/vault', what: "The passphrase that encrypts every project's variables." },
+  { href: '/keys', what: 'Tokens for the CLI, CI and the cloud API.' },
+];
+
+export function WorkspaceSettings(props: Props) {
+  const cx = useConsoleChrome();
+  const tid = () => encodeURIComponent(props.workspace.id);
+  const isAdmin = () => props.workspace.role === 'admin';
+  const [tenant] = createResource(() => props.workspace.id, () => cloud<Tenant>(`/tenants/${tid()}`).catch(() => undefined));
+  const [name, setName] = createSignal(props.workspace.name);
+  const [saving, setSaving] = createSignal(false);
+  const next = () => name().trim();
+  const dirty = () => next().length > 0 && next() !== props.workspace.name;
+
+  const save = async (e: Event) => {
+    e.preventDefault();
+    if (!dirty() || saving()) return;
+    setSaving(true);
+    const to = next();
+    if (await act('Renaming', () => cloud(`/tenants/${tid()}`, { method: 'PATCH', body: { name: to } }), `Renamed to ${to}`)) {
+      await cx?.refresh();
+    }
+    setSaving(false);
+  };
+
+  const link = (href: string) => WORKSPACE_LINKS.find((l) => l.href === href)!;
+
+  return (
+    <>
+      <Head title="Settings" />
+      <div class="fx-page">
+        <section class="fx-row">
+          <FxCell label="General" meta={<span>{props.workspace.type === 'personal' ? 'personal' : 'team'}</span>}>
+            <form class="cx-form" onSubmit={save}>
+              <label class="li-field cx-grow">
+                <span>Name</span>
+                <input value={name()} maxLength={64} disabled={!isAdmin()} onInput={(e) => setName(e.currentTarget.value)} />
+              </label>
+              <Show when={isAdmin()}>
+                <button class="btn btn-primary" type="submit" disabled={!dirty() || saving()}>{saving() ? 'Saving' : 'Save'}</button>
+              </Show>
+            </form>
+            <p class="cx-note">
+              <Show when={isAdmin()} fallback="Only an admin of this workspace can rename it.">
+                The name shows in the console and in invitations. The address stays the same.
+              </Show>
+            </p>
+            <div class="cx-kv">
+              <div><span class="cap">Address</span><b>/{props.workspace.slug}</b></div>
+              <div><span class="cap">Your role</span><b>{props.workspace.role}</b></div>
+              <div><span class="cap">Projects</span><b>{props.workspace.projects.length}</b></div>
+              <div><span class="cap">Created</span><b title={tenant()?.created_at ? formatStamp(tenant()!.created_at) : undefined}>
+                  {tenant()?.created_at ? new Date(tenant()!.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '—'}
+                </b></div>
+            </div>
+          </FxCell>
+        </section>
+        <section class="fx-row">
+          <FxCell label="Workspace ID">
+            <div class="cx-secret cx-idbox"><code>{props.workspace.id}</code><button class="btn btn-sm" onClick={() => { void navigator.clipboard?.writeText(props.workspace.id); toast('ok', 'Workspace ID copied'); }}>Copy</button></div>
+            <p class="cx-note">Send it as <code>X-Tenant-ID</code> to act in this workspace through the cloud API.</p>
+          </FxCell>
+        </section>
+        <section class="fx-row cx-manage-row">
+          <For each={MANAGE}>
+            {(m) => (
+              <A class="fx-cell cx-card cx-manage" href={m.href}>
+                <div class="cx-card-top">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d={link(m.href).icon} />
+                  </svg>
+                  <b>{link(m.href).label}</b>
+                  <svg class="cx-manage-go" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+                </div>
+                <span class="cx-note">{m.what}</span>
+              </A>
+            )}
+          </For>
         </section>
       </div>
     </>

@@ -4,7 +4,7 @@ import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
-import { AccountMenu, ProjectSwitcher, WORKSPACE_LINKS, WorkspaceSwitch, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
+import { ProjectSwitcher, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
 export interface NavLink {
   href: string;
@@ -174,9 +174,9 @@ let lastLayer: 'workspace' | 'project' | undefined;
 /**
  * The console's rail, in two layers. The workspace layer lists the
  * workspace's projects between its quick links and its own pages; opening a
- * project drills into the project layer: a way back, the project (switchable
- * in place), its quick links, then the cluster and the project's settings in
- * groups. The workspace switcher heads both, the account sits at the foot.
+ * project drills into the project layer: a way back, its quick links, then
+ * the cluster and the project's settings in groups. The project switcher heads
+ * both; the foot is one menu for the account and its workspaces.
  */
 function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void; version: string }) {
   const cx = useConsoleChrome()!;
@@ -194,7 +194,9 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
   return (
     <>
       <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-      <WorkspaceSwitch />
+      <div class="cx-rail-head">
+        <ProjectSwitcher rail />
+      </div>
       <button class="sb-jump cap" onClick={props.onJump}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
           <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
@@ -206,9 +208,8 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
         <div class={`cx-pin cx-layer ${dir}`}>
           <button class="cx-back" onClick={() => cx.go(`/${ws()?.slug}/-`)} title={`Back to ${ws()?.name ?? 'the workspace'}`}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
-            <span>All projects</span>
+            <span>{ws()?.name ?? 'Workspace'}</span>
           </button>
-          <ProjectSwitcher rail />
         </div>
       </Show>
       <div
@@ -277,7 +278,7 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
         </For>
       </div>
       <div class="sb-foot cx-foot">
-        <AccountMenu />
+        <WorkspaceMenu />
         <Show when={props.version}><div class="sb-ver cap">{props.version}</div></Show>
       </div>
     </>
@@ -310,8 +311,8 @@ export function Shell(props: {
 }) {
   const location = useLocation();
   const [open, setOpen] = createSignal(false);
-  // In the console the workspace menu (top-right) holds the account, and
-  // Deployments and Settings join the rail; elsewhere this is undefined.
+  // In the console the workspace menu (the rail's foot) holds the account,
+  // and Deployments and Settings join the rail; elsewhere this is undefined.
   const cx = useConsoleChrome();
 
   // Pages only a scheduler can fill: an SSP serving the API alone has no
@@ -603,7 +604,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
           }
         >
           <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-          <div class="cx-wsw-wrap"><span class="cx-wsw"><span class="cx-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
+          <div class="cx-rail-head"><span class="cx-prow"><span class="fx-sq idle" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
         </Show>
         <div class="sb-jump cap">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -631,6 +632,9 @@ export function FrameSkeleton(props: { console?: boolean }) {
           </For>
         </div>
         <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
+          <Show when={props.console}>
+            <span class="cx-who"><span class="cx-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
+          </Show>
           <div class="sb-ver cap" />
         </div>
       </nav>

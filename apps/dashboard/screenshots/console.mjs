@@ -113,6 +113,11 @@ function cloudRoute(method, path) {
     { id: 'm1', account_id: 'acct-1', role: 'admin', email: 'mira@acme.dev', github_login: 'mono424', created_at: iso(300 * 24 * H) },
     { id: 'm2', account_id: 'acct-2', role: 'member', email: 'sam@acme.dev', github_login: 'samk', created_at: iso(40 * 24 * H) },
   ]];
+  if ((m = path.match(/^\/tenants\/([^/]+)$/))) {
+    const w = WORKSPACES.find((x) => x.id === m[1]);
+    if (!w) return [404, { error: 'tenant not found' }];
+    return [200, { id: w.id, name: w.name, slug: w.slug, type: w.type, created_at: iso(400 * 24 * H) }];
+  }
   if (/^\/tenants\/[^/]+\/invitations$/.test(path)) return [200, [{ id: 'i1', email: 'jo@acme.dev', role: 'member', expires_at: iso(-5 * 24 * H) }]];
   if (method !== 'GET') return [200, { status: 'ok' }];
   return [404, { error: `no fixture for ${method} ${path}` }];

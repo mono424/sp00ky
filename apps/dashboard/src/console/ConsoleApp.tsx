@@ -37,7 +37,7 @@ import { ProjectApp } from '../ProjectApp';
 import { CloudError, consoleApi, signIn, signOut, type Grant, type Workspace, type WorkspaceProject } from './cloud';
 import { ConsoleChromeProvider, WORKSPACE_LINKS, type ConsoleChrome } from './chrome';
 import { Deployments, Settings } from './project';
-import { Activity, Billing, Keys, Members, Projects, Sessions, Vault } from './workspace';
+import { Activity, Billing, Keys, Members, Projects, Sessions, Vault, WorkspaceSettings } from './workspace';
 import { lock } from './vault';
 
 const LAST_KEY = 'spky.console.last';
@@ -92,6 +92,12 @@ export function ConsoleApp() {
     const w = where();
     return w.kind === 'project' ? workspace()?.projects.find((p) => p.slug === w.project) : undefined;
   });
+  // What a page is keyed on: the minute's refetch brings new objects for the
+  // same workspace and project, which must not remount the page (for a
+  // project, a new session).
+  const sameId = <T extends { id: string }>(a: T | undefined, b: T | undefined) => a?.id === b?.id;
+  const workspaceKey = createMemo(workspace, undefined, { equals: sameId });
+  const projectKey = createMemo(project, undefined, { equals: sameId });
 
   // `/` goes where the operator last was, else the first project there is.
   const landing = createMemo(() => {
@@ -124,6 +130,7 @@ export function ConsoleApp() {
     project,
     limited,
     go: (to) => go(to),
+    refresh: () => Promise.resolve(refetch()),
     signOut: () => {
       lock();
       void signOut().then(() => window.location.assign('/'));
@@ -144,13 +151,13 @@ export function ConsoleApp() {
             <Switch fallback={<Splash text="Nothing here" detail="This workspace or project does not exist, or you are not a member of it." />}>
               <Match when={where().kind === 'project' && project()}>
                 {/* Keyed: switching projects is a fresh session on another host. */}
-                <Show when={project()} keyed>
-                  {(p) => <ProjectView workspace={workspace()!} project={p} setLimited={setLimited} />}
+                <Show when={projectKey()} keyed>
+                  {(p) => <ProjectView workspace={workspace()!} project={project() ?? p} setLimited={setLimited} />}
                 </Show>
               </Match>
               <Match when={where().kind === 'workspace' && workspace()}>
-                <Show when={workspace()} keyed>
-                  {(w) => <WorkspaceView workspace={w} />}
+                <Show when={workspaceKey()} keyed>
+                  {(w) => <WorkspaceView workspace={workspace() ?? w} />}
                 </Show>
               </Match>
               <Match when={where().kind === 'root' && workspaces()!.length === 0}>
@@ -379,6 +386,7 @@ function WorkspaceView(props: { workspace: Workspace }) {
       <Route path="/keys" component={() => <Keys />} />
       <Route path="/activity" component={() => <Activity workspace={props.workspace} />} />
       <Route path="/sessions" component={() => <Sessions />} />
+      <Route path="/settings" component={() => <WorkspaceSettings workspace={props.workspace} />} />
       <Route path="*" component={() => <Projects workspace={props.workspace} />} />
     </Router>
   );

@@ -1,12 +1,14 @@
 /**
  * The console's chrome: which workspace and project the page is in, the
- * project switcher (the breadcrumb, top-left) and the workspace menu
- * (top-right). Shared through a context so the scheduler's own components
- * (Shell, PageHead) can show it without knowing about Sp00ky Cloud; outside
- * the console the context is empty and they render as they always did.
+ * project switcher (the rail's head) and the workspace menu (the rail's foot,
+ * which is also the account's). Shared through a context so the scheduler's
+ * own components (Shell, PageHead) can show it without knowing about Sp00ky
+ * Cloud; outside the console the context is empty and they render as they
+ * always did.
  */
 
 import { For, Show, createContext, createMemo, createSignal, onCleanup, useContext, type Accessor } from 'solid-js';
+import { useNavigate, useResolvedPath } from '@solidjs/router';
 import { formatDuration, formatStamp } from '../lib/format';
 import type { Me, Workspace, WorkspaceProject } from './cloud';
 
@@ -19,6 +21,8 @@ export interface ConsoleChrome {
   limited: Accessor<boolean>;
   /** Go to a console path (`/acme/whitepawn/deployments`). */
   go: (path: string) => void;
+  /** Load the workspaces again, after one of them changed. */
+  refresh: () => Promise<unknown>;
   signOut: () => void;
 }
 
@@ -28,6 +32,23 @@ export const ConsoleChromeProvider = Ctx.Provider;
 /** The console's chrome, or undefined outside the console. */
 export function useConsoleChrome(): ConsoleChrome | undefined {
   return useContext(Ctx);
+}
+
+/**
+ * Go to a console path from inside a page's router. A path under this router
+ * goes through it (a bare `history.pushState` would change the address but
+ * not the page); anything else, another project or workspace, through the
+ * console.
+ */
+export function useGo(): (to: string) => void {
+  const c = useConsoleChrome()!;
+  const navigate = useNavigate();
+  const root = useResolvedPath(() => '/');
+  return (to) => {
+    const base = (root() ?? '').replace(/\/$/, '');
+    if (base && (to === base || to.startsWith(`${base}/`))) navigate(to.slice(base.length) || '/');
+    else c.go(to);
+  };
 }
 
 export function initials(text: string | undefined | null): string {
@@ -92,6 +113,9 @@ const caret = (up: boolean) => (
   </svg>
 );
 
+export const GEAR =
+  'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z';
+
 /** A workspace's own pages in the rail; its projects sit between the two groups. */
 export const WORKSPACE_LINKS: { href: string; label: string; icon: string; group?: string }[] = [
   { href: '/', label: 'Overview', icon: 'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z' },
@@ -100,11 +124,17 @@ export const WORKSPACE_LINKS: { href: string; label: string; icon: string; group
   { href: '/billing', label: 'Billing & usage', group: 'Workspace', icon: 'M3 6h18v12H3z M3 10h18 M7 15h4' },
   { href: '/vault', label: 'Vault', group: 'Workspace', icon: 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4' },
   { href: '/keys', label: 'API keys', group: 'Workspace', icon: 'M14 4a6 6 0 1 0 3 11.2L20 18v3h-3v-2h-2v-2l-1.2-1.2A6 6 0 0 0 14 4z' },
+  { href: '/settings', label: 'Settings', group: 'Workspace', icon: GEAR },
 ];
 
-/** The breadcrumb's project: a button that opens every project in the workspace. ⌘P. */
+/**
+ * The project switcher: a button that opens every project in the workspace.
+ * ⌘P. In the rail it heads both layers; on a workspace page it offers the
+ * projects without one being open.
+ */
 export function ProjectSwitcher(props: { rail?: boolean }) {
   const c = useConsoleChrome()!;
+  const go = useGo();
   const [open, setOpen] = usePopover('.cx-proj-wrap');
   const [q, setQ] = createSignal('');
   const onKey = (e: KeyboardEvent) => {
@@ -141,10 +171,19 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
         }
       >
         <button class="cx-prow" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()} title="Switch project (⌘P)">
-          <span class={`fx-sq ${c.project() ? projectTone(c.project()!) : 'idle'}`} />
+          <Show
+            when={c.project()}
+            fallback={
+              <svg class="cx-prow-ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                <path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z" />
+              </svg>
+            }
+          >
+            {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
+          </Show>
           <span class="cx-prow-text">
-            <b>{c.project()?.slug ?? 'Project'}</b>
-            <small>{c.project() ? projectLine(c.project()!) : ''}</small>
+            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? 'Open a project'}</b>
+            <small>{c.project() ? projectLine(c.project()!) : `${c.workspace()?.projects.length ?? 0} in ${c.workspace()?.name ?? 'this workspace'}`}</small>
           </span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
             <path d="M8 9l4-4 4 4 M8 15l4 4 4-4" />
@@ -172,7 +211,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
                   role="menuitem"
                   onClick={() => {
                     setOpen(false);
-                    c.go(`/${c.workspace()!.slug}/${p.slug}`);
+                    go(`/${c.workspace()!.slug}/${p.slug}`);
                   }}
                 >
                   <span class={`fx-sq ${projectTone(p)}`} />
@@ -188,7 +227,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
             </For>
           </div>
           <div class="cx-pfoot cap">
-            <button onClick={() => { setOpen(false); c.go(`/${c.workspace()!.slug}/-`); }}>All projects</button>
+            <button onClick={() => { setOpen(false); go(`/${c.workspace()!.slug}/-`); }}>All projects</button>
             <span>⌘K jumps anywhere</span>
           </div>
         </div>
@@ -197,71 +236,152 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
   );
 }
 
-/** The rail's head: which workspace this is, and every other one. ⌘⇧W. */
-export function WorkspaceSwitch() {
+/** The signed-in person's GitHub picture over their initials; the initials stay if it cannot load. */
+function UserAvatar(props: { small?: boolean }) {
   const c = useConsoleChrome()!;
-  const [open, setOpen] = usePopover('.cx-wsw-wrap');
-  const onKey = (e: KeyboardEvent) => {
+  const login = () => c.me()?.account.github_login;
+  const [failed, setFailed] = createSignal(false);
+  const who = () => login() ?? c.me()?.account.email ?? '';
+  return (
+    <span class="cx-uav" classList={{ sm: !!props.small }} aria-hidden="true">
+      {initials(who())}
+      <Show when={login() && !failed()}>
+        <img src={`https://avatars.githubusercontent.com/${encodeURIComponent(login()!)}?s=64`} alt="" loading="lazy" onError={() => setFailed(true)} />
+      </Show>
+    </span>
+  );
+}
+
+/**
+ * The rail's foot: who is signed in and which workspace they are in, as one
+ * menu. It holds the account, every workspace (each with a way to its
+ * settings), the account's sessions and signing out. ⌘⇧W opens it; arrows
+ * move through the workspaces, Enter opens one.
+ */
+export function WorkspaceMenu() {
+  const c = useConsoleChrome()!;
+  const [open, setOpen] = usePopover('.cx-who-wrap');
+  const [q, setQ] = createSignal('');
+  const [hot, setHot] = createSignal(0);
+  const account = () => c.me()?.account;
+  const who = () => account()?.github_login ?? account()?.email ?? 'Account';
+  const ws = () => c.workspace();
+  const list = createMemo(() => {
+    const needle = q().trim().toLowerCase();
+    const all = c.workspaces();
+    return needle ? all.filter((w) => `${w.name} ${w.slug}`.toLowerCase().includes(needle)) : all;
+  });
+  const toggle = (v = !open()) => {
+    if (v) {
+      setQ('');
+      setHot(Math.max(0, c.workspaces().findIndex((w) => w.id === ws()?.id)));
+    }
+    setOpen(v);
+  };
+  const go = useGo();
+  const leave = (to: string) => {
+    setOpen(false);
+    go(to);
+  };
+  const onGlobalKey = (e: KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'w') {
       e.preventDefault();
-      setOpen(!open());
+      toggle();
     }
   };
-  window.addEventListener('keydown', onKey);
-  onCleanup(() => window.removeEventListener('keydown', onKey));
-  const ws = () => c.workspace();
+  window.addEventListener('keydown', onGlobalKey);
+  onCleanup(() => window.removeEventListener('keydown', onGlobalKey));
+
+  const onKey = (e: KeyboardEvent) => {
+    const n = list().length;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHot((i) => Math.min(i + 1, n - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHot((i) => Math.max(i - 1, 0));
+    } else if (e.key === 'Enter' && list()[hot()]) {
+      e.preventDefault();
+      leave(`/${list()[hot()].slug}/-`);
+    }
+  };
+  const kind = (w: Workspace) => (w.type === 'personal' ? 'Personal' : 'Team');
+  const count = (n: number) => `${n} ${n === 1 ? 'project' : 'projects'}`;
+
   return (
-    <div class="cx-wsw-wrap">
-      <button class="cx-wsw" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()} title="Switch workspace (⌘⇧W)">
+    <div class="cx-who-wrap">
+      <Show when={open()}>
+        <div
+          class="cx-menu cx-who-menu"
+          role="menu"
+          tabIndex={-1}
+          onKeyDown={onKey}
+          ref={(el) => queueMicrotask(() => (el.querySelector<HTMLInputElement>('.cx-find input') ?? el).focus())}
+        >
+          <div class="cx-who-acct">
+            <UserAvatar />
+            <span class="cx-mi-text">
+              <b>{who()}</b>
+              <small>{account()?.github_login && account()?.email ? account()!.email : 'Signed in with GitHub'}</small>
+            </span>
+          </div>
+          <div class="cx-who-sec">
+            <div class="cap cx-h"><span>Workspaces</span><kbd>⌘⇧W</kbd></div>
+            <Show when={c.workspaces().length > 5}>
+              <label class="cx-find cap">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                  <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
+                </svg>
+                <input placeholder="Find a workspace" value={q()} onInput={(e) => { setQ(e.currentTarget.value); setHot(0); }} />
+              </label>
+            </Show>
+            <div class="cx-who-list">
+              <For each={list()} fallback={<div class="cx-empty cap">No workspace matches</div>}>
+                {(w, i) => (
+                  <div class="cx-wrow" classList={{ on: w.id === ws()?.id, hot: i() === hot() }} onMouseEnter={() => setHot(i())}>
+                    <button class="cx-wrow-main" role="menuitemradio" aria-checked={w.id === ws()?.id} onClick={() => leave(`/${w.slug}/-`)}>
+                      <span class="cx-av2">{initials(w.name)}</span>
+                      <span class="cx-mi-text">
+                        <b>{w.name}</b>
+                        <small>{kind(w)} · {count(w.projects.length)}{w.role === 'admin' ? ' · admin' : ''}</small>
+                      </span>
+                      <Show when={w.id === ws()?.id}>
+                        <svg class="cx-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-label="Current workspace">
+                          <path d="M5 12.5l4.5 4.5L19 7.5" />
+                        </svg>
+                      </Show>
+                    </button>
+                    <button class="cx-wrow-gear" title={`${w.name} settings`} aria-label={`${w.name} settings`} onClick={() => leave(`/${w.slug}/-/settings`)}>
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d={GEAR} />
+                      </svg>
+                    </button>
+                  </div>
+                )}
+              </For>
+            </div>
+          </div>
+          <div class="cx-who-foot">
+            <button class="cx-mi" role="menuitem" onClick={() => leave(`/${ws()?.slug ?? c.workspaces()[0]?.slug ?? '-'}/-/sessions`)}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 5h18v11H3z M8 20h8 M12 16v4" /></svg>
+              Sessions
+            </button>
+            <button class="cx-mi" role="menuitem" onClick={() => { setOpen(false); c.signOut(); }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M14 4h5v16h-5 M10 8l-4 4 4 4 M6 12h10" /></svg>
+              Sign out
+            </button>
+          </div>
+        </div>
+      </Show>
+      <button class="cx-who" classList={{ on: open() }} onClick={() => toggle()} aria-haspopup="menu" aria-expanded={open()} title="Account and workspaces (⌘⇧W)">
         <span class="cx-av">{initials(ws()?.name)}</span>
         <span class="cx-wsw-text">
           <b>{ws()?.name ?? 'Workspace'}</b>
-          <small>{ws() ? `${ws()!.projects.length} projects · ${ws()!.role}` : ''}</small>
+          <small class="cx-who-user"><UserAvatar small /><span>{who()}</span></small>
         </span>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
           <path d="M8 9l4-4 4 4 M8 15l4 4 4-4" />
         </svg>
-      </button>
-      <Show when={open()}>
-        <div class="cx-menu cx-rail-menu" role="menu">
-          <div class="cap cx-h"><span>Workspaces</span><span>⌘⇧W</span></div>
-          <For each={c.workspaces()}>
-            {(w) => (
-              <button class="cx-mi" classList={{ on: w.id === ws()?.id }} role="menuitem" onClick={() => { setOpen(false); c.go(`/${w.slug}/-`); }}>
-                <span class="cx-av2">{initials(w.name)}</span>
-                <span class="cx-mi-text">
-                  {w.name}
-                  <small>{w.type === 'personal' ? 'Personal' : 'Organization'} · {w.projects.length} projects</small>
-                </span>
-                <Show when={w.id === ws()?.id}><span class="cx-check">✓</span></Show>
-              </button>
-            )}
-          </For>
-        </div>
-      </Show>
-    </div>
-  );
-}
-
-/** The rail's foot: who is signed in, their sessions, signing out. */
-export function AccountMenu() {
-  const c = useConsoleChrome()!;
-  const [open, setOpen] = usePopover('.cx-acct-wrap');
-  const account = () => c.me()?.account;
-  const who = () => account()?.github_login ?? account()?.email ?? 'Account';
-  return (
-    <div class="cx-acct-wrap">
-      <Show when={open()}>
-        <div class="cx-menu cx-rail-menu up" role="menu">
-          <div class="cap cx-h"><span>{account()?.email ?? ''}</span><span>GitHub</span></div>
-          <button class="cx-mi" role="menuitem" onClick={() => { setOpen(false); c.go(`/${c.workspace()?.slug ?? c.workspaces()[0]?.slug ?? '-'}/-/sessions`); }}>Sessions</button>
-          <button class="cx-mi" role="menuitem" onClick={() => { setOpen(false); c.signOut(); }}>Sign out</button>
-        </div>
-      </Show>
-      <button class="cx-acct" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()}>
-        <span class="sb-av">{initials(who())}</span>
-        <span class="cx-wsw-text"><b>{who()}</b><Show when={account()?.github_login && account()?.email}><small>{account()!.email}</small></Show></span>
-        {caret(!open())}
       </button>
     </div>
   );

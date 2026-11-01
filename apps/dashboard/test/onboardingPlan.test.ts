@@ -196,6 +196,23 @@ test('findings name what is there and what to do about the client', () => {
   assert.equal(titles[4].href, 'https://sp00ky.dev/docs/guide/solid');
 });
 
+test('the client is suggested for the app, not the marketing site', () => {
+  // mono424/hockeymask's real shape: an Astro landing page listed first.
+  const list = findings(
+    ins({
+      apps: [
+        { path: 'apps/api', kind: 'backend', framework: 'Hono' },
+        { path: 'apps/landing', kind: 'frontend', framework: 'Astro' },
+        { path: 'apps/web', kind: 'frontend', framework: 'React' },
+      ],
+    }),
+  );
+  assert.ok(list.some((f) => f.title === 'Add the client to apps/web'));
+  // A site is all there is: it is still the one to suggest.
+  const only = findings(ins({ apps: [{ path: 'apps/landing', kind: 'frontend', framework: 'Astro' }] }));
+  assert.ok(only.some((f) => f.title === 'Add the client to apps/landing'));
+});
+
 test('a project already on Sp00ky reads as such', () => {
   const list = findings(ins({ uses_spooky: true, config: { path: 'sp00ky.yml', valid: true, slug: 'app', mode: 'cluster', apps: [{ name: 'web', type: 'frontend' }] } }));
   assert.equal(list[0].title, 'Set up for Sp00ky');

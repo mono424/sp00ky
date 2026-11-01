@@ -45,6 +45,12 @@ function whileVisible(run: (comingBack: boolean) => void | Promise<void>, ms: nu
   });
 }
 
+/** The first stage's answer before one account has been picked. */
+function accountsLine(c: GitHubConnections | undefined): string | undefined {
+  const accounts = c?.installations ?? [];
+  return accounts.length > 1 ? `${accounts.length} accounts` : accounts[0]?.account;
+}
+
 export function GitHubMark() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -99,12 +105,19 @@ export function Onboarding(props: { workspace: Workspace }) {
       <div class="fx-page ob">
         <Stages
           stage={stage}
-          account={installation()?.account ?? connections()?.installations[0]?.account}
+          account={installation()?.account ?? accountsLine(connections())}
           repo={params.repo && params.repo !== 'none' ? params.repo : undefined}
           scratch={params.repo === 'none'}
           onRepo={() => setParams({ repo: undefined, installation: undefined })}
         />
         <Switch>
+          <Match when={stage() === 'loading'}>
+            <section class="fx-row">
+              <div class="fx-cell">
+                <div class="ob-reading">Looking up your GitHub accounts<span class="li-term-caret" /></div>
+              </div>
+            </section>
+          </Match>
           <Match when={stage() === 'error'}>
             <section class="fx-row">
               <div class="fx-cell">

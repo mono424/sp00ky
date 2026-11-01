@@ -257,6 +257,13 @@ export interface Finding {
   href?: string;
 }
 
+/** The app the client belongs in: not the marketing site, if there is anything else. */
+function clientApp(ins: Inspection): Inspection['apps'][number] | undefined {
+  const apps = ins.apps.filter((a) => a.kind !== 'backend');
+  const brochure = (a: Inspection['apps'][number]) => a.framework === 'Astro' || /landing|docs|marketing|website/.test(a.path);
+  return apps.find((a) => !brochure(a)) ?? apps[0];
+}
+
 const GUIDES: Record<string, string> = {
   Solid: 'solid',
   SolidStart: 'solid',
@@ -288,7 +295,7 @@ export function findings(ins: Inspection): Finding[] {
   if (ins.schema_files > 0) {
     out.push({ tone: 'ok', title: plural(ins.schema_files, 'SurrealQL file'), detail: ins.schema_dir });
   }
-  const client = ins.apps.find((a) => a.kind !== 'backend');
+  const client = clientApp(ins);
   if (ins.uses_spooky) {
     out.push({ tone: 'ok', title: 'Sp00ky client installed' });
   } else if (client) {

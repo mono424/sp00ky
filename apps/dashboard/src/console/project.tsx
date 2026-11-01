@@ -625,8 +625,18 @@ const PREVIEW_KEY = 'spky.console.preview';
 /** The viewport the site is drawn at before it is scaled into the card. */
 const PREVIEW_W = 1280;
 const [previewOn, setPreviewOn] = createSignal(localStorage.getItem(PREVIEW_KEY) !== 'off');
+/**
+ * Whether this device can run a second copy of the app beside the console. A
+ * sp00ky app brings its own workers, wasm and local database; on a phone the
+ * browser kills that frame and shows its sad-page icon, so a phone gets the
+ * site's card instead.
+ */
+const ROOMY =
+  window.matchMedia('(min-width: 1100px) and (pointer: fine)').matches &&
+  ((navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8) >= 4;
 
 function PreviewToggle() {
+  if (!ROOMY) return null;
   return (
     <button
       class="cx-toggle cap"
@@ -645,14 +655,16 @@ function PreviewToggle() {
  * desktop width and scaled into the card. Sandboxed and credentialless (its
  * own throwaway storage, no cookies, so it shows what a new visitor sees),
  * never focused or clicked; a click opens the site. Turning it off is kept
- * per browser, for an app too heavy to keep a second copy of open.
+ * per browser, for an app too heavy to keep a second copy of open. A device
+ * without the room for it gets the site's card.
  */
 function Preview(props: { target: Endpoint | undefined; loading: boolean }) {
   const [phase, setPhase] = createSignal<'loading' | 'ready' | 'failed'>('loading');
   let screen!: HTMLDivElement;
   let host!: HTMLDivElement;
   // Keyed on the address alone: a refetch hands back an equal target.
-  const src = createMemo(() => (previewOn() && props.target?.web ? props.target.url : undefined));
+  const src = createMemo(() => (ROOMY && previewOn() && props.target?.web ? props.target.url : undefined));
+  const card = () => (!ROOMY && props.target?.web ? props.target : undefined);
 
   onMount(() => {
     // Width sets the scale; the frame is as tall as the card, so the preview
@@ -702,7 +714,7 @@ function Preview(props: { target: Endpoint | undefined; loading: boolean }) {
   };
 
   return (
-    <div class="cx-shot" classList={{ ready: !!src() && phase() === 'ready' }}>
+    <div class="cx-shot" classList={{ ready: !!src() && phase() === 'ready', static: !!card() }}>
       <div class="cx-shot-bar">
         <i /><i /><i />
         <span>{props.target?.host ?? ''}</span>
@@ -710,14 +722,19 @@ function Preview(props: { target: Endpoint | undefined; loading: boolean }) {
       <div class="cx-shot-screen" ref={screen}>
         {/* The frame lives here, outside what Solid renders. */}
         <div class="cx-shot-host" ref={host} />
-        <Show when={note()} fallback={<Show when={phase() !== 'ready' || !src()}><span class="sk cx-shot-sk" /></Show>}>
-          {(n) => (
-            <div class="cx-shot-note">
-              <b>{n().title}</b>
-              <Show when={n().detail}><span class="cap">{n().detail}</span></Show>
-            </div>
-          )}
-        </Show>
+        <Switch fallback={<Show when={phase() !== 'ready' || !src()}><span class="sk cx-shot-sk" /></Show>}>
+          <Match when={card()} keyed>
+            {(t) => <SiteCard url={t.url} host={t.host} />}
+          </Match>
+          <Match when={note()}>
+            {(n) => (
+              <div class="cx-shot-note">
+                <b>{n().title}</b>
+                <Show when={n().detail}><span class="cap">{n().detail}</span></Show>
+              </div>
+            )}
+          </Match>
+        </Switch>
         <Show when={props.target}>
           {(t) => (
             <a class="cx-shot-open" href={t().url} target="_blank" rel="noopener noreferrer" aria-label={`Open ${t().host}`}>
@@ -726,6 +743,25 @@ function Preview(props: { target: Endpoint | undefined; loading: boolean }) {
           )}
         </Show>
       </div>
+    </div>
+  );
+}
+
+/** Where a site keeps its icon, best first; a miss tries the next. */
+const SITE_ICONS = ['/apple-touch-icon.png', '/favicon.svg', '/favicon.ico', '/favicon.png', '/logo.png'];
+
+/** A site as a card, where a live copy is too heavy: its icon and its address. */
+function SiteCard(props: { url: string; host: string }) {
+  const [i, setI] = createSignal(0);
+  return (
+    <div class="cx-shot-note cx-site">
+      <span class="cx-site-icon">
+        <Show when={i() < SITE_ICONS.length} fallback={<b>{props.host.charAt(0).toUpperCase()}</b>}>
+          <img src={new URL(SITE_ICONS[i()], props.url).href} alt="" referrerpolicy="no-referrer" onError={() => setI(i() + 1)} />
+        </Show>
+      </span>
+      <b>{props.host}</b>
+      <span class="cap">Live preview on desktop</span>
     </div>
   );
 }

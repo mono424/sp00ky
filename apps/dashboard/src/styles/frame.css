@@ -4003,6 +4003,12 @@ h2 {
 }
 .cx-shot-open:hover, .cx-shot-open:focus-visible { opacity: 1; }
 .cx-shot-open .cap { padding: 5px 9px; border: 1px solid rgba(255, 255, 255, 0.16); background: var(--bg); color: var(--ink); }
+.cx-shot.static .cx-shot-open { opacity: 1; background: none; }
+.cx-site { gap: 8px; }
+.cx-site-icon { display: grid; place-items: center; width: 52px; height: 52px; margin-bottom: 4px; border: 1px solid var(--line); background: var(--bg); overflow: hidden; }
+.cx-site-icon img { width: 100%; height: 100%; padding: 7px; object-fit: contain; }
+.cx-site-icon b { font: 500 20px var(--mono); color: var(--ink-dim); }
+.cx-site > b { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 14px var(--mono); color: var(--ink); }
 .cx-toggle { padding: 0; border: 0; background: none; cursor: pointer; }
 .cx-toggle:hover { color: var(--ink-dim); }
 

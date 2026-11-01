@@ -13,7 +13,7 @@ import { confirm, toast } from '../components/Actions';
 import { formatDuration, formatStamp } from '../lib/format';
 import { useOverview } from '../ProjectApp';
 import { cloud, consoleApi, type DeploymentRow, type PendingBuild, type Workspace, type WorkspaceProject } from './cloud';
-import { useConsoleChrome } from './chrome';
+import { Stamp, ago, useConsoleChrome } from './chrome';
 import { isUnlocked, loadValues, unlock } from './vault';
 
 interface Ctx {
@@ -46,13 +46,6 @@ async function act(label: string, run: () => Promise<unknown>, done?: string): P
 const DEPLOY_STEPS = ['pending', 'provisioning', 'migrating', 'deploying_apps', 'running'] as const;
 const BUILD_STEPS = ['pending', 'cloning', 'building', 'uploading', 'deploying'] as const;
 const IN_FLIGHT = new Set(['pending', 'provisioning', 'migrating', 'deploying_apps']);
-
-function ago(iso: string | null | undefined): string {
-  if (!iso) return '—';
-  const ms = Date.now() - Date.parse(iso);
-  if (!Number.isFinite(ms)) return '—';
-  return ms < 60_000 ? 'just now' : `${formatDuration(ms)} ago`;
-}
 
 function took(d: DeploymentRow): string {
   if (!d.deployed_at) return IN_FLIGHT.has(d.status) ? '…' : '—';
@@ -188,19 +181,19 @@ export function Deployments(props: Ctx) {
         actions={
           <>
             <span class="cx-menu-wrap">
-              <button class="btn btn-sm" onClick={() => setMenu(!menu())}>Restart ▾</button>
+              <button class="btn btn-sm" onClick={() => setMenu(!menu())}>Manage ▾</button>
               <Show when={menu()}>
                 <div class="cx-menu small" role="menu" onClick={() => setMenu(false)}>
+                  <Show when={rollbackTarget()}>
+                    <button class="cx-mi" onClick={() => void rollback()}>Roll back to v{rollbackTarget()!.version}</button>
+                  </Show>
                   <button class="cx-mi" onClick={() => void restart(undefined, false)}>Restart everything</button>
-                  <button class="cx-mi" onClick={() => void restart(['scheduler', 'ssp'], false)}>Scheduler and SSPs</button>
-                  <button class="cx-mi" onClick={() => void restart(['backend', 'frontend'], false)}>Apps only</button>
+                  <button class="cx-mi" onClick={() => void restart(['scheduler', 'ssp'], false)}>Restart scheduler and SSPs</button>
+                  <button class="cx-mi" onClick={() => void restart(['backend', 'frontend'], false)}>Restart apps only</button>
                   <button class="cx-mi" onClick={() => void restart(['scheduler', 'ssp'], true)}>Upgrade to the newest images</button>
                 </div>
               </Show>
             </span>
-            <Show when={rollbackTarget()}>
-              <button class="btn btn-sm" onClick={() => void rollback()}>Roll back to v{rollbackTarget()!.version}</button>
-            </Show>
             <Show when={link()?.status === 'linked'}>
               <button class="btn btn-sm btn-primary" disabled={busy()} onClick={rebuild}>Rebuild</button>
             </Show>
@@ -214,16 +207,19 @@ export function Deployments(props: Ctx) {
 
         <section class="fx-row cx-top">
           <FxCell
-            label={<span class="cx-head">Live deployment <Show when={live()}><span class="cx-chip live">Live</span></Show></span>}
-            meta={<Show when={live()?.live_from}><span>since {formatStamp(live()!.live_from)}</span></Show>}
+            label="Live deployment"
+            meta={<Show when={live()?.live_from}><span title={`since ${formatStamp(live()!.live_from)}`}>up {ago(live()!.live_from).replace(/ ago$/, '')}</span></Show>}
           >
             <Show when={live()} fallback={<div class="fx-empty cap">{data.loading ? 'Loading' : 'Nothing is live yet'}</div>}>
               {(d) => (
                 <>
-                  <div class="fx-big">v{d().version ?? '?'}<small>{d().status === 'degraded' ? 'degraded' : 'serving'} · rollout {took(d())}</small></div>
+                  <div class="fx-big">v{d().version ?? '?'}<small classList={{ warn: d().status === 'degraded' }}>{d().status === 'degraded' ? 'degraded' : 'serving'}</small></div>
+                  <div class="cx-facts cap">
+                    <span>rolled out in {took(d())}</span>
+                    <Show when={d().actor ?? d().build?.commit_author}><span>by {d().actor ?? d().build?.commit_author}</span></Show>
+                  </div>
                   <div class="cx-commit">
                     <span>{source(d())}</span>
-                    <span class="cap dim" style={{ 'margin-left': 'auto' }}>{d().actor ?? d().build?.commit_author ?? ''}</span>
                   </div>
                   <div class="cx-kv">
                     <For each={images(d())} fallback={<div><span class="cap">Images</span><b>defaults</b></div>}>
@@ -274,9 +270,11 @@ export function Deployments(props: Ctx) {
               <Show when={Object.keys(status()?.urls ?? {}).length}>
                 <div class="cx-urls">
                   <span class="cap">Open</span>
-                  <For each={Object.entries(status()!.urls).filter(([k, v]) => /^https:/.test(v) && k !== 'admin')}>
-                    {([name, url]) => <a href={url} target="_blank" rel="noopener noreferrer">{name} ↗</a>}
-                  </For>
+                  <div class="cx-links">
+                    <For each={Object.entries(status()!.urls).filter(([k, v]) => /^https:/.test(v) && k !== 'admin')}>
+                      {([name, url]) => <a href={url} target="_blank" rel="noopener noreferrer">{name} ↗</a>}
+                    </For>
+                  </div>
                 </div>
               </Show>
             </div>
@@ -326,7 +324,7 @@ export function Deployments(props: Ctx) {
                         <Show when={d.error}><span class="warn"> · {d.error}</span></Show>
                       </td>
                       <td>{d.actor ?? d.build?.commit_author ?? '—'}</td>
-                      <td>{formatStamp(d.created_at)}</td>
+                      <td><Stamp at={d.created_at} /></td>
                       <td class="r">{took(d)}</td>
                       <td class="r">
                         <Show when={rollbackTarget()?.id === d.id}>
@@ -405,7 +403,11 @@ function SettingsTabs(props: { active: string; limited: boolean }) {
     <nav class="cx-tabs cap">
       <For each={TABS.filter((t) => !(props.limited && t.id === 'access'))}>
         {(t) => (
-          <A href={href(t.id)} classList={{ on: props.active === t.id }}>
+          <A
+            href={href(t.id)}
+            classList={{ on: props.active === t.id }}
+            ref={(el) => props.active === t.id && queueMicrotask(() => el.scrollIntoView({ block: 'nearest', inline: 'nearest' }))}
+          >
             {t.label}
           </A>
         )}
@@ -470,6 +472,13 @@ function EnvTab(props: Ctx) {
     const ok = await confirm({ title: `Delete ${n}`, consequences: ['Removes it from development and production.', 'Takes effect on the next deploy or restart.'], verb: 'Delete' });
     if (ok && (await act('Deleting ' + n, () => cloud(`/projects/${pid(props.project)}/envs/${encodeURIComponent(n)}`, { method: 'DELETE', tenant }), `${n} deleted`))) void refetch();
   };
+  let form: HTMLFormElement | undefined;
+  const edit = (n: string) => {
+    setName(n);
+    setValue('');
+    form?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    form?.querySelector<HTMLInputElement>('input[type=password]')?.focus({ preventScroll: true });
+  };
   const show = (env: 'development' | 'production', n: string, has: boolean) => {
     if (!has) return <span class="dim">—</span>;
     const v = values()?.[env]?.[n];
@@ -506,12 +515,12 @@ function EnvTab(props: Ctx) {
               <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.loading ? 'Loading' : rows.error ? message(rows.error) : 'No variables yet'}</td></tr>}>
                 {(r) => (
                   <tr>
-                    <td><b>{r.name}</b></td>
-                    <td>{show('development', r.name, r.has_dev)}</td>
-                    <td>{show('production', r.name, r.has_prod)}</td>
-                    <td>{formatStamp(r.updated_at)}</td>
-                    <td class="r">
-                      <button class="btn btn-sm" onClick={() => { setName(r.name); setValue(''); }}>Edit</button>{' '}
+                    <td class="cx-env-name"><b>{r.name}</b></td>
+                    <td data-label="dev">{show('development', r.name, r.has_dev)}</td>
+                    <td data-label="prod">{show('production', r.name, r.has_prod)}</td>
+                    <td><Stamp at={r.updated_at} /></td>
+                    <td class="r cx-acts">
+                      <button class="btn btn-sm" onClick={() => edit(r.name)}>Edit</button>
                       <button class="btn btn-sm" onClick={() => void remove(r.name)}>Delete</button>
                     </td>
                   </tr>
@@ -522,8 +531,8 @@ function EnvTab(props: Ctx) {
         </FxCell>
       </section>
       <section class="fx-row">
-        <FxCell label="Set a variable" meta={<span>encrypted on the server with the workspace key</span>}>
-          <form class="cx-form" onSubmit={save}>
+        <FxCell label="Set a variable" meta={<span>encrypted with the workspace key</span>}>
+          <form class="cx-form cx-setvar" ref={form} onSubmit={save}>
             <label class="li-field"><span>Name</span><input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="STRIPE_SECRET_KEY" /></label>
             <label class="li-field"><span>Value</span><input type="password" value={value()} onInput={(e) => setValue(e.currentTarget.value)} autocomplete="off" /></label>
             <div class="fx-range" role="radiogroup">
@@ -681,7 +690,7 @@ function GitTab(props: Ctx) {
                     <td><span class="cx-sha">{r.commit_sha.slice(0, 7)}</span> <span class="dim">{r.commit_message?.split('\n')[0]}</span></td>
                     <td>{r.commit_author ?? '—'}</td>
                     <td><span class={`cx-chip ${r.status === 'running' ? 'live' : r.status === 'failed' ? 'fail' : r.status === 'cancelled' ? 'dim' : 'run'}`}>{r.status}</span></td>
-                    <td>{formatStamp(r.created_at)}</td>
+                    <td><Stamp at={r.created_at} /></td>
                   </tr>
                 )}
               </For>

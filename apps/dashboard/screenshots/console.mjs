@@ -89,7 +89,7 @@ function cloudRoute(method, path) {
     return [200, { deployment: { id: 'd42', version: 42, status: 'superseded' }, vms: [
       { role: 'scheduler', status: 'running', name: 'scheduler' }, { role: 'ssp', status: 'running', name: 'ssp-0' }, { role: 'ssp', status: 'running', name: 'ssp-1' },
       { role: 'surrealdb', status: 'running', name: 'surrealdb' }, { role: 'backend', status: 'running', name: 'api' },
-    ], urls: { app: 'https://whitepawn-app.stg.spky.cloud', surrealdb: 'https://whitepawn-db.stg.spky.cloud', admin: 'https://whitepawn-admin.stg.spky.cloud/admin' } }];
+    ], urls: { app: 'https://whitepawn-app.stg.spky.cloud', ...Object.fromEntries(['comments', 'chat', 'games', 'server', 'iroh-relay', 'livekit', 'play', 'record', 'relay', 'surreal', 'video', 'call'].map((n) => [n, `https://whitepawn-${n}.stg.spky.cloud`])), surrealdb: 'https://whitepawn-db.stg.spky.cloud', admin: 'https://whitepawn-admin.stg.spky.cloud/admin' } }];
   }
   if (/^\/projects\/[^/]+\/link$/.test(path) && method === 'GET') return [200, { status: 'linked', repo_owner: 'mono424', repo_name: 'whitepawn', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' }];
   if (/^\/projects\/[^/]+\/link\/runs$/.test(path)) return [200, [

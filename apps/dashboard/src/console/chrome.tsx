@@ -7,6 +7,7 @@
  */
 
 import { For, Show, createContext, createMemo, createSignal, onCleanup, useContext, type Accessor } from 'solid-js';
+import { formatDuration, formatStamp } from '../lib/format';
 import type { Me, Workspace, WorkspaceProject } from './cloud';
 
 export interface ConsoleChrome {
@@ -250,6 +251,25 @@ export function WorkspaceMenu(props: { shortcut?: boolean }) {
           </div>
         </div>
       </Show>
+    </span>
+  );
+}
+
+/** How long ago, as `3.2h ago`; `—` for no time. */
+export function ago(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms)) return '—';
+  if (ms < 0) return `in ${formatDuration(-ms)}`;
+  return ms < 60_000 ? 'just now' : `${formatDuration(ms)} ago`;
+}
+
+/** A time in a list: the full stamp, and on a phone how long ago. */
+export function Stamp(props: { at: string | null | undefined }) {
+  return (
+    <span title={props.at ? formatStamp(props.at) : undefined}>
+      <span class="cx-abs">{props.at ? formatStamp(props.at) : '—'}</span>
+      <span class="cx-rel">{ago(props.at)}</span>
     </span>
   );
 }

@@ -10,7 +10,7 @@ import { FxCell, Sq } from '../components/Frame';
 import { confirm, toast } from '../components/Actions';
 import { formatStamp } from '../lib/format';
 import { cloud, consoleApi, type Workspace } from './cloud';
-import { projectLine, projectTone, useConsoleChrome } from './chrome';
+import { Stamp, projectLine, projectTone, useConsoleChrome } from './chrome';
 import { derivedKey, isUnlocked, lock, unlock, vaultStatus } from './vault';
 
 type Props = { workspace: Workspace };
@@ -117,15 +117,15 @@ export function Members(props: Props) {
       <div class="fx-page">
         <section class="fx-row">
           <FxCell label="Members" meta={<span>{members()?.length ?? 0}</span>}>
-            <table class="fx-list">
+            <table class="fx-list cx-members">
               <thead><tr><th class="cap">Who</th><th class="cap">Role</th><th class="cap">Since</th><th class="cap" /></tr></thead>
               <tbody>
                 <For each={members() ?? []} fallback={<tr><td colspan="4" class="dim">{members.loading ? 'Loading' : members.error ? message(members.error) : 'Nobody yet'}</td></tr>}>
                   {(m) => (
                     <tr>
-                      <td><b>{m.github_login ?? m.email ?? m.account_id}</b> <span class="dim">{m.github_login ? m.email ?? '' : ''}</span></td>
+                      <td class="cx-who"><b>{m.github_login ?? m.email ?? m.account_id}</b> <span class="dim">{m.github_login ? m.email ?? '' : ''}</span></td>
                       <td><span class={`cx-chip ${m.role === 'admin' ? 'live' : 'dim'}`}>{m.role}</span></td>
-                      <td>{formatStamp(m.created_at)}</td>
+                      <td><Stamp at={m.created_at} /></td>
                       <td class="r"><Show when={isAdmin()}><button class="btn btn-sm" onClick={() => void remove(m)}>Remove</button></Show></td>
                     </tr>
                   )}
@@ -150,7 +150,7 @@ export function Members(props: Props) {
               <For each={invites() ?? []} fallback={<div class="fx-empty cap">None pending</div>}>
                 {(i) => (
                   <div class="cx-line">
-                    <b>{i.email}</b><span class="cap dim">{i.role} · expires {formatStamp(i.expires_at)}</span>
+                    <span class="cx-line-main"><b>{i.email}</b><span class="cap dim">{i.role} · expires {formatStamp(i.expires_at)}</span></span>
                     <button class="btn btn-sm" onClick={() => void revoke(i)}>Revoke</button>
                   </div>
                 )}
@@ -390,7 +390,7 @@ export function Activity(props: Props) {
                 <For each={events() ?? []} fallback={<tr><td colspan="5" class="dim">{events.loading ? 'Loading' : events.error ? message(events.error) : 'Nothing yet'}</td></tr>}>
                   {(e) => (
                     <tr>
-                      <td>{formatStamp(e.at)}</td>
+                      <td><Stamp at={e.at} /></td>
                       <td><b>{e.actor}</b></td>
                       <td>{ACTIONS[e.action] ?? e.action}</td>
                       <td>{e.project ?? '—'}</td>
@@ -432,8 +432,8 @@ export function Sessions() {
                     <tr>
                       <td><b>{(s.user_agent ?? 'unknown').replace(/\).*$/, ')').slice(0, 60)}</b> <Show when={s.current}><span class="cx-chip live">This one</span></Show></td>
                       <td class="dim">{s.ip ?? ''}</td>
-                      <td>{formatStamp(s.created_at)}</td>
-                      <td>{formatStamp(s.last_seen_at)}</td>
+                      <td><Stamp at={s.created_at} /></td>
+                      <td><Stamp at={s.last_seen_at} /></td>
                       <td class="r"><Show when={!s.current}><button class="btn btn-sm" onClick={() => void revoke(s.id)}>Sign out</button></Show></td>
                     </tr>
                   )}

@@ -59,6 +59,7 @@ const CLOUD = {
     { id: 'sess-2', ip: '84.150.12.9', user_agent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Safari/604.1', created_at: iso(40 * H), last_seen_at: iso(20 * H), expires_at: iso(-5 * 24 * H), current: false },
   ],
   'GET /vault/status': { initialized: true },
+  'GET /vault/ci-access': { enabled: false },
   'GET /vault/key-params': { salt: '00112233445566778899aabbccddeeff', params: { time: 1, memory: 65536, threads: 4 } },
   'GET /billing/usage': [
     { project: 'whitepawn', metric: 'ssp_hours', total: 2160 },

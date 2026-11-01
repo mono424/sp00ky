@@ -431,7 +431,7 @@ export function IncidentDetail() {
           <section class="fx-row">
             <FxCell label="Timeline" meta={<span>oldest first</span>}>
               <Show when={incident().events.length} fallback={<div class="fx-empty cap">No events kept</div>}>
-                <table class="fx-list inc-list">
+                <table class="fx-list inc-list inc-events">
                   <colgroup><col style={{ width: '16%' }} /><col style={{ width: '12%' }} /><col /><col style={{ width: '24%' }} /></colgroup>
                   <thead><tr><th class="cap">Time</th><th class="cap">State</th><th class="cap">What happened</th><th class="cap r">Version</th></tr></thead>
                   <tbody><For each={incident().events}>{(event) => (

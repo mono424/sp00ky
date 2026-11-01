@@ -4,7 +4,7 @@ import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
-import { WORKSPACE_LINKS, WorkspaceMenu, useConsoleChrome } from '../console/chrome';
+import { AccountMenu, ProjectSwitcher, WORKSPACE_LINKS, WorkspaceSwitch, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
 export interface NavLink {
   href: string;
@@ -16,6 +16,8 @@ export interface NavLink {
   warn?: boolean;
   /** Section heading the link sits under; links keep their order. */
   group?: string;
+  /** A console address outside this router (another project, the workspace). */
+  go?: boolean;
 }
 
 /** Two letters for an avatar: initials of a name, or the first two of a slug. */
@@ -39,6 +41,13 @@ const NAV_PATHS: Record<string, string> = {
   '/access': 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3',
   '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
   '/deployments': 'M12 3l9 5-9 5-9-5 9-5z M3 13l9 5 9-5',
+  '/settings/env': 'M4 7h16 M4 12h16 M4 17h10 M18 15l3 3-3 3',
+  '/settings/domains': 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M3 12h18 M12 3c3 3.5 3 14.5 0 18 M12 3c-3 3.5-3 14.5 0 18',
+  '/settings/git': 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M18 9a9 9 0 0 1-9 9',
+  '/settings/scale': 'M4 21v-7 M4 10V3 M12 21v-9 M12 8V3 M20 21v-5 M20 12V3 M1 14h6 M9 8h6 M17 16h6',
+  '/settings/danger': 'M12 9v4 M12 17h.01 M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
+  project: 'M4 4h16v16H4z M9 9h6v6H9z',
+  workspace: 'M3 21h18 M5 21V7l7-4 7 4v14 M9 21v-6h6v6',
   '/settings': 'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z',
 };
 
@@ -51,13 +60,26 @@ function NavIcon(props: { href: string; icon?: string }) {
 }
 
 /**
- * A project's rail, counts off the overview where it has them. The console
- * adds Deployments and keeps tokens under Settings.
+ * A project's rail, counts off the overview where it has them. Quick access
+ * first (what an operator opens most), then the cluster by layer. The console
+ * adds Deployments and the project's Settings pages; `limited` is a project
+ * whose own dashboard cannot open there, so only Sp00ky Cloud's pages remain.
  */
-export function projectNav(console: boolean, overview?: Overview): NavLink[] {
+export function projectNav(console: boolean, overview?: Overview, limited = false): NavLink[] {
   const o = overview;
+  const settings: NavLink[] = console
+    ? [
+        { href: '/settings', label: 'Environment', group: 'Settings', icon: NAV_PATHS['/settings/env'] },
+        { href: '/settings/domains', label: 'Domains', group: 'Settings' },
+        { href: '/settings/git', label: 'Git & builds', group: 'Settings' },
+        { href: '/settings/scale', label: 'Scale', group: 'Settings' },
+        ...(limited ? [] : [{ href: '/access', label: 'Access tokens', group: 'Settings' }]),
+        { href: '/settings/danger', label: 'Danger zone', group: 'Settings' },
+      ]
+    : [];
+  if (limited) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }, ...settings];
   return [
-    // Where an operator starts: the cluster, what went wrong, what it said.
+    // Where an operator starts: the cluster, what shipped, what went wrong, what it said.
     { href: '/', label: 'Overview' },
     ...(console ? [{ href: '/deployments', label: 'Deployments' }] : []),
     {
@@ -102,7 +124,8 @@ export function projectNav(console: boolean, overview?: Overview): NavLink[] {
     // database's volume, the control plane can. Hidden, not disabled, when
     // unlinked: there is nothing on that page a self-hosted cluster could use.
     ...(o?.cloud_linked ? [{ href: '/resources', label: 'Resources', group: 'Data' }] : []),
-    ...(console ? [] : [{ href: '/access', label: 'Access', group: 'Data' }]),
+    // In the console the tokens are one of the project's settings.
+    ...(console ? settings : [{ href: '/access', label: 'Access', group: 'Data' }]),
   ];
 }
 
@@ -115,6 +138,150 @@ function sectionsOf(links: NavLink[]): { group?: string; links: NavLink[] }[] {
     else out.push({ group: l.group, links: [l] });
   }
   return out;
+}
+
+/** One rail link, with its count. */
+function NavItem(props: { link: NavLink; atRoot: () => boolean }) {
+  const link = props.link;
+  return (
+    // `activeClass` + `end` rather than comparing pathnames by hand: the
+    // router applies the base ("/admin") to every href, so a hand-rolled
+    // `location.pathname === href` never matches and the rail silently
+    // highlights nothing. `end` keeps "/" (and "/settings") from matching
+    // every route under it as a prefix.
+    <A
+      href={link.href}
+      class="nav-link"
+      activeClass="active"
+      end={link.href === '/' || link.href === '/settings'}
+      // The scheduler serves the app at "/admin/", which the router's exact
+      // match for "/admin" does not count. Only on that link: the router
+      // merges this over its own active class, so `active: false` elsewhere
+      // would erase it.
+      classList={link.href === '/' ? { active: props.atRoot() } : undefined}
+    >
+      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} icon={link.icon} /><span>{link.label}</span></span>
+      <Show when={link.count}>
+        <span class="nav-count" classList={{ warn: link.warn }}>{link.count}</span>
+      </Show>
+    </A>
+  );
+}
+
+/** Which console layer the rail showed last, so a change slides the right way. */
+let lastLayer: 'workspace' | 'project' | undefined;
+
+/**
+ * The console's rail, in two layers. The workspace layer lists the
+ * workspace's projects between its quick links and its own pages; opening a
+ * project drills into the project layer: a way back, the project (switchable
+ * in place), its quick links, then the cluster and the project's settings in
+ * groups. The workspace switcher heads both, the account sits at the foot.
+ */
+function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void; version: string }) {
+  const cx = useConsoleChrome()!;
+  const layer = props.workspaceLayer ? 'workspace' : 'project';
+  const dir = lastLayer && lastLayer !== layer ? (layer === 'project' ? 'in' : 'out') : '';
+  lastLayer = layer;
+  const ws = () => cx.workspace();
+  const quick = () => sectionsOf(props.links).filter((x) => !x.group);
+  const grouped = () => sectionsOf(props.links).filter((x) => x.group);
+  // The project's settings fold under one row: open on their pages, or when asked.
+  const location = useLocation();
+  const inSettings = () => /\/(settings|access)(\/|$)/.test(location.pathname);
+  const [settingsOpen, setSettingsOpen] = createSignal(inSettings());
+  createEffect(() => { if (inSettings()) setSettingsOpen(true); });
+  return (
+    <>
+      <div class="cx-brand"><Logo /><span class="cap">console</span></div>
+      <WorkspaceSwitch />
+      <button class="sb-jump cap" onClick={props.onJump}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
+        </svg>
+        Jump to
+        <kbd>⌘K</kbd>
+      </button>
+      <Show when={!props.workspaceLayer}>
+        <div class={`cx-pin cx-layer ${dir}`}>
+          <button class="cx-back" onClick={() => cx.go(`/${ws()?.slug}/-`)} title={`Back to ${ws()?.name ?? 'the workspace'}`}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
+            <span>All projects</span>
+          </button>
+          <ProjectSwitcher rail />
+        </div>
+      </Show>
+      <div
+        class={`nav cx-layer ${dir}`}
+        ref={(el) => {
+          // Keep the page you are on in view when the rail is taller than the screen.
+          createEffect(() => {
+            location.pathname;
+            settingsOpen();
+            setTimeout(() => el.querySelector('.nav-link.active')?.scrollIntoView({ block: 'nearest' }), 60);
+          });
+        }}
+      >
+        <For each={quick()}>
+          {(section) => (
+            <div class="nav-section cx-quick">
+              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
+            </div>
+          )}
+        </For>
+        <Show when={props.workspaceLayer && ws()}>
+          {(w) => (
+            <div class="nav-section">
+              <div class="nav-heading cx-nh"><span>Projects</span><span>{w().projects.length}</span></div>
+              <For each={w().projects} fallback={<div class="cx-empty cap">No projects yet</div>}>
+                {(p) => (
+                  <button class="nav-link cx-pl" title={projectLine(p)} onClick={() => cx.go(`/${w().slug}/${p.slug}`)}>
+                    <span class="row" style={{ gap: '10px', 'min-width': '0' }}>
+                      <span class={`fx-sq ${projectTone(p)}`} />
+                      <span class="cx-pl-name">{p.slug}</span>
+                    </span>
+                    <span class="cx-pl-r">
+                      <Show when={p.platform === 'cloudflare'}><span class="cx-tag cf">CF</span></Show>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+                    </span>
+                  </button>
+                )}
+              </For>
+            </div>
+          )}
+        </Show>
+        <For each={grouped()}>
+          {(section) => (
+            <Show
+              when={section.group === 'Settings'}
+              fallback={
+                <div class="nav-section">
+                  <div class="nav-heading">{section.group}</div>
+                  <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
+                </div>
+              }
+            >
+              <div class="nav-section cx-fold" classList={{ open: settingsOpen() }}>
+                <button class="nav-link cx-fold-head" classList={{ here: inSettings() }} aria-expanded={settingsOpen()} onClick={() => setSettingsOpen(!settingsOpen())}>
+                  <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+                </button>
+                <Show when={settingsOpen()}>
+                  <div class="cx-fold-list">
+                    <For each={section.links}>{(link) => <NavItem link={{ ...link, icon: undefined }} atRoot={props.atRoot} />}</For>
+                  </div>
+                </Show>
+              </div>
+            </Show>
+          )}
+        </For>
+      </div>
+      <div class="sb-foot cx-foot">
+        <AccountMenu />
+        <Show when={props.version}><div class="sb-ver cap">{props.version}</div></Show>
+      </div>
+    </>
+  );
 }
 
 /**
@@ -151,12 +318,29 @@ export function Shell(props: {
   // presence sampler, incident log, log ring or backups.
   const clusterOnly = new Set(['/views', '/backups', '/incidents', '/logs']);
   const links = (): NavLink[] => {
-    if (props.nav) return props.nav.links.map((l) => ({ ...l, group: props.nav!.heading }));
-    if (cx?.limited()) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }];
-    return projectNav(!!cx, props.overview).filter((l) => !servedByNode() || !clusterOnly.has(l.href));
+    if (props.nav) return props.nav.links;
+    return projectNav(!!cx, props.overview, !!cx?.limited()).filter((l) => !servedByNode() || !clusterOnly.has(l.href));
   };
 
   const sections = () => sectionsOf(links());
+
+  // ⌘K reaches past this router in the console: other projects, the
+  // workspace's own pages, other workspaces.
+  const paletteLinks = (): NavLink[] => {
+    const w = cx?.workspace();
+    if (!cx || !w) return links();
+    const extra: NavLink[] = [];
+    for (const p of w.projects) {
+      if (p.id !== cx.project()?.id) extra.push({ href: `/${w.slug}/${p.slug}`, label: p.slug, group: 'Projects', icon: NAV_PATHS.project, go: true });
+    }
+    if (!props.nav) {
+      for (const l of WORKSPACE_LINKS) extra.push({ href: `/${w.slug}/-${l.href === '/' ? '' : l.href}`, label: l.label, icon: l.icon, group: w.name, go: true });
+    }
+    for (const o of cx.workspaces()) {
+      if (o.id !== w.id) extra.push({ href: `/${o.slug}/-`, label: o.name, group: 'Workspaces', icon: NAV_PATHS.workspace, go: true });
+    }
+    return [...links(), ...extra];
+  };
 
   const slug = () => currentMode().config?.project_slug ?? 'sp00ky';
 
@@ -238,9 +422,14 @@ export function Shell(props: {
           <span />
         </button>
         <Logo />
-        {/* The page head's workspace menu, moved up here on a phone. */}
+        {/* Where this is; the drawer holds the switchers. */}
         <Show when={cx}>
-          <span class="mb-ws"><WorkspaceMenu shortcut={false} /></span>
+          <button class="mb-ctx" onClick={() => setOpen(true)}>
+            <Show when={cx!.project()} fallback={<span class="cx-av">{(cx!.workspace()?.name ?? '?').slice(0, 2).toUpperCase()}</span>}>
+              {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
+            </Show>
+            <b>{cx!.project()?.slug ?? cx!.workspace()?.name ?? ''}</b>
+          </button>
         </Show>
       </header>
 
@@ -248,14 +437,21 @@ export function Shell(props: {
         <div class="scrim show" onClick={() => setOpen(false)} />
       </Show>
 
-      <nav class="sidebar" classList={{ open: open() }}>
+      <nav class="sidebar" classList={{ open: open(), 'cx-rail': !!cx }}>
         {/* Who is signed in. The menu holds what used to sit at the foot:
             access and signing out. In the console the account lives in the
             workspace menu, and the rail starts with the wordmark. */}
         <Show when={cx}>
-          <div class="sb-me cx-brand"><Logo /><span class="cap">console</span></div>
+          <ConsoleRail
+            links={links()}
+            workspaceLayer={!!props.nav}
+            atRoot={atRoot}
+            onJump={() => setPaletteOpen(true)}
+            version={props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? ''}
+          />
         </Show>
-        <div class="sb-me" style={cx ? { display: 'none' } : undefined}>
+        <Show when={!cx}>
+        <div class="sb-me">
           <button
             class="sb-me-btn"
             aria-haspopup="menu"
@@ -300,54 +496,23 @@ export function Shell(props: {
                 <Show when={section.group}>
                   <div class="nav-heading">{section.group}</div>
                 </Show>
-                <For each={section.links}>
-                  {(link) => (
-                    // `activeClass` + `end` rather than comparing pathnames by
-                    // hand: the router applies the base ("/admin") to every
-                    // href, so a hand-rolled `location.pathname === href`
-                    // never matches and the rail silently highlights nothing.
-                    // `end` keeps "/" from matching every route as a prefix.
-                    <A
-                      href={link.href}
-                      class="nav-link"
-                      activeClass="active"
-                      end={link.href === '/'}
-                      // The scheduler serves the app at "/admin/", which the
-                      // router's exact match for "/admin" does not count.
-                      // Only on that link: the router merges this over its own
-                      // active class, so `active: false` elsewhere would erase it.
-                      classList={link.href === '/' ? { active: atRoot() } : undefined}
-                    >
-                      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} icon={link.icon} /><span>{link.label}</span></span>
-                      <Show when={link.count}>
-                        <span class="nav-count" classList={{ warn: link.warn }}>{link.count}</span>
-                      </Show>
-                    </A>
-                  )}
-                </For>
+                <For each={section.links}>{(link) => <NavItem link={link} atRoot={atRoot} />}</For>
               </div>
             )}
           </For>
         </div>
 
-        {/* The foot of the rail: Settings (console only) and the version,
-            pinned to the bottom however long the nav runs. */}
-        <Show when={!props.nav}>
-          <div class="sb-foot" classList={{ 'cx-foot': !!cx }}>
-            <Show when={cx}>
-              <A href="/settings" class="nav-link" activeClass="active">
-                <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
-              </A>
-            </Show>
-            <div class="sb-ver cap">
-              {props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? currentMode().config?.version?.replace(/^0\.0\.1-/, '') ?? ''}
-            </div>
+        {/* The foot of the rail: the version, pinned to the bottom. */}
+        <div class="sb-foot">
+          <div class="sb-ver cap">
+            {props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? currentMode().config?.version?.replace(/^0\.0\.1-/, '') ?? ''}
           </div>
+        </div>
         </Show>
       </nav>
 
       <Show when={paletteOpen()}>
-        <Palette links={links()} onClose={() => setPaletteOpen(false)} />
+        <Palette links={paletteLinks()} onClose={() => setPaletteOpen(false)} />
       </Show>
 
       <div class="main-frame">
@@ -421,7 +586,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
   const seg = window.location.pathname.split('/').filter(Boolean);
   const workspace = props.console && seg.length > 0 && (seg.length === 1 || seg[1] === '-');
   const links = (): NavLink[] =>
-    workspace ? WORKSPACE_LINKS.map((l) => ({ ...l, group: seg[0] })) : projectNav(!!props.console);
+    workspace ? WORKSPACE_LINKS : projectNav(!!props.console).filter((l) => l.group !== 'Settings');
   return (
     <div class="shell settled">
       <header class="mobile-bar">
@@ -437,7 +602,8 @@ export function FrameSkeleton(props: { console?: boolean }) {
             </div>
           }
         >
-          <div class="sb-me cx-brand"><Logo /><span class="cap">console</span></div>
+          <div class="cx-brand"><Logo /><span class="cap">console</span></div>
+          <div class="cx-wsw-wrap"><span class="cx-wsw"><span class="cx-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
         </Show>
         <div class="sb-jump cap">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -464,16 +630,9 @@ export function FrameSkeleton(props: { console?: boolean }) {
             )}
           </For>
         </div>
-        <Show when={!workspace}>
-          <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
-            <Show when={props.console}>
-              <span class="nav-link">
-                <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
-              </span>
-            </Show>
-            <div class="sb-ver cap" />
-          </div>
-        </Show>
+        <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
+          <div class="sb-ver cap" />
+        </div>
       </nav>
       <div class="main-frame">
         <main class="main">
@@ -490,6 +649,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
  */
 function Palette(props: { links: NavLink[]; onClose: () => void }) {
   const navigate = useNavigate();
+  const cx = useConsoleChrome();
   const [query, setQuery] = createSignal('');
   const [index, setIndex] = createSignal(0);
   const matches = createMemo(() => {
@@ -504,7 +664,8 @@ function Palette(props: { links: NavLink[]; onClose: () => void }) {
   const go = (l: NavLink | undefined) => {
     if (!l) return;
     props.onClose();
-    navigate(l.href);
+    if (l.go && cx) cx.go(l.href);
+    else navigate(l.href);
   };
 
   const onKey = (e: KeyboardEvent) => {

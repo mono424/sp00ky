@@ -1,7 +1,7 @@
 import { For, Show, type JSX } from 'solid-js';
 import { A } from '@solidjs/router';
 import { currentMode } from '../api/client';
-import { ProjectSwitcher, WorkspaceMenu, useConsoleChrome } from '../console/chrome';
+import { projectTone, useConsoleChrome } from '../console/chrome';
 
 /** Small shared pieces of the panel chrome. */
 
@@ -15,15 +15,19 @@ export function PageHead(props: {
   actions?: JSX.Element;
 }) {
   // Every page's top bar reads `project / [list /] page`, in the frame's voice.
-  // In the console the project is the switcher, and the workspace menu sits
-  // at the far right.
+  // In the console it names the project (or workspace); the rail switches.
   const slug = () => currentMode().config?.project_slug ?? currentMode().config?.scheduler_id ?? 'sp00ky';
   const cx = useConsoleChrome();
   return (
     <div class="page-head">
       <div class="ph-crumb cap">
         <Show when={cx} fallback={<span>{slug()}</span>}>
-          <ProjectSwitcher />
+          {/* The rail switches workspaces and projects; the crumb only says where this is. */}
+          <span class="ph-ctx">
+            <Show when={cx!.project()} fallback={<b>{cx!.workspace()?.name ?? 'sp00ky'}</b>}>
+              {(p) => <><span class={`fx-sq ${projectTone(p())}`} /><b>{p().slug}</b></>}
+            </Show>
+          </span>
         </Show>
         <Show when={props.crumb}>
           <span class="ph-sep">/</span>
@@ -35,13 +39,8 @@ export function PageHead(props: {
           <span class="ph-sub">{props.subtitle}</span>
         </Show>
       </div>
-      <Show when={props.actions || cx}>
-        <div class="row">
-          {props.actions}
-          <Show when={cx}>
-            <WorkspaceMenu />
-          </Show>
-        </div>
+      <Show when={props.actions}>
+        <div class="row">{props.actions}</div>
       </Show>
     </div>
   );

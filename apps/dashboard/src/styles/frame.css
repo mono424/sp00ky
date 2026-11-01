@@ -4435,3 +4435,128 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
   .cx-secrets td:first-child { white-space: nowrap; }
   .cx-vault-top .cx-unlock { flex-wrap: nowrap; }
 }
+
+/* ======================================================================
+   CONSOLE RAIL: workspace switcher on top, two layers (a workspace and its
+   projects; a project and its pages), the account at the foot
+   ====================================================================== */
+.sidebar.cx-rail { overflow: visible; }
+.cx-rail .cx-brand { flex: none; border-bottom: 1px solid var(--line); }
+.cx-rail .nav { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-bottom: 10px; }
+.cx-rail .sb-jump { flex: none; margin: 8px 10px 4px; }
+.cx-rail .nav > * { flex: none; }
+
+.cx-wsw-wrap { position: relative; flex: none; padding: 10px 10px 0; }
+.cx-wsw, .cx-prow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.015);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.cx-wsw:hover, .cx-wsw.on, .cx-prow:hover, .cx-prow.on { border-color: rgba(156, 165, 211, 0.45); background: rgba(156, 165, 211, 0.07); }
+.cx-wsw > svg, .cx-prow > svg { flex: none; margin-left: auto; color: var(--ink-ghost); }
+.cx-wsw .cx-av { width: 26px; height: 26px; font-size: 10px; }
+.cx-wsw-text, .cx-prow-text { display: grid; gap: 1px; min-width: 0; flex: 1 1 auto; }
+.cx-wsw-text b, .cx-prow-text b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 550 13px var(--sans); color: var(--ink); }
+.cx-wsw-text small, .cx-prow-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10.5px var(--mono); color: var(--ink-ghost); }
+.cx-prow b { font-family: var(--mono); font-weight: 500; }
+
+.cx-menu.cx-rail-menu { left: 10px; right: 10px; top: calc(100% + 6px); width: auto; padding: 4px 0; }
+.cx-menu.cx-rail-menu.up { top: auto; bottom: calc(100% + 6px); }
+.cx-rail-menu .cx-h { display: flex; justify-content: space-between; }
+
+/* the project layer: a way back, then the project */
+.cx-back {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 30px;
+  margin-top: 4px;
+  padding: 0 16px 0 11px;
+  border: 0;
+  background: none;
+  color: var(--ink-faint);
+  font: 500 10.5px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.cx-back:hover { color: var(--ink); }
+.cx-proj-wrap.in-rail { display: block; padding: 0 10px 6px; }
+.cx-proj-wrap.in-rail .cx-pop { left: 10px; right: 10px; width: auto; top: calc(100% - 2px); }
+.cx-quick { padding-top: 4px; }
+
+/* the workspace layer: its projects, each a way in */
+.cx-nh { display: flex; justify-content: space-between; padding-right: 16px; }
+.cx-pl { width: 100%; border: 0; background: none; font: inherit; font-weight: 500; text-align: left; color: var(--ink-dim); cursor: pointer; justify-content: space-between; }
+.cx-pl:hover { color: var(--ink); }
+.cx-pl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 12.5px var(--mono); }
+.cx-pl-r { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-ghost); }
+.cx-pl:hover .cx-pl-r svg { color: var(--ink); }
+
+/* moving between layers slides the way you went */
+.cx-layer.in { animation: cx-slide-in 0.2s cubic-bezier(0.2, 0.7, 0.2, 1); }
+.cx-layer.out { animation: cx-slide-out 0.2s cubic-bezier(0.2, 0.7, 0.2, 1); }
+@keyframes cx-slide-in { from { opacity: 0; transform: translateX(16px); } }
+@keyframes cx-slide-out { from { opacity: 0; transform: translateX(-16px); } }
+@media (prefers-reduced-motion: reduce) { .cx-layer.in, .cx-layer.out { animation: none; } }
+
+/* the foot: who is signed in */
+.sb-foot.cx-foot { padding: 8px 10px 10px; }
+.cx-acct-wrap { position: relative; }
+.cx-acct { display: flex; align-items: center; gap: 10px; width: 100%; padding: 6px 8px; border: 0; background: none; color: var(--ink); text-align: left; cursor: pointer; }
+.cx-acct:hover, .cx-acct.on { background: var(--bg-hover); }
+.cx-acct > svg { flex: none; margin-left: auto; color: var(--ink-ghost); }
+.cx-acct .cx-wsw-text b { font-size: 12.5px; }
+.sb-foot.cx-foot .sb-ver { padding: 6px 8px 0; }
+
+/* the crumb names where this is */
+.ph-ctx { display: inline-flex; align-items: center; gap: 8px; }
+.ph-ctx b { font: 500 12.5px var(--mono); letter-spacing: 0; text-transform: none; color: var(--ink); }
+
+@media (max-width: 860px) {
+  .sidebar.cx-rail { width: 280px; overflow: hidden; }
+  .mb-ctx {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    max-width: 55vw;
+    height: 30px;
+    margin-left: auto;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    background: none;
+    color: var(--ink);
+  }
+  .mb-ctx b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 12.5px var(--mono); }
+  .mb-ctx .cx-av { width: 18px; height: 18px; font-size: 8.5px; }
+}
+
+/* a group that folds: the project's settings */
+.cx-fold { margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 6px; }
+.cx-fold-head { width: 100%; border: 0; background: none; font: inherit; font-weight: 500; color: var(--ink-dim); text-align: left; cursor: pointer; justify-content: space-between; }
+.cx-fold-head > svg { flex: none; color: var(--ink-ghost); transition: transform 0.15s; }
+.cx-fold.open .cx-fold-head > svg { transform: rotate(90deg); }
+.cx-fold-head.here { color: var(--ink); }
+.cx-fold-list { position: relative; margin: 2px 0 4px 23px; border-left: 1px solid var(--line); }
+.cx-fold-list .nav-link { height: 28px; padding-left: 14px; font-size: 12.5px; }
+.cx-fold-list .nav-link.active::before { left: -1px; }
+.cx-fold-list .nav-link svg { display: none; }
+
+/* the rail is the settings nav on a desktop; the tabs stay for the phone */
+@media (min-width: 861px) { .cx-tabs { display: none; } }
+
+/* a denser rail: everything in reach on a laptop screen */
+.cx-rail .nav-heading { padding: 12px 16px 4px; }
+.cx-rail .nav-link { height: 30px; }
+.cx-rail .cx-fold-list .nav-link { height: 27px; }
+.cx-pin { flex: none; border-bottom: 1px solid var(--line-soft); padding-bottom: 4px; }
+.cx-pin .cx-proj-wrap.in-rail { padding-bottom: 6px; }

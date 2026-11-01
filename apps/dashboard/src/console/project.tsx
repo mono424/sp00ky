@@ -752,7 +752,7 @@ function Stage(props: { title: string; steps: string[]; at: string }) {
 const TABS: { id: string; label: string }[] = [
   { id: 'env', label: 'Environment' },
   { id: 'domains', label: 'Domains' },
-  { id: 'git', label: 'Git link' },
+  { id: 'git', label: 'Git & builds' },
   { id: 'scale', label: 'Scale' },
   { id: 'access', label: 'Access tokens' },
   { id: 'danger', label: 'Danger zone' },
@@ -764,7 +764,7 @@ export function Settings(props: Ctx) {
   const tab = () => params.tab ?? 'env';
   return (
     <>
-        <PageHead title="Settings" />
+        <PageHead crumb="Settings" crumbHref="/settings" title={TABS.find((t) => t.id === tab())?.label ?? 'Settings'} />
         <SettingsTabs active={tab()} limited={!!cx?.limited()} />
         <div class="fx-page">
           <Switch>

@@ -27,7 +27,7 @@ import {
   onMount,
   type JSX,
 } from 'solid-js';
-import { Route, Router, useParams } from '@solidjs/router';
+import { A, Route, Router, useParams } from '@solidjs/router';
 import { fetchConfig, onUnauthorized, setConsoleTarget } from '../api/client';
 import type { LoginResponse } from '../api/types';
 import { ConfirmHost, ToastHost } from '../components/Actions';
@@ -335,9 +335,13 @@ function CloudOnly(props: { base: string; reason: string; routes: JSX.Element })
       <PageHead title="Overview" />
       <div class="fx-page">
         <section class="fx-row">
-          <div class="fx-cell">
-            <div class="fx-log"><span class="fx-what">{props.reason}</span></div>
-            <p class="cx-note">Deployments and Settings come from Sp00ky Cloud and work as usual.</p>
+          <div class="fx-cell cx-limited">
+            <div class="fx-head"><span class="cap">Live dashboard</span><span class="fx-meta cap"><span class="warn">unavailable</span></span></div>
+            <p class="cx-reason">{props.reason}</p>
+            <div class="cx-actions">
+              <A class="btn btn-sm" href="/deployments">Deployments</A>
+              <A class="btn btn-sm" href="/settings">Settings</A>
+            </div>
           </div>
         </section>
       </div>

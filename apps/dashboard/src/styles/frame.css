@@ -3559,7 +3559,11 @@ h2 {
   }
   table.fx-list td:first-child {
     white-space: normal;
-    word-break: break-word;
+    /* break inside a word only when the word alone is wider than the
+       column could ever be; word-break would let a table squeeze a name
+       to one letter per line */
+    word-break: normal;
+    overflow-wrap: break-word;
   }
   .rn-queues td:first-child {
     white-space: nowrap;
@@ -3701,7 +3705,9 @@ h2 {
   font: 13px/1.5 var(--sans);
   color: var(--ink-dim);
 }
-.cx-pop { left: 0; width: 360px; }
+.cx-pop { left: 0; width: 360px; max-width: calc(100vw - var(--pad) * 2); }
+/* the crumb clips long titles, but never the project switcher's popover */
+.ph-crumb:has(.cx-proj-wrap) { overflow: visible; }
 .cx-menu { right: 0; width: 318px; }
 .cx-menu.small { width: 260px; padding: 6px 0; }
 
@@ -3815,6 +3821,16 @@ h2 {
 
 /* ---- shared page parts ---- */
 .cx-note { margin: 10px 0 0; color: var(--ink-faint); font-size: 12.5px; line-height: 1.6; }
+.cx-note + .btn { align-self: flex-start; margin-top: 14px; }
+.cx-reason {
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 2px solid var(--warn);
+  background: rgba(241, 180, 64, 0.05);
+  font: 12.5px/1.6 var(--mono);
+  color: var(--ink-dim);
+}
+.cx-pop .cx-find input { height: 100%; padding: 0; border: 0 !important; box-shadow: none !important; background: none !important; }
 .cx-head { display: inline-flex; align-items: center; gap: 10px; }
 .cx-chip {
   display: inline-block;
@@ -3915,6 +3931,12 @@ h2 {
 .cx-dns { font: 11.5px var(--mono); color: var(--ink-faint); white-space: normal; }
 .cx-mid { font-size: 18px; letter-spacing: -0.01em; }
 .cx-row { display: flex; align-items: center; gap: 12px; }
+.cx-state { display: flex; align-items: center; gap: 12px; }
+.cx-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.cx-vault-top { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cx-vault-top .cx-unlock { margin-top: 14px; flex-wrap: nowrap; }
+.cx-vault-top .cx-unlock input { flex: 1 1 auto; width: auto; min-width: 0; }
+.fx-meta .acc { color: var(--accent); }
 .cx-danger { color: var(--bad, #ff6369); border-color: rgba(255, 99, 105, 0.4); }
 .cx-line { display: flex; align-items: center; gap: 12px; min-height: 38px; border-bottom: 1px solid var(--line-soft); }
 .cx-line .cap { margin-left: auto; }
@@ -4032,7 +4054,7 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
   .ov-queues th:nth-child(3), .ov-queues td:nth-child(3),
   .ov-queues th:nth-child(5), .ov-queues td:nth-child(5),
   .ov-queues th:nth-child(6), .ov-queues td:nth-child(6),
-  .inc-list td:nth-child(3), .inc-list td:nth-child(5),
+  .inc-list .inc-tr td:nth-child(3), .inc-list .inc-tr td:nth-child(5),
   .vw-list th:nth-child(2), .vw-list td:nth-child(2),
   .vw-list th:nth-child(5), .vw-list td:nth-child(5),
   .vw-list th:nth-child(6), .vw-list td:nth-child(6),
@@ -4137,4 +4159,143 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
   .cx-setvar .fx-range { flex: 1 1 auto; }
   .cx-setvar .fx-range button { flex: 1; padding-left: 6px; padding-right: 6px; }
   .cx-setvar > .btn { flex: none; }
+}
+
+/* ---- phone, every page: tiles two by two, rows as records ---- */
+@media (max-width: 860px) {
+  /* four KPI tiles: two by two, not four screens tall */
+  .fx-row[style*='repeat(4'] { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .fx-row[style*='repeat(4'] > .fx-cell:nth-child(even) { border-left: 1px solid var(--line); }
+  .fx-row[style*='repeat(4'] > .fx-cell:nth-child(2) { border-top: 0; }
+  .fx-row[style*='repeat(4'] .fx-big { font-size: 28px; }
+
+  /* an SSP or backend: identity across, its gauges in pairs */
+  .sp-row, .bk-row { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .sp-row > .sp-id, .bk-row > .sp-id, .bk-row > .bk-resp, .sp-row > .sp-boot { grid-column: 1 / -1; }
+  .sp-row > .fx-cell:nth-child(odd):not(:first-child):not(.sp-boot),
+  .bk-row > .fx-cell:nth-child(4) { border-left: 1px solid var(--line); }
+  .sp-facts, .sp-facts:has(> :nth-child(4)) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sp-facts dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* incidents: the time stays on one line */
+  .inc-list td:first-child { white-space: nowrap; }
+
+  /* backups: name and actions, then when and state */
+  table.fx-list.bu-list { display: block; width: calc(100% + var(--pad) * 2); }
+  table.fx-list.bu-list thead { display: none; }
+  table.fx-list.bu-list tbody { display: block; }
+  table.fx-list.bu-list tr {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: 'name name act' 'when state act';
+    align-items: center;
+    gap: 4px 12px;
+    padding: 12px var(--pad);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  table.fx-list.bu-list td,
+  table.fx-list.bu-list td:first-child,
+  table.fx-list.bu-list td:last-child { display: block; padding: 0; min-width: 0; max-width: none; width: auto; height: auto; border: 0; }
+  table.fx-list.bu-list td:nth-child(1) { grid-area: name; }
+  table.fx-list.bu-list td:nth-child(2) { grid-area: when; color: var(--ink-faint); }
+  table.fx-list.bu-list td:nth-child(5) { grid-area: state; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.fx-list.bu-list td:nth-child(6) { grid-area: act; }
+  table.fx-list.bu-list td[colspan] { grid-column: 1 / -1; }
+  .bu-list .vw-meta { display: block; margin-top: 2px; }
+
+  /* domains: name, state and Remove, then the DNS to set */
+  table.fx-list.cx-domains { display: block; width: calc(100% + var(--pad) * 2); }
+  table.fx-list.cx-domains thead { display: none; }
+  table.fx-list.cx-domains tbody { display: block; }
+  table.fx-list.cx-domains tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-areas: 'name status act' 'dns dns dns';
+    align-items: center;
+    gap: 8px 10px;
+    padding: 12px var(--pad);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  table.fx-list.cx-domains td,
+  table.fx-list.cx-domains td:first-child,
+  table.fx-list.cx-domains td:last-child { display: block; padding: 0; min-width: 0; max-width: none; width: auto; height: auto; border: 0; }
+  table.fx-list.cx-domains td:nth-child(1) { grid-area: name; overflow-wrap: anywhere; }
+  table.fx-list.cx-domains td:nth-child(3) { grid-area: status; }
+  table.fx-list.cx-domains td:nth-child(4) { grid-area: dns; }
+  table.fx-list.cx-domains td:nth-child(5) { grid-area: act; }
+  table.fx-list.cx-domains td[colspan] { grid-column: 1 / -1; }
+
+  /* builds: the commit across, then state and when */
+  table.fx-list.cx-builds { display: block; width: calc(100% + var(--pad) * 2); }
+  table.fx-list.cx-builds thead { display: none; }
+  table.fx-list.cx-builds tbody { display: block; }
+  table.fx-list.cx-builds tr {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: 'commit commit' 'status when';
+    align-items: center;
+    gap: 6px 12px;
+    padding: 12px var(--pad);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  table.fx-list.cx-builds td,
+  table.fx-list.cx-builds td:first-child,
+  table.fx-list.cx-builds td:last-child { display: block; padding: 0; min-width: 0; max-width: none; width: auto; height: auto; border: 0; }
+  table.fx-list.cx-builds td:nth-child(1) { grid-area: commit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.fx-list.cx-builds td:nth-child(3) { grid-area: status; }
+  table.fx-list.cx-builds td:nth-child(4) { grid-area: when; color: var(--ink-faint); text-align: right; }
+  table.fx-list.cx-builds td[colspan] { grid-column: 1 / -1; }
+
+  /* MCP tools: name and kind, the description under them */
+  table.fx-list.ax-tools, table.fx-list.ax-tools tbody { display: block; }
+  table.fx-list.ax-tools { width: calc(100% + var(--pad) * 2); }
+  table.fx-list.ax-tools colgroup { display: none; }
+  table.fx-list.ax-tools tr.fx-gh { display: block; }
+  table.fx-list.ax-tools tr.fx-gh th { display: flex; gap: 8px; padding: 14px var(--pad) 8px; }
+  table.fx-list.ax-tools tr:not(.fx-gh) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: 'name kind' 'desc desc';
+    gap: 4px 12px;
+    padding: 10px var(--pad);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  table.fx-list.ax-tools td,
+  table.fx-list.ax-tools td:first-child,
+  table.fx-list.ax-tools td:last-child { display: block; padding: 0; height: auto; min-width: 0; max-width: none; width: auto; border: 0; }
+  table.fx-list.ax-tools td:nth-child(1) { grid-area: name; overflow-wrap: anywhere; }
+  table.fx-list.ax-tools td:nth-child(2) { grid-area: desc; white-space: normal; overflow: visible; color: var(--ink-faint); }
+  table.fx-list.ax-tools td:nth-child(3) { grid-area: kind; }
+
+  /* an incident's timeline: when and state, then what happened */
+  table.fx-list.inc-events, table.fx-list.inc-events tbody { display: block; }
+  table.fx-list.inc-events { width: calc(100% + var(--pad) * 2); }
+  table.fx-list.inc-events thead { display: none; }
+  table.fx-list.inc-events tr {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: 'when state ver' 'what what what';
+    align-items: center;
+    gap: 4px 12px;
+    padding: 12px var(--pad);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  table.fx-list.inc-events td,
+  table.fx-list.inc-events td:first-child,
+  table.fx-list.inc-events td:last-child { display: block !important; padding: 0; height: auto; min-width: 0; max-width: none; width: auto; border: 0; }
+  table.fx-list.inc-events td:nth-child(1) { grid-area: when; white-space: nowrap; color: var(--ink-faint); }
+  table.fx-list.inc-events td:nth-child(2) { grid-area: state; }
+  table.fx-list.inc-events td:nth-child(3) { grid-area: what; white-space: normal; overflow: visible; }
+  table.fx-list.inc-events td:nth-child(4) { grid-area: ver; color: var(--ink-faint); }
+
+  /* a sheet's head: the title on one line, what it is under it */
+  .sheet-head { flex-wrap: wrap; height: auto; min-height: 52px; padding-top: 10px; padding-bottom: 10px; row-gap: 2px; }
+  .sheet-title { white-space: nowrap; min-width: 0; }
+  .sheet-meta { order: 3; flex: 1 1 100%; }
+
+  /* vault: how many, not which environment */
+  .cx-secrets th:nth-child(3), .cx-secrets td:nth-child(3),
+  .cx-secrets th:nth-child(4), .cx-secrets td:nth-child(4) { display: none; }
+  .cx-secrets td:first-child { white-space: nowrap; }
+  .cx-vault-top .cx-unlock { flex-wrap: nowrap; }
 }

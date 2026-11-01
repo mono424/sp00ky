@@ -203,7 +203,7 @@ export function Billing(props: Props) {
                         <tr>
                           <td>{i() === 0 ? <b>{project}</b> : ''}</td>
                           <td>{r.metric.replace(/_/g, ' ')}</td>
-                          <td class="r">{Number.isInteger(r.total) ? r.total : r.total.toFixed(2)}</td>
+                          <td class="r">{r.total.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
                         </tr>
                       )}
                     </For>
@@ -223,16 +223,39 @@ export function Billing(props: Props) {
 
 /* ---------- vault ---------- */
 
+interface EnvCount {
+  name: string;
+  has_dev: boolean;
+  has_prod: boolean;
+}
+
 export function Vault(props: Props) {
-  const [status] = createResource(() => vaultStatus(props.workspace.id));
+  const cx = useConsoleChrome();
+  const tenant = () => props.workspace.id;
+  const [status] = createResource(() => vaultStatus(tenant()));
+  const [ci, { refetch: refetchCi }] = createResource(() =>
+    cloud<{ enabled: boolean }>('/vault/ci-access', { tenant: tenant() }).catch(() => null),
+  );
+  // What the vault holds: every project's variables, names only.
+  const [secrets] = createResource(() =>
+    Promise.all(
+      props.workspace.projects.map(async (p) => ({
+        project: p,
+        rows: await cloud<EnvCount[]>(`/projects/${encodeURIComponent(p.id)}/envs`, { tenant: tenant() }).catch(() => null),
+      })),
+    ),
+  );
   const [pass, setPass] = createSignal('');
   const [busy, setBusy] = createSignal(false);
+  const unlocked = () => isUnlocked(tenant());
   const firstProject = () => props.workspace.projects[0]?.id ?? null;
+  const total = () => (secrets() ?? []).reduce((n, s) => n + (s.rows?.length ?? 0), 0);
+
   const doUnlock = async (e: Event) => {
     e.preventDefault();
     setBusy(true);
     try {
-      await unlock(props.workspace.id, firstProject(), pass());
+      await unlock(tenant(), firstProject(), pass());
       setPass('');
       toast('ok', 'Vault unlocked', 'It locks itself after five idle minutes.');
     } catch (err) {
@@ -241,27 +264,81 @@ export function Vault(props: Props) {
       setBusy(false);
     }
   };
+  const toggleCi = async () => {
+    if (ci()?.enabled) {
+      const ok = await confirm({ title: 'Turn off CI access', consequences: ['Push deploys stop receiving production secrets.', 'Deploys from the CLI are not affected.'], verb: 'Turn off' });
+      if (ok && (await act('CI access', () => cloud('/vault/ci-access', { method: 'DELETE', tenant: tenant() }), 'CI access off'))) void refetchCi();
+      return;
+    }
+    const key = derivedKey(tenant());
+    if (!key) return;
+    if (await act('CI access', () => cloud('/vault/ci-access', { method: 'POST', tenant: tenant(), body: { derived_key: key } }), 'Push deploys can read secrets')) void refetchCi();
+  };
+
   return (
     <>
       <Head title="Vault" />
       <div class="fx-page">
-        <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 1fr) minmax(0, 2fr)' }}>
-          <FxCell label="State">
-            <div class="cx-row">
-              <Sq tone={status()?.initialized ? (isUnlocked(props.workspace.id) ? 'ok' : 'idle') : 'warn'} />
-              <span class="fx-big cx-mid">{!status() ? '…' : !status()!.initialized ? 'not set up' : isUnlocked(props.workspace.id) ? 'unlocked here' : 'locked'}</span>
+        <section class="fx-row cx-vault-top">
+          <FxCell label="State" meta={<Show when={status()?.initialized}><span>{total()} secrets</span></Show>}>
+            <div class="cx-state">
+              <Sq tone={status()?.initialized ? (unlocked() ? 'ok' : 'idle') : 'warn'} />
+              <span class="fx-big cx-mid">{!status() ? '…' : !status()!.initialized ? 'not set up' : unlocked() ? 'unlocked' : 'locked'}</span>
             </div>
-          </FxCell>
-          <FxCell label="Unlock in this tab">
-            <Show when={status()?.initialized} fallback={<p class="cx-note">Set the vault up once with `spky cloud vault init`; every env value is encrypted with it.</p>}>
-              <Show when={!isUnlocked(props.workspace.id)} fallback={<div class="cx-row"><span class="cx-note">Unlocked. Env values can be revealed and invitations share the vault.</span><button class="btn btn-sm" onClick={lock}>Lock now</button></div>}>
-                <form class="cx-form" onSubmit={doUnlock}>
-                  <label class="li-field"><span>Passphrase</span><input type="password" value={pass()} onInput={(e) => setPass(e.currentTarget.value)} autocomplete="current-password" /></label>
-                  <button class="btn btn-primary" type="submit" disabled={busy() || !pass()}>{busy() ? 'Unlocking' : 'Unlock'}</button>
+            <p class="cx-note">
+              {!status()?.initialized
+                ? 'Set the vault up once with `spky cloud vault init`; every env value is encrypted with it.'
+                : unlocked()
+                  ? 'Values can be revealed and invitations share the vault. Locks after five idle minutes.'
+                  : 'Every env value is encrypted with this workspace key. Unlock to reveal values; setting one never needs it.'}
+            </p>
+            <Show when={status()?.initialized}>
+              <Show
+                when={!unlocked()}
+                fallback={<div class="cx-actions"><button class="btn btn-sm" onClick={lock}>Lock now</button></div>}
+              >
+                <form class="cx-unlock" onSubmit={doUnlock}>
+                  <input type="password" placeholder="Vault passphrase" value={pass()} onInput={(e) => setPass(e.currentTarget.value)} autocomplete="current-password" />
+                  <button class="btn btn-sm btn-primary" type="submit" disabled={busy() || !pass()}>{busy() ? 'Unlocking' : 'Unlock'}</button>
                 </form>
                 <p class="cx-note">The passphrase never leaves this page: it is stretched here (argon2id) and only the result is sent.</p>
               </Show>
             </Show>
+          </FxCell>
+          <FxCell label="Push deploys" meta={<Show when={ci()}><span classList={{ acc: !!ci()?.enabled }}>{ci()!.enabled ? 'on' : 'off'}</span></Show>}>
+            <div class="cx-state">
+              <Sq tone={ci()?.enabled ? 'ok' : 'idle'} />
+              <span class="fx-big cx-mid">{ci() === undefined ? '…' : ci() === null ? 'unknown' : ci()!.enabled ? 'can read secrets' : 'no secrets'}</span>
+            </div>
+            <p class="cx-note">Lets git-linked builds read production values without a passphrase. The CLI never needs this.</p>
+            <Show when={ci()}>
+              <div class="cx-actions">
+                <button class="btn btn-sm" disabled={!ci()!.enabled && !unlocked()} onClick={() => void toggleCi()}>
+                  {ci()!.enabled ? 'Turn off' : 'Turn on'}
+                </button>
+                <Show when={!ci()!.enabled && !unlocked()}><span class="cap dim">unlock first</span></Show>
+              </div>
+            </Show>
+          </FxCell>
+        </section>
+        <section class="fx-row">
+          <FxCell label="Secrets by project" meta={<span>{props.workspace.projects.length} projects</span>}>
+            <table class="fx-list cx-secrets">
+              <thead><tr><th class="cap">Project</th><th class="cap r">Variables</th><th class="cap r">Development</th><th class="cap r">Production</th><th class="cap" /></tr></thead>
+              <tbody>
+                <For each={secrets() ?? []} fallback={<tr><td colspan="5" class="dim">{secrets.loading ? 'Loading' : 'No projects yet'}</td></tr>}>
+                  {(s) => (
+                    <tr>
+                      <td><span class={`fx-sq ${projectTone(s.project)}`} /> <b>{s.project.slug}</b></td>
+                      <td class="r">{s.rows ? s.rows.length : '—'}</td>
+                      <td class="r dim">{s.rows ? s.rows.filter((r) => r.has_dev).length : '—'}</td>
+                      <td class="r dim">{s.rows ? s.rows.filter((r) => r.has_prod).length : '—'}</td>
+                      <td class="r"><button class="btn btn-sm" onClick={() => cx?.go(`/${props.workspace.slug}/${s.project.slug}/settings`)}>Open</button></td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
           </FxCell>
         </section>
       </div>
@@ -341,7 +418,7 @@ export function Keys() {
             <For each={keys() ?? []} fallback={<div class="fx-empty cap">{keys.loading ? 'Loading' : 'No API keys'}</div>}>
               {(k) => (
                 <div class="cx-line">
-                  <b class="cx-sha">{k.prefix}…</b><span class="cap dim">created {formatStamp(k.created_at)}</span>
+                  <span class="cx-line-main"><b class="cx-sha">{k.prefix}…</b><span class="cap dim">created {formatStamp(k.created_at)}</span></span>
                   <button class="btn btn-sm" onClick={() => void revoke('key', k.id, `${k.prefix}…`)}>Revoke</button>
                 </div>
               )}
@@ -356,7 +433,7 @@ export function Keys() {
             <For each={tokens() ?? []}>
               {(t) => (
                 <div class="cx-line">
-                  <b>{t.name}</b><span class="cap dim">{t.prefix}… · {t.last_used_at ? `used ${formatStamp(t.last_used_at)}` : 'never used'}</span>
+                  <span class="cx-line-main"><b>{t.name}</b><span class="cap dim">{t.prefix}… · {t.last_used_at ? <>used <Stamp at={t.last_used_at} /></> : 'never used'}</span></span>
                   <button class="btn btn-sm" onClick={() => void revoke('token', t.id, t.name)}>Revoke</button>
                 </div>
               )}
@@ -366,6 +443,14 @@ export function Keys() {
       </div>
     </>
   );
+}
+
+/** A user agent as people say it: `Chrome · macOS`. */
+function browser(ua: string | null | undefined): string {
+  if (!ua) return 'Unknown browser';
+  const name = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : /curl|spky/i.test(ua) ? ua.split(' ')[0] : 'Browser';
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Mac OS X|Macintosh/.test(ua) ? 'macOS' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${name} · ${os}` : name;
 }
 
 /* ---------- activity ---------- */
@@ -430,7 +515,7 @@ export function Sessions() {
                 <For each={sessions() ?? []}>
                   {(s) => (
                     <tr>
-                      <td><b>{(s.user_agent ?? 'unknown').replace(/\).*$/, ')').slice(0, 60)}</b> <Show when={s.current}><span class="cx-chip live">This one</span></Show></td>
+                      <td class="cx-who"><b title={s.user_agent ?? undefined}>{browser(s.user_agent)}</b> <Show when={s.current}><span class="cx-chip live">This one</span></Show></td>
                       <td class="dim">{s.ip ?? ''}</td>
                       <td><Stamp at={s.created_at} /></td>
                       <td><Stamp at={s.last_seen_at} /></td>

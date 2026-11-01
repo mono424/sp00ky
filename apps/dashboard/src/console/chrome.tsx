@@ -182,7 +182,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
             {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
           </Show>
           <span class="cx-prow-text">
-            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? 'Open a project'}</b>
+            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? (c.workspace()?.projects.length ? 'Open a project' : 'No projects yet')}</b>
             <small>{c.project() ? projectLine(c.project()!) : `${c.workspace()?.projects.length ?? 0} in ${c.workspace()?.name ?? 'this workspace'}`}</small>
           </span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -228,6 +228,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
           </div>
           <div class="cx-pfoot cap">
             <button onClick={() => { setOpen(false); go(`/${c.workspace()!.slug}/-`); }}>All projects</button>
+            <button onClick={() => { setOpen(false); go(`/${c.workspace()!.slug}/-/new`); }}>New project</button>
             <span>⌘K jumps anywhere</span>
           </div>
         </div>

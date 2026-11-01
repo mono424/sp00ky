@@ -8,6 +8,11 @@
  * account with two workspaces, deployments, env, members...) and a project's
  * admin API, answered under `/fx/admin/api/*` from the same `fixtures.mjs` the
  * scheduler dashboard is photographed with. `?signedout` shows the landing.
+ *
+ * The workspace `nadia` has no projects, so it opens on the first-project page.
+ * `GET /__onboarding?connected=1&cli=1&config=1&project=pending|building|running&repo=configured`
+ * moves that page's world on, the way a terminal elsewhere would: it updates by
+ * itself, and `?reset=1` starts over.
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -40,6 +45,57 @@ const WORKSPACES = [
   { id: 'ten-mira', name: 'mira', slug: 'mira', type: 'personal', role: 'admin', projects: [{ id: 'prj-n', slug: 'notes', plan: 'free', platform: 'cloudflare', status: 'active', deployment_status: 'running', deployment_version: 3, admin: 'ssp' }] },
 ];
 
+const FRESH = { id: 'ten-nadia', name: 'nadia', slug: 'nadia', type: 'personal', role: 'admin', projects: [] };
+WORKSPACES.push(FRESH);
+
+// The first-project page's world, moved on through `/__onboarding`.
+const ONBOARDING = { connected: false, cli: false, config: false, repo: 'plain', project: null, linked: false };
+const NEW_PROJECT = (project) => ({
+  id: 'prj-new', slug: 'tideline', plan: 'payg', platform: 'cloudflare', admin: 'ssp',
+  status: project === 'pending' ? 'pending_payment' : 'active',
+  deployment_status: project === 'pending' || project === 'paid' ? null : project === 'building' ? 'provisioning' : project,
+  deployment_version: project === 'running' ? 1 : null,
+});
+const repo = (owner, name, language, description, days, priv = true) => ({
+  owner, name, full_name: `${owner}/${name}`, private: priv, default_branch: 'main', language, description, pushed_at: iso(days * 24 * H),
+});
+const GITHUB = {
+  configured: true,
+  install_url: 'https://github.com/apps/sp00ky-cloud/installations/new?state=fixture',
+  installations: [
+    {
+      id: 7001, account: 'nadia-k', type: 'User', selection: 'all', manage_url: 'https://github.com/settings/installations/7001', avatar_url: 'https://avatars.githubusercontent.com/u/9919?v=4',
+      repos: [
+        repo('nadia-k', 'tideline', 'TypeScript', 'Tide tables and harbour alerts for small boats', 0.1),
+        repo('nadia-k', 'fieldnotes', 'TypeScript', 'Shared notebooks for survey crews, offline first', 3),
+        repo('nadia-k', 'harbour-api', 'Go', 'Port schedules as a small API', 11),
+        repo('nadia-k', 'dotfiles', 'Shell', null, 40, false),
+        repo('nadia-k', 'chart-render', 'Rust', 'Vector nautical charts to tiles', 120, false),
+        repo('nadia-k', 'sailing-log', 'Dart', 'Logbook app', 300),
+      ],
+    },
+    { id: 7002, account: 'northsound', type: 'Organization', selection: 'selected', manage_url: 'https://github.com/organizations/northsound/settings/installations/7002', avatar_url: 'https://avatars.githubusercontent.com/u/9892?v=4', repos: [repo('northsound', 'dock-booking', 'TypeScript', 'Berth bookings', 2)] },
+  ],
+};
+const inspection = () => {
+  const configured = ONBOARDING.repo === 'configured';
+  return {
+    repo: 'nadia-k/tideline', branch: 'main', sha: ONBOARDING.config ? '7c41e09ab2d' : 'a3f9c1e7d2b', private: true, language: 'TypeScript',
+    description: 'Tide tables and harbour alerts for small boats', url: 'https://github.com/nadia-k/tideline',
+    empty: false, files: 212, truncated: false,
+    config: configured
+      ? { path: 'sp00ky.yml', valid: true, slug: 'tideline', mode: 'singlenode', schema: './schema', apps: [{ name: 'web', type: 'frontend' }] }
+      : ONBOARDING.config ? { path: 'spooky/sp00ky.yml', valid: true, mode: 'singlenode', schema: '.', apps: [] } : null,
+    package_manager: 'pnpm', monorepo: true,
+    apps: [
+      { path: 'apps/web', name: '@tideline/web', kind: 'frontend', framework: 'Solid' },
+      { path: 'services/alerts', name: '@tideline/alerts', kind: 'backend', framework: 'Hono' },
+    ],
+    schema_dir: configured ? 'schema' : ONBOARDING.config ? 'spooky' : undefined, schema_files: configured ? 6 : ONBOARDING.config ? 1 : 0,
+    dockerfiles: 1, uses_spooky: configured, has_cli: false,
+  };
+};
+
 const DEPLOYMENTS = {
   deployments: [
     { id: 'd43', version: 43, status: 'provisioning', error: null, live: false, live_from: null, live_until: null, source: 'git', actor: null, rollback_of: null, images: { scheduler: '0.0.1-canary.370', ssp: '0.0.1-canary.370', surrealdb: 'v3.1.5' }, created_at: iso(130_000), deployed_at: null, updated_at: iso(5000), build: { commit_sha: 'a3f9c1e7d2', commit_message: 'fix(game): pending moves survive a reload', commit_author: 'mono424', status: 'deploying' } },
@@ -70,7 +126,20 @@ const CLOUD = {
   'GET /mcp/tokens': [{ id: 'mt1', name: 'claude on my laptop', prefix: 'mcp_live_3fa1', scopes: ['mcp:full'], created_at: iso(9 * 24 * H), last_used_at: iso(2 * H) }],
 };
 
-function cloudRoute(method, path) {
+function cloudRoute(method, path, url) {
+  FRESH.projects = ONBOARDING.project ? [NEW_PROJECT(ONBOARDING.project)] : [];
+  if (path === '/console/me') {
+    const me = CLOUD['GET /console/me'];
+    return [200, { ...me, account: { ...me.account, cli_login_at: ONBOARDING.cli ? iso(4000) : null }, api_url: 'https://api-stg.sp00ky.cloud' }];
+  }
+  if (path === '/github') return [200, ONBOARDING.connected ? GITHUB : { ...GITHUB, installations: [] }];
+  if (path === '/github/inspect') {
+    return url.searchParams.get('repo') === 'nadia-k/tideline' ? [200, inspection()] : [404, { error: 'the app cannot see that repository' }];
+  }
+  if (path === '/projects/prj-new/link') {
+    if (method === 'PATCH') ONBOARDING.linked = true;
+    return [200, ONBOARDING.linked ? { status: 'linked', repo_owner: 'nadia-k', repo_name: 'tideline', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' } : { status: 'not_linked' }];
+  }
   const exact = CLOUD[`${method} ${path}`];
   if (exact !== undefined) return [200, exact];
   let m;
@@ -135,11 +204,18 @@ createServer(async (req, res) => {
     res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': '*' });
     res.end(JSON.stringify(body));
   };
+  if (url.pathname === '/__onboarding') {
+    if (url.searchParams.has('reset')) Object.assign(ONBOARDING, { connected: false, cli: false, config: false, repo: 'plain', project: null, linked: false });
+    for (const key of ['connected', 'cli', 'config']) if (url.searchParams.has(key)) ONBOARDING[key] = url.searchParams.get(key) === '1';
+    if (url.searchParams.has('repo')) ONBOARDING.repo = url.searchParams.get('repo');
+    if (url.searchParams.has('project')) ONBOARDING.project = url.searchParams.get('project') || null;
+    return json(200, ONBOARDING);
+  }
   if (url.searchParams.has('signedout')) signedOut = true;
   if (url.searchParams.has('signedin')) signedOut = false;
   if (url.pathname.startsWith('/v1/')) {
     if (signedOut) return json(401, { error: 'missing authorization header', code: 'unauthorized' });
-    const [status, body] = cloudRoute(req.method, url.pathname.slice(3));
+    const [status, body] = cloudRoute(req.method, url.pathname.slice(3), url);
     return json(status, body);
   }
   // A Cloudflare project whose SSP predates console grants.

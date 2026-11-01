@@ -234,7 +234,7 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
           {(w) => (
             <div class="nav-section">
               <div class="nav-heading cx-nh"><span>Projects</span><span>{w().projects.length}</span></div>
-              <For each={w().projects} fallback={<div class="cx-empty cap">No projects yet</div>}>
+              <For each={w().projects}>
                 {(p) => (
                   <button class="nav-link cx-pl" title={projectLine(p)} onClick={() => cx.go(`/${w().slug}/${p.slug}`)}>
                     <span class="row" style={{ gap: '10px', 'min-width': '0' }}>

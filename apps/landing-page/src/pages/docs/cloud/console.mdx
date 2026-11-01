@@ -14,6 +14,31 @@ import LinkCard from '../../../components/ui/LinkCard.astro';
 Sp00ky Cloud projects. Sign in with GitHub, the same account `spky cloud login`
 uses, and you see every workspace you belong to and every project in it.
 
+## Your first project
+
+A workspace with no projects opens on the steps that get one running. **New project**
+(on the Projects page and in the project switcher) opens the same steps at any time.
+
+1. **Connect GitHub.** Install the Sp00ky Cloud GitHub app on your account or an
+   organization. It reads code and posts deploy checks, nothing else, and you choose
+   which repositories it can see. An app already on your own account connects by itself.
+2. **Pick a repository.** The console reads the default branch and says what it found:
+   a `sp00ky.yml`, your apps and their frameworks, SurrealQL files, the package manager.
+3. **Run the commands.** They are written for that repository, and each one ticks off
+   as it lands: `spky login` when it finishes, a pushed `sp00ky.yml` as soon as it is on
+   the branch, then the project, its checkout and its deployment during `spky deploy`.
+   The repository is linked to the project once checkout is paid, so pushes to the
+   default branch deploy from then on. Turn that off under **Settings → Git link**.
+
+No repository yet? **Start without a repository** gives you the commands for
+`spky init` and a first deploy instead.
+
+<Note>
+The console never creates a project for you: `spky deploy` does that, and it opens
+checkout. `spky deploy` creates projects in your personal workspace, so a project
+started from a team workspace shows up there.
+</Note>
+
 ## Finding your way
 
 - **The workspace selector** (top right) switches workspaces and holds the
@@ -70,7 +95,8 @@ Settings until their SSP learns console sign-in.
 The console's own session is a cookie that only console.sp00ky.cloud can
 read or send, and every request it makes carries a header no other page can
 add, so no other site can act through it. Project secrets and database
-passwords are never sent to the console.
+passwords are never sent to the console. Reading a repository returns what it
+found, never a file's contents.
 
 <CardGrid>
   <LinkCard title="Admin dashboard" href="/docs/reference/admin-dashboard" description="Every page of a project's dashboard, and the API behind it." />

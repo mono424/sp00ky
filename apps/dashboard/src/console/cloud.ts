@@ -19,15 +19,48 @@ export class CloudError extends Error {
   }
 }
 
-/** Send the browser through GitHub, back to where it was. */
+/** Where signing in starts: through GitHub, back to where the browser was. */
+export function signInUrl(): string {
+  const query = new URLSearchParams(window.location.search);
+  query.delete('signin_error');
+  const search = query.toString();
+  const back = window.location.pathname + (search ? `?${search}` : '');
+  return `/v1/auth/web/login?return_to=${encodeURIComponent(back)}`;
+}
+
+/** A session that ended mid-use: straight back through GitHub. */
 export function signIn(): never {
-  const back = window.location.pathname + window.location.search;
-  window.location.assign(`/v1/auth/web/login?return_to=${encodeURIComponent(back)}`);
+  window.location.assign(signInUrl());
   throw new CloudError(401, 'unauthorized', 'Signing in');
 }
 
 export async function signOut(): Promise<void> {
+  rememberSignedIn(false);
   await fetch('/v1/auth/web/logout', { method: 'POST', credentials: 'same-origin', headers: { 'X-Spky-Console': '1' } });
+}
+
+const SIGNED_IN_KEY = 'spky.console.signed-in';
+
+/**
+ * Whether this browser was signed in last time. The session cookie is out of
+ * JavaScript's reach, so this is what decides the first paint: the dashboard's
+ * frame for someone coming back, not for a first visit to the sign-in page.
+ */
+export function wasSignedIn(): boolean {
+  try {
+    return localStorage.getItem(SIGNED_IN_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function rememberSignedIn(signedIn: boolean): void {
+  try {
+    if (signedIn) localStorage.setItem(SIGNED_IN_KEY, '1');
+    else localStorage.removeItem(SIGNED_IN_KEY);
+  } catch {
+    /* privacy modes: the first paint is all that depends on it */
+  }
 }
 
 export interface CallOptions {
@@ -35,6 +68,8 @@ export interface CallOptions {
   body?: unknown;
   /** The workspace a tenant-scoped route acts in (`X-Tenant-ID`). */
   tenant?: string;
+  /** A 401 is an answer here (who is signed in?), not a reason to go to GitHub. */
+  anonymous?: boolean;
 }
 
 export async function cloud<T>(path: string, opts: CallOptions = {}): Promise<T> {
@@ -47,7 +82,10 @@ export async function cloud<T>(path: string, opts: CallOptions = {}): Promise<T>
     headers,
     body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   });
-  if (res.status === 401) signIn();
+  if (res.status === 401) {
+    if (opts.anonymous) throw new CloudError(401, 'unauthorized', 'Signed out');
+    signIn();
+  }
   if (!res.ok) {
     let message = `Request failed (${res.status})`;
     let code: string | undefined;
@@ -70,9 +108,18 @@ export async function cloud<T>(path: string, opts: CallOptions = {}): Promise<T>
 /* ------------------------------------------------------------------ */
 
 export interface Me {
-  account: { id: string; github_login: string | null; email: string | null; created_at: string };
+  account: {
+    id: string;
+    github_login: string | null;
+    email: string | null;
+    created_at: string;
+    /** When `spky login` last finished for this account. */
+    cli_login_at: string | null;
+  };
   session: string;
   grants: boolean;
+  /** The API the CLI has to talk to for this console's projects. */
+  api_url: string;
 }
 
 export interface WorkspaceProject {
@@ -152,8 +199,71 @@ export interface AuditEvent {
   detail: Record<string, unknown>;
 }
 
+export interface GitHubRepo {
+  owner: string;
+  name: string;
+  full_name: string;
+  private: boolean;
+  default_branch: string;
+  pushed_at?: string;
+  language?: string;
+  description?: string;
+}
+
+export interface GitHubInstallation {
+  id: number;
+  account: string;
+  type: 'User' | 'Organization' | string;
+  avatar_url?: string;
+  selection: 'all' | 'selected' | string;
+  manage_url?: string;
+  repos: GitHubRepo[];
+  error?: string;
+}
+
+export interface GitHubConnections {
+  configured: boolean;
+  install_url?: string;
+  installations: GitHubInstallation[];
+}
+
+/** What reading a repository found; see `Inspection` in the control plane. */
+export interface Inspection {
+  repo: string;
+  branch: string;
+  sha?: string;
+  private: boolean;
+  language?: string;
+  description?: string;
+  url?: string;
+  empty: boolean;
+  files: number;
+  truncated: boolean;
+  config: {
+    path: string;
+    valid: boolean;
+    slug?: string;
+    mode?: string;
+    cloud_api?: string;
+    schema?: string;
+    apps: { name: string; type?: string }[];
+  } | null;
+  package_manager?: string;
+  monorepo: boolean;
+  apps: { path: string; name?: string; kind: 'frontend' | 'backend' | 'mobile' | string; framework: string }[];
+  schema_dir?: string;
+  schema_files: number;
+  dockerfiles: number;
+  uses_spooky: boolean;
+  has_cli: boolean;
+}
+
 export const consoleApi = {
-  me: () => cloud<Me>('/console/me'),
+  me: () => cloud<Me>('/console/me', { anonymous: true }),
+  github: (tenant: string, returnTo: string) =>
+    cloud<GitHubConnections>(`/github?return_to=${encodeURIComponent(returnTo)}`, { tenant }),
+  inspect: (tenant: string, installation: number | string, repo: string) =>
+    cloud<Inspection>(`/github/inspect?installation_id=${encodeURIComponent(installation)}&repo=${encodeURIComponent(repo)}`, { tenant }),
   workspaces: () => cloud<{ workspaces: Workspace[] }>('/console/workspaces').then((r) => r.workspaces),
   grant: (projectId: string) => cloud<Grant>(`/console/projects/${encodeURIComponent(projectId)}/grant`, { method: 'POST' }),
   sessions: () => cloud<ConsoleSession[]>('/console/sessions'),

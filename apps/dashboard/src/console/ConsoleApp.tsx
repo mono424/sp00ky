@@ -110,6 +110,11 @@ export function ConsoleApp() {
     const to = landing();
     if (to) go(to, true);
   });
+  // A bare `/acme` is the workspace's projects; its router lives under `/acme/-`.
+  createEffect(() => {
+    const seg = path().split('/').filter(Boolean);
+    if (seg.length === 1) go(`/${seg[0]}/-`, true);
+  });
 
   const [limited, setLimited] = createSignal(false);
   const chrome: ConsoleChrome = {

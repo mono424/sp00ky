@@ -237,17 +237,28 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
 }
 
 /** The signed-in person's GitHub picture over their initials; the initials stay if it cannot load. */
-function UserAvatar(props: { small?: boolean }) {
+function UserAvatar() {
   const c = useConsoleChrome()!;
   const login = () => c.me()?.account.github_login;
   const [failed, setFailed] = createSignal(false);
   const who = () => login() ?? c.me()?.account.email ?? '';
   return (
-    <span class="cx-uav" classList={{ sm: !!props.small }} aria-hidden="true">
+    <span class="cx-uav" aria-hidden="true">
       {initials(who())}
       <Show when={login() && !failed()}>
-        <img src={`https://avatars.githubusercontent.com/${encodeURIComponent(login()!)}?s=64`} alt="" loading="lazy" onError={() => setFailed(true)} />
+        <img src={`https://avatars.githubusercontent.com/${encodeURIComponent(login()!)}?s=96`} alt="" loading="lazy" onError={() => setFailed(true)} />
       </Show>
+    </span>
+  );
+}
+
+/** Who is signed in, with the workspace they are in as a badge on the picture's corner. */
+function AccountFace() {
+  const c = useConsoleChrome()!;
+  return (
+    <span class="cx-face" aria-hidden="true">
+      <UserAvatar />
+      <span class="cx-face-ws">{initials(c.workspace()?.name).slice(0, 1)}</span>
     </span>
   );
 }
@@ -373,11 +384,19 @@ export function WorkspaceMenu() {
           </div>
         </div>
       </Show>
-      <button class="cx-who" classList={{ on: open() }} onClick={() => toggle()} aria-haspopup="menu" aria-expanded={open()} title="Account and workspaces (⌘⇧W)">
-        <span class="cx-av">{initials(ws()?.name)}</span>
+      <button
+        class="cx-me"
+        classList={{ on: open() }}
+        onClick={() => toggle()}
+        aria-haspopup="menu"
+        aria-expanded={open()}
+        aria-label={`${who()} in ${ws()?.name ?? 'no workspace'}: account and workspaces`}
+        title="Account and workspaces (⌘⇧W)"
+      >
+        <AccountFace />
         <span class="cx-wsw-text">
           <b>{ws()?.name ?? 'Workspace'}</b>
-          <small class="cx-who-user"><UserAvatar small /><span>{who()}</span></small>
+          <small>{who()}</small>
         </span>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
           <path d="M8 9l4-4 4 4 M8 15l4 4 4-4" />

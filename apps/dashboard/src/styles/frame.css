@@ -4536,45 +4536,83 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
 
 /* the foot: one menu for the account and its workspaces */
 .sb-foot.cx-foot { padding: 8px 10px 10px; }
-.sb-foot.cx-foot .sb-ver { padding: 6px 8px 0; }
+.sb-foot.cx-foot .sb-ver { padding: 7px 11px 0; }
 .cx-who-wrap { position: relative; }
-.cx-who {
+/* the same box as the project switcher at the rail's head, so the two line up */
+.cx-me {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 12px;
   width: 100%;
-  padding: 7px 8px;
-  border: 1px solid transparent;
-  background: none;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.015);
   color: var(--ink);
   text-align: left;
   cursor: pointer;
   transition: background 0.12s, border-color 0.12s;
 }
-.cx-who:hover { background: var(--bg-hover); }
-.cx-who.on { border-color: rgba(156, 165, 211, 0.45); background: rgba(156, 165, 211, 0.07); }
-.cx-who > svg { flex: none; margin-left: auto; color: var(--ink-ghost); }
-.cx-who .cx-wsw-text b { font-size: 13px; }
-/* the workspace, and under its name who is in it */
-.cx-who > .cx-av { width: 30px; height: 30px; font-size: 10.5px; }
-.cx-wsw-text small.cx-who-user { display: flex; align-items: center; gap: 6px; }
-.cx-who-user > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cx-me:hover, .cx-me.on { border-color: rgba(156, 165, 211, 0.45); background: rgba(156, 165, 211, 0.07); }
+.cx-me > svg { flex: none; margin-left: auto; color: var(--ink-ghost); transition: color 0.12s; }
+.cx-me:hover > svg, .cx-me.on > svg { color: var(--ink-dim); }
+.cx-me .cx-wsw-text { gap: 3px; }
+span.cx-me { pointer-events: none; }
+
+/* who is signed in, and the workspace as a badge cut into the picture's corner */
+.cx-face {
+  --face: 32px;
+  --badge: 16px;
+  /* how far the badge hangs past the picture, and the gap cut around it */
+  --hang: 4px;
+  --cut: calc(var(--badge) - var(--hang) + 2px);
+  position: relative;
+  display: block;
+  flex: none;
+  width: var(--face);
+  height: var(--face);
+}
+.cx-face > .cx-uav {
+  width: 100%;
+  height: 100%;
+  font-size: 10px;
+  -webkit-mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  -webkit-mask-size: var(--cut) var(--cut), 100% 100%;
+  -webkit-mask-position: 100% 100%, 0 0;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-composite: xor;
+  mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  mask-size: var(--cut) var(--cut), 100% 100%;
+  mask-position: 100% 100%, 0 0;
+  mask-repeat: no-repeat;
+  mask-composite: exclude;
+}
+.cx-face-ws {
+  position: absolute;
+  right: calc(-1 * var(--hang));
+  bottom: calc(-1 * var(--hang));
+  display: grid;
+  place-items: center;
+  width: var(--badge);
+  height: var(--badge);
+  border: 1px solid rgba(156, 165, 211, 0.5);
+  background: #1c1f2e;
+  font: 700 8.5px/1 var(--mono);
+  color: var(--accent-strong);
+}
 .cx-uav {
   position: relative;
   display: grid;
   place-items: center;
   flex: none;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 50%;
   background: #1a1a1d;
   font: 600 10.5px var(--mono);
   color: var(--ink-dim);
 }
 .cx-uav img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.cx-uav.sm { width: 14px; height: 14px; border: 0; font-size: 6px; }
 
 .cx-menu.cx-who-menu {
   top: auto;

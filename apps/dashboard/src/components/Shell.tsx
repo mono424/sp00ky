@@ -633,7 +633,10 @@ export function FrameSkeleton(props: { console?: boolean }) {
         </div>
         <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
           <Show when={props.console}>
-            <span class="cx-who"><span class="cx-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
+            <span class="cx-me">
+              <span class="cx-face sk" />
+              <span class="cx-wsw-text"><span class="sk sk-cap" style={{ width: '72px' }} /><span class="sk sk-cap" style={{ width: '52px' }} /></span>
+            </span>
           </Show>
           <div class="sb-ver cap" />
         </div>

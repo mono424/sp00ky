@@ -198,11 +198,7 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
   const ws = () => cx.workspace();
   const quick = () => sectionsOf(props.links).filter((x) => !x.group);
   const grouped = () => sectionsOf(props.links).filter((x) => x.group);
-  // The project's settings fold under one row: open on their pages, or when asked.
   const location = useLocation();
-  const inSettings = () => /\/(settings|access)(\/|$)/.test(location.pathname);
-  const [settingsOpen, setSettingsOpen] = createSignal(inSettings());
-  createEffect(() => { if (inSettings()) setSettingsOpen(true); });
   return (
     <>
       <div class="cx-brand"><Logo /><span class="cap">console</span></div>
@@ -230,7 +226,6 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
           // Keep the page you are on in view when the rail is taller than the screen.
           createEffect(() => {
             location.pathname;
-            settingsOpen();
             setTimeout(() => el.querySelector('.nav-link.active')?.scrollIntoView({ block: 'nearest' }), 60);
           });
         }}
@@ -265,27 +260,10 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
         </Show>
         <For each={grouped()}>
           {(section) => (
-            <Show
-              when={section.group === 'Settings'}
-              fallback={
-                <div class="nav-section">
-                  <div class="nav-heading">{section.group}</div>
-                  <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
-                </div>
-              }
-            >
-              <div class="nav-section cx-fold" classList={{ open: settingsOpen() }}>
-                <button class="nav-link cx-fold-head" classList={{ here: inSettings() }} aria-expanded={settingsOpen()} onClick={() => setSettingsOpen(!settingsOpen())}>
-                  <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
-                </button>
-                <Show when={settingsOpen()}>
-                  <div class="cx-fold-list">
-                    <For each={section.links}>{(link) => <NavItem link={{ ...link, icon: undefined }} atRoot={props.atRoot} />}</For>
-                  </div>
-                </Show>
-              </div>
-            </Show>
+            <div class="nav-section">
+              <div class="nav-heading">{section.group}</div>
+              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
+            </div>
           )}
         </For>
       </div>

@@ -4720,16 +4720,6 @@ span.cx-me { pointer-events: none; }
   .mb-ctx .cx-av { width: 18px; height: 18px; font-size: 8.5px; }
 }
 
-/* a group that folds: the project's settings */
-.cx-fold { margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 6px; }
-.cx-fold-head { width: 100%; border: 0; background: none; font: inherit; font-weight: 500; color: var(--ink-dim); text-align: left; cursor: pointer; justify-content: space-between; }
-.cx-fold-head > svg { flex: none; color: var(--ink-ghost); transition: transform 0.15s; }
-.cx-fold.open .cx-fold-head > svg { transform: rotate(90deg); }
-.cx-fold-head.here { color: var(--ink); }
-.cx-fold-list { position: relative; margin: 2px 0 4px 23px; border-left: 1px solid var(--line); }
-.cx-fold-list .nav-link { height: 28px; padding-left: 14px; font-size: 12.5px; }
-.cx-fold-list .nav-link.active::before { left: -1px; }
-.cx-fold-list .nav-link svg { display: none; }
 
 /* the rail is the settings nav on a desktop; the tabs stay for the phone */
 @media (min-width: 861px) { .cx-tabs { display: none; } }
@@ -4737,7 +4727,6 @@ span.cx-me { pointer-events: none; }
 /* a denser rail: everything in reach on a laptop screen */
 .cx-rail .nav-heading { padding: 12px 16px 4px; }
 .cx-rail .nav-link { height: 30px; }
-.cx-rail .cx-fold-list .nav-link { height: 27px; }
 .cx-pin { flex: none; border-bottom: 1px solid var(--line-soft); padding-bottom: 4px; }
 
 /* ================================================================

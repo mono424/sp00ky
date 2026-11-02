@@ -12,6 +12,8 @@ export interface ServerConfig {
   topics?: string[];
   /** Whether a Sp00ky Cloud console user can sign in here with a grant. */
   cloud_login?: boolean;
+  /** Whether the project's tables, users and bucket files can be reached (`/data`). */
+  data?: boolean;
   scheduler_id: string;
   version: string;
   /** Whether `SPKY_ADMIN_PASSWORD` is set, i.e. password-only login is offered. */

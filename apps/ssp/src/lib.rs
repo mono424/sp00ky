@@ -1145,7 +1145,10 @@ pub async fn run_server() -> anyhow::Result<()> {
         schema_poll_secs: config.schema_poll_secs,
         schema_watch: Default::default(),
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        admin: Default::default(),
+        admin: ssp_node::admin::AdminState::new(ssp_node::admin::AdminSettings {
+            data_disabled: ssp_node::admin::data_is_off(std::env::var("SPKY_ADMIN_DATA").ok().as_deref()),
+            ..Default::default()
+        }),
     });
     let runtime = ssp_node::Runtime::new(node.clone());
 

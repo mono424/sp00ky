@@ -34,6 +34,9 @@ import { ConfirmHost, ToastHost } from '../components/Actions';
 import { Logo, PageHead } from '../components/Chrome';
 import { FrameSkeleton, PageSkeleton, Shell } from '../components/Shell';
 import { ProjectApp } from '../ProjectApp';
+import { Database, SqlEditor } from '../routes/Database';
+import { Storage } from '../routes/Storage';
+import { Users } from '../routes/Users';
 import { SignInFrame } from '../routes/Login';
 import { CloudError, consoleApi, rememberSignedIn, signInUrl, signOut, wasSignedIn, type Grant, type Workspace, type WorkspaceProject } from './cloud';
 import { ConsoleChromeProvider, WORKSPACE_LINKS, type ConsoleChrome } from './chrome';
@@ -325,6 +328,16 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
     </>
   );
 
+  /** The project's own data, read through its admin API, so only with a session. */
+  const dataRoutes = (): JSX.Element => (
+    <>
+      <Route path={['/database', '/database/table/:table']} component={Database} />
+      <Route path="/database/sql" component={SqlEditor} />
+      <Route path="/users" component={Users} />
+      <Route path="/storage/:bucket?" component={Storage} />
+    </>
+  );
+
   return (
     <Switch>
       <Match when={state().kind === 'connecting'}>
@@ -341,7 +354,7 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
             scope={`${props.project.id}@${adminUrl}`}
             renew={renew}
             onSignOut={() => undefined}
-            routes={cloudRoutes()}
+            routes={<>{cloudRoutes()}{dataRoutes()}</>}
           />
         )}
       </Match>

@@ -14,6 +14,7 @@
 //! `ssp-node::ports` so a future wasm shell can link the crate.
 
 pub mod admin;
+pub mod admin_data;
 pub mod cron;
 pub mod dag;
 pub mod db;

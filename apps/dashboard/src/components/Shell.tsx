@@ -39,6 +39,9 @@ const NAV_PATHS: Record<string, string> = {
   '/incidents': 'M12 3 2 21h20L12 3z M12 9v5 M12 17v1',
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
   '/access': 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3',
+  '/database': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0',
+  '/users': 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M22 21v-2a4 4 0 0 0-3-3.9 M16 3.1a4 4 0 0 1 0 7.8',
+  '/storage': 'M3 6h6l2 2h10v11H3z',
   '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
   '/deployments': 'M12 3l9 5-9 5-9-5 9-5z M3 13l9 5 9-5',
   '/settings/env': 'M4 7h16 M4 12h16 M4 17h10 M18 15l3 3-3 3',
@@ -119,6 +122,15 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
       // sampler has run once, which is not the same as "the queue is empty".
       count: o?.jobs?.ready ? formatCount(o.jobs.counts.pending + o.jobs.counts.processing) : undefined,
     },
+    // The project's own data. In the console first; a host says whether it
+    // can serve it, since the console also opens older schedulers.
+    ...(console && currentMode().config?.data
+      ? [
+          { href: '/database', label: 'Database', group: 'Data' },
+          { href: '/users', label: 'Users', group: 'Data' },
+          { href: '/storage', label: 'Storage', group: 'Data' },
+        ]
+      : []),
     { href: '/backups', label: 'Backups', group: 'Data' },
     // Sp00ky Cloud only: the scheduler cannot measure its neighbours or the
     // database's volume, the control plane can. Hidden, not disabled, when

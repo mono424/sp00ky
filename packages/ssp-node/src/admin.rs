@@ -24,6 +24,7 @@ use ssp_protocol::admin_mcp::{self as mcp, Rpc, ServerInfo, ToolDef};
 use ssp_protocol::admin_session::{self as signed, Claims, Scope, SessionMode};
 
 use schedule_core::admin as core;
+use schedule_core::admin_data;
 
 use crate::api::{ApiRequest, ApiResponse, Method};
 use crate::node::SspNode;
@@ -65,6 +66,14 @@ pub struct AdminSettings {
     /// deploy time (`SPKY_ADMIN_CLOUD_JWKS`). A Worker cannot be relied on to
     /// fetch them mid-request, so a node accepts grants only when given both.
     pub cloud_jwks: Option<String>,
+    /// `SPKY_ADMIN_DATA=off`: no `/data` routes (the dashboard's Database, Users
+    /// and Storage pages).
+    pub data_disabled: bool,
+}
+
+/// Whether a value of `SPKY_ADMIN_DATA` turns the `/data` routes off, for the shells.
+pub fn data_is_off(value: Option<&str>) -> bool {
+    admin_data::is_off(value)
 }
 
 /// How long a session opened with a console grant lasts; the console renews it.
@@ -454,6 +463,24 @@ impl SspNode {
                 from_core(out, 200)
             }
 
+            // ---- Tables, users, bucket files ----
+            (method, ["data", rest @ ..]) => {
+                if self.admin.settings.data_disabled {
+                    return error(403, "Data access is turned off on this project (SPKY_ADMIN_DATA)");
+                }
+                if session.mode == SessionMode::Mcp {
+                    return error(403, "MCP tokens cannot reach project data; sign in to the dashboard");
+                }
+                let method = match method {
+                    Method::Get => "GET",
+                    Method::Post => "POST",
+                    Method::Put => "PUT",
+                    Method::Delete => "DELETE",
+                };
+                let request = admin_data::Request { method, path: rest, query: &pairs, body: &req.body, actor: &session.subject };
+                from_core(admin_data::dispatch(&db, request).await, 200)
+            }
+
             (_, [first, ..]) if CLUSTER_ONLY.contains(first) => error(
                 501,
                 format!("'{first}' needs a scheduler; this project runs without one (a Cloudflare project)"),
@@ -479,6 +506,8 @@ impl SspNode {
                 "streams": false,
                 // Whether a Sp00ky Cloud console user can sign in with a grant.
                 "cloud_login": self.admin.settings.cloud_login().is_some(),
+                // Whether `/data` (the Database, Users and Storage pages) is on here.
+                "data": !self.admin.settings.data_disabled,
             }),
         )
     }

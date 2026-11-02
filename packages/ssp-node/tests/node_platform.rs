@@ -4553,6 +4553,55 @@ async fn admin_sessions_scopes_and_revocation() {
 }
 
 #[tokio::test]
+async fn admin_data_routes_answer_through_the_node_and_refuse_agents() {
+    let h = build(HarnessOpts { admin_password: Some("glass"), ..Default::default() }).await;
+    h.raw_db.query("DEFINE TABLE note SCHEMALESS; CREATE note:a SET text = 'hi', password = 'hunter2';").await.unwrap();
+
+    let (_, config) = admin(&h, Method::Get, "/admin/api/config", None, Value::Null).await;
+    assert_eq!(config["data"], true, "{config}");
+    assert_eq!(admin(&h, Method::Get, "/admin/api/data/tables", None, Value::Null).await.0, 401);
+
+    let (_, login) = admin(&h, Method::Post, "/admin/api/session", None, json!({ "password": "glass" })).await;
+    let session = login["token"].as_str().unwrap().to_string();
+
+    let (status, page) =
+        admin(&h, Method::Get, "/admin/api/data/tables/note/rows?sort=text&limit=5", Some(&session), Value::Null).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["rows"][0]["text"], "hi");
+    assert_eq!(page["rows"][0]["password"], json!({ "$redacted": true }));
+
+    // The query string survives for a percent-encoded id, and writes go through.
+    let (status, updated) = admin(
+        &h,
+        Method::Put,
+        "/admin/api/data/tables/note/row?id=note%3Aa",
+        Some(&session),
+        json!({ "set": { "text": "bye" } }),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["row"]["text"], "bye");
+
+    // Agents neither read nor write, whatever their scope.
+    for scope in ["read", "full"] {
+        let (_, minted) =
+            admin(&h, Method::Post, "/admin/api/tokens", Some(&session), json!({ "label": "agent", "scope": scope })).await;
+        let agent = minted["token"].as_str().unwrap().to_string();
+        assert_eq!(admin(&h, Method::Get, "/admin/api/data/tables", Some(&agent), Value::Null).await.0, 403, "{scope}");
+        assert_eq!(
+            admin(&h, Method::Post, "/admin/api/data/query", Some(&agent), json!({ "sql": "RETURN 1" })).await.0,
+            403,
+            "{scope}"
+        );
+    }
+
+    let (status, answer) =
+        admin(&h, Method::Post, "/admin/api/data/query", Some(&session), json!({ "sql": "RETURN 40 + 2" })).await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["results"][0]["value"], 42);
+}
+
+#[tokio::test]
 async fn admin_lists_and_kills_jobs_through_the_node() {
     let h = build(HarnessOpts { job_tables: vec![("job", "http://backend")], ..Default::default() }).await;
     h.raw_db.query("UPSERT _00_retention:default SET job_tables = ['job']").await.unwrap();

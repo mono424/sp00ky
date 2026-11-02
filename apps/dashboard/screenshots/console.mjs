@@ -24,6 +24,22 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = resolve(HERE, '..', 'dist-console');
 const PORT = Number(process.env.PORT ?? 4320);
 const ORIGIN = `http://localhost:${PORT}`;
+const REAL_ADMIN = process.env.FX_ADMIN;
+// The policy console.sp00ky.cloud serves (spooky-cloud internal/console/static.go),
+// so a page that needs more than it allows fails here first.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
+  "worker-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https://avatars.githubusercontent.com",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "object-src 'none'",
+].join('; ');
 let signedOut = false;
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
@@ -194,7 +210,7 @@ function cloudRoute(method, path, url) {
 
 async function sendFile(res, path) {
   const body = await readFile(path);
-  res.writeHead(200, { 'content-type': TYPES[extname(path)] ?? 'application/octet-stream' });
+  res.writeHead(200, { 'content-type': TYPES[extname(path)] ?? 'application/octet-stream', 'content-security-policy': CSP });
   res.end(body);
 }
 
@@ -220,6 +236,22 @@ createServer(async (req, res) => {
   }
   // A Cloudflare project whose SSP predates console grants.
   if (url.pathname.startsWith('/cf/admin/api/config')) return json(200, { ...ROUTES['GET /config'], host: 'ssp', cloud_login: undefined });
+  if (url.pathname.startsWith('/fx/admin/api') && REAL_ADMIN) {
+    if (req.method === 'OPTIONS') return json(204, {});
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const session = url.pathname.endsWith('/session');
+    const upstream = await fetch(`${REAL_ADMIN}${url.pathname.replace(/^\/fx/, '')}${url.search}`, {
+      method: req.method,
+      headers: { 'content-type': req.headers['content-type'] ?? 'application/json', ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}) },
+      body: session ? JSON.stringify({ password: process.env.FX_ADMIN_PASSWORD }) : chunks.length ? Buffer.concat(chunks) : undefined,
+    });
+    const text = await upstream.text();
+    // No socket through this little proxy: the pages poll.
+    if (url.pathname.endsWith('/config')) return json(200, { ...JSON.parse(text), cloud_login: true, live: undefined });
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json', 'access-control-allow-origin': '*' });
+    return res.end(text);
+  }
   if (url.pathname.startsWith('/fx/admin/api')) {
     if (req.method === 'OPTIONS') return json(204, {});
     const key = `${req.method} ${url.pathname.replace(/^\/fx\/admin\/api/, '') || '/'}`;

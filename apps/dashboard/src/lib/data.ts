@@ -147,6 +147,8 @@ export interface FileEntry {
 export interface FilesPage {
   prefix: string;
   folders: string[];
+  /** Entries in each folder, where the host can read the bucket's disk. */
+  counts?: Record<string, number>;
   files: FileEntry[];
   next: string | null;
 }
@@ -359,8 +361,37 @@ export function crumbsOf(prefix: string): { name: string; prefix: string }[] {
 
 /** A typed folder path as a listing prefix. */
 export function normalizePrefix(path: string): string {
-  const inner = path.trim().split('/').filter(Boolean).join('/');
+  const inner = path.split('/').filter(Boolean).join('/');
   return inner ? `${inner}/` : '';
+}
+
+/** The folder a key is in: `a/b/x.png` is in `a/b/`, `x.png` in the root (`''`). */
+export function parentOf(key: string): string {
+  return key.slice(0, key.lastIndexOf('/') + 1);
+}
+
+/** One column per level on the way to a folder: `a/b/` is `''`, `a/`, `a/b/`. */
+export function columnPrefixes(path: string): string[] {
+  return ['', ...crumbsOf(path).map((c) => c.prefix)];
+}
+
+/** The next folder on the way from `prefix` to `path`, if `path` is under it. */
+export function childOn(prefix: string, path: string): string | null {
+  if (path === prefix || !path.startsWith(prefix)) return null;
+  return path.slice(prefix.length).split('/')[0] || null;
+}
+
+/** A folder's entry count, which a host stops at 1000 so a huge one stays cheap. */
+export function countLabel(n: number): string {
+  return n >= 1000 ? '999+' : String(n);
+}
+
+/** What a folder holds, in words. */
+export function folderSummary(folders: number, files: number, more: boolean): string {
+  const part = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : `${n} ${many}`);
+  if (!folders && !files) return 'Empty';
+  const said = [folders ? part(folders, 'folder', 'folders') : '', files ? part(files, 'file', 'files') : ''].filter(Boolean).join(', ');
+  return more ? `${said} so far` : said;
 }
 
 export type FileKind = 'image' | 'video' | 'audio' | 'text' | 'other';
@@ -391,21 +422,23 @@ const TEXT_EXTENSIONS = new Set([
   'html', 'htm',
 ]);
 
-function extensionOf(name: string): string {
+export function extensionOf(name: string): string {
   const base = name.slice(name.lastIndexOf('/') + 1);
   const dot = base.lastIndexOf('.');
   return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
 }
 
+/** Own keys only: a file named `.constructor` has no type. */
+const mimeOf = (ext: string) => (Object.prototype.hasOwnProperty.call(MIME, ext) ? MIME[ext] : undefined);
+
 export function fileKindOf(name: string): FileKind {
   const ext = extensionOf(name);
-  if (MIME[ext]) return MIME[ext][1];
-  return TEXT_EXTENSIONS.has(ext) ? 'text' : 'other';
+  return mimeOf(ext)?.[1] ?? (TEXT_EXTENSIONS.has(ext) ? 'text' : 'other');
 }
 
 /** The type a preview blob gets. Never one a browser would run as a page. */
 export function previewMime(name: string): string {
-  return MIME[extensionOf(name)]?.[0] ?? 'application/octet-stream';
+  return mimeOf(extensionOf(name))?.[0] ?? 'application/octet-stream';
 }
 
 export function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {

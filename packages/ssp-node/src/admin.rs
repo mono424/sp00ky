@@ -477,7 +477,7 @@ impl SspNode {
                     Method::Put => "PUT",
                     Method::Delete => "DELETE",
                 };
-                let request = admin_data::Request { method, path: rest, query: &pairs, body: &req.body, actor: &session.subject };
+                let request = admin_data::Request { method, path: rest, query: &pairs, body: &req.body, actor: &session.subject, dirs: None };
                 from_core(admin_data::dispatch(&db, request).await, 200)
             }
 

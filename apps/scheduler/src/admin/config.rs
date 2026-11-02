@@ -87,6 +87,9 @@ pub struct AdminConfig {
     /// the console renews it from a fresh grant, so a member removed from a
     /// workspace loses access within this window.
     pub cloud_session_ttl: std::time::Duration,
+    /// Whether the dashboard can browse and edit the project's own tables,
+    /// users and bucket files (`SPKY_ADMIN_DATA`, default on).
+    pub data: bool,
 }
 
 impl AdminConfig {
@@ -184,6 +187,7 @@ impl AdminConfig {
             job_live_interval: std::time::Duration::from_secs(
                 job_live_interval_secs.min(job_interval_secs.max(1)),
             ),
+            data: !schedule_core::admin_data::is_off(std::env::var("SPKY_ADMIN_DATA").ok().as_deref()),
             allowed_origins: std::env::var("SPKY_ADMIN_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')

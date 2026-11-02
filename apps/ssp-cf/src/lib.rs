@@ -571,6 +571,7 @@ fn read_config(env: &Env) -> Result<NodeConfigCf> {
             // Console sign-in: who signs grants and the keys to check them with.
             cloud_issuer: Some(var("SPKY_CLOUD_API_URL")).filter(|s| !s.is_empty()),
             cloud_jwks: Some(var("SPKY_ADMIN_CLOUD_JWKS")).filter(|s| !s.is_empty()),
+            data_disabled: ssp_node::admin::data_is_off(Some(&var("SPKY_ADMIN_DATA"))),
         },
         // Must match the client's `refMode` (sp00ky.yml). Default Dedicated —
         // core's default (see ssp-node config.rs) and the common case; a

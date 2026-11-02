@@ -28,6 +28,17 @@ Full documentation: [Admin dashboard](https://sp00ky.dev/docs/reference/admin-da
 - **Access** — mint a scoped token for an AI agent, with the `claude mcp add`,
   Cursor and VS Code snippets, and the tool list the scheduler's MCP server reports
 
+In the Sp00ky Cloud console (for now), three pages over `/admin/api/data`:
+
+- **Database** — tables, rows with filters and sort, inline edit, a row sheet,
+  structure, and a SQL editor
+- **Users** — the app's users as its `SIGNIN` clause finds them: search, who is
+  online, password reset, the admin roster, create and delete
+- **Storage** — bucket folders and files: preview, upload, download, rename, delete
+
+`FX_ADMIN=http://localhost:9668 FX_ADMIN_PASSWORD=... node screenshots/console.mjs`
+tries them against a real scheduler, under the console's real CSP.
+
 Every SSP and the scheduler carry an action menu (restart, clean restart,
 reload, reclone, and the cloud-only image upgrade / volume wipe).
 

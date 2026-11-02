@@ -424,6 +424,7 @@ export const OVERVIEW = {
 };
 
 export const CONFIG = {
+  data: true,
   scheduler_id: 'scheduler-0',
   version: '0.0.1-canary.265',
   breakglass_available: true,
@@ -1298,7 +1299,76 @@ const scheduleDetail = (sc) => {
   };
 };
 
+/** The Database, Users and Storage pages (`/data`), with no database behind them. */
+const DATA_TABLES = [
+  { name: 'game', kind: 'normal', schemafull: true, view: false, internal: false },
+  { name: 'puzzle', kind: 'normal', schemafull: true, view: false, internal: false },
+  { name: 'user', kind: 'normal', schemafull: true, view: false, internal: false },
+  { name: 'follows', kind: 'relation', in: ['user'], out: ['user'], schemafull: true, view: false, internal: false },
+  { name: '_00_admin', kind: 'normal', schemafull: true, view: false, internal: true },
+  { name: '_00_query', kind: 'normal', schemafull: true, view: false, internal: true },
+];
+const dataField = (name, kind, extra = {}) => ({ name, kind, optional: kind.startsWith('none |'), nested: false, readonly: false, flexible: false, credential: false, required: !kind.startsWith('none |'), ...extra });
+const DATA_USER_FIELDS = [
+  dataField('username', 'string'),
+  dataField('email', 'none | string'),
+  dataField('password', 'string', { credential: true }),
+  dataField('rating', 'none | int'),
+  dataField('coach', 'none | record<user>'),
+  dataField('created_at', 'datetime', { default: 'time::now()', required: false, readonly: true }),
+];
+const DATA_USERS = [
+  ['mira', 'mira@acme.dev', 2210, 3, 2, 400],
+  ['jonas', 'jonas@acme.dev', 1874, 0, 0, 90],
+  ['ana', 'ana@acme.dev', 1650, 1, 1, 60],
+  ['kofi', null, 1422, 0, 0, 21],
+  ['lena', 'lena@acme.dev', 2044, 0, 0, 2],
+].map(([username, email, rating, views, sessions, days], i) => ({
+  row: { id: `user:${username}`, username, email: email ?? undefined, password: { $redacted: true }, rating, coach: i ? 'user:mira' : undefined, created_at: iso(days * 86_400_000) },
+  is_admin: i === 0,
+  views,
+  sessions,
+}));
+const DATA_SOURCE = { access: 'account', table: 'user', identifier: 'username', created_field: 'created_at', search_fields: ['username', 'email'], can_set_password: true, sources: ['account'] };
+const DATA_ROUTES = {
+  'GET /data/tables': { tables: DATA_TABLES },
+  'GET /data/tables/user': {
+    ...DATA_TABLES[2],
+    fields: DATA_USER_FIELDS,
+    indexes: [{ name: 'unique_username', cols: ['username'], index: 'UNIQUE' }],
+    events: [{ name: '_00_user_mutation', when: "$before != $after AND $event != 'DELETE'" }],
+    read_only: false,
+  },
+  'GET /data/tables/user/rows': { rows: DATA_USERS.map((u) => u.row), has_more: false, limit: 50, start: 0 },
+  'GET /data/tables/user/count': { count: DATA_USERS.length },
+  'GET /data/tables/user/row': { row: DATA_USERS[0].row },
+  'GET /data/users': { source: DATA_SOURCE, users: DATA_USERS, has_more: false, limit: 50, start: 0 },
+  'GET /data/users/stats': { total: DATA_USERS.length, admins: 1, online: 2 },
+  'GET /data/users/user': { source: DATA_SOURCE, row: DATA_USERS[0].row, is_admin: true, admin: { note: 'founder', added_at: iso(300 * 86_400_000) }, sessions: [{ client_id: 'c-41f2', views: 2 }, { client_id: 'c-9a07', views: 1 }], flags: [{ key: 'new-board', variant: 'on' }] },
+  'GET /data/buckets': {
+    buckets: [
+      { name: 'avatars', backend: 'r2', readonly: false, browsable: false, lists_folders: true },
+      { name: 'club_covers', backend: 'file', location: '/buckets/club_covers', readonly: false, max_bytes: 5242880, browsable: true, lists_folders: false },
+      { name: 'pgn_uploads', backend: 'memory', readonly: false, browsable: true, lists_folders: true },
+    ],
+    max_read_bytes: 33554432,
+    default_upload_bytes: 3141632,
+  },
+  'GET /data/buckets/pgn_uploads/files': {
+    prefix: '',
+    folders: ['2026-10', '2026-11'],
+    files: [
+      { key: 'lichess-export.pgn', name: 'lichess-export.pgn', size: 482_113, updated: iso(3_600_000) },
+      { key: 'cover.png', name: 'cover.png', size: 70, updated: iso(86_400_000) },
+    ],
+    next: null,
+  },
+  'GET /data/buckets/club_covers/files': { prefix: '', folders: [], files: [{ key: 'default.png', name: 'default.png', size: 70, updated: iso(86_400_000 * 4) }], next: null },
+  'POST /data/query': { results: [{ rows: DATA_USERS.map((u) => u.row), total: DATA_USERS.length, truncated: false }], limit_added: 1000 },
+};
+
 export const ROUTES = {
+  ...DATA_ROUTES,
   'GET /config': CONFIG,
   'GET /me': ME,
   'GET /overview': OVERVIEW,

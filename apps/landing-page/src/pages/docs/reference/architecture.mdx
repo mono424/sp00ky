@@ -282,6 +282,12 @@ How a committed row change leaves SurrealDB is chosen per project
   not touch `_00_version`); a 2 s poll is the safety net. A cursor older than the retention triggers a
   replica re-clone, the same remediation the drift check uses.
 
+On a Pro project the database and the scheduler run on different VMs (see
+[Pro projects on Sp00ky Cloud](#pro-projects-on-sp00ky-cloud)), joined by a
+tunnel. The `http` transport makes one call to the scheduler per write, and
+that call crosses the tunnel, which adds a small network cost to each write.
+`changefeed` has no call inside the transaction.
+
 ### Schema changes
 
 Adding, changing or removing a table needs no restart and no re-clone. The
@@ -507,6 +513,19 @@ SPKY_SSP_REF_MODE=dedicated
 Production setup with high availability and load distribution.
 
 For detailed deployment instructions, see [Self-hosting](/docs/self-hosting).
+
+### Pro projects on Sp00ky Cloud
+
+A Pro project runs on two VMs of its own:
+
+- **Project host**: the scheduler, the SSPs, backends, frontends and the proxy (Traefik). Default type `cx33`, 8 GB.
+- **Database VM**: SurrealDB, with its data on a volume at the provider. Default type `cax21` (ARM), 8 GB, of which the database may use 6 GB.
+
+The shared host that runs Sp00ky Cloud keeps only the control plane. The scheduler and the database
+reach each other across a tunnel between the two VMs, and the scheduler no longer mounts the bucket
+volume. See
+[Your own VMs](/docs/cloud/deploying#your-own-vms-pro) for the machine types, upgrades and moving an
+existing project.
 
 ## How this compares to other realtime frameworks
 

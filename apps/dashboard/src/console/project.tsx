@@ -34,6 +34,18 @@ import {
   type UpgradeRun,
   type UpgradeStatus,
 } from './dbUpgradePlan';
+import {
+  canUpgrade,
+  emptyNote,
+  kindLabel,
+  kindRole,
+  statusChip,
+  upgradeConfirm,
+  upgradeNote,
+  upgrading,
+  type HostStatus,
+  type HostView,
+} from './hostPlan';
 import { isUnlocked, loadValues, unlock } from './vault';
 
 interface Ctx {
@@ -811,6 +823,7 @@ const TABS: { id: string; label: string }[] = [
   { id: 'domains', label: 'Domains' },
   { id: 'git', label: 'Git & builds' },
   { id: 'scale', label: 'Scale' },
+  { id: 'machines', label: 'Machines' },
   { id: 'database', label: 'Database' },
   { id: 'access', label: 'Access tokens' },
   { id: 'danger', label: 'Danger zone' },
@@ -823,13 +836,14 @@ export function Settings(props: Ctx) {
   return (
     <>
         <PageHead crumb="Settings" crumbHref="/settings" title={TABS.find((t) => t.id === tab())?.label ?? 'Settings'} />
-        <SettingsTabs active={tab()} limited={!!cx?.limited()} />
+        <SettingsTabs active={tab()} limited={!!cx?.limited()} hosted={props.project.platform !== 'cloudflare'} />
         <div class="fx-page">
           <Switch>
             <Match when={tab() === 'env'}><EnvTab {...props} /></Match>
             <Match when={tab() === 'domains'}><DomainsTab {...props} /></Match>
             <Match when={tab() === 'git'}><GitTab {...props} /></Match>
             <Match when={tab() === 'scale'}><ScaleTab {...props} /></Match>
+            <Match when={tab() === 'machines'}><MachinesTab {...props} /></Match>
             <Match when={tab() === 'database'}><DatabaseTab {...props} /></Match>
             <Match when={tab() === 'danger'}><DangerTab {...props} /></Match>
           </Switch>
@@ -838,13 +852,14 @@ export function Settings(props: Ctx) {
   );
 }
 
-function SettingsTabs(props: { active: string; limited: boolean }) {
+function SettingsTabs(props: { active: string; limited: boolean; hosted: boolean }) {
   // Access tokens are the scheduler's own page (it mints them), so that tab
-  // goes there, and is absent when the scheduler is not reachable.
+  // goes there, and is absent when the scheduler is not reachable. A Cloudflare
+  // project has no machines.
   const href = (id: string) => (id === 'env' ? '/settings' : id === 'access' ? '/access' : `/settings/${id}`);
   return (
     <nav class="cx-tabs cap">
-      <For each={TABS.filter((t) => !(props.limited && t.id === 'access'))}>
+      <For each={TABS.filter((t) => !(props.limited && t.id === 'access') && !(!props.hosted && t.id === 'machines'))}>
         {(t) => (
           <A
             href={href(t.id)}
@@ -1165,6 +1180,100 @@ function ScaleTab(props: Ctx) {
         <p class="cx-note">Starter runs one SSP, Pro up to three. More SSPs spread views and survive one failing.</p>
       </FxCell>
     </section>
+  );
+}
+
+/* ---------- machines ---------- */
+
+/** The VMs a pro project runs on, and upgrading the project host. */
+function MachinesTab(props: Ctx) {
+  const tenant = props.workspace.id;
+  const path = `/projects/${pid(props.project)}/host`;
+  const [stale, setStale] = createSignal(false);
+  // A refresh that fails keeps what it had: a blip must not hide a running upgrade.
+  const [data, { refetch }] = createResource<HostStatus>(async (_key, info) => {
+    try {
+      const next = await cloud<HostStatus>(path, { tenant });
+      setStale(false);
+      return next;
+    } catch (err) {
+      setStale(true);
+      if (info.value) return info.value;
+      throw err;
+    }
+  });
+  const status = () => (data.error ? undefined : data());
+
+  // Fast while an upgrade runs, slow at rest.
+  const moving = createMemo(() => !!status()?.hosts.some(upgrading));
+  createEffect(() => {
+    const timer = setInterval(() => void refetch(), moving() ? 5000 : 30000);
+    onCleanup(() => clearInterval(timer));
+  });
+
+  const [busy, setBusy] = createSignal(false);
+  const upgrade = async (h: HostView) => {
+    if (!(await confirm(upgradeConfirm(h)))) return;
+    setBusy(true);
+    await act('Upgrade', () => cloud(`${path}/upgrade`, { method: 'POST', tenant }), `Upgrading the project host to ${h.target_type ?? 'the larger type'}`);
+    setBusy(false);
+    void refetch();
+  };
+
+  return (
+    <Show
+      when={status()}
+      fallback={
+        <section class="fx-row">
+          <FxCell label="Machines">
+            <Show when={data.error} fallback={<div class="fx-empty cap">Loading</div>}>
+              <p class="cx-reason bad">{message(data.error)}</p>
+            </Show>
+          </FxCell>
+        </section>
+      }
+    >
+      {(s) => (
+        <Show
+          when={s().hosts.length}
+          fallback={
+            <section class="fx-row">
+              <FxCell label="Machines">
+                <p class="cx-note cx-upfirst">{emptyNote(s())}</p>
+              </FxCell>
+            </section>
+          }
+        >
+          <For each={s().hosts}>
+            {(h) => (
+              <section class="fx-row">
+                <FxCell
+                  label={<span class="cx-head">{kindLabel(h.kind)} <span class={`cx-chip ${statusChip(h).tone}`}>{statusChip(h).label}</span></span>}
+                  meta={<Show when={stale()}><span class="warn">Last refresh failed</span></Show>}
+                >
+                  <div class="cx-kv cx-upkv">
+                    <div><span class="cap">Type</span><b>{h.server_type}</b></div>
+                    <div><span class="cap">Location</span><b>{h.location}</b></div>
+                    <div><span class="cap">Status</span><b>{h.status}</b></div>
+                  </div>
+                  <Show when={kindRole(h.kind)}><p class="cx-note">{kindRole(h.kind)}.</p></Show>
+                  <Show when={upgradeNote(h, s().quiet_window, props.workspace.role)}>
+                    {(note) => <p class="cx-note">{note()}</p>}
+                  </Show>
+                  <Show when={h.upgrade_error}><p class="cx-reason bad">{h.upgrade_error}</p></Show>
+                  <Show when={canUpgrade(h, props.workspace.role)}>
+                    <div class="cx-actions cx-upacts">
+                      <button class="btn btn-primary" disabled={busy()} onClick={() => void upgrade(h)}>Upgrade to {h.target_type}</button>
+                    </div>
+                  </Show>
+                </FxCell>
+              </section>
+            )}
+          </For>
+          <Show when={s().hosts.some((h) => h.upgrade_pending) && s().note}><p class="cx-note">{s().note}</p></Show>
+        </Show>
+      )}
+    </Show>
   );
 }
 

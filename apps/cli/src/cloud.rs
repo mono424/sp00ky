@@ -10484,8 +10484,12 @@ fn db_upgrade_follow() -> Result<()> {
                 }
                 anyhow::bail!("The upgrade failed and the database is unchanged.");
             }
-            // A rollback asked for in the watch window hasn't begun yet: keep following.
-            "soak" if !run["rollback_requested"].as_bool().unwrap_or(false) => {
+            // A rollback or an abort asked for in the watch window hasn't begun yet:
+            // keep following.
+            "soak"
+                if !run["rollback_requested"].as_bool().unwrap_or(false)
+                    && !run["abort_requested"].as_bool().unwrap_or(false) =>
+            {
                 print_db_upgrade_run(run);
                 println!("  The new version is live. If something looks wrong:");
                 println!("    spky db upgrade cancel    goes back without losing a write");

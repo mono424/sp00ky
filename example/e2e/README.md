@@ -42,6 +42,20 @@ result. Helpers live in `fixtures/app.ts`.
 Each test signs up its own users and deletes the threads it created
 (`track`), so the home list (ten threads) stays readable for the next one.
 
+## The upgrade spec (`tests/upgrade`)
+
+`spky db upgrade` against a deployed project, with signed-in browsers on two
+accounts writing and watching throughout: nobody signed out, no page reloaded, every
+write on the server exactly once, live updates still flowing. It changes the
+project for good, so it only runs when given the command:
+
+```bash
+E2E_BASE_URL=... E2E_DB_URL=... E2E_DB_AUTH=... \
+E2E_UPGRADE_CMD='spky db upgrade --confirm my-project' \
+E2E_UPGRADE_VERSION=surrealdb-4.0.0-beta.1 \
+npx playwright test tests/upgrade --project=chromium --no-deps
+```
+
 ## Other specs (`tests/*.spec.ts`)
 
 Older regression tests for specific sync bugs: CRDT merging and folds, the

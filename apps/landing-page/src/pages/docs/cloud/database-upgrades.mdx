@@ -25,17 +25,17 @@ Both kinds of step take a fresh [backup](/docs/cloud/backups) first and stop if 
 The new version opens the same files, so there is nothing to wait for:
 
 1. **Rehearsal.** The database freezes for a moment while its files are linked into a copy. The new version opens that copy on a private network, and it is compared with the live database, then thrown away. You see how long it took to open.
-2. **Swap.** The database stops, a new copy is linked, and the new version starts on it. Expect a few seconds of downtime, about what the rehearsal's opening took. Clients reconnect and resend what they had queued.
+2. **Swap.** The database stops, a new copy is linked, and the new version starts on it. Expect about 5 seconds of downtime, plus however long the rehearsal took to open the data. Clients reconnect and resend what they had queued.
 
 ### From 3.x to 4.x
 
 Opening the data on 4.x converts it, which takes time proportional to its size. So your database keeps serving meanwhile:
 
 1. **Capture.** A database-wide change feed turns on, covering every table.
-2. **Copy and convert.** The new version converts a copy on a private network, and rebuilds the indexes SurrealDB's upgrade notes call for.
+2. **Copy and convert.** The new version converts a copy on a private network and rebuilds every index. An index built on 3.x still answers correctly on 4.x, but some queries plan more slowly until it is rebuilt.
 3. **Catch up.** Every change since the copy is replayed onto the new version, without running your events a second time. Tables your app creates at runtime come along.
 4. **Compare.** Every row of every table is compared between the two.
-5. **Cutover.** Writes are refused for a few seconds while the last changes cross over, then the new version takes over. Clients retry what was refused. Anything a client saw acknowledged has been carried over.
+5. **Cutover.** Writes are refused for about 10 to 20 seconds while the last changes cross over and the new version takes over. Clients retry what was refused. Anything a client saw acknowledged has been carried over.
 6. **Watch window.** For an hour (`--soak-minutes`, up to 2 days), changes keep being recorded, so you can go back without losing anything. Deploys wait until it ends. `spky db upgrade finish` ends it early.
 
 <Warning>

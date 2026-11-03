@@ -95,7 +95,7 @@ async fn call_as(db: &MemDb, actor: &str, method: &str, path: &str, query: &[(&s
     let segments: Vec<&str> = path.split('/').collect();
     let pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     let bytes = if body.is_null() { Vec::new() } else { body.to_string().into_bytes() };
-    dispatch(db, Request { method, path: &segments, query: &pairs, body: &bytes, actor }).await
+    dispatch(db, Request { method, path: &segments, query: &pairs, body: &bytes, actor, dirs: None }).await
 }
 
 // --- pure ---------------------------------------------------------------------
@@ -862,6 +862,75 @@ async fn files_round_trip_rename_and_delete() {
     let root = call(&db, "GET", "buckets/pics/files", &[], Value::Null).await.unwrap();
     assert_eq!(root["files"], json!([]));
     assert_eq!(root["folders"], json!([]));
+}
+
+/// A bucket volume, as a host that mounts it would read it.
+struct FakeDisk;
+
+#[async_trait::async_trait]
+impl BucketDirs for FakeDisk {
+    fn covers(&self, location: &str) -> bool {
+        location.starts_with("/buckets/")
+    }
+
+    async fn list(&self, location: &str, prefix: &str, start: Option<&str>, limit: usize) -> Result<DirPage, String> {
+        assert_eq!(location, "/buckets/disk");
+        if prefix == "boom/" {
+            return Err("permission denied".to_string());
+        }
+        assert_eq!(limit, 100);
+        assert!(start.is_none_or(|s| !s.contains('/')), "a disk listing pages by name: {start:?}");
+        Ok(DirPage {
+            folders: vec![(format!("{prefix}sub").replace('/', "_"), 3)],
+            files: vec![DirFile { name: "a.png".into(), size: 7, updated: Some("2026-01-01T00:00:00Z".into()) }],
+            next: start.is_none().then(|| "a.png".to_string()),
+        })
+    }
+}
+
+async fn with_disk(db: &MemDb, path: &str, query: &[(&str, &str)]) -> AdminResult<Value> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    dispatch(db, Request { method: "GET", path: &segments, query: &pairs, body: &[], actor: "x", dirs: Some(&FakeDisk) }).await
+}
+
+#[tokio::test]
+async fn a_host_with_the_volume_lists_subfolders_on_disk_buckets() {
+    let db = setup().await;
+    db.query("DEFINE BUCKET disk BACKEND \"memory\";", &[]).await.unwrap();
+    // A memory bucket stands in: the listing only reads its backend's location.
+    let info = call(&db, "GET", "buckets", &[], Value::Null).await.unwrap();
+    assert_eq!(info["buckets"].as_array().unwrap().iter().find(|b| b["name"] == "pics").unwrap()["lists_folders"], true);
+
+    // Pure: a file: backend lists folders only where a host covers it.
+    let entry = json!({ "name": "disk", "backend": "file:/buckets/disk" });
+    let empty = json!({});
+    assert_eq!(describe_bucket(&entry, &empty, None)["lists_folders"], false);
+    assert_eq!(describe_bucket(&entry, &empty, Some(&FakeDisk))["lists_folders"], true);
+    let elsewhere = json!({ "name": "disk", "backend": "file:/elsewhere/disk" });
+    assert_eq!(describe_bucket(&elsewhere, &empty, Some(&FakeDisk))["lists_folders"], false);
+
+    // The page has the database listing's shape, keys included, plus the counts.
+    let page = list_dir(&FakeDisk, "/buckets/disk", "a/b/", None, 100).await.unwrap();
+    assert_eq!(page["prefix"], "a/b/");
+    assert_eq!(page["folders"], json!(["a_b_sub"]));
+    assert_eq!(page["counts"], json!({ "a_b_sub": 3 }));
+    assert_eq!(page["files"][0]["key"], "a/b/a.png");
+    assert_eq!(page["files"][0]["name"], "a.png");
+    assert_eq!(page["files"][0]["size"], 7);
+    assert_eq!(page["next"], "a/b/a.png");
+    // The cursor is a key, as in the database's listing; FakeDisk is handed the name.
+    let last = list_dir(&FakeDisk, "/buckets/disk", "a/b/", Some("a/b/a.png"), 100).await.unwrap();
+    assert_eq!(last["next"], Value::Null);
+    let failed = list_dir(&FakeDisk, "/buckets/disk", "boom/", None, 100).await.unwrap_err();
+    assert_eq!(failed.status, 502);
+    assert!(failed.message.contains("permission denied"));
+
+    // Without a file: backend, the disk is not consulted: FakeDisk would panic.
+    let root = with_disk(&db, "buckets/pics/files", &[]).await.unwrap();
+    assert_eq!(root["folders"], json!([]));
+    // A traversal is refused before any host sees it.
+    assert_eq!(with_disk(&db, "buckets/pics/files", &[("prefix", "../x")]).await.unwrap_err().status, 400);
 }
 
 #[tokio::test]

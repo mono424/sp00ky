@@ -3594,6 +3594,7 @@ mod admin_plane {
             cloud_issuer: None,
             cloud_session_ttl: std::time::Duration::from_secs(900),
             data: true,
+            bucket_dir: None,
         };
         admin::build(config, h.admin_deps(None, None))
     }
@@ -3644,6 +3645,7 @@ mod admin_plane {
             cloud_issuer: None,
             cloud_session_ttl: std::time::Duration::from_secs(900),
             data: true,
+            bucket_dir: None,
         };
         admin::build(config, h.admin_deps(cloud_api_url, auth_secret))
     }

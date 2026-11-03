@@ -26,6 +26,9 @@
 //!   tables of push keys and device tokens are not browsed at all.
 //! - `INFO FOR DB` carries every access method's signing keys. Only the parts
 //!   named below ever leave this file.
+//! - A folder's listing can come from the disk instead (see [`BucketDirs`]), and
+//!   that reads names and sizes only: every file operation still goes through
+//!   the database, so its rules and its one writer stay as they are.
 //! - Reads carry a `TIMEOUT` and a `LIMIT`. Nothing here counts or sorts a table
 //!   unasked, a scan of a large user table being a real load on the project's
 //!   database: the Database page's count is a button, and the Users list is sorted
@@ -39,6 +42,7 @@ use serde_json::{json, Map, Value};
 use crate::admin::{AdminError, AdminResult};
 use crate::db::{rows, ScheduleDb, ScheduleDbError};
 use crate::sql::is_plain_identifier;
+use crate::MaybeSendSync;
 
 /// Cap on `?limit=`.
 pub const MAX_ROWS_PAGE: usize = 500;
@@ -86,6 +90,43 @@ pub fn is_off(value: Option<&str>) -> bool {
     matches!(value.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
+/// One folder of a `file:` bucket as the disk has it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DirPage {
+    /// Subfolders, each with how many entries it holds, up to [`DIR_COUNT_CAP`].
+    pub folders: Vec<(String, u64)>,
+    pub files: Vec<DirFile>,
+    /// Where the next page starts, when there is one.
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirFile {
+    pub name: String,
+    pub size: u64,
+    pub updated: Option<String>,
+}
+
+/// Where a folder's entry count stops. The page shows it as "999+".
+pub const DIR_COUNT_CAP: u64 = 1000;
+
+/// A host that can read a `file:` bucket's directory itself.
+///
+/// `file::list` answers with the files of one directory and leaves out the
+/// directories in it, on every SurrealDB version probed (3.1.5, 4.0.0-beta.1), so
+/// through the database a subfolder can only be found by already knowing its path.
+/// A host that mounts the bucket volume read-only can list them. One that cannot
+/// passes `None` and the page says a folder must be opened by its path.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait BucketDirs: MaybeSendSync {
+    /// Whether this host can read a bucket stored at `location`.
+    fn covers(&self, location: &str) -> bool;
+    /// One page of `prefix` (empty, or `a/b/`, already validated) under `location`,
+    /// in name order, starting after the `start` it returned earlier.
+    async fn list(&self, location: &str, prefix: &str, start: Option<&str>, limit: usize) -> Result<DirPage, String>;
+}
+
 /// One request, already authenticated and past the scope rule.
 pub struct Request<'a> {
     pub method: &'a str,
@@ -96,6 +137,8 @@ pub struct Request<'a> {
     /// The session's subject, for the audit line and to stop an operator
     /// removing themselves.
     pub actor: &'a str,
+    /// See [`BucketDirs`].
+    pub dirs: Option<&'a dyn BucketDirs>,
 }
 
 /// Answer one data request. Every change is logged with who made it.
@@ -135,7 +178,7 @@ async fn route(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
         ("PUT", ["users", "user", "password"]) => reset_password(db, req).await,
         ("PUT", ["users", "user", "admin"]) => set_admin(db, req).await,
 
-        ("GET", ["buckets"]) => list_buckets(db).await,
+        ("GET", ["buckets"]) => list_buckets(db, req.dirs).await,
         ("GET", ["buckets", bucket, "files"]) => list_files(db, bucket, req).await,
         ("GET", ["buckets", bucket, "file"]) => read_file(db, bucket, req).await,
         ("PUT", ["buckets", bucket, "file"]) => write_file(db, bucket, req).await,
@@ -1518,7 +1561,7 @@ fn is_r2(info: &Value, bucket: &str) -> bool {
         .any(|f| f.get("name").and_then(Value::as_str) == Some(function.as_str()))
 }
 
-fn describe_bucket(entry: &Value, info: &Value) -> Value {
+fn describe_bucket(entry: &Value, info: &Value, dirs: Option<&dyn BucketDirs>) -> Value {
     let name = entry.get("name").and_then(Value::as_str).unwrap_or_default();
     let raw = entry.get("backend").and_then(Value::as_str).unwrap_or("global");
     let r2 = is_r2(info, name);
@@ -1530,30 +1573,33 @@ fn describe_bucket(entry: &Value, info: &Value) -> Value {
         raw
     };
     let comment = entry.get("comment").and_then(Value::as_str);
+    let location = raw.strip_prefix("file:");
+    let on_disk = !r2 && location.is_some_and(|l| dirs.is_some_and(|d| d.covers(l)));
     json!({
         "name": name,
         "backend": kind,
-        "location": raw.strip_prefix("file:"),
+        "location": location,
         "readonly": entry.get("readonly").and_then(Value::as_bool).unwrap_or(false),
         "max_bytes": max_size_of(comment),
         // Its database listing would be empty and a file put there would vanish
         // on restart; the files are in the SSP's store.
         "browsable": !r2,
         // SurrealDB's file store lists one directory and leaves its
-        // subdirectories out, so a folder there is only found by its path.
-        "lists_folders": kind != "file",
+        // subdirectories out, so without the disk a folder there is only found
+        // by its path.
+        "lists_folders": kind != "file" || on_disk,
     })
 }
 
 /// `GET buckets`.
-async fn list_buckets(db: &dyn ScheduleDb) -> AdminResult<Value> {
+async fn list_buckets(db: &dyn ScheduleDb, dirs: Option<&dyn BucketDirs>) -> AdminResult<Value> {
     let info = db_info(db).await?;
     let mut buckets: Vec<Value> = info
         .get("buckets")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|b| describe_bucket(b, &info))
+        .map(|b| describe_bucket(b, &info, dirs))
         .collect();
     buckets.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(json!({
@@ -1585,7 +1631,7 @@ fn checked_key(key: Option<&str>) -> AdminResult<String> {
 
 /// A folder as a listing prefix: `a/b/`, or empty for the bucket's root.
 fn checked_prefix(prefix: Option<&str>) -> AdminResult<String> {
-    let trimmed = prefix.map(str::trim).unwrap_or_default().trim_matches('/');
+    let trimmed = prefix.unwrap_or_default().trim_matches('/');
     if trimmed.is_empty() {
         return Ok(String::new());
     }
@@ -1608,6 +1654,21 @@ async fn list_files(db: &dyn ScheduleDb, bucket: &str, req: &Request<'_>) -> Adm
     let bucket = checked_bucket(bucket)?;
     let prefix = checked_prefix(param(req, "prefix"))?;
     let limit = number_param(req, "limit").unwrap_or(DEFAULT_FILE_PAGE).clamp(1, MAX_FILE_PAGE);
+    if let Some(dirs) = req.dirs {
+        let info = db_info(db).await?;
+        let location = info
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|b| b["name"] == bucket)
+            .and_then(|b| b.get("backend")?.as_str()?.strip_prefix("file:"))
+            .filter(|l| dirs.covers(l))
+            .map(str::to_string);
+        if let Some(location) = location {
+            return list_dir(dirs, &location, &prefix, param(req, "start"), limit).await;
+        }
+    }
     let mut cursor = param(req, "start").map(str::to_string);
     let expected = format!("/{prefix}");
 
@@ -1673,6 +1734,30 @@ async fn list_files(db: &dyn ScheduleDb, bucket: &str, req: &Request<'_>) -> Adm
         "folders": folders,
         "files": files,
         "next": if more { cursor } else { None },
+    }))
+}
+
+/// A folder off the disk, in the shape the database's listing answers with.
+async fn list_dir(dirs: &dyn BucketDirs, location: &str, prefix: &str, start: Option<&str>, limit: usize) -> AdminResult<Value> {
+    // `start` and `next` are keys, here as in the database's listing, so a page
+    // still follows on after the host gains or loses the volume.
+    let start = start.and_then(|s| s.strip_prefix(prefix));
+    let page = dirs
+        .list(location, prefix, start, limit)
+        .await
+        .map_err(|e| AdminError::new(502, format!("Could not read this folder from the bucket volume: {e}")))?;
+    let counts: Map<String, Value> = page.folders.iter().map(|(name, n)| (name.clone(), json!(n))).collect();
+    let files: Vec<Value> = page
+        .files
+        .iter()
+        .map(|f| json!({ "key": format!("{prefix}{}", f.name), "name": f.name, "size": f.size, "updated": f.updated }))
+        .collect();
+    Ok(json!({
+        "prefix": prefix,
+        "folders": page.folders.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        "counts": counts,
+        "files": files,
+        "next": page.next.as_ref().map(|name| format!("{prefix}{name}")),
     }))
 }
 

@@ -625,6 +625,7 @@ falls back to polling on its own.
 | `SPKY_ADMIN_CLOUD_ISSUER`           | `SPKY_CLOUD_API_URL`          | The issuer a grant must name                                                                                                                                                                                                                                           |
 | `SPKY_ADMIN_CLOUD_SESSION_TTL_SECS` | `900`                         | Lifetime of a session opened with a grant (capped by `SPKY_ADMIN_SESSION_TTL_SECS`)                                                                                                                                                                                    |
 | `SPKY_ADMIN_DATA`                   | `true`                        | Set to `0`/`false`/`off`/`no` to refuse `/admin/api/data` and hide the console's Database, Users and Storage pages for this project. On Sp00ky Cloud, set it under `deployment.env` for the `scheduler`  |
+| `SPKY_BUCKET_DIR`                   | unset                         | A directory holding `file:` buckets, mounted read-only at the same path SurrealDB uses. Buckets under it list their subfolders in the Storage page. Writes still go through SurrealDB |
 | `SPKY_CLOUD_API_URL`                | unset                         | Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane                                                                                                                                                                                  |
 | `SPKY_CLOUD_PROJECT`                | unset                         | The project slug, injected alongside it                                                                                                                                                                                                                                |
 | `SPKY_PROJECT_SLUG`                 | `default`                     | Storage prefix for backups on an unlinked scheduler                                                                                                                                                                                                                    |
@@ -824,8 +825,8 @@ its text.
 | `PUT /data/users/user/password?id=` | `{password}`, 8 characters or more, hashed with the algorithm `SIGNIN` compares with. `501` when `SIGNIN` does not show one |
 | `PUT /data/users/user/admin?id=` | `{admin, note?}`: what `spky admin add` and `remove` do. Nobody can remove themselves |
 | `DELETE /data/users/user?id=` | The row, its roster entry and its feature flags. Nobody can delete themselves |
-| `GET /data/buckets` | Each bucket's backend and limit, and whether it can be browsed |
-| `GET /data/buckets/:bucket/files` | `?prefix=`, `?start=`, `?limit=`. One folder's `files` and `folders`, and `next` when there is more |
+| `GET /data/buckets` | Each bucket's backend and limit, whether it can be browsed, and `lists_folders`: `false` for a `file:` bucket whose subfolders this host cannot see |
+| `GET /data/buckets/:bucket/files` | `?prefix=`, `?start=`, `?limit=`. One folder's `files` and `folders`, and `next` when there is more. `counts` gives each folder's entries, up to 1000, when the folder was read from disk |
 | `GET /data/buckets/:bucket/file?key=` | `{key, size, updated, data}`, `data` in base64, up to 32 MB. `&meta=1` leaves `data` out |
 | `PUT /data/buckets/:bucket/file?key=` | `{data}` in base64. `409` when the key is in use, unless `&overwrite=1` |
 | `DELETE /data/buckets/:bucket/file?key=` | One file |

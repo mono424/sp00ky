@@ -4,17 +4,23 @@ import assert from 'node:assert/strict';
 import {
   base64ToBytes,
   baseKind,
+  childOn,
+  columnPrefixes,
   columnsOf,
+  countLabel,
   crumbsOf,
   draftOf,
   editorFor,
+  extensionOf,
   fileKindOf,
+  folderSummary,
   generatePassword,
   holdsMask,
   isRedacted,
   isTrimmed,
   looksLikeStamp,
   normalizePrefix,
+  parentOf,
   parseDraft,
   previewMime,
   recordTable,
@@ -134,13 +140,40 @@ test('words that write are found in code, not in strings or comments', () => {
 test('a prefix breaks into the folders on the way to it', () => {
   assert.deepEqual(crumbsOf(''), []);
   assert.deepEqual(crumbsOf('a/b/'), [{ name: 'a', prefix: 'a/' }, { name: 'b', prefix: 'a/b/' }]);
-  assert.equal(normalizePrefix(' /a//b/ '), 'a/b/');
+  assert.equal(normalizePrefix('/a//b/'), 'a/b/');
+  assert.equal(normalizePrefix(' a/'), ' a/');
   assert.equal(normalizePrefix('/'), '');
   assert.equal(normalizePrefix('a'), 'a/');
 });
 
+test('a path opens as one column per level', () => {
+  assert.deepEqual(columnPrefixes(''), ['']);
+  assert.deepEqual(columnPrefixes('a/b/'), ['', 'a/', 'a/b/']);
+  assert.equal(parentOf('a/b/x.png'), 'a/b/');
+  assert.equal(parentOf('x.png'), '');
+  assert.equal(childOn('', 'a/b/'), 'a');
+  assert.equal(childOn('a/', 'a/b/'), 'b');
+  assert.equal(childOn('a/b/', 'a/b/'), null, 'the last column has no next folder');
+  assert.equal(childOn('c/', 'a/b/'), null, 'not on the way');
+  // A folder that only shares a start with another is not on the way to it.
+  assert.equal(childOn('ab/', 'a/b/'), null);
+  assert.equal(extensionOf('a/photo.PNG'), 'png');
+  assert.equal(extensionOf('.env'), '');
+});
+
+test('a folder says what it holds', () => {
+  assert.equal(countLabel(3), '3');
+  assert.equal(countLabel(1000), '999+');
+  assert.equal(folderSummary(0, 0, false), 'Empty');
+  assert.equal(folderSummary(1, 0, false), '1 folder');
+  assert.equal(folderSummary(2, 1, false), '2 folders, 1 file');
+  assert.equal(folderSummary(0, 100, true), '100 files so far');
+});
+
 test('nothing previewable can run as a page', () => {
   assert.equal(fileKindOf('a/photo.PNG'), 'image');
+  assert.equal(fileKindOf('x.constructor'), 'other');
+  assert.equal(previewMime('x.__proto__'), 'application/octet-stream');
   assert.equal(fileKindOf('clip.webm'), 'video');
   assert.equal(fileKindOf('notes.md'), 'text');
   assert.equal(fileKindOf('page.html'), 'text', 'read as text, never rendered');

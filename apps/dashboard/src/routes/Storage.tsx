@@ -1,16 +1,21 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup } from 'solid-js';
+import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount, untrack } from 'solid-js';
 import { A, useNavigate, useParams, useSearchParams } from '@solidjs/router';
 import { api, ApiError, currentMode } from '../api/client';
 import { confirm, toast } from '../components/Actions';
 import { PageHead } from '../components/Chrome';
 import { CopyText, DataError, enc, useCanWrite } from '../components/DataParts';
-import { Sheet, SheetSection } from '../components/Frame';
 import { formatBytes, formatStamp, relativeStamp } from '../lib/format';
 import {
   base64ToBytes,
+  childOn,
+  columnPrefixes,
+  countLabel,
   crumbsOf,
+  extensionOf,
   fileKindOf,
+  folderSummary,
   normalizePrefix,
+  parentOf,
   previewMime,
   type BucketInfo,
   type BucketsAnswer,
@@ -20,8 +25,10 @@ import {
 } from '../lib/data';
 
 /**
- * The files of the project's SurrealDB buckets. A bucket has keys, not folders;
- * the server reads a folder out of them (see `list_files`).
+ * The files of the project's SurrealDB buckets, as columns: one per folder on the
+ * way to where you are, with what you opened in the last. A bucket has keys, not
+ * folders; the server reads a folder out of them (see `list_files`), or off the
+ * disk on a `file:` bucket whose volume it can read.
  *
  * Bytes come back as base64. Nothing is ever opened as a page: a blob URL keeps
  * this page's origin, so an uploaded HTML file rendered from one could read the
@@ -33,6 +40,10 @@ import {
 /** A preview loads by itself up to this size; past it, on request. */
 const AUTO_PREVIEW_BYTES = 4 * 1024 * 1024;
 const TEXT_PREVIEW_BYTES = 256 * 1024;
+
+/** The widths in styles/frame.css, which the columns are fitted to. */
+const COLUMN_WIDTH = 248;
+const PANE_MIN_WIDTH = 340;
 
 /** Folders opened by hand, for a backend that cannot list them. */
 function rememberedKey(bucket: string): string {
@@ -87,7 +98,7 @@ export function Storage() {
   return (
     <>
       <PageHead title="Storage" />
-      <div class="dx-page dx-split">
+      <div class="dx-page dx-split st-page">
         <aside class="dx-side">
           <div class="dx-side-find dx-side-title">
             <span class="cap">Buckets</span>
@@ -97,11 +108,11 @@ export function Storage() {
             <For each={buckets()}>{(b) => <option value={b.name} selected={b.name === params.bucket}>{b.name}</option>}</For>
           </select>
           <div class="dx-side-list">
-            <For each={buckets()} fallback={<Show when={list()}><div class="dx-side-empty cap">No buckets</div></Show>}>
+            <For each={buckets()} fallback={<Show when={list()}><div class="dx-side-empty">No buckets</div></Show>}>
               {(b) => (
-                <A class="dx-tlink" activeClass="on" href={`/storage/${enc(b.name)}`}>
+                <A class="dx-tlink st-blink" activeClass="on" href={`/storage/${enc(b.name)}`}>
                   <span class="dx-tname">{b.name}</span>
-                  <span class="cap">{b.backend}</span>
+                  <span class="st-backend">{b.backend}</span>
                 </A>
               )}
             </For>
@@ -112,13 +123,14 @@ export function Storage() {
             <div class="dx-pad"><DataError message={(list() as { ok: false; message: string }).message} /></div>
           </Show>
           <Show when={answer() && !buckets().length}>
-            <div class="dx-empty">
-              <p class="cap">This project has no buckets</p>
-              <p class="dx-note cap">Add one with `spky bucket create`.</p>
+            <div class="st-note">
+              <h2>No buckets yet</h2>
+              <p>Add one with <code>spky bucket create</code>, then deploy.</p>
             </div>
           </Show>
-          <Show when={current()} keyed>
-            {(b) => <BucketView bucket={b} limits={answer()!} canWrite={canWrite()} />}
+          {/* By name: reloading the list must not drop running uploads or the selection. */}
+          <Show when={current()?.name} keyed>
+            {(_name) => <BucketView bucket={current()!} limits={answer()!} canWrite={canWrite()} />}
           </Show>
         </div>
       </div>
@@ -133,80 +145,103 @@ interface Upload {
   error?: string;
 }
 
+interface Summary {
+  folders: number;
+  files: number;
+  bytes: number;
+  more: boolean;
+}
+
 function BucketView(props: { bucket: BucketInfo; limits: BucketsAnswer; canWrite: boolean }) {
   const [query, setQuery] = useSearchParams<{ path?: string; file?: string }>();
   const url = `/data/buckets/${enc(props.bucket.name)}`;
-  const prefix = () => normalizePrefix(query.path ?? '');
+  const fileKey = () => query.file;
+  // An open file decides the folder, whatever else the address says.
+  const path = () => (fileKey() ? parentOf(fileKey()!) : normalizePrefix(query.path ?? ''));
+  const prefixes = createMemo(() => columnPrefixes(path()));
   const writable = () => props.canWrite && props.bucket.browsable && !props.bucket.readonly;
 
-  const [cursor, setCursor] = createSignal<string | null>(null);
-  const [folders, setFolders] = createSignal<string[]>([]);
-  const [files, setFiles] = createSignal<FileEntry[]>([]);
-  const [next, setNext] = createSignal<string | null>(null);
-  const [error, setError] = createSignal<string>();
-  const [loading, setLoading] = createSignal(false);
+  /** Bumped by anything that changes files, so every open column reads again. */
+  const [version, setVersion] = createSignal(0);
+  const refresh = () => setVersion((v) => v + 1);
+  const [summaries, setSummaries] = createSignal<Record<string, Summary>>({});
   const [selected, setSelected] = createSignal<ReadonlySet<string>>(new Set<string>());
   const [filter, setFilter] = createSignal('');
   const [goTo, setGoTo] = createSignal('');
   const [uploads, setUploads] = createSignal<Upload[]>([]);
   const [dragging, setDragging] = createSignal(false);
   const [remembered, setRemembered] = createSignal(readRemembered(props.bucket.name));
+  const [room, setRoom] = createSignal(0);
   let fileInput: HTMLInputElement | undefined;
+  let scroller: HTMLDivElement | undefined;
 
-  // Only the newest request answers: a slow folder must not land over the one
-  // opened after it.
-  let latest = 0;
-  const load = async (more: boolean) => {
-    if (!props.bucket.browsable) return;
-    const mine = ++latest;
-    setLoading(true);
-    const p = new URLSearchParams();
-    if (prefix()) p.set('prefix', prefix());
-    if (more && cursor()) p.set('start', cursor()!);
-    const r = await api.getResult<FilesPage>(`${url}/files?${p.toString()}`);
-    if (mine !== latest) return;
-    setLoading(false);
-    if (!r.ok) {
-      setError(r.message);
-      return;
-    }
-    setError(undefined);
-    setFolders(more ? [...new Set([...folders(), ...r.value.folders])] : r.value.folders);
-    setFiles(more ? [...files(), ...r.value.files] : r.value.files);
-    setNext(r.value.next);
-    setCursor(r.value.next);
-    if (!more) setSelected(new Set<string>());
-    // A folder found by its path is worth a shortcut on a backend that hides it.
-    if (!props.bucket.lists_folders && prefix() && (r.value.files.length || r.value.folders.length)) {
-      remember(props.bucket.name, prefix());
-      setRemembered(readRemembered(props.bucket.name));
-    }
-  };
-  createEffect(() => {
-    prefix();
-    void load(false);
+  onMount(() => {
+    if (!scroller) return;
+    // Measured now as well: the first scroll below has to see the pane's real width.
+    setRoom(scroller.clientWidth);
+    const watch = new ResizeObserver(() => setRoom(scroller?.clientWidth ?? 0));
+    watch.observe(scroller);
+    onCleanup(() => watch.disconnect());
   });
+  /**
+   * How wide the last column is, so that scrolling to the end stops on a column's
+   * edge: as many whole columns as fit beside it, and it takes the rest. Anything
+   * else leaves the first one on screen cut off through its names.
+   */
+  const paneWidth = () => {
+    const fits = Math.max(1, Math.floor((room() - PANE_MIN_WIDTH) / COLUMN_WIDTH));
+    return `${Math.max(PANE_MIN_WIDTH, room() - fits * COLUMN_WIDTH)}px`;
+  };
 
-  const open = (path: string) => setQuery({ path: path || undefined, file: undefined });
+  const openFolder = (prefix: string) => {
+    setFilter('');
+    setQuery({ path: prefix || undefined, file: undefined });
+  };
+  const openFile = (key: string) => setQuery({ path: undefined, file: key });
   const openTyped = (e: Event) => {
     e.preventDefault();
-    open(normalizePrefix(goTo()));
+    openFolder(normalizePrefix(goTo().trim()));
     setGoTo('');
   };
 
-  const needle = () => filter().trim().toLowerCase();
-  const shownFolders = createMemo(() => folders().filter((f) => f.toLowerCase().includes(needle())));
-  const shownFiles = createMemo(() => files().filter((f) => f.name.toLowerCase().includes(needle())));
-  const empty = () => !loading() && !error() && !folders().length && !files().length;
+  // The newest column is the one being looked at. A phone shows one pane at a
+  // time, so there it stops on the folder's contents, with its details a swipe away.
+  const showNewest = (behavior: ScrollBehavior) => {
+    if (!scroller) return;
+    const columns = scroller.querySelectorAll<HTMLElement>('.st-col');
+    const contents = !fileKey() && window.matchMedia?.('(max-width: 860px)').matches ? columns[columns.length - 1] : undefined;
+    scroller.scrollTo({ left: contents ? contents.offsetLeft : scroller.scrollWidth, behavior });
+  };
+  createEffect(
+    on(
+      () => [prefixes().length, fileKey()],
+      (_, before) => {
+        // Opening a page lands on its place at once; only walking there slides.
+        const slide = before && !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+        queueMicrotask(() => showNewest(slide ? 'smooth' : 'auto'));
+      },
+    ),
+  );
+  createEffect(on(room, () => showNewest('auto'), { defer: true }));
 
-  const allShown = () => shownFiles().length > 0 && shownFiles().every((f) => selected().has(f.key));
-  const toggleAll = () => setSelected(allShown() ? new Set<string>() : new Set(shownFiles().map((f) => f.key)));
+  // A selection belongs to the folder it was made in.
+  createEffect(on(path, () => setSelected(new Set<string>()), { defer: true }));
+
   const toggle = (key: string) => {
     const set = new Set(selected());
     if (set.has(key)) set.delete(key);
     else set.add(key);
     setSelected(set);
   };
+
+  /** A folder found by its path is worth a shortcut where nothing else can list it. */
+  const noteFolder = (prefix: string, found: boolean) => {
+    if (props.bucket.lists_folders || !prefix || !found) return;
+    remember(props.bucket.name, prefix);
+    setRemembered(readRemembered(props.bucket.name));
+  };
+
+  const summarize = (prefix: string, s: Summary) => setSummaries((all) => ({ ...all, [prefix]: s }));
 
   const removeSelected = async () => {
     const keys = [...selected()];
@@ -220,7 +255,9 @@ function BucketView(props: { bucket: BucketInfo; limits: BucketsAnswer; canWrite
     try {
       await api.post(`${url}/delete`, { keys });
       toast('ok', `${keys.length} deleted`);
-      void load(false);
+      if (fileKey() && keys.includes(fileKey()!)) setQuery({ path: path() || undefined, file: undefined });
+      setSelected(new Set<string>());
+      refresh();
     } catch (err) {
       toast('bad', 'Could not delete', err instanceof Error ? err.message : undefined);
     }
@@ -232,10 +269,11 @@ function BucketView(props: { bucket: BucketInfo; limits: BucketsAnswer; canWrite
   /** One at a time: each holds the whole file in memory on the way through. */
   const upload = async (list: File[]) => {
     if (!list.length) return;
+    const target = path();
     setUploads(list.map((f) => ({ name: f.name, size: f.size, state: 'waiting' })));
     for (const file of list) {
       patchUpload(file.name, { state: 'uploading' });
-      const key = `${prefix()}${file.name}`;
+      const key = `${target}${file.name}`;
       try {
         const data = await fileToBase64(file);
         const put = (overwrite: boolean) =>
@@ -260,7 +298,7 @@ function BucketView(props: { bucket: BucketInfo; limits: BucketsAnswer; canWrite
         patchUpload(file.name, { state: 'failed', error: err instanceof Error ? err.message : 'Upload failed' });
       }
     }
-    void load(false);
+    refresh();
   };
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
@@ -269,12 +307,48 @@ function BucketView(props: { bucket: BucketInfo; limits: BucketsAnswer; canWrite
   };
   const uploadsDone = () => uploads().length > 0 && uploads().every((u) => u.state === 'done' || u.state === 'failed');
 
-  const opened = () => query.file;
+  /** Arrows walk the columns: up and down within one, right into a folder, left back out. */
+  const onKey = (e: KeyboardEvent) => {
+    const row = (e.target as HTMLElement).closest<HTMLElement>('.st-row');
+    if (!row) return;
+    const column = row.closest<HTMLElement>('.st-col');
+    if (!column) return;
+    const rows = [...column.querySelectorAll<HTMLElement>('.st-row')];
+    const at = rows.indexOf(row);
+    const step = (to: HTMLElement | undefined) => {
+      e.preventDefault();
+      to?.focus();
+    };
+    if (e.key === 'ArrowDown') return step(rows[at + 1]);
+    if (e.key === 'ArrowUp') return step(rows[at - 1]);
+    if (e.key === 'ArrowRight' && row.dataset.folder) {
+      e.preventDefault();
+      row.click();
+      // The next column is there on the next tick, its rows once it has read.
+      setTimeout(() => (column.nextElementSibling?.querySelector('.st-row') as HTMLElement | null)?.focus(), 250);
+    }
+    if (e.key === 'ArrowLeft') {
+      const before = column.previousElementSibling as HTMLElement | null;
+      if (!before) return;
+      e.preventDefault();
+      (before.querySelector('.st-row.trail, .st-row.now') as HTMLElement | null)?.focus();
+    }
+  };
+
+  // Escape closes what is open, back to the folder it is in.
+  const onEscape = (e: KeyboardEvent) => {
+    if (e.key === 'Escape' && fileKey() && !document.querySelector('dialog[open]')) setQuery({ path: path() || undefined, file: undefined });
+  };
+  document.addEventListener('keydown', onEscape);
+  onCleanup(() => document.removeEventListener('keydown', onEscape));
+
+  const reference = (prefix: string) => `/${prefix}`;
 
   return (
     <div
-      class="dx-table dx-bucket"
+      class="st-bucket"
       classList={{ dropping: dragging() }}
+      data-target={`Drop to upload to ${reference(path())}`}
       onDragOver={(e) => {
         if (!writable()) return;
         e.preventDefault();
@@ -285,184 +359,382 @@ function BucketView(props: { bucket: BucketInfo; limits: BucketsAnswer; canWrite
       }}
       onDrop={onDrop}
     >
-      <div class="dx-bar">
-        <div class="dx-bar-title">
-          <b>{props.bucket.name}</b>
-          <span class="cap">
-            {props.bucket.backend}
-            <Show when={props.bucket.max_bytes}> · app limit {formatBytes(props.bucket.max_bytes)}</Show>
-            <Show when={props.bucket.readonly}> · read-only</Show>
-          </span>
-        </div>
-        <Show when={props.bucket.browsable}>
-          <div class="dx-bar-end">
-            <Show when={selected().size}>
-              <button class="btn btn-sm dx-danger" onClick={() => void removeSelected()}>Delete {selected().size}</button>
-            </Show>
-            <input class="dx-find" type="search" placeholder="Filter this folder" aria-label="Filter this folder" value={filter()} onInput={(e) => setFilter(e.currentTarget.value)} />
-            <Show when={writable()}>
-              <input
-                ref={fileInput}
-                type="file"
-                multiple
-                hidden
-                onChange={(e) => {
-                  void upload([...(e.currentTarget.files ?? [])]);
-                  e.currentTarget.value = '';
-                }}
-              />
-              <button class="btn btn-sm btn-primary" title={`Up to about ${formatBytes(props.limits.default_upload_bytes)} a file, unless the database's request limit was raised`} onClick={() => fileInput?.click()}>Upload</button>
-            </Show>
-            <button class="dx-iconbtn" title="Reload" aria-label="Reload" onClick={() => void load(false)}>↻</button>
-          </div>
-        </Show>
-      </div>
-
-      <Show when={!props.bucket.browsable}>
-        <div class="dx-pad">
-          <div class="dx-hint">
-            <b>This bucket's files are not in the database.</b>
-            <span>It is declared `BACKEND "r2"`: the SSP keeps its files in R2 (on Cloudflare) or a directory, and the database only checks permissions. Browsing that store is not available here yet.</span>
-          </div>
-        </div>
-      </Show>
-
-      <Show when={props.bucket.browsable}>
-        <div class="dx-crumbs">
-          <button class="fx-link" classList={{ 'dx-here': !prefix() }} onClick={() => open('')}>{props.bucket.name}</button>
-          <For each={crumbsOf(prefix())}>
-            {(c, i) => (
+      <div class="st-bar">
+        <nav class="st-crumbs" aria-label="Path">
+          <button class="st-crumb" classList={{ here: !path() && !fileKey() }} onClick={() => openFolder('')}>{props.bucket.name}</button>
+          <For each={crumbsOf(path())}>
+            {(c) => (
               <>
-                <span class="dx-sep">/</span>
-                <button class="fx-link" classList={{ 'dx-here': i() === crumbsOf(prefix()).length - 1 }} onClick={() => open(c.prefix)}>{c.name}</button>
+                <span class="st-sep" aria-hidden="true">/</span>
+                <button class="st-crumb" classList={{ here: c.prefix === path() && !fileKey() }} onClick={() => openFolder(c.prefix)}>{c.name}</button>
               </>
             )}
           </For>
-          <form class="dx-goto" onSubmit={openTyped}>
-            <input placeholder="Open a folder by path" aria-label="Open a folder by path" value={goTo()} onInput={(e) => setGoTo(e.currentTarget.value)} />
-          </form>
-        </div>
-
-        <Show when={!props.bucket.lists_folders}>
-          <div class="dx-hint inline">
-            <span><b>Subfolders don't show up here.</b> This bucket lives on disk, and SurrealDB lists one folder at a time without naming the folders inside it. Open one by its path.</span>
-            <Show when={remembered().length}>
-              <span class="dx-remembered">
-                <For each={remembered()}>{(p) => <button class="dx-chip plain" onClick={() => open(p)}>{p}</button>}</For>
-              </span>
-            </Show>
-          </div>
-        </Show>
-
-        <Show when={uploads().length}>
-          <div class="dx-uploads">
-            <div class="fx-head">
-              <span class="cap">Uploads</span>
-              <Show when={uploadsDone()}><button class="fx-link cap fx-meta" onClick={() => setUploads([])}>Dismiss</button></Show>
-            </div>
-            <For each={uploads()}>
-              {(u) => (
-                <div class="dx-upload" classList={{ bad: u.state === 'failed' }}>
-                  <span class="dx-tname">{u.name}</span>
-                  <span class="cap">{formatBytes(u.size)}</span>
-                  <span class="cap dx-upload-state">{u.state === 'failed' ? u.error : u.state}</span>
-                </div>
-              )}
-            </For>
-          </div>
-        </Show>
-
-        <DataError message={error()} />
-
-        <div class="dx-grid-wrap">
-          <table class="dx-grid dx-files">
-            <thead>
-              <tr>
+          <Show when={fileKey()}>
+            {(k) => (
+              <>
+                <span class="st-sep" aria-hidden="true">/</span>
+                <span class="st-crumb here">{k().slice(k().lastIndexOf('/') + 1)}</span>
+              </>
+            )}
+          </Show>
+        </nav>
+        <Show when={props.bucket.browsable}>
+          <Show
+            when={selected().size}
+            fallback={
+              <div class="st-tools">
+                <form class="st-goto" onSubmit={openTyped}>
+                  <input placeholder="Go to folder" aria-label="Go to folder" value={goTo()} onInput={(e) => setGoTo(e.currentTarget.value)} />
+                </form>
+                <input class="st-filter" type="search" placeholder="Filter" aria-label="Filter this folder" value={filter()} onInput={(e) => setFilter(e.currentTarget.value)} />
+                <button class="dx-iconbtn" title="Reload" aria-label="Reload" onClick={refresh}>↻</button>
                 <Show when={writable()}>
-                  <th class="dx-check"><input type="checkbox" aria-label="Select all files" checked={allShown()} onChange={toggleAll} /></th>
+                  <input
+                    ref={fileInput}
+                    type="file"
+                    multiple
+                    hidden
+                    onChange={(e) => {
+                      void upload([...(e.currentTarget.files ?? [])]);
+                      e.currentTarget.value = '';
+                    }}
+                  />
+                  <button
+                    class="btn btn-sm btn-primary"
+                    title={`Up to about ${formatBytes(props.limits.default_upload_bytes)} a file, unless the database's request limit was raised`}
+                    onClick={() => fileInput?.click()}
+                  >
+                    Upload
+                  </button>
                 </Show>
-                <th>Name</th>
-                <th class="dx-r">Size</th>
-                <th class="dx-col-mid">Modified</th>
-              </tr>
-            </thead>
-            <tbody>
-              <For each={shownFolders()}>
-                {(f) => (
-                  <tr class="dx-rowlink" onClick={() => open(`${prefix()}${f}/`)}>
-                    <Show when={writable()}><td class="dx-check" /></Show>
-                    <td class="dx-fname"><FileGlyph folder /><button class="dx-open">{f}/</button></td>
-                    <td class="dx-r dx-dim">—</td>
-                    <td class="dx-col-mid dx-dim">—</td>
-                  </tr>
-                )}
-              </For>
-              <For each={shownFiles()}>
-                {(f) => (
-                  <tr class="dx-rowlink" classList={{ on: selected().has(f.key) }} onClick={() => setQuery({ file: f.key })}>
-                    <Show when={writable()}>
-                      <td class="dx-check" onClick={(e) => e.stopPropagation()}>
-                        <input type="checkbox" aria-label={`Select ${f.name}`} checked={selected().has(f.key)} onChange={() => toggle(f.key)} />
-                      </td>
-                    </Show>
-                    <td class="dx-fname"><FileGlyph name={f.name} /><button class="dx-open">{f.name}</button></td>
-                    <td class="dx-r">{formatBytes(f.size)}</td>
-                    <td class="dx-col-mid" title={formatStamp(f.updated)}>{relativeStamp(f.updated)}</td>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
-          <Show when={empty()}>
-            <div class="dx-empty">
-              <p class="cap">{prefix() ? 'Nothing in this folder' : 'This bucket is empty'}</p>
-              <Show when={writable()}><p class="dx-note cap">Drop files here, or use Upload.</p></Show>
+              </div>
+            }
+          >
+            <div class="st-tools st-picked">
+              <span>{selected().size} selected</span>
+              <button class="btn btn-sm" onClick={() => setSelected(new Set<string>())}>Clear</button>
+              <button class="btn btn-sm dx-danger" onClick={() => void removeSelected()}>
+                Delete {selected().size} {selected().size === 1 ? 'file' : 'files'}
+              </button>
             </div>
           </Show>
-          <Show when={next()}>
-            <div class="dx-more"><button class="btn btn-sm" disabled={loading()} onClick={() => void load(true)}>{loading() ? 'Loading…' : 'Load more'}</button></div>
+        </Show>
+      </div>
+
+      <Show
+        when={props.bucket.browsable}
+        fallback={
+          <div class="st-note">
+            <h2>These files are in R2, not in the database</h2>
+            <p>This bucket is declared <code>BACKEND "r2"</code>: the SSP keeps its files next to itself, and the database only checks permissions. Browsing that store is not available here yet.</p>
+          </div>
+        }
+      >
+        <Show when={!props.bucket.lists_folders}>
+          <p class="st-limit-short">Subfolders are hidden here. Use Go to folder to open one by its path.</p>
+        </Show>
+        {/* Columns scroll sideways; arrow keys are handled for the rows inside them. */}
+        <div class="st-columns" ref={scroller} style={{ '--st-pane': paneWidth() }} onKeyDown={onKey}>
+          <For each={prefixes()}>
+            {(prefix) => (
+              <Column
+                url={url}
+                prefix={prefix}
+                path={path()}
+                fileKey={fileKey()}
+                version={version()}
+                filter={prefix === path() ? filter() : ''}
+                selected={selected()}
+                selectable={writable()}
+                onFolder={openFolder}
+                onFile={openFile}
+                onToggle={toggle}
+                onLoaded={(found) => noteFolder(prefix, found)}
+                onSummary={(s) => summarize(prefix, s)}
+              />
+            )}
+          </For>
+          <Show
+            when={fileKey()}
+            keyed
+            fallback={
+              <FolderPane
+                bucket={props.bucket}
+                prefix={path()}
+                summary={summaries()[path()]}
+                writable={writable()}
+                remembered={remembered()}
+                onUpload={() => fileInput?.click()}
+                onOpen={openFolder}
+              />
+            }
+          >
+            {(key) => (
+              <FilePane
+                bucket={props.bucket}
+                fileKey={key}
+                maxRead={props.limits.max_read_bytes}
+                writable={writable()}
+                onClose={() => setQuery({ path: parentOf(key) || undefined, file: undefined })}
+                onMoved={(to) => {
+                  refresh();
+                  openFile(to);
+                }}
+                onGone={() => {
+                  setQuery({ path: parentOf(key) || undefined, file: undefined });
+                  refresh();
+                }}
+              />
+            )}
           </Show>
         </div>
       </Show>
 
-      <Show when={opened()} keyed>
-        {(key) => (
-          <FileSheet
-            bucket={props.bucket}
-            fileKey={key}
-            maxRead={props.limits.max_read_bytes}
-            writable={writable()}
-            onClose={() => setQuery({ file: undefined })}
-            onChanged={() => void load(false)}
-          />
-        )}
+      <Show when={uploads().length}>
+        <div class="st-tray" role="status">
+          <div class="st-tray-head">
+            <span>{uploadsDone() ? 'Uploads finished' : 'Uploading'}</span>
+            <Show when={uploadsDone()}><button class="fx-link" onClick={() => setUploads([])}>Dismiss</button></Show>
+          </div>
+          <For each={uploads()}>
+            {(u) => (
+              <div class="st-up" classList={{ bad: u.state === 'failed', done: u.state === 'done', busy: u.state === 'uploading' }}>
+                <span class="st-up-name">{u.name}</span>
+                <span class="st-up-state">{u.state === 'failed' ? u.error : u.state === 'done' ? formatBytes(u.size) : u.state === 'waiting' ? 'Waiting' : 'Uploading'}</span>
+              </div>
+            )}
+          </For>
+        </div>
       </Show>
     </div>
   );
 }
 
-function FileGlyph(props: { folder?: boolean; name?: string }) {
-  const kind = () => (props.folder ? 'folder' : fileKindOf(props.name ?? ''));
-  const paths: Record<string, string> = {
-    folder: 'M3 6h6l2 2h10v11H3z',
-    image: 'M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 9h.01',
-    video: 'M4 5h16v14H4z M10 9l5 3-5 3z',
-    audio: 'M9 18V6l10-2v12 M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z M19 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
-    text: 'M6 3h9l4 4v14H6z M9 11h7 M9 15h7',
-    other: 'M6 3h9l4 4v14H6z',
+/* ------------------------------------------------------------------ */
+/* One folder                                                           */
+/* ------------------------------------------------------------------ */
+
+function Column(props: {
+  url: string;
+  prefix: string;
+  path: string;
+  fileKey: string | undefined;
+  version: number;
+  filter: string;
+  selected: ReadonlySet<string>;
+  selectable: boolean;
+  onFolder: (prefix: string) => void;
+  onFile: (key: string) => void;
+  onToggle: (key: string) => void;
+  onLoaded: (found: boolean) => void;
+  onSummary: (s: Summary) => void;
+}) {
+  const [folders, setFolders] = createSignal<string[]>([]);
+  const [files, setFiles] = createSignal<FileEntry[]>([]);
+  const [counts, setCounts] = createSignal<Record<string, number>>({});
+  const [next, setNext] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(true);
+  const [error, setError] = createSignal<string>();
+
+  // Only the newest request answers: a slow page must not land over a fresh one.
+  let latest = 0;
+  const load = async (more: boolean) => {
+    const mine = ++latest;
+    setLoading(true);
+    const q = new URLSearchParams();
+    if (props.prefix) q.set('prefix', props.prefix);
+    const cursor = untrack(next);
+    if (more && cursor) q.set('start', cursor);
+    const r = await api.getResult<FilesPage>(`${props.url}/files?${q.toString()}`);
+    if (mine !== latest) return;
+    setLoading(false);
+    if (!r.ok) return void setError(r.message);
+    setError(undefined);
+    const nextFolders = more ? [...new Set([...untrack(folders), ...r.value.folders])] : r.value.folders;
+    const nextFiles = more ? [...untrack(files), ...r.value.files] : r.value.files;
+    setFolders(nextFolders);
+    setFiles(nextFiles);
+    setCounts(more ? { ...untrack(counts), ...r.value.counts } : (r.value.counts ?? {}));
+    setNext(r.value.next);
+    props.onLoaded(nextFolders.length + nextFiles.length > 0);
+    props.onSummary({
+      folders: nextFolders.length,
+      files: nextFiles.length,
+      bytes: nextFiles.reduce((n, f) => n + f.size, 0),
+      more: !!r.value.next,
+    });
   };
+  createEffect(on(() => props.version, () => void load(false)));
+
+  const needle = () => props.filter.trim().toLowerCase();
+  const activeChild = () => childOn(props.prefix, props.path);
+  // The way forward stays visible even where the listing cannot name it: a folder
+  // typed in on a backend that hides folders, one that has no file in it yet.
+  const shownFolders = createMemo(() => {
+    const child = activeChild();
+    const list = child && !folders().includes(child) ? [...folders(), child].sort() : folders();
+    return list.filter((f) => f.toLowerCase().includes(needle()));
+  });
+  const shownFiles = createMemo(() => files().filter((f) => f.name.toLowerCase().includes(needle())));
+  const empty = () => !loading() && !error() && !shownFolders().length && !shownFiles().length;
+  const fileOpenHere = () => !!props.fileKey && parentOf(props.fileKey) === props.prefix;
+
   return (
-    <svg class="dx-glyph" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d={paths[kind()]} />
-    </svg>
+    <section class="st-col" aria-label={props.prefix ? `Folder ${props.prefix}` : 'Bucket root'}>
+      <Show when={error()}>
+        <div class="st-col-note bad">{error()}</div>
+      </Show>
+      <Show when={loading() && !folders().length && !files().length && !activeChild()}>
+        <div class="st-skel" aria-hidden="true"><i /><i /><i /><i /></div>
+      </Show>
+      <For each={shownFolders()}>
+        {(name) => {
+          const on = () => activeChild() === name;
+          const count = () => counts()[name];
+          return (
+            <div class="st-item">
+              <button
+                class="st-row"
+                classList={{ trail: on() && (fileOpenHere() || childOn(`${props.prefix}${name}/`, props.path) !== null || !!props.fileKey), now: on() && props.path === `${props.prefix}${name}/` && !props.fileKey }}
+                data-folder="1"
+                aria-current={on() ? 'true' : undefined}
+                onClick={() => props.onFolder(`${props.prefix}${name}/`)}
+              >
+                <Glyph kind="folder" />
+                <span class="st-name">{name}</span>
+                <Show when={count() !== undefined}><span class="st-aside">{countLabel(count())}</span></Show>
+                <svg class="st-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+              </button>
+            </div>
+          );
+        }}
+      </For>
+      <For each={shownFiles()}>
+        {(f) => (
+          <div class="st-item" classList={{ picked: props.selected.has(f.key), picking: props.selected.size > 0 }}>
+            <Show when={props.selectable}>
+              <input class="st-check" type="checkbox" aria-label={`Select ${f.name}`} checked={props.selected.has(f.key)} onChange={() => props.onToggle(f.key)} />
+            </Show>
+            <button
+              class="st-row"
+              classList={{ now: props.fileKey === f.key }}
+              aria-current={props.fileKey === f.key ? 'true' : undefined}
+              title={`${f.name}, modified ${formatStamp(f.updated)}`}
+              onClick={() => props.onFile(f.key)}
+            >
+              <Glyph kind={fileKindOf(f.name)} />
+              <span class="st-name">{f.name}</span>
+              <span class="st-aside">{formatBytes(f.size)}</span>
+            </button>
+          </div>
+        )}
+      </For>
+      <Show when={empty()}>
+        <div class="st-col-note">{props.filter ? 'Nothing matches' : 'Empty'}</div>
+      </Show>
+      <Show when={next()}>
+        <button class="st-more" disabled={loading()} onClick={() => void load(true)}>{loading() ? 'Loading' : 'Load more'}</button>
+      </Show>
+    </section>
+  );
+}
+
+const GLYPHS: Record<string, string> = {
+  image: 'M4 4h16v16H4z M4 16l5-5 4 4 3-3 4 4 M15 9h.01',
+  video: 'M4 5h16v14H4z M10 9l5 3-5 3z',
+  audio: 'M9 18V6l10-2v12 M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z M19 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
+  text: 'M6 3h9l4 4v14H6z M9 11h7 M9 15h7',
+  other: 'M6 3h9l4 4v14H6z',
+};
+
+function Glyph(props: { kind: string }) {
+  return (
+    <Show
+      when={props.kind !== 'folder'}
+      fallback={
+        <svg class="st-glyph folder" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 5h6.5l2 2.5H21V19H3z" /></svg>
+      }
+    >
+      <svg class={`st-glyph ${props.kind}`} width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d={GLYPHS[props.kind]} />
+      </svg>
+    </Show>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* One file                                                             */
+/* The last column                                                      */
 /* ------------------------------------------------------------------ */
 
-function FileSheet(props: { bucket: BucketInfo; fileKey: string; maxRead: number; writable: boolean; onClose: () => void; onChanged: () => void }) {
+/** Where a bucket's files live, and what that means for them. */
+function whereKept(bucket: BucketInfo): string {
+  if (bucket.backend === 'file') return `On disk at ${bucket.location}`;
+  if (bucket.backend === 'memory') return 'In memory: every file is lost when the database restarts';
+  if (bucket.backend === 'r2') return 'In R2, next to the SSP';
+  return bucket.backend === 'global' ? "In the database server's global store" : bucket.backend;
+}
+
+/** Nothing open: where you are, what is here, and the way to add to it. */
+function FolderPane(props: {
+  bucket: BucketInfo;
+  prefix: string;
+  summary: Summary | undefined;
+  writable: boolean;
+  remembered: string[];
+  onUpload: () => void;
+  onOpen: (prefix: string) => void;
+}) {
+  const title = () => {
+    const parts = props.prefix.split('/').filter(Boolean);
+    return parts[parts.length - 1] ?? props.bucket.name;
+  };
+  return (
+    <aside class="st-pane st-folder">
+      <div class="st-folder-mark"><Glyph kind="folder" /></div>
+      <h2 class="st-title">{title()}</h2>
+      <Show when={props.summary}>
+        {(s) => (
+          <p class="st-holds">
+            {folderSummary(s().folders, s().files, s().more)}
+            <Show when={s().bytes > 0}>, {formatBytes(s().bytes)}</Show>
+          </p>
+        )}
+      </Show>
+      <Show when={props.writable}>
+        <div class="st-pane-actions">
+          <button class="btn btn-sm" onClick={props.onUpload}>Upload here</button>
+          <span class="st-quiet">or drop files anywhere on this page</span>
+        </div>
+      </Show>
+      <dl class="st-facts">
+        <div><dt>Kept</dt><dd>{whereKept(props.bucket)}</dd></div>
+        <Show when={props.bucket.max_bytes}><div><dt>App upload limit</dt><dd>{formatBytes(props.bucket.max_bytes)} a file</dd></div></Show>
+        <Show when={props.bucket.readonly}><div><dt>Access</dt><dd>Read-only</dd></div></Show>
+      </dl>
+      <Show when={!props.bucket.lists_folders}>
+        <div class="st-limit">
+          <p><b>Subfolders are hidden here.</b> This project's scheduler cannot read the bucket's disk, and SurrealDB does not name the folders inside a folder. Use Go to folder to open one by its path.</p>
+          <Show when={props.remembered.length}>
+            <div class="st-remembered">
+              <For each={props.remembered}>{(p) => <button class="dx-chip plain" onClick={() => props.onOpen(p)}>{p}</button>}</For>
+            </div>
+          </Show>
+        </div>
+      </Show>
+    </aside>
+  );
+}
+
+function FilePane(props: {
+  bucket: BucketInfo;
+  fileKey: string;
+  maxRead: number;
+  writable: boolean;
+  onClose: () => void;
+  onMoved: (to: string) => void;
+  onGone: () => void;
+}) {
   const url = `/data/buckets/${enc(props.bucket.name)}`;
   const name = () => props.fileKey.slice(props.fileKey.lastIndexOf('/') + 1);
   const kind = () => fileKindOf(props.fileKey);
@@ -473,6 +745,10 @@ function FileSheet(props: { bucket: BucketInfo; fileKey: string; maxRead: number
     const m = meta();
     return m?.ok ? m.value.size : undefined;
   };
+  const updated = () => {
+    const m = meta();
+    return m?.ok ? m.value.updated : undefined;
+  };
 
   const [content, setContent] = createSignal<FileContent | null>(null);
   const [mediaUrl, setMediaUrl] = createSignal<string | null>(null);
@@ -481,7 +757,9 @@ function FileSheet(props: { bucket: BucketInfo; fileKey: string; maxRead: number
   const [cut, setCut] = createSignal(false);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal<string>();
+  let closed = false;
   onCleanup(() => {
+    closed = true;
     const u = mediaUrl();
     if (u?.startsWith('blob:')) URL.revokeObjectURL(u);
   });
@@ -502,7 +780,7 @@ function FileSheet(props: { bucket: BucketInfo; fileKey: string; maxRead: number
 
   const preview = async () => {
     const c = await fetchContent();
-    if (!c?.data) return;
+    if (closed || !c?.data) return;
     const bytes = base64ToBytes(c.data);
     if (kind() === 'text') {
       const head = bytes.subarray(0, TEXT_PREVIEW_BYTES);
@@ -543,17 +821,16 @@ function FileSheet(props: { bucket: BucketInfo; fileKey: string; maxRead: number
 
   const [renaming, setRenaming] = createSignal(false);
   const [target, setTarget] = createSignal(props.fileKey);
-  const [, setQuery] = useSearchParams<{ file?: string }>();
 
   const rename = async (e: Event) => {
     e.preventDefault();
+    if (target() === props.fileKey) return void setRenaming(false);
     const to = target().trim().replace(/^\/+/, '');
     if (!to || to === props.fileKey) return void setRenaming(false);
     try {
       await api.post(`${url}/rename`, { key: props.fileKey, target: to });
       toast('ok', 'Renamed', to);
-      props.onChanged();
-      setQuery({ file: to });
+      props.onMoved(to);
     } catch (err) {
       toast('bad', 'Could not rename', err instanceof Error ? err.message : undefined);
     }
@@ -569,71 +846,96 @@ function FileSheet(props: { bucket: BucketInfo; fileKey: string; maxRead: number
     try {
       await api.delete(`${url}/file?key=${enc(props.fileKey)}`);
       toast('ok', `${name()} deleted`);
-      props.onChanged();
-      props.onClose();
+      props.onGone();
     } catch (err) {
       toast('bad', 'Could not delete', err instanceof Error ? err.message : undefined);
     }
   };
 
   return (
-    <Sheet open wide title={<span class="dx-sheet-id">{name()}</span>} meta={<Show when={size() !== undefined}>{formatBytes(size())}</Show>} onClose={props.onClose}>
+    <aside class="st-pane st-file" aria-label={`File ${name()}`}>
       <Show when={meta() && !meta()!.ok}>
-        <section class="sheet-sec"><DataError message={(meta() as { ok: false; message: string }).message} /></section>
+        <DataError message={(meta() as { ok: false; message: string }).message} />
       </Show>
-      <Show when={meta()?.ok}>
-        <section class="sheet-sec dx-actions">
-          <button class="btn btn-sm btn-primary" disabled={loading() || tooBig()} title={tooBig() ? `Larger than the ${formatBytes(props.maxRead)} this API reads` : undefined} onClick={() => void download()}>
-            {loading() ? 'Reading…' : 'Download'}
+      <div class="st-stage" classList={{ media: kind() === 'image', text: text() !== null }}>
+        <Show when={kind() === 'image' && mediaUrl()}>
+          <img class="st-media" src={mediaUrl() ?? undefined} alt={name()} onError={() => setMediaBlocked(true)} />
+        </Show>
+        <Show when={kind() === 'video' && mediaUrl() && !mediaBlocked()}>
+          <video class="st-media" src={mediaUrl() ?? undefined} controls onError={() => setMediaBlocked(true)} />
+        </Show>
+        <Show when={kind() === 'audio' && mediaUrl() && !mediaBlocked()}>
+          <audio class="st-audio" src={mediaUrl() ?? undefined} controls onError={() => setMediaBlocked(true)} />
+        </Show>
+        <Show when={text() !== null}>
+          <pre class="st-text">{text()}</pre>
+        </Show>
+        <Show when={!mediaUrl() && text() === null}>
+          <div class="st-placeholder">
+            <span class="st-ext">{extensionOf(props.fileKey) || 'file'}</span>
+            <Show
+              when={previewable()}
+              fallback={<span>Download to open it.</span>}
+            >
+              <Show
+                when={!tooBig()}
+                fallback={<span>Larger than the {formatBytes(props.maxRead)} this page can read.</span>}
+              >
+                <Show
+                  when={(size() ?? 0) > AUTO_PREVIEW_BYTES}
+                  fallback={<span aria-busy="true">{loading() ? 'Reading' : ''}</span>}
+                >
+                  <button class="btn btn-sm" disabled={loading()} onClick={() => void preview()}>{loading() ? 'Reading' : `Load preview, ${formatBytes(size())}`}</button>
+                </Show>
+              </Show>
+            </Show>
+          </div>
+        </Show>
+        <Show when={mediaBlocked()}>
+          <div class="st-placeholder"><span>This browser cannot play it here. Download it to open it.</span></div>
+        </Show>
+      </div>
+      <Show when={cut()}><p class="st-quiet st-cut">Showing the first {formatBytes(TEXT_PREVIEW_BYTES)}.</p></Show>
+      <DataError message={error()} />
+
+      <div class="st-file-body">
+        <h2 class="st-title">{name()}</h2>
+        <p class="st-holds">
+          <Show when={size() !== undefined}>{formatBytes(size())}</Show>
+          <Show when={updated()}>{(u) => <span title={formatStamp(u())}>, modified {relativeStamp(u())}</span>}</Show>
+        </p>
+
+        <div class="st-pane-actions">
+          <button
+            class="btn btn-sm btn-primary"
+            disabled={loading() || tooBig()}
+            title={tooBig() ? `Larger than the ${formatBytes(props.maxRead)} this page can read` : undefined}
+            onClick={() => void download()}
+          >
+            {loading() ? 'Reading' : 'Download'}
           </button>
           <CopyText value={reference()} label="Copy reference" />
           <Show when={props.writable}>
-            <button class="btn btn-sm" onClick={() => setRenaming(!renaming())}>Rename</button>
+            <button class="btn btn-sm" aria-expanded={renaming()} onClick={() => setRenaming(!renaming())}>Rename</button>
             <button class="btn btn-sm dx-danger" onClick={() => void remove()}>Delete</button>
           </Show>
-        </section>
+        </div>
+
         <Show when={renaming()}>
-          <section class="sheet-sec">
-            <form class="dx-pass" onSubmit={rename}>
-              <input class="dx-input mono" aria-label="New key" value={target()} onInput={(e) => setTarget(e.currentTarget.value)} />
-              <button class="btn btn-sm btn-primary" type="submit">Rename</button>
-            </form>
-          </section>
+          <form class="st-rename" onSubmit={rename}>
+            <input aria-label="New path" ref={(el) => queueMicrotask(() => el.focus())} value={target()} onInput={(e) => setTarget(e.currentTarget.value)} />
+            <button class="btn btn-sm btn-primary" type="submit">Save</button>
+          </form>
         </Show>
-        <DataError message={error()} />
-        <SheetSection label="Preview">
-          <Show when={mediaUrl() || text() !== null} fallback={
-            <div class="dx-empty small">
-              <Show when={previewable()} fallback={<p class="cap">No preview for this type of file</p>}>
-                <Show when={tooBig()} fallback={
-                  <Show when={(size() ?? 0) > AUTO_PREVIEW_BYTES} fallback={<p class="cap">{loading() ? 'Reading…' : ''}</p>}>
-                    <button class="btn btn-sm" disabled={loading()} onClick={() => void preview()}>{loading() ? 'Reading…' : `Load preview (${formatBytes(size())})`}</button>
-                  </Show>
-                }>
-                  <p class="cap">Too large to read through this API</p>
-                </Show>
-              </Show>
-            </div>
-          }>
-            <Show when={kind() === 'image'}><img class="dx-preview" src={mediaUrl() ?? undefined} alt={name()} onError={() => setMediaBlocked(true)} /></Show>
-            <Show when={kind() === 'video' && !mediaBlocked()}><video class="dx-preview" src={mediaUrl() ?? undefined} controls onError={() => setMediaBlocked(true)} /></Show>
-            <Show when={kind() === 'audio' && !mediaBlocked()}><audio class="dx-preview audio" src={mediaUrl() ?? undefined} controls onError={() => setMediaBlocked(true)} /></Show>
-            <Show when={mediaBlocked()}><p class="cap dx-note">This browser cannot show it here. Download it to open it.</p></Show>
-            <Show when={text() !== null}>
-              <pre class="vw-pre dim dx-pre">{text()}</pre>
-              <Show when={cut()}><p class="cap dx-note">Showing the first {formatBytes(TEXT_PREVIEW_BYTES)}.</p></Show>
-            </Show>
-          </Show>
-        </SheetSection>
-        <SheetSection label="Details">
-          <div class="dx-kv">
-            <div><span class="cap">Key</span><div class="dx-kv-v">/{props.fileKey}</div></div>
-            <div><span class="cap">Size</span><div class="dx-kv-v">{formatBytes(size())}</div></div>
-            <div><span class="cap">Modified</span><div class="dx-kv-v">{formatStamp(meta()?.ok ? (meta() as { ok: true; value: FileContent }).value.updated : undefined)}</div></div>
-            <div><span class="cap">Reference</span><div class="dx-kv-v">{reference()}</div></div>
-          </div>
-        </SheetSection>
-      </Show>
-    </Sheet>
+
+        <dl class="st-facts">
+          <div><dt>Path</dt><dd>/{props.fileKey}</dd></div>
+          <div><dt>In queries</dt><dd>{reference()}</dd></div>
+        </dl>
+      </div>
+      <button class="st-close" aria-label="Close preview" title="Close preview (Esc)" onClick={props.onClose}>
+        <svg width="12" height="12" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6" /></svg>
+      </button>
+    </aside>
   );
 }

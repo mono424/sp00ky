@@ -34,7 +34,7 @@ In the Sp00ky Cloud console (for now), three pages over `/admin/api/data`:
   structure, and a SQL editor
 - **Users** — the app's users as its `SIGNIN` clause finds them: search, who is
   online, password reset, the admin roster, create and delete
-- **Storage** — bucket folders and files: preview, upload, download, rename, delete
+- **Storage** — bucket folders and files in columns: preview, upload, download, rename, delete. Subfolders of a `file:` bucket need `SPKY_BUCKET_DIR` on the scheduler
 
 `FX_ADMIN=http://localhost:9668 FX_ADMIN_PASSWORD=... node screenshots/console.mjs`
 tries them against a real scheduler, under the console's real CSP.

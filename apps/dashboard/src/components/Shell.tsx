@@ -513,8 +513,8 @@ export function Shell(props: {
             <div class="page-body">
               <div class="banner" style={{ 'margin-top': '16px' }}>
                 <span class="dot warn" />
-                Signed in with the break-glass password — the{' '}
-                <span class="dim mono">_00_admin</span> roster was bypassed.
+                {/* One element: the banner is a flex row, which would split the sentence. */}
+                <span>Signed in with the break-glass password, so the <span class="dim mono">_00_admin</span> roster was bypassed.</span>
               </div>
             </div>
           </Show>

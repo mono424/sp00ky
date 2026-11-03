@@ -1270,7 +1270,9 @@ function MachinesTab(props: Ctx) {
               </section>
             )}
           </For>
-          <Show when={s().hosts.some((h) => h.upgrade_pending) && s().note}><p class="cx-note">{s().note}</p></Show>
+          <Show when={s().hosts.some((h) => h.upgrade_pending) && s().note}>
+            <section class="fx-row"><FxCell><p class="cx-note">{s().note}</p></FxCell></section>
+          </Show>
         </Show>
       )}
     </Show>

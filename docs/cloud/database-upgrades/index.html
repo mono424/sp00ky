@@ -17,16 +17,16 @@ spky db upgrade cancel    # stop it, or go back during the watch window"> <svg c
 <p>The new version opens the same files, so there is nothing to wait for:</p>
 <ol>
 <li><strong>Rehearsal.</strong> The database freezes for a moment while its files are linked into a copy. The new version opens that copy on a private network, and it is compared with the live database, then thrown away. You see how long it took to open.</li>
-<li><strong>Swap.</strong> The database stops, a new copy is linked, and the new version starts on it. Expect a few seconds of downtime, about what the rehearsal’s opening took. Clients reconnect and resend what they had queued.</li>
+<li><strong>Swap.</strong> The database stops, a new copy is linked, and the new version starts on it. Expect about 5 seconds of downtime, plus however long the rehearsal took to open the data. Clients reconnect and resend what they had queued.</li>
 </ol>
 <h3 id="from-3x-to-4x">From 3.x to 4.x</h3>
 <p>Opening the data on 4.x converts it, which takes time proportional to its size. So your database keeps serving meanwhile:</p>
 <ol>
 <li><strong>Capture.</strong> A database-wide change feed turns on, covering every table.</li>
-<li><strong>Copy and convert.</strong> The new version converts a copy on a private network, and rebuilds the indexes SurrealDB’s upgrade notes call for.</li>
+<li><strong>Copy and convert.</strong> The new version converts a copy on a private network and rebuilds every index. An index built on 3.x still answers correctly on 4.x, but some queries plan more slowly until it is rebuilt.</li>
 <li><strong>Catch up.</strong> Every change since the copy is replayed onto the new version, without running your events a second time. Tables your app creates at runtime come along.</li>
 <li><strong>Compare.</strong> Every row of every table is compared between the two.</li>
-<li><strong>Cutover.</strong> Writes are refused for a few seconds while the last changes cross over, then the new version takes over. Clients retry what was refused. Anything a client saw acknowledged has been carried over.</li>
+<li><strong>Cutover.</strong> Writes are refused for about 10 to 20 seconds while the last changes cross over and the new version takes over. Clients retry what was refused. Anything a client saw acknowledged has been carried over.</li>
 <li><strong>Watch window.</strong> For an hour (<code>--soak-minutes</code>, up to 2 days), changes keep being recorded, so you can go back without losing anything. Deploys wait until it ends. <code>spky db upgrade finish</code> ends it early.</li>
 </ol>
 <div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-amber-500/20 bg-amber-500/[0.07]"> <div class="shrink-0 mt-0.5 text-amber-500"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-amber-200/70"> <strong class="block mb-1 text-sm font-medium text-amber-500">Warning</strong> <p>SurrealDB 4 is in beta at the moment, and moving to it is a real change of behaviour: a query on a table that was never defined answers an error, and rows come back in no defined order without <code>ORDER BY</code>. Try your app against a <a href="/docs/cloud/billing#surrealdb-version">new project on 4.x</a> first. Apps built with a JS SDK before 2.1.0 or Dart before canary.363 cannot connect to it, so update them first.</p> </div> </div>

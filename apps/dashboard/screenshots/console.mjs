@@ -13,6 +13,10 @@
  * `GET /__onboarding?connected=1&cli=1&config=1&project=pending|building|running&repo=configured`
  * moves that page's world on, the way a terminal elsewhere would: it updates by
  * itself, and `?reset=1` starts over.
+ *
+ * Settings > Database shows one SurrealDB upgrade scenario at a time: open any
+ * page with `?upgrade=soak` (see UPGRADES below for the names; `?upgrade=` goes
+ * back to each project's own offer). The buttons move it on as the API would.
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -142,7 +146,82 @@ const CLOUD = {
   'GET /mcp/tokens': [{ id: 'mt1', name: 'claude on my laptop', prefix: 'mcp_live_3fa1', scopes: ['mcp:full'], created_at: iso(9 * 24 * H), last_used_at: iso(2 * H) }],
 };
 
-function cloudRoute(method, path, url) {
+// The Database tab's world: `/projects/{pid}/database/upgrade`, one scenario at a time.
+const MIN = 60_000;
+const SCHEDULER_SDK = { code: 'scheduler_sdk', message: 'Projects with a scheduler stay on v3.3.5 for now: its SurrealDB SDK refuses 4.x servers.' };
+const BUSY = { code: 'busy', message: 'An upgrade is already running.' };
+const offer = (over) => ({ current: 'v3.1.5', beta: false, one_way: false, up_to_date: false, blockers: [], ...over });
+const OFFER_3 = { target: 'v3.3.5', kind: 'swap' };
+const OFFER_4 = { current: 'v3.3.5', target: 'v4.0.0-beta.1', kind: 'replay', beta: true, one_way: true };
+const replay = (over) => ({
+  id: 'up-7', kind: 'replay', state: 'sync', active: true, from_version: 'v3.3.5', to_version: 'v4.0.0-beta.1', reverse: false, hold_at_ready: false, abort_requested: false,
+  backup_id: 'bk-2291', stats: { frozen_ms: 180, open_ms: 41_300, rebuilt_indexes: 6, applied_entries: 8112, applied_rows: 1_284_120, lag_ms: 2400 }, created_at: iso(38 * MIN), ...over,
+});
+const swap = (over) => ({
+  id: 'up-6', kind: 'swap', state: 'rehearse', active: true, from_version: 'v3.1.5', to_version: 'v3.3.5', reverse: false, hold_at_ready: false, abort_requested: false,
+  backup_id: 'bk-2288', stats: {}, created_at: iso(4 * MIN), ...over,
+});
+const CUT = { hold_ms: 1240, verified_tables: 42, verified_rows: 3_418_907 };
+const UPGRADES = {
+  // What is on offer.
+  offer3: () => offer(OFFER_3),
+  offer4: () => offer(OFFER_4),
+  blocked: () => offer({ ...OFFER_4, blockers: [SCHEDULER_SDK] }),
+  uptodate: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true }),
+  nodb: () => offer({ blockers: [{ code: 'no_database', message: 'This project does not run on a database of its own here.' }] }),
+  // A move inside 3.x.
+  swap: () => offer({ ...OFFER_3, blockers: [BUSY], upgrade: swap() }),
+  swapready: () => offer({ ...OFFER_3, blockers: [BUSY], upgrade: swap({ state: 'ready', hold_at_ready: true, stats: { frozen_ms: 90, open_ms: 2140 } }) }),
+  swapflip: () => offer({ ...OFFER_3, blockers: [BUSY], upgrade: swap({ state: 'flip_start', flip_at: iso(4000), stats: { frozen_ms: 90, open_ms: 2140 } }) }),
+  swapdone: () => offer({ current: 'v3.3.5', ...OFFER_4, blockers: [SCHEDULER_SDK], upgrade: swap({ state: 'done', active: false, flip_at: iso(2 * H), rollback_until: iso(-166 * H), finished_at: iso(2 * H - MIN), stats: { frozen_ms: 90, open_ms: 2140, hold_ms: 4310 } }) }),
+  // The step to 4.x.
+  clone: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'clone', created_at: iso(6 * MIN), stats: { frozen_ms: 180 } }) }),
+  sync: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay() }),
+  verify: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'verify', stats: { ...replay().stats, lag_ms: 800, verified_rows: 912_004, detail: 'comparing game_analysis' } }) }),
+  ready: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'ready', hold_at_ready: true, stats: { ...replay().stats, lag_ms: undefined, ...CUT, hold_ms: undefined } }) }),
+  fence: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'fence', stats: { ...replay().stats, lag_ms: undefined, ...CUT, hold_ms: undefined } }) }),
+  soak: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'soak', flip_at: iso(18 * MIN), soak_until: iso(-42 * MIN), stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  soakwarn: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'soak', flip_at: iso(18 * MIN), soak_until: iso(-42 * MIN), warning: 'The abort failed and the new version is still serving: the old database did not open its data.', stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  reverse: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'sync', reverse: true, abort_requested: true, flip_at: iso(24 * MIN), stats: { open_ms: 3800, frozen_ms: 180, applied_rows: 2204, lag_ms: 600, hold_ms: 1240 } }) }),
+  rollback: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'rollback', flip_at: iso(24 * MIN), stats: { ...CUT } }) }),
+  undoing: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'abort', abort_requested: true, stats: { frozen_ms: 180 } }) }),
+  // How it ended.
+  done: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, upgrade: replay({ state: 'done', active: false, flip_at: iso(3 * H), rollback_until: iso(-165 * H), finished_at: iso(2 * H), stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  closed: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, upgrade: replay({ state: 'done', active: false, flip_at: iso(200 * H), created_at: iso(201 * H), finished_at: iso(199 * H), stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  failed: () => offer({ ...OFFER_4, upgrade: replay({ state: 'failed', active: false, error: 'the two databases differ: table game_analysis, row game_analysis:9f2a has a different value for depth', finished_at: iso(6 * MIN), stats: { ...replay().stats, lag_ms: undefined, verified_rows: 912_004 } }) }),
+  failedflip: () => offer({ current: 'v3.1.5', ...OFFER_3, upgrade: swap({ state: 'failed', active: false, flip_at: iso(30 * MIN), error: 'The old database could not be started again: container exited with code 137', finished_at: iso(20 * MIN), stats: { frozen_ms: 90, open_ms: 2140 } }) }),
+  aborted: () => offer({ ...OFFER_4, upgrade: replay({ state: 'aborted', active: false, reverse: true, flip_at: iso(50 * MIN), finished_at: iso(9 * MIN), stats: { open_ms: 3800, applied_rows: 2204, hold_ms: 1180 } }) }),
+  cancelled: () => offer({ ...OFFER_4, upgrade: replay({ state: 'aborted', active: false, finished_at: iso(9 * MIN), stats: { frozen_ms: 180 } }) }),
+  rolled_back: () => offer({ ...OFFER_4, upgrade: replay({ state: 'rolled_back', active: false, flip_at: iso(70 * MIN), finished_at: iso(61 * MIN), stats: { ...CUT } }) }),
+};
+// What each button leads to, from where it can be pressed.
+const UPGRADE_MOVES = {
+  cutover: { ready: 'fence', swapready: 'swapflip' },
+  cancel: { soak: 'reverse', soakwarn: 'reverse', swap: 'cancelled', swapready: 'cancelled', clone: 'cancelled', sync: 'cancelled', verify: 'cancelled', ready: 'cancelled' },
+  finish: { soak: 'done', soakwarn: 'done' },
+  rollback: { soak: 'rolled_back', soakwarn: 'rolled_back', done: 'rolled_back', swapdone: 'rolled_back' },
+};
+// Null is each project's own: a project with a scheduler is held on 3.x, Cloudflare goes on to 4.x.
+let upgradeScenario = null;
+const upgradeOf = (projectId) => upgradeScenario ?? (projectId === 'prj-td' ? 'offer4' : 'offer3');
+
+function upgradeRoute(method, projectId, action, body) {
+  const at = upgradeOf(projectId);
+  const shown = UPGRADES[at]();
+  if (method === 'GET') return [200, shown];
+  if (!action) {
+    if (shown.blockers.length) return [409, { code: shown.blockers[0].code, error: shown.blockers[0].message }];
+    if (body?.to !== shown.target) return [409, { code: 'wrong_step', error: `the next step from ${shown.current} is ${shown.target}, not ${body?.to}` }];
+    upgradeScenario = shown.kind === 'swap' ? (body.no_cutover ? 'swapready' : 'swap') : body.no_cutover ? 'ready' : 'clone';
+    return [202, UPGRADES[upgradeScenario]().upgrade];
+  }
+  const next = UPGRADE_MOVES[action]?.[at];
+  if (!next) return [409, { code: action === 'rollback' ? 'no_rollback' : 'no_db_upgrade', error: `nothing to ${action} from ${at}` }];
+  upgradeScenario = next;
+  return [200, UPGRADES[next]().upgrade];
+}
+
+function cloudRoute(method, path, url, body) {
   FRESH.projects = ONBOARDING.project ? [NEW_PROJECT(ONBOARDING.project)] : [];
   if (path === '/console/me') {
     const me = CLOUD['GET /console/me'];
@@ -164,6 +243,7 @@ function cloudRoute(method, path, url) {
     if (p?.platform === 'cloudflare') return [200, { grant: 'fx', admin_url: `${ORIGIN}/cf`, admin: 'ssp', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
     return [200, { grant: 'fixture-grant', admin_url: `${ORIGIN}/fx`, admin: 'scheduler', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
   }
+  if ((m = path.match(/^\/projects\/([^/]+)\/database\/upgrade(?:\/(cutover|cancel|finish|rollback))?$/))) return upgradeRoute(method, m[1], m[2], body);
   if (/^\/console\/projects\/[^/]+\/deployments$/.test(path)) return [200, DEPLOYMENTS];
   if (/^\/console\/workspaces\/[^/]+\/activity$/.test(path)) {
     return [200, { events: [
@@ -229,9 +309,13 @@ createServer(async (req, res) => {
   }
   if (url.searchParams.has('signedout')) signedOut = true;
   if (url.searchParams.has('signedin')) signedOut = false;
+  if (url.searchParams.has('upgrade')) upgradeScenario = url.searchParams.get('upgrade') || null;
   if (url.pathname.startsWith('/v1/')) {
     if (signedOut) return json(401, { error: 'missing authorization header', code: 'unauthorized' });
-    const [status, body] = cloudRoute(req.method, url.pathname.slice(3), url);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const sent = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined;
+    const [status, body] = cloudRoute(req.method, url.pathname.slice(3), url, sent);
     return json(status, body);
   }
   // A Cloudflare project whose SSP predates console grants.

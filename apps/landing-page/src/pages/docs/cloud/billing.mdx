@@ -79,7 +79,7 @@ A project with its own database (`surrealdb.endpoint`) has no managed database a
 
 ### SurrealDB version
 
-A new pay-as-you-go database runs SurrealDB 4 (`v4.0.0-beta.1`, a beta) on SurrealKV, its only storage engine. A database created before that keeps SurrealDB 3.1.5 until you run:
+A new pay-as-you-go database runs SurrealDB 4 (`v4.0.0-beta.1`, a beta) on SurrealKV, its only storage engine. A database created before that keeps its SurrealDB 3 until you upgrade it. [`spky db upgrade`](/docs/cloud/database-upgrades) does that with a few seconds of refused writes and a way back that loses nothing, and is what to use on a database with data in it. The older way takes the database down for the whole conversion:
 
 <CodeBlock code={upgradeCode} lang="bash" />
 

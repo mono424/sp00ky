@@ -1280,6 +1280,30 @@ pub async fn run_server() -> anyhow::Result<()> {
             .with_state(Arc::clone(&log_ring)),
     );
 
+    // The control plane moved SurrealDB to another container (a version upgrade):
+    // reconnect now rather than after a streak of failed probes.
+    app = app.merge(
+        Router::new()
+            .route(
+                "/db/reconnect",
+                axum::routing::post({
+                    let db = Arc::clone(&db);
+                    move || {
+                        let db = Arc::clone(&db);
+                        async move {
+                            info!("SurrealDB moved; reconnecting");
+                            db.database_moved();
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                config.auth_secret.clone(),
+                auth_middleware,
+            )),
+    );
+
     if standalone {
         // Backup/restore plane (same routes as the scheduler's port 9667,
         // but behind this SSP's bearer auth — spooky-cloud must send

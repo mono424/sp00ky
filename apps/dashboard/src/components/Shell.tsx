@@ -48,6 +48,7 @@ const NAV_PATHS: Record<string, string> = {
   '/settings/domains': 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M3 12h18 M12 3c3 3.5 3 14.5 0 18 M12 3c-3 3.5-3 14.5 0 18',
   '/settings/git': 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M18 9a9 9 0 0 1-9 9',
   '/settings/scale': 'M4 21v-7 M4 10V3 M12 21v-9 M12 8V3 M20 21v-5 M20 12V3 M1 14h6 M9 8h6 M17 16h6',
+  '/settings/database': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M12 18v-7 M9 14l3-3 3 3',
   '/settings/danger': 'M12 9v4 M12 17h.01 M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
   project: 'M4 4h16v16H4z M9 9h6v6H9z',
   workspace: 'M3 21h18 M5 21V7l7-4 7 4v14 M9 21v-6h6v6',
@@ -76,6 +77,7 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
         { href: '/settings/domains', label: 'Domains', group: 'Settings' },
         { href: '/settings/git', label: 'Git & builds', group: 'Settings' },
         { href: '/settings/scale', label: 'Scale', group: 'Settings' },
+        { href: '/settings/database', label: 'Database', group: 'Settings' },
         ...(limited ? [] : [{ href: '/access', label: 'Access tokens', group: 'Settings' }]),
         { href: '/settings/danger', label: 'Danger zone', group: 'Settings' },
       ]

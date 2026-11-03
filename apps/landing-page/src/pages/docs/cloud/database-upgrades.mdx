@@ -1,0 +1,82 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Database upgrades
+description: Move a project to a newer SurrealDB with seconds of downtime, from the CLI or the console.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+`spky db upgrade` moves your database one step at a time: to the newest 3.x, and from there to 4.x. The console has the same action under **Settings, Database**. Your frontend and your apps need no change and no rebuild, because the `{project}-db` address stays the same. Signed-in users stay signed in.
+
+<CodeBlock code={upgradeCode} lang="bash" />
+
+Sp00ky Cloud only offers versions that have passed our conformance suite, so the newest version offered can trail SurrealDB's own releases.
+
+## What happens
+
+Both kinds of step take a fresh [backup](/docs/cloud/backups) first and stop if that fails. Neither ever changes the database's current files: the new version runs on a copy made of hard links, so the copy takes almost no time or disk at first.
+
+### Inside 3.x
+
+The new version opens the same files, so there is nothing to wait for:
+
+1. **Rehearsal.** The database freezes for a moment while its files are linked into a copy. The new version opens that copy on a private network, and it is compared with the live database, then thrown away. You see how long it took to open.
+2. **Swap.** The database stops, a new copy is linked, and the new version starts on it. Expect a few seconds of downtime, about what the rehearsal's opening took. Clients reconnect and resend what they had queued.
+
+### From 3.x to 4.x
+
+Opening the data on 4.x converts it, which takes time proportional to its size. So your database keeps serving meanwhile:
+
+1. **Capture.** A database-wide change feed turns on, covering every table.
+2. **Copy and convert.** The new version converts a copy on a private network, and rebuilds the indexes SurrealDB's upgrade notes call for.
+3. **Catch up.** Every change since the copy is replayed onto the new version, without running your events a second time. Tables your app creates at runtime come along.
+4. **Compare.** Every row of every table is compared between the two.
+5. **Cutover.** Writes are refused for a few seconds while the last changes cross over, then the new version takes over. Clients retry what was refused. Anything a client saw acknowledged has been carried over.
+6. **Watch window.** For an hour (`--soak-minutes`, up to 2 days), changes keep being recorded, so you can go back without losing anything. Deploys wait until it ends. `spky db upgrade finish` ends it early.
+
+<Warning>
+SurrealDB 4 is in beta at the moment, and moving to it is a real change of behaviour: a query on a table that was never defined answers an error, and rows come back in no defined order without `ORDER BY`. Try your app against a [new project on 4.x](/docs/cloud/billing#surrealdb-version) first. Apps built with a JS SDK before 2.1.0 or Dart before canary.363 cannot connect to it, so update them first.
+</Warning>
+
+## If it goes wrong
+
+Any failure before the cutover undoes the upgrade by itself and leaves your database as it was. So does `spky db upgrade cancel`. If the new version does not come up at the cutover, the old one starts again, with nothing lost.
+
+After a cutover to 4.x, while the watch window is open, `spky db upgrade cancel` starts the old version beside the new one, replays what was written since onto it, and swaps back the same way. **Nothing is lost**, and a check that fails right after the cutover takes this path by itself.
+
+<Warning>
+`spky db upgrade rollback` is for when the new version is too broken for that. It goes back to the data as it stood at the cutover and **drops every write made since**. The old data is kept for 7 days, or less if the disk runs low, and is then deleted.
+</Warning>
+
+## Stopping before the cutover
+
+`--no-cutover` does everything up to the cutover and then waits, up to 24 hours, so you can choose a quiet moment. The new version keeps catching up while it waits.
+
+<CodeBlock code={holdCode} lang="bash" />
+
+## While an upgrade runs
+
+Deploys, restarts, restores and scaling are refused with a clear message, and pushes to a [linked repository](/docs/cloud/ci-cd) wait their turn. Scheduled backups pause. If the database stops answering while the upgrade is at work, the upgrade cancels itself, so normal recovery can run. While it waits at the cutover or in the watch window, automatic recovery stays on. A project that reaches its [spend cap](/docs/cloud/billing) cancels its upgrade the same way.
+
+The upgrade needs room on the database's disk (a little over the size of the data inside 3.x, over twice that for 4.x) and enough memory for a second database. `spky db upgrade status` says what is missing.
+
+<Note>
+Projects with a scheduler (the VM plans) stop at the newest 3.x for now: the scheduler's SurrealDB SDK refuses 4.x servers. Pay-as-you-go projects can take both steps. The free plan's shared database and a database of your own (`surrealdb.endpoint`) are not upgraded from here.
+</Note>
+
+<CardGrid>
+  <LinkCard title="Backups" href="/docs/cloud/backups" description="What the upgrade takes first, and how to restore one." />
+  <LinkCard title="Console" href="/docs/cloud/console" description="The same upgrade, with its progress on screen." />
+</CardGrid>
+
+export const upgradeCode = `spky db upgrade status    # the version you run, the next step, what blocks it
+spky db upgrade           # go
+spky db upgrade watch     # follow it again, from any machine
+spky db upgrade cancel    # stop it, or go back during the watch window`;
+
+export const holdCode = `spky db upgrade --no-cutover
+spky db upgrade cutover   # when you are ready`;

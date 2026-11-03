@@ -387,6 +387,11 @@ enum Commands {
         #[command(subcommand)]
         action: CloudBackupCommands,
     },
+    /// Manage the project's SurrealDB
+    Db {
+        #[command(subcommand)]
+        action: DbCommands,
+    },
     /// Link a GitHub repository for automated deployments
     Link {
         #[command(subcommand)]
@@ -1110,6 +1115,53 @@ pub enum CloudLinkCommands {
     Trigger,
     /// List recent build runs
     Runs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DbCommands {
+    /// Upgrade SurrealDB one step: to the newest 3.x, then from there to 4.x
+    Upgrade {
+        /// The version to go to. Fails unless it is the next step
+        #[arg(long)]
+        to: Option<String>,
+        /// Do everything but the cutover, then wait for `spky db upgrade cutover`
+        #[arg(long)]
+        no_cutover: bool,
+        /// Minutes after a 4.x cutover in which `spky db upgrade cancel` goes back
+        /// without losing a write (default 60)
+        #[arg(long)]
+        soak_minutes: Option<u32>,
+        /// Name the project to go ahead without being asked: a 4.x step cannot be
+        /// undone once its watch window ends, so --yes does not cover it
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Start it and return, without following it
+        #[arg(long)]
+        no_wait: bool,
+        #[command(subcommand)]
+        action: Option<DbUpgradeCommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DbUpgradeCommands {
+    /// Show the running version, the next step and the current upgrade
+    Status,
+    /// Follow the upgrade in progress
+    Watch,
+    /// Go ahead with an upgrade waiting at the cutover
+    Cutover,
+    /// Stop the upgrade. Before the cutover it undoes everything; in the watch
+    /// window after a 4.x cutover it goes back without losing a write
+    Cancel,
+    /// End the watch window after a 4.x cutover early
+    Finish,
+    /// Go back to the old data, DROPPING writes made since the cutover
+    Rollback {
+        /// Name the project to go ahead without being asked
+        #[arg(long)]
+        confirm: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3345,6 +3397,7 @@ fn main() -> Result<()> {
             cloud::notice(message, notice_type, timeout, action)
         }
         Some(Commands::Backup { action }) => cloud::backup(action),
+        Some(Commands::Db { action }) => cloud::db(action),
         Some(Commands::Link { action }) => cloud::link(action),
         Some(Commands::Flag { action }) => flag::run(action),
         Some(Commands::Admin { action }) => admin::run(action),

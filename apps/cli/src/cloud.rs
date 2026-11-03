@@ -13,7 +13,8 @@ use crate::backend::{self, BackendDevConfig, BackendDevTypedConfig, DeployEnv, H
 use crate::surreal_client::MigrationDB;
 use crate::{
     CloudBackupCommands, CloudBillingCommands, CloudDomainCommands, CloudKeyCommands,
-    CloudLinkCommands, CloudTeamCommands, CloudVaultCommands, EnvCommands, EnvResetCommands,
+    CloudLinkCommands, CloudTeamCommands, CloudVaultCommands, DbCommands, DbUpgradeCommands,
+    EnvCommands, EnvResetCommands,
     NoticeCommands,
 };
 
@@ -10236,4 +10237,311 @@ expose: [/llm/*]
         assert_eq!(bare["expose"], serde_json::json!([]));
         assert_eq!(bare["env"], serde_json::json!({}));
     }
+}
+
+// ── spky db ─────────────────────────────────────────────────────────────────
+
+pub fn db(action: DbCommands) -> Result<()> {
+    match action {
+        DbCommands::Upgrade {
+            to,
+            no_cutover,
+            soak_minutes,
+            confirm,
+            no_wait,
+            action,
+        } => match action {
+            None => db_upgrade_start(to, no_cutover, soak_minutes, confirm, no_wait),
+            Some(DbUpgradeCommands::Status) => db_upgrade_status(),
+            Some(DbUpgradeCommands::Watch) => db_upgrade_follow(),
+            Some(DbUpgradeCommands::Cutover) => db_upgrade_ask("cutover", "Going ahead with the cutover."),
+            Some(DbUpgradeCommands::Cancel) => db_upgrade_ask(
+                "cancel",
+                "Stopping the upgrade. Follow it with `spky db upgrade watch`.",
+            ),
+            Some(DbUpgradeCommands::Finish) => db_upgrade_ask("finish", "Ending the watch window."),
+            Some(DbUpgradeCommands::Rollback { confirm }) => db_upgrade_rollback(confirm),
+        },
+    }
+}
+
+fn db_upgrade_read(client: &mut CloudClient, pid: &str) -> Result<serde_json::Value> {
+    Ok(client
+        .get(&format!("/v1/projects/{pid}/database/upgrade"))?
+        .into_json()?)
+}
+
+/// What a state means, in words. The console shows the same steps.
+fn db_upgrade_step_label(state: &str, reverse: bool) -> &'static str {
+    match (state, reverse) {
+        ("preflight", _) => "Checking disk and memory",
+        ("backup", _) => "Taking a backup",
+        ("rehearse", _) => "Rehearsing on a copy of the data",
+        ("capture", _) => "Turning on change capture",
+        ("clone", _) => "Copying the data",
+        ("convert", false) => "Starting the new version on the copy",
+        ("convert", true) => "Starting the old version again, beside the new one",
+        ("rebuild", _) => "Rebuilding indexes on the copy",
+        ("sync", false) => "Catching up on changes",
+        ("sync", true) => "Bringing the old data up to date",
+        ("verify", _) => "Comparing every row",
+        ("ready", _) => "Ready for the cutover",
+        ("fence", _) => "Cutover: taking the last writes across",
+        ("flip_stop", _) => "Cutover: stopping the old database",
+        ("flip_start", _) => "Cutover: starting the new database",
+        ("reconnect", _) => "Telling the sync services",
+        ("smoke", _) => "Checking it from the outside",
+        ("soak", _) => "Watching the new version",
+        ("finalize", _) => "Cleaning up",
+        ("abort", _) => "Undoing the upgrade",
+        ("revert", _) => "Bringing the old version back",
+        ("rollback", _) => "Rolling back",
+        ("done", _) => "Done",
+        ("failed", _) => "Failed",
+        ("aborted", _) => "Cancelled",
+        ("rolled_back", _) => "Rolled back",
+        _ => "Working",
+    }
+}
+
+fn print_db_upgrade_run(run: &serde_json::Value) {
+    let state = run["state"].as_str().unwrap_or("?");
+    let reverse = run["reverse"].as_bool().unwrap_or(false);
+    println!(
+        "  Upgrade {} -> {}: {}",
+        run["from_version"].as_str().unwrap_or("?"),
+        run["to_version"].as_str().unwrap_or("?"),
+        db_upgrade_step_label(state, reverse)
+    );
+    let stats = &run["stats"];
+    if let Some(ms) = stats["hold_ms"].as_i64() {
+        println!("  Writes refused at the cutover: {:.1} s", ms as f64 / 1000.0);
+    }
+    if let Some(rows) = stats["applied_rows"].as_i64() {
+        println!("  Rows replayed: {rows}");
+    }
+    if let Some(rows) = stats["verified_rows"].as_i64() {
+        println!("  Rows compared: {rows}");
+    }
+    if let Some(until) = run["soak_until"].as_str() {
+        if state == "soak" {
+            println!("  Watch window ends: {until}");
+        }
+    }
+    if let Some(until) = run["rollback_until"].as_str() {
+        println!("  Old data kept until: {until}");
+    }
+    if let Some(warning) = run["warning"].as_str() {
+        crate::ui::warn(warning);
+    }
+    if let Some(error) = run["error"].as_str() {
+        crate::ui::error(error);
+    }
+}
+
+fn db_upgrade_status() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = db_upgrade_read(&mut client, &pid)?;
+    println!("  {slug}: SurrealDB {}", status["current"].as_str().unwrap_or("?"));
+    if status["up_to_date"].as_bool().unwrap_or(false) {
+        println!("  On the newest version we offer.");
+    } else if let Some(target) = status["target"].as_str() {
+        let beta = if status["beta"].as_bool().unwrap_or(false) { " (beta)" } else { "" };
+        println!("  Next step: {target}{beta}");
+    }
+    for blocker in status["blockers"].as_array().into_iter().flatten() {
+        crate::ui::warn(blocker["message"].as_str().unwrap_or("Blocked."));
+    }
+    if status["upgrade"].is_object() {
+        print_db_upgrade_run(&status["upgrade"]);
+    }
+    Ok(())
+}
+
+fn db_upgrade_start(
+    to: Option<String>,
+    no_cutover: bool,
+    soak_minutes: Option<u32>,
+    confirm: Option<String>,
+    no_wait: bool,
+) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = db_upgrade_read(&mut client, &pid)?;
+
+    if status["upgrade"]["active"].as_bool().unwrap_or(false) {
+        println!("  An upgrade is already running.");
+        return db_upgrade_follow();
+    }
+    let current = status["current"].as_str().unwrap_or("?");
+    if status["up_to_date"].as_bool().unwrap_or(false) {
+        println!("  SurrealDB {current} is the newest version we offer.");
+        return Ok(());
+    }
+    if let Some(blocker) = status["blockers"].as_array().and_then(|b| b.first()) {
+        anyhow::bail!("{}", blocker["message"].as_str().unwrap_or("This upgrade is blocked."));
+    }
+    let Some(target) = status["target"].as_str() else {
+        anyhow::bail!("There is no upgrade to offer for SurrealDB {current}.");
+    };
+    if let Some(asked) = &to {
+        if asked != target {
+            anyhow::bail!("The next step from {current} is {target}, not {asked}. Upgrades go one step at a time.");
+        }
+    }
+
+    let one_way = status["one_way"].as_bool().unwrap_or(false);
+    let soak = soak_minutes.unwrap_or(60);
+    let confirmed = if one_way {
+        let beta = if status["beta"].as_bool().unwrap_or(false) { ", a beta release," } else { "" };
+        println!("  This moves {slug} from SurrealDB {current} to {target}{beta}.");
+        println!("  - The database keeps serving while the new version catches up, then refuses");
+        println!("    writes for a few seconds at the cutover. Clients retry them.");
+        println!("  - Every row is compared before the cutover. Any failure before it leaves the");
+        println!("    database exactly as it is.");
+        println!("  - For {soak} minutes after it, `spky db upgrade cancel` goes back without losing");
+        println!("    a write. After that the old data is kept 7 days, but going back drops newer writes.");
+        println!("  - Apps built before JS SDK 2.1.0 or Dart canary.363 must be updated first.");
+        crate::ui::consent_naming(
+            &format!("Upgrade '{slug}' to {target}?"),
+            &slug,
+            confirm.as_deref(),
+        )?
+    } else {
+        println!("  This moves {slug} from SurrealDB {current} to {target}.");
+        println!("  - A backup first, then a rehearsal on a copy of the data.");
+        println!("  - Then a few seconds of downtime while the database restarts on the new version.");
+        println!("  - The old data is kept 7 days. Going back drops writes made since.");
+        crate::ui::consent(&format!("Upgrade '{slug}' to {target}?"))?
+    };
+    if !confirmed {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let mut body = serde_json::json!({ "to": target, "no_cutover": no_cutover });
+    if soak_minutes == Some(0) {
+        anyhow::bail!("--soak-minutes must be at least 1. To end the watch window early: `spky db upgrade finish`.");
+    }
+    if let Some(minutes) = soak_minutes {
+        body["soak_minutes"] = serde_json::json!(minutes);
+    }
+    client.post(&format!("/v1/projects/{pid}/database/upgrade"), &body)?;
+    println!("  Upgrade started.");
+    if no_wait {
+        println!("  Follow it with `spky db upgrade watch`.");
+        return Ok(());
+    }
+    db_upgrade_follow()
+}
+
+/// Prints each new step until the run ends or needs a person. Interrupting this
+/// stops nothing: the upgrade runs in the cloud.
+fn db_upgrade_follow() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (_slug, pid) = resolve_project_id(&mut client)?;
+    let mut last = String::new();
+    let mut failures = 0;
+    loop {
+        let status = match db_upgrade_read(&mut client, &pid) {
+            Ok(status) => {
+                failures = 0;
+                status
+            }
+            Err(e) => {
+                failures += 1;
+                if failures > 30 {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+        };
+        let run = &status["upgrade"];
+        let Some(state) = run["state"].as_str() else {
+            println!("  No upgrade has run for this project.");
+            return Ok(());
+        };
+        let reverse = run["reverse"].as_bool().unwrap_or(false);
+        let key = format!("{state}/{reverse}");
+        if key != last {
+            println!("  {}", db_upgrade_step_label(state, reverse));
+            last = key;
+        }
+        match state {
+            "done" | "aborted" | "rolled_back" => {
+                print_db_upgrade_run(run);
+                return Ok(());
+            }
+            "failed" => {
+                print_db_upgrade_run(run);
+                if run["stats"]["not_serving"].as_bool().unwrap_or(false) {
+                    anyhow::bail!("The database is not serving. Run `spky restart --surreal`, and contact support if it stays down.");
+                }
+                anyhow::bail!("The upgrade failed and the database is unchanged.");
+            }
+            // A rollback asked for in the watch window hasn't begun yet: keep following.
+            "soak" if !run["rollback_requested"].as_bool().unwrap_or(false) => {
+                print_db_upgrade_run(run);
+                println!("  The new version is live. If something looks wrong:");
+                println!("    spky db upgrade cancel    goes back without losing a write");
+                println!("    spky db upgrade finish    ends the watch window now");
+                return Ok(());
+            }
+            "ready" if run["hold_at_ready"].as_bool().unwrap_or(false) => {
+                print_db_upgrade_run(run);
+                println!("  Waiting for the go: `spky db upgrade cutover`, or `spky db upgrade cancel`.");
+                return Ok(());
+            }
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn db_upgrade_ask(what: &str, message: &str) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (_slug, pid) = resolve_project_id(&mut client)?;
+    client.post(
+        &format!("/v1/projects/{pid}/database/upgrade/{what}"),
+        &serde_json::json!({}),
+    )?;
+    println!("  {message}");
+    Ok(())
+}
+
+fn db_upgrade_rollback(confirm: Option<String>) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = db_upgrade_read(&mut client, &pid)?;
+    let run = &status["upgrade"];
+    let flip = run["flip_at"].as_str().unwrap_or("the cutover");
+    println!(
+        "  This puts {slug} back on SurrealDB {} with the data as it stood at {flip}.",
+        run["from_version"].as_str().unwrap_or("?")
+    );
+    println!("  EVERY WRITE MADE SINCE THEN IS DROPPED.");
+    if run["state"].as_str() == Some("soak") {
+        println!("  The watch window is still open: `spky db upgrade cancel` goes back without losing anything.");
+    }
+    if !crate::ui::consent_naming(
+        &format!("Roll '{slug}' back and drop those writes?"),
+        &slug,
+        confirm.as_deref(),
+    )? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    client.post(
+        &format!("/v1/projects/{pid}/database/upgrade/rollback"),
+        &serde_json::json!({}),
+    )?;
+    println!("  Rolling back.");
+    db_upgrade_follow()
 }

@@ -36,6 +36,12 @@ In the Sp00ky Cloud console (for now), three pages over `/admin/api/data`:
   online, password reset, the admin roster, create and delete
 - **Storage** — bucket folders and files in columns: preview, upload, download, rename, delete. Subfolders of a `file:` bucket need `SPKY_BUCKET_DIR` on the scheduler
 
+Settings has a **Database** tab, from Sp00ky Cloud rather than the scheduler, so it
+also works in limited mode and on Cloudflare: the SurrealDB version, the next
+upgrade and its blockers, a running upgrade's steps with cancel, cut over, finish
+and roll back. `node screenshots/console.mjs` shows each state with `?upgrade=soak`
+and the like on the page's address.
+
 `FX_ADMIN=http://localhost:9668 FX_ADMIN_PASSWORD=... node screenshots/console.mjs`
 tries them against a real scheduler, under the console's real CSP.
 

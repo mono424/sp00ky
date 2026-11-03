@@ -138,6 +138,7 @@ instead of opening one they stop with the exact command or environment variable 
 | `spky env` | Encrypted variables and the vault: `set`, `list`, `rm`, `pull`, `import`, `unlock`, `passphrase`, `share-ci`, `reset`. `set --file <path>` reads a multi-line value (a PEM key) from disk, scoped with `--dev` or `--prod`. `reset` takes `request`, `approve <email>`, `complete`, `list`. [Docs](/docs/cloud/env-variables) |
 | `spky domain` | Custom domains: `add`, `list`, `remove`. `add --app <name>` picks which app serves it (a frontend, an exposed backend, or a backend on a [dedicated machine](/docs/cloud/dedicated-machines)), `add --status` attaches it to the public uptime page. |
 | `spky backup` | Database backups: `list`, `create`, `restore`, `delete`, `configure`, `reset`. [Docs](/docs/cloud/backups) |
+| `spky db upgrade` | Upgrade SurrealDB one step: to the newest 3.x, then from there to 4.x. `--no-cutover` stops before the cutover, `--soak-minutes` sets the watch window after a 4.x cutover (default 60), `--confirm <project>` goes ahead on a 4.x step without being asked, `--no-wait` returns at once. Subcommands: `status`, `watch`, `cutover`, `cancel`, `finish`, `rollback`. [Docs](/docs/cloud/database-upgrades) |
 | `spky link` | GitHub push-to-deploy: `connect`, `status`, `settings`, `disconnect`, `trigger`, `runs`. [Docs](/docs/cloud/ci-cd) |
 | `spky token` | API tokens for CI: `create`, `list`, `revoke`. |
 | `spky team` | Members and invitations: `list`, `invite`, `invites`, `revoke`, `remove`, `rename`. [Docs](/docs/cloud/team) |

@@ -94,6 +94,7 @@ export const docsNav = [
       { text: 'Environment & vault', href: `${basePath}/docs/cloud/env-variables` },
       { text: 'Logs & monitoring', href: `${basePath}/docs/cloud/logs` },
       { text: 'Backups', href: `${basePath}/docs/cloud/backups` },
+      { text: 'Database upgrades', href: `${basePath}/docs/cloud/database-upgrades` },
       { text: 'CI/CD', href: `${basePath}/docs/cloud/ci-cd` },
       { text: 'Teams', href: `${basePath}/docs/cloud/team` },
       { text: 'Self-hosting', href: `${basePath}/docs/self-hosting` },

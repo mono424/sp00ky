@@ -4320,6 +4320,40 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
   .cx-setvar > .btn { flex: none; }
 }
 
+/* database upgrade: one bar across its phases, a segment the same width in each */
+.cx-upver { flex-wrap: wrap; row-gap: 6px; }
+.cx-upver .cx-chip { align-self: center; letter-spacing: 0.12em; }
+.cx-upsteps .cx-sub { justify-content: flex-start; gap: 3px; }
+.cx-upsteps .cx-sub span { flex: 1 1 0; min-width: 0; white-space: nowrap; }
+.cx-upsteps .cx-sub span.now { color: var(--accent); }
+.cx-commit.cx-updoing { flex-wrap: wrap; row-gap: 4px; margin-top: 0; }
+.cx-updoing > span:first-child { overflow: visible; white-space: normal; }
+.cx-updoing > .cap { flex: 0 1 auto; }
+.cx-upacts { flex-wrap: wrap; }
+.cx-upkv { margin-top: 18px; }
+.cx-upkv > div { align-content: start; box-shadow: 0 -1px 0 var(--line-soft); }
+.cx-upkv small { font: 400 11.5px var(--mono); color: var(--ink-faint); overflow-wrap: anywhere; }
+.cx-upform { align-items: center; margin-top: 14px; }
+.cx-upcheck { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; white-space: nowrap; }
+.cx-form .cx-upcheck input { flex: none; width: 14px; height: 14px; margin: 0; padding: 0; accent-color: var(--accent); }
+.cx-upfirst { margin-top: 0; }
+.cx-reason.bad { border-left-color: var(--bad); background: rgba(255, 99, 105, 0.05); }
+.cx-reason + .cx-reason, .cx-reason + .cx-note, .cx-note + .cx-reason { margin-top: 10px; }
+.confirm-warning { white-space: pre-line; }
+@media (max-width: 1240px) {
+  .cx-steps.cx-upsteps { grid-template-columns: minmax(0, 1fr) !important; }
+  .cx-upsteps .cx-stage + .cx-stage { border-left: 0; border-top: 1px solid var(--line-soft); }
+}
+@media (max-width: 860px) {
+  .cx-updoing > .cap { margin-left: 0; }
+  /* every number stays whole on a phone, two by two */
+  .cx-kv.cx-upkv { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cx-kv.cx-upkv > div { border-left: 0; border-top: 0; }
+  .cx-kv.cx-upkv > div:nth-child(even) { border-left: 1px solid var(--line-soft); }
+  .cx-kv.cx-upkv > div:nth-child(n + 3) { border-top: 1px solid var(--line-soft); }
+  .cx-kv.cx-upkv b { overflow: visible; white-space: normal; }
+}
+
 /* ---- phone, every page: tiles two by two, rows as records ---- */
 @media (max-width: 860px) {
   /* four KPI tiles: two by two, not four screens tall */

@@ -1,11 +1,11 @@
 /**
  * A project's pages that come from Sp00ky Cloud rather than its scheduler:
  * Deployments (what is live and where, what is rolling out, what came before) and
- * Settings (env, domains, git link, scale, tokens, danger zone). They work
+ * Settings (env, domains, git link, scale, database, tokens, danger zone). They work
  * whether or not the project's own dashboard could open.
  */
 
-import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js';
+import { For, Index, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js';
 import { A, useParams } from '@solidjs/router';
 import { PageHead } from '../components/Chrome';
 import { FxCell, Sq } from '../components/Frame';
@@ -14,6 +14,26 @@ import { formatDuration, formatStamp } from '../lib/format';
 import { useOverview } from '../ProjectApp';
 import { cloud, consoleApi, type DeploymentRow, type PendingBuild, type Workspace, type WorkspaceProject } from './cloud';
 import { Stamp, ago, useConsoleChrome } from './chrome';
+import {
+  actionsFor,
+  cancelConfirm,
+  cutOverConfirm,
+  doing,
+  facts,
+  finishConfirm,
+  goBackConfirm,
+  hasOwnDatabase,
+  outcome,
+  phases,
+  rollbackConfirm,
+  runChip,
+  startConfirm,
+  stateNote,
+  stepWord,
+  versionLine,
+  type UpgradeRun,
+  type UpgradeStatus,
+} from './dbUpgradePlan';
 import { isUnlocked, loadValues, unlock } from './vault';
 
 interface Ctx {
@@ -767,16 +787,17 @@ function SiteCard(props: { url: string; host: string }) {
 }
 
 /** One stage of a rollout as segments: done, current, waiting. */
-function Stage(props: { title: string; steps: string[]; at: string }) {
+function Stage(props: { title: string; steps: string[]; at: string; word?: (step: string) => string }) {
   const idx = () => (props.at === 'done' ? props.steps.length : props.steps.indexOf(props.at));
-  const label = () => (props.at === 'done' ? 'done' : props.at === 'skip' ? 'not built here' : props.at === 'waiting' ? 'waiting' : props.at.replace('_', ' '));
+  const name = (step: string) => props.word?.(step) ?? step.replace('_', ' ');
+  const label = () => (props.at === 'done' ? 'done' : props.at === 'skip' ? 'not built here' : props.at === 'waiting' ? 'waiting' : name(props.at));
   return (
     <div class="cx-stage" classList={{ idle: props.at === 'skip' || props.at === 'waiting' }}>
       <div class="cap cx-stage-head"><span>{props.title}</span><span classList={{ acc: idx() >= 0 && idx() < props.steps.length }}>{label()}</span></div>
       <div class="cx-segs">
         <For each={props.steps}>{(_, i) => <i classList={{ done: i() < idx(), now: i() === idx() }} />}</For>
       </div>
-      <div class="cx-sub cap"><For each={props.steps}>{(s) => <span>{s.replace('_', ' ')}</span>}</For></div>
+      <div class="cx-sub cap"><For each={props.steps}>{(s, i) => <span classList={{ now: i() === idx() }}>{name(s)}</span>}</For></div>
     </div>
   );
 }
@@ -790,6 +811,7 @@ const TABS: { id: string; label: string }[] = [
   { id: 'domains', label: 'Domains' },
   { id: 'git', label: 'Git & builds' },
   { id: 'scale', label: 'Scale' },
+  { id: 'database', label: 'Database' },
   { id: 'access', label: 'Access tokens' },
   { id: 'danger', label: 'Danger zone' },
 ];
@@ -808,6 +830,7 @@ export function Settings(props: Ctx) {
             <Match when={tab() === 'domains'}><DomainsTab {...props} /></Match>
             <Match when={tab() === 'git'}><GitTab {...props} /></Match>
             <Match when={tab() === 'scale'}><ScaleTab {...props} /></Match>
+            <Match when={tab() === 'database'}><DatabaseTab {...props} /></Match>
             <Match when={tab() === 'danger'}><DangerTab {...props} /></Match>
           </Switch>
         </div>
@@ -1142,6 +1165,238 @@ function ScaleTab(props: Ctx) {
         <p class="cx-note">Starter runs one SSP, Pro up to three. More SSPs spread views and survive one failing.</p>
       </FxCell>
     </section>
+  );
+}
+
+/* ---------- database ---------- */
+
+/** The project's SurrealDB version and moving it to the next one. */
+function DatabaseTab(props: Ctx) {
+  const tenant = props.workspace.id;
+  const slug = props.project.slug;
+  const path = `/projects/${pid(props.project)}/database/upgrade`;
+  const [stale, setStale] = createSignal(false);
+  // A refresh that fails keeps what it had: a blip must not hide a running upgrade.
+  const [data, { refetch }] = createResource<UpgradeStatus>(async (_key, info) => {
+    try {
+      const next = await cloud<UpgradeStatus>(path, { tenant });
+      setStale(false);
+      return next;
+    } catch (err) {
+      setStale(true);
+      if (info.value) return info.value;
+      throw err;
+    }
+  });
+  const status = () => (data.error ? undefined : data());
+  const run = () => status()?.upgrade;
+
+  // Fast while something is moving, slow at rest.
+  const active = createMemo(() => !!run()?.active);
+  createEffect(() => {
+    const timer = setInterval(() => void refetch(), active() ? 3000 : 15000);
+    onCleanup(() => clearInterval(timer));
+  });
+
+  const [noCutover, setNoCutover] = createSignal(false);
+  const [busy, setBusy] = createSignal(false);
+  const post = async (label: string, done: string, sub = '', body?: unknown) => {
+    setBusy(true);
+    await act(label, () => cloud(`${path}${sub}`, { method: 'POST', tenant, body }), done);
+    setBusy(false);
+    void refetch();
+  };
+
+  const start = async (e: Event) => {
+    e.preventDefault();
+    const s = status();
+    if (!s?.target || !(await confirm(startConfirm(s, noCutover(), slug)))) return;
+    await post('Starting the upgrade', `Upgrading to ${s.target}`, '', { to: s.target, no_cutover: noCutover() });
+  };
+  const cancel = async (r: UpgradeRun) => {
+    if (await confirm(cancelConfirm(r))) await post('Cancelling', 'Cancelling the upgrade', '/cancel');
+  };
+  const goBack = async (r: UpgradeRun) => {
+    if (await confirm(goBackConfirm(r))) await post('Going back', `Going back to ${r.from_version}`, '/cancel');
+  };
+  const cutOver = async (r: UpgradeRun) => {
+    if (await confirm(cutOverConfirm(r))) await post('Cutting over', `Cutting over to ${r.to_version}`, '/cutover');
+  };
+  const finish = async () => {
+    if (await confirm(finishConfirm())) await post('Finishing', 'Ending the watch window', '/finish');
+  };
+  const rollBack = async (r: UpgradeRun) => {
+    if (await confirm(rollbackConfirm(r, slug, r.flip_at ? ago(r.flip_at) : undefined))) {
+      await post('Rolling back', `Rolling back to ${r.from_version}`, '/rollback');
+    }
+  };
+
+  const line = () => versionLine(status()!);
+  const can = () => {
+    const r = run();
+    return r ? actionsFor(r, Date.now()) : undefined;
+  };
+  const RunMessages = (p: { run: UpgradeRun }) => (
+    <>
+      <Show when={p.run.error}><p class="cx-reason bad">{p.run.error}</p></Show>
+      <Show when={p.run.warning}><p class="cx-reason">{p.run.warning}</p></Show>
+    </>
+  );
+  const RunFacts = (p: { run: UpgradeRun }) => (
+    <Show when={facts(p.run).length}>
+      <div class="cx-kv cx-upkv">
+        <Index each={facts(p.run)}>
+          {(f) => (
+            <div>
+              <span class="cap">{f().label}</span>
+              <b>{f().value}</b>
+              <Show when={f().note}><small>{f().note}</small></Show>
+            </div>
+          )}
+        </Index>
+      </div>
+    </Show>
+  );
+
+  return (
+    <Show
+      when={status()}
+      fallback={
+        <section class="fx-row">
+          <FxCell label="Version">
+            <Show when={data.error} fallback={<div class="fx-empty cap">Loading</div>}>
+              <p class="cx-reason bad">{message(data.error)}</p>
+            </Show>
+          </FxCell>
+        </section>
+      }
+    >
+      {(s) => (
+        <>
+          <section class="fx-row">
+            <FxCell
+              label="Version"
+              meta={
+                <>
+                  <Show when={stale()}><span class="warn">Last refresh failed</span></Show>
+                  <Show when={active()} fallback={<Show when={s().up_to_date}><span class="cx-chip live">Up to date</span></Show>}>
+                    <span>serving {s().current}</span>
+                  </Show>
+                </>
+              }
+            >
+              <Show when={hasOwnDatabase(s())} fallback={<div class="cx-stat">None</div>}>
+                <div class="cx-stat cx-upver">
+                  <span>{line().from}</span>
+                  <Show when={line().to}>
+                    <small>to</small>
+                    <span>{line().to}</span>
+                  </Show>
+                  <Show when={line().to && line().beta}><span class="cx-chip fail">Beta</span></Show>
+                </div>
+              </Show>
+              <Show when={!active() && s().up_to_date}>
+                <p class="cx-note">This is the newest version we offer.</p>
+              </Show>
+              <Show when={!active() && !s().up_to_date && !s().target && !s().blockers?.length}>
+                <p class="cx-note">No upgrade can be offered right now.</p>
+              </Show>
+            </FxCell>
+          </section>
+
+          <Show when={active() && run()}>
+            {(r) => (
+              <section class="fx-row">
+                <FxCell
+                  label={<span class="cx-head">Upgrade <span class={`cx-chip ${runChip(r()).tone}`}>{runChip(r()).label}</span></span>}
+                  meta={<span title={formatStamp(r().created_at)}>started {ago(r().created_at)}</span>}
+                >
+                  <div class="cx-commit cx-updoing">
+                    <span>{doing(r())}</span>
+                    <Show when={r().state === 'soak' && r().soak_until}>
+                      <span class="cap dim">Watch window ends {ago(r().soak_until)}, {formatStamp(r().soak_until)}</span>
+                    </Show>
+                  </div>
+                  <div
+                    class="cx-steps cx-upsteps"
+                    style={{ 'grid-template-columns': phases(r()).map((p) => `minmax(0, ${Math.max(p.steps.length, 2)}fr)`).join(' ') }}
+                  >
+                    <Index each={phases(r())}>
+                      {(p) => <Stage title={p().title} steps={p().steps} at={p().at} word={stepWord} />}
+                    </Index>
+                  </div>
+                  <Show when={stateNote(r())}><p class="cx-note">{stateNote(r())}</p></Show>
+                  <RunMessages run={r()} />
+                  <Show when={can()?.cancel || can()?.goBack || can()?.cutOver || can()?.finish || can()?.rollBack}>
+                    <div class="cx-actions cx-upacts">
+                      <Show when={can()?.cutOver}><button class="btn btn-primary" disabled={busy()} onClick={() => void cutOver(r())}>Cut over now</button></Show>
+                      <Show when={can()?.finish}><button class="btn btn-primary" disabled={busy()} onClick={() => void finish()}>Finish now</button></Show>
+                      <Show when={can()?.cancel}><button class="btn" disabled={busy()} onClick={() => void cancel(r())}>Cancel</button></Show>
+                      <Show when={can()?.goBack}><button class="btn" disabled={busy()} onClick={() => void goBack(r())}>Abort and go back</button></Show>
+                      <Show when={can()?.rollBack}><button class="btn cx-danger" disabled={busy()} onClick={() => void rollBack(r())}>Roll back</button></Show>
+                    </div>
+                  </Show>
+                  <RunFacts run={r()} />
+                </FxCell>
+              </section>
+            )}
+          </Show>
+
+          <Show when={!active() && run()}>
+            {(r) => (
+              <section class="fx-row">
+                <FxCell
+                  label={<span class="cx-head">Last upgrade <span class={`cx-chip ${outcome(r()).tone}`}>{outcome(r()).chip}</span></span>}
+                  meta={
+                    <Show when={r().finished_at} fallback={<span title={formatStamp(r().created_at)}>started {ago(r().created_at)}</span>}>
+                      <span title={formatStamp(r().finished_at)}>finished {ago(r().finished_at)}</span>
+                    </Show>
+                  }
+                >
+                  <RunMessages run={r()} />
+                  <Show when={outcome(r()).caution} fallback={<p class="cx-note cx-upfirst">{outcome(r()).text}</p>}>
+                    <p class="cx-reason">{outcome(r()).text}</p>
+                  </Show>
+                  <Show when={r().state === 'done'}>
+                    <Show when={can()?.rollBack} fallback={<p class="cx-note">The window for going back has closed.</p>}>
+                      <p class="cx-note">
+                        You can go back until {formatStamp(r().rollback_until)}, {ago(r().rollback_until)}. Going back drops writes made since the cutover.
+                      </p>
+                      <div class="cx-actions cx-upacts">
+                        <button class="btn cx-danger" disabled={busy()} onClick={() => void rollBack(r())}>Roll back</button>
+                      </div>
+                    </Show>
+                  </Show>
+                  <RunFacts run={r()} />
+                </FxCell>
+              </section>
+            )}
+          </Show>
+
+          <Show when={!active() && (s().target || s().blockers?.length)}>
+            <section class="fx-row">
+              <FxCell label="Upgrade">
+                <For each={s().blockers ?? []}>{(b) => <p class="cx-reason">{b.message}</p>}</For>
+                <Show when={s().target}>
+                  <p class="cx-note cx-upfirst">
+                    {s().kind === 'replay'
+                      ? 'The database stays up while the new version catches up, then a few seconds of refused writes at the cutover.'
+                      : 'A fresh backup first, a rehearsal on a copy, then a few seconds of downtime while the database restarts on the new version.'}
+                  </p>
+                  <form class="cx-form cx-upform" onSubmit={start}>
+                    <label class="cx-upcheck">
+                      <input type="checkbox" checked={noCutover()} onChange={(e) => setNoCutover(e.currentTarget.checked)} />
+                      <span>Stop before the cutover</span>
+                    </label>
+                    <button class="btn btn-primary" type="submit" disabled={busy() || !!s().blockers?.length}>Upgrade to {s().target}</button>
+                  </form>
+                </Show>
+              </FxCell>
+            </section>
+          </Show>
+        </>
+      )}
+    </Show>
   );
 }
 

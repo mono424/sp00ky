@@ -275,6 +275,20 @@ impl ReconnectingDb {
         self.wake.notify_one();
     }
 
+    /// The control plane moved the database to another container: replace the
+    /// handle now instead of after a streak of failed probes. A handle stays
+    /// pinned to the address it resolved, and with the old server gone every
+    /// probe answers a transport error, which on its own takes three ticks to
+    /// count as a move. The next probe decides, so a handle that still works is
+    /// left alone.
+    pub fn database_moved(&self) {
+        self.transport_failures.store(
+            TRANSPORT_FAILURES_BEFORE_RECONNECT,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.wake.notify_one();
+    }
+
     /// One maintenance pass. Returns `true` if the handle is usable afterwards.
     ///
     /// A healthy handle with a young token costs one read-only `version()`

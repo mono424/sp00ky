@@ -12,6 +12,23 @@ export const code5 = `spky deploy`;
 
 export const code4 = `spky deploy --upgrade`;
 
+export const codeVms = `# The project's VMs: kind, type, location, status, any upgrade waiting
+spky host status
+
+# Upgrade the project host now instead of in its quiet window
+spky host upgrade
+
+# Move a pro project that still runs on the shared host onto VMs of its own
+spky project move`;
+
+export const codeMove = `spky project move                # copy the data, then wait for the go
+spky project move --no-hold      # cut over by itself when the data is across
+spky project move status         # the current or last move
+spky project move watch          # follow it
+spky project move cutover        # go ahead; the project is down for a few minutes
+spky project move abort          # before the cutover: nothing changes
+spky project move rollback       # after it: back to the shared host`;
+
 export const code3 = `spky status`;
 
 export const code2 = `# Scale to 3 SSP instances
@@ -153,6 +170,44 @@ say. Two kinds keep their first definition: `DEFINE ACCESS` (overwriting a recor
 overwrite rebuilds the index row by row). To change one of those, write `OVERWRITE` into that
 statement yourself for one deploy.
 
+## Your own VMs (Pro)
+
+A Pro project runs on two VMs of its own. The **project host** carries the scheduler, the SSPs, your
+backends and frontends and the proxy; the **database VM** carries SurrealDB, with its data on a
+volume at the provider. The shared host that Sp00ky Cloud runs on keeps only the control plane. The
+infrastructure is included in the Pro price.
+
+| VM | Default type | Memory |
+| :--- | :--- | :--- |
+| Database VM | `cax21` (ARM) | 8 GB, of which the database may use 6 GB |
+| Project host | `cx33` | 8 GB |
+
+If `cx33` cannot be had when the project is set up, the project host starts on `cx23` (4 GB), or on
+`cpx22` for a new signup, and upgrades to `cx33` by itself in a quiet window, 03:30 to 05:30 UTC. A
+project admin can ask for it sooner. `spky host status` shows each VM and any upgrade waiting, and the
+[console](/docs/cloud/console) shows the same under Settings, Machines.
+
+<CodeBlock code={codeVms} lang="bash" />
+
+<Warning>
+  An upgrade restarts the project host: web, API and live sync are down for about two minutes. The
+  database VM is not touched. `spky host upgrade` asks before it starts, and refuses while a backup, a
+  database upgrade, a move or a deploy is running, saying which.
+</Warning>
+
+A Pro project that still runs on the shared host moves onto its own VMs with `spky project move`. The
+data is copied across while the project keeps running, and the move then waits for your go unless you
+passed `--no-hold`.
+
+<CodeBlock code={codeMove} lang="bash" />
+
+`cutover` and `rollback` ask before they start, and say that the project goes down. `abort` stops a
+move before the cutover and leaves everything where it was. After the cutover the project is
+watched for a while, and `rollback` takes it back to the shared host in that time: the project goes
+down and its data travels back. Only a Pro project can move.
+
+When a project is destroyed, the volumes of its VMs are kept for 7 days.
+
 ## Checking Status
 
 <CodeBlock
@@ -205,6 +260,8 @@ mounted at `/buckets` in your SurrealDB container. Size it in `sp00ky.yml`:
   lang="yaml"
 />
 
+- **A Pro project on its own VMs**: the scheduler no longer mounts this volume,
+  so the dashboard does not list storage subfolders for such a project.
 - **It is a real disk of that size.** When it is full, uploads fail; nothing
   else on the host is affected. Raise `sizeGB` and redeploy (or push) to grow it
   in place, without restarting the database.

@@ -47,11 +47,13 @@ const plans: Plan[] = [
   },
   {
     name: 'Pro',
-    description: 'Dedicated VMs for teams shipping production apps.',
+    description: 'Includes its own project host and database VM, for teams shipping production apps.',
     monthlyPrice: 229,
     yearlyPrice: 2290,
     command: 'npx @spooky-sync/cli project create --plan pro',
     features: [
+      { label: 'Its own project host VM', type: 'included', specs: { mem: '8GB' } },
+      { label: 'Its own database VM', type: 'included', specs: { mem: '8GB' } },
       { label: 'Scheduler', type: 'included', specs: { cpu: '2', mem: '2GB' } },
       { label: '3 SSP instances', type: 'included', specs: { cpu: '2', mem: '1GB' } },
       { label: '1 Backend Service', type: 'included', specs: { cpu: '2', mem: '1GB' } },

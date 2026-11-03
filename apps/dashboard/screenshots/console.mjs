@@ -17,6 +17,10 @@
  * Settings > Database shows one SurrealDB upgrade scenario at a time: open any
  * page with `?upgrade=soak` (see UPGRADES below for the names; `?upgrade=` goes
  * back to each project's own offer). The buttons move it on as the API would.
+ *
+ * Settings > Machines is the same, with `?host=` : `pending` (project host on cx23
+ * with an upgrade waiting, the default), `waiting` (cx33 not available yet),
+ * `upgrading`, `failed`, `current` (nothing to upgrade) or `none` (no VMs of its own).
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -221,6 +225,38 @@ function upgradeRoute(method, projectId, action, body) {
   return [200, UPGRADES[next]().upgrade];
 }
 
+// The Machines tab's world: `/projects/{pid}/host`, one scenario at a time.
+const HOST_NOTE = 'An upgrade restarts the project host: web, API and live sync are down for about two minutes. The database is not touched.';
+const hostView = (app, placement = 'active') => ({
+  placement,
+  hosts: [
+    app,
+    { kind: 'db', status: 'ready', server_type: 'cax21', location: 'fsn1', target_available: true, upgrade_pending: false },
+  ],
+  quiet_window: '03:30 to 05:30 UTC',
+  note: HOST_NOTE,
+});
+const OLD_APP = { kind: 'app', status: 'ready', server_type: 'cx23', location: 'fsn1', target_type: 'cx33', target_available: true, upgrade_pending: true };
+const HOSTS = {
+  pending: () => hostView(OLD_APP),
+  waiting: () => hostView({ ...OLD_APP, target_available: false }),
+  upgrading: () => hostView({ ...OLD_APP, upgrade_state: 'requested' }),
+  failed: () => hostView({ ...OLD_APP, upgrade_error: 'cx33 could not be created in fsn1: resource unavailable' }),
+  current: () => hostView({ kind: 'app', status: 'ready', server_type: 'cx33', location: 'fsn1', target_available: true, upgrade_pending: false }),
+  none: () => ({ placement: '', hosts: [], quiet_window: '03:30 to 05:30 UTC', note: HOST_NOTE }),
+};
+let hostScenario = null;
+function hostRoute(method, action) {
+  const at = hostScenario ?? 'pending';
+  if (method === 'GET') return [200, HOSTS[at]()];
+  if (action === 'upgrade') {
+    if (at !== 'pending' && at !== 'waiting' && at !== 'failed') return [409, { code: at === 'current' ? 'already_upgraded' : 'busy', error: at === 'current' ? 'this project host is already on cx33' : 'an upgrade is already running on this host' }];
+    hostScenario = 'upgrading';
+    return [202, { status: 'requested' }];
+  }
+  return [404, { error: 'not found' }];
+}
+
 function cloudRoute(method, path, url, body) {
   FRESH.projects = ONBOARDING.project ? [NEW_PROJECT(ONBOARDING.project)] : [];
   if (path === '/console/me') {
@@ -244,6 +280,7 @@ function cloudRoute(method, path, url, body) {
     return [200, { grant: 'fixture-grant', admin_url: `${ORIGIN}/fx`, admin: 'scheduler', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
   }
   if ((m = path.match(/^\/projects\/([^/]+)\/database\/upgrade(?:\/(cutover|cancel|finish|rollback))?$/))) return upgradeRoute(method, m[1], m[2], body);
+  if ((m = path.match(/^\/projects\/([^/]+)\/host(?:\/(upgrade))?$/))) return hostRoute(method, m[2]);
   if (/^\/console\/projects\/[^/]+\/deployments$/.test(path)) return [200, DEPLOYMENTS];
   if (/^\/console\/workspaces\/[^/]+\/activity$/.test(path)) {
     return [200, { events: [
@@ -310,6 +347,7 @@ createServer(async (req, res) => {
   if (url.searchParams.has('signedout')) signedOut = true;
   if (url.searchParams.has('signedin')) signedOut = false;
   if (url.searchParams.has('upgrade')) upgradeScenario = url.searchParams.get('upgrade') || null;
+  if (url.searchParams.has('host')) hostScenario = url.searchParams.get('host') || null;
   if (url.pathname.startsWith('/v1/')) {
     if (signedOut) return json(401, { error: 'missing authorization header', code: 'unauthorized' });
     const chunks = [];

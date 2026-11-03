@@ -223,8 +223,9 @@ sparklines; the <a href="/docs/cloud/dedicated-machines">dedicated machines</a> 
 pool VMs; and the <a href="/docs/cloud/deploying#bucket-storage">bucket volume</a> with how
 much of it is used and free. A container’s disk is what its volumes take (the
 database’s data, the scheduler’s replica and event log, an SSP’s snapshot and
-arena) against that plus what is still free on the host disk they share, so a
-host filling up shows on every container. The scheduler cannot see its
+arena) against that plus what is still free on the disk of the VM they run on, so a
+VM filling up shows on every container on it. On a Pro project with its own
+VMs the database is on the database VM and the rest on the project host. The scheduler cannot see its
 neighbours’ containers or the database’s volume, so all of it comes from
 Sp00ky Cloud through the <a href="#configuration">cloud link</a>: container samples every
 15 seconds, disk and the bucket volume every 5 minutes. The Overview’s database

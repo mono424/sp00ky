@@ -80,6 +80,8 @@ hard cap that only affects this project, and that grows in place when you
 raise the number. It cannot shrink. Starter includes 5 GB and Pro 20 GB, and
 storage above that is billed per GB-month. See
 <a href="/docs/cloud/deploying#bucket-storage">Deploying → Bucket Storage</a>.</li>
+<li><strong>On a Pro project’s own VMs</strong>, the scheduler no longer mounts the volume, so
+the dashboard does not list storage subfolders.</li>
 </ul>
 <h2 id="r2-storage-any-database">R2 storage (any database)</h2>
 <p>A SurrealDB bucket keeps its files wherever its server can, and some servers

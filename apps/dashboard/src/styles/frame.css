@@ -3204,6 +3204,19 @@ h2 {
    RESOURCES
    ================================================================ */
 
+/* A VM's heading: its name, then what it is. */
+.rs-vm { padding-block: 16px; }
+.rs-vm .fx-head { margin-bottom: 0; }
+/* Two short cells beside two tall charts, so the row has no empty corner. */
+.rs-stack { display: grid; grid-auto-rows: 1fr; min-width: 0; border-left: 1px solid var(--line); }
+.rs-stack > .fx-cell + .fx-cell { border-left: 0; border-top: 1px solid var(--line); }
+.rs-stack > .fx-cell + .fx-cell::before { display: none; }
+@media (max-width: 1100px) {
+  .rs-stack { border-left: 0; border-top: 1px solid var(--line); }
+}
+.rs-vm-name { color: var(--ink); }
+.rs-vm-spec { display: inline-flex; flex-wrap: wrap; gap: 4px 14px; justify-content: flex-end; }
+.rs-vm-spec b { color: var(--ink); }
 .rs-disk {
   margin-top: 18px;
   border-top: 1px solid rgba(255, 255, 255, 0.04);

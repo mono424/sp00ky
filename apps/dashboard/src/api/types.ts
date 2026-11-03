@@ -963,6 +963,8 @@ export interface ResourceSample {
 }
 
 export interface CloudService {
+  /** Which of the project's own VMs this runs on, `app` or `db`. Absent on the shared host. */
+  host?: string;
   id: string;
   name: string;
   role: 'surrealdb' | 'scheduler' | 'ssp' | 'backend' | 'frontend' | string;
@@ -1033,9 +1035,31 @@ export interface CloudBucketVolume {
   } | null;
 }
 
+/** One of a project's own VMs, as the whole machine measures itself. Zero until its first samples. */
+export interface CloudHost {
+  /** `db` is the database VM, `app` the project host. */
+  kind: string;
+  status: string;
+  server_type: string;
+  location: string;
+  vcpus: number;
+  memory_bytes: number;
+  memory_used_bytes: number;
+  disk_bytes: number;
+  disk_used_bytes: number;
+  /** All cores, 100 = the machine is full. Null until two samples exist. */
+  cpu_pct: number | null;
+  load1: number | null;
+  measured_at: string | null;
+  /** The database's volume, on the database VM. */
+  data_volume_gb?: number;
+}
+
 export interface CloudStats {
   deployment: { id: string; version: number; status: string; deployed_at: string | null } | null;
   services: CloudService[];
+  /** The project's own VMs, the database's first. Empty or absent on the shared host. */
+  hosts?: CloudHost[];
   /** False when the control plane has no metrics backend (or it failed). */
   metrics_available: boolean;
   machines: CloudDedicatedMachine[];

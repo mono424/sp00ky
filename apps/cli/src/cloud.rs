@@ -757,10 +757,10 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
 }
 
 /// The plans a new project can be created on, in prompt order. Pay as you go
-/// runs on Cloudflare and is the default; starter and pro run on VMs.
-const PLAN_CHOICES: [(&str, &str); 3] = [
+/// runs on Cloudflare and is the default; pro runs on VMs. Starter takes no new
+/// projects for now.
+const PLAN_CHOICES: [(&str, &str); 2] = [
     ("Pay as you go: Cloudflare, base fee includes usage (recommended)", "payg"),
-    ("Starter: VMs", "starter"),
     ("Pro: VMs", "pro"),
 ];
 
@@ -909,8 +909,9 @@ fn ensure_billing_active(
 /// Open Stripe checkout and poll until payment completes.
 fn wait_for_billing(client: &mut CloudClient, slug: &str) -> Result<()> {
     // The plan follows the project's hosting: a pay-as-you-go (Cloudflare)
-    // project pays for that plan, monthly; a VM project picks Starter or Pro.
-    // Crossing between the two is refused by the API.
+    // project pays for that plan, monthly; a VM project pays for Pro, or picks
+    // between Starter and Pro if it is already on Starter, which takes no new
+    // projects for now. Crossing between the two is refused by the API.
     let current_plan = fetch_project(client, slug)?
         .and_then(|p| p["plan"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "payg".to_string());
@@ -924,18 +925,16 @@ fn wait_for_billing(client: &mut CloudClient, slug: &str) -> Result<()> {
     let payg = current_plan == "payg";
     let plan = if payg {
         "payg"
+    } else if current_plan != "starter" {
+        "pro"
     } else if is_interactive() {
-        let plans = vec!["Starter", "Pro"];
-        let selection = inquire::Select::new("Select a plan:", plans)
-            .with_starting_cursor(if current_plan == "pro" { 1 } else { 0 })
+        let selection = inquire::Select::new("Select a plan:", vec!["Starter", "Pro"])
             .prompt()
             .context("Failed to select plan")?;
         match selection {
             "Pro" => "pro",
             _ => "starter",
         }
-    } else if current_plan == "pro" {
-        "pro"
     } else {
         "starter"
     };
@@ -4386,6 +4385,10 @@ mod version_skew_tests {
         assert_eq!(platform_for_plan("starter"), "hetzner");
         assert_eq!(platform_for_plan("pro"), "hetzner");
         assert_eq!(PLAN_CHOICES[0].1, "payg", "pay as you go is offered first");
+        assert!(
+            PLAN_CHOICES.iter().all(|(_, plan)| *plan != "starter"),
+            "starter takes no new projects for now"
+        );
     }
 
     #[test]
@@ -7361,7 +7364,7 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
             match current_plan {
                 "payg" => {
                     println!("  Pay as you go is the only plan for Cloudflare projects.");
-                    println!("  Moving to VM hosting (Starter, Pro) needs a new project: `spky project create --plan starter`.");
+                    println!("  Moving to VM hosting (Pro) needs a new project: `spky project create --plan starter`.");
                     return Ok(());
                 }
                 "free" => {
@@ -7372,11 +7375,14 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
                 _ => {}
             }
 
-            // Plan selection (VM plans)
-            let plans = vec!["Starter", "Pro"];
-            let default_plan = if current_plan == "pro" { 1 } else { 0 };
+            // Plan selection (VM plans). Starter takes no new projects for now,
+            // so only a project already on it is offered it.
+            let plans = if current_plan == "starter" {
+                vec!["Starter", "Pro"]
+            } else {
+                vec!["Pro"]
+            };
             let plan_selection = inquire::Select::new("Select a plan:", plans)
-                .with_starting_cursor(default_plan)
                 .prompt()
                 .context("Failed to select plan")?;
             let new_plan = match plan_selection {

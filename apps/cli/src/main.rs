@@ -954,7 +954,7 @@ enum ProjectCommands {
         /// Project slug (lowercase, alphanumeric + hyphens)
         #[arg(long)]
         slug: Option<String>,
-        /// Plan: payg (Cloudflare, pay as you go), starter or pro (VMs)
+        /// Plan: payg (Cloudflare, pay as you go) or pro (VMs)
         #[arg(long, default_value = "payg")]
         plan: String,
     },

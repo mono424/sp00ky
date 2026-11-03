@@ -74,17 +74,20 @@ table events do. Deleting a user removes the row, its roster entry and its
 feature flags, and rows that point at the user stay. A password reset does not end
 sessions already open, because SurrealDB has nothing to revoke them with.</p>
 <h2 id="storage">Storage</h2>
-<p>The files of your SurrealDB buckets. Move through folders, preview images and
-text, download, upload by button or by dropping files on the page, rename, and
-delete. An HTML file shows as text and never runs.</p>
+<p>The files of your SurrealDB buckets. Folders open side by side in columns, with
+the file or folder you picked at the end, so you always see how you got there.
+Preview images and text, download, upload by button or by dropping files on the
+page, rename, and delete. An HTML file shows as text and never runs.</p>
 <p>Three limits come from where the files are:</p>
 <ul>
 <li><strong>Uploads stop at about 3 MB</strong>, the most that fits SurrealDB’s 4 MiB request
 limit (<code>SURREAL_HTTP_MAX_RPC_BODY_SIZE</code>) once encoded. Your app’s own uploads
 are not affected. Reads go up to 32 MB.</li>
-<li><strong>A <code>file:</code> bucket shows one folder at a time.</strong> SurrealDB lists the files of a
-directory and not the directories in it, so a subfolder has to be opened by its
-path. The page remembers the ones you opened.</li>
+<li><strong>A <code>file:</code> bucket needs its folder on the scheduler’s disk to show subfolders.</strong>
+SurrealDB lists the files of a directory and not the directories in it, so the
+scheduler reads them from the bucket’s volume, which Sp00ky Cloud mounts read-only
+on VM projects from their next upgrade. Until then a subfolder has to be opened
+by its path, and the page remembers the ones you opened.</li>
 <li><strong>A <code>BACKEND &quot;r2&quot;</code> bucket is listed but cannot be browsed yet</strong>: its files live
 in R2 next to the SSP, not in the database.</li>
 </ul>

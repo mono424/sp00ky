@@ -1186,16 +1186,26 @@ const service = (id, name, role, vcpus, memoryMb, cpu, cpuSwing, memMb, extra = 
 };
 /** A container's volumes on the host disk (160 GB, 62 GB of it free). */
 const disk = (usedBytes) => ({ disk: { used_bytes: usedBytes, fs_bytes: 171_798_691_840, free_bytes: 66_571_993_088, measured_at: iso(2 * 60_000) } });
+/** The database's own volume: 50 GB. */
+const volumeDisk = (usedBytes) => ({ disk: { used_bytes: usedBytes, fs_bytes: 52_521_566_208, free_bytes: 47_900_000_000, measured_at: iso(2 * 60_000) } });
 const CLOUD_STATS = {
   deployment: { id: 'dep_7f2c', version: 142, status: 'running', deployed_at: iso(2 * 3_600_000) },
   services: [
-    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740, disk(4_617_089_843)),
-    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210, disk(1_288_490_189)),
-    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380, disk(402_653_184)),
-    service('vm-api', 'api', 'backend', 1, 512, 6, 3, 212, { image: 'acme/api' }),
-    service('vm-mail', 'email', 'backend', 1, 512, 1.2, 0.6, 64, { image: 'acme/email' }),
-    service('vm-render', 'renderer', 'backend', 1, 64, 0.4, 0.2, 9, { image: 'nginx:1.27-alpine', machine: 'media' }),
-    service('vm-web', 'web', 'frontend', 1, 512, 0.3, 0.2, 18, { image: 'acme/web' }),
+    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740, { ...volumeDisk(4_617_089_843), host: 'db' }),
+    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210, { ...disk(1_288_490_189), host: 'app' }),
+    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380, { ...disk(402_653_184), host: 'app' }),
+    service('vm-api', 'api', 'backend', 1, 512, 6, 3, 212, { image: 'acme/api', host: 'app' }),
+    service('vm-mail', 'email', 'backend', 1, 512, 1.2, 0.6, 64, { image: 'acme/email', host: 'app' }),
+    service('vm-render', 'renderer', 'backend', 1, 64, 0.4, 0.2, 9, { image: 'nginx:1.27-alpine', machine: 'media', host: 'app' }),
+    service('vm-web', 'web', 'frontend', 1, 512, 0.3, 0.2, 18, { image: 'acme/web', host: 'app' }),
+    service('vm-link-db', 'dblink-db', 'dblink', 1, 128, 1.1, 0.4, 17, { host: 'db' }),
+    service('vm-link-app', 'dblink-app', 'dblink', 1, 128, 1.2, 0.4, 17, { host: 'app' }),
+  ],
+  hosts: process.env.FX_SHARED_HOST ? [] : [
+    { kind: 'db', status: 'ready', server_type: 'cax21', location: 'fsn1', vcpus: 4, memory_bytes: 8_106_127_360, memory_used_bytes: 2_560_000_000,
+      disk_bytes: 80_307_429_376, disk_used_bytes: 4_210_000_000, cpu_pct: 12.4, load1: 0.42, measured_at: iso(31_000), data_volume_gb: 50 },
+    { kind: 'app', status: 'ready', server_type: 'cx33', location: 'fsn1', vcpus: 4, memory_bytes: 8_106_127_360, memory_used_bytes: 3_180_000_000,
+      disk_bytes: 80_307_429_376, disk_used_bytes: 18_740_000_000, cpu_pct: 21.7, load1: 0.86, measured_at: iso(31_000) },
   ],
   metrics_available: true,
   machines: [

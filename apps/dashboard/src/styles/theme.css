@@ -128,27 +128,12 @@ body {
   overflow: hidden;
 }
 
-/* Thin, translucent scrollbars: the card has its own scroll region and a
-   classic grey bar would read as a window inside a window. */
+/* No scrollbars anywhere. Everything still scrolls, by wheel, trackpad and touch. */
+* {
+  scrollbar-width: none;
+}
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.09);
-  border-radius: 5px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.14);
-  background-clip: padding-box;
-}
-::-webkit-scrollbar-corner {
-  background: transparent;
+  display: none;
 }
 
 /* Figures and identifiers. Everything that is data rather than label. */

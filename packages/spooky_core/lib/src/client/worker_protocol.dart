@@ -57,9 +57,10 @@ final class QueryCommand extends WorkerCommand {
 }
 
 final class RemoteCommand extends WorkerCommand {
-  const RemoteCommand(this.sql, this.vars);
+  const RemoteCommand(this.sql, this.vars, {this.interactive = false});
   final String sql;
   final Map<String, dynamic>? vars;
+  final bool interactive;
   @override
   WorkerOp get op => WorkerOp.remote;
 }

@@ -117,8 +117,11 @@ class FetchPlan {
   final Map<String, int> versions;
 }
 
-/// Cross-query, deduped, chunked list of ids to pull from the server.
-FetchPlan planFetch(ClientState s, {int chunkSize = fetchChunk}) {
+/// Cross-query, deduped, chunked list of ids to pull from the server: the next
+/// round's worth, smallest need first, so one row that was just requested does
+/// not wait for another query's thousands. The loop plans again after a round.
+FetchPlan planFetch(ClientState s,
+    {int chunkSize = fetchChunk, int maxChunks = fetchRoundChunks}) {
   final versions = <String, int>{};
   final hashes = <QueryHash>[];
   void add(RecordVersionArray pairs) {
@@ -127,15 +130,29 @@ FetchPlan planFetch(ClientState s, {int chunkSize = fetchChunk}) {
     }
   }
 
-  for (final hash in s.queries.keys) {
-    final missing = needed(s, hash);
-    if (missing.isNotEmpty) hashes.add(hash);
-    add(missing);
-    add(neededChildren(s, hash));
+  final wants = [
+    for (final hash in s.queries.keys)
+      (hash: hash, missing: needed(s, hash), children: neededChildren(s, hash))
+  ];
+  // A stable sort: queries needing the same amount keep their registration
+  // order.
+  final order = List<int>.generate(wants.length, (i) => i)
+    ..sort((a, b) {
+      final size = wants[a].missing.length + wants[a].children.length;
+      final other = wants[b].missing.length + wants[b].children.length;
+      return size != other ? size.compareTo(other) : a.compareTo(b);
+    });
+  for (final i in order) {
+    final want = wants[i];
+    if (want.missing.isNotEmpty) hashes.add(want.hash);
+    add(want.missing);
+    add(want.children);
   }
   final all = versions.keys.toList();
   final chunks = <List<String>>[];
-  for (var i = 0; i < all.length; i += chunkSize) {
+  for (var i = 0;
+      i < all.length && chunks.length < maxChunks;
+      i += chunkSize) {
     chunks.add(all.sublist(i, math.min(i + chunkSize, all.length)));
   }
   return FetchPlan(hashes: hashes, chunks: chunks, versions: versions);

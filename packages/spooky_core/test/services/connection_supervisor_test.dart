@@ -47,10 +47,14 @@ class _Transport {
     disconnected.add(null);
   }
 
-  ConnectionSupervisor supervisor({ReconnectConfig? config}) =>
+  ConnectionSupervisor supervisor({
+    ReconnectConfig? config,
+    Future<void> Function()? wakeProbe,
+  }) =>
       ConnectionSupervisor(
         reconnect: reconnect,
         probe: probe,
+        wakeProbe: wakeProbe,
         forceClose: forceClose,
         isConnected: () => open,
         onConnected: connected.stream,
@@ -168,6 +172,61 @@ void main() {
       sup.wake();
       async.flushMicrotasks();
       expect(t.probes, 2);
+      unawaited(sup.dispose());
+      async.flushTimers();
+    });
+  });
+
+  test('one missed wake probe replaces the socket, without a second chance',
+      () {
+    fakeAsync((async) {
+      final t = _Transport();
+      final sup = t.supervisor(
+        config: const ReconnectConfig(wakeProbeTimeoutMs: 3000),
+        wakeProbe: () => Completer<void>().future,
+      )..start();
+      sup.wake('resumed');
+      async.elapse(const Duration(milliseconds: 2999));
+      expect(t.forceCloses, 0);
+      expect(t.reconnects, 0);
+      async.elapse(const Duration(milliseconds: 1));
+      expect(t.forceCloses, 1);
+      async.elapse(Duration.zero);
+      expect(t.reconnects, 1, reason: 'at once, not after a backoff');
+      expect(sup.connection, ConnectionState.connected);
+      unawaited(sup.dispose());
+      async.flushTimers();
+    });
+  });
+
+  test('a wake probe asks the socket: a busy lane cannot fail it', () {
+    fakeAsync((async) {
+      final t = _Transport()..probeHangs = true;
+      var wakeProbes = 0;
+      final sup = t.supervisor(wakeProbe: () async => wakeProbes++)..start();
+      sup.wake('resumed');
+      async.elapse(const Duration(seconds: 5));
+      expect(wakeProbes, 1);
+      expect(t.probes, 0);
+      expect(t.forceCloses, 0);
+      unawaited(sup.dispose());
+      async.flushTimers();
+    });
+  });
+
+  test('a wake is not swallowed by a heartbeat already in flight', () {
+    fakeAsync((async) {
+      final t = _Transport()..probeHangs = true;
+      var wakeProbes = 0;
+      final sup = t.supervisor(
+        config: const ReconnectConfig(heartbeatIntervalMs: 1000),
+        wakeProbe: () async => wakeProbes++,
+      )..start();
+      async.elapse(const Duration(seconds: 1));
+      expect(t.probes, 1, reason: 'the heartbeat is now waiting on its probe');
+      sup.wake('resumed');
+      async.flushMicrotasks();
+      expect(wakeProbes, 1);
       unawaited(sup.dispose());
       async.flushTimers();
     });

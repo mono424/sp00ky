@@ -110,11 +110,21 @@ class WebSocketSurrealClient
     }
     channel.stream.listen(
       _onMessage,
-      onDone: () => _onSocketEnd(null),
-      onError: (Object error) => _onSocketEnd(error),
+      onDone: () => _onChannelEnd(channel, null),
+      onError: (Object error) => _onChannelEnd(channel, error),
       cancelOnError: false,
     );
     _connected.add(null);
+  }
+
+  /// [channel] ended. `_channel` is what [isConnected] reports, so it has to go
+  /// with the socket: left set, a closed socket read as connected, the
+  /// supervisor's revive loop saw nothing to do and nothing ever re-opened it.
+  /// A socket this client already replaced says nothing about the current one.
+  void _onChannelEnd(WebSocketChannel channel, Object? error) {
+    if (!identical(_channel, channel)) return;
+    _channel = null;
+    _onSocketEnd(error);
   }
 
   /// The socket ended. Every in-flight RPC is now unanswerable: completing it
@@ -147,13 +157,15 @@ class WebSocketSurrealClient
     final channel = _channel;
     _channel = null;
     if (channel == null) return;
+    // Before the close: closing a half-open socket takes the whole bound below,
+    // and nothing in flight on it is coming back.
+    _onSocketEnd(null);
     try {
       await channel.sink.close().timeout(const Duration(seconds: 2));
     } catch (_) {
       // A socket that is already gone, or one too wedged to close, is exactly
       // the state we wanted to reach.
     }
-    _onSocketEnd(null);
   }
 
   String _rpcEndpoint(String endpoint) {

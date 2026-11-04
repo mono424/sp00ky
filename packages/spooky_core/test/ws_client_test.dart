@@ -11,10 +11,16 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 class FakeChannel implements WebSocketChannel {
   final _incoming = StreamController<dynamic>.broadcast();
   final List<Map<String, dynamic>> sent = [];
-  late final _FakeSink _sink = _FakeSink(sent);
+  late final _FakeSink _sink = _FakeSink(sent, this);
 
   void push(Map<String, dynamic> frame) =>
       _incoming.add(surrealCborEncode(frame));
+
+  /// The socket ended, as the transport reports it.
+  void end() => unawaited(_incoming.close());
+
+  /// What closing the sink waits for, as a half-open socket's close does.
+  Future<void>? closeResult;
 
   /// Auto-complete the most recent RPC with [result].
   void respondLast(dynamic result) {
@@ -33,15 +39,26 @@ class FakeChannel implements WebSocketChannel {
 }
 
 class _FakeSink implements WebSocketSink {
-  _FakeSink(this.sent);
+  _FakeSink(this.sent, this.owner);
   final List<Map<String, dynamic>> sent;
+  final FakeChannel owner;
   @override
   void add(dynamic data) =>
       sent.add(surrealCborDecode(data as List<int>) as Map<String, dynamic>);
   @override
-  Future<void> close([int? closeCode, String? closeReason]) async {}
+  Future<void> close([int? closeCode, String? closeReason]) async =>
+      owner.closeResult;
   @override
   dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);
+}
+
+/// WS client handing out a new [FakeChannel] per connect.
+class SequenceClient extends WebSocketSurrealClient {
+  SequenceClient(this.channels);
+  final List<FakeChannel> channels;
+  var _next = 0;
+  @override
+  WebSocketChannel createChannel(Uri uri) => channels[_next++];
 }
 
 /// WS client wired to a [FakeChannel].
@@ -191,6 +208,53 @@ void main() {
       fake.respondLast(null);
       await killFuture;
       await sub.cancel();
+    });
+
+    test('a socket that ends reads as closed and fails what was in flight',
+        () async {
+      expect(client.isConnected, isTrue);
+      final disconnected = expectLater(client.onDisconnected, emits(null));
+      final pending = client.query('RETURN true');
+      final failed = expectLater(pending, throwsA(isA<StateError>()));
+      fake.end();
+      await disconnected;
+      await failed;
+      expect(client.isConnected, isFalse,
+          reason: 'the revive loop reads this and would do nothing');
+      await expectLater(client.query('RETURN true'), throwsA(isA<StateError>()));
+    });
+
+    test('forceClose fails what was in flight before the close finishes',
+        () async {
+      final closing = Completer<void>();
+      fake.closeResult = closing.future;
+      final pending = client.query('RETURN true');
+      final failed = expectLater(pending, throwsA(isA<StateError>()));
+      final closed = client.forceClose();
+      await failed.timeout(const Duration(seconds: 1));
+      closing.complete();
+      await closed;
+    });
+
+    test('the end of a replaced socket does not touch the current one',
+        () async {
+      final first = FakeChannel();
+      final second = FakeChannel();
+      final c = SequenceClient([first, second]);
+      await c.connect('ws://x:8000');
+      await c.connect('ws://x:8000');
+      var disconnects = 0;
+      c.onDisconnected.listen((_) => disconnects++);
+      final pending = c.query('RETURN true');
+      first.end();
+      await Future<void>.delayed(Duration.zero);
+      expect(c.isConnected, isTrue);
+      expect(disconnects, 0);
+      second.respondLast([
+        {'status': 'OK', 'result': 1}
+      ]);
+      expect(await pending, [1]);
+      await c.close();
     });
 
     test('an error frame rejects the pending RPC', () async {

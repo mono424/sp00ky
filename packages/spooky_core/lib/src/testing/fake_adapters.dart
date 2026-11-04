@@ -131,6 +131,11 @@ class FakeRemotePort implements RemotePort {
   }
 
   @override
+  Future<List<StatementResult>> bodyStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      queryStatements(sql, vars);
+
+  @override
   Future<List<StatementResult>> writeStatements(String sql,
       [Map<String, dynamic>? vars]) async {
     _log('remote.write', [sql, vars]);

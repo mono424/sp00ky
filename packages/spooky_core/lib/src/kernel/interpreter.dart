@@ -31,6 +31,10 @@ abstract interface class RemotePort {
   Future<List<StatementResult>> queryStatements(String sql,
       [Map<String, dynamic>? vars]);
 
+  /// [queryStatements] for a row body fetch: does not wait behind other reads.
+  Future<List<StatementResult>> bodyStatements(String sql,
+      [Map<String, dynamic>? vars]);
+
   /// [queryStatements] for a write: starts once every earlier write has
   /// settled, so writes reach the server one at a time, in issue order.
   Future<List<StatementResult>> writeStatements(String sql,
@@ -169,10 +173,18 @@ class Interpreter implements Ctx {
         return null as R;
       case LocalEpoch():
         return _adapters.local.epoch as R;
-      case RemoteQuery(:final sql, :final vars, :final timeoutMs, :final write):
+      case RemoteQuery(
+          :final sql,
+          :final vars,
+          :final timeoutMs,
+          :final write,
+          :final bodies
+        ):
         final pending = write
             ? _adapters.remote.writeStatements(sql, vars)
-            : _adapters.remote.queryStatements(sql, vars);
+            : bodies
+                ? _adapters.remote.bodyStatements(sql, vars)
+                : _adapters.remote.queryStatements(sql, vars);
         if (timeoutMs == null) return await pending as R;
         return await pending.timeout(
           Duration(milliseconds: timeoutMs),

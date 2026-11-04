@@ -32,6 +32,11 @@ const int ackGraceMs = 30000;
 /// Ids per body-fetch statement.
 const int fetchChunk = 500;
 
+/// Chunks fetched and landed per round of the fetch loop. Dart only. Rows land
+/// between rounds, and each round plans again, so a backlog neither hides what
+/// already arrived nor holds back a row that became known meanwhile.
+const int fetchRoundChunks = 4;
+
 /// Outbox statements per push request.
 const int outboxBatchSize = 50;
 

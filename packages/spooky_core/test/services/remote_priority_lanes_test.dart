@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:spooky_core/src/kernel/effects.dart' show StatementResult;
 import 'package:spooky_core/src/services/database/remote_database_service.dart';
 import 'package:spooky_core/src/services/logger/logger.dart';
-import 'package:spooky_core/src/surreal/remote_client.dart';
 import 'package:spooky_core/src/types.dart';
 import 'package:test/test.dart';
 

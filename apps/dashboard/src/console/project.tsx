@@ -659,9 +659,8 @@ const PREVIEW_W = 1280;
 const [previewOn, setPreviewOn] = createSignal(localStorage.getItem(PREVIEW_KEY) !== 'off');
 /**
  * Whether this device can run a second copy of the app beside the console. A
- * sp00ky app brings its own workers, wasm and local database; on a phone the
- * browser kills that frame and shows its sad-page icon, so a phone gets the
- * site's card instead.
+ * sp00ky app brings its own workers, wasm and local database, too much to ask
+ * of a phone, so a phone gets the site's card instead.
  */
 const ROOMY =
   window.matchMedia('(min-width: 1100px) and (pointer: fine)').matches &&

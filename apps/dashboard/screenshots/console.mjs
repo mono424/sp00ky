@@ -43,6 +43,7 @@ const CSP = [
   "img-src 'self' data: https://avatars.githubusercontent.com",
   "font-src 'self'",
   "connect-src 'self'",
+  "frame-src https:",
   "frame-ancestors 'none'",
   "base-uri 'none'",
   "form-action 'self'",

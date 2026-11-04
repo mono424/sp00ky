@@ -493,12 +493,8 @@ pub async fn cloud_restart(
     // Will this process survive? Empty roles means scheduler + SSPs; clean
     // always forces the scheduler in. If not, there is nobody left to mark
     // the operation done, and the dashboard's reconnect loop takes over.
-    let restarts_scheduler = req.clean
-        || req.roles.is_empty()
-        || req
-            .roles
-            .iter()
-            .any(|r| r == "scheduler" || r == "surrealdb");
+    let restarts_scheduler = restart_replaces_scheduler(&req);
+    let restarts_ssps = req.roles.iter().any(|r| r == "ssp");
     let op = state.ops.start(
         OpKind::CloudRestart,
         None,
@@ -518,6 +514,12 @@ pub async fn cloud_restart(
             &op.id,
             json!({ "phase": "queued; this scheduler will be recreated" }),
         );
+    } else if !restarts_ssps {
+        // The database, backends or frontends. This process stays and has
+        // nothing of its own to watch: an SSP is not replaced, so waiting for
+        // one to come back would fail, and leaving the operation open left it
+        // `running` until the next scheduler restart.
+        state.ops.finish(&op.id, Some("Handed to Sp00ky Cloud".to_string()));
     } else {
         // SSP-only: watch them all come back. The worker destroys and
         // recreates them, so every current registration will be replaced.
@@ -548,6 +550,12 @@ pub async fn cloud_restart(
         });
     }
     Ok(accepted(state.ops.get(&op.id).unwrap_or(op)))
+}
+
+/// Whether the control plane recreates this scheduler for `req`. A database
+/// restart does not: the worker stops only the roles it was asked to.
+fn restart_replaces_scheduler(req: &CloudRestartRequest) -> bool {
+    req.clean || req.roles.is_empty() || req.roles.iter().any(|r| r == "scheduler")
 }
 
 /// `GET /admin/api/cloud/deployment`
@@ -615,6 +623,21 @@ pub async fn stream_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_scheduler_role_replaces_this_process() {
+        let req = |roles: &[&str], clean| CloudRestartRequest {
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            clean,
+            ..Default::default()
+        };
+        assert!(restart_replaces_scheduler(&req(&[], false)), "the default is scheduler + SSPs");
+        assert!(restart_replaces_scheduler(&req(&["scheduler"], false)));
+        assert!(restart_replaces_scheduler(&req(&["ssp"], true)), "clean wipes its volume");
+        assert!(!restart_replaces_scheduler(&req(&["surrealdb"], false)));
+        assert!(!restart_replaces_scheduler(&req(&["ssp"], false)));
+        assert!(!restart_replaces_scheduler(&req(&["backend", "frontend"], false)));
+    }
 
     #[test]
     fn modes_map_to_resync_kinds() {

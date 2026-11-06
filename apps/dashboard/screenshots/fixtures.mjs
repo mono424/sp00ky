@@ -425,6 +425,7 @@ export const OVERVIEW = {
 
 export const CONFIG = {
   data: true,
+  flags: true,
   scheduler_id: 'scheduler-0',
   version: '0.0.1-canary.265',
   breakglass_available: true,
@@ -1354,7 +1355,49 @@ const DATA_USERS = [
   sessions,
 }));
 const DATA_SOURCE = { access: 'account', table: 'user', identifier: 'username', created_field: 'created_at', search_fields: ['username', 'email'], can_set_password: true, sources: ['account'] };
+/** The Feature flags page (`/data/flags`) and the flags on one user. */
+const flag = (key, description, extra = {}) => ({
+  key,
+  description,
+  variants: ['off', 'on'],
+  default_variant: 'off',
+  enabled: true,
+  rollouts: [],
+  pinned: 0,
+  other_rules: 0,
+  created_at: iso(40 * 86_400_000),
+  updated_at: iso(3 * 3_600_000),
+  ...extra,
+});
+const DATA_FLAGS = [
+  flag('analysis-v2', 'Engine lines in the review panel', { rollouts: [{ variant: 'on', percent: 25 }], pinned: 2, updated_at: iso(40 * 60_000) }),
+  flag('board-theme', 'Seasonal board colours', { variants: ['classic', 'autumn', 'night'], default_variant: 'classic', rollouts: [{ variant: 'autumn', percent: 10 }, { variant: 'night', percent: 30 }] }),
+  flag('club-chat', null, { enabled: false, pinned: 1, updated_at: iso(6 * 86_400_000) }),
+  flag('new-board', 'The rewritten board, drag and premoves', { rollouts: [{ variant: 'on', percent: 100 }], updated_at: iso(12 * 86_400_000) }),
+];
+const DATA_FLAG_DETAIL = {
+  flag: { ...DATA_FLAGS[0], payloads: { on: { depth: 22 } } },
+  counts: { off: 3, on: 2 },
+  pins: [
+    { id: 'user:mira', variant: 'on', name: 'mira', exists: true },
+    { id: 'user:ghost', variant: 'on', name: null, exists: false },
+  ],
+  pins_total: 2,
+};
+const DATA_USER_FEATURES = [
+  { key: 'analysis-v2', description: 'Engine lines in the review panel', variants: ['off', 'on'], default_variant: 'off', enabled: true, variant: 'on', pinned: 'on' },
+  { key: 'board-theme', description: 'Seasonal board colours', variants: ['classic', 'autumn', 'night'], default_variant: 'classic', enabled: true, variant: 'night', pinned: null },
+  { key: 'club-chat', description: null, variants: ['off', 'on'], default_variant: 'off', enabled: false, variant: 'off', pinned: null },
+  { key: 'new-board', description: 'The rewritten board, drag and premoves', variants: ['off', 'on'], default_variant: 'off', enabled: true, variant: 'on', pinned: null },
+];
 const DATA_ROUTES = {
+  'GET /data/flags': { installed: true, evaluator: true, users_table: true, flags: DATA_FLAGS },
+  'POST /data/flags': { flag: flag('beta', null), evaluate: true },
+  'GET /data/flags/flag': DATA_FLAG_DETAIL,
+  'PUT /data/flags/flag': { flag: DATA_FLAGS[0], evaluate: true },
+  'DELETE /data/flags/flag': { deleted: 'analysis-v2' },
+  'POST /data/flags/flag/evaluate': { evaluated: DATA_USERS.length, next: null, total: DATA_USERS.length },
+  'PUT /data/flags/flag/user': { key: 'analysis-v2', id: 'user:mira', pinned: 'on', variant: 'on' },
   'GET /data/tables': { tables: DATA_TABLES },
   'GET /data/tables/user': {
     ...DATA_TABLES[2],
@@ -1368,7 +1411,7 @@ const DATA_ROUTES = {
   'GET /data/tables/user/row': { row: DATA_USERS[0].row },
   'GET /data/users': { source: DATA_SOURCE, users: DATA_USERS, has_more: false, limit: 50, start: 0 },
   'GET /data/users/stats': { total: DATA_USERS.length, admins: 1, online: 2 },
-  'GET /data/users/user': { source: DATA_SOURCE, row: DATA_USERS[0].row, is_admin: true, admin: { note: 'founder', added_at: iso(300 * 86_400_000) }, sessions: [{ client_id: 'c-41f2', views: 2 }, { client_id: 'c-9a07', views: 1 }], flags: [{ key: 'new-board', variant: 'on' }] },
+  'GET /data/users/user': { source: DATA_SOURCE, row: DATA_USERS[0].row, is_admin: true, admin: { note: 'founder', added_at: iso(300 * 86_400_000) }, sessions: [{ client_id: 'c-41f2', views: 2 }, { client_id: 'c-9a07', views: 1 }], flags: DATA_USER_FEATURES.map((f) => ({ key: f.key, variant: f.variant })), features: DATA_USER_FEATURES, features_assignable: true },
   'GET /data/buckets': {
     buckets: [
       { name: 'avatars', backend: 'r2', readonly: false, browsable: false, lists_folders: true },

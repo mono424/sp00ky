@@ -508,6 +508,8 @@ impl SspNode {
                 "cloud_login": self.admin.settings.cloud_login().is_some(),
                 // Whether `/data` (the Database, Users and Storage pages) is on here.
                 "data": !self.admin.settings.data_disabled,
+                // Whether `/data/flags` is: the Feature flags page, flags on a user.
+                "flags": !self.admin.settings.data_disabled,
             }),
         )
     }

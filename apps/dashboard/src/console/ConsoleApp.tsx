@@ -35,6 +35,7 @@ import { Logo, PageHead } from '../components/Chrome';
 import { FrameSkeleton, PageSkeleton, Shell } from '../components/Shell';
 import { ProjectApp } from '../ProjectApp';
 import { Database, SqlEditor } from '../routes/Database';
+import { Flags } from '../routes/Flags';
 import { Storage } from '../routes/Storage';
 import { Users } from '../routes/Users';
 import { SignInFrame } from '../routes/Login';
@@ -334,6 +335,7 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
       <Route path={['/database', '/database/table/:table']} component={Database} />
       <Route path="/database/sql" component={SqlEditor} />
       <Route path="/users" component={Users} />
+      <Route path="/flags" component={Flags} />
       <Route path="/storage/:bucket?" component={Storage} />
     </>
   );

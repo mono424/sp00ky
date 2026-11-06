@@ -29,6 +29,9 @@
 //! - A folder's listing can come from the disk instead (see [`BucketDirs`]), and
 //!   that reads names and sizes only: every file operation still goes through
 //!   the database, so its rules and its one writer stay as they are.
+//! - Feature flags change through their own routes, in the shape `spky flag`
+//!   writes and evaluated by the project's own `fn::feature::*`, so the console,
+//!   the CLI and the DevTools panel cannot assign different variants.
 //! - Reads carry a `TIMEOUT` and a `LIMIT`. Nothing here counts or sorts a table
 //!   unasked, a scan of a large user table being a real load on the project's
 //!   database: the Database page's count is a button, and the Users list is sorted
@@ -177,6 +180,14 @@ async fn route(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
         ("DELETE", ["users", "user"]) => delete_user(db, req).await,
         ("PUT", ["users", "user", "password"]) => reset_password(db, req).await,
         ("PUT", ["users", "user", "admin"]) => set_admin(db, req).await,
+
+        ("GET", ["flags"]) => list_flags(db).await,
+        ("POST", ["flags"]) => create_flag(db, req).await,
+        ("GET", ["flags", "flag"]) => flag_detail(db, req).await,
+        ("PUT", ["flags", "flag"]) => update_flag(db, req).await,
+        ("DELETE", ["flags", "flag"]) => delete_flag(db, req).await,
+        ("POST", ["flags", "flag", "evaluate"]) => evaluate_flag(db, req).await,
+        ("PUT", ["flags", "flag", "user"]) => pin_user(db, req).await,
 
         ("GET", ["buckets"]) => list_buckets(db, req.dirs).await,
         ("GET", ["buckets", bucket, "files"]) => list_files(db, bucket, req).await,
@@ -1393,6 +1404,7 @@ async fn user_detail(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Valu
     )
     .await
     .ok();
+    let features = user_features(db, &id, flags.as_deref().unwrap_or_default()).await;
     Ok(json!({
         "source": cx.describe(),
         "row": clean_row(table, row, &cx.known, ROW_CELL_BYTES),
@@ -1400,7 +1412,43 @@ async fn user_detail(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Valu
         "admin": admin.flatten(),
         "sessions": sessions,
         "flags": flags,
+        "features": features,
+        // The evaluator materializes rows for `user` records only.
+        "features_assignable": table == FLAG_USER_TABLE,
     }))
+}
+
+/// Every defined flag with what this user gets and the variant they are pinned
+/// to, if any. `None` when flags cannot be read, an older schema among others.
+async fn user_features(db: &dyn ScheduleDb, id: &str, assigned: &[Value]) -> Option<Vec<Value>> {
+    let uid = canonical_id(db, id).await.ok()?;
+    let flags = first_rows(
+        db,
+        "SELECT key, description, variants, default_variant, enabled, rules FROM _00_feature_flag \
+         ORDER BY key LIMIT 500 TIMEOUT 4s;",
+        &[],
+    )
+    .await
+    .ok()?;
+    let variant_of = |key: &str| assigned.iter().find(|a| a["key"] == key).map(|a| a["variant"].clone());
+    Some(
+        flags
+            .into_iter()
+            .filter_map(|flag| {
+                let key = flag["key"].as_str()?.to_string();
+                let rules = rules_of(&flag);
+                Some(json!({
+                    "key": key,
+                    "description": flag.get("description"),
+                    "variants": flag.get("variants"),
+                    "default_variant": flag.get("default_variant"),
+                    "enabled": flag.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                    "variant": variant_of(&key),
+                    "pinned": pinned_variant(&rules, &uid),
+                }))
+            })
+            .collect(),
+    )
 }
 
 /// Whether a request's id is the signed-in user's own record, however it is
@@ -1537,6 +1585,590 @@ async fn delete_user(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Valu
     }
     let gone = first_rows(db, "DELETE <record>$id RETURN BEFORE;", &bound).await?;
     Ok(json!({ "deleted": gone.len() }))
+}
+
+// =============================================================
+// Feature flags
+// =============================================================
+//
+// A flag is a row of `_00_feature_flag`; what each user gets is a row of
+// `_00_user_feature`, the table clients sync. The rules are the ones `spky flag`
+// writes: an allowlist per variant (priority 10) and a rollout per variant
+// (priority 50). Every assignment is made by the project's `fn::feature::assign`,
+// the evaluator the CLI's and the scheduler's are pinned against, so whichever
+// tool changed a flag, a user lands on the same variant.
+//
+// A change to a flag's rules re-evaluates every user, which posts each changed
+// row to the SSP inside its transaction: on Cloudflare that is most of a second
+// per user. So the routes that change rules answer at once with `evaluate`, and
+// the console walks `flags/flag/evaluate` page by page, a bounded request each,
+// with a progress bar. Pinning one user re-evaluates that user only.
+
+/// The table `fn::feature::*` and the scheduler's sweep evaluate flags for.
+const FLAG_USER_TABLE: &str = "user";
+const MAX_FLAG_KEY_BYTES: usize = 100;
+const MAX_VARIANT_BYTES: usize = 64;
+const MAX_VARIANTS: usize = 16;
+/// The priorities `spky flag` writes: an allowlist beats a rollout.
+const PRIORITY_ALLOWLIST: i64 = 10;
+const PRIORITY_ROLLOUT: i64 = 50;
+/// Users one `flags/flag/evaluate` request walks, by default and at most.
+const DEFAULT_EVALUATE_PAGE: usize = 100;
+const MAX_EVALUATE_PAGE: usize = 500;
+/// Pinned users a flag's page lists by name.
+const MAX_PINS_SHOWN: usize = 500;
+/// Read-modify-write attempts on a flag's rules before giving up.
+const FLAG_WRITE_ATTEMPTS: usize = 4;
+/// Read with every write: a write applies only while it still matches.
+const FLAG_SELECT: &str = "SELECT key, description, variants, default_variant, enabled, rules, payloads, created_at, updated_at, \
+     <string>(updated_at ?? '') AS stamp FROM _00_feature_flag WHERE key = $key LIMIT 1;";
+
+/// A flag key as clients name it in code: `beta`, `checkout.v2`, `ui/new-nav`.
+fn checked_flag_key(key: Option<&str>) -> AdminResult<&str> {
+    let key = key.map(str::trim).unwrap_or_default();
+    let ok = !key.is_empty()
+        && key.len() <= MAX_FLAG_KEY_BYTES
+        && key.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/'));
+    if ok {
+        Ok(key)
+    } else {
+        Err(AdminError::new(400, "A flag key is letters, digits and _ - . : /, starting with a letter or digit, at most 100 characters"))
+    }
+}
+
+fn checked_variants(value: &Value) -> AdminResult<Vec<String>> {
+    let list = value.as_array().ok_or_else(|| AdminError::new(400, "variants must be a list of names"))?;
+    let mut out: Vec<String> = Vec::with_capacity(list.len());
+    for v in list {
+        let name = v.as_str().map(str::trim).unwrap_or_default();
+        if name.is_empty() || name.len() > MAX_VARIANT_BYTES || name.contains(',') {
+            return Err(AdminError::new(400, "A variant is a name of 1 to 64 characters, without commas"));
+        }
+        if out.iter().any(|seen| seen == name) {
+            return Err(AdminError::new(400, format!("Variant '{name}' is listed twice")));
+        }
+        out.push(name.to_string());
+    }
+    if out.len() < 2 || out.len() > MAX_VARIANTS {
+        return Err(AdminError::new(400, "A flag has between 2 and 16 variants"));
+    }
+    Ok(out)
+}
+
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value.and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect()
+}
+
+fn rules_of(flag: &Value) -> Vec<Value> {
+    flag.get("rules").and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
+fn rule_kind(rule: &Value) -> &str {
+    rule.get("kind").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// An allowlist's members as strings. `rules[].users` holds strings, as `spky
+/// flag` writes them; a hand-written record reads back as its id string too.
+fn rule_users(rule: &Value) -> Vec<String> {
+    string_list(rule.get("users"))
+}
+
+/// The variant `uid` is allowlisted into. A user on two lists gets the first by
+/// priority, then by position, as the evaluator ranks them.
+fn pinned_variant(rules: &[Value], uid: &str) -> Option<String> {
+    let mut lists: Vec<(i64, usize, &Value)> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| rule_kind(r) == "allowlist" && rule_users(r).iter().any(|u| u == uid))
+        .map(|(i, r)| (r.get("priority").and_then(Value::as_i64).unwrap_or(100), i, r))
+        .collect();
+    lists.sort_by_key(|(priority, i, _)| (*priority, *i));
+    lists.first().and_then(|(_, _, r)| r.get("variant")?.as_str().map(str::to_string))
+}
+
+/// `rules` with `uid` off every allowlist, then on `variant`'s when given. A list
+/// emptied by this goes, as `spky flag unset` leaves it.
+fn pin_rules(rules: &[Value], uid: &str, variant: Option<&str>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(rules.len() + 1);
+    for rule in rules {
+        if rule_kind(rule) != "allowlist" {
+            out.push(rule.clone());
+            continue;
+        }
+        let users = rule_users(rule);
+        if !users.iter().any(|u| u == uid) {
+            out.push(rule.clone());
+            continue;
+        }
+        let rest: Vec<String> = users.into_iter().filter(|u| u != uid).collect();
+        if !rest.is_empty() {
+            let mut kept = rule.clone();
+            kept["users"] = json!(rest);
+            out.push(kept);
+        }
+    }
+    let Some(variant) = variant else { return out };
+    match out.iter_mut().find(|r| rule_kind(r) == "allowlist" && r["variant"] == variant) {
+        Some(rule) => {
+            let mut users = rule_users(rule);
+            users.push(uid.to_string());
+            rule["users"] = json!(users);
+        }
+        None => out.push(json!({ "kind": "allowlist", "variant": variant, "users": [uid], "priority": PRIORITY_ALLOWLIST })),
+    }
+    out
+}
+
+/// `rules` with its rollouts replaced by `rollouts`, `(variant, percent)` in the
+/// order given. Each rollout takes the users hashed below its percent who are
+/// not taken already, so two rollouts of 20 and 30 split 20 and 10.
+fn rollout_rules(rules: &[Value], rollouts: &[(String, i64)]) -> Vec<Value> {
+    let mut out: Vec<Value> = rules.iter().filter(|r| rule_kind(r) != "rollout").cloned().collect();
+    out.extend(
+        rollouts
+            .iter()
+            .filter(|(_, percent)| *percent > 0)
+            .map(|(variant, percent)| json!({ "kind": "rollout", "variant": variant, "percent": percent, "priority": PRIORITY_ROLLOUT })),
+    );
+    out
+}
+
+fn checked_rollouts(value: &Value, variants: &[String]) -> AdminResult<Vec<(String, i64)>> {
+    let list = value.as_array().ok_or_else(|| AdminError::new(400, "rollouts must be a list of {variant, percent}"))?;
+    let mut out: Vec<(String, i64)> = Vec::with_capacity(list.len());
+    for item in list {
+        let variant = item.get("variant").and_then(Value::as_str).unwrap_or_default();
+        if !variants.iter().any(|v| v == variant) {
+            return Err(AdminError::new(400, format!("'{variant}' is not a variant of this flag")));
+        }
+        if out.iter().any(|(seen, _)| seen == variant) {
+            return Err(AdminError::new(400, format!("'{variant}' has two rollouts")));
+        }
+        let percent = item.get("percent").and_then(Value::as_i64).filter(|p| (0..=100).contains(p));
+        let percent = percent.ok_or_else(|| AdminError::new(400, "A rollout's percent is a whole number from 0 to 100"))?;
+        out.push((variant.to_string(), percent));
+    }
+    Ok(out)
+}
+
+/// What a page shows of a flag. Allowlists are counted, not listed: one can hold
+/// every user of the app.
+fn flag_summary(flag: &Value) -> Value {
+    let rules = rules_of(flag);
+    let pinned: BTreeSet<String> = rules.iter().filter(|r| rule_kind(r) == "allowlist").flat_map(rule_users).collect();
+    let rollouts: Vec<Value> = rules
+        .iter()
+        .filter(|r| rule_kind(r) == "rollout")
+        .map(|r| json!({ "variant": r.get("variant"), "percent": r.get("percent").and_then(Value::as_i64).unwrap_or(0) }))
+        .collect();
+    json!({
+        "key": flag.get("key"),
+        "description": flag.get("description"),
+        "variants": flag.get("variants"),
+        "default_variant": flag.get("default_variant"),
+        "enabled": flag.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        "rollouts": rollouts,
+        "pinned": pinned.len(),
+        // Rules no route here writes: kept as they are, counted so a page can say so.
+        "other_rules": rules.iter().filter(|r| !matches!(rule_kind(r), "allowlist" | "rollout")).count(),
+        "created_at": flag.get("created_at"),
+        "updated_at": flag.get("updated_at"),
+    })
+}
+
+/// The database's own spelling of a record id: what `fn::feature::*` compares
+/// allowlists against. `user:alice` and `` user:`alice` `` are one record.
+async fn canonical_id(db: &dyn ScheduleDb, id: &str) -> AdminResult<String> {
+    let out = run(db, "RETURN <string><record>$id;", &[("id", json!(id))]).await?;
+    out.into_iter().next().and_then(|v| v.as_str().map(str::to_string)).ok_or_else(|| AdminError::new(400, format!("'{id}' is not a record id")))
+}
+
+async fn load_flag(db: &dyn ScheduleDb, key: &str) -> AdminResult<Value> {
+    match first_rows(db, FLAG_SELECT, &[("key", json!(key))]).await {
+        Ok(found) => found.into_iter().next().ok_or_else(|| AdminError::new(404, format!("No flag '{key}'"))),
+        Err(e) if is_missing_table(&e) => Err(AdminError::new(404, "This project's schema has no feature flags yet; deploy it with a current spky")),
+        Err(e) => Err(e),
+    }
+}
+
+/// An error from `fn::feature::*` that only means the project's functions are
+/// older than this API.
+fn evaluator_error(e: AdminError) -> AdminError {
+    let m = e.message.to_ascii_lowercase();
+    if m.contains("fn::feature::") && (m.contains("does not exist") || m.contains("not found")) {
+        return AdminError::new(
+            409,
+            "This project's feature flag functions predate the console. Redeploy it (spky deploy) to update them, then try again.",
+        );
+    }
+    e
+}
+
+/// Read the flag, let `change` decide the new fields from it, write them while
+/// the flag is still the one read. `change` answers `None` to write nothing.
+/// Another writer in between, an admin in the DevTools or `spky flag`, makes the
+/// write miss, and it is decided again from what they left.
+async fn write_flag<F>(db: &dyn ScheduleDb, key: &str, mut change: F) -> AdminResult<Value>
+where
+    F: FnMut(&Value) -> AdminResult<Option<Vec<(&'static str, Value)>>>,
+{
+    for _ in 0..FLAG_WRITE_ATTEMPTS {
+        let flag = load_flag(db, key).await?;
+        let Some(set) = change(&flag)? else { return Ok(flag) };
+        let stamp = flag.get("stamp").cloned().unwrap_or(Value::Null);
+        let mut binds: Vec<(&str, Value)> = vec![("key", json!(key)), ("stamp", stamp)];
+        let mut parts: Vec<String> = Vec::with_capacity(set.len());
+        for (field, value) in set {
+            // An absent description is NONE; a bound null would fail option<string>.
+            if value.is_null() {
+                parts.push(format!("{field} = NONE"));
+            } else {
+                parts.push(format!("{field} = ${field}"));
+                binds.push((field, value));
+            }
+        }
+        let surql = format!(
+            "UPDATE _00_feature_flag SET {} WHERE key = $key AND <string>(updated_at ?? '') = $stamp RETURN VALUE key;",
+            parts.join(", ")
+        );
+        match first_rows(db, &surql, &binds).await {
+            Ok(written) if !written.is_empty() => return load_flag(db, key).await,
+            Ok(_) => continue,
+            Err(e) if e.message.to_ascii_lowercase().contains("conflict") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(AdminError::new(409, "The flag kept changing while this was saved. Try again."))
+}
+
+/// Whether the project's schema has flags, and the functions that evaluate them.
+fn flag_schema(info: &Value) -> (bool, bool) {
+    let installed = table_entry(info).any(|t| t["name"] == "_00_feature_flag");
+    let evaluator = info
+        .get("functions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|f| f["name"].as_str().is_some_and(|n| n.trim_start_matches("fn::") == "feature::assign"));
+    (installed, evaluator)
+}
+
+/// `GET flags`.
+async fn list_flags(db: &dyn ScheduleDb) -> AdminResult<Value> {
+    let info = db_info(db).await?;
+    let (installed, evaluator) = flag_schema(&info);
+    let users_table = table_entry(&info).any(|t| t["name"] == FLAG_USER_TABLE);
+    let flags = if installed {
+        first_rows(
+            db,
+            &format!(
+                "SELECT key, description, variants, default_variant, enabled, rules, created_at, updated_at \
+                 FROM _00_feature_flag ORDER BY key LIMIT 500 TIMEOUT {READ_TIMEOUT};"
+            ),
+            &[],
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    Ok(json!({
+        "installed": installed,
+        "evaluator": evaluator,
+        "users_table": users_table,
+        "flags": flags.iter().map(flag_summary).collect::<Vec<_>>(),
+    }))
+}
+
+/// `GET flags/flag?key`: the flag, how many users have each variant, and who is
+/// pinned, by name where the users page would show one.
+async fn flag_detail(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
+    let key = checked_flag_key(param(req, "key"))?;
+    let flag = load_flag(db, key).await?;
+    let rules = rules_of(&flag);
+
+    // Best effort: the index leads with the user, so this reads the table.
+    let counts = first_rows(
+        db,
+        "SELECT variant, count() AS n FROM _00_user_feature WHERE key = $key GROUP BY variant TIMEOUT 4s;",
+        &[("key", json!(key))],
+    )
+    .await
+    .ok()
+    .map(|found| {
+        found
+            .into_iter()
+            .filter_map(|r| Some((r["variant"].as_str()?.to_string(), json!(r["n"].as_u64().unwrap_or(0)))))
+            .collect::<Map<String, Value>>()
+    });
+
+    let mut pins: Vec<(String, String)> = Vec::new();
+    for rule in rules.iter().filter(|r| rule_kind(r) == "allowlist") {
+        let variant = rule.get("variant").and_then(Value::as_str).unwrap_or_default();
+        for user in rule_users(rule) {
+            if !pins.iter().any(|(u, _)| *u == user) {
+                pins.push((user, variant.to_string()));
+            }
+        }
+    }
+    let total = pins.len();
+    pins.truncate(MAX_PINS_SHOWN);
+    let names = pin_names(db, req, &pins).await;
+    let pins: Vec<Value> = pins
+        .into_iter()
+        .map(|(id, variant)| {
+            let found = names.as_ref().map(|n| n.get(&id).cloned());
+            json!({
+                "id": id,
+                "variant": variant,
+                "name": found.clone().flatten().flatten(),
+                // Known only when the names were read: a deleted user stays on a list.
+                "exists": found.map(|f| f.is_some()),
+            })
+        })
+        .collect();
+
+    let mut out = flag_summary(&flag);
+    out["payloads"] = flag.get("payloads").cloned().unwrap_or(Value::Null);
+    Ok(json!({ "flag": out, "counts": counts, "pins": pins, "pins_total": total }))
+}
+
+/// `id -> identifier` for the pinned users that still exist, `None` when they
+/// could not be read.
+async fn pin_names(db: &dyn ScheduleDb, req: &Request<'_>, pins: &[(String, String)]) -> Option<HashMap<String, Option<String>>> {
+    if pins.is_empty() {
+        return Some(HashMap::new());
+    }
+    let cx = user_context(db, req).await.ok().flatten();
+    let field = cx
+        .as_ref()
+        .filter(|cx| cx.source.table == FLAG_USER_TABLE)
+        .and_then(|cx| cx.source.identifier.clone().filter(|f| !is_credential(FLAG_USER_TABLE, f, &cx.known)));
+    let projection = field.as_deref().unwrap_or("NONE");
+    let ids: Vec<&str> = pins.iter().map(|(id, _)| id.as_str()).filter(|id| id.starts_with("user:")).collect();
+    let results = run(
+        db,
+        &format!("LET $records = $ids.map(|$i| <record>$i); SELECT <string>id AS id, {projection} AS name FROM $records TIMEOUT 4s;"),
+        &[("ids", json!(ids))],
+    )
+    .await
+    .ok()?;
+    let found = results.into_iter().last().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    Some(
+        found
+            .into_iter()
+            .filter_map(|r| Some((r["id"].as_str()?.to_string(), r["name"].as_str().map(str::to_string))))
+            .collect(),
+    )
+}
+
+/// `POST flags` with `{key, description?, variants?, default_variant?}`, as `spky
+/// flag create` makes one: on, no rules, everyone on the default. Answers
+/// `evaluate: true`: no user has a row for it yet.
+async fn create_flag(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
+    let body = body_object(req)?;
+    let key = checked_flag_key(body.get("key").and_then(Value::as_str))?;
+    let variants = match body.get("variants") {
+        Some(v) if !v.is_null() => checked_variants(v)?,
+        _ => vec!["off".to_string(), "on".to_string()],
+    };
+    let default = match body.get("default_variant").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+        Some(d) if variants.iter().any(|v| v == d) => d.to_string(),
+        Some(d) => return Err(AdminError::new(400, format!("The default '{d}' is not one of the variants"))),
+        None => variants[0].clone(),
+    };
+    let description = body.get("description").and_then(Value::as_str).map(str::trim).filter(|d| !d.is_empty());
+
+    match first_rows(db, "SELECT VALUE key FROM _00_feature_flag WHERE key = $key LIMIT 1;", &[("key", json!(key))]).await {
+        Ok(found) if !found.is_empty() => return Err(AdminError::new(409, format!("A flag '{key}' exists already"))),
+        Ok(_) => {}
+        Err(e) if is_missing_table(&e) => return Err(AdminError::new(409, "This project's schema has no feature flags yet; deploy it with a current spky")),
+        Err(e) => return Err(e),
+    }
+    let mut binds = vec![("key", json!(key)), ("variants", json!(variants)), ("default", json!(default))];
+    let description_sql = match description {
+        Some(d) => {
+            binds.push(("description", json!(d)));
+            "$description"
+        }
+        None => "NONE",
+    };
+    first_rows(
+        db,
+        &format!(
+            "CREATE _00_feature_flag SET key = $key, variants = $variants, default_variant = $default, \
+             description = {description_sql}, rules = [], enabled = true RETURN VALUE key;"
+        ),
+        &binds,
+    )
+    .await?;
+    let flag = load_flag(db, key).await?;
+    Ok(json!({ "flag": flag_summary(&flag), "evaluate": true }))
+}
+
+/// `PUT flags/flag?key` with any of `{enabled, description, default_variant,
+/// variants, rollouts: [{variant, percent}]}`. `rollouts` replaces every rollout
+/// rule; allowlists move through `flags/flag/user`. `evaluate` says whether
+/// assignments can have moved.
+async fn update_flag(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
+    let key = checked_flag_key(param(req, "key"))?;
+    let body = body_object(req)?;
+    let enabled = match body.get("enabled") {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| AdminError::new(400, "enabled must be true or false"))?),
+    };
+    let variants = match body.get("variants") {
+        None => None,
+        Some(v) => Some(checked_variants(v)?),
+    };
+    let description = match body.get("description") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(d)) => Some(Some(d.trim().to_string()).filter(|d| !d.is_empty())),
+        Some(_) => return Err(AdminError::new(400, "description must be text or null")),
+    };
+    let default = match body.get("default_variant") {
+        None => None,
+        Some(v) => Some(v.as_str().filter(|d| !d.is_empty()).ok_or_else(|| AdminError::new(400, "default_variant must be a variant's name"))?.to_string()),
+    };
+    let rollouts = body.get("rollouts");
+    let evaluate = enabled.is_some() || default.is_some() || rollouts.is_some();
+
+    let flag = write_flag(db, key, |flag| {
+        let current = string_list(flag.get("variants"));
+        let names = variants.clone().unwrap_or(current);
+        let default_now = default.clone().or_else(|| flag["default_variant"].as_str().map(str::to_string)).unwrap_or_default();
+        if !names.contains(&default_now) {
+            return Err(AdminError::new(400, format!("The default '{default_now}' is not one of the variants")));
+        }
+        let mut rules = rules_of(flag);
+        if let Some(list) = rollouts {
+            rules = rollout_rules(&rules, &checked_rollouts(list, &names)?);
+        }
+        // A rule naming a variant that is gone would hand out a variant clients
+        // were never told about.
+        if let Some(missing) = rules.iter().filter_map(|r| r.get("variant")?.as_str()).find(|v| !names.iter().any(|n| n == v)) {
+            return Err(AdminError::new(400, format!("A rule still hands out '{missing}'; remove it before the variant")));
+        }
+        let mut set: Vec<(&'static str, Value)> = Vec::new();
+        if let Some(on) = enabled {
+            set.push(("enabled", json!(on)));
+        }
+        if let Some(d) = &description {
+            set.push(("description", d.as_ref().map_or(Value::Null, |d| json!(d))));
+        }
+        if let Some(d) = &default {
+            set.push(("default_variant", json!(d)));
+        }
+        if variants.is_some() {
+            set.push(("variants", json!(names)));
+        }
+        if rollouts.is_some() {
+            set.push(("rules", Value::Array(rules)));
+        }
+        Ok((!set.is_empty()).then_some(set))
+    })
+    .await?;
+    Ok(json!({ "flag": flag_summary(&flag), "evaluate": evaluate }))
+}
+
+/// `DELETE flags/flag?key`: the flag and every assignment of it, as `spky flag
+/// delete` does. A client still asking for it gets its own fallback.
+async fn delete_flag(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
+    let key = checked_flag_key(param(req, "key"))?;
+    load_flag(db, key).await?;
+    let bound = [("key", json!(key))];
+    run(db, "DELETE _00_feature_flag WHERE key = $key; DELETE _00_user_feature WHERE key = $key;", &bound).await?;
+    Ok(json!({ "deleted": key }))
+}
+
+/// `POST flags/flag/evaluate?key&after&limit`: re-evaluate one page of users,
+/// in id order from after `after`. Answers `next`, the `after` of the next page,
+/// null once every user has been walked, and on the first page the total to
+/// walk. An assignment that does not move is rewritten byte for byte, so it costs
+/// no SSP round trip (see `fn::feature::assign`).
+async fn evaluate_flag(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
+    let key = checked_flag_key(param(req, "key"))?;
+    let limit = number_param(req, "limit").unwrap_or(DEFAULT_EVALUATE_PAGE).clamp(1, MAX_EVALUATE_PAGE);
+    let after = param(req, "after");
+    let mut binds = vec![("key", json!(key))];
+    let range = match after {
+        Some(id) => {
+            checked_id(FLAG_USER_TABLE, Some(id))?;
+            binds.push(("after", json!(id)));
+            " WHERE id > <record>$after"
+        }
+        None => "",
+    };
+    let surql = format!(
+        "LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+         LET $ids = (SELECT VALUE id FROM {FLAG_USER_TABLE}{range} ORDER BY id LIMIT {limit});
+         IF $flag != NONE {{
+             LET $ranked = fn::feature::rules($flag);
+             FOR $u IN $ids {{ fn::feature::assign($flag, $ranked, $u); }};
+         }};
+         RETURN {{ found: $flag != NONE, ids: array::len($ids), last: <string>(array::last($ids) ?? '') }};"
+    );
+    let out = run(db, &surql, &binds).await.map_err(evaluator_error)?;
+    let page = out.into_iter().last().unwrap_or(Value::Null);
+    if page["found"] != true {
+        return Err(AdminError::new(404, format!("No flag '{key}'")));
+    }
+    let walked = page["ids"].as_u64().unwrap_or(0) as usize;
+    let next = page["last"].as_str().filter(|_| walked == limit).filter(|l| !l.is_empty());
+    let total = match after {
+        None => first_rows(db, &format!("SELECT count() FROM {FLAG_USER_TABLE} GROUP ALL TIMEOUT {COUNT_TIMEOUT};"), &[])
+            .await
+            .ok()
+            .map(|found| found.first().and_then(|r| r["count"].as_u64()).unwrap_or(0)),
+        Some(_) => None,
+    };
+    Ok(json!({ "evaluated": walked, "next": next, "total": total }))
+}
+
+/// `PUT flags/flag/user?key&id` with `{variant}`: pin the user to that variant,
+/// or with `{variant: null}` unpin them, back to the rollouts and the default.
+/// Then re-evaluate that one user: nobody else's variant can have moved.
+async fn pin_user(db: &dyn ScheduleDb, req: &Request<'_>) -> AdminResult<Value> {
+    let key = checked_flag_key(param(req, "key"))?;
+    let id = checked_id(FLAG_USER_TABLE, param(req, "id"))
+        .map_err(|_| AdminError::new(400, "Flags are evaluated for records of the user table only"))?;
+    let body = body_object(req)?;
+    let variant = match body.get("variant") {
+        Some(Value::String(v)) => Some(v.as_str()),
+        Some(Value::Null) => None,
+        _ => return Err(AdminError::new(400, "variant must be a variant's name, or null to unpin")),
+    };
+    // A deleted user can stay on a list; they can be taken off it, not put on.
+    let exists = !first_rows(db, "SELECT VALUE id FROM <record>$id;", &[("id", json!(id))]).await?.is_empty();
+    if !exists && variant.is_some() {
+        return Err(AdminError::new(404, format!("{id} does not exist")));
+    }
+    let uid = canonical_id(db, &id).await?;
+    write_flag(db, key, |flag| {
+        if let Some(v) = variant {
+            if !string_list(flag.get("variants")).iter().any(|n| n == v) {
+                return Err(AdminError::new(400, format!("'{v}' is not a variant of {key}")));
+            }
+        }
+        let rules = rules_of(flag);
+        let next = pin_rules(&rules, &uid, variant);
+        Ok((next != rules).then(|| vec![("rules", Value::Array(next))]))
+    })
+    .await?;
+    if !exists {
+        // Evaluating them would write an assignment for a user who is gone.
+        return Ok(json!({ "key": key, "id": uid, "pinned": Value::Null, "variant": Value::Null }));
+    }
+    let out = run(
+        db,
+        "LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+         RETURN fn::feature::assign($flag, fn::feature::rules($flag), <record>$id);",
+        &[("key", json!(key)), ("id", json!(id))],
+    )
+    .await
+    .map_err(evaluator_error)?;
+    Ok(json!({ "key": key, "id": uid, "pinned": variant, "variant": out.into_iter().last() }))
 }
 
 // =============================================================

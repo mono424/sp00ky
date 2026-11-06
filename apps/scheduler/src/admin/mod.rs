@@ -278,6 +278,8 @@ async fn config_handler(State(state): State<AdminState>) -> Json<serde_json::Val
         "cloud_login": state.grants.is_some(),
         // Whether `/data` (the Database, Users and Storage pages) is on here.
         "data": state.config.data,
+        // Whether `/data/flags` is: the Feature flags page, flags on a user.
+        "flags": state.config.data,
         // The live protocol this host speaks (`/v2/live`) and what it can
         // subscribe to; a dashboard without it falls back to polling.
         "live": ssp_protocol::admin_live::PROTOCOL_VERSION,

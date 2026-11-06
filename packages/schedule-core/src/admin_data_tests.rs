@@ -723,6 +723,288 @@ async fn a_project_without_users_says_so() {
     assert_eq!(call(&db, "GET", "buckets", &[], Value::Null).await.unwrap()["buckets"], json!([]));
 }
 
+// --- feature flags ------------------------------------------------------------
+
+/// The flag tables and `fn::feature::*` exactly as `spky` deploys them.
+fn feature_schema() -> &'static str {
+    const META: &str = include_str!("../../../apps/cli/src/meta_tables_remote.surql");
+    let start = META.find("DEFINE TABLE OVERWRITE _00_admin").expect("the roster table");
+    let end = META.find("-- SPOOKY APP RELEASE").expect("the section after the flags");
+    &META[start..end]
+}
+
+async fn setup_flags() -> MemDb {
+    let db = setup().await;
+    db.0.query(feature_schema()).await.unwrap().check().unwrap();
+    db
+}
+
+async fn variant_of(db: &MemDb, user: &str, key: &str) -> Value {
+    let out = db
+        .query("SELECT VALUE variant FROM _00_user_feature WHERE user = <record>$u AND key = $k;", &[("u", json!(user)), ("k", json!(key))])
+        .await
+        .unwrap();
+    out[0].as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null)
+}
+
+/// What the console does after a change: walk every user, one page at a time.
+async fn evaluate_all(db: &MemDb, key: &str, limit: &str) -> (u64, Value) {
+    let mut after: Option<String> = None;
+    let mut walked = 0;
+    let mut total = Value::Null;
+    loop {
+        let mut query = vec![("key", key), ("limit", limit)];
+        if let Some(a) = after.as_deref() {
+            query.push(("after", a));
+        }
+        let page = call(db, "POST", "flags/flag/evaluate", &query, Value::Null).await.unwrap();
+        if after.is_none() {
+            total = page["total"].clone();
+        }
+        walked += page["evaluated"].as_u64().unwrap();
+        match page["next"].as_str() {
+            Some(next) => after = Some(next.to_string()),
+            None => return (walked, total),
+        }
+    }
+}
+
+#[test]
+fn pinning_moves_a_user_between_allowlists() {
+    let rules = vec![
+        json!({ "kind": "allowlist", "variant": "on", "users": ["user:a", "user:b"], "priority": 10 }),
+        json!({ "kind": "rollout", "variant": "on", "percent": 20, "priority": 50 }),
+        json!({ "kind": "allowlist", "variant": "off", "users": ["user:c"], "priority": 10 }),
+    ];
+    assert_eq!(pinned_variant(&rules, "user:b").as_deref(), Some("on"));
+    assert_eq!(pinned_variant(&rules, "user:z"), None);
+
+    // Onto the other list, off the first, which keeps its other member.
+    let moved = pin_rules(&rules, "user:b", Some("off"));
+    assert_eq!(moved[0]["users"], json!(["user:a"]));
+    assert_eq!(moved[2]["users"], json!(["user:c", "user:b"]));
+    assert_eq!(pinned_variant(&moved, "user:b").as_deref(), Some("off"));
+
+    // Unpinned, a list left empty goes and the rollout stays.
+    let unpinned = pin_rules(&rules, "user:c", None);
+    assert_eq!(unpinned.len(), 2);
+    assert!(unpinned.iter().all(|r| r["variant"] != "off"));
+
+    // A variant with no list yet gets one, at the allowlist priority.
+    let fresh = pin_rules(&[], "user:a", Some("on"));
+    assert_eq!(fresh, vec![json!({ "kind": "allowlist", "variant": "on", "users": ["user:a"], "priority": 10 })]);
+    assert_eq!(pin_rules(&rules, "user:a", Some("on")).len(), 3, "pinned again where they are: one list still");
+}
+
+#[test]
+fn rollouts_replace_rollouts_and_keep_the_rest() {
+    let rules = vec![
+        json!({ "kind": "rollout", "variant": "on", "percent": 20, "priority": 50 }),
+        json!({ "kind": "allowlist", "variant": "on", "users": ["user:a"], "priority": 10 }),
+        json!({ "kind": "custom", "variant": "on" }),
+    ];
+    let next = rollout_rules(&rules, &[("on".into(), 35), ("beta".into(), 0)]);
+    assert_eq!(next.len(), 3, "a 0% rollout is no rule at all");
+    assert_eq!(next[0]["kind"], "allowlist");
+    assert_eq!(next[1]["kind"], "custom");
+    assert_eq!(next[2], json!({ "kind": "rollout", "variant": "on", "percent": 35, "priority": 50 }));
+
+    let variants = vec!["off".to_string(), "on".to_string()];
+    assert!(checked_rollouts(&json!([{ "variant": "on", "percent": 101 }]), &variants).is_err());
+    assert!(checked_rollouts(&json!([{ "variant": "nope", "percent": 1 }]), &variants).is_err());
+    assert!(checked_rollouts(&json!([{ "variant": "on", "percent": 1 }, { "variant": "on", "percent": 2 }]), &variants).is_err());
+}
+
+#[test]
+fn flag_keys_and_variants_are_checked() {
+    for good in ["beta", "checkout.v2", "ui/new-nav", "a:b_c-d", "9lives"] {
+        assert_eq!(checked_flag_key(Some(good)).unwrap(), good);
+    }
+    for bad in ["", "-x", "has space", "quote'", "a;b", &"k".repeat(101)] {
+        assert!(checked_flag_key(Some(bad)).is_err(), "{bad:?}");
+    }
+    assert_eq!(checked_variants(&json!([" off", "on "])).unwrap(), vec!["off", "on"]);
+    assert!(checked_variants(&json!(["on"])).is_err());
+    assert!(checked_variants(&json!(["on", "on"])).is_err());
+    assert!(checked_variants(&json!(["a,b", "c"])).is_err());
+    assert!(checked_variants(&json!("off,on")).is_err());
+}
+
+#[tokio::test]
+async fn a_flag_is_created_evaluated_for_everyone_and_listed() {
+    let db = setup_flags().await;
+    let out = call(&db, "GET", "flags", &[], Value::Null).await.unwrap();
+    assert_eq!(out["installed"], true);
+    assert_eq!(out["evaluator"], true);
+    assert_eq!(out["users_table"], true);
+    assert_eq!(out["flags"], json!([]));
+
+    let made = call(&db, "POST", "flags", &[], json!({ "key": "checkout", "variants": ["control", "new", "newer"], "description": " Checkout redesign " }))
+        .await
+        .unwrap();
+    assert_eq!(made["evaluate"], true);
+    assert_eq!(made["flag"]["default_variant"], "control");
+    assert_eq!(made["flag"]["description"], "Checkout redesign");
+    assert_eq!(made["flag"]["enabled"], true);
+    assert_eq!(call(&db, "POST", "flags", &[], json!({ "key": "checkout" })).await.unwrap_err().status, 409);
+    assert_eq!(call(&db, "POST", "flags", &[], json!({ "key": "x", "default_variant": "maybe" })).await.unwrap_err().status, 400);
+
+    // One user a page: every page but the last says where the next starts.
+    let (walked, total) = evaluate_all(&db, "checkout", "1").await;
+    assert_eq!((walked, total), (3, json!(3)));
+    for user in ["user:alice", "user:bobby", "user:carol"] {
+        assert_eq!(variant_of(&db, user, "checkout").await, "control", "{user}");
+    }
+    let (walked, _) = evaluate_all(&db, "checkout", "100").await;
+    assert_eq!(walked, 3);
+
+    let list = call(&db, "GET", "flags", &[], Value::Null).await.unwrap();
+    assert_eq!(list["flags"][0]["key"], "checkout");
+    assert_eq!(list["flags"][0]["pinned"], 0);
+    let detail = call(&db, "GET", "flags/flag", &[("key", "checkout")], Value::Null).await.unwrap();
+    assert_eq!(detail["counts"], json!({ "control": 3 }));
+    assert_eq!(call(&db, "GET", "flags/flag", &[("key", "nope")], Value::Null).await.unwrap_err().status, 404);
+    assert_eq!(call(&db, "POST", "flags/flag/evaluate", &[("key", "nope")], Value::Null).await.unwrap_err().status, 404);
+}
+
+#[tokio::test]
+async fn pinning_a_user_moves_only_them() {
+    let db = setup_flags().await;
+    call(&db, "POST", "flags", &[], json!({ "key": "beta" })).await.unwrap();
+    evaluate_all(&db, "beta", "100").await;
+
+    let out = call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:bobby")], json!({ "variant": "on" })).await.unwrap();
+    assert_eq!(out["variant"], "on");
+    assert_eq!(variant_of(&db, "user:bobby", "beta").await, "on");
+    assert_eq!(variant_of(&db, "user:carol", "beta").await, "off");
+
+    // The user's own page shows every flag, what they get and what they are pinned to.
+    let user = call(&db, "GET", "users/user", &[("id", "user:bobby")], Value::Null).await.unwrap();
+    assert_eq!(user["features_assignable"], true);
+    let beta = user["features"].as_array().unwrap().iter().find(|f| f["key"] == "beta").unwrap().clone();
+    assert_eq!(beta["variant"], "on");
+    assert_eq!(beta["pinned"], "on");
+    assert_eq!(beta["variants"], json!(["off", "on"]));
+
+    // Pinned to the other variant: off the first list, not on two.
+    call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:bobby")], json!({ "variant": "off" })).await.unwrap();
+    let detail = call(&db, "GET", "flags/flag", &[("key", "beta")], Value::Null).await.unwrap();
+    assert_eq!(detail["pins"], json!([{ "id": "user:bobby", "variant": "off", "name": "bobby", "exists": true }]));
+    assert_eq!(detail["flag"]["pinned"], 1);
+
+    // A rollout to everyone moves the rest, not the pinned user.
+    let put = call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "rollouts": [{ "variant": "on", "percent": 100 }] })).await.unwrap();
+    assert_eq!(put["evaluate"], true);
+    assert_eq!(put["flag"]["rollouts"], json!([{ "variant": "on", "percent": 100 }]));
+    evaluate_all(&db, "beta", "2").await;
+    assert_eq!(variant_of(&db, "user:carol", "beta").await, "on");
+    assert_eq!(variant_of(&db, "user:bobby", "beta").await, "off");
+
+    // Unpinned, the rollout has them too.
+    call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:bobby")], json!({ "variant": null })).await.unwrap();
+    assert_eq!(variant_of(&db, "user:bobby", "beta").await, "on");
+    assert_eq!(call(&db, "GET", "flags/flag", &[("key", "beta")], Value::Null).await.unwrap()["pins"], json!([]));
+
+    assert_eq!(call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:bobby")], json!({ "variant": "maybe" })).await.unwrap_err().status, 400);
+    assert_eq!(call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:nobody")], json!({ "variant": "on" })).await.unwrap_err().status, 404);
+
+    // A user deleted while pinned stays on the list until taken off it, with no
+    // assignment written for them on the way.
+    db.query("RETURN fn::feature::allow('beta', 'on', user:bobby); DELETE user:bobby; DELETE _00_user_feature WHERE user = user:bobby;", &[]).await.unwrap();
+    let pins = call(&db, "GET", "flags/flag", &[("key", "beta")], Value::Null).await.unwrap()["pins"].clone();
+    assert_eq!(pins, json!([{ "id": "user:bobby", "variant": "on", "name": null, "exists": false }]));
+    call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:bobby")], json!({ "variant": null })).await.unwrap();
+    assert_eq!(call(&db, "GET", "flags/flag", &[("key", "beta")], Value::Null).await.unwrap()["pins"], json!([]));
+    assert_eq!(variant_of(&db, "user:bobby", "beta").await, Value::Null);
+    assert_eq!(call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "note:x")], json!({ "variant": "on" })).await.unwrap_err().status, 400);
+    assert_eq!(call(&db, "PUT", "flags/flag/user", &[("key", "nope"), ("id", "user:alice")], json!({ "variant": "on" })).await.unwrap_err().status, 404);
+}
+
+#[tokio::test]
+async fn editing_a_flag_keeps_it_consistent() {
+    let db = setup_flags().await;
+    call(&db, "POST", "flags", &[], json!({ "key": "beta" })).await.unwrap();
+    call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:alice")], json!({ "variant": "on" })).await.unwrap();
+
+    // Off: everyone on the default, the pinned user too.
+    let off = call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "enabled": false })).await.unwrap();
+    assert_eq!(off["evaluate"], true);
+    evaluate_all(&db, "beta", "100").await;
+    assert_eq!(variant_of(&db, "user:alice", "beta").await, "off");
+
+    // A description alone moves nobody.
+    let described = call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "description": "Beta lane" })).await.unwrap();
+    assert_eq!(described["evaluate"], false);
+    assert_eq!(described["flag"]["description"], "Beta lane");
+    let cleared = call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "description": null })).await.unwrap();
+    assert_eq!(cleared["flag"]["description"], Value::Null);
+
+    // A variant can be added; one a rule or the default still uses cannot go.
+    let grown = call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "variants": ["off", "on", "loud"] })).await.unwrap();
+    assert_eq!(grown["flag"]["variants"], json!(["off", "on", "loud"]));
+    assert_eq!(call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "variants": ["off", "loud"] })).await.unwrap_err().status, 400);
+    assert_eq!(call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "variants": ["on", "loud"] })).await.unwrap_err().status, 400);
+    assert_eq!(call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "default_variant": "nope" })).await.unwrap_err().status, 400);
+    call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "variants": ["off", "on"] })).await.unwrap();
+
+    // Back on with a new default: alice keeps her pin, the rest take the default.
+    call(&db, "PUT", "flags/flag", &[("key", "beta")], json!({ "enabled": true, "default_variant": "on" })).await.unwrap();
+    call(&db, "PUT", "flags/flag/user", &[("key", "beta"), ("id", "user:alice")], json!({ "variant": "off" })).await.unwrap();
+    evaluate_all(&db, "beta", "100").await;
+    assert_eq!(variant_of(&db, "user:alice", "beta").await, "off");
+    assert_eq!(variant_of(&db, "user:carol", "beta").await, "on");
+
+    let gone = call(&db, "DELETE", "flags/flag", &[("key", "beta")], Value::Null).await.unwrap();
+    assert_eq!(gone["deleted"], "beta");
+    assert_eq!(variant_of(&db, "user:carol", "beta").await, Value::Null);
+    assert_eq!(call(&db, "DELETE", "flags/flag", &[("key", "beta")], Value::Null).await.unwrap_err().status, 404);
+}
+
+/// A database where someone else writes the flag between our read and our write.
+struct Racing {
+    inner: MemDb,
+    competing: std::sync::Mutex<Option<&'static str>>,
+}
+
+#[async_trait::async_trait]
+impl ScheduleDb for Racing {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, ScheduleDbError> {
+        if surql.starts_with("UPDATE _00_feature_flag") {
+            let competing = self.competing.lock().unwrap().take();
+            if let Some(other) = competing {
+                self.inner.query(other, &[]).await?;
+            }
+        }
+        self.inner.query(surql, binds).await
+    }
+}
+
+#[tokio::test]
+async fn a_write_against_a_flag_changed_meanwhile_is_decided_again() {
+    let inner = setup_flags().await;
+    call(&inner, "POST", "flags", &[], json!({ "key": "beta" })).await.unwrap();
+    // The DevTools pin carol while the console pins alice from what it read before.
+    let db = Racing { inner, competing: std::sync::Mutex::new(Some("RETURN fn::feature::allow('beta', 'on', user:carol);")) };
+    let req_q = [("key".to_string(), "beta".to_string()), ("id".to_string(), "user:alice".to_string())];
+    let body = json!({ "variant": "on" }).to_string().into_bytes();
+    let path = ["flags", "flag", "user"];
+    dispatch(&db, Request { method: "PUT", path: &path, query: &req_q, body: &body, actor: "breakglass", dirs: None }).await.unwrap();
+
+    let flag = load_flag(&db, "beta").await.unwrap();
+    let pinned: Vec<String> = rules_of(&flag).iter().flat_map(rule_users).collect();
+    assert_eq!(pinned, vec!["user:carol", "user:alice"], "neither write lost the other");
+    assert_eq!(variant_of(&db.inner, "user:carol", "beta").await, "on");
+    assert_eq!(variant_of(&db.inner, "user:alice", "beta").await, "on");
+}
+
+#[tokio::test]
+async fn a_schema_without_flags_says_so() {
+    let db = setup().await;
+    let out = call(&db, "GET", "flags", &[], Value::Null).await.unwrap();
+    assert_eq!(out["installed"], false);
+    assert_eq!(out["flags"], json!([]));
+}
+
 // --- buckets ------------------------------------------------------------------
 
 async fn put(db: &MemDb, key: &str, text: &str) {

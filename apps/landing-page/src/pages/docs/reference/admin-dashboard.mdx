@@ -806,10 +806,10 @@ These are sampled measurements; a spike between samples can be missed.
 
 ### Project data
 
-`/admin/api/data` is what the console's [Database, Users and Storage](/docs/cloud/console#database)
+`/admin/api/data` is what the console's [Database, Users, Feature flags and Storage](/docs/cloud/console#database)
 pages read. The scheduler and the SSP node serve the same routes from one
 implementation (`schedule_core::admin_data`). `GET /admin/api/config` says whether a
-host has them, as `data`. These pages are in the console only for now; the
+host has them, as `data`, and the flag routes, as `flags`. These pages are in the console only for now; the
 scheduler-hosted `/admin` does not show them.
 
 A read-only session gets the `GET` routes. An MCP token gets none of them, whatever
@@ -831,11 +831,18 @@ its text.
 | `POST /data/query` | `{sql}`, as root. A lone `SELECT` is given a `TIMEOUT 30s` and a `LIMIT 1001` when it has neither (one past what is returned, so `truncated` can say there was more), and 1000 rows of any one statement come back. Refused to read-only sessions |
 | `GET /data/users` | `?q=`, `?filter=admins\|online`, `?limit=`, `?start=`, `?sort=`, `?dir=`, `?source=`. Where the users are comes from the `SIGNIN` clause of a record access (`?source=` picks one), and each carries `is_admin`, `views` and `sessions`. Newest first only when an index on the created field makes that free (`created_indexed`); otherwise ask with `?sort=` |
 | `GET /data/users/stats` | `total`, `admins`, `online`. `null` for one it could not read |
-| `GET /data/users/user?id=` | The row, roster entry, live sessions and feature flags |
+| `GET /data/users/user?id=` | The row, roster entry, live sessions and feature flags: `features` lists every flag with the variant the user gets and the one they are pinned to, `features_assignable` whether flags apply to their table |
 | `POST /data/users` | `{identifier, password, fields?}` |
 | `PUT /data/users/user/password?id=` | `{password}`, 8 characters or more, hashed with the algorithm `SIGNIN` compares with. `501` when `SIGNIN` does not show one |
 | `PUT /data/users/user/admin?id=` | `{admin, note?}`: what `spky admin add` and `remove` do. Nobody can remove themselves |
 | `DELETE /data/users/user?id=` | The row, its roster entry and its feature flags. Nobody can delete themselves |
+| `GET /data/flags` | Every flag with its rollouts and how many users are pinned, and whether the schema has the flag tables (`installed`), `fn::feature::assign` (`evaluator`) and a `user` table (`users_table`) |
+| `POST /data/flags` | `{key, description?, variants?, default_variant?}`, as `spky flag create`: on, no rules. Answers `evaluate: true` |
+| `GET /data/flags/flag?key=` | The flag, users per variant (`counts`, `null` when the count timed out) and the pinned users by name, 500 at most (`pins_total` counts them all) |
+| `PUT /data/flags/flag?key=` | Any of `{enabled, description, default_variant, variants, rollouts: [{variant, percent}]}`. `rollouts` replaces every rollout rule. A variant the default or a rule still uses cannot be removed. `evaluate` says whether assignments can have moved |
+| `DELETE /data/flags/flag?key=` | The flag and every assignment of it |
+| `POST /data/flags/flag/evaluate?key=` | Re-evaluate one page of users in id order: `?limit=` (500 at most), `?after=` the `next` of the page before. `total` on the first page, `next: null` after the last |
+| `PUT /data/flags/flag/user?key=&id=` | `{variant}` pins a `user` record to a variant (an allowlist rule), `{variant: null}` unpins them. Only that user is re-evaluated |
 | `GET /data/buckets` | Each bucket's backend and limit, whether it can be browsed, and `lists_folders`: `false` for a `file:` bucket whose subfolders this host cannot see |
 | `GET /data/buckets/:bucket/files` | `?prefix=`, `?start=`, `?limit=`. One folder's `files` and `folders`, and `next` when there is more. `counts` gives each folder's entries, up to 1000, when the folder was read from disk |
 | `GET /data/buckets/:bucket/file?key=` | `{key, size, updated, data}`, `data` in base64, up to 32 MB. `&meta=1` leaves `data` out |

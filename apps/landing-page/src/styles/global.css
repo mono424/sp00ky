@@ -461,17 +461,20 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  background: #fff;
-  color: #000;
-  padding: 8px 14px;
-  border-radius: 8px;
+  /* Fades to clear as the nav lifts into the floating glass bar. */
+  background: rgb(255 255 255 / calc(0.14 * (1 - var(--nav-glass-opacity, 0))));
+  color: #fff;
+  padding: 8px 17px;
+  border-radius: 999px;
   font-weight: 500;
   font-size: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: none;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   transition: all 160ms ease;
 }
 .nav-cta:hover {
-  background: rgba(255, 255, 255, 0.88);
+  background: rgb(255 255 255 / max(0.1, calc(0.22 * (1 - var(--nav-glass-opacity, 0)))));
 }
 .nav-cta svg {
   width: 14px;

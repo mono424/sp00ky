@@ -59,7 +59,7 @@
     },
     {
       "name": "logs",
-      "caption": "Live logs from the scheduler, an SSP or one of your backends.",
+      "caption": "A time window brushed across the log volume, read out in the pill and filtering the lines below.",
       "file": "logs.png"
     },
     {

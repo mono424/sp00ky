@@ -4558,6 +4558,10 @@ h2 {
 .cx-dep-when > span:first-child { font: 12px var(--mono); color: var(--ink-dim); }
 .cx-who-by { font: 11.5px var(--mono); color: var(--ink-faint); }
 .cx-dep-act { justify-items: end; }
+/* Every version a rollback can reach has the button; only the default target shows it at rest. */
+.cx-dep .cx-rb:not(.pin) { visibility: hidden; }
+.cx-dep:hover .cx-rb, .cx-dep:focus-within .cx-rb { visibility: visible; }
+@media (hover: none) { .cx-dep .cx-rb:not(.pin) { visibility: visible; } }
 .cx-dep.failed .cx-dep-v b, .cx-dep.failed .cx-dep-what .t { color: var(--ink-dim); }
 .cx-dep-empty { padding: 14px var(--pad); border-top: 1px solid var(--line-soft); font: 12px var(--mono); }
 .cx-branch { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-dim); }

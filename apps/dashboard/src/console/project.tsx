@@ -81,6 +81,11 @@ const IN_FLIGHT = new Set(['pending', 'provisioning', 'migrating', 'deploying_ap
 /** History rows and addresses shown before "Show all". */
 const HISTORY_ROWS = 10;
 const URL_ROWS = 5;
+/**
+ * How far back a rollback reaches, in deployments: Sp00ky Cloud keeps the images
+ * of the newest ten (deployments.RollbackWindow), older ones may be gone.
+ */
+const ROLLBACK_WINDOW = 10;
 
 const sha7 = (sha: string) => sha.slice(0, 7);
 const firstLine = (s: string | null | undefined) => s?.split('\n')[0]?.trim() ?? '';
@@ -97,7 +102,11 @@ function state(d: DeploymentRow): { label: string; tone: string } {
   if (d.live) return d.status === 'degraded' ? { label: 'Degraded', tone: 'warn' } : { label: 'Live', tone: 'ok' };
   if (IN_FLIGHT.has(d.status)) return { label: d.status === 'pending' ? 'Queued' : upper1(d.status.replace('_', ' ')), tone: 'run' };
   if (d.status === 'failed') return { label: 'Failed', tone: 'bad' };
-  if (d.status === 'superseded') return { label: d.live_from ? 'Replaced' : 'Never live', tone: 'idle' };
+  if (d.status === 'superseded') {
+    if (d.live_from) return { label: 'Replaced', tone: 'idle' };
+    // A deploy that failed and was then replaced, e.g. by its automatic rollback.
+    return d.error ? { label: 'Failed', tone: 'bad' } : { label: 'Never live', tone: 'idle' };
+  }
   return { label: upper1(d.status), tone: 'idle' };
 }
 
@@ -251,12 +260,23 @@ export function Deployments(props: Ctx) {
   const rolling = createMemo(() => list().find((d) => IN_FLIGHT.has(d.status)));
   const pendingBuild = createMemo<PendingBuild | undefined>(() => data()?.builds?.[0]);
   const busy = () => !!rolling() || !!pendingBuild();
-  /** The deployment `POST /deploy/rollback` would bring back: the newest replaced one. */
-  const rollbackTarget = createMemo(() =>
-    list()
-      .filter((d) => d.status === 'superseded' && !d.live)
-      .sort((a, b) => (b.version ?? 0) - (a.version ?? 0))[0],
-  );
+  /** The newest ROLLBACK_WINDOW deployments, newest first: all a rollback can reach. */
+  const recent = createMemo(() => [...list()].sort((a, b) => (b.version ?? 0) - (a.version ?? 0)).slice(0, ROLLBACK_WINDOW));
+  /** Whether a rollback can bring `d` back: it served, it is recent enough, and it is not already the current one. */
+  const canRollBack = (d: DeploymentRow) => {
+    const r = recent();
+    return !!d.live_from && r.includes(d) && !(d === r[0] && d.live);
+  };
+  /**
+   * What `POST /deploy/rollback` brings back without a version: what serves when
+   * the newest deployment never took over, else the newest one before the live one.
+   */
+  const rollbackTarget = createMemo(() => {
+    const [newest, ...older] = recent();
+    if (!newest) return undefined;
+    if (!newest.live) return recent().find((d) => d.live) ?? older.find((d) => d.live_from);
+    return older.find((d) => d.live_from);
+  });
   const urls = createMemo(() => endpoints(status(), domains()));
   const main = createMemo(() => mainOf(urls()));
   const linked = () => link()?.status === 'linked';
@@ -294,16 +314,21 @@ export function Deployments(props: Ctx) {
     );
     void refetch();
   };
-  const rollback = async () => {
-    const t = rollbackTarget();
+  const rollback = async (t: DeploymentRow | undefined) => {
     if (!t) return;
     const ok = await confirm({
       title: `Roll back to v${t.version}`,
-      consequences: [`Deploys v${t.version}'s configuration and images as a new version.`, 'The live deployment keeps serving until the new one is up.'],
+      consequences: [
+        `Deploys the apps of v${t.version} (backends and frontends, their images and settings) as a new version.`,
+        'The scheduler, SSPs and database stay on the versions that run now, and no migrations run.',
+        'What serves now keeps serving until the new version is up; containers that did not change are kept.',
+      ],
       verb: 'Roll back',
     });
     if (!ok) return;
-    await act('Rollback', () => cloud(`/projects/${pid(props.project)}/deploy/rollback`, { method: 'POST', tenant: tenant() }));
+    await act('Rollback', () =>
+      cloud(`/projects/${pid(props.project)}/deploy/rollback`, { method: 'POST', tenant: tenant(), body: { version: t.version } }),
+    );
     void refetch();
   };
   const rebuild = () =>
@@ -361,7 +386,7 @@ export function Deployments(props: Ctx) {
               <Show when={menu()}>
                 <div class="cx-menu small" role="menu" onClick={() => setMenu(false)}>
                   <Show when={rollbackTarget()}>
-                    <button class="cx-mi" onClick={() => void rollback()}>Roll back to v{rollbackTarget()!.version}</button>
+                    <button class="cx-mi" disabled={busy()} onClick={() => void rollback(rollbackTarget())}>Roll back to v{rollbackTarget()!.version}</button>
                   </Show>
                   <button class="cx-mi" onClick={() => void restart(undefined, false)}>Restart everything</button>
                   <button class="cx-mi" onClick={() => void restart(['scheduler', 'ssp'], false)}>Restart scheduler and SSPs</button>
@@ -604,12 +629,18 @@ export function Deployments(props: Ctx) {
                         <span class="cx-who-by">{who ? `by ${who}` : ''}</span>
                       </div>
                       <div class="cx-dep-act">
-                        <Switch>
-                          <Match when={d.live}><span class="cx-chip live">current</span></Match>
-                          <Match when={rollbackTarget()?.id === d.id}>
-                            <button class="btn btn-sm" onClick={() => void rollback()}>Roll back</button>
-                          </Match>
-                        </Switch>
+                        <Show when={d.live}><span class="cx-chip live">current</span></Show>
+                        <Show when={canRollBack(d)}>
+                          <button
+                            class="btn btn-sm cx-rb"
+                            classList={{ pin: rollbackTarget() === d }}
+                            disabled={busy()}
+                            title={busy() ? 'A deploy is in progress' : `Bring back the apps of v${d.version}`}
+                            onClick={() => void rollback(d)}
+                          >
+                            Roll back
+                          </button>
+                        </Show>
                       </div>
                     </div>
                   );

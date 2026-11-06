@@ -128,6 +128,25 @@ If the new container never becomes ready, the old one keeps serving and the
 restart or deploy reports the failure. `--clean` (which wipes the scheduler
 volume) and SurrealDB upgrades still stop the old container first.
 
+### Failed deploys and rollbacks
+
+A deploy that fails does not take the project down: what serves keeps serving,
+custom domains included, until new containers are up. When a deploy fails
+before it ever served (its migrations failed, it never left the queue, its apps
+never came up healthy), Sp00ky Cloud falls back by itself within seconds: it
+deploys again what served last, as a new version marked `auto rollback` in the
+history. A failed rollback is not rolled back again, and a deployment that
+served and failed later is left to autoheal.
+
+To go back by hand, open **Deployments** in the [console](https://console.sp00ky.cloud)
+and choose **Roll back** on a version that served. Any of the newest ten
+deployments can be brought back; the images of older ones may be gone. A
+rollback deploys that version's apps (backends and frontends, their images and
+settings) as a new version. The scheduler, the SSPs and SurrealDB stay on the
+versions that run now, and no migrations run, since migrations only go forward.
+Agents can do the same with the `deploy_rollback` tool of the
+[Sp00ky Cloud MCP server](/docs/reference/mcp), which takes the `version`.
+
 ### Cloudflare projects
 
 A Cloudflare project (plan `payg`, pay as you go) has no VMs and no containers of its own except its

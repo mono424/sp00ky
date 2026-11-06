@@ -403,6 +403,8 @@ export function openStream(
     onEvent: (event: string, data: string) => void;
     onError?: (err: unknown) => void;
     onOpen?: () => void;
+    /** The server ended the stream (a one-shot like `tail=false`), not us. */
+    onDone?: () => void;
   },
 ): () => void {
   const controller = new AbortController();
@@ -461,6 +463,7 @@ export function openStream(
           if (dataLines.length) handlers.onEvent(eventName, dataLines.join('\n'));
         }
       }
+      if (!closed) handlers.onDone?.();
     } catch (err) {
       // An abort is us closing the stream, not a failure.
       if (!closed && (err as { name?: string })?.name !== 'AbortError') {

@@ -1042,20 +1042,30 @@ const LOG_LINES = [
 ];
 
 /**
- * Twenty minutes of tail: the lines above on a loop, a line every few seconds,
- * with one bad stretch (a backend timing out, then a job failing) so the page
- * has levels to tell apart.
+ * Three hours of tail, about eight thousand lines: the lines above on a loop,
+ * busier toward now and uneven on the way, with numbers that vary line to
+ * line, and one bad stretch (a backend timing out, then a job
+ * failing) so the histogram has a shape and the page has levels to tell apart.
+ * Seeded, so every run draws the same chart.
  */
 const LOG_TAIL = (() => {
+  let seed = 7;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
   const out = [];
-  const span = 20 * 60_000;
-  let t = span;
+  const span = 3 * 3_600_000;
+  // The bad stretch: 40 to 52 minutes before the newest line.
+  const badFrom = span - 52 * 60_000;
+  const badTo = span - 40 * 60_000;
+  let t = 0;
   let i = 0;
-  while (t > 0) {
+  while (t < span) {
     const base = LOG_LINES[i % LOG_LINES.length];
-    const minute = Math.floor((span - t) / 60_000);
-    let line = { ...base, fields: '' };
-    if (minute >= 11 && minute <= 13 && i % 3 === 0) {
+    let line = {
+      ...base,
+      message: base.message.replace(/\b\d{2,}\b/g, (d) => String(Math.max(1, Math.round(Number(d) * (0.6 + rand() * 0.8))))),
+      fields: '',
+    };
+    if (t > badFrom && t < badTo && i % 3 === 0) {
       line = {
         level: 'WARN',
         target: 'scheduler::backends',
@@ -1063,16 +1073,20 @@ const LOG_TAIL = (() => {
         fields: 'backend=worker attempt=1',
       };
     }
-    if (minute === 12 && i % 5 === 0) {
+    if (t > badFrom + 4 * 60_000 && t < badTo - 3 * 60_000 && i % 5 === 0) {
       line = {
         level: 'ERROR',
         target: 'scheduler::jobs',
         message: 'job /jobs/welcome-mail failed: backend returned 503',
-        fields: 'table=digest_job attempt=4 max=4',
+        fields: 'table=digest_job attempt=4 max=4 error=upstream connect error or disconnect/reset before headers',
       };
     }
-    out.push({ ...line, ts: ago(t) });
-    t -= 3_000 + ((i * 1_700) % 4_000);
+    out.push({ ...line, ts: ago(span - t) });
+    // Traffic climbs toward now, drifts window to window, and bursts now and then.
+    const w = Math.floor(t / 90_000);
+    const drift = 0.5 + 0.5 * Math.sin(w * 1.7) * Math.cos(w * 0.31);
+    const load = 0.25 + 1.1 * (t / span) + 0.55 * drift + (w % 23 === 7 || w % 31 === 12 ? 1.4 : 0);
+    t += Math.round((400 + rand() * 2_400) / load);
     i++;
   }
   return out;

@@ -97,8 +97,10 @@ Tail logs from your cloud deployment in real time:
 
 ### From the dashboard
 
-The scheduler's [admin dashboard](/docs/reference/admin-dashboard) has a live log view over the
-same scheduler and SSP sources, with the SSP picked per instance. It is the quicker route when
+The scheduler's [admin dashboard](/docs/reference/admin-dashboard) has a log explorer over the
+same scheduler and SSP sources, with the SSP picked per instance: a histogram of the last
+10,000 lines to brush a time window across and zoom into, search and level filters, and the
+live tail. It is the quicker route when
 you are already looking at a cluster's health, and it works against a self-hosted scheduler,
 where `spky logs` has no cloud deployment to talk to.
 

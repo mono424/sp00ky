@@ -102,7 +102,20 @@ const SHOTS = [
     name: 'logs',
     route: '/logs',
     height: 900,
-    caption: 'Live logs from the scheduler, an SSP or one of your backends.',
+    caption: 'A time window brushed across the log volume, read out in the pill and filtering the lines below.',
+    // Drag a window across the histogram with the real mouse, as a reader would.
+    async act(page) {
+      await page.waitForSelector('.lx-rows .lx-row');
+      const box = await page.locator('.lx-plot').boundingBox();
+      const y = box.y + box.height - 24;
+      await page.mouse.move(box.x + box.width * 0.56, y);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width * 0.79, y, { steps: 12 });
+      await page.mouse.up();
+      // Past the bars' grow-in, and the pointer off the chart so no column is lit.
+      await page.mouse.move(box.x + box.width * 0.3, box.y - 110);
+      await page.waitForTimeout(700);
+    },
   },
   {
     name: 'access',
@@ -208,6 +221,7 @@ run({
       waitUntil: 'networkidle',
     });
     await page.waitForSelector('.shell, .login-wrap');
+    await shot.act?.(page);
   },
 
   shots: SHOTS,

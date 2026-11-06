@@ -1975,7 +1975,8 @@ h2 {
 .main:has(.lx-page) {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* clip, not hidden: a popover past the edge must not let focus scroll the page sideways */
+  overflow: clip;
   padding-bottom: 0;
 }
 
@@ -2238,6 +2239,16 @@ h2 {
 
 .lx-search input::-webkit-search-cancel-button {
   display: none;
+}
+
+/* the filter button keeps to the row's right end, wrapped or not, so its menus open leftward */
+.lx-query-cell .fm {
+  margin-left: auto;
+}
+
+.lx-query-cell .fm-pop {
+  right: 0;
+  left: auto;
 }
 
 .lx-time-chip {

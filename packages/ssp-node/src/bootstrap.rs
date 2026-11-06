@@ -55,6 +55,20 @@ pub struct LoadedSchema {
     pub tables: BTreeMap<String, TableMeta>,
     /// `_00_version` exists upstream, so row versions are durable.
     pub has_versions: bool,
+    /// How a scan reads those versions on this server.
+    pub version_lookup: ssp_protocol::VersionLookup,
+}
+
+/// The ledger lookup the server plans as an index read, from its `/version`.
+/// The SurrealDB 3 form when the version cannot be read.
+pub(crate) async fn version_lookup(db: &dyn Db) -> ssp_protocol::VersionLookup {
+    match db.version().await {
+        Ok(v) => ssp_protocol::VersionLookup::for_server(&v),
+        Err(e) => {
+            warn!(error = %e, "server version unavailable; reading row versions the SurrealDB 3 way");
+            ssp_protocol::VersionLookup::default()
+        }
+    }
 }
 
 /// Read upstream's schema probe ([`INFO_FOR_DB`] plus the CLI's
@@ -164,10 +178,15 @@ pub async fn load_schema(db: &dyn Db) -> anyhow::Result<LoadedSchema> {
             tables.insert(table.clone(), meta);
         }
     }
+    let version_lookup = match has_versions {
+        true => version_lookup(db).await,
+        false => Default::default(),
+    };
     Ok(LoadedSchema {
         probe,
         tables,
         has_versions,
+        version_lookup,
     })
 }
 
@@ -298,7 +317,7 @@ pub async fn rebuild_from_db(
 
     // 2. Page each table's rows into the circuit store.
     for (table, meta) in &schema.tables {
-        load_table_rows(db, processor, table, meta, page_size, has_versions).await?;
+        load_table_rows(db, processor, table, meta, page_size, has_versions, schema.version_lookup).await?;
     }
 
     // 3. Re-register persisted views from _00_query.
@@ -348,6 +367,7 @@ pub(crate) async fn load_table_rows(
     meta: &TableMeta,
     page_size: usize,
     has_versions: bool,
+    lookup: ssp_protocol::VersionLookup,
 ) -> anyhow::Result<usize> {
     let omit = &meta.opaque;
     let mut record_count = 0usize;
@@ -356,7 +376,7 @@ pub(crate) async fn load_table_rows(
     loop {
         let query = bootstrap_page_query(table, limit, after_id.as_deref(), omit);
         let query = if has_versions {
-            ssp_protocol::with_durable_row_versions(&query)
+            ssp_protocol::with_durable_row_versions_using(&query, lookup)
         } else { query };
         let result = match q1(db, &query).await {
             Ok(result) => result,

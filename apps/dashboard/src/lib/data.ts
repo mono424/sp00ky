@@ -119,6 +119,96 @@ export interface UserDetail {
   admin: { note?: string | null; added_at?: string } | null;
   sessions: { client_id: string; views: number }[] | null;
   flags: { key: string; variant: string }[] | null;
+  /** Every defined flag and where this user stands on it; absent on older hosts. */
+  features?: UserFeature[] | null;
+  /** Whether flags can be assigned here: the evaluator covers the `user` table only. */
+  features_assignable?: boolean;
+}
+
+/** A flag as one user's page shows it. */
+export interface UserFeature {
+  key: string;
+  description?: string | null;
+  variants: string[];
+  default_variant: string;
+  enabled: boolean;
+  /** What their `_00_user_feature` row says, null before the flag reached them. */
+  variant: string | null;
+  /** The variant an allowlist pins them to, null when the rules decide. */
+  pinned: string | null;
+}
+
+export interface FlagRollout {
+  variant: string;
+  percent: number;
+}
+
+/** A flag as a list shows it. Allowlists are counted, not listed. */
+export interface FlagSummary {
+  key: string;
+  description?: string | null;
+  variants: string[];
+  default_variant: string;
+  enabled: boolean;
+  rollouts: FlagRollout[];
+  /** Users pinned to a variant by an allowlist. */
+  pinned: number;
+  /** Rules of a kind the console does not edit; kept as they are. */
+  other_rules: number;
+  created_at?: string;
+  updated_at?: string;
+  payloads?: Record<string, unknown> | null;
+}
+
+export interface FlagsAnswer {
+  /** Whether the project's schema has the flag tables at all. */
+  installed: boolean;
+  /** Whether it has `fn::feature::assign`, which every change here goes through. */
+  evaluator: boolean;
+  /** Whether a `user` table exists to evaluate flags for. */
+  users_table: boolean;
+  flags: FlagSummary[];
+}
+
+export interface FlagPin {
+  id: string;
+  variant: string;
+  name: string | null;
+  /** False for a deleted user still on a list; null when that could not be read. */
+  exists: boolean | null;
+}
+
+export interface FlagDetail {
+  flag: FlagSummary;
+  /** Users per variant, null when the count timed out. */
+  counts: Record<string, number> | null;
+  pins: FlagPin[];
+  pins_total: number;
+}
+
+/** A change to a flag; `evaluate` says whether every user must be walked again. */
+export interface FlagChange {
+  flag: FlagSummary;
+  evaluate: boolean;
+}
+
+export interface EvaluatePage {
+  evaluated: number;
+  next: string | null;
+  total: number | null;
+}
+
+/**
+ * Each rollout's real share. Rollouts read one hash, each taking the users below
+ * its percent that a rollout before it did not, so 20% then 30% hand out 20 and 10.
+ */
+export function rolloutShares(rollouts: FlagRollout[]): number[] {
+  let taken = 0;
+  return rollouts.map((r) => {
+    const share = Math.max(0, Math.min(100, r.percent) - taken);
+    taken = Math.max(taken, Math.min(100, r.percent));
+    return share;
+  });
 }
 
 export interface BucketInfo {

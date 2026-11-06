@@ -15,6 +15,7 @@ import {
   type TableDetail,
   type UserDetail,
   type UserEntry,
+  type UserFeature,
   type UserSource,
   type UserStats,
   type UsersPage,
@@ -454,19 +455,125 @@ function UserSheet(props: { id: string; source: UserSource; canWrite: boolean; o
               )}
             </Show>
 
-            <Show when={d().flags?.length}>
-              <SheetSection label="Feature flags" meta={<b>{d().flags!.length}</b>}>
-                <table class="fx-list">
-                  <tbody>
-                    <For each={d().flags!}>{(f) => <tr><td>{f.key}</td><td class="r dx-dim">{f.variant}</td></tr>}</For>
-                  </tbody>
-                </table>
-              </SheetSection>
+            <Show
+              when={d().features}
+              fallback={
+                // A host older than the flag routes: what they get, read only.
+                <Show when={d().flags?.length}>
+                  <SheetSection label="Feature flags" meta={<b>{d().flags!.length}</b>}>
+                    <table class="fx-list">
+                      <tbody>
+                        <For each={d().flags!}>{(f) => <tr><td>{f.key}</td><td class="r dx-dim">{f.variant}</td></tr>}</For>
+                      </tbody>
+                    </table>
+                  </SheetSection>
+                </Show>
+              }
+            >
+              {(features) => (
+                <UserFlags
+                  id={props.id}
+                  name={name()}
+                  features={features()}
+                  canWrite={props.canWrite && !!d().features_assignable}
+                  assignable={!!d().features_assignable}
+                  table={props.source.table}
+                  onOpenFlag={(key) => navigate(`/flags?key=${enc(key)}`)}
+                  onChanged={() => void refetch()}
+                />
+              )}
             </Show>
           </>
         )}
       </Show>
     </Sheet>
+  );
+}
+
+/** Follow the rules: the user is on no allowlist of the flag. */
+const FOLLOW = '';
+
+/**
+ * Every flag and where this user stands: the variant they get, and whether a
+ * pin or the rules decide it. Picking a variant pins them to it (an allowlist,
+ * as `spky flag set --for-user` writes); picking the rules unpins them.
+ */
+function UserFlags(props: {
+  id: string;
+  name: string;
+  features: UserFeature[];
+  canWrite: boolean;
+  assignable: boolean;
+  table: string;
+  onOpenFlag: (key: string) => void;
+  onChanged: () => void;
+}) {
+  const [working, setWorking] = createSignal<string | null>(null);
+  const pinned = () => props.features.filter((f) => f.pinned).length;
+  const choose = async (f: UserFeature, choice: string) => {
+    const variant = choice === FOLLOW ? null : choice;
+    if (variant === f.pinned) return;
+    setWorking(f.key);
+    try {
+      const out = await api.put<{ variant: string | null }>(`/data/flags/flag/user?key=${enc(f.key)}&id=${enc(props.id)}`, { variant });
+      toast(
+        'ok',
+        variant ? `${f.key}: ${props.name} pinned to ${variant}` : `${f.key}: ${props.name} unpinned`,
+        out.variant && out.variant !== variant ? `The rules give them ${out.variant}.` : undefined,
+      );
+      props.onChanged();
+    } catch (err) {
+      toast('bad', `Could not change ${f.key}`, err instanceof Error ? err.message : undefined);
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  return (
+    <SheetSection label="Feature flags" meta={<span><b>{props.features.length}</b> {props.features.length === 1 ? 'flag' : 'flags'}<Show when={pinned()}> · <b>{pinned()}</b> pinned</Show></span>}>
+      <Show when={props.features.length} fallback={<p class="cap dx-note">This project defines no feature flags.</p>}>
+        <table class="fx-list ff-user">
+          <tbody>
+            <For each={props.features}>
+              {(f) => (
+                <tr>
+                  <td class="ff-key">
+                    <button class="fx-link dx-rec" onClick={() => props.onOpenFlag(f.key)}>{f.key}</button>
+                    <Show when={f.description}><span class="ff-desc">{f.description}</span></Show>
+                  </td>
+                  <td class="ff-gets">
+                    <Show when={f.variant} fallback={<span class="dx-dim" title="No assignment row yet: the client uses the fallback its code passes">not evaluated</span>}>
+                      <span class="dx-tag">{f.variant}</span>
+                    </Show>
+                    <span class="cap dx-dim">{!f.enabled ? 'flag off' : f.pinned ? 'pinned' : 'by rules'}</span>
+                  </td>
+                  <td class="r">
+                    <Show when={props.canWrite} fallback={<Show when={f.pinned}><span class="dx-tag">pinned {f.pinned}</span></Show>}>
+                      <select
+                        class="dx-select ff-variant"
+                        aria-label={`${f.key} for ${props.name}`}
+                        value={f.pinned ?? FOLLOW}
+                        disabled={working() === f.key}
+                        onChange={(e) => void choose(f, e.currentTarget.value)}
+                      >
+                        <option value={FOLLOW} selected={!f.pinned}>Follow the rules</option>
+                        <For each={f.variants}>{(v) => <option value={v} selected={v === f.pinned}>Pin to {v}</option>}</For>
+                      </select>
+                    </Show>
+                  </td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+        <Show when={!props.assignable}>
+          <p class="cap dx-note ff-gap">Flags are evaluated for records of `user`, and this user is in `{props.table}`, so they cannot be assigned one.</p>
+        </Show>
+        <Show when={props.canWrite && props.features.some((f) => !f.enabled && f.pinned)}>
+          <p class="cap dx-note ff-gap">A flag that is off gives everyone its default; a pin on it takes effect when it is turned on.</p>
+        </Show>
+      </Show>
+    </SheetSection>
   );
 }
 

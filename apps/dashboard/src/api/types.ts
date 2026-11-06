@@ -14,6 +14,8 @@ export interface ServerConfig {
   cloud_login?: boolean;
   /** Whether the project's tables, users and bucket files can be reached (`/data`). */
   data?: boolean;
+  /** Whether feature flags can be managed (`/data/flags`); absent on older hosts. */
+  flags?: boolean;
   scheduler_id: string;
   version: string;
   /** Whether `SPKY_ADMIN_PASSWORD` is set, i.e. password-only login is offered. */

@@ -41,6 +41,7 @@ const NAV_PATHS: Record<string, string> = {
   '/access': 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3',
   '/database': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0',
   '/users': 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M22 21v-2a4 4 0 0 0-3-3.9 M16 3.1a4 4 0 0 1 0 7.8',
+  '/flags': 'M5 21V3 M5 4h12l-2.5 4.5L17 13H5',
   '/storage': 'M3 6h6l2 2h10v11H3z',
   '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
   '/deployments': 'M12 3l9 5-9 5-9-5 9-5z M3 13l9 5 9-5',
@@ -130,6 +131,8 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
       ? [
           { href: '/database', label: 'Database', group: 'Data' },
           { href: '/users', label: 'Users', group: 'Data' },
+          // A host older than the flag routes still serves the rest of `/data`.
+          ...(currentMode().config?.flags ? [{ href: '/flags', label: 'Feature flags', group: 'Data' }] : []),
           { href: '/storage', label: 'Storage', group: 'Data' },
         ]
       : []),

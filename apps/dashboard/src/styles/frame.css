@@ -5894,6 +5894,52 @@ span.cx-me { pointer-events: none; }
 
 .fx-sq.ok-live { background: var(--accent); }
 
+/* feature flags: the list, one flag's sheet, the flags on a user */
+.ff-list td { white-space: nowrap; }
+.ff-key { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+.ff-key > * { vertical-align: baseline; }
+.ff-desc { margin-left: 10px; font: 12px var(--sans); color: var(--ink-faint); }
+.ff-variants .dx-tag { margin: 0 4px 0 0; border-color: var(--line); color: var(--ink-faint); }
+.ff-variants .dx-tag.ff-default { border-color: rgba(156, 165, 211, 0.4); color: var(--accent); }
+.ff-running { color: var(--accent); }
+.ff-gap { margin-top: 10px; }
+.ff-sheet-desc { flex-basis: 100%; margin-bottom: 4px; color: var(--ink-dim); }
+.ff-stamp { margin-left: auto; }
+.ff-save { padding-bottom: 0; }
+
+.ff-track { position: relative; display: block; height: 6px; overflow: hidden; background: rgba(255, 255, 255, 0.05); }
+.ff-track > i { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: 0.75; transition: width 0.3s ease-out; }
+.ff-progress { display: grid; gap: 8px; }
+.ff-progress .cap { color: var(--ink-faint); }
+
+.ff-dist, .ff-rollout { display: grid; gap: 10px; }
+.ff-dist-row { display: grid; grid-template-columns: minmax(96px, 180px) minmax(0, 1fr) 96px; align-items: center; gap: 14px; }
+.ff-dist-name { overflow: hidden; font: 12.5px var(--mono); color: var(--ink); text-overflow: ellipsis; white-space: nowrap; }
+.ff-dist-n { font: 12px var(--mono); text-align: right; white-space: nowrap; }
+.ff-dist-n b { font-weight: 500; color: var(--ink); }
+.ff-roll-row { display: grid; grid-template-columns: minmax(96px, 180px) 92px minmax(0, 1fr); align-items: center; gap: 14px; }
+.ff-pct { display: inline-flex; align-items: center; gap: 6px; }
+.ff-pct .dx-input { width: 60px; height: 28px; padding: 0 8px; text-align: right; }
+
+/* a list in a sheet runs into the section's foot; these have more below them */
+.ff-pins, .ff-user { table-layout: auto; }
+.sheet .ff-pins:not(:last-child), .sheet .ff-user:not(:last-child) { margin-bottom: 0; }
+.sheet .ff-pins td.r, .sheet .ff-user td.r { width: 1%; text-align: right; white-space: nowrap; word-break: normal; }
+.ff-pins td.r > * + *, .ff-user td.r > * + * { margin-left: 8px; }
+.ff-variant { width: auto; max-width: 180px; }
+.ff-gone { border-color: rgba(255, 255, 255, 0.12); color: var(--ink-ghost); }
+.ff-find { display: grid; gap: 8px; margin-top: 14px; }
+.ff-find .dx-input { flex: 1; min-width: 180px; width: auto; height: 28px; padding: 0 8px; }
+.ff-gets .dx-tag { margin-left: 0; }
+.ff-gets .cap { margin-left: 8px; text-transform: none; letter-spacing: 0.02em; }
+
+@media (max-width: 860px) {
+  .ff-desc { display: none; }
+  .ff-dist-row, .ff-roll-row { grid-template-columns: minmax(72px, 120px) minmax(0, 1fr) auto; gap: 10px; }
+  .ff-roll-row > .cap { grid-column: 1 / -1; }
+  .ff-gets .cap { display: none; }
+}
+
 /* storage: one column per folder on the way, then whatever is open */
 .st-bucket { position: relative; display: flex; flex: 1; flex-direction: column; min-height: 0; }
 

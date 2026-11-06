@@ -98,6 +98,32 @@ table events do. Deleting a user removes the row, its roster entry and its
 feature flags, and rows that point at the user stay. A password reset does not end
 sessions already open, because SurrealDB has nothing to revoke them with.
 
+A user's page lists every [feature flag](/docs/client/feature-flags) with the
+variant they get and whether a pin or the rules decide it. Pick a variant to pin
+them to it, or **Follow the rules** to unpin them; only that user is re-evaluated,
+and their app picks the change up live.
+
+## Feature flags
+
+The flags `spky flag` manages, with the same rules. **New flag** takes a key, its
+variants and a default; it starts on, with everyone on the default. A flag's page
+shows how many users have each variant and lets you:
+
+- turn it **off** (everyone gets the default, pins too) and back **on**;
+- set a **rollout** percent per variant: a stable share of users, by a hash of
+  the flag and the user, so raising it keeps the users who already had it;
+- **pin** users to a variant, found by the same search as the Users page. A pin
+  beats every rollout;
+- change its description, variants and default, or delete it.
+
+A change that can move many users (on and off, a rollout, a new default, a new
+flag) re-evaluates every user, a page of them at a time, with a progress bar.
+Keep the tab open until it finishes; if it stops part way, **Re-evaluate all
+users** finishes the job. What each user gets is written by the project's own
+`fn::feature::assign`, the evaluator the CLI and the DevTools use, so whichever
+one changed a flag, a user lands on the same variant. A project whose flag
+functions predate the console shows its flags read-only until it is redeployed.
+
 ## Storage
 
 The files of your SurrealDB buckets. Folders open side by side in columns, with
@@ -158,7 +184,8 @@ A project's live dashboard needs a scheduler from canary.370 or later. An
 older one still shows Deployments and Settings, with a note to upgrade it
 (`spky restart --upgrade`). Cloudflare projects show Deployments and
 Settings until their SSP learns console sign-in. Database, Users and Storage
-appear once a project's scheduler or SSP is on canary.371 or later.
+appear once a project's scheduler or SSP is on canary.371 or later, Feature
+flags on the first release after canary.379.
 </Note>
 
 The console's own session is a cookie that only console.sp00ky.cloud can

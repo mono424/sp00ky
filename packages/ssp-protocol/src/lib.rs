@@ -743,15 +743,84 @@ mod tests {
             ["secret_token", "blob"].iter().map(|s| s.to_string()).collect();
         assert_eq!(omit_clause(&fields), " OMIT blob, secret_token");
     }
+
+    #[test]
+    fn version_lookup_follows_the_server_major() {
+        for (v, want) in [
+            ("surrealdb-4.0.0-beta.1", VersionLookup::ParentId),
+            ("4.0.0", VersionLookup::ParentId),
+            ("v4.1.2", VersionLookup::ParentId),
+            ("surrealdb-3.3.5", VersionLookup::BoundId),
+            ("3.1.5", VersionLookup::BoundId),
+            ("portable-mem", VersionLookup::BoundId),
+            ("", VersionLookup::BoundId),
+        ] {
+            assert_eq!(VersionLookup::for_server(v), want, "{v}");
+        }
+    }
+
+    #[test]
+    fn durable_versions_project_the_lookup_the_server_indexes() {
+        let page = "SELECT * OMIT blob FROM game WHERE id > game:a ORDER BY id LIMIT 10";
+        let v3 = with_durable_row_versions(page);
+        assert_eq!(v3, with_durable_row_versions_using(page, VersionLookup::BoundId));
+        assert!(v3.contains("record_id = $spky_row_id"), "{v3}");
+        let v4 = with_durable_row_versions_using(page, VersionLookup::ParentId);
+        assert!(v4.starts_with("SELECT *, (SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1 AS _00_rv OMIT blob FROM game"), "{v4}");
+        assert!(!v4.contains("$spky_row_id"), "{v4}");
+    }
+}
+
+/// How a scan reads each row's version from the `_00_version` ledger: a
+/// correlated subquery per row, which the two SurrealDB lines plan in
+/// opposite ways. Measured 2026-11-06 on pages over a 46k-row ledger: 3.3.5
+/// uses the index for an id bound in a block first (5 rows: 5 ms) and scans
+/// the ledger for every row on `$parent.id` (28 s); 4.0.0-beta.1 is the
+/// reverse (46 rows: 35 s bound, 0.2 s on `$parent.id`), and a cold SSP
+/// bootstrap of a 46k-row table took over an hour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VersionLookup {
+    /// The outer id bound with `LET` before the lookup: SurrealDB 3.
+    #[default]
+    BoundId,
+    /// The lookup on `$parent.id`: SurrealDB 4.
+    ParentId,
+}
+
+impl VersionLookup {
+    /// The lookup for a server whose `/version` reads `version`
+    /// (`surrealdb-4.0.0-beta.1`, `4.0.0`): `ParentId` from 4 on, `BoundId`
+    /// for anything else, an unknown version included.
+    pub fn for_server(version: &str) -> Self {
+        let v = version.trim();
+        let v = v.strip_prefix("surrealdb-").unwrap_or(v);
+        let v = v.strip_prefix('v').unwrap_or(v);
+        match v.split('.').next().and_then(|major| major.parse::<u32>().ok()) {
+            Some(major) if major >= 4 => Self::ParentId,
+            _ => Self::BoundId,
+        }
+    }
 }
 
 /// Include durable row versions when scanning upstream application tables.
 /// Call only when INFO FOR DB contains `_00_version`; replicas already carry
 /// `_00_rv`, and bare integration databases may have no version table.
+/// The SurrealDB 3 form; see [`with_durable_row_versions_using`].
 pub fn with_durable_row_versions(page_query: &str) -> String {
-    // Bind the outer id before planning the lookup. A correlated $parent.id
-    // predicate makes SurrealDB scan the entire ledger for every source row.
-    page_query.replacen("SELECT *", "SELECT *, { LET $spky_row_id = id; RETURN (SELECT VALUE version FROM _00_version WHERE record_id = $spky_row_id LIMIT 1)[0] ?? _00_rv ?? 1; } AS _00_rv", 1)
+    with_durable_row_versions_using(page_query, VersionLookup::BoundId)
+}
+
+/// [`with_durable_row_versions`] with the lookup the server plans as an
+/// index read ([`VersionLookup`]).
+pub fn with_durable_row_versions_using(page_query: &str, lookup: VersionLookup) -> String {
+    let projection = match lookup {
+        // Bind the outer id before planning the lookup. A correlated $parent.id
+        // predicate makes SurrealDB 3 scan the entire ledger for every source row.
+        VersionLookup::BoundId => "SELECT *, { LET $spky_row_id = id; RETURN (SELECT VALUE version FROM _00_version WHERE record_id = $spky_row_id LIMIT 1)[0] ?? _00_rv ?? 1; } AS _00_rv",
+        // SurrealDB 4 scans the ledger for a bound id and seeks the index on this.
+        VersionLookup::ParentId => "SELECT *, (SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1 AS _00_rv",
+    };
+    page_query.replacen("SELECT *", projection, 1)
 }
 
 /// The SurrealQL literal for a record id as a SELECT returns it: SurrealDB's

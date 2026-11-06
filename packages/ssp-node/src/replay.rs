@@ -75,6 +75,10 @@ impl SspNode {
         }
 
         let mut changes: Vec<IngestRequest> = Vec::new();
+        let lookup = match by_table.is_empty() {
+            true => Default::default(),
+            false => crate::bootstrap::version_lookup(self.platform.db.as_ref()).await,
+        };
         for (table, ids) in by_table {
             let omit = self
                 .processor
@@ -85,7 +89,7 @@ impl SspNode {
                 .unwrap_or_default();
             let mut current: HashMap<String, Value> = HashMap::new();
             for chunk in ids.chunks(FETCH_CHUNK) {
-                current.extend(fetch_current(self.platform.db.as_ref(), chunk, &omit).await?);
+                current.extend(fetch_current(self.platform.db.as_ref(), chunk, &omit, lookup).await?);
             }
             let circuit = self.processor.read().await;
             for id in ids {
@@ -188,11 +192,12 @@ pub(crate) async fn fetch_current(
     db: &dyn crate::ports::Db,
     ids: &[String],
     omit: &str,
+    lookup: ssp_protocol::VersionLookup,
 ) -> anyhow::Result<HashMap<String, Value>> {
     let select = format!("SELECT *{omit} FROM $records");
     let sql = |select: &str| format!("LET $records = array::map($ids, |$i| type::record($i)); {select};");
     let ids_json = Value::Array(ids.iter().cloned().map(Value::String).collect());
-    let durable = sql(&ssp_protocol::with_durable_row_versions(&select));
+    let durable = sql(&ssp_protocol::with_durable_row_versions_using(&select, lookup));
     let results = match db.query(&durable, &[("ids", ids_json.clone())]).await {
         // No ledger on this database: the row's field is the version.
         Err(e) if e.to_string().contains("_00_version") => db.query(&sql(&select), &[("ids", ids_json)]).await,

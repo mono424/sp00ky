@@ -59,6 +59,37 @@ export const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 export const people = (p: ActivityPoint): number => p.users_avg + p.anon_avg;
 export const peakPeople = (p: ActivityPoint): number => p.users_max + p.anon_max;
 
+/** What the project's own scheduler says right now, sampled every few seconds. */
+export interface LivePresence {
+  totals: { users: number; anon_sessions: number };
+  taken_at_ms: number | null;
+  error: string | null;
+  ready: boolean;
+}
+
+export interface OnlineNow {
+  live: boolean;
+  people: number;
+  signedIn: number;
+  signedOut: number;
+}
+
+/** A live reading this old means the feed has stopped. */
+const LIVE_STALE_MS = 60_000;
+
+/**
+ * Who is online: the scheduler's live count while it is current, otherwise the
+ * peak of the last finished bucket. A peak and not an average, because an
+ * average rounds a short visit away and its parts need not add up to its total.
+ */
+export function onlineNow(live: LivePresence | undefined, latest: ActivityPoint, now = Date.now()): OnlineNow {
+  if (live?.ready && !live.error && live.taken_at_ms != null && now - live.taken_at_ms < LIVE_STALE_MS) {
+    const { users, anon_sessions } = live.totals;
+    return { live: true, people: users + anon_sessions, signedIn: users, signedOut: anon_sessions };
+  }
+  return { live: false, people: peakPeople(latest), signedIn: latest.users_max, signedOut: latest.anon_max };
+}
+
 /** Views a person holds open. Unknown with nobody there, rather than zero. */
 export function viewsPerPerson(p: ActivityPoint): number | null {
   const n = people(p);

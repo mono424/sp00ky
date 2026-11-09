@@ -48,6 +48,14 @@
 //! exists for is a bulk import into a table someone has open (2026-10-08:
 //! a PGN import moved one game-list view ~125 times a second and filled the
 //! SSP's publication queue).
+//!
+//! # Activity
+//!
+//! The sample ring only reaches back half an hour. To see when a project's
+//! users are around, and later to pick quiet hours for backups and upgrades,
+//! each sample also folds into a 15-minute bucket that goes to Sp00ky Cloud,
+//! which is what schedules those. An unlinked scheduler keeps nothing. A sample
+//! that failed adds nothing, so an outage reads as missing data, not as zero.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -90,6 +98,13 @@ const HOT_COOLDOWN_MS: u64 = 60_000;
 
 /// The incident component hot views are reported under.
 const HOT_COMPONENT: &str = "views";
+
+/// One activity bucket. As fine as the signal goes: a tab that dies silently
+/// takes about 9 minutes to decay out of the numbers.
+const ACTIVITY_BUCKET_MS: u64 = 15 * 60 * 1000;
+
+/// A day of buckets held for a control plane that cannot be reached.
+const ACTIVITY_BACKLOG: usize = 96;
 
 /// The `_00_query` key of a view id, whichever way it was spelled.
 ///
@@ -154,6 +169,111 @@ pub struct TopUser {
     pub auth_id: String,
     pub views: u64,
     pub sessions: u64,
+}
+
+/// One finished 15-minute measurement, in the shape the control plane takes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct ActivityBucket {
+    bucket: String,
+    samples: u64,
+    users_avg: f64,
+    users_max: u64,
+    anon_avg: f64,
+    anon_max: u64,
+    views_avg: f64,
+    views_max: u64,
+}
+
+/// The bucket still being filled. Each pair is (sum, peak).
+#[derive(Debug, Clone, Copy)]
+struct OpenBucket {
+    start_ms: u64,
+    samples: u64,
+    users: (u64, u64),
+    anon: (u64, u64),
+    views: (u64, u64),
+}
+
+impl OpenBucket {
+    fn close(self) -> Option<ActivityBucket> {
+        let bucket = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(self.start_ms as i64)?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let avg = |sum: u64| sum as f64 / self.samples as f64;
+        Some(ActivityBucket {
+            bucket,
+            samples: self.samples,
+            users_avg: avg(self.users.0),
+            users_max: self.users.1,
+            anon_avg: avg(self.anon.0),
+            anon_max: self.anon.1,
+            views_avg: avg(self.views.0),
+            views_max: self.views.1,
+        })
+    }
+}
+
+/// Folds samples into buckets and holds what has not been delivered. Pure, so
+/// the rollup and the backlog are testable without a control plane.
+#[derive(Debug, Default)]
+struct ActivityRollup {
+    open: Option<OpenBucket>,
+    unsent: VecDeque<ActivityBucket>,
+}
+
+impl ActivityRollup {
+    /// Add one sample. True when it finished a bucket, so there is a report to send.
+    fn add(&mut self, at_ms: u64, users: u64, anon: u64, views: u64) -> bool {
+        let start_ms = at_ms - at_ms % ACTIVITY_BUCKET_MS;
+        let mut closed = false;
+        match self.open.as_mut() {
+            Some(open) if open.start_ms == start_ms => {
+                open.samples += 1;
+                for (slot, value) in [
+                    (&mut open.users, users),
+                    (&mut open.anon, anon),
+                    (&mut open.views, views),
+                ] {
+                    slot.0 += value;
+                    slot.1 = slot.1.max(value);
+                }
+                return false;
+            }
+            Some(open) => {
+                if let Some(done) = open.close() {
+                    self.unsent.push_back(done);
+                    closed = true;
+                }
+            }
+            None => {}
+        }
+        self.open = Some(OpenBucket {
+            start_ms,
+            samples: 1,
+            users: (users, users),
+            anon: (anon, anon),
+            views: (views, views),
+        });
+        self.trim();
+        closed
+    }
+
+    fn take(&mut self) -> Vec<ActivityBucket> {
+        self.unsent.drain(..).collect()
+    }
+
+    /// A report that could not be delivered goes back, oldest first.
+    fn put_back(&mut self, batch: Vec<ActivityBucket>) {
+        for bucket in batch.into_iter().rev() {
+            self.unsent.push_front(bucket);
+        }
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.unsent.len() > ACTIVITY_BACKLOG {
+            self.unsent.pop_front();
+        }
+    }
 }
 
 /// A view updating at or over the hot rate, as of the last sample.
@@ -341,6 +461,7 @@ pub struct PresenceTracker {
     /// writes it, and a view that left the sample leaves the map.
     rates: RwLock<HashMap<String, Rate>>,
     episode: Mutex<Option<Episode>>,
+    activity: Arc<Mutex<ActivityRollup>>,
 }
 
 impl PresenceTracker {
@@ -355,6 +476,7 @@ impl PresenceTracker {
             max_rows: config.presence_max_rows,
             rates: RwLock::new(HashMap::new()),
             episode: Mutex::new(None),
+            activity: Arc::new(Mutex::new(ActivityRollup::default())),
         })
     }
 
@@ -512,6 +634,7 @@ impl PresenceTracker {
             *guard = rates;
         }
         self.step_hot_episode(&snapshot, now);
+        self.report_activity(state, &snapshot.totals, now);
 
         let sample = PresenceSample {
             ts: snapshot.taken_at_ms,
@@ -529,6 +652,40 @@ impl PresenceTracker {
         if let Ok(mut guard) = self.snapshot.write() {
             *guard = Some(snapshot);
         }
+    }
+
+    /// Fold this sample into its activity bucket, and when that finishes one,
+    /// send everything undelivered. Off this task: the sampler must not wait
+    /// on the control plane. A refusal is final, an outage is retried with the
+    /// next finished bucket.
+    fn report_activity(&self, state: &AdminState, totals: &Totals, now: u64) {
+        let Some(link) = state.cloud.clone() else {
+            return;
+        };
+        let batch = {
+            let Ok(mut rollup) = self.activity.lock() else {
+                return;
+            };
+            if !rollup.add(now, totals.users, totals.anon_sessions, totals.views) {
+                return;
+            }
+            rollup.take()
+        };
+        let activity = Arc::clone(&self.activity);
+        tokio::spawn(async move {
+            let body = json!({ "buckets": batch });
+            if let Err((status, _)) = link
+                .call(reqwest::Method::POST, "/activity", Some(body))
+                .await
+            {
+                warn!(%status, buckets = batch.len(), "Could not report activity to Sp00ky Cloud");
+                if status.is_server_error() {
+                    if let Ok(mut rollup) = activity.lock() {
+                        rollup.put_back(batch);
+                    }
+                }
+            }
+        });
     }
 
     /// Open or close the `hot_views` incident off this sample.
@@ -1244,6 +1401,81 @@ async fn siblings_of(
 }
 
 #[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    const START: u64 = 1_794_000_000_000 - 1_794_000_000_000 % ACTIVITY_BUCKET_MS;
+
+    #[test]
+    fn a_bucket_holds_its_average_and_peak() {
+        let mut r = ActivityRollup::default();
+        assert!(!r.add(START, 2, 1, 10));
+        assert!(!r.add(START + 15_000, 4, 3, 30));
+        assert!(r.unsent.is_empty(), "a bucket still filling is not reported");
+
+        assert!(r.add(START + ACTIVITY_BUCKET_MS, 9, 9, 9), "the next bucket closes it");
+        let batch = r.take();
+        assert_eq!(batch.len(), 1);
+        let b = &batch[0];
+        assert_eq!(b.samples, 2);
+        assert_eq!((b.users_avg, b.users_max), (3.0, 4));
+        assert_eq!((b.anon_avg, b.anon_max), (2.0, 3));
+        assert_eq!((b.views_avg, b.views_max), (20.0, 30));
+    }
+
+    #[test]
+    fn bucket_times_are_on_the_boundary_in_utc() {
+        let mut r = ActivityRollup::default();
+        r.add(ACTIVITY_BUCKET_MS * 4 + 7_000, 1, 0, 1);
+        r.add(ACTIVITY_BUCKET_MS * 5, 1, 0, 1);
+        assert_eq!(r.take()[0].bucket, "1970-01-01T01:00:00Z");
+    }
+
+    /// An outage in the middle leaves a gap, never buckets of zeros.
+    #[test]
+    fn a_gap_in_samples_is_a_gap_in_buckets() {
+        let mut r = ActivityRollup::default();
+        r.add(START, 1, 0, 1);
+        assert!(r.add(START + 5 * ACTIVITY_BUCKET_MS, 1, 0, 1));
+        assert_eq!(r.take().len(), 1);
+    }
+
+    #[test]
+    fn an_undelivered_report_is_sent_again_in_order() {
+        let mut r = ActivityRollup::default();
+        r.add(START, 1, 0, 1);
+        r.add(START + ACTIVITY_BUCKET_MS, 1, 0, 1);
+        let first = r.take();
+        r.add(START + 2 * ACTIVITY_BUCKET_MS, 1, 0, 1);
+        r.put_back(first.clone());
+        let again = r.take();
+        assert_eq!(again.len(), 2);
+        assert_eq!(again[0], first[0]);
+        assert!(again[0].bucket < again[1].bucket);
+    }
+
+    #[test]
+    fn the_backlog_keeps_the_newest_day() {
+        let mut r = ActivityRollup::default();
+        for i in 0..(ACTIVITY_BACKLOG as u64 + 10) {
+            r.add(START + i * ACTIVITY_BUCKET_MS, 1, 0, 1);
+        }
+        assert_eq!(r.unsent.len(), ACTIVITY_BACKLOG);
+    }
+
+    #[test]
+    fn a_bucket_reports_the_field_names_the_control_plane_reads() {
+        let mut r = ActivityRollup::default();
+        r.add(START, 1, 0, 1);
+        r.add(START + ACTIVITY_BUCKET_MS, 1, 0, 1);
+        let v = serde_json::to_value(&r.take()[0]).unwrap();
+        for key in ["bucket", "samples", "users_avg", "users_max", "anon_avg", "anon_max", "views_avg", "views_max"] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1258,6 +1490,7 @@ mod tests {
             max_rows: 100,
             rates: RwLock::new(HashMap::new()),
             episode: Mutex::new(None),
+            activity: Arc::new(Mutex::new(ActivityRollup::default())),
         })
     }
 

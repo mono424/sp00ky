@@ -8,6 +8,7 @@
  * Nothing here ever sees or stores a token for the cloud.
  */
 
+import type { ActivityReport } from './audienceStats';
 import type { BuildPoint, RunStep, StepStat } from './buildStats';
 
 export class CloudError extends Error {
@@ -283,6 +284,8 @@ export const consoleApi = {
     cloud<BuildList>(`/console/projects/${encodeURIComponent(projectId)}/builds?days=${days}${steps ? '' : '&steps=0'}`),
   build: (projectId: string, id: string) =>
     cloud<{ run: BuildPoint; steps: RunStep[] }>(`/console/projects/${encodeURIComponent(projectId)}/builds/${encodeURIComponent(id)}`),
-  activity: (tenantId: string) =>
+  activity: (projectId: string, days: number, tz: string) =>
+    cloud<ActivityReport>(`/console/projects/${encodeURIComponent(projectId)}/activity?days=${days}&tz=${encodeURIComponent(tz)}`),
+  workspaceActivity: (tenantId: string) =>
     cloud<{ events: AuditEvent[] }>(`/console/workspaces/${encodeURIComponent(tenantId)}/activity`).then((r) => r.events),
 };

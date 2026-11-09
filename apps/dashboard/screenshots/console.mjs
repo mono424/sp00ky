@@ -251,6 +251,73 @@ function buildsList(url) {
   return [200, out];
 }
 
+// The Audience page's world: a daily and weekly rhythm, slow growth, and a gap.
+function activityReport(url) {
+  const days = Number(url.searchParams.get('days') ?? 30);
+  const step = days <= 14 ? '15m' : days <= 90 ? '1h' : '1d';
+  const stepMs = { '15m': 15 * 60_000, '1h': H, '1d': BUILD_DAY }[step];
+  const shape = (t) => {
+    const at = new Date(t);
+    const hour = at.getHours() + at.getMinutes() / 60;
+    const day = (at.getDay() + 6) % 7;
+    const daily = Math.max(0, Math.sin(((hour - 7) / 24) * 2 * Math.PI)) ** 1.5;
+    const evening = Math.exp(-((hour - 20.5) ** 2) / 6) * 0.55;
+    const weekend = day >= 5 ? 1.25 : 1;
+    const growth = 1 + (1 - (now - t) / (365 * BUILD_DAY)) * 0.9;
+    return { load: (0.03 + daily + evening) * weekend * growth };
+  };
+  const pointAt = (t, i) => {
+    const { load } = shape(t);
+    const wob = 0.86 + buildNoise(i, 21) * 0.28;
+    const users = 46 * load * wob;
+    const anon = 12 * load * (0.8 + buildNoise(i, 22) * 0.4);
+    const perPerson = t < now - 21 * BUILD_DAY ? 6.2 : 7.6;
+    return {
+      at: new Date(t).toISOString(),
+      users_avg: users, users_max: Math.ceil(users * 1.22),
+      anon_avg: anon, anon_max: Math.ceil(anon * 1.4),
+      views_avg: (users + anon) * perPerson, views_max: Math.ceil((users + anon) * perPerson * 1.18),
+    };
+  };
+  const bucketNow = Math.floor(now / stepMs) * stepMs;
+  const outage = [now - 6.2 * BUILD_DAY, now - 5.9 * BUILD_DAY];
+  const series = [];
+  for (let t = bucketNow - days * BUILD_DAY, i = 0; t <= bucketNow; t += stepMs, i++) {
+    if (step !== '1d' && t > outage[0] && t < outage[1]) continue;
+    series.push(pointAt(t, i));
+  }
+  const cells = [];
+  for (let d = 1; d <= 7; d++) for (let h = 0; h < 24; h++) {
+    const monday = new Date(now);
+    monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7) + d - 1);
+    monday.setHours(h, 30, 0, 0);
+    const p = pointAt(monday.getTime(), d * 24 + h);
+    cells.push({ day: d, hour: h, people: p.users_avg + p.anon_avg, views: p.views_avg });
+  }
+  const week = 7 * 24;
+  const at = (d, h) => cells[(d - 1) * 24 + h].people;
+  const windows = [];
+  for (let s = 0; s < week; s++) windows.push({ day: Math.floor(s / 24) + 1, hour: s % 24, hours: 2, people: (cells[s].people + cells[(s + 1) % week].people) / 2 });
+  windows.sort((a, b) => a.people - b.people);
+  const quiet = [];
+  const pos = (w) => (w.day - 1) * 24 + w.hour;
+  for (const w of windows) {
+    if (quiet.length === 3) break;
+    if (quiet.every((q) => { const d = Math.abs(pos(q) - pos(w)); return d >= 2 && week - d >= 2; })) quiet.push(w);
+  }
+  void at;
+  const summarize = (rows) => ({
+    people_avg: rows.reduce((a, p) => a + p.users_avg + p.anon_avg, 0) / Math.max(1, rows.length),
+    people_peak: Math.max(0, ...rows.map((p) => p.users_max + p.anon_max)),
+    views_avg: rows.reduce((a, p) => a + p.views_avg, 0) / Math.max(1, rows.length),
+    views_peak: Math.max(0, ...rows.map((p) => p.views_max)),
+    measured: rows.length,
+  });
+  const prior = [];
+  for (let t = bucketNow - 2 * days * BUILD_DAY, i = 0; t < bucketNow - days * BUILD_DAY; t += stepMs, i++) prior.push({ ...pointAt(t, i), users_avg: pointAt(t, i).users_avg * 0.88, anon_avg: pointAt(t, i).anon_avg * 0.88 });
+  return { step, series, cells, quiet, current: summarize(series), prior: summarize(prior), latest: series[series.length - 1], first_at: iso(200 * BUILD_DAY), tz: url.searchParams.get('tz') || 'UTC' };
+}
+
 const CLOUD = {
   'GET /console/me': { account: { id: 'acct-1', github_login: 'mono424', email: 'mira@acme.dev', created_at: iso(400 * 24 * H) }, session: 'sess-1', grants: true },
   'GET /console/workspaces': { workspaces: WORKSPACES },
@@ -402,6 +469,8 @@ function cloudRoute(method, path, url, body) {
   if ((m = path.match(/^\/projects\/([^/]+)\/database\/upgrade(?:\/(cutover|cancel|finish|rollback))?$/))) return upgradeRoute(method, m[1], m[2], body);
   if ((m = path.match(/^\/projects\/([^/]+)\/host(?:\/(upgrade))?$/))) return hostRoute(method, m[2]);
   if (/^\/console\/projects\/[^/]+\/deployments$/.test(path)) return [200, DEPLOYMENTS];
+  if (/^\/console\/projects\/prj-td\/activity$/.test(path)) return [200, { step: '1h', series: [], cells: [], quiet: [], current: { people_avg: 0, people_peak: 0, views_avg: 0, views_peak: 0, measured: 0 }, prior: { people_avg: 0, people_peak: 0, views_avg: 0, views_peak: 0, measured: 0 }, latest: null, first_at: null, tz: 'UTC' }];
+  if (/^\/console\/projects\/[^/]+\/activity$/.test(path)) return [200, activityReport(url)];
   if ((m = path.match(/^\/console\/projects\/[^/]+\/builds\/([^/]+)$/))) return buildDetail(m[1]);
   if (/^\/console\/projects\/[^/]+\/builds$/.test(path)) return buildsList(url);
   if (/^\/console\/workspaces\/[^/]+\/activity$/.test(path)) {

@@ -43,6 +43,7 @@ import { CloudError, consoleApi, rememberSignedIn, signInUrl, signOut, wasSigned
 import { ConsoleChromeProvider, WORKSPACE_LINKS, type ConsoleChrome } from './chrome';
 import { GitHubMark, Onboarding } from './onboarding';
 import { Deployments, Settings } from './project';
+import { Audience } from './audience';
 import { BuildRun, Builds } from './builds';
 import { Activity, Billing, Keys, Members, Projects, Sessions, Vault, WorkspaceSettings } from './workspace';
 import { lock } from './vault';
@@ -328,6 +329,7 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
       <Route path="/deployments" component={() => <Deployments workspace={props.workspace} project={props.project} />} />
       <Route path="/deployments/builds" component={() => <Builds workspace={props.workspace} project={props.project} />} />
       <Route path="/deployments/builds/:id" component={() => <BuildRun workspace={props.workspace} project={props.project} />} />
+      <Route path="/audience" component={() => <Audience workspace={props.workspace} project={props.project} />} />
       <Route path="/settings/:tab?" component={() => <Settings workspace={props.workspace} project={props.project} />} />
     </>
   );

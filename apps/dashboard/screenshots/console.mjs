@@ -132,6 +132,125 @@ const DEPLOYMENTS = {
   builds: [],
 };
 
+// The Build time pages' world: 130 pushes over 88 days, in four regimes, so the
+// page has step changes to find.
+const BUILD_DAY = 24 * H;
+const buildNoise = (i, salt) => {
+  const x = Math.sin(i * 12.9898 + salt * 78.233) * 43758.5453;
+  return x - Math.floor(x);
+};
+const buildSpread = (i, salt, lo, hi) => Math.round(lo + (hi - lo) * buildNoise(i, salt));
+const BUILD_MESSAGES = ['fix(game): pending moves survive a reload', 'feat(puzzles): daily set survives a reload', 'chore: bump the board renderer', 'feat(analysis): engine depth per plan', 'fix(chat): typing state clears on leave', 'refactor(profile): one query for the header', 'feat(import): PGN batches stream progress'];
+const BUILD_SERIES = Array.from({ length: 130 }, (_, n) => {
+  const i = 129 - n;
+  const agoMs = Math.round((i / 129) * 88 * BUILD_DAY) + 40 * 60_000;
+  const daysAgo = agoMs / BUILD_DAY;
+  const renderer = daysAgo > 58 ? 95_000 : daysAgo > 22 ? 430_000 : daysAgo > 7 ? 205_000 : 48_000;
+  const web = buildSpread(n, 3, 88_000, 132_000);
+  const server = buildNoise(n, 5) > 0.55 ? 3_000 : buildSpread(n, 6, 44_000, 76_000);
+  const failed = buildNoise(n, 7) > 0.93;
+  const wedge = !failed && buildNoise(n, 8) > 0.975 ? 2.4 : 1;
+  const apps = [
+    { name: 'renderer', ms: Math.round(renderer * (0.86 + buildNoise(n, 9) * 0.3) * wedge), status: 'ok' },
+    { name: 'web', ms: web, status: 'ok' },
+    { name: 'game-server', ms: server, status: server < 5000 ? 'reused' : 'ok' },
+    { name: 'mailer', ms: 1800, status: 'reused' },
+  ];
+  const build = apps.reduce((a, b) => a + b.ms, 0) + buildSpread(n, 10, 4000, 9000);
+  const phases = failed
+    ? { queue: buildSpread(n, 1, 1000, 9000), source: buildSpread(n, 2, 5000, 9000), build: Math.round(build * 0.6), infra: 0, migrate: 0, rollout: 0 }
+    : { queue: buildSpread(n, 1, 1000, buildNoise(n, 12) > 0.85 ? 180_000 : 9000), source: buildSpread(n, 2, 5000, 9000), build, infra: buildSpread(n, 13, 44_000, 70_000), migrate: buildSpread(n, 14, 8000, 22_000), rollout: buildSpread(n, 15, 38_000, 92_000) };
+  const layers = apps.filter((a) => a.status === 'ok').length * 13;
+  return {
+    id: `bld-${n}`, kind: 'build', status: failed ? 'failed' : 'success', version: 200 + n, source: 'git',
+    commit_sha: `${(0x1a2b3c4 + n * 7919).toString(16)}e7d2aa`, commit_message: BUILD_MESSAGES[n % BUILD_MESSAGES.length], commit_author: n % 3 ? 'mono424' : 'mira',
+    error: failed ? 'docker build failed for renderer: exit status 1\n#14 ERROR: process "/bin/sh -c pnpm build" did not complete successfully: exit code: 1' : null,
+    created_at: iso(agoMs), total_ms: Object.values(phases).reduce((a, b) => a + b, 0), phases,
+    detailed: daysAgo < 60, apps: daysAgo < 60 ? apps : [],
+    apps_built: daysAgo < 60 ? apps.filter((a) => a.status === 'ok').length : 0,
+    apps_reused: daysAgo < 60 ? apps.filter((a) => a.status === 'reused').length : 0,
+    layers: daysAgo < 60 ? layers : 0, layers_cached: daysAgo < 60 ? Math.round(layers * (0.55 + buildNoise(n, 16) * 0.3)) : 0,
+  };
+});
+const BUILD_LAYERS = [
+  ['[internal] load build context', 2200, 0], ['importing cache manifest from registry', 3100, 0], ['builder · FROM docker.io/library/node:22', 0, 1],
+  ['builder · RUN corepack enable && pnpm fetch', 41_000, 1], ['builder · COPY . .', 3800, 0], ['builder · RUN pnpm install --offline', 22_000, 1],
+  ['builder · RUN pnpm --filter ./apps/renderer build', 214_000, 0], ['runtime · FROM docker.io/library/nginx:1.27', 0, 1],
+  ['runtime · COPY --from=builder /app/dist /usr/share/nginx/html', 1900, 0], ['exporting to image', 31_000, 0], ['exporting cache to registry', 26_000, 0],
+];
+function buildStat(phase, step, app, name, ms, skipped = 0) {
+  const series = Array.from({ length: 30 }, (_, i) => Math.round(ms * (i > 18 ? 1.5 : 0.92 + buildNoise(i, ms % 97) * 0.2)));
+  return { phase, step, app, name, count: 34, skipped, median_ms: skipped === 34 ? 0 : ms, p90_ms: skipped === 34 ? 0 : Math.round(ms * 1.3), total_ms: ms * 34, prior_median_ms: Math.round(ms * (name === 'renderer' ? 2.4 : 1.06)), series };
+}
+const BUILD_STEPS = [
+  buildStat('source', 'clone', '', 'Clone repository', 5200), buildStat('source', 'vault', '', 'Load vault secrets', 380), buildStat('source', 'manifest', '', 'Read and check sp00ky.yml', 620),
+  buildStat('build', 'registry', '', 'Log in to the build registry', 900), buildStat('build', 'create_deployment', '', 'Create deployment', 1400),
+  buildStat('build', 'app', 'renderer', 'renderer', 205_000), buildStat('build', 'docker_build', 'renderer', 'docker build', 198_000), buildStat('build', 'key', 'renderer', 'Hash inputs, check reuse', 620), buildStat('build', 'inspect', 'renderer', 'Inspect image', 310),
+  ...BUILD_LAYERS.map(([name, ms, hit]) => buildStat('build', 'layer', 'renderer', name, ms, hit ? 27 : 0)),
+  buildStat('build', 'app', 'web', 'web', 108_000), buildStat('build', 'docker_build', 'web', 'docker build', 104_000), buildStat('build', 'layer', 'web', 'builder · RUN pnpm --filter ./apps/web build', 71_000), buildStat('build', 'layer', 'web', 'exporting to image', 14_000),
+  buildStat('build', 'app', 'game-server', 'game-server', 58_000, 18), buildStat('build', 'docker_build', 'game-server', 'docker build', 54_000), buildStat('build', 'app', 'mailer', 'mailer', 1800, 34),
+  buildStat('infra', 'registry_prune', '', 'Prune build registry', 2100), buildStat('migrate', 'migrate', '', 'Apply migrations', 9400), buildStat('migrate', 'pools', '', 'Sync machine pools', 2100), buildStat('rollout', 'announce', '', 'Announce frontend releases', 480),
+];
+function buildDetail(id) {
+  const run = BUILD_SERIES.find((b) => b.id === id);
+  if (!run) return [404, { error: 'build not found' }];
+  if (!run.detailed) return [200, { run, steps: [] }];
+  const zero = Date.parse(run.created_at);
+  const at = (ms) => new Date(zero + ms).toISOString();
+  const steps = [];
+  let nextId = 1;
+  const add = (phase, step, app, name, offset, ms, status = 'ok', parent_id = null) => {
+    const row = { id: nextId++, parent_id, phase, step, app, name, status, started_at: at(offset), duration_ms: ms };
+    steps.push(row);
+    return row.id;
+  };
+  const p = run.phases;
+  let t = p.queue;
+  add('source', 'clone', null, 'Clone repository', t, Math.round(p.source * 0.74));
+  add('source', 'vault', null, 'Load vault secrets', t + Math.round(p.source * 0.76), 380);
+  add('source', 'manifest', null, 'Read and check sp00ky.yml', t + Math.round(p.source * 0.84), 620);
+  t += p.source;
+  add('build', 'registry', null, 'Log in to the build registry', t, 900);
+  t += 1000;
+  for (const a of run.apps) {
+    const parent = add('build', 'app', a.name, a.name, t, a.ms, a.status);
+    add('build', 'key', a.name, 'Hash inputs, check reuse', t, 620, 'ok', parent);
+    if (a.status === 'ok') {
+      const docker = add('build', 'docker_build', a.name, 'docker build', t + 700, Math.round(a.ms * 0.96), 'ok', parent);
+      let l = t + 900;
+      const scale = (a.ms * 0.94) / BUILD_LAYERS.reduce((sum, [, ms]) => sum + ms, 0);
+      for (const [name, ms, hit] of BUILD_LAYERS) {
+        const cached = hit && buildNoise(ms, 3) >= 0;
+        const took = cached ? 0 : Math.round(ms * scale);
+        add('build', 'layer', a.name, name, l, took, cached ? 'cached' : 'ok', docker);
+        l += took;
+      }
+      add('build', 'inspect', a.name, 'Inspect image', t + Math.round(a.ms * 0.97), 310, 'ok', parent);
+    }
+    t += a.ms;
+  }
+  add('build', 'create_deployment', null, 'Create deployment', t, 1400);
+  t = p.queue + p.source + p.build;
+  if (p.infra) add('infra', 'registry_prune', null, 'Prune build registry', t, 2100);
+  t += p.infra;
+  if (p.migrate) {
+    add('migrate', 'migrate', null, 'Apply migrations', t, Math.round(p.migrate * 0.76));
+    add('migrate', 'pools', null, 'Sync machine pools', t + Math.round(p.migrate * 0.78), Math.round(p.migrate * 0.2));
+  }
+  t += p.migrate;
+  if (p.rollout) add('rollout', 'announce', null, 'Announce frontend releases', t + 400, 480);
+  return [200, { run, steps }];
+}
+function buildsList(url) {
+  const days = Number(url.searchParams.get('days') ?? 30);
+  const out = {
+    runs: BUILD_SERIES.filter((b) => Date.parse(b.created_at) >= now - 2 * days * BUILD_DAY),
+    window_start: iso(days * BUILD_DAY),
+  };
+  if (url.searchParams.get('steps') !== '0') out.steps = BUILD_STEPS;
+  return [200, out];
+}
+
 const CLOUD = {
   'GET /console/me': { account: { id: 'acct-1', github_login: 'mono424', email: 'mira@acme.dev', created_at: iso(400 * 24 * H) }, session: 'sess-1', grants: true },
   'GET /console/workspaces': { workspaces: WORKSPACES },
@@ -283,6 +402,8 @@ function cloudRoute(method, path, url, body) {
   if ((m = path.match(/^\/projects\/([^/]+)\/database\/upgrade(?:\/(cutover|cancel|finish|rollback))?$/))) return upgradeRoute(method, m[1], m[2], body);
   if ((m = path.match(/^\/projects\/([^/]+)\/host(?:\/(upgrade))?$/))) return hostRoute(method, m[2]);
   if (/^\/console\/projects\/[^/]+\/deployments$/.test(path)) return [200, DEPLOYMENTS];
+  if ((m = path.match(/^\/console\/projects\/[^/]+\/builds\/([^/]+)$/))) return buildDetail(m[1]);
+  if (/^\/console\/projects\/[^/]+\/builds$/.test(path)) return buildsList(url);
   if (/^\/console\/workspaces\/[^/]+\/activity$/.test(path)) {
     return [200, { events: [
       { id: 3, at: iso(60_000), actor: 'mono424', action: 'console.grant', project: 'whitepawn', ip: '84.150.12.9', detail: {} },

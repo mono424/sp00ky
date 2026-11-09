@@ -67,6 +67,26 @@ started it and how long it took; **Roll back** brings back the newest version
 before the live one, **Restart** can restart or upgrade parts of the project,
 and **Rebuild** reruns the build of a git-linked project.
 
+### Build time
+
+The **Build time** box on the Deployments page shows how long a push takes to go
+live and how the latest build split up. It opens a page for finding out why:
+
+- The median push-to-live time, the slowest 1 in 10, build, rollout and image
+  reuse, each against the period before.
+- A chart of every build with a rolling median. Failed builds are marked, and
+  points where the time stepped up or down are numbered, with the phase, app and
+  commit that go with the change.
+- The same builds split into phases: queue, source, build, infra, migrate and
+  rollout. Pick a phase to chart it alone and to list only its steps.
+- Every step ranked by time. An image expands to its `docker build` and each
+  Docker layer, with how often it was cached.
+- Any single build as a waterfall, with a mark for what each step usually takes.
+
+Git-linked builds are timed step by step, including their layers (kept for 180
+days; other steps as long as the build). A deployment from `spky deploy` on your
+own machine shows its rollout only, because its images are built on your machine.
+
 ## Database
 
 Your project's tables, in the shape of a table editor. Pick a table on the left

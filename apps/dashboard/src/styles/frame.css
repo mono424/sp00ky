@@ -125,7 +125,8 @@ label,
   align-items: center;
   gap: 10px;
   width: 100%;
-  height: 52px;
+  /* 51 and the line under it: the same 52 as the top bar, so the two lines meet */
+  height: 51px;
   padding: 0 16px;
   border: 0;
   background: none;
@@ -304,6 +305,24 @@ label,
   padding: 0 0 48px;
 }
 
+/* The page scrolls inside `.main`, and a scroll box clips whatever leaves it.
+   The squares where a row's line meets the sidebar straddle the sidebar's
+   line, so the box reaches that far over the rail and pads the page back to
+   where it was. Without this only the right half of each square shows.
+   (Scoped to the frame's child: `.main` is also a row modifier elsewhere.) */
+.main-frame > .main {
+  --edge: 5px;
+  margin-left: calc(var(--edge) * -1);
+  padding-left: var(--edge);
+}
+
+/* Under a phone's top bar there is no sidebar line to cross. */
+@media (max-width: 860px) {
+  .main-frame > .main {
+    --edge: 0px;
+  }
+}
+
 /* ---- jump-to palette ---------------------------------------------- */
 
 .palette-scrim {
@@ -389,12 +408,30 @@ label,
   -webkit-backdrop-filter: blur(10px);
 }
 
+/* The squares where two of the frame's lines cross. Each is 9px (7 and its
+   own border: `*` box-sizing does not reach a pseudo-element), so it sits
+   4px either side of a 1px line. Its box starts just past that line, which
+   makes every offset -5px. */
+
+/* The page reaches a few pixels over the rail (see `.main`), and the bar
+   does not, so a row's square would slide up beside the bar as the page
+   scrolls under it. This covers that strip, sidebar line included. */
+.main-frame > .main .page-head::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--edge) * -1);
+  width: var(--edge);
+  background: linear-gradient(var(--line), var(--line)) right / 1px 100% no-repeat, var(--bg);
+}
+
 /* where the top bar meets the sidebar */
 .page-head::after {
   content: '';
   position: absolute;
-  left: -4px;
-  bottom: -4px;
+  left: -5px;
+  bottom: -5px;
   width: 7px;
   height: 7px;
   background: var(--bg);
@@ -537,8 +574,8 @@ tbody tr:hover > td {
   content: '';
   position: absolute;
   z-index: 3;
-  left: -4px;
-  bottom: -4px;
+  left: -5px;
+  bottom: -5px;
   width: 7px;
   height: 7px;
   background: var(--bg);
@@ -562,12 +599,24 @@ tbody tr:hover > td {
   content: '';
   position: absolute;
   z-index: 3;
-  left: -4px;
-  top: -4px;
+  left: -5px;
+  top: -5px;
   width: 7px;
   height: 7px;
   background: var(--bg);
   border: 1px solid var(--line-cross);
+}
+
+/* The top bar sticks above the page, so it would cover the upper half of the
+   squares on its own line. While the page rests at its top they sit over the
+   bar; `.scrolled` (Shell) lets them pass under it with the rest. */
+.main:not(.scrolled) .fx-page > .fx-row:first-child > .fx-cell + .fx-cell::before {
+  z-index: 6;
+}
+
+/* ...and the bar rises again while one of its menus is open over them. */
+.page-head:has([role='menu']) {
+  z-index: 7;
 }
 
 .fx-head {
@@ -822,7 +871,7 @@ tbody tr:hover > td {
   content: '';
   position: absolute;
   z-index: 3;
-  left: -4px;
+  left: -5px;
   width: 7px;
   height: 7px;
   background: var(--bg);
@@ -830,11 +879,11 @@ tbody tr:hover > td {
 }
 
 .fx-cell + .fx-cell > .fx-gauges::before {
-  top: -4px;
+  top: -5px;
 }
 
 .fx-cell + .fx-cell > .fx-gauges::after {
-  bottom: -4px;
+  bottom: -5px;
 }
 
 .fx-gauge {
@@ -1302,8 +1351,8 @@ tbody tr:hover > td {
   content: '';
   position: absolute;
   z-index: 3;
-  left: -4px;
-  bottom: -4px;
+  left: -5px;
+  bottom: -5px;
   width: 7px;
   height: 7px;
   background: var(--bg);
@@ -1670,6 +1719,7 @@ h2 {
 
 .inc-find {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin-left: auto;
 }
@@ -2748,22 +2798,21 @@ h2 {
   margin-bottom: 12px;
 }
 
+/* Each fact is as wide as what it says and the spare room goes between
+   them: fixed fractions let a long label (HEARTBEAT) run into its
+   neighbour once a fourth fact (an SSP's disk) joined the line. */
 .sp-facts {
-  display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
   gap: 10px 16px;
   margin: 0 0 14px;
 }
 
-/* an SSP measured by Sp00ky Cloud has its disk as a fourth fact, on the
-   same line */
-.sp-facts:has(> :nth-child(4)) {
-  grid-template-columns: 1.3fr 0.8fr 1fr 0.9fr;
-}
-
 .sp-facts div {
   display: grid;
-  gap: 3px;
+  gap: 4px;
+  min-width: 0;
 }
 
 .sp-facts dt {
@@ -3710,8 +3759,10 @@ h2 {
   cursor: pointer;
 }
 
+/* a row whose name carries a second line needs the room of two */
 .rn-sched td,
-.rn-list td {
+.rn-list td,
+.rs-containers td {
   height: auto;
   padding-top: 10px;
   padding-bottom: 10px;
@@ -4223,7 +4274,10 @@ h2 {
 }
 .cx-tag.cf { color: #f3a35b; border-color: rgba(243, 163, 91, 0.4); }
 .cx-empty { padding: 10px 14px; color: var(--ink-ghost); }
-.cx-pfoot { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; color: var(--ink-ghost); }
+/* two ways out and a hint: a gap between them always, a second line when the box is narrow */
+.cx-pfoot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 10px 12px; color: var(--ink-ghost); }
+.cx-pfoot > * { flex: none; white-space: nowrap; }
+.cx-pfoot > span { margin-left: auto; }
 .cx-pfoot button { border: 0; background: none; color: var(--ink-dim); font: inherit; letter-spacing: inherit; text-transform: inherit; padding: 0; }
 .cx-pfoot button:hover { color: var(--ink); }
 
@@ -4367,7 +4421,8 @@ h2 {
   font: 12.5px var(--mono);
 }
 .cx-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
-.cx-form .li-field { display: grid; gap: 6px; min-width: 200px; }
+/* `label` carries a bottom margin of its own; here it would lift the field off the line its button stands on */
+.cx-form .li-field { display: grid; gap: 6px; min-width: 200px; margin: 0; }
 .cx-form .li-field span { font: 500 10.5px var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); }
 .cx-mask { letter-spacing: 0.2em; color: var(--ink-ghost); }
 .cx-val { font: 12px var(--mono); color: var(--ink); word-break: break-all; white-space: normal; }
@@ -4826,7 +4881,7 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
   .sp-row > .sp-id, .bk-row > .sp-id, .bk-row > .bk-resp, .sp-row > .sp-boot { grid-column: 1 / -1; }
   .sp-row > .fx-cell:nth-child(odd):not(:first-child):not(.sp-boot),
   .bk-row > .fx-cell:nth-child(4) { border-left: 1px solid var(--line); }
-  .sp-facts, .sp-facts:has(> :nth-child(4)) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sp-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .sp-facts dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* incidents: the time stays on one line */
@@ -4967,7 +5022,7 @@ span.nav-link { display: flex; align-items: center; color: var(--ink-faint); }
 .cx-rail-head { flex: none; padding-top: 10px; }
 .cx-rail-head .cx-proj-wrap.in-rail { padding: 0 10px; }
 /* wider than the rail, as the workspace menu is, so no line wraps */
-.cx-rail-head .cx-proj-wrap.in-rail .cx-pop { right: auto; width: 320px; max-width: calc(100vw - 20px); top: calc(100% + 6px); }
+.cx-rail-head .cx-proj-wrap.in-rail .cx-pop { right: auto; width: 372px; max-width: calc(100vw - 20px); top: calc(100% + 6px); }
 .cx-prow {
   display: flex;
   align-items: center;
@@ -5525,7 +5580,7 @@ span.cx-me { pointer-events: none; }
   gap: 6px;
   flex: none;
   height: 45px;
-  padding: 0 8px 0 var(--pad);
+  padding: 0 14px 0 var(--pad);
   border-bottom: 1px solid var(--line);
 }
 
@@ -5862,7 +5917,8 @@ span.cx-me { pointer-events: none; }
 .dx-source { margin-top: 8px; font: 500 15px var(--mono); color: var(--ink); }
 .dx-users { table-layout: auto; }
 .dx-users th { text-align: left; }
-.dx-users-foot { display: flex; justify-content: flex-end; padding: 12px var(--pad) 0; margin: 0 calc(var(--pad) * -1); border-top: 1px solid var(--line-soft); }
+/* the list above ends with a -22px margin (it closes on the row's line), so the foot starts that far down, clear of the last row */
+.dx-users-foot { display: flex; justify-content: flex-end; padding: 12px var(--pad) 0; margin: 22px calc(var(--pad) * -1) -10px; border-top: 1px solid var(--line-soft); }
 .dx-who { max-width: 280px; }
 .dx-who > * { vertical-align: middle; }
 
@@ -6167,7 +6223,8 @@ button.st-crumb:hover { color: var(--ink); }
 }
 
 @media (max-width: 1100px) {
-  .dx-col-wide { display: none; }
+  /* with the table: the phone rule `table.fx-list td` would otherwise show the cell under a hidden header */
+  .dx-col-wide, table.fx-list .dx-col-wide { display: none; }
   .dx-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dx-stats .fx-cell:nth-child(3) { border-left: 0; border-top: 1px solid var(--line); }
   .dx-stats .fx-cell:nth-child(4) { border-top: 1px solid var(--line); }
@@ -6188,7 +6245,7 @@ button.st-crumb:hover { color: var(--ink); }
   .dx-side-find, .dx-side-list { display: none; }
   .dx-side-pick { display: block; width: calc(100% - var(--pad) * 2); height: 34px; margin: 8px var(--pad); }
   .dx-main { flex: 1; }
-  .dx-col-mid { display: none; }
+  .dx-col-mid, table.fx-list .dx-col-mid { display: none; }
   .dx-bar-end { margin-left: 0; width: 100%; }
   /* one column to a screen, swiped between; the path above is the way back */
   .st-columns { scroll-snap-type: x mandatory; }
@@ -6481,3 +6538,49 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
   .au-cell { height: 18px; }
   .au-hour { font-size: 8.5px; }
 }
+
+/* ================================================================
+   CONTROLS ON ONE LINE SHARE ONE HEIGHT
+   A field with the button that sends it, a segmented control beside
+   a search: one band, not three sizes centred on each other.
+   ================================================================ */
+
+/* the top bar: 24px, the small button's height */
+.page-head .fx-range button,
+.page-head .fx-range .dx-tab { height: 22px; }
+.page-head .bt-seg button { height: 22px; padding-block: 0; }
+.page-head .split .btn { height: 24px; padding-inline: 9px; font-size: 10px; }
+
+/* a toolbar over a list: 28px, the search field's height */
+.inc-filters .fx-range button,
+.dx-pager .fx-range button { height: 26px; }
+.inc-filters .btn-sm,
+.inc-filters .fm-chip,
+.st-tools .btn-sm { height: 28px; }
+
+/* A section's label stays on its own line whatever sits beside it: a button
+   or a chip in the head would otherwise make that one head taller and push
+   its label below the label of the cell next to it. */
+.fx-head .btn-sm { margin-block: -4px; }
+.fx-head .cx-chip { margin-block: -2px; }
+
+/* a list under the form that adds to it starts after a breath */
+.cx-form + .cx-line { margin-top: 12px; border-top: 1px solid var(--line-soft); }
+
+/* the logs search is 34px tall; its filter button stands as tall beside it */
+.lx-query-cell .fm-btn { height: 34px; padding-inline: 12px; }
+
+/* A `label` is a block with a 5px bottom margin (theme.css), right over a
+   field. As a control in a row it would stand 5px high of its neighbours. */
+.lx-search,
+.switch,
+.cx-upcheck { margin-bottom: 0; }
+
+/* the button that sends a field is as tall as the field */
+.cx-unlock .btn,
+.ax-revoke .btn { height: 30px; }
+.dx-pass .dx-input,
+.dx-pass .dx-select,
+.dx-pass .btn { height: 32px; }
+.dx-addfield .btn { height: 28px; }
+

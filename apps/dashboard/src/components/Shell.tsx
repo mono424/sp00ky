@@ -307,6 +307,9 @@ export function Shell(props: {
 }) {
   const location = useLocation();
   const [open, setOpen] = createSignal(false);
+  // The top bar sticks above the page. While the page is at its top, the
+  // squares on the bar's line show whole; once it moves they pass under.
+  const [scrolled, setScrolled] = createSignal(false);
   // In the console the workspace menu (the rail's foot) holds the account,
   // and Deployments and Settings join the rail; elsewhere this is undefined.
   const cx = useConsoleChrome();
@@ -513,7 +516,7 @@ export function Shell(props: {
       </Show>
 
       <div class="main-frame">
-        <main class="main">
+        <main class="main" classList={{ scrolled: scrolled() }} onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}>
           {props.children}
           <Show when={props.session.mode === 'breakglass'}>
             <div class="page-body">

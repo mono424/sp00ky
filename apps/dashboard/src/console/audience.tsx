@@ -7,6 +7,7 @@
 import { For, Show, createMemo, createResource, createSignal, onCleanup, type JSX } from 'solid-js';
 import { PageHead } from '../components/Chrome';
 import { FxCell } from '../components/Frame';
+import { useOverview } from '../ProjectApp';
 import { consoleApi, type Workspace, type WorkspaceProject } from './cloud';
 import { ago } from './chrome';
 import {
@@ -20,6 +21,7 @@ import {
   heatLevel,
   heatMax,
   nearestIndex,
+  onlineNow,
   peakPeople,
   people,
   segments,
@@ -43,8 +45,6 @@ const RANGES = [
   { days: 90, label: '90d' },
   { days: 365, label: '1y' },
 ] as const;
-/** A reading this old is no longer what is happening now. */
-const STALE_MS = 45 * 60_000;
 const HOURS = Array.from({ length: 24 }, (_, h) => h);
 const MARGIN = { l: 48, r: 14, t: 12, b: 26 };
 
@@ -83,8 +83,14 @@ export function Audience(props: Ctx) {
     () => ({ id: props.project.id, days: days() }),
     (k) => consoleApi.activity(k.id, k.days, zone()),
   );
-  const timer = setInterval(() => void refetch(), 60_000);
+  // The clock moves on its own, so a live feed that froze stops reading as live.
+  const [clock, setClock] = createSignal(Date.now());
+  const timer = setInterval(() => {
+    setClock(Date.now());
+    void refetch();
+  }, 60_000);
   onCleanup(() => clearInterval(timer));
+  const overview = useOverview();
 
   const report = () => data.latest;
   const [hover, setHover] = createSignal<{ ms: number; owner: string } | null>(null);
@@ -99,9 +105,9 @@ export function Audience(props: Ctx) {
     return r ? changePct(pick(r.current), pick(r.prior), r.prior.measured) : null;
   };
   const perPerson = (s: ActivityReport['current']) => (s.people_avg >= 0.5 ? s.views_avg / s.people_avg : 0);
-  const fresh = () => {
-    const at = report()?.latest?.at;
-    return !!at && Date.now() - Date.parse(at) < STALE_MS;
+  const online = (latest: ActivityPoint) => {
+    clock();
+    return onlineNow(overview()?.presence, latest);
   };
   const historyDays = () => {
     const first = report()?.first_at;
@@ -139,9 +145,12 @@ export function Audience(props: Ctx) {
           {(latest) => (
             <>
               <section class="fx-row bt-tiles">
-                <FxCell label={fresh() ? 'Online now' : 'Last measured'} meta={<span>{ago(latest().at)}</span>}>
-                  <span class="bt-figure hero">{Math.round(people(latest())).toLocaleString()}</span>
-                  <span class="bt-delta none">{Math.round(latest().users_avg).toLocaleString()} signed in, {Math.round(latest().anon_avg).toLocaleString()} signed out</span>
+                <FxCell
+                  label={online(latest()).live ? 'Online now' : 'Last measured peak'}
+                  meta={<span>{online(latest()).live ? 'live' : ago(latest().at)}</span>}
+                >
+                  <span class="bt-figure hero">{online(latest()).people.toLocaleString()}</span>
+                  <span class="bt-delta none">{online(latest()).signedIn.toLocaleString()} signed in, {online(latest()).signedOut.toLocaleString()} signed out</span>
                 </FxCell>
                 <FxCell label="Online on average">
                   <span class="bt-figure">{formatCount(report()!.current.people_avg)}</span>

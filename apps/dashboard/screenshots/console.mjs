@@ -569,6 +569,8 @@ createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return json(204, {});
     const key = `${req.method} ${url.pathname.replace(/^\/fx\/admin\/api/, '') || '/'}`;
     if (key === 'GET /config') return json(200, { ...ROUTES['GET /config'], cloud_login: true, project_slug: 'whitepawn' });
+    // The shared fixtures are frozen at one date; a live reading has to be current.
+    if (key === 'GET /overview') return json(200, { ...ROUTES[key], presence: { ...ROUTES[key].presence, taken_at_ms: Date.now() } });
     if (key === 'POST /session') return json(200, { token: 'fixture-session', mode: 'cloud', subject: 'cloud:acct-1', label: 'mono424', expires_in_secs: 900 });
     if (STREAMS[key] !== undefined) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'access-control-allow-origin': '*' });

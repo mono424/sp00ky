@@ -11,6 +11,7 @@ import {
   heatLevel,
   heatMax,
   nearestIndex,
+  onlineNow,
   people,
   segments,
   trailingAverage,
@@ -18,6 +19,7 @@ import {
   windowCells,
   windowLabel,
   type ActivityPoint,
+  type LivePresence,
 } from '../src/console/audienceStats.ts';
 
 const T0 = Date.UTC(2026, 9, 1);
@@ -34,6 +36,41 @@ const point = (minutes: number, over: Partial<ActivityPoint> = {}): ActivityPoin
 
 test('people are signed-in users and signed-out sessions together', () => {
   assert.equal(people(point(0)), 4);
+});
+
+const live = (over: Partial<LivePresence> = {}): LivePresence => ({
+  totals: { users: 3, anon_sessions: 2 },
+  taken_at_ms: T0,
+  error: null,
+  ready: true,
+  ...over,
+});
+
+test('online now is the live count while it is current', () => {
+  assert.deepEqual(onlineNow(live(), point(0), T0 + 15_000), { live: true, people: 5, signedIn: 3, signedOut: 2 });
+});
+
+test('nobody online live is a real zero, not a reason to fall back', () => {
+  const now = onlineNow(live({ totals: { users: 0, anon_sessions: 0 } }), point(0), T0 + 15_000);
+  assert.equal(now.live, true);
+  assert.equal(now.people, 0);
+});
+
+test('without a usable live reading it falls back to the last bucket', () => {
+  const bucket = point(0);
+  const expected = { live: false, people: 7, signedIn: 5, signedOut: 2 };
+  assert.deepEqual(onlineNow(undefined, bucket, T0), expected);
+  assert.deepEqual(onlineNow(live({ ready: false }), bucket, T0), expected);
+  assert.deepEqual(onlineNow(live({ error: 'db down' }), bucket, T0), expected);
+  assert.deepEqual(onlineNow(live({ taken_at_ms: null }), bucket, T0), expected);
+  assert.deepEqual(onlineNow(live(), bucket, T0 + 61_000), expected, 'a frozen feed is not live');
+});
+
+test('a short visit survives the fallback and its parts add up', () => {
+  const visit = point(0, { users_avg: 0.37, users_max: 1, anon_avg: 0.38, anon_max: 1 });
+  const now = onlineNow(undefined, visit, T0);
+  assert.equal(now.people, 2);
+  assert.equal(now.signedIn + now.signedOut, now.people);
 });
 
 test('views per person is unknown with nobody there, not zero', () => {

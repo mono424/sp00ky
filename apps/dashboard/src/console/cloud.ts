@@ -8,6 +8,8 @@
  * Nothing here ever sees or stores a token for the cloud.
  */
 
+import type { BuildPoint, RunStep, StepStat } from './buildStats';
+
 export class CloudError extends Error {
   constructor(
     readonly status: number,
@@ -258,6 +260,12 @@ export interface Inspection {
   has_cli: boolean;
 }
 
+export interface BuildList {
+  runs: BuildPoint[];
+  window_start: string;
+  steps?: StepStat[];
+}
+
 export const consoleApi = {
   me: () => cloud<Me>('/console/me', { anonymous: true }),
   github: (tenant: string, returnTo: string) =>
@@ -271,6 +279,10 @@ export const consoleApi = {
   revokeOthers: () => cloud<void>('/console/sessions/revoke-others', { method: 'POST' }),
   deployments: (projectId: string) =>
     cloud<{ deployments: DeploymentRow[]; builds: PendingBuild[] }>(`/console/projects/${encodeURIComponent(projectId)}/deployments`),
+  builds: (projectId: string, days: number, steps = true) =>
+    cloud<BuildList>(`/console/projects/${encodeURIComponent(projectId)}/builds?days=${days}${steps ? '' : '&steps=0'}`),
+  build: (projectId: string, id: string) =>
+    cloud<{ run: BuildPoint; steps: RunStep[] }>(`/console/projects/${encodeURIComponent(projectId)}/builds/${encodeURIComponent(id)}`),
   activity: (tenantId: string) =>
     cloud<{ events: AuditEvent[] }>(`/console/workspaces/${encodeURIComponent(tenantId)}/activity`).then((r) => r.events),
 };

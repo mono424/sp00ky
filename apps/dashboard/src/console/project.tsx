@@ -47,6 +47,7 @@ import {
   type HostView,
 } from './hostPlan';
 import { isUnlocked, loadValues, unlock } from './vault';
+import { BuildTimeBox } from './builds';
 
 interface Ctx {
   workspace: Workspace;
@@ -534,6 +535,8 @@ export function Deployments(props: Ctx) {
             </FxCell>
           </section>
         </Show>
+
+        <BuildTimeBox project={props.project} />
 
         <Show when={urls().length}>
           <section class="fx-row">

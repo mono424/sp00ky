@@ -466,7 +466,7 @@ const ACTIONS: Record<string, string> = {
 };
 
 export function Activity(props: Props) {
-  const [events] = createResource(() => consoleApi.activity(props.workspace.id));
+  const [events] = createResource(() => consoleApi.workspaceActivity(props.workspace.id));
   return (
     <>
       <Head title="Activity" />

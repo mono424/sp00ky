@@ -45,6 +45,7 @@ const NAV_PATHS: Record<string, string> = {
   '/storage': 'M3 6h6l2 2h10v11H3z',
   '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
   '/deployments': 'M12 3l9 5-9 5-9-5 9-5z M3 13l9 5 9-5',
+  '/audience': 'M4 20V11 M10 20V4 M16 20v-7 M21 20H3',
   '/settings/env': 'M4 7h16 M4 12h16 M4 17h10 M18 15l3 3-3 3',
   '/settings/domains': 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M3 12h18 M12 3c3 3.5 3 14.5 0 18 M12 3c-3 3.5-3 14.5 0 18',
   '/settings/git': 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M18 9a9 9 0 0 1-9 9',
@@ -83,11 +84,11 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
         { href: '/settings/danger', label: 'Danger zone', group: 'Settings' },
       ]
     : [];
-  if (limited) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }, ...settings];
+  if (limited) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }, { href: '/audience', label: 'Audience' }, ...settings];
   return [
     // Where an operator starts: the cluster, what shipped, what went wrong, what it said.
     { href: '/', label: 'Overview' },
-    ...(console ? [{ href: '/deployments', label: 'Deployments' }] : []),
+    ...(console ? [{ href: '/deployments', label: 'Deployments' }, { href: '/audience', label: 'Audience' }] : []),
     {
       href: '/incidents',
       label: 'Incidents',

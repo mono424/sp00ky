@@ -40,4 +40,7 @@ pub mod value;
 pub use error::{Error, Result};
 pub use types::*;
 pub use value::{from_row, from_value, to_object, to_value, IntoObject, Object, RecordId, RecordKey, Row, SurrealDuration, Value};
-pub use client::{Engine, LiveQuery, QueryOptions, Sp00kyClient};
+pub use client::{
+    AppRelease, AuthState, Bucket, Channel, Engine, FeatureFlag, LiveQuery, Push, QueryOptions, Sp00kyChannel,
+    Sp00kyClient,
+};

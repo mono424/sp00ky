@@ -130,6 +130,11 @@ async fn two_clients_of_one_user_sync_live() {
     a.sign_up("account", creds()).await.expect("sign up");
     let user = a.user_id().expect("signed in");
     assert!(user.starts_with("user:"), "{user}");
+    let auth = a.auth_state();
+    assert!(auth.is_authenticated());
+    assert_eq!(auth.access.as_deref(), Some("account"));
+    assert!(auth.token.is_some());
+    let mut events = a.events();
 
     let query = |c: &Sp00kyClient| c.query("note").where_eq("owner", user.as_str()).order_by("rank", "desc");
     let mut live_a = a.live(query(&a)).await.expect("live a");
@@ -144,6 +149,11 @@ async fn two_clients_of_one_user_sync_live() {
     .expect("create");
     wait_rows(&mut live_a, "optimistic create", |rows| title_of(rows, &note).is_some()).await;
     wait_until("outbox drained", || a.pending_mutation_count() == 0).await;
+    let mut settled = false;
+    while let Ok(event) = events.try_recv() {
+        settled |= event.kind() == "mutation:settled";
+    }
+    assert!(settled, "no mutation:settled event for the acked create");
     assert_eq!(a.failed_mutation_count(), 0, "create was rejected");
     wait_until("authoritative", || live_a.is_authoritative()).await;
 

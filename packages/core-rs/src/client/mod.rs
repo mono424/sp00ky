@@ -9,5 +9,5 @@ mod wiring;
 
 pub use channels::{Channel, Sp00kyChannel};
 pub use engine::{Engine, QueryOptions};
-pub use handle::{AppRelease, Bucket, FeatureFlag, LiveQuery, Sp00kyClient};
+pub use handle::{AppRelease, AuthState, Bucket, FeatureFlag, LiveQuery, Sp00kyClient};
 pub use push::Push;

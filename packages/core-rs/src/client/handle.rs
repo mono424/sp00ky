@@ -45,8 +45,46 @@ enum Msg {
     Shutdown,
 }
 
+/// The auth session as the thread-safe client exposes it (Dart `Sp00kyAuth`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AuthState {
+    pub user_id: Option<String>,
+    /// The signed-in user's row (`SELECT * FROM ONLY $auth.id`).
+    pub current_user: Option<Object>,
+    pub token: Option<String>,
+    /// The access method of the session (`DEFINE ACCESS <name>`).
+    pub access: Option<String>,
+    pub is_loading: bool,
+    pub is_impersonating: bool,
+    /// A deferred verification failure; the restored session stays usable.
+    pub verification_error: Option<String>,
+}
+
+impl AuthState {
+    pub fn is_authenticated(&self) -> bool {
+        self.user_id.is_some()
+    }
+}
+
+fn auth_state(auth: Option<&crate::modules::auth::AuthService>) -> AuthState {
+    let Some(a) = auth else {
+        return AuthState::default();
+    };
+    AuthState {
+        user_id: a.user_id(),
+        current_user: a.current_user().map(|u| (*u).clone()),
+        token: a.token(),
+        access: a.access(),
+        is_loading: a.is_loading(),
+        is_impersonating: a.is_impersonating(),
+        verification_error: a.verification_error().map(|e| format!("{}: {}", e.kind.as_str(), e.message)),
+    }
+}
+
 struct Observed {
     user: watch::Receiver<Option<String>>,
+    auth: watch::Receiver<AuthState>,
+    events: tokio::sync::broadcast::Sender<OutEvent>,
     health: watch::Receiver<SyncHealth>,
     pending: watch::Receiver<usize>,
     fetching: watch::Receiver<usize>,
@@ -431,6 +469,44 @@ impl Sp00kyClient {
         self.call(|w| async move { Ok(w.engine.auth().and_then(|a| a.token())) }).await
     }
 
+    /// The auth session: user, row, token, access, loading, impersonation.
+    pub fn auth_state(&self) -> AuthState {
+        self.shared.observed.auth.borrow().clone()
+    }
+
+    pub fn auth_watch(&self) -> watch::Receiver<AuthState> {
+        self.shared.observed.auth.clone()
+    }
+
+    /// Verify the session (or `token`) against the server now.
+    pub async fn check_auth(&self, token: Option<&str>) -> Result<()> {
+        let token = token.map(str::to_string);
+        self.call(move |w| async move {
+            match w.engine.auth() {
+                Some(a) => a.check(token.as_deref()).await,
+                None => Err(Error::NoRemote("auth requires a remote endpoint".into())),
+            }
+        })
+        .await
+    }
+
+    /// Every outbound engine event (records, statuses, mutations, health,
+    /// logs): the Dart `runtime.on('*')`. A slow receiver lags and skips.
+    pub fn events(&self) -> tokio::sync::broadcast::Receiver<OutEvent> {
+        self.shared.observed.events.subscribe()
+    }
+
+    /// Whether server membership is known for a registered query.
+    pub async fn is_query_authoritative(&self, hash: &str) -> Result<bool> {
+        let hash = hash.to_string();
+        self.call(move |w| async move { Ok(w.engine.is_query_authoritative(&hash)) }).await
+    }
+
+    /// Counters of the blob cache (requires a remote endpoint).
+    pub async fn blob_cache_stats(&self) -> Result<crate::modules::blobs::BlobCacheStats> {
+        self.call(|w| async move { Ok(w.engine.blob_cache()?.stats()) }).await
+    }
+
     // ---- query builder ------------------------------------------------------------------------
 
     /// A fluent query on `table`, typed against the client's schema. Run it
@@ -570,12 +646,20 @@ impl Sp00kyClient {
 /// from any thread.
 fn observe(engine: &Rc<Engine>) -> (Observed, Vec<Subscription>) {
     let (user_tx, user) = watch::channel(engine.user_id());
+    let (auth_tx, auth_rx) = watch::channel(auth_state(engine.auth()));
     let mut keep = Vec::new();
     if let Some(auth) = engine.auth() {
+        let svc = auth.clone();
         keep.push(auth.subscribe(move |u| {
             user_tx.send_replace(u.map(str::to_string));
+            auth_tx.send_replace(auth_state(Some(&svc)));
         }));
     }
+    let (events_tx, _) = tokio::sync::broadcast::channel::<OutEvent>(256);
+    let all = events_tx.clone();
+    keep.push(engine.on("*", move |e| {
+        let _ = all.send(e.clone());
+    }));
     let (health_tx, health) = watch::channel(engine.sync_health());
     let (pending_tx, pending) = watch::channel(engine.pending_mutation_count());
     let (fetching_tx, fetching) = watch::channel(engine.fetching_query_count());
@@ -601,6 +685,8 @@ fn observe(engine: &Rc<Engine>) -> (Observed, Vec<Subscription>) {
     (
         Observed {
             user,
+            auth: auth_rx,
+            events: events_tx,
             health,
             pending,
             fetching,

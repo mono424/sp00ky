@@ -40,6 +40,10 @@ pub enum Error {
     /// The in-process circuit failed.
     #[error("stream processor: {0}")]
     Ssp(String),
+    /// A preload's registration failed, so it can never settle (Dart
+    /// `PreloadFailedError`).
+    #[error("PreloadFailedError: preload could not settle, the registration of {hash} failed")]
+    PreloadFailed { hash: String },
     /// A caller passed something unusable.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),

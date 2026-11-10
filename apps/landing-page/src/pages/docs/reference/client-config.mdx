@@ -135,7 +135,9 @@ Settings for [peer to peer channels](/docs/client/channels) on `-- @channel` tab
 
 In Dart (`spooky_core`) the same keys live on `ChannelsConfig` (`accept`, `iceServers`, `transport`,
 `confirmTimeoutMs`), plus `rtc`: the peer connection factory, `flutterWebRtc` from `spooky_flutter`.
-Without `rtc` or `transport`, channels report `unsupported`.
+Without `rtc` or `transport`, channels report `unsupported`. Rust (`spooky-core`) has the same
+`ChannelsConfig` in snake case (`accept`, `ice_servers`, `rtc`, `transport`, `confirm_timeout_ms`),
+with `rtc` a factory for the app's own WebRTC stack.
 
 #### `liveInlineBodies`
 

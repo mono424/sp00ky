@@ -110,7 +110,8 @@ Mutations made while offline sit in a queue. `pendingMutationCount` is how many 
 Useful for a "3 changes not yet saved" indicator, and for warning before the user closes the tab
 with unsynced work.
 
-The Dart client also reports *which* records are still waiting. `unsyncedRecordIds` is the set of
+The Dart and Rust clients also report *which* records are still waiting (in Rust:
+`unsynced_record_ids()` and `unsynced_records_watch()`). `unsyncedRecordIds` is the set of
 record ids with a write the server has not acknowledged yet, and `subscribeToUnsyncedRecords` fires
 whenever that set changes, even when the count stays the same because one write was acknowledged as
 another was queued. Use it for a per-row indicator, like one tick while a message is only on the
@@ -142,7 +143,7 @@ navigate to and the next screen paints instantly.
 | Resolved before on this device | Resolves at once; the rows are already in the local store. |
 | Never resolved | Resolves once the server's membership and every record are local. Pass `signal` to abort the wait. |
 | Signed out, without `enableAnonymousLiveQueries` | Resolves at once. The server sends a signed-out session membership only with anonymous live queries on, so there is nothing to wait for. |
-| Offline | Resolves at once with whatever is local, so an app started without a network still paints; the query fills in once the network returns. The browser reads `navigator.onLine`; the Dart client cannot see connectivity, so it goes by what the app last passed to `client.setOffline` ([Flutter startup](/docs/guide/flutter#startup)). |
+| Offline | Resolves at once with whatever is local, so an app started without a network still paints; the query fills in once the network returns. The browser reads `navigator.onLine`; the Dart and Rust clients cannot see connectivity, so they go by what the app last passed to `client.setOffline` / `client.set_offline` ([Flutter startup](/docs/guide/flutter#startup)). |
 
 A preloaded query stays registered (and live) until a ttl after nothing has mounted it; a view
 that mounts the same query simply attaches to it.

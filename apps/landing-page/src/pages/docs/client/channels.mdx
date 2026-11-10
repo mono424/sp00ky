@@ -222,6 +222,13 @@ list of them) and write as usual:
 - With the default background client, the connections live on the app's isolate and the database
   work (signaling rows, peers' creates and deletes) in the sync worker.
 
+## Rust
+
+The Rust client (`spooky-core`) speaks the same protocol, so it joins the same channels as browsers
+and Flutter apps. It ships no WebRTC either: adapt one (webrtc-rs, libwebrtc bindings) to the
+`RtcPeerConnection` and `RtcDataChannel` traits and pass the factory as `ChannelsConfig::rtc`, then
+`client.channel(queries, peers)`. See [the Rust guide](/docs/guide/rust#peer-to-peer-channels).
+
 ## Limits
 
 - Mesh topology, so small groups.

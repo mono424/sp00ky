@@ -184,7 +184,7 @@ Self-hosted, set them on the SSP process ([Self-hosting](/docs/self-hosting)). O
 - **The column trails the editor.** List previews update when the server folds, also for your own edits.
 - **Every fold rewrites the record.** The column and its `__crdt` stamp are an update of the parent row, so `VALUE time::now()` fields such as `updated_at` move on each fold, and the row syncs to everyone watching it.
 - **Impersonation is read-only here.** An [impersonation](/docs/client/impersonation) session cannot write edits or presence.
-- **JavaScript clients only.** The Dart client (`spooky_core`, Flutter) throws `UnimplementedError` for CRDT fields.
+- **JavaScript clients only.** The Dart client (`spooky_core`, Flutter) throws `UnimplementedError` for CRDT fields. The Rust client (`spooky-core`) reads the server-written text mirror and has no editing API.
 - **API may change** while experimental.
 
 ## Next steps

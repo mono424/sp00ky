@@ -210,6 +210,10 @@ If the app ships its own `google-services.json`, it must be for the same Firebas
 
 <CodeBlock code={coreCode} lang="dart" />
 
+The Rust client has the same server side as `client.push()` (`register`, `sync`, `unsubscribe`,
+`devices`, `notify`); the app supplies the APNs or FCM token. See
+[the Rust guide](/docs/guide/rust#native-push).
+
 <PropTable props={[
   { name: 'info({refresh})', type: 'Future<PushInfo>', default: '-', desc: 'providers (web, apns, fcm) and the Android Firebase client config. Cached.' },
   { name: 'register(token, {label, rules, meta, userAgent})', type: 'Future<PushDevice>', default: '-', desc: 'Register this device for the signed-in user and remember the choice.' },

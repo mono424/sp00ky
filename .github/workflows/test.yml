@@ -66,6 +66,25 @@ jobs:
       - name: Portable node builds for wasm
         run: bash scripts/check-portability.sh --locked
 
+  rust-client-core:
+    name: Rust client core (tests, local-only build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core-rs
+      - name: Unit and local integration tests
+        run: cargo test --locked -p spooky-core
+      - name: Builds without the remote transport
+        run: cargo check --locked -p spooky-core --no-default-features
+
   dart-core:
     name: Dart core (native, analysis, codegen)
     runs-on: ubuntu-latest

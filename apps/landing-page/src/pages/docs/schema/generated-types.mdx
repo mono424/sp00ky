@@ -31,6 +31,10 @@ List as many as you need: a Flutter app and a web app can generate from one sche
 `typescript` uses the built-in generator. `dart` shells out to `spooky_core`'s generator
 (`dart run spooky_core:spooky_gen`). See the [Flutter guide](/docs/guide/flutter).
 
+Rust apps generate from a `build.rs` instead of `clientTypes`:
+`spooky_core::codegen::generate_rust` turns the same `.surql` into serde structs, patches and typed
+query helpers on every build. See the [Rust guide](/docs/guide/rust#generate-types-from-the-schema).
+
 ## Generating without a config
 
 For one-off runs, or a schema that isn't part of a project yet, point the CLI at a file directly.

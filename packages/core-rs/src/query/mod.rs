@@ -8,4 +8,10 @@ pub mod materialize;
 pub mod membership;
 pub mod membership_saga;
 pub mod register;
+pub mod relations;
+pub mod render;
 pub mod sql;
+pub mod window;
+
+#[cfg(test)]
+pub(crate) mod test_support;

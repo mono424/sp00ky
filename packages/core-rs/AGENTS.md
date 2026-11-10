@@ -140,8 +140,8 @@ The generated `AppDb` drives `Sp00kyClient` only.
   `rows()` is empty and `!is_authoritative()`.
 - **`AppDb` futures are not `Send`** (`TypedClient` is `async_trait(?Send)`):
   await them in place, never in `tokio::spawn`. Plain client calls are `Send`.
-- **Channel writes take `impl Into<Object>`**, not `IntoObject`: wrap JSON with
-  `spooky_core::value::object_from_json(json!(..))`.
+- **Engine writes take an `Object`** (`spooky_core::object_from_json(json!(..))`);
+  `Sp00kyClient` and `Channel` writes take any `IntoObject`, `json!` included.
 - **Remote-only modules** (`feature`, `app_release`, `bucket`, `check_auth`)
   error with `Error::NoRemote` on a local-only client; `push()` calls answer
   `PushErrorCode::Server` with that error as `cause`.

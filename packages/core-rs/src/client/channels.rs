@@ -33,7 +33,7 @@ use crate::modules::query_builder::QueryBuilder;
 use crate::mutation::write::{self as write_saga, PeerWriteInput};
 use crate::runtime::Subscription;
 use crate::types::UpdateOptions;
-use crate::value::{table_of, Object, Row, Value};
+use crate::value::{table_of, IntoObject, Object, Row, Value};
 
 /// The engine's channel state: the manager (built at wiring), the signaling
 /// port, and the channels the thread-safe client opened.
@@ -546,8 +546,8 @@ impl Sp00kyClient {
 
     /// A channel peer created a row (diagnostics and tests; see
     /// [`Engine::peer_create`]).
-    pub async fn peer_create(&self, id: &str, row: impl Into<Object>, ttl_ms: u64) -> Result<bool> {
-        let (id, row) = (id.to_string(), row.into());
+    pub async fn peer_create(&self, id: &str, row: impl IntoObject, ttl_ms: u64) -> Result<bool> {
+        let (id, row) = (id.to_string(), row.into_object()?);
         self.call(move |w| async move { w.engine.peer_create(&id, row, ttl_ms).await })
             .await
     }
@@ -645,25 +645,25 @@ impl Channel {
     }
 
     /// Create `id` and send it to this channel's peers only.
-    pub async fn create(&self, id: &str, data: impl Into<Object>) -> Result<Row> {
-        let (cid, id, data) = (self.id, id.to_string(), data.into());
+    pub async fn create(&self, id: &str, data: impl IntoObject) -> Result<Row> {
+        let (cid, id, data) = (self.id, id.to_string(), data.into_object()?);
         self.client
             .call(move |w| async move { w.engine.shared_channel(cid)?.create(&id, data).await })
             .await
     }
 
     /// Update `id` and send it to this channel's peers only.
-    pub async fn update(&self, id: &str, data: impl Into<Object>) -> Result<Row> {
+    pub async fn update(&self, id: &str, data: impl IntoObject) -> Result<Row> {
         self.update_with(id, data, UpdateOptions::default()).await
     }
 
     pub async fn update_with(
         &self,
         id: &str,
-        data: impl Into<Object>,
+        data: impl IntoObject,
         options: UpdateOptions,
     ) -> Result<Row> {
-        let (cid, id, data) = (self.id, id.to_string(), data.into());
+        let (cid, id, data) = (self.id, id.to_string(), data.into_object()?);
         self.client
             .call(move |w| async move {
                 w.engine

@@ -85,7 +85,16 @@ while let Ok(rows) = notes.changed().await {
 
 Writes take anything `IntoObject`: a `json!({...})` object, a
 `serde_json::Map`, or an `Object`; `spooky_core::to_object(&my_struct)` turns
-your own `Serialize` types into one. A `record<..>` field may be given as its `table:key` string:
+your own `Serialize` types into one. Writes and the query builder re-type a
+`record<..>` field given as its `table:key` string from the schema; the
+parameters of a raw SurrealQL query (`live_raw`, `query_raw`) are sent as
+given, so pass a `RecordId` there.
+
+A builder from `client.query(..)` is build-only: run it with `client.live`,
+`live_typed` or `preload_query` (its own `run`/`subscribe` need the
+in-process engine). The generated `AppDb` over `Sp00kyClient` runs on the
+caller's executor and its futures are not `Send`; call the plain client
+methods from `tokio::spawn` or other `Send`-only contexts. A `record<..>` field may be given as its `table:key` string:
 the schema re-types it before it reaches the server.
 
 ### In a GPUI app
@@ -131,8 +140,10 @@ written (dropping the last handle closes in the background).
 ## In-process engine
 
 `spooky_core::Engine` is the engine itself, single-threaded on a tokio
-`LocalSet`, with the same API returning `!Send` futures and callback
-subscriptions. Use it when you already own a `LocalSet` (tests, embedding).
+`LocalSet`, with a similar API returning `!Send` futures and callback
+subscriptions (writes take an `Object`; its builder from `engine.query(..)`
+can `run` and `subscribe` itself). Use it when you already own a `LocalSet`
+(tests, embedding).
 
 ## Layout
 

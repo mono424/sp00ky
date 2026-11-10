@@ -726,7 +726,6 @@ config.channels = Some(
 );`;
 
 export const channelsCode = `use serde_json::json;
-use spooky_core::value::object_from_json;
 
 // call is a -- @channel table; its cursor_pos field is -- @ephemeral.
 let lobby = client.query("call").where_eq("room", "lobby");
@@ -734,7 +733,7 @@ let mut channel = client.channel(&[lobby], ["user:bob", "user:carol"]).await?;
 
 // Goes to this channel's peers; an @ephemeral field never reaches the database.
 channel
-    .update("call:lobby", object_from_json(json!({"cursor_pos": {"x": 10, "y": 4}})))
+    .update("call:lobby", json!({"cursor_pos": {"x": 10, "y": 4}}))
     .await?;
 
 // Connection state: Idle, Connecting, Connected, Failed or Unsupported, plus connected users.

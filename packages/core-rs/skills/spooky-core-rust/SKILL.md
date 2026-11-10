@@ -155,8 +155,7 @@ needs the backend in the generated schema.
 
 - `client.channel(&[client.query("call").where_eq("room", "lobby")], ["user:bob"]).await?`
   on `-- @channel` tables; only the `where` counts; both sides must list each
-  other. Channel writes take `impl Into<Object>`: use
-  `spooky_core::value::object_from_json(json!(..))`. The app injects a WebRTC
+  other. Channel writes take any `IntoObject`, like client writes. The app injects a WebRTC
   stack via `config.channels = Some(ChannelsConfig { rtc: Some(factory), .. })`,
   else the status is `Unsupported`.
 - `let push = client.push();` at startup, then

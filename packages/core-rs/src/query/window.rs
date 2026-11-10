@@ -45,6 +45,13 @@ pub fn build_window_materialization(surql: &str) -> Option<WindowMaterialization
     })
 }
 
+/// The query's top-level `ORDER BY` terms, windowed or not; empty when it
+/// has none.
+pub fn query_order_by(surql: &str) -> Vec<OrderByTerm> {
+    let clauses = scan_top_level_clauses(surql);
+    parse_order_by(surql, &clauses)
+}
+
 static ORDER_BY_PREFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^ORDER\s+BY\s+").unwrap());
 

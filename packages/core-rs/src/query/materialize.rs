@@ -21,7 +21,7 @@ use crate::kernel::Ctx;
 use crate::modules::query_builder::RelationPlan;
 use crate::query::relations::{resolve_relations, CtxRelationFetcher};
 use crate::query::render::{build_render_ids, resolve_membership, RenderOptions};
-use crate::query::window::build_window_materialization;
+use crate::query::window::{build_window_materialization, query_order_by};
 use crate::state::reducers as r;
 use crate::state::selectors::{overlay, settled};
 use crate::types::{QueryHash, TimingPhase};
@@ -32,12 +32,20 @@ pub fn is_windowed(surql: &str) -> bool {
     build_window_materialization(surql).is_some()
 }
 
-/// Re-apply a windowed query's own `ORDER BY` to rows resolved by id. No
-/// window, or no `ORDER BY`: the rows keep their order.
+/// Re-apply the query's own `ORDER BY` to rows resolved by id. No `ORDER BY`:
+/// the rows keep their order.
+///
+/// Divergence from Dart, which re-sorts only windowed queries and otherwise
+/// keeps "the order the circuit applied": the circuit keeps an unbounded
+/// view's id-set, not its order (an `ORDER BY score DESC` view whose row's
+/// score changes keeps the row where it was), so every ordered query is
+/// sorted here.
 pub fn apply_window_order(surql: &str, rows: &mut [Row]) {
-    if let Some(window) = build_window_materialization(surql) {
-        sort_rows(rows, &window.order_by);
-    }
+    let order_by = match build_window_materialization(surql) {
+        Some(window) => window.order_by,
+        None => query_order_by(surql),
+    };
+    sort_rows(rows, &order_by);
 }
 
 /// The table a render set belongs to. Ids in one view share a table, so the
@@ -75,9 +83,7 @@ struct RenderJob {
 
 fn read_rows(ctx: &Ctx, job: &RenderJob) -> Result<Vec<Row>> {
     let mut rows = ctx.local_get_many(&job.table, &job.ids)?;
-    if job.is_window {
-        apply_window_order(&job.surql, &mut rows);
-    }
+    apply_window_order(&job.surql, &mut rows);
     if !job.relations.is_empty() {
         // `.related()` projections are resolved from the local cache rather
         // than re-evaluated by the store: sqlite cannot run the correlated

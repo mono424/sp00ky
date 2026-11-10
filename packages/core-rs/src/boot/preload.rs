@@ -79,7 +79,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs register_local"]
+    
     async fn a_query_resolved_before_returns_as_soon_as_the_entry_exists() {
         run_local(async {
             let (rig, _) = new_rig(test_env(), signed_in());
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs register_local"]
+    
     async fn a_cold_query_blocks_on_the_settle_gate() {
         run_local(async {
             let anon_live = SagaEnv {
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs register_local"]
+    
     async fn signed_out_without_anonymous_live_queries_never_waits() {
         // No membership can reach this session.
         run_local(async {
@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs register_local"]
+    
     async fn offline_registers_but_never_waits() {
         // A launch without a network paints from what is local.
         run_local(async {

@@ -81,11 +81,14 @@ fn reapplies_a_window_order_by_to_rows_resolved_by_id() {
     );
     let n: Vec<i64> = sorted.iter().map(|r| r["n"].as_i64().unwrap()).collect();
     assert_eq!(n, [1, 2, 3]);
-    // No window, or no ORDER BY: the circuit's order is kept.
-    for surql in [
-        "SELECT * FROM thing ORDER BY n",
-        "SELECT * FROM thing LIMIT 10 START 10",
-    ] {
+    // An unbounded ordered query is sorted too: the circuit keeps the id-set,
+    // not the order.
+    let mut sorted = rows();
+    apply_window_order("SELECT * FROM thing ORDER BY n DESC", &mut sorted);
+    let n: Vec<i64> = sorted.iter().map(|r| r["n"].as_i64().unwrap()).collect();
+    assert_eq!(n, [3, 2, 1]);
+    // No ORDER BY: the circuit's order is kept.
+    for surql in ["SELECT * FROM thing", "SELECT * FROM thing LIMIT 10 START 10"] {
         let mut kept = rows();
         apply_window_order(surql, &mut kept);
         assert_eq!(kept, rows());

@@ -62,6 +62,11 @@ pub trait AuthRemote {
     async fn force_close(&self);
     /// The token a rebuilt socket authenticates with.
     fn set_auth_token(&self, token: Option<&str>);
+    /// The server's refusal of `token` while a socket was being set up, if
+    /// that is why the last connect failed. Taken: answered once.
+    fn take_handshake_rejection(&self, _token: &str) -> Option<Error> {
+        None
+    }
 }
 
 /// Per-device key/value persistence, as `PersistenceClient` defines it.
@@ -457,6 +462,12 @@ impl AuthService {
             self.0.state.borrow_mut().needs_verification = false;
             return Ok(());
         };
+        // The socket refused this token while connecting and was closed
+        // again, so asking once more would only time out as "offline". The
+        // refusal is the answer: sign out, and the next connect is anonymous.
+        if let Some(rejection) = self.0.remote.take_handshake_rejection(&token) {
+            return Err(rejection);
+        }
         self.0.remote.authenticate(&token).await?;
         if generation != self.generation() {
             return Ok(());
@@ -496,17 +507,7 @@ impl AuthService {
             kind,
             message: error.to_string(),
         });
-        let message = error.to_string().to_lowercase();
-        let rejected = [
-            "invalid authentication",
-            "invalid token",
-            "token expired",
-            "authentication failed",
-            "problem with authentication",
-        ]
-        .iter()
-        .any(|p| message.contains(p));
-        if rejected {
+        if error.is_auth_rejection() {
             if let Err(e) = self.sign_out_inner(false).await {
                 tracing::debug!(target: "spooky", "Sign-out after a rejected token failed: {e}");
             }
@@ -777,6 +778,7 @@ mod tests {
         last_signup: RefCell<Option<Object>>,
         token: RefCell<Option<String>>,
         transitions: Cell<u64>,
+        handshake_rejection: RefCell<Option<(String, Error)>>,
     }
 
     #[async_trait(?Send)]
@@ -821,6 +823,16 @@ mod tests {
         }
         fn set_auth_token(&self, token: Option<&str>) {
             *self.token.borrow_mut() = token.map(str::to_string);
+        }
+        fn take_handshake_rejection(&self, token: &str) -> Option<Error> {
+            let mut slot = self.handshake_rejection.borrow_mut();
+            match slot.take() {
+                Some((t, e)) if t == token => Some(e),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
         }
     }
 
@@ -941,6 +953,47 @@ mod tests {
             1,
             "a failed sign-in restores the transport"
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_the_socket_refused_while_connecting_signs_out_at_once() {
+        let rig = Rig::new();
+        rig.store(&jwt()).await;
+        let auth = rig.build();
+        auth.restore_session_from_token(true).await.unwrap();
+        // Asking again would fail as offline: the refused socket was closed.
+        *rig.remote.authentication_error.borrow_mut() = Some(Error::Network("closed".into()));
+        *rig.remote.handshake_rejection.borrow_mut() = Some((
+            jwt(),
+            Error::Rpc {
+                code: -32000,
+                message: "The token has expired".into(),
+            },
+        ));
+        assert!(auth.check(None).await.is_err());
+        assert!(!auth.is_authenticated());
+        assert_eq!(rig.stored().await, None);
+        assert_eq!(
+            *rig.remote.token.borrow(),
+            None,
+            "the next socket connects anonymously"
+        );
+    }
+
+    #[test]
+    fn expired_tokens_and_sessions_are_rejections() {
+        for message in [
+            "The token has expired",
+            "The session has expired",
+            "There was a problem with authentication",
+        ] {
+            let e = Error::Rpc {
+                code: -32000,
+                message: message.into(),
+            };
+            assert!(e.is_auth_rejection(), "{message}");
+        }
+        assert!(!Error::Network("connection reset".into()).is_auth_rejection());
     }
 
     #[tokio::test]

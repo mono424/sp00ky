@@ -112,6 +112,11 @@ struct Inner {
     /// behind it, forever.
     handshake_timeout: Cell<Duration>,
 
+    /// The token the server refused during the last handshake, with its
+    /// answer. The auth check takes it (`take_handshake_rejection`) instead
+    /// of asking again over a socket that is closed by then.
+    handshake_rejection: RefCell<Option<(String, Error)>>,
+
     session_ids: RefCell<Vec<String>>,
     on_handshake: RefCell<Option<Rc<dyn Fn()>>>,
 }
@@ -227,6 +232,7 @@ impl RemoteDatabaseService {
             connect_gate: RefCell::new(None),
             connect_gate_timeout: Cell::new(Duration::from_secs(20)),
             handshake_timeout: Cell::new(Duration::from_secs(10)),
+            handshake_rejection: RefCell::new(None),
             session_ids: RefCell::new(Vec::new()),
             on_handshake: RefCell::new(None),
         }))
@@ -278,8 +284,22 @@ impl RemoteDatabaseService {
         let inner = &self.0;
         if *inner.auth_token.borrow() != token {
             inner.auth_epoch.set(inner.auth_epoch.get() + 1);
+            inner.handshake_rejection.borrow_mut().take();
         }
         *inner.auth_token.borrow_mut() = token;
+    }
+
+    /// The server's refusal of `token` during the last handshake, if that is
+    /// why the socket is closed. Answered once.
+    pub fn take_handshake_rejection(&self, token: &str) -> Option<Error> {
+        let mut slot = self.0.handshake_rejection.borrow_mut();
+        match slot.take() {
+            Some((refused, error)) if refused == token => Some(error),
+            other => {
+                *slot = other;
+                None
+            }
+        }
     }
 
     /// Called after every connect attempt, success or not (the client wires
@@ -394,7 +414,18 @@ impl RemoteDatabaseService {
             .clone()
             .or_else(|| inner.config.token.clone());
         if let Some(token) = token {
-            client.authenticate(&token).await?;
+            if let Err(e) = client.authenticate(&token).await {
+                if e.is_auth_rejection() {
+                    // Left open, the socket would serve this session's reads
+                    // anonymously, and an anonymous read of a user's views is
+                    // an empty one. Close it; the auth check signs out on this
+                    // answer and the next connect is anonymous on purpose.
+                    tracing::warn!(target: "spooky", "The server refused the session's token: {e}");
+                    *inner.handshake_rejection.borrow_mut() = Some((token, e.clone()));
+                    self.force_close().await;
+                }
+                return Err(e);
+            }
         }
         if epoch != inner.auth_epoch.get() {
             self.force_close().await;
@@ -814,6 +845,7 @@ mod tests {
         connect_fails: bool,
         /// `use` never answers: a socket that opened and then went quiet.
         use_hangs: Cell<bool>,
+        auth_error: RefCell<Option<Error>>,
     }
 
     impl SlowRemote {
@@ -825,6 +857,7 @@ mod tests {
                 release_tx: RefCell::new(Some(tx)),
                 connect_fails,
                 use_hangs: Cell::new(false),
+                auth_error: RefCell::new(None),
             })
         }
 
@@ -862,6 +895,9 @@ mod tests {
         }
         async fn authenticate(&self, _: &str) -> Result<Value> {
             self.log("authenticate");
+            if let Some(e) = self.auth_error.borrow().clone() {
+                return Err(e);
+            }
             Ok(Value::None)
         }
         async fn signin(&self, _: Object) -> Result<Value> {
@@ -899,6 +935,9 @@ mod tests {
         }
         async fn close(&self) {
             self.log("close");
+        }
+        async fn force_close(&self) {
+            self.log("force_close");
         }
     }
 
@@ -1011,6 +1050,41 @@ mod tests {
                 Err(Error::Timeout(10_000))
             ));
             assert!(signin.is_finished(), "held RPCs stop waiting");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_closes_the_socket_and_is_kept_for_the_auth_check() {
+        run_local(async {
+            let remote = SlowRemote::new(false);
+            remote.release_connect();
+            *remote.auth_error.borrow_mut() = Some(Error::Rpc {
+                code: -32000,
+                message: "The token has expired".into(),
+            });
+            let service = gated(&remote);
+            service.set_auth_token(Some("old".into()));
+            assert!(service.connect().await.is_err());
+            assert!(remote.calls().contains(&"force_close".to_string()));
+            assert!(service.take_handshake_rejection("other").is_none());
+            assert!(service
+                .take_handshake_rejection("old")
+                .unwrap()
+                .is_auth_rejection());
+            assert!(
+                service.take_handshake_rejection("old").is_none(),
+                "answered once"
+            );
+
+            // A new token forgets an old refusal.
+            *remote.auth_error.borrow_mut() = Some(Error::Rpc {
+                code: -32000,
+                message: "There was a problem with authentication".into(),
+            });
+            let _ = service.connect().await;
+            service.set_auth_token(Some("new".into()));
+            assert!(service.take_handshake_rejection("old").is_none());
         })
         .await;
     }

@@ -53,6 +53,9 @@ mod remote_auth {
         fn set_auth_token(&self, token: Option<&str>) {
             RemoteDatabaseService::set_auth_token(self, token.map(str::to_string))
         }
+        fn take_handshake_rejection(&self, token: &str) -> Option<crate::error::Error> {
+            RemoteDatabaseService::take_handshake_rejection(self, token)
+        }
     }
 }
 

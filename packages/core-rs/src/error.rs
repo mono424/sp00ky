@@ -62,6 +62,24 @@ impl Error {
     pub fn is_network(&self) -> bool {
         matches!(self, Error::Network(_) | Error::Timeout(_) | Error::NoRemote(_))
     }
+
+    /// The server refused the credential itself rather than the request: a
+    /// bad or revoked token, a token past its `DURATION FOR TOKEN` ("The
+    /// token has expired"), or a session past its `DURATION FOR SESSION`.
+    /// Retrying with the same token cannot succeed.
+    pub fn is_auth_rejection(&self) -> bool {
+        let message = self.to_string().to_lowercase();
+        [
+            "invalid authentication",
+            "invalid token",
+            "token expired",
+            "has expired",
+            "authentication failed",
+            "problem with authentication",
+        ]
+        .iter()
+        .any(|p| message.contains(p))
+    }
 }
 
 impl From<rusqlite::Error> for Error {

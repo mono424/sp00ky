@@ -67,7 +67,7 @@ pub fn route(env: &SagaEnv, event: RuntimeEvent) -> Route {
         E::MaterializeDirty => route_to(None, materialize_dirty),
         E::StreamUpdate { update } => {
             route_to(Some(Lane::serial(format!("stream:{}", update.query_hash))), move |ctx| async move {
-                materialize::stream_update(&ctx, update).await
+                materialize::stream_update(&ctx, *update).await
             })
         }
         E::LifecycleTick | E::HeartbeatNow => route_to(Some(Lane::dedupe("lifecycle")), move |ctx| async move {

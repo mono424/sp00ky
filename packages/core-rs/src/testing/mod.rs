@@ -79,9 +79,11 @@ impl CallLog {
 // ---- timers ---------------------------------------------------------------------
 
 /// Timers that only fire when the test says so.
+type PendingTimers = BTreeMap<String, (u64, Option<Box<dyn FnOnce()>>)>;
+
 #[derive(Clone, Default)]
 pub struct FakeTimers {
-    pending: Rc<RefCell<BTreeMap<String, (u64, Option<Box<dyn FnOnce()>>)>>>,
+    pending: Rc<RefCell<PendingTimers>>,
 }
 
 impl FakeTimers {
@@ -340,11 +342,13 @@ impl RemotePort for FakeRemote {
 
 // ---- circuit ----------------------------------------------------------------------
 
+type LocalArrayFn = Rc<dyn Fn(&str) -> RecordVersionArray>;
+
 /// A circuit that answers registrations from a script and records ingests.
 #[derive(Clone)]
 pub struct FakeSsp {
     log: CallLog,
-    pub local_array_for: Rc<RefCell<Option<Rc<dyn Fn(&str) -> RecordVersionArray>>>>,
+    pub local_array_for: Rc<RefCell<Option<LocalArrayFn>>>,
     pub ingested: Rc<RefCell<Vec<IngestRecord>>>,
     pub unregistered: Rc<RefCell<Vec<String>>>,
     pub registered: Rc<RefCell<Vec<RegisterPlan>>>,

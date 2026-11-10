@@ -40,7 +40,7 @@ pub enum RuntimeEvent {
     BucketSwitch { target: String },
     AppDetached,
     ConnectionChanged { state: ConnectionState },
-    StreamUpdate { update: StreamUpdate },
+    StreamUpdate { update: Box<StreamUpdate> },
     LiveStart,
     LiveChange { hashes: Vec<QueryHash>, rows: Option<Vec<InlineRow>> },
 }

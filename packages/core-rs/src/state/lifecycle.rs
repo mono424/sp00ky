@@ -2,12 +2,12 @@
 //!
 //! [`QueryPhase`] answers "where do this query's rows come from":
 //!
-//! - `Cold`      never resolved on this device: rows come from the circuit's
-//!               local window, bindings show a loader.
-//! - `Cached`    a durable `_00_view` row was found: rows come from that id-set.
-//! - `Live`      a server membership set was accepted this session.
-//! - `ViewLost`  the server's `_00_query` row vanished while we held
-//!               membership; rows are kept, a re-registration is under way.
+//! - `Cold`: never resolved on this device. Rows come from the circuit's
+//!   local window, bindings show a loader.
+//! - `Cached`: a durable `_00_view` row was found. Rows come from that id-set.
+//! - `Live`: a server membership set was accepted this session.
+//! - `ViewLost`: the server's `_00_query` row vanished while we held
+//!   membership. Rows are kept, a re-registration is under way.
 //!
 //! `remote` tracks the server-side registration, `fetch_depth` is the refcount
 //! behind `status: fetching`, and `notified` says whether subscribers received

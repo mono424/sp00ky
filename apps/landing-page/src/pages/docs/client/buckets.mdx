@@ -315,7 +315,10 @@ Access a bucket from your `Sp00kyClient` or `SyncedDb` instance:
 The React binding (`@spooky-sync/client-react`) exports the same hooks and components with plain
 values: `useDownloadFile('avatars', path)` takes the path itself instead of an accessor and returns
 `{ url, isLoading, error, refetch }`, and `<BucketImage>` takes `className` / `imgClassName`. See the
-[React guide](/docs/guide/react#files-and-images).
+[React guide](/docs/guide/react#files-and-images). The Svelte binding (`@spooky-sync/client-svelte`)
+takes paths as getters (`useDownloadFile('avatars', () => path)`), returns reactive getters, and its
+`<BucketImage>` takes `class` / `imgClass` and a `fallback` snippet. See the
+[Svelte guide](/docs/guide/svelte#files-and-images).
 
 ### useFileUpload
 

@@ -40,6 +40,18 @@ export function Checkout() {
   return flag.enabled ? <RedesignedCheckout /> : <LegacyCheckout />;
 }`;
 
+export const svelteCode = `<script lang="ts">
+  import { useFeatureFlag } from '@spooky-sync/client-svelte';
+
+  const flag = useFeatureFlag('new-checkout');
+</script>
+
+{#if flag.enabled}
+  <RedesignedCheckout />
+{:else}
+  <LegacyCheckout />
+{/if}`;
+
 export const solidCode = `import { Show } from 'solid-js';
 import { useFeatureFlag } from '@spooky-sync/client-solid';
 
@@ -155,6 +167,12 @@ The returned object exposes:
 
 <CodeBlock code={reactCode} lang="tsx" />
 
+### Svelte
+
+`@spooky-sync/client-svelte` exports the same hook. Its fields are reactive getters, read them in markup or `$derived`:
+
+<CodeBlock code={svelteCode} lang="svelte" />
+
 ### Multi-variant flags
 
 For experiments with more than two variants, read `variant()` directly instead of `enabled()`. Each variant can carry an arbitrary JSON `payload` (configured on the flag definition's `payloads` map) that you read with `payload()`.
@@ -163,7 +181,7 @@ For experiments with more than two variants, read `variant()` directly instead o
 
 ### Vanilla JS / TS
 
-Outside of SolidJS and React, call `feature()` on your `Sp00kyClient` directly. It returns a `FeatureFlagHandle` with the same `variant()` / `enabled()` / `payload()` methods plus a `subscribe()` for change notifications.
+Outside of SolidJS, React and Svelte, call `feature()` on your `Sp00kyClient` directly. It returns a `FeatureFlagHandle` with the same `variant()` / `enabled()` / `payload()` methods plus a `subscribe()` for change notifications.
 
 <CodeBlock code={vanillaCode} lang="typescript" />
 

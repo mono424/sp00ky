@@ -1,0 +1,72 @@
+{
+  "name": "@spooky-sync/client-svelte",
+  "version": "0.0.1-canary.370",
+  "type": "module",
+  "sideEffects": false,
+  "description": "Svelte 5 (runes) bindings for the sp00ky local-first sync client",
+  "svelte": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "svelte": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "AGENTS.md",
+    "QUICK_START.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "svelte-package -i src -o dist",
+    "build:watch": "svelte-package -i src -o dist --watch",
+    "dev": "svelte-package -i src -o dist --watch",
+    "test": "vitest run",
+    "type-check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings"
+  },
+  "keywords": [
+    "surrealdb",
+    "database",
+    "browser",
+    "offline",
+    "sync",
+    "svelte",
+    "svelte-5",
+    "runes",
+    "local-first",
+    "tanstack-intent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mono424/sp00ky.git",
+    "directory": "packages/client-svelte"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "dependencies": {
+    "@spooky-sync/core": "workspace:*",
+    "@spooky-sync/query-builder": "workspace:*",
+    "@surrealdb/wasm": "^3.1.0",
+    "surrealdb": "2.1.0"
+  },
+  "peerDependencies": {
+    "svelte": "^5.29.0"
+  },
+  "devDependencies": {
+    "@sveltejs/package": "^2.5.0",
+    "@sveltejs/vite-plugin-svelte": "^4.0.4",
+    "@types/node": "^22.5.2",
+    "happy-dom": "^21.0.4",
+    "svelte": "^5.43.0",
+    "svelte-check": "^4.3.0",
+    "typescript": "^5.6.2",
+    "vitest": "^3.2.0"
+  }
+}

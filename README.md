@@ -71,6 +71,7 @@ const ThreadList = () => {
 | [`@spooky-sync/core`](https://www.npmjs.com/package/@spooky-sync/core)                   | Core client SDK — sync engine, caching, reactivity |
 | [`@spooky-sync/client-solid`](https://www.npmjs.com/package/@spooky-sync/client-solid)   | SolidJS bindings (`useQuery`, etc.)                |
 | [`@spooky-sync/client-react`](https://www.npmjs.com/package/@spooky-sync/client-react)   | React bindings (`useQuery`, `useSubmission`, etc.) ([guide](https://mono424.github.io/sp00ky/docs/guide/react)) |
+| [`@spooky-sync/client-svelte`](https://www.npmjs.com/package/@spooky-sync/client-svelte) | Svelte 5 bindings on runes (`useQuery`, `useSubmission`, etc.) ([guide](https://mono424.github.io/sp00ky/docs/guide/svelte)) |
 | [`@spooky-sync/query-builder`](https://www.npmjs.com/package/@spooky-sync/query-builder) | Type-safe query builder                            |
 | [`@spooky-sync/backend`](https://www.npmjs.com/package/@spooky-sync/backend)             | Backend SDK: durable workflows (`step.do`) on sp00ky's job engine |
 | [`@spooky-sync/cli`](https://www.npmjs.com/package/@spooky-sync/cli)                     | CLI for schema generation                          |

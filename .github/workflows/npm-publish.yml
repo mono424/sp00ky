@@ -107,7 +107,7 @@ jobs:
       - name: Rewrite workspace deps to release version
         run: |
           V="${{ needs.prepare.outputs.version }}"
-          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/backend/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json packages/client-react/package.json apps/devtools-mcp/package.json; do
+          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/backend/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json packages/client-react/package.json packages/client-svelte/package.json apps/devtools-mcp/package.json; do
             jq --arg v "$V" 'reduce ("dependencies","optionalDependencies","peerDependencies") as $k (.; if (.[$k]|type)=="object" then .[$k] |= with_entries(if (.value|type)=="string" and (.value|startswith("workspace:")) then .value=$v else . end) else . end)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
@@ -184,6 +184,22 @@ jobs:
       - name: Publish client-react
         continue-on-error: true
         working-directory: packages/client-react
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
+      # 4d. Build and publish @spooky-sync/client-svelte (Svelte 5 bindings).
+      # Allowed to fail until its first publish, like client-react above: an
+      # owner of the @spooky-sync scope publishes it once by hand.
+      - name: Set version — client-svelte
+        continue-on-error: true
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/client-svelte/package.json > tmp.json && mv tmp.json packages/client-svelte/package.json
+
+      - name: Build client-svelte
+        continue-on-error: true
+        run: pnpm --filter @spooky-sync/client-svelte build
+
+      - name: Publish client-svelte
+        continue-on-error: true
+        working-directory: packages/client-svelte
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
       # 5. Build and publish @spooky-sync/devtools-mcp

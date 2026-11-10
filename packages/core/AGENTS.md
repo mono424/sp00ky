@@ -2,7 +2,7 @@
 
 ## What this package is
 
-The sync engine. A `Sp00kyClient<S>` owns a local database (memory or IndexedDB), a remote SurrealDB connection, a mutation queue, and a CRDT manager. It's framework-agnostic — UI bindings live in `@spooky-sync/client-solid` (or future `client-react`, etc.). Most app code touches this package indirectly through a UI binding's `useDb()` hook.
+The sync engine. A `Sp00kyClient<S>` owns a local database (memory or IndexedDB), a remote SurrealDB connection, a mutation queue, and a CRDT manager. It's framework-agnostic — UI bindings live in `@spooky-sync/client-solid`, `client-solid2`, `client-react` and `client-svelte`. Most app code touches this package indirectly through a UI binding's `useDb()` hook.
 
 ## Mental model
 

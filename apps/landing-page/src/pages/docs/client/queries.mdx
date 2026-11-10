@@ -78,6 +78,8 @@ component.
   [Solid 2 guide](/docs/guide/solid2#result-surface). The React binding
   (`@spooky-sync/client-react`) has the same flags as plain values: `useQuery(query)` returns
   `{ data, isLoading, isEmpty, ... }`, see the [React guide](/docs/guide/react#result-surface).
+  The Svelte binding (`@spooky-sync/client-svelte`) returns them as reactive getters from
+  `useQuery(() => query)`, see the [Svelte guide](/docs/guide/svelte#result-surface).
 </Note>
 
 Two options are worth knowing:

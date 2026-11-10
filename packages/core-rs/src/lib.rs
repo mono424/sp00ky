@@ -19,6 +19,8 @@
 
 pub mod boot;
 pub mod client;
+#[cfg(feature = "codegen")]
+pub mod codegen;
 pub mod error;
 pub mod kernel;
 pub mod modules;
@@ -30,6 +32,7 @@ pub mod state;
 pub mod surreal;
 pub mod sync;
 pub mod testing;
+pub mod typed;
 pub mod types;
 pub mod utils;
 pub mod value;

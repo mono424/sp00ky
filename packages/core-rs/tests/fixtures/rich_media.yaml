@@ -1,0 +1,11 @@
+openapi: 3.1.0
+paths:
+  /thumbnails/make:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              properties:
+                path: { type: string }
+              required: [path]

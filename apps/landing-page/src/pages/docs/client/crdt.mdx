@@ -73,7 +73,7 @@ Each fold also writes `<field>__crdt` on the record, a stamp of the folded versi
   { name: 'field', type: 'string', default: '-', desc: 'The `@crdt` field name' },
 ]} />
 
-It returns an accessor that is `null` until the field is open, then a `CrdtField`. It must live inside a `<Sp00kyProvider>`, and has the same shape in `@spooky-sync/client-solid` and `@spooky-sync/client-solid2`.
+It returns an accessor that is `null` until the field is open, then a `CrdtField`. It must live inside a `<Sp00kyProvider>`, and has the same shape in `@spooky-sync/client-solid` and `@spooky-sync/client-solid2`. In `@spooky-sync/client-react` the record id is a plain value (`useCrdtField('post', postId, 'body')`) and the hook returns the `CrdtField` or `null` directly.
 
 Without Solid, open and close the field on the client yourself. Every open of the same field in a tab shares one document, so pair each open with a close:
 

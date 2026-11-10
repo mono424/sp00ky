@@ -312,6 +312,11 @@ Access a bucket from your `Sp00kyClient` or `SyncedDb` instance:
 
 ## SolidJS Hooks
 
+The React binding (`@spooky-sync/client-react`) exports the same hooks and components with plain
+values: `useDownloadFile('avatars', path)` takes the path itself instead of an accessor and returns
+`{ url, isLoading, error, refetch }`, and `<BucketImage>` takes `className` / `imgClassName`. See the
+[React guide](/docs/guide/react#files-and-images).
+
 ### useFileUpload
 
 Upload files with built-in validation against your bucket configuration (max size, allowed extensions):

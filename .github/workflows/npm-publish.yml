@@ -107,7 +107,7 @@ jobs:
       - name: Rewrite workspace deps to release version
         run: |
           V="${{ needs.prepare.outputs.version }}"
-          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/backend/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json apps/devtools-mcp/package.json; do
+          for f in packages/query-builder/package.json packages/query-allowlist/package.json packages/ssp-wasm/package.json packages/backend/package.json packages/core/package.json packages/client-solid/package.json packages/client-solid2/package.json packages/client-react/package.json apps/devtools-mcp/package.json; do
             jq --arg v "$V" 'reduce ("dependencies","optionalDependencies","peerDependencies") as $k (.; if (.[$k]|type)=="object" then .[$k] |= with_entries(if (.value|type)=="string" and (.value|startswith("workspace:")) then .value=$v else . end) else . end)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
@@ -167,6 +167,23 @@ jobs:
 
       - name: Publish client-solid2
         working-directory: packages/client-solid2
+        run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
+
+      # 4c. Build and publish @spooky-sync/client-react (React bindings).
+      # Allowed to fail until its first publish: npm refuses a package's first
+      # publish from CI (E404 on PUT), so an owner of the @spooky-sync scope
+      # publishes it once by hand, then this step takes over.
+      - name: Set version — client-react
+        continue-on-error: true
+        run: jq '.version = "${{ needs.prepare.outputs.version }}"' packages/client-react/package.json > tmp.json && mv tmp.json packages/client-react/package.json
+
+      - name: Build client-react
+        continue-on-error: true
+        run: pnpm --filter @spooky-sync/client-react build
+
+      - name: Publish client-react
+        continue-on-error: true
+        working-directory: packages/client-react
         run: npm publish --provenance --access public --tag ${{ needs.prepare.outputs.npm_tag }}
 
       # 5. Build and publish @spooky-sync/devtools-mcp

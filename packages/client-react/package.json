@@ -1,0 +1,73 @@
+{
+  "name": "@spooky-sync/client-react",
+  "version": "0.0.1-canary.382",
+  "type": "module",
+  "sideEffects": false,
+  "description": "React bindings for the sp00ky local-first sync client",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "AGENTS.md",
+    "QUICK_START.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "build:watch": "tsdown --watch",
+    "dev": "tsdown --watch",
+    "test": "vitest run",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "surrealdb",
+    "database",
+    "browser",
+    "offline",
+    "sync",
+    "react",
+    "local-first",
+    "tanstack-intent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mono424/sp00ky.git",
+    "directory": "packages/client-react"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "dependencies": {
+    "@spooky-sync/core": "workspace:*",
+    "@spooky-sync/query-builder": "workspace:*",
+    "@surrealdb/wasm": "^3.1.0",
+    "surrealdb": "2.1.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.2",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "happy-dom": "^21.0.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tsdown": "^0.12.4",
+    "typescript": "^5.6.2",
+    "vitest": "^3.2.0"
+  }
+}

@@ -33,6 +33,13 @@ spky flag enable new-checkout
 # Dry-run an evaluation for one user without writing anything
 spky flag eval new-checkout --as-user alice`;
 
+export const reactCode = `import { useFeatureFlag } from '@spooky-sync/client-react';
+
+export function Checkout() {
+  const flag = useFeatureFlag('new-checkout');
+  return flag.enabled ? <RedesignedCheckout /> : <LegacyCheckout />;
+}`;
+
 export const solidCode = `import { Show } from 'solid-js';
 import { useFeatureFlag } from '@spooky-sync/client-solid';
 
@@ -142,6 +149,12 @@ The returned object exposes:
 | `enabled()` | `boolean` | `true` when the variant is set and not `'off'`. Use for boolean flags. |
 | `payload()` | `unknown \| undefined` | The JSON payload attached to the resolved variant, if any. |
 
+### React
+
+`@spooky-sync/client-react` exports the same hook. It returns plain values and re-renders when the assignment changes:
+
+<CodeBlock code={reactCode} lang="tsx" />
+
 ### Multi-variant flags
 
 For experiments with more than two variants, read `variant()` directly instead of `enabled()`. Each variant can carry an arbitrary JSON `payload` (configured on the flag definition's `payloads` map) that you read with `payload()`.
@@ -150,7 +163,7 @@ For experiments with more than two variants, read `variant()` directly instead o
 
 ### Vanilla JS / TS
 
-Outside of SolidJS, call `feature()` on your `Sp00kyClient` directly. It returns a `FeatureFlagHandle` with the same `variant()` / `enabled()` / `payload()` methods plus a `subscribe()` for change notifications.
+Outside of SolidJS and React, call `feature()` on your `Sp00kyClient` directly. It returns a `FeatureFlagHandle` with the same `variant()` / `enabled()` / `payload()` methods plus a `subscribe()` for change notifications.
 
 <CodeBlock code={vanillaCode} lang="typescript" />
 

@@ -176,7 +176,7 @@ By default the warning is shown and the page is shifted and rounded for you; you
 
 **Show nothing.** `mode: 'none'` renders nothing, ever, and does not fall back. It is your call, and then it is your job to make an impersonated session obvious: the page otherwise looks exactly like an ordinary session of someone else's account. The client logs one console warning to say so.
 
-To react to impersonation yourself, use the hook (Solid) or the auth service (any client):
+To react to impersonation yourself, use the hook (Solid or React) or the auth service (any client):
 
 <CodeBlock code={solidCode} lang="tsx" />
 
@@ -189,7 +189,7 @@ To react to impersonation yourself, use the hook (Solid) or the auth service (an
     { name: 'auth.subscribeImpersonation(cb)', type: '() => void', default: '-', desc: 'Called immediately and on every change. Returns an unsubscribe.' },
     { name: 'auth.searchImpersonationTargets(search)', type: 'Promise<ImpersonationCandidate[]>', default: '-', desc: 'The DevTools user search. Admins only.' },
     { name: 'auth.listActiveImpersonations()', type: 'Promise<ActiveImpersonation[]>', default: '-', desc: 'Open sessions. Admins only.' },
-    { name: 'useImpersonation()', type: '{ impersonation, isImpersonating, stop }', default: '-', desc: 'Solid hook in `@spooky-sync/client-solid` and `client-solid2`.' },
+    { name: 'useImpersonation()', type: '{ impersonation, isImpersonating, stop }', default: '-', desc: 'Hook in `@spooky-sync/client-solid`, `client-solid2` and `client-react` (where the fields are plain values).' },
 ]} />
 
 Signing out while impersonating ends the impersonation and signs the admin out too.

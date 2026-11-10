@@ -8,6 +8,7 @@
 //! dedicated thread and talks to it over channels.
 
 pub mod router;
+pub mod services;
 pub mod timers;
 
 use std::cell::{Cell, RefCell};

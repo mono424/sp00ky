@@ -26,6 +26,19 @@ void main() {
       expect(a.signinParams, ['username', 'password']);
     });
 
+    test('keeps the names of accesses defined IF NOT EXISTS or OVERWRITE', () {
+      const surql = '''
+        DEFINE ACCESS IF NOT EXISTS account ON DATABASE TYPE RECORD
+          SIGNIN ( SELECT * FROM user WHERE email = \$email );
+        DEFINE ACCESS OVERWRITE device ON DATABASE TYPE RECORD
+          SIGNIN ( SELECT * FROM user WHERE key = crypto::sha256(\$key) );
+      ''';
+      final accesses = parseAccesses(surql);
+      expect(accesses.map((a) => a.name), ['account', 'device']);
+      expect(accesses.first.signinParams, ['email']);
+      expect(accesses.last.signinParams, ['key']);
+    });
+
     test('excludes @nosync tables (and their fields) from the client schema',
         () {
       const surql = '''

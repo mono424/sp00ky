@@ -108,8 +108,12 @@ static TYPE_TERMINATOR: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
-static DEFINE_ACCESS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)DEFINE\s+ACCESS\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+static DEFINE_ACCESS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)DEFINE\s+ACCESS\s+(?:IF\s+NOT\s+EXISTS\s+|OVERWRITE\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    .unwrap()
+});
 
 static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([A-Za-z_][A-Za-z0-9_]*)").unwrap());
 
@@ -627,6 +631,22 @@ DEFINE FIELD tags ON thread TYPE array<string>;
     }
 
     // ---- Dart `codegen_parsers_test.dart` ------------------------------------------------
+
+    #[test]
+    fn accesses_defined_with_if_not_exists_or_overwrite_keep_their_names() {
+        let surql = "
+        DEFINE ACCESS IF NOT EXISTS account ON DATABASE TYPE RECORD
+          SIGNIN ( SELECT * FROM user WHERE email = $email )
+          DURATION FOR TOKEN 30d;
+        DEFINE ACCESS OVERWRITE device ON DATABASE TYPE RECORD
+          SIGNIN ( SELECT * FROM user WHERE id = (SELECT VALUE owner FROM d WHERE h = crypto::sha256($key))[0] );
+      ";
+        let accesses = parse_accesses(surql);
+        let names: Vec<&str> = accesses.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["account", "device"]);
+        assert_eq!(accesses[0].signin_params, ["email"]);
+        assert_eq!(accesses[1].signin_params, ["key"]);
+    }
 
     #[test]
     fn access_vars_exclude_built_ins() {

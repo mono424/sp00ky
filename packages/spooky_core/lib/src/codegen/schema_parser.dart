@@ -119,8 +119,9 @@ const _builtinVars = {
   'event',
 };
 
-final _defineAccess =
-    RegExp(r'DEFINE\s+ACCESS\s+([A-Za-z_][A-Za-z0-9_]*)', caseSensitive: false);
+final _defineAccess = RegExp(
+    r'DEFINE\s+ACCESS\s+(?:IF\s+NOT\s+EXISTS\s+|OVERWRITE\s+)?([A-Za-z_][A-Za-z0-9_]*)',
+    caseSensitive: false);
 
 /// Extract [AccessDef]s by scanning the full source (access blocks span
 /// braces/parens with internal `;`, so they survive the statement splitter).

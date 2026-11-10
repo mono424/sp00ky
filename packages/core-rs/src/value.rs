@@ -309,6 +309,41 @@ pub fn object_from_json(v: serde_json::Value) -> Object {
     Value::from(v).into_object().unwrap_or_default()
 }
 
+/// Anything a write or a sign-in takes as its fields: an [`Object`], a
+/// `serde_json::json!({...})` object, or a `serde_json::Map`.
+pub trait IntoObject {
+    fn into_object(self) -> Result<Object>;
+}
+
+impl IntoObject for Object {
+    fn into_object(self) -> Result<Object> {
+        Ok(self)
+    }
+}
+
+impl IntoObject for serde_json::Value {
+    fn into_object(self) -> Result<Object> {
+        match Value::from(self) {
+            Value::Object(o) => Ok(o),
+            other => Err(Error::InvalidArgument(format!("expected an object, got {other}"))),
+        }
+    }
+}
+
+impl IntoObject for serde_json::Map<String, serde_json::Value> {
+    fn into_object(self) -> Result<Object> {
+        serde_json::Value::Object(self).into_object()
+    }
+}
+
+/// A `Serialize` struct as an [`Object`] (for writes of your own types).
+pub fn to_object<T: Serialize + ?Sized>(value: &T) -> Result<Object> {
+    match to_value(value)? {
+        Value::Object(o) => Ok(o),
+        other => Err(Error::InvalidArgument(format!("expected an object, got {other}"))),
+    }
+}
+
 /// Any `Serialize` value as a [`Value`] (through its JSON form, so a
 /// [`RecordId`] field becomes its `table:id` string; the schema re-types it on
 /// the way out).

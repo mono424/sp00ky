@@ -29,7 +29,7 @@ use crate::modules::query_builder::QueryBuilder;
 use crate::mutation::rows::FailedMutationRow;
 use crate::runtime::Subscription;
 use crate::types::{QueryHash, QueryStatus, QueryTimings, RunOptions, Schema, Sp00kyConfig, SyncHealth, UpdateOptions};
-use crate::value::{from_row, Object, Row, Value};
+use crate::value::{from_row, IntoObject, Object, Row, Value};
 
 /// What runs on the engine thread.
 pub(crate) struct Worker {
@@ -300,19 +300,19 @@ impl Sp00kyClient {
     // ---- mutations -----------------------------------------------------------------
 
     /// Create `id` (`table:key`) optimistically; returns the row.
-    pub async fn create(&self, id: &str, data: impl Into<Object>) -> Result<Row> {
-        let (id, data) = (id.to_string(), data.into());
+    pub async fn create(&self, id: &str, data: impl IntoObject) -> Result<Row> {
+        let (id, data) = (id.to_string(), data.into_object()?);
         self.call(move |w| async move { w.engine.create(&id, data).await }).await
     }
 
     /// Merge `data` into `id` optimistically; returns the row.
-    pub async fn update(&self, id: &str, data: impl Into<Object>) -> Result<Row> {
+    pub async fn update(&self, id: &str, data: impl IntoObject) -> Result<Row> {
         self.update_with(id, data, UpdateOptions::default()).await
     }
 
     /// [`Sp00kyClient::update`] with options (debouncing).
-    pub async fn update_with(&self, id: &str, data: impl Into<Object>, options: UpdateOptions) -> Result<Row> {
-        let (id, data) = (id.to_string(), data.into());
+    pub async fn update_with(&self, id: &str, data: impl IntoObject, options: UpdateOptions) -> Result<Row> {
+        let (id, data) = (id.to_string(), data.into_object()?);
         self.call(move |w| async move { w.engine.update(&id, data, options).await }).await
     }
 
@@ -329,8 +329,8 @@ impl Sp00kyClient {
     }
 
     /// Enqueue a backend job.
-    pub async fn run(&self, backend: &str, path: &str, payload: Object, options: RunOptions) -> Result<()> {
-        let (backend, path) = (backend.to_string(), path.to_string());
+    pub async fn run(&self, backend: &str, path: &str, payload: impl IntoObject, options: RunOptions) -> Result<()> {
+        let (backend, path, payload) = (backend.to_string(), path.to_string(), payload.into_object()?);
         self.call(move |w| async move { w.engine.run_job(&backend, &path, &payload, &options).await })
             .await
     }
@@ -400,14 +400,14 @@ impl Sp00kyClient {
     /// Sign in through `DEFINE ACCESS <access>` with its declared params.
     /// The account switch (local store, queries) has happened when this
     /// resolves.
-    pub async fn sign_in(&self, access: &str, params: impl Into<Object>) -> Result<()> {
-        let (access, params) = (access.to_string(), params.into());
+    pub async fn sign_in(&self, access: &str, params: impl IntoObject) -> Result<()> {
+        let (access, params) = (access.to_string(), params.into_object()?);
         self.call(move |w| async move { w.engine.sign_in(&access, params).await }).await
     }
 
     /// Sign up through `DEFINE ACCESS <access>` with its declared params.
-    pub async fn sign_up(&self, access: &str, params: impl Into<Object>) -> Result<()> {
-        let (access, params) = (access.to_string(), params.into());
+    pub async fn sign_up(&self, access: &str, params: impl IntoObject) -> Result<()> {
+        let (access, params) = (access.to_string(), params.into_object()?);
         self.call(move |w| async move { w.engine.sign_up(&access, params).await }).await
     }
 
@@ -841,5 +841,49 @@ impl Bucket {
     pub async fn evict(&self, path: &str) -> Result<()> {
         let path = path.to_string();
         bucket_call!(self, |h| h.evict(&path).await)
+    }
+}
+
+/// The generated `AppDb` over the thread-safe client:
+/// `AppDb::new(client.clone()).note().create(&note)`. Reads go through
+/// [`Sp00kyClient::live`] with the typed query's builder.
+#[async_trait::async_trait(?Send)]
+impl crate::typed::TypedClient for Sp00kyClient {
+    fn query(&self, table: &str) -> QueryBuilder {
+        Sp00kyClient::query(self, table)
+    }
+
+    async fn create(&self, id: &str, data: Object) -> Result<Row> {
+        Sp00kyClient::create(self, id, data).await
+    }
+
+    async fn update(&self, _table: &str, id: &str, data: Object, options: UpdateOptions) -> Result<Row> {
+        Sp00kyClient::update_with(self, id, data, options).await
+    }
+
+    async fn delete(&self, _table: &str, id: &str) -> Result<()> {
+        Sp00kyClient::delete(self, id).await
+    }
+
+    async fn run(&self, backend: &str, path: &str, payload: Object, options: RunOptions) -> Result<()> {
+        Sp00kyClient::run(self, backend, path, payload, options).await
+    }
+
+    async fn sign_in(&self, access: &str, params: Object) -> Result<()> {
+        Sp00kyClient::sign_in(self, access, params).await
+    }
+
+    async fn sign_up(&self, access: &str, params: Object) -> Result<()> {
+        Sp00kyClient::sign_up(self, access, params).await
+    }
+}
+
+impl Sp00kyClient {
+    /// Subscribe to a typed query; read it with [`LiveQuery::rows_as`].
+    pub fn live_typed<T>(
+        &self,
+        query: crate::typed::TypedQuery<T>,
+    ) -> impl Future<Output = Result<LiveQuery>> + Send + 'static {
+        self.live(query.into_builder())
     }
 }

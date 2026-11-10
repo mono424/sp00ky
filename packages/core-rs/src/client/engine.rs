@@ -656,6 +656,19 @@ impl Engine {
         Err(Error::NoRemote("query_remote requires a remote endpoint".into()))
     }
 
+    /// [`Engine::query_remote`] for a read a screen is waiting on (a search
+    /// box, a detail view): it runs in its own small pool and never queues
+    /// behind the sync's registrations and body fetches. Keep background work
+    /// on `query_remote` so these slots stay free.
+    pub async fn query_interactive(&self, sql: &str, vars: Option<Object>) -> Result<Vec<Value>> {
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            return remote.query_interactive(sql, vars).await;
+        }
+        let _ = (sql, vars);
+        Err(Error::NoRemote("query_interactive requires a remote endpoint".into()))
+    }
+
     fn register_input(&self, sql: &str, params: Object, options: QueryOptions) -> Result<RegisterInput> {
         Ok(RegisterInput {
             table_name: parse_table_from_surql(sql)?,

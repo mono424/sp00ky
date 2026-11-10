@@ -98,7 +98,7 @@ async fn pull_chunks(
                     .collect(),
             ),
         );
-        ctx.remote_query(sql::body_select(), Some(vars), Some(env.remote_timeout_ms))
+        ctx.remote_bodies(sql::body_select(), Some(vars), Some(env.remote_timeout_ms))
     });
     let results = join_all(requests).await;
     let mut failed = 0;

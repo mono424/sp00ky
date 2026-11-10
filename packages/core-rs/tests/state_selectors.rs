@@ -150,6 +150,44 @@ fn needed_compares_versions_and_skips_pending_deletes() {
 }
 
 #[test]
+fn plan_fetch_puts_the_smallest_need_first() {
+    let live = life(QueryPhase::Live);
+    let games: Vec<(String, i64)> = (0..5).map(|i| (format!("game:{i}"), 1)).collect();
+    let s = state(vec![
+        e_with("big", live, games, Vec::new()),
+        e_with("linkup", live, pairs(&[("friendship:1", 1)]), Vec::new()),
+    ]);
+    assert_eq!(
+        sel::plan_fetch_chunked(&s, 2, usize::MAX).chunks[0],
+        ["friendship:1", "game:0"]
+    );
+}
+
+#[test]
+fn plan_fetch_stops_at_a_round_and_the_next_plan_picks_up_the_rest() {
+    let games: Vec<(String, i64)> = (0..10).map(|i| (format!("game:{i}"), 1)).collect();
+    let mut s = state(vec![e_with(
+        "big",
+        life(QueryPhase::Live),
+        games,
+        Vec::new(),
+    )]);
+    let plan = sel::plan_fetch_chunked(&s, 2, 3);
+    assert_eq!(plan.chunks.len(), 3);
+    let landed: RecordVersionArray = plan
+        .chunks
+        .iter()
+        .flatten()
+        .map(|id| (id.clone(), 1))
+        .collect();
+    r::set_versions(&mut s, &landed);
+    assert_eq!(
+        sel::plan_fetch_chunked(&s, 2, 3).chunks,
+        vec![vec!["game:6", "game:7"], vec!["game:8", "game:9"]]
+    );
+}
+
+#[test]
 fn plan_fetch_dedupes_includes_subquery_children_and_chunks() {
     let live = life(QueryPhase::Live);
     let s = state(vec![
@@ -178,14 +216,16 @@ fn plan_fetch_dedupes_includes_subquery_children_and_chunks() {
             Vec::new(),
         ),
     ]);
-    let plan = sel::plan_fetch_chunked(&s, 2);
+    let plan = sel::plan_fetch_chunked(&s, 2, usize::MAX);
     assert_eq!(plan.hashes, ["a", "b"]);
+    // `a` and `c` need two rows each, `b` three: smallest first, ties in
+    // registration order.
     assert_eq!(
         plan.chunks,
         vec![
             vec!["thing:1".to_string(), "thing:2".to_string()],
-            vec!["thing:3".to_string(), "child:1".to_string()],
-            vec!["child:2".to_string()],
+            vec!["child:1".to_string(), "child:2".to_string()],
+            vec!["thing:3".to_string()],
         ]
     );
     assert_eq!(plan.versions["thing:2"], 3);

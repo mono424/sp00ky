@@ -124,7 +124,7 @@ membership known: an empty list really is empty) drive loading states.
 | What | API |
 | --- | --- |
 | Raw SurrealQL query | `live_raw(sql, params, QueryOptions)`, `query_raw`, `preload` |
-| One-shot server read, not synced | `query_remote(sql, vars)` |
+| One-shot server read, not synced | `query_remote(sql, vars)`; `query_interactive` for a read a screen waits on |
 | Debounced updates (typing) | `update_with(id, data, UpdateOptions::debounced())` |
 | Rejected writes | `failed_mutations_watch()`, `list_failed_mutations`, `retry_failed_mutation`, `discard_failed_mutation` |
 | Sync indicators | `sync_health_watch()`, `pending_mutations_watch()`, `unsynced_records_watch()`, `fetch_activity_watch()` |

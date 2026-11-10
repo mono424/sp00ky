@@ -214,6 +214,13 @@ impl Ctx {
         self.fenced(Self::with_timeout(timeout_ms, remote.query(sql, vars))).await
     }
 
+    /// A row body fetch: runs in the transport's body lane, so a row already
+    /// known to be missing does not wait behind other queries' registrations.
+    pub async fn remote_bodies(&self, sql: &str, vars: Option<Object>, timeout_ms: Option<u64>) -> Result<Vec<StatementResult>> {
+        let remote = self.rt.adapters().remote.clone();
+        self.fenced(Self::with_timeout(timeout_ms, remote.bodies(sql, vars))).await
+    }
+
     /// A write: runs in the transport's write lane, one at a time.
     pub async fn remote_write(&self, sql: &str, vars: Option<Object>, timeout_ms: Option<u64>) -> Result<Vec<StatementResult>> {
         let remote = self.rt.adapters().remote.clone();

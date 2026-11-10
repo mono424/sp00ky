@@ -335,6 +335,14 @@ impl Sp00kyClient {
         self.call(move |w| async move { w.engine.query_remote(&sql, vars).await }).await
     }
 
+    /// [`Sp00kyClient::query_remote`] for a read a screen is waiting on: it
+    /// does not queue behind the sync's registrations and body fetches.
+    /// Background work stays on `query_remote`, so these slots stay free.
+    pub async fn query_interactive(&self, sql: &str, vars: Option<Object>) -> Result<Vec<Value>> {
+        let sql = sql.to_string();
+        self.call(move |w| async move { w.engine.query_interactive(&sql, vars).await }).await
+    }
+
     // ---- mutations -----------------------------------------------------------------
 
     /// Create `id` (`table:key`) optimistically; returns the row.

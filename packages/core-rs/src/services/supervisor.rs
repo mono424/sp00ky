@@ -43,6 +43,9 @@ pub struct SupervisorHooks {
     pub reconnect: AsyncHook,
     /// One end-to-end round trip.
     pub probe: AsyncHook,
+    /// The first round trip after a wake, straight on the socket and outside
+    /// the lanes, so a busy lane cannot fail it. `None` uses `probe`.
+    pub wake_probe: Option<AsyncHook>,
     /// Drop the socket; its `Disconnected` event drives the revive loop.
     pub force_close: Rc<dyn Fn() -> LocalBoxFuture<'static, ()>>,
     pub is_connected: Rc<dyn Fn() -> bool>,
@@ -52,7 +55,8 @@ impl SupervisorHooks {
     /// Hooks over a [`RemoteDatabaseService`]. The client wiring that also
     /// retries auth verification after a probe builds its own `probe`.
     pub fn for_remote(remote: &RemoteDatabaseService) -> Self {
-        let (r1, r2, r3, r4) = (
+        let (r1, r2, r3, r4, r5) = (
+            remote.clone(),
             remote.clone(),
             remote.clone(),
             remote.clone(),
@@ -64,6 +68,7 @@ impl SupervisorHooks {
                 async move { r.connect().await }.boxed_local()
             }),
             probe: Rc::new(move || r2.probe().boxed_local()),
+            wake_probe: Some(Rc::new(move || r5.probe_socket().boxed_local())),
             force_close: Rc::new(move || {
                 let r = r3.clone();
                 async move { r.force_close().await }.boxed_local()
@@ -94,6 +99,7 @@ struct Inner {
     heartbeat_timer: RefCell<Option<JoinHandle<()>>>,
     heartbeat_in_flight: Cell<bool>,
     heartbeat_failures: Cell<u32>,
+    wake_probe_in_flight: Cell<bool>,
 
     revive_timer: RefCell<Option<JoinHandle<()>>>,
     revive_attempts: Cell<u32>,
@@ -171,6 +177,7 @@ impl ConnectionSupervisor {
             heartbeat_timer: RefCell::new(None),
             heartbeat_in_flight: Cell::new(false),
             heartbeat_failures: Cell::new(0),
+            wake_probe_in_flight: Cell::new(false),
             revive_timer: RefCell::new(None),
             revive_attempts: Cell::new(0),
             last_wake_probe_at: Cell::new(None),
@@ -297,7 +304,7 @@ impl ConnectionSupervisor {
         inner.revive_attempts.set(0);
         if connected {
             inner.stop_heartbeat();
-            tokio::task::spawn_local(Inner::beat(inner.clone()));
+            tokio::task::spawn_local(Inner::probe_after_wake(inner.clone()));
             return;
         }
         inner.clear_revive_timer();
@@ -440,6 +447,52 @@ impl Inner {
         if !self.is_connected() {
             self.schedule_revive();
         }
+    }
+
+    /// The first round trip after the host comes back. The heartbeat's rules
+    /// would take 25 s to give up on a socket that died during a sleep, with
+    /// the user waiting on it. Its second chance is there because it shares
+    /// lanes with ordinary traffic and cannot tell busy from dead; the wake
+    /// probe goes to the socket directly, so one short miss is enough. A
+    /// connect already in flight is its own probe.
+    async fn probe_after_wake(self: Rc<Self>) {
+        if !self.started.get() || self.parked() {
+            return;
+        }
+        if self.reviving.get() || self.wake_probe_in_flight.get() || !self.is_connected() {
+            return;
+        }
+        self.wake_probe_in_flight.set(true);
+        let hook = self.hooks.wake_probe.as_ref().unwrap_or(&self.hooks.probe);
+        let probe = bounded(hook(), self.config.wake_probe_timeout_ms, "Wake probe").await;
+        match probe {
+            Ok(()) => {
+                self.heartbeat_failures.set(0);
+                self.set_state(ConnectionState::Connected);
+                self.start_heartbeat();
+            }
+            Err(e) => {
+                if self.disposed.get() {
+                    self.wake_probe_in_flight.set(false);
+                    return;
+                }
+                tracing::info!(target: "spooky", "The socket did not answer after a wake; reconnecting: {e}");
+                self.heartbeat_failures.set(0);
+                self.stop_heartbeat();
+                // Not awaited: the old socket's close can take seconds and the
+                // new one does not depend on it.
+                tokio::task::spawn_local((self.hooks.force_close)());
+                // Once `Disconnected` has been heard, so the state reads in
+                // order. It armed a revive on backoff, which this replaces:
+                // someone is waiting.
+                tokio::task::yield_now().await;
+                if !self.disposed.get() {
+                    self.clear_revive_timer();
+                    tokio::task::spawn_local(Inner::revive(self.clone()));
+                }
+            }
+        }
+        self.wake_probe_in_flight.set(false);
     }
 
     // ---- heartbeat watchdog -----------------------------------------------------------
@@ -615,6 +668,7 @@ mod tests {
                     }
                     .boxed_local()
                 }),
+                wake_probe: None,
                 force_close: Rc::new(move || {
                     let t = t3.clone();
                     async move {
@@ -709,6 +763,7 @@ mod tests {
                     futures::future::pending().boxed_local()
                 }),
                 probe: Rc::new(|| async { Ok(()) }.boxed_local()),
+                wake_probe: None,
                 force_close: Rc::new(|| async {}.boxed_local()),
                 is_connected: Rc::new(move || open.open.get()),
             };
@@ -854,6 +909,98 @@ mod tests {
             sup.wake("wake");
             pump().await;
             assert_eq!(t.probes.get(), 2);
+            sup.dispose();
+        })
+        .await;
+    }
+
+    fn with_wake_probe(
+        t: &Rc<Transport>,
+        config: ReconnectConfig,
+        wake_probe: AsyncHook,
+    ) -> ConnectionSupervisor {
+        let base = t.supervisor(config);
+        let mut hooks = base.0.hooks.clone();
+        hooks.wake_probe = Some(wake_probe);
+        let t5 = t.clone();
+        ConnectionSupervisor::new(hooks, t.events.subscribe(), config)
+            .with_clock(move || t5.now_ms.get())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_missed_wake_probe_replaces_the_socket_without_a_second_chance() {
+        run_local(async {
+            let t = Transport::new();
+            let sup = with_wake_probe(
+                &t,
+                ReconnectConfig::default(),
+                Rc::new(|| futures::future::pending().boxed_local()),
+            );
+            sup.start();
+            sup.wake("resumed");
+            elapse(2_999).await;
+            assert_eq!(t.force_closes.get(), 0);
+            assert_eq!(t.reconnects.get(), 0);
+            elapse(1).await;
+            assert_eq!(t.force_closes.get(), 1);
+            assert_eq!(t.reconnects.get(), 1, "at once, not after a backoff");
+            assert_eq!(sup.connection(), ConnectionState::Connected);
+            sup.dispose();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_probe_asks_the_socket_so_a_busy_lane_cannot_fail_it() {
+        run_local(async {
+            let t = Transport::new();
+            t.probe_hangs.set(true);
+            let wake_probes = Rc::new(Cell::new(0));
+            let w = wake_probes.clone();
+            let sup = with_wake_probe(
+                &t,
+                ReconnectConfig::default(),
+                Rc::new(move || {
+                    w.set(w.get() + 1);
+                    async { Ok(()) }.boxed_local()
+                }),
+            );
+            sup.start();
+            sup.wake("resumed");
+            elapse(5_000).await;
+            assert_eq!(wake_probes.get(), 1);
+            assert_eq!(t.probes.get(), 0);
+            assert_eq!(t.force_closes.get(), 0);
+            sup.dispose();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_is_not_swallowed_by_a_heartbeat_already_in_flight() {
+        run_local(async {
+            let t = Transport::new();
+            t.probe_hangs.set(true);
+            let wake_probes = Rc::new(Cell::new(0));
+            let w = wake_probes.clone();
+            let sup = with_wake_probe(
+                &t,
+                heartbeat(1_000, 10_000),
+                Rc::new(move || {
+                    w.set(w.get() + 1);
+                    async { Ok(()) }.boxed_local()
+                }),
+            );
+            sup.start();
+            elapse(1_000).await;
+            assert_eq!(
+                t.probes.get(),
+                1,
+                "the heartbeat is now waiting on its probe"
+            );
+            sup.wake("resumed");
+            pump().await;
+            assert_eq!(wake_probes.get(), 1);
             sup.dispose();
         })
         .await;

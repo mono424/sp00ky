@@ -99,7 +99,9 @@ while let Ok(rows) = notes.changed().await { /* re-render */ }
 - Raw: `client.live_raw(sql, params, QueryOptions::default())`. Raw params are
   NOT re-typed: pass `Value::from(RecordId::parse("user:ada"))` for records.
 - `preload_query(q)` prewarms; `query_remote(sql, vars)` is a one-shot read,
-  not cached and not live (do not build UI lists on it).
+  not cached and not live (do not build UI lists on it). `query_interactive`
+  is the same for a read a screen waits on: its own pool, never queued behind
+  the sync.
 - `client.query(..)` has no query host: never call `.run()` / `.subscribe()` on
   it, use `client.live(..)`.
 

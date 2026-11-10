@@ -89,7 +89,7 @@ The other knobs are public fields on the config:
 | `ref_sync_interval_ms` | `500` | Base cadence of the membership poll. |
 | `enable_anonymous_live_queries` | `false` | Realtime sync while signed out. Must match the server's `anonymousLiveQueries`. |
 | `sync_health` | degraded after 3 failures | `SyncHealthConfig::DISABLED` never reports degraded. |
-| `reconnect` | 15 s backoff cap, 20 s heartbeat | `ReconnectConfig`: backoff, heartbeat interval and timeout, connect timeout. |
+| `reconnect` | 15 s backoff cap, 20 s heartbeat | `ReconnectConfig`: backoff, heartbeat interval and timeout, connect timeout, and the 3 s probe after a `wake()`. |
 | `circuit_checkpoint_ms` | `30000` | How often a changed circuit is snapshotted to the store. |
 | `channels` | `None` | Peer to peer channels (see [Channels](#peer-to-peer-channels)). |
 
@@ -150,7 +150,9 @@ the last subscriber leaves (`10m` by default).
 `LiveQuery` to it later. `preload_query(builder)` (or `preload(sql, params, options)`) prewarms a query:
 it returns at once when the query resolved before on this device, otherwise once the server's
 membership and every row are local. `query_remote(sql, vars)` is a one-shot server read that is not
-synced into the local store: use it for counts and other reads a view cannot express.
+synced into the local store: use it for counts and other reads a view cannot express. For a read a
+screen is waiting on (a search box, a detail lookup) use `query_interactive(sql, vars)`: the same
+call, in a small pool of its own that never queues behind the sync's registrations and row fetches.
 
 ## Typed rows
 
@@ -315,6 +317,7 @@ The core cannot see the network or the app's lifecycle, so the app reports both:
 <CodeBlock code={lifecycleCode} lang="rust" />
 
 - `wake()` on a resume or a returning network: reset the reconnect backoff and probe the socket now.
+  A socket that died during a sleep is replaced within about 3 s (`ReconnectConfig::wake_probe_timeout_ms`).
 - `set_offline(true)` when the OS reports no network: a `preload` that never resolved on this device
   returns at once instead of waiting for the server, so an app holding its first screen on it still opens.
   Report it before the first `preload`.

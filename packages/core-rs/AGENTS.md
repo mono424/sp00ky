@@ -52,7 +52,9 @@ work on any executor (GPUI, smol, tokio, `futures::executor::block_on`).
   (or `live_with_ttl(q, Some("1h"))`) -> `LiveQuery`, `preload_query(q)`.
   Raw: `live_raw(sql, params: Object, QueryOptions { ttl, .. })`,
   `query_raw` (hash only), `subscribe(hash)`, `preload(sql, params, opts)`.
-  One-shot server read, not cached, not live: `query_remote(sql, vars)`.
+  One-shot server read, not cached, not live: `query_remote(sql, vars)`;
+  `query_interactive(sql, vars)` for one a screen waits on (own pool, never
+  behind the sync's registrations and row fetches).
   Also `is_query_settled`, `is_query_authoritative`, `query_timings`,
   `deregister_query`.
 - `LiveQuery` (keep it alive; dropping unsubscribes): `rows() -> Arc<Vec<Row>>`,
@@ -110,7 +112,8 @@ work on any executor (GPUI, smol, tokio, `futures::executor::block_on`).
   `notify`, `cancel`, `test(title, body)`, `unsubscribe_on_sign_out` /
   `set_unsubscribe_on_sign_out`. Errors: `PushError { code, message, cause }`.
   Types in `spooky_core::modules::push`. The app gets the token from the OS.
-- Lifecycle: `wake()` (resume / network back), `set_offline(bool)`,
+- Lifecycle: `wake()` (resume / network back; a dead socket is replaced
+  within `ReconnectConfig::wake_probe_timeout_ms`, 3 s), `set_offline(bool)`,
   `checkpoint().await` (background), `detach().await` (leaving for good),
   `close().await` (before exit), `inspect_state()`, `is_local_ready()`, `kv_read`, `kv_write`.
 

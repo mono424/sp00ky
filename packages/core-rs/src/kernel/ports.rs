@@ -140,6 +140,11 @@ pub trait RemotePort {
     /// whole failed (transport, RPC error), never for one statement. Reads
     /// share a pool and overlap.
     async fn query(&self, sql: &str, vars: Option<Object>) -> Result<Vec<StatementResult>>;
+    /// [`RemotePort::query`] for a row body fetch: it does not wait behind
+    /// other reads (a registration can spend seconds on the server).
+    async fn bodies(&self, sql: &str, vars: Option<Object>) -> Result<Vec<StatementResult>> {
+        self.query(sql, vars).await
+    }
     /// [`RemotePort::query`] for a write: starts once every earlier write has
     /// settled, so writes reach the server one at a time, in issue order.
     async fn write(&self, sql: &str, vars: Option<Object>) -> Result<Vec<StatementResult>>;

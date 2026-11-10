@@ -253,6 +253,10 @@ pub struct ReconnectConfig {
     pub heartbeat_timeout_ms: u64,
     /// Deadline for opening a socket (a black-holed endpoint never answers).
     pub connect_timeout_ms: u64,
+    /// Deadline for the one round trip after a wake. Short on purpose:
+    /// someone is looking at the screen, and a false alarm only costs a
+    /// reconnect.
+    pub wake_probe_timeout_ms: u64,
 }
 
 impl Default for ReconnectConfig {
@@ -262,6 +266,7 @@ impl Default for ReconnectConfig {
             heartbeat_interval_ms: 20_000,
             heartbeat_timeout_ms: 10_000,
             connect_timeout_ms: 10_000,
+            wake_probe_timeout_ms: 3_000,
         }
     }
 }

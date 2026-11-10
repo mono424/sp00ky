@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::kernel::constants::FETCH_CHUNK;
+use crate::kernel::constants::{FETCH_CHUNK, FETCH_ROUND_CHUNKS};
 use crate::modules::query_builder::RelationPlan;
 use crate::state::lifecycle::{derive_status, has_server_membership, is_foreground_fetching, QueryPhase, RemotePhase};
 use crate::state::{ClientState, OutboxStatus, PeerWriteKind, QueryEntry};
@@ -126,12 +126,15 @@ pub struct FetchPlan {
     pub versions: BTreeMap<String, i64>,
 }
 
-/// Cross-query, deduped, chunked list of ids to pull from the server.
+/// Cross-query, deduped, chunked list of ids to pull from the server: the
+/// next round's worth, smallest need first, so one row that was just requested
+/// does not wait for another query's thousands. The loop plans again after a
+/// round.
 pub fn plan_fetch(s: &ClientState) -> FetchPlan {
-    plan_fetch_chunked(s, FETCH_CHUNK)
+    plan_fetch_chunked(s, FETCH_CHUNK, FETCH_ROUND_CHUNKS)
 }
 
-pub fn plan_fetch_chunked(s: &ClientState, chunk_size: usize) -> FetchPlan {
+pub fn plan_fetch_chunked(s: &ClientState, chunk_size: usize, max_chunks: usize) -> FetchPlan {
     let mut versions: BTreeMap<String, i64> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut hashes = Vec::new();
@@ -146,15 +149,26 @@ pub fn plan_fetch_chunked(s: &ClientState, chunk_size: usize) -> FetchPlan {
             }
         }
     };
-    for hash in s.queries.keys() {
-        let missing = needed(s, hash);
+    let mut wants: Vec<(&QueryHash, RecordVersionArray, RecordVersionArray)> = s
+        .queries
+        .keys()
+        .map(|hash| (hash, needed(s, hash), needed_children(s, hash)))
+        .collect();
+    // A stable sort: queries needing the same amount keep their registration
+    // order.
+    wants.sort_by_key(|(_, missing, children)| missing.len() + children.len());
+    for (hash, missing, children) in wants {
         if !missing.is_empty() {
             hashes.push(hash.clone());
         }
         add(missing, &mut versions);
-        add(needed_children(s, hash), &mut versions);
+        add(children, &mut versions);
     }
-    let chunks = order.chunks(chunk_size.max(1)).map(<[String]>::to_vec).collect();
+    let chunks = order
+        .chunks(chunk_size.max(1))
+        .take(max_chunks)
+        .map(<[String]>::to_vec)
+        .collect();
     FetchPlan {
         hashes,
         chunks,

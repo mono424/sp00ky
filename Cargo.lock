@@ -7265,7 +7265,7 @@ dependencies = [
 
 [[package]]
 name = "spooky-core"
-version = "0.0.1-canary.370"
+version = "0.0.1-canary.382"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

@@ -56,7 +56,16 @@ impl Gate {
 enum Lane {
     Read,
     Write,
+    Bodies,
+    Interactive,
 }
+
+/// Body fetches in flight at once. Matches
+/// [`crate::kernel::constants::FETCH_ROUND_CHUNKS`].
+pub const BODY_LANE_CAPACITY: usize = 4;
+
+/// One-shot reads a screen is waiting on, in flight at once.
+pub const INTERACTIVE_LANE_CAPACITY: usize = 3;
 
 /// The heartbeat statement, sent through both lanes.
 const PROBE_SQL: &str = "RETURN true";
@@ -70,6 +79,8 @@ struct Inner {
     client: Rc<dyn RemoteSurrealClient>,
     reads: Semaphore,
     writes: Semaphore,
+    bodies: Semaphore,
+    interactive: Semaphore,
 
     /// The token the session last authenticated with, re-applied by `connect`
     /// so a socket rebuilt from scratch comes back authenticated.
@@ -94,6 +105,12 @@ struct Inner {
     /// dead one.
     connect_gate: RefCell<Option<Rc<Gate>>>,
     connect_gate_timeout: Cell<Duration>,
+
+    /// How long `use` and `authenticate` get on a socket that just opened.
+    /// Neither has a deadline of its own, and a socket that opened and then
+    /// went quiet would otherwise hold the boot's connect, and every RPC
+    /// behind it, forever.
+    handshake_timeout: Cell<Duration>,
 
     session_ids: RefCell<Vec<String>>,
     on_handshake: RefCell<Option<Rc<dyn Fn()>>>,
@@ -140,6 +157,8 @@ impl Inner {
         match lane {
             Lane::Read => &self.reads,
             Lane::Write => &self.writes,
+            Lane::Bodies => &self.bodies,
+            Lane::Interactive => &self.interactive,
         }
     }
 }
@@ -179,6 +198,12 @@ type ClientCall<T> =
 /// Writes ([`RemoteDatabaseService::write_statements`], the outbox push) run
 /// one at a time in issue order, so one push never overlaps another.
 ///
+/// Row bodies ([`RemoteDatabaseService::body_statements`]) and reads a screen
+/// is waiting on ([`RemoteDatabaseService::query_interactive`]) have small
+/// pools of their own. A registration can spend seconds on the server building
+/// an index, and a launch sends dozens: in one shared queue six slow ones held
+/// back the row the user had just been notified about, and the search box.
+///
 /// A request starts when it is made, not when its future is first polled, and
 /// holds its slot until the RPC settles even when its caller has stopped
 /// waiting: a slot is only free when the server is done with it.
@@ -193,12 +218,15 @@ impl RemoteDatabaseService {
             client,
             reads: Semaphore::new(pool),
             writes: Semaphore::new(1),
+            bodies: Semaphore::new(BODY_LANE_CAPACITY),
+            interactive: Semaphore::new(INTERACTIVE_LANE_CAPACITY),
             auth_token: RefCell::new(None),
             auth_epoch: Cell::new(0),
             transition: Cell::new(0),
             identity_gate: RefCell::new(None),
             connect_gate: RefCell::new(None),
             connect_gate_timeout: Cell::new(Duration::from_secs(20)),
+            handshake_timeout: Cell::new(Duration::from_secs(10)),
             session_ids: RefCell::new(Vec::new()),
             on_handshake: RefCell::new(None),
         }))
@@ -281,6 +309,12 @@ impl RemoteDatabaseService {
         self.0.connect_gate_timeout.set(timeout);
     }
 
+    /// How long `use` and `authenticate` get on a freshly opened socket before
+    /// the connect fails and the socket is dropped. Default 10 s.
+    pub fn set_handshake_timeout(&self, timeout: Duration) {
+        self.0.handshake_timeout.set(timeout);
+    }
+
     /// Hold RPCs until the first connect attempt finishes. Called before the
     /// engine boots, so a call made before [`RemoteDatabaseService::connect`]
     /// still waits for it.
@@ -333,8 +367,23 @@ impl RemoteDatabaseService {
 
     async fn handshake(&self, endpoint: &str) -> Result<()> {
         let inner = &self.0;
+        inner.client.connect(endpoint).await?;
+        let timeout = inner.handshake_timeout.get();
+        match tokio::time::timeout(timeout, self.use_and_authenticate()).await {
+            Ok(out) => out?,
+            Err(_) => {
+                self.force_close().await;
+                return Err(Error::Timeout(timeout.as_millis() as u64));
+            }
+        }
+        tokio::task::spawn_local(record_session_id(inner.clone()));
+        tracing::info!(target: "spooky", "Connected to remote database");
+        Ok(())
+    }
+
+    async fn use_and_authenticate(&self) -> Result<()> {
+        let inner = &self.0;
         let client = inner.client.clone();
-        client.connect(endpoint).await?;
         client
             .use_db(&inner.config.namespace, &inner.config.database)
             .await?;
@@ -351,8 +400,6 @@ impl RemoteDatabaseService {
             self.force_close().await;
             inner.check_epoch(epoch)?;
         }
-        tokio::task::spawn_local(record_session_id(inner.clone()));
-        tracing::info!(target: "spooky", "Connected to remote database");
         Ok(())
     }
 
@@ -416,6 +463,30 @@ impl RemoteDatabaseService {
         self.statements(Lane::Read, sql, vars)
     }
 
+    /// A read a screen is waiting on, in its own small pool: it never queues
+    /// behind the sync's registrations and body fetches. Fails on a failed
+    /// statement.
+    pub fn query_interactive(
+        &self,
+        sql: &str,
+        vars: Option<Object>,
+    ) -> impl Future<Output = Result<Vec<Value>>> + 'static {
+        let sql = sql.to_string();
+        self.run(
+            Lane::Interactive,
+            Box::new(move |c| async move { c.query(&sql, vars).await }.boxed_local()),
+        )
+    }
+
+    /// Per-statement outcomes of a row body fetch, in its own pool.
+    pub fn body_statements(
+        &self,
+        sql: &str,
+        vars: Option<Object>,
+    ) -> impl Future<Output = Result<Vec<StatementResult>>> + 'static {
+        self.statements(Lane::Bodies, sql, vars)
+    }
+
     /// Per-statement outcomes of a write, in the write lane: it starts only
     /// once every write issued before it has settled.
     pub fn write_statements(
@@ -457,6 +528,16 @@ impl RemoteDatabaseService {
             read?;
             write?;
             Ok(())
+        }
+    }
+
+    /// One `RETURN true` on the socket itself, outside every lane: it asks
+    /// whether the socket works, and a busy lane cannot fail it.
+    pub fn probe_socket(&self) -> impl Future<Output = Result<()>> + 'static {
+        let inner = self.0.clone();
+        async move {
+            inner.await_connect().await;
+            inner.client.query(PROBE_SQL, None).await.map(|_| ())
         }
     }
 
@@ -611,6 +692,10 @@ impl RemotePort for RemoteAdapter {
         self.remote.query_statements(sql, vars).await
     }
 
+    async fn bodies(&self, sql: &str, vars: Option<Object>) -> Result<Vec<StatementResult>> {
+        self.remote.body_statements(sql, vars).await
+    }
+
     async fn write(&self, sql: &str, vars: Option<Object>) -> Result<Vec<StatementResult>> {
         self.remote.write_statements(sql, vars).await
     }
@@ -727,6 +812,8 @@ mod tests {
         release: Shared<oneshot::Receiver<()>>,
         release_tx: RefCell<Option<oneshot::Sender<()>>>,
         connect_fails: bool,
+        /// `use` never answers: a socket that opened and then went quiet.
+        use_hangs: Cell<bool>,
     }
 
     impl SlowRemote {
@@ -737,6 +824,7 @@ mod tests {
                 release: rx.shared(),
                 release_tx: RefCell::new(Some(tx)),
                 connect_fails,
+                use_hangs: Cell::new(false),
             })
         }
 
@@ -767,6 +855,9 @@ mod tests {
         }
         async fn use_db(&self, _: &str, _: &str) -> Result<()> {
             self.log("use");
+            if self.use_hangs.get() {
+                futures::future::pending::<()>().await;
+            }
             Ok(())
         }
         async fn authenticate(&self, _: &str) -> Result<Value> {
@@ -895,6 +986,31 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             pump().await;
             assert!(signin.is_finished());
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_that_goes_quiet_fails_the_connect_and_opens_the_gate() {
+        run_local(async {
+            let remote = SlowRemote::new(false);
+            remote.use_hangs.set(true);
+            remote.release_connect();
+            let service = gated(&remote);
+            service.set_handshake_timeout(Duration::from_secs(10));
+            let s = service.clone();
+            let connect = tokio::task::spawn_local(async move { s.connect().await });
+            let signin = tokio::task::spawn_local(service.signin(access("account")));
+            tokio::time::sleep(Duration::from_millis(9_999)).await;
+            pump().await;
+            assert!(!connect.is_finished());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            pump().await;
+            assert!(matches!(
+                connect.await.unwrap(),
+                Err(Error::Timeout(10_000))
+            ));
+            assert!(signin.is_finished(), "held RPCs stop waiting");
         })
         .await;
     }
@@ -1086,6 +1202,39 @@ mod tests {
             assert_eq!(socket.max_in_flight.get(), 2);
             let mut watches = watches.into_iter();
             assert!(watches.next().unwrap().await.unwrap().is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bodies_interactive_reads_and_the_socket_probe_skip_held_registrations() {
+        run_local(async {
+            let (socket, remote) = held(2);
+            // Every read slot held by a registration, more of them queued
+            // behind, the way a server building an index for each does.
+            for i in 0..4 {
+                tokio::task::spawn_local(
+                    remote.query_statements(&format!("fn::query::register({i})"), None),
+                );
+            }
+            let read =
+                tokio::task::spawn_local(remote.query_statements("SELECT * FROM read", None));
+            let body = tokio::task::spawn_local(remote.body_statements("SELECT * FROM body", None));
+            let search =
+                tokio::task::spawn_local(remote.query_interactive("SELECT * FROM search", None));
+            let probe = tokio::task::spawn_local(remote.probe_socket());
+            pump().await;
+            assert!(!socket.started().contains(&"SELECT * FROM read".to_string()));
+            socket.answer("SELECT * FROM body");
+            socket.answer("SELECT * FROM search");
+            pump().await;
+            assert!(body.is_finished(), "a body fetch does not wait");
+            assert!(
+                search.is_finished(),
+                "a read a screen waits on does not wait"
+            );
+            probe.await.unwrap().unwrap();
+            assert!(!read.is_finished(), "a shared-pool read does");
         })
         .await;
     }

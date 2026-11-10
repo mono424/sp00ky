@@ -23,6 +23,11 @@ pub const ACK_GRACE_MS: u64 = 30_000;
 /// Ids per body-fetch statement.
 pub const FETCH_CHUNK: usize = 500;
 
+/// Chunks fetched and landed per round of the fetch loop. Rows land between
+/// rounds, and each round plans again, so a backlog neither hides what already
+/// arrived nor holds back a row that became known meanwhile.
+pub const FETCH_ROUND_CHUNKS: usize = 4;
+
 /// Outbox statements per push request.
 pub const OUTBOX_BATCH_SIZE: usize = 50;
 

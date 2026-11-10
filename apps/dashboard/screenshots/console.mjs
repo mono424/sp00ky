@@ -444,6 +444,28 @@ function hostRoute(method, action) {
   return [404, { error: 'not found' }];
 }
 
+// Settings > Git: each project's link, changed by the editor the way the API would.
+const LINKS = {};
+function linkRoute(method, id, body) {
+  const at = id in LINKS ? LINKS[id] : { status: 'linked', installation_id: 7001, repo_owner: 'mono424', repo_name: 'whitepawn', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' };
+  if (method === 'DELETE') {
+    LINKS[id] = { status: 'not_linked' };
+    return [200, { status: 'unlinked' }];
+  }
+  if (method === 'PATCH') {
+    const b = body ?? {};
+    if (b.branch !== undefined && !String(b.branch).trim()) return [400, { error: `"${b.branch}" is not a branch name` }];
+    if (b.repo_owner && b.repo_name) {
+      LINKS[id] = { status: 'linked', installation_id: b.installation_id, repo_owner: b.repo_owner, repo_name: b.repo_name, branch: b.branch ?? 'main', config_path: b.config_path || 'sp00ky.yml', auto_deploy: b.auto_deploy ?? at.auto_deploy ?? true };
+      return [200, { status: 'linked' }];
+    }
+    if (at.status !== 'linked') return [404, { error: 'this project is not linked to a repository' }];
+    LINKS[id] = { ...at, ...Object.fromEntries(['branch', 'auto_deploy', 'config_path'].filter((k) => b[k] !== undefined).map((k) => [k, b[k]])) };
+    return [200, { status: 'updated' }];
+  }
+  return [200, at];
+}
+
 function cloudRoute(method, path, url, body) {
   FRESH.projects = ONBOARDING.project ? [NEW_PROJECT(ONBOARDING.project)] : [];
   if (path === '/console/me') {
@@ -487,7 +509,11 @@ function cloudRoute(method, path, url, body) {
       ...backends.map((name) => ({ role: 'backend', status: name === 'livekit' ? 'starting' : 'running', name })),
     ], urls: { app: 'https://whitepawn-app.stg.spky.cloud', ...Object.fromEntries(backends.map((n) => [n, `https://whitepawn-${n}.stg.spky.cloud`])), surrealdb: 'https://whitepawn-db.stg.spky.cloud', admin: 'https://whitepawn-admin.stg.spky.cloud/admin' } }];
   }
-  if (/^\/projects\/[^/]+\/link$/.test(path) && method === 'GET') return [200, { status: 'linked', repo_owner: 'mono424', repo_name: 'whitepawn', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' }];
+  if (path === '/github/branches') {
+    const r = GITHUB.installations.flatMap((i) => i.repos).find((x) => x.full_name === url.searchParams.get('repo'));
+    return r ? [200, { default_branch: 'main', branches: ['main', 'develop', 'release/2.1', 'feat/offline-tides'] }] : [404, { error: 'the app cannot see that repository' }];
+  }
+  if ((m = path.match(/^\/projects\/([^/]+)\/link$/))) return linkRoute(method, m[1], body);
   if (/^\/projects\/[^/]+\/link\/runs$/.test(path)) return [200, [
     { id: 'r1', commit_sha: 'a3f9c1e7d2', commit_message: 'fix(game): pending moves survive a reload', commit_author: 'mono424', status: 'deploying', created_at: iso(130_000) },
     { id: 'r0', commit_sha: '9b2e07d1aa', commit_message: 'feat(puzzles): daily set survives a reload', commit_author: 'mono424', status: 'running', created_at: iso(52 * H) },

@@ -10,6 +10,7 @@
 
 import type { ActivityReport } from './audienceStats';
 import type { BuildPoint, RunStep, StepStat } from './buildStats';
+import type { BranchList } from './linkPlan';
 
 export class CloudError extends Error {
   constructor(
@@ -273,6 +274,8 @@ export const consoleApi = {
     cloud<GitHubConnections>(`/github?return_to=${encodeURIComponent(returnTo)}`, { tenant }),
   inspect: (tenant: string, installation: number | string, repo: string) =>
     cloud<Inspection>(`/github/inspect?installation_id=${encodeURIComponent(installation)}&repo=${encodeURIComponent(repo)}`, { tenant }),
+  branches: (tenant: string, installation: number | string, repo: string) =>
+    cloud<BranchList>(`/github/branches?installation_id=${encodeURIComponent(installation)}&repo=${encodeURIComponent(repo)}`, { tenant }),
   workspaces: () => cloud<{ workspaces: Workspace[] }>('/console/workspaces').then((r) => r.workspaces),
   grant: (projectId: string) => cloud<Grant>(`/console/projects/${encodeURIComponent(projectId)}/grant`, { method: 'POST' }),
   sessions: () => cloud<ConsoleSession[]>('/console/sessions'),

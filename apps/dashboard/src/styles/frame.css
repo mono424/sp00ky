@@ -4623,6 +4623,17 @@ h2 {
 .cx-branch svg { flex: none; color: var(--ink-faint); }
 a.cx-sha:hover { text-decoration: underline; text-underline-offset: 3px; }
 
+/* settings: the git link, and the form that changes it */
+.cx-ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cx-ellipsis a { color: inherit; text-decoration: none; }
+.cx-ellipsis a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.cx-link-accounts { align-items: center; margin-bottom: 16px; }
+.cx-note.cx-inline { margin: 0 4px; }
+.cx-note.warn { color: var(--warn); }
+.cx-link-form .li-field input { width: 100%; }
+.cx-check-field { display: inline-flex; align-items: center; gap: 8px; height: 30px; margin: 0; font: 500 10.5px var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-dim); cursor: pointer; }
+.cx-form .cx-check-field input { width: 14px; height: 14px; padding: 0; margin: 0; accent-color: var(--accent); }
+
 @media (max-width: 1100px) {
   /* stacked, the preview stays a thumbnail */
   .cx-prod-shot .cx-shot { width: 100%; max-width: 520px; }

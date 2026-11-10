@@ -48,6 +48,21 @@ import {
 } from './hostPlan';
 import { isUnlocked, loadValues, unlock } from './vault';
 import { BuildTimeBox } from './builds';
+import { GitHubMark } from './onboarding';
+import {
+  DEFAULT_CONFIG,
+  branchNote,
+  draftFrom,
+  linkedRepo,
+  moves,
+  patchBody,
+  problem,
+  saveConfirm,
+  savedMessage,
+  unlinkConfirm,
+  type Draft,
+  type Link,
+} from './linkPlan';
 
 interface Ctx {
   workspace: Workspace;
@@ -1113,15 +1128,6 @@ function DomainsTab(props: Ctx) {
 
 /* ---------- git link ---------- */
 
-interface Link {
-  status: string;
-  repo_owner?: string;
-  repo_name?: string;
-  branch?: string;
-  auto_deploy?: boolean;
-  config_path?: string;
-}
-
 interface BuildRun {
   id: string;
   commit_sha: string;
@@ -1135,61 +1141,289 @@ interface BuildRun {
 
 function GitTab(props: Ctx) {
   const tenant = props.workspace.id;
-  const [link, { refetch }] = createResource(() => cloud<Link>(`/projects/${pid(props.project)}/link`, { tenant }));
-  const [runs, { refetch: refetchRuns }] = createResource(
-    () => link()?.status === 'linked',
-    () => cloud<BuildRun[]>(`/projects/${pid(props.project)}/link/runs`, { tenant }),
+  const path = () => `/projects/${pid(props.project)}/link`;
+  // Kept beside the resource: reading a resource that failed throws.
+  const [linkError, setLinkError] = createSignal<string | null>(null);
+  const [link, { refetch }] = createResource(() =>
+    cloud<Link>(path(), { tenant }).then(
+      (l) => (setLinkError(null), l),
+      (err) => (setLinkError(message(err)), undefined),
+    ),
   );
+  const linked = () => !!linkedRepo(link());
+  const [editing, setEditing] = createSignal(false);
+  const [runs, { refetch: refetchRuns }] = createResource(linked, () => cloud<BuildRun[]>(`${path()}/runs`, { tenant }));
   const toggleAuto = async () => {
     const next = !link()?.auto_deploy;
-    if (await act('Auto deploy', () => cloud(`/projects/${pid(props.project)}/link`, { method: 'PATCH', tenant, body: { auto_deploy: next } }), next ? 'Pushes deploy automatically' : 'Pushes no longer deploy')) void refetch();
+    if (await act('Deploy on push', () => cloud(path(), { method: 'PATCH', tenant, body: { auto_deploy: next } }), next ? 'Pushes deploy automatically' : 'Pushes no longer deploy')) void refetch();
   };
   const trigger = async () => {
-    if (await act('Build', () => cloud(`/projects/${pid(props.project)}/link/trigger`, { method: 'POST', tenant }), 'Build started')) void refetchRuns();
+    if (await act('Build', () => cloud(`${path()}/trigger`, { method: 'POST', tenant }), 'Build started')) void refetchRuns();
+  };
+  const unlink = async () => {
+    const l = link();
+    if (!l || !(await confirm(unlinkConfirm(l, props.project.slug)))) return;
+    if (await act('Unlink', () => cloud(path(), { method: 'DELETE', tenant }), `Unlinked ${linkedRepo(l)}`)) {
+      setEditing(false);
+      void refetch();
+    }
+  };
+  const saved = () => {
+    setEditing(false);
+    void refetch();
   };
   return (
-    <Show
-      when={link()?.status === 'linked'}
-      fallback={
+    <Switch>
+      <Match when={linkError() && !link()}>
         <section class="fx-row">
-          <FxCell label="Git link">
-            <p class="cx-note">
-              {link.loading ? 'Loading' : link()?.status === 'pending_repo_selection' ? 'The GitHub App is installed; pick a repository with `spky link`.' : 'Not linked. Run `spky link` in the project to deploy on every push.'}
-            </p>
+          <FxCell label="Repository">
+            <p class="cx-reason">{linkError()}</p>
+            <div class="cx-actions"><button class="btn btn-sm" onClick={() => void refetch()}>Try again</button></div>
           </FxCell>
         </section>
-      }
-    >
-      <section class="fx-row" style={{ 'grid-template-columns': 'repeat(3, minmax(0, 1fr))' }}>
-        <FxCell label="Repository"><div class="fx-big cx-mid">{link()!.repo_owner}/{link()!.repo_name}</div></FxCell>
-        <FxCell label="Branch"><div class="fx-big cx-mid">{link()!.branch}</div></FxCell>
-        <FxCell label="On push">
-          <div class="cx-row">
-            <span class="fx-big cx-mid">{link()!.auto_deploy ? 'deploy' : 'nothing'}</span>
-            <button class="btn btn-sm" onClick={() => void toggleAuto()}>{link()!.auto_deploy ? 'Turn off' : 'Turn on'}</button>
-          </div>
-        </FxCell>
-      </section>
+      </Match>
+      <Match when={!link()}>
+        <section class="fx-row"><FxCell label="Repository"><p class="cx-note">Loading</p></FxCell></section>
+      </Match>
+      <Match when={!linked() || editing()}>
+        <LinkEditor {...props} link={link()!} onSaved={saved} onCancel={linked() ? () => setEditing(false) : undefined} onUnlink={linked() ? () => void unlink() : undefined} />
+      </Match>
+      <Match when={linked()}>
+        <section class="fx-row cx-strip" style={{ 'grid-template-columns': 'repeat(4, minmax(0, 1fr))' }}>
+          <FxCell label="Repository" meta={<button class="btn btn-sm" onClick={() => setEditing(true)}>Change</button>}>
+            <div class="fx-big cx-mid cx-ellipsis">
+              <a href={`https://github.com/${linkedRepo(link())}`} target="_blank" rel="noreferrer">{linkedRepo(link())}</a>
+            </div>
+          </FxCell>
+          <FxCell label="Branch"><div class="fx-big cx-mid cx-ellipsis"><span class="cx-branch"><BranchIcon />{link()!.branch}</span></div></FxCell>
+          <FxCell label="Manifest"><div class="fx-big cx-mid cx-ellipsis">{link()!.config_path || DEFAULT_CONFIG}</div></FxCell>
+          <FxCell label="On push">
+            <div class="cx-row">
+              <span class="fx-big cx-mid">{link()!.auto_deploy ? 'deploy' : 'nothing'}</span>
+              <button class="btn btn-sm" onClick={() => void toggleAuto()}>{link()!.auto_deploy ? 'Turn off' : 'Turn on'}</button>
+            </div>
+          </FxCell>
+        </section>
+        <section class="fx-row">
+          <FxCell label="Builds" meta={<button class="btn btn-sm btn-primary" onClick={() => void trigger()}>Build now</button>}>
+            <table class="fx-list cx-builds">
+              <thead><tr><th class="cap">Commit</th><th class="cap">Author</th><th class="cap">Status</th><th class="cap">Started</th></tr></thead>
+              <tbody>
+                <For each={runs() ?? []} fallback={<tr><td colspan="4" class="dim">No builds yet</td></tr>}>
+                  {(r) => (
+                    <tr>
+                      <td><span class="cx-sha">{r.commit_sha.slice(0, 7)}</span> <span class="dim">{r.commit_message?.split('\n')[0]}</span></td>
+                      <td>{r.commit_author ?? '—'}</td>
+                      <td><span class={`cx-chip ${r.status === 'running' ? 'live' : r.status === 'failed' ? 'fail' : r.status === 'cancelled' ? 'dim' : 'run'}`}>{r.status}</span></td>
+                      <td><Stamp at={r.created_at} /></td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </FxCell>
+        </section>
+      </Match>
+    </Switch>
+  );
+}
+
+/**
+ * Connect a repository, or point the link at another repository, branch or
+ * manifest. The accounts and repositories are the ones the console's first-project
+ * page offers (`GET /v1/github`); what saving sends comes from linkPlan.ts.
+ */
+function LinkEditor(props: Ctx & { link: Link; onSaved: () => void; onCancel?: () => void; onUnlink?: () => void }) {
+  const tenant = props.workspace.id;
+  const [connError, setConnError] = createSignal<string | null>(null);
+  const [connections, { refetch: refetchConnections }] = createResource(() =>
+    consoleApi.github(tenant, window.location.pathname).then(
+      (c) => (setConnError(null), c),
+      (err) => (setConnError(message(err)), undefined),
+    ),
+  );
+  const accounts = () => connections()?.installations ?? [];
+  const linked = () => !!linkedRepo(props.link);
+  const [draft, setDraft] = createSignal<Draft>(draftFrom(props.link));
+  const set = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
+  // Typed by hand: picking another repository no longer fills these in.
+  let ownBranch = false;
+  let ownConfig = false;
+
+  // Connecting: start on the first account once the accounts are in.
+  createEffect(() => {
+    const first = accounts()[0];
+    if (first && draft().installation === undefined) set({ installation: first.id });
+  });
+
+  const account = () => accounts().find((i) => i.id === draft().installation);
+  /** The chosen account's repositories, or undefined when that is not known. */
+  const repoNames = () => (account() ? account()!.repos.map((r) => r.full_name) : connections.loading ? undefined : linked() ? undefined : []);
+  const repoInfo = () => account()?.repos.find((r) => r.full_name === draft().repo.trim());
+
+  const [branches] = createResource(
+    () => (repoInfo() ? ([draft().installation!, repoInfo()!.full_name] as const) : false),
+    ([installation, repo]) => consoleApi.branches(tenant, installation, repo).catch(() => undefined),
+  );
+
+  // A repository picked from the list fills in its default branch and, when the
+  // app finds one, its manifest, unless those were typed by hand.
+  let lastRepo = draft().repo;
+  createEffect(() => {
+    const r = repoInfo();
+    if (!r || r.full_name === lastRepo) return;
+    lastRepo = r.full_name;
+    if (!ownBranch) set({ branch: r.default_branch });
+    if (!ownConfig) {
+      const installation = draft().installation!;
+      consoleApi.inspect(tenant, installation, r.full_name).then(
+        (ins) => {
+          if (!ownConfig && draft().repo.trim() === r.full_name && ins.config?.path) set({ configPath: ins.config.path });
+        },
+        () => undefined,
+      );
+    }
+  });
+
+  const why = () =>
+    linked() && !account() && !connections.loading && moves(props.link, draft()) ? 'Pick one of your GitHub accounts to move the link' : problem(props.link, draft(), repoNames());
+  const body = () => patchBody(props.link, draft());
+  const note = () => branchNote(draft().branch, branches());
+  const [saving, setSaving] = createSignal(false);
+  const save = async (e: Event) => {
+    e.preventDefault();
+    const b = body();
+    if (why() || !b || saving()) return;
+    const ask = saveConfirm(props.link, draft(), props.project.slug);
+    if (ask && !(await confirm(ask))) return;
+    setSaving(true);
+    const ok = await act('Saving the link', () => cloud(`/projects/${pid(props.project)}/link`, { method: 'PATCH', tenant, body: b }), savedMessage(props.link, draft(), b));
+    setSaving(false);
+    if (ok) props.onSaved();
+  };
+
+  return (
+    <>
       <section class="fx-row">
-        <FxCell label="Builds" meta={<button class="btn btn-sm btn-primary" onClick={() => void trigger()}>Build now</button>}>
-          <table class="fx-list cx-builds">
-            <thead><tr><th class="cap">Commit</th><th class="cap">Author</th><th class="cap">Status</th><th class="cap">Started</th></tr></thead>
-            <tbody>
-              <For each={runs() ?? []} fallback={<tr><td colspan="4" class="dim">No builds yet</td></tr>}>
-                {(r) => (
-                  <tr>
-                    <td><span class="cx-sha">{r.commit_sha.slice(0, 7)}</span> <span class="dim">{r.commit_message?.split('\n')[0]}</span></td>
-                    <td>{r.commit_author ?? '—'}</td>
-                    <td><span class={`cx-chip ${r.status === 'running' ? 'live' : r.status === 'failed' ? 'fail' : r.status === 'cancelled' ? 'dim' : 'run'}`}>{r.status}</span></td>
-                    <td><Stamp at={r.created_at} /></td>
-                  </tr>
-                )}
-              </For>
-            </tbody>
-          </table>
+        <FxCell
+          label={linked() ? 'Change the link' : 'Connect a repository'}
+          meta={<Show when={props.onUnlink}><button class="btn btn-sm cx-danger" onClick={() => props.onUnlink!()}>Unlink</button></Show>}
+        >
+          <Switch>
+            <Match when={connError() && !connections()}>
+              <p class="cx-reason">{connError()}</p>
+              <div class="cx-actions"><button class="btn btn-sm" onClick={() => void refetchConnections()}>Try again</button></div>
+            </Match>
+            <Match when={connections() && !connections()!.configured}>
+              <p class="cx-note">GitHub is not set up on this cloud.</p>
+            </Match>
+            <Match when={connections() && !accounts().length && !linked()}>
+              <p class="cx-note">Install the GitHub app on the account that holds the repository, then pick it here.</p>
+              <div class="cx-actions">
+                <Show when={connections()!.install_url}>
+                  <a class="btn btn-primary" href={connections()!.install_url}><GitHubMark />Install the GitHub app</a>
+                </Show>
+              </div>
+            </Match>
+            <Match when={true}>
+              <div class="ob-accounts cx-link-accounts" role="radiogroup" aria-label="GitHub account">
+                <For each={accounts()}>
+                  {(i) => (
+                    <button
+                      type="button"
+                      class="ob-account"
+                      classList={{ on: i.id === draft().installation }}
+                      role="radio"
+                      aria-checked={i.id === draft().installation}
+                      onClick={() => set({ installation: i.id })}
+                    >
+                      <Show when={i.avatar_url}><img src={`${i.avatar_url}${i.avatar_url!.includes('?') ? '&' : '?'}s=48`} alt="" /></Show>
+                      {i.account || `Installation ${i.id}`}
+                    </button>
+                  )}
+                </For>
+                <Show when={linked() && !account() && !connections.loading}>
+                  <span class="cx-note cx-inline">Linked through a GitHub account you cannot read from here; pick one of yours to move it.</span>
+                </Show>
+                <Show when={connections()?.install_url}>
+                  <a class="ob-account ob-account-add" href={connections()!.install_url}>Add an account</a>
+                </Show>
+              </div>
+              <Show when={account()?.error}>
+                <p class="cx-reason">{account()!.error}</p>
+              </Show>
+              <form class="cx-form cx-link-form" onSubmit={save}>
+                <label class="li-field cx-grow">
+                  <span>Repository</span>
+                  <input
+                    list="cx-link-repos"
+                    value={draft().repo}
+                    onInput={(e) => set({ repo: e.currentTarget.value })}
+                    placeholder={connections.loading ? 'Loading repositories' : 'owner/name'}
+                    autocomplete="off"
+                    spellcheck={false}
+                  />
+                  <datalist id="cx-link-repos">
+                    <For each={account()?.repos ?? []}>{(r) => <option value={r.full_name} />}</For>
+                  </datalist>
+                </label>
+                <label class="li-field">
+                  <span>Branch</span>
+                  <input
+                    list="cx-link-branches"
+                    value={draft().branch}
+                    onInput={(e) => {
+                      ownBranch = true;
+                      set({ branch: e.currentTarget.value });
+                    }}
+                    placeholder={repoInfo()?.default_branch ?? 'main'}
+                    autocomplete="off"
+                    spellcheck={false}
+                  />
+                  <datalist id="cx-link-branches">
+                    <For each={branches()?.branches ?? []}>{(b) => <option value={b} />}</For>
+                  </datalist>
+                </label>
+                <label class="li-field">
+                  <span>Manifest</span>
+                  <input
+                    value={draft().configPath}
+                    onInput={(e) => {
+                      ownConfig = true;
+                      set({ configPath: e.currentTarget.value });
+                    }}
+                    placeholder={DEFAULT_CONFIG}
+                    autocomplete="off"
+                    spellcheck={false}
+                  />
+                </label>
+                <Show when={!linked()}>
+                  <label class="cx-check-field">
+                    <input type="checkbox" checked={draft().autoDeploy} onChange={(e) => set({ autoDeploy: e.currentTarget.checked })} />
+                    <span>Deploy on push</span>
+                  </label>
+                </Show>
+                <div class="cx-row">
+                  <button class="btn btn-primary" type="submit" disabled={!!why() || !body() || saving()}>
+                    {saving() ? 'Saving' : linked() ? 'Save' : 'Connect'}
+                  </button>
+                  <Show when={props.onCancel}><button class="btn" type="button" onClick={() => props.onCancel!()}>Cancel</button></Show>
+                </div>
+              </form>
+              <Show
+                when={draft().repo.trim() && why()}
+                fallback={<Show when={note()}><p class={`cx-note ${note()!.tone === 'warn' ? 'warn' : ''}`}>{note()!.text}</p></Show>}
+              >
+                <p class="cx-note">{why()}</p>
+              </Show>
+              <Show when={!linked()}>
+                <p class="cx-note">Or run <code>spky link</code> in the project. Each push to the branch builds and deploys {props.project.slug}.</p>
+              </Show>
+            </Match>
+          </Switch>
         </FxCell>
       </section>
-    </Show>
+    </>
   );
 }
 

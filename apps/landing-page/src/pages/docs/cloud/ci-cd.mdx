@@ -68,6 +68,11 @@ Link a GitHub repository for automated deployments on push:
   GitHub integration installs a GitHub App on your repository. Pushes to the configured branch automatically trigger a build and deploy.
 </Note>
 
+The console does the same from a project's **Settings > Git & builds**: connect
+a repository, or change the linked repository, the GitHub account it is read
+through, the branch and the manifest path. Moving to another repository keeps
+the project's build history; **Unlink** deletes it.
+
 A linked build reads `sp00ky.yml` from the pushed commit the same way
 `spky deploy` reads it locally: the apps and their `deploy:` blocks, the
 `surrealdb:` block, `anonymousLiveQueries`, `deployment.env` and `sync:`. Keep

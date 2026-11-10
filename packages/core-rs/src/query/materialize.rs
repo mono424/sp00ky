@@ -77,7 +77,6 @@ struct RenderJob {
     ids: Vec<String>,
     table: String,
     surql: String,
-    is_window: bool,
     relations: Vec<RelationPlan>,
 }
 
@@ -117,7 +116,6 @@ pub async fn materialize(ctx: &Ctx, hash: &str) -> Result<()> {
             table: table_of_ids(&ids, &e.def.table_name).to_string(),
             ids,
             surql: e.def.surql.clone(),
-            is_window,
             relations: e.def.relations.clone(),
         })
     })?;

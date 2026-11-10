@@ -42,12 +42,10 @@ fn base36(mut n: u32, width: usize) -> String {
 /// A fresh `_00_pending_mutations:<ts>_<seq>_<client_id>` id.
 pub fn mint_mutation_id(client_id: &str) -> String {
     let ts = chrono::Utc::now().timestamp_millis();
-    let prev = SEQ
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
-            Some((s + 1) % SEQ_SPAN)
-        })
-        .unwrap_or(0);
-    let seq = (prev + 1) % SEQ_SPAN;
+    // The remainder of an ever-growing counter. When the u32 itself wraps
+    // the cycle restarts early, which only matters for uniqueness within one
+    // millisecond, where it cannot happen.
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % SEQ_SPAN;
     format!("{PENDING_TABLE}:{ts:013}_{}_{client_id}", base36(seq, 4))
 }
 

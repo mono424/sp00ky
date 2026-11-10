@@ -15,6 +15,7 @@ const CARGO_TOML_PACKAGES = [
   "packages/ssp/Cargo.toml",
   "packages/ssp-protocol/Cargo.toml",
   "packages/ssp-ffi/Cargo.toml",
+  "packages/core-rs/Cargo.toml",
   "packages/ssp-node/Cargo.toml",
   "packages/push-core/Cargo.toml",
   "packages/maintenance/Cargo.toml",

@@ -532,16 +532,17 @@ impl MutationEventType {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DebounceKey {
     /// One pending write per record.
-    #[default]
     RecordId,
-    /// One pending write per record and set of fields.
+    /// One pending write per record and set of fields (the default, as in the
+    /// Dart and TypeScript cores).
+    #[default]
     RecordIdXFields,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DebounceOptions {
     pub key: DebounceKey,
-    /// Milliseconds; the default is 200.
+    /// Milliseconds; the default is 300.
     pub delay_ms: Option<u64>,
 }
 

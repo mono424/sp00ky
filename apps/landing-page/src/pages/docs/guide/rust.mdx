@@ -11,17 +11,12 @@ import Experimental from '../../../components/ui/Experimental.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
-`spooky-core` (lib `spooky_core`) is the native Rust client for sp00ky. It runs the same engine as
-the TypeScript (`@spooky-sync/core`) and Dart (`spooky_core`) clients, so a Rust desktop app, a
-Flutter app and a web tab sync the same rows the same way:
-
-- **Local-first.** Rows live in a sqlite store, one file per signed-in account. Queries paint from it
-  before the network answers. Writes apply at once and sync through an outbox that survives restarts.
-- **Live.** A query is a materialized view. The in-process circuit (the `ssp` crate, no FFI) keeps it
-  current as local writes land, and the server's membership keeps it in step with every other client.
-- **Any executor.** The engine runs on its own thread with its own tokio runtime. `Sp00kyClient` is
-  `Send + Sync + Clone`, and its futures and watch channels work from GPUI, smol, tokio or a plain
-  `block_on`.
+`spooky-core` (lib `spooky_core`) is the native Rust client for sp00ky, for desktop apps, CLIs and
+services. It runs the same engine as the TypeScript and Dart clients, so a Rust desktop app, a
+Flutter app and a web tab sync the same rows the same way. Rows live in a local SQLite store, one
+file per signed-in account: queries paint from it before the network answers and stay live as
+anyone writes, and writes apply at once and sync through an outbox that survives restarts. The
+engine runs on its own thread, so the client works from GPUI, smol, tokio or a plain `block_on`.
 
 <Note>
   The crate is not on crates.io yet. Install it from git, and pin a `rev` for reproducible builds.

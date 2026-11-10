@@ -12,27 +12,22 @@ import Warning from '../../../components/ui/Warning.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
-`@spooky-sync/client-solid2` is the Solid **2.0** native binding. It is the counterpart of
-[`@spooky-sync/client-solid`](/docs/guide/solid), which stays on Solid 1.x — the two packages
-coexist until Solid 2.0 is stable, and you pick one per app.
+`@spooky-sync/client-solid2` connects Solid 2.0 apps to Sp00ky. `createQuery` hands back live rows
+reconciled by `id`, so `<For>` only touches the rows that changed, and it can either expose loading
+flags or suspend into a `<Loading>` boundary. Every write lands in the local database first, and
+the engine syncs it with the server and every other tab and device in the background. Reloads
+paint from the local cache, and the app keeps working offline.
+
+Apps still on Solid 1.x use [`@spooky-sync/client-solid`](/docs/guide/solid) instead; pick one
+package per app.
 
 <Warning title="Tracks a Solid release candidate">
   Solid 2.0 is still an RC. This package pins `solid-js@^2.0.0-rc.0` and `@solidjs/signals@^2.0.0-rc.0`
   as peers, and its semantics probes (`src/lib/__tests__/rc-semantics.test.ts`) exist to catch RC
-  drift. On Solid 1.x apps use the [SolidJS guide](/docs/guide/solid) instead.
+  drift.
 </Warning>
 
-## What "native" means here
-
-- Query results are a `createProjection` fed by an async generator over the engine's live
-  subscription: keyed reconcile by `id`, row identity preserved across updates, `<For>` notified on
-  add / remove / reorder. No manual reconcile or version-signal plumbing.
-- `createQuery` exposes both worlds: non-suspending accessors (`data`, `isLoading`, `isFetching`,
-  `isAuthoritative`, `hasData`, `isEmpty`, `isSettled`, `error`) **and** a suspending `ready()` for
-  `<Loading>` boundaries. Queries are born committed, so a local-first cache paint never suspends.
-- Status hooks are async-iterable-backed memos with a `loadingValue`.
-- Mutations stay plain async calls — the engine is already optimistic local-first end to end
-  (local commit → live re-emit → outbox sync). `createSubmission` only adds button pending/error state.
+## Setup
 
 <Steps>
   <Step title="Install">
@@ -49,7 +44,7 @@ coexist until Solid 2.0 is stable, and you pick one per app.
   <Step title="Generate types">
     <CodeBlock code={generateCode} lang="bash" />
 
-    Same generator as every other client — see [Generated types](/docs/schema/generated-types).
+    Same generator as every other client, see [Generated types](/docs/schema/generated-types).
   </Step>
 
   <Step title="Configure the client">
@@ -74,14 +69,14 @@ with a provider in context, or `(db, query, options?)`.
 
 <CodeBlock fileName="src/components/PostList.tsx" code={queryCode} lang="tsx" />
 
-Pass a thunk when the query depends on signals — read them inside it:
+Pass a thunk when the query depends on signals, and read them inside it:
 
 <CodeBlock code={reactiveQueryCode} lang="tsx" />
 
 ### Suspension style
 
 `ready()` reads the same data but participates in Solid 2's boundary protocol: it pends until the
-first real result lands. `<Loading>` is Solid 2's renamed `<Suspense>`.
+first real result lands. A paint from the local cache counts, so a cached query never suspends. `<Loading>` is Solid 2's renamed `<Suspense>`.
 
 <CodeBlock code={loadingCode} lang="tsx" />
 
@@ -289,7 +284,7 @@ const sync = useSyncStatus();
 const pending = usePendingMutations();
 
 <Show when={sync().isDegraded}>
-  <Banner>Can't reach the server — {pending()} change(s) queued.</Banner>
+  <Banner>Can't reach the server, {pending()} change(s) queued.</Banner>
 </Show>`;
 
 export const vitestCode = `import { defineConfig } from 'vitest/config';

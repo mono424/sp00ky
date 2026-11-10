@@ -12,36 +12,20 @@ import Warning from '../../../components/ui/Warning.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
-`@spooky-sync/client-react` brings Sp00ky to React 18 and 19. Your components read live queries
-through hooks that return plain values, every write lands in the local database first, and the
-engine keeps that database in sync with the server and with every other tab and device in the
-background. Queries paint from the local cache on reload, keep working offline, and update the
-moment anyone changes a row they match.
+`@spooky-sync/client-react` connects React 18 and 19 apps to Sp00ky. Hooks such as `useQuery`
+return plain values that stay live: every write lands in the local database first, the engine
+syncs it with the server and every other tab and device in the background, and a component
+re-renders only when the rows it reads actually changed. Reloads paint from the local cache, and
+the app keeps working offline.
 
-This guide walks through a complete app: setup, queries, sign-in, writes, sync status, files,
+This guide builds a complete app: setup, queries, sign-in, writes, sync status, files,
 collaborative fields and peer to peer channels.
 
 <Warning title="React DOM, not React Native">
-  The client runs SurrealDB and SQLite as WebAssembly in the browser, with IndexedDB / OPFS storage
-  and web workers. React Native's runtime has none of these, so this package targets React in the
-  browser (Vite, Next.js client components, Remix, and so on). For a native mobile app use the
-  [Flutter guide](/docs/guide/flutter).
+  The client runs SurrealDB and SQLite as WebAssembly with IndexedDB / OPFS storage and web
+  workers, which React Native does not have. Use it with React in the browser (Vite, Next.js client
+  components, Remix); for a native mobile app use the [Flutter guide](/docs/guide/flutter).
 </Warning>
-
-## How it fits React
-
-- **Tear-free reads.** Every hook reads its state through `useSyncExternalStore`, so a concurrent
-  render never sees two different versions of a query or of the sync status.
-- **Structural sharing.** Each live update is merged into the previous result: rows are matched by
-  `id`, unchanged rows keep their object identity, and an update that changed nothing does not
-  re-render at all. `React.memo` rows and `useMemo` deps keyed on a row only re-run when that row
-  changed.
-- **Lifecycle in effects.** The client, query registrations, CRDT fields, channels and file leases
-  are opened in effects and released in their cleanups, never during render. StrictMode's double
-  mount ends with exactly one of each.
-- **Local-first writes.** The engine commits a write locally and re-renders every affected query
-  before it syncs, so there is no optimistic layer to maintain. Mutations are plain
-  `await db.create(...)` calls; `useSubmission` adds button pending and error state.
 
 ## Setup
 

@@ -12,48 +12,20 @@ import Warning from '../../../components/ui/Warning.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
-`@spooky-sync/client-svelte` brings Sp00ky to Svelte 5, built on runes. Your components read live
-queries through reactive getters (`posts.data`, `posts.isLoading`), every write lands in the local
-database first, and the engine keeps that database in sync with the server and with every other
-tab and device in the background. Queries paint from the local cache on reload, keep working
-offline, and update the moment anyone changes a row they match.
+`@spooky-sync/client-svelte` connects Svelte 5 apps to Sp00ky, built on runes. A live query is an
+object of reactive getters (`posts.data`, `posts.isLoading`) that markup, `$derived` and `$effect`
+track like any other state. Every write lands in the local database first, and the engine syncs it
+with the server and every other tab and device in the background. Reloads paint from the local
+cache, and the app keeps working offline.
 
-This guide walks through a complete app: setup, queries, sign-in, writes, sync status, files,
+This guide builds a complete app: setup, queries, sign-in, writes, sync status, files,
 collaborative fields and peer to peer channels. It needs Svelte 5.29 or newer.
 
 <Warning title="Browser only">
-  The client runs SurrealDB and SQLite as WebAssembly, with IndexedDB / OPFS storage and web
-  workers. `<Sp00kyProvider>` creates the client in `onMount`, so a server render only produces its
-  `fallback`. In SvelteKit, turn server rendering off for the app (`export const ssr = false` in the
-  root `+layout.ts`): the client does not load on the server, and a local-first app paints from the
-  local cache anyway.
+  The client runs SurrealDB and SQLite as WebAssembly with IndexedDB / OPFS storage and web
+  workers, so it only runs in the browser. `<Sp00kyProvider>` renders its `fallback` during a
+  server render; in SvelteKit, turn server rendering off as shown below.
 </Warning>
-
-## How it fits Svelte
-
-- **Runes, no stores.** Results live in `$state.raw` and are read through getters, so markup,
-  `$derived` and `$effect` track exactly the fields they read.
-- **Getters in, getters out.** An input that should follow your state is passed as a getter
-  (`() => db.query(...).build()`, `() => postId`). A hook returns an object whose fields are
-  getters, and a hook with a single value exposes it as `.current`, like `svelte/reactivity`.
-- **Structural sharing.** Each live update is merged into the previous result: rows are matched by
-  `id`, unchanged rows keep their object identity, and an update that changed nothing is the same
-  value. A keyed `{#each}` only updates the rows that changed, and nothing reading `data` re-runs
-  for an update that changed nothing. Rows stay plain objects, never deep proxies.
-- **Engine status through `createSubscriber`.** `useSyncStatus`, `usePendingMutations` and the other
-  status hooks subscribe to the engine only while something reads them, read the engine's own
-  current value (nothing to go stale), and unsubscribe when the last reader is gone. The same
-  primitive backs Svelte's `MediaQuery`.
-- **Lifecycle in effects.** Query registrations, CRDT fields, channels and file leases are opened in
-  `$effect` and released in its teardown, so they end with the component.
-- **Snippets and attachments.** The provider's `fallback` is a snippet; `<BucketImage>` reveals the
-  image through an `{@attach}` decode gate.
-- **`$state` payloads are safe to write.** A `$state` object is a Proxy, which cannot reach the
-  SQLite and shared-tabs workers. Writes copy plain objects and arrays before they reach the
-  engine, and leave class instances (`RecordId`, `Date`, bytes) as they are.
-- **Local-first writes.** The engine commits a write locally and re-renders every affected query
-  before it syncs, so there is no optimistic layer to maintain. Mutations are plain
-  `await db.create(...)` calls; `useSubmission` adds button pending and error state.
 
 ## Setup
 

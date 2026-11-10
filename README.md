@@ -74,6 +74,7 @@ const ThreadList = () => {
 | [`@spooky-sync/backend`](https://www.npmjs.com/package/@spooky-sync/backend)             | Backend SDK: durable workflows (`step.do`) on sp00ky's job engine |
 | [`@spooky-sync/cli`](https://www.npmjs.com/package/@spooky-sync/cli)                     | CLI for schema generation                          |
 | [`@spooky-sync/query-allowlist`](https://www.npmjs.com/package/@spooky-sync/query-allowlist) | Records the query allowlist from an app's `q*` module (`spky generate`) |
+| [`spooky-core`](packages/core-rs) (Rust crate, git)                                      | Native Rust client: same sync engine, for desktop apps, CLIs and services ([guide](https://mono424.github.io/sp00ky/docs/guide/rust)) |
 | [`mono424/spooky-ssp`](https://hub.docker.com/r/mono424/spooky-ssp)                     | SSP sidecar (Docker)                               |
 | [`mono424/spooky-scheduler`](https://hub.docker.com/r/mono424/spooky-scheduler)          | Scheduler service, and the operator dashboard and MCP server it serves on port 9668 (Docker) |
 

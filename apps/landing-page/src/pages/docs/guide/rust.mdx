@@ -1,0 +1,885 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Rust guide
+description: Use the native Rust client for local-first sync in desktop apps, CLIs and services, with types generated from your schema.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+`spooky-core` (lib `spooky_core`) is the native Rust client for sp00ky. It runs the same engine as
+the TypeScript (`@spooky-sync/core`) and Dart (`spooky_core`) clients, so a Rust desktop app, a
+Flutter app and a web tab sync the same rows the same way:
+
+- **Local-first.** Rows live in a sqlite store, one file per signed-in account. Queries paint from it
+  before the network answers. Writes apply at once and sync through an outbox that survives restarts.
+- **Live.** A query is a materialized view. The in-process circuit (the `ssp` crate, no FFI) keeps it
+  current as local writes land, and the server's membership keeps it in step with every other client.
+- **Any executor.** The engine runs on its own thread with its own tokio runtime. `Sp00kyClient` is
+  `Send + Sync + Clone`, and its futures and watch channels work from GPUI, smol, tokio or a plain
+  `block_on`.
+
+<Note>
+  The crate is not on crates.io yet. Install it from git, and pin a `rev` for reproducible builds.
+  It needs Rust 1.85 or newer.
+</Note>
+
+## Install
+
+<CodeBlock fileName="Cargo.toml" code={installCode} lang="toml" />
+
+Two features, both on by default: `remote` (the SurrealDB WebSocket transport; without it the client
+is local-only) and `codegen` (schema to Rust, for build scripts). The generated code needs nothing
+but `spooky_core`.
+
+## Generate types from the schema
+
+The examples on this page use this schema, the same one `tests/live_stack.rs` runs against:
+
+<CodeBlock fileName="schema/src/schema.surql" code={schemaCode} lang="sql" />
+
+Generate Rust from it in a build script and include the output as a module:
+
+<CodeBlock fileName="build.rs" code={buildRsCode} lang="rust" />
+
+<CodeBlock fileName="src/db.rs" code={dbRsCode} lang="rust" />
+
+The generated `db.rs` holds:
+
+| Item | What it is |
+| --- | --- |
+| `schema()`, `SURQL_SCHEMA` | The runtime schema and the SurrealQL for the local store, server-only (`-- @nosync`) fields stripped. |
+| `config(DatabaseConfig)` | A `Sp00kyConfig` for this schema. Start every client from it. |
+| `Note`, `NotePatch` | A serde struct per table (`id` plus every synced field) and an all-`Option` partial update. |
+| `Note::rank`, `Note::owner`, ... | Typed field tokens: each only takes operands of its column's type. |
+| `AuthApi` | `sign_in_<access>` / `sign_up_<access>` per `DEFINE ACCESS`, params as `&str`. |
+| `Backends` | One method per backend route, when you pass OpenAPI specs (see [Backend jobs](#backend-jobs)). |
+| `AppDb` | The facade: `AppDb::new(client.clone()).note()`, `.auth()`, `.run()`. |
+
+`record<..>` fields are `String`s holding `table:id`, `datetime` fields are `spooky_core::typed::Datetime`,
+`option<..>` fields are `Option`s.
+
+## Open the client
+
+<CodeBlock fileName="src/sync.rs" code={openCode} lang="rust" />
+
+`Sp00kyClient::open` starts the engine thread and runs the local half of boot: the store opens, the
+schema is provisioned, the circuit is restored from its snapshot and the cached session is restored.
+It returns once a query registered next can paint from the local cache. Connecting, verifying the
+session and registering queries with the server run in the background.
+
+Without `.endpoint(..)` the client is local-only: writes and live queries work, nothing syncs. That is
+also the quickest way to test your own code (see [Tests](#tests)). For a local `spky dev` stack the
+endpoint is `ws://127.0.0.1:8666/rpc`.
+
+The other knobs are public fields on the config:
+
+| Field | Default | What it does |
+| --- | --- | --- |
+| `database.store` | `StoreType::Memory` | `StoreType::File(path)`: sqlite files derived from `path` (`spooky.db` becomes `spooky.<bucket>.db`, one per account). |
+| `database.max_concurrent_queries` | `6` | Remote reads in flight at once. Writes go one at a time in a lane of their own. |
+| `database.token` | `None` | A token to authenticate with on connect. |
+| `persistence` | `PersistenceConfig::Session` | Where the boot hint and auth token live: a session database next to the store, or `Memory`. |
+| `blob_cache` | in memory, 256 MB | `BlobCacheConfig { directory, max_bytes, clear_on_sign_out }` for bucket files. |
+| `stream_debounce_ms` | `50` | Minimum gap between two re-materializations of one query. |
+| `ref_sync_interval_ms` | `500` | Base cadence of the membership poll. |
+| `enable_anonymous_live_queries` | `false` | Realtime sync while signed out. Must match the server's `anonymousLiveQueries`. |
+| `sync_health` | degraded after 3 failures | `SyncHealthConfig::DISABLED` never reports degraded. |
+| `reconnect` | 15 s backoff cap, 20 s heartbeat | `ReconnectConfig`: backoff, heartbeat interval and timeout, connect timeout. |
+| `circuit_checkpoint_ms` | `30000` | How often a changed circuit is snapshotted to the store. |
+| `channels` | `None` | Peer to peer channels (see [Channels](#peer-to-peer-channels)). |
+
+## Authentication
+
+<CodeBlock code={authCode} lang="rust" />
+
+`sign_in` and `sign_up` go through `DEFINE ACCESS <access>` with the params it declares. They resolve
+after the account switch: that user's local store is open and the registered queries run against it.
+`sign_out` pushes queued writes first while the session is still valid.
+
+`auth_state()` (and `auth_watch()`) carries the user id, the user row (`current_user`), the token, the
+access method, `is_loading`, `is_impersonating` and a deferred `verification_error` (the restored
+session stays usable). `check_auth(None)` verifies the session against the server now;
+`authenticate(token)` / `deauthenticate()` drive the socket with a token from outside the client.
+
+## Live queries
+
+Build a query on a table, then `live` registers it and subscribes in one call. The query stays
+registered, and its rows live, while the returned `LiveQuery` does.
+
+<CodeBlock code={queriesCode} lang="rust" />
+
+A `LiveQuery` reads like a watch channel: the latest rows are always there, a slow consumer never builds
+a backlog.
+
+| Method | Returns |
+| --- | --- |
+| `rows()` | `Arc<Vec<Row>>`, the latest rows. `Row` is a `BTreeMap<String, Value>`. |
+| `rows_as::<T>()` | The latest rows decoded into your `Deserialize` type. |
+| `changed().await` | Waits for the next change; `Err(Error::Closed)` once the client is gone. |
+| `status()` | `QueryStatus::Fetching` while bodies are being pulled, else `Idle`. |
+| `is_authoritative()` | True once server membership is known. Only then does an empty list mean "empty". |
+| `rows_watch()`, `status_watch()`, `authority_watch()` | The underlying `tokio::sync::watch` receivers. |
+| `into_stream()` | The current rows, then every change, as a `futures::Stream`. |
+
+Rows hold plain JSON shapes: record links are `table:id` strings and datetimes are ISO strings.
+
+The builder covers filters, ordering, paging and joins. Conditions are AND-joined, one per field;
+a repeated field replaces the earlier condition. String values for `record<..>` and `datetime` columns
+are re-typed from the schema, so `where_eq("owner", "user:ada")` matches on the server.
+
+<CodeBlock code={builderCode} lang="rust" />
+
+`.related(field)` follows a relationship from the schema: a forward `record<x>` field joins one row
+under the same name, the reverse direction joins a list. Use `.related_with(field, |q| q.limit(5))`
+to shape the joined rows. `.one()` limits to one row, `.select([..])` projects fields.
+
+### Raw SurrealQL
+
+`live_raw` registers any `SELECT` the stream processor can run. Raw params are sent as given, so pass
+record links as `RecordId` values. `QueryOptions::ttl` sets how long the server keeps the view after
+the last subscriber leaves (`10m` by default).
+
+<CodeBlock code={rawCode} lang="rust" />
+
+`query_raw` registers without subscribing and returns the hash; `subscribe(hash)` attaches a
+`LiveQuery` to it later. `preload_query(builder)` (or `preload(sql, params, options)`) prewarms a query:
+it returns at once when the query resolved before on this device, otherwise once the server's
+membership and every row are local. `query_remote(sql, vars)` is a one-shot server read that is not
+synced into the local store: use it for counts and other reads a view cannot express.
+
+## Typed rows
+
+`rows_as` decodes into any `Deserialize` type, your own or a generated one:
+
+<CodeBlock code={rowsAsCode} lang="rust" />
+
+The generated `AppDb` adds typed filters and writes. Its `query()` gives a `TypedQuery` that
+`client.live_typed(..)` runs:
+
+<CodeBlock code={typedCode} lang="rust" />
+
+<Note>
+  `AppDb` writes go through the `TypedClient` trait, whose futures are not `Send`. Await them in place
+  (a GPUI task, `block_on`, a `tokio::main` body or a `LocalSet`), not inside `tokio::spawn`. The plain
+  client methods (`client.create(..)` and friends) are `Send`.
+</Note>
+
+## Writes
+
+<CodeBlock code={writesCode} lang="rust" />
+
+`create`, `update` and `delete` are optimistic: the row changes in the local store and in every live
+query before the call returns, and the write is queued in the outbox, which is pushed in order in the
+background and survives restarts. Record ids are full `table:key` strings; `spooky_core::value::generate_id()`
+makes a fresh key.
+
+Writes take anything `IntoObject`: a `serde_json::json!({..})` object, a `serde_json::Map`, or an
+`Object`. `spooky_core::to_object(&value)` turns your own `Serialize` type into one. A `record<..>`
+field may be given as its `table:id` string: the schema re-types it before it reaches the server.
+`update` merges the given fields into the row. `read_row(id)` reads one row as the local store holds it.
+
+### Debounced updates
+
+For a text field saved as the user types, fold rapid updates into one outbox write:
+
+<CodeBlock code={debounceCode} lang="rust" />
+
+A debounced update applies locally at once, then writes the merged patch after the pause (300 ms by
+default). By default one write is kept per record and set of fields (`DebounceKey::RecordIdXFields`);
+`DebounceKey::RecordId` keeps one per record.
+
+## Failed writes
+
+A write the server rejects is undone locally and parked in a tray, so the app can show it and let
+the user retry or drop it:
+
+<CodeBlock code={trayCode} lang="rust" />
+
+Each `FailedMutationRow` has the mutation type, the record id, the data, the row as it was before
+(`before_record`), the error (`message` and `kind`), the attempt count and how much was reverted.
+`retry_failed_mutation(id)` re-applies it as a new optimistic write; `discard_failed_mutation(id)` drops it.
+
+## Sync indicators
+
+Every indicator is a value you can read now plus a `tokio::sync::watch` receiver for every change
+after. Watch receivers need no tokio runtime on your side, so they work on any executor.
+
+| What | Now | Every change |
+| --- | --- | --- |
+| Sync health (the "can't reach the server" banner) | `sync_health()` | `sync_health_watch()` |
+| Queued writes | `pending_mutation_count()` | `pending_mutations_watch()` |
+| Queries a user waits on | `fetching_query_count()` | `fetch_activity_watch()` |
+| Rejected writes | `failed_mutation_count()` | `failed_mutations_watch()` |
+| Records with unacknowledged writes | `unsynced_record_ids()` | `unsynced_records_watch()` |
+| Signed-in user / auth session | `user_id()` / `auth_state()` | `user_watch()` / `auth_watch()` |
+
+<CodeBlock code={syncCode} lang="rust" />
+
+`SyncHealth` has `status` (`Healthy` or `Degraded`), `consecutive_failures`, `kind` (`network` or
+`application`) and `error` while degraded, `ever_connected`, and `connection` (the socket's own
+state, independent of health). `client.events()` is a broadcast of every engine event
+(records, statuses, mutations, health, logs) for diagnostics; a slow receiver skips.
+See [Offline & sync health](/docs/client/offline-sync) for what each signal means.
+
+## Buckets
+
+<CodeBlock code={bucketsCode} lang="rust" />
+
+`read` goes through the blob cache: a warm read never touches the socket. Give
+`BlobCacheConfig::directory` a path to keep files on disk between runs; without one the cache is in
+memory. Files never expire by age: the least recently used go past `max_bytes`, files are kept per
+signed-in user, and `put` / `delete` on a path invalidate it. `get` always reads the server,
+`evict(path)` drops the cached copy, and `client.blob_cache_stats()` reports hits, misses and size.
+Buckets need a remote endpoint; see [File buckets](/docs/client/buckets) for defining them.
+
+## Feature flags and releases
+
+<CodeBlock code={flagsCode} lang="rust" />
+
+`feature(key, fallback)` is live: `variant()` is the assigned variant, or the fallback while the user
+has none, `enabled()` is true for any variant other than `off`, and `payload_as::<T>()` decodes the
+flag's payload. `app_release(app)` watches the latest release announced for `app`; `update_available`
+compares it with your version. Both need a remote endpoint and stay live while the handle lives. See
+[Feature flags](/docs/client/feature-flags) and
+[Telling clients a new version shipped](/docs/client/offline-sync#telling-clients-a-new-version-shipped).
+
+## Backend jobs
+
+`run(backend, path, payload, options)` enqueues a job for a backend: a row in the backend's outbox table,
+written through the same optimistic path as any other write, so it queues while offline.
+
+<CodeBlock code={jobsCode} lang="rust" />
+
+The backend must be in the client schema. Pass its OpenAPI spec to codegen, which also generates a
+typed method per route (`app.run().api().spookify(..)`): required args are plain parameters,
+optional ones `Option`s.
+
+<CodeBlock fileName="build.rs" code={backendsBuildCode} lang="rust" />
+
+`RunOptions` sets `assigned_to`, `max_retries`, `retry_strategy`, `timeout` and `delay` (ms). See
+[Add a backend](/docs/backend/add) for the server side.
+
+## Peer to peer channels
+
+<Experimental>
+  Channels are experimental. The Rust client speaks the same wire protocol as the web and Flutter
+  clients, so all three connect to each other.
+</Experimental>
+
+Tables marked `-- @channel` can carry writes straight between devices over WebRTC, so a peer's change
+(a cursor, a chat message, a move) shows up before the server has it. The core has no WebRTC stack of
+its own: the app adapts one (webrtc-rs, libwebrtc bindings, ...) to the `RtcPeerConnection` and
+`RtcDataChannel` traits in `spooky_core::modules::channel` and hands the factory in through the config.
+Without a factory (or a custom `transport`) channels report `ChannelStatus::Unsupported`.
+
+<CodeBlock code={channelsConfigCode} lang="rust" />
+
+Open a channel with the queries whose rows it carries and the users it connects to. Only the queries'
+`where` counts, evaluated against each row; they are never registered. A connection forms only when
+both sides list each other, your own id is skipped, and the transport starts once a user is signed in.
+
+<CodeBlock code={channelsCode} lang="rust" />
+
+Plain `client.update(..)` on a matching row reaches the peers of every open channel whose filter the
+row matches; `channel.create/update/delete` reach that channel's peers only. `-- @ephemeral` fields
+travel between peers and never reach the database. The channel closes when dropped.
+`channel.set_peers(..)` and `channel.set_queries(..)` change it in place. See
+[Peer to peer channels](/docs/client/channels) for the model, accept rules and TURN servers.
+
+## Native push
+
+<Experimental>
+  Native push is experimental. The core registers the device with the server; getting the device
+  token from APNs or FCM is up to the app.
+</Experimental>
+
+<CodeBlock code={pushCode} lang="rust" />
+
+Call `client.push()` once at startup: the first call installs the sign-out hook that unregisters this
+device while the session is still valid. `register` stores the device for the signed-in user and
+remembers the choice; `sync` (call it on every launch) brings the server in line after a token rotation
+and never fails, it answers a `PushSyncStatus`. `unsubscribe(all)`, `update(changes)`, `devices()`,
+`notify(message)`, `cancel(id)` and `test(title, body)` cover the rest. Errors are `PushError` with a
+`code` (`SignedOut`, `Disabled`, `NotSubscribed`, `Server`, ...). A client without an endpoint answers
+every call with `PushErrorCode::Server`. See [Native push](/docs/client/native-push) for the server setup.
+
+## Lifecycle
+
+The core cannot see the network or the app's lifecycle, so the app reports both:
+
+<CodeBlock code={lifecycleCode} lang="rust" />
+
+- `wake()` on a resume or a returning network: reset the reconnect backoff and probe the socket now.
+- `set_offline(true)` when the OS reports no network: a `preload` that never resolved on this device
+  returns at once instead of waiting for the server, so an app holding its first screen on it still opens.
+  Report it before the first `preload`.
+- `checkpoint().await` when the app goes to the background: snapshots the circuit so the next boot
+  restores it instead of re-reading every row. The client also checkpoints on its own (5 s after boot,
+  then every `circuit_checkpoint_ms`), and it is free when nothing changed.
+- `detach().await` when this install goes away for good: hands its views back to the server instead of
+  leaving them to expire.
+- `close().await` before the process exits.
+
+<Warning>
+  Dropping the last `Sp00kyClient` handle closes the client in the background, and a process that exits
+  right after may kill the engine thread before the snapshot is written. Await `client.close()` before
+  `main` returns.
+</Warning>
+
+## GPUI and other executors
+
+The engine never runs on your executor. `Sp00kyClient` talks to its thread over a channel, so any
+async runtime can await it, and a UI thread never blocks on sqlite or the socket. In GPUI, hold the
+client in your app state and pump a `LiveQuery` from a foreground task:
+
+<CodeBlock fileName="src/notes_view.rs" code={gpuiCode} lang="rust" />
+
+The same works with no async runtime at all:
+
+<CodeBlock fileName="src/main.rs" code={blockOnCode} lang="rust" />
+
+`client.live(..)` returns a `Send + 'static` future, so you can build it on one thread and await it on
+another. A `LiveQuery` is `Send` too: hand it to a background task with `tokio::spawn` if that is
+where your app lives.
+
+## The in-process engine
+
+`spooky_core::Engine` is the engine itself, without the thread: single-threaded on a tokio `LocalSet`,
+with the same calls returning non-`Send` futures and callback subscriptions. Use it when you already own
+a `LocalSet` (tests, embedding in a single-threaded runtime).
+
+<CodeBlock fileName="src/main.rs" code={engineCode} lang="rust" />
+
+`Engine::open` returns an `Rc<Engine>`. Its builder is bound to the engine, so `query(..).run(ttl)`
+registers and `query(..).subscribe(ttl, cb)` registers and watches in one call; `TypedQuery::watch`
+works the same way. Writes take an `Object` (use `object_from_json(json!(..))`), `close()` returns
+nothing, and the generated `AppDb` drives `Sp00kyClient` only.
+
+## Tests
+
+Inside your app, a local-only client (no endpoint, memory store, memory persistence) is a full engine
+with no server: writes land and live queries see them.
+
+<CodeBlock fileName="tests/notes.rs" code={appTestCode} lang="rust" />
+
+The crate's own suite runs from the monorepo:
+
+<CodeBlock code={testsCode} lang="bash" />
+
+`tests/live_stack.rs` signs up two clients of one user against a running stack and checks that
+creates, edits, ordering and deletes reach the other client live. It is skipped unless
+`SPOOKY_IT_ENDPOINT` is set, and the stack's database (`SPOOKY_IT_NS` / `SPOOKY_IT_DB`, default `main` /
+`rustcore`) must hold the schema at the top of this page. `tests/ws_client_live.rs` tests the raw
+WebSocket transport against a plain SurrealDB (`SURREAL_IT_ENDPOINT`), and the codegen goldens are
+refreshed with `SPOOKY_UPDATE_GOLDENS=1`.
+
+## Next steps
+
+<CardGrid>
+  <LinkCard
+    href="/docs/client/queries"
+    title="Reactive queries"
+    icon="live"
+    description="How views stay current, and what the builder compiles to."
+  />
+  <LinkCard
+    href="/docs/client/offline-sync"
+    title="Offline & sync health"
+    icon="offline"
+    description="What each sync signal means and when to show it."
+  />
+  <LinkCard
+    href="/docs/schema/generated-types"
+    title="Generated types"
+    icon="types"
+    description="Schema annotations that shape the generated code."
+  />
+  <LinkCard
+    href="/docs/how-it-works"
+    title="How it works"
+    icon="brain"
+    description="Why these queries stay current without polling."
+  />
+</CardGrid>
+
+export const installCode = `[dependencies]
+spooky-core = { git = "https://github.com/mono424/sp00ky", package = "spooky-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+spooky-core = { git = "https://github.com/mono424/sp00ky", package = "spooky-core" }`;
+
+export const schemaCode = `DEFINE ACCESS account ON DATABASE TYPE RECORD
+  SIGNUP ( CREATE user SET username = $username, password = crypto::argon2::generate($password) )
+  SIGNIN ( SELECT * FROM user WHERE username = $username AND crypto::argon2::compare(password, $password) )
+  DURATION FOR TOKEN 1h, FOR SESSION 1d;
+
+DEFINE TABLE user SCHEMAFULL PERMISSIONS FOR select, update, delete WHERE id = $auth.id FOR create WHERE true;
+DEFINE FIELD username ON TABLE user TYPE string ASSERT string::len($value) > 3;
+DEFINE FIELD password ON TABLE user TYPE string PERMISSIONS FOR select WHERE false;
+
+DEFINE TABLE note SCHEMAFULL PERMISSIONS FOR select, create, update, delete WHERE owner = $auth.id;
+DEFINE FIELD owner ON TABLE note TYPE record<user>;
+DEFINE FIELD title ON TABLE note TYPE string;
+DEFINE FIELD body ON TABLE note TYPE option<string>;
+DEFINE FIELD rank ON TABLE note TYPE int;`;
+
+export const buildRsCode = `fn main() {
+    let surql = std::fs::read_to_string("schema/src/schema.surql").unwrap();
+    let code = spooky_core::codegen::generate_rust(&surql, &[]).unwrap();
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("db.rs");
+    std::fs::write(out, code).unwrap();
+    println!("cargo:rerun-if-changed=schema/src/schema.surql");
+}`;
+
+export const dbRsCode = `include!(concat!(env!("OUT_DIR"), "/db.rs"));`;
+
+export const openCode = `use std::path::Path;
+
+use spooky_core::{BlobCacheConfig, DatabaseConfig, Sp00kyClient, StoreType};
+
+use crate::db;
+
+pub async fn open(data_dir: &Path) -> spooky_core::Result<Sp00kyClient> {
+    let mut config = db::config(
+        DatabaseConfig::new("main", "app")
+            .endpoint("wss://app.example.com/rpc")
+            .store(StoreType::File(data_dir.join("spooky.db"))),
+    );
+    // Keep bucket files on disk between runs.
+    config.blob_cache = BlobCacheConfig {
+        directory: Some(data_dir.join("blobs")),
+        ..Default::default()
+    };
+    Sp00kyClient::open(config).await
+}`;
+
+export const authCode = `use serde_json::json;
+
+client
+    .sign_up("account", json!({"username": "ada", "password": "correct horse"}))
+    .await?;
+// or, for an existing account:
+client
+    .sign_in("account", json!({"username": "ada", "password": "correct horse"}))
+    .await?;
+
+let me: String = client.user_id().expect("signed in"); // "user:..."
+
+// The generated AuthApi does the same with typed params:
+db::AppDb::new(client.clone())
+    .auth()
+    .sign_in_account("ada", "correct horse")
+    .await?;
+
+// Pushes queued writes first, then drops the session.
+client.sign_out().await?;
+
+// Elsewhere, in a task of its own: react to every sign-in and sign-out.
+let mut user = client.user_watch();
+while user.changed().await.is_ok() {
+    let current = user.borrow_and_update().clone();
+    println!("signed in as {current:?}");
+}`;
+
+export const queriesCode = `let mut notes = client
+    .live(
+        client
+            .query("note")
+            .where_eq("owner", me.as_str())
+            .order_by("rank", "desc")
+            .limit(50),
+    )
+    .await?;
+
+println!("{} notes from the local store", notes.rows().len());
+
+// Every change after: a local write, another device, the web app.
+while let Ok(rows) = notes.changed().await {
+    println!("{} notes", rows.len());
+}`;
+
+export const builderCode = `use spooky_core::modules::query_builder::{QueryOp, WhereValue};
+
+let query = client
+    .query("note")
+    .where_eq("owner", me.as_str())
+    .where_op("rank", QueryOp::new(">=", 3))
+    .where_or([
+        ("title", WhereValue::Eq("Inbox".into())),
+        ("body", WhereValue::Eq("pinned".into())),
+    ])
+    .order_by("rank", "desc")
+    .offset(20)
+    .limit(20)
+    .related("owner");
+
+// With a ttl: how long the server keeps the view after the last subscriber.
+let page = client.live_with_ttl(query, Some("1h")).await?;`;
+
+export const rawCode = `use spooky_core::{Object, QueryOptions, RecordId, Value};
+
+let params = Object::from([("owner".to_string(), Value::from(RecordId::parse(&me)))]);
+let top = client
+    .live_raw(
+        "SELECT * FROM note WHERE owner = $owner ORDER BY rank DESC LIMIT 5",
+        params,
+        QueryOptions { ttl: Some("1h".into()), ..Default::default() },
+    )
+    .await?;
+
+// A one-shot server read, not synced into the local store.
+let counts = client
+    .query_remote("SELECT count() FROM note GROUP ALL", None)
+    .await?;`;
+
+export const rowsAsCode = `#[derive(serde::Deserialize)]
+struct NoteTitle {
+    id: String,
+    title: String,
+}
+
+let titles: Vec<NoteTitle> = notes.rows_as()?;
+let full: Vec<db::Note> = notes.rows_as()?;`;
+
+export const typedCode = `use db::{AppDb, Note, NotePatch};
+use spooky_core::value::generate_id;
+
+let app = AppDb::new(client.clone());
+
+// Field tokens only take operands of the column's type.
+let query = app
+    .note()
+    .query()
+    .where_([Note::owner.eq(me.as_str()), Note::rank.gte(3)])
+    .order_by_desc(Note::rank)
+    .limit(20);
+let live = client.live_typed(query).await?;
+let notes: Vec<Note> = live.rows_as()?;
+
+let id = format!("note:{}", generate_id());
+app.note()
+    .create(&Note {
+        id: id.clone(),
+        owner: me.clone(),
+        title: "Hello".into(),
+        body: None,
+        rank: 1,
+    })
+    .await?;
+app.note()
+    .update(&id, &NotePatch { title: Some("Hello again".into()), ..Default::default() })
+    .await?;
+app.note().delete(&id).await?;`;
+
+export const writesCode = `use serde_json::json;
+use spooky_core::value::generate_id;
+
+let id = format!("note:{}", generate_id());
+client.create(&id, json!({"owner": me, "title": "Hello", "rank": 1})).await?;
+client.update(&id, json!({"title": "Hello again"})).await?;
+client.delete(&id).await?;
+
+// Your own Serialize types:
+#[derive(serde::Serialize)]
+struct NewNote<'a> {
+    owner: &'a str,
+    title: &'a str,
+    rank: i64,
+}
+let other = format!("note:{}", generate_id());
+let data = spooky_core::to_object(&NewNote { owner: &me, title: "Second", rank: 2 })?;
+client.create(&other, data).await?;`;
+
+export const debounceCode = `use serde_json::json;
+use spooky_core::{DebounceKey, DebounceOptions, UpdateOptions};
+
+// On every keystroke: one outbox write per pause, not one per key.
+client
+    .update_with(&id, json!({"title": draft}), UpdateOptions::debounced())
+    .await?;
+
+// A longer pause, one pending write per record whatever the fields.
+let options = UpdateOptions {
+    debounced: Some(DebounceOptions { key: DebounceKey::RecordId, delay_ms: Some(800) }),
+};
+client.update_with(&id, json!({"body": text}), options).await?;`;
+
+export const trayCode = `let mut failed = client.failed_mutations_watch();
+while failed.changed().await.is_ok() {
+    for row in client.list_failed_mutations().await? {
+        eprintln!(
+            "{} of {} was rejected: {}",
+            row.mutation_type.as_str(),
+            row.record_id,
+            row.error.message,
+        );
+        // Re-apply it as a new optimistic write, or drop it:
+        // client.retry_failed_mutation(&row.id).await?;
+        client.discard_failed_mutation(&row.id).await?;
+    }
+}`;
+
+export const syncCode = `// Read it now...
+let health = client.sync_health();
+println!("{:?}, degraded: {}", health.connection, health.is_degraded());
+
+// A per-row "not synced yet" mark:
+let unsynced = client.unsynced_record_ids();
+let is_pending = unsynced.contains(&note_id);
+
+// ...and on every change after.
+let mut health = client.sync_health_watch();
+while health.changed().await.is_ok() {
+    let h = health.borrow_and_update().clone();
+    show_offline_banner(h.ever_connected && h.is_degraded());
+}`;
+
+export const bucketsCode = `let avatars = client.bucket("avatars");
+
+avatars.put("ada.png", png_bytes).await?; // Vec<u8>, or a string for text
+let bytes: Option<Vec<u8>> = avatars.read("ada.png").await?; // through the cache
+let exists = avatars.exists("ada.png").await?;
+let files: Vec<String> = avatars.list(Some("a")).await?;
+avatars.evict("ada.png").await?; // drop the cached copy only
+avatars.delete("ada.png").await?;`;
+
+export const flagsCode = `let mut editor = client.feature("new-editor", Some("off")).await?;
+if editor.enabled() {
+    println!("variant {:?}", editor.variant());
+}
+
+#[derive(serde::Deserialize)]
+struct EditorConfig {
+    autosave_ms: u64,
+}
+let config: Option<EditorConfig> = editor.payload_as()?;
+
+let release = client.app_release("desktop").await?;
+if release.update_available(env!("CARGO_PKG_VERSION")) {
+    let latest = release.snapshot();
+    prompt_update(latest.version.as_deref(), latest.mandatory);
+}
+
+// Flags are live: targeting changes reach a running app.
+while let Ok(snapshot) = editor.changed().await {
+    println!("new-editor is now {:?}", snapshot.variant);
+}`;
+
+export const jobsCode = `use serde_json::json;
+use spooky_core::RunOptions;
+
+// "api" is the backend's key under apps: in sp00ky.yml, "/spookify" a route of its spec.
+client
+    .run("api", "/spookify", json!({"id": "thread:kv9b3b"}), RunOptions::default())
+    .await?;
+
+// Run it a minute from now, retrying up to five times.
+let options = RunOptions { delay: Some(60_000), max_retries: Some(5), ..Default::default() };
+client.run("api", "/spookify", json!({"id": "thread:kv9b3b"}), options).await?;
+
+// Typed, from the generated Backends:
+db::AppDb::new(client.clone()).run().api().spookify("thread:kv9b3b").await?;`;
+
+export const backendsBuildCode = `use spooky_core::codegen::{generate_rust, parse_open_api};
+
+fn main() {
+    let surql = std::fs::read_to_string("schema/src/schema.surql").unwrap();
+    let spec = std::fs::read_to_string("api/openapi.yml").unwrap();
+    // The backend's key under apps:, its spec, and its method.table (the outbox table).
+    let backends = [parse_open_api("api", &spec, Some("job")).unwrap()];
+    let code = generate_rust(&surql, &backends).unwrap();
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("db.rs");
+    std::fs::write(out, code).unwrap();
+    println!("cargo:rerun-if-changed=schema/src/schema.surql");
+    println!("cargo:rerun-if-changed=api/openapi.yml");
+}`;
+
+export const channelsConfigCode = `use std::rc::Rc;
+use std::sync::Arc;
+
+use futures::FutureExt; // boxed_local
+use spooky_core::modules::channel::{ChannelsConfig, RtcPeerConnection};
+
+let mut config = db::config(database);
+config.channels = Some(
+    ChannelsConfig {
+        // Runs on the engine thread; the connection it returns stays there.
+        rtc: Some(Arc::new(|rtc_configuration: serde_json::Value| {
+            async move {
+                // Your adapter over a WebRTC stack, implementing RtcPeerConnection.
+                let pc: Rc<dyn RtcPeerConnection> = Rc::new(MyPeerConnection::new(rtc_configuration).await?);
+                Ok::<_, spooky_core::Error>(pc)
+            }
+            .boxed_local()
+        })),
+        ..Default::default()
+    }
+    // Optional: decide per table whether to apply a peer's write.
+    .accept("call", |op| op.from != "user:blocked"),
+);`;
+
+export const channelsCode = `use serde_json::json;
+use spooky_core::value::object_from_json;
+
+// call is a -- @channel table; its cursor_pos field is -- @ephemeral.
+let lobby = client.query("call").where_eq("room", "lobby");
+let mut channel = client.channel(&[lobby], ["user:bob", "user:carol"]).await?;
+
+// Goes to this channel's peers; an @ephemeral field never reaches the database.
+channel
+    .update("call:lobby", object_from_json(json!({"cursor_pos": {"x": 10, "y": 4}})))
+    .await?;
+
+// Connection state: Idle, Connecting, Connected, Failed or Unsupported, plus connected users.
+while let Ok(state) = channel.changed().await {
+    println!("{:?} with {:?}", state.status, state.peers);
+}`;
+
+export const pushCode = `use spooky_core::modules::push::{
+    ApnsEnvironment, PushKind, PushPlatform, PushRegisterOptions, PushSyncOptions, PushToken,
+};
+
+// At startup, so sign-out can unregister this device while the session is valid.
+let push = client.push();
+
+// The device token comes from the platform; the core does not fetch it.
+let token = PushToken::new(PushKind::Apns, apns_hex_token, "com.example.notes")
+    .with_platform(PushPlatform::Macos)
+    .with_environment(ApnsEnvironment::Sandbox);
+
+// When the user turns notifications on:
+match push.register(token.clone(), PushRegisterOptions::default()).await {
+    Ok(device) => println!("registered {device:?}"),
+    Err(e) => eprintln!("push: {:?} {}", e.code, e.message),
+}
+
+// On every launch: token rotation, re-registration, sign-in changes.
+let status = push.sync(Some(token), PushSyncOptions::default()).await;
+
+// A visible test push to every device of the user.
+push.test(Some("Hello"), Some("from Rust")).await?;`;
+
+export const lifecycleCode = `client.wake();                 // foreground again, or the network came back
+client.set_offline(true);      // the OS reports no network (false when it returns)
+client.checkpoint().await?;    // going to the background
+client.detach().await?;        // this install is going away for good
+client.close().await?;         // before the process exits`;
+
+export const gpuiCode = `use gpui::Context;
+use spooky_core::Sp00kyClient;
+
+use crate::db::Note;
+
+pub struct NotesView {
+    client: Sp00kyClient,
+    notes: Vec<Note>,
+}
+
+impl NotesView {
+    fn watch_notes(&mut self, owner: String, cx: &mut Context<Self>) {
+        let live = self.client.live(self.client.query("note").where_eq("owner", owner));
+        cx.spawn(async move |this, cx| {
+            let Ok(mut live) = live.await else { return };
+            loop {
+                let notes = live.rows_as::<Note>().unwrap_or_default();
+                let alive = this.update(cx, |view, cx| {
+                    view.notes = notes;
+                    cx.notify();
+                });
+                // Stop when the view is gone or the client closed.
+                if alive.is_err() || live.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+}`;
+
+export const blockOnCode = `use futures::executor::block_on;
+use serde_json::json;
+use spooky_core::{DatabaseConfig, Sp00kyClient};
+
+mod db;
+
+fn main() -> spooky_core::Result<()> {
+    block_on(async {
+        let client = Sp00kyClient::open(db::config(
+            DatabaseConfig::new("main", "app").endpoint("ws://127.0.0.1:8666/rpc"),
+        ))
+        .await?;
+        client
+            .sign_in("account", json!({"username": "ada", "password": "correct horse"}))
+            .await?;
+        let notes = client.live(client.query("note").order_by("rank", "desc")).await?;
+        println!("{} notes", notes.rows().len());
+        client.close().await
+    })
+}`;
+
+export const engineCode = `use serde_json::json;
+use spooky_core::value::object_from_json;
+use spooky_core::{DatabaseConfig, Engine};
+
+mod db;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> spooky_core::Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let engine = Engine::open(db::config(DatabaseConfig::new("main", "app"))).await?;
+
+            let hash = engine.query("note").order_by("rank", "desc").run("10m").await?;
+            let _sub = engine.subscribe(&hash, |rows| println!("{} notes", rows.len()), true);
+
+            engine
+                .create("note:a", object_from_json(json!({"owner": "user:ada", "title": "Hi", "rank": 1})))
+                .await?;
+
+            engine.close().await;
+            Ok(())
+        })
+        .await
+}`;
+
+export const appTestCode = `use serde_json::json;
+use spooky_core::{DatabaseConfig, PersistenceConfig, Sp00kyClient, StoreType};
+
+mod db {
+    include!(concat!(env!("OUT_DIR"), "/db.rs"));
+}
+
+#[tokio::test]
+async fn a_new_note_shows_in_the_list() {
+    let mut config = db::config(DatabaseConfig::new("test", "test").store(StoreType::Memory));
+    config.persistence = PersistenceConfig::Memory;
+    let client = Sp00kyClient::open(config).await.unwrap();
+
+    let mut notes = client.live(client.query("note")).await.unwrap();
+    client
+        .create("note:a", json!({"owner": "user:ada", "title": "Hi", "rank": 1}))
+        .await
+        .unwrap();
+    while notes.rows().is_empty() {
+        notes.changed().await.unwrap();
+    }
+    client.close().await.unwrap();
+}`;
+
+export const testsCode = `# Unit and local tests, no server needed
+cargo test -p spooky-core
+
+# Against a running dev stack (spky dev)
+SPOOKY_IT_ENDPOINT=ws://127.0.0.1:8666/rpc SPOOKY_IT_NS=main SPOOKY_IT_DB=rustcore \\
+  cargo test -p spooky-core --test live_stack -- --nocapture
+
+# Refresh the codegen goldens after changing the emitter
+SPOOKY_UPDATE_GOLDENS=1 cargo test -p spooky-core --test codegen_goldens`;

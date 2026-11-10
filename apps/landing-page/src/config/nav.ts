@@ -51,6 +51,7 @@ export const docsNav = [
       { text: 'SolidJS', href: `${basePath}/docs/guide/solid` },
       { text: 'Solid 2 (RC)', href: `${basePath}/docs/guide/solid2` },
       { text: 'Flutter', href: `${basePath}/docs/guide/flutter` },
+      { text: 'Rust', href: `${basePath}/docs/guide/rust` },
       { text: 'Vanilla JS / TS', href: `${basePath}/docs/guide/vanilla` },
     ],
   },

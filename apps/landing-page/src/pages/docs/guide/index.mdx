@@ -1,0 +1,201 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Framework guides
+description: "Every sp00ky client side by side: which package to install, the same live query in each, and what each one supports."
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Note from '../../../components/ui/Note.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+export const solidCode = `import { For } from 'solid-js';
+import { useDb, useQuery } from '@spooky-sync/client-solid';
+
+const db = useDb<typeof schema>();
+const threads = useQuery(() =>
+  db.query('thread').orderBy('created_at', 'desc').limit(20).build()
+);
+
+<For each={threads.data() || []}>{(t) => <li>{t.title}</li>}</For>`;
+
+export const solid2Code = `import { For } from 'solid-js';
+import { createQuery, useDb } from '@spooky-sync/client-solid2';
+
+const db = useDb<typeof schema>();
+const threads = createQuery(
+  db.query('thread').orderBy('created_at', 'desc').limit(20).build()
+);
+
+<For each={threads.data()}>{(t) => <li>{t.title}</li>}</For>`;
+
+export const reactCode = `import { useDb, useQuery } from '@spooky-sync/client-react';
+
+const db = useDb<typeof schema>();
+const threads = useQuery(
+  db.query('thread').orderBy('created_at', 'desc').limit(20).build()
+);
+
+if (threads.isLoading) return <Spinner />;
+return threads.data.map((t) => <li key={String(t.id)}>{t.title}</li>);`;
+
+export const flutterCode = `// db is the AppDb generated from your schema
+final Stream<List<Thread>> threads = db.thread
+    .query()
+    .orderBy(Thread$.createdAt, desc: true)
+    .limit(20)
+    .watch();
+
+StreamBuilder<List<Thread>>(
+  stream: threads,
+  builder: (context, snap) => ListView(
+    children: [for (final t in snap.data ?? const <Thread>[]) Text(t.title)],
+  ),
+)`;
+
+export const rustCode = `let mut threads = client
+    .live(client.query("thread").order_by("created_at", "desc").limit(20))
+    .await?;
+
+println!("{} threads from the local store", threads.rows().len());
+
+// Every change after: a local write, another device, the web app.
+while let Ok(rows) = threads.changed().await {
+    println!("{} threads", rows.len());
+}`;
+
+export const vanillaCode = `import { client } from './db';
+
+const { hash } = await client
+  .query('thread', {})
+  .orderBy('created_at', 'desc')
+  .limit(20)
+  .build()
+  .run();
+
+const unsubscribe = await client.subscribe(hash, renderThreads, { immediate: true });`;
+
+sp00ky has one sync engine and a client for each place your app runs. The TypeScript core
+(`@spooky-sync/core`) runs in the browser, and the Solid, Solid 2 and React bindings wrap it in
+each framework's own reactivity. Flutter apps use the Dart client, and desktop apps, CLIs and
+services use the Rust client. They all talk to the same server with the same protocol, so a web
+app, a phone and a desktop app can share one database and see each other's writes live.
+
+## Pick a client
+
+| Client | Install | Runs on | Guide |
+| --- | --- | --- | --- |
+| SolidJS | `@spooky-sync/client-solid` | Browser, Solid 1.x | [SolidJS guide](/docs/guide/solid) |
+| Solid 2 (RC) | `@spooky-sync/client-solid2` | Browser, Solid 2.0 RC | [Solid 2 guide](/docs/guide/solid2) |
+| React | `@spooky-sync/client-react` | Browser, React 18 and 19 | [React guide](/docs/guide/react) |
+| Flutter | `spooky_core` and `spooky_flutter` (Dart, from git) | Flutter apps on iOS and Android | [Flutter guide](/docs/guide/flutter) |
+| Rust | `spooky-core` crate (from git) | Desktop apps, CLIs and services | [Rust guide](/docs/guide/rust) |
+| Vanilla JS / TS | `@spooky-sync/core` | Browser, with any framework or none | [Vanilla guide](/docs/guide/vanilla) |
+
+<Note title="React Native">
+  The TypeScript clients run SurrealDB and SQLite as WebAssembly with IndexedDB or OPFS and web
+  workers, which React Native does not have. For a mobile app, use the [Flutter](/docs/guide/flutter)
+  client.
+</Note>
+
+## The same live query in each
+
+The latest 20 threads, newest first. Each version paints from the local store first, then stays
+live: a local write, another tab or another device updates it without a refetch.
+
+### SolidJS
+
+<CodeBlock code={solidCode} lang="tsx" />
+
+### Solid 2
+
+<CodeBlock code={solid2Code} lang="tsx" />
+
+### React
+
+<CodeBlock code={reactCode} lang="tsx" />
+
+### Flutter
+
+<CodeBlock code={flutterCode} lang="dart" />
+
+### Rust
+
+<CodeBlock code={rustCode} lang="rust" />
+
+### Vanilla JS / TS
+
+<CodeBlock code={vanillaCode} lang="typescript" />
+
+## How each one hands you data
+
+| Client | Live results | Writes | Loading state |
+| --- | --- | --- | --- |
+| SolidJS | Accessors: `threads.data()` | `db.create` / `db.update` / `db.delete` | `isLoading()` |
+| Solid 2 | Accessors, plus `ready()` for `<Loading>` suspension | Same, plus `createSubmission` for button state | `isLoading()`, `isEmpty()`, `isSettled()` |
+| React | Plain values through `useSyncExternalStore`, rows keep their identity between updates | Same, plus `useSubmission` for button state | `isLoading`, `isEmpty`, `isSettled` |
+| Flutter | `Stream<List<T>>` from the generated `AppDb`, for a `StreamBuilder` | `create` / `update` / `delete` on the client or the typed tables | `isQueryAuthoritative`, `isQuerySettled` |
+| Rust | `LiveQuery`: `rows()` now, `changed().await` for each update | `create` / `update` / `delete`, typed structs from `build.rs` | `is_authoritative()` and `status()` on the live query |
+| Vanilla | `client.subscribe(hash, callback)` | `client.create` / `update` / `delete` | `subscribeQueryAuthority`, `subscribeQueryStatus` |
+
+Every client writes to the local store first and syncs in the background, so writes work offline
+and the UI updates before the server answers.
+
+## What each client supports
+
+| Feature | Solid | Solid 2 | React | Flutter | Rust | Vanilla |
+| --- | --- | --- | --- | --- | --- | --- |
+| [Live queries](/docs/client/queries), [mutations](/docs/client/mutations), [auth](/docs/client/auth) | Yes | Yes | Yes | Yes | Yes | Yes |
+| [Offline and sync health](/docs/client/offline-sync) | Yes | Yes | Yes | Yes | Yes | Yes |
+| [File buckets](/docs/client/buckets) | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `BucketImage` | Yes | Yes |
+| [Feature flags](/docs/client/feature-flags) and app releases | Yes | Yes | Yes | Yes | Yes | Yes |
+| [CRDT fields](/docs/client/crdt) | Yes | Yes | Yes | No | No | Yes |
+| [Peer to peer channels](/docs/client/channels) | Yes | Yes | Yes | Yes | Yes | Yes |
+| Push | [Web Push](/docs/client/push-notifications) | Web Push | Web Push | [APNs and FCM](/docs/client/native-push) | APNs and FCM | Web Push |
+
+## One schema, every client
+
+All clients read the same `.surql` schema. `spky generate` writes the TypeScript and Dart types
+from the `clientTypes` entries in `sp00ky.yml`, and Rust apps generate theirs from a `build.rs`.
+See [Generated types](/docs/schema/generated-types).
+
+## Guides
+
+<CardGrid cols={3}>
+  <LinkCard
+    href="/docs/guide/solid"
+    title="SolidJS"
+    icon="code"
+    description="Full walkthrough: provider, queries, auth, mutations."
+  />
+  <LinkCard
+    href="/docs/guide/solid2"
+    title="Solid 2 (RC)"
+    icon="code"
+    description="createQuery, <Loading> suspension, createSubmission."
+  />
+  <LinkCard
+    href="/docs/guide/react"
+    title="React"
+    icon="code"
+    description="Provider, useQuery with structural sharing, status hooks."
+  />
+  <LinkCard
+    href="/docs/guide/flutter"
+    title="Flutter"
+    icon="mobile"
+    description="Generated Dart models and offline-first mobile apps."
+  />
+  <LinkCard
+    href="/docs/guide/rust"
+    title="Rust"
+    icon="code"
+    description="Native client for desktop apps, CLIs and services."
+  />
+  <LinkCard
+    href="/docs/guide/vanilla"
+    title="Vanilla JS / TS"
+    icon="terminal"
+    description="No framework required. Use the core client directly."
+  />
+</CardGrid>

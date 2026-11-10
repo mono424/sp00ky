@@ -986,6 +986,7 @@ mod tests {
             "The token has expired",
             "The session has expired",
             "There was a problem with authentication",
+            "No record was returned",
         ] {
             let e = Error::Rpc {
                 code: -32000,

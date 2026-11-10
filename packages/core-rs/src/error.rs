@@ -65,8 +65,10 @@ impl Error {
 
     /// The server refused the credential itself rather than the request: a
     /// bad or revoked token, a token past its `DURATION FOR TOKEN` ("The
-    /// token has expired"), or a session past its `DURATION FOR SESSION`.
-    /// Retrying with the same token cannot succeed.
+    /// token has expired"), a session past its `DURATION FOR SESSION`, or a
+    /// record access whose SIGNIN matched no record ("No record was
+    /// returned": wrong credentials, a revoked key). Retrying with the same
+    /// credentials cannot succeed.
     pub fn is_auth_rejection(&self) -> bool {
         let message = self.to_string().to_lowercase();
         [
@@ -76,6 +78,7 @@ impl Error {
             "has expired",
             "authentication failed",
             "problem with authentication",
+            "no record was returned",
         ]
         .iter()
         .any(|p| message.contains(p))

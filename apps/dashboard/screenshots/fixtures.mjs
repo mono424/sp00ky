@@ -424,6 +424,8 @@ export const OVERVIEW = {
 };
 
 export const CONFIG = {
+  data: true,
+  flags: true,
   scheduler_id: 'scheduler-0',
   version: '0.0.1-canary.265',
   breakglass_available: true,
@@ -1041,20 +1043,30 @@ const LOG_LINES = [
 ];
 
 /**
- * Twenty minutes of tail: the lines above on a loop, a line every few seconds,
- * with one bad stretch (a backend timing out, then a job failing) so the page
- * has levels to tell apart.
+ * Three hours of tail, about eight thousand lines: the lines above on a loop,
+ * busier toward now and uneven on the way, with numbers that vary line to
+ * line, and one bad stretch (a backend timing out, then a job
+ * failing) so the histogram has a shape and the page has levels to tell apart.
+ * Seeded, so every run draws the same chart.
  */
 const LOG_TAIL = (() => {
+  let seed = 7;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
   const out = [];
-  const span = 20 * 60_000;
-  let t = span;
+  const span = 3 * 3_600_000;
+  // The bad stretch: 40 to 52 minutes before the newest line.
+  const badFrom = span - 52 * 60_000;
+  const badTo = span - 40 * 60_000;
+  let t = 0;
   let i = 0;
-  while (t > 0) {
+  while (t < span) {
     const base = LOG_LINES[i % LOG_LINES.length];
-    const minute = Math.floor((span - t) / 60_000);
-    let line = { ...base, fields: '' };
-    if (minute >= 11 && minute <= 13 && i % 3 === 0) {
+    let line = {
+      ...base,
+      message: base.message.replace(/\b\d{2,}\b/g, (d) => String(Math.max(1, Math.round(Number(d) * (0.6 + rand() * 0.8))))),
+      fields: '',
+    };
+    if (t > badFrom && t < badTo && i % 3 === 0) {
       line = {
         level: 'WARN',
         target: 'scheduler::backends',
@@ -1062,16 +1074,20 @@ const LOG_TAIL = (() => {
         fields: 'backend=worker attempt=1',
       };
     }
-    if (minute === 12 && i % 5 === 0) {
+    if (t > badFrom + 4 * 60_000 && t < badTo - 3 * 60_000 && i % 5 === 0) {
       line = {
         level: 'ERROR',
         target: 'scheduler::jobs',
         message: 'job /jobs/welcome-mail failed: backend returned 503',
-        fields: 'table=digest_job attempt=4 max=4',
+        fields: 'table=digest_job attempt=4 max=4 error=upstream connect error or disconnect/reset before headers',
       };
     }
-    out.push({ ...line, ts: ago(t) });
-    t -= 3_000 + ((i * 1_700) % 4_000);
+    out.push({ ...line, ts: ago(span - t) });
+    // Traffic climbs toward now, drifts window to window, and bursts now and then.
+    const w = Math.floor(t / 90_000);
+    const drift = 0.5 + 0.5 * Math.sin(w * 1.7) * Math.cos(w * 0.31);
+    const load = 0.25 + 1.1 * (t / span) + 0.55 * drift + (w % 23 === 7 || w % 31 === 12 ? 1.4 : 0);
+    t += Math.round((400 + rand() * 2_400) / load);
     i++;
   }
   return out;
@@ -1185,16 +1201,26 @@ const service = (id, name, role, vcpus, memoryMb, cpu, cpuSwing, memMb, extra = 
 };
 /** A container's volumes on the host disk (160 GB, 62 GB of it free). */
 const disk = (usedBytes) => ({ disk: { used_bytes: usedBytes, fs_bytes: 171_798_691_840, free_bytes: 66_571_993_088, measured_at: iso(2 * 60_000) } });
+/** The database's own volume: 50 GB. */
+const volumeDisk = (usedBytes) => ({ disk: { used_bytes: usedBytes, fs_bytes: 52_521_566_208, free_bytes: 47_900_000_000, measured_at: iso(2 * 60_000) } });
 const CLOUD_STATS = {
   deployment: { id: 'dep_7f2c', version: 142, status: 'running', deployed_at: iso(2 * 3_600_000) },
   services: [
-    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740, disk(4_617_089_843)),
-    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210, disk(1_288_490_189)),
-    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380, disk(402_653_184)),
-    service('vm-api', 'api', 'backend', 1, 512, 6, 3, 212, { image: 'acme/api' }),
-    service('vm-mail', 'email', 'backend', 1, 512, 1.2, 0.6, 64, { image: 'acme/email' }),
-    service('vm-render', 'renderer', 'backend', 1, 64, 0.4, 0.2, 9, { image: 'nginx:1.27-alpine', machine: 'media' }),
-    service('vm-web', 'web', 'frontend', 1, 512, 0.3, 0.2, 18, { image: 'acme/web' }),
+    service('vm-db', 'surrealdb', 'surrealdb', 3, 3072, 38, 14, 1740, { ...volumeDisk(4_617_089_843), host: 'db' }),
+    service('vm-sched', 'scheduler', 'scheduler', 1, 3072, 11, 4, 1210, { ...disk(1_288_490_189), host: 'app' }),
+    service('vm-ssp0', 'ssp-0', 'ssp', 1, 2048, 24, 9, 1380, { ...disk(402_653_184), host: 'app' }),
+    service('vm-api', 'api', 'backend', 1, 512, 6, 3, 212, { image: 'acme/api', host: 'app' }),
+    service('vm-mail', 'email', 'backend', 1, 512, 1.2, 0.6, 64, { image: 'acme/email', host: 'app' }),
+    service('vm-render', 'renderer', 'backend', 1, 64, 0.4, 0.2, 9, { image: 'nginx:1.27-alpine', machine: 'media', host: 'app' }),
+    service('vm-web', 'web', 'frontend', 1, 512, 0.3, 0.2, 18, { image: 'acme/web', host: 'app' }),
+    service('vm-link-db', 'dblink-db', 'dblink', 1, 128, 1.1, 0.4, 17, { host: 'db' }),
+    service('vm-link-app', 'dblink-app', 'dblink', 1, 128, 1.2, 0.4, 17, { host: 'app' }),
+  ],
+  hosts: process.env.FX_SHARED_HOST ? [] : [
+    { kind: 'db', status: 'ready', server_type: 'cax21', location: 'fsn1', vcpus: 4, memory_bytes: 8_106_127_360, memory_used_bytes: 2_560_000_000,
+      disk_bytes: 80_307_429_376, disk_used_bytes: 4_210_000_000, cpu_pct: 12.4, load1: 0.42, measured_at: iso(31_000), data_volume_gb: 50 },
+    { kind: 'app', status: 'ready', server_type: 'cx33', location: 'fsn1', vcpus: 4, memory_bytes: 8_106_127_360, memory_used_bytes: 3_180_000_000,
+      disk_bytes: 80_307_429_376, disk_used_bytes: 18_740_000_000, cpu_pct: 21.7, load1: 0.86, measured_at: iso(31_000) },
   ],
   metrics_available: true,
   machines: [
@@ -1298,7 +1324,118 @@ const scheduleDetail = (sc) => {
   };
 };
 
+/** The Database, Users and Storage pages (`/data`), with no database behind them. */
+const DATA_TABLES = [
+  { name: 'game', kind: 'normal', schemafull: true, view: false, internal: false },
+  { name: 'puzzle', kind: 'normal', schemafull: true, view: false, internal: false },
+  { name: 'user', kind: 'normal', schemafull: true, view: false, internal: false },
+  { name: 'follows', kind: 'relation', in: ['user'], out: ['user'], schemafull: true, view: false, internal: false },
+  { name: '_00_admin', kind: 'normal', schemafull: true, view: false, internal: true },
+  { name: '_00_query', kind: 'normal', schemafull: true, view: false, internal: true },
+];
+const dataField = (name, kind, extra = {}) => ({ name, kind, optional: kind.startsWith('none |'), nested: false, readonly: false, flexible: false, credential: false, required: !kind.startsWith('none |'), ...extra });
+const DATA_USER_FIELDS = [
+  dataField('username', 'string'),
+  dataField('email', 'none | string'),
+  dataField('password', 'string', { credential: true }),
+  dataField('rating', 'none | int'),
+  dataField('coach', 'none | record<user>'),
+  dataField('created_at', 'datetime', { default: 'time::now()', required: false, readonly: true }),
+];
+const DATA_USERS = [
+  ['mira', 'mira@acme.dev', 2210, 3, 2, 400],
+  ['jonas', 'jonas@acme.dev', 1874, 0, 0, 90],
+  ['ana', 'ana@acme.dev', 1650, 1, 1, 60],
+  ['kofi', null, 1422, 0, 0, 21],
+  ['lena', 'lena@acme.dev', 2044, 0, 0, 2],
+].map(([username, email, rating, views, sessions, days], i) => ({
+  row: { id: `user:${username}`, username, email: email ?? undefined, password: { $redacted: true }, rating, coach: i ? 'user:mira' : undefined, created_at: iso(days * 86_400_000) },
+  is_admin: i === 0,
+  views,
+  sessions,
+}));
+const DATA_SOURCE = { access: 'account', table: 'user', identifier: 'username', created_field: 'created_at', search_fields: ['username', 'email'], can_set_password: true, sources: ['account'] };
+/** The Feature flags page (`/data/flags`) and the flags on one user. */
+const flag = (key, description, extra = {}) => ({
+  key,
+  description,
+  variants: ['off', 'on'],
+  default_variant: 'off',
+  enabled: true,
+  rollouts: [],
+  pinned: 0,
+  other_rules: 0,
+  created_at: iso(40 * 86_400_000),
+  updated_at: iso(3 * 3_600_000),
+  ...extra,
+});
+const DATA_FLAGS = [
+  flag('analysis-v2', 'Engine lines in the review panel', { rollouts: [{ variant: 'on', percent: 25 }], pinned: 2, updated_at: iso(40 * 60_000) }),
+  flag('board-theme', 'Seasonal board colours', { variants: ['classic', 'autumn', 'night'], default_variant: 'classic', rollouts: [{ variant: 'autumn', percent: 10 }, { variant: 'night', percent: 30 }] }),
+  flag('club-chat', null, { enabled: false, pinned: 1, updated_at: iso(6 * 86_400_000) }),
+  flag('new-board', 'The rewritten board, drag and premoves', { rollouts: [{ variant: 'on', percent: 100 }], updated_at: iso(12 * 86_400_000) }),
+];
+const DATA_FLAG_DETAIL = {
+  flag: { ...DATA_FLAGS[0], payloads: { on: { depth: 22 } } },
+  counts: { off: 3, on: 2 },
+  pins: [
+    { id: 'user:mira', variant: 'on', name: 'mira', exists: true },
+    { id: 'user:ghost', variant: 'on', name: null, exists: false },
+  ],
+  pins_total: 2,
+};
+const DATA_USER_FEATURES = [
+  { key: 'analysis-v2', description: 'Engine lines in the review panel', variants: ['off', 'on'], default_variant: 'off', enabled: true, variant: 'on', pinned: 'on' },
+  { key: 'board-theme', description: 'Seasonal board colours', variants: ['classic', 'autumn', 'night'], default_variant: 'classic', enabled: true, variant: 'night', pinned: null },
+  { key: 'club-chat', description: null, variants: ['off', 'on'], default_variant: 'off', enabled: false, variant: 'off', pinned: null },
+  { key: 'new-board', description: 'The rewritten board, drag and premoves', variants: ['off', 'on'], default_variant: 'off', enabled: true, variant: 'on', pinned: null },
+];
+const DATA_ROUTES = {
+  'GET /data/flags': { installed: true, evaluator: true, users_table: true, flags: DATA_FLAGS },
+  'POST /data/flags': { flag: flag('beta', null), evaluate: true },
+  'GET /data/flags/flag': DATA_FLAG_DETAIL,
+  'PUT /data/flags/flag': { flag: DATA_FLAGS[0], evaluate: true },
+  'DELETE /data/flags/flag': { deleted: 'analysis-v2' },
+  'POST /data/flags/flag/evaluate': { evaluated: DATA_USERS.length, next: null, total: DATA_USERS.length },
+  'PUT /data/flags/flag/user': { key: 'analysis-v2', id: 'user:mira', pinned: 'on', variant: 'on' },
+  'GET /data/tables': { tables: DATA_TABLES },
+  'GET /data/tables/user': {
+    ...DATA_TABLES[2],
+    fields: DATA_USER_FIELDS,
+    indexes: [{ name: 'unique_username', cols: ['username'], index: 'UNIQUE' }],
+    events: [{ name: '_00_user_mutation', when: "$before != $after AND $event != 'DELETE'" }],
+    read_only: false,
+  },
+  'GET /data/tables/user/rows': { rows: DATA_USERS.map((u) => u.row), has_more: false, limit: 50, start: 0 },
+  'GET /data/tables/user/count': { count: DATA_USERS.length },
+  'GET /data/tables/user/row': { row: DATA_USERS[0].row },
+  'GET /data/users': { source: DATA_SOURCE, users: DATA_USERS, has_more: false, limit: 50, start: 0 },
+  'GET /data/users/stats': { total: DATA_USERS.length, admins: 1, online: 2 },
+  'GET /data/users/user': { source: DATA_SOURCE, row: DATA_USERS[0].row, is_admin: true, admin: { note: 'founder', added_at: iso(300 * 86_400_000) }, sessions: [{ client_id: 'c-41f2', views: 2 }, { client_id: 'c-9a07', views: 1 }], flags: DATA_USER_FEATURES.map((f) => ({ key: f.key, variant: f.variant })), features: DATA_USER_FEATURES, features_assignable: true },
+  'GET /data/buckets': {
+    buckets: [
+      { name: 'avatars', backend: 'r2', readonly: false, browsable: false, lists_folders: true },
+      { name: 'club_covers', backend: 'file', location: '/buckets/club_covers', readonly: false, max_bytes: 5242880, browsable: true, lists_folders: false },
+      { name: 'pgn_uploads', backend: 'memory', readonly: false, browsable: true, lists_folders: true },
+    ],
+    max_read_bytes: 33554432,
+    default_upload_bytes: 3141632,
+  },
+  'GET /data/buckets/pgn_uploads/files': {
+    prefix: '',
+    folders: ['2026-10', '2026-11'],
+    files: [
+      { key: 'lichess-export.pgn', name: 'lichess-export.pgn', size: 482_113, updated: iso(3_600_000) },
+      { key: 'cover.png', name: 'cover.png', size: 70, updated: iso(86_400_000) },
+    ],
+    next: null,
+  },
+  'GET /data/buckets/club_covers/files': { prefix: '', folders: [], files: [{ key: 'default.png', name: 'default.png', size: 70, updated: iso(86_400_000 * 4) }], next: null },
+  'POST /data/query': { results: [{ rows: DATA_USERS.map((u) => u.row), total: DATA_USERS.length, truncated: false }], limit_added: 1000 },
+};
+
 export const ROUTES = {
+  ...DATA_ROUTES,
   'GET /config': CONFIG,
   'GET /me': ME,
   'GET /overview': OVERVIEW,

@@ -14,7 +14,7 @@ export const createCode = `# Pay as you go (the default): runs on Cloudflare
 spky project create --slug my-app
 
 # A VM plan instead
-spky project create --slug my-app --plan starter`;
+spky project create --slug my-app --plan pro`;
 
 export const usageCode = `spky billing usage`;
 
@@ -43,7 +43,7 @@ export const sizeCode = `surrealdb:
 export const portalCode = `# Invoices, card and cancellation (opens the Stripe portal)
 spky billing
 
-# Switch between Starter and Pro (VM projects)
+# Change a VM project's plan or billing interval
 spky billing plan`;
 
 Every project is on one plan. **Pay as you go** is the default: the project runs on Cloudflare (Workers and a Durable Object for sync) with a database of its own, and costs a monthly base fee that already includes some usage. **Starter** and **Pro** run the project on VMs for a fixed price.
@@ -79,7 +79,7 @@ A project with its own database (`surrealdb.endpoint`) has no managed database a
 
 ### SurrealDB version
 
-A new pay-as-you-go database runs SurrealDB 4 (`v4.0.0-beta.1`, a beta) on SurrealKV, its only storage engine. A database created before that keeps SurrealDB 3.1.5 until you run:
+A new pay-as-you-go database runs SurrealDB 4 (`v4.0.0-beta.1`, a beta) on SurrealKV, its only storage engine. A database created before that keeps its SurrealDB 3 until you upgrade it. [`spky db upgrade`](/docs/cloud/database-upgrades) does that with a few seconds of refused writes and a way back that loses nothing, and is what to use on a database with data in it. The older way takes the database down for the whole conversion:
 
 <CodeBlock code={upgradeCode} lang="bash" />
 
@@ -122,6 +122,10 @@ A stopped project is down for everyone, including signed-in users. If your app m
 </Warning>
 
 ## Starter and Pro
+
+Starter takes no new projects for now, so a new VM project starts on Pro. A project already on Starter keeps it.
+
+A Pro project runs on two VMs of its own, a project host and a database VM, and the infrastructure is included in the Pro price. [Your own VMs](/docs/cloud/deploying#your-own-vms-pro) has the machine types and how the project host is upgraded. The volumes of a destroyed project are kept for 7 days.
 
 The VM plans have a fixed monthly or yearly price, with add-ons on the [pricing page](/pricing). They have no spend cap; their metered extras (bucket storage, build minutes, seats) are on the same monthly invoice.
 

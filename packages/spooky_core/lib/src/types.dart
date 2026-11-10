@@ -613,6 +613,7 @@ class ReconnectConfig {
     this.heartbeatIntervalMs = 20000,
     this.heartbeatTimeoutMs = 10000,
     this.connectTimeoutMs = 10000,
+    this.wakeProbeTimeoutMs = 3000,
   });
 
   /// Cap on the supervisor's exponential backoff between reconnect attempts.
@@ -626,6 +627,10 @@ class ReconnectConfig {
   /// Deadline for a heartbeat response. Exceeding it means the socket is dead
   /// regardless of what it claims, so the connection is torn down and rebuilt.
   final int heartbeatTimeoutMs;
+
+  /// Deadline for the one round trip after a wake. Short on purpose: someone
+  /// is looking at the screen, and a false alarm only costs a reconnect.
+  final int wakeProbeTimeoutMs;
 
   /// Deadline for opening a socket.
   ///

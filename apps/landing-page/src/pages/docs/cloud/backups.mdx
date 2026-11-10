@@ -119,6 +119,8 @@ Restoring replaces your current data with the backup. Anything you wrote after t
 
 A pay-as-you-go project has no scheduler, so Sp00ky Cloud takes and restores its backups itself, with the same commands and the same backup files. A restore wipes the database, imports the backup and reloads the sync engine, which picks up the restored data on its own; run your migrations again afterwards as above.
 
+To change SurrealDB version, use [`spky db upgrade`](/docs/cloud/database-upgrades), not a backup and restore: it keeps everyone signed in, and takes a backup of its own first.
+
 ### Signing keys after a restore
 
 Every restore, on VMs and on pay as you go, gives each record `DEFINE ACCESS` a new signing key, so everyone signed in has to sign in again. SurrealDB's export does not contain the keys (it writes `'[REDACTED]'`), and a database restored with that placeholder would let anyone sign a valid token for any user. Sp00ky Cloud checks the restored database after every restore, whatever scheduler version imported it, and refuses to report a restore as done until no access accepts such a token.

@@ -901,6 +901,7 @@ pub fn routes(deps: RouteDeps) -> Router {
         .route("/handover/release", post(release_route))
         .route("/handover/commit", post(commit_route))
         .route("/handover/ssps", get(ssps))
+        .route("/db/reconnect", post(db_reconnect))
         .with_state(deps)
 }
 
@@ -913,6 +914,17 @@ fn authorized(deps: &RouteDeps, headers: &HeaderMap) -> Option<Response> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     (presented != Some(secret)).then(|| StatusCode::UNAUTHORIZED.into_response())
+}
+
+/// `POST /db/reconnect`: the control plane moved SurrealDB to another container
+/// (a version upgrade), so reconnect now rather than after failed probes.
+async fn db_reconnect(axum::extract::State(deps): axum::extract::State<RouteDeps>, headers: HeaderMap) -> Response {
+    if let Some(denied) = authorized(&deps, &headers) {
+        return denied;
+    }
+    info!("SurrealDB moved; reconnecting");
+    deps.scheduler.database_moved();
+    StatusCode::OK.into_response()
 }
 
 fn refusal(r: Refusal) -> Response {

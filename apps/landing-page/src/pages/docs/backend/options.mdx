@@ -120,7 +120,7 @@ The backend itself is unchanged: it still answers a POST per job. What a pool ne
 
 ## Running on a dedicated machine
 
-`runOn: { machine: <name> }` gives an always-on backend a Hetzner VM of its own instead of a container on the shared host. It stays reachable exactly as before (`expose`, custom domains, outbox jobs); only where it runs changes.
+`runOn: { machine: <name> }` gives an always-on backend a Hetzner VM of its own instead of a container on the project's host (the shared host, or a Pro project's own project host). It stays reachable exactly as before (`expose`, custom domains, outbox jobs); only where it runs changes.
 
 ```yaml
 machines:

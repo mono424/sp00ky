@@ -208,6 +208,10 @@ class WorkerSp00kyClient extends Sp00kyClient {
   Future<List<dynamic>> queryRemote(String sql, [Map<String, dynamic>? vars]) =>
       _call(RemoteCommand(sql, vars));
   @override
+  Future<List<dynamic>> queryInteractive(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _call(RemoteCommand(sql, vars, interactive: true));
+  @override
   Future<Object?> kvRead(String key) => _call(KvCommand(key));
   @override
   Future<void> kvWrite(String key, Object? value) =>
@@ -550,7 +554,9 @@ Future<void> _workerMain((SendPort, Sp00kyConfig) input) async {
               ttl: command.ttl, relations: command.relations);
           watchQuery(result);
         case RemoteCommand command:
-          result = await client.queryRemote(command.sql, command.vars);
+          result = command.interactive
+              ? await client.queryInteractive(command.sql, command.vars)
+              : await client.queryRemote(command.sql, command.vars);
         case KvCommand command:
           if (command.write) {
             await client.kvWrite(command.key, command.value);

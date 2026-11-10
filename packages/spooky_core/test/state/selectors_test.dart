@@ -128,6 +128,37 @@ void main() {
       expect(sel.needed(cached, 'c'), isEmpty);
     });
 
+    test('planFetch puts the smallest need first, whatever registered first',
+        () {
+      final s = buildState([
+        e('big', lifecycle: live, remoteArray: [
+          for (var i = 0; i < 5; i++) ('game:$i', 1),
+        ]),
+        e('linkup', lifecycle: live, remoteArray: [('friendship:1', 1)]),
+      ]);
+      expect(sel.planFetch(s, chunkSize: 2).chunks.first,
+          ['friendship:1', 'game:0']);
+    });
+
+    test('planFetch stops at a round, the next plan picks up the rest', () {
+      final s = buildState([
+        e('big', lifecycle: live, remoteArray: [
+          for (var i = 0; i < 10; i++) ('game:$i', 1),
+        ]),
+      ]);
+      final plan = sel.planFetch(s, chunkSize: 2, maxChunks: 3);
+      expect(plan.chunks, hasLength(3));
+      final landed = r.setVersions([
+        for (final chunk in plan.chunks)
+          for (final id in chunk) (id, 1),
+      ])(s);
+      expect(sel.planFetch(landed, chunkSize: 2, maxChunks: 3).chunks,
+          [
+            ['game:6', 'game:7'],
+            ['game:8', 'game:9'],
+          ]);
+    });
+
     test('planFetch dedupes, includes subquery children, chunks', () {
       final s = buildState([
         e('a', lifecycle: live, remoteArray: [('thing:1', 1), ('thing:2', 3)]),
@@ -144,10 +175,12 @@ void main() {
       ]);
       final plan = sel.planFetch(s, chunkSize: 2);
       expect(plan.hashes, ['a', 'b']);
+      // `a` and `c` need two rows each, `b` three: smallest first, ties in
+      // registration order.
       expect(plan.chunks, [
         ['thing:1', 'thing:2'],
-        ['thing:3', 'child:1'],
-        ['child:2'],
+        ['child:1', 'child:2'],
+        ['thing:3'],
       ]);
       expect(plan.versions['thing:2'], 3);
       expect(plan.versions['child:1'], 2);

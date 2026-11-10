@@ -387,6 +387,16 @@ enum Commands {
         #[command(subcommand)]
         action: CloudBackupCommands,
     },
+    /// Manage the project's SurrealDB
+    Db {
+        #[command(subcommand)]
+        action: DbCommands,
+    },
+    /// Show a pro project's own VMs and upgrade its project host
+    Host {
+        #[command(subcommand)]
+        action: HostCommands,
+    },
     /// Link a GitHub repository for automated deployments
     Link {
         #[command(subcommand)]
@@ -450,7 +460,7 @@ enum Commands {
     },
 
     // ── Account ─────────────────────────────────────────────────────────────
-    /// Manage cloud projects (create, list, credentials, destroy)
+    /// Manage cloud projects (create, list, credentials, move, destroy)
     Project {
         #[command(subcommand)]
         action: ProjectCommands,
@@ -949,7 +959,7 @@ enum ProjectCommands {
         /// Project slug (lowercase, alphanumeric + hyphens)
         #[arg(long)]
         slug: Option<String>,
-        /// Plan: payg (Cloudflare, pay as you go), starter or pro (VMs)
+        /// Plan: payg (Cloudflare, pay as you go) or pro (VMs)
         #[arg(long, default_value = "payg")]
         plan: String,
     },
@@ -964,6 +974,18 @@ enum ProjectCommands {
         #[arg(long)]
         raw: bool,
     },
+    /// Move a pro project onto its own VMs: a project host and a database VM
+    Move {
+        /// Cut over by itself as soon as the data is across, instead of
+        /// waiting for `spky project move cutover`
+        #[arg(long)]
+        no_hold: bool,
+        /// Start it and return, without following it
+        #[arg(long)]
+        no_wait: bool,
+        #[command(subcommand)]
+        action: Option<MoveCommands>,
+    },
     /// Destroy the cloud project and all its VMs
     Destroy {
         /// The project's slug, typed out. Required wherever there is no terminal
@@ -972,6 +994,22 @@ enum ProjectCommands {
         #[arg(long, value_name = "PROJECT")]
         confirm: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MoveCommands {
+    /// Show the current or last move
+    Status,
+    /// Follow the move in progress
+    Watch,
+    /// Go ahead with a move waiting at the cutover. The project goes down for a
+    /// few minutes
+    Cutover,
+    /// Stop a move before the cutover. The project stays where it was
+    Abort,
+    /// Take a moved project back to the core host. The project goes down while
+    /// its data travels back
+    Rollback,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1110,6 +1148,62 @@ pub enum CloudLinkCommands {
     Trigger,
     /// List recent build runs
     Runs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DbCommands {
+    /// Upgrade SurrealDB one step: to the newest 3.x, then from there to 4.x
+    Upgrade {
+        /// The version to go to. Fails unless it is the next step
+        #[arg(long)]
+        to: Option<String>,
+        /// Do everything but the cutover, then wait for `spky db upgrade cutover`
+        #[arg(long)]
+        no_cutover: bool,
+        /// Minutes after a 4.x cutover in which `spky db upgrade cancel` goes back
+        /// without losing a write (default 60)
+        #[arg(long)]
+        soak_minutes: Option<u32>,
+        /// Name the project to go ahead without being asked: a 4.x step cannot be
+        /// undone once its watch window ends, so --yes does not cover it
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Start it and return, without following it
+        #[arg(long)]
+        no_wait: bool,
+        #[command(subcommand)]
+        action: Option<DbUpgradeCommands>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HostCommands {
+    /// Show the project's VMs: kind, type, location, status and any upgrade waiting
+    Status,
+    /// Upgrade the project host now instead of in its quiet window. Web, API and
+    /// live sync are down for about two minutes; the database is not touched
+    Upgrade,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DbUpgradeCommands {
+    /// Show the running version, the next step and the current upgrade
+    Status,
+    /// Follow the upgrade in progress
+    Watch,
+    /// Go ahead with an upgrade waiting at the cutover
+    Cutover,
+    /// Stop the upgrade. Before the cutover it undoes everything; in the watch
+    /// window after a 4.x cutover it goes back without losing a write
+    Cancel,
+    /// End the watch window after a 4.x cutover early
+    Finish,
+    /// Go back to the old data, DROPPING writes made since the cutover
+    Rollback {
+        /// Name the project to go ahead without being asked
+        #[arg(long)]
+        confirm: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3345,6 +3439,8 @@ fn main() -> Result<()> {
             cloud::notice(message, notice_type, timeout, action)
         }
         Some(Commands::Backup { action }) => cloud::backup(action),
+        Some(Commands::Db { action }) => cloud::db(action),
+        Some(Commands::Host { action }) => cloud::host(action),
         Some(Commands::Link { action }) => cloud::link(action),
         Some(Commands::Flag { action }) => flag::run(action),
         Some(Commands::Admin { action }) => admin::run(action),
@@ -3375,6 +3471,11 @@ fn main() -> Result<()> {
             ProjectCommands::Create { slug, plan } => cloud::create(slug, plan),
             ProjectCommands::List => cloud::list(),
             ProjectCommands::Credentials { raw } => cloud::credentials(raw),
+            ProjectCommands::Move {
+                no_hold,
+                no_wait,
+                action,
+            } => cloud::project_move(no_hold, no_wait, action),
             ProjectCommands::Destroy { confirm } => cloud::destroy(confirm),
         },
         Some(Commands::Team { action }) => cloud::team(action),

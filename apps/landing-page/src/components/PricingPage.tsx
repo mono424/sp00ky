@@ -46,33 +46,14 @@ const plans: Plan[] = [
     ],
   },
   {
-    name: 'Starter',
-    description: 'Dedicated VMs for side projects and small apps.',
-    monthlyPrice: 29,
-    yearlyPrice: 290,
-    command: 'npx @spooky-sync/cli project create --plan starter',
-    features: [
-      { label: 'Scheduler', type: 'included', specs: { cpu: '1', mem: '512MB' } },
-      { label: '1 SSP instance', type: 'included', specs: { cpu: '1', mem: '512MB' } },
-      { label: '1 Backend Service', type: 'included', specs: { cpu: '1', mem: '512MB' } },
-      { label: '5GB file storage', type: 'included' },
-      { label: 'CI/CD Cloud Builder (60 min/mo)', type: 'included' },
-      { label: 'Shared Vault', type: 'included' },
-      { label: 'Custom domains', type: 'included' },
-      { label: 'Community support', type: 'included' },
-      { label: 'SSO', type: 'excluded' },
-      { label: 'Backups', type: 'excluded' },
-      { label: '5 team members included', type: 'excluded' },
-      { label: 'Priority support', type: 'excluded' },
-    ],
-  },
-  {
     name: 'Pro',
-    description: 'Dedicated VMs for teams shipping production apps.',
+    description: 'Includes its own project host and database VM, for teams shipping production apps.',
     monthlyPrice: 229,
     yearlyPrice: 2290,
     command: 'npx @spooky-sync/cli project create --plan pro',
     features: [
+      { label: 'Its own project host VM', type: 'included', specs: { mem: '8GB' } },
+      { label: 'Its own database VM', type: 'included', specs: { mem: '8GB' } },
       { label: 'Scheduler', type: 'included', specs: { cpu: '2', mem: '2GB' } },
       { label: '3 SSP instances', type: 'included', specs: { cpu: '2', mem: '1GB' } },
       { label: '1 Backend Service', type: 'included', specs: { cpu: '2', mem: '1GB' } },
@@ -220,7 +201,7 @@ export const PricingPage: React.FC = () => {
       </div>
 
       {/* Plan Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {plans.map((plan) => {
           const showYearly = yearly && !plan.monthlyOnly;
           const price = showYearly ? plan.yearlyPrice : plan.monthlyPrice;

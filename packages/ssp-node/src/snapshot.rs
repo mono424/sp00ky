@@ -150,6 +150,7 @@ impl SspNode {
                         table_meta,
                         self.bootstrap_page_size,
                         schema.has_versions,
+                        schema.version_lookup,
                     )
                     .await?;
                     report.tables_from_db += 1;
@@ -173,7 +174,7 @@ impl SspNode {
             for (table, ids) in noticed {
                 let omit = ssp_protocol::omit_clause(&schema.tables[&table].opaque);
                 for chunk in ids.chunks(CATCH_UP_CHUNK) {
-                    let mut current = crate::replay::fetch_current(db, chunk, &omit)
+                    let mut current = crate::replay::fetch_current(db, chunk, &omit, schema.version_lookup)
                         .await
                         .context("snapshot catch-up")?;
                     let mut circuit = self.processor.write().await;

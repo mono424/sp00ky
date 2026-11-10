@@ -64,11 +64,21 @@ const NETWORK_ERROR_PATTERNS = [
 const SP00KY_EVENT_POST_FAILED =
   /error while processing event _00_[^:\s]*: (?:there was an error processing a remote http request: (?:error sending request|5\d\d\b|408\b|429\b)|failed to lookup address information)/;
 
+/**
+ * What the proxy in front of a database answers while the database is away: a
+ * restart, or the seconds of a version upgrade. Over HTTP the SDK's error message
+ * IS the response body, so these arrive as bare words, and an `application`
+ * reading rolls the write back. Anchored: a statement can mention these words,
+ * but SurrealDB never answers with nothing else.
+ */
+const PROXY_UNAVAILABLE = /^(?:bad gateway|service unavailable|gateway timeout|404 page not found)\s*$/;
+
 export function classifySyncError(error: unknown): 'network' | 'application' {
   const message =
     error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
 
   if (SP00KY_EVENT_POST_FAILED.test(message)) return 'network';
+  if (PROXY_UNAVAILABLE.test(message)) return 'network';
 
   for (const pattern of NETWORK_ERROR_PATTERNS) {
     if (message.includes(pattern)) {

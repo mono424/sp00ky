@@ -80,11 +80,11 @@ Two server tables back the whole system:
 
 | Table | Who can read it | Who can write it |
 |---|---|---|
-| `_00_feature_flag` | nobody (root only) | `spky flag` CLI + scheduler |
+| `_00_feature_flag` | nobody (root only) | `spky flag` CLI, the [console](/docs/cloud/console#feature-flags) + scheduler |
 | `_00_user_feature` | each user, their own rows only | nobody but root |
 
-1. You write a flag **definition** (variants, default, targeting rules) into `_00_feature_flag` with the `spky flag` CLI.
-2. On every write the CLI runs the evaluator inline and **materializes one row per existing user** into `_00_user_feature` with their resolved variant. Only the rows whose variant or payload changed are written, so only those users' clients are notified; re-running an unchanged flag costs nothing on the sync path. Allowlisting or removing one user from the DevTools Access tab re-evaluates just that user.
+1. You write a flag **definition** (variants, default, targeting rules) into `_00_feature_flag` with the `spky flag` CLI, or from the [Feature flags page](/docs/cloud/console#feature-flags) of the Sp00ky Cloud console.
+2. On every write the CLI runs the evaluator inline and **materializes one row per existing user** into `_00_user_feature` with their resolved variant. Only the rows whose variant or payload changed are written, so only those users' clients are notified; re-running an unchanged flag costs nothing on the sync path. The console does the same a page of users at a time, with a progress bar. Pinning or unpinning one user, from the console or the DevTools Access tab, re-evaluates just that user.
 3. The scheduler runs a periodic sweep that fills in assignments for **users who signed up since the last write**, so new accounts get their flags within seconds.
 4. The client subscribes to its own `_00_user_feature` row. When the materialized variant changes, the new value rides the existing websocket straight into your reactive UI.
 

@@ -132,6 +132,11 @@ class RemoteAdapter implements RemotePort {
       _remote.queryStatements(sql, vars);
 
   @override
+  Future<List<StatementResult>> bodyStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _remote.bodyStatements(sql, vars);
+
+  @override
   Future<List<StatementResult>> writeStatements(String sql,
           [Map<String, dynamic>? vars]) =>
       _remote.writeStatements(sql, vars);

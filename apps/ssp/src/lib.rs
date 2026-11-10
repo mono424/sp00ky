@@ -1145,7 +1145,10 @@ pub async fn run_server() -> anyhow::Result<()> {
         schema_poll_secs: config.schema_poll_secs,
         schema_watch: Default::default(),
         last_heartbeat_seen: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        admin: Default::default(),
+        admin: ssp_node::admin::AdminState::new(ssp_node::admin::AdminSettings {
+            data_disabled: ssp_node::admin::data_is_off(std::env::var("SPKY_ADMIN_DATA").ok().as_deref()),
+            ..Default::default()
+        }),
     });
     let runtime = ssp_node::Runtime::new(node.clone());
 
@@ -1275,6 +1278,30 @@ pub async fn run_server() -> anyhow::Result<()> {
                 auth_middleware,
             ))
             .with_state(Arc::clone(&log_ring)),
+    );
+
+    // The control plane moved SurrealDB to another container (a version upgrade):
+    // reconnect now rather than after a streak of failed probes.
+    app = app.merge(
+        Router::new()
+            .route(
+                "/db/reconnect",
+                axum::routing::post({
+                    let db = Arc::clone(&db);
+                    move || {
+                        let db = Arc::clone(&db);
+                        async move {
+                            info!("SurrealDB moved; reconnecting");
+                            db.database_moved();
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                config.auth_secret.clone(),
+                auth_middleware,
+            )),
     );
 
     if standalone {

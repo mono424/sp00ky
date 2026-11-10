@@ -39,7 +39,7 @@ Future<void> fetchRows(Ctx ctx, SagaEnv env) async {
     try {
       final results = await ctx(Fx.all([
         for (final ids in plan.chunks)
-          Fx.remoteQuery(
+          Fx.remoteBodies(
             sql.bodySelect(),
             vars: {'ids': [for (final id in ids) parseRecordIdString(id)]},
             timeoutMs: env.remoteTimeoutMs,

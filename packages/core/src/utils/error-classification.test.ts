@@ -2,6 +2,17 @@ import { describe, it, expect } from 'vitest';
 import { classifySyncError, isRefusedSessionError } from './error-classification';
 
 describe('classifySyncError', () => {
+  it('classifies a proxy with no database behind it as network', () => {
+    // Over HTTP the SDK's message is the response body. These are Traefik's, while
+    // a database restarts or moves in a version upgrade; a rollback would lose the
+    // write.
+    for (const body of ['Bad Gateway', 'Service Unavailable', 'Gateway Timeout', '404 page not found\n']) {
+      expect(classifySyncError(new Error(body))).toBe('network');
+    }
+    // Only as the whole message: a statement's own error can use the words.
+    expect(classifySyncError(new Error('Thrown error: bad gateway to the partner API'))).toBe('application');
+  });
+
   it('classifies surreal ConnectionUnavailableError as network', () => {
     // Thrown synchronously by the WS engine's send() while the socket is down
     // but reconnect hasn't fired. Message contains "connected", not "connection".

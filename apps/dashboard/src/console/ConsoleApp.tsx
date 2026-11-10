@@ -34,10 +34,18 @@ import { ConfirmHost, ToastHost } from '../components/Actions';
 import { Logo, PageHead } from '../components/Chrome';
 import { FrameSkeleton, PageSkeleton, Shell } from '../components/Shell';
 import { ProjectApp } from '../ProjectApp';
-import { CloudError, consoleApi, signIn, signOut, type Grant, type Workspace, type WorkspaceProject } from './cloud';
+import { Database, SqlEditor } from '../routes/Database';
+import { Flags } from '../routes/Flags';
+import { Storage } from '../routes/Storage';
+import { Users } from '../routes/Users';
+import { SignInFrame } from '../routes/Login';
+import { CloudError, consoleApi, rememberSignedIn, signInUrl, signOut, wasSignedIn, type Grant, type Workspace, type WorkspaceProject } from './cloud';
 import { ConsoleChromeProvider, WORKSPACE_LINKS, type ConsoleChrome } from './chrome';
+import { GitHubMark, Onboarding } from './onboarding';
 import { Deployments, Settings } from './project';
-import { Activity, Billing, Keys, Members, Projects, Sessions, Vault } from './workspace';
+import { Audience } from './audience';
+import { BuildRun, Builds } from './builds';
+import { Activity, Billing, Keys, Members, Projects, Sessions, Vault, WorkspaceSettings } from './workspace';
 import { lock } from './vault';
 
 const LAST_KEY = 'spky.console.last';
@@ -75,9 +83,21 @@ export function ConsoleApp() {
       throw err;
     }
   });
+  createEffect(() => {
+    if (me.state === 'ready') rememberSignedIn(me() !== null);
+  });
+  // A refresh that fails keeps what it had: a blip is not a reason to replace
+  // the whole console with an error.
   const [workspaces, { refetch }] = createResource(
     () => me(),
-    () => consoleApi.workspaces(),
+    async (_me, info: { value: Workspace[] | undefined }): Promise<Workspace[]> => {
+      try {
+        return await consoleApi.workspaces();
+      } catch (err) {
+        if (info.value) return info.value;
+        throw err;
+      }
+    },
   );
   // Project states in the switcher stay fresh without a socket per project.
   const tick = setInterval(() => me() && void refetch(), 60_000);
@@ -92,6 +112,12 @@ export function ConsoleApp() {
     const w = where();
     return w.kind === 'project' ? workspace()?.projects.find((p) => p.slug === w.project) : undefined;
   });
+  // What a page is keyed on: the minute's refetch brings new objects for the
+  // same workspace and project, which must not remount the page (for a
+  // project, a new session).
+  const sameId = <T extends { id: string }>(a: T | undefined, b: T | undefined) => a?.id === b?.id;
+  const workspaceKey = createMemo(workspace, undefined, { equals: sameId });
+  const projectKey = createMemo(project, undefined, { equals: sameId });
 
   // `/` goes where the operator last was, else the first project there is.
   const landing = createMemo(() => {
@@ -124,6 +150,7 @@ export function ConsoleApp() {
     project,
     limited,
     go: (to) => go(to),
+    refresh: () => Promise.resolve(refetch()),
     signOut: () => {
       lock();
       void signOut().then(() => window.location.assign('/'));
@@ -132,7 +159,7 @@ export function ConsoleApp() {
 
   return (
     <>
-      <Switch fallback={<FrameSkeleton console />}>
+      <Switch fallback={wasSignedIn() ? <FrameSkeleton console /> : <div class="li-wrap" />}>
         <Match when={me.state === 'ready' && me() === null}>
           <Landing />
         </Match>
@@ -144,13 +171,13 @@ export function ConsoleApp() {
             <Switch fallback={<Splash text="Nothing here" detail="This workspace or project does not exist, or you are not a member of it." />}>
               <Match when={where().kind === 'project' && project()}>
                 {/* Keyed: switching projects is a fresh session on another host. */}
-                <Show when={project()} keyed>
-                  {(p) => <ProjectView workspace={workspace()!} project={p} setLimited={setLimited} />}
+                <Show when={projectKey()} keyed>
+                  {(p) => <ProjectView workspace={workspace()!} project={project() ?? p} setLimited={setLimited} />}
                 </Show>
               </Match>
               <Match when={where().kind === 'workspace' && workspace()}>
-                <Show when={workspace()} keyed>
-                  {(w) => <WorkspaceView workspace={w} />}
+                <Show when={workspaceKey()} keyed>
+                  {(w) => <WorkspaceView workspace={workspace() ?? w} />}
                 </Show>
               </Match>
               <Match when={where().kind === 'root' && workspaces()!.length === 0}>
@@ -173,17 +200,31 @@ export function ConsoleApp() {
 function Landing() {
   const error = new URLSearchParams(window.location.search).get('signin_error');
   return (
-    <div class="cx-landing">
-      <div class="cx-landing-card">
-        <Logo />
-        <h1>Sign in to the console</h1>
-        <p>Your workspaces and projects, live: deployments, sync, jobs and the rest of every Sp00ky Cloud project you are a member of.</p>
+    <SignInFrame docs="https://sp00ky.dev/docs/cloud/console" left={window.location.host} right="sp00ky cloud">
+      <div class="li-eyebrow">Sp00ky Cloud</div>
+      <h1 class="li-title">
+        Sign in to
+        <br />
+        <span class="iri-text">your console</span>
+      </h1>
+      <div class="li-form">
         <Show when={error}>
-          <div class="fx-log bad"><span class="fx-what">{error}</span></div>
+          <div class="login-error li-error" role="alert">{error}</div>
         </Show>
-        <button class="btn btn-primary" onClick={() => signIn()}>Sign in with GitHub</button>
+        <a class="li-submit" href={signInUrl()}>
+          <span class="li-submit-label li-social">
+            <GitHubMark />
+            Continue with GitHub
+          </span>
+          <span class="li-submit-arrow" aria-hidden="true">→</span>
+        </a>
       </div>
-    </div>
+      <div class="li-foot">
+        <span>
+          The same account as <span class="mono">spky login</span>. New here? This creates it.
+        </span>
+      </div>
+    </SignInFrame>
   );
 }
 
@@ -286,7 +327,21 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
   const cloudRoutes = (): JSX.Element => (
     <>
       <Route path="/deployments" component={() => <Deployments workspace={props.workspace} project={props.project} />} />
+      <Route path="/deployments/builds" component={() => <Builds workspace={props.workspace} project={props.project} />} />
+      <Route path="/deployments/builds/:id" component={() => <BuildRun workspace={props.workspace} project={props.project} />} />
+      <Route path="/audience" component={() => <Audience workspace={props.workspace} project={props.project} />} />
       <Route path="/settings/:tab?" component={() => <Settings workspace={props.workspace} project={props.project} />} />
+    </>
+  );
+
+  /** The project's own data, read through its admin API, so only with a session. */
+  const dataRoutes = (): JSX.Element => (
+    <>
+      <Route path={['/database', '/database/table/:table']} component={Database} />
+      <Route path="/database/sql" component={SqlEditor} />
+      <Route path="/users" component={Users} />
+      <Route path="/flags" component={Flags} />
+      <Route path="/storage/:bucket?" component={Storage} />
     </>
   );
 
@@ -306,7 +361,7 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
             scope={`${props.project.id}@${adminUrl}`}
             renew={renew}
             onSignOut={() => undefined}
-            routes={cloudRoutes()}
+            routes={<>{cloudRoutes()}{dataRoutes()}</>}
           />
         )}
       </Match>
@@ -373,12 +428,14 @@ function WorkspaceView(props: { workspace: Workspace }) {
       )}
     >
       <Route path="/" component={() => <Projects workspace={props.workspace} />} />
+      <Route path="/new" component={() => <Onboarding workspace={props.workspace} />} />
       <Route path="/members" component={() => <Members workspace={props.workspace} />} />
       <Route path="/billing" component={() => <Billing workspace={props.workspace} />} />
       <Route path="/vault" component={() => <Vault workspace={props.workspace} />} />
       <Route path="/keys" component={() => <Keys />} />
       <Route path="/activity" component={() => <Activity workspace={props.workspace} />} />
       <Route path="/sessions" component={() => <Sessions />} />
+      <Route path="/settings" component={() => <WorkspaceSettings workspace={props.workspace} />} />
       <Route path="*" component={() => <Projects workspace={props.workspace} />} />
     </Router>
   );

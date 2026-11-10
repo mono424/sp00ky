@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js';
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js';
 import { currentMode, login, setEndpoint } from '../api/client';
 import type { LoginResponse } from '../api/types';
 import { Logo } from '../components/Chrome';
@@ -65,134 +65,142 @@ export function Login(props: { onSignedIn: (session: LoginResponse) => void }) {
   const name = () => config()?.project_slug ?? config()?.scheduler_id;
 
   return (
+    <SignInFrame
+      docs="https://sp00ky.dev/docs/reference/admin-dashboard"
+      left={
+        <Show when={config()} fallback="not connected">
+          {(c) => (
+            <>
+              {c().scheduler_id}
+              <span class="li-sep">/</span>
+              {c().version.replace(/^0\.0\.1-/, '')}
+            </>
+          )}
+        </Show>
+      }
+      right={config()?.cloud_linked ? 'sp00ky cloud' : 'self-hosted'}
+    >
+      <div class="li-eyebrow">
+        {breakglass() ? 'Break-glass access' : 'Operator console'}
+      </div>
+      <h1 class="li-title">
+        <Show when={name()} fallback={<>Connect to<br /><span class="iri-text">a scheduler</span></>}>
+          {(n) => (
+            <>
+              Sign in to
+              <br />
+              <span class="iri-text">{n()}</span>
+            </>
+          )}
+        </Show>
+      </h1>
+      <Show when={breakglass()}>
+        <p class="li-lede">
+          The shared admin password, for when no roster account can sign in. You act as
+          Break-glass, not as yourself.
+        </p>
+      </Show>
+
+      <form class="li-form" onSubmit={submit}>
+        <Show when={!embedded()}>
+          <div class="li-field">
+            <label for="endpoint">Scheduler endpoint</label>
+            <input
+              id="endpoint"
+              class="mono"
+              placeholder="http://10.0.0.5:9668"
+              value={endpoint()}
+              onInput={(e) => setEndpointValue(e.currentTarget.value)}
+              onBlur={connect}
+              autocomplete="url"
+            />
+          </div>
+        </Show>
+
+        <Show when={!breakglass()}>
+          <div class="li-field">
+            <label for="username">Username</label>
+            <input
+              id="username"
+              value={username()}
+              onInput={(e) => setUsername(e.currentTarget.value)}
+              autocomplete="username"
+              autofocus
+            />
+          </div>
+        </Show>
+
+        <div class="li-field">
+          <label for="password">{breakglass() ? 'Admin password' : 'Password'}</label>
+          <input
+            id="password"
+            type="password"
+            value={password()}
+            onInput={(e) => setPassword(e.currentTarget.value)}
+            autocomplete="current-password"
+          />
+        </div>
+
+        <Show when={error()}>
+          <div class="login-error li-error" role="alert">{error()}</div>
+        </Show>
+
+        <button class="li-submit" type="submit" disabled={busy()}>
+          <span class="li-submit-label">{busy() ? 'Signing in…' : 'Sign in'}</span>
+          <span class="li-submit-arrow" aria-hidden="true">→</span>
+        </button>
+      </form>
+
+      <div class="li-foot">
+        <Show when={!breakglass()}>
+          <span>
+            Get access with <span class="mono">spky admin add</span>
+          </span>
+        </Show>
+        {/* Offered only when the scheduler says a break-glass password is
+            configured, so the option never appears where it cannot work. */}
+        <Show when={config()?.breakglass_available}>
+          <button
+            type="button"
+            class="link-btn"
+            onClick={() => {
+              setBreakglass(!breakglass());
+              setError(null);
+            }}
+          >
+            {breakglass() ? 'Use an admin account' : 'Use the break-glass password'}
+          </button>
+        </Show>
+      </div>
+    </SignInFrame>
+  );
+}
+
+/**
+ * The page around signing in, here and on the Sp00ky Cloud console: the frame,
+ * the rolling terminal, and whatever a host asks for in the column beside it.
+ */
+export function SignInFrame(props: { docs: string; left: JSX.Element; right: JSX.Element; children: JSX.Element }) {
+  return (
     <div class="li-wrap">
       <div class="li-frame">
         <header class="li-top">
           <span class="li-brand">
             <Logo />
           </span>
-          <a
-            class="li-docs"
-            href="https://sp00ky.dev/docs/reference/admin-dashboard"
-            target="_blank"
-            rel="noreferrer"
-          >
+          <a class="li-docs" href={props.docs} target="_blank" rel="noreferrer">
             Docs <span aria-hidden="true">↗</span>
           </a>
         </header>
 
         <main class="li-main">
-          <section class="li-side">
-            <div class="li-eyebrow">
-              {breakglass() ? 'Break-glass access' : 'Operator console'}
-            </div>
-            <h1 class="li-title">
-              <Show when={name()} fallback={<>Connect to<br /><span class="iri-text">a scheduler</span></>}>
-                {(n) => (
-                  <>
-                    Sign in to
-                    <br />
-                    <span class="iri-text">{n()}</span>
-                  </>
-                )}
-              </Show>
-            </h1>
-            <Show when={breakglass()}>
-              <p class="li-lede">
-                The shared admin password, for when no roster account can sign in. You act as
-                Break-glass, not as yourself.
-              </p>
-            </Show>
-
-            <form class="li-form" onSubmit={submit}>
-              <Show when={!embedded()}>
-                <div class="li-field">
-                  <label for="endpoint">Scheduler endpoint</label>
-                  <input
-                    id="endpoint"
-                    class="mono"
-                    placeholder="http://10.0.0.5:9668"
-                    value={endpoint()}
-                    onInput={(e) => setEndpointValue(e.currentTarget.value)}
-                    onBlur={connect}
-                    autocomplete="url"
-                  />
-                </div>
-              </Show>
-
-              <Show when={!breakglass()}>
-                <div class="li-field">
-                  <label for="username">Username</label>
-                  <input
-                    id="username"
-                    value={username()}
-                    onInput={(e) => setUsername(e.currentTarget.value)}
-                    autocomplete="username"
-                    autofocus
-                  />
-                </div>
-              </Show>
-
-              <div class="li-field">
-                <label for="password">{breakglass() ? 'Admin password' : 'Password'}</label>
-                <input
-                  id="password"
-                  type="password"
-                  value={password()}
-                  onInput={(e) => setPassword(e.currentTarget.value)}
-                  autocomplete="current-password"
-                />
-              </div>
-
-              <Show when={error()}>
-                <div class="login-error li-error" role="alert">{error()}</div>
-              </Show>
-
-              <button class="li-submit" type="submit" disabled={busy()}>
-                <span class="li-submit-label">{busy() ? 'Signing in…' : 'Sign in'}</span>
-                <span class="li-submit-arrow" aria-hidden="true">→</span>
-              </button>
-            </form>
-
-            <div class="li-foot">
-              <Show when={!breakglass()}>
-                <span>
-                  Get access with <span class="mono">spky admin add</span>
-                </span>
-              </Show>
-              {/* Offered only when the scheduler says a break-glass password is
-                  configured, so the option never appears where it cannot work. */}
-              <Show when={config()?.breakglass_available}>
-                <button
-                  type="button"
-                  class="link-btn"
-                  onClick={() => {
-                    setBreakglass(!breakglass());
-                    setError(null);
-                  }}
-                >
-                  {breakglass() ? 'Use an admin account' : 'Use the break-glass password'}
-                </button>
-              </Show>
-            </div>
-          </section>
-
+          <section class="li-side">{props.children}</section>
           <Terminal />
         </main>
 
         <footer class="li-bottom mono">
-          <span>
-            <Show when={config()} fallback="not connected">
-              {(c) => (
-                <>
-                  {c().scheduler_id}
-                  <span class="li-sep">/</span>
-                  {c().version.replace(/^0\.0\.1-/, '')}
-                </>
-              )}
-            </Show>
-          </span>
-          <span>{config()?.cloud_linked ? 'sp00ky cloud' : 'self-hosted'}</span>
+          <span>{props.left}</span>
+          <span>{props.right}</span>
         </footer>
       </div>
     </div>
@@ -220,7 +228,7 @@ const FADE = [1, 0.2, 0.07];
 
 const command = (k: number) => COMMANDS[((k % COMMANDS.length) + COMMANDS.length) % COMMANDS.length];
 
-function Terminal() {
+export function Terminal() {
   const [step, setStep] = createSignal(0);
   // The line just run (leaving upward), the live one, and what comes next.
   // Nothing behind it: the page opens on a command, not on a history.

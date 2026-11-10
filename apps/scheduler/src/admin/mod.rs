@@ -25,6 +25,7 @@ pub mod backends;
 pub mod backups;
 pub mod cloud;
 pub mod config;
+pub mod data;
 pub mod grant;
 pub mod jobs;
 pub mod incidents;
@@ -41,11 +42,11 @@ pub mod workflows;
 
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -275,6 +276,10 @@ async fn config_handler(State(state): State<AdminState>) -> Json<serde_json::Val
         "project_slug": state.project_slug,
         // Whether a Sp00ky Cloud console user can sign in here with a grant.
         "cloud_login": state.grants.is_some(),
+        // Whether `/data` (the Database, Users and Storage pages) is on here.
+        "data": state.config.data,
+        // Whether `/data/flags` is: the Feature flags page, flags on a user.
+        "flags": state.config.data,
         // The live protocol this host speaks (`/v2/live`) and what it can
         // subscribe to; a dashboard without it falls back to polling.
         "live": ssp_protocol::admin_live::PROTOCOL_VERSION,
@@ -418,6 +423,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/jobs/:id", get(jobs::job_detail))
         .route("/jobs/:id/kill", post(jobs::job_kill))
         .route("/jobs/:id/retry", post(jobs::job_retry))
+        // The project's own data: tables, users, bucket files. One catch-all,
+        // because `schedule_core::admin_data` routes it for every host.
+        .route(
+            "/data/*rest",
+            any(data::handle).layer(DefaultBodyLimit::max(schedule_core::admin_data::MAX_BODY_BYTES)),
+        )
         // Agents. Tokens are minted by a person; the MCP endpoint takes any
         // bearer and dispatches tools back through this same router.
         .route("/tokens", post(tokens::mint).delete(tokens::revoke))

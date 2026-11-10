@@ -1,6 +1,7 @@
-import { For, Show, createMemo, createResource, onCleanup } from 'solid-js';
+import { For, Show, createMemo, createResource, onCleanup, type JSX } from 'solid-js';
 import { api } from '../api/client';
-import type { CloudService, CloudStats } from '../api/types';
+import type { CloudHost, CloudService, CloudStats } from '../api/types';
+import { kindLabel } from '../console/hostPlan';
 import { PageHead } from '../components/Chrome';
 import { FxCell, LineChart, Meter, Seg, Sq } from '../components/Frame';
 import { formatBytes, formatUptime, relativeStamp } from '../lib/format';
@@ -9,10 +10,15 @@ import { containerTone } from '../lib/status';
 /**
  * Resources: what the deployment runs on, as Sp00ky Cloud measures it.
  *
- * Top to bottom: the deployment's CPU, memory and bucket disk against what is
- * allocated, over the last fifteen minutes; how that CPU and memory splits
- * across the containers; every container, closest to a limit first; and the
- * machines behind dedicated and pooled backends.
+ * A project on its own VMs reads one VM at a time, the database's first: the
+ * machine's CPU, memory and disk against its real size, then what runs on it.
+ * Container caps cannot say this: they are limits, and on one machine they overlap.
+ *
+ * A project on the shared host has no machine of its own to measure, so it reads
+ * as a whole: CPU, memory and bucket disk against what is allocated, how that
+ * splits across the containers, then every container.
+ *
+ * Either way the machines behind dedicated and pooled backends come last.
  *
  * Only a cloud-linked scheduler has this page (the nav hides it otherwise):
  * the scheduler cannot see its neighbours' containers or the database's
@@ -107,6 +113,11 @@ export function Resources() {
     return SHADES[Math.max(0, names.indexOf(name)) % SHADES.length];
   };
 
+  const hosts = () => data()?.hosts ?? [];
+  const onHost = (kind: string) => services().filter((s) => s.host === kind);
+  /** Anything not on a VM of the project's, which should only be for a moment. */
+  const elsewhere = () => services().filter((s) => !hosts().some((h) => h.kind === s.host));
+
   const volume = () => data()?.bucket_volume ?? null;
   const diskPct = () => {
     const u = volume()?.usage;
@@ -177,123 +188,95 @@ export function Resources() {
               </section>
             </Show>
 
-            {/* the deployment as a whole, last 15 minutes ====================== */}
-            <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1.4fr)) minmax(0, 1fr)' }}>
-              <FxCell label="CPU" meta={<span>of <b>{cpuAlloc()}</b> vCPU · last 15 min</span>}>
-                <div class="fx-big">
-                  {metrics() ? cores(cpuNow()) : '—'}
-                  <small>cores · {pct(cpuAlloc() ? (cpuNow() / cpuAlloc()) * 100 : null)}</small>
-                </div>
-                <Show when={metrics()}>
-                  <LineChart points={cpuPoints()} format={(v) => `${cores(v)}`} now={now()} />
-                </Show>
-              </FxCell>
-              <FxCell label="Memory" meta={<span>of <b>{formatBytes(memAlloc())}</b> · last 15 min</span>}>
-                <div class="fx-big">
-                  {metrics() ? formatBytes(memNow()) : '—'}
-                  <small>{pct(memAlloc() ? (memNow() / memAlloc()) * 100 : null)}</small>
-                </div>
-                <Show when={metrics()}>
-                  <LineChart points={memPoints()} format={(v) => formatBytes(v)} now={now()} />
-                </Show>
-              </FxCell>
-              <FxCell label="Bucket disk" meta={<Show when={volume()?.usage}>{(u) => <span>measured {relativeStamp(u().measured_at)}</span>}</Show>}>
-                <div class="fx-big">
-                  <span classList={{ warn: (diskPct() ?? 0) >= 80 && (diskPct() ?? 0) < 90, bad: (diskPct() ?? 0) >= 90 }}>
-                    {diskPct() != null ? pct(diskPct()) : '—'}
-                  </span>
-                  <Show when={diskPct() != null}><small>full</small></Show>
-                </div>
-                <Show
-                  when={volume()?.usage}
-                  fallback={<div class="fx-sub cap"><span>{volume() ? 'waiting for the first measurement' : 'no bucket volume configured'}</span></div>}
-                >
-                  {(u) => (
-                    <>
-                      <div style={{ 'margin-top': '16px' }}><Seg pct={diskPct()} wide /></div>
-                      <div class="fx-foot rs-disk">
-                        <div><span class="cap">Used</span><b>{formatBytes(u().used_bytes)}</b></div>
-                        <div><span class="cap">Free</span><b>{formatBytes(u().free_bytes)}</b></div>
-                        <div><span class="cap">Volume</span><b>{volume()!.provisioned_gb} <em>GB</em></b></div>
+            <Show
+              when={hosts().length > 0}
+              fallback={
+                <>
+                  {/* the deployment as a whole, last 15 minutes ====================== */}
+                  <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1.4fr)) minmax(0, 1fr)' }}>
+                    <FxCell label="CPU" meta={<span>of <b>{cpuAlloc()}</b> vCPU · last 15 min</span>}>
+                      <div class="fx-big">
+                        {metrics() ? cores(cpuNow()) : '—'}
+                        <small>cores · {pct(cpuAlloc() ? (cpuNow() / cpuAlloc()) * 100 : null)}</small>
                       </div>
-                    </>
-                  )}
-                </Show>
-              </FxCell>
-            </section>
-
-            {/* who uses it ===================================================== */}
-            <Show when={metrics() && running().length > 0}>
-              <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1fr))' }}>
-                <Split
-                  label="CPU by container"
-                  items={running().map((s) => ({ name: s.name, value: (s.sample?.cpu_pct ?? 0) / 100, shade: shade(s.name) }))}
-                  format={(v) => `${cores(v)} cores`}
-                />
-                <Split
-                  label="Memory by container"
-                  items={running().map((s) => ({ name: s.name, value: s.sample?.mem_bytes ?? 0, shade: shade(s.name) }))}
-                  format={(v) => formatBytes(v)}
-                />
-              </section>
-            </Show>
-
-            {/* every container ================================================== */}
-            <section class="fx-row">
-              <FxCell label="Containers" meta={<span><b>{running().length}</b> of {services().length} running · closest to a limit first</span>}>
-                <Show when={services().length} fallback={<div class="fx-empty cap">No containers are running</div>}>
-                  <table class="fx-list rs-containers">
-                    <colgroup>
-                      <col style={{ width: '13%' }} /><col style={{ width: '18%' }} /><col style={{ width: '18%' }} />
-                      <col style={{ width: '19%' }} /><col style={{ width: '8%' }} /><col style={{ width: '17%' }} /><col style={{ width: '7%' }} />
-                    </colgroup>
-                    <thead>
-                      <tr>
-                        <th class="cap">Container</th><th class="cap">CPU</th><th class="cap">Memory</th>
-                        <th class="cap" title="its volumes, against what they take plus what is still free on the host disk">Disk</th>
-                        <th class="cap r">Disk writes</th><th class="cap r">Network in / out</th><th class="cap r">Up</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <For each={services()}>
-                        {(s) => (
-                          <tr>
-                            <td>
-                              <span class="fx-who">
-                                <Sq tone={toneOf(s)} />
-                                <span style={{ color: 'var(--ink)' }}>{s.name}</span>
-                              </span>
-                              <span class="vw-meta cap">
-                                <span>{s.machine ? `forwards to ${s.machine}` : s.role}</span>
-                                <Show when={s.status !== 'running'}><span classList={{ warn: toneOf(s) === 'warn', bad: toneOf(s) === 'bad' }}>{s.status}</span></Show>
-                              </span>
-                            </td>
-                            <td>
-                              <Meter pct={s.status === 'running' && s.sample ? cpuPct(s) : null}>
-                                {pct(cpuPct(s))} <em>/ {s.vcpus} vCPU</em>
-                              </Meter>
-                            </td>
-                            <td>
-                              <Meter pct={s.status === 'running' && s.sample ? memPct(s) : null}>
-                                {s.sample ? formatBytes(s.sample.mem_bytes) : '—'} <em>/ {formatBytes(memLimit(s))}</em>
-                              </Meter>
-                            </td>
-                            <td>
-                              <Meter pct={volumesPct(s)}>
-                                {formatBytes(s.disk?.used_bytes)} <em>/ {formatBytes(s.disk ? s.disk.used_bytes + s.disk.free_bytes : null)}</em>
-                              </Meter>
-                            </td>
-                            <td class="r">{rate(s.sample?.disk_write_bps)}</td>
-                            <td class="r">{rate(s.sample?.net_rx_bps)} <span style={{ color: 'var(--ink-ghost)' }}>/</span> {rate(s.sample?.net_tx_bps)}</td>
-                            <td class="r">{s.since ? formatUptime((now() - Date.parse(s.since)) / 1000) : '—'}</td>
-                          </tr>
+                      <Show when={metrics()}>
+                        <LineChart points={cpuPoints()} format={(v) => `${cores(v)}`} now={now()} />
+                      </Show>
+                    </FxCell>
+                    <FxCell label="Memory" meta={<span>of <b>{formatBytes(memAlloc())}</b> · last 15 min</span>}>
+                      <div class="fx-big">
+                        {metrics() ? formatBytes(memNow()) : '—'}
+                        <small>{pct(memAlloc() ? (memNow() / memAlloc()) * 100 : null)}</small>
+                      </div>
+                      <Show when={metrics()}>
+                        <LineChart points={memPoints()} format={(v) => formatBytes(v)} now={now()} />
+                      </Show>
+                    </FxCell>
+                    <FxCell label="Bucket disk" meta={<Show when={volume()?.usage}>{(u) => <span>measured {relativeStamp(u().measured_at)}</span>}</Show>}>
+                      <div class="fx-big">
+                        <span classList={{ warn: (diskPct() ?? 0) >= 80 && (diskPct() ?? 0) < 90, bad: (diskPct() ?? 0) >= 90 }}>
+                          {diskPct() != null ? pct(diskPct()) : '—'}
+                        </span>
+                        <Show when={diskPct() != null}><small>full</small></Show>
+                      </div>
+                      <Show
+                        when={volume()?.usage}
+                        fallback={<div class="fx-sub cap"><span>{volume() ? 'waiting for the first measurement' : 'no bucket volume configured'}</span></div>}
+                      >
+                        {(u) => (
+                          <>
+                            <div style={{ 'margin-top': '16px' }}><Seg pct={diskPct()} wide /></div>
+                            <div class="fx-foot rs-disk">
+                              <div><span class="cap">Used</span><b>{formatBytes(u().used_bytes)}</b></div>
+                              <div><span class="cap">Free</span><b>{formatBytes(u().free_bytes)}</b></div>
+                              <div><span class="cap">Volume</span><b>{volume()!.provisioned_gb} <em>GB</em></b></div>
+                            </div>
+                          </>
                         )}
-                      </For>
-                    </tbody>
-                  </table>
-                </Show>
-              </FxCell>
-            </section>
+                      </Show>
+                    </FxCell>
+                  </section>
+
+                  {/* who uses it ===================================================== */}
+                  <Show when={metrics() && running().length > 0}>
+                    <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1fr))' }}>
+                      <Split
+                        label="CPU by container"
+                        items={running().map((s) => ({ name: s.name, value: (s.sample?.cpu_pct ?? 0) / 100, shade: shade(s.name) }))}
+                        format={(v) => `${cores(v)} cores`}
+                      />
+                      <Split
+                        label="Memory by container"
+                        items={running().map((s) => ({ name: s.name, value: s.sample?.mem_bytes ?? 0, shade: shade(s.name) }))}
+                        format={(v) => formatBytes(v)}
+                      />
+                    </section>
+                  </Show>
+
+                  <section class="fx-row">
+                    <ContainerTable services={services()} now={now()} />
+                  </section>
+                </>
+              }
+            >
+              <For each={hosts()}>
+                {(host) => (
+                  <HostSection
+                    host={host}
+                    services={onHost(host.kind)}
+                    bucket={host.kind === 'db' ? volume() : null}
+                    metrics={metrics()}
+                    now={now()}
+                    shade={shade}
+                  />
+                )}
+              </For>
+              <Show when={elsewhere().length > 0}>
+                <section class="fx-row">
+                  <ContainerTable label="Not on a VM yet" services={elsewhere()} now={now()} />
+                </section>
+              </Show>
+            </Show>
 
             {/* the machines behind dedicated and pooled backends ================ */}
             <Show when={machines().length > 0}>
@@ -330,6 +313,251 @@ export function Resources() {
         )}
       </Show>
     </>
+  );
+}
+
+/** One VM: the machine against its real size, how it is used, what runs on it. */
+function HostSection(props: {
+  host: CloudHost;
+  services: CloudService[];
+  bucket: CloudStats['bucket_volume'];
+  metrics: boolean;
+  now: number;
+  shade: (name: string) => string | undefined;
+}) {
+  const h = () => props.host;
+  const running = () => props.services.filter((s) => s.status === 'running');
+  const points = (values: number[]) =>
+    values.map((v, i) => ({ ts: props.now - (values.length - 1 - i) * SAMPLE_MS, v }));
+  const cpuPoints = () => points(sumSeries(running().map((s) => s.cpu_series)).map((v) => v / 100));
+  const memPoints = () => points(sumSeries(running().map((s) => s.mem_series)));
+  const cpuNow = () => running().reduce((a, s) => a + (s.sample?.cpu_pct ?? 0), 0) / 100;
+  const memPct = () => (h().memory_bytes > 0 ? (h().memory_used_bytes / h().memory_bytes) * 100 : null);
+  const measured = () => !!h().measured_at;
+
+  // The database's disk is its volume, read off the container using it. Everything
+  // else on any VM lives on the system disk.
+  const data = () => props.services.find((s) => s.role === 'surrealdb')?.disk ?? null;
+  const dataUsed = () => {
+    const d = data();
+    return d ? d.fs_bytes - d.free_bytes : null;
+  };
+  const dataPct = () => {
+    const d = data();
+    return d && d.fs_bytes > 0 ? ((d.fs_bytes - d.free_bytes) / d.fs_bytes) * 100 : null;
+  };
+  const systemPct = () => (h().disk_bytes > 0 ? (h().disk_used_bytes / h().disk_bytes) * 100 : null);
+  const bucketPct = () => {
+    const u = props.bucket?.usage;
+    return u && u.fs_bytes > 0 ? (u.used_bytes / u.fs_bytes) * 100 : null;
+  };
+  const systemDisk = () => (
+    <DiskCell
+      label="System disk"
+      meta={<Show when={h().measured_at}>{(m) => <span>measured {relativeStamp(m())}</span>}</Show>}
+      pct={systemPct()}
+      used={measured() ? h().disk_used_bytes : null}
+      free={measured() ? h().disk_bytes - h().disk_used_bytes : null}
+      total={measured() ? formatBytes(h().disk_bytes) : '—'}
+      totalLabel="Disk"
+    />
+  );
+  // Limits are ceilings and they overlap: together they can pass the machine's size,
+  // which is normal. It says what could happen if every container peaked at once.
+  const limits = () => (
+    <FxCell label="Container limits" meta={<span>what they may use</span>}>
+      <div class="fx-big">
+        {formatBytes(running().reduce((a, s) => a + memLimit(s), 0))}
+        <small>memory</small>
+      </div>
+      <div class="fx-foot rs-disk">
+        <div><span class="cap">vCPU</span><b>{running().reduce((a, s) => a + s.vcpus, 0)}</b></div>
+        <div><span class="cap">Machine</span><b>{h().vcpus || '—'} <em>vCPU</em></b></div>
+        <div><span class="cap">Running</span><b>{running().length}</b></div>
+      </div>
+    </FxCell>
+  );
+
+  return (
+    <>
+      <section class="fx-row">
+        <FxCell
+          class="rs-vm"
+          label={<span class="rs-vm-name">{kindLabel(h().kind)}</span>}
+          meta={
+            <span class="rs-vm-spec">
+              <b>{h().server_type}</b>
+              <span>{h().location}</span>
+              <Show when={h().vcpus > 0}><span>{h().vcpus} vCPU</span></Show>
+              <Show when={h().memory_bytes > 0}><span>{formatBytes(h().memory_bytes)}</span></Show>
+              <Show when={h().status !== 'ready'}><span class="warn">{h().status}</span></Show>
+            </span>
+          }
+        >
+          <></>
+        </FxCell>
+      </section>
+      <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1.4fr)) minmax(0, 1fr)' }}>
+        <FxCell label="CPU" meta={<span>containers <b>{props.metrics ? cores(cpuNow()) : '—'}</b> cores · last 15 min</span>}>
+          <div class="fx-big">
+            <span classList={{ warn: (h().cpu_pct ?? 0) >= 80 && (h().cpu_pct ?? 0) < 90, bad: (h().cpu_pct ?? 0) >= 90 }}>
+              {pct(h().cpu_pct)}
+            </span>
+            <small>of the machine<Show when={h().load1 != null}> · load {h().load1!.toFixed(2)}</Show></small>
+          </div>
+          <Show when={props.metrics}>
+            <LineChart points={cpuPoints()} format={(v) => `${cores(v)}`} now={props.now} />
+          </Show>
+        </FxCell>
+        <FxCell label="Memory" meta={<span>containers <b>{formatBytes(running().reduce((a, s) => a + (s.sample?.mem_bytes ?? 0), 0))}</b> · last 15 min</span>}>
+          <div class="fx-big">
+            <span classList={{ warn: (memPct() ?? 0) >= 80 && (memPct() ?? 0) < 90, bad: (memPct() ?? 0) >= 90 }}>
+              {measured() ? formatBytes(h().memory_used_bytes) : '—'}
+            </span>
+            <Show when={measured()}><small>of {formatBytes(h().memory_bytes)} · {pct(memPct())}</small></Show>
+          </div>
+          <Show when={props.metrics}>
+            <LineChart points={memPoints()} format={(v) => formatBytes(v)} now={props.now} />
+          </Show>
+        </FxCell>
+        <div class="rs-stack">
+          <Show when={h().kind === 'db'} fallback={systemDisk()}>
+            <DiskCell
+              label="Data volume"
+              meta={<Show when={data()}>{(d) => <span>measured {relativeStamp(d().measured_at)}</span>}</Show>}
+              pct={dataPct()}
+              used={dataUsed()}
+              free={data()?.free_bytes ?? null}
+              total={h().data_volume_gb ? `${h().data_volume_gb} GB` : '—'}
+              totalLabel="Volume"
+            />
+          </Show>
+          <Show when={props.bucket} fallback={h().kind === 'db' ? systemDisk() : limits()}>
+            {(b) => (
+              <DiskCell
+                label="Bucket volume"
+                meta={<Show when={b().usage}>{(u) => <span>measured {relativeStamp(u().measured_at)}</span>}</Show>}
+                pct={bucketPct()}
+                used={b().usage?.used_bytes ?? null}
+                free={b().usage?.free_bytes ?? null}
+                total={`${b().provisioned_gb} GB`}
+                totalLabel="Volume"
+              />
+            )}
+          </Show>
+        </div>
+      </section>
+      <Show when={props.metrics && running().length > 3}>
+        <section class="fx-row" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1fr))' }}>
+          <Split
+            label="CPU by container"
+            items={running().map((s) => ({ name: s.name, value: (s.sample?.cpu_pct ?? 0) / 100, shade: props.shade(s.name) ?? SHADES[0]! }))}
+            format={(v) => `${cores(v)} cores`}
+          />
+          <Split
+            label="Memory by container"
+            items={running().map((s) => ({ name: s.name, value: s.sample?.mem_bytes ?? 0, shade: props.shade(s.name) ?? SHADES[0]! }))}
+            format={(v) => formatBytes(v)}
+          />
+        </section>
+      </Show>
+      <section class="fx-row">
+        <ContainerTable label="On this VM" services={props.services} now={props.now} />
+      </section>
+    </>
+  );
+}
+
+/** A disk: how full, used, free and its size. */
+function DiskCell(props: {
+  label: string;
+  meta?: JSX.Element;
+  pct: number | null;
+  used: number | null;
+  free: number | null;
+  total: string;
+  totalLabel: string;
+}) {
+  return (
+    <FxCell label={props.label} meta={props.meta}>
+      <div class="fx-big">
+        <span classList={{ warn: (props.pct ?? 0) >= 80 && (props.pct ?? 0) < 90, bad: (props.pct ?? 0) >= 90 }}>
+          {props.pct != null ? pct(props.pct) : '—'}
+        </span>
+        <Show when={props.pct != null}><small>full</small></Show>
+      </div>
+      <Show when={props.pct != null} fallback={<div class="fx-sub cap"><span>waiting for the first measurement</span></div>}>
+        <div style={{ 'margin-top': '16px' }}><Seg pct={props.pct} wide /></div>
+        <div class="fx-foot rs-disk">
+          <div><span class="cap">Used</span><b>{formatBytes(props.used)}</b></div>
+          <div><span class="cap">Free</span><b>{formatBytes(props.free)}</b></div>
+          <div><span class="cap">{props.totalLabel}</span><b>{props.total}</b></div>
+        </div>
+      </Show>
+    </FxCell>
+  );
+}
+
+/** Containers, closest to a limit first. */
+function ContainerTable(props: { label?: string; services: CloudService[]; now: number }) {
+  const running = () => props.services.filter((s) => s.status === 'running').length;
+  const sorted = () => [...props.services].sort((a, b) => pressure(b) - pressure(a) || a.name.localeCompare(b.name));
+  const roleText = (s: CloudService) =>
+    s.machine ? `forwards to ${s.machine}` : s.role === 'dblink' ? 'tunnel' : s.role;
+  return (
+    <FxCell label={props.label ?? 'Containers'} meta={<span><b>{running()}</b> of {props.services.length} running · closest to a limit first</span>}>
+      <Show when={props.services.length} fallback={<div class="fx-empty cap">No containers are running</div>}>
+        <table class="fx-list rs-containers">
+          <colgroup>
+            <col style={{ width: '13%' }} /><col style={{ width: '18%' }} /><col style={{ width: '18%' }} />
+            <col style={{ width: '19%' }} /><col style={{ width: '8%' }} /><col style={{ width: '17%' }} /><col style={{ width: '7%' }} />
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="cap">Container</th><th class="cap" title="against this container's own limit">CPU</th><th class="cap" title="against this container's own limit">Memory</th>
+              <th class="cap" title="its volumes, against what they take plus what is still free on their disk">Disk</th>
+              <th class="cap r">Disk writes</th><th class="cap r">Network in / out</th><th class="cap r">Up</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={sorted()}>
+              {(s) => (
+                <tr>
+                  <td>
+                    <span class="fx-who">
+                      <Sq tone={toneOf(s)} />
+                      <span style={{ color: 'var(--ink)' }}>{s.name}</span>
+                    </span>
+                    <span class="vw-meta cap">
+                      <span>{roleText(s)}</span>
+                      <Show when={s.status !== 'running'}><span classList={{ warn: toneOf(s) === 'warn', bad: toneOf(s) === 'bad' }}>{s.status}</span></Show>
+                    </span>
+                  </td>
+                  <td>
+                    <Meter pct={s.status === 'running' && s.sample ? cpuPct(s) : null}>
+                      {pct(cpuPct(s))} <em>/ {s.vcpus} vCPU</em>
+                    </Meter>
+                  </td>
+                  <td>
+                    <Meter pct={s.status === 'running' && s.sample ? memPct(s) : null}>
+                      {s.sample ? formatBytes(s.sample.mem_bytes) : '—'} <em>/ {formatBytes(memLimit(s))}</em>
+                    </Meter>
+                  </td>
+                  <td>
+                    <Meter pct={volumesPct(s)}>
+                      {formatBytes(s.disk?.used_bytes)} <em>/ {formatBytes(s.disk ? s.disk.used_bytes + s.disk.free_bytes : null)}</em>
+                    </Meter>
+                  </td>
+                  <td class="r">{rate(s.sample?.disk_write_bps)}</td>
+                  <td class="r">{rate(s.sample?.net_rx_bps)} <span style={{ color: 'var(--ink-ghost)' }}>/</span> {rate(s.sample?.net_tx_bps)}</td>
+                  <td class="r">{s.since ? formatUptime((props.now - Date.parse(s.since)) / 1000) : '—'}</td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </Show>
+    </FxCell>
   );
 }
 

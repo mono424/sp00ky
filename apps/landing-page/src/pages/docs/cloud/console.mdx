@@ -14,6 +14,31 @@ import LinkCard from '../../../components/ui/LinkCard.astro';
 Sp00ky Cloud projects. Sign in with GitHub, the same account `spky cloud login`
 uses, and you see every workspace you belong to and every project in it.
 
+## Your first project
+
+A workspace with no projects opens on the steps that get one running. **New project**
+(on the Projects page and in the project switcher) opens the same steps at any time.
+
+1. **Connect GitHub.** Install the Sp00ky Cloud GitHub app on your account or an
+   organization. It reads code and posts deploy checks, nothing else, and you choose
+   which repositories it can see. An app already on your own account connects by itself.
+2. **Pick a repository.** The console reads the default branch and says what it found:
+   a `sp00ky.yml`, your apps and their frameworks, SurrealQL files, the package manager.
+3. **Run the commands.** They are written for that repository, and each one ticks off
+   as it lands: `spky login` when it finishes, a pushed `sp00ky.yml` as soon as it is on
+   the branch, then the project, its checkout and its deployment during `spky deploy`.
+   The repository is linked to the project once checkout is paid, so pushes to the
+   default branch deploy from then on. Turn that off under **Settings → Git link**.
+
+No repository yet? **Start without a repository** gives you the commands for
+`spky init` and a first deploy instead.
+
+<Note>
+The console never creates a project for you: `spky deploy` does that, and it opens
+checkout. `spky deploy` creates projects in your personal workspace, so a project
+started from a team workspace shows up there.
+</Note>
+
 ## Finding your way
 
 - **The workspace selector** (top right) switches workspaces and holds the
@@ -23,9 +48,10 @@ uses, and you see every workspace you belong to and every project in it.
   `⌘P` opens it; each project shows its state and whether it runs on VMs or
   on Cloudflare.
 - **The sidebar** is the project's dashboard: Overview, Deployments,
-  Incidents, Logs, sync, runs, backups, resources, and **Settings** at the
-  bottom (environment, domains, git link, scale, access tokens, danger zone).
-  `⌘K` jumps to any page.
+  Incidents, Logs, sync, runs, the project's data (database, users, storage),
+  backups, resources, and **Settings** at the bottom (environment, domains,
+  git link, scale, [database upgrades](/docs/cloud/database-upgrades), access
+  tokens, danger zone). `⌘K` jumps to any page.
 
 Addresses are shareable: `/acme/whitepawn/deployments` is that page of that
 project, `/acme/-/members` the members of that workspace.
@@ -40,6 +66,131 @@ build and deploy stages as they move. History lists every version with who
 started it and how long it took; **Roll back** brings back the newest version
 before the live one, **Restart** can restart or upgrade parts of the project,
 and **Rebuild** reruns the build of a git-linked project.
+
+### Build time
+
+The **Build time** box on the Deployments page shows how long a push takes to go
+live and how the latest build split up. It opens a page for finding out why:
+
+- The median push-to-live time, the slowest 1 in 10, build, rollout and image
+  reuse, each against the period before.
+- A chart of every build with a rolling median. Failed builds are marked, and
+  points where the time stepped up or down are numbered, with the phase, app and
+  commit that go with the change.
+- The same builds split into phases: queue, source, build, infra, migrate and
+  rollout. Pick a phase to chart it alone and to list only its steps.
+- Every step ranked by time. An image expands to its `docker build` and each
+  Docker layer, with how often it was cached.
+- Any single build as a waterfall, with a mark for what each step usually takes.
+
+Git-linked builds are timed step by step, including their layers (kept for 180
+days; other steps as long as the build). A deployment from `spky deploy` on your
+own machine shows its rollout only, because its images are built on your machine.
+
+## Audience
+
+Audience shows how many people are online and how many views they hold, over
+time. People are signed-in users plus signed-out sessions. A week heatmap, in
+your own time zone, shows when they tend to be around, and the quietest hours
+are the ones to aim backups and upgrades at (nothing is scheduled from them yet).
+
+**Online now** is live. The charts follow in 15-minute steps: a project's
+scheduler reports each step when it ends, so the page starts filling once the
+project runs a release with activity reporting. Gaps mean nothing was
+measured, not that nobody was there. Cloudflare projects are not measured yet.
+
+## Database
+
+Your project's tables, in the shape of a table editor. Pick a table on the left
+and read its rows, sort by any column, stack filters (typed by the column, so
+`created_at > 2026-01-01` compares dates), and page through. **Count rows** is a
+button because a count is a scan of the table. Double-click a value to change it;
+click a row's id for all its fields; a record links to the row it points at.
+**Structure** shows the table's fields, indexes and events. The tables behind
+sync (`_00_*`) are listed apart and are read-only here.
+
+The **SQL editor** runs SurrealQL as root, past every table permission. It asks
+before a statement that writes, and a lone `SELECT` with no `LIMIT` shows at most
+1000 rows and stops after 30 seconds, because a forgotten limit on a large table
+is a real load on your database. Statements before one that
+fails have already run: SurrealDB commits one at a time unless the script says
+`BEGIN`.
+
+## Users
+
+The users of your app, found through the `SIGNIN` clause of its `DEFINE ACCESS`:
+which table they are in, which field identifies them, and how passwords are
+hashed. Search them, see who is online right now and on how many tabs, sort by
+when they joined, and open one to reset the password (hashed the way `SIGNIN` checks it), add or remove them
+from the [admin roster](/docs/reference/admin-dashboard#admin-accounts-the-normal-path),
+or delete them.
+
+**New user** writes the row directly: the app's `SIGNUP` block does not run, its
+table events do. Deleting a user removes the row, its roster entry and its
+feature flags, and rows that point at the user stay. A password reset does not end
+sessions already open, because SurrealDB has nothing to revoke them with.
+
+A user's page lists every [feature flag](/docs/client/feature-flags) with the
+variant they get and whether a pin or the rules decide it. Pick a variant to pin
+them to it, or **Follow the rules** to unpin them; only that user is re-evaluated,
+and their app picks the change up live.
+
+## Feature flags
+
+The flags `spky flag` manages, with the same rules. **New flag** takes a key, its
+variants and a default; it starts on, with everyone on the default. A flag's page
+shows how many users have each variant and lets you:
+
+- turn it **off** (everyone gets the default, pins too) and back **on**;
+- set a **rollout** percent per variant: a stable share of users, by a hash of
+  the flag and the user, so raising it keeps the users who already had it;
+- **pin** users to a variant, found by the same search as the Users page. A pin
+  beats every rollout;
+- change its description, variants and default, or delete it.
+
+A change that can move many users (on and off, a rollout, a new default, a new
+flag) re-evaluates every user, a page of them at a time, with a progress bar.
+Keep the tab open until it finishes; if it stops part way, **Re-evaluate all
+users** finishes the job. What each user gets is written by the project's own
+`fn::feature::assign`, the evaluator the CLI and the DevTools use, so whichever
+one changed a flag, a user lands on the same variant. A project whose flag
+functions predate the console shows its flags read-only until it is redeployed.
+
+## Storage
+
+The files of your SurrealDB buckets. Folders open side by side in columns, with
+the file or folder you picked at the end, so you always see how you got there.
+Preview images and text, download, upload by button or by dropping files on the
+page, rename, and delete. An HTML file shows as text and never runs.
+
+Three limits come from where the files are:
+
+- **Uploads stop at about 3 MB**, the most that fits SurrealDB's 4 MiB request
+  limit (`SURREAL_HTTP_MAX_RPC_BODY_SIZE`) once encoded. Your app's own uploads
+  are not affected. Reads go up to 32 MB.
+- **A `file:` bucket needs its folder on the scheduler's disk to show subfolders.**
+  SurrealDB lists the files of a directory and not the directories in it, so the
+  scheduler reads them from the bucket's volume, which Sp00ky Cloud mounts read-only
+  on VM projects from their next upgrade. Until then a subfolder has to be opened
+  by its path, and the page remembers the ones you opened.
+- **A `BACKEND "r2"` bucket is listed but cannot be browsed yet**: its files live
+  in R2 next to the SSP, not in the database.
+
+<Note>
+Everyone in a workspace can open these pages for its projects, and with them read
+and change your users' data. To turn them off for a project on VMs, set
+`SPKY_ADMIN_DATA: off` for the `scheduler` under
+[`deployment.env`](/docs/reference/config) in `sp00ky.yml`; a Cloudflare project has
+no such setting yet.
+
+The Database and Users pages mask a field named like a credential (`password`,
+`token`, `api_key` and so on) and the field `SIGNIN` compares a password against,
+and that field cannot be filtered, sorted on or edited there. Push keys and device
+tokens are not listed at all. This goes by name, so a secret kept under an ordinary
+name shows like anything else, and a statement in the SQL editor returns whatever
+it selects. MCP tokens cannot reach any of this. Every change is logged with who
+made it.
+</Note>
 
 ## Settings
 
@@ -64,13 +215,16 @@ has the details.
 A project's live dashboard needs a scheduler from canary.370 or later. An
 older one still shows Deployments and Settings, with a note to upgrade it
 (`spky restart --upgrade`). Cloudflare projects show Deployments and
-Settings until their SSP learns console sign-in.
+Settings until their SSP learns console sign-in. Database, Users and Storage
+appear once a project's scheduler or SSP is on canary.371 or later, Feature
+flags on the first release after canary.379.
 </Note>
 
 The console's own session is a cookie that only console.sp00ky.cloud can
 read or send, and every request it makes carries a header no other page can
 add, so no other site can act through it. Project secrets and database
-passwords are never sent to the console.
+passwords are never sent to the console. Reading a repository returns what it
+found, never a file's contents.
 
 <CardGrid>
   <LinkCard title="Admin dashboard" href="/docs/reference/admin-dashboard" description="Every page of a project's dashboard, and the API behind it." />

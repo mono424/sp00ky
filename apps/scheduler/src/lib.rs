@@ -295,6 +295,8 @@ pub enum SchedulerStatus {
 /// Main Scheduler service that orchestrates SurrealDB and SSP sidecars
 pub struct Scheduler {
     config: SchedulerConfig,
+    /// Every long-lived upstream handle, for [`Scheduler::database_moved`].
+    db_handles: std::sync::Mutex<Vec<Arc<maintenance::db::ReconnectingDb>>>,
     /// Filled in by `start()` once the shared root handle exists. The admin
     /// plane and ingest observers use this slot because their HTTP handlers
     /// are created before the upstream connection is ready.
@@ -362,6 +364,18 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    fn track_db_handle(&self, db: &Arc<maintenance::db::ReconnectingDb>) {
+        self.db_handles.lock().expect("db handles lock poisoned").push(Arc::clone(db));
+    }
+
+    /// The control plane moved SurrealDB to another container: every handle
+    /// reconnects now instead of after minutes of failed probes.
+    pub fn database_moved(&self) {
+        for db in self.db_handles.lock().expect("db handles lock poisoned").iter() {
+            db.database_moved();
+        }
+    }
+
     /// Create a new Scheduler instance
     pub async fn new(config: SchedulerConfig, transport: Arc<HttpTransport>) -> Result<Self> {
         let strategy = config.load_balance.clone();
@@ -381,6 +395,7 @@ impl Scheduler {
         Ok(Self {
             config,
             db_slot: crate::admin::new_db_slot(),
+            db_handles: std::sync::Mutex::new(Vec::new()),
             transport,
             replica: Arc::new(RwLock::new(replica)),
             ssp_pool: Arc::new(RwLock::new(SspPool::new(strategy, max_buffer_per_ssp))),
@@ -548,6 +563,7 @@ impl Scheduler {
             }
         };
         maintenance::db::spawn_periodic_resignin(Arc::clone(&db), maintenance::db::RESIGNIN_INTERVAL_SECS);
+        self.track_db_handle(&db);
         let Some(query_state) = self.query_state_slot.get().cloned() else {
             error!("Changefeed transport configured but no query state attached; view teardown would be lost, tail NOT started");
             return;
@@ -854,6 +870,7 @@ impl Scheduler {
         // previous `db.clone()` per consumer meant several independent sessions
         // to lose and several to re-establish.
         let shared_db = maintenance::db::ReconnectingDb::new(db, self.config.db.clone());
+        self.track_db_handle(&shared_db);
         // Store a list pushed before this point, or restore the one the last
         // deploy pushed (the control plane does not push it after a restart).
         if let Some(registry) = self.backend_registry_slot.get() {
@@ -876,6 +893,7 @@ impl Scheduler {
                 Arc::clone(&shared_db)
             }
         };
+        self.track_db_handle(&admin_db);
         // Publish it for the admin plane, which came up with the HTTP servers
         // (before this point) and answers 503 until this lands.
         *self.db_slot.write().await = Some(admin_db);

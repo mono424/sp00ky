@@ -4,7 +4,7 @@ import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
-import { AccountMenu, ProjectSwitcher, WORKSPACE_LINKS, WorkspaceSwitch, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
+import { ProjectSwitcher, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
 export interface NavLink {
   href: string;
@@ -39,12 +39,18 @@ const NAV_PATHS: Record<string, string> = {
   '/incidents': 'M12 3 2 21h20L12 3z M12 9v5 M12 17v1',
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
   '/access': 'M5 10h14v11H5z M8 10V6a4 4 0 0 1 8 0v4 M12 14v3',
+  '/database': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0',
+  '/users': 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M22 21v-2a4 4 0 0 0-3-3.9 M16 3.1a4 4 0 0 1 0 7.8',
+  '/flags': 'M5 21V3 M5 4h12l-2.5 4.5L17 13H5',
+  '/storage': 'M3 6h6l2 2h10v11H3z',
   '/resources': 'M6 6h12v12H6z M9 9h6v6H9z M9 3v3 M15 3v3 M9 18v3 M15 18v3 M3 9h3 M3 15h3 M18 9h3 M18 15h3',
   '/deployments': 'M12 3l9 5-9 5-9-5 9-5z M3 13l9 5 9-5',
+  '/audience': 'M4 20V11 M10 20V4 M16 20v-7 M21 20H3',
   '/settings/env': 'M4 7h16 M4 12h16 M4 17h10 M18 15l3 3-3 3',
   '/settings/domains': 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M3 12h18 M12 3c3 3.5 3 14.5 0 18 M12 3c-3 3.5-3 14.5 0 18',
   '/settings/git': 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M18 9a9 9 0 0 1-9 9',
   '/settings/scale': 'M4 21v-7 M4 10V3 M12 21v-9 M12 8V3 M20 21v-5 M20 12V3 M1 14h6 M9 8h6 M17 16h6',
+  '/settings/database': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M12 18v-7 M9 14l3-3 3 3',
   '/settings/danger': 'M12 9v4 M12 17h.01 M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z',
   project: 'M4 4h16v16H4z M9 9h6v6H9z',
   workspace: 'M3 21h18 M5 21V7l7-4 7 4v14 M9 21v-6h6v6',
@@ -73,15 +79,16 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
         { href: '/settings/domains', label: 'Domains', group: 'Settings' },
         { href: '/settings/git', label: 'Git & builds', group: 'Settings' },
         { href: '/settings/scale', label: 'Scale', group: 'Settings' },
+        { href: '/settings/database', label: 'Database', group: 'Settings' },
         ...(limited ? [] : [{ href: '/access', label: 'Access tokens', group: 'Settings' }]),
         { href: '/settings/danger', label: 'Danger zone', group: 'Settings' },
       ]
     : [];
-  if (limited) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }, ...settings];
+  if (limited) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }, { href: '/audience', label: 'Audience' }, ...settings];
   return [
     // Where an operator starts: the cluster, what shipped, what went wrong, what it said.
     { href: '/', label: 'Overview' },
-    ...(console ? [{ href: '/deployments', label: 'Deployments' }] : []),
+    ...(console ? [{ href: '/deployments', label: 'Deployments' }, { href: '/audience', label: 'Audience' }] : []),
     {
       href: '/incidents',
       label: 'Incidents',
@@ -119,6 +126,17 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
       // sampler has run once, which is not the same as "the queue is empty".
       count: o?.jobs?.ready ? formatCount(o.jobs.counts.pending + o.jobs.counts.processing) : undefined,
     },
+    // The project's own data. In the console first; a host says whether it
+    // can serve it, since the console also opens older schedulers.
+    ...(console && currentMode().config?.data
+      ? [
+          { href: '/database', label: 'Database', group: 'Data' },
+          { href: '/users', label: 'Users', group: 'Data' },
+          // A host older than the flag routes still serves the rest of `/data`.
+          ...(currentMode().config?.flags ? [{ href: '/flags', label: 'Feature flags', group: 'Data' }] : []),
+          { href: '/storage', label: 'Storage', group: 'Data' },
+        ]
+      : []),
     { href: '/backups', label: 'Backups', group: 'Data' },
     // Sp00ky Cloud only: the scheduler cannot measure its neighbours or the
     // database's volume, the control plane can. Hidden, not disabled, when
@@ -174,9 +192,9 @@ let lastLayer: 'workspace' | 'project' | undefined;
 /**
  * The console's rail, in two layers. The workspace layer lists the
  * workspace's projects between its quick links and its own pages; opening a
- * project drills into the project layer: a way back, the project (switchable
- * in place), its quick links, then the cluster and the project's settings in
- * groups. The workspace switcher heads both, the account sits at the foot.
+ * project drills into the project layer: a way back, its quick links, then
+ * the cluster and the project's settings in groups. The project switcher heads
+ * both; the foot is one menu for the account and its workspaces.
  */
 function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void; version: string }) {
   const cx = useConsoleChrome()!;
@@ -186,15 +204,13 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
   const ws = () => cx.workspace();
   const quick = () => sectionsOf(props.links).filter((x) => !x.group);
   const grouped = () => sectionsOf(props.links).filter((x) => x.group);
-  // The project's settings fold under one row: open on their pages, or when asked.
   const location = useLocation();
-  const inSettings = () => /\/(settings|access)(\/|$)/.test(location.pathname);
-  const [settingsOpen, setSettingsOpen] = createSignal(inSettings());
-  createEffect(() => { if (inSettings()) setSettingsOpen(true); });
   return (
     <>
       <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-      <WorkspaceSwitch />
+      <div class="cx-rail-head">
+        <ProjectSwitcher rail />
+      </div>
       <button class="sb-jump cap" onClick={props.onJump}>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
           <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
@@ -206,9 +222,8 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
         <div class={`cx-pin cx-layer ${dir}`}>
           <button class="cx-back" onClick={() => cx.go(`/${ws()?.slug}/-`)} title={`Back to ${ws()?.name ?? 'the workspace'}`}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
-            <span>All projects</span>
+            <span>{ws()?.name ?? 'Workspace'}</span>
           </button>
-          <ProjectSwitcher rail />
         </div>
       </Show>
       <div
@@ -217,7 +232,6 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
           // Keep the page you are on in view when the rail is taller than the screen.
           createEffect(() => {
             location.pathname;
-            settingsOpen();
             setTimeout(() => el.querySelector('.nav-link.active')?.scrollIntoView({ block: 'nearest' }), 60);
           });
         }}
@@ -233,7 +247,7 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
           {(w) => (
             <div class="nav-section">
               <div class="nav-heading cx-nh"><span>Projects</span><span>{w().projects.length}</span></div>
-              <For each={w().projects} fallback={<div class="cx-empty cap">No projects yet</div>}>
+              <For each={w().projects}>
                 {(p) => (
                   <button class="nav-link cx-pl" title={projectLine(p)} onClick={() => cx.go(`/${w().slug}/${p.slug}`)}>
                     <span class="row" style={{ gap: '10px', 'min-width': '0' }}>
@@ -252,32 +266,15 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
         </Show>
         <For each={grouped()}>
           {(section) => (
-            <Show
-              when={section.group === 'Settings'}
-              fallback={
-                <div class="nav-section">
-                  <div class="nav-heading">{section.group}</div>
-                  <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
-                </div>
-              }
-            >
-              <div class="nav-section cx-fold" classList={{ open: settingsOpen() }}>
-                <button class="nav-link cx-fold-head" classList={{ here: inSettings() }} aria-expanded={settingsOpen()} onClick={() => setSettingsOpen(!settingsOpen())}>
-                  <span class="row" style={{ gap: '10px' }}><NavIcon href="/settings" /><span>Settings</span></span>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
-                </button>
-                <Show when={settingsOpen()}>
-                  <div class="cx-fold-list">
-                    <For each={section.links}>{(link) => <NavItem link={{ ...link, icon: undefined }} atRoot={props.atRoot} />}</For>
-                  </div>
-                </Show>
-              </div>
-            </Show>
+            <div class="nav-section">
+              <div class="nav-heading">{section.group}</div>
+              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
+            </div>
           )}
         </For>
       </div>
       <div class="sb-foot cx-foot">
-        <AccountMenu />
+        <WorkspaceMenu />
         <Show when={props.version}><div class="sb-ver cap">{props.version}</div></Show>
       </div>
     </>
@@ -310,8 +307,11 @@ export function Shell(props: {
 }) {
   const location = useLocation();
   const [open, setOpen] = createSignal(false);
-  // In the console the workspace menu (top-right) holds the account, and
-  // Deployments and Settings join the rail; elsewhere this is undefined.
+  // The top bar sticks above the page. While the page is at its top, the
+  // squares on the bar's line show whole; once it moves they pass under.
+  const [scrolled, setScrolled] = createSignal(false);
+  // In the console the workspace menu (the rail's foot) holds the account,
+  // and Deployments and Settings join the rail; elsewhere this is undefined.
   const cx = useConsoleChrome();
 
   // Pages only a scheduler can fill: an SSP serving the API alone has no
@@ -516,14 +516,14 @@ export function Shell(props: {
       </Show>
 
       <div class="main-frame">
-        <main class="main">
+        <main class="main" classList={{ scrolled: scrolled() }} onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}>
           {props.children}
           <Show when={props.session.mode === 'breakglass'}>
             <div class="page-body">
               <div class="banner" style={{ 'margin-top': '16px' }}>
                 <span class="dot warn" />
-                Signed in with the break-glass password — the{' '}
-                <span class="dim mono">_00_admin</span> roster was bypassed.
+                {/* One element: the banner is a flex row, which would split the sentence. */}
+                <span>Signed in with the break-glass password, so the <span class="dim mono">_00_admin</span> roster was bypassed.</span>
               </div>
             </div>
           </Show>
@@ -603,7 +603,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
           }
         >
           <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-          <div class="cx-wsw-wrap"><span class="cx-wsw"><span class="cx-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
+          <div class="cx-rail-head"><span class="cx-prow"><span class="fx-sq idle" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
         </Show>
         <div class="sb-jump cap">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
@@ -631,6 +631,12 @@ export function FrameSkeleton(props: { console?: boolean }) {
           </For>
         </div>
         <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
+          <Show when={props.console}>
+            <span class="cx-me">
+              <span class="cx-face sk" />
+              <span class="cx-wsw-text"><span class="sk sk-cap" style={{ width: '72px' }} /><span class="sk sk-cap" style={{ width: '52px' }} /></span>
+            </span>
+          </Show>
           <div class="sb-ver cap" />
         </div>
       </nav>

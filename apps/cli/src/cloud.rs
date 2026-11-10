@@ -13,7 +13,8 @@ use crate::backend::{self, BackendDevConfig, BackendDevTypedConfig, DeployEnv, H
 use crate::surreal_client::MigrationDB;
 use crate::{
     CloudBackupCommands, CloudBillingCommands, CloudDomainCommands, CloudKeyCommands,
-    CloudLinkCommands, CloudTeamCommands, CloudVaultCommands, EnvCommands, EnvResetCommands,
+    CloudLinkCommands, CloudTeamCommands, CloudVaultCommands, DbCommands, DbUpgradeCommands,
+    EnvCommands, EnvResetCommands,
     NoticeCommands,
 };
 
@@ -356,6 +357,14 @@ impl CloudClient {
                 }
                 "slug_taken" => {
                     "A project with this slug already exists — choose a different slug.".to_string()
+                }
+                // The control plane's own reason for a refusal ("a backup is running")
+                // is the whole answer: no HTTP framing around it.
+                "busy" | "forbidden" | "no_host" | "already_upgraded" | "plan_not_supported"
+                | "no_running_deployment" | "move_active" | "no_active_move"
+                    if !error_msg.is_empty() =>
+                {
+                    reason_sentence(error_msg)
                 }
                 _ if !error_msg.is_empty() => {
                     format!("API error (HTTP {}): {}", code, error_msg)
@@ -756,10 +765,10 @@ fn ensure_project(client: &mut CloudClient) -> Result<(String, serde_json::Value
 }
 
 /// The plans a new project can be created on, in prompt order. Pay as you go
-/// runs on Cloudflare and is the default; starter and pro run on VMs.
-const PLAN_CHOICES: [(&str, &str); 3] = [
+/// runs on Cloudflare and is the default; pro runs on VMs. Starter takes no new
+/// projects for now.
+const PLAN_CHOICES: [(&str, &str); 2] = [
     ("Pay as you go: Cloudflare, base fee includes usage (recommended)", "payg"),
-    ("Starter: VMs", "starter"),
     ("Pro: VMs", "pro"),
 ];
 
@@ -908,8 +917,9 @@ fn ensure_billing_active(
 /// Open Stripe checkout and poll until payment completes.
 fn wait_for_billing(client: &mut CloudClient, slug: &str) -> Result<()> {
     // The plan follows the project's hosting: a pay-as-you-go (Cloudflare)
-    // project pays for that plan, monthly; a VM project picks Starter or Pro.
-    // Crossing between the two is refused by the API.
+    // project pays for that plan, monthly; a VM project pays for Pro, or picks
+    // between Starter and Pro if it is already on Starter, which takes no new
+    // projects for now. Crossing between the two is refused by the API.
     let current_plan = fetch_project(client, slug)?
         .and_then(|p| p["plan"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "payg".to_string());
@@ -923,18 +933,16 @@ fn wait_for_billing(client: &mut CloudClient, slug: &str) -> Result<()> {
     let payg = current_plan == "payg";
     let plan = if payg {
         "payg"
+    } else if current_plan != "starter" {
+        "pro"
     } else if is_interactive() {
-        let plans = vec!["Starter", "Pro"];
-        let selection = inquire::Select::new("Select a plan:", plans)
-            .with_starting_cursor(if current_plan == "pro" { 1 } else { 0 })
+        let selection = inquire::Select::new("Select a plan:", vec!["Starter", "Pro"])
             .prompt()
             .context("Failed to select plan")?;
         match selection {
             "Pro" => "pro",
             _ => "starter",
         }
-    } else if current_plan == "pro" {
-        "pro"
     } else {
         "starter"
     };
@@ -4385,6 +4393,10 @@ mod version_skew_tests {
         assert_eq!(platform_for_plan("starter"), "hetzner");
         assert_eq!(platform_for_plan("pro"), "hetzner");
         assert_eq!(PLAN_CHOICES[0].1, "payg", "pay as you go is offered first");
+        assert!(
+            PLAN_CHOICES.iter().all(|(_, plan)| *plan != "starter"),
+            "starter takes no new projects for now"
+        );
     }
 
     #[test]
@@ -7360,7 +7372,7 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
             match current_plan {
                 "payg" => {
                     println!("  Pay as you go is the only plan for Cloudflare projects.");
-                    println!("  Moving to VM hosting (Starter, Pro) needs a new project: `spky project create --plan starter`.");
+                    println!("  Moving to VM hosting (Pro) needs a new project: `spky project create --plan starter`.");
                     return Ok(());
                 }
                 "free" => {
@@ -7371,11 +7383,14 @@ pub fn billing(action: Option<CloudBillingCommands>) -> Result<()> {
                 _ => {}
             }
 
-            // Plan selection (VM plans)
-            let plans = vec!["Starter", "Pro"];
-            let default_plan = if current_plan == "pro" { 1 } else { 0 };
+            // Plan selection (VM plans). Starter takes no new projects for now,
+            // so only a project already on it is offered it.
+            let plans = if current_plan == "starter" {
+                vec!["Starter", "Pro"]
+            } else {
+                vec!["Pro"]
+            };
             let plan_selection = inquire::Select::new("Select a plan:", plans)
-                .with_starting_cursor(default_plan)
                 .prompt()
                 .context("Failed to select plan")?;
             let new_plan = match plan_selection {
@@ -10235,5 +10250,771 @@ expose: [/llm/*]
         assert_eq!(bare["workflows"], serde_json::json!([]));
         assert_eq!(bare["expose"], serde_json::json!([]));
         assert_eq!(bare["env"], serde_json::json!({}));
+    }
+}
+
+// ── spky db ─────────────────────────────────────────────────────────────────
+
+pub fn db(action: DbCommands) -> Result<()> {
+    match action {
+        DbCommands::Upgrade {
+            to,
+            no_cutover,
+            soak_minutes,
+            confirm,
+            no_wait,
+            action,
+        } => match action {
+            None => db_upgrade_start(to, no_cutover, soak_minutes, confirm, no_wait),
+            Some(DbUpgradeCommands::Status) => db_upgrade_status(),
+            Some(DbUpgradeCommands::Watch) => db_upgrade_follow(),
+            Some(DbUpgradeCommands::Cutover) => db_upgrade_ask("cutover", "Going ahead with the cutover."),
+            Some(DbUpgradeCommands::Cancel) => db_upgrade_ask(
+                "cancel",
+                "Stopping the upgrade. Follow it with `spky db upgrade watch`.",
+            ),
+            Some(DbUpgradeCommands::Finish) => db_upgrade_ask("finish", "Ending the watch window."),
+            Some(DbUpgradeCommands::Rollback { confirm }) => db_upgrade_rollback(confirm),
+        },
+    }
+}
+
+fn db_upgrade_read(client: &mut CloudClient, pid: &str) -> Result<serde_json::Value> {
+    Ok(client
+        .get(&format!("/v1/projects/{pid}/database/upgrade"))?
+        .into_json()?)
+}
+
+/// What a state means, in words. The console shows the same steps.
+fn db_upgrade_step_label(state: &str, reverse: bool) -> &'static str {
+    match (state, reverse) {
+        ("preflight", _) => "Checking disk and memory",
+        ("backup", _) => "Taking a backup",
+        ("rehearse", _) => "Rehearsing on a copy of the data",
+        ("capture", _) => "Turning on change capture",
+        ("clone", _) => "Copying the data",
+        ("convert", false) => "Starting the new version on the copy",
+        ("convert", true) => "Starting the old version again, beside the new one",
+        ("rebuild", _) => "Rebuilding indexes on the copy",
+        ("sync", false) => "Catching up on changes",
+        ("sync", true) => "Bringing the old data up to date",
+        ("verify", _) => "Comparing every row",
+        ("ready", _) => "Ready for the cutover",
+        ("fence", _) => "Cutover: taking the last writes across",
+        ("flip_stop", _) => "Cutover: stopping the old database",
+        ("flip_start", _) => "Cutover: starting the new database",
+        ("reconnect", _) => "Telling the sync services",
+        ("smoke", _) => "Checking it from the outside",
+        ("soak", _) => "Watching the new version",
+        ("finalize", _) => "Cleaning up",
+        ("abort", _) => "Undoing the upgrade",
+        ("revert", _) => "Bringing the old version back",
+        ("rollback", _) => "Rolling back",
+        ("done", _) => "Done",
+        ("failed", _) => "Failed",
+        ("aborted", _) => "Cancelled",
+        ("rolled_back", _) => "Rolled back",
+        _ => "Working",
+    }
+}
+
+fn print_db_upgrade_run(run: &serde_json::Value) {
+    let state = run["state"].as_str().unwrap_or("?");
+    let reverse = run["reverse"].as_bool().unwrap_or(false);
+    println!(
+        "  Upgrade {} -> {}: {}",
+        run["from_version"].as_str().unwrap_or("?"),
+        run["to_version"].as_str().unwrap_or("?"),
+        db_upgrade_step_label(state, reverse)
+    );
+    let stats = &run["stats"];
+    if let Some(ms) = stats["hold_ms"].as_i64() {
+        println!("  Writes refused at the cutover: {:.1} s", ms as f64 / 1000.0);
+    }
+    if let Some(rows) = stats["applied_rows"].as_i64() {
+        println!("  Rows replayed: {rows}");
+    }
+    if let Some(rows) = stats["verified_rows"].as_i64() {
+        println!("  Rows compared: {rows}");
+    }
+    if let Some(until) = run["soak_until"].as_str() {
+        if state == "soak" {
+            println!("  Watch window ends: {until}");
+        }
+    }
+    if let Some(until) = run["rollback_until"].as_str() {
+        println!("  Old data kept until: {until}");
+    }
+    if let Some(warning) = run["warning"].as_str() {
+        crate::ui::warn(warning);
+    }
+    if let Some(error) = run["error"].as_str() {
+        crate::ui::error(error);
+    }
+}
+
+fn db_upgrade_status() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = db_upgrade_read(&mut client, &pid)?;
+    println!("  {slug}: SurrealDB {}", status["current"].as_str().unwrap_or("?"));
+    if status["up_to_date"].as_bool().unwrap_or(false) {
+        println!("  On the newest version we offer.");
+    } else if let Some(target) = status["target"].as_str() {
+        let beta = if status["beta"].as_bool().unwrap_or(false) { " (beta)" } else { "" };
+        println!("  Next step: {target}{beta}");
+    }
+    for blocker in status["blockers"].as_array().into_iter().flatten() {
+        crate::ui::warn(blocker["message"].as_str().unwrap_or("Blocked."));
+    }
+    if status["upgrade"].is_object() {
+        print_db_upgrade_run(&status["upgrade"]);
+    }
+    Ok(())
+}
+
+fn db_upgrade_start(
+    to: Option<String>,
+    no_cutover: bool,
+    soak_minutes: Option<u32>,
+    confirm: Option<String>,
+    no_wait: bool,
+) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = db_upgrade_read(&mut client, &pid)?;
+
+    if status["upgrade"]["active"].as_bool().unwrap_or(false) {
+        println!("  An upgrade is already running.");
+        return db_upgrade_follow();
+    }
+    let current = status["current"].as_str().unwrap_or("?");
+    if status["up_to_date"].as_bool().unwrap_or(false) {
+        println!("  SurrealDB {current} is the newest version we offer.");
+        return Ok(());
+    }
+    if let Some(blocker) = status["blockers"].as_array().and_then(|b| b.first()) {
+        anyhow::bail!("{}", blocker["message"].as_str().unwrap_or("This upgrade is blocked."));
+    }
+    let Some(target) = status["target"].as_str() else {
+        anyhow::bail!("There is no upgrade to offer for SurrealDB {current}.");
+    };
+    if let Some(asked) = &to {
+        if asked != target {
+            anyhow::bail!("The next step from {current} is {target}, not {asked}. Upgrades go one step at a time.");
+        }
+    }
+
+    let one_way = status["one_way"].as_bool().unwrap_or(false);
+    let soak = soak_minutes.unwrap_or(60);
+    let confirmed = if one_way {
+        let beta = if status["beta"].as_bool().unwrap_or(false) { ", a beta release," } else { "" };
+        println!("  This moves {slug} from SurrealDB {current} to {target}{beta}.");
+        println!("  - The database keeps serving while the new version catches up, then refuses");
+        println!("    writes for a few seconds at the cutover. Clients retry them.");
+        println!("  - Every row is compared before the cutover. Any failure before it leaves the");
+        println!("    database exactly as it is.");
+        println!("  - For {soak} minutes after it, `spky db upgrade cancel` goes back without losing");
+        println!("    a write. After that the old data is kept 7 days, but going back drops newer writes.");
+        println!("  - Apps built before JS SDK 2.1.0 or Dart canary.363 must be updated first.");
+        crate::ui::consent_naming(
+            &format!("Upgrade '{slug}' to {target}?"),
+            &slug,
+            confirm.as_deref(),
+        )?
+    } else {
+        println!("  This moves {slug} from SurrealDB {current} to {target}.");
+        println!("  - A backup first, then a rehearsal on a copy of the data.");
+        println!("  - Then a few seconds of downtime while the database restarts on the new version.");
+        println!("  - The old data is kept 7 days. Going back drops writes made since.");
+        crate::ui::consent(&format!("Upgrade '{slug}' to {target}?"))?
+    };
+    if !confirmed {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let mut body = serde_json::json!({ "to": target, "no_cutover": no_cutover });
+    if soak_minutes == Some(0) {
+        anyhow::bail!("--soak-minutes must be at least 1. To end the watch window early: `spky db upgrade finish`.");
+    }
+    if let Some(minutes) = soak_minutes {
+        body["soak_minutes"] = serde_json::json!(minutes);
+    }
+    client.post(&format!("/v1/projects/{pid}/database/upgrade"), &body)?;
+    println!("  Upgrade started.");
+    if no_wait {
+        println!("  Follow it with `spky db upgrade watch`.");
+        return Ok(());
+    }
+    db_upgrade_follow()
+}
+
+/// Prints each new step until the run ends or needs a person. Interrupting this
+/// stops nothing: the upgrade runs in the cloud.
+fn db_upgrade_follow() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (_slug, pid) = resolve_project_id(&mut client)?;
+    let mut last = String::new();
+    let mut failures = 0;
+    loop {
+        let status = match db_upgrade_read(&mut client, &pid) {
+            Ok(status) => {
+                failures = 0;
+                status
+            }
+            Err(e) => {
+                failures += 1;
+                if failures > 30 {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+        };
+        let run = &status["upgrade"];
+        let Some(state) = run["state"].as_str() else {
+            println!("  No upgrade has run for this project.");
+            return Ok(());
+        };
+        let reverse = run["reverse"].as_bool().unwrap_or(false);
+        let key = format!("{state}/{reverse}");
+        if key != last {
+            println!("  {}", db_upgrade_step_label(state, reverse));
+            last = key;
+        }
+        match state {
+            "done" | "aborted" | "rolled_back" => {
+                print_db_upgrade_run(run);
+                return Ok(());
+            }
+            "failed" => {
+                print_db_upgrade_run(run);
+                if run["stats"]["not_serving"].as_bool().unwrap_or(false) {
+                    anyhow::bail!("The database is not serving. Run `spky restart --surreal`, and contact support if it stays down.");
+                }
+                anyhow::bail!("The upgrade failed and the database is unchanged.");
+            }
+            // A rollback or an abort asked for in the watch window hasn't begun yet:
+            // keep following.
+            "soak"
+                if !run["rollback_requested"].as_bool().unwrap_or(false)
+                    && !run["abort_requested"].as_bool().unwrap_or(false) =>
+            {
+                print_db_upgrade_run(run);
+                println!("  The new version is live. If something looks wrong:");
+                println!("    spky db upgrade cancel    goes back without losing a write");
+                println!("    spky db upgrade finish    ends the watch window now");
+                return Ok(());
+            }
+            "ready" if run["hold_at_ready"].as_bool().unwrap_or(false) => {
+                print_db_upgrade_run(run);
+                println!("  Waiting for the go: `spky db upgrade cutover`, or `spky db upgrade cancel`.");
+                return Ok(());
+            }
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn db_upgrade_ask(what: &str, message: &str) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (_slug, pid) = resolve_project_id(&mut client)?;
+    client.post(
+        &format!("/v1/projects/{pid}/database/upgrade/{what}"),
+        &serde_json::json!({}),
+    )?;
+    println!("  {message}");
+    Ok(())
+}
+
+fn db_upgrade_rollback(confirm: Option<String>) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = db_upgrade_read(&mut client, &pid)?;
+    let run = &status["upgrade"];
+    let flip = run["flip_at"].as_str().unwrap_or("the cutover");
+    println!(
+        "  This puts {slug} back on SurrealDB {} with the data as it stood at {flip}.",
+        run["from_version"].as_str().unwrap_or("?")
+    );
+    println!("  EVERY WRITE MADE SINCE THEN IS DROPPED.");
+    if run["state"].as_str() == Some("soak") {
+        println!("  The watch window is still open: `spky db upgrade cancel` goes back without losing anything.");
+    }
+    if !crate::ui::consent_naming(
+        &format!("Roll '{slug}' back and drop those writes?"),
+        &slug,
+        confirm.as_deref(),
+    )? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    client.post(
+        &format!("/v1/projects/{pid}/database/upgrade/rollback"),
+        &serde_json::json!({}),
+    )?;
+    println!("  Rolling back.");
+    db_upgrade_follow()
+}
+
+// ── spky host, spky project move ────────────────────────────────────────────
+
+/// The reason a pro project's host and move calls refuse, as a sentence. The
+/// control plane answers these with a code and a message that already says why.
+fn reason_sentence(message: &str) -> String {
+    let message = message.trim().trim_end_matches('.');
+    let mut chars = message.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// One line per VM, then what an upgrade waiting on the project host means.
+fn host_lines(status: &serde_json::Value) -> Vec<String> {
+    let hosts = status["hosts"].as_array().cloned().unwrap_or_default();
+    if hosts.is_empty() {
+        return vec![if status["placement"].as_str() == Some("preparing") {
+            "  This project's own VMs are being prepared.".to_string()
+        } else {
+            "  This project has no VMs of its own.".to_string()
+        }];
+    }
+    let quiet = status["quiet_window"].as_str().unwrap_or("");
+    let mut lines = Vec::new();
+    let mut pending = false;
+    for host in &hosts {
+        let kind = match host["kind"].as_str().unwrap_or("?") {
+            "app" => "Project host",
+            "db" => "Database VM",
+            other => other,
+        };
+        lines.push(format!(
+            "  {:<14}{:<9}{:<7}{}",
+            kind,
+            host["server_type"].as_str().unwrap_or("?"),
+            host["location"].as_str().unwrap_or("?"),
+            host["status"].as_str().unwrap_or("?"),
+        ));
+        if !host["upgrade_pending"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        pending = true;
+        let target = host["target_type"].as_str().unwrap_or("a larger type");
+        match host["upgrade_state"].as_str().filter(|s| !s.is_empty()) {
+            Some(state) => lines.push(format!("    Upgrading to {target}: {state}.")),
+            None => {
+                lines.push(format!(
+                    "    Upgrade to {target} waiting. It runs by itself in the quiet window, {quiet}, or now with `spky host upgrade`."
+                ));
+                if !host["target_available"].as_bool().unwrap_or(true) {
+                    lines.push(format!(
+                        "    {target} is not available in {} right now.",
+                        host["location"].as_str().unwrap_or("this location")
+                    ));
+                }
+            }
+        }
+        if let Some(error) = host["upgrade_error"].as_str().filter(|s| !s.is_empty()) {
+            lines.push(format!("    Last upgrade error: {error}"));
+        }
+    }
+    if pending {
+        if let Some(note) = status["note"].as_str().filter(|s| !s.is_empty()) {
+            lines.push(format!("  {note}"));
+        }
+    }
+    lines
+}
+
+pub fn host(action: crate::HostCommands) -> Result<()> {
+    match action {
+        crate::HostCommands::Status => host_status(),
+        crate::HostCommands::Upgrade => host_upgrade(),
+    }
+}
+
+fn host_read(client: &mut CloudClient, pid: &str) -> Result<serde_json::Value> {
+    Ok(client.get(&format!("/v1/projects/{pid}/host"))?.into_json()?)
+}
+
+fn host_status() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = host_read(&mut client, &pid)?;
+    println!("  {slug}");
+    for line in host_lines(&status) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn host_upgrade() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let status = host_read(&mut client, &pid)?;
+    let app = status["hosts"]
+        .as_array()
+        .and_then(|hosts| hosts.iter().find(|h| h["kind"].as_str() == Some("app")))
+        .cloned();
+    let Some(app) = app else {
+        anyhow::bail!("{slug} has no project host to upgrade. See `spky host status`.");
+    };
+    if !app["upgrade_pending"].as_bool().unwrap_or(false) {
+        println!(
+            "  The project host of {slug} is already on {}.",
+            app["server_type"].as_str().unwrap_or("its target type")
+        );
+        return Ok(());
+    }
+    let from = app["server_type"].as_str().unwrap_or("?");
+    let to = app["target_type"].as_str().unwrap_or("a larger type");
+    println!("  This moves the project host of {slug} from {from} to {to}.");
+    println!("  - Web, API and live sync are down for about two minutes while it restarts.");
+    println!("  - The database VM is not touched.");
+    if !crate::ui::consent(&format!("Upgrade the project host of '{slug}' to {to} now?"))? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    client.post(&format!("/v1/projects/{pid}/host/upgrade"), &serde_json::json!({}))?;
+    println!("  Upgrade requested. Follow it with `spky host status`.");
+    Ok(())
+}
+
+/// What a move's state means, in words.
+fn move_step_label(state: &str) -> &'static str {
+    match state {
+        "preflight" => "Checking the project can move",
+        "backup" => "Taking a backup",
+        "provision" => "Creating the project host and the database VM",
+        "seed" => "Copying the data while the project keeps running",
+        "rehearse" => "Rehearsing on a copy of the data",
+        "ready" => "Ready for the cutover",
+        "stop" => "Cutover: stopping the project",
+        "final_sync" => "Cutover: taking the last writes across",
+        "verify" => "Cutover: comparing the data",
+        "flip" => "Cutover: switching traffic to the new VMs",
+        "start" => "Cutover: starting the project on the new VMs",
+        "smoke" => "Checking it from the outside",
+        "soak" => "Watching the new VMs",
+        "done" => "Done",
+        "aborting" => "Undoing the move",
+        "aborted" => "Cancelled",
+        "failed" => "Failed",
+        "rollback_stop" => "Rolling back: stopping the project",
+        "rollback_sync" => "Rolling back: taking the data back",
+        "rollback_flip" => "Rolling back: switching traffic back",
+        "rollback_start" => "Rolling back: starting the project on the core host",
+        "rolled_back" => "Rolled back",
+        _ => "Working",
+    }
+}
+
+/// The facts of a move worth a line each. The error is printed apart.
+fn move_lines(mv: &serde_json::Value) -> Vec<String> {
+    let state = mv["state"].as_str().unwrap_or("?");
+    let mut lines = vec![format!("  Move: {}", move_step_label(state))];
+    let stats = &mv["stats"];
+    if let (Some(app), Some(db)) = (stats["app_type"].as_str(), stats["db_type"].as_str()) {
+        lines.push(format!("  Machines: project host {app}, database VM {db}"));
+    }
+    if let Some(ms) = stats["downtime_ms"].as_i64() {
+        lines.push(format!("  Project down for: {:.1} s", ms as f64 / 1000.0));
+    }
+    if state == "soak" {
+        if let Some(until) = mv["finalize_after"].as_str() {
+            lines.push(format!("  Old data kept until: {until}"));
+        }
+    }
+    lines
+}
+
+fn print_move(mv: &serde_json::Value) {
+    for line in move_lines(mv) {
+        println!("{line}");
+    }
+    if let Some(error) = mv["error"].as_str().filter(|s| !s.is_empty()) {
+        crate::ui::error(error);
+    }
+}
+
+pub fn project_move(
+    no_hold: bool,
+    no_wait: bool,
+    action: Option<crate::MoveCommands>,
+) -> Result<()> {
+    use crate::MoveCommands;
+    match action {
+        None => move_start(no_hold, no_wait),
+        Some(MoveCommands::Status) => move_status(),
+        Some(MoveCommands::Watch) => move_follow(),
+        Some(MoveCommands::Cutover) => move_cutover(),
+        Some(MoveCommands::Abort) => move_ask(
+            "abort",
+            "Stopping the move. Follow it with `spky project move watch`.",
+        ),
+        Some(MoveCommands::Rollback) => move_rollback(),
+    }
+}
+
+fn move_read(client: &mut CloudClient, pid: &str) -> Result<serde_json::Value> {
+    let body: serde_json::Value = client.get(&format!("/v1/projects/{pid}/move"))?.into_json()?;
+    Ok(body["move"].clone())
+}
+
+fn move_status() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let mv = move_read(&mut client, &pid)?;
+    println!("  {slug}");
+    if mv.is_null() {
+        println!("  No move has run for this project.");
+        return Ok(());
+    }
+    print_move(&mv);
+    Ok(())
+}
+
+fn move_start(no_hold: bool, no_wait: bool) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    let current = move_read(&mut client, &pid)?;
+    if current["active"].as_bool().unwrap_or(false) {
+        println!("  A move is already running.");
+        return move_follow();
+    }
+
+    println!("  This moves {slug} onto VMs of its own: a project host and a database VM.");
+    println!("  - A backup first, then the data is copied across while the project keeps running.");
+    if no_hold {
+        println!("  - It then cuts over by itself. The project is down for a few minutes at the cutover.");
+    } else {
+        println!("  - It then waits for `spky project move cutover`. The project is down for a few");
+        println!("    minutes at the cutover.");
+    }
+    println!("  - `spky project move abort` undoes it before the cutover. After it,");
+    println!("    `spky project move rollback` takes the project back to the core host.");
+    if !crate::ui::consent(&format!("Move '{slug}' onto its own VMs?"))? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let body = serde_json::json!({ "hold": !no_hold });
+    client.post(&format!("/v1/projects/{pid}/move"), &body)?;
+    println!("  Move started.");
+    if no_wait {
+        println!("  Follow it with `spky project move watch`.");
+        return Ok(());
+    }
+    move_follow()
+}
+
+/// Prints each new step until the move ends or needs a person. Interrupting this
+/// stops nothing: the move runs in the cloud.
+fn move_follow() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (_slug, pid) = resolve_project_id(&mut client)?;
+    let mut last = String::new();
+    let mut failures = 0;
+    loop {
+        let mv = match move_read(&mut client, &pid) {
+            Ok(mv) => {
+                failures = 0;
+                mv
+            }
+            Err(e) => {
+                failures += 1;
+                if failures > 30 {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+        };
+        let Some(state) = mv["state"].as_str() else {
+            println!("  No move has run for this project.");
+            return Ok(());
+        };
+        if state != last {
+            println!("  {}", move_step_label(state));
+            last = state.to_string();
+        }
+        match state {
+            "done" | "aborted" | "rolled_back" => {
+                print_move(&mv);
+                return Ok(());
+            }
+            "failed" => {
+                print_move(&mv);
+                anyhow::bail!("The move failed and the project is where it was.");
+            }
+            "soak" => {
+                print_move(&mv);
+                println!("  The project runs on its own VMs. If something looks wrong:");
+                println!("    spky project move rollback    takes it back to the core host");
+                return Ok(());
+            }
+            "ready" if mv["hold"].as_bool().unwrap_or(false) => {
+                print_move(&mv);
+                println!("  Waiting for the go: `spky project move cutover`, or `spky project move abort`.");
+                return Ok(());
+            }
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+fn move_ask(what: &str, message: &str) -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (_slug, pid) = resolve_project_id(&mut client)?;
+    client.post(&format!("/v1/projects/{pid}/move/{what}"), &serde_json::json!({}))?;
+    println!("  {message}");
+    Ok(())
+}
+
+fn move_cutover() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    println!("  {slug} goes down for a few minutes while the last writes cross to the new VMs.");
+    if !crate::ui::consent(&format!("Go ahead with the cutover of '{slug}'?"))? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    client.post(&format!("/v1/projects/{pid}/move/cutover"), &serde_json::json!({}))?;
+    println!("  Going ahead with the cutover.");
+    move_follow()
+}
+
+fn move_rollback() -> Result<()> {
+    let creds = require_credentials()?;
+    let mut client = CloudClient::new(&creds);
+    let (slug, pid) = resolve_project_id(&mut client)?;
+    println!("  {slug} goes down while its data travels back to the core host.");
+    if !crate::ui::consent(&format!("Roll '{slug}' back to the core host?"))? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    client.post(&format!("/v1/projects/{pid}/move/rollback"), &serde_json::json!({}))?;
+    println!("  Rolling back.");
+    move_follow()
+}
+
+#[cfg(test)]
+mod host_move_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reasons_read_as_sentences() {
+        assert_eq!(reason_sentence("a backup is running"), "A backup is running.");
+        assert_eq!(reason_sentence("already done."), "Already done.");
+        assert_eq!(reason_sentence(""), "");
+    }
+
+    #[test]
+    fn host_lines_show_each_vm_and_a_waiting_upgrade() {
+        let status = json!({
+            "placement": "active",
+            "hosts": [
+                { "kind": "app", "status": "ready", "server_type": "cx23", "location": "fsn1",
+                  "target_type": "cx33", "target_available": false, "upgrade_pending": true },
+                { "kind": "db", "status": "ready", "server_type": "cax21", "location": "fsn1",
+                  "target_available": true, "upgrade_pending": false },
+            ],
+            "quiet_window": "03:30 to 05:30 UTC",
+            "note": "Restarts the project host.",
+        });
+        let lines = host_lines(&status);
+        assert!(lines[0].starts_with("  Project host"));
+        assert!(lines[0].contains("cx23") && lines[0].contains("fsn1") && lines[0].ends_with("ready"));
+        assert!(lines[1].contains("Upgrade to cx33 waiting"));
+        assert!(lines[1].contains("03:30 to 05:30 UTC"));
+        assert!(lines[2].contains("cx33 is not available in fsn1"));
+        assert!(lines[3].starts_with("  Database VM") && lines[3].contains("cax21"));
+        assert_eq!(lines[4], "  Restarts the project host.");
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn host_lines_for_a_running_upgrade_and_an_error() {
+        let status = json!({
+            "hosts": [{ "kind": "app", "status": "ready", "server_type": "cx23", "location": "fsn1",
+                        "target_type": "cx33", "target_available": true, "upgrade_pending": true,
+                        "upgrade_state": "requested", "upgrade_error": "no capacity" }],
+            "quiet_window": "03:30 to 05:30 UTC",
+        });
+        let lines = host_lines(&status);
+        assert_eq!(lines[1], "    Upgrading to cx33: requested.");
+        assert_eq!(lines[2], "    Last upgrade error: no capacity");
+    }
+
+    #[test]
+    fn host_lines_without_vms() {
+        assert_eq!(
+            host_lines(&json!({ "placement": "", "hosts": [] })),
+            vec!["  This project has no VMs of its own."]
+        );
+        assert_eq!(
+            host_lines(&json!({ "placement": "preparing", "hosts": [] })),
+            vec!["  This project's own VMs are being prepared."]
+        );
+    }
+
+    #[test]
+    fn a_current_host_has_no_upgrade_lines() {
+        let status = json!({
+            "hosts": [{ "kind": "app", "status": "ready", "server_type": "cx33", "location": "fsn1",
+                        "target_available": true, "upgrade_pending": false }],
+            "note": "never shown without a waiting upgrade",
+        });
+        assert_eq!(host_lines(&status).len(), 1);
+    }
+
+    #[test]
+    fn every_move_state_has_a_label() {
+        for state in [
+            "preflight", "backup", "provision", "seed", "rehearse", "ready", "stop", "final_sync",
+            "verify", "flip", "start", "smoke", "soak", "done", "aborting", "aborted", "failed",
+            "rollback_stop", "rollback_sync", "rollback_flip", "rollback_start", "rolled_back",
+        ] {
+            assert_ne!(move_step_label(state), "Working", "{state}");
+        }
+        assert_eq!(move_step_label("something_new"), "Working");
+    }
+
+    #[test]
+    fn move_lines_report_only_what_the_stats_hold() {
+        let waiting = json!({ "state": "ready", "stats": {} });
+        assert_eq!(move_lines(&waiting), vec!["  Move: Ready for the cutover"]);
+
+        let soaking = json!({
+            "state": "soak",
+            "finalize_after": "2026-11-09T04:00:00Z",
+            "stats": { "app_type": "cx33", "db_type": "cax21", "downtime_ms": 94500 },
+        });
+        assert_eq!(
+            move_lines(&soaking),
+            vec![
+                "  Move: Watching the new VMs",
+                "  Machines: project host cx33, database VM cax21",
+                "  Project down for: 94.5 s",
+                "  Old data kept until: 2026-11-09T04:00:00Z",
+            ]
+        );
     }
 }

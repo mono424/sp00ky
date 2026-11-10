@@ -61,8 +61,9 @@ export const statusOutput = `  MACHINE        IP                 TYPE       STAT
   <code>spky deploy</code> prints for them may still change.
 </Experimental>
 
-A backend normally runs as a container on the shared host of your deployment, next to the
-database, the scheduler and the SSPs. A **dedicated machine** gives always-on backends a Hetzner VM
+A backend normally runs as a container on your deployment's host: the shared host, or for a Pro
+project its own [project host](/docs/cloud/deploying#your-own-vms-pro), next to the scheduler and
+the SSPs. On a Pro project the database has a VM of its own. A **dedicated machine** gives always-on backends a Hetzner VM
 of their own instead: its own CPU and memory, nothing of the platform on the box, and a fixed
 address. One backend can have a machine to itself, or several can share one.
 

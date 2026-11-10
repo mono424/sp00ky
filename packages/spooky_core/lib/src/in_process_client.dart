@@ -200,6 +200,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
           RemoteAdapter(remote, _logger, inlineBodies: config.liveInlineBodies);
       _supervisor = ConnectionSupervisor(
         reconnect: remote.connect,
+        wakeProbe: remote.probeSocket,
         probe: () async {
           await remote.probe();
           if (auth.needsVerification) {
@@ -376,6 +377,16 @@ class InProcessSp00kyClient extends Sp00kyClient {
       throw StateError('queryRemote requires a remote endpoint');
     }
     return remote.query(sql, vars);
+  }
+
+  @override
+  Future<List<dynamic>> queryInteractive(String sql,
+      [Map<String, dynamic>? vars]) {
+    final remote = _remote;
+    if (remote == null) {
+      throw StateError('queryInteractive requires a remote endpoint');
+    }
+    return remote.queryInteractive(sql, vars);
   }
 
   /// Register a raw SURQL query and return its hash. The table is parsed from
@@ -886,6 +897,11 @@ class _NoSignal implements SignalPort {
 class _OfflineRemote implements RemotePort {
   @override
   Future<List<StatementResult>> queryStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      Future.error(StateError('No remote endpoint is configured'));
+
+  @override
+  Future<List<StatementResult>> bodyStatements(String sql,
           [Map<String, dynamic>? vars]) =>
       Future.error(StateError('No remote endpoint is configured'));
 

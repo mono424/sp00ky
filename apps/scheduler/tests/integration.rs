@@ -3593,6 +3593,8 @@ mod admin_plane {
             cloud_jwks: None,
             cloud_issuer: None,
             cloud_session_ttl: std::time::Duration::from_secs(900),
+            data: true,
+            bucket_dir: None,
         };
         admin::build(config, h.admin_deps(None, None))
     }
@@ -3642,6 +3644,8 @@ mod admin_plane {
             cloud_jwks: cloud_jwks.map(str::to_string),
             cloud_issuer: None,
             cloud_session_ttl: std::time::Duration::from_secs(900),
+            data: true,
+            bucket_dir: None,
         };
         admin::build(config, h.admin_deps(cloud_api_url, auth_secret))
     }
@@ -3699,6 +3703,45 @@ mod admin_plane {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         body_json(res).await["token"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn data_routes_are_gated_and_take_a_file_sized_body() {
+        let h = TestHarness::new().await;
+        let app = admin_app(&h, Some("data-test"));
+        let config = body_json(app.clone().oneshot(get("/admin/api/config")).await.unwrap()).await;
+        assert_eq!(config["data"], true);
+        assert_eq!(app.clone().oneshot(get("/admin/api/data/tables")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // Past the gate: this plane has no database handle in these tests.
+        let token = breakglass_token(&app, "data-test").await;
+        let res = app.clone().oneshot(get_auth("/admin/api/data/tables", &token)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // A file larger than axum's default 2 MB body limit reaches the handler.
+        let upload = Request::builder()
+            .method("PUT")
+            .uri("/admin/api/data/buckets/pics/file?key=big.bin")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(json!({ "data": "A".repeat(4 * 1024 * 1024) }).to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(upload).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Agents are refused whatever their scope, ahead of the database.
+        for scope in ["read", "full"] {
+            let mint = Request::builder()
+                .method("POST")
+                .uri("/admin/api/tokens")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(json!({ "label": "agent", "scope": scope }).to_string()))
+                .unwrap();
+            let minted = body_json(app.clone().oneshot(mint).await.unwrap()).await;
+            let agent = minted["token"].as_str().unwrap();
+            let res = app.clone().oneshot(get_auth("/admin/api/data/tables", agent)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{scope}");
+        }
     }
 
     #[tokio::test]

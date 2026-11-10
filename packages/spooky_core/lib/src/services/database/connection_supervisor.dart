@@ -26,6 +26,7 @@ class ConnectionSupervisor {
   ConnectionSupervisor({
     required Future<void> Function() reconnect,
     required Future<void> Function() probe,
+    Future<void> Function()? wakeProbe,
     required Future<void> Function() forceClose,
     required bool Function() isConnected,
     required Stream<void> onConnected,
@@ -35,6 +36,7 @@ class ConnectionSupervisor {
     int Function()? now,
   })  : _reconnect = reconnect,
         _probe = probe,
+        _wakeProbe = wakeProbe ?? probe,
         _forceClose = forceClose,
         _isConnected = isConnected,
         _onConnected = onConnected,
@@ -45,6 +47,7 @@ class ConnectionSupervisor {
 
   final Future<void> Function() _reconnect;
   final Future<void> Function() _probe;
+  final Future<void> Function() _wakeProbe;
   final Future<void> Function() _forceClose;
   final bool Function() _isConnected;
   final Stream<void> _onConnected;
@@ -86,6 +89,7 @@ class ConnectionSupervisor {
   Timer? _heartbeatTimer;
   bool _heartbeatInFlight = false;
   int _heartbeatFailures = 0;
+  bool _wakeProbeInFlight = false;
 
   Timer? _reviveTimer;
   int _reviveAttempts = 0;
@@ -164,11 +168,50 @@ class ConnectionSupervisor {
     _reviveAttempts = 0;
     if (_isConnected()) {
       _stopHeartbeat();
-      unawaited(_beat());
+      unawaited(_probeAfterWake());
       return;
     }
     _clearReviveTimer();
     unawaited(_revive());
+  }
+
+  /// The first round trip after the host comes back. The heartbeat's rules
+  /// would take 25 s to give up on a socket that died during a sleep, with the
+  /// user waiting on it. Its second chance is there because it shares lanes
+  /// with ordinary traffic and cannot tell busy from dead; [_wakeProbe] goes to
+  /// the socket directly, so one short miss is enough. A connect already in
+  /// flight is its own probe.
+  Future<void> _probeAfterWake() async {
+    if (!_started || _disposed || _suspended) return;
+    if (_reviving || _wakeProbeInFlight || !_isConnected()) return;
+    _wakeProbeInFlight = true;
+    try {
+      await _wakeProbe().timeout(
+          Duration(milliseconds: _config.wakeProbeTimeoutMs),
+          onTimeout: () => throw TimeoutException(
+              'Wake probe timed out after ${_config.wakeProbeTimeoutMs}ms'));
+      _heartbeatFailures = 0;
+      _setState(ConnectionState.connected);
+      _startHeartbeat();
+    } catch (e) {
+      if (_disposed) return;
+      _logger.info('The socket did not answer after a wake; reconnecting: $e');
+      _heartbeatFailures = 0;
+      _stopHeartbeat();
+      // Not awaited: the old socket's close can take seconds and the new one
+      // does not depend on it.
+      unawaited(_forceClose().catchError((Object e) {
+        _logger.debug('Force close after a wake failed: $e');
+      }));
+      // Once `disconnected` has been heard, so the state reads in order. It
+      // armed a revive on backoff, which this replaces: someone is waiting.
+      await Future<void>.delayed(Duration.zero);
+      if (_disposed) return;
+      _clearReviveTimer();
+      unawaited(_revive());
+    } finally {
+      _wakeProbeInFlight = false;
+    }
   }
 
   Future<void> dispose() async {

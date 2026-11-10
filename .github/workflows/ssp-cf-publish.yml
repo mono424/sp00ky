@@ -112,7 +112,10 @@ jobs:
           PY
 
           echo "Publishing ssp-cf '$VERSION' -> $SPOOKY_API_URL"
-          curl -fsS -X POST "$SPOOKY_API_URL/v1/admin/ssp-wasm/versions" \
+          # The route upserts on (role, version), so a retry is safe. The upload
+          # crosses Cloudflare, and a blip there otherwise costs a full wasm rebuild.
+          curl -fsS --retry 5 --retry-all-errors --retry-delay 30 --max-time 300 \
+            -X POST "$SPOOKY_API_URL/v1/admin/ssp-wasm/versions" \
             -H "Authorization: AdminKey $ADMIN_API_KEY" \
             -H "Content-Type: application/json" \
             --data @"$PAYLOAD"

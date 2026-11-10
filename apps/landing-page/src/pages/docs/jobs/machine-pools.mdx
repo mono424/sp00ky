@@ -112,7 +112,7 @@ SPKY_POOL_DOCKER_NETWORK=my-network`;
 
 ## Overview
 
-Every backend normally runs as one always-on container next to your database, and the SSPs hand it one job after another. That is right for most work. It is wrong for work that needs a machine of its own: a render that pins every core for twenty minutes, a transcode, a headless browser, a model run, anything whose CPU, memory or bandwidth would starve the rest of the project.
+Every backend normally runs as one always-on container on your project's host, next to the scheduler and the SSPs, and the SSPs hand it one job after another. That is right for most work. It is wrong for work that needs a machine of its own: a render that pins every core for twenty minutes, a transcode, a headless browser, a model run, anything whose CPU, memory or bandwidth would starve the rest of the project.
 
 A **machine pool** gives a backend's jobs their own machines, created when there is work and destroyed when there is not. You declare the pool in `sp00ky.yml` and point a backend at it with `runOn`. Nothing about the backend changes: it still answers a POST per job, and your app still creates jobs with `db.run()` or a schedule.
 

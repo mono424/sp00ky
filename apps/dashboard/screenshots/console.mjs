@@ -8,6 +8,19 @@
  * account with two workspaces, deployments, env, members...) and a project's
  * admin API, answered under `/fx/admin/api/*` from the same `fixtures.mjs` the
  * scheduler dashboard is photographed with. `?signedout` shows the landing.
+ *
+ * The workspace `nadia` has no projects, so it opens on the first-project page.
+ * `GET /__onboarding?connected=1&cli=1&config=1&project=pending|building|running&repo=configured`
+ * moves that page's world on, the way a terminal elsewhere would: it updates by
+ * itself, and `?reset=1` starts over.
+ *
+ * Settings > Database shows one SurrealDB upgrade scenario at a time: open any
+ * page with `?upgrade=soak` (see UPGRADES below for the names; `?upgrade=` goes
+ * back to each project's own offer). The buttons move it on as the API would.
+ *
+ * Settings > Machines is the same, with `?host=` : `pending` (project host on cx23
+ * with an upgrade waiting, the default), `waiting` (cx33 not available yet),
+ * `upgrading`, `failed`, `current` (nothing to upgrade) or `none` (no VMs of its own).
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -19,6 +32,23 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = resolve(HERE, '..', 'dist-console');
 const PORT = Number(process.env.PORT ?? 4320);
 const ORIGIN = `http://localhost:${PORT}`;
+const REAL_ADMIN = process.env.FX_ADMIN;
+// The policy console.sp00ky.cloud serves (spooky-cloud internal/console/static.go),
+// so a page that needs more than it allows fails here first.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
+  "worker-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https://avatars.githubusercontent.com",
+  "font-src 'self'",
+  "connect-src 'self'",
+  "frame-src https:",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "object-src 'none'",
+].join('; ');
 let signedOut = false;
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
@@ -40,6 +70,57 @@ const WORKSPACES = [
   { id: 'ten-mira', name: 'mira', slug: 'mira', type: 'personal', role: 'admin', projects: [{ id: 'prj-n', slug: 'notes', plan: 'free', platform: 'cloudflare', status: 'active', deployment_status: 'running', deployment_version: 3, admin: 'ssp' }] },
 ];
 
+const FRESH = { id: 'ten-nadia', name: 'nadia', slug: 'nadia', type: 'personal', role: 'admin', projects: [] };
+WORKSPACES.push(FRESH);
+
+// The first-project page's world, moved on through `/__onboarding`.
+const ONBOARDING = { connected: false, cli: false, config: false, repo: 'plain', project: null, linked: false };
+const NEW_PROJECT = (project) => ({
+  id: 'prj-new', slug: 'tideline', plan: 'payg', platform: 'cloudflare', admin: 'ssp',
+  status: project === 'pending' ? 'pending_payment' : 'active',
+  deployment_status: project === 'pending' || project === 'paid' ? null : project === 'building' ? 'provisioning' : project,
+  deployment_version: project === 'running' ? 1 : null,
+});
+const repo = (owner, name, language, description, days, priv = true) => ({
+  owner, name, full_name: `${owner}/${name}`, private: priv, default_branch: 'main', language, description, pushed_at: iso(days * 24 * H),
+});
+const GITHUB = {
+  configured: true,
+  install_url: 'https://github.com/apps/sp00ky-cloud/installations/new?state=fixture',
+  installations: [
+    {
+      id: 7001, account: 'nadia-k', type: 'User', selection: 'all', manage_url: 'https://github.com/settings/installations/7001', avatar_url: 'https://avatars.githubusercontent.com/u/9919?v=4',
+      repos: [
+        repo('nadia-k', 'tideline', 'TypeScript', 'Tide tables and harbour alerts for small boats', 0.1),
+        repo('nadia-k', 'fieldnotes', 'TypeScript', 'Shared notebooks for survey crews, offline first', 3),
+        repo('nadia-k', 'harbour-api', 'Go', 'Port schedules as a small API', 11),
+        repo('nadia-k', 'dotfiles', 'Shell', null, 40, false),
+        repo('nadia-k', 'chart-render', 'Rust', 'Vector nautical charts to tiles', 120, false),
+        repo('nadia-k', 'sailing-log', 'Dart', 'Logbook app', 300),
+      ],
+    },
+    { id: 7002, account: 'northsound', type: 'Organization', selection: 'selected', manage_url: 'https://github.com/organizations/northsound/settings/installations/7002', avatar_url: 'https://avatars.githubusercontent.com/u/9892?v=4', repos: [repo('northsound', 'dock-booking', 'TypeScript', 'Berth bookings', 2)] },
+  ],
+};
+const inspection = () => {
+  const configured = ONBOARDING.repo === 'configured';
+  return {
+    repo: 'nadia-k/tideline', branch: 'main', sha: ONBOARDING.config ? '7c41e09ab2d' : 'a3f9c1e7d2b', private: true, language: 'TypeScript',
+    description: 'Tide tables and harbour alerts for small boats', url: 'https://github.com/nadia-k/tideline',
+    empty: false, files: 212, truncated: false,
+    config: configured
+      ? { path: 'sp00ky.yml', valid: true, slug: 'tideline', mode: 'singlenode', schema: './schema', apps: [{ name: 'web', type: 'frontend' }] }
+      : ONBOARDING.config ? { path: 'spooky/sp00ky.yml', valid: true, mode: 'singlenode', schema: '.', apps: [] } : null,
+    package_manager: 'pnpm', monorepo: true,
+    apps: [
+      { path: 'apps/web', name: '@tideline/web', kind: 'frontend', framework: 'Solid' },
+      { path: 'services/alerts', name: '@tideline/alerts', kind: 'backend', framework: 'Hono' },
+    ],
+    schema_dir: configured ? 'schema' : ONBOARDING.config ? 'spooky' : undefined, schema_files: configured ? 6 : ONBOARDING.config ? 1 : 0,
+    dockerfiles: 1, uses_spooky: configured, has_cli: false,
+  };
+};
+
 const DEPLOYMENTS = {
   deployments: [
     { id: 'd43', version: 43, status: 'provisioning', error: null, live: false, live_from: null, live_until: null, source: 'git', actor: null, rollback_of: null, images: { scheduler: '0.0.1-canary.370', ssp: '0.0.1-canary.370', surrealdb: 'v3.1.5' }, created_at: iso(130_000), deployed_at: null, updated_at: iso(5000), build: { commit_sha: 'a3f9c1e7d2', commit_message: 'fix(game): pending moves survive a reload', commit_author: 'mono424', status: 'deploying' } },
@@ -50,6 +131,192 @@ const DEPLOYMENTS = {
   ],
   builds: [],
 };
+
+// The Build time pages' world: 130 pushes over 88 days, in four regimes, so the
+// page has step changes to find.
+const BUILD_DAY = 24 * H;
+const buildNoise = (i, salt) => {
+  const x = Math.sin(i * 12.9898 + salt * 78.233) * 43758.5453;
+  return x - Math.floor(x);
+};
+const buildSpread = (i, salt, lo, hi) => Math.round(lo + (hi - lo) * buildNoise(i, salt));
+const BUILD_MESSAGES = ['fix(game): pending moves survive a reload', 'feat(puzzles): daily set survives a reload', 'chore: bump the board renderer', 'feat(analysis): engine depth per plan', 'fix(chat): typing state clears on leave', 'refactor(profile): one query for the header', 'feat(import): PGN batches stream progress'];
+const BUILD_SERIES = Array.from({ length: 130 }, (_, n) => {
+  const i = 129 - n;
+  const agoMs = Math.round((i / 129) * 88 * BUILD_DAY) + 40 * 60_000;
+  const daysAgo = agoMs / BUILD_DAY;
+  const renderer = daysAgo > 58 ? 95_000 : daysAgo > 22 ? 430_000 : daysAgo > 7 ? 205_000 : 48_000;
+  const web = buildSpread(n, 3, 88_000, 132_000);
+  const server = buildNoise(n, 5) > 0.55 ? 3_000 : buildSpread(n, 6, 44_000, 76_000);
+  const failed = buildNoise(n, 7) > 0.93;
+  const wedge = !failed && buildNoise(n, 8) > 0.975 ? 2.4 : 1;
+  const apps = [
+    { name: 'renderer', ms: Math.round(renderer * (0.86 + buildNoise(n, 9) * 0.3) * wedge), status: 'ok' },
+    { name: 'web', ms: web, status: 'ok' },
+    { name: 'game-server', ms: server, status: server < 5000 ? 'reused' : 'ok' },
+    { name: 'mailer', ms: 1800, status: 'reused' },
+  ];
+  const build = apps.reduce((a, b) => a + b.ms, 0) + buildSpread(n, 10, 4000, 9000);
+  const phases = failed
+    ? { queue: buildSpread(n, 1, 1000, 9000), source: buildSpread(n, 2, 5000, 9000), build: Math.round(build * 0.6), infra: 0, migrate: 0, rollout: 0 }
+    : { queue: buildSpread(n, 1, 1000, buildNoise(n, 12) > 0.85 ? 180_000 : 9000), source: buildSpread(n, 2, 5000, 9000), build, infra: buildSpread(n, 13, 44_000, 70_000), migrate: buildSpread(n, 14, 8000, 22_000), rollout: buildSpread(n, 15, 38_000, 92_000) };
+  const layers = apps.filter((a) => a.status === 'ok').length * 13;
+  return {
+    id: `bld-${n}`, kind: 'build', status: failed ? 'failed' : 'success', version: 200 + n, source: 'git',
+    commit_sha: `${(0x1a2b3c4 + n * 7919).toString(16)}e7d2aa`, commit_message: BUILD_MESSAGES[n % BUILD_MESSAGES.length], commit_author: n % 3 ? 'mono424' : 'mira',
+    error: failed ? 'docker build failed for renderer: exit status 1\n#14 ERROR: process "/bin/sh -c pnpm build" did not complete successfully: exit code: 1' : null,
+    created_at: iso(agoMs), total_ms: Object.values(phases).reduce((a, b) => a + b, 0), phases,
+    detailed: daysAgo < 60, apps: daysAgo < 60 ? apps : [],
+    apps_built: daysAgo < 60 ? apps.filter((a) => a.status === 'ok').length : 0,
+    apps_reused: daysAgo < 60 ? apps.filter((a) => a.status === 'reused').length : 0,
+    layers: daysAgo < 60 ? layers : 0, layers_cached: daysAgo < 60 ? Math.round(layers * (0.55 + buildNoise(n, 16) * 0.3)) : 0,
+  };
+});
+const BUILD_LAYERS = [
+  ['[internal] load build context', 2200, 0], ['importing cache manifest from registry', 3100, 0], ['builder · FROM docker.io/library/node:22', 0, 1],
+  ['builder · RUN corepack enable && pnpm fetch', 41_000, 1], ['builder · COPY . .', 3800, 0], ['builder · RUN pnpm install --offline', 22_000, 1],
+  ['builder · RUN pnpm --filter ./apps/renderer build', 214_000, 0], ['runtime · FROM docker.io/library/nginx:1.27', 0, 1],
+  ['runtime · COPY --from=builder /app/dist /usr/share/nginx/html', 1900, 0], ['exporting to image', 31_000, 0], ['exporting cache to registry', 26_000, 0],
+];
+function buildStat(phase, step, app, name, ms, skipped = 0) {
+  const series = Array.from({ length: 30 }, (_, i) => Math.round(ms * (i > 18 ? 1.5 : 0.92 + buildNoise(i, ms % 97) * 0.2)));
+  return { phase, step, app, name, count: 34, skipped, median_ms: skipped === 34 ? 0 : ms, p90_ms: skipped === 34 ? 0 : Math.round(ms * 1.3), total_ms: ms * 34, prior_median_ms: Math.round(ms * (name === 'renderer' ? 2.4 : 1.06)), series };
+}
+const BUILD_STEPS = [
+  buildStat('source', 'clone', '', 'Clone repository', 5200), buildStat('source', 'vault', '', 'Load vault secrets', 380), buildStat('source', 'manifest', '', 'Read and check sp00ky.yml', 620),
+  buildStat('build', 'registry', '', 'Log in to the build registry', 900), buildStat('build', 'create_deployment', '', 'Create deployment', 1400),
+  buildStat('build', 'app', 'renderer', 'renderer', 205_000), buildStat('build', 'docker_build', 'renderer', 'docker build', 198_000), buildStat('build', 'key', 'renderer', 'Hash inputs, check reuse', 620), buildStat('build', 'inspect', 'renderer', 'Inspect image', 310),
+  ...BUILD_LAYERS.map(([name, ms, hit]) => buildStat('build', 'layer', 'renderer', name, ms, hit ? 27 : 0)),
+  buildStat('build', 'app', 'web', 'web', 108_000), buildStat('build', 'docker_build', 'web', 'docker build', 104_000), buildStat('build', 'layer', 'web', 'builder · RUN pnpm --filter ./apps/web build', 71_000), buildStat('build', 'layer', 'web', 'exporting to image', 14_000),
+  buildStat('build', 'app', 'game-server', 'game-server', 58_000, 18), buildStat('build', 'docker_build', 'game-server', 'docker build', 54_000), buildStat('build', 'app', 'mailer', 'mailer', 1800, 34),
+  buildStat('infra', 'registry_prune', '', 'Prune build registry', 2100), buildStat('migrate', 'migrate', '', 'Apply migrations', 9400), buildStat('migrate', 'pools', '', 'Sync machine pools', 2100), buildStat('rollout', 'announce', '', 'Announce frontend releases', 480),
+];
+function buildDetail(id) {
+  const run = BUILD_SERIES.find((b) => b.id === id);
+  if (!run) return [404, { error: 'build not found' }];
+  if (!run.detailed) return [200, { run, steps: [] }];
+  const zero = Date.parse(run.created_at);
+  const at = (ms) => new Date(zero + ms).toISOString();
+  const steps = [];
+  let nextId = 1;
+  const add = (phase, step, app, name, offset, ms, status = 'ok', parent_id = null) => {
+    const row = { id: nextId++, parent_id, phase, step, app, name, status, started_at: at(offset), duration_ms: ms };
+    steps.push(row);
+    return row.id;
+  };
+  const p = run.phases;
+  let t = p.queue;
+  add('source', 'clone', null, 'Clone repository', t, Math.round(p.source * 0.74));
+  add('source', 'vault', null, 'Load vault secrets', t + Math.round(p.source * 0.76), 380);
+  add('source', 'manifest', null, 'Read and check sp00ky.yml', t + Math.round(p.source * 0.84), 620);
+  t += p.source;
+  add('build', 'registry', null, 'Log in to the build registry', t, 900);
+  t += 1000;
+  for (const a of run.apps) {
+    const parent = add('build', 'app', a.name, a.name, t, a.ms, a.status);
+    add('build', 'key', a.name, 'Hash inputs, check reuse', t, 620, 'ok', parent);
+    if (a.status === 'ok') {
+      const docker = add('build', 'docker_build', a.name, 'docker build', t + 700, Math.round(a.ms * 0.96), 'ok', parent);
+      let l = t + 900;
+      const scale = (a.ms * 0.94) / BUILD_LAYERS.reduce((sum, [, ms]) => sum + ms, 0);
+      for (const [name, ms, hit] of BUILD_LAYERS) {
+        const cached = hit && buildNoise(ms, 3) >= 0;
+        const took = cached ? 0 : Math.round(ms * scale);
+        add('build', 'layer', a.name, name, l, took, cached ? 'cached' : 'ok', docker);
+        l += took;
+      }
+      add('build', 'inspect', a.name, 'Inspect image', t + Math.round(a.ms * 0.97), 310, 'ok', parent);
+    }
+    t += a.ms;
+  }
+  add('build', 'create_deployment', null, 'Create deployment', t, 1400);
+  t = p.queue + p.source + p.build;
+  if (p.infra) add('infra', 'registry_prune', null, 'Prune build registry', t, 2100);
+  t += p.infra;
+  if (p.migrate) {
+    add('migrate', 'migrate', null, 'Apply migrations', t, Math.round(p.migrate * 0.76));
+    add('migrate', 'pools', null, 'Sync machine pools', t + Math.round(p.migrate * 0.78), Math.round(p.migrate * 0.2));
+  }
+  t += p.migrate;
+  if (p.rollout) add('rollout', 'announce', null, 'Announce frontend releases', t + 400, 480);
+  return [200, { run, steps }];
+}
+function buildsList(url) {
+  const days = Number(url.searchParams.get('days') ?? 30);
+  const out = {
+    runs: BUILD_SERIES.filter((b) => Date.parse(b.created_at) >= now - 2 * days * BUILD_DAY),
+    window_start: iso(days * BUILD_DAY),
+  };
+  if (url.searchParams.get('steps') !== '0') out.steps = BUILD_STEPS;
+  return [200, out];
+}
+
+// The Audience page's world: a daily and weekly rhythm, slow growth, and a gap.
+function activityReport(url) {
+  const days = Number(url.searchParams.get('days') ?? 30);
+  const step = days <= 14 ? '15m' : days <= 90 ? '1h' : '1d';
+  const stepMs = { '15m': 15 * 60_000, '1h': H, '1d': BUILD_DAY }[step];
+  const shape = (t) => {
+    const at = new Date(t);
+    const hour = at.getHours() + at.getMinutes() / 60;
+    const day = (at.getDay() + 6) % 7;
+    const daily = Math.max(0, Math.sin(((hour - 7) / 24) * 2 * Math.PI)) ** 1.5;
+    const evening = Math.exp(-((hour - 20.5) ** 2) / 6) * 0.55;
+    const weekend = day >= 5 ? 1.25 : 1;
+    const growth = 1 + (1 - (now - t) / (365 * BUILD_DAY)) * 0.9;
+    return { load: (0.03 + daily + evening) * weekend * growth };
+  };
+  const pointAt = (t, i) => {
+    const { load } = shape(t);
+    const wob = 0.86 + buildNoise(i, 21) * 0.28;
+    const users = 46 * load * wob;
+    const anon = 12 * load * (0.8 + buildNoise(i, 22) * 0.4);
+    const perPerson = t < now - 21 * BUILD_DAY ? 6.2 : 7.6;
+    return {
+      at: new Date(t).toISOString(),
+      users_avg: users, users_max: Math.ceil(users * 1.22),
+      anon_avg: anon, anon_max: Math.ceil(anon * 1.4),
+      views_avg: (users + anon) * perPerson, views_max: Math.ceil((users + anon) * perPerson * 1.18),
+    };
+  };
+  const bucketNow = Math.floor(now / stepMs) * stepMs;
+  const outage = [now - 6.2 * BUILD_DAY, now - 5.9 * BUILD_DAY];
+  const series = [];
+  for (let t = bucketNow - days * BUILD_DAY, i = 0; t <= bucketNow; t += stepMs, i++) {
+    if (step !== '1d' && t > outage[0] && t < outage[1]) continue;
+    series.push(pointAt(t, i));
+  }
+  const cells = [];
+  for (let d = 1; d <= 7; d++) for (let h = 0; h < 24; h++) {
+    const monday = new Date(now);
+    monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7) + d - 1);
+    monday.setHours(h, 30, 0, 0);
+    const p = pointAt(monday.getTime(), d * 24 + h);
+    cells.push({ day: d, hour: h, people: p.users_avg + p.anon_avg, views: p.views_avg });
+  }
+  const week = 7 * 24;
+  const at = (d, h) => cells[(d - 1) * 24 + h].people;
+  const windows = [];
+  for (let s = 0; s < week; s++) windows.push({ day: Math.floor(s / 24) + 1, hour: s % 24, hours: 2, people: (cells[s].people + cells[(s + 1) % week].people) / 2 });
+  windows.sort((a, b) => a.people - b.people);
+  const quiet = [];
+  const pos = (w) => (w.day - 1) * 24 + w.hour;
+  for (const w of windows) {
+    if (quiet.length === 3) break;
+    if (quiet.every((q) => { const d = Math.abs(pos(q) - pos(w)); return d >= 2 && week - d >= 2; })) quiet.push(w);
+  }
+  void at;
+  const summarize = (rows) => ({
+    people_avg: rows.reduce((a, p) => a + p.users_avg + p.anon_avg, 0) / Math.max(1, rows.length),
+    people_peak: Math.max(0, ...rows.map((p) => p.users_max + p.anon_max)),
+    views_avg: rows.reduce((a, p) => a + p.views_avg, 0) / Math.max(1, rows.length),
+    views_peak: Math.max(0, ...rows.map((p) => p.views_max)),
+    measured: rows.length,
+  });
+  const prior = [];
+  for (let t = bucketNow - 2 * days * BUILD_DAY, i = 0; t < bucketNow - days * BUILD_DAY; t += stepMs, i++) prior.push({ ...pointAt(t, i), users_avg: pointAt(t, i).users_avg * 0.88, anon_avg: pointAt(t, i).anon_avg * 0.88 });
+  return { step, series, cells, quiet, current: summarize(series), prior: summarize(prior), latest: series[series.length - 1], first_at: iso(200 * BUILD_DAY), tz: url.searchParams.get('tz') || 'UTC' };
+}
 
 const CLOUD = {
   'GET /console/me': { account: { id: 'acct-1', github_login: 'mono424', email: 'mira@acme.dev', created_at: iso(400 * 24 * H) }, session: 'sess-1', grants: true },
@@ -70,7 +337,149 @@ const CLOUD = {
   'GET /mcp/tokens': [{ id: 'mt1', name: 'claude on my laptop', prefix: 'mcp_live_3fa1', scopes: ['mcp:full'], created_at: iso(9 * 24 * H), last_used_at: iso(2 * H) }],
 };
 
-function cloudRoute(method, path) {
+// The Database tab's world: `/projects/{pid}/database/upgrade`, one scenario at a time.
+const MIN = 60_000;
+const SCHEDULER_SDK = { code: 'scheduler_sdk', message: 'Projects with a scheduler stay on v3.3.5 for now: its SurrealDB SDK refuses 4.x servers.' };
+const BUSY = { code: 'busy', message: 'An upgrade is already running.' };
+const offer = (over) => ({ current: 'v3.1.5', beta: false, one_way: false, up_to_date: false, blockers: [], ...over });
+const OFFER_3 = { target: 'v3.3.5', kind: 'swap' };
+const OFFER_4 = { current: 'v3.3.5', target: 'v4.0.0-beta.1', kind: 'replay', beta: true, one_way: true };
+const replay = (over) => ({
+  id: 'up-7', kind: 'replay', state: 'sync', active: true, from_version: 'v3.3.5', to_version: 'v4.0.0-beta.1', reverse: false, hold_at_ready: false, abort_requested: false,
+  backup_id: 'bk-2291', stats: { frozen_ms: 180, open_ms: 41_300, rebuilt_indexes: 6, applied_entries: 8112, applied_rows: 1_284_120, lag_ms: 2400 }, created_at: iso(38 * MIN), ...over,
+});
+const swap = (over) => ({
+  id: 'up-6', kind: 'swap', state: 'rehearse', active: true, from_version: 'v3.1.5', to_version: 'v3.3.5', reverse: false, hold_at_ready: false, abort_requested: false,
+  backup_id: 'bk-2288', stats: {}, created_at: iso(4 * MIN), ...over,
+});
+const CUT = { hold_ms: 1240, verified_tables: 42, verified_rows: 3_418_907 };
+const UPGRADES = {
+  // What is on offer.
+  offer3: () => offer(OFFER_3),
+  offer4: () => offer(OFFER_4),
+  blocked: () => offer({ ...OFFER_4, blockers: [SCHEDULER_SDK] }),
+  uptodate: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true }),
+  nodb: () => offer({ blockers: [{ code: 'no_database', message: 'This project does not run on a database of its own here.' }] }),
+  // A move inside 3.x.
+  swap: () => offer({ ...OFFER_3, blockers: [BUSY], upgrade: swap() }),
+  swapready: () => offer({ ...OFFER_3, blockers: [BUSY], upgrade: swap({ state: 'ready', hold_at_ready: true, stats: { frozen_ms: 90, open_ms: 2140 } }) }),
+  swapflip: () => offer({ ...OFFER_3, blockers: [BUSY], upgrade: swap({ state: 'flip_start', flip_at: iso(4000), stats: { frozen_ms: 90, open_ms: 2140 } }) }),
+  swapdone: () => offer({ current: 'v3.3.5', ...OFFER_4, blockers: [SCHEDULER_SDK], upgrade: swap({ state: 'done', active: false, flip_at: iso(2 * H), rollback_until: iso(-166 * H), finished_at: iso(2 * H - MIN), stats: { frozen_ms: 90, open_ms: 2140, hold_ms: 4310 } }) }),
+  // The step to 4.x.
+  clone: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'clone', created_at: iso(6 * MIN), stats: { frozen_ms: 180 } }) }),
+  sync: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay() }),
+  verify: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'verify', stats: { ...replay().stats, lag_ms: 800, verified_rows: 912_004, detail: 'comparing game_analysis' } }) }),
+  ready: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'ready', hold_at_ready: true, stats: { ...replay().stats, lag_ms: undefined, ...CUT, hold_ms: undefined } }) }),
+  fence: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'fence', stats: { ...replay().stats, lag_ms: undefined, ...CUT, hold_ms: undefined } }) }),
+  soak: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'soak', flip_at: iso(18 * MIN), soak_until: iso(-42 * MIN), stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  soakwarn: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'soak', flip_at: iso(18 * MIN), soak_until: iso(-42 * MIN), warning: 'The abort failed and the new version is still serving: the old database did not open its data.', stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  reverse: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'sync', reverse: true, abort_requested: true, flip_at: iso(24 * MIN), stats: { open_ms: 3800, frozen_ms: 180, applied_rows: 2204, lag_ms: 600, hold_ms: 1240 } }) }),
+  rollback: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, blockers: [BUSY], upgrade: replay({ state: 'rollback', flip_at: iso(24 * MIN), stats: { ...CUT } }) }),
+  undoing: () => offer({ ...OFFER_4, blockers: [BUSY], upgrade: replay({ state: 'abort', abort_requested: true, stats: { frozen_ms: 180 } }) }),
+  // How it ended.
+  done: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, upgrade: replay({ state: 'done', active: false, flip_at: iso(3 * H), rollback_until: iso(-165 * H), finished_at: iso(2 * H), stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  closed: () => offer({ current: 'v4.0.0-beta.1', up_to_date: true, upgrade: replay({ state: 'done', active: false, flip_at: iso(200 * H), created_at: iso(201 * H), finished_at: iso(199 * H), stats: { ...replay().stats, lag_ms: undefined, ...CUT } }) }),
+  failed: () => offer({ ...OFFER_4, upgrade: replay({ state: 'failed', active: false, error: 'the two databases differ: table game_analysis, row game_analysis:9f2a has a different value for depth', finished_at: iso(6 * MIN), stats: { ...replay().stats, lag_ms: undefined, verified_rows: 912_004 } }) }),
+  failedflip: () => offer({ current: 'v3.1.5', ...OFFER_3, upgrade: swap({ state: 'failed', active: false, flip_at: iso(30 * MIN), error: 'The old database could not be started again: container exited with code 137', finished_at: iso(20 * MIN), stats: { frozen_ms: 90, open_ms: 2140 } }) }),
+  aborted: () => offer({ ...OFFER_4, upgrade: replay({ state: 'aborted', active: false, reverse: true, flip_at: iso(50 * MIN), finished_at: iso(9 * MIN), stats: { open_ms: 3800, applied_rows: 2204, hold_ms: 1180 } }) }),
+  cancelled: () => offer({ ...OFFER_4, upgrade: replay({ state: 'aborted', active: false, finished_at: iso(9 * MIN), stats: { frozen_ms: 180 } }) }),
+  rolled_back: () => offer({ ...OFFER_4, upgrade: replay({ state: 'rolled_back', active: false, flip_at: iso(70 * MIN), finished_at: iso(61 * MIN), stats: { ...CUT } }) }),
+};
+// What each button leads to, from where it can be pressed.
+const UPGRADE_MOVES = {
+  cutover: { ready: 'fence', swapready: 'swapflip' },
+  cancel: { soak: 'reverse', soakwarn: 'reverse', swap: 'cancelled', swapready: 'cancelled', clone: 'cancelled', sync: 'cancelled', verify: 'cancelled', ready: 'cancelled' },
+  finish: { soak: 'done', soakwarn: 'done' },
+  rollback: { soak: 'rolled_back', soakwarn: 'rolled_back', done: 'rolled_back', swapdone: 'rolled_back' },
+};
+// Null is each project's own: a project with a scheduler is held on 3.x, Cloudflare goes on to 4.x.
+let upgradeScenario = null;
+const upgradeOf = (projectId) => upgradeScenario ?? (projectId === 'prj-td' ? 'offer4' : 'offer3');
+
+function upgradeRoute(method, projectId, action, body) {
+  const at = upgradeOf(projectId);
+  const shown = UPGRADES[at]();
+  if (method === 'GET') return [200, shown];
+  if (!action) {
+    if (shown.blockers.length) return [409, { code: shown.blockers[0].code, error: shown.blockers[0].message }];
+    if (body?.to !== shown.target) return [409, { code: 'wrong_step', error: `the next step from ${shown.current} is ${shown.target}, not ${body?.to}` }];
+    upgradeScenario = shown.kind === 'swap' ? (body.no_cutover ? 'swapready' : 'swap') : body.no_cutover ? 'ready' : 'clone';
+    return [202, UPGRADES[upgradeScenario]().upgrade];
+  }
+  const next = UPGRADE_MOVES[action]?.[at];
+  if (!next) return [409, { code: action === 'rollback' ? 'no_rollback' : 'no_db_upgrade', error: `nothing to ${action} from ${at}` }];
+  upgradeScenario = next;
+  return [200, UPGRADES[next]().upgrade];
+}
+
+// The Machines tab's world: `/projects/{pid}/host`, one scenario at a time.
+const HOST_NOTE = 'An upgrade restarts the project host: web, API and live sync are down for about two minutes. The database is not touched.';
+const hostView = (app, placement = 'active') => ({
+  placement,
+  hosts: [
+    app,
+    { kind: 'db', status: 'ready', server_type: 'cax21', location: 'fsn1', target_available: true, upgrade_pending: false },
+  ],
+  quiet_window: '03:30 to 05:30 UTC',
+  note: HOST_NOTE,
+});
+const OLD_APP = { kind: 'app', status: 'ready', server_type: 'cx23', location: 'fsn1', target_type: 'cx33', target_available: true, upgrade_pending: true };
+const HOSTS = {
+  pending: () => hostView(OLD_APP),
+  waiting: () => hostView({ ...OLD_APP, target_available: false }),
+  upgrading: () => hostView({ ...OLD_APP, upgrade_state: 'requested' }),
+  failed: () => hostView({ ...OLD_APP, upgrade_error: 'cx33 could not be created in fsn1: resource unavailable' }),
+  current: () => hostView({ kind: 'app', status: 'ready', server_type: 'cx33', location: 'fsn1', target_available: true, upgrade_pending: false }),
+  none: () => ({ placement: '', hosts: [], quiet_window: '03:30 to 05:30 UTC', note: HOST_NOTE }),
+};
+let hostScenario = null;
+function hostRoute(method, action) {
+  const at = hostScenario ?? 'pending';
+  if (method === 'GET') return [200, HOSTS[at]()];
+  if (action === 'upgrade') {
+    if (at !== 'pending' && at !== 'waiting' && at !== 'failed') return [409, { code: at === 'current' ? 'already_upgraded' : 'busy', error: at === 'current' ? 'this project host is already on cx33' : 'an upgrade is already running on this host' }];
+    hostScenario = 'upgrading';
+    return [202, { status: 'requested' }];
+  }
+  return [404, { error: 'not found' }];
+}
+
+// Settings > Git: each project's link, changed by the editor the way the API would.
+const LINKS = {};
+function linkRoute(method, id, body) {
+  const at = id in LINKS ? LINKS[id] : { status: 'linked', installation_id: 7001, repo_owner: 'mono424', repo_name: 'whitepawn', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' };
+  if (method === 'DELETE') {
+    LINKS[id] = { status: 'not_linked' };
+    return [200, { status: 'unlinked' }];
+  }
+  if (method === 'PATCH') {
+    const b = body ?? {};
+    if (b.branch !== undefined && !String(b.branch).trim()) return [400, { error: `"${b.branch}" is not a branch name` }];
+    if (b.repo_owner && b.repo_name) {
+      LINKS[id] = { status: 'linked', installation_id: b.installation_id, repo_owner: b.repo_owner, repo_name: b.repo_name, branch: b.branch ?? 'main', config_path: b.config_path || 'sp00ky.yml', auto_deploy: b.auto_deploy ?? at.auto_deploy ?? true };
+      return [200, { status: 'linked' }];
+    }
+    if (at.status !== 'linked') return [404, { error: 'this project is not linked to a repository' }];
+    LINKS[id] = { ...at, ...Object.fromEntries(['branch', 'auto_deploy', 'config_path'].filter((k) => b[k] !== undefined).map((k) => [k, b[k]])) };
+    return [200, { status: 'updated' }];
+  }
+  return [200, at];
+}
+
+function cloudRoute(method, path, url, body) {
+  FRESH.projects = ONBOARDING.project ? [NEW_PROJECT(ONBOARDING.project)] : [];
+  if (path === '/console/me') {
+    const me = CLOUD['GET /console/me'];
+    return [200, { ...me, account: { ...me.account, cli_login_at: ONBOARDING.cli ? iso(4000) : null }, api_url: 'https://api-stg.sp00ky.cloud' }];
+  }
+  if (path === '/github') return [200, ONBOARDING.connected ? GITHUB : { ...GITHUB, installations: [] }];
+  if (path === '/github/inspect') {
+    return url.searchParams.get('repo') === 'nadia-k/tideline' ? [200, inspection()] : [404, { error: 'the app cannot see that repository' }];
+  }
+  if (path === '/projects/prj-new/link') {
+    if (method === 'PATCH') ONBOARDING.linked = true;
+    return [200, ONBOARDING.linked ? { status: 'linked', repo_owner: 'nadia-k', repo_name: 'tideline', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' } : { status: 'not_linked' }];
+  }
   const exact = CLOUD[`${method} ${path}`];
   if (exact !== undefined) return [200, exact];
   let m;
@@ -79,7 +488,13 @@ function cloudRoute(method, path) {
     if (p?.platform === 'cloudflare') return [200, { grant: 'fx', admin_url: `${ORIGIN}/cf`, admin: 'ssp', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
     return [200, { grant: 'fixture-grant', admin_url: `${ORIGIN}/fx`, admin: 'scheduler', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
   }
+  if ((m = path.match(/^\/projects\/([^/]+)\/database\/upgrade(?:\/(cutover|cancel|finish|rollback))?$/))) return upgradeRoute(method, m[1], m[2], body);
+  if ((m = path.match(/^\/projects\/([^/]+)\/host(?:\/(upgrade))?$/))) return hostRoute(method, m[2]);
   if (/^\/console\/projects\/[^/]+\/deployments$/.test(path)) return [200, DEPLOYMENTS];
+  if (/^\/console\/projects\/prj-td\/activity$/.test(path)) return [200, { step: '1h', series: [], cells: [], quiet: [], current: { people_avg: 0, people_peak: 0, views_avg: 0, views_peak: 0, measured: 0 }, prior: { people_avg: 0, people_peak: 0, views_avg: 0, views_peak: 0, measured: 0 }, latest: null, first_at: null, tz: 'UTC' }];
+  if (/^\/console\/projects\/[^/]+\/activity$/.test(path)) return [200, activityReport(url)];
+  if ((m = path.match(/^\/console\/projects\/[^/]+\/builds\/([^/]+)$/))) return buildDetail(m[1]);
+  if (/^\/console\/projects\/[^/]+\/builds$/.test(path)) return buildsList(url);
   if (/^\/console\/workspaces\/[^/]+\/activity$/.test(path)) {
     return [200, { events: [
       { id: 3, at: iso(60_000), actor: 'mono424', action: 'console.grant', project: 'whitepawn', ip: '84.150.12.9', detail: {} },
@@ -94,7 +509,11 @@ function cloudRoute(method, path) {
       ...backends.map((name) => ({ role: 'backend', status: name === 'livekit' ? 'starting' : 'running', name })),
     ], urls: { app: 'https://whitepawn-app.stg.spky.cloud', ...Object.fromEntries(backends.map((n) => [n, `https://whitepawn-${n}.stg.spky.cloud`])), surrealdb: 'https://whitepawn-db.stg.spky.cloud', admin: 'https://whitepawn-admin.stg.spky.cloud/admin' } }];
   }
-  if (/^\/projects\/[^/]+\/link$/.test(path) && method === 'GET') return [200, { status: 'linked', repo_owner: 'mono424', repo_name: 'whitepawn', branch: 'main', auto_deploy: true, config_path: 'sp00ky.yml' }];
+  if (path === '/github/branches') {
+    const r = GITHUB.installations.flatMap((i) => i.repos).find((x) => x.full_name === url.searchParams.get('repo'));
+    return r ? [200, { default_branch: 'main', branches: ['main', 'develop', 'release/2.1', 'feat/offline-tides'] }] : [404, { error: 'the app cannot see that repository' }];
+  }
+  if ((m = path.match(/^\/projects\/([^/]+)\/link$/))) return linkRoute(method, m[1], body);
   if (/^\/projects\/[^/]+\/link\/runs$/.test(path)) return [200, [
     { id: 'r1', commit_sha: 'a3f9c1e7d2', commit_message: 'fix(game): pending moves survive a reload', commit_author: 'mono424', status: 'deploying', created_at: iso(130_000) },
     { id: 'r0', commit_sha: '9b2e07d1aa', commit_message: 'feat(puzzles): daily set survives a reload', commit_author: 'mono424', status: 'running', created_at: iso(52 * H) },
@@ -113,6 +532,11 @@ function cloudRoute(method, path) {
     { id: 'm1', account_id: 'acct-1', role: 'admin', email: 'mira@acme.dev', github_login: 'mono424', created_at: iso(300 * 24 * H) },
     { id: 'm2', account_id: 'acct-2', role: 'member', email: 'sam@acme.dev', github_login: 'samk', created_at: iso(40 * 24 * H) },
   ]];
+  if ((m = path.match(/^\/tenants\/([^/]+)$/))) {
+    const w = WORKSPACES.find((x) => x.id === m[1]);
+    if (!w) return [404, { error: 'tenant not found' }];
+    return [200, { id: w.id, name: w.name, slug: w.slug, type: w.type, created_at: iso(400 * 24 * H) }];
+  }
   if (/^\/tenants\/[^/]+\/invitations$/.test(path)) return [200, [{ id: 'i1', email: 'jo@acme.dev', role: 'member', expires_at: iso(-5 * 24 * H) }]];
   if (method !== 'GET') return [200, { status: 'ok' }];
   return [404, { error: `no fixture for ${method} ${path}` }];
@@ -120,7 +544,7 @@ function cloudRoute(method, path) {
 
 async function sendFile(res, path) {
   const body = await readFile(path);
-  res.writeHead(200, { 'content-type': TYPES[extname(path)] ?? 'application/octet-stream' });
+  res.writeHead(200, { 'content-type': TYPES[extname(path)] ?? 'application/octet-stream', 'content-security-policy': CSP });
   res.end(body);
 }
 
@@ -130,19 +554,49 @@ createServer(async (req, res) => {
     res.writeHead(status, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': '*' });
     res.end(JSON.stringify(body));
   };
+  if (url.pathname === '/__onboarding') {
+    if (url.searchParams.has('reset')) Object.assign(ONBOARDING, { connected: false, cli: false, config: false, repo: 'plain', project: null, linked: false });
+    for (const key of ['connected', 'cli', 'config']) if (url.searchParams.has(key)) ONBOARDING[key] = url.searchParams.get(key) === '1';
+    if (url.searchParams.has('repo')) ONBOARDING.repo = url.searchParams.get('repo');
+    if (url.searchParams.has('project')) ONBOARDING.project = url.searchParams.get('project') || null;
+    return json(200, ONBOARDING);
+  }
   if (url.searchParams.has('signedout')) signedOut = true;
   if (url.searchParams.has('signedin')) signedOut = false;
+  if (url.searchParams.has('upgrade')) upgradeScenario = url.searchParams.get('upgrade') || null;
+  if (url.searchParams.has('host')) hostScenario = url.searchParams.get('host') || null;
   if (url.pathname.startsWith('/v1/')) {
     if (signedOut) return json(401, { error: 'missing authorization header', code: 'unauthorized' });
-    const [status, body] = cloudRoute(req.method, url.pathname.slice(3));
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const sent = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined;
+    const [status, body] = cloudRoute(req.method, url.pathname.slice(3), url, sent);
     return json(status, body);
   }
   // A Cloudflare project whose SSP predates console grants.
   if (url.pathname.startsWith('/cf/admin/api/config')) return json(200, { ...ROUTES['GET /config'], host: 'ssp', cloud_login: undefined });
+  if (url.pathname.startsWith('/fx/admin/api') && REAL_ADMIN) {
+    if (req.method === 'OPTIONS') return json(204, {});
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const session = url.pathname.endsWith('/session');
+    const upstream = await fetch(`${REAL_ADMIN}${url.pathname.replace(/^\/fx/, '')}${url.search}`, {
+      method: req.method,
+      headers: { 'content-type': req.headers['content-type'] ?? 'application/json', ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}) },
+      body: session ? JSON.stringify({ password: process.env.FX_ADMIN_PASSWORD }) : chunks.length ? Buffer.concat(chunks) : undefined,
+    });
+    const text = await upstream.text();
+    // No socket through this little proxy: the pages poll.
+    if (url.pathname.endsWith('/config')) return json(200, { ...JSON.parse(text), cloud_login: true, live: undefined });
+    res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json', 'access-control-allow-origin': '*' });
+    return res.end(text);
+  }
   if (url.pathname.startsWith('/fx/admin/api')) {
     if (req.method === 'OPTIONS') return json(204, {});
     const key = `${req.method} ${url.pathname.replace(/^\/fx\/admin\/api/, '') || '/'}`;
     if (key === 'GET /config') return json(200, { ...ROUTES['GET /config'], cloud_login: true, project_slug: 'whitepawn' });
+    // The shared fixtures are frozen at one date; a live reading has to be current.
+    if (key === 'GET /overview') return json(200, { ...ROUTES[key], presence: { ...ROUTES[key].presence, taken_at_ms: Date.now() } });
     if (key === 'POST /session') return json(200, { token: 'fixture-session', mode: 'cloud', subject: 'cloud:acct-1', label: 'mono424', expires_in_secs: 900 });
     if (STREAMS[key] !== undefined) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'access-control-allow-origin': '*' });

@@ -38,6 +38,12 @@ abstract class Sp00kyClient {
       {QueryTimeToLive ttl = defaultTtl,
       List<RelationPlan> relations = const []});
   Future<List<dynamic>> queryRemote(String sql, [Map<String, dynamic>? vars]);
+
+  /// [queryRemote] for a read a screen is waiting on: it does not queue behind
+  /// the sync's registrations and body fetches. Background work stays on
+  /// [queryRemote], so these slots stay free.
+  Future<List<dynamic>> queryInteractive(String sql,
+      [Map<String, dynamic>? vars]);
   Future<void> preload(String sql, Map<String, dynamic> params,
       {QueryTimeToLive ttl = defaultTtl});
   /// A registered query's rows as a broadcast [Stream]. With `@channel` tables

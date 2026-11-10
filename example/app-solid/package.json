@@ -1,6 +1,6 @@
 {
   "name": "@example/app-solid",
-  "version": "0.0.1-canary.370",
+  "version": "0.0.1-canary.382",
   "description": "Solid.js Thread Application with Authentication",
   "type": "module",
   "scripts": {

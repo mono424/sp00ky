@@ -19,6 +19,12 @@ import '../logger/logger.dart';
 /// Writes ([writeStatements], the outbox push) run one at a time in issue
 /// order, so one push never overlaps another.
 ///
+/// Row bodies ([bodyStatements]) and reads a screen is waiting on
+/// ([queryInteractive]) have small pools of their own. A registration can spend
+/// seconds on the server building an index, and a launch sends dozens: in one
+/// shared queue six slow ones held back the row the user had just been notified
+/// about, and the search box.
+///
 /// A request holds its slot until the RPC settles, even when its caller has
 /// stopped waiting: a slot is only free when the server is done with it.
 class RemoteDatabaseService {
@@ -32,6 +38,14 @@ class RemoteDatabaseService {
 
   final _Lane _reads;
   final _Lane _writes = _Lane(1);
+  final _Lane _bodies = _Lane(bodyLaneCapacity);
+  final _Lane _interactive = _Lane(interactiveLaneCapacity);
+
+  /// Body fetches in flight at once. Matches `fetchRoundChunks`.
+  static const int bodyLaneCapacity = 4;
+
+  /// One-shot reads a screen is waiting on, in flight at once.
+  static const int interactiveLaneCapacity = 3;
 
   /// The token the session last authenticated with, re-applied by [connect] so
   /// a socket rebuilt from scratch comes back authenticated.
@@ -112,6 +126,11 @@ class RemoteDatabaseService {
   /// fails it as a network error, which the outbox and the registrations retry;
   /// waiting forever would wedge them instead.
   Duration connectGateTimeout = const Duration(seconds: 20);
+
+  /// How long `use` and `authenticate` get on a socket that just opened. Neither
+  /// has a deadline of its own, and a socket that opened and then went quiet
+  /// would otherwise hold the boot's connect, and every RPC behind it, forever.
+  Duration handshakeTimeout = const Duration(seconds: 10);
 
   /// Hold RPCs until the first connect attempt finishes. Called before the
   /// engine boots, so a call made before [connect] still waits for it.
@@ -203,16 +222,11 @@ class RemoteDatabaseService {
     if (gate == null || gate.isCompleted) _connectGate = Completer<void>();
     try {
       await _client.connect(endpoint);
-      await _client.use(
-          namespace: _config.namespace, database: _config.database);
-      final epoch = _authEpoch;
-      final token = _authToken ?? _config.token;
-      if (token != null) {
-        await _client.authenticate(token);
-      }
-      if (epoch != _authEpoch) {
+      try {
+        await _handshake().timeout(handshakeTimeout);
+      } on TimeoutException {
         await forceClose();
-        _checkEpoch(epoch);
+        rethrow;
       }
       unawaited(_recordSessionId());
       _logger.info('Connected to remote database');
@@ -220,6 +234,19 @@ class RemoteDatabaseService {
       // Success or failure: the attempt is over, so held RPCs stop waiting.
       _openConnectGate();
       scheduleMicrotask(() => onHandshake?.call());
+    }
+  }
+
+  Future<void> _handshake() async {
+    await _client.use(namespace: _config.namespace, database: _config.database);
+    final epoch = _authEpoch;
+    final token = _authToken ?? _config.token;
+    if (token != null) {
+      await _client.authenticate(token);
+    }
+    if (epoch != _authEpoch) {
+      await forceClose();
+      _checkEpoch(epoch);
     }
   }
 
@@ -247,6 +274,17 @@ class RemoteDatabaseService {
   Future<List<StatementResult>> queryStatements(String sql,
           [Map<String, dynamic>? vars]) =>
       _statements(_reads, sql, vars);
+
+  /// A read a screen is waiting on, in its own small pool: it never queues
+  /// behind the sync's registrations and body fetches.
+  Future<List<dynamic>> queryInteractive(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _run(_interactive, () => _client.query(sql, vars));
+
+  /// Per-statement outcomes of a row body fetch, in its own pool.
+  Future<List<StatementResult>> bodyStatements(String sql,
+          [Map<String, dynamic>? vars]) =>
+      _statements(_bodies, sql, vars);
 
   /// Per-statement outcomes of a write, in the write lane: it starts only once
   /// every write issued before it has settled.
@@ -282,6 +320,13 @@ class RemoteDatabaseService {
         query('RETURN true'),
         _run(_writes, () => _client.query('RETURN true')),
       ]);
+
+  /// One `RETURN true` on the socket itself, outside every lane: it asks whether
+  /// the socket works, and a busy lane cannot fail it.
+  Future<void> probeSocket() async {
+    await _awaitConnect();
+    await _client.query('RETURN true');
+  }
 
   Future<T> execute<T>(SealedQuery<T> query,
       [Map<String, dynamic>? vars]) async {

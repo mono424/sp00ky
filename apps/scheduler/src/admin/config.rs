@@ -87,6 +87,14 @@ pub struct AdminConfig {
     /// the console renews it from a fresh grant, so a member removed from a
     /// workspace loses access within this window.
     pub cloud_session_ttl: std::time::Duration,
+    /// Whether the dashboard can browse and edit the project's own tables,
+    /// users and bucket files (`SPKY_ADMIN_DATA`, default on).
+    pub data: bool,
+    /// Where this host can read `file:` bucket volumes, mounted read-only at the
+    /// same path SurrealDB has them (`SPKY_BUCKET_DIR`, usually `/buckets`).
+    /// SurrealDB lists a directory without the folders in it, so this is what
+    /// lets the dashboard show subfolders. Unset, they are opened by path.
+    pub bucket_dir: Option<std::path::PathBuf>,
 }
 
 impl AdminConfig {
@@ -184,6 +192,16 @@ impl AdminConfig {
             job_live_interval: std::time::Duration::from_secs(
                 job_live_interval_secs.min(job_interval_secs.max(1)),
             ),
+            data: !schedule_core::admin_data::is_off(std::env::var("SPKY_ADMIN_DATA").ok().as_deref()),
+            // Docker mounts before this starts, so a directory missing now stays
+            // missing. Listing it would read as every bucket being empty.
+            bucket_dir: std::env::var("SPKY_BUCKET_DIR").ok().filter(|s| !s.is_empty()).map(std::path::PathBuf::from).filter(|dir| {
+                let there = dir.is_dir();
+                if !there {
+                    tracing::warn!(dir = %dir.display(), "SPKY_BUCKET_DIR is not a directory; subfolders of file: buckets stay hidden");
+                }
+                there
+            }),
             allowed_origins: std::env::var("SPKY_ADMIN_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')

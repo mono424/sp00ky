@@ -32,7 +32,7 @@ expose it:
 
 | Port | Env | Serves | Exposure |
 | --- | --- | --- | --- |
-| `9667` | `ingest_port` (YAML) | `/ingest`, `/proxy/*`, `/view/*`, `/ssp/*`, `/job/*`, `/metrics`, `/health*`, `/info`, `/backup/*`, `/handover/*` | **Private network only** |
+| `9667` | `ingest_port` (YAML) | `/ingest`, `/proxy/*`, `/view/*`, `/ssp/*`, `/job/*`, `/metrics`, `/health*`, `/info`, `/backup/*`, `/handover/*`, `/db/reconnect` | **Private network only** |
 | `9668` | `SPKY_ADMIN_PORT` | `/admin` (dashboard) and `/admin/api/*` | Safe to publish |
 | `9669` | `SPKY_POOL_PORT` | `/pool/v1/*`, the [machine pool](/docs/jobs/machine-pools) agents' connection | Publish when pool machines live outside the scheduler's network |
 
@@ -769,6 +769,10 @@ While an SSP is bootstrapping, the scheduler buffers incoming messages:
 - Heartbeat returns `409 Conflict` when buffer overflow occurs
 
 ---
+
+## `POST /db/reconnect`
+
+Bearer `SPKY_AUTH_SECRET`. SurrealDB moved to another container, as it does in a [database upgrade](/docs/cloud/database-upgrades): every upstream handle reconnects now, instead of after minutes of failed probes. Answers `200`. The SSP answers the same route with its own bearer secret.
 
 ## Blue/green handover
 

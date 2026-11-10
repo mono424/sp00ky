@@ -295,13 +295,23 @@ honest denominator, and it is the one `spky jobs` uses too.
   Overview then say they are not being measured rather than showing zeros.
 </Note>
 
-**Logs** — a live tail of the scheduler's or any SSP's log output, with level
-and text filters. If a viewer falls behind, the gap is shown explicitly rather
-than hidden.
+**Logs** — an explorer over the scheduler's or any SSP's log output. Opening
+it loads the source's whole log ring (up to 10,000 lines), then follows the
+live tail. Above the lines, a histogram shows their volume over time with
+warnings and errors stacked in their colours. Drag across it to pick a time
+window (drag inside the window to move it, drag its edges to resize it), and
+the pill over the window zooms into it, back out, or clears it. The window
+becomes a `time` chip in the search beside the level and target filters, and
+the table follows as you drag. Lines are listed newest first; click one to read
+it whole beside the table, with its fields one per row and how often a line of
+the same shape appears in the buffer. Keys: `/` focuses the search, `↑`/`↓`
+move through the lines, `Escape` closes the line, then clears the window, then
+zooms out. If a viewer falls behind the stream, the count of skipped lines is
+shown rather than hidden.
 
 <Screenshot
   src="/docs/admin/logs.png"
-  caption="A live tail of the scheduler or any SSP, filtered by level and text."
+  caption="A time window brushed across the log volume, read out in the pill and filtering the lines below."
 />
 
 Backends have no log stream: the scheduler reaches them with HTTP health checks
@@ -314,8 +324,9 @@ sparklines; the [dedicated machines](/docs/cloud/dedicated-machines) and machine
 pool VMs; and the [bucket volume](/docs/cloud/deploying#bucket-storage) with how
 much of it is used and free. A container's disk is what its volumes take (the
 database's data, the scheduler's replica and event log, an SSP's snapshot and
-arena) against that plus what is still free on the host disk they share, so a
-host filling up shows on every container. The scheduler cannot see its
+arena) against that plus what is still free on the disk of the VM they run on, so a
+VM filling up shows on every container on it. On a Pro project with its own
+VMs the database is on the database VM and the rest on the project host. The scheduler cannot see its
 neighbours' containers or the database's volume, so all of it comes from
 Sp00ky Cloud through the [cloud link](#configuration): container samples every
 15 seconds, disk and the bucket volume every 5 minutes. The Overview's database
@@ -624,6 +635,8 @@ falls back to polling on its own.
 | `SPKY_ADMIN_CLOUD_JWKS`             | unset                         | The control plane's grant keys as a JWKS document. Without it (or for an unknown key) they are fetched from `{SPKY_CLOUD_API_URL}/.well-known/jwks.json`                                                                                                              |
 | `SPKY_ADMIN_CLOUD_ISSUER`           | `SPKY_CLOUD_API_URL`          | The issuer a grant must name                                                                                                                                                                                                                                           |
 | `SPKY_ADMIN_CLOUD_SESSION_TTL_SECS` | `900`                         | Lifetime of a session opened with a grant (capped by `SPKY_ADMIN_SESSION_TTL_SECS`)                                                                                                                                                                                    |
+| `SPKY_ADMIN_DATA`                   | `true`                        | Set to `0`/`false`/`off`/`no` to refuse `/admin/api/data` and hide the console's Database, Users and Storage pages for this project. On Sp00ky Cloud, set it under `deployment.env` for the `scheduler`  |
+| `SPKY_BUCKET_DIR`                   | unset                         | A directory holding `file:` buckets, mounted read-only at the same path SurrealDB uses. Buckets under it list their subfolders in the Storage page. Writes still go through SurrealDB |
 | `SPKY_CLOUD_API_URL`                | unset                         | Sp00ky Cloud API base URL. Injected into the scheduler container by the control plane                                                                                                                                                                                  |
 | `SPKY_CLOUD_PROJECT`                | unset                         | The project slug, injected alongside it                                                                                                                                                                                                                                |
 | `SPKY_PROJECT_SLUG`                 | `default`                     | Storage prefix for backups on an unlinked scheduler                                                                                                                                                                                                                    |
@@ -790,6 +803,70 @@ batches, last successful publication, and related view links. Bulk database
 session generation and reconnect timing distinguish database recovery from
 circuit evaluation. The SSP page also shows its current publication backlog.
 These are sampled measurements; a spike between samples can be missed.
+
+### Project data
+
+`/admin/api/data` is what the console's [Database, Users, Feature flags and Storage](/docs/cloud/console#database)
+pages read. The scheduler and the SSP node serve the same routes from one
+implementation (`schedule_core::admin_data`). `GET /admin/api/config` says whether a
+host has them, as `data`, and the flag routes, as `flags`. These pages are in the console only for now; the
+scheduler-hosted `/admin` does not show them.
+
+A read-only session gets the `GET` routes. An MCP token gets none of them, whatever
+its scope, and no MCP tool reaches them. Every change is logged with the session's
+subject, and the SQL editor's log line names the first word of the statement, never
+its text.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /data/tables` | Names, kinds and shapes of the tables. Nothing is counted |
+| `GET /data/tables/:table` | Its fields (with `credential`, `required`, `readonly`), indexes and events |
+| `GET /data/tables/:table/rows` | `?limit=` (500 at most), `?start=`, `?sort=`, `?dir=`, `?filter=[{"field","op","value"}]` (16 at most). `op` is `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `contains`, `starts_with`, `is_none` or `not_none`. A value is cast by the field's type. Top-level fields only, and not a credential: filtering on one is a way to read it |
+| `GET /data/tables/:table/count` | `?filter=`. A scan, stopped at 10 s: `{"count": null, "timed_out": true}` |
+| `GET /data/tables/:table/row?id=` | One row, with long values kept |
+| `POST /data/tables/:table/rows` | `{id?, set}`. A relation takes `set.in` and `set.out` |
+| `PUT /data/tables/:table/row?id=` | `{set, unset}`. `null` and `unset` both remove a value |
+| `DELETE /data/tables/:table/row?id=` | One row |
+| `POST /data/tables/:table/rows/delete` | `{ids}`, 500 at most |
+| `POST /data/query` | `{sql}`, as root. A lone `SELECT` is given a `TIMEOUT 30s` and a `LIMIT 1001` when it has neither (one past what is returned, so `truncated` can say there was more), and 1000 rows of any one statement come back. Refused to read-only sessions |
+| `GET /data/users` | `?q=`, `?filter=admins\|online`, `?limit=`, `?start=`, `?sort=`, `?dir=`, `?source=`. Where the users are comes from the `SIGNIN` clause of a record access (`?source=` picks one), and each carries `is_admin`, `views` and `sessions`. Newest first only when an index on the created field makes that free (`created_indexed`); otherwise ask with `?sort=` |
+| `GET /data/users/stats` | `total`, `admins`, `online`. `null` for one it could not read |
+| `GET /data/users/user?id=` | The row, roster entry, live sessions and feature flags: `features` lists every flag with the variant the user gets and the one they are pinned to, `features_assignable` whether flags apply to their table |
+| `POST /data/users` | `{identifier, password, fields?}` |
+| `PUT /data/users/user/password?id=` | `{password}`, 8 characters or more, hashed with the algorithm `SIGNIN` compares with. `501` when `SIGNIN` does not show one |
+| `PUT /data/users/user/admin?id=` | `{admin, note?}`: what `spky admin add` and `remove` do. Nobody can remove themselves |
+| `DELETE /data/users/user?id=` | The row, its roster entry and its feature flags. Nobody can delete themselves |
+| `GET /data/flags` | Every flag with its rollouts and how many users are pinned, and whether the schema has the flag tables (`installed`), `fn::feature::assign` (`evaluator`) and a `user` table (`users_table`) |
+| `POST /data/flags` | `{key, description?, variants?, default_variant?}`, as `spky flag create`: on, no rules. Answers `evaluate: true` |
+| `GET /data/flags/flag?key=` | The flag, users per variant (`counts`, `null` when the count timed out) and the pinned users by name, 500 at most (`pins_total` counts them all) |
+| `PUT /data/flags/flag?key=` | Any of `{enabled, description, default_variant, variants, rollouts: [{variant, percent}]}`. `rollouts` replaces every rollout rule. A variant the default or a rule still uses cannot be removed. `evaluate` says whether assignments can have moved |
+| `DELETE /data/flags/flag?key=` | The flag and every assignment of it |
+| `POST /data/flags/flag/evaluate?key=` | Re-evaluate one page of users in id order: `?limit=` (500 at most), `?after=` the `next` of the page before. `total` on the first page, `next: null` after the last |
+| `PUT /data/flags/flag/user?key=&id=` | `{variant}` pins a `user` record to a variant (an allowlist rule), `{variant: null}` unpins them. Only that user is re-evaluated |
+| `GET /data/buckets` | Each bucket's backend and limit, whether it can be browsed, and `lists_folders`: `false` for a `file:` bucket whose subfolders this host cannot see |
+| `GET /data/buckets/:bucket/files` | `?prefix=`, `?start=`, `?limit=`. One folder's `files` and `folders`, and `next` when there is more. `counts` gives each folder's entries, up to 1000, when the folder was read from disk |
+| `GET /data/buckets/:bucket/file?key=` | `{key, size, updated, data}`, `data` in base64, up to 32 MB. `&meta=1` leaves `data` out |
+| `PUT /data/buckets/:bucket/file?key=` | `{data}` in base64. `409` when the key is in use, unless `&overwrite=1` |
+| `DELETE /data/buckets/:bucket/file?key=` | One file |
+| `POST /data/buckets/:bucket/rename` | `{key, target}`. `409` when the target is in use |
+| `POST /data/buckets/:bucket/delete` | `{keys}`, 500 at most |
+
+What the browse routes keep back:
+
+- **Credentials.** A field named like one (`password`, `secret`, `token`,
+  `private_key`, `api_key`, in any case and spelling), or the field a `SIGNIN` clause
+  compares a password against, reads as `{"$redacted": true}` whatever its shape, and
+  cannot be written, filtered or sorted on. Only a number under `token` stays:
+  `tokens_used` is a count. This goes by name. A value carrying a mask cannot be
+  written back at all, so a form cannot replace a secret with its mask.
+  `POST /data/query` returns what the statement selects.
+- **Definitions.** A credential's `default`, `value` and `assert`, every event's `then`
+  and every bucket's `permissions` stay behind: any of them can hold a literal.
+- **`_00_push_credential` and `_00_push_subscription`**, which hold push keys and device
+  tokens, are not listed and answer `403`.
+- **Long values.** Over 4 KB in a list (512 KB on one row) a value reads as
+  `{"$trimmed": true, "bytes": n, "preview": "..."}`.
+- **`_00_*` tables** answer `403` to every write. The roster moves through its own route.
 
 ## Regenerating these screenshots
 

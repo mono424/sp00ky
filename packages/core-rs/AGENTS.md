@@ -84,6 +84,10 @@ work on any executor (GPUI, smol, tokio, `futures::executor::block_on`).
   account switch), `sign_out()` (drains queued writes first), `user_id()`,
   `user_watch()`, `auth_state()` / `auth_watch()` (`AuthState { user_id, current_user, token, access, is_loading, is_impersonating, verification_error }`),
   `token().await`, `check_auth(None)`, `authenticate(token)`, `deauthenticate()`.
+  A refused token (revoked, expired token or session) signs the client out
+  (`user_watch()` -> `None`, `Error::is_auth_rejection()`); sign in again.
+  Device keys: a record access of their own (`sign_in("device", json!({"key": key}))`),
+  re-signed in when the session is gone or `token()`'s `exp` is near.
 - Buckets (remote only): `client.bucket("avatars")` -> `Bucket`: `put(path, Vec<u8> | &str)`,
   `read(path) -> Option<Vec<u8>>` (through the blob cache), `get(path)` (server,
   raw `Value`), `exists`, `list(Some(prefix))`, `delete`, `evict`.

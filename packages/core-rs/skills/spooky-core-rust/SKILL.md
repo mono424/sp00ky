@@ -73,6 +73,8 @@ use serde_json::json;
 client.sign_in("account", json!({"username": "ada", "password": "..."})).await?;
 let me = client.user_id().unwrap(); // "user:..."
 let auth = client.auth_state();     // user row, token, access, flags
+// A refused or expired token signs out: user_watch() turns to None.
+// Sign in again (a desktop app: with its device key, see the Rust guide).
 let mut user = client.user_watch(); // every change
 client.sign_out().await?;           // drains queued writes first
 ```

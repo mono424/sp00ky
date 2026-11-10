@@ -106,6 +106,27 @@ access method, `is_loading`, `is_impersonating` and a deferred `verification_err
 session stays usable). `check_auth(None)` verifies the session against the server now;
 `authenticate(token)` / `deauthenticate()` drive the socket with a token from outside the client.
 
+### Expired and refused tokens
+
+A token the server refuses, because it was revoked, is past its `DURATION FOR TOKEN`, or its session
+is past `DURATION FOR SESSION`, signs the client out. The socket that was refused is closed rather
+than kept open anonymously (an anonymous read of a user's views comes back empty), the token is
+dropped, and `user_watch()` turns to `None`, so the app can sign in again. While the server cannot be
+reached, a restored session stays usable and is verified once it answers.
+
+### Signing in with a device key
+
+A desktop app or a CLI should not keep the user's password. Let your API issue a long-lived key once
+the user approves the device in the browser, keep it in the OS keychain, and give it a record access of
+its own with short sessions. A revoked key then stops at the next sign-in.
+
+<CodeBlock code={deviceAccessCode} lang="sql" fileName="schema/src/schema.surql" />
+
+The app signs in with the key whenever it has no session, and again before the token runs out (its
+`exp` claim, from `client.token()`):
+
+<CodeBlock code={deviceSignInCode} lang="rust" />
+
 ## Live queries
 
 Build a query on a table, then `live` registers it and subscribes in one call. The query stays
@@ -461,6 +482,34 @@ pub async fn open(data_dir: &Path) -> spooky_core::Result<Sp00kyClient> {
         ..Default::default()
     };
     Sp00kyClient::open(config).await
+}`;
+
+export const deviceAccessCode = `DEFINE ACCESS IF NOT EXISTS device ON DATABASE TYPE RECORD
+  SIGNIN (
+    SELECT * FROM user WHERE id = (
+      SELECT VALUE owner FROM device_key
+        WHERE key_hash = crypto::sha256($key) AND revoked_at = NONE LIMIT 1
+    )[0]
+  )
+  DURATION FOR TOKEN 1d, FOR SESSION 1d;`;
+
+export const deviceSignInCode = `use serde_json::json;
+
+// key: read from the keychain. Runs for as long as the app does.
+let mut users = client.user_watch();
+loop {
+    if client.user_id().is_none() {
+        match client.sign_in("device", json!({ "key": key })).await {
+            Ok(()) => {}
+            // Refused: the device was disconnected. Forget the key.
+            Err(e) if e.is_auth_rejection() => break,
+            // Offline: the next change (or a timer) tries again.
+            Err(_) => {}
+        }
+    }
+    if users.changed().await.is_err() {
+        break; // the client was closed
+    }
 }`;
 
 export const authCode = `use serde_json::json;

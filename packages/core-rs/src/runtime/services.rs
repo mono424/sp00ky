@@ -32,6 +32,9 @@ pub trait AuthSession {
     fn token(&self) -> Option<String>;
 }
 
+/// Receives the `(id, rv)` pairs the boot prime read.
+pub type VersionsSink = Rc<dyn Fn(Vec<(String, i64)>)>;
+
 /// The real services behind [`Services`].
 pub struct ClientServices {
     pub holder: Rc<LocalStoreHolder>,
@@ -48,7 +51,7 @@ pub struct ClientServices {
     /// What the host last passed to `set_offline`.
     pub offline: Rc<Cell<bool>>,
     /// Where the primed `(id, rv)` pairs go (the runtime's `VersionsPrimed`).
-    pub on_versions: RefCell<Option<Rc<dyn Fn(Vec<(String, i64)>)>>>,
+    pub on_versions: RefCell<Option<VersionsSink>>,
     /// Modules whose live query must start once boot has finished.
     pub late_modules: RefCell<Vec<Rc<dyn Fn()>>>,
 }

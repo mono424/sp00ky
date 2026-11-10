@@ -208,6 +208,11 @@ impl Sp00kyClient {
         .await
     }
 
+    /// A copy of the engine state (diagnostics and tests).
+    pub async fn inspect_state(&self) -> Result<crate::state::ClientState> {
+        self.call(|w| async move { Ok(w.engine.state()) }).await
+    }
+
     pub async fn is_local_ready(&self) -> Result<bool> {
         self.call(|w| async move { Ok(w.engine.is_local_ready()) }).await
     }

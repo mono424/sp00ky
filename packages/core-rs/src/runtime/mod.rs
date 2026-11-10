@@ -36,6 +36,12 @@ pub use timers::TokioTimers;
 
 type DedupeFuture = Shared<LocalBoxFuture<'static, Result<()>>>;
 
+/// A dedupe lane's running saga and the account (store epoch) it runs for.
+struct DedupeRun {
+    fence: Option<u64>,
+    future: DedupeFuture,
+}
+
 /// Called with a query's rows on every materialization that changed them.
 pub type RecordsCallback = Rc<dyn Fn(&Arc<Vec<Row>>)>;
 pub type StatusCallback = Rc<dyn Fn(QueryStatus)>;
@@ -76,7 +82,7 @@ struct Inner {
     adapters: Adapters,
     state: RefCell<ClientState>,
     serial: RefCell<HashMap<String, Rc<tokio::sync::Mutex<()>>>>,
-    dedupe: RefCell<HashMap<String, DedupeFuture>>,
+    dedupe: RefCell<HashMap<String, DedupeRun>>,
     waiters: RefCell<Vec<Waiter>>,
     subs: RefCell<Subscribers>,
     scheduled_materialize: RefCell<BTreeSet<QueryHash>>,
@@ -568,21 +574,39 @@ impl Runtime {
     }
 
     async fn run_dedupe(&self, key: String, allows_account_change: bool, saga: router::SagaFn) -> Result<()> {
-        let running = self.0.dedupe.borrow().get(&key).cloned();
+        let fence = self.fence_for(allows_account_change);
+        // Join only a run for the same account. A run started before a bucket
+        // switch is about to fail with `AccountChanged`; joining it would
+        // swallow the switch's own dispatch (the post-sign-in `PollTick`), and
+        // a lane that only re-arms itself from its tick would stay dead for
+        // the session.
+        let running = self
+            .0
+            .dedupe
+            .borrow()
+            .get(&key)
+            .filter(|r| r.fence == fence)
+            .map(|r| r.future.clone());
         if let Some(running) = running {
             return running.await;
         }
-        let ctx = Ctx::new(self.clone(), self.fence_for(allows_account_change));
+        let ctx = Ctx::new(self.clone(), fence);
         let fut: LocalBoxFuture<'static, Result<()>> = async move {
             ctx.check()?;
             saga(ctx).await
         }
         .boxed_local();
         let shared = fut.shared();
-        self.0.dedupe.borrow_mut().insert(key.clone(), shared.clone());
+        self.0.dedupe.borrow_mut().insert(
+            key.clone(),
+            DedupeRun {
+                fence,
+                future: shared.clone(),
+            },
+        );
         let out = shared.clone().await;
         let mut lanes = self.0.dedupe.borrow_mut();
-        if lanes.get(&key).is_some_and(|f| f.ptr_eq(&shared)) {
+        if lanes.get(&key).is_some_and(|r| r.future.ptr_eq(&shared)) {
             lanes.remove(&key);
         }
         out
@@ -607,12 +631,14 @@ impl Runtime {
         }
         let kind = event.kind();
         let allows = event.allows_account_change();
+        tracing::trace!(target: "spooky::saga", "start {kind}");
         let route = router::route(&self.0.env, event);
         let out = match route.lane {
             None => self.run_on(None, allows, route.saga).await,
             Some(Lane::Serial(key)) => self.run_on(Some(&key), allows, route.saga).await,
             Some(Lane::Dedupe(key)) => self.run_dedupe(key, allows, route.saga).await,
         };
+        tracing::trace!(target: "spooky::saga", "end {kind}: {:?}", out.as_ref().err());
         match out {
             Ok(()) => {}
             Err(Error::AccountChanged | Error::Closed) => {

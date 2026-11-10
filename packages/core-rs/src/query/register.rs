@@ -16,7 +16,7 @@ use crate::kernel::events::{LogLevel, RuntimeEvent};
 use crate::kernel::ports::RegisterPlan;
 use crate::kernel::Ctx;
 use crate::modules::query_builder::RelationPlan;
-use crate::query::env::{list_ref_table, SagaEnv};
+use crate::query::env::{list_ref_table, receives_membership, SagaEnv};
 use crate::query::hash::{query_hash_input, view_key_input, QueryKeyInput};
 use crate::query::membership::{
     is_resolved_before, parse_view_row, snapshot_from_single, Answer, MembershipOutcome,
@@ -307,6 +307,14 @@ async fn register_round(
         r::apply_lifecycle(s, hash, LifecycleEvent::RemoteRegistered);
         r::reset_register_attempts(s, hash);
     })?;
+    // A brand-new account's `_00_list_ref_user_<id>` table only exists once
+    // the SSP has filed its first view, so the LIVE subscription made at
+    // sign-in failed with "table does not exist" and only the poll covered
+    // membership. A registration that just answered means the table is there
+    // now: subscribe (a no-op when LIVE is already up).
+    if ctx.read(|s| receives_membership(env, s) && s.sync.live_uuid.is_none())? {
+        ctx.dispatch(RuntimeEvent::LiveStart)?;
+    }
     ctx.dispatch(RuntimeEvent::SyncOutcome {
         ok: true,
         error: None,

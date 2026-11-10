@@ -190,3 +190,67 @@ async fn activity_and_health_events() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn dedupe_lane_does_not_join_a_run_of_another_account() {
+    use futures::future::FutureExt;
+    run_local(async {
+        let rig = TestRig::new();
+        let runs = std::rc::Rc::new(RefCell::new(0usize));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let rt = rig.runtime.clone();
+        let stale = tokio::task::spawn_local(async move {
+            rt.run_dedupe(
+                "k".into(),
+                false,
+                Box::new(move |ctx| {
+                    async move {
+                        rx.await.ok();
+                        ctx.check()
+                    }
+                    .boxed_local()
+                }),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        // Same account: the second request joins the running one.
+        let r2 = runs.clone();
+        let rt = rig.runtime.clone();
+        let joined = tokio::task::spawn_local(async move {
+            rt.run_dedupe(
+                "k".into(),
+                false,
+                Box::new(move |_ctx| {
+                    *r2.borrow_mut() += 1;
+                    async { Ok(()) }.boxed_local()
+                }),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(*runs.borrow(), 0, "a same-account request must join");
+
+        // Another account: the request runs on its own.
+        rig.local.bump_epoch();
+        let r3 = runs.clone();
+        rig.runtime
+            .run_dedupe(
+                "k".into(),
+                false,
+                Box::new(move |_ctx| {
+                    *r3.borrow_mut() += 1;
+                    async { Ok(()) }.boxed_local()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*runs.borrow(), 1, "a post-switch request must not join the stale run");
+
+        tx.send(()).ok();
+        assert!(matches!(stale.await.unwrap(), Err(Error::AccountChanged)));
+        assert!(matches!(joined.await.unwrap(), Err(Error::AccountChanged)));
+    })
+    .await;
+}

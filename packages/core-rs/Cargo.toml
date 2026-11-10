@@ -45,6 +45,7 @@ webpki-roots = { version = "1", optional = true }
 serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1.47", features = ["rt", "time", "sync", "macros", "net", "test-util"] }
 tempfile = "3"
 # Parses generated Rust in the codegen tests.

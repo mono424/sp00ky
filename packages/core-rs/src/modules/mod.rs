@@ -5,6 +5,7 @@ pub mod auth;
 pub mod blobs;
 pub mod bucket;
 pub mod feature_flag;
+pub mod push;
 pub mod query_builder;
 pub mod query_host;
 pub mod ref_tables;

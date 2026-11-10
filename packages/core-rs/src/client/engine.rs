@@ -110,6 +110,8 @@ pub struct Engine {
     features: RefCell<Option<FeatureFlagModule>>,
     releases: RefCell<Option<AppReleaseModule>>,
     blobs: RefCell<Option<BlobCache>>,
+    /// Native push registration, built on first use (`client::push`).
+    pub(super) push: RefCell<Option<crate::modules::push::PushModule>>,
     offline: Rc<Cell<bool>>,
     closed: Cell<bool>,
     checkpoint_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
@@ -304,6 +306,7 @@ impl Engine {
             features: RefCell::new(None),
             releases: RefCell::new(None),
             blobs: RefCell::new(None),
+            push: RefCell::new(None),
             offline,
             closed: Cell::new(false),
             checkpoint_task: RefCell::new(None),
@@ -577,6 +580,9 @@ impl Engine {
         }
         if let Some(r) = self.releases.borrow_mut().take() {
             r.close_all();
+        }
+        if let Some(p) = self.push.borrow_mut().take() {
+            p.dispose();
         }
         self.host.borrow_mut().take();
         self.runtime.dispose();

@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Svelte guide
-description: "Use Sp00ky from a Svelte 5 app: Sp00kyProvider, useQuery on runes, useSubmission, status hooks and bucket images."
+description: "Build a local-first Svelte 5 app with Sp00ky: provider, live queries on runes, auth, mutations, sync status, files, CRDT fields and channels."
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -12,28 +12,34 @@ import Warning from '../../../components/ui/Warning.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
-`@spooky-sync/client-svelte` is the Svelte 5 binding, built on runes. It wraps the same core client
-as the [React](/docs/guide/react) and [Solid](/docs/guide/solid) bindings and exposes the same hooks,
-written the Svelte way: a hook returns an object whose fields are reactive getters (`posts.data`,
-`posts.isLoading`), and an input that should follow your state is passed as a getter
-(`() => db.query(...).build()`). It needs Svelte 5.29 or newer; Svelte 4 is not supported.
+`@spooky-sync/client-svelte` brings Sp00ky to Svelte 5, built on runes. Your components read live
+queries through reactive getters (`posts.data`, `posts.isLoading`), every write lands in the local
+database first, and the engine keeps that database in sync with the server and with every other
+tab and device in the background. Queries paint from the local cache on reload, keep working
+offline, and update the moment anyone changes a row they match.
+
+This guide walks through a complete app: setup, queries, sign-in, writes, sync status, files,
+collaborative fields and peer to peer channels. It needs Svelte 5.29 or newer.
 
 <Warning title="Browser only">
-  The core client runs SurrealDB and SQLite as WebAssembly, with IndexedDB / OPFS storage and web
+  The client runs SurrealDB and SQLite as WebAssembly, with IndexedDB / OPFS storage and web
   workers. `<Sp00kyProvider>` creates the client in `onMount`, so a server render only produces its
   `fallback`. In SvelteKit, turn server rendering off for the app (`export const ssr = false` in the
-  root `+layout.ts`): the core client does not load on the server, and a local-first app paints
-  from the local cache anyway.
+  root `+layout.ts`): the client does not load on the server, and a local-first app paints from the
+  local cache anyway.
 </Warning>
 
-## What "native" means here
+## How it fits Svelte
 
 - **Runes, no stores.** Results live in `$state.raw` and are read through getters, so markup,
   `$derived` and `$effect` track exactly the fields they read.
-- **Structural sharing.** Each live emission is merged into the previous result: rows are matched
-  by `id`, unchanged rows keep their object identity, and a deep-equal emission is the same value.
-  A keyed `{#each}` only updates the rows that changed, and nothing reading `data` re-runs for an
-  emission that changed nothing. Rows stay plain objects, never deep proxies.
+- **Getters in, getters out.** An input that should follow your state is passed as a getter
+  (`() => db.query(...).build()`, `() => postId`). A hook returns an object whose fields are
+  getters, and a hook with a single value exposes it as `.current`, like `svelte/reactivity`.
+- **Structural sharing.** Each live update is merged into the previous result: rows are matched by
+  `id`, unchanged rows keep their object identity, and an update that changed nothing is the same
+  value. A keyed `{#each}` only updates the rows that changed, and nothing reading `data` re-runs
+  for an update that changed nothing. Rows stay plain objects, never deep proxies.
 - **Engine status through `createSubscriber`.** `useSyncStatus`, `usePendingMutations` and the other
   status hooks subscribe to the engine only while something reads them, read the engine's own
   current value (nothing to go stale), and unsubscribe when the last reader is gone. The same
@@ -43,11 +49,13 @@ written the Svelte way: a hook returns an object whose fields are reactive gette
 - **Snippets and attachments.** The provider's `fallback` is a snippet; `<BucketImage>` reveals the
   image through an `{@attach}` decode gate.
 - **`$state` payloads are safe to write.** A `$state` object is a Proxy, which cannot reach the
-  sqlite and shared-tabs workers. Writes copy plain objects and arrays before they reach the core,
-  and leave class instances (`RecordId`, `Date`, bytes) as they are.
-- **No optimistic layer.** The engine already commits writes locally and re-renders through live
-  queries before it syncs. Mutations are plain `await db.create(...)` calls; `useSubmission` only
-  adds button pending and error state.
+  SQLite and shared-tabs workers. Writes copy plain objects and arrays before they reach the
+  engine, and leave class instances (`RecordId`, `Date`, bytes) as they are.
+- **Local-first writes.** The engine commits a write locally and re-renders every affected query
+  before it syncs, so there is no optimistic layer to maintain. Mutations are plain
+  `await db.create(...)` calls; `useSubmission` adds button pending and error state.
+
+## Setup
 
 <Steps>
   <Step title="Install">
@@ -55,7 +63,7 @@ written the Svelte way: a hook returns an object whose fields are reactive gette
   </Step>
 
   <Step title="Configure Vite">
-    The core client loads its engines as WebAssembly. Keep them out of dependency pre-bundling and
+    The client loads its engines as WebAssembly. Keep them out of dependency pre-bundling and
     allow top-level await:
 
     <CodeBlock fileName="vite.config.ts" code={viteCode} lang="typescript" />
@@ -71,7 +79,8 @@ written the Svelte way: a hook returns an object whose fields are reactive gette
   <Step title="Generate types">
     <CodeBlock code={generateCode} lang="bash" />
 
-    Same generator as every other client, see [Generated types](/docs/schema/generated-types).
+    This writes `schema.gen.ts` from your `.surql` schema: the table types every query and write is
+    checked against. See [Generated types](/docs/schema/generated-types).
   </Step>
 
   <Step title="Configure the client">
@@ -83,18 +92,26 @@ written the Svelte way: a hook returns an object whose fields are reactive gette
   <Step title="Mount the provider">
     <CodeBlock fileName="src/routes/+layout.svelte" code={providerCode} lang="svelte" />
 
-    Props match the other providers: `config`, `fallback` (a snippet), `preload` (awaited before the
-    children render), `onReady`, `onError`. `config` is read once when the provider mounts; to
-    switch databases, wrap it in a `{#key}` block. A client that was handed to the tree is
-    deliberately not closed when the provider is destroyed.
+    `<Sp00kyProvider>` creates the client, opens the local database and connects to the server,
+    rendering the `fallback` snippet until it is ready. Its props:
+
+    | Prop | Meaning |
+    |---|---|
+    | `config` | The client config. Read once when the provider mounts; to switch databases, wrap the provider in a `{#key}` block. |
+    | `fallback` | Snippet rendered until the client is ready. |
+    | `preload` | Awaited before the children render, to warm the local cache. A failure is logged and the UI is revealed anyway. |
+    | `onReady` | Called with the client once it is ready. |
+    | `onError` | Called if the client fails to start. |
+
+    A client that was handed to the tree is deliberately not closed when the provider is destroyed.
   </Step>
 </Steps>
 
 ## Queries
 
-`useQuery(query, options?)` takes a getter that builds the query. It re-runs when the state the
-getter reads changes, and the query is re-registered only when its identity (its SurrealQL and
-vars) changes, not on every rebuild.
+`useQuery(query, options?)` subscribes a component to a live query. It takes a getter that builds
+the query: the getter re-runs when the state it reads changes, and the query is re-registered only
+when its identity (its SurrealQL and vars) changes, not on every rebuild.
 
 <CodeBlock fileName="src/lib/PostList.svelte" code={queryCode} lang="svelte" />
 
@@ -104,7 +121,9 @@ exist:
 <CodeBlock code={dependentCode} lang="svelte" />
 
 A query that never changes can be passed as is (`useQuery(db.query('tag').build())`), and
-`useQuery(db, query, options?)` takes the client explicitly, for code outside a provider.
+`useQuery(db, query, options?)` takes the client explicitly, for code outside a provider. The query
+builder itself (`where`, `related`, `orderBy`, `limit`, `one`) is covered in
+[Reactive queries](/docs/client/queries).
 
 <Warning title="Do not destructure a result">
   Every field is a getter. `const { data } = useQuery(...)` copies `data` once and never updates.
@@ -113,24 +132,23 @@ A query that never changes can be passed as is (`useQuery(db.query('tag').build(
   <CodeBlock code={destructureCode} lang="typescript" />
 </Warning>
 
-### Result surface
+### Result
 
-The flags are the same contract as the [Solid 2](/docs/guide/solid2#result-surface) and
-[React](/docs/guide/react#result-surface) bindings, as reactive getters:
+Every field of the result is a reactive getter:
 
 | Field | Meaning |
 |---|---|
-| `data` | Rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared between emissions. |
+| `data` | Rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared between updates. |
 | `error` | Registration or sync error (e.g. SSP 503 during bootstrap). Never thrown; the sync scheduler retries underneath. |
-| `isLoading` | Cold first load only: nothing painted for this identity, the server has not answered, and registration has not failed. A paint from the local cache ends it; the server answering with zero rows ends it too. |
+| `isLoading` | Cold first load only: nothing painted for this query, the server has not answered, and registration has not failed. A paint from the local cache ends it; the server answering with zero rows ends it too. |
 | `isFetching` | The sync engine is pulling records for this query (registration, a sync round). |
 | `isAuthoritative` | `data` holds the rendered rows of a known membership: the server's answer, or the one a previous session left on this device. From here `data` is an answer, not a cache guess. |
 | `hasData` | `data` holds something: rows for a list, a row for `.one()`. |
 | `isEmpty` | Authoritative **and** no data: the server said "no rows". Render empty states on this, never on a bare `!hasData`. |
 | `isSettled` | Authoritative **and** idle. The gate for trusting a short window as the end of a list, and for "create it if it is missing". Not monotonic: a later sync round re-enters `isFetching`. |
 
-When the query's identity changes, the previous `data` stays on screen until the new identity
-emits, while the flags reset. Growing a `.limit()` therefore never flashes an empty list:
+When the query's identity changes, the previous `data` stays on screen until the new query
+answers, while the flags reset. Growing a `.limit()` therefore never flashes an empty list:
 
 <CodeBlock code={loadMoreCode} lang="svelte" />
 
@@ -141,57 +159,77 @@ Options: `{ enabled?: boolean | (() => boolean), deregisterOnCleanup?: boolean }
 ### Preloading
 
 `usePreload(query)` warms the local cache for a query the user is likely to open next, without
-subscribing to it:
+subscribing to it. When they navigate, the page paints from the cache immediately:
 
 <CodeBlock code={preloadCode} lang="svelte" />
 
+## Authentication
+
+Sign-in runs through the SurrealDB access methods in your schema, see
+[Authentication](/docs/client/auth). `db.auth.subscribe` reports the signed-in user id now and on
+every change, which makes a small helper for the rest of the app:
+
+<CodeBlock fileName="src/lib/auth.svelte.ts" code={authCode} lang="typescript" />
+
+A sign-in form wraps the call in `useSubmission` for its pending and error state:
+
+<CodeBlock fileName="src/lib/SignIn.svelte" code={signInCode} lang="svelte" />
+
+Every live query is scoped by your table permissions, so a user only ever syncs the rows they may
+read. `db.signOut()` ends the session and clears the local data.
+
 ## Mutations
 
-Engine writes are already optimistic and local-first, so mutations are plain calls. A `$state`
-object can be written directly:
+Writes are plain calls on the client. Each one commits locally, re-renders every query it affects,
+and syncs in the background, offline included. A `$state` object can be written directly:
 
 <CodeBlock code={mutationCode} lang="typescript" />
 
 For button pending and error state, wrap the call in `useSubmission`. `submit` never rejects; a
-failure lands in `error`:
+failure lands in `error`. It needs no component and no provider:
 
 <CodeBlock code={submissionCode} lang="svelte" />
 
 An error there means the local commit failed. Sync failures surface through `useSyncStatus` and
 `usePendingMutations` instead. To track a backend job, query its outbox row: `db.run()` writes one
-with `status: 'pending'`.
+with `status: 'pending'`. See [Mutations](/docs/client/mutations).
 
-## Status hooks
+## Sync status
 
-Same shapes as the other bindings, as getters: `useDb`, `usePendingMutations`,
-[`useSyncStatus`](/docs/client/offline-sync), [`useSyncActivity`](/docs/client/offline-sync#traffic-indicator),
-[`useStorageStatus`](/docs/client/offline-sync), [`useFeatureFlag`](/docs/client/feature-flags),
-`useAppRelease`, [`useImpersonation`](/docs/client/impersonation) and [`useCrdtField`](/docs/client/crdt).
-A hook with a single value returns it as `.current`, like `svelte/reactivity` does
-(`usePendingMutations().current`, `useCrdtField(...).current`).
+`useSyncStatus` reports the connection, `usePendingMutations` the number of writes not yet on the
+server. Together they make the usual offline banner:
 
 <CodeBlock fileName="src/lib/ConnectionBanner.svelte" code={statusCode} lang="svelte" />
+
+| Hook | Returns |
+|---|---|
+| `useSyncStatus()` | `status`, `isHealthy`, `isDegraded`, `isOffline`, `isReconnecting`, `everConnected`, `connection`, `health` |
+| `usePendingMutations()` | `.current`: the number of local writes waiting to sync |
+| `useSyncActivity(options?)` | `isDownloading`, `isUploading`, `fetchingQueries`, `pendingMutations`, debounced for a traffic indicator |
+| `useStorageStatus()` | `status`, `isPersistent`, `isMemoryFallback`, `health` for the local database |
+
+What to show for each state is covered in [Offline & sync health](/docs/client/offline-sync).
 
 `useSyncStatus`, `useStorageStatus` and `usePendingMutations` need no component: they also take
 the client as their argument, so one shared instance can live in a `.svelte.ts` module. Hooks that
 open something (`useQuery`, `useCrdtField`, `useChannel`, the file hooks) or own timers
 (`useSyncActivity`) must run while a component initialises, or inside `$effect.root`.
 
-### Without the provider
+## Feature flags and releases
 
-To create the client yourself (for example in a SvelteKit `load`), `init()` it and put it in
-context with `setDbContext`; every hook below that layout then finds it through `useDb()`:
+`useFeatureFlag(key, options?)` reads a [feature flag](/docs/client/feature-flags) for the signed-in
+user and updates live when the assignment changes, so `spky flag enable` reaches open tabs without
+a reload. `useAppRelease` tells a running tab that a newer frontend was deployed:
 
-<CodeBlock code={byoTsCode} lang="typescript" />
-
-<CodeBlock fileName="src/routes/+layout.svelte" code={byoSvelteCode} lang="svelte" />
+<CodeBlock code={flagsCode} lang="svelte" />
 
 ## Files and images
 
-[`useFileUpload`, `useDownloadFile`](/docs/client/buckets), `useBlurhash`, `useBucketImage` and the
-`<BucketImage>` / `<Blurhash>` components behave as in the other bindings. Paths are getters, the
-components take `class` / `imgClass`, and the placeholder is a `fallback` snippet. On a path change
-the previous object URL stays valid until the next one is ready, so the image never flashes broken.
+[`useFileUpload` and `useDownloadFile`](/docs/client/buckets) upload to and read from a bucket.
+`<BucketImage>` renders a bucket file as an image, revealing it only once it is decoded, and
+`<Blurhash>` / `useBlurhash` paint a placeholder while it loads. Paths are getters, the components
+take `class` / `imgClass`, and the placeholder is a `fallback` snippet. On a path change the
+previous object URL stays valid until the next one is ready, so the image never flashes broken.
 
 <CodeBlock code={filesCode} lang="svelte" />
 
@@ -200,32 +238,41 @@ and flips `ready` once the bitmap is decoded, so do not bind `src` as well:
 
 <CodeBlock code={gateCode} lang="svelte" />
 
+## Collaborative fields
+
+A string field marked `@crdt` in the schema can be edited by several people at once.
+`useCrdtField(table, id, field)` opens its document while the component is mounted. Its `.current`
+is the `CrdtField`, or `null` until it has loaded; show the column's plain text until then:
+
+<CodeBlock code={crdtCode} lang="svelte" />
+
+Binding a rich text editor and showing remote cursors are covered in [CRDT fields](/docs/client/crdt).
+
 ## Peer to peer channels
 
 `useChannel(query, peers)` opens a [channel](/docs/client/channels) for the lifetime of the
-component. Both arguments may be getters and are compared by value; a `null` query closes the
+component, for fast-changing state such as drafts or cursors that should reach other peers
+directly. Both arguments may be getters and are compared by value; a `null` query closes the
 channel.
 
 <CodeBlock code={channelCode} lang="typescript" />
 
-## Coming from React or Solid
+## Admin impersonation
 
-| client-react | client-svelte |
-|---|---|
-| `useQuery(q)`, `null` to skip | `useQuery(() => q)`, the getter returns `null` to skip |
-| `posts.data`, `posts.isLoading` (values per render) | `posts.data`, `posts.isLoading` (getters: never destructure) |
-| `{ enabled: boolean }` | `{ enabled: boolean \| (() => boolean) }` |
-| `useSubmission(fn)` | `useSubmission(fn)`, no provider needed |
-| `usePendingMutations()` returns a number | `usePendingMutations().current` |
-| `useCrdtField(table, id, field)` | `useCrdtField(table, () => id, field).current` |
-| `useDownloadFile(bucket, path)` | `useDownloadFile(bucket, () => path)` |
-| `<BucketImage className="..." fallback={<Plate />}>` | `<BucketImage class="...">` with a `fallback` snippet |
-| `ref={image.gate}` plus `src={image.url}` | `{@attach image.gate}` (sets `src`) |
-| everything on `useDb()` | unchanged |
+When an admin [impersonates](/docs/client/impersonation) a user, the client shows a warning banner.
+To render your own, set `impersonationBanner: { mode: 'custom' }` in the client config and read
+`useImpersonation({ rendersBanner: true })`, which tells the client your banner is on screen:
 
-From the Solid bindings, accessors become getters: `posts.data()` is `posts.data`, and
-`createQuery(() => q)` is `useQuery(() => q)`. There is no `ready()` / suspense mode; branch on
-`isLoading` and `isEmpty`.
+<CodeBlock code={impersonationCode} lang="svelte" />
+
+## SvelteKit without the provider
+
+To create the client yourself (for example in a SvelteKit `load`), `init()` it and put it in
+context with `setDbContext`; every hook below that layout then finds it through `useDb()`:
+
+<CodeBlock code={byoTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/routes/+layout.svelte" code={byoSvelteCode} lang="svelte" />
 
 ## Next
 
@@ -234,7 +281,7 @@ From the Solid bindings, accessors become getters: `posts.data()` is `posts.data
     href="/docs/client/queries"
     title="Reactive queries"
     icon="live"
-    description="The query DSL every binding shares."
+    description="Filters, relations, ordering and pagination."
   />
   <LinkCard
     href="/docs/client/mutations"
@@ -275,7 +322,8 @@ export default defineConfig({
 export const sveltekitSsrCode = `// The client is browser-only (WebAssembly, IndexedDB, workers).
 export const ssr = false;`;
 
-export const generateCode = `spky generate`;
+export const generateCode = `# Driven by the clientTypes entries in sp00ky.yml
+spky generate`;
 
 export const configCode = `import type { SyncedDbConfig } from '@spooky-sync/client-svelte';
 import { schema, SURQL_SCHEMA } from './schema.gen';
@@ -371,12 +419,77 @@ export const preloadCode = `<script lang="ts">
 
 <a href={'/thread/' + id}>Open</a>`;
 
-export const mutationCode = `await db.create('post:' + crypto.randomUUID(), { title: 'Hi' });
+export const authCode = `import { useDb } from '@spooky-sync/client-svelte';
+import type { schema } from './schema.gen';
+
+export function useAuth() {
+  const db = useDb<typeof schema>();
+  // undefined until the client reports, then a user id or null.
+  let userId = $state<string | null | undefined>(undefined);
+
+  // subscribe() answers right away with the current user, then on every
+  // sign-in and sign-out. It returns the unsubscribe the effect tears down with.
+  $effect(() => db.auth.subscribe((id) => (userId = id)));
+
+  return {
+    get userId() {
+      return userId;
+    },
+    get isChecking() {
+      return userId === undefined;
+    },
+    signIn: (username: string, password: string) =>
+      db.auth.signIn('account', { username, password }),
+    signUp: (username: string, password: string) =>
+      db.auth.signUp('account', { username, password }),
+    signOut: () => db.signOut(),
+  };
+}`;
+
+export const signInCode = `<script lang="ts">
+  import { useSubmission } from '@spooky-sync/client-svelte';
+  import { useAuth } from '$lib/auth.svelte';
+
+  const auth = useAuth();
+  let username = $state('');
+  let password = $state('');
+  const signIn = useSubmission(auth.signIn);
+</script>
+
+{#if auth.userId}
+  <button onclick={() => auth.signOut()}>Sign out</button>
+{:else if !auth.isChecking}
+  <form
+    onsubmit={(e) => {
+      e.preventDefault();
+      void signIn.submit(username, password);
+    }}
+  >
+    <input bind:value={username} />
+    <input type="password" bind:value={password} />
+    <button disabled={signIn.pending}>Sign in</button>
+    {#if signIn.error}<p>{signIn.error.message}</p>{/if}
+  </form>
+{/if}`;
+
+export const mutationCode = `import { RecordId } from '@spooky-sync/client-svelte';
+
+// Create takes a full record id and the row.
+await db.create('post:' + crypto.randomUUID(), {
+  title: 'Hi',
+  author: new RecordId('user', userId),
+});
+
+// Update merges only the listed fields.
 await db.update('post', 'post:xyz', { title: 'Edited' });
+
+// Delete takes an id string or the RecordId a live row carries.
 await db.delete('post', row.id);
+
+// Run a backend job through the outbox.
 await db.run('backend', 'sendMail', { to });
 
-// A $state object is copied before it reaches the core's workers.
+// A $state object is copied before it reaches the engine's workers.
 let draft = $state({ title: '', tags: [] as string[] });
 await db.create('post:' + crypto.randomUUID(), draft);`;
 
@@ -412,25 +525,22 @@ export const statusCode = `<script lang="ts">
   <div class="banner">Can't reach the server, {pending.current} change(s) queued.</div>
 {/if}`;
 
-export const byoTsCode = `// src/lib/db.ts
-import { SyncedDb } from '@spooky-sync/client-svelte';
-export const db = new SyncedDb(dbConfig);
+export const flagsCode = `<script lang="ts">
+  import { useAppRelease, useFeatureFlag } from '@spooky-sync/client-svelte';
 
-// src/routes/+layout.ts
-export const ssr = false;
-export const load = async () => {
-  await db.init();
-};`;
-
-export const byoSvelteCode = `<script lang="ts">
-  import { setDbContext } from '@spooky-sync/client-svelte';
-  import { db } from '$lib/db';
-
-  let { children } = $props();
-  setDbContext(db);
+  const newEditor = useFeatureFlag('new-editor', { fallback: 'off' });
+  const release = useAppRelease({ app: 'web', currentVersion: __APP_VERSION__ });
 </script>
 
-{@render children()}`;
+{#if newEditor.enabled}
+  <NewEditorButton />
+{:else}
+  <EditorButton />
+{/if}
+
+{#if release.updateAvailable}
+  <button onclick={() => release.reload()}>Update to {release.latestVersion}</button>
+{/if}`;
 
 export const filesCode = `<script lang="ts">
   import { BucketImage, useFileUpload } from '@spooky-sync/client-svelte';
@@ -461,6 +571,35 @@ export const gateCode = `<script lang="ts">
 
 <img {@attach image.gate} alt="" style:opacity={image.ready ? 1 : 0} />`;
 
+export const crdtCode = `<script lang="ts">
+  import { useCrdtField } from '@spooky-sync/client-svelte';
+
+  // id is the full record id, e.g. 'note:abc'; summary is the column's plain text.
+  let { id, summary }: { id: string; summary: string } = $props();
+  const field = useCrdtField('note', () => id, 'summary');
+  let value = $state('');
+
+  // Follow the document: local and remote edits alike update the textarea.
+  $effect(() => {
+    const doc = field.current?.getDoc();
+    if (!doc) return;
+    const text = doc.getText('summary');
+    value = text.toString();
+    return doc.subscribe(() => (value = text.toString()));
+  });
+</script>
+
+<textarea
+  value={field.current ? value : summary}
+  readonly={!field.current}
+  oninput={(e) => {
+    const doc = field.current?.getDoc();
+    if (!doc) return;
+    doc.getText('summary').update(e.currentTarget.value); // minimal diff
+    doc.commit();
+  }}
+></textarea>`;
+
 export const channelCode = `import { useChannel } from '@spooky-sync/client-svelte';
 
 const ch = useChannel(
@@ -469,3 +608,36 @@ const ch = useChannel(
 );
 // ch.status: 'idle' | 'connecting' | 'connected' | 'failed' | 'unsupported'
 await ch.update('message', id, { draft: text });`;
+
+export const impersonationCode = `<script lang="ts">
+  import { useImpersonation } from '@spooky-sync/client-svelte';
+
+  const imp = useImpersonation({ rendersBanner: true });
+</script>
+
+{#if imp.impersonation}
+  <div class="banner">
+    Acting as {imp.impersonation.target}
+    <button onclick={() => void imp.stop()}>Stop</button>
+  </div>
+{/if}`;
+
+export const byoTsCode = `// src/lib/db.ts
+import { SyncedDb } from '@spooky-sync/client-svelte';
+export const db = new SyncedDb(dbConfig);
+
+// src/routes/+layout.ts
+export const ssr = false;
+export const load = async () => {
+  await db.init();
+};`;
+
+export const byoSvelteCode = `<script lang="ts">
+  import { setDbContext } from '@spooky-sync/client-svelte';
+  import { db } from '$lib/db';
+
+  let { children } = $props();
+  setDbContext(db);
+</script>
+
+{@render children()}`;

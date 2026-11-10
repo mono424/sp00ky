@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: React guide
-description: "Use Sp00ky from a React app: Sp00kyProvider, useQuery with structural sharing, useSubmission, status hooks and bucket images."
+description: "Build a local-first React app with Sp00ky: provider, live queries, auth, mutations, sync status, files, CRDT fields and channels."
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -12,31 +12,38 @@ import Warning from '../../../components/ui/Warning.astro';
 import CardGrid from '../../../components/ui/CardGrid.astro';
 import LinkCard from '../../../components/ui/LinkCard.astro';
 
-`@spooky-sync/client-react` is the React binding. It wraps the same core client as the
-[Solid bindings](/docs/guide/solid) and exposes the same hooks, written the React way: they return
-plain values instead of accessors, and they re-render only when what they return changed. It works
-with React 18 and 19.
+`@spooky-sync/client-react` brings Sp00ky to React 18 and 19. Your components read live queries
+through hooks that return plain values, every write lands in the local database first, and the
+engine keeps that database in sync with the server and with every other tab and device in the
+background. Queries paint from the local cache on reload, keep working offline, and update the
+moment anyone changes a row they match.
+
+This guide walks through a complete app: setup, queries, sign-in, writes, sync status, files,
+collaborative fields and peer to peer channels.
 
 <Warning title="React DOM, not React Native">
-  The core client runs SurrealDB and SQLite as WebAssembly in the browser, with IndexedDB / OPFS
-  storage and web workers. React Native's runtime has none of these, so this package targets React
-  in the browser (Vite, Next.js client components, Remix, and so on). For a native mobile app use the
+  The client runs SurrealDB and SQLite as WebAssembly in the browser, with IndexedDB / OPFS storage
+  and web workers. React Native's runtime has none of these, so this package targets React in the
+  browser (Vite, Next.js client components, Remix, and so on). For a native mobile app use the
   [Flutter guide](/docs/guide/flutter).
 </Warning>
 
-## What "native" means here
+## How it fits React
 
 - **Tear-free reads.** Every hook reads its state through `useSyncExternalStore`, so a concurrent
   render never sees two different versions of a query or of the sync status.
-- **Structural sharing.** Each live emission is merged into the previous result: rows are matched
-  by `id`, unchanged rows keep their object identity, and a deep-equal emission does not re-render
-  at all. `React.memo` rows and `useMemo` deps keyed on a row only re-run when that row changed.
+- **Structural sharing.** Each live update is merged into the previous result: rows are matched by
+  `id`, unchanged rows keep their object identity, and an update that changed nothing does not
+  re-render at all. `React.memo` rows and `useMemo` deps keyed on a row only re-run when that row
+  changed.
 - **Lifecycle in effects.** The client, query registrations, CRDT fields, channels and file leases
   are opened in effects and released in their cleanups, never during render. StrictMode's double
   mount ends with exactly one of each.
-- **No optimistic layer.** The engine already commits writes locally and re-renders through live
-  queries before it syncs. Mutations are plain `await db.create(...)` calls; `useSubmission` only
-  adds button pending and error state.
+- **Local-first writes.** The engine commits a write locally and re-renders every affected query
+  before it syncs, so there is no optimistic layer to maintain. Mutations are plain
+  `await db.create(...)` calls; `useSubmission` adds button pending and error state.
+
+## Setup
 
 <Steps>
   <Step title="Install">
@@ -44,7 +51,7 @@ with React 18 and 19.
   </Step>
 
   <Step title="Configure the bundler">
-    The core client loads its engines as WebAssembly. With Vite, keep them out of dependency
+    The client loads its engines as WebAssembly. With Vite, keep them out of dependency
     pre-bundling and allow top-level await:
 
     <CodeBlock fileName="vite.config.ts" code={viteCode} lang="typescript" />
@@ -55,7 +62,8 @@ with React 18 and 19.
   <Step title="Generate types">
     <CodeBlock code={generateCode} lang="bash" />
 
-    Same generator as every other client, see [Generated types](/docs/schema/generated-types).
+    This writes `schema.gen.ts` from your `.surql` schema: the table types every query and write is
+    checked against. See [Generated types](/docs/schema/generated-types).
   </Step>
 
   <Step title="Configure the client">
@@ -67,19 +75,27 @@ with React 18 and 19.
   <Step title="Mount the provider">
     <CodeBlock fileName="src/App.tsx" code={providerCode} lang="tsx" />
 
-    Props match the Solid providers: `config`, `fallback`, `preload` (awaited before the children
-    render), `onReady`, `onError`. The client is created in an effect, so a server render only
-    produces the fallback. `config` is read once when the provider mounts; to switch databases,
-    remount it with a new `key`. A client that was handed to the tree is deliberately not closed on
-    unmount.
+    `<Sp00kyProvider>` creates the client, opens the local database and connects to the server,
+    showing `fallback` until it is ready. Its props:
+
+    | Prop | Meaning |
+    |---|---|
+    | `config` | The client config. Read once when the provider mounts; to switch databases, remount the provider with a new `key`. |
+    | `fallback` | Rendered until the client is ready. |
+    | `preload` | Awaited before the children render, to warm the local cache. A failure is logged and the UI is revealed anyway. |
+    | `onReady` | Called with the client once it is ready. |
+    | `onError` | Called if the client fails to start. |
+
+    The client is created in an effect, so a server render only produces the fallback. A client
+    that was handed to the tree is deliberately not closed on unmount.
   </Step>
 </Steps>
 
 ## Queries
 
-`useQuery(query, options?)` takes a built query. Build it inline: the hook re-registers only when
-the query's identity (its SurrealQL and vars) changes, not when a new query object is created on
-every render.
+`useQuery(query, options?)` subscribes a component to a live query. Build the query inline: the hook
+re-registers only when the query's identity (its SurrealQL and vars) changes, not when a new query
+object is created on every render.
 
 <CodeBlock fileName="src/components/PostList.tsx" code={queryCode} lang="tsx" />
 
@@ -87,26 +103,27 @@ Pass `null` (or `{ enabled: false }`) to skip a query until its inputs exist:
 
 <CodeBlock code={dependentCode} lang="tsx" />
 
-`useQuery(db, query, options?)` takes the client explicitly, for code outside a provider.
+`useQuery(db, query, options?)` takes the client explicitly, for code outside a provider. The query
+builder itself (`where`, `related`, `orderBy`, `limit`, `one`) is covered in
+[Reactive queries](/docs/client/queries).
 
-### Result surface
+### Result
 
-The flags are the same contract as the [Solid 2 binding](/docs/guide/solid2#result-surface), as
-plain values:
+`useQuery` returns plain values, recomputed only when they change:
 
 | Field | Meaning |
 |---|---|
-| `data` | Rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared between emissions. |
+| `data` | Rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared between updates. |
 | `error` | Registration or sync error (e.g. SSP 503 during bootstrap). Never thrown; the sync scheduler retries underneath. |
-| `isLoading` | Cold first load only: nothing painted for this identity, the server has not answered, and registration has not failed. A paint from the local cache ends it; the server answering with zero rows ends it too. |
+| `isLoading` | Cold first load only: nothing painted for this query, the server has not answered, and registration has not failed. A paint from the local cache ends it; the server answering with zero rows ends it too. |
 | `isFetching` | The sync engine is pulling records for this query (registration, a sync round). |
 | `isAuthoritative` | `data` holds the rendered rows of a known membership: the server's answer, or the one a previous session left on this device. From here `data` is an answer, not a cache guess. |
 | `hasData` | `data` holds something: rows for a list, a row for `.one()`. |
 | `isEmpty` | Authoritative **and** no data: the server said "no rows". Render empty states on this, never on a bare `!hasData`. |
 | `isSettled` | Authoritative **and** idle. The gate for trusting a short window as the end of a list, and for "create it if it is missing". Not monotonic: a later sync round re-enters `isFetching`. |
 
-When the query's identity changes, the previous `data` stays on screen until the new identity
-emits, while the flags reset. Growing a `.limit()` therefore never flashes an empty list:
+When the query's identity changes, the previous `data` stays on screen until the new query
+answers, while the flags reset. Growing a `.limit()` therefore never flashes an empty list:
 
 <CodeBlock code={loadMoreCode} lang="tsx" />
 
@@ -123,13 +140,29 @@ row changes:
 ### Preloading
 
 `usePreload(query)` warms the local cache for a query the user is likely to open next, without
-subscribing to it:
+subscribing to it. When they navigate, the page paints from the cache immediately:
 
 <CodeBlock code={preloadCode} lang="tsx" />
 
+## Authentication
+
+Sign-in runs through the SurrealDB access methods in your schema, see
+[Authentication](/docs/client/auth). `db.auth.subscribe` reports the signed-in user id now and on
+every change, which makes a small hook for the rest of the app:
+
+<CodeBlock fileName="src/lib/auth.ts" code={authCode} lang="tsx" />
+
+A sign-in form wraps the call in `useSubmission` for its pending and error state:
+
+<CodeBlock fileName="src/components/SignIn.tsx" code={signInCode} lang="tsx" />
+
+Every live query is scoped by your table permissions, so a user only ever syncs the rows they may
+read. `db.signOut()` ends the session and clears the local data.
+
 ## Mutations
 
-Engine writes are already optimistic and local-first, so mutations are plain calls:
+Writes are plain calls on the client. Each one commits locally, re-renders every query it affects,
+and syncs in the background, offline included:
 
 <CodeBlock code={mutationCode} lang="typescript" />
 
@@ -140,52 +173,73 @@ renders, always calls the latest function, and never rejects:
 
 An error there means the local commit failed. Sync failures surface through `useSyncStatus` and
 `usePendingMutations` instead. To track a backend job, query its outbox row: `db.run()` writes one
-with `status: 'pending'`.
+with `status: 'pending'`. See [Mutations](/docs/client/mutations).
 
-## Status hooks
+## Sync status
 
-Same shapes as the Solid bindings, returning values: `useDb`, `usePendingMutations`,
-[`useSyncStatus`](/docs/client/offline-sync), [`useSyncActivity`](/docs/client/offline-sync#traffic-indicator),
-[`useStorageStatus`](/docs/client/offline-sync), [`useFeatureFlag`](/docs/client/feature-flags),
-`useAppRelease`, [`useImpersonation`](/docs/client/impersonation) and [`useCrdtField`](/docs/client/crdt).
+`useSyncStatus` reports the connection, `usePendingMutations` the number of writes not yet on the
+server. Together they make the usual offline banner:
 
 <CodeBlock code={statusCode} lang="tsx" />
 
+| Hook | Returns |
+|---|---|
+| `useSyncStatus()` | `status`, `isHealthy`, `isDegraded`, `isOffline`, `isReconnecting`, `everConnected`, `connection`, `health` |
+| `usePendingMutations()` | The number of local writes waiting to sync |
+| `useSyncActivity(options?)` | `isDownloading`, `isUploading`, `fetchingQueries`, `pendingMutations`, debounced for a traffic indicator |
+| `useStorageStatus()` | `status`, `isPersistent`, `isMemoryFallback`, `health` for the local database |
+
+What to show for each state is covered in [Offline & sync health](/docs/client/offline-sync).
+
+## Feature flags and releases
+
+`useFeatureFlag(key, options?)` reads a [feature flag](/docs/client/feature-flags) for the signed-in
+user and updates live when the assignment changes, so `spky flag enable` reaches open tabs without
+a reload. `useAppRelease` tells a running tab that a newer frontend was deployed:
+
+<CodeBlock code={flagsCode} lang="tsx" />
+
 ## Files and images
 
-[`useFileUpload`, `useDownloadFile`](/docs/client/buckets), `useBlurhash`, `useBucketImage` and the
-`<BucketImage>` / `<Blurhash>` components behave as in the Solid bindings. Paths are plain values,
-and the components take `className` / `style` / `imgClassName`.
+[`useFileUpload` and `useDownloadFile`](/docs/client/buckets) upload to and read from a bucket.
+`<BucketImage>` renders a bucket file as an image, revealing it only once it is decoded, and
+`<Blurhash>` / `useBlurhash` paint a placeholder while it loads. The components take `className`,
+`style` and `imgClassName`; `useBucketImage` gives you the same behaviour for custom markup.
 
 <CodeBlock code={filesCode} lang="tsx" />
 
+## Collaborative fields
+
+A string field marked `@crdt` in the schema can be edited by several people at once.
+`useCrdtField(table, id, field)` opens its document while the component is mounted and returns the
+`CrdtField`, or `null` until it has loaded; show the column's plain text until then:
+
+<CodeBlock code={crdtCode} lang="tsx" />
+
+Binding a rich text editor and showing remote cursors are covered in [CRDT fields](/docs/client/crdt).
+
 ## Peer to peer channels
 
-`useChannel(query, peers)` opens a [channel](/docs/client/channels) while the component is mounted.
-Query and peers are compared by value, so building them inline is fine; `null` closes the channel.
+`useChannel(query, peers)` opens a [channel](/docs/client/channels) while the component is mounted,
+for fast-changing state such as drafts or cursors that should reach other peers directly. Query and
+peers are compared by value, so building them inline is fine; `null` closes the channel.
 
 <CodeBlock code={channelCode} lang="tsx" />
 
-## Coming from the Solid bindings
+## Admin impersonation
 
-| client-solid / client-solid2 | client-react |
-|---|---|
-| `useQuery(() => q)` / `createQuery(() => q)` | `useQuery(q)`, with `null` to skip |
-| `posts.data()`, `posts.isLoading()` | `posts.data`, `posts.isLoading` |
-| `{ enabled: () => boolean }` | `{ enabled: boolean }` |
-| `ready()` + `<Loading>` | not available yet: branch on `isLoading` |
-| `createSubmission(fn)` | `useSubmission(fn)` |
-| `createPreload(() => q)` | `usePreload(q)` |
-| `useCrdtField(table, () => id, field)` | `useCrdtField(table, id, field)` |
-| `useDownloadFile(bucket, () => path)` | `useDownloadFile(bucket, path)` |
-| `<BucketImage class="...">` | `<BucketImage className="...">` |
-| everything on `useDb()` | unchanged |
+When an admin [impersonates](/docs/client/impersonation) a user, the client shows a warning banner.
+To render your own, set `impersonationBanner: { mode: 'custom' }` in the client config and read
+`useImpersonation({ rendersBanner: true })`, which tells the client your banner is on screen:
 
-<Note title="Next.js">
-  The bundle starts with `'use client'`, so a server component (an App Router layout) can render
-  `<Sp00kyProvider>` directly. The provider renders its `fallback` on the server; data loads in the
-  browser, from the local cache first.
-</Note>
+<CodeBlock code={impersonationCode} lang="tsx" />
+
+## Next.js and server rendering
+
+The bundle starts with `'use client'`, so a server component (an App Router layout) can render
+`<Sp00kyProvider>` directly. The provider renders its `fallback` on the server; data loads in the
+browser, from the local cache first. Keep components that call the hooks below the provider and
+inside client components.
 
 ## Next
 
@@ -194,7 +248,7 @@ Query and peers are compared by value, so building them inline is fine; `null` c
     href="/docs/client/queries"
     title="Reactive queries"
     icon="live"
-    description="The query DSL every binding shares."
+    description="Filters, relations, ordering and pagination."
   />
   <LinkCard
     href="/docs/client/mutations"
@@ -232,7 +286,8 @@ export default defineConfig({
   build: { target: 'esnext' },
 });`;
 
-export const generateCode = `spky generate`;
+export const generateCode = `# Driven by the clientTypes entries in sp00ky.yml
+spky generate`;
 
 export const configCode = `import type { SyncedDbConfig } from '@spooky-sync/client-react';
 import { schema, SURQL_SCHEMA } from './schema.gen';
@@ -309,7 +364,7 @@ export const memoCode = `const PostRow = memo(function PostRow({ post }: { post:
 
 {posts.data.map((post) => <PostRow key={String(post.id)} post={post} />)}`;
 
-export const preloadCode = `import { usePreload } from '@spooky-sync/client-react';
+export const preloadCode = `import { useDb, usePreload } from '@spooky-sync/client-react';
 
 function ThreadLink({ id }: { id: string }) {
   const db = useDb<typeof schema>();
@@ -317,12 +372,72 @@ function ThreadLink({ id }: { id: string }) {
   return <Link to={'/thread/' + id}>Open</Link>;
 }`;
 
-export const mutationCode = `await db.create('post:' + crypto.randomUUID(), { title: 'Hi' });
+export const authCode = `import { useEffect, useState } from 'react';
+import { useDb } from '@spooky-sync/client-react';
+import type { schema } from '../schema.gen';
+
+export function useAuth() {
+  const db = useDb<typeof schema>();
+  // undefined until the client reports, then a user id or null.
+  const [userId, setUserId] = useState<string | null | undefined>(undefined);
+
+  // subscribe() answers right away with the current user, then on every
+  // sign-in and sign-out. It returns the unsubscribe the effect cleans up with.
+  useEffect(() => db.auth.subscribe(setUserId), [db]);
+
+  return {
+    userId,
+    isChecking: userId === undefined,
+    signIn: (username: string, password: string) =>
+      db.auth.signIn('account', { username, password }),
+    signUp: (username: string, password: string) =>
+      db.auth.signUp('account', { username, password }),
+    signOut: () => db.signOut(),
+  };
+}`;
+
+export const signInCode = `import { useState } from 'react';
+import { useSubmission } from '@spooky-sync/client-react';
+import { useAuth } from '../lib/auth';
+
+export function SignIn() {
+  const auth = useAuth();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const signIn = useSubmission(auth.signIn);
+
+  if (auth.isChecking) return null;
+  if (auth.userId) return <button onClick={auth.signOut}>Sign out</button>;
+
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); void signIn.submit(username, password); }}>
+      <input value={username} onChange={(e) => setUsername(e.target.value)} />
+      <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+      <button disabled={signIn.pending}>Sign in</button>
+      {signIn.error && <p>{signIn.error.message}</p>}
+    </form>
+  );
+}`;
+
+export const mutationCode = `import { RecordId } from '@spooky-sync/client-react';
+
+// Create takes a full record id and the row.
+await db.create('post:' + crypto.randomUUID(), {
+  title: 'Hi',
+  author: new RecordId('user', userId),
+});
+
+// Update merges only the listed fields.
 await db.update('post', 'post:xyz', { title: 'Edited' });
+
+// Delete takes an id string or the RecordId a live row carries.
 await db.delete('post', row.id);
+
+// Run a backend job through the outbox.
 await db.run('backend', 'sendMail', { to });`;
 
-export const submissionCode = `import { useSubmission } from '@spooky-sync/client-react';
+export const submissionCode = `import { useState } from 'react';
+import { useDb, useSubmission } from '@spooky-sync/client-react';
 
 function NewPost() {
   const db = useDb<typeof schema>();
@@ -347,6 +462,19 @@ function ConnectionBanner() {
   return <Banner>Can't reach the server, {pending} change(s) queued.</Banner>;
 }`;
 
+export const flagsCode = `import { useAppRelease, useFeatureFlag } from '@spooky-sync/client-react';
+
+function Toolbar() {
+  const newEditor = useFeatureFlag('new-editor', { fallback: 'off' });
+  return newEditor.enabled ? <NewEditorButton /> : <EditorButton />;
+}
+
+function UpdatePrompt() {
+  const release = useAppRelease({ app: 'web', currentVersion: __APP_VERSION__ });
+  if (!release.updateAvailable) return null;
+  return <button onClick={() => release.reload()}>Update to {release.latestVersion}</button>;
+}`;
+
 export const filesCode = `import { BucketImage, useFileUpload } from '@spooky-sync/client-react';
 
 function Avatar({ path }: { path: string | null }) {
@@ -367,8 +495,51 @@ function AvatarUpload() {
   );
 }`;
 
+export const crdtCode = `import { useEffect, useState } from 'react';
+import { useCrdtField } from '@spooky-sync/client-react';
+
+// id is the full record id, e.g. 'note:abc'; summary is the column's plain text.
+function Summary({ id, summary }: { id: string; summary: string }) {
+  const field = useCrdtField('note', id, 'summary');
+  const [value, setValue] = useState(summary);
+
+  // Follow the document: local and remote edits alike re-render the input.
+  useEffect(() => {
+    const doc = field?.getDoc();
+    if (!doc) return;
+    const text = doc.getText('summary');
+    setValue(text.toString());
+    return doc.subscribe(() => setValue(text.toString()));
+  }, [field]);
+
+  return (
+    <textarea
+      value={value}
+      readOnly={!field}
+      onChange={(e) => {
+        const doc = field?.getDoc();
+        if (!doc) return;
+        doc.getText('summary').update(e.target.value); // minimal diff
+        doc.commit();
+      }}
+    />
+  );
+}`;
+
 export const channelCode = `import { useChannel } from '@spooky-sync/client-react';
 
 const ch = useChannel(db.query('message').where({ conversation: convoId }), [me, other]);
 // ch.status: 'idle' | 'connecting' | 'connected' | 'failed' | 'unsupported'
 await ch.update('message', id, { draft: text });`;
+
+export const impersonationCode = `import { useImpersonation } from '@spooky-sync/client-react';
+
+function ImpersonationBar() {
+  const { impersonation, stop } = useImpersonation({ rendersBanner: true });
+  if (!impersonation) return null;
+  return (
+    <div className="banner">
+      Acting as {impersonation.target} <button onClick={() => void stop()}>Stop</button>
+    </div>
+  );
+}`;

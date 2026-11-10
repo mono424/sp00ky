@@ -89,7 +89,10 @@ struct Inner {
 pub struct Subscription(Option<Box<dyn FnOnce()>>);
 
 impl Subscription {
-    fn new(f: impl FnOnce() + 'static) -> Self {
+    /// A subscription that runs `f` once, when cancelled or dropped. Public so
+    /// a seam implementor (a `QueryHost`, an auth source) can hand out the
+    /// same guard the runtime does.
+    pub fn new(f: impl FnOnce() + 'static) -> Self {
         Subscription(Some(Box::new(f)))
     }
 

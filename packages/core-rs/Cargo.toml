@@ -14,7 +14,7 @@ default = ["remote", "codegen"]
 # The SurrealDB WebSocket transport. Without it the client is local-only.
 remote = ["dep:tokio-tungstenite", "dep:rustls", "dep:webpki-roots"]
 # `spooky_core::codegen`: SurrealQL schema -> Rust types, for build scripts.
-codegen = []
+codegen = ["dep:serde_yaml"]
 
 [dependencies]
 # The in-process circuit. No mimalloc: an embedding app owns the allocator.
@@ -41,7 +41,11 @@ base64 = "0.22"
 tokio-tungstenite = { version = "0.28", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
+# OpenAPI specs for codegen's typed backend helpers.
+serde_yaml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["rt", "time", "sync", "macros", "net", "test-util"] }
 tempfile = "3"
+# Parses generated Rust in the codegen tests.
+syn = { version = "2", features = ["full"] }

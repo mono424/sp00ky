@@ -114,7 +114,7 @@ pub enum WhereClause {
 pub struct QueryBuilder {
     table: String,
     host: Option<Rc<dyn QueryHost>>,
-    schema: Rc<Schema>,
+    schema: Arc<Schema>,
     select: Vec<String>,
     where_: Vec<WhereClause>,
     order_by: Vec<(String, String)>,
@@ -153,7 +153,7 @@ impl QueryBuilder {
         QueryBuilder {
             table: table.into(),
             host: None,
-            schema: Rc::new(Schema::default()),
+            schema: Arc::new(Schema::default()),
             select: vec!["*".to_string()],
             where_: Vec::new(),
             order_by: Vec::new(),
@@ -168,11 +168,11 @@ impl QueryBuilder {
 
     /// A builder that registers through `host`, with `schema` for
     /// relationships, `-- @ephemeral` checks and param typing.
-    pub fn bound(table: impl Into<String>, host: Rc<dyn QueryHost>, schema: Rc<Schema>) -> Self {
+    pub fn bound(table: impl Into<String>, host: Rc<dyn QueryHost>, schema: Arc<Schema>) -> Self {
         QueryBuilder::new(table).with_host(host).with_schema(schema)
     }
 
-    pub fn with_schema(mut self, schema: Rc<Schema>) -> Self {
+    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
         self.schema = schema;
         self
     }
@@ -225,7 +225,7 @@ impl QueryBuilder {
         &self.relations
     }
 
-    pub fn schema(&self) -> &Rc<Schema> {
+    pub fn schema(&self) -> &Arc<Schema> {
         &self.schema
     }
 
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn params_are_typed_from_the_schema() {
         let (_, vars) = QueryBuilder::new("thread")
-            .with_schema(Rc::new(typed_schema()))
+            .with_schema(Arc::new(typed_schema()))
             .where_eq("author", "user:u1")
             .where_op("created_at", QueryOp::new(">", "2026-01-01T00:00:00Z"))
             .where_eq("id", "t1")
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn ephemeral_fields_cannot_be_filtered_or_ordered() {
-        let schema = Rc::new(typed_schema());
+        let schema = Arc::new(typed_schema());
         let err = QueryBuilder::new("call")
             .with_schema(schema.clone())
             .where_eq("view_pos", "x")
@@ -908,7 +908,7 @@ mod tests {
         }
     }
 
-    fn rel_schema() -> Rc<Schema> {
+    fn rel_schema() -> Arc<Schema> {
         let record = || ColumnSchema {
             record_id: true,
             kind: Some("record".into()),
@@ -940,7 +940,7 @@ mod tests {
             rel("thread", "comments", "comment", Cardinality::Many),
             rel("user", "comments", "comment", Cardinality::Many),
         ];
-        Rc::new(s)
+        Arc::new(s)
     }
 
     fn builder(table: &str) -> QueryBuilder {

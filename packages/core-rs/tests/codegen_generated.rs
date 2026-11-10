@@ -84,7 +84,7 @@ impl QueryHost for Host {
 /// A [`TypedClient`] that records every write.
 struct Client {
     host: Rc<Host>,
-    schema: Rc<Schema>,
+    schema: Arc<Schema>,
     calls: RefCell<Vec<(String, String, Object)>>,
 }
 
@@ -92,7 +92,7 @@ impl Client {
     fn new(schema: Schema) -> Self {
         Client {
             host: Rc::default(),
-            schema: Rc::new(schema),
+            schema: Arc::new(schema),
             calls: RefCell::default(),
         }
     }

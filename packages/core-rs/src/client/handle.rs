@@ -23,6 +23,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::client::engine::{Engine, QueryOptions};
 use crate::error::{Error, Result};
 use crate::kernel::events::OutEvent;
+use crate::modules::app_release::AppReleaseSnapshot;
+use crate::modules::feature_flag::FeatureFlagSnapshot;
+use crate::modules::query_builder::QueryBuilder;
 use crate::mutation::rows::FailedMutationRow;
 use crate::runtime::Subscription;
 use crate::types::{QueryHash, QueryStatus, QueryTimings, RunOptions, Schema, Sp00kyConfig, SyncHealth, UpdateOptions};
@@ -43,6 +46,7 @@ enum Msg {
 }
 
 struct Observed {
+    user: watch::Receiver<Option<String>>,
     health: watch::Receiver<SyncHealth>,
     pending: watch::Receiver<usize>,
     fetching: watch::Receiver<usize>,
@@ -386,6 +390,154 @@ impl Sp00kyClient {
         self.shared.observed.unsynced.clone()
     }
 
+    // ---- auth ------------------------------------------------------------------------------
+
+    /// Sign in through `DEFINE ACCESS <access>` with its declared params.
+    /// The account switch (local store, queries) has happened when this
+    /// resolves.
+    pub async fn sign_in(&self, access: &str, params: impl Into<Object>) -> Result<()> {
+        let (access, params) = (access.to_string(), params.into());
+        self.call(move |w| async move { w.engine.sign_in(&access, params).await }).await
+    }
+
+    /// Sign up through `DEFINE ACCESS <access>` with its declared params.
+    pub async fn sign_up(&self, access: &str, params: impl Into<Object>) -> Result<()> {
+        let (access, params) = (access.to_string(), params.into());
+        self.call(move |w| async move { w.engine.sign_up(&access, params).await }).await
+    }
+
+    /// Sign out. Queued writes are pushed first while the session is valid.
+    pub async fn sign_out(&self) -> Result<()> {
+        self.call(|w| async move { w.engine.sign_out().await }).await
+    }
+
+    /// The signed-in user's id (`user:<key>`).
+    pub fn user_id(&self) -> Option<String> {
+        self.shared.observed.user.borrow().clone()
+    }
+
+    /// The signed-in user: current value now, every change after.
+    pub fn user_watch(&self) -> watch::Receiver<Option<String>> {
+        self.shared.observed.user.clone()
+    }
+
+    /// The token of the current session.
+    pub async fn token(&self) -> Result<Option<String>> {
+        self.call(|w| async move { Ok(w.engine.auth().and_then(|a| a.token())) }).await
+    }
+
+    // ---- query builder ------------------------------------------------------------------------
+
+    /// A fluent query on `table`, typed against the client's schema. Run it
+    /// with [`Sp00kyClient::live`] or [`Sp00kyClient::preload_query`].
+    pub fn query(&self, table: &str) -> QueryBuilder {
+        QueryBuilder::new(table).with_schema(self.shared.schema.clone())
+    }
+
+    fn built(query: &QueryBuilder, ttl: Option<&str>) -> Result<(String, Object, QueryOptions)> {
+        let (sql, params) = query.build()?;
+        Ok((
+            sql,
+            params,
+            QueryOptions {
+                ttl: ttl.map(str::to_string),
+                relations: query.relations().to_vec(),
+            },
+        ))
+    }
+
+    /// Register a built query and subscribe to it.
+    pub fn live(&self, query: QueryBuilder) -> impl Future<Output = Result<LiveQuery>> + Send + 'static {
+        self.live_with_ttl(query, None)
+    }
+
+    /// [`Sp00kyClient::live`] with a ttl (`10m`, `1h`).
+    pub fn live_with_ttl(
+        &self,
+        query: QueryBuilder,
+        ttl: Option<&str>,
+    ) -> impl Future<Output = Result<LiveQuery>> + Send + 'static {
+        let built = Self::built(&query, ttl);
+        let client = self.clone();
+        async move {
+            let (sql, params, options) = built?;
+            client.live_raw(&sql, params, options).await
+        }
+    }
+
+    /// Prewarm a built query without subscribing.
+    pub fn preload_query(&self, query: QueryBuilder) -> impl Future<Output = Result<QueryHash>> + Send + 'static {
+        let built = Self::built(&query, None);
+        let client = self.clone();
+        async move {
+            let (sql, params, options) = built?;
+            client.preload(&sql, params, options).await
+        }
+    }
+
+    // ---- feature flags and releases ------------------------------------------------------------
+
+    /// A live feature flag. Its variant falls back to `fallback` while the key
+    /// has no assignment. Requires a remote endpoint.
+    pub async fn feature(&self, key: &str, fallback: Option<&str>) -> Result<FeatureFlag> {
+        let id = self.shared.next_sub.fetch_add(1, Ordering::Relaxed);
+        let (key, fallback) = (key.to_string(), fallback.map(str::to_string));
+        let rx = self
+            .call(move |w| async move {
+                let handle = w.engine.feature(&key, fallback.as_deref(), None)?;
+                let (tx, rx) = watch::channel(FeatureFlagSnapshot::default());
+                let sub = handle.subscribe(move |snap| {
+                    tx.send_replace(snap.clone());
+                });
+                let close = Subscription::new(move || handle.close());
+                w.subs.borrow_mut().insert(id, vec![sub, close]);
+                Ok(rx)
+            })
+            .await?;
+        Ok(FeatureFlag {
+            rx,
+            _guard: SubGuard {
+                id,
+                client: Some(self.clone()),
+            },
+        })
+    }
+
+    /// A live view of app `app`'s latest announced release.
+    pub async fn app_release(&self, app: &str) -> Result<AppRelease> {
+        let id = self.shared.next_sub.fetch_add(1, Ordering::Relaxed);
+        let app = app.to_string();
+        let rx = self
+            .call(move |w| async move {
+                let handle = w.engine.app_release(&app, None)?;
+                let (tx, rx) = watch::channel(handle.snapshot());
+                let sub = handle.subscribe(move |snap| {
+                    tx.send_replace(snap.clone());
+                });
+                let close = Subscription::new(move || handle.close());
+                w.subs.borrow_mut().insert(id, vec![sub, close]);
+                Ok(rx)
+            })
+            .await?;
+        Ok(AppRelease {
+            rx,
+            _guard: SubGuard {
+                id,
+                client: Some(self.clone()),
+            },
+        })
+    }
+
+    // ---- buckets ------------------------------------------------------------------------------
+
+    /// A storage bucket. Reads go through the client's blob cache.
+    pub fn bucket(&self, name: &str) -> Bucket {
+        Bucket {
+            client: self.clone(),
+            name: name.to_string(),
+        }
+    }
+
     // ---- key/value and raw auth ------------------------------------------------------------
 
     pub async fn kv_read(&self, key: &str) -> Result<Option<Value>> {
@@ -412,6 +564,13 @@ impl Sp00kyClient {
 /// Wire the engine's outbound events into watch channels the handle reads
 /// from any thread.
 fn observe(engine: &Rc<Engine>) -> (Observed, Vec<Subscription>) {
+    let (user_tx, user) = watch::channel(engine.user_id());
+    let mut keep = Vec::new();
+    if let Some(auth) = engine.auth() {
+        keep.push(auth.subscribe(move |u| {
+            user_tx.send_replace(u.map(str::to_string));
+        }));
+    }
     let (health_tx, health) = watch::channel(engine.sync_health());
     let (pending_tx, pending) = watch::channel(engine.pending_mutation_count());
     let (fetching_tx, fetching) = watch::channel(engine.fetching_query_count());
@@ -433,15 +592,17 @@ fn observe(engine: &Rc<Engine>) -> (Observed, Vec<Subscription>) {
         }
         _ => {}
     });
+    keep.push(sub);
     (
         Observed {
+            user,
             health,
             pending,
             fetching,
             failed,
             unsynced,
         },
-        vec![sub],
+        keep,
     )
 }
 
@@ -536,5 +697,144 @@ impl std::fmt::Debug for LiveQuery {
             .field("hash", &self.hash)
             .field("rows", &self.rows.borrow().len())
             .finish()
+    }
+}
+
+/// A live feature flag (see [`Sp00kyClient::feature`]).
+pub struct FeatureFlag {
+    rx: watch::Receiver<FeatureFlagSnapshot>,
+    _guard: SubGuard,
+}
+
+impl FeatureFlag {
+    pub fn snapshot(&self) -> FeatureFlagSnapshot {
+        self.rx.borrow().clone()
+    }
+
+    /// The variant, or the fallback while unassigned.
+    pub fn variant(&self) -> Option<String> {
+        self.rx.borrow().variant.clone()
+    }
+
+    /// True when a real variant exists and is not `off`.
+    pub fn enabled(&self) -> bool {
+        self.rx.borrow().variant.as_deref().is_some_and(|v| v != "off")
+    }
+
+    pub fn payload(&self) -> Value {
+        self.rx.borrow().payload.clone()
+    }
+
+    pub fn payload_as<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+        let payload = self.payload();
+        if payload.is_nullish() {
+            return Ok(None);
+        }
+        crate::value::from_value(payload).map(Some)
+    }
+
+    /// Wait for the next change.
+    pub async fn changed(&mut self) -> Result<FeatureFlagSnapshot> {
+        self.rx.changed().await.map_err(|_| Error::Closed)?;
+        Ok(self.rx.borrow_and_update().clone())
+    }
+
+    pub fn watch(&self) -> watch::Receiver<FeatureFlagSnapshot> {
+        self.rx.clone()
+    }
+}
+
+/// A live view of an app's latest release (see [`Sp00kyClient::app_release`]).
+pub struct AppRelease {
+    rx: watch::Receiver<AppReleaseSnapshot>,
+    _guard: SubGuard,
+}
+
+impl AppRelease {
+    pub fn snapshot(&self) -> AppReleaseSnapshot {
+        self.rx.borrow().clone()
+    }
+
+    /// True when the announced version is newer than `current_version`.
+    pub fn update_available(&self, current_version: &str) -> bool {
+        self.rx
+            .borrow()
+            .version
+            .as_deref()
+            .is_some_and(|v| crate::utils::semver_gt(v, current_version))
+    }
+
+    pub async fn changed(&mut self) -> Result<AppReleaseSnapshot> {
+        self.rx.changed().await.map_err(|_| Error::Closed)?;
+        Ok(self.rx.borrow_and_update().clone())
+    }
+
+    pub fn watch(&self) -> watch::Receiver<AppReleaseSnapshot> {
+        self.rx.clone()
+    }
+}
+
+/// A storage bucket (see [`Sp00kyClient::bucket`]).
+#[derive(Clone)]
+pub struct Bucket {
+    client: Sp00kyClient,
+    name: String,
+}
+
+macro_rules! bucket_call {
+    ($self:ident, |$h:ident| $body:expr) => {{
+        let name = $self.name.clone();
+        $self
+            .client
+            .call(move |w| async move {
+                let $h = w.engine.bucket(&name)?;
+                $body
+            })
+            .await
+    }};
+}
+
+impl Bucket {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Write `content` (bytes or text) to `path`.
+    pub async fn put(&self, path: &str, content: impl Into<Value>) -> Result<()> {
+        let (path, content) = (path.to_string(), content.into());
+        bucket_call!(self, |h| h.put(&path, content).await)
+    }
+
+    /// The file's bytes, through the blob cache; `None` when it does not exist.
+    pub async fn read(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let path = path.to_string();
+        bucket_call!(self, |h| Ok(h.read(&path).await?.map(|b| b.to_vec())))
+    }
+
+    /// The raw value of the file, bypassing the cache.
+    pub async fn get(&self, path: &str) -> Result<Value> {
+        let path = path.to_string();
+        bucket_call!(self, |h| h.get(&path).await)
+    }
+
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        let path = path.to_string();
+        bucket_call!(self, |h| h.delete(&path).await)
+    }
+
+    pub async fn exists(&self, path: &str) -> Result<bool> {
+        let path = path.to_string();
+        bucket_call!(self, |h| h.exists(&path).await)
+    }
+
+    pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        let prefix = prefix.map(str::to_string);
+        bucket_call!(self, |h| h.list(prefix.as_deref()).await)
+    }
+
+    /// Drop the cached copy of `path`.
+    pub async fn evict(&self, path: &str) -> Result<()> {
+        let path = path.to_string();
+        bucket_call!(self, |h| h.evict(&path).await)
     }
 }

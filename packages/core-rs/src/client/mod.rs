@@ -3,6 +3,7 @@
 
 pub mod engine;
 pub mod handle;
+mod wiring;
 
 pub use engine::{Engine, QueryOptions};
-pub use handle::{LiveQuery, Sp00kyClient};
+pub use handle::{AppRelease, Bucket, FeatureFlag, LiveQuery, Sp00kyClient};

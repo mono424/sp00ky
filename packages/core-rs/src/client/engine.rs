@@ -13,8 +13,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::FutureExt;
 
 use crate::boot::{auth_flip, boot as boot_saga, preload as preload_saga};
+use crate::client::wiring::EngineHost;
+#[cfg(feature = "remote")]
+use crate::client::wiring::PersistenceBridge;
+use crate::modules::app_release::{AppReleaseHandle, AppReleaseModule};
+use crate::modules::auth::{AuthService, AuthSource};
+use crate::modules::blobs::{BlobCache, BlobStore, FileBlobStore, MemoryBlobStore};
+use crate::modules::bucket::{BucketHandle, RemoteQuery};
+use crate::modules::feature_flag::{FeatureFlagHandle, FeatureFlagModule};
+use crate::modules::query_builder::QueryBuilder;
+use crate::modules::query_host::QueryHost;
+use crate::modules::ref_tables::bucket_id_for_user;
 use crate::error::{Error, Result};
 use crate::kernel::events::{OutEvent, RuntimeEvent};
 use crate::kernel::ports::{Adapters, IdScope, LiveCallback, RemotePort, StatementResult};
@@ -93,6 +105,11 @@ pub struct Engine {
     remote_adapter: Option<Rc<RemoteAdapter>>,
     #[cfg(feature = "remote")]
     supervisor: Option<ConnectionSupervisor>,
+    auth: Option<AuthService>,
+    host: RefCell<Option<Rc<dyn QueryHost>>>,
+    features: RefCell<Option<FeatureFlagModule>>,
+    releases: RefCell<Option<AppReleaseModule>>,
+    blobs: RefCell<Option<BlobCache>>,
     offline: Rc<Cell<bool>>,
     closed: Cell<bool>,
     checkpoint_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
@@ -116,6 +133,7 @@ impl Engine {
     /// background, so a query registered right after this paints from cache.
     pub async fn open(config: Sp00kyConfig) -> Result<Rc<Engine>> {
         let engine = Rc::new(Self::build(config)?);
+        engine.wire();
         engine.boot().await?;
         Ok(engine)
     }
@@ -168,8 +186,10 @@ impl Engine {
         };
         env.has_remote = has_remote;
 
+        #[cfg(not(feature = "remote"))]
+        let auth: Option<AuthService> = None;
         #[cfg(feature = "remote")]
-        let (remote, remote_adapter, supervisor) = if has_remote {
+        let (remote, remote_adapter, supervisor, auth) = if has_remote {
             let client = crate::surreal::rpc::WebSocketSurrealClient::new();
             client.set_connect_timeout(Duration::from_millis(config.reconnect.connect_timeout_ms));
             let remote = RemoteDatabaseService::new(config.database.clone(), Rc::new(client));
@@ -178,12 +198,43 @@ impl Engine {
             // resolves would otherwise reach the server before `use(ns, db)`.
             remote.arm_connect_gate();
             let adapter = Rc::new(RemoteAdapter::new(remote.clone(), config.live_inline_bodies));
-            let supervisor = ConnectionSupervisor::new(SupervisorHooks::for_remote(&remote), remote.events(), config.reconnect);
+            let auth = AuthService::new(
+                &schema,
+                Rc::new(remote.clone()),
+                Rc::new(PersistenceBridge(persistence.clone())),
+            );
+            // The liveness probe also retries a deferred auth verification.
+            let mut hooks = SupervisorHooks::for_remote(&remote);
+            let (probe_remote, probe_auth) = (remote.clone(), auth.clone());
+            hooks.probe = Rc::new(move || {
+                let (remote, auth) = (probe_remote.clone(), probe_auth.clone());
+                async move {
+                    remote.probe().await?;
+                    if auth.needs_verification() {
+                        if let Err(e) = auth.check(None).await {
+                            tracing::warn!(target: "spooky", "Auth retry deferred: {e}");
+                        }
+                    }
+                    Ok(())
+                }
+                .boxed_local()
+            });
+            let supervisor = ConnectionSupervisor::new(hooks, remote.events(), config.reconnect);
+            let handshake_auth = auth.clone();
+            remote.set_on_handshake(Some(Rc::new(move || {
+                let auth = handshake_auth.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = auth.check(None).await {
+                        tracing::warn!(target: "spooky", "Auth verification deferred: {e}");
+                    }
+                });
+            })));
             *services.remote.borrow_mut() = Some(remote.clone());
             *services.supervisor.borrow_mut() = Some(supervisor.clone());
-            (Some(remote), Some(adapter), Some(supervisor))
+            *services.auth.borrow_mut() = Some(Rc::new(auth.clone()));
+            (Some(remote), Some(adapter), Some(supervisor), Some(auth))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let remote_port: Rc<dyn RemotePort> = {
@@ -248,12 +299,69 @@ impl Engine {
             remote_adapter,
             #[cfg(feature = "remote")]
             supervisor,
+            auth,
+            host: RefCell::new(None),
+            features: RefCell::new(None),
+            releases: RefCell::new(None),
+            blobs: RefCell::new(None),
             offline,
             closed: Cell::new(false),
             checkpoint_task: RefCell::new(None),
             keep: RefCell::new(Vec::new()),
         };
         Ok(engine)
+    }
+
+    /// Hooks that need the engine itself: the query host, the auth session
+    /// flips, the sign-out drain, the flag and release modules.
+    fn wire(self: &Rc<Self>) {
+        let host: Rc<dyn QueryHost> = Rc::new(EngineHost(Rc::downgrade(self)));
+        *self.host.borrow_mut() = Some(host.clone());
+        let Some(auth) = self.auth.clone() else { return };
+
+        // Push what is already queued while the session is still valid.
+        // Bounded: an unreachable server must not hold sign-out open; anything
+        // left drains on that user's next sign-in.
+        let rt = self.runtime.downgrade();
+        let bound = Duration::from_millis(self.config.reconnect.connect_timeout_ms);
+        auth.on_before_sign_out(Rc::new(move |_| {
+            let rt = rt.clone();
+            async move {
+                if let Some(rt) = rt.upgrade() {
+                    let _ = tokio::time::timeout(bound, rt.dispatch_async(RuntimeEvent::Drain)).await;
+                }
+                Ok(())
+            }
+            .boxed_local()
+        }))
+        .forget();
+
+        // The signed-in principal drives routing, the local `$auth`, the
+        // bucket and the salt: all of that is one saga.
+        let weak = Rc::downgrade(self);
+        auth.set_on_session_changed(Some(Rc::new(move |user_id: Option<String>| {
+            let weak = weak.clone();
+            async move {
+                let Some(engine) = weak.upgrade() else { return Ok(()) };
+                let current = engine.auth.as_ref().and_then(|a| a.user_id());
+                if current != user_id {
+                    return Ok(());
+                }
+                engine.flip_session(user_id).await
+            }
+            .boxed_local()
+        })));
+
+        let source: Rc<dyn AuthSource> = Rc::new(auth.clone());
+        let features = FeatureFlagModule::new(host.clone(), source.clone());
+        let releases = AppReleaseModule::new(host, source);
+        let (f, r) = (features.clone(), releases.clone());
+        self.add_late_module(Rc::new(move || {
+            f.init();
+            r.init();
+        }));
+        *self.features.borrow_mut() = Some(features);
+        *self.releases.borrow_mut() = Some(releases);
     }
 
     async fn boot(self: &Rc<Self>) -> Result<()> {
@@ -275,6 +383,11 @@ impl Engine {
         // the app can be killed; late enough not to queue behind the first
         // screen's queries.
         self.arm_checkpoints(self.config.circuit_checkpoint_ms.min(FIRST_CHECKPOINT_MS));
+        if let Some(auth) = &self.auth {
+            if let Err(e) = auth.publish_session().await {
+                tracing::warn!(target: "spooky", "publishing the restored session failed: {e}");
+            }
+        }
         if self.env.has_remote {
             self.runtime.dispatch(RuntimeEvent::StartRemote);
         }
@@ -456,6 +569,16 @@ impl Engine {
         if let Some(remote) = &self.remote {
             remote.set_on_handshake(None);
         }
+        if let Some(auth) = &self.auth {
+            auth.dispose();
+        }
+        if let Some(f) = self.features.borrow_mut().take() {
+            f.close_all();
+        }
+        if let Some(r) = self.releases.borrow_mut().take() {
+            r.close_all();
+        }
+        self.host.borrow_mut().take();
         self.runtime.dispose();
         let _ = Self::checkpoint_now(&self.ssp, &self.holder);
         #[cfg(feature = "remote")]
@@ -761,6 +884,149 @@ impl Engine {
     #[doc(hidden)]
     pub fn mint_owner_secret() -> String {
         generate_owner_secret()
+    }
+}
+
+impl Engine {
+    // ---- auth ------------------------------------------------------------------
+
+    /// The auth module. `None` without a remote endpoint.
+    pub fn auth(&self) -> Option<&AuthService> {
+        self.auth.as_ref()
+    }
+
+    fn require_auth(&self) -> Result<&AuthService> {
+        self.auth
+            .as_ref()
+            .ok_or_else(|| Error::NoRemote("auth requires a remote endpoint".into()))
+    }
+
+    /// Sign in through `DEFINE ACCESS <access>` with its declared params.
+    pub async fn sign_in(&self, access: &str, params: Object) -> Result<()> {
+        self.require_auth()?.sign_in(access, params).await
+    }
+
+    /// Sign up through `DEFINE ACCESS <access>` with its declared params.
+    pub async fn sign_up(&self, access: &str, params: Object) -> Result<()> {
+        self.require_auth()?.sign_up(access, params).await
+    }
+
+    /// Sign out: drain the outbox while the session is valid, then drop it.
+    pub async fn sign_out(&self) -> Result<()> {
+        self.require_auth()?.sign_out().await
+    }
+
+    /// The signed-in user's id.
+    pub fn user_id(&self) -> Option<String> {
+        self.auth.as_ref().and_then(|a| a.user_id())
+    }
+
+    // ---- builder and modules ------------------------------------------------------
+
+    /// The query host the builder and the modules register through.
+    pub fn query_host(&self) -> Option<Rc<dyn QueryHost>> {
+        self.host.borrow().clone()
+    }
+
+    /// A fluent query on `table`, bound to this engine and its schema.
+    pub fn query(&self, table: &str) -> QueryBuilder {
+        let b = QueryBuilder::new(table).with_schema(self.schema.clone());
+        match self.query_host() {
+            Some(host) => b.with_host(host),
+            None => b,
+        }
+    }
+
+    /// A reactive handle for feature flag `key`. Requires a remote endpoint.
+    pub fn feature(&self, key: &str, fallback: Option<&str>, ttl: Option<&str>) -> Result<FeatureFlagHandle> {
+        let f = self.features.borrow();
+        let f = f
+            .as_ref()
+            .ok_or_else(|| Error::NoRemote("feature() requires a remote endpoint".into()))?;
+        Ok(f.feature(key, fallback, ttl))
+    }
+
+    /// A reactive handle for app `app`'s latest announced release.
+    pub fn app_release(&self, app: &str, ttl: Option<&str>) -> Result<AppReleaseHandle> {
+        let r = self.releases.borrow();
+        let r = r
+            .as_ref()
+            .ok_or_else(|| Error::NoRemote("app_release() requires a remote endpoint".into()))?;
+        Ok(r.release(app, ttl))
+    }
+
+    // ---- buckets ---------------------------------------------------------------------
+
+    #[cfg(feature = "remote")]
+    fn remote_query(&self) -> Result<RemoteQuery> {
+        let remote = self
+            .remote
+            .clone()
+            .ok_or_else(|| Error::NoRemote("bucket() requires a remote endpoint".into()))?;
+        Ok(Rc::new(move |sql: String, vars: Option<Object>| {
+            let fut = remote.query(&sql, vars);
+            fut.boxed_local()
+        }))
+    }
+
+    #[cfg(not(feature = "remote"))]
+    fn remote_query(&self) -> Result<RemoteQuery> {
+        Err(Error::NoRemote("bucket() requires a remote endpoint".into()))
+    }
+
+    /// The cache namespace for the signed-in user: the per-user bucket id
+    /// the local store is split by.
+    pub fn blob_namespace(&self) -> String {
+        bucket_id_for_user(self.user_id().as_deref())
+    }
+
+    /// The one blob cache for this client, built on first use.
+    pub fn blob_cache(self: &Rc<Self>) -> Result<BlobCache> {
+        if let Some(c) = self.blobs.borrow().as_ref() {
+            return Ok(c.clone());
+        }
+        let cfg = &self.config.blob_cache;
+        let store: Rc<dyn BlobStore> = match &cfg.directory {
+            Some(dir) => Rc::new(FileBlobStore::new(dir.clone())),
+            None => Rc::new(MemoryBlobStore::default()),
+        };
+        let cache = BlobCache::new(store, BucketHandle::fetcher(self.remote_query()?), cfg.max_bytes)
+            .with_namespace(self.blob_namespace());
+        if cfg.clear_on_sign_out {
+            if let Some(auth) = &self.auth {
+                let last = Rc::new(RefCell::new(auth.user_id()));
+                let c = cache.clone();
+                auth.subscribe(move |user| {
+                    let previous = last.replace(user.map(str::to_string));
+                    if user.is_none() {
+                        if let Some(prev) = previous {
+                            let c = c.clone();
+                            tokio::task::spawn_local(async move {
+                                c.clear(Some(&bucket_id_for_user(Some(&prev)))).await;
+                            });
+                        }
+                    }
+                })
+                .forget();
+            }
+        }
+        *self.blobs.borrow_mut() = Some(cache.clone());
+        Ok(cache)
+    }
+
+    /// A handle to storage bucket `name`, reading through the blob cache.
+    pub fn bucket(self: &Rc<Self>, name: &str) -> Result<BucketHandle> {
+        let cache = self.blob_cache()?;
+        let weak = Rc::downgrade(self);
+        Ok(BucketHandle::new(name, self.remote_query()?)
+            .with_blobs(cache)
+            .with_namespace(Rc::new(move || {
+                let ns = weak
+                    .upgrade()
+                    .map(|e| e.blob_namespace())
+                    .unwrap_or_else(|| crate::modules::ref_tables::ANON_USER_ID.to_string());
+                async move { ns }.boxed_local()
+            })))
     }
 }
 

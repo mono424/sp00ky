@@ -160,7 +160,7 @@ impl Sp00kyClient {
     }
 
     /// Run `f` on the engine thread without waiting.
-    fn fire(&self, f: impl FnOnce(Rc<Worker>) + Send + 'static) {
+    pub(crate) fn fire(&self, f: impl FnOnce(Rc<Worker>) + Send + 'static) {
         let job: Job = Box::new(move |w| {
             f(w);
             async {}.boxed_local()

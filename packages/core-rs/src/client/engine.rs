@@ -115,6 +115,8 @@ pub struct Engine {
     checkpoint_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// Unsubscribes kept for the engine's lifetime.
     keep: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// Peer to peer channels (`client/channels.rs`).
+    pub(super) channels: crate::client::channels::ChannelSlot,
 }
 
 /// The tables the circuit primes from: every schema table.
@@ -308,6 +310,7 @@ impl Engine {
             closed: Cell::new(false),
             checkpoint_task: RefCell::new(None),
             keep: RefCell::new(Vec::new()),
+            channels: Default::default(),
         };
         Ok(engine)
     }
@@ -317,6 +320,7 @@ impl Engine {
     fn wire(self: &Rc<Self>) {
         let host: Rc<dyn QueryHost> = Rc::new(EngineHost(Rc::downgrade(self)));
         *self.host.borrow_mut() = Some(host.clone());
+        self.wire_channels();
         let Some(auth) = self.auth.clone() else { return };
 
         // Push what is already queued while the session is still valid.
@@ -565,6 +569,7 @@ impl Engine {
         for off in self.keep.borrow_mut().drain(..) {
             off();
         }
+        self.close_channels();
         #[cfg(feature = "remote")]
         if let Some(remote) = &self.remote {
             remote.set_on_handshake(None);
@@ -681,9 +686,9 @@ impl Engine {
             .map(|(hash, _)| hash)
     }
 
-    /// A registered query's rows, on every change. `immediate` replays the
-    /// current rows.
-    pub fn subscribe(&self, hash: &str, cb: impl Fn(&Arc<Vec<Row>>) + 'static, immediate: bool) -> Subscription {
+    /// A registered query's rows as the engine renders them, before any
+    /// channel overlay ([`Engine::subscribe`] folds peers' values in).
+    pub fn subscribe_records(&self, hash: &str, cb: impl Fn(&Arc<Vec<Row>>) + 'static, immediate: bool) -> Subscription {
         self.runtime.subscribe(hash, cb, immediate)
     }
 
@@ -755,8 +760,9 @@ impl Engine {
             .await
     }
 
-    /// Create `id` (`table:key`) with `data`, optimistically. Returns the row.
-    pub async fn create(&self, id: &str, data: Object) -> Result<Row> {
+    /// The optimistic create itself, without channel peers (see
+    /// [`Engine::create`]).
+    pub(super) async fn create_record(&self, id: &str, data: Object) -> Result<Row> {
         let out = self
             .write(write_saga::WriteInput {
                 kind: MutationEventType::Create,
@@ -768,8 +774,8 @@ impl Engine {
         Ok(out.record.unwrap_or_else(|| with_id(data, id)))
     }
 
-    /// Merge `data` into `id`, optimistically. Returns the row.
-    pub async fn update(&self, id: &str, data: Object, options: UpdateOptions) -> Result<Row> {
+    /// The optimistic update itself, without channel peers.
+    pub(super) async fn update_record(&self, id: &str, data: Object, options: UpdateOptions) -> Result<Row> {
         let out = self
             .write(write_saga::WriteInput {
                 kind: MutationEventType::Update,
@@ -781,8 +787,8 @@ impl Engine {
         Ok(out.record.unwrap_or_else(|| with_id(data, id)))
     }
 
-    /// Delete `id`, optimistically.
-    pub async fn delete(&self, id: &str) -> Result<()> {
+    /// The optimistic delete itself, without channel peers.
+    pub(super) async fn delete_record(&self, id: &str) -> Result<()> {
         self.write(write_saga::WriteInput {
             kind: MutationEventType::Delete,
             record_id: id.to_string(),

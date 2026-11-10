@@ -322,6 +322,10 @@ pub struct Sp00kyConfig {
     pub blob_cache: BlobCacheConfig,
     /// How often a dirty circuit is snapshotted to the local store (ms).
     pub circuit_checkpoint_ms: u64,
+    /// Peer to peer channels for `-- @channel` tables: accept rules, the
+    /// WebRTC stack, a custom transport. `None` uses the defaults (no WebRTC
+    /// stack, so channels report `unsupported` unless a transport is given).
+    pub channels: Option<crate::modules::channel::ChannelsConfig>,
 }
 
 impl Sp00kyConfig {
@@ -340,6 +344,7 @@ impl Sp00kyConfig {
             reconnect: ReconnectConfig::default(),
             blob_cache: BlobCacheConfig::default(),
             circuit_checkpoint_ms: 30_000,
+            channels: None,
         }
     }
 }

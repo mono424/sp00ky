@@ -329,8 +329,17 @@ export const db = new SyncedDb<typeof schema>(dbConfig);`;
 
 export const viteExcludeCode = `export default defineConfig({
   optimizeDeps: {
-    exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@spooky-sync/ssp-wasm'],
+    exclude: [
+      '@spooky-sync/client-react', // or your binding
+      '@spooky-sync/core',
+      '@spooky-sync/ssp-wasm',
+      '@surrealdb/wasm',
+      '@surrealdb/wasm-native',
+      '@sqlite.org/sqlite-wasm',
+    ],
+    include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch'],
   },
+  build: { target: 'esnext' },
 });`;
 
 export const workersCode = `// src/app/sp00ky-surreal.worker.ts contains one line:

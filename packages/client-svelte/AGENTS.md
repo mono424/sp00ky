@@ -51,7 +51,7 @@ Provider props: `config` (read once at mount; wrap in `{#key}` to switch databas
 
 Without the provider: create `new SyncedDb(config)`, `await db.init()` (e.g. in a SvelteKit `load`), and call `setDbContext(db)` while the root layout initialises.
 
-Vite needs `vite-plugin-wasm`, `vite-plugin-top-level-await`, `build.target: 'esnext'` and `optimizeDeps.exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']`.
+Vite needs `vite-plugin-wasm`, `build.target: 'esnext'`, `optimizeDeps.exclude: ['@spooky-sync/client-svelte', '@spooky-sync/core', '@spooky-sync/ssp-wasm', '@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']` and `optimizeDeps.include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch']`. Pre-bundled, the client looks for its `.wasm` files and workers in the wrong folder (dev only: a 404 or `expected magic word`); `vite-plugin-top-level-await` is not needed and crashes with current `@swc/core`.
 
 ## Key API
 

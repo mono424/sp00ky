@@ -6,25 +6,36 @@ The same content as the docs' [Svelte guide](https://mono424.github.io/sp00ky/do
 
 ```bash
 pnpm add @spooky-sync/core @spooky-sync/client-svelte
-pnpm add -D vite-plugin-wasm vite-plugin-top-level-await
+pnpm add -D vite-plugin-wasm
 ```
 
 ## 2. Configure Vite
 
-The core client loads its engines as WebAssembly. Keep them out of dependency pre-bundling:
+The core client loads its engines as WebAssembly and starts web workers, both found next to its own files. Keep the client's packages out of dependency pre-bundling (pre-bundled, they look in the wrong folder), pre-bundle the core's CommonJS dependencies instead, and build for `esnext`:
 
 ```ts
 // vite.config.ts
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte'; // SvelteKit: sveltekit() from '@sveltejs/kit/vite'
 import wasm from 'vite-plugin-wasm';
-import topLevelAwait from 'vite-plugin-top-level-await';
 
 export default defineConfig({
-  plugins: [svelte(), wasm(), topLevelAwait()],
+  plugins: [svelte(), wasm()],
   optimizeDeps: {
-    exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm'],
+    // Served as is: pre-bundled, these look for their .wasm files and
+    // workers in the wrong folder.
+    exclude: [
+      '@spooky-sync/client-svelte',
+      '@spooky-sync/core',
+      '@spooky-sync/ssp-wasm',
+      '@surrealdb/wasm',
+      '@surrealdb/wasm-native',
+      '@sqlite.org/sqlite-wasm',
+    ],
+    // The excluded core's CommonJS dependencies, pre-bundled for it.
+    include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch'],
   },
+  // The client uses top-level await.
   build: { target: 'esnext' },
 });
 ```

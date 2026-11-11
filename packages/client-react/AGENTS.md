@@ -36,7 +36,7 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
 
 Provider props: `config` (read once at mount; remount with a new `key` to switch databases), `fallback`, `preload` (awaited before children render, best-effort), `onReady`, `onError`. The client is created in an effect, so server renders show the fallback. A client that was handed to the tree is deliberately not closed on unmount; one whose init outlived the provider is.
 
-Vite needs `vite-plugin-wasm`, `vite-plugin-top-level-await`, `build.target: 'esnext'` and `optimizeDeps.exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']`.
+Vite needs `vite-plugin-wasm`, `build.target: 'esnext'`, `optimizeDeps.exclude: ['@spooky-sync/client-react', '@spooky-sync/core', '@spooky-sync/ssp-wasm', '@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']` and `optimizeDeps.include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch']`. Pre-bundled, the client looks for its `.wasm` files and workers in the wrong folder (dev only: a 404 or `expected magic word`); `vite-plugin-top-level-await` is not needed and crashes with current `@swc/core`.
 
 ## Key API
 

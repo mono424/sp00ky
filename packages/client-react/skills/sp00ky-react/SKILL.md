@@ -27,7 +27,7 @@ import { Sp00kyProvider } from '@spooky-sync/client-react';
 </Sp00kyProvider>
 ```
 
-`config` is read once at mount. Vite needs `vite-plugin-wasm`, `vite-plugin-top-level-await`, `build.target: 'esnext'` and `optimizeDeps.exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']`.
+`config` is read once at mount. Vite needs `vite-plugin-wasm`, `build.target: 'esnext'`, `optimizeDeps.exclude: ['@spooky-sync/client-react', '@spooky-sync/core', '@spooky-sync/ssp-wasm', '@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']` and `optimizeDeps.include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch']`. Pre-bundled, the client looks for its `.wasm` files and workers in the wrong folder (dev only: a 404 or `expected magic word`); `vite-plugin-top-level-await` is not needed and crashes with current `@swc/core`.
 
 ## Queries
 

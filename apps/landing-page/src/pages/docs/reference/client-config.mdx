@@ -58,6 +58,23 @@ session runs in memory and logs `falling back to in-memory` at error level;
 the next load tries IndexedDB again. Under `localEngine: 'sqlite'`,
 `'indexeddb'` selects the OPFS-backed SQLite store instead.
 
+#### `database.workers`
+
+Factories that start the local store's web worker, for a bundler that does not bundle a worker
+started inside a dependency. That is the Angular CLI; Vite, Rollup and webpack bundle the built-in
+workers on their own, so leave this unset there. Each factory starts a module worker whose entry
+imports the module the engine expects, and the app's build bundles that entry:
+
+| Key | Engine | Worker entry imports |
+|---|---|---|
+| `surreal` | default (`localEngine: 'surrealdb'`) | `@surrealdb/wasm/worker` |
+| `sqlite` | `localEngine: 'sqlite'` | `@spooky-sync/core/sqlite-worker` |
+
+<CodeBlock code={workersCode} lang="typescript" fileName="src/app/db.ts" />
+
+A factory left out falls back to the built-in worker. The full Angular CLI setup, including the
+`.wasm` files to copy, is in the [Angular guide](/docs/guide/angular#setup).
+
 #### `logLevel`
 
 Controls the verbosity of logging output:
@@ -237,6 +254,12 @@ export const code2 = `interface SyncedDbConfig<Schema> {
 
     /** Authentication token (optional) */
     token?: string;
+
+    /** Start the local store's worker yourself (Angular CLI only) */
+    workers?: {
+      surreal?: () => Worker;
+      sqlite?: () => Worker;
+    };
   };
 
   /** Persistence client: 'surrealdb' (default), 'localstorage', or custom */
@@ -309,3 +332,15 @@ export const viteExcludeCode = `export default defineConfig({
     exclude: ['@surrealdb/wasm', '@surrealdb/wasm-native', '@spooky-sync/ssp-wasm'],
   },
 });`;
+
+export const workersCode = `// src/app/sp00ky-surreal.worker.ts contains one line:
+//   import '@surrealdb/wasm/worker';
+database: {
+  namespace: 'main',
+  database: 'main',
+  store: 'indexeddb',
+  workers: {
+    surreal: () =>
+      new Worker(new URL('./sp00ky-surreal.worker', import.meta.url), { type: 'module' }),
+  },
+},`;

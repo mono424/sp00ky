@@ -2,7 +2,9 @@
   "name": "@spooky-sync/core",
   "version": "0.0.1-canary.382",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/sqlite-worker.js"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -25,6 +27,10 @@
     "./sw": {
       "types": "./dist/sw.d.ts",
       "import": "./dist/sw.js"
+    },
+    "./sqlite-worker": {
+      "types": "./dist/sqlite-worker.d.ts",
+      "import": "./dist/sqlite-worker.js"
     }
   },
   "scripts": {

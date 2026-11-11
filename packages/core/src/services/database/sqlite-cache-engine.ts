@@ -399,7 +399,7 @@ export class SqliteCacheEngine implements LocalStore {
    */
   /** Seam for tests: swap in a fake transport instead of a real Worker. */
   protected createTransport(): SqliteTransport {
-    return new WorkerSqliteTransport(this.logger);
+    return new WorkerSqliteTransport(this.logger, this.config.workers?.sqlite);
   }
 
   private async openInternal(

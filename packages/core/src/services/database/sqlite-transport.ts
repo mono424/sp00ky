@@ -104,7 +104,7 @@ export class WorkerSqliteTransport extends BaseTransport {
    *  (see sqlite-worker.ts). The engine must treat the store as gone. */
   onLockLost: ((reason: string) => void) | null = null;
 
-  constructor(logger: Logger) {
+  constructor(logger: Logger, createWorker?: () => Worker) {
     super(logger);
     // Source references the `.ts` so the monorepo's src-bundling consumers
     // (e.g. the example app, which aliases `@spooky-sync/core` to `src`)
@@ -113,7 +113,12 @@ export class WorkerSqliteTransport extends BaseTransport {
     // emitted entry; see tsdown.config.ts), which the flat `dist/index.js`
     // resolves. The worker (+ `@sqlite.org/sqlite-wasm`) still loads lazily —
     // only when `localEngine: 'sqlite'` is used.
-    this.worker = new Worker(new URL('./sqlite-worker.ts', import.meta.url), { type: 'module' });
+    // `createWorker` (`database.workers.sqlite`) is for bundlers that do not
+    // bundle this expression from a dependency (the Angular CLI); it starts
+    // the same entry, `@spooky-sync/core/sqlite-worker`, bundled by the app.
+    this.worker =
+      createWorker?.() ??
+      new Worker(new URL('./sqlite-worker.ts', import.meta.url), { type: 'module' });
     this.worker.onmessage = (ev: MessageEvent) => {
       // Unsolicited worker-initiated notification, not a reply.
       if (ev.data?.type === 'lock-lost') {

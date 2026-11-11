@@ -105,6 +105,30 @@ export interface EventSubscriptionOptions {
 }
 
 /**
+ * Factories for the local store's web workers (`database.workers`). Each one
+ * must start a MODULE worker (`{ type: 'module' }`) whose entry imports the
+ * module named below, bundled by the app's own build:
+ *
+ * ```ts
+ * // sp00ky-surreal.worker.ts
+ * import '@surrealdb/wasm/worker';
+ *
+ * // config
+ * workers: {
+ *   surreal: () => new Worker(new URL('./sp00ky-surreal.worker', import.meta.url), { type: 'module' }),
+ * }
+ * ```
+ *
+ * A factory left out falls back to the built-in worker.
+ */
+export interface LocalWorkers {
+  /** The default engine's worker (`localEngine: 'surrealdb'`): runs `@surrealdb/wasm/worker`. */
+  surreal?: () => Worker;
+  /** The SQLite engine's worker (`localEngine: 'sqlite'`): runs `@spooky-sync/core/sqlite-worker`. */
+  sqlite?: () => Worker;
+}
+
+/**
  * Configuration options for the Sp00ky client.
  * @template S The schema structure type.
  */
@@ -154,6 +178,13 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
      * not retried). `0` disables. Defaults to `30_000`.
      */
     localOpTimeoutMs?: number;
+    /**
+     * Start the local store's web worker yourself. Only needed under a bundler
+     * that does not bundle a worker started inside a dependency, which is the
+     * Angular CLI; Vite, Rollup and webpack bundle the built-in workers on
+     * their own, so leave it unset there. See {@link LocalWorkers}.
+     */
+    workers?: LocalWorkers;
   };
   /** The schema definition. */
   schema: S;

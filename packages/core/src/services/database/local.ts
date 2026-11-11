@@ -1,7 +1,7 @@
 import type { Diagnostic} from 'surrealdb';
 import { DEFAULT_LOCAL_OP_TIMEOUT_MS, LocalOpTimeoutError } from './errors';
 import { applyDiagnostics, DateTime, RecordId, Surreal } from 'surrealdb';
-import type { Sp00kyConfig } from '../../types';
+import type { LocalWorkers, Sp00kyConfig } from '../../types';
 import type { Logger } from '../logger/index';
 import { AbstractDatabaseService } from './database';
 import { createDatabaseEventSystem, DatabaseEventTypes } from './events/index';
@@ -61,12 +61,17 @@ function createBareSurrealClient(): Surreal {
  * only enters the graph as a separate chunk fetched on first connect (module-
  * cached thereafter — `switchStore`'s await is instant).
  */
-async function createLocalSurrealClient(logger: Logger): Promise<Surreal> {
+async function createLocalSurrealClient(
+  logger: Logger,
+  createWorker: LocalWorkers['surreal']
+): Promise<Surreal> {
   const { createWasmWorkerEngines } = await import('@surrealdb/wasm');
   return new Surreal({
     codecOptions: localCodecOptions,
     engines: applyDiagnostics(
-      createWasmWorkerEngines(),
+      // An app-supplied worker (`database.workers.surreal`) for bundlers that
+      // do not bundle the engine's own `new Worker(new URL(...))`.
+      createWasmWorkerEngines(createWorker ? { createWorker } : undefined),
       ({ key, type, phase, ...other }: Diagnostic) => {
         if (phase === 'progress' || phase === 'after') {
           logger.trace(
@@ -201,7 +206,7 @@ export class LocalDatabaseService extends AbstractDatabaseService {
     // Build the real engine-backed client lazily here (first `@surrealdb/wasm`
     // load), replacing the constructor's engine-less placeholder before any
     // query runs.
-    this.client = await createLocalSurrealClient(this.logger);
+    this.client = await createLocalSurrealClient(this.logger, this.config.workers?.surreal);
     await this.openWithRecovery(this.client, storeUrl, namespace, database, bucketId, store);
   }
 
@@ -246,7 +251,7 @@ export class LocalDatabaseService extends AbstractDatabaseService {
       return;
     }
 
-    const next = await createLocalSurrealClient(this.logger);
+    const next = await createLocalSurrealClient(this.logger, this.config.workers?.surreal);
     this.pendingSwitchClient = next;
     try {
       await this.openWithRecovery(

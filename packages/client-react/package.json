@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/client-react",
-  "version": "0.0.1-canary.382",
+  "version": "0.0.1-canary.383",
   "type": "module",
   "sideEffects": false,
   "description": "React bindings for the sp00ky local-first sync client",

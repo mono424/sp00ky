@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/ng-packagr/ng-package.schema.json",
+  "dest": "dist",
+  "deleteDestPath": true,
+  "lib": {
+    "entryFile": "src/public-api.ts"
+  },
+  "allowedNonPeerDependencies": [
+    "@spooky-sync/core",
+    "@spooky-sync/query-builder",
+    "@surrealdb/wasm",
+    "surrealdb"
+  ],
+  "assets": ["README.md", "AGENTS.md", "QUICK_START.md", "skills/**/*"]
+}

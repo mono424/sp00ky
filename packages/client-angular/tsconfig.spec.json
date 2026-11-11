@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./out-tsc/spec",
+    "noEmit": true,
+    "types": ["node", "vitest/globals"],
+    "paths": {
+      "@spooky-sync/client-angular": ["./dist"]
+    }
+  },
+  "include": ["test/**/*.ts"]
+}

@@ -65,7 +65,7 @@ it must be on a `@channel` table, and the channel's writes take that table's fie
 | `failed` | No connection could be made (see [networks](#networks-and-turn)). It keeps retrying. |
 | `unsupported` | No WebRTC in this runtime (SSR, tests), or a Dart client without `ChannelsConfig(rtc: ...)`. |
 
-In `@spooky-sync/client-react`, `useChannel(query, peers)` takes plain values (compared by value, `null` closes the channel) and returns `status` and `peers` as values. In `@spooky-sync/client-svelte` both arguments may be getters (`useChannel(() => query, () => peers)`) and `status` / `peers` are reactive getters. Outside components, `db.channel(query, peers)` returns the same handle; call `close()` when done.
+In `@spooky-sync/client-react`, `useChannel(query, peers)` takes plain values (compared by value, `null` closes the channel) and returns `status` and `peers` as values. In `@spooky-sync/client-svelte` both arguments may be getters (`useChannel(() => query, () => peers)`) and `status` / `peers` are reactive getters. In `@spooky-sync/client-angular`, `injectChannel(() => query, () => peers)` takes signals or functions and returns `status` and `peers` as signals. Outside components, `db.channel(query, peers)` returns the same handle; call `close()` when done.
 
 <Note title="Both sides must list each other">
   A connection only forms when each side's channel lists the other. Nobody can push themselves into

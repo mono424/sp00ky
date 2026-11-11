@@ -318,7 +318,10 @@ values: `useDownloadFile('avatars', path)` takes the path itself instead of an a
 [React guide](/docs/guide/react#files-and-images). The Svelte binding (`@spooky-sync/client-svelte`)
 takes paths as getters (`useDownloadFile('avatars', () => path)`), returns reactive getters, and its
 `<BucketImage>` takes `class` / `imgClass` and a `fallback` snippet. See the
-[Svelte guide](/docs/guide/svelte#files-and-images).
+[Svelte guide](/docs/guide/svelte#files-and-images). The Angular binding (`@spooky-sync/client-angular`)
+names them `injectFileUpload`, `injectDownloadFile('avatars', this.path)` and so on, returns
+signals, and renders `<sp00ky-bucket-image>` with its placeholder as projected content. See the
+[Angular guide](/docs/guide/angular#files-and-images).
 
 ### useFileUpload
 

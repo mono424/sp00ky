@@ -50,6 +50,17 @@ export const svelteCode = `<script lang="ts">
 
 {#each threads.data as t (String(t.id))}<li>{t.title}</li>{/each}`;
 
+export const angularCode = `@Component({
+  selector: 'app-threads',
+  template: '@for (t of threads.data(); track t.id) { <li>{{ t.title }}</li> }',
+})
+export class Threads {
+  private readonly db = injectDb<typeof schema>();
+  protected readonly threads = injectQuery(() =>
+    this.db.query('thread').orderBy('created_at', 'desc').limit(20).build()
+  );
+}`;
+
 export const flutterCode = `// db is the AppDb generated from your schema
 final Stream<List<Thread>> threads = db.thread
     .query()
@@ -87,8 +98,8 @@ const { hash } = await client
 const unsubscribe = await client.subscribe(hash, renderThreads, { immediate: true });`;
 
 sp00ky has one sync engine and a client for each place your app runs. The TypeScript core
-(`@spooky-sync/core`) runs in the browser, and the Solid, Solid 2, React and Svelte bindings wrap it in
-each framework's own reactivity. Flutter apps use the Dart client, and desktop apps, CLIs and
+(`@spooky-sync/core`) runs in the browser, and the Solid, Solid 2, React, Svelte and Angular bindings wrap
+it in each framework's own reactivity. Flutter apps use the Dart client, and desktop apps, CLIs and
 services use the Rust client. They all talk to the same server with the same protocol, so a web
 app, a phone and a desktop app can share one database and see each other's writes live.
 
@@ -100,6 +111,7 @@ app, a phone and a desktop app can share one database and see each other's write
 | Solid 2 (RC) | `@spooky-sync/client-solid2` | Browser, Solid 2.0 RC | [Solid 2 guide](/docs/guide/solid2) |
 | React | `@spooky-sync/client-react` | Browser, React 18 and 19 | [React guide](/docs/guide/react) |
 | Svelte | `@spooky-sync/client-svelte` | Browser, Svelte 5.29+ (runes) | [Svelte guide](/docs/guide/svelte) |
+| Angular | `@spooky-sync/client-angular` | Browser, Angular 21+ (signals) | [Angular guide](/docs/guide/angular) |
 | Flutter | `spooky_core` and `spooky_flutter` (Dart, from git) | Flutter apps on iOS and Android | [Flutter guide](/docs/guide/flutter) |
 | Rust | `spooky-core` crate (from git) | Desktop apps, CLIs and services | [Rust guide](/docs/guide/rust) |
 | Vanilla JS / TS | `@spooky-sync/core` | Browser, with any framework or none | [Vanilla guide](/docs/guide/vanilla) |
@@ -131,6 +143,10 @@ live: a local write, another tab or another device updates it without a refetch.
 
 <CodeBlock code={svelteCode} lang="svelte" />
 
+### Angular
+
+<CodeBlock code={angularCode} lang="typescript" />
+
 ### Flutter
 
 <CodeBlock code={flutterCode} lang="dart" />
@@ -151,6 +167,7 @@ live: a local write, another tab or another device updates it without a refetch.
 | Solid 2 | Accessors, plus `ready()` for `<Loading>` suspension | Same, plus `createSubmission` for button state | `isLoading()`, `isEmpty()`, `isSettled()` |
 | React | Plain values through `useSyncExternalStore`, rows keep their identity between updates | Same, plus `useSubmission` for button state | `isLoading`, `isEmpty`, `isSettled` |
 | Svelte | Reactive getters on runes: `threads.data`, rows keep their identity between updates | Same, plus `useSubmission` for button state | `isLoading`, `isEmpty`, `isSettled` |
+| Angular | Signals: `threads.data()`, rows keep their identity between updates | Same, plus `injectSubmission` for button state | `isLoading()`, `isEmpty()`, `isSettled()` |
 | Flutter | `Stream<List<T>>` from the generated `AppDb`, for a `StreamBuilder` | `create` / `update` / `delete` on the client or the typed tables | `isQueryAuthoritative`, `isQuerySettled` |
 | Rust | `LiveQuery`: `rows()` now, `changed().await` for each update | `create` / `update` / `delete`, typed structs from `build.rs` | `is_authoritative()` and `status()` on the live query |
 | Vanilla | `client.subscribe(hash, callback)` | `client.create` / `update` / `delete` | `subscribeQueryAuthority`, `subscribeQueryStatus` |
@@ -160,15 +177,15 @@ and the UI updates before the server answers.
 
 ## What each client supports
 
-| Feature | Solid | Solid 2 | React | Svelte | Flutter | Rust | Vanilla |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| [Live queries](/docs/client/queries), [mutations](/docs/client/mutations), [auth](/docs/client/auth) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| [Offline and sync health](/docs/client/offline-sync) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| [File buckets](/docs/client/buckets) | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `BucketImage` | Yes | Yes |
-| [Feature flags](/docs/client/feature-flags) and app releases | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| [CRDT fields](/docs/client/crdt) | Yes | Yes | Yes | Yes | No | No | Yes |
-| [Peer to peer channels](/docs/client/channels) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Push | [Web Push](/docs/client/push-notifications) | Web Push | Web Push | Web Push | [APNs and FCM](/docs/client/native-push) | APNs and FCM | Web Push |
+| Feature | Solid | Solid 2 | React | Svelte | Angular | Flutter | Rust | Vanilla |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [Live queries](/docs/client/queries), [mutations](/docs/client/mutations), [auth](/docs/client/auth) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| [Offline and sync health](/docs/client/offline-sync) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| [File buckets](/docs/client/buckets) | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `<BucketImage>` | Yes, with `<sp00ky-bucket-image>` | Yes, with `BucketImage` | Yes | Yes |
+| [Feature flags](/docs/client/feature-flags) and app releases | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| [CRDT fields](/docs/client/crdt) | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
+| [Peer to peer channels](/docs/client/channels) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Push | [Web Push](/docs/client/push-notifications) | Web Push | Web Push | Web Push | Web Push | [APNs and FCM](/docs/client/native-push) | APNs and FCM | Web Push |
 
 ## One schema, every client
 
@@ -202,6 +219,12 @@ See [Generated types](/docs/schema/generated-types).
     title="Svelte"
     icon="code"
     description="Svelte 5 runes: useQuery getters, snippets, attachments."
+  />
+  <LinkCard
+    href="/docs/guide/angular"
+    title="Angular"
+    icon="code"
+    description="Signals: provideSp00ky, injectQuery, standalone components."
   />
   <LinkCard
     href="/docs/guide/flutter"

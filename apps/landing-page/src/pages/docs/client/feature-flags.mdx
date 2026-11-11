@@ -52,6 +52,20 @@ export const svelteCode = `<script lang="ts">
   <LegacyCheckout />
 {/if}`;
 
+export const angularCode = `import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { injectFeatureFlag } from '@spooky-sync/client-angular';
+
+@Component({
+  selector: 'app-checkout',
+  imports: [RedesignedCheckout, LegacyCheckout],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template:
+    '@if (flag.enabled()) { <app-redesigned-checkout /> } @else { <app-legacy-checkout /> }',
+})
+export class Checkout {
+  protected readonly flag = injectFeatureFlag('new-checkout');
+}`;
+
 export const solidCode = `import { Show } from 'solid-js';
 import { useFeatureFlag } from '@spooky-sync/client-solid';
 
@@ -173,6 +187,12 @@ The returned object exposes:
 
 <CodeBlock code={svelteCode} lang="svelte" />
 
+### Angular
+
+`@spooky-sync/client-angular` exports it as `injectFeatureFlag`. Its fields are signals, and the handle closes with the injection context:
+
+<CodeBlock code={angularCode} lang="typescript" />
+
 ### Multi-variant flags
 
 For experiments with more than two variants, read `variant()` directly instead of `enabled()`. Each variant can carry an arbitrary JSON `payload` (configured on the flag definition's `payloads` map) that you read with `payload()`.
@@ -181,7 +201,7 @@ For experiments with more than two variants, read `variant()` directly instead o
 
 ### Vanilla JS / TS
 
-Outside of SolidJS, React and Svelte, call `feature()` on your `Sp00kyClient` directly. It returns a `FeatureFlagHandle` with the same `variant()` / `enabled()` / `payload()` methods plus a `subscribe()` for change notifications.
+Outside of SolidJS, React, Svelte and Angular, call `feature()` on your `Sp00kyClient` directly. It returns a `FeatureFlagHandle` with the same `variant()` / `enabled()` / `payload()` methods plus a `subscribe()` for change notifications.
 
 <CodeBlock code={vanillaCode} lang="typescript" />
 

@@ -77,9 +77,11 @@ component.
   known membership are painted, and `isEmpty()` is that answer being "no rows". See the
   [Solid 2 guide](/docs/guide/solid2#result-surface). The React binding
   (`@spooky-sync/client-react`) has the same flags as plain values: `useQuery(query)` returns
-  `{ data, isLoading, isEmpty, ... }`, see the [React guide](/docs/guide/react#result-surface).
+  `{ data, isLoading, isEmpty, ... }`, see the [React guide](/docs/guide/react#result).
   The Svelte binding (`@spooky-sync/client-svelte`) returns them as reactive getters from
-  `useQuery(() => query)`, see the [Svelte guide](/docs/guide/svelte#result-surface).
+  `useQuery(() => query)`, see the [Svelte guide](/docs/guide/svelte#result). The Angular
+  binding (`@spooky-sync/client-angular`) returns them as signals from `injectQuery(() => query)`
+  (`posts.isEmpty()`), see the [Angular guide](/docs/guide/angular#result).
 </Note>
 
 Two options are worth knowing:

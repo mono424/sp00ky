@@ -1,0 +1,737 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Angular guide
+description: "Build an Angular app on Sp00ky: provideSp00ky, live queries as signals, sign-in, writes, sync status, files, collaborative fields and peer to peer channels."
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Steps from '../../../components/ui/Steps.astro';
+import Step from '../../../components/ui/Step.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+`@spooky-sync/client-angular` connects Angular apps to Sp00ky, built on signals. A live query is an
+object of read-only signals (`posts.data()`, `posts.isLoading()`) that templates, `computed()` and
+`effect()` track like any other signal. Every write lands in the local database first, and the
+engine syncs it with the server and every other tab and device in the background. Reloads paint
+from the local cache, and the app keeps working offline.
+
+This guide builds a complete app: setup, queries, sign-in, writes, sync status, files,
+collaborative fields and peer to peer channels. It needs Angular 21 or newer, and works with
+zoneless and zone.js apps alike.
+
+<Warning title="Browser only">
+  The client runs SurrealDB and SQLite as WebAssembly with IndexedDB / OPFS storage and web
+  workers, so it only runs in the browser. During a server render `provideSp00ky` never starts it;
+  render the components that use it on the client, as shown in
+  [Server-side rendering](#server-side-rendering).
+</Warning>
+
+## Setup
+
+<Steps>
+  <Step title="Install">
+    <CodeBlock code={installCode} lang="bash" />
+
+    `@surrealdb/wasm` is installed directly because the app bundles its worker (next step). With
+    pnpm, hoist the packages whose `.wasm` files the build copies, so their paths exist:
+
+    <CodeBlock fileName=".npmrc" code={npmrcCode} lang="ini" />
+  </Step>
+
+  <Step title="Configure the Angular CLI">
+    The client starts web workers and loads `.wasm` files relative to its own modules. The Angular
+    CLI's builder does not bundle a worker started inside a dependency, and does not copy a `.wasm`
+    file a dependency references. So the app bundles the worker itself and copies the `.wasm` files
+    next to its chunks.
+
+    One worker entry for the local database engine, one line long:
+
+    <CodeBlock fileName="src/app/sp00ky-surreal.worker.ts" code={surrealWorkerCode} lang="typescript" />
+
+    A TypeScript config for workers, as `ng generate web-worker` creates (exclude
+    `src/**/*.worker.ts` from `tsconfig.app.json` too):
+
+    <CodeBlock fileName="tsconfig.worker.json" code={workerTsconfigCode} lang="json" />
+
+    Then, in `angular.json`, point the build at it, copy the `.wasm` files, and keep the client's
+    packages out of the dev server's dependency pre-bundling (pre-bundled, they look for their
+    `.wasm` files in the wrong folder):
+
+    <CodeBlock fileName="angular.json (projects.<app>.architect)" code={angularJsonCode} lang="json" />
+
+    `pino` is the client's logger; `allowedCommonJsDependencies` only silences the CommonJS
+    warning about it. With `localEngine: 'sqlite'`, add a second worker entry containing
+    `import '@spooky-sync/core/sqlite-worker';` and pass it as `database.workers.sqlite`.
+  </Step>
+
+  <Step title="Generate types">
+    <CodeBlock code={generateCode} lang="bash" />
+
+    `spky generate` writes the schema types for every client, see
+    [Generated types](/docs/schema/generated-types).
+  </Step>
+
+  <Step title="Configure the client">
+    <CodeBlock fileName="src/app/db.ts" code={configCode} lang="typescript" />
+
+    `database.workers.surreal` hands the client the worker the Angular CLI just bundled. Every other
+    key is documented in [Client config](/docs/reference/client-config).
+  </Step>
+
+  <Step title="Provide the client">
+    <CodeBlock fileName="src/app/app.config.ts" code={providerCode} lang="typescript" />
+
+    `provideSp00ky(config, { preload })` starts the client in an app initializer and runs `preload`
+    (best-effort) before the first render. Until then the root element of `index.html` keeps its
+    content, so put your splash there:
+
+    <CodeBlock fileName="src/index.html" code={indexHtmlCode} lang="html" />
+
+    If the client cannot start, bootstrap fails: handle it on `bootstrapApplication(...).catch(...)`.
+    `config` may also be a function, run in the injection context, to build the config from other
+    providers. The client is closed when the application is destroyed.
+  </Step>
+</Steps>
+
+## Queries
+
+`injectQuery(query, options?)` subscribes a component to a live query. It takes a function that
+builds the query: the function re-runs when the signals it reads change, and the query is
+re-registered only when its identity (its SurrealQL and vars) changes, not on every rebuild. Like
+every `inject*` function it runs in an injection context (a field initializer or the constructor)
+and ends with it; pass `{ injector }` to call it anywhere else.
+
+<CodeBlock fileName="src/app/post-list.ts" code={queryTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/post-list.html" code={queryHtmlCode} lang="angular-html" />
+
+Return `null` from the function (or pass `{ enabled: () => false }`) to skip a query until its
+inputs exist. Signal inputs work directly:
+
+<CodeBlock fileName="src/app/post-detail.ts" code={dependentCode} lang="typescript" />
+
+A query that never changes can be passed as is (`injectQuery(this.db.query('tag').build())`). The
+query builder itself (`where`, `related`, `orderBy`, `limit`, `one`) is covered in
+[Reactive queries](/docs/client/queries).
+
+<Note title="Call the field, keep the object">
+  Every field is a signal: read it as `posts.data()` in templates, `computed()` and `effect()`.
+  Keep the result object on the component and call fields where you need them; a field read once
+  in the constructor is a one-time copy.
+</Note>
+
+### Result
+
+Every field of the result is a read-only signal:
+
+| Field | Meaning |
+|---|---|
+| `data` | Rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared between updates: unchanged rows keep their object identity, and an update that changes nothing does not notify. |
+| `error` | Registration or sync error (e.g. SSP 503 during bootstrap). Never thrown; the sync scheduler retries underneath. |
+| `isLoading` | Cold first load only: nothing painted for this query, the server has not answered, and registration has not failed. A paint from the local cache ends it; the server answering with zero rows ends it too. |
+| `isFetching` | The sync engine is pulling records for this query (registration, a sync round). |
+| `isAuthoritative` | `data` holds the rendered rows of a known membership: the server's answer, or the one a previous session left on this device. From here `data` is an answer, not a cache guess. |
+| `hasData` | `data` holds something: rows for a list, a row for `.one()`. |
+| `isEmpty` | Authoritative **and** no data: the server said "no rows". Render empty states on this, never on a bare `!hasData()`. |
+| `isSettled` | Authoritative **and** idle. The gate for trusting a short window as the end of a list, and for "create it if it is missing". Not monotonic: a later sync round re-enters `isFetching`. |
+
+When the query's identity changes, the previous `data` stays on screen until the new query
+answers, while the flags reset. Growing a `.limit()` therefore never flashes an empty list:
+
+<CodeBlock code={loadMoreCode} lang="typescript" />
+
+Options: `{ enabled?: boolean | Signal<boolean>, deregisterOnCleanup?: boolean, injector?: Injector }`.
+Use `deregisterOnCleanup` for viewport windows that mount and unmount a query per page, see
+[Pagination](/docs/client/pagination).
+
+### Preloading
+
+`injectPreload(query)` warms the local cache for a query the user is likely to open next, without
+subscribing to it. When they navigate, the page paints from the cache immediately:
+
+<CodeBlock code={preloadCode} lang="typescript" />
+
+## Authentication
+
+Sign-in runs through the SurrealDB access methods in your schema, see
+[Authentication](/docs/client/auth). `db.auth.subscribe` reports the signed-in user id now and on
+every change, which makes a small service for the rest of the app:
+
+<CodeBlock fileName="src/app/auth.ts" code={authCode} lang="typescript" />
+
+A sign-in form wraps the call in `injectSubmission` for its pending and error state:
+
+<CodeBlock fileName="src/app/sign-in.ts" code={signInTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/sign-in.html" code={signInHtmlCode} lang="angular-html" />
+
+Every live query is scoped by your table permissions, so a user only ever syncs the rows they may
+read. `db.signOut()` ends the session and clears the local data.
+
+## Mutations
+
+Writes are plain calls on the client. Each one commits locally, re-renders every query it affects,
+and syncs in the background, offline included:
+
+<CodeBlock code={mutationCode} lang="typescript" />
+
+For button pending and error state, wrap the call in `injectSubmission`. `submit` never rejects; a
+failure lands in `error`. It only holds signals, so it needs no injection context:
+
+<CodeBlock fileName="src/app/new-post.ts" code={submissionTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/new-post.html" code={submissionHtmlCode} lang="angular-html" />
+
+An error there means the local commit failed. Sync failures surface through `injectSyncStatus` and
+`injectPendingMutations` instead. To track a backend job, query its outbox row: `db.run()` writes
+one with `status: 'pending'`. See [Mutations](/docs/client/mutations).
+
+## Sync status
+
+`injectSyncStatus` reports the connection, `injectPendingMutations` the number of writes not yet on
+the server. Together they make the usual offline banner:
+
+<CodeBlock fileName="src/app/connection-banner.ts" code={statusCode} lang="typescript" />
+
+| Function | Returns |
+|---|---|
+| `injectSyncStatus()` | `status`, `isHealthy`, `isDegraded`, `isOffline`, `isReconnecting`, `everConnected`, `connection`, `health` |
+| `injectPendingMutations()` | a signal: the number of local writes waiting to sync |
+| `injectSyncActivity(options?)` | `isDownloading`, `isUploading`, `fetchingQueries`, `pendingMutations`, debounced for a traffic indicator |
+| `injectStorageStatus()` | `status`, `isPersistent`, `isMemoryFallback`, `health` for the local database |
+
+What to show for each state is covered in [Offline & sync health](/docs/client/offline-sync).
+
+None of them needs a component. In a `providedIn: 'root'` service they live as long as the app,
+so one shared instance can serve every component:
+
+<CodeBlock fileName="src/app/sync-state.ts" code={serviceCode} lang="typescript" />
+
+## Feature flags and releases
+
+`injectFeatureFlag(key, options?)` reads a [feature flag](/docs/client/feature-flags) for the
+signed-in user and updates live when the assignment changes, so `spky flag enable` reaches open tabs
+without a reload. `injectAppRelease` tells a running tab that a newer frontend was deployed:
+
+<CodeBlock fileName="src/app/editor-toolbar.ts" code={flagsTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/editor-toolbar.html" code={flagsHtmlCode} lang="angular-html" />
+
+## Files and images
+
+[`injectFileUpload` and `injectDownloadFile`](/docs/client/buckets) upload to and read from a
+bucket. `<sp00ky-bucket-image>` renders a bucket file as an image, revealing it only once it is
+decoded, with the stored blurhash as a placeholder while it loads. Paths (and bucket names) may be
+signals. On a path change the previous object URL stays valid until the next one is ready, so the
+image never flashes broken.
+
+<CodeBlock fileName="src/app/avatar.ts" code={filesTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/avatar.html" code={filesHtmlCode} lang="angular-html" />
+
+The component's projected content is the bottom placeholder layer; the blurhash paints over it,
+and the image crossfades in once its bitmap is decoded. For custom markup, `injectBucketImage` plus
+the `sp00kyImageGate` directive set the `<img>`'s `src` and flip `ready` on decode, so do not bind
+`src` as well. `<canvas [sp00kyBlurhash]="hash">` paints a blurhash on its own:
+
+<CodeBlock code={gateCode} lang="angular-html" />
+
+## Collaborative fields
+
+A string field marked `@crdt` in the schema can be edited by several people at once.
+`injectCrdtField(table, id, field)` opens its document while the component lives. It returns a
+signal holding the `CrdtField`, or `null` until it has loaded; show the column's plain text until
+then:
+
+<CodeBlock fileName="src/app/note-summary.ts" code={crdtTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/note-summary.html" code={crdtHtmlCode} lang="angular-html" />
+
+Binding a rich text editor and showing remote cursors are covered in [CRDT fields](/docs/client/crdt).
+
+## Peer to peer channels
+
+`injectChannel(query, peers)` opens a [channel](/docs/client/channels) for the lifetime of the
+component, for fast-changing state such as drafts or cursors that should reach other peers
+directly. Both arguments may be signals or functions and are compared by value; a `null` query
+closes the channel.
+
+<CodeBlock code={channelCode} lang="typescript" />
+
+## Admin impersonation
+
+When an admin [impersonates](/docs/client/impersonation) a user, the client shows a warning banner.
+To render your own, set `impersonationBanner: { mode: 'custom' }` in the client config and call
+`injectImpersonation({ rendersBanner: true })`, which tells the client your banner is on screen:
+
+<CodeBlock fileName="src/app/impersonation-banner.ts" code={impersonationTsCode} lang="typescript" />
+
+<CodeBlock fileName="src/app/impersonation-banner.html" code={impersonationHtmlCode} lang="angular-html" />
+
+## Server-side rendering
+
+During a server render, `provideSp00ky` never starts the client, and every `inject*` function that
+talks to it throws an error that says so. Keep the components that use it out of the server render:
+
+<CodeBlock code={deferCode} lang="angular-html" />
+
+A `@defer` block renders its `@placeholder` on the server and its content in the browser. For a
+whole route, use `renderMode: RenderMode.Client` in `app.routes.server.ts`. The browser paints from
+the local cache anyway, so little is lost.
+
+## Testing
+
+`SyncedDb` is the DI token, so a test provides its own client:
+
+<CodeBlock code={testingCode} lang="typescript" />
+
+## Next
+
+<CardGrid>
+  <LinkCard
+    href="/docs/client/queries"
+    title="Reactive queries"
+    icon="live"
+    description="Filters, relations, ordering and pagination."
+  />
+  <LinkCard
+    href="/docs/client/mutations"
+    title="Mutations"
+    icon="pen"
+    description="Create, update, delete and backend jobs."
+  />
+  <LinkCard
+    href="/docs/reference/client-config"
+    title="Client config"
+    icon="config"
+    description="Every key of SyncedDbConfig."
+  />
+  <LinkCard
+    href="/docs/client/offline-sync"
+    title="Offline & sync health"
+    icon="sync"
+    description="What to show when the connection drops."
+  />
+</CardGrid>
+
+export const installCode = `pnpm add @spooky-sync/core @spooky-sync/client-angular @surrealdb/wasm`;
+
+export const npmrcCode = `public-hoist-pattern[]=@spooky-sync/ssp-wasm
+public-hoist-pattern[]=@surrealdb/wasm-native
+public-hoist-pattern[]=@sqlite.org/sqlite-wasm`;
+
+export const surrealWorkerCode = `// The local SurrealDB engine's worker, bundled by the Angular CLI.
+import '@surrealdb/wasm/worker';`;
+
+export const workerTsconfigCode = `{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./out-tsc/worker",
+    "lib": ["es2022", "webworker"],
+    "types": []
+  },
+  "include": ["src/**/*.worker.ts"]
+}`;
+
+export const angularJsonCode = `"build": {
+  "builder": "@angular/build:application",
+  "options": {
+    "browser": "src/main.ts",
+    "tsConfig": "tsconfig.app.json",
+    "webWorkerTsConfig": "tsconfig.worker.json",
+    "allowedCommonJsDependencies": ["pino"],
+    "assets": [
+      { "glob": "**/*", "input": "public" },
+      { "glob": "ssp_wasm_bg.wasm", "input": "node_modules/@spooky-sync/ssp-wasm/pkg", "output": "/" },
+      { "glob": "index_bg.wasm", "input": "node_modules/@surrealdb/wasm-native/dist", "output": "/" },
+      { "glob": "tabs-broker-worker.js", "input": "node_modules/@spooky-sync/core/dist", "output": "/" },
+      {
+        "glob": "{sqlite3.wasm,sqlite3-opfs-async-proxy.js}",
+        "input": "node_modules/@sqlite.org/sqlite-wasm/dist",
+        "output": "/"
+      }
+    ]
+  }
+},
+"serve": {
+  "builder": "@angular/build:dev-server",
+  "options": {
+    "prebundle": {
+      "exclude": [
+        "@spooky-sync/client-angular",
+        "@spooky-sync/core",
+        "@spooky-sync/ssp-wasm",
+        "@surrealdb/wasm",
+        "@surrealdb/wasm-native",
+        "@sqlite.org/sqlite-wasm"
+      ]
+    }
+  }
+}`;
+
+export const generateCode = `spky generate`;
+
+export const configCode = `import type { SyncedDbConfig } from '@spooky-sync/client-angular';
+import { schema, SURQL_SCHEMA } from './schema.gen';
+
+export const dbConfig: SyncedDbConfig<typeof schema> = {
+  logLevel: 'info',
+  schema,
+  schemaSurql: SURQL_SCHEMA,
+  database: {
+    namespace: 'main',
+    database: 'main',
+    // spky dev exposes SurrealDB on 8666 by default.
+    endpoint: 'ws://localhost:8666/rpc',
+    store: 'indexeddb',
+    workers: {
+      surreal: () =>
+        new Worker(new URL('./sp00ky-surreal.worker', import.meta.url), { type: 'module' }),
+    },
+  },
+};`;
+
+export const providerCode = `import {
+  type ApplicationConfig,
+  provideBrowserGlobalErrorListeners,
+  provideZonelessChangeDetection,
+} from '@angular/core';
+import { provideRouter } from '@angular/router';
+import { provideSp00ky } from '@spooky-sync/client-angular';
+import { routes } from './app.routes';
+import { dbConfig } from './db';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideBrowserGlobalErrorListeners(),
+    provideZonelessChangeDetection(),
+    provideRouter(routes),
+    provideSp00ky(dbConfig, {
+      // Optional: warm the local cache before the first render.
+      preload: (db) => db.preload(db.query('config').build()),
+    }),
+  ],
+};`;
+
+export const indexHtmlCode = `<body>
+  <app-root><div class="splash">Initializing database…</div></app-root>
+</body>`;
+
+export const queryTsCode = `import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { injectDb, injectQuery } from '@spooky-sync/client-angular';
+import type { schema } from './schema.gen';
+
+@Component({
+  selector: 'app-post-list',
+  templateUrl: './post-list.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class PostList {
+  private readonly db = injectDb<typeof schema>();
+
+  protected readonly posts = injectQuery(() =>
+    this.db.query('post').related('author').orderBy('created_at', 'desc').limit(20).build()
+  );
+}`;
+
+export const queryHtmlCode = `@if (posts.isLoading()) {
+  <p>Loading…</p>
+} @else if (posts.isEmpty()) {
+  <p>No posts yet.</p>
+} @else {
+  <ul>
+    @for (post of posts.data(); track post.id) {
+      <li>{{ post.title }} by {{ post.author?.username }}</li>
+    }
+  </ul>
+}`;
+
+export const dependentCode = `export class PostDetail {
+  private readonly db = injectDb<typeof schema>();
+  readonly postId = input<string | null>(null);
+
+  protected readonly post = injectQuery(() => {
+    const id = this.postId();
+    return id ? this.db.query('post').where({ id }).one().build() : null;
+  });
+}`;
+
+export const loadMoreCode = `protected readonly limit = signal(20);
+protected readonly posts = injectQuery(() =>
+  this.db.query('post').orderBy('created_at', 'desc').limit(this.limit()).build()
+);
+
+// <button [disabled]="!posts.isSettled()" (click)="limit.update((n) => n + 20)">Load more</button>`;
+
+export const preloadCode = `export class ThreadRow {
+  private readonly db = injectDb<typeof schema>();
+  readonly id = input.required<string>();
+
+  constructor() {
+    injectPreload(() =>
+      this.db.query('thread').where({ id: this.id() }).related('comments').one().build()
+    );
+  }
+}`;
+
+export const mutationCode = `await this.db.create('post:' + crypto.randomUUID(), { title: 'Hi' });
+await this.db.update('post', 'post:xyz', { title: 'Edited' });
+await this.db.delete('post', row.id);
+await this.db.run('backend', 'sendMail', { to });`;
+
+export const submissionTsCode = `import { ChangeDetectionStrategy, Component, signal } from '@angular/core';
+import { injectDb, injectSubmission } from '@spooky-sync/client-angular';
+import type { schema } from './schema.gen';
+
+@Component({
+  selector: 'app-new-post',
+  templateUrl: './new-post.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class NewPost {
+  private readonly db = injectDb<typeof schema>();
+  protected readonly title = signal('');
+
+  protected readonly save = injectSubmission((title: string) =>
+    this.db.create('post:' + crypto.randomUUID(), { title })
+  );
+}`;
+
+export const submissionHtmlCode = `<form (submit)="$event.preventDefault(); save.submit(title())">
+  <input [value]="title()" (input)="title.set($any($event.target).value)" />
+  <button [disabled]="save.pending()">Save</button>
+  @if (save.error(); as error) {
+    <p>{{ error.message }}</p>
+  }
+</form>`;
+
+export const statusCode = `import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { injectPendingMutations, injectSyncStatus } from '@spooky-sync/client-angular';
+
+@Component({
+  selector: 'app-connection-banner',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template:
+    '@if (sync.isDegraded()) { <p class="banner">Cannot reach the server, {{ pending() }} change(s) queued.</p> }',
+})
+export class ConnectionBanner {
+  protected readonly sync = injectSyncStatus();
+  protected readonly pending = injectPendingMutations();
+}`;
+
+export const serviceCode = `import { Injectable } from '@angular/core';
+import { injectSyncActivity, injectSyncStatus } from '@spooky-sync/client-angular';
+
+@Injectable({ providedIn: 'root' })
+export class SyncState {
+  readonly status = injectSyncStatus();
+  readonly activity = injectSyncActivity({ downloadDelayMs: 200 });
+}`;
+
+export const deferCode = `@defer {
+  <app-post-list />
+} @placeholder {
+  <p>Loading posts…</p>
+}`;
+
+export const filesTsCode = `import { ChangeDetectionStrategy, Component, input } from '@angular/core';
+import { BucketImage, injectFileUpload } from '@spooky-sync/client-angular';
+
+@Component({
+  selector: 'app-avatar',
+  imports: [BucketImage],
+  templateUrl: './avatar.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class Avatar {
+  readonly path = input<string | null>(null);
+  protected readonly files = injectFileUpload('avatars');
+
+  protected pick(event: Event): void {
+    const file = (event.target as HTMLInputElement).files?.[0];
+    if (file) void this.files.upload(crypto.randomUUID() + '.png', file);
+  }
+}`;
+
+export const filesHtmlCode = `<sp00ky-bucket-image bucket="avatars" [path]="path()" class="h-12 w-12 rounded-full" alt="">
+  <div class="h-full w-full bg-neutral-200"></div>
+</sp00ky-bucket-image>
+
+<input type="file" [disabled]="files.isUploading()" (change)="pick($event)" />`;
+
+export const gateCode = `<!-- cover = injectBucketImage('covers', this.coverKey) in the component -->
+<div class="relative">
+  <canvas [sp00kyBlurhash]="cover.blurhash()" class="absolute inset-0 h-full w-full"></canvas>
+  <img [sp00kyImageGate]="cover" alt="" [style.opacity]="cover.ready() ? 1 : 0" />
+</div>`;
+
+export const channelCode = `readonly convoId = input.required<string>();
+readonly channel = injectChannel(
+  () => this.db.query('message').where({ conversation: this.convoId() }),
+  () => [this.me(), this.other()]
+);
+
+// channel.status(): 'idle' | 'connecting' | 'connected' | 'failed' | 'unsupported'
+await this.channel.update('message', id, { draft: text });`;
+
+export const testingCode = `TestBed.configureTestingModule({
+  providers: [
+    provideZonelessChangeDetection(),
+    { provide: SyncedDb, useValue: fakeDb },
+  ],
+});`;
+
+export const authCode = `import { computed, DestroyRef, inject, Injectable, signal } from '@angular/core';
+import { injectDb } from '@spooky-sync/client-angular';
+import type { schema } from './schema.gen';
+
+@Injectable({ providedIn: 'root' })
+export class Auth {
+  private readonly db = injectDb<typeof schema>();
+
+  /** undefined until the client reports, then a user id or null. */
+  readonly userId = signal<string | null | undefined>(undefined);
+  readonly isChecking = computed(() => this.userId() === undefined);
+
+  constructor() {
+    // subscribe() answers right away with the current user, then on every
+    // sign-in and sign-out. It returns the unsubscribe, run when the app ends.
+    inject(DestroyRef).onDestroy(this.db.auth.subscribe((id) => this.userId.set(id)));
+  }
+
+  signIn(username: string, password: string) {
+    return this.db.auth.signIn('account', { username, password });
+  }
+
+  signUp(username: string, password: string) {
+    return this.db.auth.signUp('account', { username, password });
+  }
+
+  signOut() {
+    return this.db.signOut();
+  }
+}`;
+
+export const signInTsCode = `import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { injectSubmission } from '@spooky-sync/client-angular';
+import { Auth } from './auth';
+
+@Component({
+  selector: 'app-sign-in',
+  templateUrl: './sign-in.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class SignIn {
+  protected readonly auth = inject(Auth);
+  protected readonly username = signal('');
+  protected readonly password = signal('');
+  protected readonly signIn = injectSubmission((username: string, password: string) =>
+    this.auth.signIn(username, password)
+  );
+}`;
+
+export const signInHtmlCode = `@if (auth.userId()) {
+  <button (click)="auth.signOut()">Sign out</button>
+} @else if (!auth.isChecking()) {
+  <form (submit)="$event.preventDefault(); signIn.submit(username(), password())">
+    <input [value]="username()" (input)="username.set($any($event.target).value)" />
+    <input
+      type="password"
+      [value]="password()"
+      (input)="password.set($any($event.target).value)"
+    />
+    <button [disabled]="signIn.pending()">Sign in</button>
+    @if (signIn.error(); as error) {
+      <p>{{ error.message }}</p>
+    }
+  </form>
+}`;
+
+export const flagsTsCode = `import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { injectAppRelease, injectFeatureFlag } from '@spooky-sync/client-angular';
+import { APP_VERSION } from '../version';
+
+@Component({
+  selector: 'app-editor-toolbar',
+  imports: [NewEditorButton, EditorButton],
+  templateUrl: './editor-toolbar.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class EditorToolbar {
+  protected readonly newEditor = injectFeatureFlag('new-editor', { fallback: 'off' });
+  protected readonly release = injectAppRelease({ app: 'web', currentVersion: APP_VERSION });
+}`;
+
+export const flagsHtmlCode = `@if (newEditor.enabled()) {
+  <app-new-editor-button />
+} @else {
+  <app-editor-button />
+}
+
+@if (release.updateAvailable()) {
+  <button (click)="release.reload()">Update to {{ release.latestVersion() }}</button>
+}`;
+
+export const crdtTsCode = `import { ChangeDetectionStrategy, Component, effect, input, signal } from '@angular/core';
+import { injectCrdtField } from '@spooky-sync/client-angular';
+
+@Component({
+  selector: 'app-note-summary',
+  templateUrl: './note-summary.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class NoteSummary {
+  /** The full record id, e.g. 'note:abc'. */
+  readonly id = input.required<string>();
+  /** The column's plain text, shown until the document has loaded. */
+  readonly summary = input.required<string>();
+
+  protected readonly field = injectCrdtField('note', this.id, 'summary');
+  protected readonly value = signal('');
+
+  constructor() {
+    // Follow the document: local and remote edits alike update the textarea.
+    effect((onCleanup) => {
+      const doc = this.field()?.getDoc();
+      if (!doc) return;
+      const text = doc.getText('summary');
+      this.value.set(text.toString());
+      onCleanup(doc.subscribe(() => this.value.set(text.toString())));
+    });
+  }
+
+  protected edit(event: Event): void {
+    const doc = this.field()?.getDoc();
+    if (!doc) return;
+    doc.getText('summary').update((event.target as HTMLTextAreaElement).value); // minimal diff
+    doc.commit();
+  }
+}`;
+
+export const crdtHtmlCode = `<textarea
+  [value]="field() ? value() : summary()"
+  [readOnly]="!field()"
+  (input)="edit($event)"
+></textarea>`;
+
+export const impersonationTsCode = `import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { injectImpersonation } from '@spooky-sync/client-angular';
+
+@Component({
+  selector: 'app-impersonation-banner',
+  templateUrl: './impersonation-banner.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class ImpersonationBanner {
+  protected readonly imp = injectImpersonation({ rendersBanner: true });
+}`;
+
+export const impersonationHtmlCode = `@if (imp.impersonation(); as active) {
+  <div class="banner">
+    Acting as {{ active.target }}
+    <button (click)="imp.stop()">Stop</button>
+  </div>
+}`;

@@ -1,0 +1,58 @@
+{
+  "name": "@spooky-sync/client-angular",
+  "version": "0.0.1-canary.382",
+  "description": "Angular (signals) bindings for the sp00ky local-first sync client",
+  "keywords": [
+    "surrealdb",
+    "database",
+    "browser",
+    "offline",
+    "sync",
+    "angular",
+    "signals",
+    "local-first",
+    "tanstack-intent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mono424/sp00ky.git",
+    "directory": "packages/client-angular"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "ng-packagr -p ng-package.json -c tsconfig.lib.json",
+    "dev": "ng-packagr -p ng-package.json -c tsconfig.lib.json --watch",
+    "test": "pnpm run build && vitest run",
+    "type-check": "ngc -p tsconfig.lib.json --noEmit && tsc -p tsconfig.spec.json --noEmit"
+  },
+  "dependencies": {
+    "@spooky-sync/core": "workspace:*",
+    "@spooky-sync/query-builder": "workspace:*",
+    "@surrealdb/wasm": "^3.1.0",
+    "surrealdb": "2.1.0",
+    "tslib": "^2.3.0"
+  },
+  "peerDependencies": {
+    "@angular/common": "^21.0.0 || ^22.0.0",
+    "@angular/core": "^21.0.0 || ^22.0.0"
+  },
+  "devDependencies": {
+    "@angular/common": "~21.2.0",
+    "@angular/compiler": "~21.2.0",
+    "@angular/compiler-cli": "~21.2.0",
+    "@angular/core": "~21.2.0",
+    "@angular/platform-browser": "~21.2.0",
+    "@types/node": "^22.5.2",
+    "happy-dom": "^21.0.4",
+    "ng-packagr": "~21.2.0",
+    "rxjs": "^7.8.0",
+    "typescript": "~5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

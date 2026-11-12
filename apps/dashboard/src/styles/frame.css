@@ -7069,3 +7069,41 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
   /* the drawer */
   .shell:has(.cx-rail) .sidebar.cx-rail { background: var(--rail-bg); border-right: 0; box-shadow: 16px 0 48px -12px rgba(0, 0, 0, 0.6); }
 }
+
+/* ---- burger: two lines, the lower one short. Hover draws it out to full,
+   open folds both into an X with a small overshoot. ---- */
+@media (max-width: 860px) {
+  .shell:has(.cx-rail) .burger {
+    position: relative;
+    display: block;
+    padding: 0;
+  }
+  .shell:has(.cx-rail) .burger span {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    width: 16px;
+    height: 1.75px;
+    margin-top: -0.875px;
+    background: #c4c4c4;
+    transform-origin: 50% 50%;
+    transition:
+      transform 0.38s cubic-bezier(0.34, 1.45, 0.5, 1),
+      width 0.24s cubic-bezier(0.2, 0.7, 0.2, 1),
+      opacity 0.18s ease,
+      background-color 0.2s ease;
+  }
+  .shell:has(.cx-rail) .burger span:nth-child(1) { transform: translateY(-3.5px); }
+  .shell:has(.cx-rail) .burger span:nth-child(2) { opacity: 0; transform: scaleX(0); }
+  .shell:has(.cx-rail) .burger span:nth-child(3) { width: 10px; transform: translateY(3.5px); }
+  .shell:has(.cx-rail) .burger:hover span:nth-child(3) { width: 16px; }
+  .shell:has(.cx-rail) .burger:active { transform: scale(0.94); }
+  .shell:has(.cx-rail) .burger { transition: background-color 0.15s ease, transform 0.12s ease; }
+
+  .shell:has(.cx-rail) .burger.open span { background: #ededed; }
+  .shell:has(.cx-rail) .burger.open span:nth-child(1) { transform: translateY(0) rotate(45deg); }
+  .shell:has(.cx-rail) .burger.open span:nth-child(3) { width: 16px; transform: translateY(0) rotate(-45deg); }
+}
+@media (max-width: 860px) and (prefers-reduced-motion: reduce) {
+  .shell:has(.cx-rail) .burger span { transition: none; }
+}

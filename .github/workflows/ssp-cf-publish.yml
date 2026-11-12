@@ -55,9 +55,12 @@ jobs:
         with:
           workspaces: apps/ssp-cf
 
+      # Pinned: worker-build 0.9.0 (2026-11-11) refuses the `worker` 0.8 crate
+      # apps/ssp-cf builds against, which failed canary.384's publish. Move both
+      # together.
       - name: Install worker-build
         if: steps.guard.outputs.skip != 'true'
-        run: cargo install -q worker-build
+        run: cargo install -q worker-build --version 0.8.7
 
       - name: Build ssp-cf worker
         if: steps.guard.outputs.skip != 'true'

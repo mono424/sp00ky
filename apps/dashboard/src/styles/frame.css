@@ -6997,17 +6997,17 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
   .shell:has(.cx-rail) { background: var(--rail-bg, #161616); }
   .shell:has(.cx-rail) { --rail-bg: #161616; }
   .shell:has(.cx-rail) .sidebar.cx-rail { border-right: 0; }
-  .shell:has(.cx-rail) .main-frame { padding: 8px 8px 8px 0; background: var(--rail-bg); }
+  .shell:has(.cx-rail) .main-frame { padding: 4px 4px 4px 0; background: var(--rail-bg); }
   .shell:has(.cx-rail) .main-frame > .main {
     margin-left: 0;
     padding-left: 0;
     background: var(--bg);
     border: 1px solid rgba(255, 255, 255, 0.07);
-    border-radius: 14px !important;
+    border-radius: 12px !important;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.02);
   }
   /* the sticky bar follows the card's top corners */
-  .shell:has(.cx-rail) .main .page-head { border-radius: 14px 14px 0 0 !important; }
+  .shell:has(.cx-rail) .main .page-head { border-radius: 12px 12px 0 0 !important; }
   .shell:has(.cx-rail) .main-frame > .main .page-head::before { display: none; }
 }
 

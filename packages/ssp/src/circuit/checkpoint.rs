@@ -87,7 +87,7 @@
 
 #[cfg(all(feature = "mmap-store", not(target_arch = "wasm32")))]
 use crate::circuit::arena::ImageRef;
-use crate::circuit::arena::{Arena, HeapArena};
+use crate::circuit::arena::{Arena, Cursor as ArenaCursor, HeapArena, Span};
 use crate::circuit::row_codec::{self as codec, FieldDict, RECORD_FORMAT};
 use crate::circuit::row_table::AbsorbInto;
 pub use crate::circuit::row_table::CheckpointMark;
@@ -205,30 +205,144 @@ struct ImageHeader<'a> {
     field_names: Vec<&'a str>,
 }
 
-/// One row as the writer sees it.
-enum Rec<'a> {
-    Row { head: &'a [u8], body: &'a [u8] },
-    Tombstone(&'a str),
+/// Arena bytes a writer copies under one hold of the table's lock: enough
+/// that the cost of taking the lock disappears, few enough that an ingest
+/// waiting for the lock waits milliseconds rather than for the whole table.
+/// A test build uses a few rows per chunk, so ingest gets between many.
+pub const WRITE_CHUNK_BYTES: usize = if cfg!(test) { 64 } else { 4 << 20 };
+
+/// One table's rows as a checkpoint writes them, taken under one short lock:
+/// where each record lies in the arena, never the bytes.
+///
+/// The arena only appends and moves nothing until the table is cleared,
+/// which starts a new epoch (compaction clears too). So the spans name
+/// exactly these bytes for as long as the epoch lasts, and [`write_snapshot`]
+/// copies them a chunk at a time, each chunk under its own short hold of the
+/// lock, while ingest carries on in between. What ingest changes meanwhile
+/// lands past the snapshot's mark, which is what the next delta carries.
+///
+/// Before this, one read lock was held for the whole encode and file write of
+/// a table. On whitepawn (2026-11-10) a 1.1 GB table took 100 to 205 s to
+/// write at a 2 GiB memory cap, every ingest waited for it, and live sync
+/// stopped for minutes every 5.5 hours.
+#[derive(Debug)]
+pub struct TableSnapshot {
+    name: String,
+    epoch: u64,
+    mark: CheckpointMark,
+    catchup_xor: [u8; XOR_LEN],
+    field_names: Vec<String>,
+    /// `(head, body)` of each row the file carries, in arena order.
+    records: Vec<(Span, Span)>,
+    /// Ids a delta deletes.
+    tombstones: Vec<String>,
+    delta: bool,
 }
 
-/// Write `coll`'s rows to `out` as a base image carrying `image_id`.
+impl TableSnapshot {
+    /// Every row of `coll`, for a base image, for a writer that lets go of
+    /// the table while it writes. From here on the table records removals,
+    /// watermark or not, until [`RowTable::mark_persisted`] lands this
+    /// snapshot's mark or [`RowTable::abandon_checkpoint`] gives it up.
+    pub fn full(coll: &Collection) -> Self {
+        Self::take(coll, None, Vec::new(), false, true)
+    }
+
+    /// The rows changed since `coll`'s watermark and the ids deleted since,
+    /// for a delta. Refused when the table has no watermark: nothing of it is
+    /// on disk, so there is nothing to extend.
+    pub fn delta(coll: &Collection) -> io::Result<Self> {
+        Self::delta_of(coll, true)
+    }
+
+    fn delta_of(coll: &Collection, record: bool) -> io::Result<Self> {
+        let Some(since) = coll.rows.persisted() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the table has no checkpoint to extend",
+            ));
+        };
+        let tombstones = coll.rows.tombstones_pending().into_iter().map(str::to_string).collect();
+        Ok(Self::take(coll, Some(since), tombstones, true, record))
+    }
+
+    /// `record`: start recording removals, for a writer that lets go of the
+    /// table before its mark lands. A writer holding the table throughout
+    /// does not; neither do the clients that save a store image and never
+    /// mark it, which would otherwise keep every removed id.
+    fn take(coll: &Collection, since: Option<ArenaCursor>, tombstones: Vec<String>, delta: bool, record: bool) -> Self {
+        Self {
+            name: coll.name.clone(),
+            epoch: coll.rows.epoch(),
+            mark: if record { coll.rows.begin_checkpoint() } else { coll.rows.checkpoint_mark() },
+            catchup_xor: coll.catchup_xor,
+            field_names: coll.rows.dict().names().map(str::to_string).collect(),
+            records: coll.rows.record_spans(since),
+            tombstones,
+            delta,
+        }
+    }
+
+    pub fn is_delta(&self) -> bool {
+        self.delta
+    }
+
+    /// What the file covers of the table: for [`RowTable::mark_persisted`]
+    /// once it is in place, or [`RowTable::abandon_checkpoint`] if it never is.
+    pub fn mark(&self) -> CheckpointMark {
+        self.mark
+    }
+
+    /// The table's catch-up hash when the snapshot was taken, which is what
+    /// the file declares.
+    pub fn catchup_xor(&self) -> [u8; XOR_LEN] {
+        self.catchup_xor
+    }
+}
+
+/// What a writer does with the table for one chunk.
+pub type VisitRows<'a> = dyn FnMut(&RowTable) -> io::Result<()> + 'a;
+
+/// How a writer reaches the table a snapshot was taken of, once per chunk:
+/// run the visitor on the table's rows under the lock that guards them, then
+/// let go. A table that is no longer there is a [`TableChanged`] error.
+pub type LendRows<'a> = dyn FnMut(&mut VisitRows<'_>) -> io::Result<()> + 'a;
+
+/// The table was cleared, compacted or replaced before its checkpoint was
+/// written: the bytes the snapshot named are gone. Not a failure of the
+/// disk; the next write starts over from the table as it is then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableChanged;
+
+impl std::fmt::Display for TableChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the table was cleared or replaced while its checkpoint was written")
+    }
+}
+
+impl std::error::Error for TableChanged {}
+
+impl TableChanged {
+    pub fn error() -> io::Error {
+        io::Error::other(TableChanged)
+    }
+
+    /// Whether `e` is this, rather than a real I/O failure.
+    pub fn is(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<TableChanged>())
+    }
+}
+
+/// Lend `rows` as they are: for a caller that already holds the table.
+fn held(rows: &RowTable) -> impl FnMut(&mut VisitRows<'_>) -> io::Result<()> + '_ {
+    move |visit| visit(rows)
+}
+
+/// Write `coll`'s rows to `out` as a base image carrying `image_id`, while
+/// the caller holds the table.
 pub fn write_collection<W: Write>(coll: &Collection, image_id: ImageId, out: W) -> io::Result<Written> {
-    let mark = coll.rows.checkpoint_mark();
-    let header = ImageHeader {
-        name: &coll.name,
-        image_id,
-        seq: 0,
-        catchup_xor: coll.catchup_xor,
-        prev_xor: ssp_protocol::snapshot_hash::xor_empty(),
-        field_names: coll.rows.dict().names().collect(),
-    };
-    let mut written = write_image(
-        &header,
-        || coll.rows.records().map(|(head, body)| Rec::Row { head, body }),
-        out,
-    )?;
-    written.mark = mark;
-    Ok(written)
+    let snap = TableSnapshot::take(coll, None, Vec::new(), false, false);
+    write_snapshot(&snap, image_id, 0, ssp_protocol::snapshot_hash::xor_empty(), &mut held(&coll.rows), out)
 }
 
 /// Write delta `seq` of base `base` to `out`: the rows changed since the
@@ -246,62 +360,59 @@ pub fn write_delta<W: Write>(
     if seq == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "a delta's seq starts at 1"));
     }
-    if coll.rows.persisted().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the table has no checkpoint to extend",
-        ));
+    let snap = TableSnapshot::delta_of(coll, false)?;
+    write_snapshot(&snap, base, seq, prev_xor, &mut held(&coll.rows), out)
+}
+
+/// Write `snap` to `out`: a base image `image_id` when `seq` is 0, else delta
+/// `seq` of base `image_id`, chained to `prev_xor` (the catch-up hash the file
+/// before it declared; a base ignores it). The rows' bytes come from the
+/// table through `lend`, a chunk at a time, so the table is held only while a
+/// chunk is copied and never while the file is written or hashed.
+///
+/// Fails with [`TableChanged`] when the table was cleared, compacted or
+/// replaced since the snapshot.
+pub fn write_snapshot<W: Write>(
+    snap: &TableSnapshot,
+    image_id: ImageId,
+    seq: u32,
+    prev_xor: [u8; XOR_LEN],
+    lend: &mut LendRows<'_>,
+    out: W,
+) -> io::Result<Written> {
+    if snap.delta != (seq > 0) {
+        let why = if snap.delta { "a delta's seq starts at 1" } else { "a base image has seq 0" };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
     }
-    let mark = coll.rows.checkpoint_mark();
-    let tombstones = coll.rows.tombstones_pending();
     let header = ImageHeader {
-        name: &coll.name,
-        image_id: base,
+        name: &snap.name,
+        image_id,
         seq,
-        catchup_xor: coll.catchup_xor,
-        prev_xor,
-        field_names: coll.rows.dict().names().collect(),
+        catchup_xor: snap.catchup_xor,
+        prev_xor: if snap.delta { prev_xor } else { ssp_protocol::snapshot_hash::xor_empty() },
+        field_names: snap.field_names.iter().map(String::as_str).collect(),
     };
-    let mut written = write_image(
-        &header,
-        || {
-            coll.rows
-                .records_since_persisted()
-                .map(|(head, body)| Rec::Row { head, body })
-                .chain(tombstones.iter().map(|id| Rec::Tombstone(id)))
-        },
-        out,
-    )?;
-    written.mark = mark;
+    let mut written = write_image(&header, snap, lend, out)?;
+    written.mark = snap.mark;
     Ok(written)
 }
 
-/// The writer behind every image. Three passes over `records` (which must
-/// yield the same rows in the same order each time, as an unmodified table
-/// does): the first sums the heads and bodies so the bodies' offset is known,
-/// the second writes the header and every head with its body pointer
-/// recomputed for the file, the third writes the bodies. Heads and bodies
-/// are copied as they are; nothing is decoded.
-fn write_image<'a, W, I, F>(header: &ImageHeader<'_>, records: F, out: W) -> io::Result<Written>
-where
-    W: Write,
-    I: Iterator<Item = Rec<'a>>,
-    F: Fn() -> I,
-{
-    let (mut rows, mut tombstones, mut heads_len, mut bodies_len) = (0u64, 0u64, 0u64, 0u64);
-    for rec in records() {
-        rows += 1;
-        match rec {
-            Rec::Row { head, body } => {
-                heads_len += head.len() as u64;
-                bodies_len += body.len() as u64;
-            }
-            Rec::Tombstone(id) => {
-                tombstones += 1;
-                heads_len += codec::head_len_for(id) as u64;
-            }
-        }
-    }
+/// The writer behind every image. The snapshot's spans give every length up
+/// front, so the header goes out first; then the heads, each with its body
+/// pointer recomputed for the file, then the bodies in head order. Heads and
+/// bodies are copied as they are; nothing is decoded.
+fn write_image<W: Write>(
+    header: &ImageHeader<'_>,
+    snap: &TableSnapshot,
+    lend: &mut LendRows<'_>,
+    out: W,
+) -> io::Result<Written> {
+    let records = &snap.records;
+    let tombstones = snap.tombstones.len() as u64;
+    let rows = records.len() as u64 + tombstones;
+    let heads_len: u64 = records.iter().map(|(head, _)| head.len as u64).sum::<u64>()
+        + snap.tombstones.iter().map(|id| codec::head_len_for(id) as u64).sum::<u64>();
+    let bodies_len: u64 = records.iter().map(|(_, body)| body.len as u64).sum();
 
     let mut w = Hashing::new(out);
     w.write_all(MAGIC)?;
@@ -329,30 +440,59 @@ where
         ));
     }
 
+    // The heads, each pointing at where its body lands in the file.
+    let mut chunk: Vec<u8> = Vec::with_capacity(WRITE_CHUNK_BYTES.min(heads_len.max(bodies_len) as usize) + 1024);
     let (mut head_cursor, mut body_cursor) = (0u64, 0u64);
-    let mut buf = Vec::with_capacity(256);
-    for rec in records() {
-        buf.clear();
-        match rec {
-            Rec::Row { head, body } => {
+    let mut next = 0;
+    while next < records.len() {
+        chunk.clear();
+        lend(&mut |table: &RowTable| {
+            same_epoch(table, snap)?;
+            while next < records.len() && chunk.len() < WRITE_CHUNK_BYTES {
+                let (head_span, body_span) = records[next];
+                let head = table.bytes_at(head_span);
+                if head.len() != head_span.len as usize {
+                    return Err(TableChanged::error());
+                }
                 let body_rel = (bodies_off + body_cursor) - (heads_off + head_cursor);
-                codec::relink_head(head, body_rel as u32, &mut buf);
-                body_cursor += body.len() as u64;
+                let before = chunk.len();
+                codec::relink_head(head, body_rel as u32, &mut chunk);
+                head_cursor += (chunk.len() - before) as u64;
+                body_cursor += body_span.len as u64;
+                next += 1;
             }
-            Rec::Tombstone(id) => {
-                codec::encode_head(id, &[0u8; codec::DIGEST_LEN], codec::RV_ABSENT, 0, 0, &mut buf);
-            }
-        }
+            Ok(())
+        })?;
+        w.write_all(&chunk)?;
+    }
+    let mut buf = Vec::with_capacity(256);
+    for id in &snap.tombstones {
+        buf.clear();
+        codec::encode_head(id, &[0u8; codec::DIGEST_LEN], codec::RV_ABSENT, 0, 0, &mut buf);
         head_cursor += buf.len() as u64;
         w.write_all(&buf)?;
     }
-    debug_assert_eq!(head_cursor, heads_len, "the heads pass must agree with the count pass");
+    debug_assert_eq!(head_cursor, heads_len, "the heads must add up to what the header declared");
     let heads_hash = w.take_hash();
 
-    for rec in records() {
-        if let Rec::Row { body, .. } = rec {
-            w.write_all(body)?;
-        }
+    // The bodies, in head order.
+    let mut next = 0;
+    while next < records.len() {
+        chunk.clear();
+        lend(&mut |table: &RowTable| {
+            same_epoch(table, snap)?;
+            while next < records.len() && chunk.len() < WRITE_CHUNK_BYTES {
+                let body_span = records[next].1;
+                let body = table.bytes_at(body_span);
+                if body.len() != body_span.len as usize {
+                    return Err(TableChanged::error());
+                }
+                chunk.extend_from_slice(body);
+                next += 1;
+            }
+            Ok(())
+        })?;
+        w.write_all(&chunk)?;
     }
     let bodies_hash = w.take_hash();
 
@@ -369,6 +509,16 @@ where
         seq: header.seq,
         mark: CheckpointMark::default(),
     })
+}
+
+/// The rows a snapshot names are still where it found them: the table was not
+/// cleared, compacted or replaced since.
+fn same_epoch(table: &RowTable, snap: &TableSnapshot) -> io::Result<()> {
+    if table.epoch() == snap.epoch {
+        Ok(())
+    } else {
+        Err(TableChanged::error())
+    }
 }
 
 /// The header of one image, borrowed from its bytes, and where its regions
@@ -2077,6 +2227,167 @@ mod tests {
             deltas.push(path);
         }
         (base, deltas)
+    }
+
+    /// A writer's view of the table: each chunk first lets `ingest` change
+    /// it, the way ingest gets the lock between two chunks, then lends it.
+    fn lend_with_ingest<'a>(
+        coll: &'a mut Collection,
+        calls: &'a mut usize,
+        ingest: &'a dyn Fn(&mut Collection, usize),
+    ) -> impl FnMut(&mut VisitRows<'_>) -> io::Result<()> + 'a {
+        move |visit| {
+            ingest(coll, *calls);
+            *calls += 1;
+            visit(&coll.rows)
+        }
+    }
+
+    fn filler_rows(n: usize) -> Collection {
+        let rows: Vec<(String, serde_json::Value)> =
+            (0..n).map(|i| (format!("r{i}"), json!({ "n": i, "s": "filler" }))).collect();
+        collection(&rows.iter().map(|(id, v)| (id.as_str(), v.clone())).collect::<Vec<_>>())
+    }
+
+    /// Ingest updates, creates and deletes rows between the chunks of a write.
+    /// The image is still the table as it was when the snapshot was taken,
+    /// and the next delta carries everything that happened during the write.
+    #[test]
+    fn ingest_between_chunks_stays_out_of_the_image_and_the_next_delta_carries_it() {
+        let dir = scratch("ingest-between-chunks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut coll = filler_rows(40);
+        let before = coll.clone();
+        let snap = TableSnapshot::full(&coll);
+        assert_eq!(snap.catchup_xor(), coll.catchup_xor);
+        let base = dir.join("game.rows");
+        let mut calls = 0;
+        let written = {
+            let ingest = |c: &mut Collection, n: usize| {
+                c.apply(Operation::Update, &format!("r{}", n % 40), Sp00kyValue::from(json!({ "n": -1, "fresh": "field" })));
+                c.apply(Operation::Create, &format!("new{n}"), Sp00kyValue::from(json!({ "n": n })));
+                c.apply(Operation::Delete, &format!("r{}", 39 - n % 40), Sp00kyValue::Null);
+            };
+            let mut lend = lend_with_ingest(&mut coll, &mut calls, &ingest);
+            let out = std::fs::File::create(&base).unwrap();
+            write_snapshot(&snap, ID, 0, ssp_protocol::snapshot_hash::xor_empty(), &mut lend, out).unwrap()
+        };
+        assert!(calls > 10, "the rows went out in many chunks, not one: {calls}");
+        assert_eq!(written.rows, 40);
+
+        let load = load_table(&base, &[], BodyVerify::AtLoad, &heap()).unwrap();
+        assert_same_rows(&load.collection, &before);
+        assert_ne!(coll.catchup_xor, before.catchup_xor, "ingest did change the table");
+
+        // What ingest did meanwhile lies past the mark: the next delta has it.
+        assert!(coll.rows.mark_persisted(written.mark));
+        let delta = dir.join("game.000001.delta");
+        let out = std::fs::File::create(&delta).unwrap();
+        write_delta(&coll, ID, 1, before.catchup_xor, out).unwrap();
+        let load = load_table(&base, &[delta], BodyVerify::AtLoad, &heap()).unwrap();
+        assert!(load.refused.is_none());
+        assert_same_rows(&load.collection, &coll);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A delta's snapshot holds too: rows changed after it are not in the file.
+    #[test]
+    fn a_delta_written_while_ingest_runs_holds_its_snapshot() {
+        let dir = scratch("delta-while-ingest");
+        let mut coll = filler_rows(30);
+        let (base, _) = chain_of(&mut coll, &dir, &[]);
+        for i in 0..20 {
+            coll.apply(Operation::Update, &format!("r{i}"), Sp00kyValue::from(json!({ "n": 1000 + i })));
+        }
+        coll.apply(Operation::Delete, "r25", Sp00kyValue::Null);
+        let at_snapshot = coll.clone();
+        let base_xor = {
+            let load = load_table(&base, &[], BodyVerify::AtLoad, &heap()).unwrap();
+            load.collection.catchup_xor
+        };
+        let snap = TableSnapshot::delta(&coll).unwrap();
+        assert!(snap.is_delta());
+        let delta = dir.join("game.000001.delta");
+        let mut calls = 0;
+        let written = {
+            let ingest = |c: &mut Collection, n: usize| {
+                c.apply(Operation::Update, &format!("r{}", n % 20), Sp00kyValue::from(json!({ "n": -5 })));
+                c.apply(Operation::Delete, &format!("r{}", 20 + n % 5), Sp00kyValue::Null);
+            };
+            let mut lend = lend_with_ingest(&mut coll, &mut calls, &ingest);
+            let out = std::fs::File::create(&delta).unwrap();
+            write_snapshot(&snap, ID, 1, base_xor, &mut lend, out).unwrap()
+        };
+        assert!(calls > 4, "{calls}");
+        assert_eq!(written.tombstones, 1, "r25 only; the deletes during the write wait for the next delta");
+        let load = load_table(&base, &[delta], BodyVerify::AtLoad, &heap()).unwrap();
+        assert!(load.refused.is_none());
+        assert_same_rows(&load.collection, &at_snapshot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction rewrites the arena: the spans a snapshot took name bytes
+    /// that are gone. The write stops as `TableChanged`, not as a bad file.
+    #[test]
+    fn a_table_compacted_or_cleared_mid_write_ends_the_write() {
+        for (what, change) in [
+            ("compacted", (&|c: &mut Collection| c.compact()) as &dyn Fn(&mut Collection)),
+            ("cleared", &|c: &mut Collection| c.rows.clear()),
+        ] {
+            let mut coll = filler_rows(40);
+            let snap = TableSnapshot::full(&coll);
+            let mut calls = 0;
+            let ingest = |c: &mut Collection, n: usize| {
+                if n == 3 {
+                    change(c);
+                }
+            };
+            let err = {
+                let mut lend = lend_with_ingest(&mut coll, &mut calls, &ingest);
+                write_snapshot(&snap, ID, 0, ssp_protocol::snapshot_hash::xor_empty(), &mut lend, Vec::new())
+                    .unwrap_err()
+            };
+            assert!(TableChanged::is(&err), "{what}: {err}");
+            assert_eq!(calls, 4, "{what}: stopped at the first chunk after the change");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_refuses_the_wrong_kind_of_image() {
+        let mut coll = filler_rows(3);
+        let full = TableSnapshot::full(&coll);
+        let err = write_snapshot(&full, ID, 1, coll.catchup_xor, &mut held(&coll.rows), Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(TableSnapshot::delta(&coll).is_err(), "nothing persisted: no delta");
+        let written = write_collection(&coll, ID, Vec::new()).unwrap();
+        assert!(coll.rows.mark_persisted(written.mark));
+        let delta = TableSnapshot::delta(&coll).unwrap();
+        let err = write_snapshot(&delta, ID, 0, coll.catchup_xor, &mut held(&coll.rows), Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A snapshot lists rows in arena order, whatever order the index holds
+    /// them in, so a writer reads the arena front to back.
+    /// Clients save a store image and never mark it persisted. Saving must
+    /// not leave their tables recording every removed id.
+    #[test]
+    fn writing_a_held_table_records_nothing() {
+        let mut coll = filler_rows(3);
+        write_collection(&coll, ID, Vec::new()).unwrap();
+        coll.apply(Operation::Delete, "r0", Sp00kyValue::Null);
+        assert!(coll.rows.tombstones_pending().is_empty(), "no tombstone recorded");
+        // A snapshot for a writer that lets go does record.
+        let _snap = TableSnapshot::full(&coll);
+        coll.apply(Operation::Delete, "r1", Sp00kyValue::Null);
+        assert_eq!(coll.rows.tombstones_pending(), vec!["r1"]);
+    }
+
+    #[test]
+    fn a_snapshot_lists_rows_in_arena_order() {
+        let coll = filler_rows(200);
+        let snap = TableSnapshot::full(&coll);
+        assert_eq!(snap.records.len(), 200);
+        assert!(snap.records.windows(2).all(|w| w[0].0.start() < w[1].0.start()));
     }
 
     /// The in-memory reader takes the same chain the file reader does, and

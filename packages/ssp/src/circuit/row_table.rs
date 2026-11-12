@@ -128,6 +128,8 @@ pub struct CheckpointMark {
     epoch: u64,
     cursor: Cursor,
     tombstones: usize,
+    /// [`RowTable::tombstone_resets`] when the mark was taken.
+    resets: u64,
 }
 
 fn next_epoch() -> u64 {
@@ -179,11 +181,21 @@ pub struct RowTable {
     /// Rows appended past it are exactly what a delta carries; no per-row
     /// bookkeeping, since the arena only ever appends.
     persisted: Option<Cursor>,
-    /// Ids removed while `persisted` was set, in order. A superset of what a
-    /// delta needs: a row created and removed between two checkpoints lands
-    /// here too, and the loader takes a tombstone for an absent id as a
-    /// no-op.
+    /// Ids removed while `persisted` was set or a checkpoint was being
+    /// written, in order. A superset of what a delta needs: a row created and
+    /// removed between two checkpoints lands here too, and the loader takes a
+    /// tombstone for an absent id as a no-op.
     tombstones: Vec<Box<str>>,
+    /// A checkpoint of this table is being written: record removals even
+    /// with no watermark yet. The file covers the table as of its mark, and
+    /// a row removed between the mark and [`Self::mark_persisted`] needs a
+    /// tombstone in the next delta, or it comes back at the next load. Set
+    /// through `&self` by [`Self::begin_checkpoint`], under a read lock.
+    recording: std::sync::atomic::AtomicBool,
+    /// How often the tombstones were dropped for growing past
+    /// `MAX_TOMBSTONES`. A mark taken before a drop is refused: the
+    /// removals it relied on are gone.
+    tombstone_resets: u64,
 }
 
 /// Hash of a record id, used as the index key.
@@ -221,6 +233,8 @@ impl RowTable {
             epoch: next_epoch(),
             persisted: None,
             tombstones: Vec::new(),
+            recording: Default::default(),
+            tombstone_resets: 0,
         }
     }
 
@@ -236,6 +250,8 @@ impl RowTable {
             epoch: next_epoch(),
             persisted: None,
             tombstones: Vec::new(),
+            recording: Default::default(),
+            tombstone_resets: 0,
         }
     }
 
@@ -253,7 +269,16 @@ impl RowTable {
             epoch: self.epoch,
             cursor: self.arena.end_cursor(),
             tombstones: self.tombstones.len(),
+            resets: self.tombstone_resets,
         }
+    }
+
+    /// [`Self::checkpoint_mark`] for a checkpoint about to be written, which
+    /// also has removals recorded from here on, watermark or not, until the
+    /// mark lands. Take it under the lock the records are read under.
+    pub(crate) fn begin_checkpoint(&self) -> CheckpointMark {
+        self.recording.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.checkpoint_mark()
     }
 
     /// Live rows at or past the watermark, i.e. what a delta carries. Every
@@ -274,6 +299,42 @@ impl RowTable {
         })
     }
 
+    /// The epoch this table's bytes belong to. A span read in one epoch names
+    /// the same bytes for as long as the epoch lasts: the arena only appends,
+    /// and `clear` (which compaction goes through) starts a new one.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Where each live row's head and body lie: every row, or only those at or
+    /// past `since` (what a delta carries, as in
+    /// [`Self::records_since_persisted`]). In arena order, so whoever copies
+    /// the bytes later reads the arena front to back.
+    pub(crate) fn record_spans(&self, since: Option<Cursor>) -> Vec<(Span, Span)> {
+        let arena = &*self.arena;
+        let mut spans: Vec<(Span, Span)> = self
+            .index
+            .iter()
+            .filter_map(|slot| {
+                if since.is_some_and(|cursor| slot.start() < cursor) {
+                    return None;
+                }
+                let head = arena.get(*slot);
+                if head.is_empty() {
+                    return None;
+                }
+                Some((*slot, body_of(head, *slot)?))
+            })
+            .collect();
+        spans.sort_unstable_by_key(|(head, _)| head.start());
+        spans
+    }
+
+    /// The bytes at `span`; empty when it lies outside the arena.
+    pub(crate) fn bytes_at(&self, span: Span) -> &[u8] {
+        self.arena.get(span)
+    }
+
     /// Ids removed since the watermark that are not live now, each once.
     pub fn tombstones_pending(&self) -> Vec<&str> {
         let mut seen = std::collections::HashSet::new();
@@ -285,15 +346,31 @@ impl RowTable {
     }
 
     /// The checkpoint `mark` describes is on disk. `false`, and nothing
-    /// changed, when the mark is of another epoch: the table was cleared or
-    /// replaced since it was taken, and the next checkpoint starts over.
+    /// changed, when the mark is of another epoch (the table was cleared or
+    /// replaced since it was taken) or the tombstones it counted on were
+    /// dropped since: the next checkpoint starts over.
     pub fn mark_persisted(&mut self, mark: CheckpointMark) -> bool {
-        if mark.epoch != self.epoch {
+        if mark.epoch != self.epoch || mark.resets != self.tombstone_resets {
             return false;
         }
         self.persisted = Some(mark.cursor);
         self.tombstones.drain(..mark.tombstones.min(self.tombstones.len()));
+        *self.recording.get_mut() = false;
         true
+    }
+
+    /// The checkpoint `mark` was taken for will not be written (the write
+    /// failed): stop recording removals for it. With no watermark the
+    /// removals recorded meanwhile are dropped too, since the next checkpoint
+    /// is whole anyway. A mark of another epoch changes nothing.
+    pub fn abandon_checkpoint(&mut self, mark: CheckpointMark) {
+        if mark.epoch != self.epoch {
+            return;
+        }
+        *self.recording.get_mut() = false;
+        if self.persisted.is_none() {
+            self.tombstones.clear();
+        }
     }
 
     /// For a loader: the arena's current contents are the files.
@@ -301,6 +378,7 @@ impl RowTable {
     pub(crate) fn set_persisted_at_end(&mut self) {
         self.persisted = Some(self.arena.end_cursor());
         self.tombstones.clear();
+        *self.recording.get_mut() = false;
     }
 
     /// Intern `names` in order after the dictionary's current names, the way
@@ -768,11 +846,13 @@ impl RowTable {
         if !self.remove_slot(id) {
             return false;
         }
-        if self.persisted.is_some() {
+        if self.persisted.is_some() || *self.recording.get_mut() {
             self.tombstones.push(id.into());
             if self.tombstones.len() > MAX_TOMBSTONES {
                 self.persisted = None;
                 self.tombstones.clear();
+                *self.recording.get_mut() = false;
+                self.tombstone_resets += 1;
             }
         }
         true
@@ -799,6 +879,7 @@ impl RowTable {
         self.epoch = next_epoch();
         self.persisted = None;
         self.tombstones.clear();
+        *self.recording.get_mut() = false;
     }
 
     /// Iterate `(raw_id, row)` pairs. Order is unspecified.
@@ -1410,6 +1491,71 @@ mod tests {
             .collect();
         assert_eq!(since, vec![("a", 3)]);
         assert!(t.tombstones_pending().is_empty(), "an update is no tombstone");
+    }
+
+    /// The first checkpoint of a table has no watermark to record removals
+    /// against, yet ingest goes on while it is written. A row removed after
+    /// the mark is in the file and must be in the next delta as a tombstone,
+    /// or the next load brings it back.
+    #[test]
+    fn a_removal_during_the_first_checkpoint_is_kept_for_the_next_delta() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        put(&mut t, "b", json!({ "v": 1 }));
+        let mark = t.begin_checkpoint();
+        t.remove("a");
+        assert!(t.mark_persisted(mark));
+        assert_eq!(t.tombstones_pending(), vec!["a"]);
+        // Once the mark landed, removals are recorded as usual, and nothing
+        // is recorded for a table no checkpoint is being taken of.
+        let mut quiet = RowTable::new();
+        put(&mut quiet, "x", json!({ "v": 1 }));
+        quiet.remove("x");
+        assert_eq!(quiet.checkpoint_mark().tombstones, 0);
+    }
+
+    /// Past `MAX_TOMBSTONES` the list is dropped. A checkpoint that was being
+    /// written then counted on removals that are gone, so its mark is refused
+    /// and the next checkpoint is whole.
+    #[test]
+    fn an_abandoned_first_checkpoint_stops_recording() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        put(&mut t, "b", json!({ "v": 1 }));
+        let mark = t.begin_checkpoint();
+        t.remove("a");
+        t.abandon_checkpoint(mark);
+        assert_eq!(t.checkpoint_mark().tombstones, 0, "the next checkpoint is whole: nothing to keep");
+        t.remove("b");
+        assert_eq!(t.checkpoint_mark().tombstones, 0, "and nothing recorded any more");
+        assert_eq!(t.persisted(), None);
+    }
+
+    /// A client saves store images and never marks them: that must not leave
+    /// the table recording every removal.
+    #[test]
+    fn a_plain_mark_does_not_start_recording() {
+        let mut t = RowTable::new();
+        put(&mut t, "a", json!({ "v": 1 }));
+        let _ = t.checkpoint_mark();
+        t.remove("a");
+        assert_eq!(t.checkpoint_mark().tombstones, 0);
+    }
+
+    #[test]
+    fn a_mark_taken_before_the_tombstones_overflowed_is_refused() {
+        let mut t = RowTable::new();
+        for i in 0..=MAX_TOMBSTONES {
+            put(&mut t, &format!("r{i}"), json!({ "v": 1 }));
+        }
+        let mark = t.begin_checkpoint();
+        for i in 0..=MAX_TOMBSTONES {
+            t.remove(&format!("r{i}"));
+        }
+        assert!(!t.mark_persisted(mark), "the removals it relied on were dropped");
+        assert_eq!(t.persisted(), None);
+        let mark = t.begin_checkpoint();
+        assert!(t.mark_persisted(mark), "a fresh mark lands");
     }
 
     #[test]

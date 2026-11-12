@@ -69,8 +69,8 @@ use crate::BootstrapSource;
 use serde_json::Value;
 use ssp::circuit::arena::{configured_backing, ArenaBacking};
 use ssp::circuit::checkpoint::{
-    fresh_image_id, load_table, peek_identity, touch_bodies, verify_bodies, write_collection, write_delta,
-    BodyVerify, ImageId, PendingVerify, TableLoad, Throttle, FORMAT,
+    fresh_image_id, load_table, peek_identity, verify_bodies, write_snapshot, BodyVerify, ImageId, PendingVerify,
+    TableChanged, TableLoad, TableSnapshot, Throttle, VisitRows, Written, FORMAT,
 };
 use ssp::circuit::{Circuit, Operation, Record};
 use ssp::types::Sp00kyValue;
@@ -439,10 +439,9 @@ impl RowCheckpoints {
     /// as a delta where a chain can be extended and whole otherwise, and
     /// drop the files of tables the circuit no longer holds.
     ///
-    /// Each table is written under its own short read lock, so ingest waits
-    /// for one table at a time rather than for the whole store. Tables can
-    /// therefore come from slightly different moments; that is fine, because
-    /// the next boot verifies every table on its own.
+    /// The circuit is never held while a file is written: see [`write_table`].
+    /// Tables therefore come from slightly different moments; that is fine,
+    /// because the next boot verifies every table on its own.
     pub async fn write(&self, processor: &Arc<RwLock<Circuit>>, reason: &'static str) {
         if !self.may_write() {
             info!(reason, "Skipping row checkpoint: this process does not own the checkpoint dir");
@@ -490,66 +489,17 @@ impl RowCheckpoints {
         let (mut written, mut full, mut deltas, mut tombstones, mut rows, mut bytes, mut failed) =
             (0usize, 0usize, 0usize, 0u64, 0u64, 0u64, 0usize);
         let (mut encode_ms, mut fsync_ms) = (0u64, 0u64);
+        let mut locks = LockStats::default();
         for (table, plan) in plans {
             if !self.may_write() {
                 info!(reason, written, "Row checkpoint stopped: this process no longer owns the checkpoint dir");
                 return;
             }
-            if plan == Plan::Full {
-                // A whole write copies every body; read the mapped ones
-                // through first, outside the lock, so the copy under it
-                // never waits on the disk.
-                let images = processor
-                    .read()
-                    .await
-                    .store
-                    .get_collection(&table)
-                    .map(|coll| coll.rows.images())
-                    .unwrap_or_default();
-                for image in images {
-                    let _ = tokio::task::spawn_blocking(move || touch_bodies(&image, Throttle::none())).await;
-                }
-            }
-            let guard = Arc::clone(processor).read_owned().await;
             let stem = file_stem(&table);
-            let (name, dir, task_stem) = (table.clone(), self.dir.clone(), stem.clone());
-            let result = tokio::task::spawn_blocking(move || {
-                let Some(coll) = guard.store.collections.get(&name) else {
-                    return Ok(None);
-                };
-                let hash = coll.catchup_xor;
-                // The chain can only be extended from a watermark; one that
-                // went between the plan and now makes this a whole write.
-                let plan = match plan {
-                    Plan::Delta { .. } if coll.rows.persisted().is_none() => Plan::Full,
-                    plan => plan,
-                };
-                let path = match plan {
-                    Plan::Full => dir.join(format!("{task_stem}.rows")),
-                    Plan::Delta { seq, .. } => dir.join(delta_file_name(&task_stem, seq)),
-                };
-                let tmp = tmp_path_for(&path);
-                let encode_started = Instant::now();
-                let file = std::fs::File::create(&tmp)?;
-                let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-                let w = match plan {
-                    Plan::Full => write_collection(coll, fresh_image_id(), &mut out)?,
-                    Plan::Delta { seq, base, prev_xor } => write_delta(coll, base, seq, prev_xor, &mut out)?,
-                };
-                // Release the circuit before the fsync: a flush to disk can
-                // take seconds and ingest has no reason to wait for it.
-                drop(guard);
-                let encode_ms = encode_started.elapsed().as_millis() as u64;
-                let sync_started = Instant::now();
-                let file = out.into_inner().map_err(|e| e.into_error())?;
-                file.sync_all()?;
-                std::fs::rename(&tmp, &path)?;
-                let fsync_ms = sync_started.elapsed().as_millis() as u64;
-                Ok::<_, std::io::Error>(Some((hash, w, plan, encode_ms, fsync_ms)))
-            })
-            .await;
+            let (name, dir, task_stem, circuit) = (table.clone(), self.dir.clone(), stem.clone(), Arc::clone(processor));
+            let result = tokio::task::spawn_blocking(move || write_table(&circuit, &name, plan, &dir, &task_stem)).await;
             match result {
-                Ok(Ok(Some((hash, w, plan, table_encode_ms, table_fsync_ms)))) => {
+                Ok(Ok(Some(TableWrite { hash, w, plan, encode_ms: table_encode_ms, fsync_ms: table_fsync_ms, locks: table_locks }))) => {
                     debug!(
                         table = %table,
                         kind = match plan { Plan::Full => "full", Plan::Delta { .. } => "delta" },
@@ -559,6 +509,9 @@ impl RowCheckpoints {
                         bytes = w.bytes,
                         encode_ms = table_encode_ms,
                         fsync_ms = table_fsync_ms,
+                        locks = table_locks.count,
+                        locked_ms = table_locks.total_ms(),
+                        max_lock_ms = table_locks.max_ms(),
                         "Row checkpoint table written"
                     );
                     // The table knows what is on disk now. A mark of another
@@ -612,6 +565,7 @@ impl RowCheckpoints {
                     bytes += w.bytes;
                     encode_ms += table_encode_ms;
                     fsync_ms += table_fsync_ms;
+                    locks.merge(&table_locks);
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -655,6 +609,8 @@ impl RowCheckpoints {
                 bytes,
                 encode_ms,
                 fsync_ms,
+                locked_ms = locks.total_ms(),
+                max_lock_ms = locks.max_ms(),
                 ms = started.elapsed().as_millis() as u64,
                 "Row checkpoint written"
             );
@@ -746,6 +702,213 @@ impl RowCheckpoints {
         info!(interval_secs = every.as_secs(), "Row checkpoint timer armed");
     }
 }
+
+/// What writing one table produced.
+struct TableWrite {
+    /// The table's catch-up hash the file declares.
+    hash: [u8; 32],
+    w: Written,
+    plan: Plan,
+    encode_ms: u64,
+    fsync_ms: u64,
+    locks: LockStats,
+}
+
+/// How long a write held the circuit, in how many holds.
+#[derive(Debug, Default, Clone, Copy)]
+struct LockStats {
+    count: u64,
+    total: Duration,
+    max: Duration,
+}
+
+impl LockStats {
+    fn add(&mut self, held: Duration) {
+        self.count += 1;
+        self.total += held;
+        self.max = self.max.max(held);
+    }
+
+    fn merge(&mut self, other: &LockStats) {
+        self.count += other.count;
+        self.total += other.total;
+        self.max = self.max.max(other.max);
+    }
+
+    fn total_ms(&self) -> u64 {
+        self.total.as_millis() as u64
+    }
+
+    fn max_ms(&self) -> u64 {
+        self.max.as_millis() as u64
+    }
+}
+
+/// Write one table's file, on a blocking thread.
+///
+/// The circuit is read-locked once to take a [`TableSnapshot`] (where each
+/// row lies, not its bytes) and then once per chunk of rows copied, never
+/// across the file I/O. An ingest waiting for the write lock waits for one
+/// chunk at most, and gets in between chunks: tokio's lock is fair, so the
+/// next chunk queues behind it. Before, the whole table was encoded under
+/// one lock; on whitepawn a 1.1 GB table under a 2 GiB cap held it 100 to
+/// 205 s every 5.5 hours, and live sync stopped with it (2026-11-10).
+///
+/// `None`: the table is gone, or it was cleared, compacted or replaced while
+/// it was written. The next write takes it as it is then.
+fn write_table(
+    processor: &RwLock<Circuit>,
+    table: &str,
+    plan: Plan,
+    dir: &Path,
+    stem: &str,
+) -> std::io::Result<Option<TableWrite>> {
+    let mut locks = LockStats::default();
+    let taken = {
+        let circuit = processor.blocking_read();
+        let held = Instant::now();
+        let taken = match circuit.store.collections.get(table) {
+            None => None,
+            Some(coll) => Some(match plan {
+                // The chain can only be extended from a watermark; one that
+                // went between the plan and now makes this a whole write.
+                Plan::Delta { .. } if coll.rows.persisted().is_none() => (Plan::Full, TableSnapshot::full(coll)),
+                Plan::Delta { .. } => (plan, TableSnapshot::delta(coll)?),
+                Plan::Full => (plan, TableSnapshot::full(coll)),
+            }),
+        };
+        locks.add(held.elapsed());
+        taken
+    };
+    let Some((plan, snap)) = taken else {
+        return Ok(None);
+    };
+    let path = match plan {
+        Plan::Full => dir.join(format!("{stem}.rows")),
+        Plan::Delta { seq, .. } => dir.join(delta_file_name(stem, seq)),
+    };
+    let tmp = tmp_path_for(&path);
+    match write_file(processor, table, plan, &snap, &tmp, &path, &mut locks) {
+        Ok((w, encode_ms, fsync_ms)) => Ok(Some(TableWrite { hash: snap.catchup_xor(), w, plan, encode_ms, fsync_ms, locks })),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if TableChanged::is(&e) {
+                info!(table = %table, "Row checkpoint of a table that changed during the write dropped; the next write takes it again");
+                return Ok(None);
+            }
+            // The snapshot had the table record removals for this file.
+            if let Some(coll) = processor.blocking_write().store.collections.get_mut(table) {
+                coll.rows.abandon_checkpoint(snap.mark());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Encode `snap` into `tmp`, borrowing the table a chunk at a time, then make
+/// it durable and move it to `path`. Returns the write, the encode and the
+/// sync time.
+fn write_file(
+    processor: &RwLock<Circuit>,
+    table: &str,
+    plan: Plan,
+    snap: &TableSnapshot,
+    tmp: &Path,
+    path: &Path,
+    locks: &mut LockStats,
+) -> std::io::Result<(Written, u64, u64)> {
+    let encode_started = Instant::now();
+    let file = std::fs::File::create(tmp)?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, Uncached::new(file));
+    let mut lend = |visit: &mut VisitRows<'_>| -> std::io::Result<()> {
+        let circuit = processor.blocking_read();
+        let held = Instant::now();
+        let visited = match circuit.store.collections.get(table) {
+            Some(coll) => visit(&coll.rows),
+            None => Err(TableChanged::error()),
+        };
+        drop(circuit);
+        locks.add(held.elapsed());
+        visited
+    };
+    let w = match plan {
+        Plan::Full => write_snapshot(snap, fresh_image_id(), 0, ssp_protocol::snapshot_hash::xor_empty(), &mut lend, &mut out)?,
+        Plan::Delta { seq, base, prev_xor } => write_snapshot(snap, base, seq, prev_xor, &mut lend, &mut out)?,
+    };
+    let encode_ms = encode_started.elapsed().as_millis() as u64;
+    let sync_started = Instant::now();
+    let file = out.into_inner().map_err(|e| e.into_error())?.into_file();
+    file.sync_all()?;
+    // Clean now, so all of it can leave the page cache.
+    drop_from_cache(&file, 0, 0);
+    std::fs::rename(tmp, path)?;
+    Ok((w, encode_ms, sync_started.elapsed().as_millis() as u64))
+}
+
+/// How much of a checkpoint file may sit in the page cache while it is being
+/// written. Nobody reads the file before the next boot, but its pages are
+/// charged to the SSP's cgroup, where at a 2 GiB cap a 1.1 GB file pushed out
+/// the very rows the write was copying (whitepawn, 2026-11-10). Past this,
+/// what was written goes to disk and out of the cache.
+const CACHED_WRITE_BYTES: u64 = 32 << 20;
+
+/// A checkpoint file being written, keeping at most [`CACHED_WRITE_BYTES`]
+/// of it in the page cache. Linux only; elsewhere a plain file.
+struct Uncached {
+    file: std::fs::File,
+    written: u64,
+    dropped: u64,
+}
+
+impl Uncached {
+    fn new(file: std::fs::File) -> Self {
+        Self { file, written: 0, dropped: 0 }
+    }
+
+    fn into_file(self) -> std::fs::File {
+        self.file
+    }
+}
+
+impl std::io::Write for Uncached {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        if self.written - self.dropped >= CACHED_WRITE_BYTES {
+            drop_from_cache(&self.file, self.dropped, self.written - self.dropped);
+            self.dropped = self.written;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Write `len` bytes of `file` from `offset` to disk (0: to the end) and drop
+/// them from the page cache. Advisory: a failure leaves the pages cached,
+/// which costs memory and nothing else.
+#[cfg(target_os = "linux")]
+fn drop_from_cache(file: &std::fs::File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is open for as long as `file` is borrowed, and neither
+    // call touches memory of ours.
+    unsafe {
+        // Only clean pages can be dropped, so write them out and wait first.
+        libc::sync_file_range(
+            fd,
+            offset as libc::off64_t,
+            len as libc::off64_t,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        );
+        libc::posix_fadvise(fd, offset as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_from_cache(_file: &std::fs::File, _offset: u64, _len: u64) {}
 
 /// `<pid>.<random>`: pids alone repeat across containers (often pid 1).
 fn unique_suffix() -> String {
@@ -1456,6 +1619,108 @@ mod tests {
         assert!(!game.has_row("b"), "the tombstone applied");
         assert_eq!(game.catchup_xor, fresh.read().await.store.get_collection("game").unwrap().catchup_xor);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 12,000 rows of about 2 KB: some 24 MB of bodies, several chunks.
+    async fn big_game(processor: &RwLock<Circuit>) {
+        let filler = "x".repeat(2000);
+        let mut c = processor.write().await;
+        let game = c.store.ensure_collection("game");
+        for i in 0..12_000 {
+            game.apply(
+                Operation::Create,
+                &format!("r{i}"),
+                Sp00kyValue::from(serde_json::json!({ "id": format!("game:r{i}"), "n": i, "s": filler })),
+            );
+        }
+    }
+
+    /// The circuit is held once for the snapshot and once per chunk, never
+    /// for the file: a big table takes many short holds, not one long one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_big_table_is_written_in_many_short_holds() {
+        let dir = scratch_dir("holds");
+        let processor = Arc::new(RwLock::new(Circuit::new()));
+        big_game(&processor).await;
+        let (p, d) = (Arc::clone(&processor), dir.clone());
+        let t = tokio::task::spawn_blocking(move || write_table(&p, "game", Plan::Full, &d, "game"))
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("written");
+        let chunks = t.w.bytes / ssp::circuit::checkpoint::WRITE_CHUNK_BYTES as u64;
+        assert!(t.locks.count > chunks, "one hold for the snapshot and one per chunk: {:?}", t.locks);
+        assert!(dir.join("game.rows").exists());
+        let tmp_left = std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!tmp_left, "the temp file became the checkpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ingest keeps going while a big table is written. The checkpoint holds
+    /// the table exactly as it was at one moment of that ingest, and the next
+    /// one, a delta, brings it up to date, deletes included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_runs_while_a_big_table_is_written() {
+        let dir = scratch_dir("ingest");
+        let checkpoints = Arc::new(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap));
+        let processor = Arc::new(RwLock::new(Circuit::new()));
+        big_game(&processor).await;
+        // The table's hash after each ingest: the checkpoint must be one of them.
+        let mut states = vec![processor.read().await.store.get_collection("game").unwrap().catchup_xor];
+
+        let started = Instant::now();
+        let writer = {
+            let (checkpoints, processor) = (Arc::clone(&checkpoints), Arc::clone(&processor));
+            tokio::spawn(async move { checkpoints.write(&processor, "test").await })
+        };
+        let (mut during, mut longest_wait, mut n) = (0usize, Duration::ZERO, 0usize);
+        while !writer.is_finished() {
+            let asked = Instant::now();
+            let mut c = processor.write().await;
+            longest_wait = longest_wait.max(asked.elapsed());
+            let game = c.store.ensure_collection("game");
+            game.apply(Operation::Create, &format!("new{n}"), Sp00kyValue::from(serde_json::json!({ "id": format!("game:new{n}"), "n": n })));
+            game.apply(Operation::Delete, &format!("r{n}"), Sp00kyValue::Null);
+            states.push(game.catchup_xor);
+            n += 1;
+            if !writer.is_finished() {
+                during += 1;
+            }
+            drop(c);
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        let took = started.elapsed();
+        assert!(during >= 3, "ingest got the lock {during} times during the write");
+        assert!(
+            longest_wait < took / 2,
+            "an ingest waited {longest_wait:?} of a {took:?} write: the table was held for the whole of it"
+        );
+
+        // The checkpoint is the table as it was at one moment, not a mix.
+        let first = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap).load_into(&first).await, 1);
+        {
+            let c = first.read().await;
+            let game = c.store.get_collection("game").unwrap();
+            assert_eq!(game.rows.len(), 12_000);
+            let at = states.iter().position(|xor| *xor == game.catchup_xor);
+            assert!(at.is_some_and(|at| at < n), "a state ingest passed through, before the last ingest ({at:?} of {n})");
+        }
+
+        // The next write is a delta with what ingest did meanwhile.
+        checkpoints.write(&processor, "test").await;
+        assert!(checkpoints.delta_path_for("game", 1).exists());
+        let again = Arc::new(RwLock::new(Circuit::new()));
+        assert_eq!(RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap).load_into(&again).await, 1);
+        let c = again.read().await;
+        let game = c.store.get_collection("game").unwrap();
+        let live = processor.read().await;
+        let expected = live.store.get_collection("game").unwrap();
+        assert_eq!(game.rows.len(), expected.rows.len());
+        assert_eq!(game.catchup_xor, expected.catchup_xor, "deletes made during the first write applied too");
+        assert!(!game.has_row("r0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

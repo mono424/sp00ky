@@ -37,6 +37,10 @@ base64 = "0.22"
 dashmap = "6"
 tokio-util = "0.7"
 
+# Row checkpoints drop the files they write from the page cache (`warm::drop_from_cache`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 chrono = "0.4"
 

@@ -7030,11 +7030,11 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
 @media (min-width: 861px) {
   .shell:has(.cx-rail) { --rail-bg: #1c1c1c; }
   .shell:has(.cx-rail) .main-frame > .main {
-    --bg: #131313;
-    --bg-panel: #161616;
-    --bg-raised: #1a1a1a;
-    --bg-sunken: #101010;
-    --bg-hover: #1e1e1e;
+    --bg: #0d0d0d;
+    --bg-panel: #111111;
+    --bg-raised: #151515;
+    --bg-sunken: #0a0a0a;
+    --bg-hover: #191919;
   }
 }
 .cx-rail .cx-menu.cx-who-menu, .cx-rail .cx-pop { background: #202020; }

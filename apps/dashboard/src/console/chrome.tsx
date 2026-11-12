@@ -170,7 +170,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
           </button>
         }
       >
-        <button class="cx-prow" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()} title="Switch project (⌘P)">
+        <button class="cx-prow" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()} title={`${c.project()?.slug ?? 'Projects'} · switch project (⌘P)`}>
           <Show
             when={c.project()}
             fallback={
@@ -182,7 +182,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
             {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
           </Show>
           <span class="cx-prow-text">
-            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? (c.workspace()?.projects.length ? 'Open a project' : 'No projects yet')}</b>
+            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? (c.workspace()?.projects.length ? 'Projects' : 'No projects')}</b>
             <small>{c.project() ? projectLine(c.project()!) : `${c.workspace()?.projects.length ?? 0} in ${c.workspace()?.name ?? 'this workspace'}`}</small>
           </span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">

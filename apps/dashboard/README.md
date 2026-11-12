@@ -59,6 +59,16 @@ The dev server is not served by a scheduler, so the app comes up in
 **standalone** mode: the sign-in form shows an endpoint field. Point it at a
 running scheduler's admin port (`http://localhost:9668`).
 
+The console with hot reload, on fixture data:
+
+```bash
+node apps/dashboard/screenshots/console.mjs              # fixtures on :4320
+pnpm --filter @spooky-sync/dashboard dev:console         # http://localhost:4400
+```
+
+The console dev server proxies `/v1`, `/fx` and `/cf` to the fixtures;
+`CONSOLE_API=<url>` points it at another backend.
+
 To run it the way it actually ships:
 
 ```bash

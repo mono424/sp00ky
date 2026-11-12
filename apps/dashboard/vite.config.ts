@@ -21,5 +21,13 @@ export default defineConfig(({ mode }) => ({
   },
   server: {
     port: mode === 'console' ? 4400 : 4300,
+    // `pnpm dev:console` against the fixtures (`node screenshots/console.mjs`,
+    // :4320) with hot reload. CONSOLE_API points it elsewhere.
+    proxy:
+      mode === 'console'
+        ? Object.fromEntries(
+            ['/v1', '/fx', '/cf'].map((p) => [p, { target: process.env.CONSOLE_API ?? 'http://localhost:4320', changeOrigin: true }]),
+          )
+        : undefined,
   },
 }));

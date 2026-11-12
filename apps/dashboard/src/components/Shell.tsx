@@ -289,7 +289,7 @@ let lastLayer: 'workspace' | 'project' | undefined;
  * the cluster and the project's settings in groups. The project switcher heads
  * both; the foot is one menu for the account and its workspaces.
  */
-function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void; version: string }) {
+function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void }) {
   const cx = useConsoleChrome()!;
   const layer = props.workspaceLayer ? 'workspace' : 'project';
   const dir = lastLayer && lastLayer !== layer ? (layer === 'project' ? 'in' : 'out') : '';
@@ -375,7 +375,6 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
       </div>
       <div class="sb-foot cx-foot">
         <WorkspaceMenu />
-        <Show when={props.version}><div class="sb-ver">{props.version}</div></Show>
       </div>
     </>
   );
@@ -554,7 +553,6 @@ export function Shell(props: {
             workspaceLayer={!!props.nav}
             atRoot={atRoot}
             onJump={() => setPaletteOpen(true)}
-            version={props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? ''}
           />
         </Show>
         <Show when={!cx}>

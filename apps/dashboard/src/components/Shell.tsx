@@ -528,15 +528,6 @@ export function Shell(props: {
           <span />
         </button>
         <Logo />
-        {/* Where this is; the drawer holds the switchers. */}
-        <Show when={cx}>
-          <button class="mb-ctx" onClick={() => setOpen(true)}>
-            <Show when={cx!.project()} fallback={<span class="cx-av">{(cx!.workspace()?.name ?? '?').slice(0, 2).toUpperCase()}</span>}>
-              {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
-            </Show>
-            <b>{cx!.project()?.slug ?? cx!.workspace()?.name ?? ''}</b>
-          </button>
-        </Show>
       </header>
 
       <Show when={open()}>

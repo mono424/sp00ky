@@ -5262,21 +5262,6 @@ span.cx-me { pointer-events: none; }
 
 @media (max-width: 860px) {
   .sidebar.cx-rail { width: 280px; overflow: hidden; }
-  .mb-ctx {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    max-width: 55vw;
-    height: 30px;
-    margin-left: auto;
-    padding: 0 10px;
-    border: 1px solid var(--line);
-    background: none;
-    color: var(--ink);
-  }
-  .mb-ctx b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 12.5px var(--mono); }
-  .mb-ctx .cx-av { width: 18px; height: 18px; font-size: 8.5px; }
 }
 
 
@@ -7039,17 +7024,6 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
   .shell:has(.cx-rail) .burger span { height: 1.75px; border-radius: 2px !important; background: #b4b4b4; }
   .shell:has(.cx-rail) .mobile-bar .brand-logo svg { height: 16px; width: auto; }
 
-  .shell:has(.cx-rail) .mb-ctx {
-    height: 32px;
-    gap: 8px;
-    padding: 0 12px 0 11px;
-    border: 1px solid rgba(255, 255, 255, 0.07);
-    border-radius: 999px !important;
-    background: rgba(255, 255, 255, 0.04);
-  }
-  .shell:has(.cx-rail) .mb-ctx b { font: 550 13.5px var(--sans); color: #e6e6e6; }
-  .shell:has(.cx-rail) .mb-ctx .fx-sq { width: 8px; height: 8px; border-radius: 50% !important; }
-  .shell:has(.cx-rail) .mb-ctx .cx-av { border: 0; border-radius: 6px !important; background: #2a2d3d; }
 
   /* the page as a card under the bar */
   .shell:has(.cx-rail) .main-frame { padding: 0 4px 4px; background: var(--rail-bg); }

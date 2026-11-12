@@ -7172,3 +7172,9 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
 @media (max-width: 860px) { .shell:has(.cx-rail) .mb-slot > div { display: flex; flex: 1 1 auto; min-width: 0; } }
 
 @media (max-width: 860px) { .mh-proj:last-child .cx-pop { right: -2px; } }
+
+/* the rail head lines up with the page bar: inset 4 + border 1 + half of its 51px content = 30.5 */
+@media (min-width: 861px) { .cx-rail .cx-brand { height: 61px; } }
+
+/* the account card keeps the same 4px from the window as the page card */
+@media (min-width: 861px) { .cx-rail .sb-foot.cx-foot { padding: 0 4px 4px; } }

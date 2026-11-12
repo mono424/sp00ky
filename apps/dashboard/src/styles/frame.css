@@ -7176,5 +7176,3 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
 /* the rail head lines up with the page bar: inset 4 + border 1 + half of its 51px content = 30.5 */
 @media (min-width: 861px) { .cx-rail .cx-brand { height: 61px; } }
 
-/* the account card sits the page card's 4px off the window's bottom */
-@media (min-width: 861px) { .cx-rail .sb-foot.cx-foot { padding: 0 10px 4px; } }

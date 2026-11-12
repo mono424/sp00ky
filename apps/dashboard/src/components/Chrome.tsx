@@ -1,7 +1,7 @@
 import { For, Show, type JSX } from 'solid-js';
 import { A } from '@solidjs/router';
 import { currentMode } from '../api/client';
-import { projectTone, useConsoleChrome } from '../console/chrome';
+import { ProjectSwitcher, useConsoleChrome } from '../console/chrome';
 
 /** Small shared pieces of the panel chrome. */
 
@@ -22,11 +22,9 @@ export function PageHead(props: {
     <div class="page-head">
       <div class="ph-crumb cap">
         <Show when={cx} fallback={<span>{slug()}</span>}>
-          {/* The rail switches workspaces and projects; the crumb only says where this is. */}
+          {/* The project's name switches projects (⌘P); the rail's foot switches workspaces. */}
           <span class="ph-ctx">
-            <Show when={cx!.project()} fallback={<b>{cx!.workspace()?.name ?? 'sp00ky'}</b>}>
-              {(p) => <><span class={`fx-sq ${projectTone(p())}`} /><b>{p().slug}</b></>}
-            </Show>
+            <ProjectSwitcher />
           </span>
         </Show>
         <Show when={props.crumb}>

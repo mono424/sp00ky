@@ -4,7 +4,7 @@ import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
-import { GEAR, ProjectSwitcher, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
+import { GEAR, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
 export interface NavLink {
   href: string;
@@ -315,8 +315,6 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
     <>
       <div class="cx-brand">
         <Logo />
-        <span class="rail-slash" aria-hidden="true">/</span>
-        <ProjectSwitcher rail />
         <span class="rail-tools">
           <button class="rail-tool" onClick={props.onJump} title="Search (⌘K)" aria-label="Search">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">

@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/client-angular",
-  "version": "0.0.1-canary.383",
+  "version": "0.0.1-canary.384",
   "description": "Angular (signals) bindings for the sp00ky local-first sync client",
   "keywords": [
     "surrealdb",

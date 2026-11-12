@@ -7013,3 +7013,59 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
 .shell:has(.cx-rail) .ph-ctx .cx-proj.on { border-color: rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.05); }
 .shell:has(.cx-rail) .ph-ctx .cx-proj > svg { color: var(--ink-ghost); }
 .shell:has(.cx-rail) .ph-crumb .cx-pop { left: -8px; top: calc(100% + 10px); width: 360px; }
+
+/* ---- phone: the same soft frame. The bar sits on the rail's colour, the page
+   is the dark rounded card under it, the drawer is the rail itself. ---- */
+@media (max-width: 860px) {
+  .shell:has(.cx-rail) { --rail-bg: #1c1c1c; background: var(--rail-bg); }
+  .shell:has(.cx-rail) .mobile-bar {
+    height: 52px;
+    padding: 0 10px 0 8px;
+    gap: 8px;
+    border-bottom: 0;
+    background: var(--rail-bg);
+  }
+  .shell:has(.cx-rail) .burger {
+    width: 36px;
+    height: 36px;
+    padding: 0 10px;
+    gap: 4px;
+    border: 0;
+    border-radius: 9px !important;
+    background: none;
+  }
+  .shell:has(.cx-rail) .burger:hover,
+  .shell:has(.cx-rail) .burger.open { background: rgba(255, 255, 255, 0.06); }
+  .shell:has(.cx-rail) .burger span { height: 1.75px; border-radius: 2px !important; background: #b4b4b4; }
+  .shell:has(.cx-rail) .mobile-bar .brand-logo svg { height: 16px; width: auto; }
+
+  .shell:has(.cx-rail) .mb-ctx {
+    height: 32px;
+    gap: 8px;
+    padding: 0 12px 0 11px;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 999px !important;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .shell:has(.cx-rail) .mb-ctx b { font: 550 13.5px var(--sans); color: #e6e6e6; }
+  .shell:has(.cx-rail) .mb-ctx .fx-sq { width: 8px; height: 8px; border-radius: 50% !important; }
+  .shell:has(.cx-rail) .mb-ctx .cx-av { border: 0; border-radius: 6px !important; background: #2a2d3d; }
+
+  /* the page as a card under the bar */
+  .shell:has(.cx-rail) .main-frame { padding: 0 4px 4px; background: var(--rail-bg); }
+  .shell:has(.cx-rail) .main-frame > .main {
+    --bg: #0d0d0d;
+    --bg-panel: #111111;
+    --bg-raised: #151515;
+    --bg-sunken: #0a0a0a;
+    --bg-hover: #191919;
+    background: var(--bg);
+    background-image: none;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px !important;
+  }
+  .shell:has(.cx-rail) .main .page-head { border-radius: 12px 12px 0 0 !important; background: color-mix(in srgb, var(--bg) 88%, transparent); }
+
+  /* the drawer */
+  .shell:has(.cx-rail) .sidebar.cx-rail { background: var(--rail-bg); border-right: 0; box-shadow: 16px 0 48px -12px rgba(0, 0, 0, 0.6); }
+}
